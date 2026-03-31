@@ -63,6 +63,43 @@ impl Runtime {
         }
     }
 
+    /// Create a compute node defined by a pure function.
+    /// The function receives `&Runtime` and calls `rt.get()` to read dependencies.
+    /// Dependencies are automatically tracked — no manual wiring needed.
+    pub fn create_query<T, F>(&mut self, f: F) -> Incr<T>
+    where
+        T: Any + Clone + PartialEq + 'static,
+        F: Fn(&Runtime) -> T + 'static,
+    {
+        let func = Box::new(move |rt: &Runtime| -> Box<dyn Any> { Box::new(f(rt)) });
+        let eq_fn = Box::new(|a: &dyn Any, b: &dyn Any| -> bool {
+            a.downcast_ref::<T>().unwrap() == b.downcast_ref::<T>().unwrap()
+        });
+        let entry = ComputeEntry { func, eq_fn };
+
+        let func_idx = self.funcs.len();
+        self.funcs.push(entry);
+        let id = {
+            let mut nodes = self.nodes.borrow_mut();
+            let id = NodeId(nodes.len() as u32);
+            nodes.push(crate::graph::NodeData {
+                state: NodeState::New,
+                value: None,
+                verified_at: Revision::default(),
+                changed_at: Revision::default(),
+                dependents: Vec::new(),
+                dependencies: Vec::new(),
+            });
+            id
+        };
+        self.kinds.push(NodeKind::Compute(func_idx));
+
+        Incr {
+            id,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Read the current value of a node. If the node is dirty or new,
     /// triggers recomputation of the minimum necessary subgraph.
     pub fn get<T>(&self, node: Incr<T>) -> T
@@ -158,10 +195,92 @@ impl Runtime {
             return;
         }
 
-        match &self.kinds[id.0 as usize] {
-            NodeKind::Input => return, // Inputs are always up-to-date after set()
-            NodeKind::Compute(_) => {
-                // Will be fully implemented in Task 4
+        let func_idx = match &self.kinds[id.0 as usize] {
+            NodeKind::Input => return,
+            NodeKind::Compute(idx) => *idx,
+        };
+
+        // Cycle detection
+        {
+            let computing = self.computing.borrow();
+            if computing.contains(&id) {
+                panic!(
+                    "Cycle detected: node {:?} is already being computed",
+                    id
+                );
+            }
+        }
+
+        // Step 1: Ensure all current dependencies are clean
+        let deps: Vec<NodeId> = self.nodes.borrow()[id.0 as usize].dependencies.clone();
+        for dep_id in &deps {
+            self.ensure_clean(*dep_id);
+        }
+
+        // Step 2: Check if recomputation is actually needed
+        let needs_recompute = {
+            let nodes = self.nodes.borrow();
+            let node = &nodes[id.0 as usize];
+            match node.state {
+                NodeState::New => true,
+                NodeState::Dirty => {
+                    // Recompute only if a dependency actually changed since last verification
+                    node.dependencies.iter().any(|dep_id| {
+                        nodes[dep_id.0 as usize].changed_at > node.verified_at
+                    })
+                }
+                NodeState::Clean => false,
+            }
+        };
+
+        if !needs_recompute {
+            // Dependencies haven't changed — skip recomputation
+            let mut nodes = self.nodes.borrow_mut();
+            let node = &mut nodes[id.0 as usize];
+            node.state = NodeState::Clean;
+            node.verified_at = self.revision.get();
+            return;
+        }
+
+        // Step 3: Execute the compute function
+        self.computing.borrow_mut().push(id);
+        self.dep_stack.borrow_mut().push(Vec::new());
+
+        let new_value = (self.funcs[func_idx].func)(self);
+
+        let new_deps = self.dep_stack.borrow_mut().pop().unwrap();
+        self.computing.borrow_mut().retain(|n| *n != id);
+
+        // Step 4: Update node — check for early cutoff
+        let mut nodes = self.nodes.borrow_mut();
+        let node = &mut nodes[id.0 as usize];
+        let revision = self.revision.get();
+
+        let value_changed = match &node.value {
+            Some(old_value) => !(self.funcs[func_idx].eq_fn)(old_value.as_ref(), new_value.as_ref()),
+            None => true, // First computation
+        };
+
+        if value_changed {
+            node.value = Some(new_value);
+            node.changed_at = revision;
+        }
+        node.verified_at = revision;
+        node.state = NodeState::Clean;
+
+        // Step 5: Update dependency edges
+        let old_deps = std::mem::replace(&mut node.dependencies, new_deps.clone());
+
+        // Remove self from dependents of old deps no longer needed
+        for old_dep in &old_deps {
+            if !new_deps.contains(old_dep) {
+                nodes[old_dep.0 as usize].dependents.retain(|d| *d != id);
+            }
+        }
+        // Add self to dependents of new deps
+        for new_dep in &new_deps {
+            if !old_deps.contains(new_dep) {
+                nodes[new_dep.0 as usize].dependents.push(id);
             }
         }
     }
@@ -206,5 +325,41 @@ mod tests {
         assert_eq!(rt.get(a), 1);
         assert_eq!(rt.get(b), 2);
         assert_eq!(rt.get(c), 3);
+    }
+
+    #[test]
+    fn simple_compute_node() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(10_i64);
+        let b = rt.create_query(move |rt| rt.get(a) * 2);
+        assert_eq!(rt.get(b), 20);
+    }
+
+    #[test]
+    fn compute_reads_multiple_inputs() {
+        let mut rt = Runtime::new();
+        let x = rt.create_input(3_i64);
+        let y = rt.create_input(4_i64);
+        let sum = rt.create_query(move |rt| rt.get(x) + rt.get(y));
+        assert_eq!(rt.get(sum), 7);
+    }
+
+    #[test]
+    fn chained_compute_nodes() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(5_i64);
+        let b = rt.create_query(move |rt| rt.get(a) + 1);
+        let c = rt.create_query(move |rt| rt.get(b) * 2);
+        assert_eq!(rt.get(c), 12); // (5 + 1) * 2
+    }
+
+    #[test]
+    fn diamond_dependency_first_computation() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let b = rt.create_query(move |rt| rt.get(a) + 10);
+        let c = rt.create_query(move |rt| rt.get(a) + 100);
+        let d = rt.create_query(move |rt| rt.get(b) + rt.get(c));
+        assert_eq!(rt.get(d), 112); // (1+10) + (1+100)
     }
 }
