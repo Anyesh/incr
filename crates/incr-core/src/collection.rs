@@ -183,6 +183,10 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
         }
     }
 
+    pub fn elements(&self) -> std::collections::HashSet<T> {
+        self.log.borrow().elements.clone()
+    }
+
     pub fn count(&self, rt: &Runtime) -> Incr<usize> {
         let upstream_log = self.log.clone();
         let upstream_ver = self.version_node;

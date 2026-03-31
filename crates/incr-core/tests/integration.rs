@@ -1,5 +1,5 @@
 // crates/incr-core/tests/integration.rs
-use incr_core::Runtime;
+use incr_core::{IncrCollection, Runtime};
 
 #[test]
 fn spec_example_width_height_area() {
@@ -104,4 +104,66 @@ fn string_values_work() {
 
     rt.set(first, "Goodbye".to_string());
     assert_eq!(rt.get(full), "Goodbye World");
+}
+
+#[test]
+fn collection_feeds_function_query() {
+    let rt = Runtime::new();
+    let scores = rt.create_collection::<i64>();
+    let high_scores = scores.filter(&rt, |s| *s >= 90);
+    let count = high_scores.count(&rt);
+
+    let summary = rt.create_query(move |rt| {
+        let n = rt.get(count);
+        format!("{} students scored 90+", n)
+    });
+
+    scores.insert(&rt, 85);
+    scores.insert(&rt, 92);
+    scores.insert(&rt, 78);
+    scores.insert(&rt, 95);
+
+    assert_eq!(rt.get(summary), "2 students scored 90+");
+
+    scores.insert(&rt, 91);
+    assert_eq!(rt.get(summary), "3 students scored 90+");
+
+    scores.delete(&rt, &92);
+    assert_eq!(rt.get(summary), "2 students scored 90+");
+}
+
+#[test]
+fn full_pipeline_filter_map_count_query() {
+    #[derive(Clone, Hash, Eq, PartialEq, Debug)]
+    struct User {
+        name: String,
+        age: i32,
+        active: bool,
+    }
+
+    let rt = Runtime::new();
+    let users: IncrCollection<User> = rt.create_collection();
+
+    let active_adults = users
+        .filter(&rt, |u| u.active)
+        .filter(&rt, |u| u.age >= 18)
+        .map(&rt, |u| u.name.clone());
+
+    let count = active_adults.count(&rt);
+
+    let summary = rt.create_query(move |rt| {
+        format!("{} active adults", rt.get(count))
+    });
+
+    users.insert(&rt, User { name: "Alice".into(), age: 30, active: true });
+    users.insert(&rt, User { name: "Bob".into(), age: 16, active: true });
+    users.insert(&rt, User { name: "Carol".into(), age: 25, active: false });
+
+    assert_eq!(rt.get(summary), "1 active adults");
+
+    users.insert(&rt, User { name: "Dave".into(), age: 22, active: true });
+    assert_eq!(rt.get(summary), "2 active adults");
+
+    users.delete(&rt, &User { name: "Alice".into(), age: 30, active: true });
+    assert_eq!(rt.get(summary), "1 active adults");
 }
