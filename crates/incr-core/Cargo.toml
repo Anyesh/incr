@@ -11,7 +11,12 @@ rustc-hash = "2"
 [dev-dependencies]
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
+salsa = "0.26"
 
 [[bench]]
 name = "performance"
+harness = false
+
+[[bench]]
+name = "comparison"
 harness = false
