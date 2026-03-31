@@ -1,0 +1,17 @@
+[package]
+name = "incr-core"
+version = "0.1.0"
+edition = "2021"
+description = "General-purpose incremental computation engine"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+rustc-hash = "2"
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "performance"
+harness = false
