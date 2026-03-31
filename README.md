@@ -82,8 +82,8 @@ incr-core = { path = "crates/incr-core" }
 Python (not on PyPI yet, build from source):
 ```bash
 cd incr
-uv venv ../.venv && uv pip install maturin pytest
-source ../.venv/Scripts/activate
+uv venv .venv && uv pip install maturin pytest
+source .venv/Scripts/activate
 maturin develop
 python -c "from incr import Runtime; print('ok')"
 ```
@@ -91,7 +91,7 @@ python -c "from incr import Runtime; print('ok')"
 Running the tests:
 ```bash
 cargo test -p incr-core       # rust
-pytest ../tests/python/        # python
+pytest ./examples/tests/python/        # python
 cargo bench -p incr-core       # benchmarks
 ```
 
