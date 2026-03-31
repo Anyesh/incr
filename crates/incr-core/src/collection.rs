@@ -90,38 +90,36 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
         let upstream_log = self.log.clone();
         let output_log = Rc::new(RefCell::new(CollectionLog::new()));
         let output_log_ref = output_log.clone();
-        let last_processed = Rc::new(Cell::new(0_u64));
+        let last_idx = Rc::new(Cell::new(0_usize));
         let upstream_ver = self.version_node;
 
         let version_node = rt.create_query(move |rt| -> u64 {
-            let upstream_v = rt.get(upstream_ver);
-            let last = last_processed.get();
+            let _upstream_v = rt.get(upstream_ver);
 
-            if upstream_v <= last {
+            let upstream = upstream_log.borrow();
+            let start = last_idx.get();
+            if start >= upstream.deltas.len() {
                 return output_log_ref.borrow().version;
             }
 
-            let upstream = upstream_log.borrow();
             let mut output = output_log_ref.borrow_mut();
 
-            for vd in &upstream.deltas {
-                if vd.version > last {
-                    match &vd.delta {
-                        Delta::Insert(x) => {
-                            if predicate(x) {
-                                output.insert(x.clone());
-                            }
+            for vd in &upstream.deltas[start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        if predicate(x) {
+                            output.insert(x.clone());
                         }
-                        Delta::Delete(x) => {
-                            if predicate(x) {
-                                output.delete(x);
-                            }
+                    }
+                    Delta::Delete(x) => {
+                        if predicate(x) {
+                            output.delete(x);
                         }
                     }
                 }
             }
 
-            last_processed.set(upstream_v);
+            last_idx.set(upstream.deltas.len());
             output.version
         });
 
@@ -139,41 +137,39 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
         let upstream_log = self.log.clone();
         let output_log = Rc::new(RefCell::new(CollectionLog::new()));
         let output_log_ref = output_log.clone();
-        let last_processed = Rc::new(Cell::new(0_u64));
+        let last_idx = Rc::new(Cell::new(0_usize));
         let mapping: Rc<RefCell<HashMap<T, U>>> = Rc::new(RefCell::new(HashMap::new()));
         let mapping_ref = mapping.clone();
         let upstream_ver = self.version_node;
 
         let version_node = rt.create_query(move |rt| -> u64 {
-            let upstream_v = rt.get(upstream_ver);
-            let last = last_processed.get();
+            let _upstream_v = rt.get(upstream_ver);
 
-            if upstream_v <= last {
+            let upstream = upstream_log.borrow();
+            let start = last_idx.get();
+            if start >= upstream.deltas.len() {
                 return output_log_ref.borrow().version;
             }
 
-            let upstream = upstream_log.borrow();
             let mut output = output_log_ref.borrow_mut();
             let mut map_state = mapping_ref.borrow_mut();
 
-            for vd in &upstream.deltas {
-                if vd.version > last {
-                    match &vd.delta {
-                        Delta::Insert(x) => {
-                            let y = f(x);
-                            map_state.insert(x.clone(), y.clone());
-                            output.insert(y);
-                        }
-                        Delta::Delete(x) => {
-                            if let Some(y) = map_state.remove(x) {
-                                output.delete(&y);
-                            }
+            for vd in &upstream.deltas[start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let y = f(x);
+                        map_state.insert(x.clone(), y.clone());
+                        output.insert(y);
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(y) = map_state.remove(x) {
+                            output.delete(&y);
                         }
                     }
                 }
             }
 
-            last_processed.set(upstream_v);
+            last_idx.set(upstream.deltas.len());
             output.version
         });
 
@@ -192,29 +188,27 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
         let upstream_ver = self.version_node;
         let current_count = Rc::new(Cell::new(0_usize));
         let count_ref = current_count.clone();
-        let last_processed = Rc::new(Cell::new(0_u64));
+        let last_idx = Rc::new(Cell::new(0_usize));
 
         rt.create_query(move |rt| -> usize {
-            let upstream_v = rt.get(upstream_ver);
-            let last = last_processed.get();
+            let _upstream_v = rt.get(upstream_ver);
 
-            if upstream_v <= last {
+            let upstream = upstream_log.borrow();
+            let start = last_idx.get();
+            if start >= upstream.deltas.len() {
                 return count_ref.get();
             }
 
-            let upstream = upstream_log.borrow();
             let mut count = count_ref.get();
 
-            for vd in &upstream.deltas {
-                if vd.version > last {
-                    match &vd.delta {
-                        Delta::Insert(_) => count += 1,
-                        Delta::Delete(_) => count -= 1,
-                    }
+            for vd in &upstream.deltas[start..] {
+                match &vd.delta {
+                    Delta::Insert(_) => count += 1,
+                    Delta::Delete(_) => count -= 1,
                 }
             }
 
-            last_processed.set(upstream_v);
+            last_idx.set(upstream.deltas.len());
             count_ref.set(count);
             count
         })
