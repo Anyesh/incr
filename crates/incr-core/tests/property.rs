@@ -14,7 +14,7 @@ fn verify_incremental_matches_batch(
     assert_eq!(input_values.len(), num_inputs);
 
     // --- Build incremental graph ---
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
     let mut all_nodes: Vec<Incr<i64>> = Vec::new();
 
     // Create inputs
@@ -65,7 +65,7 @@ fn verify_incremental_matches_batch(
         final_values[idx] = new_val;
     }
 
-    let mut rt2 = Runtime::new();
+    let rt2 = Runtime::new();
     let mut all_nodes2: Vec<Incr<i64>> = Vec::new();
 
     for &val in &final_values {

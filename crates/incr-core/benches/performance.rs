@@ -4,7 +4,7 @@ use incr_core::{Incr, Runtime};
 
 /// Build a linear chain: input -> n1 -> n2 -> ... -> output
 fn build_chain(size: usize) -> (Runtime, Incr<i64>, Incr<i64>) {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
     let input = rt.create_input(1_i64);
     let mut prev: Incr<i64> = input;
     for _ in 0..size {
@@ -18,7 +18,7 @@ fn build_chain(size: usize) -> (Runtime, Incr<i64>, Incr<i64>) {
 
 /// Build a wide fan-out: input -> [n1, n2, ..., n_width] -> output
 fn build_fanout(width: usize) -> (Runtime, Incr<i64>, Incr<i64>) {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
     let input = rt.create_input(1_i64);
     let mut intermediates: Vec<Incr<i64>> = Vec::new();
     for i in 0..width {
@@ -44,7 +44,7 @@ fn build_layered(
     nodes_per_layer: usize,
     num_layers: usize,
 ) -> (Runtime, Vec<Incr<i64>>, Incr<i64>) {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
     let mut inputs = Vec::new();
     let mut all_nodes: Vec<Incr<i64>> = Vec::new();
 
@@ -89,7 +89,7 @@ fn bench_propagate_single(c: &mut Criterion) {
 
 fn bench_early_cutoff(c: &mut Criterion) {
     c.bench_function("early_cutoff_chain_1000", |b| {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let input = rt.create_input(1_i64);
         let clamped = {
             let dep = input;

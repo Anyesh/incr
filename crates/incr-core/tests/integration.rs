@@ -3,7 +3,7 @@ use incr_core::Runtime;
 
 #[test]
 fn spec_example_width_height_area() {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
 
     let width = rt.create_input(10.0_f64);
     let height = rt.create_input(5.0_f64);
@@ -20,7 +20,7 @@ fn spec_example_width_height_area() {
 
 #[test]
 fn spec_example_incremental_updates() {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
 
     let x = rt.create_input(1_i64);
     let y = rt.create_input(2_i64);
@@ -43,7 +43,7 @@ fn complex_graph_with_early_cutoff() {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
 
     let raw_score = rt.create_input(85_i64);
 
@@ -91,7 +91,7 @@ fn complex_graph_with_early_cutoff() {
 
 #[test]
 fn string_values_work() {
-    let mut rt = Runtime::new();
+    let rt = Runtime::new();
 
     let first = rt.create_input("Hello".to_string());
     let last = rt.create_input("World".to_string());

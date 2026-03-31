@@ -6,16 +6,16 @@ use std::marker::PhantomData;
 
 /// The incremental computation runtime.
 ///
-/// Creation methods (`create_input`, `create_query`) take `&mut self`.
+/// Creation methods (`create_input`, `create_query`) take `&self`.
 /// Access methods (`get`, `set`) take `&self` using interior mutability.
 pub struct Runtime {
     /// Node data (values, state, edges). Interior mutability for access during compute.
     nodes: RefCell<Vec<crate::graph::NodeData>>,
-    /// Node kinds (Input or Compute). Immutable after creation.
-    kinds: Vec<NodeKind>,
-    /// Compute functions. Immutable after creation. Stored separately from nodes
+    /// Node kinds (Input or Compute). RefCell for &self creation methods.
+    kinds: RefCell<Vec<NodeKind>>,
+    /// Compute functions. RefCell for &self creation methods. Stored separately from nodes
     /// to avoid borrow conflicts: we read a function while mutating node data.
-    funcs: Vec<ComputeEntry>,
+    funcs: RefCell<Vec<ComputeEntry>>,
     /// Global revision counter. Incremented on every input mutation.
     revision: Cell<Revision>,
     /// Stack of dependency recordings. Each frame records which nodes are read
@@ -29,8 +29,8 @@ impl Runtime {
     pub fn new() -> Self {
         Runtime {
             nodes: RefCell::new(Vec::new()),
-            kinds: Vec::new(),
-            funcs: Vec::new(),
+            kinds: RefCell::new(Vec::new()),
+            funcs: RefCell::new(Vec::new()),
             revision: Cell::new(Revision(1)), // Start at 1; default 0 means "never verified"
             dep_stack: RefCell::new(Vec::new()),
             computing: RefCell::new(Vec::new()),
@@ -38,10 +38,11 @@ impl Runtime {
     }
 
     /// Create an input node with an initial value.
-    pub fn create_input<T>(&mut self, value: T) -> Incr<T>
+    pub fn create_input<T>(&self, value: T) -> Incr<T>
     where
         T: Any + Clone + PartialEq + 'static,
     {
+        assert!(self.dep_stack.borrow().is_empty(), "cannot create nodes during computation");
         let revision = self.revision.get();
         let id = {
             let mut nodes = self.nodes.borrow_mut();
@@ -56,7 +57,7 @@ impl Runtime {
             });
             id
         };
-        self.kinds.push(NodeKind::Input);
+        self.kinds.borrow_mut().push(NodeKind::Input);
         Incr {
             id,
             _phantom: PhantomData,
@@ -66,19 +67,20 @@ impl Runtime {
     /// Create a compute node defined by a pure function.
     /// The function receives `&Runtime` and calls `rt.get()` to read dependencies.
     /// Dependencies are automatically tracked — no manual wiring needed.
-    pub fn create_query<T, F>(&mut self, f: F) -> Incr<T>
+    pub fn create_query<T, F>(&self, f: F) -> Incr<T>
     where
         T: Any + Clone + PartialEq + 'static,
         F: Fn(&Runtime) -> T + 'static,
     {
+        assert!(self.dep_stack.borrow().is_empty(), "cannot create nodes during computation");
         let func = Box::new(move |rt: &Runtime| -> Box<dyn Any> { Box::new(f(rt)) });
         let eq_fn = Box::new(|a: &dyn Any, b: &dyn Any| -> bool {
             a.downcast_ref::<T>().unwrap() == b.downcast_ref::<T>().unwrap()
         });
         let entry = ComputeEntry { func, eq_fn };
 
-        let func_idx = self.funcs.len();
-        self.funcs.push(entry);
+        let func_idx = self.funcs.borrow().len();
+        self.funcs.borrow_mut().push(entry);
         let id = {
             let mut nodes = self.nodes.borrow_mut();
             let id = NodeId(nodes.len() as u32);
@@ -92,7 +94,7 @@ impl Runtime {
             });
             id
         };
-        self.kinds.push(NodeKind::Compute(func_idx));
+        self.kinds.borrow_mut().push(NodeKind::Compute(func_idx));
 
         Incr {
             id,
@@ -207,7 +209,7 @@ impl Runtime {
             if state == NodeState::Clean {
                 continue;
             }
-            if matches!(self.kinds[cur.0 as usize], NodeKind::Input) {
+            if matches!(self.kinds.borrow()[cur.0 as usize], NodeKind::Input) {
                 continue;
             }
 
@@ -236,7 +238,7 @@ impl Runtime {
             return;
         }
 
-        let func_idx = match &self.kinds[id.0 as usize] {
+        let func_idx = match &self.kinds.borrow()[id.0 as usize] {
             NodeKind::Input => return,
             NodeKind::Compute(idx) => *idx,
         };
@@ -281,7 +283,10 @@ impl Runtime {
         self.computing.borrow_mut().push(id);
         self.dep_stack.borrow_mut().push(Vec::new());
 
-        let new_value = (self.funcs[func_idx].func)(self);
+        let new_value = {
+            let funcs = self.funcs.borrow();
+            (funcs[func_idx].func)(self)
+        };
 
         let new_deps = self.dep_stack.borrow_mut().pop().unwrap();
         self.computing.borrow_mut().retain(|n| *n != id);
@@ -292,7 +297,10 @@ impl Runtime {
         let revision = self.revision.get();
 
         let value_changed = match &node.value {
-            Some(old_value) => !(self.funcs[func_idx].eq_fn)(old_value.as_ref(), new_value.as_ref()),
+            Some(old_value) => {
+                let funcs = self.funcs.borrow();
+                !(funcs[func_idx].eq_fn)(old_value.as_ref(), new_value.as_ref())
+            }
             None => true, // First computation
         };
 
@@ -329,14 +337,14 @@ mod tests {
 
     #[test]
     fn create_and_get_input() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let x = rt.create_input(42_i64);
         assert_eq!(rt.get(x), 42);
     }
 
     #[test]
     fn set_input_and_get_new_value() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let x = rt.create_input(10_i64);
         assert_eq!(rt.get(x), 10);
         rt.set(x, 20);
@@ -345,7 +353,7 @@ mod tests {
 
     #[test]
     fn set_same_value_is_noop() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let x = rt.create_input(5_i64);
         let rev_before = rt.revision.get();
         rt.set(x, 5);
@@ -355,7 +363,7 @@ mod tests {
 
     #[test]
     fn multiple_inputs() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(1_i64);
         let b = rt.create_input(2_i64);
         let c = rt.create_input(3_i64);
@@ -366,7 +374,7 @@ mod tests {
 
     #[test]
     fn simple_compute_node() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(10_i64);
         let b = rt.create_query(move |rt| rt.get(a) * 2);
         assert_eq!(rt.get(b), 20);
@@ -374,7 +382,7 @@ mod tests {
 
     #[test]
     fn compute_reads_multiple_inputs() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let x = rt.create_input(3_i64);
         let y = rt.create_input(4_i64);
         let sum = rt.create_query(move |rt| rt.get(x) + rt.get(y));
@@ -383,7 +391,7 @@ mod tests {
 
     #[test]
     fn chained_compute_nodes() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(5_i64);
         let b = rt.create_query(move |rt| rt.get(a) + 1);
         let c = rt.create_query(move |rt| rt.get(b) * 2);
@@ -392,7 +400,7 @@ mod tests {
 
     #[test]
     fn diamond_dependency_first_computation() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(1_i64);
         let b = rt.create_query(move |rt| rt.get(a) + 10);
         let c = rt.create_query(move |rt| rt.get(a) + 100);
@@ -404,7 +412,7 @@ mod tests {
 
     #[test]
     fn input_change_triggers_recomputation() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(10_i64);
         let b = rt.create_query(move |rt| rt.get(a) * 2);
         assert_eq!(rt.get(b), 20);
@@ -415,7 +423,7 @@ mod tests {
 
     #[test]
     fn chain_recomputation() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(1_i64);
         let b = rt.create_query(move |rt| rt.get(a) + 10);
         let c = rt.create_query(move |rt| rt.get(b) * 2);
@@ -427,7 +435,7 @@ mod tests {
 
     #[test]
     fn diamond_recomputation() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(1_i64);
         let b = rt.create_query(move |rt| rt.get(a) + 10);
         let c = rt.create_query(move |rt| rt.get(a) + 100);
@@ -440,7 +448,7 @@ mod tests {
 
     #[test]
     fn only_affected_nodes_recompute() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(1_i64);
         let b = rt.create_input(2_i64);
 
@@ -475,7 +483,7 @@ mod tests {
 
     #[test]
     fn multiple_mutations_before_get() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(1_i64);
         let compute_count = Rc::new(Cell::new(0_u32));
         let cc = compute_count.clone();
@@ -499,7 +507,7 @@ mod tests {
 
     #[test]
     fn early_cutoff_stops_propagation() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(50_i64);
 
         let b_count = Rc::new(Cell::new(0_u32));
@@ -542,7 +550,7 @@ mod tests {
 
     #[test]
     fn verification_skip_without_recomputation() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(5_i64);
         let unrelated = rt.create_input(100_i64);
 
@@ -578,7 +586,7 @@ mod tests {
 
     #[test]
     fn dynamic_dependency_switch() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let flag = rt.create_input(true);
         let a = rt.create_input(10_i64);
         let b = rt.create_input(20_i64);
@@ -612,7 +620,7 @@ mod tests {
 
     #[test]
     fn cycle_detection_no_false_positives() {
-        let mut rt = Runtime::new();
+        let rt = Runtime::new();
         let a = rt.create_input(1_i64);
         let b = rt.create_query(move |rt| rt.get(a) + 1);
         let c = rt.create_query(move |rt| rt.get(b) + 1);
