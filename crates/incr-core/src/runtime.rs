@@ -289,6 +289,8 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     #[test]
     fn create_and_get_input() {
@@ -361,5 +363,224 @@ mod tests {
         let c = rt.create_query(move |rt| rt.get(a) + 100);
         let d = rt.create_query(move |rt| rt.get(b) + rt.get(c));
         assert_eq!(rt.get(d), 112); // (1+10) + (1+100)
+    }
+
+    // ── Task 5: Dirty Marking and Incremental Recomputation ──────────────────
+
+    #[test]
+    fn input_change_triggers_recomputation() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(10_i64);
+        let b = rt.create_query(move |rt| rt.get(a) * 2);
+        assert_eq!(rt.get(b), 20);
+
+        rt.set(a, 15);
+        assert_eq!(rt.get(b), 30);
+    }
+
+    #[test]
+    fn chain_recomputation() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let b = rt.create_query(move |rt| rt.get(a) + 10);
+        let c = rt.create_query(move |rt| rt.get(b) * 2);
+        assert_eq!(rt.get(c), 22); // (1+10)*2
+
+        rt.set(a, 5);
+        assert_eq!(rt.get(c), 30); // (5+10)*2
+    }
+
+    #[test]
+    fn diamond_recomputation() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let b = rt.create_query(move |rt| rt.get(a) + 10);
+        let c = rt.create_query(move |rt| rt.get(a) + 100);
+        let d = rt.create_query(move |rt| rt.get(b) + rt.get(c));
+
+        assert_eq!(rt.get(d), 112); // (1+10) + (1+100)
+        rt.set(a, 2);
+        assert_eq!(rt.get(d), 114); // (2+10) + (2+100)
+    }
+
+    #[test]
+    fn only_affected_nodes_recompute() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let b = rt.create_input(2_i64);
+
+        let count_a = Rc::new(Cell::new(0_u32));
+        let count_b = Rc::new(Cell::new(0_u32));
+
+        let ca = count_a.clone();
+        let derived_a = rt.create_query(move |rt| {
+            ca.set(ca.get() + 1);
+            rt.get(a) * 10
+        });
+
+        let cb = count_b.clone();
+        let derived_b = rt.create_query(move |rt| {
+            cb.set(cb.get() + 1);
+            rt.get(b) * 10
+        });
+
+        // Initial computation
+        assert_eq!(rt.get(derived_a), 10);
+        assert_eq!(rt.get(derived_b), 20);
+        assert_eq!(count_a.get(), 1);
+        assert_eq!(count_b.get(), 1);
+
+        // Change only input a — derived_b should NOT recompute
+        rt.set(a, 5);
+        assert_eq!(rt.get(derived_a), 50);
+        assert_eq!(rt.get(derived_b), 20);
+        assert_eq!(count_a.get(), 2); // recomputed
+        assert_eq!(count_b.get(), 1); // NOT recomputed
+    }
+
+    #[test]
+    fn multiple_mutations_before_get() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let compute_count = Rc::new(Cell::new(0_u32));
+        let cc = compute_count.clone();
+        let b = rt.create_query(move |rt| {
+            cc.set(cc.get() + 1);
+            rt.get(a) + 100
+        });
+
+        assert_eq!(rt.get(b), 101);
+        assert_eq!(compute_count.get(), 1);
+
+        // Multiple sets before reading — only one recomputation on get
+        rt.set(a, 2);
+        rt.set(a, 3);
+        rt.set(a, 4);
+        assert_eq!(rt.get(b), 104);
+        assert_eq!(compute_count.get(), 2); // Only one recomputation, not three
+    }
+
+    // ── Task 6: Early Cutoff ─────────────────────────────────────────────────
+
+    #[test]
+    fn early_cutoff_stops_propagation() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(50_i64);
+
+        let b_count = Rc::new(Cell::new(0_u32));
+        let bc = b_count.clone();
+        let b = rt.create_query(move |rt| {
+            bc.set(bc.get() + 1);
+            rt.get(a).min(100) // Clamp to max 100
+        });
+
+        let c_count = Rc::new(Cell::new(0_u32));
+        let cc = c_count.clone();
+        let c = rt.create_query(move |rt| {
+            cc.set(cc.get() + 1);
+            rt.get(b) + 1
+        });
+
+        // Initial
+        assert_eq!(rt.get(c), 51); // min(50, 100) + 1
+        assert_eq!(b_count.get(), 1);
+        assert_eq!(c_count.get(), 1);
+
+        // Change A to 60 — B changes (60 != 50), C recomputes
+        rt.set(a, 60);
+        assert_eq!(rt.get(c), 61);
+        assert_eq!(b_count.get(), 2);
+        assert_eq!(c_count.get(), 2);
+
+        // Change A to 200 — B produces 100
+        rt.set(a, 200);
+        assert_eq!(rt.get(c), 101); // 100 + 1
+        assert_eq!(b_count.get(), 3);
+        assert_eq!(c_count.get(), 3);
+
+        // Change A to 300 — B still 100 (clamped), SAME as before! Early cutoff!
+        rt.set(a, 300);
+        assert_eq!(rt.get(c), 101); // Still 100 + 1
+        assert_eq!(b_count.get(), 4); // B recomputed (has to check)
+        assert_eq!(c_count.get(), 3); // C did NOT recompute — early cutoff!
+    }
+
+    #[test]
+    fn verification_skip_without_recomputation() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(5_i64);
+        let unrelated = rt.create_input(100_i64);
+
+        let b = rt.create_query(move |rt| rt.get(a).min(10)); // Clamped
+
+        let d_count = Rc::new(Cell::new(0_u32));
+        let dc = d_count.clone();
+        let d = rt.create_query(move |rt| {
+            dc.set(dc.get() + 1);
+            rt.get(unrelated) + rt.get(b)
+        });
+
+        assert_eq!(rt.get(d), 105); // 100 + 5
+        assert_eq!(d_count.get(), 1);
+
+        // Change A from 5 to 8 — B changes from 5 to 8
+        rt.set(a, 8);
+        assert_eq!(rt.get(d), 108);
+        assert_eq!(d_count.get(), 2);
+
+        // Change A from 8 to 15 — B clamped to 10
+        rt.set(a, 15);
+        assert_eq!(rt.get(d), 110);
+        assert_eq!(d_count.get(), 3);
+
+        // Change A from 15 to 20 — B still clamped to 10, SAME value
+        rt.set(a, 20);
+        assert_eq!(rt.get(d), 110);
+        assert_eq!(d_count.get(), 3); // D did not recompute
+    }
+
+    // ── Task 7: Dynamic Dependencies ─────────────────────────────────────────
+
+    #[test]
+    fn dynamic_dependency_switch() {
+        let mut rt = Runtime::new();
+        let flag = rt.create_input(true);
+        let a = rt.create_input(10_i64);
+        let b = rt.create_input(20_i64);
+
+        let a_count = Rc::new(Cell::new(0_u32));
+        let b_count = Rc::new(Cell::new(0_u32));
+        let ac = a_count.clone();
+        let bc = b_count.clone();
+
+        let result = rt.create_query(move |rt| {
+            if rt.get(flag) {
+                ac.set(ac.get() + 1);
+                rt.get(a)
+            } else {
+                bc.set(bc.get() + 1);
+                rt.get(b)
+            }
+        });
+
+        // Flag is true — reads A
+        assert_eq!(rt.get(result), 10);
+
+        // Switch flag to false — now reads B
+        rt.set(flag, false);
+        assert_eq!(rt.get(result), 20);
+
+        // Change A — result should NOT recompute (no longer depends on A)
+        rt.set(a, 99);
+        assert_eq!(rt.get(result), 20);
+    }
+
+    #[test]
+    fn cycle_detection_no_false_positives() {
+        let mut rt = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let b = rt.create_query(move |rt| rt.get(a) + 1);
+        let c = rt.create_query(move |rt| rt.get(b) + 1);
+        assert_eq!(rt.get(c), 3); // No cycle panic
     }
 }
