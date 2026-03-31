@@ -103,6 +103,20 @@ The function DAG with automatic dependency tracking, early cutoff, and dynamic d
 
 Still missing: joins and group-by for collections, proper garbage collection for long-running systems, multi-threaded change propagation, and we havent published to crates.io or PyPI yet.
 
-## Background
+## Background and references
 
-The theory goes back to Umut Acar's self-adjusting computation work at Carnegie Mellon around 2005. He proved you can take arbitrary computations and make them incremental, but nobody really made it practical. The existing systems that come close -- Salsa for compilers, Differential Dataflow for streaming SQL, Jane Street's Incremental for OCaml -- all carved out one domain and optimized for that. incr tries to cover the ground between them by putting function DAGs and incremental collections behind the same engine. Whether that actually works out as a general purpose tool is still an open question, but the early results are encouraging.
+The core theory goes back to Umut Acar's PhD thesis on [self-adjusting computation](https://www.cs.cmu.edu/~rwh/students/acar.pdf) at Carnegie Mellon around 2005. He showed you can take arbitrary functional programs, track their dependencies at runtime, and replay only the parts affected by a change. The problem was overhead -- the initial run was 2-30x slower, and memory usage exploded because you had to keep the whole dependency graph around. Nobody really figured out how to make it practical at the time.
+
+A few years later, [Adapton](https://dl.acm.org/doi/10.1145/2594291.2594324) (PLDI 2014) introduced demand-driven incremental computation -- the key idea being that you dont recompute eagerly when inputs change, you just mark things dirty and only recompute when someone asks for a result. That's the approach we use for the function DAG side.
+
+On the collections side, the big influence is Frank McSherry's [Differential Dataflow](https://www.cidrdb.org/cidr2013/Papers/CIDR13_Paper111.pdf) (CIDR 2013), which represents collections as streams of differences (+1/-1 for inserts/deletes) and propagates those differences through operators. Materialize built a whole company around this for SQL. Our delta-log approach is a simplified version of the same idea.
+
+The systems we benchmark against and learned from:
+
+- [Salsa](https://salsa-rs.github.io/salsa/) -- powers rust-analyzer's incremental analysis. Uses a "red-green" algorithm with dual timestamps for early cutoff, which we borrowed. Our `verified_at` / `changed_at` design comes directly from studying how Salsa works.
+- [Jane Street's Incremental](https://blog.janestreet.com/introducing-incremental/) -- an OCaml library that went through [seven implementations](https://www.janestreet.com/tech-talks/seven-implementations-of-incremental/) before they got it right. Their ~30ns per-node firing cost was our original performance target.
+- [Build Systems a la Carte](https://www.cambridge.org/core/journals/journal-of-functional-programming/article/build-systems-a-la-carte-theory-and-practice/097CE52C750E69BD16B78C318754C7A4) (Mokhov, Mitchell, Peyton Jones, JFP 2020) -- provided the theoretical framework showing that build systems and incremental computation are the same problem viewed from different angles.
+
+Y. Annie Liu's 2024 survey [Incremental Computation: What Is the Essence?](https://arxiv.org/abs/2312.07946) is probably the best current overview of the whole field if you want to understand where all these approaches fit relative to each other. One of her key findings is that fully general incrementalization is provably undecidable, which is why every practical system (including ours) picks a restricted but useful subset of computations to handle.
+
+None of the existing systems combine function DAGs with incremental collections in a single engine, which is what incr tries to do. Whether that actually works out as a general purpose tool is still an open question, but the early results are encouraging.
