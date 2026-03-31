@@ -1,20 +1,12 @@
 # incr
 
-A general-purpose incremental computation engine. You write normal computations, and incr figures out what to recompute when inputs change. Only the parts that are actually affected get rerun.
+Most software recomputes everything from scratch whenever anything changes. Your CI rebuilds the whole project when you edit one file, your dashboard re-queries the whole database when one row updates. There are domain-specific fixes for this -- React diffs the DOM, Salsa caches compiler queries, Materialize does incremental SQL -- but if you just want to make your own code incremental, theres nothing to reach for.
 
-Works from both Rust and Python.
+incr is a crack at solving that. Its a Rust library (with Python bindings) that tracks dependencies between computations automatically and only reruns what's actually affected by a change.
 
-## Why this exists
+## Quick look
 
-Every software system recomputes too much. When one cell changes in a spreadsheet, the whole sheet recalculates. When one file changes in CI, the whole project rebuilds. There are domain-specific solutions to this (React for UI, Salsa for compilers, Materialize for SQL) but nothing general purpose that you can just drop into your code.
-
-incr is an attempt at that general purpose thing. Its built on the same academic foundations as those systems (Acar's self-adjusting computation, Adapton's demand-driven evaluation) but packages them into a library that works with arbitrary computations, not just one domain.
-
-## What it does
-
-Two APIs that share one engine:
-
-**Function graphs** -- define inputs and derived computations. When an input changes, only affected downstream nodes recompute.
+You've got two ways to use it. Function graphs let you wire up computations that depend on each other:
 
 ```python
 from incr import Runtime
@@ -26,10 +18,10 @@ area = rt.create_query(lambda rt: rt.get(width) * rt.get(height))
 
 rt.get(area)  # 50.0
 rt.set(width, 12.0)
-rt.get(area)  # 60.0 -- only area recomputed, not height
+rt.get(area)  # 60.0 -- height wasnt touched, only area reran
 ```
 
-**Incremental collections** -- filter, map, count over datasets. When you insert or delete a row, only the new row flows through the pipeline.
+And then theres incremental collections, which is where it gets more interesting. You set up a pipeline of filter/map/count operations, and when you insert or delete a row, only that row flows through -- the engine doesnt re-examine existing data.
 
 ```python
 scores = rt.create_collection()
@@ -42,92 +34,75 @@ scores.insert(95)
 rt.get(count)  # 2
 
 scores.insert(91)
-rt.get(count)  # 3 -- only the new row was checked
+rt.get(count)  # 3
 ```
 
-These compose. A function query can depend on a collection count, and the whole thing stays incremental end to end.
+The two APIs share the same dependency graph under the hood so you can have a function query that reads from a collection's count and it all stays incremental.
 
-## Performance
+## Benchmarks
 
-Benchmarked on the same machine, same workloads, head to head against Salsa (the incremental engine used by rust-analyzer):
+We run these head-to-head against Salsa (the incremental engine in rust-analyzer) on the same machine, same workloads. Not cherry-picked.
 
 | Workload | incr | Salsa |
 |----------|------|-------|
-| Diamond graph (4 nodes), change input and propagate | 752 ns | 1,066 ns |
-| Early cutoff (input changes but output doesnt) | 445 ns | 469 ns |
-| Single tracked query, change and recompute | ~175 ns/node | ~387 ns/query |
+| Diamond graph, change input and propagate through 4 nodes | 752 ns | 1,066 ns |
+| Early cutoff (input changes but clamped output doesnt) | 445 ns | 469 ns |
+| Per-node propagation cost in a chain | ~175 ns/node | ~387 ns/query |
 
-For collections, compared against recomputing the whole pipeline from scratch:
+Collection insert vs just recomputing the whole pipeline from scratch:
 
-| Collection size | Incremental insert | Batch recompute | Speedup |
-|----------------|-------------------|----------------|---------|
-| 1,000 elements | 798 ns | 2.5 us | 3x |
-| 10,000 elements | 1.0 us | 14.2 us | 14x |
-| 100,000 elements | 818 ns | 152 us | 186x |
+| Collection size | Incremental | From scratch | Speedup |
+|----------------|-------------|-------------|---------|
+| 1K elements | 798 ns | 2.5 us | 3x |
+| 10K elements | 1.0 us | 14.2 us | 14x |
+| 100K elements | 818 ns | 152 us | 186x |
 
-The insert time stays roughly constant regardless of how big the collection is. Thats the whole point.
+The interesting thing in that second table is the incremental column barely moves as the collection grows. 818 ns for 100K is almost the same as 798 ns for 1K because we're only touching the new row, not scanning the existing ones.
 
-## How it works
+## How it works internally
 
-When you call `rt.set()` on an input, incr marks all downstream nodes as "maybe dirty". When you call `rt.get()` on a result, it walks backwards from what you asked for, only recomputing nodes whose inputs actually changed. If a node recomputes but produces the same value as before (early cutoff), propagation stops there.
+Calling `rt.set()` on an input eagerly marks downstream nodes as potentially dirty (just flipping bits, no recomputation). Then when you `rt.get()` a result, the engine walks backwards from what you asked for, checks if each dirty node's dependencies actually changed, and only reruns the ones that need it. If a node reruns but produces the same value it had before, propagation stops there -- thats the "early cutoff" you see in the benchmarks.
 
-Collections use delta-based propagation. Each pipeline stage (filter, map, count) tracks an index into the upstream change log and only processes new entries since last time. So inserting one row into a 100K-element collection touches maybe 3-4 pipeline stages, each doing O(1) work.
+For collections its a bit different. Each pipeline stage keeps a read offset into the upstream's change log. When triggered, it just reads entries past that offset, processes them, and advances the pointer. Inserting one row into a 100K collection means each stage does O(1) work regardless of collection size.
 
-## Correctness
+## Testing
 
-Every release runs 4000+ property-based test cases (proptest) that generate random computation graphs, apply random mutations, and verify the incremental result always matches computing everything from scratch. If these ever disagree, proptest gives you a minimal failing example.
+We use proptest to generate thousands of random computation graphs, apply random mutations, and check that the incremental result matches what you'd get by recomputing everything from scratch. Thats the core correctness guarantee -- if those two ever disagree on any random input, proptest shrinks it down to a minimal failing case.
 
-50 Rust tests, 15 Python tests, covering function graphs, collections, early cutoff, dynamic dependencies, and cross-API composition.
+65 tests total across Rust and Python, including property-based, integration, and unit tests.
 
-## Install
+## Getting started
 
-**Python:**
-```
-pip install incr
-```
-(not on PyPI yet -- build from source with `maturin develop`)
-
-**Rust:**
+Rust:
 ```toml
 [dependencies]
 incr-core = { path = "crates/incr-core" }
 ```
 
-## Building from source
-
-You need Rust and (for Python bindings) uv or any Python 3.9+.
-
+Python (not on PyPI yet, build from source):
 ```bash
 cd incr
-cargo test -p incr-core          # run rust tests
-cargo bench -p incr-core          # run benchmarks
-
-# for python
-uv venv ../.venv
-uv pip install maturin pytest
-source ../.venv/Scripts/activate  # or bin/activate on linux/mac
+uv venv ../.venv && uv pip install maturin pytest
+source ../.venv/Scripts/activate
 maturin develop
-pytest ../tests/python/
+python -c "from incr import Runtime; print('ok')"
 ```
 
-## Status
+Running the tests:
+```bash
+cargo test -p incr-core       # rust
+pytest ../tests/python/        # python
+cargo bench -p incr-core       # benchmarks
+```
 
-This is early stage. The core engine works and is fast, but the API will probably change. No stability guarantees yet.
+## Where this is at
 
-What works:
-- Function DAG with automatic dependency tracking
-- Early cutoff when values dont change
-- Dynamic dependencies (a node can read different inputs depending on values)
-- Incremental collections with delta-based filter, map, count
-- Python bindings via PyO3
-- Competitive with Salsa on equivalent workloads
+Early stage. The engine works and the numbers are good but the API isnt stable yet. Heres roughly what exists and what doesnt:
 
-Whats missing:
-- Collection joins and group-by (planned)
-- Memory management / garbage collection for long-running processes
-- Multi-threaded propagation
-- Published to crates.io / PyPI
+The function DAG with automatic dependency tracking, early cutoff, and dynamic dependencies is solid -- been through thousands of property test cases. Collections do delta-based filter, map, and count. Python bindings work through PyO3.
 
-## Prior art
+Still missing: joins and group-by for collections, proper garbage collection for long-running systems, multi-threaded change propagation, and we havent published to crates.io or PyPI yet.
 
-The theory behind this comes from Umut Acar's self-adjusting computation work at CMU (~2005). The practical design borrows from Salsa (rust-analyzer's incremental engine), Adapton (demand-driven evaluation), and Differential Dataflow (delta propagation for collections). None of those systems combine function DAGs with incremental collections in a single engine, which is what incr tries to do.
+## Background
+
+The theory goes back to Umut Acar's self-adjusting computation work at Carnegie Mellon around 2005. He proved you can take arbitrary computations and make them incremental, but nobody really made it practical. The existing systems that come close -- Salsa for compilers, Differential Dataflow for streaming SQL, Jane Street's Incremental for OCaml -- all carved out one domain and optimized for that. incr tries to cover the ground between them by putting function DAGs and incremental collections behind the same engine. Whether that actually works out as a general purpose tool is still an open question, but the early results are encouraging.
