@@ -178,11 +178,104 @@ fn bench_scaling(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_collection_insert(c: &mut Criterion) {
+    let mut group = c.benchmark_group("collection_insert_throughput");
+
+    for size in [1_000, 10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{}elem", size)),
+            &size,
+            |b, &size| {
+                let rt = Runtime::new();
+                let col = rt.create_collection::<i64>();
+                let filtered = col.filter(&rt, |x| x % 2 == 0);
+                let mapped = filtered.map(&rt, |x| x * 2);
+                let count = mapped.count(&rt);
+
+                for i in 0..size {
+                    col.insert(&rt, i);
+                }
+                let _ = rt.get(count);
+
+                let mut next = size;
+                b.iter(|| {
+                    col.insert(&rt, next);
+                    next += 1;
+                    black_box(rt.get(count));
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_collection_delete(c: &mut Criterion) {
+    let mut group = c.benchmark_group("collection_delete_throughput");
+
+    for size in [1_000, 10_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{}elem", size)),
+            &size,
+            |b, &size| {
+                let rt = Runtime::new();
+                let col = rt.create_collection::<i64>();
+                let filtered = col.filter(&rt, |x| x % 2 == 0);
+                let count = filtered.count(&rt);
+
+                for i in 0..size {
+                    col.insert(&rt, i);
+                }
+                let _ = rt.get(count);
+
+                let mut idx = 0_i64;
+                b.iter(|| {
+                    let val = idx % size;
+                    col.delete(&rt, &val);
+                    black_box(rt.get(count));
+                    col.insert(&rt, val);
+                    let _ = rt.get(count);
+                    idx += 1;
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_collection_pipeline_depth(c: &mut Criterion) {
+    c.bench_function("5_stage_pipeline_insert", |b| {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let stage1 = col.filter(&rt, |x| *x > 0);
+        let stage2 = stage1.filter(&rt, |x| *x < 1_000_000);
+        let stage3 = stage2.map(&rt, |x| x * 2);
+        let stage4 = stage3.filter(&rt, |x| *x < 500_000);
+        let count = stage4.count(&rt);
+
+        for i in 1..10_001_i64 {
+            col.insert(&rt, i);
+        }
+        let _ = rt.get(count);
+
+        let mut next = 10_001_i64;
+        b.iter(|| {
+            col.insert(&rt, next);
+            next += 1;
+            black_box(rt.get(count));
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_propagate_single,
     bench_early_cutoff,
     bench_overhead_vs_batch,
     bench_scaling,
+    bench_collection_insert,
+    bench_collection_delete,
+    bench_collection_pipeline_depth,
 );
 criterion_main!(benches);
