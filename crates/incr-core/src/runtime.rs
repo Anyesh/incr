@@ -187,9 +187,50 @@ impl Runtime {
     }
 
     /// Ensure a node's value is up-to-date. For inputs, this is always true.
-    /// For compute nodes, recursively ensures dependencies are clean,
-    /// then recomputes if necessary.
+    /// For compute nodes, iteratively ensures dependencies are clean in
+    /// post-order (dependencies before dependents), then recomputes if necessary.
     fn ensure_clean(&self, id: NodeId) {
+        // Fast path: already clean
+        if self.nodes.borrow()[id.0 as usize].state == NodeState::Clean {
+            return;
+        }
+
+        // Collect the post-order traversal of nodes that need processing.
+        // Each stack entry is (node_id, visited) where visited=false means
+        // "push deps first", visited=true means "now process this node".
+        let mut work_stack: Vec<(NodeId, bool)> = vec![(id, false)];
+
+        while let Some((cur, visited)) = work_stack.pop() {
+            let state = self.nodes.borrow()[cur.0 as usize].state;
+
+            // Inputs and already-clean nodes need no work
+            if state == NodeState::Clean {
+                continue;
+            }
+            if matches!(self.kinds[cur.0 as usize], NodeKind::Input) {
+                continue;
+            }
+
+            if !visited {
+                // First visit: push self again (to process after deps), then push deps
+                work_stack.push((cur, true));
+                let deps: Vec<NodeId> = self.nodes.borrow()[cur.0 as usize].dependencies.clone();
+                for dep_id in deps {
+                    let dep_state = self.nodes.borrow()[dep_id.0 as usize].state;
+                    if dep_state != NodeState::Clean {
+                        work_stack.push((dep_id, false));
+                    }
+                }
+            } else {
+                // Second visit: all deps should now be clean; process this node
+                self.compute_node(cur);
+            }
+        }
+    }
+
+    /// Compute (or verify) a single node, assuming all its known dependencies are already clean.
+    fn compute_node(&self, id: NodeId) {
+        // Re-check state (may have been cleaned by an earlier iteration)
         let state = self.nodes.borrow()[id.0 as usize].state;
         if state == NodeState::Clean {
             return;
@@ -211,13 +252,7 @@ impl Runtime {
             }
         }
 
-        // Step 1: Ensure all current dependencies are clean
-        let deps: Vec<NodeId> = self.nodes.borrow()[id.0 as usize].dependencies.clone();
-        for dep_id in &deps {
-            self.ensure_clean(*dep_id);
-        }
-
-        // Step 2: Check if recomputation is actually needed
+        // Step 1: Check if recomputation is actually needed
         let needs_recompute = {
             let nodes = self.nodes.borrow();
             let node = &nodes[id.0 as usize];
@@ -242,7 +277,7 @@ impl Runtime {
             return;
         }
 
-        // Step 3: Execute the compute function
+        // Step 2: Execute the compute function
         self.computing.borrow_mut().push(id);
         self.dep_stack.borrow_mut().push(Vec::new());
 
@@ -251,7 +286,7 @@ impl Runtime {
         let new_deps = self.dep_stack.borrow_mut().pop().unwrap();
         self.computing.borrow_mut().retain(|n| *n != id);
 
-        // Step 4: Update node — check for early cutoff
+        // Step 3: Update node — check for early cutoff
         let mut nodes = self.nodes.borrow_mut();
         let node = &mut nodes[id.0 as usize];
         let revision = self.revision.get();
@@ -268,7 +303,7 @@ impl Runtime {
         node.verified_at = revision;
         node.state = NodeState::Clean;
 
-        // Step 5: Update dependency edges
+        // Step 4: Update dependency edges
         let old_deps = std::mem::replace(&mut node.dependencies, new_deps.clone());
 
         // Remove self from dependents of old deps no longer needed
