@@ -1,8 +1,11 @@
+use crate::collection::{CollectionLog, IncrCollection};
 use crate::graph::{ComputeEntry, Graph, NodeKind, NodeState};
 use crate::types::{Incr, NodeId, Revision};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::hash::Hash;
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 /// The incremental computation runtime.
 ///
@@ -167,6 +170,19 @@ impl Runtime {
 
         // Mark all transitive dependents as dirty
         self.mark_dirty_transitive(&dependents);
+    }
+
+    pub fn create_collection<T>(&self) -> IncrCollection<T>
+    where
+        T: Any + Clone + Hash + Eq + 'static,
+    {
+        assert!(
+            self.dep_stack.borrow().is_empty(),
+            "cannot create nodes during computation"
+        );
+        let log = Rc::new(RefCell::new(CollectionLog::new()));
+        let version_node = self.create_input(0_u64);
+        IncrCollection { log, version_node }
     }
 
     /// Walk forward from the given nodes, marking all reachable compute nodes as Dirty.
