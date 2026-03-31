@@ -2,6 +2,8 @@
 name = "incr-python"
 version = "0.1.0"
 edition = "2021"
+description = "Python bindings for the incr incremental computation engine"
+license = "Apache-2.0"
 
 [lib]
 name = "incr"
