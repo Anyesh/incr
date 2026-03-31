@@ -188,17 +188,15 @@ impl Runtime {
     /// Walk forward from the given nodes, marking all reachable compute nodes as Dirty.
     fn mark_dirty_transitive(&self, start: &[NodeId]) {
         let mut queue: std::collections::VecDeque<NodeId> = start.iter().copied().collect();
+        let mut nodes = self.nodes.borrow_mut();
         while let Some(id) = queue.pop_front() {
-            let mut nodes = self.nodes.borrow_mut();
             let node = &mut nodes[id.0 as usize];
             if node.state == NodeState::Clean || node.state == NodeState::New {
                 if node.state == NodeState::Clean {
                     node.state = NodeState::Dirty;
                 }
-                let dependents = node.dependents.clone();
-                drop(nodes);
-                for dep in dependents {
-                    queue.push_back(dep);
+                for i in 0..node.dependents.len() {
+                    queue.push_back(node.dependents[i]);
                 }
             }
         }
@@ -219,7 +217,15 @@ impl Runtime {
         let mut work_stack: Vec<(NodeId, bool)> = vec![(id, false)];
 
         while let Some((cur, visited)) = work_stack.pop() {
-            let state = self.nodes.borrow()[cur.0 as usize].state;
+            if visited {
+                // Second visit: all deps should now be clean; process this node
+                self.compute_node(cur);
+                continue;
+            }
+
+            // Single borrow to check state and gather dirty deps
+            let nodes = self.nodes.borrow();
+            let state = nodes[cur.0 as usize].state;
 
             // Inputs and already-clean nodes need no work
             if state == NodeState::Clean {
@@ -229,52 +235,47 @@ impl Runtime {
                 continue;
             }
 
-            if !visited {
-                // First visit: push self again (to process after deps), then push deps
-                work_stack.push((cur, true));
-                let deps: Vec<NodeId> = self.nodes.borrow()[cur.0 as usize].dependencies.clone();
-                for dep_id in deps {
-                    let dep_state = self.nodes.borrow()[dep_id.0 as usize].state;
-                    if dep_state != NodeState::Clean {
-                        work_stack.push((dep_id, false));
-                    }
+            // First visit: push self again (to process after deps), then push dirty deps
+            work_stack.push((cur, true));
+            let deps = &nodes[cur.0 as usize].dependencies;
+            for &dep_id in deps {
+                if nodes[dep_id.0 as usize].state != NodeState::Clean {
+                    work_stack.push((dep_id, false));
                 }
-            } else {
-                // Second visit: all deps should now be clean; process this node
-                self.compute_node(cur);
             }
         }
     }
 
     /// Compute (or verify) a single node, assuming all its known dependencies are already clean.
     fn compute_node(&self, id: NodeId) {
-        // Re-check state (may have been cleaned by an earlier iteration)
-        let state = self.nodes.borrow()[id.0 as usize].state;
-        if state == NodeState::Clean {
-            return;
-        }
-
-        let func_idx = match &self.kinds.borrow()[id.0 as usize] {
-            NodeKind::Input => return,
-            NodeKind::Compute(idx) => *idx,
-        };
-
-        // Cycle detection
-        {
-            let computing = self.computing.borrow();
-            if computing.contains(&id) {
-                panic!(
-                    "Cycle detected: node {:?} is already being computed",
-                    id
-                );
-            }
-        }
-
-        // Step 1: Check if recomputation is actually needed
-        let needs_recompute = {
+        // Single borrow to gather state, kind, cycle check, and needs_recompute
+        let (func_idx, needs_recompute) = {
             let nodes = self.nodes.borrow();
             let node = &nodes[id.0 as usize];
-            match node.state {
+
+            // Re-check state (may have been cleaned by an earlier iteration)
+            if node.state == NodeState::Clean {
+                return;
+            }
+
+            let func_idx = match &self.kinds.borrow()[id.0 as usize] {
+                NodeKind::Input => return,
+                NodeKind::Compute(idx) => *idx,
+            };
+
+            // Cycle detection
+            {
+                let computing = self.computing.borrow();
+                if computing.contains(&id) {
+                    panic!(
+                        "Cycle detected: node {:?} is already being computed",
+                        id
+                    );
+                }
+            }
+
+            // Check if recomputation is actually needed
+            let needs_recompute = match node.state {
                 NodeState::New => true,
                 NodeState::Dirty => {
                     // Recompute only if a dependency actually changed since last verification
@@ -283,7 +284,9 @@ impl Runtime {
                     })
                 }
                 NodeState::Clean => false,
-            }
+            };
+
+            (func_idx, needs_recompute)
         };
 
         if !needs_recompute {
@@ -297,7 +300,7 @@ impl Runtime {
 
         // Step 2: Execute the compute function
         self.computing.borrow_mut().push(id);
-        self.dep_stack.borrow_mut().push(Vec::new());
+        self.dep_stack.borrow_mut().push(Vec::with_capacity(4));
 
         let new_value = {
             let funcs = self.funcs.borrow();
@@ -305,42 +308,58 @@ impl Runtime {
         };
 
         let new_deps = self.dep_stack.borrow_mut().pop().unwrap();
-        self.computing.borrow_mut().retain(|n| *n != id);
+        // LIFO pop instead of O(n) retain — computing is always used as a stack
+        self.computing.borrow_mut().pop();
 
-        // Step 3: Update node — check for early cutoff
-        let mut nodes = self.nodes.borrow_mut();
-        let node = &mut nodes[id.0 as usize];
-        let revision = self.revision.get();
-
-        let value_changed = match &node.value {
-            Some(old_value) => {
-                let funcs = self.funcs.borrow();
-                !(funcs[func_idx].eq_fn)(old_value.as_ref(), new_value.as_ref())
+        // Step 3: Check equality BEFORE borrowing nodes mutably
+        // This avoids holding nodes borrow_mut and funcs borrow simultaneously
+        let value_changed = {
+            let nodes = self.nodes.borrow();
+            let node = &nodes[id.0 as usize];
+            match &node.value {
+                Some(old_value) => {
+                    let funcs = self.funcs.borrow();
+                    !(funcs[func_idx].eq_fn)(old_value.as_ref(), new_value.as_ref())
+                }
+                None => true, // First computation
             }
-            None => true, // First computation
         };
 
-        if value_changed {
-            node.value = Some(new_value);
-            node.changed_at = revision;
+        // Step 4: Update node state and dependency edges in a single mutable borrow
+        let mut nodes = self.nodes.borrow_mut();
+        let revision = self.revision.get();
+
+        // Update value and timestamps
+        {
+            let node = &mut nodes[id.0 as usize];
+            if value_changed {
+                node.value = Some(new_value);
+                node.changed_at = revision;
+            }
+            node.verified_at = revision;
+            node.state = NodeState::Clean;
         }
-        node.verified_at = revision;
-        node.state = NodeState::Clean;
 
-        // Step 4: Update dependency edges
-        let old_deps = std::mem::replace(&mut node.dependencies, new_deps.clone());
+        // Update dependency edges — move new_deps in, take old_deps out
+        let old_deps = std::mem::replace(&mut nodes[id.0 as usize].dependencies, new_deps);
 
+        // Diff edges using the stored new_deps (now at nodes[id].dependencies)
         // Remove self from dependents of old deps no longer needed
         for old_dep in &old_deps {
-            if !new_deps.contains(old_dep) {
+            if !nodes[id.0 as usize].dependencies.contains(old_dep) {
                 nodes[old_dep.0 as usize].dependents.retain(|d| *d != id);
             }
         }
-        // Add self to dependents of new deps
-        for new_dep in &new_deps {
-            if !old_deps.contains(new_dep) {
-                nodes[new_dep.0 as usize].dependents.push(id);
-            }
+        // Add self to dependents of new deps not previously present
+        // Must collect indices first since we need to read nodes[id] then mutate others
+        let new_dep_ids: Vec<NodeId> = nodes[id.0 as usize]
+            .dependencies
+            .iter()
+            .filter(|new_dep| !old_deps.contains(new_dep))
+            .copied()
+            .collect();
+        for dep in new_dep_ids {
+            nodes[dep.0 as usize].dependents.push(id);
         }
     }
 }
