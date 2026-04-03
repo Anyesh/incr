@@ -20,3 +20,7 @@ harness = false
 [[bench]]
 name = "comparison"
 harness = false
+
+[[bench]]
+name = "collection_operators"
+harness = false
