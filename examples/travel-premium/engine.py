@@ -163,3 +163,37 @@ class DistanceService:
         self.stats["misses"] += 1
         self.stats["total_ms"] += delay_ms
         return dist, False
+
+
+# ── Premium Rules ────────────────────────────────────────────────────────────
+
+DAILY_CAP = 50.0
+
+
+def compute_premium(distance_km: float) -> float:
+    # Tiered: 0-5km free, 5-20km at $0.45/km, 20+km at $0.65/km.
+    if distance_km <= 5.0:
+        return 0.0
+    elif distance_km <= 20.0:
+        return (distance_km - 5.0) * 0.45
+    else:
+        return (15.0 * 0.45) + (distance_km - 20.0) * 0.65
+
+
+@dataclass
+class Segment:
+    from_id: int
+    to_id: int
+    distance_km: float
+    premium: float
+    cache_hit: bool
+
+    def __hash__(self):
+        return hash((self.from_id, self.to_id))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, Segment)
+            and self.from_id == other.from_id
+            and self.to_id == other.to_id
+        )
