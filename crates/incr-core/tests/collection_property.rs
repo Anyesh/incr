@@ -136,3 +136,51 @@ proptest! {
         verify_reduce_incremental_matches_batch(ops);
     }
 }
+
+fn verify_sort_incremental_matches_batch(ops: Vec<Op>) {
+    let rt = Runtime::new();
+    let col = rt.create_collection::<i64>();
+    let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+
+    for op in &ops {
+        match op {
+            Op::Insert(v) => col.insert(&rt, *v),
+            Op::Delete(v) => col.delete(&rt, v),
+        }
+    }
+
+    let _ = rt.get(sorted.version_node());
+    let incr_sorted = sorted.entries();
+
+    // Batch oracle
+    let mut batch_set = std::collections::HashSet::new();
+    for op in &ops {
+        match op {
+            Op::Insert(v) => {
+                batch_set.insert(*v);
+            }
+            Op::Delete(v) => {
+                batch_set.remove(v);
+            }
+        }
+    }
+    let mut batch_sorted: Vec<i64> = batch_set.into_iter().collect();
+    batch_sorted.sort();
+
+    assert_eq!(
+        incr_sorted, batch_sorted,
+        "Sort mismatch: incr={:?}, batch={:?}",
+        incr_sorted, batch_sorted
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    #[test]
+    fn sort_incremental_matches_batch(
+        ops in prop::collection::vec(op_strategy(), 1..50),
+    ) {
+        verify_sort_incremental_matches_batch(ops);
+    }
+}
