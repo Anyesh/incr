@@ -197,3 +197,146 @@ class Segment:
             and self.from_id == other.from_id
             and self.to_id == other.to_id
         )
+
+
+# ── incr Pipeline Engine ─────────────────────────────────────────────────────
+
+
+class TravelPremiumEngine:
+    def __init__(self):
+        self.rt = Runtime()
+        self.distance_service = DistanceService()
+        self.visits: dict[int, Visit] = {}
+        self.next_id = 0
+
+        # Build the incr pipeline
+        self.visit_collection = self.rt.create_collection()
+
+        self.sorted_visits = self.visit_collection.sort_by_key(lambda v: v.time)
+        self.pairs = self.sorted_visits.pairwise()
+
+        svc = self.distance_service
+
+        def _pair_to_segment(pair):
+            a, b = pair[0], pair[1]
+            dist, hit = svc.get_distance(a.lat, a.lng, b.lat, b.lng)
+            return Segment(
+                from_id=a.id,
+                to_id=b.id,
+                distance_km=dist,
+                premium=compute_premium(dist),
+                cache_hit=hit,
+            )
+
+        self.segments = self.pairs.map(_pair_to_segment)
+
+        self.total_premium = self.segments.reduce(
+            lambda segs: min(sum(s.premium for s in segs), DAILY_CAP)
+        )
+
+    def generate_initial_schedule(self, num_visits: int = 14):
+        schedule = generate_schedule(num_visits)
+        for v in schedule:
+            self.visit_collection.insert(v)
+            self.visits[v.id] = v
+        self.next_id = num_visits
+        self.rt.get(self.total_premium)
+
+    def add_visit(self, visit: Visit = None) -> Visit:
+        if visit is None:
+            lat, lng = _random_location()
+            visit = Visit(
+                id=self.next_id,
+                client_name=random.choice(CLIENT_NAMES),
+                address=random.choice(ADDRESSES),
+                time=round(random.uniform(7.5, 16.5), 2),
+                duration_mins=random.choice([15, 30, 30, 45, 60]),
+                lat=lat,
+                lng=lng,
+            )
+        self.next_id = max(self.next_id, visit.id + 1)
+        self.visit_collection.insert(visit)
+        self.visits[visit.id] = visit
+        return visit
+
+    def remove_visit(self, visit_id: int = None) -> Visit | None:
+        if not self.visits:
+            return None
+        if visit_id is None:
+            visit_id = random.choice(list(self.visits.keys()))
+        visit = self.visits.pop(visit_id, None)
+        if visit:
+            self.visit_collection.delete(visit)
+        return visit
+
+    def reschedule_visit(self, visit_id: int = None) -> tuple[Visit, Visit] | None:
+        if not self.visits:
+            return None
+        if visit_id is None:
+            visit_id = random.choice(list(self.visits.keys()))
+        old = self.visits.get(visit_id)
+        if not old:
+            return None
+        self.visit_collection.delete(old)
+        new = Visit(
+            id=old.id,
+            client_name=old.client_name,
+            address=old.address,
+            time=round(random.uniform(7.5, 16.5), 2),
+            duration_mins=old.duration_mins,
+            lat=old.lat,
+            lng=old.lng,
+        )
+        self.visit_collection.insert(new)
+        self.visits[new.id] = new
+        return old, new
+
+    def read_incremental(self) -> dict:
+        self.distance_service.reset_stats()
+
+        start = time.perf_counter()
+        total = self.rt.get(self.total_premium)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        stats = self.distance_service.stats.copy()
+
+        return {
+            "total_premium": round(total, 2),
+            "visits": [
+                {
+                    "id": v.id,
+                    "client_name": v.client_name,
+                    "address": v.address,
+                    "time": v.time,
+                    "duration_mins": v.duration_mins,
+                    "lat": v.lat,
+                    "lng": v.lng,
+                }
+                for v in sorted(self.visits.values(), key=lambda v: v.time)
+            ],
+            "distance_stats": stats,
+            "incremental_ms": round(elapsed_ms, 1),
+        }
+
+    def compute_from_scratch(self) -> dict:
+        self.distance_service.clear_cache()
+        self.distance_service.reset_stats()
+
+        start = time.perf_counter()
+
+        sorted_v = sorted(self.visits.values(), key=lambda v: v.time)
+        total = 0.0
+        for i in range(len(sorted_v) - 1):
+            a, b = sorted_v[i], sorted_v[i + 1]
+            dist, _ = self.distance_service.get_distance(a.lat, a.lng, b.lat, b.lng)
+            total += compute_premium(dist)
+        total = min(total, DAILY_CAP)
+
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        stats = self.distance_service.stats.copy()
+
+        return {
+            "total_premium": round(total, 2),
+            "distance_stats": stats,
+            "scratch_ms": round(elapsed_ms, 1),
+        }
