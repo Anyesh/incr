@@ -27,8 +27,12 @@ fn verify_collection_incremental_matches_batch(ops: Vec<Op>) {
     let mut batch_set = std::collections::HashSet::new();
     for op in &ops {
         match op {
-            Op::Insert(v) => { batch_set.insert(*v); }
-            Op::Delete(v) => { batch_set.remove(v); }
+            Op::Insert(v) => {
+                batch_set.insert(*v);
+            }
+            Op::Delete(v) => {
+                batch_set.remove(v);
+            }
         }
     }
     let batch_elements: std::collections::HashSet<i64> = batch_set
@@ -37,10 +41,14 @@ fn verify_collection_incremental_matches_batch(ops: Vec<Op>) {
         .map(|x| x * 2)
         .collect();
 
-    assert_eq!(incr_count, batch_elements.len(),
-        "Count mismatch: incr={}, batch={}", incr_count, batch_elements.len());
-    assert_eq!(incr_elements, batch_elements,
-        "Elements mismatch");
+    assert_eq!(
+        incr_count,
+        batch_elements.len(),
+        "Count mismatch: incr={}, batch={}",
+        incr_count,
+        batch_elements.len()
+    );
+    assert_eq!(incr_elements, batch_elements, "Elements mismatch");
 }
 
 fn op_strategy() -> impl Strategy<Value = Op> {
@@ -71,4 +79,60 @@ fn collection_property_specific_insert_delete_cycle() {
         Op::Insert(3),
         Op::Delete(4),
     ]);
+}
+
+fn verify_reduce_incremental_matches_batch(ops: Vec<Op>) {
+    let rt = Runtime::new();
+    let col = rt.create_collection::<i64>();
+    let sum = col.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
+    let max = col.reduce(&rt, |elements| -> Option<i64> {
+        elements.iter().copied().max()
+    });
+
+    for op in &ops {
+        match op {
+            Op::Insert(v) => col.insert(&rt, *v),
+            Op::Delete(v) => col.delete(&rt, v),
+        }
+    }
+
+    let incr_sum = rt.get(sum);
+    let incr_max = rt.get(max);
+
+    // Batch oracle
+    let mut batch_set = std::collections::HashSet::new();
+    for op in &ops {
+        match op {
+            Op::Insert(v) => {
+                batch_set.insert(*v);
+            }
+            Op::Delete(v) => {
+                batch_set.remove(v);
+            }
+        }
+    }
+    let batch_sum: i64 = batch_set.iter().sum();
+    let batch_max: Option<i64> = batch_set.iter().copied().max();
+
+    assert_eq!(
+        incr_sum, batch_sum,
+        "Sum mismatch: incr={}, batch={}",
+        incr_sum, batch_sum
+    );
+    assert_eq!(
+        incr_max, batch_max,
+        "Max mismatch: incr={:?}, batch={:?}",
+        incr_max, batch_max
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    #[test]
+    fn reduce_incremental_matches_batch(
+        ops in prop::collection::vec(op_strategy(), 1..50),
+    ) {
+        verify_reduce_incremental_matches_batch(ops);
+    }
 }
