@@ -217,6 +217,31 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
             count
         })
     }
+
+    pub fn reduce<A, F>(&self, rt: &Runtime, fold_fn: F) -> Incr<A>
+    where
+        A: Any + Clone + PartialEq + 'static,
+        F: Fn(&HashSet<T>) -> A + 'static,
+    {
+        let upstream_log = self.log.clone();
+        let upstream_ver = self.version_node;
+        let last_idx = Rc::new(Cell::new(0_usize));
+
+        rt.create_query(move |rt| -> A {
+            let _upstream_v = rt.get(upstream_ver);
+
+            let upstream = upstream_log.borrow();
+            let start = last_idx.get();
+            if start >= upstream.deltas.len() {
+                // No new deltas, but we still need to return current value.
+                // On first call with empty collection, fold over empty set.
+                return fold_fn(&upstream.elements);
+            }
+
+            last_idx.set(upstream.deltas.len());
+            fold_fn(&upstream.elements)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +533,89 @@ mod tests {
 
         col.insert(&rt, 3); // odd — count unchanged
         assert_eq!(rt.get(label), "1 evens");
+        assert_eq!(downstream_count.get(), 1); // early cutoff!
+    }
+
+    // ── reduce tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn reduce_sum() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sum = col.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
+
+        assert_eq!(rt.get(sum), 0); // empty collection
+        col.insert(&rt, 10);
+        assert_eq!(rt.get(sum), 10);
+        col.insert(&rt, 20);
+        assert_eq!(rt.get(sum), 30);
+        col.delete(&rt, &10);
+        assert_eq!(rt.get(sum), 20);
+    }
+
+    #[test]
+    fn reduce_max() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let max = col.reduce(&rt, |elements| -> Option<i64> {
+            elements.iter().copied().max()
+        });
+
+        assert_eq!(rt.get(max), None);
+        col.insert(&rt, 5);
+        assert_eq!(rt.get(max), Some(5));
+        col.insert(&rt, 3);
+        assert_eq!(rt.get(max), Some(5));
+        col.insert(&rt, 8);
+        assert_eq!(rt.get(max), Some(8));
+        col.delete(&rt, &8);
+        assert_eq!(rt.get(max), Some(5));
+    }
+
+    #[test]
+    fn reduce_after_filter() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let evens = col.filter(&rt, |x| x % 2 == 0);
+        let sum = evens.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
+
+        col.insert(&rt, 1);
+        col.insert(&rt, 2);
+        col.insert(&rt, 3);
+        col.insert(&rt, 4);
+        assert_eq!(rt.get(sum), 6);
+
+        col.insert(&rt, 6);
+        assert_eq!(rt.get(sum), 12);
+
+        col.delete(&rt, &2);
+        assert_eq!(rt.get(sum), 10);
+    }
+
+    #[test]
+    fn reduce_early_cutoff() {
+        use std::cell::Cell as StdCell;
+        use std::rc::Rc as StdRc;
+
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let max = col.reduce(&rt, |elements| -> Option<i64> {
+            elements.iter().copied().max()
+        });
+
+        let downstream_count = StdRc::new(StdCell::new(0_u32));
+        let dc = downstream_count.clone();
+        let label = rt.create_query(move |rt| {
+            dc.set(dc.get() + 1);
+            format!("max={:?}", rt.get(max))
+        });
+
+        col.insert(&rt, 5);
+        assert_eq!(rt.get(label), "max=Some(5)");
+        assert_eq!(downstream_count.get(), 1);
+
+        col.insert(&rt, 3); // doesn't change max
+        assert_eq!(rt.get(label), "max=Some(5)");
         assert_eq!(downstream_count.get(), 1); // early cutoff!
     }
 }
