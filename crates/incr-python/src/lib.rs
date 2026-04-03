@@ -28,6 +28,28 @@ impl Hash for PyValue {
     }
 }
 
+impl PartialOrd for PyValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PyValue {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        Python::with_gil(|py| {
+            let self_ref = self.0.bind(py);
+            let other_ref = other.0.bind(py);
+            if self_ref.lt(other_ref).unwrap_or(false) {
+                std::cmp::Ordering::Less
+            } else if self_ref.eq(other_ref).unwrap_or(false) {
+                std::cmp::Ordering::Equal
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        })
+    }
+}
+
 // ── PyNodeId: typed handle exposed to Python ────────────────────────────────
 
 #[pyclass(name = "NodeId")]
@@ -128,9 +150,95 @@ impl PyCollection {
         Ok(PyNodeId { inner: node })
     }
 
+    fn reduce(&self, fold_fn: PyObject) -> PyResult<PyNodeId> {
+        let rt = unsafe { &*self.rt_ptr };
+        let reduce_node: incr_core::Incr<PyValue> =
+            self.inner.reduce(rt, move |elements| -> PyValue {
+                Python::with_gil(|py| {
+                    let py_list = pyo3::types::PyList::empty(py);
+                    for elem in elements.iter() {
+                        py_list.append(elem.0.clone_ref(py)).unwrap();
+                    }
+                    let result = fold_fn
+                        .call1(py, (py_list,))
+                        .expect("reduce function raised an exception");
+                    PyValue(result)
+                })
+            });
+        Ok(PyNodeId { inner: reduce_node })
+    }
+
+    fn sort_by_key(&self, key_fn: PyObject) -> PyResult<PySortedCollection> {
+        let rt = unsafe { &*self.rt_ptr };
+        let sorted = self.inner.sort_by_key(rt, move |val: &PyValue| -> PyValue {
+            Python::with_gil(|py| {
+                let result = key_fn
+                    .call1(py, (val.0.clone_ref(py),))
+                    .expect("sort key function raised an exception");
+                PyValue(result)
+            })
+        });
+        Ok(PySortedCollection {
+            inner: sorted,
+            rt_ptr: self.rt_ptr,
+        })
+    }
+
     #[getter]
     fn version_node_id(&self) -> u32 {
         self.inner.version_node_id().raw()
+    }
+}
+
+// ── PySortedCollection: wraps SortedCollection<PyValue> ────────────────────
+
+#[pyclass(name = "SortedCollection", unsendable)]
+struct PySortedCollection {
+    inner: incr_core::SortedCollection<PyValue>,
+    rt_ptr: *const incr_core::Runtime,
+}
+
+#[pymethods]
+impl PySortedCollection {
+    fn pairwise(&self) -> PyResult<PyCollection> {
+        let rt = unsafe { &*self.rt_ptr };
+        let pair_collection = self.inner.pairwise(rt);
+        let mapped = pair_collection.map(rt, |pair: &(PyValue, PyValue)| -> PyValue {
+            Python::with_gil(|py| {
+                let tuple = pyo3::types::PyTuple::new(
+                    py,
+                    &[pair.0 .0.clone_ref(py), pair.1 .0.clone_ref(py)],
+                )
+                .unwrap();
+                PyValue(tuple.into_any().unbind())
+            })
+        });
+        Ok(PyCollection {
+            inner: mapped,
+            rt_ptr: self.rt_ptr,
+        })
+    }
+
+    fn entries(&self) -> PyResult<PyObject> {
+        let entries = self.inner.entries();
+        Python::with_gil(|py| {
+            let list = pyo3::types::PyList::empty(py);
+            for entry in entries {
+                list.append(entry.0.clone_ref(py))?;
+            }
+            Ok(list.into_any().unbind())
+        })
+    }
+
+    #[getter]
+    fn version_node(&self) -> PyResult<PyNodeId> {
+        let rt = unsafe { &*self.rt_ptr };
+        let ver_node = self.inner.version_node();
+        let node = rt.create_query(move |rt| -> PyValue {
+            let v: u64 = rt.get(ver_node);
+            Python::with_gil(|py| PyValue(v.into_pyobject(py).unwrap().into_any().unbind()))
+        });
+        Ok(PyNodeId { inner: node })
     }
 }
 
@@ -280,5 +388,6 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNodeId>()?;
     m.add_class::<PyRuntimeRef>()?;
     m.add_class::<PyCollection>()?;
+    m.add_class::<PySortedCollection>()?;
     Ok(())
 }
