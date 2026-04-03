@@ -67,6 +67,10 @@ pub struct IncrCollection<T: Any + Clone + Hash + Eq + 'static> {
 }
 
 impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
+    pub fn version_node_id(&self) -> crate::types::NodeId {
+        self.version_node.node_id()
+    }
+
     pub fn insert(&self, rt: &Runtime, value: T) {
         let changed = self.log.borrow_mut().insert(value);
         if changed {

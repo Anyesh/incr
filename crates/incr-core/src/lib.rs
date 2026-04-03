@@ -5,4 +5,6 @@ mod types;
 
 pub use collection::IncrCollection;
 pub use runtime::Runtime;
-pub use types::{Incr, NodeId, Revision};
+pub use types::{
+    Incr, NodeId, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, Revision, TraceAction,
+};

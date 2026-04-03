@@ -1,5 +1,9 @@
+
+*.pyc
+.playwright-mcp
+.playwright-mcp/
+.venv
 /target
 Cargo.lock
 __pycache__
-*.pyc
-.venv
+screenshots

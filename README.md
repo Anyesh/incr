@@ -4,6 +4,8 @@ Most software recomputes everything from scratch whenever anything changes. Your
 
 incr is a crack at solving that. Its a Rust library (with Python bindings) that tracks dependencies between computations automatically and only reruns what's actually affected by a change.
 
+![Live dashboard demo showing incr processing API traffic, with dependency graph visualization and real-time incremental vs from-scratch comparison](examples/dashboard/demo.gif)
+
 ## Quick look
 
 You've got two ways to use it. Function graphs let you wire up computations that depend on each other:
@@ -97,11 +99,17 @@ cargo bench -p incr-core       # benchmarks
 
 ## Where this is at
 
-Early stage. The engine works and the numbers are good but the API isnt stable yet. Heres roughly what exists and what doesnt:
+Early stage. The engine works and the numbers are good but the API isnt stable yet.
 
-The function DAG with automatic dependency tracking, early cutoff, and dynamic dependencies is solid -- been through thousands of property test cases. Collections do delta-based filter, map, and count. Python bindings work through PyO3.
+**What works:** The function DAG with automatic dependency tracking, early cutoff, and dynamic dependencies is solid, been through thousands of property test cases. Collections do delta-based filter, map, and count. Python bindings work through PyO3. Theres a live dashboard demo (`examples/dashboard/`) that shows the engine processing simulated API traffic with real-time tracing of which nodes recompute and which get skipped.
 
-Still missing: joins and group-by for collections, proper garbage collection for long-running systems, multi-threaded change propagation, and we havent published to crates.io or PyPI yet.
+**Where it shines:** In Rust, where theres no FFI overhead, per-node propagation costs ~175ns and collection operations stay nearly constant regardless of collection size. The combination of function DAGs and incremental collections in one runtime is something the existing tools (Salsa, Differential Dataflow, Jane Street Incremental) dont offer individually.
+
+**Where it doesnt (yet):** Through the Python bindings, the per-call overhead of crossing the Rust/Python boundary means incr only outperforms naive Python for larger datasets or more complex dependency graphs. Simple aggregations over small lists are faster to just recompute. The win grows with data size (14x at 5K events, 39x at 20K in our dashboard benchmark) but the crossover point is around 1K elements.
+
+**Still missing:** Joins and group-by for collections, garbage collection for long-running systems, multi-threaded change propagation, a `sum`/`reduce` operator for collections, and we havent published to crates.io or PyPI yet.
+
+**What would make this matter:** Someone building something real with it, a reactive UI framework, a build system, an incremental query engine, where the combination of DAGs and collections solves a problem that wasnt easy to solve before. The library is a foundation looking for its killer use case.
 
 ## Background and references
 

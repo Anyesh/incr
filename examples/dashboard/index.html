@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>incr &middot; Live API Monitor</title>
+<style>
+  :root {
+    --bg: #faf9f7;
+    --surface: #ffffff;
+    --border: #e8e5e0;
+    --border-light: #f0ede8;
+    --text: #2c2c2c;
+    --text-dim: #8c8580;
+    --text-label: #a09a93;
+    --accent: #3d3530;
+    --ok: #4a8c6f;
+    --warn: #c4883a;
+    --err: #c25a4a;
+    --chart-1: #7a6f64;
+    --chart-2: #a09080;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    max-width: 1120px;
+    margin: 0 auto;
+    padding: 32px 24px;
+  }
+
+  /* ── Header ─────────────────────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .header-left { display: flex; align-items: baseline; gap: 12px; }
+  .header-subtitle {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 28px;
+    line-height: 1.5;
+  }
+  .logo {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: var(--accent);
+  }
+  .header-title {
+    font-size: 14px;
+    color: var(--text-dim);
+  }
+  .health-badge {
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    transition: all 0.3s ease;
+  }
+  .health-healthy { background: #eef6f1; color: var(--ok); }
+  .health-degraded { background: #fdf4e8; color: var(--warn); }
+  .health-critical { background: #fbeeed; color: var(--err); }
+
+  /* ── Metric cards ───────────────────────────────────────── */
+  .metrics-row {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 24px;
+  }
+  .metric-card {
+    background: var(--surface);
+    padding: 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .metric-label {
+    font-size: 11px;
+    letter-spacing: 0.3px;
+    color: var(--text-label);
+    margin-bottom: 6px;
+  }
+  .metric-value {
+    font-size: 24px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+  }
+  .metric-unit {
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-dim);
+    margin-left: 1px;
+  }
+  .metric-sparkline {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 28px;
+    opacity: 0.25;
+  }
+
+  /* ── Main area ──────────────────────────────────────────── */
+  .main {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 24px;
+    margin-bottom: 24px;
+  }
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .panel-title {
+    font-size: 11px;
+    letter-spacing: 0.3px;
+    color: var(--text-label);
+    margin-bottom: 12px;
+  }
+
+  /* ── Charts ─────────────────────────────────────────────── */
+  .charts-area { display: flex; flex-direction: column; gap: 16px; }
+  .chart-wrapper { position: relative; }
+  .chart-container { height: 80px; }
+  .chart-container svg { width: 100%; height: 100%; }
+  .chart-subtitle {
+    font-size: 11px;
+    color: var(--text-label);
+    margin-top: 4px;
+  }
+  .chart-y-label {
+    position: absolute;
+    top: 0;
+    right: 0;
+    font-size: 10px;
+    color: var(--text-label);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Event feed ─────────────────────────────────────────── */
+  .event-feed {
+    max-height: 160px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .event-row {
+    display: grid;
+    grid-template-columns: 52px 1fr 44px 52px;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 12px;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    border-bottom: 1px solid var(--border-light);
+    align-items: center;
+  }
+  .event-method { font-weight: 600; color: var(--accent); }
+  .event-path { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .event-status { text-align: right; font-weight: 600; }
+  .event-status-ok { color: var(--ok); }
+  .event-status-err { color: var(--err); }
+  .event-latency { text-align: right; color: var(--text-dim); }
+
+  /* ── Engine panel ───────────────────────────────────────── */
+  .engine-panel { display: flex; flex-direction: column; gap: 12px; }
+
+  .engine-highlight {
+    background: #f5f3f0;
+    border-radius: 6px;
+    padding: 12px 14px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 14px;
+    color: var(--text-dim);
+  }
+  .engine-highlight strong {
+    color: var(--text);
+    font-size: 20px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .engine-highlight .saved {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--ok);
+    font-weight: 600;
+  }
+
+  .engine-hint {
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-bottom: 8px;
+    line-height: 1.4;
+  }
+
+  .engine-compare {
+    background: #f5f3f0;
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .compare-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .compare-row strong {
+    color: var(--text);
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .compare-label {
+    font-size: 12px;
+    color: var(--text-label);
+  }
+  .compare-value {
+    display: flex;
+    align-items: baseline;
+    gap: 2px;
+  }
+  .compare-unit {
+    font-size: 11px;
+    color: var(--text-label);
+  }
+  .compare-speedup {
+    border-top: 1px solid var(--border-light);
+    padding-top: 6px;
+    margin-top: 2px;
+  }
+  .compare-speedup strong {
+    color: var(--ok);
+  }
+
+  .engine-detail {
+    display: flex;
+    gap: 16px;
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .engine-detail strong {
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Dependency graph ───────────────────────────────────── */
+  .graph-container {
+    flex: 1;
+    min-height: 300px;
+    position: relative;
+  }
+  .graph-container svg { width: 100%; height: 100%; }
+  .graph-node { cursor: default; }
+  .graph-node-circle {
+    stroke-width: 1.5;
+    transition: fill 0.3s;
+  }
+  .graph-node-input .graph-node-circle { fill: var(--surface); stroke: var(--chart-1); }
+  .graph-node-compute .graph-node-circle { fill: var(--surface); stroke: var(--chart-2); }
+  .graph-node-label {
+    font-size: 8.5px;
+    fill: var(--text-dim);
+    text-anchor: middle;
+    pointer-events: none;
+    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  }
+  .graph-edge {
+    stroke: var(--border);
+    stroke-width: 1;
+    fill: none;
+    opacity: 0.5;
+  }
+
+  .graph-legend {
+    display: flex;
+    gap: 14px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border-light);
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1.5px solid;
+  }
+  .legend-active { background: #f0ebe5; border-color: var(--accent); }
+  .legend-cutoff { background: #fdf4e8; border-color: var(--warn); }
+  .legend-idle { background: var(--surface); border-color: var(--border); }
+
+  .pulse-ring { fill: none; stroke-width: 2; opacity: 0; }
+  .pulse-recomputed .graph-node-circle { fill: #f0ebe5; stroke: var(--accent); stroke-width: 2.5; }
+  .pulse-recomputed .pulse-ring { animation: pulse-active 0.5s ease-out; }
+  .pulse-cutoff .graph-node-circle { fill: #fdf4e8; stroke: var(--warn); stroke-width: 2; }
+  .pulse-cutoff .pulse-ring { animation: pulse-warn 0.5s ease-out; }
+  .pulse-verified .pulse-ring { animation: pulse-dim 0.5s ease-out; }
+
+  @keyframes pulse-active {
+    0% { stroke: var(--accent); stroke-width: 2; opacity: 0.8; }
+    100% { stroke: var(--accent); stroke-width: 8; opacity: 0; }
+  }
+  @keyframes pulse-warn {
+    0% { stroke: var(--warn); stroke-width: 2; opacity: 0.6; }
+    100% { stroke: var(--warn); stroke-width: 8; opacity: 0; }
+  }
+  @keyframes pulse-dim {
+    0% { stroke: var(--text-dim); stroke-width: 1; opacity: 0.3; }
+    100% { stroke: var(--text-dim); stroke-width: 4; opacity: 0; }
+  }
+
+  /* ── Control bar ────────────────────────────────────────── */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .controls-label {
+    font-size: 11px;
+    letter-spacing: 0.3px;
+    color: var(--text-label);
+    margin-right: 4px;
+  }
+  .ctrl-btn {
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .ctrl-btn:hover { border-color: var(--text-dim); color: var(--text); }
+  .ctrl-btn.active-danger { background: #fbeeed; border-color: var(--err); color: var(--err); }
+  .ctrl-btn.active-warning { background: #fdf4e8; border-color: var(--warn); color: var(--warn); }
+  .ctrl-btn.active-surge { background: #f0ebe5; border-color: var(--accent); color: var(--accent); }
+
+  .connection-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--err);
+    margin-left: auto;
+    transition: background 0.3s;
+  }
+  .connection-dot.connected { background: var(--ok); }
+
+  @media (max-width: 900px) {
+    .metrics-row { grid-template-columns: repeat(3, 1fr); }
+    .main { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">incr</div>
+    <div class="header-title">Live API Monitor</div>
+  </div>
+  <div id="healthBadge" class="health-badge health-healthy">Healthy</div>
+</div>
+<div class="header-subtitle">
+  This dashboard is powered by <strong>incr</strong>, an incremental computation engine.
+  Every metric below is derived from a dependency graph. When a new request arrives,
+  only the affected nodes recompute. The rest are skipped. Watch the speedup grow as data accumulates.
+</div>
+
+<div class="metrics-row">
+  <div class="metric-card">
+    <div class="metric-label">Total Requests</div>
+    <div class="metric-value"><span id="metricTotal">0</span></div>
+    <svg class="metric-sparkline" id="sparkTotal" viewBox="0 0 200 28" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Recent Errors</div>
+    <div class="metric-value" style="color: var(--err)"><span id="metricErrors">0</span></div>
+    <svg class="metric-sparkline" id="sparkErrors" viewBox="0 0 200 28" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Recent Slow (&gt;500ms)</div>
+    <div class="metric-value"><span id="metricSlow">0</span></div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Error Rate</div>
+    <div class="metric-value"><span id="metricErrorRate">0</span><span class="metric-unit">%</span></div>
+    <svg class="metric-sparkline" id="sparkErrorRate" viewBox="0 0 200 28" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Avg Latency</div>
+    <div class="metric-value"><span id="metricLatency">0</span><span class="metric-unit">ms</span></div>
+    <svg class="metric-sparkline" id="sparkLatency" viewBox="0 0 200 28" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="metric-card">
+    <div class="metric-label">Throughput</div>
+    <div class="metric-value"><span id="metricThroughput">0</span><span class="metric-unit">req/s</span></div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="charts-area">
+    <div class="panel">
+      <div class="panel-title">Error Rate (last 200 requests)</div>
+      <div class="chart-wrapper">
+        <span class="chart-y-label" id="chartErrorRateMax"></span>
+        <div class="chart-container">
+          <svg id="chartErrorRate" viewBox="0 0 400 70" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+      <div class="chart-subtitle">% of requests returning 4xx/5xx</div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Avg Latency (last 200 requests)</div>
+      <div class="chart-wrapper">
+        <span class="chart-y-label" id="chartLatencyMax"></span>
+        <div class="chart-container">
+          <svg id="chartLatency" viewBox="0 0 400 70" preserveAspectRatio="none"></svg>
+        </div>
+      </div>
+      <div class="chart-subtitle">Mean response time in ms</div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Recent Requests</div>
+      <div class="event-feed" id="eventFeed"></div>
+    </div>
+  </div>
+
+  <div class="panel engine-panel">
+    <div class="panel-title">Under the Hood</div>
+    <div class="engine-hint">Each new request touches a few nodes in the dependency graph below. The rest stay cached.</div>
+    <div class="engine-highlight">
+      <strong id="statRecomputed">0</strong>&thinsp;/&thinsp;<span id="statTotal">0</span> nodes updated
+      <span class="saved" id="statSaved"></span>
+    </div>
+    <div class="engine-compare">
+      <div class="compare-row">
+        <span class="compare-label">With incr (update affected nodes)</span>
+        <span class="compare-value"><strong id="statIncr">0</strong><span class="compare-unit">&micro;s</span></span>
+      </div>
+      <div class="compare-row">
+        <span class="compare-label">Without incr (recompute all from list)</span>
+        <span class="compare-value"><strong id="statScratch">0</strong><span class="compare-unit">&micro;s</span></span>
+      </div>
+      <div class="compare-row compare-speedup">
+        <span class="compare-label">Savings</span>
+        <span class="compare-value"><strong id="statSpeedup">0</strong><span class="compare-unit">x faster</span></span>
+      </div>
+    </div>
+    <div class="engine-detail">
+      <span>Early cutoffs <strong id="statCutoff">0</strong></span>
+      <span>Events in collection <strong id="statCollSize">0</strong></span>
+    </div>
+    <div class="graph-container" id="graphContainer">
+      <svg id="graphSvg"></svg>
+    </div>
+    <div class="graph-legend">
+      <span class="legend-item"><span class="legend-dot legend-active"></span> Updated</span>
+      <span class="legend-item"><span class="legend-dot legend-cutoff"></span> Cutoff (value unchanged)</span>
+      <span class="legend-item"><span class="legend-dot legend-idle"></span> Not affected</span>
+    </div>
+  </div>
+</div>
+
+<div class="controls">
+  <div class="controls-label">Simulate traffic patterns</div>
+  <button class="ctrl-btn" data-scenario="error_burst" data-active-class="active-danger">Error Burst</button>
+  <button class="ctrl-btn" data-scenario="latency_spike" data-active-class="active-warning">Latency Spike</button>
+  <button class="ctrl-btn" data-scenario="traffic_surge" data-active-class="active-surge">Traffic Surge</button>
+  <button class="ctrl-btn" data-scenario="normal">Reset</button>
+  <div id="connectionDot" class="connection-dot"></div>
+</div>
+
+<script>
+(function() {
+  'use strict';
+
+  var ws = null;
+  var graphNodes = [];
+  var graphLayout = {};
+  var sparkData = { total: [], errors: [], errorRate: [], latency: [] };
+  var chartData = { errorRate: [], latency: [] };
+  var SPARK_MAX = 60;
+  var CHART_MAX = 80;
+  var SVG_NS = 'http://www.w3.org/2000/svg';
+
+  // ── Controls ───────────────────────────────────────────────────────────────
+
+  document.querySelectorAll('.ctrl-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var scenario = btn.dataset.scenario;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'trigger_scenario', scenario: scenario }));
+      }
+      document.querySelectorAll('.ctrl-btn').forEach(function(b) {
+        if (b.dataset.activeClass) b.classList.remove(b.dataset.activeClass);
+      });
+      if (scenario !== 'normal' && btn.dataset.activeClass) {
+        btn.classList.add(btn.dataset.activeClass);
+      }
+    });
+  });
+
+  // ── WebSocket ──────────────────────────────────────────────────────────────
+
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
+    ws.onopen = function() { document.getElementById('connectionDot').classList.add('connected'); };
+    ws.onclose = function() { document.getElementById('connectionDot').classList.remove('connected'); setTimeout(connect, 2000); };
+    ws.onmessage = function(e) {
+      var msg = JSON.parse(e.data);
+      if (msg.type === 'graph_structure') { graphNodes = msg.nodes; buildGraph(); }
+      else if (msg.type === 'update') { handleUpdate(msg); }
+    };
+  }
+
+  // ── Update ─────────────────────────────────────────────────────────────────
+
+  function handleUpdate(msg) {
+    var m = msg.metrics;
+    setText('metricTotal', m.total_requests);
+    setText('metricErrors', m.error_count);
+    setText('metricSlow', m.slow_count);
+    setText('metricErrorRate', m.error_rate);
+    setText('metricLatency', m.avg_latency);
+    setText('metricThroughput', m.throughput);
+
+    var badge = document.getElementById('healthBadge');
+    badge.textContent = m.health;
+    badge.className = 'health-badge health-' + m.health;
+
+    pushArr(sparkData.total, m.total_requests, SPARK_MAX);
+    pushArr(sparkData.errors, m.error_count, SPARK_MAX);
+    pushArr(sparkData.errorRate, m.error_rate, SPARK_MAX);
+    pushArr(sparkData.latency, m.avg_latency, SPARK_MAX);
+    renderSparkline('sparkTotal', sparkData.total, '#a09080');
+    renderSparkline('sparkErrors', sparkData.errors, '#c25a4a');
+    renderSparkline('sparkErrorRate', sparkData.errorRate, '#c4883a');
+    renderSparkline('sparkLatency', sparkData.latency, '#7a6f64');
+
+    pushArr(chartData.errorRate, m.error_rate, CHART_MAX);
+    pushArr(chartData.latency, m.avg_latency, CHART_MAX);
+    renderChart('chartErrorRate', chartData.errorRate, '#c4883a', 'rgba(196,136,58,0.08)', 'chartErrorRateMax', '%');
+    renderChart('chartLatency', chartData.latency, '#7a6f64', 'rgba(122,111,100,0.06)', 'chartLatencyMax', 'ms');
+
+    var t = msg.trace;
+    setText('statRecomputed', t.nodes_recomputed);
+    setText('statTotal', t.total_nodes);
+    setText('statCutoff', t.nodes_cutoff);
+    setText('statIncr', t.incremental_us);
+    setText('statScratch', t.scratch_us);
+    setText('statSpeedup', t.speedup);
+    setText('statCollSize', msg.metrics.total_requests);
+
+    // Show percentage of work saved
+    var skipped = t.total_nodes - t.nodes_recomputed;
+    var pct = t.total_nodes > 0 ? Math.round((skipped / t.total_nodes) * 100) : 0;
+    setText('statSaved', pct + '% skipped');
+
+    animateGraph(t);
+    renderEvents(msg.recent_events || []);
+
+    if (msg.scenario === 'normal') {
+      document.querySelectorAll('.ctrl-btn').forEach(function(b) {
+        if (b.dataset.activeClass) b.classList.remove(b.dataset.activeClass);
+      });
+    }
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  function setText(id, val) { document.getElementById(id).textContent = val; }
+  function pushArr(arr, val, max) { arr.push(val); if (arr.length > max) arr.shift(); }
+
+  function svgEl(tag, attrs) {
+    var el = document.createElementNS(SVG_NS, tag);
+    for (var k in attrs) el.setAttribute(k, attrs[k]);
+    return el;
+  }
+  function clearChildren(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+
+  // ── Sparklines ─────────────────────────────────────────────────────────────
+
+  function renderSparkline(svgId, data, color) {
+    var svg = document.getElementById(svgId);
+    if (!svg || data.length < 2) return;
+    clearChildren(svg);
+    var maxVal = Math.max.apply(null, data) || 1;
+    var w = 200, h = 28, step = w / (SPARK_MAX - 1);
+    var pts = data.map(function(v, i) { return (i * step) + ',' + (h - (v / maxVal) * h * 0.9); }).join(' ');
+    var area = pts + ' ' + ((data.length - 1) * step) + ',' + h + ' 0,' + h;
+    svg.appendChild(svgEl('polyline', { points: area, fill: color, opacity: '0.12' }));
+    svg.appendChild(svgEl('polyline', { points: pts, fill: 'none', stroke: color, 'stroke-width': '1.5' }));
+  }
+
+  // ── Charts ─────────────────────────────────────────────────────────────────
+
+  function renderChart(svgId, data, color, areaColor, maxLabelId, unit) {
+    var svg = document.getElementById(svgId);
+    if (!svg || data.length < 2) return;
+    clearChildren(svg);
+    var maxVal = Math.max.apply(null, data) || 1;
+    var w = 400, h = 70, step = w / (CHART_MAX - 1);
+    for (var i = 0; i <= 3; i++) {
+      var y = (h / 3) * i;
+      svg.appendChild(svgEl('line', { x1: 0, y1: y, x2: w, y2: y, stroke: '#e8e5e0', 'stroke-width': '0.5' }));
+    }
+    var pts = data.map(function(v, idx) { return (idx * step) + ',' + (h - (v / maxVal) * h * 0.85 - 2); }).join(' ');
+    var area = pts + ' ' + ((data.length - 1) * step) + ',' + h + ' 0,' + h;
+    svg.appendChild(svgEl('polygon', { points: area, fill: areaColor }));
+    svg.appendChild(svgEl('polyline', { points: pts, fill: 'none', stroke: color, 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+    if (maxLabelId) {
+      var rounded = maxVal < 10 ? Math.round(maxVal * 10) / 10 : Math.round(maxVal);
+      setText(maxLabelId, rounded + (unit || ''));
+    }
+  }
+
+  // ── Event feed ─────────────────────────────────────────────────────────────
+
+  function renderEvents(events) {
+    var feed = document.getElementById('eventFeed');
+    clearChildren(feed);
+    for (var i = events.length - 1; i >= 0; i--) {
+      var ev = events[i];
+      var row = document.createElement('div');
+      row.className = 'event-row';
+      var method = document.createElement('span');
+      method.className = 'event-method';
+      method.textContent = ev.method;
+      var path = document.createElement('span');
+      path.className = 'event-path';
+      path.textContent = ev.endpoint;
+      var status = document.createElement('span');
+      status.className = 'event-status ' + (ev.status < 400 ? 'event-status-ok' : 'event-status-err');
+      status.textContent = ev.status;
+      var latency = document.createElement('span');
+      latency.className = 'event-latency';
+      latency.textContent = ev.latency + 'ms';
+      row.appendChild(method);
+      row.appendChild(path);
+      row.appendChild(status);
+      row.appendChild(latency);
+      feed.appendChild(row);
+    }
+  }
+
+  // ── Graph ──────────────────────────────────────────────────────────────────
+
+  function buildGraph() {
+    if (!graphNodes.length) return;
+    var depth = {}, depthVisited = {};
+    function computeDepth(id) {
+      if (depthVisited[id]) return depth[id] || 0;
+      depthVisited[id] = true;
+      var node = null;
+      for (var n = 0; n < graphNodes.length; n++) { if (graphNodes[n].id === id) { node = graphNodes[n]; break; } }
+      if (!node || node.dependencies.length === 0) { depth[id] = 0; return 0; }
+      var maxDep = 0;
+      for (var d = 0; d < node.dependencies.length; d++) { var dd = computeDepth(node.dependencies[d]) + 1; if (dd > maxDep) maxDep = dd; }
+      depth[id] = maxDep;
+      return maxDep;
+    }
+    graphNodes.forEach(function(n) { computeDepth(n.id); });
+    var maxDepth = 0;
+    for (var k in depth) { if (depth[k] > maxDepth) maxDepth = depth[k]; }
+    var columns = {};
+    graphNodes.forEach(function(n) { var d = depth[n.id]; if (!columns[d]) columns[d] = []; columns[d].push(n); });
+
+    var container = document.getElementById('graphContainer');
+    var svgW = container.clientWidth || 480;
+    var svgH = container.clientHeight || 260;
+    var padX = 60, padY = 24;
+    var colWidth = maxDepth > 0 ? (svgW - padX * 2) / maxDepth : 0;
+    graphLayout = {};
+    graphNodes.forEach(function(n) {
+      var d = depth[n.id], col = columns[d], idx = col.indexOf(n);
+      var spacing = (svgH - padY * 2) / Math.max(col.length, 1);
+      graphLayout[n.id] = { x: padX + d * colWidth, y: padY + idx * spacing + spacing / 2, node: n };
+    });
+    renderGraph(svgW, svgH);
+  }
+
+  function renderGraph(w, h) {
+    var svg = document.getElementById('graphSvg');
+    clearChildren(svg);
+    svg.setAttribute('viewBox', '0 0 ' + w + ' ' + h);
+    svg.setAttribute('width', w);
+    svg.setAttribute('height', h);
+
+    graphNodes.forEach(function(n) {
+      var to = graphLayout[n.id];
+      if (!to) return;
+      var drawn = {};
+      for (var di = 0; di < n.dependencies.length; di++) {
+        var depId = n.dependencies[di], edgeKey = depId + '-' + n.id;
+        if (drawn[edgeKey]) continue;
+        drawn[edgeKey] = true;
+        var from = graphLayout[depId];
+        if (!from) continue;
+        var dx = to.x - from.x, cx1 = from.x + dx * 0.4, cx2 = to.x - dx * 0.4;
+        svg.appendChild(svgEl('path', { class: 'graph-edge', d: 'M' + from.x + ',' + from.y + ' C' + cx1 + ',' + from.y + ' ' + cx2 + ',' + to.y + ' ' + to.x + ',' + to.y }));
+      }
+    });
+
+    graphNodes.forEach(function(n) {
+      var pos = graphLayout[n.id];
+      if (!pos) return;
+      var r = 12;
+      var cls = n.kind === 'input' ? 'graph-node-input' : 'graph-node-compute';
+      var label = n.label || ('#' + n.id);
+      var shortLabel = label.length > 14 ? label.slice(0, 13) + '\u2026' : label;
+      var g = svgEl('g', { class: 'graph-node ' + cls, id: 'gnode-' + n.id });
+      g.appendChild(svgEl('circle', { class: 'pulse-ring', cx: pos.x, cy: pos.y, r: r + 3 }));
+      g.appendChild(svgEl('circle', { class: 'graph-node-circle', cx: pos.x, cy: pos.y, r: r }));
+      var text = svgEl('text', { class: 'graph-node-label', x: pos.x, y: pos.y + r + 12 });
+      text.textContent = shortLabel;
+      g.appendChild(text);
+      svg.appendChild(g);
+    });
+  }
+
+  function animateGraph(trace) {
+    document.querySelectorAll('.graph-node').forEach(function(el) {
+      el.classList.remove('pulse-recomputed', 'pulse-cutoff', 'pulse-verified');
+    });
+    void document.getElementById('graphSvg').offsetHeight;
+    var recomputed = {}, cutoffs = {}, visited = {};
+    (trace.recomputed_ids || []).forEach(function(id) { recomputed[id] = true; });
+    (trace.cutoff_ids || []).forEach(function(id) { cutoffs[id] = true; });
+    (trace.visited_ids || []).forEach(function(id) { visited[id] = true; });
+    for (var id in visited) {
+      var el = document.getElementById('gnode-' + id);
+      if (!el) continue;
+      if (recomputed[id]) el.classList.add('pulse-recomputed');
+      else if (cutoffs[id]) el.classList.add('pulse-cutoff');
+      else el.classList.add('pulse-verified');
+    }
+  }
+
+  var resizeTimer;
+  window.addEventListener('resize', function() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function() { if (graphNodes.length) buildGraph(); }, 200);
+  });
+
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -1,6 +1,8 @@
 use crate::collection::{CollectionLog, IncrCollection};
-use crate::graph::{ComputeEntry, Graph, NodeKind, NodeState};
-use crate::types::{Incr, NodeId, Revision};
+use crate::graph::{ComputeEntry, NodeKind, NodeState};
+use crate::types::{
+    Incr, NodeId, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, Revision, TraceAction,
+};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::hash::Hash;
@@ -26,6 +28,12 @@ pub struct Runtime {
     dep_stack: RefCell<Vec<Vec<NodeId>>>,
     /// Set of nodes currently being computed. Used for cycle detection.
     computing: RefCell<Vec<NodeId>>,
+    /// Optional display labels for nodes (for introspection/debugging).
+    labels: RefCell<Vec<Option<String>>>,
+    /// When true, compute_node records trace events into trace_log.
+    tracing_enabled: Cell<bool>,
+    /// Trace events collected during the current get_traced() call.
+    trace_log: RefCell<Vec<NodeTrace>>,
 }
 
 impl Runtime {
@@ -37,6 +45,9 @@ impl Runtime {
             revision: Cell::new(Revision(1)), // Start at 1; default 0 means "never verified"
             dep_stack: RefCell::new(Vec::new()),
             computing: RefCell::new(Vec::new()),
+            labels: RefCell::new(Vec::new()),
+            tracing_enabled: Cell::new(false),
+            trace_log: RefCell::new(Vec::new()),
         }
     }
 
@@ -45,7 +56,10 @@ impl Runtime {
     where
         T: Any + Clone + PartialEq + 'static,
     {
-        assert!(self.dep_stack.borrow().is_empty(), "cannot create nodes during computation");
+        assert!(
+            self.dep_stack.borrow().is_empty(),
+            "cannot create nodes during computation"
+        );
         let revision = self.revision.get();
         let id = {
             let mut nodes = self.nodes.borrow_mut();
@@ -61,6 +75,7 @@ impl Runtime {
             id
         };
         self.kinds.borrow_mut().push(NodeKind::Input);
+        self.labels.borrow_mut().push(None);
         Incr {
             id,
             _phantom: PhantomData,
@@ -75,7 +90,10 @@ impl Runtime {
         T: Any + Clone + PartialEq + 'static,
         F: Fn(&Runtime) -> T + 'static,
     {
-        assert!(self.dep_stack.borrow().is_empty(), "cannot create nodes during computation");
+        assert!(
+            self.dep_stack.borrow().is_empty(),
+            "cannot create nodes during computation"
+        );
         let func = Box::new(move |rt: &Runtime| -> Box<dyn Any> { Box::new(f(rt)) });
         let eq_fn = Box::new(|a: &dyn Any, b: &dyn Any| -> bool {
             a.downcast_ref::<T>().unwrap() == b.downcast_ref::<T>().unwrap()
@@ -98,6 +116,7 @@ impl Runtime {
             id
         };
         self.kinds.borrow_mut().push(NodeKind::Compute(func_idx));
+        self.labels.borrow_mut().push(None);
 
         Incr {
             id,
@@ -185,6 +204,93 @@ impl Runtime {
         IncrCollection { log, version_node }
     }
 
+    // ── Introspection API ───────────────────────────────────────────────────
+
+    /// Assign a human-readable label to a node for visualization/debugging.
+    pub fn set_label(&self, id: NodeId, label: String) {
+        self.labels.borrow_mut()[id.0 as usize] = Some(label);
+    }
+
+    /// Enable or disable execution tracing. When enabled, compute_node records
+    /// which nodes were visited, recomputed, or cut off during get() calls.
+    pub fn set_tracing(&self, enabled: bool) {
+        self.tracing_enabled.set(enabled);
+    }
+
+    /// Like get(), but also returns a trace of which nodes were processed.
+    /// Clears the trace log before running, so the trace reflects only this call.
+    pub fn get_traced<T>(&self, node: Incr<T>) -> (T, PropagationTrace)
+    where
+        T: Any + Clone + 'static,
+    {
+        let was_enabled = self.tracing_enabled.get();
+        self.tracing_enabled.set(true);
+        self.trace_log.borrow_mut().clear();
+
+        let start = std::time::Instant::now();
+        let value = self.get(node);
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+
+        self.tracing_enabled.set(was_enabled);
+
+        let log = self.trace_log.borrow();
+        let total_nodes = self.nodes.borrow().len();
+        let nodes_recomputed = log
+            .iter()
+            .filter(|t| matches!(t.action, TraceAction::Recomputed { .. }))
+            .count();
+        let nodes_cutoff = log
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.action,
+                    TraceAction::Recomputed {
+                        value_changed: false
+                    }
+                )
+            })
+            .count();
+
+        let trace = PropagationTrace {
+            target: node.id,
+            node_traces: log.clone(),
+            total_nodes,
+            nodes_recomputed,
+            nodes_cutoff,
+            elapsed_ns,
+        };
+
+        (value, trace)
+    }
+
+    /// Return structural info about every node in the graph.
+    pub fn graph_snapshot(&self) -> Vec<NodeInfo> {
+        let nodes = self.nodes.borrow();
+        let kinds = self.kinds.borrow();
+        let labels = self.labels.borrow();
+
+        (0..nodes.len())
+            .map(|i| {
+                let id = NodeId(i as u32);
+                NodeInfo {
+                    id,
+                    kind: match &kinds[i] {
+                        NodeKind::Input => NodeKindInfo::Input,
+                        NodeKind::Compute(_) => NodeKindInfo::Compute,
+                    },
+                    label: labels[i].clone(),
+                    dependencies: nodes[i].dependencies.clone(),
+                    dependents: nodes[i].dependents.clone(),
+                }
+            })
+            .collect()
+    }
+
+    /// Return the number of nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.nodes.borrow().len()
+    }
+
     /// Walk forward from the given nodes, marking all reachable compute nodes as Dirty.
     fn mark_dirty_transitive(&self, start: &[NodeId]) {
         let mut queue: std::collections::VecDeque<NodeId> = start.iter().copied().collect();
@@ -267,10 +373,7 @@ impl Runtime {
             {
                 let computing = self.computing.borrow();
                 if computing.contains(&id) {
-                    panic!(
-                        "Cycle detected: node {:?} is already being computed",
-                        id
-                    );
+                    panic!("Cycle detected: node {:?} is already being computed", id);
                 }
             }
 
@@ -279,9 +382,9 @@ impl Runtime {
                 NodeState::New => true,
                 NodeState::Dirty => {
                     // Recompute only if a dependency actually changed since last verification
-                    node.dependencies.iter().any(|dep_id| {
-                        nodes[dep_id.0 as usize].changed_at > node.verified_at
-                    })
+                    node.dependencies
+                        .iter()
+                        .any(|dep_id| nodes[dep_id.0 as usize].changed_at > node.verified_at)
                 }
                 NodeState::Clean => false,
             };
@@ -295,6 +398,12 @@ impl Runtime {
             let node = &mut nodes[id.0 as usize];
             node.state = NodeState::Clean;
             node.verified_at = self.revision.get();
+            if self.tracing_enabled.get() {
+                self.trace_log.borrow_mut().push(NodeTrace {
+                    id,
+                    action: TraceAction::VerifiedClean,
+                });
+            }
             return;
         }
 
@@ -324,6 +433,13 @@ impl Runtime {
                 None => true, // First computation
             }
         };
+
+        if self.tracing_enabled.get() {
+            self.trace_log.borrow_mut().push(NodeTrace {
+                id,
+                action: TraceAction::Recomputed { value_changed },
+            });
+        }
 
         // Step 4: Update node state and dependency edges in a single mutable borrow
         let mut nodes = self.nodes.borrow_mut();

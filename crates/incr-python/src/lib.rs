@@ -13,12 +13,7 @@ impl Clone for PyValue {
 
 impl PartialEq for PyValue {
     fn eq(&self, other: &Self) -> bool {
-        Python::with_gil(|py| {
-            self.0
-                .bind(py)
-                .eq(other.0.bind(py))
-                .unwrap_or(false)
-        })
+        Python::with_gil(|py| self.0.bind(py).eq(other.0.bind(py)).unwrap_or(false))
     }
 }
 
@@ -39,6 +34,14 @@ impl Hash for PyValue {
 #[derive(Clone)]
 struct PyNodeId {
     inner: incr_core::Incr<PyValue>,
+}
+
+#[pymethods]
+impl PyNodeId {
+    #[getter]
+    fn id(&self) -> u32 {
+        self.inner.node_id().raw()
+    }
 }
 
 // ── PyRuntimeRef: temporary reference passed into query callbacks ────────────
@@ -124,6 +127,11 @@ impl PyCollection {
         });
         Ok(PyNodeId { inner: node })
     }
+
+    #[getter]
+    fn version_node_id(&self) -> u32 {
+        self.inner.version_node_id().raw()
+    }
 }
 
 // ── PyRuntime: the main runtime exposed to Python ───────────────────────────
@@ -157,33 +165,110 @@ impl PyRuntime {
     }
 
     fn create_query(&self, py_func: PyObject) -> PyNodeId {
-        let node = self.inner.create_query(move |rt: &incr_core::Runtime| -> PyValue {
-            Python::with_gil(|py| {
-                let rt_ref = Py::new(
-                    py,
-                    PyRuntimeRef {
-                        ptr: rt as *const _,
-                    },
-                )
-                .unwrap();
-                let result = py_func
-                    .call1(py, (rt_ref.clone_ref(py),))
-                    .expect("query function raised an exception");
-                // Invalidate the ref so it can't be used after callback returns
-                rt_ref.bind(py).borrow_mut().ptr = std::ptr::null();
-                PyValue(result)
-            })
-        });
+        let node = self
+            .inner
+            .create_query(move |rt: &incr_core::Runtime| -> PyValue {
+                Python::with_gil(|py| {
+                    let rt_ref = Py::new(
+                        py,
+                        PyRuntimeRef {
+                            ptr: rt as *const _,
+                        },
+                    )
+                    .unwrap();
+                    let result = py_func
+                        .call1(py, (rt_ref.clone_ref(py),))
+                        .expect("query function raised an exception");
+                    // Invalidate the ref so it can't be used after callback returns
+                    rt_ref.bind(py).borrow_mut().ptr = std::ptr::null();
+                    PyValue(result)
+                })
+            });
         PyNodeId { inner: node }
     }
 
     fn create_collection(&self) -> PyCollection {
         let col = self.inner.create_collection::<PyValue>();
         let rt_ptr: *const incr_core::Runtime = &self.inner;
-        PyCollection {
-            inner: col,
-            rt_ptr,
-        }
+        PyCollection { inner: col, rt_ptr }
+    }
+
+    // ── Introspection API ───────────────────────────────────────────────
+
+    fn set_label(&self, node: PyNodeId, label: String) {
+        self.inner.set_label(node.inner.node_id(), label);
+    }
+
+    fn set_label_by_id(&self, id: u32, label: String) {
+        self.inner.set_label(incr_core::NodeId::from_raw(id), label);
+    }
+
+    fn set_tracing(&self, enabled: bool) {
+        self.inner.set_tracing(enabled);
+    }
+
+    fn get_traced(&self, node: PyNodeId) -> PyResult<(PyObject, PyObject)> {
+        let (val, trace): (PyValue, incr_core::PropagationTrace) =
+            self.inner.get_traced(node.inner);
+        Python::with_gil(|py| {
+            let trace_dict = pyo3::types::PyDict::new(py);
+            trace_dict.set_item("target", trace.target.raw())?;
+            trace_dict.set_item("total_nodes", trace.total_nodes)?;
+            trace_dict.set_item("nodes_recomputed", trace.nodes_recomputed)?;
+            trace_dict.set_item("nodes_cutoff", trace.nodes_cutoff)?;
+            trace_dict.set_item("elapsed_ns", trace.elapsed_ns)?;
+
+            let node_traces = pyo3::types::PyList::empty(py);
+            for nt in &trace.node_traces {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("id", nt.id.raw())?;
+                d.set_item(
+                    "action",
+                    match &nt.action {
+                        incr_core::TraceAction::VerifiedClean => "verified_clean",
+                        incr_core::TraceAction::Recomputed {
+                            value_changed: true,
+                        } => "recomputed_changed",
+                        incr_core::TraceAction::Recomputed {
+                            value_changed: false,
+                        } => "recomputed_cutoff",
+                    },
+                )?;
+                node_traces.append(d)?;
+            }
+            trace_dict.set_item("node_traces", node_traces)?;
+
+            Ok((val.0, trace_dict.into_any().unbind()))
+        })
+    }
+
+    fn graph_snapshot(&self) -> PyResult<PyObject> {
+        let infos = self.inner.graph_snapshot();
+        Python::with_gil(|py| {
+            let result = pyo3::types::PyList::empty(py);
+            for info in &infos {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("id", info.id.raw())?;
+                d.set_item(
+                    "kind",
+                    match info.kind {
+                        incr_core::NodeKindInfo::Input => "input",
+                        incr_core::NodeKindInfo::Compute => "compute",
+                    },
+                )?;
+                d.set_item("label", &info.label)?;
+                let deps: Vec<u32> = info.dependencies.iter().map(|n| n.raw()).collect();
+                let depts: Vec<u32> = info.dependents.iter().map(|n| n.raw()).collect();
+                d.set_item("dependencies", deps)?;
+                d.set_item("dependents", depts)?;
+                result.append(d)?;
+            }
+            Ok(result.into_any().unbind())
+        })
+    }
+
+    fn node_count(&self) -> usize {
+        self.inner.node_count()
     }
 }
 

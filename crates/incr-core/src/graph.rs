@@ -93,9 +93,7 @@ mod tests {
         let mut graph = Graph::new();
         let entry = ComputeEntry {
             func: Box::new(|_| Box::new(0_i64)),
-            eq_fn: Box::new(|a, b| {
-                a.downcast_ref::<i64>() == b.downcast_ref::<i64>()
-            }),
+            eq_fn: Box::new(|a, b| a.downcast_ref::<i64>() == b.downcast_ref::<i64>()),
         };
         let id = graph.add_compute(entry);
         assert_eq!(id, NodeId(0));
