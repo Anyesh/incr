@@ -96,9 +96,7 @@ fn string_values_work() {
     let first = rt.create_input("Hello".to_string());
     let last = rt.create_input("World".to_string());
 
-    let full = rt.create_query(move |rt| {
-        format!("{} {}", rt.get(first), rt.get(last))
-    });
+    let full = rt.create_query(move |rt| format!("{} {}", rt.get(first), rt.get(last)));
 
     assert_eq!(rt.get(full), "Hello World");
 
@@ -151,19 +149,125 @@ fn full_pipeline_filter_map_count_query() {
 
     let count = active_adults.count(&rt);
 
-    let summary = rt.create_query(move |rt| {
-        format!("{} active adults", rt.get(count))
-    });
+    let summary = rt.create_query(move |rt| format!("{} active adults", rt.get(count)));
 
-    users.insert(&rt, User { name: "Alice".into(), age: 30, active: true });
-    users.insert(&rt, User { name: "Bob".into(), age: 16, active: true });
-    users.insert(&rt, User { name: "Carol".into(), age: 25, active: false });
+    users.insert(
+        &rt,
+        User {
+            name: "Alice".into(),
+            age: 30,
+            active: true,
+        },
+    );
+    users.insert(
+        &rt,
+        User {
+            name: "Bob".into(),
+            age: 16,
+            active: true,
+        },
+    );
+    users.insert(
+        &rt,
+        User {
+            name: "Carol".into(),
+            age: 25,
+            active: false,
+        },
+    );
 
     assert_eq!(rt.get(summary), "1 active adults");
 
-    users.insert(&rt, User { name: "Dave".into(), age: 22, active: true });
+    users.insert(
+        &rt,
+        User {
+            name: "Dave".into(),
+            age: 22,
+            active: true,
+        },
+    );
     assert_eq!(rt.get(summary), "2 active adults");
 
-    users.delete(&rt, &User { name: "Alice".into(), age: 30, active: true });
+    users.delete(
+        &rt,
+        &User {
+            name: "Alice".into(),
+            age: 30,
+            active: true,
+        },
+    );
     assert_eq!(rt.get(summary), "1 active adults");
+}
+
+#[test]
+fn sort_pairwise_map_reduce_pipeline() {
+    // Simulates: given a set of visit timestamps, compute total gaps between
+    // consecutive visits. This is the core pattern for travel time calculation.
+    let rt = Runtime::new();
+    let visits = rt.create_collection::<i64>(); // timestamps
+
+    let sorted = visits.sort_by_key(&rt, |t: &i64| *t);
+    let pairs = sorted.pairwise(&rt);
+
+    // Map each pair to the gap between them
+    let gaps = pairs.map(&rt, |(a, b): &(i64, i64)| b - a);
+
+    // Sum all gaps
+    let total_gap = gaps.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
+
+    // Start with visits at times 10, 30, 50
+    visits.insert(&rt, 10);
+    visits.insert(&rt, 30);
+    visits.insert(&rt, 50);
+    assert_eq!(rt.get(total_gap), 40); // (30-10) + (50-30) = 40
+
+    // Insert visit at time 20: gaps become 10 + 10 + 20 = 40 (same total!)
+    visits.insert(&rt, 20);
+    assert_eq!(rt.get(total_gap), 40); // (20-10) + (30-20) + (50-30) = 40
+
+    // Delete visit at time 30: gaps become 10 + 30 = 40 (still same!)
+    visits.delete(&rt, &30);
+    assert_eq!(rt.get(total_gap), 40); // (20-10) + (50-20) = 40
+
+    // Insert visit at time 100: adds a big gap
+    visits.insert(&rt, 100);
+    assert_eq!(rt.get(total_gap), 90); // (20-10) + (50-20) + (100-50) = 90
+
+    // Delete first visit
+    visits.delete(&rt, &10);
+    assert_eq!(rt.get(total_gap), 80); // (50-20) + (100-50) = 80
+}
+
+#[test]
+fn pipeline_early_cutoff() {
+    // Verify that early cutoff works through the full pipeline:
+    // if total doesn't change, downstream isn't recomputed
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    let rt = Runtime::new();
+    let visits = rt.create_collection::<i64>();
+    let sorted = visits.sort_by_key(&rt, |t: &i64| *t);
+    let pairs = sorted.pairwise(&rt);
+    let gaps = pairs.map(&rt, |(a, b): &(i64, i64)| b - a);
+    let total_gap = gaps.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
+
+    let downstream_evals = Rc::new(Cell::new(0_u32));
+    let dc = downstream_evals.clone();
+    let label = rt.create_query(move |rt| {
+        dc.set(dc.get() + 1);
+        format!("total={}", rt.get(total_gap))
+    });
+
+    visits.insert(&rt, 10);
+    visits.insert(&rt, 30);
+    visits.insert(&rt, 50);
+    assert_eq!(rt.get(label), "total=40");
+    assert_eq!(downstream_evals.get(), 1);
+
+    // Insert 20 between 10 and 30: total gap is still 40
+    visits.insert(&rt, 20);
+    assert_eq!(rt.get(label), "total=40");
+    // Early cutoff: total_gap unchanged, so label shouldn't recompute
+    assert_eq!(downstream_evals.get(), 1);
 }

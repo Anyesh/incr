@@ -21,22 +21,43 @@ pub(crate) struct VersionedDelta<T> {
 }
 
 pub(crate) struct CollectionLog<T: Clone + Hash + Eq> {
-    pub elements: HashSet<T>,
+    /// Counts each element. In set mode (multiset=false), counts are always 0 or 1.
+    /// In multiset mode (multiset=true), counts can exceed 1 for duplicate values.
+    pub elements: HashMap<T, usize>,
     pub deltas: Vec<VersionedDelta<T>>,
     pub version: u64,
+    /// When true, allows duplicate values (reference-counted). Used by pipeline
+    /// operators like `map` whose outputs may collide even when inputs are distinct.
+    multiset: bool,
 }
 
 impl<T: Clone + Hash + Eq> CollectionLog<T> {
+    /// Create a set-mode log: duplicate inserts are silently ignored.
     pub fn new() -> Self {
         CollectionLog {
-            elements: HashSet::new(),
+            elements: HashMap::new(),
             deltas: Vec::new(),
             version: 0,
+            multiset: false,
+        }
+    }
+
+    /// Create a multiset-mode log: duplicate inserts increment a reference count
+    /// and fire a delta each time; deletes decrement and fire a delta only when
+    /// the count reaches zero.
+    pub fn new_multiset() -> Self {
+        CollectionLog {
+            elements: HashMap::new(),
+            deltas: Vec::new(),
+            version: 0,
+            multiset: true,
         }
     }
 
     pub fn insert(&mut self, value: T) -> bool {
-        if self.elements.insert(value.clone()) {
+        if self.multiset {
+            let count = self.elements.entry(value.clone()).or_insert(0);
+            *count += 1;
             self.version += 1;
             self.deltas.push(VersionedDelta {
                 version: self.version,
@@ -44,12 +65,38 @@ impl<T: Clone + Hash + Eq> CollectionLog<T> {
             });
             true
         } else {
-            false
+            let count = self.elements.entry(value.clone()).or_insert(0);
+            if *count == 0 {
+                *count = 1;
+                self.version += 1;
+                self.deltas.push(VersionedDelta {
+                    version: self.version,
+                    delta: Delta::Insert(value),
+                });
+                true
+            } else {
+                false
+            }
         }
     }
 
     pub fn delete(&mut self, value: &T) -> bool {
-        if self.elements.remove(value) {
+        if self.multiset {
+            if let Some(count) = self.elements.get_mut(value) {
+                *count -= 1;
+                self.version += 1;
+                self.deltas.push(VersionedDelta {
+                    version: self.version,
+                    delta: Delta::Delete(value.clone()),
+                });
+                if *count == 0 {
+                    self.elements.remove(value);
+                }
+                true
+            } else {
+                false
+            }
+        } else if self.elements.remove(value).is_some() {
             self.version += 1;
             self.deltas.push(VersionedDelta {
                 version: self.version,
@@ -59,6 +106,21 @@ impl<T: Clone + Hash + Eq> CollectionLog<T> {
         } else {
             false
         }
+    }
+
+    /// Returns the set of distinct elements present (regardless of multiplicity).
+    pub fn distinct_elements(&self) -> HashSet<T> {
+        self.elements.keys().cloned().collect()
+    }
+
+    /// Returns all elements expanded by multiplicity as a Vec.
+    /// For set-mode logs (all counts 1), this is equivalent to iterating the set.
+    /// For multiset-mode logs, duplicate values appear multiple times.
+    pub fn elements_vec(&self) -> Vec<T> {
+        self.elements
+            .iter()
+            .flat_map(|(v, &count)| std::iter::repeat(v.clone()).take(count))
+            .collect()
     }
 }
 
@@ -140,7 +202,7 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
         F: Fn(&T) -> U + 'static,
     {
         let upstream_log = self.log.clone();
-        let output_log = Rc::new(RefCell::new(CollectionLog::new()));
+        let output_log = Rc::new(RefCell::new(CollectionLog::new_multiset()));
         let output_log_ref = output_log.clone();
         let last_idx = Rc::new(Cell::new(0_usize));
         let mapping: Rc<RefCell<HashMap<T, U>>> = Rc::new(RefCell::new(HashMap::new()));
@@ -185,7 +247,7 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
     }
 
     pub fn elements(&self) -> std::collections::HashSet<T> {
-        self.log.borrow().elements.clone()
+        self.log.borrow().distinct_elements()
     }
 
     pub fn count(&self, rt: &Runtime) -> Incr<usize> {
@@ -222,7 +284,7 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
     pub fn reduce<A, F>(&self, rt: &Runtime, fold_fn: F) -> Incr<A>
     where
         A: Any + Clone + PartialEq + 'static,
-        F: Fn(&HashSet<T>) -> A + 'static,
+        F: Fn(&Vec<T>) -> A + 'static,
     {
         let upstream_log = self.log.clone();
         let upstream_ver = self.version_node;
@@ -235,12 +297,14 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
             let start = last_idx.get();
             if start >= upstream.deltas.len() {
                 // No new deltas, but we still need to return current value.
-                // On first call with empty collection, fold over empty set.
-                return fold_fn(&upstream.elements);
+                // On first call with empty collection, fold over current elements.
+                let elems = upstream.elements_vec();
+                return fold_fn(&elems);
             }
 
             last_idx.set(upstream.deltas.len());
-            fold_fn(&upstream.elements)
+            let elems = upstream.elements_vec();
+            fold_fn(&elems)
         })
     }
 
@@ -519,10 +583,7 @@ mod tests {
         col.insert(&rt, 3);
 
         let _ = rt.get(doubled.version_node);
-        let elements: Vec<i64> = {
-            let log = doubled.log.borrow();
-            log.elements.iter().cloned().collect()
-        };
+        let elements: Vec<i64> = doubled.log.borrow().elements_vec();
         assert_eq!(elements.len(), 3);
         assert!(elements.contains(&2));
         assert!(elements.contains(&4));
@@ -543,7 +604,7 @@ mod tests {
         col.delete(&rt, &1);
         let _ = rt.get(doubled.version_node);
         assert_eq!(doubled.log.borrow().elements.len(), 1);
-        assert!(doubled.log.borrow().elements.contains(&4));
+        assert!(doubled.log.borrow().elements.contains_key(&4));
     }
 
     #[test]
@@ -559,10 +620,7 @@ mod tests {
         col.insert(&rt, 4);
 
         let _ = rt.get(doubled.version_node);
-        let elements: Vec<i64> = {
-            let log = doubled.log.borrow();
-            log.elements.iter().cloned().collect()
-        };
+        let elements: Vec<i64> = doubled.log.borrow().elements_vec();
         assert_eq!(elements.len(), 2);
         assert!(elements.contains(&4));
         assert!(elements.contains(&8));
