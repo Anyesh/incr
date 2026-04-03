@@ -184,3 +184,55 @@ proptest! {
         verify_sort_incremental_matches_batch(ops);
     }
 }
+
+fn verify_pairwise_incremental_matches_batch(ops: Vec<Op>) {
+    let rt = Runtime::new();
+    let col = rt.create_collection::<i64>();
+    let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+    let pairs = sorted.pairwise(&rt);
+    let pair_count = pairs.count(&rt);
+
+    for op in &ops {
+        match op {
+            Op::Insert(v) => col.insert(&rt, *v),
+            Op::Delete(v) => col.delete(&rt, v),
+        }
+    }
+
+    let _ = rt.get(pair_count); // forces stabilization of the full chain
+    let incr_pairs = pairs.elements();
+
+    // Batch oracle
+    let mut batch_set = std::collections::HashSet::new();
+    for op in &ops {
+        match op {
+            Op::Insert(v) => {
+                batch_set.insert(*v);
+            }
+            Op::Delete(v) => {
+                batch_set.remove(v);
+            }
+        }
+    }
+    let mut batch_sorted: Vec<i64> = batch_set.into_iter().collect();
+    batch_sorted.sort();
+    let batch_pairs: std::collections::HashSet<(i64, i64)> =
+        batch_sorted.windows(2).map(|w| (w[0], w[1])).collect();
+
+    assert_eq!(
+        incr_pairs, batch_pairs,
+        "Pairwise mismatch: incr={:?}, batch={:?}",
+        incr_pairs, batch_pairs
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    #[test]
+    fn pairwise_incremental_matches_batch(
+        ops in prop::collection::vec(op_strategy(), 1..50),
+    ) {
+        verify_pairwise_incremental_matches_batch(ops);
+    }
+}
