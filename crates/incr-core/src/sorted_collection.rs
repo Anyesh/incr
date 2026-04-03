@@ -99,7 +99,8 @@ mod tests {
 
         let _ = rt.get(sorted.version_node);
         let names: Vec<String> = sorted.entries().into_iter().map(|e| e.0).collect();
-        assert_eq!(names, vec!["alice", "bob", "carol"]);
+        // Sorted by key (.1) ascending: alice=10, carol=20, bob=30
+        assert_eq!(names, vec!["alice", "carol", "bob"]);
     }
 
     #[test]

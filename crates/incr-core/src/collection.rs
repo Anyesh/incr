@@ -5,6 +5,7 @@ use std::hash::Hash;
 use std::rc::Rc;
 
 use crate::runtime::Runtime;
+use crate::sorted_collection::{SortDelta, SortedCollection};
 use crate::types::Incr;
 
 #[derive(Clone, Debug)]
@@ -241,6 +242,101 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
             last_idx.set(upstream.deltas.len());
             fold_fn(&upstream.elements)
         })
+    }
+
+    pub fn sort_by_key<K, F>(&self, rt: &Runtime, key_fn: F) -> SortedCollection<T>
+    where
+        K: Ord + Clone + 'static,
+        F: Fn(&T) -> K + 'static,
+    {
+        let upstream_log = self.log.clone();
+        let upstream_ver = self.version_node;
+        let last_idx = Rc::new(Cell::new(0_usize));
+
+        // Internal state: keys vec lives inside the closure
+        let keys: Rc<RefCell<Vec<K>>> = Rc::new(RefCell::new(Vec::new()));
+        // Reverse lookup: value -> cached key (for delete)
+        let key_cache: Rc<RefCell<HashMap<T, K>>> = Rc::new(RefCell::new(HashMap::new()));
+
+        // Shared state: exposed to SortedCollection
+        let ordered_values: Rc<RefCell<Vec<T>>> = Rc::new(RefCell::new(Vec::new()));
+        let pending_deltas: Rc<RefCell<Vec<SortDelta<T>>>> = Rc::new(RefCell::new(Vec::new()));
+
+        let keys_ref = keys.clone();
+        let key_cache_ref = key_cache.clone();
+        let ordered_values_ref = ordered_values.clone();
+        let pending_deltas_ref = pending_deltas.clone();
+
+        let version_counter: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let version_counter_ref = version_counter.clone();
+
+        let version_node = rt.create_query(move |rt| -> u64 {
+            let _upstream_v = rt.get(upstream_ver);
+
+            let upstream = upstream_log.borrow();
+            let start = last_idx.get();
+            if start >= upstream.deltas.len() {
+                return version_counter_ref.get();
+            }
+
+            let mut ks = keys_ref.borrow_mut();
+            let mut kc = key_cache_ref.borrow_mut();
+            let mut vals = ordered_values_ref.borrow_mut();
+            let mut deltas = pending_deltas_ref.borrow_mut();
+
+            for vd in &upstream.deltas[start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let k = key_fn(x);
+                        let pos = ks
+                            .binary_search_by(|probe| probe.cmp(&k))
+                            .unwrap_or_else(|pos| pos);
+                        ks.insert(pos, k.clone());
+                        vals.insert(pos, x.clone());
+                        kc.insert(x.clone(), k);
+                        deltas.push(SortDelta::Inserted {
+                            index: pos,
+                            value: x.clone(),
+                        });
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(k) = kc.remove(x) {
+                            // Find the position: binary search for the key, then linear scan
+                            // for the exact value in case of duplicate keys
+                            let start_pos = ks
+                                .binary_search_by(|probe| probe.cmp(&k))
+                                .unwrap_or_else(|pos| pos);
+                            let mut pos = start_pos;
+                            while pos < vals.len() && ks[pos] == k {
+                                if vals[pos] == *x {
+                                    break;
+                                }
+                                pos += 1;
+                            }
+                            if pos < vals.len() && vals[pos] == *x {
+                                ks.remove(pos);
+                                vals.remove(pos);
+                                deltas.push(SortDelta::Removed {
+                                    index: pos,
+                                    value: x.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            last_idx.set(upstream.deltas.len());
+            let ver = version_counter_ref.get() + 1;
+            version_counter_ref.set(ver);
+            ver
+        });
+
+        SortedCollection {
+            ordered_values,
+            pending_deltas,
+            version_node,
+        }
     }
 }
 
