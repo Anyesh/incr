@@ -130,8 +130,8 @@
   /* Segment connector lines */
   .seg-line {
     position: absolute;
-    top: 34px; /* vertically centered in the 52px block area (8 + 26) */
-    height: 2px;
+    top: 33px; /* vertically centered in the 52px block area (8 + 25) */
+    height: 3px;
     background: var(--border);
     z-index: 1;
     transition: background 0.3s;
@@ -486,9 +486,9 @@
     for (var vi = 0; vi < visits.length; vi++) {
       var v = visits[vi];
       var pctLeft = timeToPercent(v.time);
-      // Duration: convert mins to fraction of day span, min visual width 4%
+      // Duration: convert mins to fraction of day span, min visual width
       var durHours = v.duration_mins / 60;
-      var pctWidth = Math.max(3.5, (durHours / DAY_SPAN) * 100);
+      var pctWidth = Math.max(3.2, (durHours / DAY_SPAN) * 100);
       // Clamp to stay within bounds
       if (pctLeft + pctWidth > 100) pctWidth = 100 - pctLeft;
 
@@ -506,10 +506,14 @@
       block.style.left  = pctLeft + '%';
       block.style.width = pctWidth + '%';
 
-      var firstName = v.client_name.split(' ')[0];
+      var parts = v.client_name.split(' ');
+      var firstName = parts[0];
+      var initials = parts.map(function(p) { return p[0]; }).join('');
+      // Always show initials — tooltip has full name on hover
+      var displayName = initials;
       var nameSpan = document.createElement('span');
       nameSpan.className = 'visit-name';
-      nameSpan.textContent = firstName;
+      nameSpan.textContent = displayName;
       block.appendChild(nameSpan);
 
       // Tooltip
@@ -634,11 +638,15 @@
         newSegmentKeys = new Set();
         prevSegmentKeys = new Set();
         renderTimeline(currentVisits, newSegmentKeys);
-        renderIncremental(msg, newSegmentKeys);
-        // Clear scratch panel to neutral state
+        // Show premium but set timing stats to a neutral initial state
+        document.getElementById('stat-premium').textContent = '$' + msg.total_premium.toFixed(2);
+        var totalSegs = Math.max(0, msg.visits.length - 1);
+        document.getElementById('stat-premium-detail').textContent = totalSegs + ' segments';
+        document.getElementById('stat-incr-time').textContent = '—';
+        document.getElementById('stat-incr-detail').textContent = 'click an action to start';
         document.getElementById('stat-scratch-time').textContent = '—';
         document.getElementById('stat-scratch-detail').textContent = '\u00a0';
-        lastIncrMs = msg.incremental_ms;
+        lastIncrMs = 0;
 
       } else if (msg.type === 'incremental') {
         var newVisits = msg.visits;
@@ -648,11 +656,15 @@
         afterKeys.forEach(function (k) {
           if (!prevSegmentKeys.has(k)) recalcKeys.add(k);
         });
-        // If nothing is "new" (e.g. reschedule keeps same pair count),
-        // fall back to all segments (conservative highlight)
-        if (recalcKeys.size === 0 && afterKeys.size > 0) {
-          // Check if any pair changed by comparing prev carefully
-          afterKeys.forEach(function (k) { recalcKeys.add(k); });
+        // Also mark segments that disappeared (were in prev but not after)
+        // as evidence that recalculation happened, even if new keys look similar
+        if (recalcKeys.size === 0 && prevSegmentKeys.size > 0) {
+          prevSegmentKeys.forEach(function (k) {
+            if (!afterKeys.has(k)) {
+              // A segment was removed, so adjacent segments likely changed
+              afterKeys.forEach(function (ak) { recalcKeys.add(ak); });
+            }
+          });
         }
         newSegmentKeys = recalcKeys;
         currentVisits  = newVisits;
