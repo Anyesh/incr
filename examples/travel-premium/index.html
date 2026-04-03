@@ -130,8 +130,10 @@
   /* Segment connector lines */
   .seg-line {
     position: absolute;
-    top: 33px; /* vertically centered in the 52px block area (8 + 25) */
-    height: 3px;
+    top: 31px;
+    height: 6px;
+    border-radius: 3px;
+    cursor: default;
     background: var(--border);
     z-index: 1;
     transition: background 0.3s;
@@ -282,6 +284,28 @@
     to { transform: rotate(360deg); }
   }
 
+  /* ── Rules panel ─────────────────────────────────────────── */
+  .rules-panel { }
+  .rules-grid {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .rule-item {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 12px;
+  }
+  .rule-range {
+    color: var(--text-dim);
+    min-width: 70px;
+  }
+  .rule-rate {
+    font-weight: 600;
+    color: var(--text);
+  }
+
   /* ── Recalc annotation ───────────────────────────────────── */
   .recalc-note {
     font-size: 11px;
@@ -361,6 +385,29 @@
     </div>
   </div>
 
+  <!-- Premium Rules Info -->
+  <div class="panel rules-panel">
+    <div class="panel-label">Premium Rules</div>
+    <div class="rules-grid">
+      <div class="rule-item">
+        <span class="rule-range">0 &ndash; 5 km</span>
+        <span class="rule-rate">no premium</span>
+      </div>
+      <div class="rule-item">
+        <span class="rule-range">5 &ndash; 20 km</span>
+        <span class="rule-rate">$0.45/km</span>
+      </div>
+      <div class="rule-item">
+        <span class="rule-range">20+ km</span>
+        <span class="rule-rate">$0.65/km</span>
+      </div>
+      <div class="rule-item">
+        <span class="rule-range">Daily cap</span>
+        <span class="rule-rate">$50.00</span>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <div class="tooltip" id="tooltip"></div>
@@ -377,6 +424,7 @@
   // ── State ────────────────────────────────────────────────────────────────────
   var ws = null;
   var currentVisits = [];     // sorted array of visit objects from last update
+  var currentSegments = [];   // array of {from_id, to_id, distance_km, premium} from engine
   var prevSegmentKeys = new Set(); // "fromId-toId" pairs before last action
   var newSegmentKeys  = new Set(); // pairs after last action (= recalculated)
 
@@ -455,7 +503,7 @@
   }
 
   // ── Render timeline ──────────────────────────────────────────────────────────
-  function renderTimeline(visits, recalcKeys) {
+  function renderTimeline(visits, recalcKeys, segments) {
     var wrap = document.getElementById('timelineWrap');
     wrap.textContent = '';
 
@@ -477,6 +525,21 @@
       line.className = 'seg-line' + (isRecalc ? ' recalculated' : '');
       line.style.left  = (pctA + blockW / 2) + '%';
       line.style.width = Math.max(0, pctB - pctA - blockW / 2) + '%';
+
+      // Segment tooltip with distance and premium
+      var segInfo = segments && segments[si];
+      if (segInfo) {
+        (function (info) {
+          var lines = [
+            info.distance_km + ' km',
+            info.premium > 0 ? '$' + info.premium.toFixed(2) + ' premium' : 'no premium (under 5km)'
+          ];
+          line.addEventListener('mouseenter', function (e) { showTooltip(e, lines); });
+          line.addEventListener('mousemove', positionTooltip);
+          line.addEventListener('mouseleave', hideTooltip);
+        })(segInfo);
+      }
+
       wrap.appendChild(line);
 
       if (isRecalc) recalcCount++;
@@ -635,9 +698,10 @@
       if (msg.type === 'initial') {
         // Full reset — no recalculated segments to show
         currentVisits = msg.visits;
+        currentSegments = msg.segments || [];
         newSegmentKeys = new Set();
         prevSegmentKeys = new Set();
-        renderTimeline(currentVisits, newSegmentKeys);
+        renderTimeline(currentVisits, newSegmentKeys, currentSegments);
         // Show premium but set timing stats to a neutral initial state
         document.getElementById('stat-premium').textContent = '$' + msg.total_premium.toFixed(2);
         var totalSegs = Math.max(0, msg.visits.length - 1);
@@ -668,8 +732,9 @@
         }
         newSegmentKeys = recalcKeys;
         currentVisits  = newVisits;
+        currentSegments = msg.segments || [];
 
-        renderTimeline(currentVisits, newSegmentKeys);
+        renderTimeline(currentVisits, newSegmentKeys, currentSegments);
         renderIncremental(msg, newSegmentKeys);
         lastIncrMs = msg.incremental_ms;
 

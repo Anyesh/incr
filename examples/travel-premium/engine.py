@@ -87,11 +87,18 @@ def _random_location():
 
 def generate_schedule(num_visits: int = 14) -> list[Visit]:
     visits = []
-    slot_duration = 10.0 / num_visits
+    current_time = 7.0  # start at 7am
+
     for i in range(num_visits):
-        base_time = 7.0 + i * slot_duration
-        time_val = round(base_time + random.uniform(0, slot_duration * 0.6), 2)
-        time_val = min(time_val, 16.75)
+        # Add a travel gap (10-20 min) between visits
+        if i > 0:
+            current_time += random.uniform(10, 20) / 60.0
+
+        time_val = round(current_time + random.uniform(0, 0.1), 2)
+        if time_val >= 16.75:
+            break  # don't schedule past 4:45pm
+
+        duration = random.choice([15, 30, 30, 45, 60])
 
         lat, lng = _random_location()
         visit = Visit(
@@ -99,11 +106,15 @@ def generate_schedule(num_visits: int = 14) -> list[Visit]:
             client_name=random.choice(CLIENT_NAMES),
             address=random.choice(ADDRESSES),
             time=time_val,
-            duration_mins=random.choice([15, 30, 30, 45, 60]),
+            duration_mins=duration,
             lat=lat,
             lng=lng,
         )
         visits.append(visit)
+
+        # Advance clock past the end of this visit
+        current_time = time_val + duration / 60.0
+
     return visits
 
 
@@ -291,6 +302,24 @@ class TravelPremiumEngine:
         self.visits[new.id] = new
         return old, new
 
+    def _segment_details(self) -> list[dict]:
+        sorted_v = sorted(self.visits.values(), key=lambda v: v.time)
+        segments = []
+        for i in range(len(sorted_v) - 1):
+            a, b = sorted_v[i], sorted_v[i + 1]
+            # Uses cache only (distances already computed by the pipeline)
+            dist, _ = self.distance_service.get_distance(a.lat, a.lng, b.lat, b.lng)
+            premium = compute_premium(dist)
+            segments.append(
+                {
+                    "from_id": a.id,
+                    "to_id": b.id,
+                    "distance_km": round(dist, 1),
+                    "premium": round(premium, 2),
+                }
+            )
+        return segments
+
     def read_incremental(self) -> dict:
         self.distance_service.reset_stats()
 
@@ -299,6 +328,7 @@ class TravelPremiumEngine:
         elapsed_ms = (time.perf_counter() - start) * 1000
 
         stats = self.distance_service.stats.copy()
+        segments = self._segment_details()
 
         return {
             "total_premium": round(total, 2),
@@ -314,6 +344,7 @@ class TravelPremiumEngine:
                 }
                 for v in sorted(self.visits.values(), key=lambda v: v.time)
             ],
+            "segments": segments,
             "distance_stats": stats,
             "incremental_ms": round(elapsed_ms, 1),
         }
