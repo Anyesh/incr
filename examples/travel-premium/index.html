@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>incr &middot; Travel Premium Demo</title>
+<style>
+  :root {
+    --bg:         #faf8f5;
+    --surface:    #ffffff;
+    --border:     #e8e4df;
+    --border-lt:  #f0ede8;
+    --text:       #2d2a26;
+    --text-dim:   #8a8580;
+    --text-label: #a8a39d;
+    --amber:      #e8a840;
+    --amber-bg:   #fdf5e6;
+    --premium:    #c06030;
+    --premium-bg: #fdf0e8;
+    --green:      #3a7a2a;
+    --green-bg:   #e8f5e0;
+    --surface-alt:#f5f2ef;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 32px 24px;
+  }
+
+  /* ── Header ──────────────────────────────────────────────── */
+  .header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 6px;
+  }
+  .header-left { display: flex; align-items: baseline; gap: 12px; }
+  .logo {
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: var(--text);
+  }
+  .header-title { font-size: 14px; color: var(--text-dim); }
+  .header-subtitle {
+    font-size: 13px;
+    color: var(--text-dim);
+    margin-bottom: 28px;
+    line-height: 1.5;
+  }
+  .conn-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #c25a4a;
+    flex-shrink: 0;
+    transition: background 0.3s;
+  }
+  .conn-dot.connected { background: #4a8c6f; }
+
+  /* ── Layout ──────────────────────────────────────────────── */
+  .layout {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* ── Panel shared ────────────────────────────────────────── */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+  }
+  .panel-label {
+    font-size: 11px;
+    letter-spacing: 0.4px;
+    color: var(--text-label);
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+
+  /* ── Timeline panel ──────────────────────────────────────── */
+  .timeline-wrap {
+    position: relative;
+    height: 88px;
+    margin-bottom: 8px;
+  }
+
+  /* Visit blocks */
+  .visit-block {
+    position: absolute;
+    top: 8px;
+    height: 52px;
+    min-width: 6px;
+    border-radius: 4px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-dim);
+    cursor: default;
+    overflow: hidden;
+    transition: background 0.3s, border-color 0.3s;
+    z-index: 2;
+  }
+  .visit-block.recalculated {
+    background: var(--amber-bg);
+    border-color: var(--amber);
+    color: #8a6010;
+  }
+  .visit-block .visit-name {
+    padding: 0 5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+  }
+
+  /* Segment connector lines */
+  .seg-line {
+    position: absolute;
+    top: 34px; /* vertically centered in the 52px block area (8 + 26) */
+    height: 2px;
+    background: var(--border);
+    z-index: 1;
+    transition: background 0.3s;
+  }
+  .seg-line.recalculated {
+    background: var(--amber);
+  }
+
+  /* Hour axis */
+  .timeline-axis {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 4px;
+    padding: 0 0;
+    font-size: 10px;
+    color: var(--text-label);
+    font-variant-numeric: tabular-nums;
+    position: relative;
+  }
+  .axis-tick {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+  .axis-tick-line {
+    width: 1px;
+    height: 5px;
+    background: var(--border);
+  }
+
+  /* Tooltip */
+  .tooltip {
+    position: fixed;
+    background: var(--text);
+    color: #fff;
+    font-size: 11px;
+    line-height: 1.6;
+    padding: 8px 12px;
+    border-radius: 6px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.1s;
+    z-index: 100;
+    white-space: nowrap;
+  }
+  .tooltip.visible { opacity: 1; }
+
+  /* ── Controls panel ──────────────────────────────────────── */
+  .controls-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .ctrl-sep {
+    width: 1px;
+    height: 20px;
+    background: var(--border);
+    flex-shrink: 0;
+  }
+  .ctrl-btn {
+    padding: 7px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+    white-space: nowrap;
+  }
+  .ctrl-btn:hover {
+    border-color: #b0aaa4;
+    color: var(--text);
+  }
+  .ctrl-btn:active { opacity: 0.75; }
+  .ctrl-btn.scenario {
+    background: var(--surface-alt);
+    font-style: italic;
+  }
+  .ctrl-btn.reset-btn {
+    margin-left: auto;
+    color: var(--text-label);
+  }
+  .ctrl-btn.reset-btn:hover {
+    color: var(--premium);
+    border-color: var(--premium);
+  }
+
+  /* ── Stats panel ─────────────────────────────────────────── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+  .stat-card {
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 18px;
+  }
+  .stat-card-label {
+    font-size: 11px;
+    color: var(--text-label);
+    letter-spacing: 0.3px;
+    margin-bottom: 8px;
+  }
+  .stat-card-value {
+    font-size: 28px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    margin-bottom: 6px;
+  }
+  .stat-card-detail {
+    font-size: 12px;
+    color: var(--text-dim);
+  }
+  .stat-card-value.premium-color { color: var(--premium); }
+  .stat-card-value.amber-color   { color: var(--amber); }
+  .stat-card-value.text-color    { color: var(--text); }
+
+  .speedup-badge {
+    display: inline-block;
+    background: var(--green-bg);
+    color: var(--green);
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 4px;
+    letter-spacing: 0.2px;
+  }
+
+  /* ── Spinner ─────────────────────────────────────────────── */
+  .spinner {
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    border: 2px solid var(--border);
+    border-top-color: var(--text-dim);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    vertical-align: middle;
+  }
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  /* ── Recalc annotation ───────────────────────────────────── */
+  .recalc-note {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 2px;
+  }
+  .recalc-note .amber { color: var(--amber); font-weight: 600; }
+
+  @media (max-width: 720px) {
+    .stats-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="logo">incr</div>
+    <div class="header-title">Travel Premium Demo</div>
+  </div>
+  <div id="connDot" class="conn-dot"></div>
+</div>
+<div class="header-subtitle">
+  A home-care scheduler's daily route, recomputed incrementally. Each action touches only the
+  segments that change; distances are fetched on miss and cached on hit. The panel below
+  shows the incremental result arriving immediately, then the from-scratch comparison
+  finishing a moment later.
+</div>
+
+<div class="layout">
+
+  <!-- Timeline -->
+  <div class="panel">
+    <div class="panel-label">Daily schedule &mdash; 7am to 5pm</div>
+    <div class="timeline-wrap" id="timelineWrap"></div>
+    <div class="timeline-axis" id="timelineAxis"></div>
+    <div class="recalc-note" id="recalcNote">&nbsp;</div>
+  </div>
+
+  <!-- Controls -->
+  <div class="panel">
+    <div class="panel-label">Actions</div>
+    <div class="controls-row">
+      <button class="ctrl-btn" data-action="add_visit">Add Visit</button>
+      <button class="ctrl-btn" data-action="remove_visit">Remove Visit</button>
+      <button class="ctrl-btn" data-action="reschedule_visit">Reschedule Visit</button>
+
+      <div class="ctrl-sep"></div>
+
+      <button class="ctrl-btn scenario" data-action="midday_insertion">Midday Insertion</button>
+      <button class="ctrl-btn scenario" data-action="morning_shuffle">Morning Shuffle</button>
+      <button class="ctrl-btn scenario" data-action="cancel_afternoon">Cancel Afternoon</button>
+
+      <button class="ctrl-btn reset-btn" data-action="reset">Reset Schedule</button>
+    </div>
+  </div>
+
+  <!-- Stats -->
+  <div class="panel">
+    <div class="panel-label">Computation stats</div>
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-card-label">Total Premium</div>
+        <div class="stat-card-value premium-color" id="stat-premium">$—</div>
+        <div class="stat-card-detail" id="stat-premium-detail">&nbsp;</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-label">Incremental time</div>
+        <div class="stat-card-value amber-color" id="stat-incr-time">—</div>
+        <div class="stat-card-detail" id="stat-incr-detail">&nbsp;</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-card-label">From-scratch time</div>
+        <div class="stat-card-value text-color" id="stat-scratch-time">—</div>
+        <div class="stat-card-detail" id="stat-scratch-detail">&nbsp;</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  // ── Constants ────────────────────────────────────────────────────────────────
+  var DAY_START = 7.0;   // 7am
+  var DAY_END   = 17.0;  // 5pm
+  var DAY_SPAN  = DAY_END - DAY_START;
+
+  // ── State ────────────────────────────────────────────────────────────────────
+  var ws = null;
+  var currentVisits = [];     // sorted array of visit objects from last update
+  var prevSegmentKeys = new Set(); // "fromId-toId" pairs before last action
+  var newSegmentKeys  = new Set(); // pairs after last action (= recalculated)
+
+  // ── Tooltip ──────────────────────────────────────────────────────────────────
+  var tooltipEl = document.getElementById('tooltip');
+
+  function showTooltip(e, lines) {
+    tooltipEl.textContent = '';
+    lines.forEach(function (line, i) {
+      if (i > 0) tooltipEl.appendChild(document.createElement('br'));
+      tooltipEl.appendChild(document.createTextNode(line));
+    });
+    tooltipEl.classList.add('visible');
+    positionTooltip(e);
+  }
+
+  function positionTooltip(e) {
+    var x = e.clientX + 14;
+    var y = e.clientY - 10;
+    if (x + 200 > window.innerWidth) x = e.clientX - 180;
+    tooltipEl.style.left = x + 'px';
+    tooltipEl.style.top  = y + 'px';
+  }
+
+  function hideTooltip() {
+    tooltipEl.classList.remove('visible');
+  }
+
+  // ── Timeline helpers ─────────────────────────────────────────────────────────
+  function timeToPercent(hour) {
+    return ((hour - DAY_START) / DAY_SPAN) * 100;
+  }
+
+  function formatHour(h) {
+    var ampm = h < 12 ? 'am' : 'pm';
+    var display = h <= 12 ? h : h - 12;
+    return display + ampm;
+  }
+
+  function formatHourFull(h) {
+    var total = Math.round(h * 60);
+    var hr = Math.floor(total / 60);
+    var min = total % 60;
+    var ampm = hr < 12 ? 'am' : 'pm';
+    var hr12 = hr <= 12 ? hr : hr - 12;
+    return hr12 + ':' + (min < 10 ? '0' : '') + min + ampm;
+  }
+
+  // ── Build axis ───────────────────────────────────────────────────────────────
+  function buildAxis() {
+    var axis = document.getElementById('timelineAxis');
+    axis.textContent = '';
+    for (var h = DAY_START; h <= DAY_END; h++) {
+      var tick = document.createElement('div');
+      tick.className = 'axis-tick';
+
+      var line = document.createElement('div');
+      line.className = 'axis-tick-line';
+
+      var label = document.createElement('span');
+      label.textContent = formatHour(h);
+
+      tick.appendChild(line);
+      tick.appendChild(label);
+      axis.appendChild(tick);
+    }
+  }
+
+  // ── Compute segment keys ─────────────────────────────────────────────────────
+  function segmentKeysFromVisits(visits) {
+    var keys = new Set();
+    for (var i = 0; i < visits.length - 1; i++) {
+      keys.add(visits[i].id + '-' + visits[i + 1].id);
+    }
+    return keys;
+  }
+
+  // ── Render timeline ──────────────────────────────────────────────────────────
+  function renderTimeline(visits, recalcKeys) {
+    var wrap = document.getElementById('timelineWrap');
+    wrap.textContent = '';
+
+    var recalcCount = 0;
+
+    // Draw segment connector lines first (so they sit behind blocks)
+    for (var si = 0; si < visits.length - 1; si++) {
+      var a = visits[si], b = visits[si + 1];
+      var key = a.id + '-' + b.id;
+      var isRecalc = recalcKeys.has(key);
+
+      var pctA = timeToPercent(a.time);
+      var pctB = timeToPercent(b.time);
+      // Line runs from right edge of block A to left edge of block B.
+      // We approximate block width as ~4% for connector purposes.
+      var blockW = 4;
+
+      var line = document.createElement('div');
+      line.className = 'seg-line' + (isRecalc ? ' recalculated' : '');
+      line.style.left  = (pctA + blockW / 2) + '%';
+      line.style.width = Math.max(0, pctB - pctA - blockW / 2) + '%';
+      wrap.appendChild(line);
+
+      if (isRecalc) recalcCount++;
+    }
+
+    // Draw visit blocks
+    for (var vi = 0; vi < visits.length; vi++) {
+      var v = visits[vi];
+      var pctLeft = timeToPercent(v.time);
+      // Duration: convert mins to fraction of day span, min visual width 4%
+      var durHours = v.duration_mins / 60;
+      var pctWidth = Math.max(3.5, (durHours / DAY_SPAN) * 100);
+      // Clamp to stay within bounds
+      if (pctLeft + pctWidth > 100) pctWidth = 100 - pctLeft;
+
+      var isRecalcVisit = false;
+      // A visit is "recalculated" if any of its adjacent segments was recalculated
+      if (vi > 0) {
+        if (recalcKeys.has(visits[vi - 1].id + '-' + v.id)) isRecalcVisit = true;
+      }
+      if (vi < visits.length - 1) {
+        if (recalcKeys.has(v.id + '-' + visits[vi + 1].id)) isRecalcVisit = true;
+      }
+
+      var block = document.createElement('div');
+      block.className = 'visit-block' + (isRecalcVisit ? ' recalculated' : '');
+      block.style.left  = pctLeft + '%';
+      block.style.width = pctWidth + '%';
+
+      var firstName = v.client_name.split(' ')[0];
+      var nameSpan = document.createElement('span');
+      nameSpan.className = 'visit-name';
+      nameSpan.textContent = firstName;
+      block.appendChild(nameSpan);
+
+      // Tooltip
+      (function (visit) {
+        block.addEventListener('mouseenter', function (e) {
+          showTooltip(e, [
+            visit.client_name,
+            visit.address,
+            formatHourFull(visit.time) + ' \u00b7 ' + visit.duration_mins + ' min'
+          ]);
+        });
+        block.addEventListener('mousemove', positionTooltip);
+        block.addEventListener('mouseleave', hideTooltip);
+      })(v);
+
+      wrap.appendChild(block);
+    }
+
+    // Update recalc annotation
+    var note = document.getElementById('recalcNote');
+    note.textContent = '';
+    if (recalcKeys.size > 0) {
+      note.appendChild(document.createTextNode(recalcCount + ' of ' + (visits.length - 1) + ' segments '));
+      var hi = document.createElement('span');
+      hi.className = 'amber';
+      hi.textContent = 'recalculated';
+      note.appendChild(hi);
+      note.appendChild(document.createTextNode(' on last action'));
+    } else {
+      note.appendChild(document.createTextNode('\u00a0'));
+    }
+  }
+
+  // ── Render stats ─────────────────────────────────────────────────────────────
+  function renderIncremental(data, recalcKeys) {
+    // Premium card
+    var premiumEl = document.getElementById('stat-premium');
+    premiumEl.textContent = '$' + data.total_premium.toFixed(2);
+
+    var premiumDetail = document.getElementById('stat-premium-detail');
+    premiumDetail.textContent = '';
+    var recalcSegCount = recalcKeys.size;
+    var totalSegs = Math.max(0, data.visits.length - 1);
+    if (totalSegs > 0) {
+      premiumDetail.textContent = recalcSegCount + ' of ' + totalSegs + ' segments recalculated';
+    } else {
+      premiumDetail.textContent = 'no segments';
+    }
+
+    // Incremental time card
+    var incrTimeEl = document.getElementById('stat-incr-time');
+    incrTimeEl.textContent = data.incremental_ms + 'ms';
+
+    var incrDetail = document.getElementById('stat-incr-detail');
+    incrDetail.textContent = '';
+    var ds = data.distance_stats;
+    incrDetail.appendChild(document.createTextNode(ds.misses + ' cache miss, ' + ds.hits + ' cache hit'));
+  }
+
+  function renderScratch(data, incrMs) {
+    var scratchTimeEl = document.getElementById('stat-scratch-time');
+    scratchTimeEl.textContent = data.scratch_ms + 'ms';
+
+    var detail = document.getElementById('stat-scratch-detail');
+    detail.textContent = '';
+
+    var misses = data.distance_stats.misses;
+    detail.appendChild(document.createTextNode(misses + ' lookups '));
+
+    if (incrMs > 0 && data.scratch_ms > 0) {
+      var speedup = Math.round(data.scratch_ms / incrMs);
+      if (speedup >= 2) {
+        var badge = document.createElement('span');
+        badge.className = 'speedup-badge';
+        badge.textContent = speedup + 'x faster';
+        detail.appendChild(badge);
+      }
+    }
+  }
+
+  // ── WebSocket send ────────────────────────────────────────────────────────────
+  var lastIncrMs = 0;
+
+  function send(action) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      // Capture current segment keys before this action as "prev"
+      prevSegmentKeys = segmentKeysFromVisits(currentVisits);
+      newSegmentKeys  = new Set();
+
+      // Show spinner for from-scratch while waiting
+      var scratchTimeEl = document.getElementById('stat-scratch-time');
+      scratchTimeEl.textContent = '';
+      var spinner = document.createElement('span');
+      spinner.className = 'spinner';
+      scratchTimeEl.appendChild(spinner);
+      document.getElementById('stat-scratch-detail').textContent = 'computing\u2026';
+
+      ws.send(JSON.stringify({ action: action }));
+    }
+  }
+
+  // ── WebSocket ────────────────────────────────────────────────────────────────
+  function connect() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
+
+    ws.onopen = function () {
+      document.getElementById('connDot').classList.add('connected');
+    };
+
+    ws.onclose = function () {
+      document.getElementById('connDot').classList.remove('connected');
+      setTimeout(connect, 2000);
+    };
+
+    ws.onmessage = function (e) {
+      var msg = JSON.parse(e.data);
+
+      if (msg.type === 'initial') {
+        // Full reset — no recalculated segments to show
+        currentVisits = msg.visits;
+        newSegmentKeys = new Set();
+        prevSegmentKeys = new Set();
+        renderTimeline(currentVisits, newSegmentKeys);
+        renderIncremental(msg, newSegmentKeys);
+        // Clear scratch panel to neutral state
+        document.getElementById('stat-scratch-time').textContent = '—';
+        document.getElementById('stat-scratch-detail').textContent = '\u00a0';
+        lastIncrMs = msg.incremental_ms;
+
+      } else if (msg.type === 'incremental') {
+        var newVisits = msg.visits;
+        // Detect which segment pairs are new vs what existed before
+        var afterKeys = segmentKeysFromVisits(newVisits);
+        var recalcKeys = new Set();
+        afterKeys.forEach(function (k) {
+          if (!prevSegmentKeys.has(k)) recalcKeys.add(k);
+        });
+        // If nothing is "new" (e.g. reschedule keeps same pair count),
+        // fall back to all segments (conservative highlight)
+        if (recalcKeys.size === 0 && afterKeys.size > 0) {
+          // Check if any pair changed by comparing prev carefully
+          afterKeys.forEach(function (k) { recalcKeys.add(k); });
+        }
+        newSegmentKeys = recalcKeys;
+        currentVisits  = newVisits;
+
+        renderTimeline(currentVisits, newSegmentKeys);
+        renderIncremental(msg, newSegmentKeys);
+        lastIncrMs = msg.incremental_ms;
+
+      } else if (msg.type === 'scratch') {
+        renderScratch(msg, lastIncrMs);
+      }
+    };
+  }
+
+  // ── Wire up buttons ───────────────────────────────────────────────────────────
+  document.querySelectorAll('.ctrl-btn[data-action]').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      send(btn.dataset.action);
+    });
+  });
+
+  // ── Init ─────────────────────────────────────────────────────────────────────
+  buildAxis();
+  connect();
+
+})();
+</script>
+</body>
+</html>
