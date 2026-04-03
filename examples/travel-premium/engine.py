@@ -105,3 +105,61 @@ def generate_schedule(num_visits: int = 14) -> list[Visit]:
         )
         visits.append(visit)
     return visits
+
+
+# ── Distance Service ─────────────────────────────────────────────────────────
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlng / 2) ** 2
+    )
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _round_coord(v: float) -> float:
+    # Round to ~100m precision for cache keys.
+    return round(v, 3)
+
+
+class DistanceService:
+    def __init__(self, latency_ms: tuple[int, int] = (30, 50)):
+        self.latency_range = latency_ms
+        self.cache: dict[tuple, float] = {}
+        self.stats = {"hits": 0, "misses": 0, "total_ms": 0.0}
+
+    def reset_stats(self):
+        self.stats = {"hits": 0, "misses": 0, "total_ms": 0.0}
+
+    def clear_cache(self):
+        self.cache.clear()
+
+    def get_distance(
+        self, lat1: float, lng1: float, lat2: float, lng2: float
+    ) -> tuple[float, bool]:
+        # Returns (distance_km, cache_hit).
+        key = (
+            _round_coord(lat1),
+            _round_coord(lng1),
+            _round_coord(lat2),
+            _round_coord(lng2),
+        )
+
+        if key in self.cache:
+            self.stats["hits"] += 1
+            return self.cache[key], True
+
+        delay_ms = random.randint(*self.latency_range)
+        time.sleep(delay_ms / 1000.0)
+
+        dist = haversine_km(lat1, lng1, lat2, lng2)
+        self.cache[key] = dist
+        self.stats["misses"] += 1
+        self.stats["total_ms"] += delay_ms
+        return dist, False
