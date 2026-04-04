@@ -345,15 +345,19 @@ class Segment:
 
 
 class TravelPremiumEngine:
-    def __init__(self):
-        self.rt = Runtime()
-        self.distance_service = DistanceService()
+    def __init__(
+        self, db_path: str = "visits.db", cache_path: str = "distance_cache.db"
+    ):
+        self.db = Database(db_path)
+        self.cache = PersistentCache(cache_path)
+        self.distance_service = DistanceService(cache=self.cache)
         self.visits: dict[int, Visit] = {}
         self.next_id = 0
+        self.startup_info = ""
 
         # Build the incr pipeline
+        self.rt = Runtime()
         self.visit_collection = self.rt.create_collection()
-
         self.sorted_visits = self.visit_collection.sort_by_key(lambda v: v.time)
         self.pairs = self.sorted_visits.pairwise()
 
@@ -371,18 +375,35 @@ class TravelPremiumEngine:
             )
 
         self.segments = self.pairs.map(_pair_to_segment)
-
         self.total_premium = self.segments.reduce(
             lambda segs: min(sum(s.premium for s in segs), DAILY_CAP)
         )
 
-    def generate_initial_schedule(self, num_visits: int = 14):
-        schedule = generate_schedule(num_visits)
-        for v in schedule:
-            self.visit_collection.insert(v)
-            self.visits[v.id] = v
-        self.next_id = num_visits
-        self.rt.get(self.total_premium)
+        # Load existing visits from database
+        existing = self.db.load_all_visits()
+        if existing:
+            self.distance_service.reset_stats()
+            for v in existing:
+                self.visit_collection.insert(v)
+                self.visits[v.id] = v
+            self.next_id = self.db.max_id() + 1
+            self.rt.get(self.total_premium)
+            stats = self.distance_service.stats
+            self.startup_info = (
+                f"Loaded from database ({len(existing)} visits, "
+                f"cache: {stats['hits']}/{stats['hits'] + stats['misses']} hits)"
+            )
+        else:
+            # Fresh database: generate initial schedule
+            schedule = generate_schedule(14)
+            self.distance_service.reset_stats()
+            for v in schedule:
+                self.db.insert_visit(v)
+                self.visit_collection.insert(v)
+                self.visits[v.id] = v
+            self.next_id = len(schedule)
+            self.rt.get(self.total_premium)
+            self.startup_info = f"Fresh schedule generated ({len(schedule)} visits)"
 
     def add_visit(self, visit: Visit = None) -> Visit:
         if visit is None:
@@ -397,6 +418,9 @@ class TravelPremiumEngine:
                 lng=lng,
             )
         self.next_id = max(self.next_id, visit.id + 1)
+        # Database first
+        self.db.insert_visit(visit)
+        # Then incr graph
         self.visit_collection.insert(visit)
         self.visits[visit.id] = visit
         return visit
@@ -408,6 +432,9 @@ class TravelPremiumEngine:
             visit_id = random.choice(list(self.visits.keys()))
         visit = self.visits.pop(visit_id, None)
         if visit:
+            # Database first
+            self.db.delete_visit(visit_id)
+            # Then incr graph
             self.visit_collection.delete(visit)
         return visit
 
@@ -419,7 +446,6 @@ class TravelPremiumEngine:
         old = self.visits.get(visit_id)
         if not old:
             return None
-        self.visit_collection.delete(old)
         new = Visit(
             id=old.id,
             client_name=old.client_name,
@@ -429,6 +455,10 @@ class TravelPremiumEngine:
             lat=old.lat,
             lng=old.lng,
         )
+        # Database first
+        self.db.update_visit(new)
+        # Then incr graph
+        self.visit_collection.delete(old)
         self.visit_collection.insert(new)
         self.visits[new.id] = new
         return old, new
@@ -438,7 +468,6 @@ class TravelPremiumEngine:
         segments = []
         for i in range(len(sorted_v) - 1):
             a, b = sorted_v[i], sorted_v[i + 1]
-            # Uses cache only (distances already computed by the pipeline)
             dist, _ = self.distance_service.get_distance(a.lat, a.lng, b.lat, b.lng)
             premium = compute_premium(dist)
             segments.append(
@@ -478,10 +507,12 @@ class TravelPremiumEngine:
             "segments": segments,
             "distance_stats": stats,
             "incremental_ms": round(elapsed_ms, 1),
+            "startup_info": self.startup_info,
         }
 
     def compute_from_scratch(self) -> dict:
-        self.distance_service.reset_stats()
+        # Bypass persistent cache entirely for an honest baseline.
+        scratch_stats = {"hits": 0, "misses": 0, "total_ms": 0.0}
 
         start = time.perf_counter()
 
@@ -489,15 +520,18 @@ class TravelPremiumEngine:
         total = 0.0
         for i in range(len(sorted_v) - 1):
             a, b = sorted_v[i], sorted_v[i + 1]
-            dist, _ = self.distance_service.get_distance(a.lat, a.lng, b.lat, b.lng)
+            delay_ms = random.randint(*self.distance_service.latency_range)
+            time.sleep(delay_ms / 1000.0)
+            dist = haversine_km(a.lat, a.lng, b.lat, b.lng)
             total += compute_premium(dist)
+            scratch_stats["misses"] += 1
+            scratch_stats["total_ms"] += delay_ms
         total = min(total, DAILY_CAP)
 
         elapsed_ms = (time.perf_counter() - start) * 1000
-        stats = self.distance_service.stats.copy()
 
         return {
             "total_premium": round(total, 2),
-            "distance_stats": stats,
+            "distance_stats": scratch_stats,
             "scratch_ms": round(elapsed_ms, 1),
         }
