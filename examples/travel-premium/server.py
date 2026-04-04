@@ -5,6 +5,7 @@ from-scratch results to connected WebSocket clients.
 """
 
 import asyncio
+import os
 import random
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -12,10 +13,12 @@ from fastapi.responses import FileResponse
 
 from engine import TravelPremiumEngine, Visit, _random_location, CLIENT_NAMES, ADDRESSES
 
+DB_PATH = "visits.db"
+CACHE_PATH = "distance_cache.db"
+
 app = FastAPI()
-engine = TravelPremiumEngine()
+engine = TravelPremiumEngine(db_path=DB_PATH, cache_path=CACHE_PATH)
 engine.distance_service.latency_range = (30, 50)
-engine.generate_initial_schedule(14)
 
 
 @app.get("/")
@@ -25,9 +28,9 @@ async def index():
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    global engine
     await ws.accept()
 
-    # Send initial state
     try:
         result = engine.read_incremental()
         await ws.send_json({"type": "initial", **result})
@@ -73,9 +76,14 @@ async def websocket_endpoint(ws: WebSocket):
                     engine.remove_visit(v.id)
 
             elif action == "reset":
-                engine.__init__()
+                engine.db.close()
+                engine.cache.close()
+                if os.path.exists(DB_PATH):
+                    os.remove(DB_PATH)
+                if os.path.exists(CACHE_PATH):
+                    os.remove(CACHE_PATH)
+                engine = TravelPremiumEngine(db_path=DB_PATH, cache_path=CACHE_PATH)
                 engine.distance_service.latency_range = (30, 50)
-                engine.generate_initial_schedule(14)
                 result = engine.read_incremental()
                 await ws.send_json({"type": "initial", **result})
                 continue
@@ -83,11 +91,9 @@ async def websocket_endpoint(ws: WebSocket):
             else:
                 continue
 
-            # First message: incremental result (fast)
             result = engine.read_incremental()
             await ws.send_json({"type": "incremental", **result})
 
-            # Second message: from-scratch comparison (slow, runs in thread)
             scratch = await asyncio.to_thread(engine.compute_from_scratch)
             await ws.send_json({"type": "scratch", **scratch})
 
