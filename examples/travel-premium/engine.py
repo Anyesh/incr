@@ -7,6 +7,7 @@ travel premiums incrementally.
 
 import math
 import random
+import sqlite3
 import time
 from dataclasses import dataclass, field
 
@@ -116,6 +117,92 @@ def generate_schedule(num_visits: int = 14) -> list[Visit]:
         current_time = time_val + duration / 60.0
 
     return visits
+
+
+# ── Database ────────────────────────────────────────────────────────────────
+
+
+class Database:
+    def __init__(self, path: str):
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS visits (
+                id INTEGER PRIMARY KEY,
+                client_name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                time REAL NOT NULL,
+                duration_mins INTEGER NOT NULL,
+                lat REAL NOT NULL,
+                lng REAL NOT NULL
+            )
+        """)
+        self.conn.commit()
+
+    def load_all_visits(self) -> list[Visit]:
+        rows = self.conn.execute(
+            "SELECT id, client_name, address, time, duration_mins, lat, lng FROM visits ORDER BY time"
+        ).fetchall()
+        return [
+            Visit(
+                id=r[0],
+                client_name=r[1],
+                address=r[2],
+                time=r[3],
+                duration_mins=r[4],
+                lat=r[5],
+                lng=r[6],
+            )
+            for r in rows
+        ]
+
+    def insert_visit(self, visit: Visit):
+        self.conn.execute(
+            "INSERT INTO visits (id, client_name, address, time, duration_mins, lat, lng) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                visit.id,
+                visit.client_name,
+                visit.address,
+                visit.time,
+                visit.duration_mins,
+                visit.lat,
+                visit.lng,
+            ),
+        )
+        self.conn.commit()
+
+    def update_visit(self, visit: Visit):
+        self.conn.execute(
+            "UPDATE visits SET client_name=?, address=?, time=?, duration_mins=?, lat=?, lng=? WHERE id=?",
+            (
+                visit.client_name,
+                visit.address,
+                visit.time,
+                visit.duration_mins,
+                visit.lat,
+                visit.lng,
+                visit.id,
+            ),
+        )
+        self.conn.commit()
+
+    def delete_visit(self, visit_id: int):
+        self.conn.execute("DELETE FROM visits WHERE id=?", (visit_id,))
+        self.conn.commit()
+
+    def clear(self):
+        self.conn.execute("DELETE FROM visits")
+        self.conn.commit()
+
+    def count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM visits").fetchone()[0]
+
+    def max_id(self) -> int:
+        row = self.conn.execute("SELECT MAX(id) FROM visits").fetchone()
+        return row[0] if row[0] is not None else -1
+
+    def close(self):
+        self.conn.close()
 
 
 # ── Distance Service ─────────────────────────────────────────────────────────
