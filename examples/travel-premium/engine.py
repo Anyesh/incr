@@ -205,6 +205,45 @@ class Database:
         self.conn.close()
 
 
+class PersistentCache:
+    def __init__(self, path: str):
+        self.path = path
+        self.conn = sqlite3.connect(path)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS distance_cache (
+                lat1 REAL NOT NULL,
+                lng1 REAL NOT NULL,
+                lat2 REAL NOT NULL,
+                lng2 REAL NOT NULL,
+                distance_km REAL NOT NULL,
+                PRIMARY KEY (lat1, lng1, lat2, lng2)
+            )
+        """)
+        self.conn.commit()
+
+    def get(self, lat1: float, lng1: float, lat2: float, lng2: float) -> float | None:
+        row = self.conn.execute(
+            "SELECT distance_km FROM distance_cache WHERE lat1=? AND lng1=? AND lat2=? AND lng2=?",
+            (lat1, lng1, lat2, lng2),
+        ).fetchone()
+        return row[0] if row else None
+
+    def put(
+        self, lat1: float, lng1: float, lat2: float, lng2: float, distance_km: float
+    ):
+        self.conn.execute(
+            "INSERT OR REPLACE INTO distance_cache (lat1, lng1, lat2, lng2, distance_km) VALUES (?, ?, ?, ?, ?)",
+            (lat1, lng1, lat2, lng2, distance_km),
+        )
+        self.conn.commit()
+
+    def count(self) -> int:
+        return self.conn.execute("SELECT COUNT(*) FROM distance_cache").fetchone()[0]
+
+    def close(self):
+        self.conn.close()
+
+
 # ── Distance Service ─────────────────────────────────────────────────────────
 
 
@@ -227,21 +266,21 @@ def _round_coord(v: float) -> float:
 
 
 class DistanceService:
-    def __init__(self, latency_ms: tuple[int, int] = (30, 50)):
+    def __init__(
+        self,
+        latency_ms: tuple[int, int] = (30, 50),
+        cache: PersistentCache | None = None,
+    ):
         self.latency_range = latency_ms
-        self.cache: dict[tuple, float] = {}
+        self.persistent_cache = cache
         self.stats = {"hits": 0, "misses": 0, "total_ms": 0.0}
 
     def reset_stats(self):
         self.stats = {"hits": 0, "misses": 0, "total_ms": 0.0}
 
-    def clear_cache(self):
-        self.cache.clear()
-
     def get_distance(
         self, lat1: float, lng1: float, lat2: float, lng2: float
     ) -> tuple[float, bool]:
-        # Returns (distance_km, cache_hit).
         key = (
             _round_coord(lat1),
             _round_coord(lng1),
@@ -249,15 +288,20 @@ class DistanceService:
             _round_coord(lng2),
         )
 
-        if key in self.cache:
-            self.stats["hits"] += 1
-            return self.cache[key], True
+        if self.persistent_cache:
+            cached = self.persistent_cache.get(*key)
+            if cached is not None:
+                self.stats["hits"] += 1
+                return cached, True
 
         delay_ms = random.randint(*self.latency_range)
         time.sleep(delay_ms / 1000.0)
 
         dist = haversine_km(lat1, lng1, lat2, lng2)
-        self.cache[key] = dist
+
+        if self.persistent_cache:
+            self.persistent_cache.put(*key, dist)
+
         self.stats["misses"] += 1
         self.stats["total_ms"] += delay_ms
         return dist, False
@@ -437,7 +481,6 @@ class TravelPremiumEngine:
         }
 
     def compute_from_scratch(self) -> dict:
-        self.distance_service.clear_cache()
         self.distance_service.reset_stats()
 
         start = time.perf_counter()
