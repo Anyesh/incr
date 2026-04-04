@@ -707,7 +707,7 @@
         var totalSegs = Math.max(0, msg.visits.length - 1);
         document.getElementById('stat-premium-detail').textContent = totalSegs + ' segments';
         document.getElementById('stat-incr-time').textContent = '—';
-        document.getElementById('stat-incr-detail').textContent = 'click an action to start';
+        document.getElementById('stat-incr-detail').textContent = msg.startup_info || 'click an action to start';
         document.getElementById('stat-scratch-time').textContent = '—';
         document.getElementById('stat-scratch-detail').textContent = '\u00a0';
         lastIncrMs = 0;
