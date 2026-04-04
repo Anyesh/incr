@@ -284,6 +284,41 @@
     to { transform: rotate(360deg); }
   }
 
+  /* ── Data source bar ─────────────────────────────────────── */
+  .data-source-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    font-size: 11px;
+    color: var(--text-dim);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 12px;
+  }
+  .data-source-bar .ds-label {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-label);
+    font-size: 10px;
+  }
+  .data-source-bar .ds-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .data-source-bar .ds-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+  }
+  .data-source-bar .ds-dot.fresh {
+    background: var(--amber);
+  }
+
   /* ── Rules panel ─────────────────────────────────────────── */
   .rules-panel { }
   .rules-grid {
@@ -343,6 +378,14 @@
     <div class="timeline-wrap" id="timelineWrap"></div>
     <div class="timeline-axis" id="timelineAxis"></div>
     <div class="recalc-note" id="recalcNote">&nbsp;</div>
+  </div>
+
+  <!-- Data Source -->
+  <div class="data-source-bar" id="dataSourceBar">
+    <span class="ds-label">Data</span>
+    <span class="ds-item" id="dsVisits"><span class="ds-dot"></span> visits.db</span>
+    <span class="ds-item" id="dsCache"><span class="ds-dot"></span> distance_cache.db</span>
+    <span id="dsStatus"></span>
   </div>
 
   <!-- Controls -->
@@ -657,6 +700,35 @@
     }
   }
 
+  // ── Data source bar ──────────────────────────────────────────────────────────
+  function updateDataSource(data) {
+    var visits = data.visits || [];
+    var stats = data.distance_stats || {};
+    var isLoaded = (data.startup_info || '').indexOf('Loaded') >= 0;
+    var cacheEntries = stats.hits + stats.misses;
+
+    var visitsEl = document.getElementById('dsVisits');
+    visitsEl.textContent = '';
+    var dot1 = document.createElement('span');
+    dot1.className = 'ds-dot' + (isLoaded ? '' : ' fresh');
+    visitsEl.appendChild(dot1);
+    visitsEl.appendChild(document.createTextNode(' visits.db \u00b7 ' + visits.length + ' rows'));
+
+    var cacheEl = document.getElementById('dsCache');
+    cacheEl.textContent = '';
+    var dot2 = document.createElement('span');
+    dot2.className = 'ds-dot';
+    cacheEl.appendChild(dot2);
+    cacheEl.appendChild(document.createTextNode(' distance_cache.db'));
+
+    var statusEl = document.getElementById('dsStatus');
+    if (isLoaded) {
+      statusEl.textContent = 'restored from disk';
+    } else {
+      statusEl.textContent = 'freshly generated';
+    }
+  }
+
   // ── WebSocket send ────────────────────────────────────────────────────────────
   var lastIncrMs = 0;
 
@@ -711,6 +783,7 @@
         document.getElementById('stat-scratch-time').textContent = '—';
         document.getElementById('stat-scratch-detail').textContent = '\u00a0';
         lastIncrMs = 0;
+        updateDataSource(msg);
 
       } else if (msg.type === 'incremental') {
         var newVisits = msg.visits;
@@ -737,6 +810,16 @@
         renderTimeline(currentVisits, newSegmentKeys, currentSegments);
         renderIncremental(msg, newSegmentKeys);
         lastIncrMs = msg.incremental_ms;
+
+        // Update visit count in data source bar
+        var visitsEl = document.getElementById('dsVisits');
+        if (visitsEl) {
+          visitsEl.textContent = '';
+          var dot = document.createElement('span');
+          dot.className = 'ds-dot';
+          visitsEl.appendChild(dot);
+          visitsEl.appendChild(document.createTextNode(' visits.db \u00b7 ' + currentVisits.length + ' rows'));
+        }
 
       } else if (msg.type === 'scratch') {
         renderScratch(msg, lastIncrMs);
