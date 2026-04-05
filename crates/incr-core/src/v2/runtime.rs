@@ -159,6 +159,19 @@ pub struct Runtime {
     /// same lock.
     compute_fns: RwLock<Vec<Option<Arc<ComputeFn>>>>,
 
+    /// Forward edges. Indexed by node slot; `dependents[slot]` holds
+    /// the list of nodes that depend on the node at `slot`. Populated
+    /// by `run_compute` after a query publishes its recorded deps: for
+    /// each dep, the computing node is appended to that dep's
+    /// dependents list. A later commit's dirty walk reads this vector
+    /// to find every query that needs invalidation when an input
+    /// changes.
+    ///
+    /// This is the spec's "parallel dependents vec" per section 5.1
+    /// (the NodeData docs also call it out as the resolved design for
+    /// the inline-vs-parallel ambiguity in the spec).
+    dependents: RwLock<Vec<Vec<NodeId>>>,
+
     /// Arena registry; owns the typed storage for node values.
     registry: ArenaRegistry,
 
@@ -183,6 +196,7 @@ impl Runtime {
             id: registry.id(),
             nodes: RwLock::new(Vec::new()),
             compute_fns: RwLock::new(Vec::new()),
+            dependents: RwLock::new(Vec::new()),
             registry,
             revision: AtomicU64::new(0),
             write_mutex: Mutex::new(()),
@@ -402,15 +416,19 @@ impl Runtime {
 
     // -- internal helpers --------------------------------------------------
 
-    /// Append a new node to the store and parallel compute_fns vec,
-    /// returning the slot. Called from the write-mutex-guarded paths.
+    /// Append a new node to the store and the parallel compute_fns and
+    /// dependents vecs, returning the slot. Called from the
+    /// write-mutex-guarded paths.
     fn append_node(&self, node: Box<NodeData>, compute: Option<Arc<ComputeFn>>) -> u32 {
         let mut nodes = self.nodes.write().expect("nodes lock poisoned");
         let mut computes = self.compute_fns.write().expect("compute lock poisoned");
+        let mut dependents = self.dependents.write().expect("dependents lock poisoned");
         debug_assert_eq!(nodes.len(), computes.len());
+        debug_assert_eq!(nodes.len(), dependents.len());
         let slot = nodes.len() as u32;
         nodes.push(node);
         computes.push(compute);
+        dependents.push(Vec::new());
         slot
     }
 
@@ -565,6 +583,20 @@ impl Runtime {
         {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize].publish_initial_deps(&recorded_deps);
+        }
+
+        // Publish reverse edges: for every dep this compute recorded,
+        // append `slot` to the dep's dependents list. This is what
+        // the dirty walk (commit J) will read to find every query
+        // that needs invalidation when an input changes. The lock is
+        // taken briefly because the inner Vec::push is the only
+        // mutation; readers of the dependents vec (the dirty walk)
+        // take a read lock.
+        if !recorded_deps.is_empty() {
+            let mut dependents = self.dependents.write().expect("dependents lock poisoned");
+            for dep in &recorded_deps {
+                dependents[dep.0 as usize].push(NodeId(slot));
+            }
         }
 
         // Release-store state to Clean. This publishes the arena write
@@ -940,6 +972,13 @@ mod tests {
         nodes[slot as usize].collect_deps()
     }
 
+    /// Read a node's published dependents (forward edges). Test-only
+    /// helper for commit I's reverse-edge bookkeeping.
+    fn collect_dependents_for_slot(rt: &Runtime, slot: u32) -> Vec<super::super::node::NodeId> {
+        let dependents = rt.dependents.read().unwrap();
+        dependents[slot as usize].clone()
+    }
+
     #[test]
     fn query_records_its_input_dependency() {
         let rt = Runtime::new();
@@ -1097,5 +1136,141 @@ mod tests {
         assert_eq!(rt.get(q), 42);
         let deps = collect_deps_for_slot(&rt, q.slot());
         assert!(deps.is_empty(), "got unexpected deps: {:?}", deps);
+    }
+
+    // -------------------------------------------------------------------
+    // Forward-edge (dependents) tests (commit I).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn fresh_input_has_no_dependents() {
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let dependents = collect_dependents_for_slot(&rt, input.slot());
+        assert!(dependents.is_empty());
+    }
+
+    #[test]
+    fn fresh_query_has_no_dependents() {
+        let rt = Runtime::new();
+        let q = rt.create_query::<u64, _>(|_| 1);
+        // Dependents are populated for a node when OTHER queries
+        // depend on it, not when this query runs its own compute.
+        let dependents = collect_dependents_for_slot(&rt, q.slot());
+        assert!(dependents.is_empty());
+    }
+
+    #[test]
+    fn input_gains_dependent_after_query_first_reads_it() {
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(10);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) + 1);
+
+        // Before the query is ever run, input has no dependents.
+        assert!(collect_dependents_for_slot(&rt, input.slot()).is_empty());
+
+        // Running the query triggers its first compute, which
+        // records input as a dep and writes the reverse edge.
+        let _ = rt.get(q);
+
+        let dependents = collect_dependents_for_slot(&rt, input.slot());
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].0, q.slot());
+    }
+
+    #[test]
+    fn input_with_multiple_dependents_collects_all_of_them() {
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(5);
+        let q1 = rt.create_query::<u64, _>(move |rt| rt.get(input) * 2);
+        let q2 = rt.create_query::<u64, _>(move |rt| rt.get(input) * 3);
+        let q3 = rt.create_query::<u64, _>(move |rt| rt.get(input) + 100);
+
+        let _ = rt.get(q1);
+        let _ = rt.get(q2);
+        let _ = rt.get(q3);
+
+        let dependents = collect_dependents_for_slot(&rt, input.slot());
+        assert_eq!(dependents.len(), 3);
+        // Order reflects the order in which queries were first computed.
+        assert_eq!(dependents[0].0, q1.slot());
+        assert_eq!(dependents[1].0, q2.slot());
+        assert_eq!(dependents[2].0, q3.slot());
+    }
+
+    #[test]
+    fn intermediate_query_has_its_downstream_as_dependent() {
+        // input → q1 → q2
+        // After running q2, q1's dependents should be [q2] and
+        // input's dependents should be [q1]. This exercises the
+        // multi-level dep chain.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(3);
+        let q1 = rt.create_query::<u64, _>(move |rt| rt.get(input) + 10);
+        let q2 = rt.create_query::<u64, _>(move |rt| rt.get(q1) * 2);
+
+        let _ = rt.get(q2); // triggers q1's compute as a side effect
+
+        let input_deps = collect_dependents_for_slot(&rt, input.slot());
+        assert_eq!(input_deps.len(), 1);
+        assert_eq!(input_deps[0].0, q1.slot());
+
+        let q1_deps = collect_dependents_for_slot(&rt, q1.slot());
+        assert_eq!(q1_deps.len(), 1);
+        assert_eq!(q1_deps[0].0, q2.slot());
+
+        // q2 has no dependents yet; nothing reads it.
+        let q2_deps = collect_dependents_for_slot(&rt, q2.slot());
+        assert!(q2_deps.is_empty());
+    }
+
+    #[test]
+    fn query_with_multiple_distinct_deps_writes_reverse_edge_to_each() {
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(1);
+        let b = rt.create_input::<u64>(2);
+        let c = rt.create_input::<u64>(3);
+        let sum = rt.create_query::<u64, _>(move |rt| rt.get(a) + rt.get(b) + rt.get(c));
+
+        let _ = rt.get(sum);
+
+        let a_deps = collect_dependents_for_slot(&rt, a.slot());
+        let b_deps = collect_dependents_for_slot(&rt, b.slot());
+        let c_deps = collect_dependents_for_slot(&rt, c.slot());
+
+        assert_eq!(a_deps.len(), 1);
+        assert_eq!(a_deps[0].0, sum.slot());
+        assert_eq!(b_deps.len(), 1);
+        assert_eq!(b_deps[0].0, sum.slot());
+        assert_eq!(c_deps.len(), 1);
+        assert_eq!(c_deps[0].0, sum.slot());
+    }
+
+    #[test]
+    fn reverse_edges_are_written_once_per_dep_not_once_per_read() {
+        // A query that reads the same input three times should still
+        // add exactly one reverse edge. The dep recording dedup
+        // happens inside the compute frame, so publish_initial_deps
+        // sees a single entry, and the reverse-edge loop runs once
+        // per unique dep.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(7);
+        let q = rt.create_query::<u64, _>(move |rt| {
+            let a = rt.get(input);
+            let b = rt.get(input);
+            let c = rt.get(input);
+            a + b + c
+        });
+
+        let _ = rt.get(q);
+
+        let dependents = collect_dependents_for_slot(&rt, input.slot());
+        assert_eq!(
+            dependents.len(),
+            1,
+            "expected exactly one reverse edge, got {:?}",
+            dependents
+        );
+        assert_eq!(dependents[0].0, q.slot());
     }
 }
