@@ -4,6 +4,7 @@
 .playwright-mcp/
 .venv
 /target
+.worktrees/
 Cargo.lock
 __pycache__
 screenshots
