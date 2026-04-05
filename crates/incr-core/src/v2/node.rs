@@ -234,22 +234,26 @@ impl NodeData {
     /// publish that lands in commit F. It may be called exactly once,
     /// by the runtime, before the node has been read by any other
     /// thread. It does not coordinate with the state machine or with
-    /// epoch reclamation; it assumes the caller has exclusive access.
+    /// epoch reclamation; it assumes the caller owns the node's
+    /// `Computing` state (or has equivalent exclusive access).
+    ///
+    /// Takes `&self` rather than `&mut self` because all underlying
+    /// stores are on atomic fields that do not require exclusive
+    /// reference. The caller accesses the node through a shared
+    /// `nodes.read()` guard. The exclusivity guarantee needed for
+    /// correctness comes from the state machine (Computing state is
+    /// owned by exactly one thread at a time), not from Rust's
+    /// aliasing rules.
     ///
     /// # Panics
     /// Panics in debug builds if called on a node that already has
     /// dependencies, or on a node whose state has already transitioned
     /// out of `New`. Safe but meaningless in release in those cases.
-    pub(crate) fn publish_initial_deps(&mut self, deps: &[NodeId]) {
+    pub(crate) fn publish_initial_deps(&self, deps: &[NodeId]) {
         debug_assert_eq!(
             self.dep_count.load(Ordering::Relaxed),
             0,
             "publish_initial_deps on a node with existing deps"
-        );
-        debug_assert_eq!(
-            self.state.load_relaxed(),
-            NodeState::New,
-            "publish_initial_deps on a non-New node"
         );
         let count = deps.len();
         assert!(
@@ -266,9 +270,10 @@ impl NodeData {
                 deps: deps.to_vec().into_boxed_slice(),
             });
             let ptr = Box::into_raw(list);
-            // Store uses Relaxed because the caller has exclusive access
-            // and the eventual publish step (state transition to Clean)
-            // will Release-synchronize this write with any future reader.
+            // Store uses Relaxed because the caller owns exclusive
+            // access via the state machine (Computing state) and the
+            // eventual publish step (state transition to Clean) will
+            // Release-synchronize this write with any future reader.
             self.overflow_deps.store(ptr, Ordering::Relaxed);
         }
         self.dep_count.store(count as u8, Ordering::Relaxed);
@@ -472,7 +477,7 @@ mod tests {
 
     #[test]
     fn publish_zero_inline_deps() {
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         node.publish_initial_deps(&[]);
         assert_eq!(node.dep_count(), 0);
         assert!(node.collect_deps().is_empty());
@@ -480,7 +485,7 @@ mod tests {
 
     #[test]
     fn publish_one_inline_dep() {
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         node.publish_initial_deps(&[NodeId(42)]);
         assert_eq!(node.dep_count(), 1);
         assert_eq!(node.collect_deps(), vec![NodeId(42)]);
@@ -488,7 +493,7 @@ mod tests {
 
     #[test]
     fn publish_seven_inline_deps_exactly() {
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         let deps: Vec<NodeId> = (0..7u32).map(NodeId).collect();
         node.publish_initial_deps(&deps);
         assert_eq!(node.dep_count(), 7);
@@ -499,7 +504,7 @@ mod tests {
 
     #[test]
     fn publish_eight_deps_spills_to_overflow() {
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         let deps: Vec<NodeId> = (100..108u32).map(NodeId).collect();
         node.publish_initial_deps(&deps);
         assert_eq!(node.dep_count(), 8);
@@ -510,7 +515,7 @@ mod tests {
 
     #[test]
     fn publish_many_deps_via_overflow() {
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         let deps: Vec<NodeId> = (1000..1100u32).map(NodeId).collect();
         node.publish_initial_deps(&deps);
         assert_eq!(node.dep_count(), 100);
@@ -519,7 +524,7 @@ mod tests {
 
     #[test]
     fn for_each_dep_visits_inline_deps_in_order() {
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         let expected = [NodeId(3), NodeId(1), NodeId(4), NodeId(1), NodeId(5)];
         node.publish_initial_deps(&expected);
         let mut visited = Vec::new();
@@ -529,7 +534,7 @@ mod tests {
 
     #[test]
     fn for_each_dep_visits_overflow_deps_in_order() {
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         let expected: Vec<NodeId> = (0..12u32).rev().map(NodeId).collect();
         node.publish_initial_deps(&expected);
         let mut visited = Vec::new();
@@ -540,7 +545,7 @@ mod tests {
     #[test]
     fn dropping_node_with_overflow_deps_is_leak_free() {
         // Use Miri to really verify; here we just exercise the Drop path.
-        let mut node = NodeData::new_query(0, 0);
+        let node = NodeData::new_query(0, 0);
         let deps: Vec<NodeId> = (0..50u32).map(NodeId).collect();
         node.publish_initial_deps(&deps);
         drop(node);

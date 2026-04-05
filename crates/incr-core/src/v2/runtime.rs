@@ -62,14 +62,67 @@
 //! compute do not reenter the same lock.
 
 use std::any::Any;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use super::arena::GenericArena;
 use super::handle::{Incr, RuntimeId};
-use super::node::NodeData;
+use super::node::{NodeData, NodeId};
 use super::registry::ArenaRegistry;
 use super::state::NodeState;
+
+// ---------------------------------------------------------------------------
+// COMPUTE_STACK: per-thread stack of active compute frames.
+// ---------------------------------------------------------------------------
+//
+// When the Runtime enters `run_compute` for a node, it pushes a frame onto
+// this thread's compute stack. Every `rt.get` call checks the stack top:
+// if there is an active frame for the same runtime, the handle being read
+// is recorded as a dependency of the frame's node. On compute exit, the
+// frame is popped and its recorded deps are published to the node.
+//
+// The stack is per-thread, not per-runtime, so a compute closure running
+// on thread T recording deps sees only the frames that T is responsible
+// for. Cross-thread dep tracking is a non-concept: a compute closure runs
+// on exactly one thread from start to finish. Cross-runtime dep tracking
+// is explicitly skipped: a compute closure for runtime A that happens to
+// call into runtime B does not record B's nodes as deps of A's node. The
+// frame's `runtime_id` field is how we make that distinction.
+//
+// Cycle detection will plug into this stack in a later commit (L per the
+// rewrite sequencing): before pushing a frame for node X, walk the stack
+// to see whether X is already present on the current thread. If yes,
+// panic with CycleError. This commit does not implement that check; a
+// cyclic query will simply self-spin on its own Computing state and the
+// test suite stays away from that case.
+
+/// A single frame in the compute stack. Created when `run_compute` begins
+/// for a node and destroyed when the compute completes (or panics, once
+/// panic catching lands).
+struct ComputeFrame {
+    /// Identity of the runtime that pushed this frame. A cross-runtime
+    /// `rt.get` call whose runtime id does not match this field skips
+    /// dep recording. This keeps cross-runtime compute closures honest:
+    /// they do not contaminate each other's dep graphs.
+    runtime_id: RuntimeId,
+    /// Slot index of the node whose compute this frame is tracking.
+    /// Recorded deps become this node's dependencies on compute exit.
+    node_slot: u32,
+    /// Dependencies recorded so far. Appended to on every `rt.get` inside
+    /// the compute closure that matches this frame's runtime. Deduplicated
+    /// on compute exit before publishing to the node.
+    deps: Vec<NodeId>,
+}
+
+thread_local! {
+    /// Per-thread stack of active compute frames. Nested computes push
+    /// and pop in LIFO order. `RefCell` suffices because a single thread
+    /// cannot have two overlapping borrows on its own stack (nested
+    /// operations are strictly sequential), and the stack is never
+    /// shared across threads.
+    static COMPUTE_STACK: RefCell<Vec<ComputeFrame>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Type-erased compute closure. A query node's compute fn takes the
 /// runtime (so it can call `rt.get(...)` for dependencies) and returns
@@ -216,6 +269,11 @@ impl Runtime {
         T: Clone + Send + Sync + 'static,
     {
         self.check_runtime(handle);
+        // If this get is happening inside a compute closure, record
+        // the handle as a dependency of the currently-computing node.
+        // This runs before the actual read so the dep is captured
+        // even if the read panics or the node is still computing.
+        self.record_dep(handle.slot());
         loop {
             // Fast path (Clean): hold nodes.read() through the arena
             // read so no writer can mutate the slot in between.
@@ -372,9 +430,88 @@ impl Runtime {
         }
     }
 
+    /// Record `slot` as a dependency of the currently-computing node on
+    /// this thread, if any. Called at the start of every `get`.
+    ///
+    /// Dep recording is silently skipped in three cases, and the skip
+    /// is intentional rather than an oversight:
+    ///
+    /// 1. No active compute frame on this thread. Top-level `rt.get`
+    ///    calls from user code are not deps of anything.
+    /// 2. The active frame belongs to a different runtime. A compute
+    ///    closure for runtime A that happens to call into runtime B
+    ///    does not record B's nodes as deps of A's node.
+    /// 3. The `slot` equals the frame's own `node_slot`. A query whose
+    ///    compute reads its own handle is a self-cycle; recording it
+    ///    would create a self-loop in the dep graph. Cycle detection
+    ///    proper arrives in a later commit (L) and will panic instead
+    ///    of silently skipping; for now the self-read simply does not
+    ///    create a dep edge and the node's Computing state will cause
+    ///    the self-read to spin (caller's problem, not ours).
+    fn record_dep(&self, slot: u32) {
+        COMPUTE_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if let Some(frame) = stack.last_mut() {
+                if frame.runtime_id == self.id && frame.node_slot != slot {
+                    frame.deps.push(NodeId(slot));
+                }
+            }
+        });
+    }
+
+    /// Push a new compute frame onto this thread's stack. Called at
+    /// the start of `run_compute`.
+    fn push_compute_frame(&self, node_slot: u32) {
+        COMPUTE_STACK.with(|stack| {
+            stack.borrow_mut().push(ComputeFrame {
+                runtime_id: self.id,
+                node_slot,
+                deps: Vec::new(),
+            });
+        });
+    }
+
+    /// Pop the top compute frame from this thread's stack and return
+    /// its recorded (and deduplicated, order-preserving) deps. Called
+    /// at the end of `run_compute`. Panics if the stack is empty or
+    /// the top frame does not match the expected node slot, either of
+    /// which would indicate a bug in the push/pop pairing.
+    fn pop_compute_frame(&self, expected_node_slot: u32) -> Vec<NodeId> {
+        COMPUTE_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            let frame = stack.pop().expect("compute stack underflow");
+            debug_assert_eq!(
+                frame.runtime_id, self.id,
+                "compute frame belongs to a different runtime"
+            );
+            debug_assert_eq!(
+                frame.node_slot, expected_node_slot,
+                "compute frame node_slot mismatch (expected {}, got {})",
+                expected_node_slot, frame.node_slot
+            );
+            // Deduplicate while preserving the order of first occurrence.
+            let mut seen: std::collections::HashSet<NodeId> =
+                std::collections::HashSet::with_capacity(frame.deps.len());
+            frame
+                .deps
+                .into_iter()
+                .filter(|id| seen.insert(*id))
+                .collect()
+        })
+    }
+
     /// Run the compute closure for a query node and transition its
     /// state to Clean. The caller must have already CAS'd the state
     /// from New to Computing.
+    ///
+    /// Dependency tracking: a compute frame is pushed onto the thread
+    /// stack before invoking the closure and popped afterward. Every
+    /// `rt.get` call inside the closure records its handle's slot on
+    /// the frame via `record_dep`. On return, the deduplicated deps
+    /// are published to the node via `NodeData::publish_initial_deps`
+    /// before the final Release store to Clean, so a reader that
+    /// Acquire-loads Clean and inspects deps observes the exact set
+    /// of nodes this compute depended on.
     fn run_compute<T>(&self, slot: u32)
     where
         T: Clone + Send + Sync + 'static,
@@ -391,8 +528,18 @@ impl Runtime {
                 .clone()
         };
 
+        // Push a compute frame so that any `rt.get` calls made by the
+        // closure record their handles as dependencies of this node.
+        self.push_compute_frame(slot);
+
         // Run the closure outside any lock.
         let value_box: Box<dyn Any + Send + Sync> = (compute)(self);
+
+        // Pop the frame and retrieve the (deduplicated) deps the
+        // closure recorded. The pop must happen before publishing so
+        // that if the closure nested another compute, the parent
+        // frame is restored as the top of stack.
+        let recorded_deps = self.pop_compute_frame(slot);
 
         // Downcast to the caller's expected type. A mismatch here is a
         // bug in how `create_query` packed the closure; it should be
@@ -402,7 +549,8 @@ impl Runtime {
             .downcast::<T>()
             .expect("compute function returned wrong type");
 
-        // Look up the arena slot for this node, then write and publish.
+        // Look up the arena slot for this node, then write value and
+        // publish deps.
         let arena_slot = {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize].arena_slot()
@@ -410,9 +558,19 @@ impl Runtime {
 
         self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, value));
 
+        // Publish recorded dependencies on the node. This is the
+        // write-once dep publish path; a later commit (J, for
+        // recompute) adds an atomic-swap variant with epoch
+        // reclamation for dep list mutation on subsequent computes.
+        {
+            let nodes = self.nodes.read().expect("nodes lock poisoned");
+            nodes[slot as usize].publish_initial_deps(&recorded_deps);
+        }
+
         // Release-store state to Clean. This publishes the arena write
-        // (Relaxed) together with the state transition (Release) to
-        // readers that Acquire-load state afterward.
+        // and the dep list (both Relaxed) together with the state
+        // transition (Release) to readers that Acquire-load state
+        // afterward.
         {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize]
@@ -761,5 +919,183 @@ mod tests {
             h.join()
                 .expect("reader thread panicked; data race detected");
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Dependency tracking tests (commit H).
+    // -------------------------------------------------------------------
+    //
+    // These tests verify that `rt.get` calls inside a compute closure
+    // record their handles as dependencies of the currently-computing
+    // node, and that the recorded deps are correctly deduplicated and
+    // published to the node. They do NOT test reactivity: commit H
+    // records deps but does not yet propagate changes through them.
+    // Reactivity is commit J.
+
+    /// Read a node's published dependencies. Test-only helper so the
+    /// test body can reach through the RwLock and the NodeData to
+    /// get a concrete `Vec<NodeId>` for assertions.
+    fn collect_deps_for_slot(rt: &Runtime, slot: u32) -> Vec<super::super::node::NodeId> {
+        let nodes = rt.nodes.read().unwrap();
+        nodes[slot as usize].collect_deps()
+    }
+
+    #[test]
+    fn query_records_its_input_dependency() {
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(7);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) + 1);
+        assert_eq!(rt.get(q), 8);
+        let deps = collect_deps_for_slot(&rt, q.slot());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, input.slot());
+    }
+
+    #[test]
+    fn query_records_multiple_input_dependencies_in_get_order() {
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(1);
+        let b = rt.create_input::<u64>(2);
+        let c = rt.create_input::<u64>(3);
+        let sum = rt.create_query::<u64, _>(move |rt| rt.get(a) + rt.get(b) + rt.get(c));
+        assert_eq!(rt.get(sum), 6);
+        let deps = collect_deps_for_slot(&rt, sum.slot());
+        assert_eq!(deps.len(), 3);
+        assert_eq!(deps[0].0, a.slot());
+        assert_eq!(deps[1].0, b.slot());
+        assert_eq!(deps[2].0, c.slot());
+    }
+
+    #[test]
+    fn duplicate_reads_dedup_to_single_dep_in_first_occurrence_order() {
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(10);
+        let b = rt.create_input::<u64>(20);
+        // Compute reads a, b, a, b, a. The dedup should preserve the
+        // order of first occurrence: [a, b], not [b, a] or duplicates.
+        let q = rt.create_query::<u64, _>(move |rt| {
+            let _ = rt.get(a);
+            let _ = rt.get(b);
+            let _ = rt.get(a);
+            let _ = rt.get(b);
+            rt.get(a)
+        });
+        let _ = rt.get(q);
+        let deps = collect_deps_for_slot(&rt, q.slot());
+        assert_eq!(deps.len(), 2, "expected 2 unique deps, got {:?}", deps);
+        assert_eq!(deps[0].0, a.slot(), "first unique dep should be a");
+        assert_eq!(deps[1].0, b.slot(), "second unique dep should be b");
+    }
+
+    #[test]
+    fn nested_queries_each_get_their_own_dep_list() {
+        // Q1 reads input I.
+        // Q2 reads Q1 only.
+        // Verify Q1's deps are [I] and Q2's deps are [Q1], not that
+        // Q2 transitively inherits I. Each compute frame has its own
+        // recorded deps, and reads to Q1 from inside Q2's compute
+        // run in their own (newly pushed) frame rather than appending
+        // to Q2's.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(5);
+        let q1 = rt.create_query::<u64, _>(move |rt| rt.get(input) * 2);
+        let q2 = rt.create_query::<u64, _>(move |rt| rt.get(q1) + 3);
+        assert_eq!(rt.get(q2), 13);
+
+        let q1_deps = collect_deps_for_slot(&rt, q1.slot());
+        assert_eq!(q1_deps.len(), 1);
+        assert_eq!(q1_deps[0].0, input.slot());
+
+        let q2_deps = collect_deps_for_slot(&rt, q2.slot());
+        assert_eq!(q2_deps.len(), 1);
+        assert_eq!(
+            q2_deps[0].0,
+            q1.slot(),
+            "q2's deps should contain q1, not input transitively"
+        );
+    }
+
+    #[test]
+    fn top_level_get_outside_compute_records_nothing() {
+        // A plain `rt.get(input)` from the test body (no active
+        // compute frame on this thread) must not panic and must not
+        // leave stale state in the thread-local stack. After the
+        // call, any subsequent compute should still be able to push
+        // a fresh frame cleanly.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(42);
+        // Top-level read: no compute is running, no frame to record on.
+        assert_eq!(rt.get(input), 42);
+        // Now create a query and verify its first compute works
+        // normally (i.e., the stack was left in a clean state after
+        // the top-level read).
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) * 10);
+        assert_eq!(rt.get(q), 420);
+        let deps = collect_deps_for_slot(&rt, q.slot());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, input.slot());
+    }
+
+    #[test]
+    fn compute_stack_is_clean_between_queries() {
+        // After one query's compute runs, the stack should be empty
+        // again. If it isn't, the next query would see the previous
+        // query's frame as its "parent" and misattribute deps.
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(1);
+        let b = rt.create_input::<u64>(2);
+        let q_a = rt.create_query::<u64, _>(move |rt| rt.get(a));
+        let q_b = rt.create_query::<u64, _>(move |rt| rt.get(b));
+        // Trigger q_a first, then q_b, and verify each has only its
+        // own dep, not the union. If the stack leaked between
+        // compute invocations, q_b's deps would include `a`.
+        let _ = rt.get(q_a);
+        let _ = rt.get(q_b);
+        let q_a_deps = collect_deps_for_slot(&rt, q_a.slot());
+        let q_b_deps = collect_deps_for_slot(&rt, q_b.slot());
+        assert_eq!(q_a_deps.len(), 1);
+        assert_eq!(q_a_deps[0].0, a.slot());
+        assert_eq!(q_b_deps.len(), 1);
+        assert_eq!(q_b_deps[0].0, b.slot());
+    }
+
+    #[test]
+    fn cross_runtime_get_inside_compute_does_not_record_on_current_frame() {
+        // A compute closure for runtime A that captures a handle from
+        // runtime B and reads it should not record B's slot on A's
+        // frame. Runtime identity is the gate.
+        let rt_a = Arc::new(Runtime::new());
+        let rt_b = Arc::new(Runtime::new());
+        let b_input = rt_b.create_input::<u64>(99);
+        let a_input = rt_a.create_input::<u64>(1);
+
+        // Build a compute closure that captures rt_b and b_input by
+        // Arc + Copy and reads both a_input (own runtime) and b_input
+        // (other runtime).
+        let q = {
+            let rt_b_inner = rt_b.clone();
+            rt_a.create_query::<u64, _>(move |rt| {
+                let other = rt_b_inner.get(b_input); // cross-runtime, must not record on rt_a's frame
+                rt.get(a_input) + other
+            })
+        };
+        assert_eq!(rt_a.get(q), 100);
+        let deps = collect_deps_for_slot(&rt_a, q.slot());
+        assert_eq!(
+            deps.len(),
+            1,
+            "cross-runtime reads should not record; expected only a_input dep, got {:?}",
+            deps
+        );
+        assert_eq!(deps[0].0, a_input.slot());
+    }
+
+    #[test]
+    fn query_reading_nothing_records_empty_deps() {
+        let rt = Runtime::new();
+        let q = rt.create_query::<u64, _>(|_rt| 42);
+        assert_eq!(rt.get(q), 42);
+        let deps = collect_deps_for_slot(&rt, q.slot());
+        assert!(deps.is_empty(), "got unexpected deps: {:?}", deps);
     }
 }
