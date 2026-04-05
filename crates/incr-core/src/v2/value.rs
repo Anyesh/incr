@@ -239,3 +239,38 @@ where
         downcast_generic::<Vec<T>>(arena).write(slot, value);
     }
 }
+
+impl<T> Value for Option<T>
+where
+    T: Clone + PartialEq + Send + Sync + 'static,
+{
+    #[inline]
+    fn create_arena() -> Box<dyn ErasedArena> {
+        Box::new(GenericArena::<Option<T>>::new())
+    }
+
+    #[inline]
+    fn reserve_with(arena: &dyn ErasedArena, initial: Self) -> u32 {
+        downcast_generic::<Option<T>>(arena).reserve_with(initial)
+    }
+
+    #[inline]
+    fn reserve_empty(arena: &dyn ErasedArena) -> u32 {
+        downcast_generic::<Option<T>>(arena).reserve()
+    }
+
+    #[inline]
+    fn read(arena: &dyn ErasedArena, slot: u32) -> Self {
+        downcast_generic::<Option<T>>(arena).read(slot)
+    }
+
+    #[inline]
+    fn try_read(arena: &dyn ErasedArena, slot: u32) -> Option<Self> {
+        downcast_generic::<Option<T>>(arena).try_read(slot)
+    }
+
+    #[inline]
+    fn write(arena: &dyn ErasedArena, slot: u32, value: Self) {
+        downcast_generic::<Option<T>>(arena).write(slot, value);
+    }
+}

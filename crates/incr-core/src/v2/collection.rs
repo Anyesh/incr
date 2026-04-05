@@ -253,6 +253,62 @@ where
             version_node,
         }
     }
+
+    pub fn count(&self, rt: &Runtime) -> Incr<u64> {
+        let upstream_log = self.log.clone();
+        let upstream_ver = self.version_node;
+        let current_count = Arc::new(AtomicUsize::new(0));
+        let count_ref = current_count.clone();
+        let last_idx = Arc::new(AtomicUsize::new(0));
+
+        rt.create_query(move |rt| -> u64 {
+            let _upstream_v = rt.get(upstream_ver);
+
+            let upstream = upstream_log.read().unwrap();
+            let start = last_idx.load(Ordering::Relaxed);
+            if start >= upstream.deltas.len() {
+                return count_ref.load(Ordering::Relaxed) as u64;
+            }
+
+            let mut count = count_ref.load(Ordering::Relaxed);
+
+            for vd in &upstream.deltas[start..] {
+                match &vd.delta {
+                    Delta::Insert(_) => count += 1,
+                    Delta::Delete(_) => count -= 1,
+                }
+            }
+
+            last_idx.store(upstream.deltas.len(), Ordering::Relaxed);
+            count_ref.store(count, Ordering::Relaxed);
+            count as u64
+        })
+    }
+
+    pub fn reduce<A, F>(&self, rt: &Runtime, fold_fn: F) -> Incr<A>
+    where
+        A: super::value::Value,
+        F: Fn(&Vec<T>) -> A + Send + Sync + 'static,
+    {
+        let upstream_log = self.log.clone();
+        let upstream_ver = self.version_node;
+        let last_idx = Arc::new(AtomicUsize::new(0));
+
+        rt.create_query(move |rt| -> A {
+            let _upstream_v = rt.get(upstream_ver);
+
+            let upstream = upstream_log.read().unwrap();
+            let start = last_idx.load(Ordering::Relaxed);
+            if start >= upstream.deltas.len() {
+                let elems = upstream.elements_vec();
+                return fold_fn(&elems);
+            }
+
+            last_idx.store(upstream.deltas.len(), Ordering::Relaxed);
+            let elems = upstream.elements_vec();
+            fold_fn(&elems)
+        })
+    }
 }
 
 impl Runtime {
@@ -488,5 +544,114 @@ mod tests {
         assert_eq!(elements.len(), 2);
         assert!(elements.contains(&4));
         assert!(elements.contains(&8));
+    }
+
+    // ── count tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn count_basic() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let count = col.count(&rt);
+
+        assert_eq!(rt.get(count), 0);
+        col.insert(&rt, 1);
+        assert_eq!(rt.get(count), 1);
+        col.insert(&rt, 2);
+        assert_eq!(rt.get(count), 2);
+        col.delete(&rt, &1);
+        assert_eq!(rt.get(count), 1);
+    }
+
+    #[test]
+    fn count_after_filter() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let evens = col.filter(&rt, |x| x % 2 == 0);
+        let count = evens.count(&rt);
+
+        col.insert(&rt, 1);
+        col.insert(&rt, 2);
+        col.insert(&rt, 3);
+        col.insert(&rt, 4);
+        assert_eq!(rt.get(count), 2);
+
+        col.insert(&rt, 6);
+        assert_eq!(rt.get(count), 3);
+    }
+
+    #[test]
+    fn count_early_cutoff() {
+        use std::sync::atomic::AtomicU32;
+
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let evens = col.filter(&rt, |x| x % 2 == 0);
+        let count = evens.count(&rt);
+
+        let downstream_count = Arc::new(AtomicU32::new(0));
+        let dc = downstream_count.clone();
+        let label = rt.create_query(move |rt| {
+            dc.fetch_add(1, Ordering::Relaxed);
+            format!("{} evens", rt.get(count))
+        });
+
+        col.insert(&rt, 2);
+        assert_eq!(rt.get(label), "1 evens");
+        assert_eq!(downstream_count.load(Ordering::Relaxed), 1);
+
+        col.insert(&rt, 3); // odd, count unchanged
+        assert_eq!(rt.get(label), "1 evens");
+        assert_eq!(downstream_count.load(Ordering::Relaxed), 1); // early cutoff
+    }
+
+    // ── reduce tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn reduce_sum() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sum = col.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
+
+        assert_eq!(rt.get(sum), 0);
+        col.insert(&rt, 10);
+        assert_eq!(rt.get(sum), 10);
+        col.insert(&rt, 20);
+        assert_eq!(rt.get(sum), 30);
+        col.delete(&rt, &10);
+        assert_eq!(rt.get(sum), 20);
+    }
+
+    #[test]
+    fn reduce_max() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let max = col.reduce(&rt, |elements| -> Option<i64> {
+            elements.iter().copied().max()
+        });
+
+        assert_eq!(rt.get(max), None);
+        col.insert(&rt, 5);
+        assert_eq!(rt.get(max), Some(5));
+        col.insert(&rt, 3);
+        assert_eq!(rt.get(max), Some(5));
+        col.insert(&rt, 8);
+        assert_eq!(rt.get(max), Some(8));
+        col.delete(&rt, &8);
+        assert_eq!(rt.get(max), Some(5));
+    }
+
+    #[test]
+    fn reduce_after_filter() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let evens = col.filter(&rt, |x| x % 2 == 0);
+        let sum = evens.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
+
+        col.insert(&rt, 1);
+        col.insert(&rt, 2);
+        col.insert(&rt, 3);
+        col.insert(&rt, 4);
+        assert_eq!(rt.get(sum), 6);
     }
 }
