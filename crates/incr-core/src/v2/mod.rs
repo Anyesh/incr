@@ -34,4 +34,6 @@ pub(crate) mod handle;
 pub(crate) mod node;
 pub(crate) mod registry;
 pub(crate) mod runtime;
+#[cfg(test)]
+mod runtime_proptest;
 pub(crate) mod state;
