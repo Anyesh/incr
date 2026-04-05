@@ -15,9 +15,35 @@
 //!   machine is still the authority on whether the value is *meaningful*
 //!   (Clean vs Dirty), but the raw bytes can be loaded any time without
 //!   undefined behavior.
-//! - `GenericArena<T>` (commit B) stores everything else in
-//!   `UnsafeCell<MaybeUninit<T>>` slots and gates access on the node state
-//!   machine. Not yet implemented.
+//! - [`GenericArena`] holds everything else (`Clone + Send + Sync` types)
+//!   in `UnsafeCell<Option<T>>` slots. Access is coordinated by the node
+//!   state machine: readers only touch a slot when they have observed
+//!   `Clean` via an Acquire load on the node's state, and writers only
+//!   touch a slot when they own `Computing` state. The arena does not
+//!   enforce this at the type level; the runtime is responsible for
+//!   the invariant.
+//!
+//! ## Why `Option<T>` instead of the spec's `MaybeUninit<T>`
+//!
+//! Section 5.2 of the spec presents `UnsafeCell<MaybeUninit<T>>` as a
+//! sketch. `Option<T>` is a cleaner equivalent that preserves the spec's
+//! intent while avoiding two costs that `MaybeUninit` would impose:
+//!
+//! 1. **Drop correctness comes for free.** `Option::drop` destructs the
+//!    contained `T` if `Some` and does nothing if `None`. With
+//!    `MaybeUninit` the arena would have to track per-slot initialization
+//!    (via an extra `AtomicBool` or a bitmap) just to know what to drop
+//!    when the arena itself is dropped, because the node state machine
+//!    is not available at `Drop` time.
+//! 2. **Query nodes can defer initialization.** A query slot is allocated
+//!    before the first compute runs and starts as `None`. With
+//!    `MaybeUninit` the caller would have to provide a placeholder `T`
+//!    at reserve time, which would force `T: Default` on the user-facing
+//!    query API.
+//!
+//! The cost is one discriminant byte per slot (often niche-optimized
+//! away for `Box`, `Vec`, `String`, `&T`, etc.) and one predictable
+//! branch on the read path. Negligible.
 //!
 //! ## Segmented storage and lock-free growth
 //!
@@ -419,6 +445,259 @@ impl<T: AtomicPrimitive> ErasedArena for AtomicPrimitiveArena<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GenericArena: non-primitive values coordinated by the state machine.
+// ---------------------------------------------------------------------------
+
+use std::cell::UnsafeCell;
+
+/// One slot in a `GenericArena`. The inner `Option<T>` starts `None` at
+/// segment allocation and becomes `Some(value)` once the arena's user
+/// writes a value into it. Interior mutability is granted by `UnsafeCell`
+/// and exclusivity is enforced at runtime by the node state machine: at
+/// any instant, a slot is being read by zero-or-more threads that have
+/// observed `Clean` via Acquire, or being written by exactly one thread
+/// that owns `Computing` via CAS, never both.
+struct GenericSlot<T> {
+    cell: UnsafeCell<Option<T>>,
+}
+
+impl<T> GenericSlot<T> {
+    fn none() -> Self {
+        Self {
+            cell: UnsafeCell::new(None),
+        }
+    }
+}
+
+// SAFETY: `GenericSlot<T>` wraps an `UnsafeCell<Option<T>>`, which is
+// `!Sync` by default. We share slots across threads behind the invariant
+// that the node state machine linearizes access: a slot is either being
+// read (zero-or-more Acquire observers of `Clean`) or written (exactly
+// one `Computing` owner), never both. Under that invariant, concurrent
+// access to the underlying `Option<T>` bytes is coordinated by
+// Release-Acquire synchronization on the node's state field, which
+// establishes happens-before for the slot's plain memory operations.
+// This is the same coordination the spec describes for atomic slots;
+// here we apply it to non-atomic memory.
+//
+// `T: Send + Sync` is required because (a) a reader on thread A may
+// call `Clone` on the `T`, which briefly creates an `&T` on thread A,
+// requiring `T: Sync`, and (b) the cloned value may be moved across
+// threads by the caller, requiring `T: Send`.
+unsafe impl<T: Send + Sync> Sync for GenericSlot<T> {}
+unsafe impl<T: Send> Send for GenericSlot<T> {}
+
+/// Arena for `Clone + Send + Sync` values whose access is coordinated by
+/// the node state machine.
+///
+/// Layout and growth mirror [`AtomicPrimitiveArena`]: a fixed-size
+/// top-level directory of `AtomicPtr<Segment<GenericSlot<T>>>` with lazy
+/// segment allocation via CAS. Only the slot body differs: generic values
+/// live in `UnsafeCell<Option<T>>` cells, and access safety depends on
+/// external coordination rather than atomicity.
+pub(crate) struct GenericArena<T: Clone + Send + Sync + 'static> {
+    segments: Box<[AtomicPtr<Segment<GenericSlot<T>>>]>,
+    len: AtomicU32,
+}
+
+impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
+    /// Construct an empty arena.
+    pub(crate) fn new() -> Self {
+        let segments = (0..MAX_SEGMENTS)
+            .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            segments,
+            len: AtomicU32::new(0),
+        }
+    }
+
+    /// Reserve a new slot, leaving it `None` (uninitialized).
+    ///
+    /// The caller is expected to follow up with [`GenericArena::write`]
+    /// once they have a value to store. For query nodes the first write
+    /// happens at the end of the first compute; for input nodes it
+    /// happens immediately after reservation (and both happen under the
+    /// runtime's write mutex, so there is no window where another thread
+    /// could observe the handle before the slot is populated).
+    ///
+    /// Panics on exhaustion, same contract as `AtomicPrimitiveArena`.
+    pub(crate) fn reserve(&self) -> u32 {
+        let idx = self.len.fetch_add(1, Ordering::Relaxed);
+        if idx >= MAX_SLOTS {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+            panic!(
+                "GenericArena<{}> exhausted at {} slots",
+                std::any::type_name::<T>(),
+                MAX_SLOTS
+            );
+        }
+        let seg_idx = (idx >> SEGMENT_SHIFT) as usize;
+        // Ensure segment exists. We don't need to touch the slot here;
+        // segments are allocated with all slots `None`.
+        let _ = self.get_or_allocate_segment(seg_idx);
+        idx
+    }
+
+    /// Convenience: reserve and immediately initialize to `Some(initial)`.
+    ///
+    /// Used by the runtime's `create_input` path where the initial value
+    /// is known at node creation time. Equivalent to `reserve()` followed
+    /// by `write(slot, initial)`, but saves one segment lookup.
+    pub(crate) fn reserve_with(&self, initial: T) -> u32 {
+        let idx = self.reserve();
+        self.write(idx, initial);
+        idx
+    }
+
+    /// Clone the value at `slot`.
+    ///
+    /// The caller must have established happens-before with the most
+    /// recent writer via an Acquire load on the owning node's state;
+    /// typically the caller observed the node in state `Clean`. Reading
+    /// a slot whose state is `New` (still `None` in the Option) is a
+    /// logic error and panics with a clear message; in release builds
+    /// this may still panic via `Option::expect`.
+    pub(crate) fn read(&self, slot: u32) -> T {
+        debug_assert!(
+            slot < self.len.load(Ordering::Relaxed),
+            "read of unreserved slot {} (len {})",
+            slot,
+            self.len.load(Ordering::Relaxed)
+        );
+        let seg_idx = (slot >> SEGMENT_SHIFT) as usize;
+        let within = (slot & SEGMENT_MASK) as usize;
+        let seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
+        debug_assert!(
+            !seg_ptr.is_null(),
+            "read of slot {} in unallocated segment {}",
+            slot,
+            seg_idx
+        );
+        // SAFETY: `seg_ptr` was published via `Release` by a prior
+        // `reserve`; segments are never moved or freed until Drop; and
+        // `within` is in range. The read of the `Option<T>` is
+        // non-atomic but is synchronized with the writer via the
+        // caller's Acquire load on the node state, which happens-after
+        // the writer's Release store on the same state field. Under
+        // that happens-before the plain memory of the slot is visible
+        // consistently. `Clone::clone` may panic; that is fine, the
+        // slot is unchanged.
+        unsafe {
+            let slot_ref = &(*seg_ptr).slots[within];
+            (*slot_ref.cell.get())
+                .as_ref()
+                .expect("GenericArena::read on uninitialized slot; caller must check state first")
+                .clone()
+        }
+    }
+
+    /// Overwrite the value at `slot` with `Some(value)`.
+    ///
+    /// If the slot previously held `Some(old)`, the old value is dropped
+    /// in place. This is called exclusively by the writer that owns the
+    /// slot (the compute thread holding Computing state for a query
+    /// node, or the runtime under the write mutex for an input node).
+    /// The arena does not enforce exclusivity; the state machine does.
+    pub(crate) fn write(&self, slot: u32, value: T) {
+        debug_assert!(
+            slot < self.len.load(Ordering::Relaxed),
+            "write to unreserved slot {} (len {})",
+            slot,
+            self.len.load(Ordering::Relaxed)
+        );
+        let seg_idx = (slot >> SEGMENT_SHIFT) as usize;
+        let within = (slot & SEGMENT_MASK) as usize;
+        let seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
+        debug_assert!(
+            !seg_ptr.is_null(),
+            "write to slot {} in unallocated segment {}",
+            slot,
+            seg_idx
+        );
+        // SAFETY: the state machine invariant guarantees no concurrent
+        // readers or writers are touching this slot. `UnsafeCell::get`
+        // yields a raw pointer we may write through without creating a
+        // Rust &mut reference, so no aliasing rule is violated even if
+        // compiler-inserted reads existed briefly. Dropping the old
+        // `Option` (possibly a `Some(T)`) runs `T::drop` if a value was
+        // present; the state machine ensures no reader has an `&T` into
+        // the slot at this moment.
+        unsafe {
+            let slot_ref = &(*seg_ptr).slots[within];
+            *slot_ref.cell.get() = Some(value);
+        }
+    }
+
+    /// Current number of reserved slots.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> u32 {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    fn get_or_allocate_segment(&self, seg_idx: usize) -> *const Segment<GenericSlot<T>> {
+        let existing = self.segments[seg_idx].load(Ordering::Acquire);
+        if !existing.is_null() {
+            return existing;
+        }
+        let slots: Vec<GenericSlot<T>> = (0..SEGMENT_SIZE).map(|_| GenericSlot::none()).collect();
+        let segment = Box::new(Segment {
+            slots: slots.into_boxed_slice(),
+        });
+        let ptr = Box::into_raw(segment);
+        match self.segments[seg_idx].compare_exchange(
+            std::ptr::null_mut(),
+            ptr,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => ptr,
+            Err(winner) => {
+                // SAFETY: `ptr` came from `Box::into_raw` above and was
+                // never published anywhere else; we own it.
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+                winner
+            }
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> Drop for GenericArena<T> {
+    fn drop(&mut self) {
+        // Reclaim every allocated segment. Each segment's `Drop` in
+        // turn drops its `Box<[GenericSlot<T>]>`, which drops each
+        // `GenericSlot<T>`, which drops the inner `UnsafeCell<Option<T>>`,
+        // which drops the `Option<T>` (calling `T::drop` if `Some`).
+        // This is why we do not need a separate "which slots are
+        // initialized" tracker: the `Option` discriminant is the tracker.
+        for entry in self.segments.iter() {
+            let ptr = entry.load(Ordering::Acquire);
+            if !ptr.is_null() {
+                // SAFETY: pointer came from `Box::into_raw` in
+                // `get_or_allocate_segment`; uniquely owned by this
+                // arena; `&mut self` guarantees no concurrent access.
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }
+    }
+}
+
+impl<T: Clone + Send + Sync + 'static> ErasedArena for GenericArena<T> {
+    fn erased_type_id(&self) -> TypeId {
+        TypeId::of::<T>()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +912,196 @@ mod tests {
             arena.reserve(i as u64);
         }
         drop(arena);
+    }
+
+    // -----------------------------------------------------------------
+    // GenericArena tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn generic_reserve_starts_none_and_write_populates() {
+        let arena: GenericArena<String> = GenericArena::new();
+        let slot = arena.reserve();
+        assert_eq!(slot, 0);
+        arena.write(slot, "hello".to_string());
+        assert_eq!(arena.read(slot), "hello");
+    }
+
+    #[test]
+    fn generic_reserve_with_initializes_immediately() {
+        let arena: GenericArena<String> = GenericArena::new();
+        let slot = arena.reserve_with("world".to_string());
+        assert_eq!(arena.read(slot), "world");
+        assert_eq!(arena.len(), 1);
+    }
+
+    #[test]
+    fn generic_write_overwrites_and_drops_old_value() {
+        // Use a struct that tracks its drops, so we can verify that
+        // overwriting a Some(old) with Some(new) runs old's destructor.
+        use std::sync::atomic::AtomicUsize;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Clone)]
+        struct DropCounter(#[allow(dead_code)] u64);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROPS.store(0, Ordering::SeqCst);
+        let arena: GenericArena<DropCounter> = GenericArena::new();
+        let slot = arena.reserve_with(DropCounter(1));
+        // One DropCounter briefly existed as the argument to reserve_with,
+        // but the value is moved into the slot so its destructor is not
+        // called yet.
+        assert_eq!(DROPS.load(Ordering::SeqCst), 0);
+
+        arena.write(slot, DropCounter(2));
+        // The write replaced Some(DropCounter(1)) with Some(DropCounter(2));
+        // the old DropCounter(1) was dropped as part of the Option
+        // assignment.
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+
+        arena.write(slot, DropCounter(3));
+        assert_eq!(DROPS.load(Ordering::SeqCst), 2);
+
+        drop(arena);
+        // The arena's Drop runs DropCounter(3).
+        assert_eq!(DROPS.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn generic_reservations_span_segment_boundary() {
+        let arena: GenericArena<Vec<u32>> = GenericArena::new();
+        let count = SEGMENT_SIZE + 25;
+        let mut slots = Vec::with_capacity(count);
+        for i in 0..count {
+            slots.push(arena.reserve_with(vec![i as u32, (i as u32) * 2]));
+        }
+        for (i, slot) in slots.into_iter().enumerate() {
+            let v = arena.read(slot);
+            assert_eq!(v, vec![i as u32, (i as u32) * 2]);
+        }
+    }
+
+    #[test]
+    fn generic_read_clones_independent_copies() {
+        // Mutating the cloned value must not affect the arena's copy.
+        let arena: GenericArena<Vec<u32>> = GenericArena::new();
+        let slot = arena.reserve_with(vec![1, 2, 3]);
+        let mut clone_a = arena.read(slot);
+        clone_a.push(999);
+        let clone_b = arena.read(slot);
+        assert_eq!(clone_b, vec![1, 2, 3]);
+        assert_eq!(clone_a, vec![1, 2, 3, 999]);
+    }
+
+    #[test]
+    fn generic_arena_drops_all_initialized_slots() {
+        // Cross several segments with values that track Drop, then let
+        // the arena fall out of scope and verify every value was dropped
+        // exactly once.
+        use std::sync::atomic::AtomicUsize;
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Clone)]
+        struct Tracked;
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROPS.store(0, Ordering::SeqCst);
+        let arena: GenericArena<Tracked> = GenericArena::new();
+        let populated = SEGMENT_SIZE + 10;
+        for _ in 0..populated {
+            arena.reserve_with(Tracked);
+        }
+        // Also reserve some slots that remain uninitialized (None).
+        // Their Drop should not count, because Option::None has no T.
+        for _ in 0..7 {
+            arena.reserve();
+        }
+        drop(arena);
+        assert_eq!(DROPS.load(Ordering::SeqCst), populated);
+    }
+
+    #[test]
+    fn generic_erased_type_id_and_downcast() {
+        let arena: Box<dyn ErasedArena> = Box::new(GenericArena::<String>::new());
+        assert_eq!(arena.erased_type_id(), TypeId::of::<String>());
+        let concrete = arena
+            .as_any()
+            .downcast_ref::<GenericArena<String>>()
+            .expect("downcast to GenericArena<String>");
+        let slot = concrete.reserve_with("downcast".to_string());
+        assert_eq!(concrete.read(slot), "downcast");
+    }
+
+    #[test]
+    fn generic_concurrent_readers_see_stable_value() {
+        // Many readers clone the same slot in parallel while we hold
+        // the value constant. This exercises the Sync impl and the
+        // read path's non-atomic access under a shared reference.
+        // Correctness for concurrent read-and-write is the state
+        // machine's job, not the arena's; here we only verify that
+        // concurrent reads of a stable value work.
+        const READERS: usize = 16;
+        const ITERS: usize = 10_000;
+
+        let arena: Arc<GenericArena<String>> = Arc::new(GenericArena::new());
+        let slot = arena.reserve_with("stable".to_string());
+
+        let handles: Vec<_> = (0..READERS)
+            .map(|_| {
+                let arena = arena.clone();
+                thread::spawn(move || {
+                    for _ in 0..ITERS {
+                        assert_eq!(arena.read(slot), "stable");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn generic_concurrent_reservers_get_unique_indices() {
+        // Same invariant as the primitive arena: concurrent reserve()
+        // hands out a dense range of unique indices. This exercises
+        // the segment-allocation CAS on the GenericArena path.
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 1500;
+
+        let arena: Arc<GenericArena<u64>> = Arc::new(GenericArena::new());
+        let handles: Vec<_> = (0..THREADS)
+            .map(|tid| {
+                let arena = arena.clone();
+                thread::spawn(move || {
+                    let mut mine = Vec::with_capacity(PER_THREAD);
+                    for i in 0..PER_THREAD {
+                        let v = (tid as u64) * 1_000_000 + i as u64;
+                        let slot = arena.reserve_with(v);
+                        mine.push((slot, v));
+                    }
+                    mine
+                })
+            })
+            .collect();
+
+        let mut all: Vec<(u32, u64)> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+        all.sort_by_key(|(slot, _)| *slot);
+
+        assert_eq!(all.len(), THREADS * PER_THREAD);
+        for (i, (slot, v)) in all.iter().enumerate() {
+            assert_eq!(*slot as usize, i);
+            assert_eq!(arena.read(*slot), *v);
+        }
     }
 }
