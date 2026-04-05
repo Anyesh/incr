@@ -118,7 +118,7 @@ In Rust, per-node propagation costs about 175ns and collection operations stay n
 
 Through the Python bindings, the per-call overhead of crossing the Rust/Python boundary means incr only outperforms naive Python for larger datasets or pipelines where each element involves real work. For pure in-memory arithmetic on small collections under about 5K elements, batch recomputation is faster because the pipeline traversal overhead dominates.
 
-Joins and group-by for collections, garbage collection for long-running systems, and multi-threaded change propagation are not yet implemented, and we havent published to crates.io or PyPI.
+Joins and group-by for collections are not yet implemented, the runtime is single-threaded and the `Runtime` type cannot currently be shared across threads, garbage collection for long-running graphs is an open problem, and we havent published to crates.io or PyPI.
 
 The travel premium demo also validates an integration pattern worth noting: incr graphs work well as ephemeral materialized views over database slices. You load a small scope from the database, build the incr pipeline over it, mutate both the DB and the graph together, and read computed results from incr. Expensive intermediate results (like distance caches) can be persisted separately so that rebuilding the graph after a restart is fast.
 
