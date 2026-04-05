@@ -216,9 +216,15 @@ impl Runtime {
     }
 
     /// Create an input node holding the given initial value.
+    ///
+    /// The `T: PartialEq` bound enables early cutoff: a `set` with the
+    /// same value as the current one is a no-op (no revision bump, no
+    /// dirty walk), and a recompute that produces a value equal to the
+    /// previous one skips the arena write. The bound is uniform across
+    /// all v2 value types so the API surface stays consistent.
     pub fn create_input<T>(&self, initial: T) -> Incr<T>
     where
-        T: Clone + Send + Sync + 'static,
+        T: Clone + PartialEq + Send + Sync + 'static,
     {
         let _guard = self
             .write_mutex
@@ -236,14 +242,19 @@ impl Runtime {
 
     /// Create a query node whose value is produced by running `compute`.
     ///
-    /// The closure runs lazily on the first `get` and its result is
-    /// memoized. In this commit there is no dependency tracking, so
-    /// setting an input that a query "conceptually depends on" does
-    /// not invalidate the query's cached value. Reactivity lands in a
-    /// subsequent commit.
+    /// Reactivity: after the initial compute on first `get`, the value
+    /// is memoized until an input this query transitively depends on
+    /// changes, at which point the query is marked Dirty and the next
+    /// read triggers a recompute. Early cutoff applies: if a recompute
+    /// produces a value equal to the previous one, the arena write is
+    /// skipped, which saves a clone for expensive value types. Full
+    /// transitive early cutoff (where an unchanged recompute also
+    /// prevents downstream queries from recomputing) requires red-green
+    /// verification via `verified_at` / `changed_at` and is deferred
+    /// to a later commit.
     pub fn create_query<T, F>(&self, compute: F) -> Incr<T>
     where
-        T: Clone + Send + Sync + 'static,
+        T: Clone + PartialEq + Send + Sync + 'static,
         F: Fn(&Runtime) -> T + Send + Sync + 'static,
     {
         let _guard = self
@@ -280,7 +291,7 @@ impl Runtime {
     /// proper hazard / RCU scheme so reads do not need the RwLock gate.
     pub fn get<T>(&self, handle: Incr<T>) -> T
     where
-        T: Clone + Send + Sync + 'static,
+        T: Clone + PartialEq + Send + Sync + 'static,
     {
         self.check_runtime(handle);
         // If this get is happening inside a compute closure, record
@@ -390,7 +401,7 @@ impl Runtime {
     /// correctness mechanism.
     pub fn set<T>(&self, handle: Incr<T>, value: T)
     where
-        T: Clone + Send + Sync + 'static,
+        T: Clone + PartialEq + Send + Sync + 'static,
     {
         self.check_runtime(handle);
         let _guard = self
@@ -411,6 +422,21 @@ impl Runtime {
             "set() called on a query node; only input nodes may be set"
         );
         let arena_slot = node.arena_slot();
+
+        // Early cutoff: if the new value equals the current value,
+        // treat this set as a no-op. Skip the arena write, skip the
+        // revision bump, and skip the dirty walk. The spec section
+        // 6.4 describes this as the first cheap case the writer path
+        // should handle, and the T: PartialEq bound on create_input
+        // enables it uniformly. For large value types (String, Vec,
+        // structs with heap storage) the saved work includes the
+        // clone inside the arena write, the full dirty walk traversal
+        // over transitive dependents, and any recomputes those
+        // dependents would later trigger.
+        let current: T = self.with_generic_arena::<T, _, _>(|arena| arena.read(arena_slot));
+        if current == value {
+            return;
+        }
 
         // Arena write happens while holding nodes.write(). No reader
         // can be inside a concurrent arena.read on the same slot,
@@ -565,7 +591,7 @@ impl Runtime {
     /// if a future change starts using the recorded deps on recompute.
     fn run_compute<T>(&self, slot: u32, is_recompute: bool)
     where
-        T: Clone + Send + Sync + 'static,
+        T: Clone + PartialEq + Send + Sync + 'static,
     {
         // Extract the compute closure under a short-lived read guard.
         // Clone the Arc so we can drop the guard before calling, which
@@ -596,18 +622,35 @@ impl Runtime {
         // bug in how `create_query` packed the closure; it should be
         // impossible from safe user code because `create_query<T, F>`
         // binds T at the call site.
-        let value: T = *value_box
+        let new_value: T = *value_box
             .downcast::<T>()
             .expect("compute function returned wrong type");
 
-        // Look up the arena slot for this node, then write the new
-        // value.
+        // Look up the arena slot for this node.
         let arena_slot = {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize].arena_slot()
         };
 
-        self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, value));
+        // Early cutoff on recompute: if the new value equals the value
+        // currently in the arena (from a previous compute), skip the
+        // arena write. This saves the clone inside `arena.write` for
+        // large types. Only applies to recomputes, because a first
+        // compute starts from an uninitialized slot and must always
+        // write. Full transitive early cutoff (where an unchanged
+        // recompute prevents downstream queries from recomputing)
+        // requires red-green verification via `verified_at` /
+        // `changed_at` and is deferred to a later commit.
+        let should_write = if is_recompute {
+            let old_value: T = self.with_generic_arena::<T, _, _>(|arena| arena.read(arena_slot));
+            old_value != new_value
+        } else {
+            true
+        };
+
+        if should_write {
+            self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, new_value));
+        }
 
         if !is_recompute {
             // First compute: publish the recorded deps on the node and
@@ -1585,5 +1628,143 @@ mod tests {
         assert_eq!(rt.get(greeting), "hi, Anish");
         rt.set(name, "world".to_string());
         assert_eq!(rt.get(greeting), "hi, world");
+    }
+
+    // -------------------------------------------------------------------
+    // Early cutoff tests (commit K).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn set_with_same_value_is_a_noop() {
+        // Setting an input to its current value should not bump the
+        // revision counter, because the early cutoff short-circuits
+        // before the arena write. Verifies the no-op path at the input
+        // level, which is the cheapest and most common case.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(42);
+        assert_eq!(rt.revision(), 0);
+
+        rt.set(input, 42); // same value
+        assert_eq!(rt.revision(), 0, "no-op set must not bump revision");
+
+        rt.set(input, 100); // different value
+        assert_eq!(rt.revision(), 1, "real set should bump revision");
+
+        rt.set(input, 100); // same as current
+        assert_eq!(rt.revision(), 1, "second no-op set must not bump");
+    }
+
+    #[test]
+    fn set_with_same_value_does_not_dirty_dependents() {
+        // The dirty walk should be skipped on a no-op set. Dependents
+        // stay Clean because the walk never runs.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) + 100);
+
+        assert_eq!(rt.get(q), 101);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Clean);
+
+        rt.set(input, 1); // no-op
+        assert_eq!(
+            state_of(&rt, q.slot()),
+            NodeState::Clean,
+            "no-op set must not mark dependent Dirty"
+        );
+        // Reading q returns the cached value without recomputing.
+        assert_eq!(rt.get(q), 101);
+    }
+
+    #[test]
+    fn set_with_same_string_is_a_noop() {
+        // Early cutoff for non-primitive types. PartialEq on String
+        // drives the check; the saved work is the String clone inside
+        // arena.write, which is the whole point of cutoff for large
+        // value types.
+        let rt = Runtime::new();
+        let s = rt.create_input::<String>("hello".to_string());
+        assert_eq!(rt.revision(), 0);
+        rt.set(s, "hello".to_string());
+        assert_eq!(rt.revision(), 0, "no-op String set must not bump revision");
+        rt.set(s, "world".to_string());
+        assert_eq!(rt.revision(), 1);
+    }
+
+    #[test]
+    fn recompute_returning_same_value_transitions_clean_without_panic() {
+        // When a recompute produces the same value as before, the
+        // arena write is skipped (saves a clone for large types) and
+        // the state transitions back to Clean. This test verifies
+        // the path runs without panicking or leaving the node in a
+        // weird state; the value-level cutoff's effect is hard to
+        // observe directly without red-green verification, which is
+        // a follow-up commit.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(5);
+        // Query whose value depends on the input but happens to be
+        // constant over the range of inputs we use: sign of input.
+        let q = rt.create_query::<u64, _>(move |rt| if rt.get(input) > 0 { 1 } else { 0 });
+
+        assert_eq!(rt.get(q), 1);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Clean);
+
+        // Change input to another positive value. q is marked Dirty.
+        rt.set(input, 100);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Dirty);
+
+        // Recompute produces 1 again (same value). The code path
+        // skips the arena write. q transitions to Clean.
+        assert_eq!(rt.get(q), 1);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Clean);
+
+        // Changing to a value that would flip the output actually
+        // does flip it.
+        rt.set(input, 0);
+        assert_eq!(rt.get(q), 0);
+    }
+
+    #[test]
+    fn input_with_dependents_noop_set_does_not_trigger_recompute() {
+        // Count compute invocations via a shared counter. A no-op
+        // set must not cause the dependent query to recompute, which
+        // the counter directly proves.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rt = Runtime::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        let input = rt.create_input::<u64>(10);
+        let q = {
+            let counter = counter.clone();
+            rt.create_query::<u64, _>(move |rt| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                rt.get(input) * 2
+            })
+        };
+
+        // First read triggers the initial compute (count = 1).
+        assert_eq!(rt.get(q), 20);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // No-op set: no dirty walk, no recompute.
+        rt.set(input, 10);
+        assert_eq!(rt.get(q), 20);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "no-op set should not recompute"
+        );
+
+        // Real set: dirty walk runs, recompute happens.
+        rt.set(input, 20);
+        assert_eq!(rt.get(q), 40);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "real set should recompute"
+        );
+
+        // Another no-op set: no recompute.
+        rt.set(input, 20);
+        assert_eq!(rt.get(q), 40);
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 }
