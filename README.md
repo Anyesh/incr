@@ -112,7 +112,7 @@ The function DAG with automatic dependency tracking, early cutoff, and dynamic d
 There are two demos that show different aspects of the library:
 
 - `examples/dashboard/` is a live API monitoring dashboard with dependency graph visualization and real-time tracing of which nodes recompute vs get skipped.
-- `examples/travel-premium/` is a careworker scheduling demo that computes travel premiums incrementally using the full operator pipeline (sort, pairwise, map, reduce). Its backed by SQLite for persistence, with a distance cache that survives server restarts, and shows 5-8x speedup over batch recomputation when the map step involves expensive operations like distance lookups.
+- `examples/travel-premium/` is a mobile worker scheduling demo that computes travel premiums incrementally using the full operator pipeline (sort, pairwise, map, reduce). Its backed by SQLite for persistence, with a distance cache that survives server restarts, and shows 5-8x speedup over batch recomputation when the map step involves expensive operations like distance lookups.
 
 In Rust, per-node propagation costs about 175ns and collection operations stay nearly constant regardless of collection size. The real advantage shows up when pipelines include expensive operations like API calls or complex calculations, because incr tells you exactly which elements changed so you can skip the expensive work for everything else. The combination of function DAGs and incremental collections in one runtime is something the existing tools (Salsa, Differential Dataflow, Jane Street Incremental) dont offer individually.
 
