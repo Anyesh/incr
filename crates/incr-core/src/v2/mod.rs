@@ -35,5 +35,7 @@ pub(crate) mod node;
 pub(crate) mod registry;
 pub(crate) mod runtime;
 #[cfg(test)]
+mod runtime_concurrent_test;
+#[cfg(test)]
 mod runtime_proptest;
 pub(crate) mod state;

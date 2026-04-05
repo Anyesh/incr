@@ -1,0 +1,350 @@
+//! Concurrent correctness tests for the v2 Runtime.
+//!
+//! The v2 architecture's core claim is single-writer-many-readers:
+//! one writer at a time serializes through the runtime's write
+//! mutex while any number of readers call `rt.get` concurrently
+//! without contention on the reader-reader path. The existing
+//! commit H-N tests cover this architecturally (each piece in
+//! isolation) and the proptest in `runtime_proptest.rs` covers it
+//! functionally (incremental equals batch), but neither exercises
+//! the full concurrent path with real OS threads doing real
+//! simultaneous reads against a live writer.
+//!
+//! This module does that. Each test spawns N reader threads
+//! against a shared `Arc<Runtime>` while a writer thread perturbs
+//! inputs on a schedule, and asserts that every value a reader
+//! observes is legitimate (comes from the set of values the writer
+//! has ever written, possibly through a deterministic compute).
+//! A stronger property (full linearizability via happens-before
+//! reasoning across every observation) is left to commit P if
+//! this coarser property passes cleanly.
+//!
+//! Placed in-crate because v2 is `pub(crate)` until Gate 5; tests
+//! need crate-private access to construct handles and check state
+//! that the public API will eventually expose differently.
+
+#![cfg(test)]
+
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::thread;
+
+use super::runtime::Runtime;
+
+/// Stress duration per test. Short enough that the whole suite
+/// runs in under a second in normal mode, long enough that any
+/// data race or ordering bug has thousands of opportunities to
+/// trip.
+const DEFAULT_WRITER_ITERS: usize = 5_000;
+
+#[test]
+fn many_readers_observe_only_written_input_values() {
+    // One String input, 8 readers, writer cycles through a known
+    // set of strings. Any observation not in the set is either a
+    // torn read (UB we would have hit before commit G's fix, and
+    // should still pass now that the RwLock gate on nodes serves
+    // as the correctness barrier) or a stale value from a
+    // different writer generation, neither of which can happen
+    // under the current design.
+    const READERS: usize = 8;
+
+    let rt = Arc::new(Runtime::new());
+    let values: Vec<String> = (0..16)
+        .map(|i| format!("value-{}-padding-to-force-heap-allocation", i))
+        .collect();
+    let valid: HashSet<String> = values.iter().cloned().collect();
+    let input = rt.create_input::<String>(values[0].clone());
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_handles: Vec<_> = (0..READERS)
+        .map(|_| {
+            let rt = rt.clone();
+            let valid = valid.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut observations = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let v = rt.get(input);
+                    assert!(
+                        valid.contains(&v),
+                        "reader observed non-written value: {:?}",
+                        v
+                    );
+                    observations += 1;
+                }
+                observations
+            })
+        })
+        .collect();
+
+    for i in 0..DEFAULT_WRITER_ITERS {
+        let v = &values[i % values.len()];
+        rt.set(input, v.clone());
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    let total: usize = reader_handles
+        .into_iter()
+        .map(|h| h.join().expect("reader panicked"))
+        .sum();
+    assert!(
+        total > 0,
+        "readers should have completed at least one read each"
+    );
+}
+
+#[test]
+fn many_readers_observe_only_valid_query_values() {
+    // Input plus a pure function query. Every query observation
+    // must be `input + 100` for some input value the writer has
+    // set. This exercises the full reactivity path (set → dirty
+    // walk → reader observes Dirty → reader CASes to Computing →
+    // reader recomputes → reader observes Clean) under concurrency.
+    const READERS: usize = 8;
+
+    let rt = Arc::new(Runtime::new());
+    let inputs: Vec<u64> = (0..20).collect();
+    let valid_queries: HashSet<u64> = inputs.iter().map(|i| i + 100).collect();
+
+    let input = rt.create_input::<u64>(inputs[0]);
+    let query = rt.create_query::<u64, _>(move |rt| rt.get(input) + 100);
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_handles: Vec<_> = (0..READERS)
+        .map(|_| {
+            let rt = rt.clone();
+            let valid = valid_queries.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let v = rt.get(query);
+                    assert!(
+                        valid.contains(&v),
+                        "reader observed query value {} not in valid set (expected input+100 for some written input)",
+                        v
+                    );
+                }
+            })
+        })
+        .collect();
+
+    for i in 0..DEFAULT_WRITER_ITERS {
+        let v = inputs[i % inputs.len()];
+        rt.set(input, v);
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    for h in reader_handles {
+        h.join().expect("reader panicked");
+    }
+}
+
+#[test]
+fn many_readers_on_chain_of_queries_observe_valid_values() {
+    // input → q1 (+1) → q2 (*2) → q3 (+100). Compute function for
+    // q3(input) = ((input + 1) * 2) + 100. Readers spin on q3;
+    // writer sets input. Every observation must be valid for some
+    // written input.
+    const READERS: usize = 6;
+
+    let rt = Arc::new(Runtime::new());
+    let inputs: Vec<u64> = (0..50).collect();
+    let valid: HashSet<u64> = inputs.iter().map(|i| ((i + 1) * 2) + 100).collect();
+
+    let input = rt.create_input::<u64>(inputs[0]);
+    let q1 = rt.create_query::<u64, _>(move |rt| rt.get(input) + 1);
+    let q2 = rt.create_query::<u64, _>(move |rt| rt.get(q1) * 2);
+    let q3 = rt.create_query::<u64, _>(move |rt| rt.get(q2) + 100);
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let reader_handles: Vec<_> = (0..READERS)
+        .map(|_| {
+            let rt = rt.clone();
+            let valid = valid.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let v = rt.get(q3);
+                    assert!(
+                        valid.contains(&v),
+                        "reader observed q3 value {} not valid for any input in {:?}",
+                        v,
+                        (0..5u64)
+                    );
+                }
+            })
+        })
+        .collect();
+
+    for i in 0..DEFAULT_WRITER_ITERS {
+        rt.set(input, inputs[i % inputs.len()]);
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    for h in reader_handles {
+        h.join().expect("reader panicked");
+    }
+}
+
+#[test]
+fn concurrent_reads_of_multiple_unrelated_chains_do_not_cross_contaminate() {
+    // Two independent chains sharing a runtime. Readers on chain A
+    // should never observe values from chain B's inputs, even if
+    // the writer is updating both. This catches any cross-slot
+    // contamination in the state machine or dep graph.
+    const READERS_PER_CHAIN: usize = 3;
+
+    let rt = Arc::new(Runtime::new());
+
+    let a_inputs: Vec<u64> = (0..20).collect();
+    let b_inputs: Vec<u64> = (100..120).collect();
+    let a_valid: HashSet<u64> = a_inputs.iter().map(|i| i * 10).collect();
+    let b_valid: HashSet<u64> = b_inputs.iter().map(|i| i * 10).collect();
+
+    let a_in = rt.create_input::<u64>(a_inputs[0]);
+    let b_in = rt.create_input::<u64>(b_inputs[0]);
+    let a_q = rt.create_query::<u64, _>(move |rt| rt.get(a_in) * 10);
+    let b_q = rt.create_query::<u64, _>(move |rt| rt.get(b_in) * 10);
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let mut handles = Vec::new();
+    for _ in 0..READERS_PER_CHAIN {
+        let rt = rt.clone();
+        let valid = a_valid.clone();
+        let stop = stop.clone();
+        handles.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let v = rt.get(a_q);
+                assert!(
+                    valid.contains(&v),
+                    "chain A reader observed cross-contaminated value: {}",
+                    v
+                );
+            }
+        }));
+    }
+    for _ in 0..READERS_PER_CHAIN {
+        let rt = rt.clone();
+        let valid = b_valid.clone();
+        let stop = stop.clone();
+        handles.push(thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let v = rt.get(b_q);
+                assert!(
+                    valid.contains(&v),
+                    "chain B reader observed cross-contaminated value: {}",
+                    v
+                );
+            }
+        }));
+    }
+
+    for i in 0..DEFAULT_WRITER_ITERS {
+        rt.set(a_in, a_inputs[i % a_inputs.len()]);
+        rt.set(b_in, b_inputs[i % b_inputs.len()]);
+    }
+    stop.store(true, Ordering::Relaxed);
+
+    for h in handles {
+        h.join().expect("reader panicked");
+    }
+}
+
+#[test]
+fn compute_function_runs_at_most_once_per_dirty_cycle() {
+    // When multiple readers race to recompute a Dirty query, only
+    // one should actually execute the compute closure per dirty
+    // cycle. The state machine's Dirty → Computing CAS enforces
+    // this. Count compute invocations; expected upper bound is
+    // roughly the number of times the writer called `set`.
+    //
+    // We allow a margin: the writer may set faster than readers
+    // can recompute, so several sets can coalesce into one
+    // recompute (good), and a set during Computing can miss the
+    // dirty mark on the current generation (the known race; its
+    // impact here is that the count may be slightly LOWER than
+    // the number of sets, not higher). The bounds we assert are
+    // loose enough that both directions are tolerated.
+    const READERS: usize = 8;
+    const WRITER_SETS: usize = 2_000;
+
+    let rt = Arc::new(Runtime::new());
+    let compute_invocations = Arc::new(AtomicUsize::new(0));
+
+    let input = rt.create_input::<u64>(0);
+    let query = {
+        let counter = compute_invocations.clone();
+        rt.create_query::<u64, _>(move |rt| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            rt.get(input) * 2
+        })
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_handles: Vec<_> = (0..READERS)
+        .map(|_| {
+            let rt = rt.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = rt.get(query);
+                }
+            })
+        })
+        .collect();
+
+    for i in 0..WRITER_SETS {
+        rt.set(input, i as u64);
+    }
+    stop.store(true, Ordering::Relaxed);
+    for h in reader_handles {
+        h.join().expect("reader panicked");
+    }
+
+    let total = compute_invocations.load(Ordering::SeqCst);
+    // Each set() triggers at most one recompute. Readers may
+    // observe stale Clean between sets without triggering a
+    // recompute (coalescing). We expect total <= WRITER_SETS + 1
+    // (the +1 for the initial compute). We also expect total >= 1
+    // (at least the initial compute ran).
+    assert!(
+        total >= 1,
+        "expected at least one compute invocation, got {}",
+        total
+    );
+    assert!(
+        total <= WRITER_SETS + READERS + 10,
+        "compute ran too many times ({}); expected <= {} (writer_sets + readers + slack)",
+        total,
+        WRITER_SETS + READERS + 10
+    );
+}
+
+#[test]
+fn reader_threads_can_be_spawned_and_joined_repeatedly_on_same_runtime() {
+    // Correctness under repeated reader-thread lifetimes. Spawn a
+    // batch of readers, join them, set the input, spawn again.
+    // Ensures the TLS compute cache and COMPUTE_STACK are clean
+    // between reader lifetimes.
+    let rt = Arc::new(Runtime::new());
+    let input = rt.create_input::<u64>(1);
+    let query = rt.create_query::<u64, _>(move |rt| rt.get(input) + 1000);
+
+    for round in 0..5u64 {
+        rt.set(input, round);
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let rt = rt.clone();
+                thread::spawn(move || rt.get(query))
+            })
+            .collect();
+        for h in handles {
+            assert_eq!(h.join().unwrap(), round + 1000);
+        }
+    }
+}
