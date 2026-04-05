@@ -326,6 +326,144 @@ fn compute_function_runs_at_most_once_per_dirty_cycle() {
 }
 
 #[test]
+fn computing_during_dirty_walk_does_not_leak_stale_value() {
+    // Deterministic reproduction of the Computing-during-dirty-walk
+    // race via two barriers. This race existed in commits J through
+    // N and was fixed in commit P by a post-compute revision check
+    // inside run_compute: before transitioning from Computing to
+    // Clean, compare the current revision counter to the one
+    // recorded at compute start. If they differ, a writer landed a
+    // set during the compute, so the result is potentially stale
+    // and we transition to Dirty instead of Clean, forcing the
+    // next reader to retry the compute against the fresh inputs.
+    //
+    // The test threads are:
+    //   - compute thread: triggers rt.get(q), blocks inside the
+    //     compute closure on barrier A, then reads input, then
+    //     blocks on barrier B.
+    //   - writer thread: waits on barrier A so compute has started,
+    //     then calls rt.set(input, new_value) which bumps revision
+    //     and runs the dirty walk (which sees q in Computing state
+    //     and fails to mark it Dirty), then releases barrier B.
+    //   - main thread: after both join, reads q and asserts it
+    //     reflects the new input value, not the stale one.
+    //
+    // Without the fix, the compute finishes with the old input
+    // value, Release-stores Clean with the stale result, and the
+    // next reader sees Clean + stale. With the fix, the compute
+    // detects the revision bump, transitions to Dirty, and the
+    // next reader's get() triggers a retry that uses the new input.
+    use std::sync::Barrier;
+
+    let rt = Arc::new(Runtime::new());
+    let input = rt.create_input::<u64>(10);
+
+    // Barriers coordinate the two compute-side threads. Each is
+    // sized to 2 (compute thread plus writer thread).
+    let started_barrier = Arc::new(Barrier::new(2));
+    let set_complete_barrier = Arc::new(Barrier::new(2));
+    // Only the FIRST invocation of the compute closure blocks on
+    // the barriers. When commit P's fix detects the revision bump
+    // and marks the node Dirty, the next reader retries the
+    // closure; the retry must NOT block on the barriers because
+    // the writer thread has already finished and would never
+    // arrive. This counter tracks "is this the first call" with
+    // AtomicUsize so the closure stays Fn (not FnOnce).
+    let first_call = Arc::new(AtomicUsize::new(0));
+
+    let q = {
+        let started = started_barrier.clone();
+        let set_complete = set_complete_barrier.clone();
+        let first_call = first_call.clone();
+        rt.create_query::<u64, _>(move |rt| {
+            // Read the input first so this becomes a recorded dep.
+            let v = rt.get(input);
+            // Only the first invocation participates in the
+            // barrier dance. Retries (from the revision-bump
+            // detection in run_compute) just return the current
+            // input value without waiting.
+            if first_call.fetch_add(1, Ordering::SeqCst) == 0 {
+                // First call: signal the writer that our compute
+                // has started and we have already read the old
+                // input value.
+                started.wait();
+                // Block until the writer has called set and
+                // finished its (failed-to-mark-us-dirty) walk.
+                set_complete.wait();
+            }
+            // Produce the result based on whatever input value we
+            // read. On the first call v=10 (stale), on the retry
+            // v=20 (fresh).
+            v * 100
+        })
+    };
+
+    // Compute thread: runs the read that triggers the compute.
+    let compute_rt = rt.clone();
+    let compute_thread = thread::spawn(move || compute_rt.get(q));
+
+    // Writer thread: waits for compute to start, sets the input,
+    // then releases the compute.
+    let writer_rt = rt.clone();
+    let writer_started = started_barrier.clone();
+    let writer_set_complete = set_complete_barrier.clone();
+    let writer_thread = thread::spawn(move || {
+        writer_started.wait();
+        writer_rt.set(input, 20);
+        writer_set_complete.wait();
+    });
+
+    // Wait for the race to play out.
+    let first_result = compute_thread.join().expect("compute thread panicked");
+    writer_thread.join().expect("writer thread panicked");
+
+    // With commit P's fix: the stale first compute (v=10, produces
+    // 1000) is detected by the post-compute revision check inside
+    // run_compute, which transitions the node to Dirty instead of
+    // Clean. The outer `rt.get(q)` loop in the compute thread
+    // observes Dirty on its next iteration, retries the compute
+    // (this time with first_call >= 1 so the closure skips the
+    // barriers), reads the fresh input value 20, and produces
+    // 2000. The compute thread's `rt.get(q)` therefore returns the
+    // correct post-set value 2000, not the stale 1000.
+    //
+    // Without the fix: run_compute would have Release-stored Clean
+    // with the stale 1000 value. The compute thread's `rt.get(q)`
+    // would return 1000. The next reader would also see 1000. The
+    // assertion below would fail because first_result would be
+    // 1000, not 2000.
+    assert_eq!(
+        first_result, 2000,
+        "expected compute thread to observe the post-set value (2000) via \
+         the internal retry triggered by commit P's revision check; got {}. \
+         This failure indicates the Computing-during-dirty-walk race is \
+         NOT closed: the stale compute leaked into Clean state.",
+        first_result
+    );
+
+    // The closure should have run exactly twice: once with the
+    // stale input (v=10, barriers taken), once with the fresh
+    // input (v=20, barriers skipped via the first_call counter).
+    // Without the fix, it would have run exactly once.
+    let invocations = first_call.load(Ordering::SeqCst);
+    assert_eq!(
+        invocations, 2,
+        "closure should run twice (stale then retry); got {} invocations",
+        invocations
+    );
+
+    // Reading q again returns the (now-Clean) cached fresh value,
+    // no additional compute invocations.
+    let second_result = rt.get(q);
+    assert_eq!(second_result, 2000);
+    assert_eq!(
+        first_call.load(Ordering::SeqCst),
+        2,
+        "second read should not have invoked the closure"
+    );
+}
+
+#[test]
 fn reader_threads_can_be_spawned_and_joined_repeatedly_on_same_runtime() {
     // Correctness under repeated reader-thread lifetimes. Spawn a
     // batch of readers, join them, set the input, spawn again.

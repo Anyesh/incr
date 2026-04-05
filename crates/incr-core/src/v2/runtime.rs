@@ -668,6 +668,18 @@ impl Runtime {
                 .clone()
         };
 
+        // Snapshot the revision BEFORE the compute runs. After the
+        // compute returns, we compare this to the current revision.
+        // If any writer called `set` during our compute (bumping the
+        // revision), our result may be based on stale input values
+        // that the writer's dirty walk could not mark us Dirty for
+        // because we were Computing. In that case we transition to
+        // Dirty instead of Clean so the next reader retries the
+        // compute with fresh inputs. This closes the "Computing-
+        // during-dirty-walk" race the commit J docs flagged as a
+        // known limitation.
+        let revision_at_start = self.revision.load(Ordering::Relaxed);
+
         // Push a compute frame so that any `rt.get` calls made by the
         // closure record their handles as dependencies of this node.
         self.push_compute_frame(slot);
@@ -784,6 +796,31 @@ impl Runtime {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize].arena_slot()
         };
+
+        // Post-compute revision check: if the revision bumped during
+        // our compute, at least one writer ran `set` while we were
+        // computing, and the dirty walk from that set could not mark
+        // us Dirty because our state was Computing. Our result may
+        // be stale. Transition to Dirty instead of Clean so the next
+        // reader retries the compute against the fresh input values.
+        // Skip the arena write in this case: writing the stale value
+        // would pollute the slot with wrong data if an early-cutoff-
+        // style optimization later decided to believe it.
+        let revision_at_end = self.revision.load(Ordering::Relaxed);
+        let stale_due_to_concurrent_write = revision_at_end != revision_at_start;
+
+        if stale_due_to_concurrent_write {
+            // Do not write the stale value. Transition to Dirty via
+            // Release so the next reader observes Dirty and retries.
+            // The recorded_deps are still published above, so the
+            // retry has an accurate dep list for the dirty walk to
+            // reach it on subsequent sets.
+            let nodes = self.nodes.read().expect("nodes lock poisoned");
+            nodes[slot as usize]
+                .state_cell()
+                .store_release(NodeState::Dirty);
+            return;
+        }
 
         // Early cutoff on recompute: if the new value equals the value
         // currently in the arena (from a previous compute), skip the
@@ -908,14 +945,16 @@ impl Runtime {
     /// - New: never computed, nothing to invalidate.
     /// - Dirty: already marked by a previous walk.
     /// - Computing: concurrent recompute in progress on another
-    ///   thread. In commit J's single-writer-many-readers model, a
-    ///   Computing node that is the target of a dirty walk is a
-    ///   race: the current compute is using the old input value and
-    ///   will store_release(Clean) when it finishes, overwriting any
-    ///   Dirty mark we placed. A correct fix needs either a
-    ///   post-compute version check or a separate "Dirty During
-    ///   Compute" state; that work lands in a follow-up commit. For
-    ///   single-threaded tests this case never arises.
+    ///   thread. The walk's `try_transition(Clean, Dirty)` fails
+    ///   silently for this node, which would leak a stale result
+    ///   if the compute finished with a pre-set value and
+    ///   Release-stored Clean. Commit P's post-compute revision
+    ///   check in `run_compute` handles this: before transitioning
+    ///   out of Computing, the compute thread compares the current
+    ///   revision to the revision it recorded at compute start, and
+    ///   transitions to Dirty (not Clean) if they differ. Any set
+    ///   that raced with Computing bumped the revision, so the
+    ///   mismatch is detected and the next reader retries.
     /// - Failed: the node's last compute panicked. The walk attempts
     ///   Failed → Dirty so an upstream change gives the failed node
     ///   a chance to retry on the next read (per spec section 8).
