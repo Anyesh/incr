@@ -19,6 +19,15 @@
 //!
 //! Status as of first commit: skeleton, state machine, typed arenas. No
 //! Runtime yet, no compute, no dirty propagation.
+//!
+//! The module is under active construction. Items land ahead of their
+//! first consumer (state machine before NodeData, arenas before Runtime,
+//! etc.), which trips dead-code warnings on every partial commit. We
+//! suppress them here for the duration of the rewrite; individual items
+//! are still exercised by their own unit tests. The allow comes off when
+//! v2 is wired into `lib.rs` at Gate 5 per the spec.
+
+#![allow(dead_code)]
 
 pub(crate) mod arena;
 pub(crate) mod state;
