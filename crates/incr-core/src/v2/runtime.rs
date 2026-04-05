@@ -610,6 +610,16 @@ impl Runtime {
     /// the top frame does not match the expected node slot, either of
     /// which would indicate a bug in the push/pop pairing.
     fn pop_compute_frame(&self, expected_node_slot: u32) -> Vec<NodeId> {
+        /// Threshold below which linear dedup beats HashSet. Nearly
+        /// every compute in realistic workloads has 1-4 deps, and
+        /// linear scan over a small list (~1-2 ns per probe) is
+        /// dramatically cheaper than building a HashSet (~15-20 ns
+        /// hash + insert per element plus allocation). 8 is a
+        /// conservative cutoff: at 8 elements linear dedup does 28
+        /// compares worst case, well under the constant cost of a
+        /// single HashSet operation.
+        const LINEAR_DEDUP_THRESHOLD: usize = 8;
+
         COMPUTE_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             let frame = stack.pop().expect("compute stack underflow");
@@ -623,13 +633,25 @@ impl Runtime {
                 expected_node_slot, frame.node_slot
             );
             // Deduplicate while preserving the order of first occurrence.
-            let mut seen: std::collections::HashSet<NodeId> =
-                std::collections::HashSet::with_capacity(frame.deps.len());
-            frame
-                .deps
-                .into_iter()
-                .filter(|id| seen.insert(*id))
-                .collect()
+            // Linear scan for small lists (the common case by far);
+            // HashSet for wide fan-in nodes.
+            if frame.deps.len() <= LINEAR_DEDUP_THRESHOLD {
+                let mut out: Vec<NodeId> = Vec::with_capacity(frame.deps.len());
+                for id in frame.deps {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+                out
+            } else {
+                let mut seen: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::with_capacity(frame.deps.len());
+                frame
+                    .deps
+                    .into_iter()
+                    .filter(|id| seen.insert(*id))
+                    .collect()
+            }
         })
     }
 
@@ -882,18 +904,43 @@ impl Runtime {
     fn update_deps_on_recompute(&self, slot: u32, new_deps: &[NodeId]) {
         use std::collections::HashSet;
 
-        // Snapshot the old dep list. Brief read guard.
+        // Fast path: check for exact match without allocating a
+        // snapshot Vec. The vast majority of recomputes have
+        // unchanged dep sets (static deps), and allocating a Vec
+        // on every recompute just to compare and throw away is a
+        // measurable chunk of propagate_chain_1000's cost (~100 µs
+        // on a 1000-node chain). Walk the existing deps via
+        // for_each_dep and compare element-by-element against
+        // new_deps; short-circuit on the first mismatch.
+        let matches: bool = {
+            let nodes = self.nodes.read().expect("nodes lock poisoned");
+            let node = &nodes[slot as usize];
+            if node.dep_count() as usize != new_deps.len() {
+                false
+            } else {
+                let mut iter = new_deps.iter();
+                let mut all_matched = true;
+                node.for_each_dep(|existing| {
+                    if all_matched {
+                        match iter.next() {
+                            Some(expected) if *expected == existing => {}
+                            _ => all_matched = false,
+                        }
+                    }
+                });
+                all_matched
+            }
+        };
+        if matches {
+            return;
+        }
+
+        // Slow path: dep set changed. Now snapshot the old deps
+        // into a Vec so we can compute diff sets against new_deps.
         let old_deps: Vec<NodeId> = {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize].collect_deps()
         };
-
-        // Fast path: dep lists match exactly (same order, same
-        // contents). This is the common static-deps case. Avoid
-        // the HashSet allocation and the write lock.
-        if old_deps.len() == new_deps.len() && old_deps.iter().eq(new_deps.iter()) {
-            return;
-        }
 
         // Slow path: something changed. Compute the added and
         // removed sets for reverse-edge bookkeeping.
