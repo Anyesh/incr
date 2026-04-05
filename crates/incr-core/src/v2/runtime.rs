@@ -66,11 +66,12 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::arena::GenericArena;
+use super::arena::ErasedArena;
 use super::handle::{Incr, RuntimeId};
 use super::node::{NodeData, NodeId};
 use super::registry::ArenaRegistry;
 use super::state::NodeState;
+use super::value::Value;
 
 // ---------------------------------------------------------------------------
 // COMPUTE_STACK: per-thread stack of active compute frames.
@@ -234,7 +235,7 @@ impl Runtime {
     /// all v2 value types so the API surface stays consistent.
     pub fn create_input<T>(&self, initial: T) -> Incr<T>
     where
-        T: Clone + PartialEq + Send + Sync + 'static,
+        T: Value,
     {
         let _guard = self
             .write_mutex
@@ -242,7 +243,7 @@ impl Runtime {
             .expect("runtime write mutex poisoned");
         let revision = self.revision.load(Ordering::Relaxed);
 
-        let arena_slot = self.with_generic_arena::<T, _, _>(|arena| arena.reserve_with(initial));
+        let arena_slot = T::reserve_with(self.arena_for::<T>(), initial);
 
         let node = Box::new(NodeData::new_input(0, arena_slot, revision));
 
@@ -264,7 +265,7 @@ impl Runtime {
     /// to a later commit.
     pub fn create_query<T, F>(&self, compute: F) -> Incr<T>
     where
-        T: Clone + PartialEq + Send + Sync + 'static,
+        T: Value,
         F: Fn(&Runtime) -> T + Send + Sync + 'static,
     {
         let _guard = self
@@ -273,8 +274,9 @@ impl Runtime {
             .expect("runtime write mutex poisoned");
 
         // Reserve an empty slot in the arena; first compute will
-        // populate it.
-        let arena_slot = self.with_generic_arena::<T, _, _>(|arena| arena.reserve());
+        // populate it. For primitive types this zero-initializes the
+        // slot; for generic types it leaves the Option None.
+        let arena_slot = T::reserve_empty(self.arena_for::<T>());
 
         let node = Box::new(NodeData::new_query(0, arena_slot));
 
@@ -301,7 +303,7 @@ impl Runtime {
     /// proper hazard / RCU scheme so reads do not need the RwLock gate.
     pub fn get<T>(&self, handle: Incr<T>) -> T
     where
-        T: Clone + PartialEq + Send + Sync + 'static,
+        T: Value,
     {
         self.check_runtime(handle);
         // Cycle detection: if the handle's slot is already on this
@@ -326,8 +328,7 @@ impl Runtime {
                     .unwrap_or_else(|e| panic!("{}", e));
                 if node.state() == NodeState::Clean {
                     let arena_slot = node.arena_slot();
-                    let value: T =
-                        self.with_generic_arena::<T, _, _>(|arena| arena.read(arena_slot));
+                    let value: T = T::read(self.arena_for::<T>(), arena_slot);
                     return value;
                 }
             }
@@ -432,7 +433,7 @@ impl Runtime {
     /// correctness mechanism.
     pub fn set<T>(&self, handle: Incr<T>, value: T)
     where
-        T: Clone + PartialEq + Send + Sync + 'static,
+        T: Value,
     {
         self.check_runtime(handle);
         let _guard = self
@@ -464,7 +465,7 @@ impl Runtime {
         // clone inside the arena write, the full dirty walk traversal
         // over transitive dependents, and any recomputes those
         // dependents would later trigger.
-        let current: T = self.with_generic_arena::<T, _, _>(|arena| arena.read(arena_slot));
+        let current: T = T::read(self.arena_for::<T>(), arena_slot);
         if current == value {
             return;
         }
@@ -473,7 +474,7 @@ impl Runtime {
         // can be inside a concurrent arena.read on the same slot,
         // because readers require nodes.read() which is mutually
         // exclusive with nodes.write().
-        self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, value));
+        T::write(self.arena_for::<T>(), arena_slot, value);
 
         // State was already Clean and stays Clean; this Release store
         // is a no-op semantically but anchors the memory ordering
@@ -676,7 +677,7 @@ impl Runtime {
     /// if a future change starts using the recorded deps on recompute.
     fn run_compute<T>(&self, slot: u32, is_recompute: bool)
     where
-        T: Clone + PartialEq + Send + Sync + 'static,
+        T: Value,
     {
         // Extract the compute closure under a short-lived read guard.
         // Clone the Arc so we can drop the guard before calling, which
@@ -861,7 +862,7 @@ impl Runtime {
         // still `None`. In that case there is nothing to compare
         // against and we must always write.
         let should_write = if is_recompute {
-            match self.with_generic_arena::<T, _, _>(|arena| arena.try_read(arena_slot)) {
+            match T::try_read(self.arena_for::<T>(), arena_slot) {
                 Some(old_value) => old_value != new_value,
                 None => true,
             }
@@ -870,7 +871,7 @@ impl Runtime {
         };
 
         if should_write {
-            self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, new_value));
+            T::write(self.arena_for::<T>(), arena_slot, new_value);
         }
 
         // Release-store state to Clean. This publishes the arena write
@@ -1081,30 +1082,23 @@ impl Runtime {
         }
     }
 
-    /// Look up (creating if necessary) the `GenericArena<T>` for T and
-    /// pass it to the closure. The closure runs with a reference to the
-    /// arena that is valid for the registry's lifetime.
-    fn with_generic_arena<T, F, R>(&self, f: F) -> R
-    where
-        T: Clone + Send + Sync + 'static,
-        F: FnOnce(&GenericArena<T>) -> R,
-    {
-        let arena_ptr = self
-            .registry
-            .ensure_arena::<T, _>(|| Box::new(GenericArena::<T>::new()));
+    /// Look up (creating if necessary) the arena for value type `T`
+    /// via the Value trait. Returns a `&dyn ErasedArena` that the
+    /// Value trait's methods downcast to the concrete arena type.
+    ///
+    /// Per commit T: T's Value impl decides whether to route to
+    /// `AtomicPrimitiveArena<T>` (for primitives — tear-free reads)
+    /// or `GenericArena<T>` (for non-primitives — Option-gated).
+    /// The registry caches the arena per type so the factory runs
+    /// at most once per T per runtime.
+    fn arena_for<T: Value>(&self) -> &dyn ErasedArena {
+        let arena_ptr = self.registry.ensure_arena::<T, _>(|| T::create_arena());
         // SAFETY: `arena_ptr` was returned by the registry and is
-        // stable for the registry's lifetime (arenas are never removed
-        // and each arena lives at a fixed heap address via Box).
-        // The type assertion via downcast_ref is enforced by matching
-        // TypeId, so we cannot accidentally pull a differently-typed
-        // arena out from under the T parameter.
-        let arena: &GenericArena<T> = unsafe {
-            (*arena_ptr)
-                .as_any()
-                .downcast_ref::<GenericArena<T>>()
-                .expect("arena type mismatch; registry invariant violated")
-        };
-        f(arena)
+        // stable for the registry's lifetime (arenas are never
+        // removed and each arena lives at a fixed heap address via
+        // Box). The returned reference's lifetime is tied to &self,
+        // which outlives the registry.
+        unsafe { &*arena_ptr }
     }
 }
 
