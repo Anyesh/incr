@@ -461,6 +461,21 @@ impl NodeData {
         self.changed_at.load(Ordering::Relaxed)
     }
 
+    /// Update this node's last-verified revision. Relaxed store;
+    /// visibility to other threads is established by the subsequent
+    /// Release on the node's state cell.
+    #[inline]
+    pub(crate) fn set_verified_at(&self, revision: u64) {
+        self.verified_at.store(revision, Ordering::Relaxed);
+    }
+
+    /// Update this node's last-changed revision. Same ordering
+    /// argument as `set_verified_at`.
+    #[inline]
+    pub(crate) fn set_changed_at(&self, revision: u64) {
+        self.changed_at.store(revision, Ordering::Relaxed);
+    }
+
     /// Current dependency count.
     #[inline]
     pub(crate) fn dep_count(&self) -> u8 {

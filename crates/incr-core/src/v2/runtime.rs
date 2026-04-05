@@ -126,107 +126,38 @@ thread_local! {
     static COMPUTE_STACK: RefCell<Vec<ComputeFrame>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Type-erased compute closure. A query node's compute fn takes the
-/// runtime (so it can call `rt.get(...)` for dependencies) and returns
-/// a `Box<dyn Any + Send + Sync>` which the runtime downcasts to the
-/// concrete value type at call time. The double boxing (Arc + Box)
-/// lets `run_compute` clone the Arc under a read lock and release the
-/// lock before calling the closure, avoiding reentrant lock issues.
-type ComputeFn = dyn Fn(&Runtime) -> Box<dyn Any + Send + Sync> + Send + Sync;
+/// Type-erased compute closure for a query node. Returns `true` if the
+/// new value differs from the previous arena value (so the runtime
+/// should bump `changed_at`), `false` if local early cutoff applied.
+/// The closure owns all T-specific work (user compute, early-cutoff
+/// comparison, arena write) so `run_compute` can be non-generic.
+type ComputeFn = dyn Fn(&Runtime, u32, bool) -> bool + Send + Sync;
 
-/// Runtime state protected by a single `RwLock`. Commit V consolidated
-/// the previously separate `compute_fns`, `dependents`, and
-/// `failure_messages` RwLocks into this struct so that each runtime
-/// operation acquires at most one lock from this trio instead of up to
-/// three.
-///
-/// The practical wins:
-///
-/// - `append_node` takes one write guard instead of three.
-/// - `set`'s query-node assertion takes one read guard instead of
-///   holding `compute_fns` separately.
-/// - `run_compute` still takes a brief read (to clone the compute Arc)
-///   and a later write (to publish reverse edges or stash a failure
-///   message), but both are on the same lock, so contention with other
-///   runtime operations is characterized by one readers-writer lock
-///   rather than three.
-/// - `mark_dependents_dirty` holds one read guard across the entire
-///   BFS walk and only upgrades to a write guard at the end when
-///   Failed nodes need their stashed messages cleared. Before V the
-///   walk re-acquired the dependents read lock for each visited node
-///   (two acquires per node: seed plus children probe), which
-///   contributed a large fraction of `propagate_chain_1000`'s cost.
-///
-/// Fields are parallel Vecs indexed by node slot. They grow together
-/// via `Runtime::append_node` and never shrink.
+/// Runtime state behind a single `RwLock`. Three parallel Vecs
+/// indexed by node slot, grown together via `append_node`.
 struct RuntimeInner {
-    /// Compute closures for query nodes. Indexed by node slot. `None`
-    /// for input nodes. `Arc` lets `run_compute` extract the closure
-    /// under a short-lived read guard and invoke it after the guard is
-    /// dropped, so nested `get` calls do not reenter this lock.
+    /// `None` for input nodes; `Some(arc)` for query nodes.
     compute_fns: Vec<Option<Arc<ComputeFn>>>,
-
-    /// Forward edges. `dependents[slot]` holds the list of nodes that
-    /// depend on the node at `slot`. Populated by `run_compute` after a
-    /// query publishes its recorded deps: for each dep, the computing
-    /// node is appended to that dep's dependents list. `set`'s dirty
-    /// walk reads this vector to find every query that needs
-    /// invalidation when an input changes.
-    ///
-    /// This is the spec's "parallel dependents vec" per section 5.1
-    /// (the NodeData docs also call it out as the resolved design for
-    /// the inline-vs-parallel ambiguity in the spec).
+    /// Forward edges: `dependents[slot]` lists nodes that depend on
+    /// `slot`. Spec section 5.1's parallel dependents vec.
     dependents: Vec<Vec<NodeId>>,
-
-    /// Failure messages for nodes in the `Failed` state. `Some(msg)`
-    /// when the node's most recent compute panicked, `None` otherwise.
-    /// Populated in the panic-catching path of `run_compute` and read
-    /// when `get` encounters a Failed node. Cleared when the dirty walk
-    /// transitions a node out of Failed (Failed → Dirty on an upstream
-    /// change, allowing a retry).
+    /// Stashed panic message for nodes in the Failed state, else
+    /// None. Cleared by the dirty walk on Failed → Dirty.
     failure_messages: Vec<Option<String>>,
 }
 
 /// The v2 incremental computation runtime.
 pub struct Runtime {
-    /// Stable identity for this runtime. Used by `Incr<T>` handles to
-    /// detect cross-runtime misuse. Adopted from the arena registry's
-    /// id so the two systems share one identity concept.
     id: RuntimeId,
-
-    /// Node storage. `SegmentedNodes` is a lock-free segmented store
-    /// that gives readers direct `&NodeData` access without any
-    /// RwLock acquisition (commit U replaced the prior
-    /// `RwLock<Vec<Box<NodeData>>>`). Segments are 1024 slots each,
-    /// allocated lazily and never moved or deallocated until the
-    /// store drops, so references obtained during reads remain
-    /// valid for the runtime's lifetime.
-    ///
-    /// Writers serialize through the runtime's `write_mutex`; no
-    /// writer contention on the `len` counter or segment allocation.
-    /// Readers Acquire-load `len` and then `&` the appropriate slot,
-    /// with the Release-Acquire pair on `len` synchronizing the
-    /// reader's view of the initialized NodeData.
+    /// Lock-free segmented node store. Readers get direct `&NodeData`
+    /// via Acquire on `len`; writers serialize through `write_mutex`.
     nodes: SegmentedNodes,
-
-    /// Consolidated runtime state (compute closures, forward edges,
-    /// failure messages). Commit V replaced three separate RwLocks
-    /// with this single one so each operation takes at most one lock
-    /// from this trio. See `RuntimeInner` for the field-level layout.
     inner: RwLock<RuntimeInner>,
-
-    /// Arena registry; owns the typed storage for node values.
     registry: ArenaRegistry,
-
-    /// Monotonic revision counter. Bumped on every `set`. Used by
-    /// `run_compute`'s post-compute revision check to detect whether a
-    /// writer raced during compute (commit P).
+    /// Monotonic revision counter. Bumped on every `set`; used by
+    /// the post-compute revision check to detect writer races.
     revision: AtomicU64,
-
-    /// Serializes all writer operations (`create_*`, `set`). The spec's
-    /// single-writer-many-readers model holds this mutex briefly for
-    /// the duration of an input update; here it also covers node
-    /// creation because we have a simpler store.
+    /// Serializes all writers (`create_*`, `set`).
     write_mutex: Mutex<()>,
 }
 
@@ -286,17 +217,7 @@ impl Runtime {
     }
 
     /// Create a query node whose value is produced by running `compute`.
-    ///
-    /// Reactivity: after the initial compute on first `get`, the value
-    /// is memoized until an input this query transitively depends on
-    /// changes, at which point the query is marked Dirty and the next
-    /// read triggers a recompute. Early cutoff applies: if a recompute
-    /// produces a value equal to the previous one, the arena write is
-    /// skipped, which saves a clone for expensive value types. Full
-    /// transitive early cutoff (where an unchanged recompute also
-    /// prevents downstream queries from recomputing) requires red-green
-    /// verification via `verified_at` / `changed_at` and is deferred
-    /// to a later commit.
+    /// The value is memoized until an upstream input changes.
     pub fn create_query<T, F>(&self, compute: F) -> Incr<T>
     where
         T: Value,
@@ -307,149 +228,145 @@ impl Runtime {
             .lock()
             .expect("runtime write mutex poisoned");
 
-        // Reserve an empty slot in the arena; first compute will
-        // populate it. For primitive types this zero-initializes the
-        // slot; for generic types it leaves the Option None.
         let arena_slot = T::reserve_empty(self.arena_for::<T>());
-
         let node = NodeData::new_query(0, arena_slot);
 
-        // Type-erase the closure: return a Box<dyn Any + Send + Sync>
-        // that the runtime downcasts to T at call time.
-        let erased: Arc<ComputeFn> = Arc::new(move |rt: &Runtime| -> Box<dyn Any + Send + Sync> {
-            let value = compute(rt);
-            Box::new(value) as Box<dyn Any + Send + Sync>
-        });
+        // Wrap the user closure in a type-erased adapter that owns all
+        // T-specific post-compute work so `run_compute` can be
+        // non-generic. `try_read` handles the Failed→Dirty retry case
+        // where the previous compute panicked before writing.
+        let erased: Arc<ComputeFn> = Arc::new(
+            move |rt: &Runtime, _slot: u32, is_recompute: bool| -> bool {
+                let new_value: T = compute(rt);
+                let arena = rt.arena_for::<T>();
+                let value_changed = if is_recompute {
+                    match T::try_read(arena, arena_slot) {
+                        Some(old_value) => old_value != new_value,
+                        None => true,
+                    }
+                } else {
+                    true
+                };
+                if value_changed {
+                    T::write(arena, arena_slot, new_value);
+                }
+                value_changed
+            },
+        );
 
         let slot = self.append_node(node, Some(erased));
         Incr::new(slot, 0, self.id)
     }
 
-    /// Read the value of a node.
-    ///
-    /// The fast path (observing `Clean`) holds a `nodes.read()` guard
-    /// across the arena read so that no writer can mutate the slot
-    /// concurrently: `set` takes `nodes.write()`, which is mutually
-    /// exclusive with any outstanding `nodes.read()`. This is the
-    /// commit-F correctness fallback for the reader-writer race on
-    /// `GenericArena<T>` slots that was discovered in review finding C1.
-    /// A later commit replaces nodes with a segmented store and uses a
-    /// proper hazard / RCU scheme so reads do not need the RwLock gate.
+    /// Read the value of a node. Fast path is a lock-free Clean check;
+    /// slow path delegates to the type-erased `ensure_clean` walker.
     pub fn get<T>(&self, handle: Incr<T>) -> T
     where
         T: Value,
     {
         self.check_runtime(handle);
-        // Combined cycle check + dep recording. Commit V inlines the
-        // previously separate `check_for_cycle` and `record_dep`
-        // helpers into a single thread-local access so the hot path
-        // (top-level get, COMPUTE_STACK empty) performs one RefCell
-        // borrow and early-returns, instead of three separate
-        // borrows. See `check_cycle_and_record_dep` for the full
-        // semantics; the hot path is the `is_empty` branch.
         self.check_cycle_and_record_dep(handle.slot());
-        loop {
-            // Fast path (Clean): direct lock-free access via the
-            // segmented nodes store. No RwLock. Reader/writer
-            // synchronization on the arena slot is delegated to the
-            // Value trait implementation (atomic loads for primitive
-            // types, per-slot mutex for generic types).
-            {
-                let node = self.nodes.get(handle.slot());
-                node.verify_handle(handle, self.id)
-                    .unwrap_or_else(|e| panic!("{}", e));
-                if node.state() == NodeState::Clean {
-                    let arena_slot = node.arena_slot();
-                    let value: T = T::read(self.arena_for::<T>(), arena_slot);
-                    return value;
-                }
+
+        let node = self.nodes.get(handle.slot());
+        node.verify_handle(handle, self.id)
+            .unwrap_or_else(|e| panic!("{}", e));
+        if node.state() == NodeState::Clean {
+            let arena_slot = node.arena_slot();
+            return T::read(self.arena_for::<T>(), arena_slot);
+        }
+
+        self.ensure_clean(handle.slot());
+        let arena_slot = self.nodes.get(handle.slot()).arena_slot();
+        T::read(self.arena_for::<T>(), arena_slot)
+    }
+
+    /// Iterative post-order walker: drive the node at `target` to
+    /// Clean. Each stack entry is `(slot, visited)`. Unvisited: push
+    /// self back as visited, then push not-yet-Clean deps. Visited:
+    /// deps are Clean, run the compute. Cycle detection in user dep
+    /// graphs still flows through `COMPUTE_STACK` via
+    /// `check_cycle_and_record_dep`; this walker can't hit a cycle
+    /// because the dep graph is a DAG by construction.
+    fn ensure_clean(&self, target: u32) {
+        if self.nodes.get(target).state() == NodeState::Clean {
+            return;
+        }
+
+        let mut stack: Vec<(u32, bool)> = Vec::with_capacity(16);
+        stack.push((target, false));
+
+        while let Some((slot, visited)) = stack.pop() {
+            if visited {
+                self.compute_slot_via_walker(slot);
+                continue;
             }
 
-            // Slow path: not Clean. Check the state and dispatch.
-            let state = self.nodes.get(handle.slot()).state();
-            match state {
-                NodeState::Clean => {
-                    // Raced with a compute completion between our fast
-                    // path check and here. Loop to re-enter the fast path.
-                }
-                NodeState::New => {
-                    // First-time compute. CAS New or Dirty to Computing
-                    // via try_claim_compute (which accepts both source
-                    // states). If we win we own the compute; if we lose,
-                    // another thread won and will transition to Clean.
-                    let claimed = self
-                        .nodes
-                        .get(handle.slot())
-                        .state_cell()
-                        .try_claim_compute()
-                        .is_ok();
-                    if claimed {
-                        self.run_compute::<T>(handle.slot(), false);
-                    } else {
-                        std::hint::spin_loop();
-                    }
-                }
-                NodeState::Dirty => {
-                    // Recompute. Same CAS path as New (try_claim_compute
-                    // handles both source states), but `is_recompute` is
-                    // true so run_compute uses the dep-diff path.
-                    let claimed = self
-                        .nodes
-                        .get(handle.slot())
-                        .state_cell()
-                        .try_claim_compute()
-                        .is_ok();
-                    if claimed {
-                        self.run_compute::<T>(handle.slot(), true);
-                    } else {
-                        std::hint::spin_loop();
-                    }
-                }
+            let node = self.nodes.get(slot);
+            match node.state() {
+                NodeState::Clean => {}
+                NodeState::Failed => self.panic_with_failure(slot),
                 NodeState::Computing => {
-                    // Another thread (or a prior CAS from this thread
-                    // in a nested call) is running the compute. Spin.
                     std::hint::spin_loop();
+                    stack.push((slot, false));
                 }
-                NodeState::Failed => {
-                    // A prior compute panicked and the node was
-                    // transitioned to Failed. Look up the stored
-                    // failure message and panic with it so the
-                    // caller sees the original diagnostic. Retry
-                    // is only possible via an upstream change that
-                    // transitions Failed → Dirty through the walk.
-                    let msg = {
-                        let inner = self.inner.read().expect("runtime inner lock poisoned");
-                        inner.failure_messages[handle.slot() as usize].clone()
-                    };
-                    panic!(
-                        "v2 runtime: node at slot {} is Failed: {}",
-                        handle.slot(),
-                        msg.as_deref().unwrap_or("unknown failure")
-                    );
+                NodeState::New | NodeState::Dirty => {
+                    stack.push((slot, true));
+                    node.for_each_dep(|dep| {
+                        if self.nodes.get(dep.0).state() != NodeState::Clean {
+                            stack.push((dep.0, false));
+                        }
+                    });
                 }
             }
         }
     }
 
+    /// Post-order-visit handler for `ensure_clean`. Loops until the
+    /// slot is observably Clean: `run_compute` may transition back
+    /// to Dirty when the commit-P revision check detects a
+    /// concurrent writer race, in which case we retry.
+    fn compute_slot_via_walker(&self, slot: u32) {
+        loop {
+            let state = self.nodes.get(slot).state();
+            match state {
+                NodeState::Clean => return,
+                NodeState::Failed => self.panic_with_failure(slot),
+                NodeState::Computing => std::hint::spin_loop(),
+                NodeState::New | NodeState::Dirty => {
+                    let claimed = self
+                        .nodes
+                        .get(slot)
+                        .state_cell()
+                        .try_claim_compute()
+                        .is_ok();
+                    if claimed {
+                        self.run_compute(slot, state == NodeState::Dirty);
+                        continue;
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+
+    /// Panic with a Failed node's stashed compute-closure message.
+    #[cold]
+    fn panic_with_failure(&self, slot: u32) -> ! {
+        let msg = {
+            let inner = self.inner.read().expect("runtime inner lock poisoned");
+            inner.failure_messages[slot as usize].clone()
+        };
+        panic!(
+            "v2 runtime: node at slot {} is Failed: {}",
+            slot,
+            msg.as_deref().unwrap_or("unknown failure")
+        );
+    }
+
     /// Update an input node's value. Panics if the handle refers to a
-    /// query node.
-    ///
-    /// Takes `nodes.write()` rather than `nodes.read()` for the
-    /// duration of the arena mutation. This excludes all concurrent
-    /// `get` callers (which hold `nodes.read()` on their fast path)
-    /// so the writer has exclusive access to the arena slot while
-    /// calling `arena.write(slot, value)`, which for `GenericArena<T>`
-    /// is a plain non-atomic store that drops the old `T` and
-    /// installs a new one. Without this exclusion a concurrent reader
-    /// could observe a torn value (review finding C1).
-    ///
-    /// Commit U replaces the nodes RwLock with a lock-free segmented
-    /// store. C1 synchronization between readers and writers of the
-    /// same arena slot now lives at the Value trait layer: primitive
-    /// types route to `AtomicPrimitiveArena` where reads and writes
-    /// are tear-free atomic operations, and non-primitive types
-    /// route to `GenericArena` which (in commit U) gains per-slot
-    /// mutex synchronization around the `Option<T>` cell.
+    /// query node. Writer/reader exclusion on the arena slot is
+    /// handled by the Value trait (atomic for primitives, per-slot
+    /// mutex for generics); `write_mutex` only serializes writers.
     pub fn set<T>(&self, handle: Incr<T>, value: T)
     where
         T: Value,
@@ -460,9 +377,6 @@ impl Runtime {
             .lock()
             .expect("runtime write mutex poisoned");
 
-        // Direct lock-free access to the node; write_mutex serializes
-        // us against other writers and the Value trait handles
-        // reader/writer exclusion on the arena slot.
         let node = self.nodes.get(handle.slot());
         node.verify_handle(handle, self.id)
             .unwrap_or_else(|e| panic!("{}", e));
@@ -476,52 +390,27 @@ impl Runtime {
         );
         let arena_slot = node.arena_slot();
 
-        // Early cutoff: if the new value equals the current value,
-        // treat this set as a no-op. Skip the arena write, skip the
-        // revision bump, and skip the dirty walk.
+        // Early cutoff: same-value set is a no-op.
         let current: T = T::read(self.arena_for::<T>(), arena_slot);
         if current == value {
             return;
         }
 
-        // Arena write. For primitive types this is a tear-free
-        // atomic store via AtomicPrimitiveArena and safe against
-        // concurrent readers. For generic types this is a
-        // mutex-guarded replacement via GenericArena (commit U) and
-        // also safe against concurrent readers.
         T::write(self.arena_for::<T>(), arena_slot, value);
-
-        // State was and remains Clean. This Release store anchors
-        // the memory ordering contract for any reader that observes
-        // the Clean state via Acquire: it synchronizes with the
-        // arena write above for the non-atomic generic path.
+        let new_revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
+        node.set_changed_at(new_revision);
+        node.set_verified_at(new_revision);
+        // State was and remains Clean; the Release store anchors the
+        // arena write and revision bumps for readers that Acquire
+        // Clean.
         node.state_cell().store_release(NodeState::Clean);
-
-        self.revision.fetch_add(1, Ordering::Relaxed);
-
-        // Transitively mark every query reachable from this input as
-        // Dirty. Done after the input's new value is published (both
-        // the arena write and the state Release above have completed)
-        // so that any reader that observes a dependent Dirty and then
-        // recomputes is guaranteed to see the new input value via the
-        // Release-Acquire chain on the dependent's state. The walk
-        // runs outside the nodes.write() guard because (a) it only
-        // needs read access to nodes and (b) it takes its own brief
-        // locks on dependents and state cells for each visited node.
         self.mark_dependents_dirty(handle.slot());
     }
 
     // -- internal helpers --------------------------------------------------
 
-    /// Append a new node to the store and the parallel compute_fns,
-    /// dependents, and failure_messages vecs, returning the slot.
-    /// Called from the write-mutex-guarded paths.
-    ///
-    /// The nodes store is lock-free (commit U) and manages its own
-    /// synchronization via Release on `len`; only the parallel vecs
-    /// in `inner` need explicit write-lock acquisition. Commit V
-    /// merged the three previously separate RwLocks into a single
-    /// `inner` lock, so this helper takes one write guard.
+    /// Append a new node to the store and the parallel vecs in
+    /// `inner`, returning the slot. Caller must hold `write_mutex`.
     fn append_node(&self, node: NodeData, compute: Option<Arc<ComputeFn>>) -> u32 {
         let slot = self.nodes.push(node);
 
@@ -552,50 +441,18 @@ impl Runtime {
         }
     }
 
-    /// Combined cycle detection + dep recording for the `get` hot path.
-    ///
-    /// Commit V folded the previously separate `check_for_cycle` and
-    /// `record_dep` helpers into this single function so that the
-    /// common case (top-level `rt.get` with no active compute frame)
-    /// performs one RefCell borrow that early-returns, instead of two
-    /// back-to-back borrows that each walked or pushed to the stack.
-    /// The measurable impact is ~5 ns on `hot_clean_read_input_u64`
-    /// and `hot_clean_read_query_u64`.
-    ///
-    /// Semantics when the stack is non-empty are identical to the
-    /// pre-V split:
-    ///
-    /// 1. **Cycle detection (spec section 9).** Walk every frame on
-    ///    this thread's stack. If any frame belongs to this runtime
-    ///    and refers to `slot`, the caller is trying to `get` a node
-    ///    that is already computing on the same thread. Panic with
-    ///    a CycleError diagnostic. Cross-runtime frames are skipped
-    ///    because a cycle inside runtime A cannot pass through
-    ///    runtime B's dep graph.
-    ///
-    /// 2. **Dep recording.** If the top frame belongs to this runtime
-    ///    and is not a self-read (which the cycle check above would
-    ///    already have caught with a panic, so this guard is
-    ///    belt-and-suspenders), push `slot` onto the top frame's
-    ///    deps. Dep recording is silently skipped when the top frame
-    ///    belongs to a different runtime (cross-runtime compute
-    ///    closure) or when the stack is empty (top-level get).
-    ///
-    /// The cycle check precedes the dep push so a cycling `rt.get`
-    /// never contaminates a parent frame's dep list with a self- or
-    /// back-edge before it panics.
+    /// Combined cycle detection and dep recording for the `get` hot
+    /// path. Hot path is an empty-stack early return (one RefCell
+    /// borrow). On a non-empty stack, walks all frames for cycles
+    /// (spec section 9), then pushes `slot` onto the top frame's
+    /// deps if it belongs to this runtime and isn't a self-read.
     #[inline]
     fn check_cycle_and_record_dep(&self, slot: u32) {
         COMPUTE_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
-            // Hot path: no active compute frame. No cycle is possible
-            // (cycles require at least one frame) and there is no
-            // frame to record a dep on. Early-return after the single
-            // borrow_mut / is_empty pair.
             if stack.is_empty() {
                 return;
             }
-            // Cycle detection: walk every frame on the stack.
             for frame in stack.iter() {
                 if frame.runtime_id == self.id && frame.node_slot == slot {
                     panic!(
@@ -605,8 +462,6 @@ impl Runtime {
                     );
                 }
             }
-            // Dep recording: push onto the top frame if it belongs to
-            // this runtime and is not a self-read.
             if let Some(frame) = stack.last_mut() {
                 if frame.runtime_id == self.id && frame.node_slot != slot {
                     frame.deps.push(NodeId(slot));
@@ -679,32 +534,55 @@ impl Runtime {
     }
 
     /// Run the compute closure for a query node and transition its
-    /// state to Clean. The caller must have already CAS'd the state
-    /// from New or Dirty to Computing.
+    /// state to Clean (or Dirty if a concurrent writer raced). The
+    /// caller must have already CAS'd the state from New or Dirty to
+    /// Computing via `try_claim_compute`, and `ensure_clean`'s
+    /// iterative walker guarantees every dep is already Clean by the
+    /// time we get here.
     ///
-    /// `is_recompute = false` on the first compute (source state was
-    /// New) publishes recorded deps and reverse edges.
-    /// `is_recompute = true` on a recompute (source state was Dirty)
-    /// skips both, assuming the dep set is unchanged between runs.
-    /// Dynamic dependencies (where the dep set differs between runs)
-    /// are not supported in this commit: the recompute path will
-    /// silently use the stale dep list and produce a correct value
-    /// for the original deps but miss any new deps that would have
-    /// been discovered on this run. A follow-up commit adds dep
-    /// diff + epoch reclamation for the dynamic case.
-    ///
-    /// Dep tracking still happens on every run (the COMPUTE_STACK
-    /// frame is pushed and popped) because it is cheap and symmetric,
-    /// and because skipping it would leave stale state on the stack
-    /// if a future change starts using the recorded deps on recompute.
-    fn run_compute<T>(&self, slot: u32, is_recompute: bool)
-    where
-        T: Value,
-    {
-        // Extract the compute closure under a short-lived read guard.
-        // Clone the Arc so we can drop the guard before calling, which
-        // means the closure may freely recurse into self.get without
-        // self-deadlocking on `inner`.
+    /// On Dirty recomputes, red-green runs before anything else:
+    /// load each dep's `changed_at` and compare against our
+    /// `verified_at`. If nothing moved, skip the closure entirely,
+    /// bump `verified_at`, Release Clean. This is the spec's section
+    /// 14 transitive early cutoff. Red-green must precede the
+    /// `inner.read()` Arc clone and frame push so short-circuits pay
+    /// neither cost.
+    fn run_compute(&self, slot: u32, is_recompute: bool) {
+        let revision_at_start = self.revision.load(Ordering::Relaxed);
+
+        // Red-green short-circuit: only on recompute, only when no
+        // dep has moved since our last verification.
+        if is_recompute {
+            let node = self.nodes.get(slot);
+            let my_verified = node.verified_at();
+            let mut any_dep_changed = false;
+            node.for_each_dep(|dep| {
+                if any_dep_changed {
+                    return;
+                }
+                if self.nodes.get(dep.0).changed_at() > my_verified {
+                    any_dep_changed = true;
+                }
+            });
+
+            if !any_dep_changed {
+                let revision_at_end = self.revision.load(Ordering::Relaxed);
+                if revision_at_end != revision_at_start {
+                    // Writer raced during our red-green walk; go
+                    // Dirty and let the next reader retry.
+                    node.state_cell().store_release(NodeState::Dirty);
+                    return;
+                }
+                // Do NOT touch `changed_at`: downstream red-green
+                // checks need to see it unchanged so they too can
+                // short-circuit.
+                node.set_verified_at(revision_at_end);
+                node.state_cell().store_release(NodeState::Clean);
+                return;
+            }
+        }
+
+        // Full compute path.
         let compute = {
             let inner = self.inner.read().expect("runtime inner lock poisoned");
             inner.compute_fns[slot as usize]
@@ -712,54 +590,14 @@ impl Runtime {
                 .expect("query node has no compute closure")
                 .clone()
         };
-
-        // Snapshot the revision BEFORE the compute runs. After the
-        // compute returns, we compare this to the current revision.
-        // If any writer called `set` during our compute (bumping the
-        // revision), our result may be based on stale input values
-        // that the writer's dirty walk could not mark us Dirty for
-        // because we were Computing. In that case we transition to
-        // Dirty instead of Clean so the next reader retries the
-        // compute with fresh inputs. This closes the "Computing-
-        // during-dirty-walk" race the commit J docs flagged as a
-        // known limitation.
-        let revision_at_start = self.revision.load(Ordering::Relaxed);
-
-        // Push a compute frame so that any `rt.get` calls made by the
-        // closure record their handles as dependencies of this node.
         self.push_compute_frame(slot);
 
-        // Run the closure outside any lock, inside a catch_unwind
-        // boundary so a panic inside the closure does not leave the
-        // COMPUTE_STACK in an inconsistent state or poison the whole
-        // runtime. `AssertUnwindSafe` is safe here because the runtime
-        // state we touch on unwind (stack, failure_messages, node
-        // state cell) is explicitly restored in the error arm below.
-        //
-        // Per spec section 8: a caught panic transitions the node to
-        // Failed, stashes a string representation of the panic payload
-        // so subsequent `get` calls can report it, and re-raises the
-        // panic so the original `rt.get` caller sees the diagnostic
-        // rather than a silently-swallowed failure. The re-raise is
-        // important: a compute panic is a programmer error and needs
-        // to be visible, not absorbed.
-        let value_box_result: std::thread::Result<Box<dyn Any + Send + Sync>> =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (compute)(self)));
-
-        // Pop the frame regardless of compute outcome. In the Ok
-        // branch this restores the parent frame for continued dep
-        // tracking; in the Err branch it prevents a leaked frame
-        // from corrupting subsequent computes on the same thread.
+        let value_changed_result: std::thread::Result<bool> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (compute)(self, slot, is_recompute)
+            }));
         let recorded_deps = self.pop_compute_frame(slot);
 
-        // Publish dependencies and reverse edges. On first compute
-        // we install them fresh; on recompute we diff against the
-        // previous set and update only the differences. Both paths
-        // run regardless of whether the compute succeeded or
-        // panicked, because a partial dep record from a panicked
-        // compute is still the most accurate information we have
-        // and it lets the dirty walk reach a Failed node on a
-        // subsequent upstream change (enabling retry).
         if !is_recompute {
             self.nodes.get(slot).publish_initial_deps(&recorded_deps);
             if !recorded_deps.is_empty() {
@@ -769,86 +607,34 @@ impl Runtime {
                 }
             }
         } else {
-            // Recompute: diff the new recorded deps against the
-            // node's previous dep list and update only the
-            // differences. Handles the dynamic-deps case where a
-            // compute reads a different set of deps on different
-            // runs (e.g., a conditional that branches on an input
-            // value).
             self.update_deps_on_recompute(slot, &recorded_deps);
         }
 
-        // Handle the compute result. The panic arm runs AFTER the
-        // dep publish above, so a Failed node has enough reverse-
-        // edge bookkeeping in place for the dirty walk to find it
-        // on the next upstream change.
-        let value_box = match value_box_result {
-            Ok(v) => v,
+        let value_changed = match value_changed_result {
+            Ok(c) => c,
             Err(panic_payload) => {
-                // Extract a readable message from the panic payload.
-                // Rust panic payloads are `Box<dyn Any + Send>`; the
-                // common cases are `&'static str` (from `panic!("...")`
-                // with a string literal) and `String` (from
-                // `panic!("{}", ...)`).
+                // Stash the message and transition Failed before
+                // re-raising. Dep bookkeeping above is preserved so
+                // the next upstream change can Failed → Dirty retry.
                 let msg = extract_panic_message(&panic_payload);
-
-                // Stash the message before transitioning state so a
-                // reader that observes Failed can immediately retrieve
-                // it. The lock is held briefly.
                 {
                     let mut inner = self.inner.write().expect("runtime inner lock poisoned");
                     inner.failure_messages[slot as usize] = Some(msg);
                 }
-
-                // Transition the node to Failed with Release so that
-                // subsequent readers observing Failed also observe
-                // the stored failure message via the happens-before
-                // chain (read lock on inner + Release on state gives
-                // the necessary ordering).
                 self.nodes
                     .get(slot)
                     .state_cell()
                     .store_release(NodeState::Failed);
-
-                // Re-raise the panic so the `rt.get` caller that
-                // triggered this compute sees it. This unwinds past
-                // the caller's frame too; a caller who wants to
-                // handle the error without dying needs to wrap the
-                // `rt.get` in `catch_unwind` themselves (a future
-                // `try_get` method provides the ergonomic version).
                 std::panic::resume_unwind(panic_payload);
             }
         };
 
-        // Downcast to the caller's expected type. A mismatch here is a
-        // bug in how `create_query` packed the closure; it should be
-        // impossible from safe user code because `create_query<T, F>`
-        // binds T at the call site.
-        let new_value: T = *value_box
-            .downcast::<T>()
-            .expect("compute function returned wrong type");
-
-        // Look up the arena slot for this node.
-        let arena_slot = self.nodes.get(slot).arena_slot();
-
-        // Post-compute revision check: if the revision bumped during
-        // our compute, at least one writer ran `set` while we were
-        // computing, and the dirty walk from that set could not mark
-        // us Dirty because our state was Computing. Our result may
-        // be stale. Transition to Dirty instead of Clean so the next
-        // reader retries the compute against the fresh input values.
-        // Skip the arena write in this case: writing the stale value
-        // would pollute the slot with wrong data if an early-cutoff-
-        // style optimization later decided to believe it.
+        // Post-compute revision check: if a writer raced during the
+        // compute, our result may be based on stale inputs. Go Dirty
+        // and let the next reader retry; skip the verified_at/
+        // changed_at updates.
         let revision_at_end = self.revision.load(Ordering::Relaxed);
-        let stale_due_to_concurrent_write = revision_at_end != revision_at_start;
-
-        if stale_due_to_concurrent_write {
-            // Do not write the stale value. Transition to Dirty via
-            // Release so the next reader observes Dirty and retries.
-            // The recorded_deps are still published above, so the
-            // retry has an accurate dep list for the dirty walk to
-            // reach it on subsequent sets.
+        if revision_at_end != revision_at_start {
             self.nodes
                 .get(slot)
                 .state_cell()
@@ -856,42 +642,14 @@ impl Runtime {
             return;
         }
 
-        // Early cutoff on recompute: if the new value equals the value
-        // currently in the arena (from a previous compute), skip the
-        // arena write. This saves the clone inside `arena.write` for
-        // large types. Only applies to recomputes, because a first
-        // compute starts from an uninitialized slot and must always
-        // write. Full transitive early cutoff (where an unchanged
-        // recompute prevents downstream queries from recomputing)
-        // requires red-green verification via `verified_at` /
-        // `changed_at` and is deferred to a later commit.
-        //
-        // Uses `try_read` rather than `read` because a Failed → Dirty
-        // retry (commit L) may call `run_compute` with is_recompute
-        // true even though the slot has never been written: the
-        // previous compute panicked before writing, so the cell is
-        // still `None`. In that case there is nothing to compare
-        // against and we must always write.
-        let should_write = if is_recompute {
-            match T::try_read(self.arena_for::<T>(), arena_slot) {
-                Some(old_value) => old_value != new_value,
-                None => true,
-            }
-        } else {
-            true
-        };
-
-        if should_write {
-            T::write(self.arena_for::<T>(), arena_slot, new_value);
+        // Update red-green revisions. `changed_at` only on actual
+        // value change so local early cutoff propagates transitively.
+        let node = self.nodes.get(slot);
+        if value_changed {
+            node.set_changed_at(revision_at_end);
         }
-
-        // Release-store state to Clean. This publishes the arena write
-        // (and any dep list changes) together with the state
-        // transition to readers that Acquire-load state afterward.
-        self.nodes
-            .get(slot)
-            .state_cell()
-            .store_release(NodeState::Clean);
+        node.set_verified_at(revision_at_end);
+        node.state_cell().store_release(NodeState::Clean);
     }
 
     /// Diff the new recorded deps against the node's previous dep
@@ -990,61 +748,23 @@ impl Runtime {
         }
     }
 
-    /// Transitively mark every query reachable from `changed_slot`
-    /// (via forward edges in `dependents`) as Dirty.
-    ///
-    /// Called from `set` after the input's new value is written and
-    /// published. Walks the dependents graph breadth-first from the
-    /// changed input, using `try_transition(Clean, Dirty)` on each
-    /// visited query. Nodes in states other than Clean are skipped:
-    ///
-    /// - New: never computed, nothing to invalidate.
-    /// - Dirty: already marked by a previous walk.
-    /// - Computing: concurrent recompute in progress on another
-    ///   thread. The walk's `try_transition(Clean, Dirty)` fails
-    ///   silently for this node, which would leak a stale result
-    ///   if the compute finished with a pre-set value and
-    ///   Release-stored Clean. Commit P's post-compute revision
-    ///   check in `run_compute` handles this: before transitioning
-    ///   out of Computing, the compute thread compares the current
-    ///   revision to the revision it recorded at compute start, and
-    ///   transitions to Dirty (not Clean) if they differ. Any set
-    ///   that raced with Computing bumped the revision, so the
-    ///   mismatch is detected and the next reader retries.
-    /// - Failed: the node's last compute panicked. The walk attempts
-    ///   Failed → Dirty so an upstream change gives the failed node
-    ///   a chance to retry on the next read (per spec section 8).
-    ///   If the transition succeeds, the stashed failure message is
-    ///   cleared.
-    ///
-    /// The walk does not mark the changed node itself (it is an input
-    /// and stays Clean by convention; only its dependents are
-    /// potentially stale).
+    /// BFS from `changed_slot`'s dependents, transitioning each
+    /// reachable query to Dirty (or Failed → Dirty, for retry on
+    /// upstream change). Holds one `inner` read guard across the
+    /// entire walk to avoid per-node lock acquires. Clean→Dirty is
+    /// the common case; other source states (New, Dirty, Computing)
+    /// are skipped — Computing races are handled by the
+    /// post-compute revision check in `run_compute`. Failed nodes
+    /// that transition back to Dirty have their stashed messages
+    /// cleared at the end in one batched write.
     fn mark_dependents_dirty(&self, changed_slot: u32) {
         use std::collections::HashSet;
         let mut visited: HashSet<u32> = HashSet::new();
         let mut queue: Vec<u32> = Vec::new();
-        // Track nodes whose Failed state we transitioned to Dirty
-        // so we can clear their stashed failure messages at the end
-        // of the walk (one batched write lock on inner instead of
-        // one per node).
         let mut cleared_failures: Vec<u32> = Vec::new();
 
-        // Commit V: hold a single `inner` read guard across the
-        // entire BFS walk. Before V, the dependents vector lived
-        // behind its own RwLock and the walk re-acquired a read
-        // lock both to seed from the changed node's direct
-        // dependents and again for every visited node's children.
-        // On `propagate_chain_1000` that was ~2000 lock acquires
-        // for a single `set`. Holding one read guard collapses
-        // those to 1 and still allows concurrent readers; the only
-        // contention is with a concurrent writer (run_compute
-        // publishing reverse edges, another set), which is rare
-        // in practice because set serializes through write_mutex
-        // and run_compute's dep publish is a brief write.
         {
             let inner = self.inner.read().expect("runtime inner lock poisoned");
-            // Seed the queue with the changed node's direct dependents.
             for dep in &inner.dependents[changed_slot as usize] {
                 if visited.insert(dep.0) {
                     queue.push(dep.0);
@@ -1052,13 +772,6 @@ impl Runtime {
             }
 
             while let Some(slot) = queue.pop() {
-                // Try Clean → Dirty first (the common case). If that
-                // fails, try Failed → Dirty to allow retry of a failed
-                // compute after an upstream change. Other source states
-                // (New, Computing, Dirty) are skipped silently. State
-                // cells are atomic and don't need the inner guard,
-                // but we hold it anyway for the dependents indexing
-                // below.
                 let cell = self.nodes.get(slot).state_cell();
                 if cell
                     .try_transition(NodeState::Clean, NodeState::Dirty)
@@ -1070,12 +783,9 @@ impl Runtime {
                     cleared_failures.push(slot);
                 }
 
-                // Walk forward from this node regardless of whether the
-                // transition succeeded. Even if we did not transition this
-                // node (e.g., it was already Dirty), its dependents may
-                // not yet have been visited on a previous walk, and they
-                // might still be Clean and need marking. The visited set
-                // prevents revisiting a node we have already queued.
+                // Walk forward regardless of whether we transitioned
+                // this node: dependents below may still be Clean and
+                // need marking.
                 for child in &inner.dependents[slot as usize] {
                     if visited.insert(child.0) {
                         queue.push(child.0);
@@ -1084,9 +794,6 @@ impl Runtime {
             }
         }
 
-        // Clear the stashed failure messages for nodes that
-        // transitioned Failed → Dirty. One write lock for the whole
-        // batch keeps this cheap even when many nodes retry at once.
         if !cleared_failures.is_empty() {
             let mut inner = self.inner.write().expect("runtime inner lock poisoned");
             for slot in cleared_failures {
@@ -1138,12 +845,9 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
     }
 }
 
-// SAFETY: Runtime's fields are all Send + Sync already (SegmentedNodes,
-// RwLock<RuntimeInner>, Mutex, ArenaRegistry, AtomicU64, RuntimeId).
-// The compute closures are bound to `Fn + Send + Sync + 'static`, so
-// the `Arc<ComputeFn>` values inside `inner.compute_fns` are Send + Sync,
-// and the remaining `inner` fields (`Vec<Vec<NodeId>>` and
-// `Vec<Option<String>>`) are trivially Send + Sync.
+// Runtime is Send + Sync via its fields: compute closures are bound
+// to `Fn + Send + Sync + 'static`, and everything else is either
+// atomic or wrapped in RwLock/Mutex.
 
 #[cfg(test)]
 mod tests {
@@ -1468,10 +1172,7 @@ mod tests {
         rt.nodes.get(slot).collect_deps()
     }
 
-    /// Read a node's published dependents (forward edges). Test-only
-    /// helper for commit I's reverse-edge bookkeeping. Commit V
-    /// folded the dependents RwLock into the consolidated `inner`
-    /// lock, so this helper reads through `rt.inner`.
+    /// Test-only: read a node's published dependents (forward edges).
     fn collect_dependents_for_slot(rt: &Runtime, slot: u32) -> Vec<super::super::node::NodeId> {
         let inner = rt.inner.read().unwrap();
         inner.dependents[slot as usize].clone()
@@ -2123,9 +1824,6 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// Read a node's stashed failure message for test assertions.
-    /// Commit V folded the failure_messages RwLock into the
-    /// consolidated `inner` lock, so this helper reads through
-    /// `rt.inner`.
     fn failure_message_for(rt: &Runtime, slot: u32) -> Option<String> {
         let inner = rt.inner.read().unwrap();
         inner.failure_messages[slot as usize].clone()

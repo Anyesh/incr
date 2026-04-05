@@ -205,6 +205,82 @@ fn bench_propagate_chain_1000() {
 
 #[test]
 #[ignore = "benchmark, run with --release"]
+fn bench_propagate_chain_1000_stable_intermediate() {
+    // Red-green transitive early cutoff showcase. A "stabilizer" q0
+    // reads the input but returns a constant; every downstream query
+    // is a `+ 1` of its predecessor. On set(input), red-green should
+    // short-circuit every level past q0 because q0's changed_at
+    // never moves. v1 has the same mechanism; v2 should match it.
+
+    fn build_v1(size: usize) -> (V1Runtime, crate::Incr<i64>, crate::Incr<i64>) {
+        let rt = V1Runtime::new();
+        let input = rt.create_input::<i64>(1);
+        let q0 = rt.create_query::<i64, _>(move |rt| {
+            let _ = rt.get(input);
+            0
+        });
+        let mut prev = q0;
+        for _ in 0..size {
+            let dep = prev;
+            prev = rt.create_query::<i64, _>(move |rt| rt.get(dep).wrapping_add(1));
+        }
+        let _ = rt.get(prev);
+        (rt, input, prev)
+    }
+
+    fn build_v2(
+        size: usize,
+    ) -> (
+        V2Runtime,
+        crate::v2::handle::Incr<i64>,
+        crate::v2::handle::Incr<i64>,
+    ) {
+        let rt = V2Runtime::new();
+        let input = rt.create_input::<i64>(1);
+        let q0 = rt.create_query::<i64, _>(move |rt| {
+            let _ = rt.get(input);
+            0
+        });
+        let mut prev = q0;
+        for _ in 0..size {
+            let dep = prev;
+            prev = rt.create_query::<i64, _>(move |rt| rt.get(dep).wrapping_add(1));
+        }
+        let _ = rt.get(prev);
+        (rt, input, prev)
+    }
+
+    let v1_ns = {
+        let (rt, input, output) = build_v1(1000);
+        let mut val: i64 = 100;
+        let start = Instant::now();
+        for _ in 0..ITERS_PROPAGATE {
+            val = val.wrapping_add(1);
+            rt.set(input, val);
+            black_box(rt.get(output));
+        }
+        let elapsed = start.elapsed();
+        elapsed.as_nanos() as f64 / ITERS_PROPAGATE as f64
+    };
+
+    let v2_ns = {
+        let (rt, input, output) = build_v2(1000);
+        let mut val: i64 = 100;
+        let start = Instant::now();
+        for _ in 0..ITERS_PROPAGATE {
+            val = val.wrapping_add(1);
+            rt.set(input, val);
+            black_box(rt.get(output));
+        }
+        let elapsed = start.elapsed();
+        elapsed.as_nanos() as f64 / ITERS_PROPAGATE as f64
+    };
+
+    report("propagate_chain_1000_stable_intermediate", v1_ns, v2_ns);
+}
+
+#[test]
+#[ignore = "benchmark, run with --release"]
 fn bench_set_input_only() {
     // Set an input with no dependents in a tight loop. Measures
     // set() cost without any dirty walk work: write mutex, arena
