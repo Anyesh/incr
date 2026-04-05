@@ -69,6 +69,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use super::arena::ErasedArena;
 use super::handle::{Incr, RuntimeId};
 use super::node::{NodeData, NodeId};
+use super::nodes_store::SegmentedNodes;
 use super::registry::ArenaRegistry;
 use super::state::NodeState;
 use super::value::Value;
@@ -140,18 +141,20 @@ pub struct Runtime {
     /// id so the two systems share one identity concept.
     id: RuntimeId,
 
-    /// Node storage. `Box<NodeData>` keeps each node at a stable heap
-    /// address across vec resizes; the `RwLock` allows concurrent reads
-    /// (one briefly per `get`) with exclusive access for the writer
-    /// (one briefly per `create_*` append).
+    /// Node storage. `SegmentedNodes` is a lock-free segmented store
+    /// that gives readers direct `&NodeData` access without any
+    /// RwLock acquisition (commit U replaced the prior
+    /// `RwLock<Vec<Box<NodeData>>>`). Segments are 1024 slots each,
+    /// allocated lazily and never moved or deallocated until the
+    /// store drops, so references obtained during reads remain
+    /// valid for the runtime's lifetime.
     ///
-    /// `clippy::vec_box` suggests collapsing `Vec<Box<NodeData>>` into
-    /// `Vec<NodeData>`, but that would invalidate pointers into nodes
-    /// on every `Vec` reallocation, which this design relies on
-    /// (`NodeData` carries atomics that cannot be relocated while
-    /// another thread is observing them). The Box is load-bearing.
-    #[allow(clippy::vec_box)]
-    nodes: RwLock<Vec<Box<NodeData>>>,
+    /// Writers serialize through the runtime's `write_mutex`; no
+    /// writer contention on the `len` counter or segment allocation.
+    /// Readers Acquire-load `len` and then `&` the appropriate slot,
+    /// with the Release-Acquire pair on `len` synchronizing the
+    /// reader's view of the initialized NodeData.
+    nodes: SegmentedNodes,
 
     /// Compute closures for query nodes. Indexed the same way as
     /// `nodes`. `None` for input nodes. `Arc` lets `run_compute` extract
@@ -204,7 +207,7 @@ impl Runtime {
         let registry = ArenaRegistry::new();
         Self {
             id: registry.id(),
-            nodes: RwLock::new(Vec::new()),
+            nodes: SegmentedNodes::new(),
             compute_fns: RwLock::new(Vec::new()),
             dependents: RwLock::new(Vec::new()),
             failure_messages: RwLock::new(Vec::new()),
@@ -245,7 +248,7 @@ impl Runtime {
 
         let arena_slot = T::reserve_with(self.arena_for::<T>(), initial);
 
-        let node = Box::new(NodeData::new_input(0, arena_slot, revision));
+        let node = NodeData::new_input(0, arena_slot, revision);
 
         let slot = self.append_node(node, None);
         Incr::new(slot, 0, self.id)
@@ -278,7 +281,7 @@ impl Runtime {
         // slot; for generic types it leaves the Option None.
         let arena_slot = T::reserve_empty(self.arena_for::<T>());
 
-        let node = Box::new(NodeData::new_query(0, arena_slot));
+        let node = NodeData::new_query(0, arena_slot);
 
         // Type-erase the closure: return a Box<dyn Any + Send + Sync>
         // that the runtime downcasts to T at call time.
@@ -319,11 +322,13 @@ impl Runtime {
         // even if the read panics or the node is still computing.
         self.record_dep(handle.slot());
         loop {
-            // Fast path (Clean): hold nodes.read() through the arena
-            // read so no writer can mutate the slot in between.
+            // Fast path (Clean): direct lock-free access via the
+            // segmented nodes store. No RwLock. Reader/writer
+            // synchronization on the arena slot is delegated to the
+            // Value trait implementation (atomic loads for primitive
+            // types, per-slot mutex for generic types).
             {
-                let nodes = self.nodes.read().expect("nodes lock poisoned");
-                let node = &nodes[handle.slot() as usize];
+                let node = self.nodes.get(handle.slot());
                 node.verify_handle(handle, self.id)
                     .unwrap_or_else(|e| panic!("{}", e));
                 if node.state() == NodeState::Clean {
@@ -333,14 +338,8 @@ impl Runtime {
                 }
             }
 
-            // Slow path: not Clean. Release the nodes guard before
-            // calling back into the runtime (CAS, compute, spin) so
-            // std::sync::RwLock is not reentered on this thread (std
-            // RwLock is not guaranteed reentrant).
-            let state = {
-                let nodes = self.nodes.read().expect("nodes lock poisoned");
-                nodes[handle.slot() as usize].state()
-            };
+            // Slow path: not Clean. Check the state and dispatch.
+            let state = self.nodes.get(handle.slot()).state();
             match state {
                 NodeState::Clean => {
                     // Raced with a compute completion between our fast
@@ -351,11 +350,12 @@ impl Runtime {
                     // via try_claim_compute (which accepts both source
                     // states). If we win we own the compute; if we lose,
                     // another thread won and will transition to Clean.
-                    let claimed = {
-                        let nodes = self.nodes.read().expect("nodes lock poisoned");
-                        let node = &nodes[handle.slot() as usize];
-                        node.state_cell().try_claim_compute().is_ok()
-                    };
+                    let claimed = self
+                        .nodes
+                        .get(handle.slot())
+                        .state_cell()
+                        .try_claim_compute()
+                        .is_ok();
                     if claimed {
                         self.run_compute::<T>(handle.slot(), false);
                     } else {
@@ -365,14 +365,13 @@ impl Runtime {
                 NodeState::Dirty => {
                     // Recompute. Same CAS path as New (try_claim_compute
                     // handles both source states), but `is_recompute` is
-                    // true so run_compute skips the dep publish path
-                    // (commit J assumes deps do not change between
-                    // runs; dynamic deps are a follow-up).
-                    let claimed = {
-                        let nodes = self.nodes.read().expect("nodes lock poisoned");
-                        let node = &nodes[handle.slot() as usize];
-                        node.state_cell().try_claim_compute().is_ok()
-                    };
+                    // true so run_compute uses the dep-diff path.
+                    let claimed = self
+                        .nodes
+                        .get(handle.slot())
+                        .state_cell()
+                        .try_claim_compute()
+                        .is_ok();
                     if claimed {
                         self.run_compute::<T>(handle.slot(), true);
                     } else {
@@ -420,17 +419,13 @@ impl Runtime {
     /// installs a new one. Without this exclusion a concurrent reader
     /// could observe a torn value (review finding C1).
     ///
-    /// The RwLock gate is a commit-F fallback: the spec's intended
-    /// model is lock-free reads via a segmented nodes store, where
-    /// reader/writer synchronization on an input slot is carried by
-    /// the dirty walk (which marks dependent queries Dirty with
-    /// Release). That model assumes input values are reached through
-    /// dependent queries, not via direct `rt.get(input_handle)` from
-    /// a concurrent reader, but the public API permits direct reads
-    /// and therefore the runtime has to handle them. The segmented
-    /// store + hazard / RCU approach that replaces this gate lands
-    /// in a later commit; until then, nodes RwLock is the honest
-    /// correctness mechanism.
+    /// Commit U replaces the nodes RwLock with a lock-free segmented
+    /// store. C1 synchronization between readers and writers of the
+    /// same arena slot now lives at the Value trait layer: primitive
+    /// types route to `AtomicPrimitiveArena` where reads and writes
+    /// are tear-free atomic operations, and non-primitive types
+    /// route to `GenericArena` which (in commit U) gains per-slot
+    /// mutex synchronization around the `Option<T>` cell.
     pub fn set<T>(&self, handle: Incr<T>, value: T)
     where
         T: Value,
@@ -441,11 +436,10 @@ impl Runtime {
             .lock()
             .expect("runtime write mutex poisoned");
 
-        // Take nodes.write() to exclude all concurrent readers for
-        // the duration of the arena mutation below. See the method
-        // docs for the reasoning.
-        let nodes = self.nodes.write().expect("nodes lock poisoned");
-        let node = &nodes[handle.slot() as usize];
+        // Direct lock-free access to the node; write_mutex serializes
+        // us against other writers and the Value trait handles
+        // reader/writer exclusion on the arena slot.
+        let node = self.nodes.get(handle.slot());
         node.verify_handle(handle, self.id)
             .unwrap_or_else(|e| panic!("{}", e));
         assert!(
@@ -457,33 +451,25 @@ impl Runtime {
 
         // Early cutoff: if the new value equals the current value,
         // treat this set as a no-op. Skip the arena write, skip the
-        // revision bump, and skip the dirty walk. The spec section
-        // 6.4 describes this as the first cheap case the writer path
-        // should handle, and the T: PartialEq bound on create_input
-        // enables it uniformly. For large value types (String, Vec,
-        // structs with heap storage) the saved work includes the
-        // clone inside the arena write, the full dirty walk traversal
-        // over transitive dependents, and any recomputes those
-        // dependents would later trigger.
+        // revision bump, and skip the dirty walk.
         let current: T = T::read(self.arena_for::<T>(), arena_slot);
         if current == value {
             return;
         }
 
-        // Arena write happens while holding nodes.write(). No reader
-        // can be inside a concurrent arena.read on the same slot,
-        // because readers require nodes.read() which is mutually
-        // exclusive with nodes.write().
+        // Arena write. For primitive types this is a tear-free
+        // atomic store via AtomicPrimitiveArena and safe against
+        // concurrent readers. For generic types this is a
+        // mutex-guarded replacement via GenericArena (commit U) and
+        // also safe against concurrent readers.
         T::write(self.arena_for::<T>(), arena_slot, value);
 
-        // State was already Clean and stays Clean; this Release store
-        // is a no-op semantically but anchors the memory ordering
-        // contract for the future lock-free variant. When the RwLock
-        // gate is removed, readers will Acquire-load state to gate
-        // their arena access and this Release is the publish side.
+        // State was and remains Clean. This Release store anchors
+        // the memory ordering contract for any reader that observes
+        // the Clean state via Acquire: it synchronizes with the
+        // arena write above for the non-atomic generic path.
         node.state_cell().store_release(NodeState::Clean);
 
-        drop(nodes);
         self.revision.fetch_add(1, Ordering::Relaxed);
 
         // Transitively mark every query reachable from this input as
@@ -503,19 +489,22 @@ impl Runtime {
     /// Append a new node to the store and the parallel compute_fns,
     /// dependents, and failure_messages vecs, returning the slot.
     /// Called from the write-mutex-guarded paths.
-    fn append_node(&self, node: Box<NodeData>, compute: Option<Arc<ComputeFn>>) -> u32 {
-        let mut nodes = self.nodes.write().expect("nodes lock poisoned");
+    ///
+    /// The nodes store is lock-free (commit U) and manages its own
+    /// synchronization via Release on `len`; only the parallel vecs
+    /// need explicit write-lock acquisition.
+    fn append_node(&self, node: NodeData, compute: Option<Arc<ComputeFn>>) -> u32 {
+        let slot = self.nodes.push(node);
+
         let mut computes = self.compute_fns.write().expect("compute lock poisoned");
         let mut dependents = self.dependents.write().expect("dependents lock poisoned");
         let mut failures = self
             .failure_messages
             .write()
             .expect("failure_messages lock poisoned");
-        debug_assert_eq!(nodes.len(), computes.len());
-        debug_assert_eq!(nodes.len(), dependents.len());
-        debug_assert_eq!(nodes.len(), failures.len());
-        let slot = nodes.len() as u32;
-        nodes.push(node);
+        debug_assert_eq!(slot as usize, computes.len());
+        debug_assert_eq!(slot as usize, dependents.len());
+        debug_assert_eq!(slot as usize, failures.len());
         computes.push(compute);
         dependents.push(Vec::new());
         failures.push(None);
@@ -739,10 +728,7 @@ impl Runtime {
         // and it lets the dirty walk reach a Failed node on a
         // subsequent upstream change (enabling retry).
         if !is_recompute {
-            {
-                let nodes = self.nodes.read().expect("nodes lock poisoned");
-                nodes[slot as usize].publish_initial_deps(&recorded_deps);
-            }
+            self.nodes.get(slot).publish_initial_deps(&recorded_deps);
             if !recorded_deps.is_empty() {
                 let mut dependents = self.dependents.write().expect("dependents lock poisoned");
                 for dep in &recorded_deps {
@@ -789,12 +775,10 @@ impl Runtime {
                 // the stored failure message via the happens-before
                 // chain (read lock on failure_messages + Release on
                 // state gives the necessary ordering).
-                {
-                    let nodes = self.nodes.read().expect("nodes lock poisoned");
-                    nodes[slot as usize]
-                        .state_cell()
-                        .store_release(NodeState::Failed);
-                }
+                self.nodes
+                    .get(slot)
+                    .state_cell()
+                    .store_release(NodeState::Failed);
 
                 // Re-raise the panic so the `rt.get` caller that
                 // triggered this compute sees it. This unwinds past
@@ -815,10 +799,7 @@ impl Runtime {
             .expect("compute function returned wrong type");
 
         // Look up the arena slot for this node.
-        let arena_slot = {
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            nodes[slot as usize].arena_slot()
-        };
+        let arena_slot = self.nodes.get(slot).arena_slot();
 
         // Post-compute revision check: if the revision bumped during
         // our compute, at least one writer ran `set` while we were
@@ -838,8 +819,8 @@ impl Runtime {
             // The recorded_deps are still published above, so the
             // retry has an accurate dep list for the dirty walk to
             // reach it on subsequent sets.
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            nodes[slot as usize]
+            self.nodes
+                .get(slot)
                 .state_cell()
                 .store_release(NodeState::Dirty);
             return;
@@ -877,12 +858,10 @@ impl Runtime {
         // Release-store state to Clean. This publishes the arena write
         // (and any dep list changes) together with the state
         // transition to readers that Acquire-load state afterward.
-        {
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            nodes[slot as usize]
-                .state_cell()
-                .store_release(NodeState::Clean);
-        }
+        self.nodes
+            .get(slot)
+            .state_cell()
+            .store_release(NodeState::Clean);
     }
 
     /// Diff the new recorded deps against the node's previous dep
@@ -897,11 +876,17 @@ impl Runtime {
     /// inside the compute closure caused it to read a different
     /// set of deps than the previous run.
     ///
-    /// Takes `nodes.write()` briefly when the dep set has actually
-    /// changed, because `NodeData::replace_deps` frees the old
-    /// overflow list immediately and needs mutual exclusion with
-    /// any concurrent readers. A later commit replaces this with
-    /// epoch reclamation so recompute can run fully lock-free.
+    /// After commit U (SegmentedNodes), mutual exclusion for
+    /// `NodeData::replace_deps`'s overflow-pointer swap comes from
+    /// the Runtime's `write_mutex` being held by the caller
+    /// (run_compute is only invoked from get, which does not hold
+    /// any node lock, BUT a concurrent writer calling set would
+    /// take write_mutex and be blocked from running another
+    /// recompute). Since run_compute runs outside write_mutex,
+    /// there can be concurrent recompute on different nodes but
+    /// not on the same node (state machine's Computing CAS
+    /// guarantees at most one). The same-node exclusion is what
+    /// replace_deps actually needs.
     fn update_deps_on_recompute(&self, slot: u32, new_deps: &[NodeId]) {
         use std::collections::HashSet;
 
@@ -909,42 +894,36 @@ impl Runtime {
         // snapshot Vec. The vast majority of recomputes have
         // unchanged dep sets (static deps), and allocating a Vec
         // on every recompute just to compare and throw away is a
-        // measurable chunk of propagate_chain_1000's cost (~100 µs
-        // on a 1000-node chain). Walk the existing deps via
-        // for_each_dep and compare element-by-element against
-        // new_deps; short-circuit on the first mismatch.
-        let matches: bool = {
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            let node = &nodes[slot as usize];
-            if node.dep_count() as usize != new_deps.len() {
-                false
-            } else {
-                let mut iter = new_deps.iter();
-                let mut all_matched = true;
-                node.for_each_dep(|existing| {
-                    if all_matched {
-                        match iter.next() {
-                            Some(expected) if *expected == existing => {}
-                            _ => all_matched = false,
-                        }
+        // measurable chunk of propagate_chain_1000's cost. Walk
+        // the existing deps via for_each_dep and compare
+        // element-by-element against new_deps; short-circuit on
+        // the first mismatch.
+        let node = self.nodes.get(slot);
+        let matches: bool = if node.dep_count() as usize != new_deps.len() {
+            false
+        } else {
+            let mut iter = new_deps.iter();
+            let mut all_matched = true;
+            node.for_each_dep(|existing| {
+                if all_matched {
+                    match iter.next() {
+                        Some(expected) if *expected == existing => {}
+                        _ => all_matched = false,
                     }
-                });
-                all_matched
-            }
+                }
+            });
+            all_matched
         };
         if matches {
             return;
         }
 
-        // Slow path: dep set changed. Now snapshot the old deps
-        // into a Vec so we can compute diff sets against new_deps.
-        let old_deps: Vec<NodeId> = {
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            nodes[slot as usize].collect_deps()
-        };
+        // Slow path: dep set changed. Snapshot the old deps into
+        // a Vec so we can compute diff sets against new_deps.
+        let old_deps: Vec<NodeId> = node.collect_deps();
 
-        // Slow path: something changed. Compute the added and
-        // removed sets for reverse-edge bookkeeping.
+        // Compute the added and removed sets for reverse-edge
+        // bookkeeping.
         let old_set: HashSet<NodeId> = old_deps.iter().copied().collect();
         let new_set: HashSet<NodeId> = new_deps.iter().copied().collect();
         let added: Vec<NodeId> = new_deps
@@ -958,19 +937,18 @@ impl Runtime {
             .copied()
             .collect();
 
-        // Replace the node's forward dep list under a write guard
-        // on nodes. The write guard guarantees no concurrent reader
-        // is dereferencing the old overflow pointer when
-        // `NodeData::replace_deps` frees it. A later commit lifts
-        // this requirement via epoch reclamation.
-        {
-            let nodes = self.nodes.write().expect("nodes lock poisoned");
-            nodes[slot as usize].replace_deps(new_deps);
-        }
+        // Replace the node's forward dep list. The state machine's
+        // Computing ownership guarantees no other thread is
+        // computing this same node, but concurrent readers may be
+        // observing `overflow_deps` if they already loaded it. For
+        // commit U we leak the old overflow list (skip the
+        // Box::from_raw in replace_deps) and defer proper
+        // reclamation to a follow-up epoch-based commit. Leaking is
+        // a memory cost only, not a correctness cost.
+        node.replace_deps_leaking_old_overflow(new_deps);
 
         // Update reverse edges. Added deps gain an incoming edge
-        // from `slot`; removed deps lose theirs. Both under a
-        // single brief write guard on dependents.
+        // from `slot`; removed deps lose theirs.
         if !added.is_empty() || !removed.is_empty() {
             let mut dependents = self.dependents.write().expect("dependents lock poisoned");
             for dep in &added {
@@ -1037,18 +1015,15 @@ impl Runtime {
             // fails, try Failed → Dirty to allow retry of a failed
             // compute after an upstream change. Other source states
             // (New, Computing, Dirty) are skipped silently.
+            let cell = self.nodes.get(slot).state_cell();
+            if cell
+                .try_transition(NodeState::Clean, NodeState::Dirty)
+                .is_err()
+                && cell
+                    .try_transition(NodeState::Failed, NodeState::Dirty)
+                    .is_ok()
             {
-                let nodes = self.nodes.read().expect("nodes lock poisoned");
-                let cell = nodes[slot as usize].state_cell();
-                if cell
-                    .try_transition(NodeState::Clean, NodeState::Dirty)
-                    .is_err()
-                    && cell
-                        .try_transition(NodeState::Failed, NodeState::Dirty)
-                        .is_ok()
-                {
-                    cleared_failures.push(slot);
-                }
+                cleared_failures.push(slot);
             }
 
             // Walk forward from this node regardless of whether the
@@ -1446,12 +1421,11 @@ mod tests {
     // records deps but does not yet propagate changes through them.
     // Reactivity is commit J.
 
-    /// Read a node's published dependencies. Test-only helper so the
-    /// test body can reach through the RwLock and the NodeData to
-    /// get a concrete `Vec<NodeId>` for assertions.
+    /// Read a node's published dependencies. Test-only helper.
+    /// After commit U the nodes store is lock-free; this helper
+    /// just calls through to the direct accessor.
     fn collect_deps_for_slot(rt: &Runtime, slot: u32) -> Vec<super::super::node::NodeId> {
-        let nodes = rt.nodes.read().unwrap();
-        nodes[slot as usize].collect_deps()
+        rt.nodes.get(slot).collect_deps()
     }
 
     /// Read a node's published dependents (forward edges). Test-only
@@ -1761,8 +1735,7 @@ mod tests {
     // -------------------------------------------------------------------
 
     fn state_of(rt: &Runtime, slot: u32) -> NodeState {
-        let nodes = rt.nodes.read().unwrap();
-        nodes[slot as usize].state()
+        rt.nodes.get(slot).state()
     }
 
     #[test]

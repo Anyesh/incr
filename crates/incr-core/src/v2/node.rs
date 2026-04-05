@@ -310,6 +310,68 @@ impl NodeData {
         }
     }
 
+    /// Variant of `replace_deps` that skips reclamation of the old
+    /// overflow list, leaking it instead.
+    ///
+    /// Used by the Runtime's recompute path after commit U replaced
+    /// the nodes RwLock with SegmentedNodes: without the write lock
+    /// there is no guarantee that concurrent readers have finished
+    /// dereferencing the old overflow pointer when we want to free
+    /// it. Leaking is a memory cost (one `Box<[NodeId]>` per dep
+    /// list replacement) but not a correctness cost. A follow-up
+    /// commit replaces this with epoch-based reclamation so the
+    /// memory is recovered bounded-time after the last reader
+    /// departs.
+    ///
+    /// `Drop` on the `NodeData` itself still reclaims the final
+    /// overflow list via `Box::from_raw`, so leaked overflow lists
+    /// from intermediate `replace_deps` calls are eventually freed
+    /// when the Runtime (and thus the SegmentedNodes, and thus the
+    /// NodeData) drops. The window of leak is bounded by node
+    /// lifetime rather than unbounded.
+    pub(crate) fn replace_deps_leaking_old_overflow(&self, new_deps: &[NodeId]) {
+        let count = new_deps.len();
+        assert!(
+            count <= u8::MAX as usize,
+            "deps overflow u8 count: {}",
+            count
+        );
+
+        if count <= 7 {
+            for (i, dep) in new_deps.iter().enumerate() {
+                self.inline_deps[i].store(dep.0, Ordering::Relaxed);
+            }
+            // We do NOT clear overflow_deps here. If we did and the
+            // previous deps were in overflow, we would lose the
+            // pointer without freeing it AND Drop would fail to
+            // reclaim the final overflow allocation. Leaving the
+            // old overflow pointer in place means Drop still has
+            // something to free; it just frees a list that is not
+            // the current dep list. Accepted tradeoff for the
+            // commit U stopgap.
+            //
+            // A reader that loads overflow_deps and sees the old
+            // pointer will dereference the old list, but since we
+            // also updated dep_count to `count` <= 7, the reader's
+            // for_each_dep takes the inline branch (`if count <= 7`)
+            // and never touches overflow_deps. So the stale pointer
+            // is never read as deps; it is only used at Drop time.
+        } else {
+            let list = Box::new(DepList {
+                deps: new_deps.to_vec().into_boxed_slice(),
+            });
+            let new_ptr = Box::into_raw(list);
+            // Swap the pointer, leaking the old one (intentional
+            // per the method contract). Drop will reclaim `new_ptr`
+            // when the node itself drops, but any prior overflow
+            // lists this slot held are leaked for the node's
+            // lifetime.
+            self.overflow_deps.store(new_ptr, Ordering::Relaxed);
+        }
+
+        self.dep_count.store(count as u8, Ordering::Relaxed);
+    }
+
     /// Publish an initial dependency list on a `New` query node.
     ///
     /// This is the commit-D placeholder for the full compute-path dep

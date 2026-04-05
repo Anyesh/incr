@@ -453,40 +453,40 @@ use std::cell::UnsafeCell;
 
 /// One slot in a `GenericArena`. The inner `Option<T>` starts `None` at
 /// segment allocation and becomes `Some(value)` once the arena's user
-/// writes a value into it. Interior mutability is granted by `UnsafeCell`
-/// and exclusivity is enforced at runtime by the node state machine: at
-/// any instant, a slot is being read by zero-or-more threads that have
-/// observed `Clean` via Acquire, or being written by exactly one thread
-/// that owns `Computing` via CAS, never both.
+/// writes a value into it.
+///
+/// Commit U changed the slot from `UnsafeCell<Option<T>>` to
+/// `Mutex<Option<T>>` as part of removing the nodes `RwLock`. The
+/// nodes store is now lock-free (SegmentedNodes), so the RwLock that
+/// previously gated reader/writer exclusion on generic arena slots
+/// no longer exists. Per-slot mutex is the finest-grained replacement
+/// that preserves correctness: readers take the mutex briefly to
+/// clone the value, writers take the mutex to replace it. Uncontended
+/// std::sync::Mutex is ~5 ns on Linux — more expensive than the old
+/// UnsafeCell path, but correct under concurrent rt.get and rt.set
+/// on non-primitive inputs.
+///
+/// Primitive types do not pay this cost because they use
+/// `AtomicPrimitiveArena` via the Value trait dispatch from commit T.
+/// Only non-primitive types route through `GenericArena` and incur
+/// the per-slot mutex overhead.
 struct GenericSlot<T> {
-    cell: UnsafeCell<Option<T>>,
+    cell: std::sync::Mutex<Option<T>>,
 }
 
 impl<T> GenericSlot<T> {
     fn none() -> Self {
         Self {
-            cell: UnsafeCell::new(None),
+            cell: std::sync::Mutex::new(None),
         }
     }
 }
 
-// SAFETY: `GenericSlot<T>` wraps an `UnsafeCell<Option<T>>`, which is
-// `!Sync` by default. We share slots across threads behind the invariant
-// that the node state machine linearizes access: a slot is either being
-// read (zero-or-more Acquire observers of `Clean`) or written (exactly
-// one `Computing` owner), never both. Under that invariant, concurrent
-// access to the underlying `Option<T>` bytes is coordinated by
-// Release-Acquire synchronization on the node's state field, which
-// establishes happens-before for the slot's plain memory operations.
-// This is the same coordination the spec describes for atomic slots;
-// here we apply it to non-atomic memory.
-//
-// `T: Send + Sync` is required because (a) a reader on thread A may
-// call `Clone` on the `T`, which briefly creates an `&T` on thread A,
-// requiring `T: Sync`, and (b) the cloned value may be moved across
-// threads by the caller, requiring `T: Send`.
-unsafe impl<T: Send + Sync> Sync for GenericSlot<T> {}
-unsafe impl<T: Send> Send for GenericSlot<T> {}
+// `Mutex<Option<T>>` is `Sync` when `Option<T>: Send`, which is when
+// `T: Send`. So `GenericSlot<T: Send>` is automatically `Sync` with
+// no unsafe impl needed. The old unsafe Sync/Send impls that
+// justified the `UnsafeCell` approach under state-machine
+// coordination are no longer needed.
 
 /// Arena for `Clone + Send + Sync` values whose access is coordinated by
 /// the node state machine.
@@ -554,12 +554,10 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
 
     /// Clone the value at `slot`.
     ///
-    /// The caller must have established happens-before with the most
-    /// recent writer via an Acquire load on the owning node's state;
-    /// typically the caller observed the node in state `Clean`. Reading
-    /// a slot whose state is `New` (still `None` in the Option) is a
-    /// logic error and panics with a clear message; in release builds
-    /// this may still panic via `Option::expect`.
+    /// Takes the per-slot `Mutex<Option<T>>` briefly, clones the
+    /// contained value, and releases. Commit U changed this from
+    /// unsafe UnsafeCell access to mutex-guarded access; see the
+    /// `GenericSlot` doc comment for the rationale.
     pub(crate) fn read(&self, slot: u32) -> T {
         debug_assert!(
             slot < self.len.load(Ordering::Relaxed),
@@ -577,33 +575,24 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
             seg_idx
         );
         // SAFETY: `seg_ptr` was published via `Release` by a prior
-        // `reserve`; segments are never moved or freed until Drop; and
-        // `within` is in range. The read of the `Option<T>` is
-        // non-atomic but is synchronized with the writer via the
-        // caller's Acquire load on the node state, which happens-after
-        // the writer's Release store on the same state field. Under
-        // that happens-before the plain memory of the slot is visible
-        // consistently. `Clone::clone` may panic; that is fine, the
-        // slot is unchanged.
-        unsafe {
-            let slot_ref = &(*seg_ptr).slots[within];
-            (*slot_ref.cell.get())
-                .as_ref()
-                .expect("GenericArena::read on uninitialized slot; caller must check state first")
-                .clone()
-        }
+        // `reserve`; segments are never moved or freed until Drop;
+        // `within` is in range. The slot's `Mutex<Option<T>>` is the
+        // synchronization primitive; `seg_ptr` dereference is the
+        // only unsafe, and it's sound per the segment invariants.
+        let slot_ref: &GenericSlot<T> = unsafe { &(*seg_ptr).slots[within] };
+        let guard = slot_ref
+            .cell
+            .lock()
+            .expect("GenericArena slot mutex poisoned");
+        guard
+            .as_ref()
+            .expect("GenericArena::read on uninitialized slot; caller must check state first")
+            .clone()
     }
 
-    /// Clone the value at `slot` if it exists, returning `None` if the
-    /// slot has never been written (still `Option::None` inside the
-    /// cell). Used by callers that cannot guarantee the slot has been
-    /// initialized, such as the Runtime's early-cutoff path during a
-    /// retry-from-Failed recompute where the first compute panicked
-    /// before the arena was written.
-    ///
-    /// The same happens-before requirements as `read` apply: the
-    /// caller must have established synchronization with the most
-    /// recent writer via an Acquire load on the owning node's state.
+    /// Clone the value at `slot` if it exists, returning `None` if
+    /// the slot has never been written. Used by the Runtime's
+    /// early-cutoff path for Failed-retry recomputes.
     pub(crate) fn try_read(&self, slot: u32) -> Option<T> {
         if slot >= self.len.load(Ordering::Relaxed) {
             return None;
@@ -614,22 +603,19 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
         if seg_ptr.is_null() {
             return None;
         }
-        // SAFETY: same as `read`, plus we now also check for the
-        // `None` variant of the inner `Option` and return `None`
-        // from this method in that case rather than panicking.
-        unsafe {
-            let slot_ref = &(*seg_ptr).slots[within];
-            (*slot_ref.cell.get()).as_ref().cloned()
-        }
+        let slot_ref: &GenericSlot<T> = unsafe { &(*seg_ptr).slots[within] };
+        let guard = slot_ref
+            .cell
+            .lock()
+            .expect("GenericArena slot mutex poisoned");
+        guard.as_ref().cloned()
     }
 
     /// Overwrite the value at `slot` with `Some(value)`.
     ///
-    /// If the slot previously held `Some(old)`, the old value is dropped
-    /// in place. This is called exclusively by the writer that owns the
-    /// slot (the compute thread holding Computing state for a query
-    /// node, or the runtime under the write mutex for an input node).
-    /// The arena does not enforce exclusivity; the state machine does.
+    /// Takes the per-slot mutex, replaces the contained Option with
+    /// `Some(value)` (dropping any previous value in place), and
+    /// releases. Concurrent readers block briefly on the mutex.
     pub(crate) fn write(&self, slot: u32, value: T) {
         debug_assert!(
             slot < self.len.load(Ordering::Relaxed),
@@ -646,18 +632,12 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
             slot,
             seg_idx
         );
-        // SAFETY: the state machine invariant guarantees no concurrent
-        // readers or writers are touching this slot. `UnsafeCell::get`
-        // yields a raw pointer we may write through without creating a
-        // Rust &mut reference, so no aliasing rule is violated even if
-        // compiler-inserted reads existed briefly. Dropping the old
-        // `Option` (possibly a `Some(T)`) runs `T::drop` if a value was
-        // present; the state machine ensures no reader has an `&T` into
-        // the slot at this moment.
-        unsafe {
-            let slot_ref = &(*seg_ptr).slots[within];
-            *slot_ref.cell.get() = Some(value);
-        }
+        let slot_ref: &GenericSlot<T> = unsafe { &(*seg_ptr).slots[within] };
+        let mut guard = slot_ref
+            .cell
+            .lock()
+            .expect("GenericArena slot mutex poisoned");
+        *guard = Some(value);
     }
 
     /// Current number of reserved slots.

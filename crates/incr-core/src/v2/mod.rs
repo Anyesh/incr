@@ -32,6 +32,7 @@
 pub(crate) mod arena;
 pub(crate) mod handle;
 pub(crate) mod node;
+pub(crate) mod nodes_store;
 pub(crate) mod registry;
 pub(crate) mod runtime;
 #[cfg(test)]
