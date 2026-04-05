@@ -134,6 +134,59 @@ thread_local! {
 /// lock before calling the closure, avoiding reentrant lock issues.
 type ComputeFn = dyn Fn(&Runtime) -> Box<dyn Any + Send + Sync> + Send + Sync;
 
+/// Runtime state protected by a single `RwLock`. Commit V consolidated
+/// the previously separate `compute_fns`, `dependents`, and
+/// `failure_messages` RwLocks into this struct so that each runtime
+/// operation acquires at most one lock from this trio instead of up to
+/// three.
+///
+/// The practical wins:
+///
+/// - `append_node` takes one write guard instead of three.
+/// - `set`'s query-node assertion takes one read guard instead of
+///   holding `compute_fns` separately.
+/// - `run_compute` still takes a brief read (to clone the compute Arc)
+///   and a later write (to publish reverse edges or stash a failure
+///   message), but both are on the same lock, so contention with other
+///   runtime operations is characterized by one readers-writer lock
+///   rather than three.
+/// - `mark_dependents_dirty` holds one read guard across the entire
+///   BFS walk and only upgrades to a write guard at the end when
+///   Failed nodes need their stashed messages cleared. Before V the
+///   walk re-acquired the dependents read lock for each visited node
+///   (two acquires per node: seed plus children probe), which
+///   contributed a large fraction of `propagate_chain_1000`'s cost.
+///
+/// Fields are parallel Vecs indexed by node slot. They grow together
+/// via `Runtime::append_node` and never shrink.
+struct RuntimeInner {
+    /// Compute closures for query nodes. Indexed by node slot. `None`
+    /// for input nodes. `Arc` lets `run_compute` extract the closure
+    /// under a short-lived read guard and invoke it after the guard is
+    /// dropped, so nested `get` calls do not reenter this lock.
+    compute_fns: Vec<Option<Arc<ComputeFn>>>,
+
+    /// Forward edges. `dependents[slot]` holds the list of nodes that
+    /// depend on the node at `slot`. Populated by `run_compute` after a
+    /// query publishes its recorded deps: for each dep, the computing
+    /// node is appended to that dep's dependents list. `set`'s dirty
+    /// walk reads this vector to find every query that needs
+    /// invalidation when an input changes.
+    ///
+    /// This is the spec's "parallel dependents vec" per section 5.1
+    /// (the NodeData docs also call it out as the resolved design for
+    /// the inline-vs-parallel ambiguity in the spec).
+    dependents: Vec<Vec<NodeId>>,
+
+    /// Failure messages for nodes in the `Failed` state. `Some(msg)`
+    /// when the node's most recent compute panicked, `None` otherwise.
+    /// Populated in the panic-catching path of `run_compute` and read
+    /// when `get` encounters a Failed node. Cleared when the dirty walk
+    /// transitions a node out of Failed (Failed → Dirty on an upstream
+    /// change, allowing a retry).
+    failure_messages: Vec<Option<String>>,
+}
+
 /// The v2 incremental computation runtime.
 pub struct Runtime {
     /// Stable identity for this runtime. Used by `Incr<T>` handles to
@@ -156,42 +209,18 @@ pub struct Runtime {
     /// reader's view of the initialized NodeData.
     nodes: SegmentedNodes,
 
-    /// Compute closures for query nodes. Indexed the same way as
-    /// `nodes`. `None` for input nodes. `Arc` lets `run_compute` extract
-    /// the closure under a short-lived read guard and invoke it after
-    /// the guard is dropped, so nested `get` calls do not reenter the
-    /// same lock.
-    compute_fns: RwLock<Vec<Option<Arc<ComputeFn>>>>,
-
-    /// Forward edges. Indexed by node slot; `dependents[slot]` holds
-    /// the list of nodes that depend on the node at `slot`. Populated
-    /// by `run_compute` after a query publishes its recorded deps: for
-    /// each dep, the computing node is appended to that dep's
-    /// dependents list. A later commit's dirty walk reads this vector
-    /// to find every query that needs invalidation when an input
-    /// changes.
-    ///
-    /// This is the spec's "parallel dependents vec" per section 5.1
-    /// (the NodeData docs also call it out as the resolved design for
-    /// the inline-vs-parallel ambiguity in the spec).
-    dependents: RwLock<Vec<Vec<NodeId>>>,
-
-    /// Failure messages for nodes in the `Failed` state. Parallel to
-    /// `nodes`; `Some(msg)` when the node's most recent compute
-    /// panicked, `None` otherwise. Populated in the panic-catching
-    /// path of `run_compute` and read when `get` encounters a Failed
-    /// node. Cleared when the dirty walk transitions a node out of
-    /// Failed (Failed → Dirty on an upstream change, allowing a
-    /// retry).
-    failure_messages: RwLock<Vec<Option<String>>>,
+    /// Consolidated runtime state (compute closures, forward edges,
+    /// failure messages). Commit V replaced three separate RwLocks
+    /// with this single one so each operation takes at most one lock
+    /// from this trio. See `RuntimeInner` for the field-level layout.
+    inner: RwLock<RuntimeInner>,
 
     /// Arena registry; owns the typed storage for node values.
     registry: ArenaRegistry,
 
-    /// Monotonic revision counter. Bumped on every `set`. Not yet used
-    /// for dirty propagation or early cutoff in this commit, but kept
-    /// in the struct so subsequent commits can plug in without
-    /// breaking the public shape.
+    /// Monotonic revision counter. Bumped on every `set`. Used by
+    /// `run_compute`'s post-compute revision check to detect whether a
+    /// writer raced during compute (commit P).
     revision: AtomicU64,
 
     /// Serializes all writer operations (`create_*`, `set`). The spec's
@@ -208,9 +237,11 @@ impl Runtime {
         Self {
             id: registry.id(),
             nodes: SegmentedNodes::new(),
-            compute_fns: RwLock::new(Vec::new()),
-            dependents: RwLock::new(Vec::new()),
-            failure_messages: RwLock::new(Vec::new()),
+            inner: RwLock::new(RuntimeInner {
+                compute_fns: Vec::new(),
+                dependents: Vec::new(),
+                failure_messages: Vec::new(),
+            }),
             registry,
             revision: AtomicU64::new(0),
             write_mutex: Mutex::new(()),
@@ -309,18 +340,14 @@ impl Runtime {
         T: Value,
     {
         self.check_runtime(handle);
-        // Cycle detection: if the handle's slot is already on this
-        // thread's compute stack, running compute on it would either
-        // spin forever on the Computing state or recurse infinitely.
-        // Panic with a clear diagnostic instead. This runs before
-        // record_dep so a cycling `rt.get` never contaminates the
-        // parent frame's dep list with a self-edge.
-        self.check_for_cycle(handle.slot());
-        // If this get is happening inside a compute closure, record
-        // the handle as a dependency of the currently-computing node.
-        // This runs before the actual read so the dep is captured
-        // even if the read panics or the node is still computing.
-        self.record_dep(handle.slot());
+        // Combined cycle check + dep recording. Commit V inlines the
+        // previously separate `check_for_cycle` and `record_dep`
+        // helpers into a single thread-local access so the hot path
+        // (top-level get, COMPUTE_STACK empty) performs one RefCell
+        // borrow and early-returns, instead of three separate
+        // borrows. See `check_cycle_and_record_dep` for the full
+        // semantics; the hot path is the `is_empty` branch.
+        self.check_cycle_and_record_dep(handle.slot());
         loop {
             // Fast path (Clean): direct lock-free access via the
             // segmented nodes store. No RwLock. Reader/writer
@@ -391,11 +418,8 @@ impl Runtime {
                     // is only possible via an upstream change that
                     // transitions Failed → Dirty through the walk.
                     let msg = {
-                        let fails = self
-                            .failure_messages
-                            .read()
-                            .expect("failure_messages lock poisoned");
-                        fails[handle.slot() as usize].clone()
+                        let inner = self.inner.read().expect("runtime inner lock poisoned");
+                        inner.failure_messages[handle.slot() as usize].clone()
                     };
                     panic!(
                         "v2 runtime: node at slot {} is Failed: {}",
@@ -443,7 +467,10 @@ impl Runtime {
         node.verify_handle(handle, self.id)
             .unwrap_or_else(|e| panic!("{}", e));
         assert!(
-            self.compute_fns.read().expect("compute lock poisoned")[handle.slot() as usize]
+            self.inner
+                .read()
+                .expect("runtime inner lock poisoned")
+                .compute_fns[handle.slot() as usize]
                 .is_none(),
             "set() called on a query node; only input nodes may be set"
         );
@@ -492,22 +519,19 @@ impl Runtime {
     ///
     /// The nodes store is lock-free (commit U) and manages its own
     /// synchronization via Release on `len`; only the parallel vecs
-    /// need explicit write-lock acquisition.
+    /// in `inner` need explicit write-lock acquisition. Commit V
+    /// merged the three previously separate RwLocks into a single
+    /// `inner` lock, so this helper takes one write guard.
     fn append_node(&self, node: NodeData, compute: Option<Arc<ComputeFn>>) -> u32 {
         let slot = self.nodes.push(node);
 
-        let mut computes = self.compute_fns.write().expect("compute lock poisoned");
-        let mut dependents = self.dependents.write().expect("dependents lock poisoned");
-        let mut failures = self
-            .failure_messages
-            .write()
-            .expect("failure_messages lock poisoned");
-        debug_assert_eq!(slot as usize, computes.len());
-        debug_assert_eq!(slot as usize, dependents.len());
-        debug_assert_eq!(slot as usize, failures.len());
-        computes.push(compute);
-        dependents.push(Vec::new());
-        failures.push(None);
+        let mut inner = self.inner.write().expect("runtime inner lock poisoned");
+        debug_assert_eq!(slot as usize, inner.compute_fns.len());
+        debug_assert_eq!(slot as usize, inner.dependents.len());
+        debug_assert_eq!(slot as usize, inner.failure_messages.len());
+        inner.compute_fns.push(compute);
+        inner.dependents.push(Vec::new());
+        inner.failure_messages.push(None);
         slot
     }
 
@@ -517,6 +541,7 @@ impl Runtime {
     /// runtime's nodes vec. Runs before any index operation so the
     /// user sees the actual cross-runtime diagnostic rather than an
     /// opaque index-out-of-bounds panic.
+    #[inline]
     fn check_runtime<T: 'static>(&self, handle: Incr<T>) {
         if handle.runtime_id() != self.id {
             panic!(
@@ -527,20 +552,50 @@ impl Runtime {
         }
     }
 
-    /// Walk the current thread's compute stack looking for a frame
-    /// belonging to this runtime whose `node_slot` equals `slot`. If
-    /// found, the caller is trying to `get` a node that is already
-    /// computing on the same thread: a dependency cycle. Panic with
-    /// a clear diagnostic. Cross-runtime frames are ignored, because
-    /// a cycle inside runtime A cannot pass through runtime B's
-    /// dep graph.
+    /// Combined cycle detection + dep recording for the `get` hot path.
     ///
-    /// This is the spec's section 9 cycle detection. Called from
-    /// `get` before `record_dep` so a cycling read never contaminates
-    /// a parent frame's dep list with a self- or back-edge.
-    fn check_for_cycle(&self, slot: u32) {
+    /// Commit V folded the previously separate `check_for_cycle` and
+    /// `record_dep` helpers into this single function so that the
+    /// common case (top-level `rt.get` with no active compute frame)
+    /// performs one RefCell borrow that early-returns, instead of two
+    /// back-to-back borrows that each walked or pushed to the stack.
+    /// The measurable impact is ~5 ns on `hot_clean_read_input_u64`
+    /// and `hot_clean_read_query_u64`.
+    ///
+    /// Semantics when the stack is non-empty are identical to the
+    /// pre-V split:
+    ///
+    /// 1. **Cycle detection (spec section 9).** Walk every frame on
+    ///    this thread's stack. If any frame belongs to this runtime
+    ///    and refers to `slot`, the caller is trying to `get` a node
+    ///    that is already computing on the same thread. Panic with
+    ///    a CycleError diagnostic. Cross-runtime frames are skipped
+    ///    because a cycle inside runtime A cannot pass through
+    ///    runtime B's dep graph.
+    ///
+    /// 2. **Dep recording.** If the top frame belongs to this runtime
+    ///    and is not a self-read (which the cycle check above would
+    ///    already have caught with a panic, so this guard is
+    ///    belt-and-suspenders), push `slot` onto the top frame's
+    ///    deps. Dep recording is silently skipped when the top frame
+    ///    belongs to a different runtime (cross-runtime compute
+    ///    closure) or when the stack is empty (top-level get).
+    ///
+    /// The cycle check precedes the dep push so a cycling `rt.get`
+    /// never contaminates a parent frame's dep list with a self- or
+    /// back-edge before it panics.
+    #[inline]
+    fn check_cycle_and_record_dep(&self, slot: u32) {
         COMPUTE_STACK.with(|stack| {
-            let stack = stack.borrow();
+            let mut stack = stack.borrow_mut();
+            // Hot path: no active compute frame. No cycle is possible
+            // (cycles require at least one frame) and there is no
+            // frame to record a dep on. Early-return after the single
+            // borrow_mut / is_empty pair.
+            if stack.is_empty() {
+                return;
+            }
+            // Cycle detection: walk every frame on the stack.
             for frame in stack.iter() {
                 if frame.runtime_id == self.id && frame.node_slot == slot {
                     panic!(
@@ -550,30 +605,8 @@ impl Runtime {
                     );
                 }
             }
-        });
-    }
-
-    /// Record `slot` as a dependency of the currently-computing node on
-    /// this thread, if any. Called at the start of every `get`.
-    ///
-    /// Dep recording is silently skipped in three cases, and the skip
-    /// is intentional rather than an oversight:
-    ///
-    /// 1. No active compute frame on this thread. Top-level `rt.get`
-    ///    calls from user code are not deps of anything.
-    /// 2. The active frame belongs to a different runtime. A compute
-    ///    closure for runtime A that happens to call into runtime B
-    ///    does not record B's nodes as deps of A's node.
-    /// 3. The `slot` equals the frame's own `node_slot`. A query whose
-    ///    compute reads its own handle is a self-cycle; recording it
-    ///    would create a self-loop in the dep graph. Cycle detection
-    ///    proper arrives in a later commit (L) and will panic instead
-    ///    of silently skipping; for now the self-read simply does not
-    ///    create a dep edge and the node's Computing state will cause
-    ///    the self-read to spin (caller's problem, not ours).
-    fn record_dep(&self, slot: u32) {
-        COMPUTE_STACK.with(|stack| {
-            let mut stack = stack.borrow_mut();
+            // Dep recording: push onto the top frame if it belongs to
+            // this runtime and is not a self-read.
             if let Some(frame) = stack.last_mut() {
                 if frame.runtime_id == self.id && frame.node_slot != slot {
                     frame.deps.push(NodeId(slot));
@@ -671,10 +704,10 @@ impl Runtime {
         // Extract the compute closure under a short-lived read guard.
         // Clone the Arc so we can drop the guard before calling, which
         // means the closure may freely recurse into self.get without
-        // self-deadlocking on compute_fns.
+        // self-deadlocking on `inner`.
         let compute = {
-            let computes = self.compute_fns.read().expect("compute lock poisoned");
-            computes[slot as usize]
+            let inner = self.inner.read().expect("runtime inner lock poisoned");
+            inner.compute_fns[slot as usize]
                 .as_ref()
                 .expect("query node has no compute closure")
                 .clone()
@@ -730,9 +763,9 @@ impl Runtime {
         if !is_recompute {
             self.nodes.get(slot).publish_initial_deps(&recorded_deps);
             if !recorded_deps.is_empty() {
-                let mut dependents = self.dependents.write().expect("dependents lock poisoned");
+                let mut inner = self.inner.write().expect("runtime inner lock poisoned");
                 for dep in &recorded_deps {
-                    dependents[dep.0 as usize].push(NodeId(slot));
+                    inner.dependents[dep.0 as usize].push(NodeId(slot));
                 }
             }
         } else {
@@ -763,18 +796,15 @@ impl Runtime {
                 // reader that observes Failed can immediately retrieve
                 // it. The lock is held briefly.
                 {
-                    let mut fails = self
-                        .failure_messages
-                        .write()
-                        .expect("failure_messages lock poisoned");
-                    fails[slot as usize] = Some(msg);
+                    let mut inner = self.inner.write().expect("runtime inner lock poisoned");
+                    inner.failure_messages[slot as usize] = Some(msg);
                 }
 
                 // Transition the node to Failed with Release so that
                 // subsequent readers observing Failed also observe
                 // the stored failure message via the happens-before
-                // chain (read lock on failure_messages + Release on
-                // state gives the necessary ordering).
+                // chain (read lock on inner + Release on state gives
+                // the necessary ordering).
                 self.nodes
                     .get(slot)
                     .state_cell()
@@ -950,12 +980,12 @@ impl Runtime {
         // Update reverse edges. Added deps gain an incoming edge
         // from `slot`; removed deps lose theirs.
         if !added.is_empty() || !removed.is_empty() {
-            let mut dependents = self.dependents.write().expect("dependents lock poisoned");
+            let mut inner = self.inner.write().expect("runtime inner lock poisoned");
             for dep in &added {
-                dependents[dep.0 as usize].push(NodeId(slot));
+                inner.dependents[dep.0 as usize].push(NodeId(slot));
             }
             for dep in &removed {
-                dependents[dep.0 as usize].retain(|d| d.0 != slot);
+                inner.dependents[dep.0 as usize].retain(|d| d.0 != slot);
             }
         }
     }
@@ -996,49 +1026,60 @@ impl Runtime {
         let mut queue: Vec<u32> = Vec::new();
         // Track nodes whose Failed state we transitioned to Dirty
         // so we can clear their stashed failure messages at the end
-        // of the walk (one batched write lock on failure_messages
-        // instead of one per node).
+        // of the walk (one batched write lock on inner instead of
+        // one per node).
         let mut cleared_failures: Vec<u32> = Vec::new();
 
-        // Seed the queue with the changed node's direct dependents.
+        // Commit V: hold a single `inner` read guard across the
+        // entire BFS walk. Before V, the dependents vector lived
+        // behind its own RwLock and the walk re-acquired a read
+        // lock both to seed from the changed node's direct
+        // dependents and again for every visited node's children.
+        // On `propagate_chain_1000` that was ~2000 lock acquires
+        // for a single `set`. Holding one read guard collapses
+        // those to 1 and still allows concurrent readers; the only
+        // contention is with a concurrent writer (run_compute
+        // publishing reverse edges, another set), which is rare
+        // in practice because set serializes through write_mutex
+        // and run_compute's dep publish is a brief write.
         {
-            let dependents = self.dependents.read().expect("dependents lock poisoned");
-            for dep in &dependents[changed_slot as usize] {
+            let inner = self.inner.read().expect("runtime inner lock poisoned");
+            // Seed the queue with the changed node's direct dependents.
+            for dep in &inner.dependents[changed_slot as usize] {
                 if visited.insert(dep.0) {
                     queue.push(dep.0);
                 }
             }
-        }
 
-        while let Some(slot) = queue.pop() {
-            // Try Clean → Dirty first (the common case). If that
-            // fails, try Failed → Dirty to allow retry of a failed
-            // compute after an upstream change. Other source states
-            // (New, Computing, Dirty) are skipped silently.
-            let cell = self.nodes.get(slot).state_cell();
-            if cell
-                .try_transition(NodeState::Clean, NodeState::Dirty)
-                .is_err()
-                && cell
-                    .try_transition(NodeState::Failed, NodeState::Dirty)
-                    .is_ok()
-            {
-                cleared_failures.push(slot);
-            }
+            while let Some(slot) = queue.pop() {
+                // Try Clean → Dirty first (the common case). If that
+                // fails, try Failed → Dirty to allow retry of a failed
+                // compute after an upstream change. Other source states
+                // (New, Computing, Dirty) are skipped silently. State
+                // cells are atomic and don't need the inner guard,
+                // but we hold it anyway for the dependents indexing
+                // below.
+                let cell = self.nodes.get(slot).state_cell();
+                if cell
+                    .try_transition(NodeState::Clean, NodeState::Dirty)
+                    .is_err()
+                    && cell
+                        .try_transition(NodeState::Failed, NodeState::Dirty)
+                        .is_ok()
+                {
+                    cleared_failures.push(slot);
+                }
 
-            // Walk forward from this node regardless of whether the
-            // transition succeeded. Even if we did not transition this
-            // node (e.g., it was already Dirty), its dependents may
-            // not yet have been visited on a previous walk, and they
-            // might still be Clean and need marking. The visited set
-            // prevents revisiting a node we have already queued.
-            let children: Vec<u32> = {
-                let dependents = self.dependents.read().expect("dependents lock poisoned");
-                dependents[slot as usize].iter().map(|id| id.0).collect()
-            };
-            for child in children {
-                if visited.insert(child) {
-                    queue.push(child);
+                // Walk forward from this node regardless of whether the
+                // transition succeeded. Even if we did not transition this
+                // node (e.g., it was already Dirty), its dependents may
+                // not yet have been visited on a previous walk, and they
+                // might still be Clean and need marking. The visited set
+                // prevents revisiting a node we have already queued.
+                for child in &inner.dependents[slot as usize] {
+                    if visited.insert(child.0) {
+                        queue.push(child.0);
+                    }
                 }
             }
         }
@@ -1047,12 +1088,9 @@ impl Runtime {
         // transitioned Failed → Dirty. One write lock for the whole
         // batch keeps this cheap even when many nodes retry at once.
         if !cleared_failures.is_empty() {
-            let mut fails = self
-                .failure_messages
-                .write()
-                .expect("failure_messages lock poisoned");
+            let mut inner = self.inner.write().expect("runtime inner lock poisoned");
             for slot in cleared_failures {
-                fails[slot as usize] = None;
+                inner.failure_messages[slot as usize] = None;
             }
         }
     }
@@ -1100,10 +1138,12 @@ fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
     }
 }
 
-// SAFETY: Runtime's fields are all Send + Sync already (RwLock, Mutex,
-// ArenaRegistry, AtomicU64, RuntimeId). The compute closures are bound
-// to `Fn + Send + Sync + 'static`, so the `Arc<ComputeFn>` values inside
-// the compute_fns vec are Send + Sync.
+// SAFETY: Runtime's fields are all Send + Sync already (SegmentedNodes,
+// RwLock<RuntimeInner>, Mutex, ArenaRegistry, AtomicU64, RuntimeId).
+// The compute closures are bound to `Fn + Send + Sync + 'static`, so
+// the `Arc<ComputeFn>` values inside `inner.compute_fns` are Send + Sync,
+// and the remaining `inner` fields (`Vec<Vec<NodeId>>` and
+// `Vec<Option<String>>`) are trivially Send + Sync.
 
 #[cfg(test)]
 mod tests {
@@ -1429,10 +1469,12 @@ mod tests {
     }
 
     /// Read a node's published dependents (forward edges). Test-only
-    /// helper for commit I's reverse-edge bookkeeping.
+    /// helper for commit I's reverse-edge bookkeeping. Commit V
+    /// folded the dependents RwLock into the consolidated `inner`
+    /// lock, so this helper reads through `rt.inner`.
     fn collect_dependents_for_slot(rt: &Runtime, slot: u32) -> Vec<super::super::node::NodeId> {
-        let dependents = rt.dependents.read().unwrap();
-        dependents[slot as usize].clone()
+        let inner = rt.inner.read().unwrap();
+        inner.dependents[slot as usize].clone()
     }
 
     #[test]
@@ -2081,9 +2123,12 @@ mod tests {
     // -------------------------------------------------------------------
 
     /// Read a node's stashed failure message for test assertions.
+    /// Commit V folded the failure_messages RwLock into the
+    /// consolidated `inner` lock, so this helper reads through
+    /// `rt.inner`.
     fn failure_message_for(rt: &Runtime, slot: u32) -> Option<String> {
-        let fails = rt.failure_messages.read().unwrap();
-        fails[slot as usize].clone()
+        let inner = rt.inner.read().unwrap();
+        inner.failure_messages[slot as usize].clone()
     }
 
     #[test]
