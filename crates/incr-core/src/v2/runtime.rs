@@ -172,6 +172,15 @@ pub struct Runtime {
     /// the inline-vs-parallel ambiguity in the spec).
     dependents: RwLock<Vec<Vec<NodeId>>>,
 
+    /// Failure messages for nodes in the `Failed` state. Parallel to
+    /// `nodes`; `Some(msg)` when the node's most recent compute
+    /// panicked, `None` otherwise. Populated in the panic-catching
+    /// path of `run_compute` and read when `get` encounters a Failed
+    /// node. Cleared when the dirty walk transitions a node out of
+    /// Failed (Failed → Dirty on an upstream change, allowing a
+    /// retry).
+    failure_messages: RwLock<Vec<Option<String>>>,
+
     /// Arena registry; owns the typed storage for node values.
     registry: ArenaRegistry,
 
@@ -197,6 +206,7 @@ impl Runtime {
             nodes: RwLock::new(Vec::new()),
             compute_fns: RwLock::new(Vec::new()),
             dependents: RwLock::new(Vec::new()),
+            failure_messages: RwLock::new(Vec::new()),
             registry,
             revision: AtomicU64::new(0),
             write_mutex: Mutex::new(()),
@@ -294,6 +304,13 @@ impl Runtime {
         T: Clone + PartialEq + Send + Sync + 'static,
     {
         self.check_runtime(handle);
+        // Cycle detection: if the handle's slot is already on this
+        // thread's compute stack, running compute on it would either
+        // spin forever on the Computing state or recurse infinitely.
+        // Panic with a clear diagnostic instead. This runs before
+        // record_dep so a cycling `rt.get` never contaminates the
+        // parent frame's dep list with a self-edge.
+        self.check_for_cycle(handle.slot());
         // If this get is happening inside a compute closure, record
         // the handle as a dependency of the currently-computing node.
         // This runs before the actual read so the dep is captured
@@ -367,9 +384,23 @@ impl Runtime {
                     std::hint::spin_loop();
                 }
                 NodeState::Failed => {
+                    // A prior compute panicked and the node was
+                    // transitioned to Failed. Look up the stored
+                    // failure message and panic with it so the
+                    // caller sees the original diagnostic. Retry
+                    // is only possible via an upstream change that
+                    // transitions Failed → Dirty through the walk.
+                    let msg = {
+                        let fails = self
+                            .failure_messages
+                            .read()
+                            .expect("failure_messages lock poisoned");
+                        fails[handle.slot() as usize].clone()
+                    };
                     panic!(
-                        "v2 runtime: encountered Failed state, but error \
-                         handling is deferred to a later commit."
+                        "v2 runtime: node at slot {} is Failed: {}",
+                        handle.slot(),
+                        msg.as_deref().unwrap_or("unknown failure")
                     );
                 }
             }
@@ -468,19 +499,25 @@ impl Runtime {
 
     // -- internal helpers --------------------------------------------------
 
-    /// Append a new node to the store and the parallel compute_fns and
-    /// dependents vecs, returning the slot. Called from the
-    /// write-mutex-guarded paths.
+    /// Append a new node to the store and the parallel compute_fns,
+    /// dependents, and failure_messages vecs, returning the slot.
+    /// Called from the write-mutex-guarded paths.
     fn append_node(&self, node: Box<NodeData>, compute: Option<Arc<ComputeFn>>) -> u32 {
         let mut nodes = self.nodes.write().expect("nodes lock poisoned");
         let mut computes = self.compute_fns.write().expect("compute lock poisoned");
         let mut dependents = self.dependents.write().expect("dependents lock poisoned");
+        let mut failures = self
+            .failure_messages
+            .write()
+            .expect("failure_messages lock poisoned");
         debug_assert_eq!(nodes.len(), computes.len());
         debug_assert_eq!(nodes.len(), dependents.len());
+        debug_assert_eq!(nodes.len(), failures.len());
         let slot = nodes.len() as u32;
         nodes.push(node);
         computes.push(compute);
         dependents.push(Vec::new());
+        failures.push(None);
         slot
     }
 
@@ -498,6 +535,32 @@ impl Runtime {
                 self.id
             );
         }
+    }
+
+    /// Walk the current thread's compute stack looking for a frame
+    /// belonging to this runtime whose `node_slot` equals `slot`. If
+    /// found, the caller is trying to `get` a node that is already
+    /// computing on the same thread: a dependency cycle. Panic with
+    /// a clear diagnostic. Cross-runtime frames are ignored, because
+    /// a cycle inside runtime A cannot pass through runtime B's
+    /// dep graph.
+    ///
+    /// This is the spec's section 9 cycle detection. Called from
+    /// `get` before `record_dep` so a cycling read never contaminates
+    /// a parent frame's dep list with a self- or back-edge.
+    fn check_for_cycle(&self, slot: u32) {
+        COMPUTE_STACK.with(|stack| {
+            let stack = stack.borrow();
+            for frame in stack.iter() {
+                if frame.runtime_id == self.id && frame.node_slot == slot {
+                    panic!(
+                        "CycleError: dependency cycle detected: node at slot {} \
+                         is already computing on this thread",
+                        slot
+                    );
+                }
+            }
+        });
     }
 
     /// Record `slot` as a dependency of the currently-computing node on
@@ -609,14 +672,103 @@ impl Runtime {
         // closure record their handles as dependencies of this node.
         self.push_compute_frame(slot);
 
-        // Run the closure outside any lock.
-        let value_box: Box<dyn Any + Send + Sync> = (compute)(self);
+        // Run the closure outside any lock, inside a catch_unwind
+        // boundary so a panic inside the closure does not leave the
+        // COMPUTE_STACK in an inconsistent state or poison the whole
+        // runtime. `AssertUnwindSafe` is safe here because the runtime
+        // state we touch on unwind (stack, failure_messages, node
+        // state cell) is explicitly restored in the error arm below.
+        //
+        // Per spec section 8: a caught panic transitions the node to
+        // Failed, stashes a string representation of the panic payload
+        // so subsequent `get` calls can report it, and re-raises the
+        // panic so the original `rt.get` caller sees the diagnostic
+        // rather than a silently-swallowed failure. The re-raise is
+        // important: a compute panic is a programmer error and needs
+        // to be visible, not absorbed.
+        let value_box_result: std::thread::Result<Box<dyn Any + Send + Sync>> =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (compute)(self)));
 
-        // Pop the frame and retrieve the (deduplicated) deps the
-        // closure recorded. The pop must happen before publishing so
-        // that if the closure nested another compute, the parent
-        // frame is restored as the top of stack.
+        // Pop the frame regardless of compute outcome. In the Ok
+        // branch this restores the parent frame for continued dep
+        // tracking; in the Err branch it prevents a leaked frame
+        // from corrupting subsequent computes on the same thread.
         let recorded_deps = self.pop_compute_frame(slot);
+
+        // Publish dependencies and reverse edges on first compute
+        // regardless of whether the compute itself succeeded. A
+        // partial dep record from a panicked compute is still
+        // useful: it lets the dirty walk reach this Failed node on
+        // a subsequent upstream change and transition it to Dirty
+        // for retry. Without this, Failed nodes would be
+        // unreachable from their inputs and retry would never
+        // happen. On recompute we keep the existing dep list
+        // untouched (dynamic dep updates are a follow-up).
+        if !is_recompute {
+            {
+                let nodes = self.nodes.read().expect("nodes lock poisoned");
+                nodes[slot as usize].publish_initial_deps(&recorded_deps);
+            }
+            if !recorded_deps.is_empty() {
+                let mut dependents = self.dependents.write().expect("dependents lock poisoned");
+                for dep in &recorded_deps {
+                    dependents[dep.0 as usize].push(NodeId(slot));
+                }
+            }
+        } else {
+            // Recompute: assume the dep set is unchanged. The
+            // existing dep list and the existing reverse edges stay
+            // valid. Dep diff + epoch reclamation for dynamic deps
+            // is a follow-up.
+            let _ = recorded_deps;
+        }
+
+        // Handle the compute result. The panic arm runs AFTER the
+        // dep publish above, so a Failed node has enough reverse-
+        // edge bookkeeping in place for the dirty walk to find it
+        // on the next upstream change.
+        let value_box = match value_box_result {
+            Ok(v) => v,
+            Err(panic_payload) => {
+                // Extract a readable message from the panic payload.
+                // Rust panic payloads are `Box<dyn Any + Send>`; the
+                // common cases are `&'static str` (from `panic!("...")`
+                // with a string literal) and `String` (from
+                // `panic!("{}", ...)`).
+                let msg = extract_panic_message(&panic_payload);
+
+                // Stash the message before transitioning state so a
+                // reader that observes Failed can immediately retrieve
+                // it. The lock is held briefly.
+                {
+                    let mut fails = self
+                        .failure_messages
+                        .write()
+                        .expect("failure_messages lock poisoned");
+                    fails[slot as usize] = Some(msg);
+                }
+
+                // Transition the node to Failed with Release so that
+                // subsequent readers observing Failed also observe
+                // the stored failure message via the happens-before
+                // chain (read lock on failure_messages + Release on
+                // state gives the necessary ordering).
+                {
+                    let nodes = self.nodes.read().expect("nodes lock poisoned");
+                    nodes[slot as usize]
+                        .state_cell()
+                        .store_release(NodeState::Failed);
+                }
+
+                // Re-raise the panic so the `rt.get` caller that
+                // triggered this compute sees it. This unwinds past
+                // the caller's frame too; a caller who wants to
+                // handle the error without dying needs to wrap the
+                // `rt.get` in `catch_unwind` themselves (a future
+                // `try_get` method provides the ergonomic version).
+                std::panic::resume_unwind(panic_payload);
+            }
+        };
 
         // Downcast to the caller's expected type. A mismatch here is a
         // bug in how `create_query` packed the closure; it should be
@@ -641,40 +793,24 @@ impl Runtime {
         // recompute prevents downstream queries from recomputing)
         // requires red-green verification via `verified_at` /
         // `changed_at` and is deferred to a later commit.
+        //
+        // Uses `try_read` rather than `read` because a Failed → Dirty
+        // retry (commit L) may call `run_compute` with is_recompute
+        // true even though the slot has never been written: the
+        // previous compute panicked before writing, so the cell is
+        // still `None`. In that case there is nothing to compare
+        // against and we must always write.
         let should_write = if is_recompute {
-            let old_value: T = self.with_generic_arena::<T, _, _>(|arena| arena.read(arena_slot));
-            old_value != new_value
+            match self.with_generic_arena::<T, _, _>(|arena| arena.try_read(arena_slot)) {
+                Some(old_value) => old_value != new_value,
+                None => true,
+            }
         } else {
             true
         };
 
         if should_write {
             self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, new_value));
-        }
-
-        if !is_recompute {
-            // First compute: publish the recorded deps on the node and
-            // the reverse edges in the runtime's dependents vec.
-            {
-                let nodes = self.nodes.read().expect("nodes lock poisoned");
-                nodes[slot as usize].publish_initial_deps(&recorded_deps);
-            }
-
-            if !recorded_deps.is_empty() {
-                let mut dependents = self.dependents.write().expect("dependents lock poisoned");
-                for dep in &recorded_deps {
-                    dependents[dep.0 as usize].push(NodeId(slot));
-                }
-            }
-        } else {
-            // Recompute: assume the dep set is unchanged. The existing
-            // dep list on the node and the existing reverse edges in
-            // the dependents vec stay valid. A dynamic-deps-aware
-            // follow-up commit will diff `recorded_deps` against the
-            // node's current deps and update both sides. For now we
-            // simply drop `recorded_deps`; its frame was still pushed
-            // and popped correctly, so no bookkeeping is leaking.
-            let _ = recorded_deps;
         }
 
         // Release-store state to Clean. This publishes the arena write
@@ -707,7 +843,11 @@ impl Runtime {
     ///   post-compute version check or a separate "Dirty During
     ///   Compute" state; that work lands in a follow-up commit. For
     ///   single-threaded tests this case never arises.
-    /// - Failed: later commit for error handling.
+    /// - Failed: the node's last compute panicked. The walk attempts
+    ///   Failed → Dirty so an upstream change gives the failed node
+    ///   a chance to retry on the next read (per spec section 8).
+    ///   If the transition succeeds, the stashed failure message is
+    ///   cleared.
     ///
     /// The walk does not mark the changed node itself (it is an input
     /// and stays Clean by convention; only its dependents are
@@ -716,6 +856,11 @@ impl Runtime {
         use std::collections::HashSet;
         let mut visited: HashSet<u32> = HashSet::new();
         let mut queue: Vec<u32> = Vec::new();
+        // Track nodes whose Failed state we transitioned to Dirty
+        // so we can clear their stashed failure messages at the end
+        // of the walk (one batched write lock on failure_messages
+        // instead of one per node).
+        let mut cleared_failures: Vec<u32> = Vec::new();
 
         // Seed the queue with the changed node's direct dependents.
         {
@@ -728,15 +873,22 @@ impl Runtime {
         }
 
         while let Some(slot) = queue.pop() {
-            // Attempt the Clean -> Dirty transition on this node.
-            // Failure is fine; it just means the node is not in a
-            // state where our mark applies (see the doc comment
-            // above).
+            // Try Clean → Dirty first (the common case). If that
+            // fails, try Failed → Dirty to allow retry of a failed
+            // compute after an upstream change. Other source states
+            // (New, Computing, Dirty) are skipped silently.
             {
                 let nodes = self.nodes.read().expect("nodes lock poisoned");
-                let _ = nodes[slot as usize]
-                    .state_cell()
-                    .try_transition(NodeState::Clean, NodeState::Dirty);
+                let cell = nodes[slot as usize].state_cell();
+                if cell
+                    .try_transition(NodeState::Clean, NodeState::Dirty)
+                    .is_err()
+                    && cell
+                        .try_transition(NodeState::Failed, NodeState::Dirty)
+                        .is_ok()
+                {
+                    cleared_failures.push(slot);
+                }
             }
 
             // Walk forward from this node regardless of whether the
@@ -753,6 +905,19 @@ impl Runtime {
                 if visited.insert(child) {
                     queue.push(child);
                 }
+            }
+        }
+
+        // Clear the stashed failure messages for nodes that
+        // transitioned Failed → Dirty. One write lock for the whole
+        // batch keeps this cheap even when many nodes retry at once.
+        if !cleared_failures.is_empty() {
+            let mut fails = self
+                .failure_messages
+                .write()
+                .expect("failure_messages lock poisoned");
+            for slot in cleared_failures {
+                fails[slot as usize] = None;
             }
         }
     }
@@ -787,6 +952,23 @@ impl Runtime {
 impl Default for Runtime {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Extract a readable message from a caught panic payload.
+///
+/// Rust panic payloads are `Box<dyn Any + Send>` with no enforced
+/// type; the common producers are `panic!("literal")` which yields a
+/// `&'static str` and `panic!("fmt {}", x)` which yields a `String`.
+/// Other types (user-constructed panics via `panic_any`) fall back to
+/// a generic message so failures are never silently swallowed.
+fn extract_panic_message(payload: &Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "compute function panicked with a non-string payload".to_string()
     }
 }
 
@@ -1766,5 +1948,201 @@ mod tests {
         rt.set(input, 20);
         assert_eq!(rt.get(q), 40);
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // Cycle detection and panic catching tests (commit L).
+    // -------------------------------------------------------------------
+
+    /// Read a node's stashed failure message for test assertions.
+    fn failure_message_for(rt: &Runtime, slot: u32) -> Option<String> {
+        let fails = rt.failure_messages.read().unwrap();
+        fails[slot as usize].clone()
+    }
+
+    #[test]
+    fn self_cycle_panics_and_leaves_node_failed() {
+        // A query whose compute reads its own handle. Build the
+        // handle first (via a Mutex<Option<_>>) so the closure can
+        // reach back to it after create_query returns.
+        use std::sync::Mutex;
+        let rt = Runtime::new();
+        let me: Arc<Mutex<Option<Incr<u64>>>> = Arc::new(Mutex::new(None));
+        let q = {
+            let me = me.clone();
+            rt.create_query::<u64, _>(move |rt| {
+                let h = me.lock().unwrap().expect("self handle not set");
+                rt.get(h) // cycles
+            })
+        };
+        *me.lock().unwrap() = Some(q);
+
+        // Reading q triggers its compute, which attempts to read q,
+        // which trips the cycle detector. The panic unwinds through
+        // the compute closure, is caught by run_compute, the node is
+        // transitioned to Failed, and the panic is re-raised to our
+        // caller frame here.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q)));
+        assert!(result.is_err(), "expected cycle to panic");
+
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Failed);
+        let msg = failure_message_for(&rt, q.slot()).expect("failure stashed");
+        assert!(
+            msg.contains("CycleError"),
+            "expected CycleError in failure message, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn mutual_cycle_between_two_queries_panics() {
+        use std::sync::Mutex;
+        let rt = Runtime::new();
+        let q1_handle: Arc<Mutex<Option<Incr<u64>>>> = Arc::new(Mutex::new(None));
+        let q2_handle: Arc<Mutex<Option<Incr<u64>>>> = Arc::new(Mutex::new(None));
+
+        let q1 = {
+            let q2h = q2_handle.clone();
+            rt.create_query::<u64, _>(move |rt| {
+                let h = q2h.lock().unwrap().expect("q2 handle not set");
+                rt.get(h)
+            })
+        };
+        let q2 = {
+            let q1h = q1_handle.clone();
+            rt.create_query::<u64, _>(move |rt| {
+                let h = q1h.lock().unwrap().expect("q1 handle not set");
+                rt.get(h)
+            })
+        };
+        *q1_handle.lock().unwrap() = Some(q1);
+        *q2_handle.lock().unwrap() = Some(q2);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q1)));
+        assert!(result.is_err(), "expected mutual cycle to panic");
+    }
+
+    #[test]
+    fn compute_panic_is_caught_and_node_transitions_to_failed() {
+        let rt = Runtime::new();
+        let q = rt.create_query::<u64, _>(|_| panic!("oops, compute failed"));
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q)));
+        assert!(result.is_err());
+
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Failed);
+        let msg = failure_message_for(&rt, q.slot()).expect("failure stashed");
+        assert!(
+            msg.contains("oops, compute failed"),
+            "expected panic message in failure, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn subsequent_get_on_failed_node_panics_with_stored_message() {
+        let rt = Runtime::new();
+        let q = rt.create_query::<u64, _>(|_| panic!("original failure text"));
+
+        // First get triggers the panic path.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q)));
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Failed);
+
+        // Second get on the Failed node should panic again with the
+        // stored message (not re-run the compute).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q)));
+        let err = result.unwrap_err();
+        let msg = err
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| err.downcast_ref::<&'static str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            msg.contains("Failed") && msg.contains("original failure text"),
+            "expected Failed + original message, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn panic_preserves_compute_stack_for_subsequent_operations() {
+        // After a panicking compute, the thread's COMPUTE_STACK must
+        // be empty again so subsequent computes can push fresh
+        // frames. If the stack leaked, the next query's deps would
+        // be misattributed to the dead frame.
+        let rt = Runtime::new();
+        let panicking = rt.create_query::<u64, _>(|_| panic!("this compute fails"));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(panicking)));
+
+        // Now create and run a query that should work fine.
+        let input = rt.create_input::<u64>(5);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) * 2);
+        assert_eq!(rt.get(q), 10);
+
+        // And its deps should be recorded correctly.
+        let deps = collect_deps_for_slot(&rt, q.slot());
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, input.slot());
+    }
+
+    #[test]
+    fn failed_node_retries_after_upstream_set() {
+        // A query that panics only if its input is below some
+        // threshold. Set the input to a value that panics, observe
+        // Failed, set the input to a safe value, observe the node
+        // transitions Failed → Dirty → Clean on next read.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(0);
+        let q = rt.create_query::<u64, _>(move |rt| {
+            let v = rt.get(input);
+            if v == 0 {
+                panic!("input is zero");
+            }
+            v * 10
+        });
+
+        let r1 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q)));
+        assert!(r1.is_err());
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Failed);
+        assert!(failure_message_for(&rt, q.slot()).is_some());
+
+        // Set input to a non-panicking value. The dirty walk should
+        // transition Failed → Dirty and clear the stashed message.
+        rt.set(input, 7);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Dirty);
+        assert!(failure_message_for(&rt, q.slot()).is_none());
+
+        // Next get retries the compute, which now succeeds.
+        assert_eq!(rt.get(q), 70);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Clean);
+    }
+
+    #[test]
+    fn panic_inside_nested_compute_propagates_to_outer() {
+        // q_outer reads q_inner; q_inner panics. The panic should
+        // leave both nodes in Failed state (q_inner directly from
+        // its own compute, q_outer because its compute panicked
+        // while propagating q_inner's panic).
+        let rt = Runtime::new();
+        let q_inner = rt.create_query::<u64, _>(|_| panic!("inner failure"));
+        let q_outer = rt.create_query::<u64, _>(move |rt| rt.get(q_inner) + 1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q_outer)));
+        assert!(result.is_err());
+
+        assert_eq!(state_of(&rt, q_inner.slot()), NodeState::Failed);
+        assert_eq!(state_of(&rt, q_outer.slot()), NodeState::Failed);
+    }
+
+    #[test]
+    fn non_cycling_read_does_not_trigger_cycle_check() {
+        // Sanity: a compute that reads an unrelated node should NOT
+        // trip the cycle check, even if its slot index happens to be
+        // low or near the computing node's slot.
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(1);
+        let b = rt.create_input::<u64>(2);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(a) + rt.get(b));
+        assert_eq!(rt.get(q), 3); // no panic
     }
 }

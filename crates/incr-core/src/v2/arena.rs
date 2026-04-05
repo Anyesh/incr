@@ -594,6 +594,35 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
         }
     }
 
+    /// Clone the value at `slot` if it exists, returning `None` if the
+    /// slot has never been written (still `Option::None` inside the
+    /// cell). Used by callers that cannot guarantee the slot has been
+    /// initialized, such as the Runtime's early-cutoff path during a
+    /// retry-from-Failed recompute where the first compute panicked
+    /// before the arena was written.
+    ///
+    /// The same happens-before requirements as `read` apply: the
+    /// caller must have established synchronization with the most
+    /// recent writer via an Acquire load on the owning node's state.
+    pub(crate) fn try_read(&self, slot: u32) -> Option<T> {
+        if slot >= self.len.load(Ordering::Relaxed) {
+            return None;
+        }
+        let seg_idx = (slot >> SEGMENT_SHIFT) as usize;
+        let within = (slot & SEGMENT_MASK) as usize;
+        let seg_ptr = self.segments[seg_idx].load(Ordering::Acquire);
+        if seg_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: same as `read`, plus we now also check for the
+        // `None` variant of the inner `Option` and return `None`
+        // from this method in that case rather than panicking.
+        unsafe {
+            let slot_ref = &(*seg_ptr).slots[within];
+            (*slot_ref.cell.get()).as_ref().cloned()
+        }
+    }
+
     /// Overwrite the value at `slot` with `Some(value)`.
     ///
     /// If the slot previously held `Some(old)`, the old value is dropped
