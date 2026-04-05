@@ -30,6 +30,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod arena;
+pub(crate) mod handle;
 pub(crate) mod node;
 pub(crate) mod registry;
 pub(crate) mod state;

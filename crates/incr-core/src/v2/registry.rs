@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use super::arena::ErasedArena;
+use super::handle::RuntimeId;
 
 /// Source of monotonic registry ids. Starts at 1; 0 is reserved as the
 /// "never assigned" sentinel used by the TLS cache to mean "empty slot
@@ -75,10 +76,13 @@ static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct ArenaRegistry {
     /// Monotonic id that uniquely identifies this registry for its
     /// lifetime and across all registries ever constructed in this
-    /// process. Used by the TLS cache to distinguish entries belonging
-    /// to this registry from entries belonging to dropped-or-other
-    /// registries; see the module docs.
-    id: u64,
+    /// process. Also serves as the owning runtime's `RuntimeId`: a
+    /// runtime adopts its registry's id rather than tracking its own,
+    /// so the TLS cache and `Incr<T>` handles can share a single
+    /// identity concept. Used by the TLS cache to distinguish entries
+    /// belonging to this registry from entries belonging to
+    /// dropped-or-other registries; see the module docs.
+    id: RuntimeId,
     arenas: RwLock<HashMap<TypeId, Box<dyn ErasedArena>>>,
 }
 
@@ -86,14 +90,15 @@ impl ArenaRegistry {
     /// Create an empty registry with a fresh monotonic id.
     pub(crate) fn new() -> Self {
         Self {
-            id: NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed),
+            id: RuntimeId::from_raw(NEXT_REGISTRY_ID.fetch_add(1, Ordering::Relaxed)),
             arenas: RwLock::new(HashMap::new()),
         }
     }
 
     /// Return this registry's unique id. Exposed so the Runtime can
-    /// adopt it as its own `RuntimeId` in commit E.
-    pub(crate) fn id(&self) -> u64 {
+    /// adopt it as its own `RuntimeId` and so `Incr<T>` handles can
+    /// carry it for cross-runtime detection.
+    pub(crate) fn id(&self) -> RuntimeId {
         self.id
     }
 
@@ -114,7 +119,7 @@ impl ArenaRegistry {
         let tid = TypeId::of::<T>();
 
         // Hottest path: TLS cache hit.
-        if let Some(ptr) = cache_lookup(self.id, tid) {
+        if let Some(ptr) = cache_lookup(self.id.get(), tid) {
             return ptr;
         }
 
@@ -126,7 +131,7 @@ impl ArenaRegistry {
                 .expect("arena registry read lock poisoned");
             if let Some(entry) = guard.get(&tid) {
                 let ptr = entry.as_ref() as *const dyn ErasedArena;
-                cache_insert(self.id, tid, ptr);
+                cache_insert(self.id.get(), tid, ptr);
                 return ptr;
             }
         }
@@ -140,7 +145,7 @@ impl ArenaRegistry {
             .expect("arena registry write lock poisoned");
         let entry = guard.entry(tid).or_insert_with(factory);
         let ptr = entry.as_ref() as *const dyn ErasedArena;
-        cache_insert(self.id, tid, ptr);
+        cache_insert(self.id.get(), tid, ptr);
         ptr
     }
 
@@ -154,7 +159,7 @@ impl ArenaRegistry {
         let tid = TypeId::of::<T>();
 
         // Hottest path: TLS cache hit.
-        if let Some(ptr) = cache_lookup(self.id, tid) {
+        if let Some(ptr) = cache_lookup(self.id.get(), tid) {
             return Some(ptr);
         }
 
@@ -168,7 +173,7 @@ impl ArenaRegistry {
                 .get(&tid)
                 .map(|entry| entry.as_ref() as *const dyn ErasedArena)
         }?;
-        cache_insert(self.id, tid, ptr);
+        cache_insert(self.id.get(), tid, ptr);
         Some(ptr)
     }
 

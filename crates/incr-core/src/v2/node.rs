@@ -22,7 +22,7 @@
 //!   56     2     type_tag      u16           (write-once)
 //!   58     1     state         AtomicNodeState
 //!   59     1     dep_count     AtomicU8
-//!   60     4     (trailing padding to reach 64)
+//!   60     4     generation    AtomicU32     (bumped on slot recycle)
 //! ```
 //!
 //! `#[repr(C, align(64))]` forces both the layout (C-style, no field
@@ -75,6 +75,7 @@
 
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
+use super::handle::{HandleError, Incr, RuntimeId};
 use super::state::{AtomicNodeState, NodeState};
 
 /// Stable identifier for a node within a `Runtime`. The `u32` is an index
@@ -147,10 +148,15 @@ pub(crate) struct NodeData {
     /// Current number of dependencies. Used to decide whether to read
     /// from `inline_deps` or `overflow_deps`.
     dep_count: AtomicU8,
-    // Trailing 4 bytes of padding inserted by `#[repr(C, align(64))]` to
-    // round the struct size up to a multiple of 64. Do not add fields
-    // here without recomputing the layout: the `const _` size assertion
-    // at the bottom of this file will trip if the struct grows.
+
+    /// Generation counter for detecting use-after-recycle of this slot.
+    /// Matched against `Incr<T>::generation` on every handle access.
+    /// Bumped by `Runtime::delete_node` (a future capability; commit E
+    /// reserves the field but does not yet recycle slots). Lives in the
+    /// four bytes that would otherwise be trailing padding, so adding
+    /// this field does not change the struct size. The const assertion
+    /// at the bottom of this file enforces size == 64.
+    generation: AtomicU32,
 }
 
 // These assertions are load-bearing. A mismatch means a later edit
@@ -183,6 +189,7 @@ impl NodeData {
             type_tag,
             state: AtomicNodeState::new(NodeState::Clean),
             dep_count: AtomicU8::new(0),
+            generation: AtomicU32::new(0),
         }
     }
 
@@ -202,6 +209,7 @@ impl NodeData {
             type_tag,
             state: AtomicNodeState::new(NodeState::New),
             dep_count: AtomicU8::new(0),
+            generation: AtomicU32::new(0),
         }
     }
 
@@ -308,6 +316,57 @@ impl NodeData {
     #[inline]
     pub(crate) fn dep_count(&self) -> u8 {
         self.dep_count.load(Ordering::Relaxed)
+    }
+
+    /// Current generation counter. Handles carry an expected generation
+    /// and verify it against this value on every access.
+    #[inline]
+    pub(crate) fn generation(&self) -> u32 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Verify that a handle is valid for this node in a given runtime.
+    ///
+    /// Returns `Ok(())` if the handle's runtime id matches `runtime_id`
+    /// AND the handle's generation matches this node's current
+    /// generation. Returns a descriptive error otherwise. The runtime's
+    /// public `get` / `set` methods turn these errors into panics; tests
+    /// observe the `Result` directly.
+    ///
+    /// The caller is responsible for establishing happens-before with
+    /// the most recent writer of this node (typically via an Acquire
+    /// load on state before calling `verify_handle`).
+    pub(crate) fn verify_handle<T: 'static>(
+        &self,
+        handle: Incr<T>,
+        runtime_id: RuntimeId,
+    ) -> Result<(), HandleError> {
+        if handle.runtime_id() != runtime_id {
+            return Err(HandleError::WrongRuntime {
+                handle_runtime: handle.runtime_id(),
+                current_runtime: runtime_id,
+            });
+        }
+        let current = self.generation();
+        if handle.generation() != current {
+            return Err(HandleError::StaleGeneration {
+                handle_generation: handle.generation(),
+                current_generation: current,
+            });
+        }
+        Ok(())
+    }
+
+    /// Bump this node's generation counter, invalidating all outstanding
+    /// handles to the slot. Reserved for future use by `Runtime::delete_node`;
+    /// not exercised in commit E because node deletion is not yet a
+    /// capability of the runtime. Exposed now to lock in the Release
+    /// ordering contract: any subsequent reader that verifies a handle
+    /// with an Acquire-adjacent load sees the bumped generation and
+    /// rejects the handle.
+    #[cfg(test)]
+    pub(crate) fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Iterate over this node's dependencies.
@@ -500,6 +559,7 @@ mod tests {
         let type_tag = &node.type_tag as *const _ as usize - base;
         let state = &node.state as *const _ as usize - base;
         let dep_count = &node.dep_count as *const _ as usize - base;
+        let generation = &node.generation as *const _ as usize - base;
 
         assert_eq!(verified_at, 0, "verified_at at offset 0");
         assert_eq!(changed_at, 8, "changed_at at offset 8");
@@ -509,6 +569,7 @@ mod tests {
         assert_eq!(type_tag, 56, "type_tag at offset 56");
         assert_eq!(state, 58, "state at offset 58");
         assert_eq!(dep_count, 59, "dep_count at offset 59");
+        assert_eq!(generation, 60, "generation at offset 60");
     }
 
     #[test]
@@ -518,5 +579,89 @@ mod tests {
         // this fn will fail to compile.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<NodeData>();
+    }
+
+    #[test]
+    fn new_node_starts_at_generation_zero() {
+        let input = NodeData::new_input(0, 0, 0);
+        assert_eq!(input.generation(), 0);
+        let query = NodeData::new_query(0, 0);
+        assert_eq!(query.generation(), 0);
+    }
+
+    #[test]
+    fn verify_handle_succeeds_on_match() {
+        let node = NodeData::new_input(0, 0, 0);
+        let rid = RuntimeId::from_raw(42);
+        let h: Incr<u64> = Incr::new(7, 0, rid);
+        assert!(node.verify_handle(h, rid).is_ok());
+    }
+
+    #[test]
+    fn verify_handle_rejects_wrong_runtime() {
+        let node = NodeData::new_input(0, 0, 0);
+        let rid_a = RuntimeId::from_raw(42);
+        let rid_b = RuntimeId::from_raw(43);
+        let h: Incr<u64> = Incr::new(7, 0, rid_a);
+        let err = node.verify_handle(h, rid_b).unwrap_err();
+        assert_eq!(
+            err,
+            HandleError::WrongRuntime {
+                handle_runtime: rid_a,
+                current_runtime: rid_b,
+            }
+        );
+    }
+
+    #[test]
+    fn verify_handle_rejects_stale_generation() {
+        let node = NodeData::new_input(0, 0, 0);
+        let rid = RuntimeId::from_raw(42);
+        // Handle with an out-of-date generation.
+        let h: Incr<u64> = Incr::new(7, 5, rid);
+        let err = node.verify_handle(h, rid).unwrap_err();
+        assert_eq!(
+            err,
+            HandleError::StaleGeneration {
+                handle_generation: 5,
+                current_generation: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn bumping_generation_invalidates_outstanding_handles() {
+        let node = NodeData::new_input(0, 0, 0);
+        let rid = RuntimeId::from_raw(42);
+        let h: Incr<u64> = Incr::new(7, 0, rid);
+        // Fresh handle works.
+        assert!(node.verify_handle(h, rid).is_ok());
+        // Bump the generation (simulating a slot recycle).
+        node.bump_generation();
+        assert_eq!(node.generation(), 1);
+        // Old handle no longer works.
+        let err = node.verify_handle(h, rid).unwrap_err();
+        assert!(matches!(err, HandleError::StaleGeneration { .. }));
+        // A handle with the new generation would work.
+        let h2: Incr<u64> = Incr::new(7, 1, rid);
+        assert!(node.verify_handle(h2, rid).is_ok());
+    }
+
+    #[test]
+    fn verify_handle_checks_runtime_before_generation() {
+        // If both runtime and generation are wrong, the runtime error
+        // should win because it is the more specific failure (cross-
+        // runtime handles are a hard bug; stale generations are a
+        // legitimate state after a node has been recycled).
+        let node = NodeData::new_input(0, 0, 0);
+        node.bump_generation(); // current generation = 1
+        let rid_other = RuntimeId::from_raw(99);
+        let rid_this = RuntimeId::from_raw(42);
+        let h: Incr<u64> = Incr::new(7, 0, rid_other);
+        let err = node.verify_handle(h, rid_this).unwrap_err();
+        assert!(
+            matches!(err, HandleError::WrongRuntime { .. }),
+            "runtime mismatch should be reported before generation mismatch"
+        );
     }
 }
