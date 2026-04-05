@@ -318,17 +318,34 @@ impl Runtime {
                     // path check and here. Loop to re-enter the fast path.
                 }
                 NodeState::New => {
-                    // Try to CAS from New to Computing. If we win we
-                    // own the compute; if we lose, another thread won
-                    // and will transition to Clean shortly.
+                    // First-time compute. CAS New or Dirty to Computing
+                    // via try_claim_compute (which accepts both source
+                    // states). If we win we own the compute; if we lose,
+                    // another thread won and will transition to Clean.
                     let claimed = {
                         let nodes = self.nodes.read().expect("nodes lock poisoned");
                         let node = &nodes[handle.slot() as usize];
                         node.state_cell().try_claim_compute().is_ok()
                     };
                     if claimed {
-                        self.run_compute::<T>(handle.slot());
-                        // Loop to re-read and return the Clean value.
+                        self.run_compute::<T>(handle.slot(), false);
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                }
+                NodeState::Dirty => {
+                    // Recompute. Same CAS path as New (try_claim_compute
+                    // handles both source states), but `is_recompute` is
+                    // true so run_compute skips the dep publish path
+                    // (commit J assumes deps do not change between
+                    // runs; dynamic deps are a follow-up).
+                    let claimed = {
+                        let nodes = self.nodes.read().expect("nodes lock poisoned");
+                        let node = &nodes[handle.slot() as usize];
+                        node.state_cell().try_claim_compute().is_ok()
+                    };
+                    if claimed {
+                        self.run_compute::<T>(handle.slot(), true);
                     } else {
                         std::hint::spin_loop();
                     }
@@ -338,12 +355,10 @@ impl Runtime {
                     // in a nested call) is running the compute. Spin.
                     std::hint::spin_loop();
                 }
-                NodeState::Dirty | NodeState::Failed => {
+                NodeState::Failed => {
                     panic!(
-                        "v2 skeletal runtime: encountered {:?} state, but dirty/failed \
-                         are not supported in this commit. Reactivity and error \
-                         handling land in subsequent commits.",
-                        state
+                        "v2 runtime: encountered Failed state, but error \
+                         handling is deferred to a later commit."
                     );
                 }
             }
@@ -412,6 +427,17 @@ impl Runtime {
 
         drop(nodes);
         self.revision.fetch_add(1, Ordering::Relaxed);
+
+        // Transitively mark every query reachable from this input as
+        // Dirty. Done after the input's new value is published (both
+        // the arena write and the state Release above have completed)
+        // so that any reader that observes a dependent Dirty and then
+        // recomputes is guaranteed to see the new input value via the
+        // Release-Acquire chain on the dependent's state. The walk
+        // runs outside the nodes.write() guard because (a) it only
+        // needs read access to nodes and (b) it takes its own brief
+        // locks on dependents and state cells for each visited node.
+        self.mark_dependents_dirty(handle.slot());
     }
 
     // -- internal helpers --------------------------------------------------
@@ -520,17 +546,24 @@ impl Runtime {
 
     /// Run the compute closure for a query node and transition its
     /// state to Clean. The caller must have already CAS'd the state
-    /// from New to Computing.
+    /// from New or Dirty to Computing.
     ///
-    /// Dependency tracking: a compute frame is pushed onto the thread
-    /// stack before invoking the closure and popped afterward. Every
-    /// `rt.get` call inside the closure records its handle's slot on
-    /// the frame via `record_dep`. On return, the deduplicated deps
-    /// are published to the node via `NodeData::publish_initial_deps`
-    /// before the final Release store to Clean, so a reader that
-    /// Acquire-loads Clean and inspects deps observes the exact set
-    /// of nodes this compute depended on.
-    fn run_compute<T>(&self, slot: u32)
+    /// `is_recompute = false` on the first compute (source state was
+    /// New) publishes recorded deps and reverse edges.
+    /// `is_recompute = true` on a recompute (source state was Dirty)
+    /// skips both, assuming the dep set is unchanged between runs.
+    /// Dynamic dependencies (where the dep set differs between runs)
+    /// are not supported in this commit: the recompute path will
+    /// silently use the stale dep list and produce a correct value
+    /// for the original deps but miss any new deps that would have
+    /// been discovered on this run. A follow-up commit adds dep
+    /// diff + epoch reclamation for the dynamic case.
+    ///
+    /// Dep tracking still happens on every run (the COMPUTE_STACK
+    /// frame is pushed and popped) because it is cheap and symmetric,
+    /// and because skipping it would leave stale state on the stack
+    /// if a future change starts using the recorded deps on recompute.
+    fn run_compute<T>(&self, slot: u32, is_recompute: bool)
     where
         T: Clone + Send + Sync + 'static,
     {
@@ -567,8 +600,8 @@ impl Runtime {
             .downcast::<T>()
             .expect("compute function returned wrong type");
 
-        // Look up the arena slot for this node, then write value and
-        // publish deps.
+        // Look up the arena slot for this node, then write the new
+        // value.
         let arena_slot = {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize].arena_slot()
@@ -576,38 +609,108 @@ impl Runtime {
 
         self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, value));
 
-        // Publish recorded dependencies on the node. This is the
-        // write-once dep publish path; a later commit (J, for
-        // recompute) adds an atomic-swap variant with epoch
-        // reclamation for dep list mutation on subsequent computes.
-        {
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            nodes[slot as usize].publish_initial_deps(&recorded_deps);
-        }
-
-        // Publish reverse edges: for every dep this compute recorded,
-        // append `slot` to the dep's dependents list. This is what
-        // the dirty walk (commit J) will read to find every query
-        // that needs invalidation when an input changes. The lock is
-        // taken briefly because the inner Vec::push is the only
-        // mutation; readers of the dependents vec (the dirty walk)
-        // take a read lock.
-        if !recorded_deps.is_empty() {
-            let mut dependents = self.dependents.write().expect("dependents lock poisoned");
-            for dep in &recorded_deps {
-                dependents[dep.0 as usize].push(NodeId(slot));
+        if !is_recompute {
+            // First compute: publish the recorded deps on the node and
+            // the reverse edges in the runtime's dependents vec.
+            {
+                let nodes = self.nodes.read().expect("nodes lock poisoned");
+                nodes[slot as usize].publish_initial_deps(&recorded_deps);
             }
+
+            if !recorded_deps.is_empty() {
+                let mut dependents = self.dependents.write().expect("dependents lock poisoned");
+                for dep in &recorded_deps {
+                    dependents[dep.0 as usize].push(NodeId(slot));
+                }
+            }
+        } else {
+            // Recompute: assume the dep set is unchanged. The existing
+            // dep list on the node and the existing reverse edges in
+            // the dependents vec stay valid. A dynamic-deps-aware
+            // follow-up commit will diff `recorded_deps` against the
+            // node's current deps and update both sides. For now we
+            // simply drop `recorded_deps`; its frame was still pushed
+            // and popped correctly, so no bookkeeping is leaking.
+            let _ = recorded_deps;
         }
 
         // Release-store state to Clean. This publishes the arena write
-        // and the dep list (both Relaxed) together with the state
-        // transition (Release) to readers that Acquire-load state
-        // afterward.
+        // (and any dep list changes) together with the state
+        // transition to readers that Acquire-load state afterward.
         {
             let nodes = self.nodes.read().expect("nodes lock poisoned");
             nodes[slot as usize]
                 .state_cell()
                 .store_release(NodeState::Clean);
+        }
+    }
+
+    /// Transitively mark every query reachable from `changed_slot`
+    /// (via forward edges in `dependents`) as Dirty.
+    ///
+    /// Called from `set` after the input's new value is written and
+    /// published. Walks the dependents graph breadth-first from the
+    /// changed input, using `try_transition(Clean, Dirty)` on each
+    /// visited query. Nodes in states other than Clean are skipped:
+    ///
+    /// - New: never computed, nothing to invalidate.
+    /// - Dirty: already marked by a previous walk.
+    /// - Computing: concurrent recompute in progress on another
+    ///   thread. In commit J's single-writer-many-readers model, a
+    ///   Computing node that is the target of a dirty walk is a
+    ///   race: the current compute is using the old input value and
+    ///   will store_release(Clean) when it finishes, overwriting any
+    ///   Dirty mark we placed. A correct fix needs either a
+    ///   post-compute version check or a separate "Dirty During
+    ///   Compute" state; that work lands in a follow-up commit. For
+    ///   single-threaded tests this case never arises.
+    /// - Failed: later commit for error handling.
+    ///
+    /// The walk does not mark the changed node itself (it is an input
+    /// and stays Clean by convention; only its dependents are
+    /// potentially stale).
+    fn mark_dependents_dirty(&self, changed_slot: u32) {
+        use std::collections::HashSet;
+        let mut visited: HashSet<u32> = HashSet::new();
+        let mut queue: Vec<u32> = Vec::new();
+
+        // Seed the queue with the changed node's direct dependents.
+        {
+            let dependents = self.dependents.read().expect("dependents lock poisoned");
+            for dep in &dependents[changed_slot as usize] {
+                if visited.insert(dep.0) {
+                    queue.push(dep.0);
+                }
+            }
+        }
+
+        while let Some(slot) = queue.pop() {
+            // Attempt the Clean -> Dirty transition on this node.
+            // Failure is fine; it just means the node is not in a
+            // state where our mark applies (see the doc comment
+            // above).
+            {
+                let nodes = self.nodes.read().expect("nodes lock poisoned");
+                let _ = nodes[slot as usize]
+                    .state_cell()
+                    .try_transition(NodeState::Clean, NodeState::Dirty);
+            }
+
+            // Walk forward from this node regardless of whether the
+            // transition succeeded. Even if we did not transition this
+            // node (e.g., it was already Dirty), its dependents may
+            // not yet have been visited on a previous walk, and they
+            // might still be Clean and need marking. The visited set
+            // prevents revisiting a node we have already queued.
+            let children: Vec<u32> = {
+                let dependents = self.dependents.read().expect("dependents lock poisoned");
+                dependents[slot as usize].iter().map(|id| id.0).collect()
+            };
+            for child in children {
+                if visited.insert(child) {
+                    queue.push(child);
+                }
+            }
         }
     }
 
@@ -762,25 +865,26 @@ mod tests {
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn query_memoization_is_NOT_reactive_in_this_commit() {
-        // Document the explicit scope limit: setting an input does not
-        // invalidate queries that "depend on" it, because there is no
-        // dependency tracking in the skeletal runtime. This test
-        // exists so that a future commit introducing reactivity will
-        // trip it and force an author to decide whether to update or
-        // delete this test.
+    fn query_recomputes_when_its_input_changes() {
+        // Commit J makes v2 reactive. Previous commits shipped a
+        // failing-intent test named
+        // query_memoization_is_NOT_reactive_in_this_commit that
+        // asserted the opposite of this behavior. That test was
+        // renamed and its assertion flipped here. A future commit
+        // touching reactivity that breaks this test is breaking
+        // something load-bearing.
         let rt = Runtime::new();
         let a = rt.create_input::<u64>(1);
         let q = rt.create_query::<u64, _>(move |rt| rt.get(a) * 10);
         assert_eq!(rt.get(q), 10);
         rt.set(a, 7);
-        // No dirty walk: q still memoizes the first result.
         assert_eq!(
             rt.get(q),
-            10,
-            "skeletal runtime is non-reactive by design; this assertion flips when dep tracking lands"
+            70,
+            "query should reflect the new input value after set + get"
         );
+        rt.set(a, 100);
+        assert_eq!(rt.get(q), 1000);
     }
 
     #[test]
@@ -1272,5 +1376,214 @@ mod tests {
             dependents
         );
         assert_eq!(dependents[0].0, q.slot());
+    }
+
+    // -------------------------------------------------------------------
+    // Reactivity tests (commit J).
+    // -------------------------------------------------------------------
+
+    fn state_of(rt: &Runtime, slot: u32) -> NodeState {
+        let nodes = rt.nodes.read().unwrap();
+        nodes[slot as usize].state()
+    }
+
+    #[test]
+    fn set_marks_single_direct_dependent_dirty() {
+        // After set, the dependent query should be in Dirty state
+        // (before it has been re-read). This proves the dirty walk
+        // visited the query and transitioned it.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) + 100);
+
+        // First compute leaves q in Clean.
+        let _ = rt.get(q);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Clean);
+
+        // Set the input; the dirty walk should mark q Dirty.
+        rt.set(input, 50);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Dirty);
+
+        // Reading q triggers the recompute and observes the new value.
+        assert_eq!(rt.get(q), 150);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Clean);
+    }
+
+    #[test]
+    fn set_marks_transitive_dependents_dirty() {
+        // input -> q1 -> q2 -> q3. Setting input should mark all
+        // three queries Dirty via the transitive walk.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q1 = rt.create_query::<u64, _>(move |rt| rt.get(input) + 1);
+        let q2 = rt.create_query::<u64, _>(move |rt| rt.get(q1) * 2);
+        let q3 = rt.create_query::<u64, _>(move |rt| rt.get(q2) + 100);
+
+        assert_eq!(rt.get(q3), ((1 + 1) * 2) + 100); // 104
+        assert_eq!(state_of(&rt, q1.slot()), NodeState::Clean);
+        assert_eq!(state_of(&rt, q2.slot()), NodeState::Clean);
+        assert_eq!(state_of(&rt, q3.slot()), NodeState::Clean);
+
+        rt.set(input, 10);
+        // All three should be Dirty after the walk.
+        assert_eq!(state_of(&rt, q1.slot()), NodeState::Dirty);
+        assert_eq!(state_of(&rt, q2.slot()), NodeState::Dirty);
+        assert_eq!(state_of(&rt, q3.slot()), NodeState::Dirty);
+
+        // Reading q3 cascades recomputes through q2 and q1.
+        assert_eq!(rt.get(q3), ((10 + 1) * 2) + 100); // 122
+    }
+
+    #[test]
+    fn set_leaves_unrelated_queries_clean() {
+        // Two inputs, two queries. Setting one input should only
+        // dirty the query that reads it, not the other.
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(1);
+        let b = rt.create_input::<u64>(10);
+        let q_a = rt.create_query::<u64, _>(move |rt| rt.get(a) * 100);
+        let q_b = rt.create_query::<u64, _>(move |rt| rt.get(b) * 100);
+
+        assert_eq!(rt.get(q_a), 100);
+        assert_eq!(rt.get(q_b), 1000);
+
+        rt.set(a, 5);
+        assert_eq!(state_of(&rt, q_a.slot()), NodeState::Dirty);
+        assert_eq!(
+            state_of(&rt, q_b.slot()),
+            NodeState::Clean,
+            "q_b reads b, not a; should not be invalidated"
+        );
+
+        assert_eq!(rt.get(q_a), 500);
+        assert_eq!(rt.get(q_b), 1000); // unchanged
+    }
+
+    #[test]
+    fn multiple_dependents_of_one_input_all_dirtied() {
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q1 = rt.create_query::<u64, _>(move |rt| rt.get(input) + 1);
+        let q2 = rt.create_query::<u64, _>(move |rt| rt.get(input) + 2);
+        let q3 = rt.create_query::<u64, _>(move |rt| rt.get(input) + 3);
+
+        let _ = rt.get(q1);
+        let _ = rt.get(q2);
+        let _ = rt.get(q3);
+
+        rt.set(input, 100);
+        assert_eq!(state_of(&rt, q1.slot()), NodeState::Dirty);
+        assert_eq!(state_of(&rt, q2.slot()), NodeState::Dirty);
+        assert_eq!(state_of(&rt, q3.slot()), NodeState::Dirty);
+
+        assert_eq!(rt.get(q1), 101);
+        assert_eq!(rt.get(q2), 102);
+        assert_eq!(rt.get(q3), 103);
+    }
+
+    #[test]
+    fn diamond_dependency_each_node_visited_once() {
+        // q1 depends on input; q2a and q2b both depend on q1; q3
+        // depends on both q2a and q2b. This is a diamond: q1 is
+        // reached via two paths in the dirty walk. The visited set
+        // ensures it's only processed once.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q1 = rt.create_query::<u64, _>(move |rt| rt.get(input) * 2);
+        let q2a = rt.create_query::<u64, _>(move |rt| rt.get(q1) + 10);
+        let q2b = rt.create_query::<u64, _>(move |rt| rt.get(q1) + 20);
+        let q3 = rt.create_query::<u64, _>(move |rt| rt.get(q2a) + rt.get(q2b));
+
+        // Initial: input=1 → q1=2 → q2a=12, q2b=22 → q3=34.
+        assert_eq!(rt.get(q3), 34);
+
+        rt.set(input, 5);
+        // input=5 → q1=10 → q2a=20, q2b=30 → q3=50.
+        assert_eq!(rt.get(q3), 50);
+    }
+
+    #[test]
+    fn multiple_sets_in_sequence_propagate_correctly() {
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) * 1000);
+
+        assert_eq!(rt.get(q), 1000);
+        rt.set(input, 2);
+        assert_eq!(rt.get(q), 2000);
+        rt.set(input, 3);
+        assert_eq!(rt.get(q), 3000);
+        rt.set(input, 4);
+        assert_eq!(rt.get(q), 4000);
+        rt.set(input, 5);
+        assert_eq!(rt.get(q), 5000);
+    }
+
+    #[test]
+    fn set_on_input_with_no_dependents_is_a_noop_walk() {
+        // An input that no query depends on still has its value
+        // updated correctly on set, and the (empty) dirty walk
+        // should not do anything observable.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(10);
+        assert_eq!(rt.get(input), 10);
+        rt.set(input, 99);
+        assert_eq!(rt.get(input), 99);
+    }
+
+    #[test]
+    fn query_never_computed_is_unaffected_by_set() {
+        // A query in New state (never computed) should not be
+        // transitioned to Dirty by a set. The dirty walk's
+        // try_transition(Clean, Dirty) should fail silently on New.
+        // The dependents edge doesn't exist yet either (it's written
+        // on first compute), so the walk simply doesn't reach it.
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) * 10);
+
+        // Do NOT read q. Its state is New, and input has no
+        // dependents recorded yet.
+        assert_eq!(state_of(&rt, q.slot()), NodeState::New);
+        assert!(collect_dependents_for_slot(&rt, input.slot()).is_empty());
+
+        rt.set(input, 5);
+
+        // q is still New; the first get after this set will compute
+        // with the latest value (5), not 1.
+        assert_eq!(state_of(&rt, q.slot()), NodeState::New);
+        assert_eq!(rt.get(q), 50);
+    }
+
+    #[test]
+    fn query_reading_two_inputs_invalidated_by_either() {
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(1);
+        let b = rt.create_input::<u64>(2);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(a) * 10 + rt.get(b));
+
+        assert_eq!(rt.get(q), 12);
+
+        rt.set(a, 5);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Dirty);
+        assert_eq!(rt.get(q), 52);
+
+        rt.set(b, 99);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Dirty);
+        assert_eq!(rt.get(q), 149);
+    }
+
+    #[test]
+    fn string_query_reactivity() {
+        // Reactivity with a non-primitive value type. Exercises the
+        // same code path as the u64 tests but through GenericArena's
+        // UnsafeCell<Option<String>> storage.
+        let rt = Runtime::new();
+        let name = rt.create_input::<String>("Anish".to_string());
+        let greeting = rt.create_query::<String, _>(move |rt| format!("hi, {}", rt.get(name)));
+
+        assert_eq!(rt.get(greeting), "hi, Anish");
+        rt.set(name, "world".to_string());
+        assert_eq!(rt.get(greeting), "hi, world");
     }
 }
