@@ -98,10 +98,10 @@ impl AtomicNodeState {
     /// Load the current state with `Relaxed` ordering.
     ///
     /// Use this only when no synchronization with other fields is required,
-    /// for example when printing the state for debugging. Do not use it on
-    /// the hot path before reading a node's value.
+    /// for example for debug assertions, diagnostics, or when the caller
+    /// has already established happens-before via another Acquire load.
+    /// Do not use it on the hot path before reading a node's value.
     #[inline]
-    #[cfg(test)]
     pub(crate) fn load_relaxed(&self) -> NodeState {
         NodeState::from_u8(self.cell.load(Ordering::Relaxed))
     }
