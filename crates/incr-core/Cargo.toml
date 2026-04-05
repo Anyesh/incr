@@ -12,6 +12,8 @@ rustc-hash = "2"
 proptest = "1"
 criterion = { version = "0.5", features = ["html_reports"] }
 salsa = "0.26"
+crossbeam-epoch = "0.9"
+rand = "0.8"
 
 [[bench]]
 name = "performance"
@@ -23,4 +25,12 @@ harness = false
 
 [[bench]]
 name = "collection_operators"
+harness = false
+
+[[bench]]
+name = "concurrency_primitives"
+harness = false
+
+[[bench]]
+name = "contended_concurrency"
 harness = false
