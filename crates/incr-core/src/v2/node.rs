@@ -228,6 +228,88 @@ impl NodeData {
         ]
     }
 
+    /// Replace this node's dependency list with a new set.
+    ///
+    /// Called by the runtime on recompute when the compute closure
+    /// recorded a different set of dependencies than the previous run
+    /// (dynamic dependencies). Handles all four inline/overflow
+    /// transitions:
+    ///
+    /// - inline → inline: overwrite the inline slots in place, clear
+    ///   the overflow pointer if it was somehow non-null (shouldn't
+    ///   be, but harmless).
+    /// - inline → overflow: allocate a new DepList, install it in the
+    ///   overflow pointer.
+    /// - overflow → inline: copy into inline slots, free the old
+    ///   overflow box.
+    /// - overflow → overflow: allocate a new DepList, swap it into
+    ///   the overflow pointer, free the old one.
+    ///
+    /// # Safety of overflow reclamation
+    ///
+    /// The caller must guarantee that no concurrent reader holds a
+    /// pointer to the old overflow list at the time of this call.
+    /// The runtime enforces this by taking `nodes.write()` for the
+    /// duration of the call, which is mutually exclusive with any
+    /// reader's `nodes.read()` guard. A later commit replaces this
+    /// with epoch reclamation so recompute can run without the write
+    /// lock; for now the write lock is the correctness mechanism.
+    ///
+    /// Stores use `Relaxed` ordering because the caller will issue a
+    /// `Release` store on the node's state after this call (the
+    /// Computing → Clean transition at the end of `run_compute`),
+    /// which publishes these writes to subsequent readers via the
+    /// standard Release-Acquire chain on state.
+    pub(crate) fn replace_deps(&self, new_deps: &[NodeId]) {
+        let count = new_deps.len();
+        assert!(
+            count <= u8::MAX as usize,
+            "deps overflow u8 count: {}",
+            count
+        );
+
+        // Snapshot the old overflow pointer so we can reclaim it
+        // after installing the new dep list. Load is Relaxed because
+        // the caller already owns exclusive access via nodes.write()
+        // and no other thread can be racing on this slot.
+        let old_overflow = self.overflow_deps.load(Ordering::Relaxed);
+
+        if count <= 7 {
+            // New deps fit inline. Overwrite inline slots and clear
+            // the overflow pointer. Slots beyond `count` are stale
+            // but ignored by for_each_dep (which loops to count).
+            for (i, dep) in new_deps.iter().enumerate() {
+                self.inline_deps[i].store(dep.0, Ordering::Relaxed);
+            }
+            self.overflow_deps
+                .store(std::ptr::null_mut(), Ordering::Relaxed);
+        } else {
+            // New deps spill to overflow. Allocate a fresh DepList
+            // and install it. The inline slots are ignored when
+            // dep_count > 7 so we do not touch them.
+            let list = Box::new(DepList {
+                deps: new_deps.to_vec().into_boxed_slice(),
+            });
+            let new_ptr = Box::into_raw(list);
+            self.overflow_deps.store(new_ptr, Ordering::Relaxed);
+        }
+
+        self.dep_count.store(count as u8, Ordering::Relaxed);
+
+        // Reclaim the old overflow box if present. The caller's
+        // nodes.write() guarantees no concurrent reader can be
+        // dereferencing this pointer right now.
+        if !old_overflow.is_null() {
+            // SAFETY: the pointer came from `Box::into_raw` in a
+            // previous call to `publish_initial_deps` or
+            // `replace_deps`; the caller holds nodes.write() so no
+            // concurrent reader can still be using it.
+            unsafe {
+                drop(Box::from_raw(old_overflow));
+            }
+        }
+    }
+
     /// Publish an initial dependency list on a `New` query node.
     ///
     /// This is the commit-D placeholder for the full compute-path dep
@@ -415,8 +497,9 @@ impl NodeData {
 
     /// Collect dependencies into a `Vec<NodeId>`. Convenience for tests
     /// and diagnostics; production code uses `for_each_dep` to avoid
-    /// the allocation.
-    #[cfg(test)]
+    /// the allocation where possible. The runtime's dep-diff path on
+    /// recompute calls `collect_deps` to materialize the previous
+    /// dep list for comparison against the newly-recorded set.
     pub(crate) fn collect_deps(&self) -> Vec<NodeId> {
         let mut out = Vec::with_capacity(self.dep_count() as usize);
         self.for_each_dep(|id| out.push(id));

@@ -695,15 +695,14 @@ impl Runtime {
         // from corrupting subsequent computes on the same thread.
         let recorded_deps = self.pop_compute_frame(slot);
 
-        // Publish dependencies and reverse edges on first compute
-        // regardless of whether the compute itself succeeded. A
-        // partial dep record from a panicked compute is still
-        // useful: it lets the dirty walk reach this Failed node on
-        // a subsequent upstream change and transition it to Dirty
-        // for retry. Without this, Failed nodes would be
-        // unreachable from their inputs and retry would never
-        // happen. On recompute we keep the existing dep list
-        // untouched (dynamic dep updates are a follow-up).
+        // Publish dependencies and reverse edges. On first compute
+        // we install them fresh; on recompute we diff against the
+        // previous set and update only the differences. Both paths
+        // run regardless of whether the compute succeeded or
+        // panicked, because a partial dep record from a panicked
+        // compute is still the most accurate information we have
+        // and it lets the dirty walk reach a Failed node on a
+        // subsequent upstream change (enabling retry).
         if !is_recompute {
             {
                 let nodes = self.nodes.read().expect("nodes lock poisoned");
@@ -716,11 +715,13 @@ impl Runtime {
                 }
             }
         } else {
-            // Recompute: assume the dep set is unchanged. The
-            // existing dep list and the existing reverse edges stay
-            // valid. Dep diff + epoch reclamation for dynamic deps
-            // is a follow-up.
-            let _ = recorded_deps;
+            // Recompute: diff the new recorded deps against the
+            // node's previous dep list and update only the
+            // differences. Handles the dynamic-deps case where a
+            // compute reads a different set of deps on different
+            // runs (e.g., a conditional that branches on an input
+            // value).
+            self.update_deps_on_recompute(slot, &recorded_deps);
         }
 
         // Handle the compute result. The panic arm runs AFTER the
@@ -821,6 +822,78 @@ impl Runtime {
             nodes[slot as usize]
                 .state_cell()
                 .store_release(NodeState::Clean);
+        }
+    }
+
+    /// Diff the new recorded deps against the node's previous dep
+    /// list and update both the node's forward dep list and the
+    /// runtime's reverse-edge (dependents) vec to reflect the
+    /// difference.
+    ///
+    /// Called from `run_compute` on recompute (when `is_recompute`
+    /// is true). The common case is that the dep set is unchanged
+    /// and this function is a fast compare-and-return; the
+    /// interesting case is dynamic dependencies where a conditional
+    /// inside the compute closure caused it to read a different
+    /// set of deps than the previous run.
+    ///
+    /// Takes `nodes.write()` briefly when the dep set has actually
+    /// changed, because `NodeData::replace_deps` frees the old
+    /// overflow list immediately and needs mutual exclusion with
+    /// any concurrent readers. A later commit replaces this with
+    /// epoch reclamation so recompute can run fully lock-free.
+    fn update_deps_on_recompute(&self, slot: u32, new_deps: &[NodeId]) {
+        use std::collections::HashSet;
+
+        // Snapshot the old dep list. Brief read guard.
+        let old_deps: Vec<NodeId> = {
+            let nodes = self.nodes.read().expect("nodes lock poisoned");
+            nodes[slot as usize].collect_deps()
+        };
+
+        // Fast path: dep lists match exactly (same order, same
+        // contents). This is the common static-deps case. Avoid
+        // the HashSet allocation and the write lock.
+        if old_deps.len() == new_deps.len() && old_deps.iter().eq(new_deps.iter()) {
+            return;
+        }
+
+        // Slow path: something changed. Compute the added and
+        // removed sets for reverse-edge bookkeeping.
+        let old_set: HashSet<NodeId> = old_deps.iter().copied().collect();
+        let new_set: HashSet<NodeId> = new_deps.iter().copied().collect();
+        let added: Vec<NodeId> = new_deps
+            .iter()
+            .filter(|d| !old_set.contains(*d))
+            .copied()
+            .collect();
+        let removed: Vec<NodeId> = old_deps
+            .iter()
+            .filter(|d| !new_set.contains(*d))
+            .copied()
+            .collect();
+
+        // Replace the node's forward dep list under a write guard
+        // on nodes. The write guard guarantees no concurrent reader
+        // is dereferencing the old overflow pointer when
+        // `NodeData::replace_deps` frees it. A later commit lifts
+        // this requirement via epoch reclamation.
+        {
+            let nodes = self.nodes.write().expect("nodes lock poisoned");
+            nodes[slot as usize].replace_deps(new_deps);
+        }
+
+        // Update reverse edges. Added deps gain an incoming edge
+        // from `slot`; removed deps lose theirs. Both under a
+        // single brief write guard on dependents.
+        if !added.is_empty() || !removed.is_empty() {
+            let mut dependents = self.dependents.write().expect("dependents lock poisoned");
+            for dep in &added {
+                dependents[dep.0 as usize].push(NodeId(slot));
+            }
+            for dep in &removed {
+                dependents[dep.0 as usize].retain(|d| d.0 != slot);
+            }
         }
     }
 
@@ -2144,5 +2217,230 @@ mod tests {
         let b = rt.create_input::<u64>(2);
         let q = rt.create_query::<u64, _>(move |rt| rt.get(a) + rt.get(b));
         assert_eq!(rt.get(q), 3); // no panic
+    }
+
+    // -------------------------------------------------------------------
+    // Dynamic dependency tests (commit M).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn query_with_conditional_deps_tracks_only_read_branch() {
+        // A classic dynamic-dep query: read `flag`, then read one of
+        // two inputs depending on the flag. Initial flag true, reads
+        // `a`. Query's deps should be [flag, a].
+        let rt = Runtime::new();
+        let flag = rt.create_input::<bool>(true);
+        let a = rt.create_input::<u64>(10);
+        let b = rt.create_input::<u64>(20);
+
+        let q =
+            rt.create_query::<u64, _>(move |rt| if rt.get(flag) { rt.get(a) } else { rt.get(b) });
+
+        assert_eq!(rt.get(q), 10);
+        let deps = collect_deps_for_slot(&rt, q.slot());
+        // Deps should be [flag, a] — only the branch that was
+        // actually taken.
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.0 == flag.slot()));
+        assert!(deps.iter().any(|d| d.0 == a.slot()));
+        assert!(!deps.iter().any(|d| d.0 == b.slot()));
+    }
+
+    #[test]
+    fn flipping_conditional_dep_updates_dep_list_and_reverse_edges() {
+        // Start with flag=true (reads a). Change flag to false, read
+        // q again (triggers recompute via dirty walk from flag). The
+        // new recompute reads b, not a. Assert that:
+        //   1. q's new deps are [flag, b]
+        //   2. a's dependents list no longer contains q (stale
+        //      reverse edge removed)
+        //   3. b's dependents list now contains q (new reverse edge
+        //      added)
+        let rt = Runtime::new();
+        let flag = rt.create_input::<bool>(true);
+        let a = rt.create_input::<u64>(100);
+        let b = rt.create_input::<u64>(200);
+
+        let q =
+            rt.create_query::<u64, _>(move |rt| if rt.get(flag) { rt.get(a) } else { rt.get(b) });
+
+        // First compute: reads flag + a.
+        assert_eq!(rt.get(q), 100);
+        assert!(collect_dependents_for_slot(&rt, a.slot())
+            .iter()
+            .any(|d| d.0 == q.slot()));
+        assert!(!collect_dependents_for_slot(&rt, b.slot())
+            .iter()
+            .any(|d| d.0 == q.slot()));
+
+        // Flip the flag. Dirty walk marks q Dirty via flag's
+        // dependents list.
+        rt.set(flag, false);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Dirty);
+
+        // Recompute. Now reads flag + b instead of flag + a.
+        assert_eq!(rt.get(q), 200);
+        let deps = collect_deps_for_slot(&rt, q.slot());
+        assert_eq!(deps.len(), 2);
+        assert!(deps.iter().any(|d| d.0 == flag.slot()));
+        assert!(deps.iter().any(|d| d.0 == b.slot()));
+        assert!(!deps.iter().any(|d| d.0 == a.slot()));
+
+        // Reverse edges: a should no longer point to q, b should.
+        let a_deps = collect_dependents_for_slot(&rt, a.slot());
+        let b_deps = collect_dependents_for_slot(&rt, b.slot());
+        assert!(
+            !a_deps.iter().any(|d| d.0 == q.slot()),
+            "stale reverse edge a -> q not removed: {:?}",
+            a_deps
+        );
+        assert!(
+            b_deps.iter().any(|d| d.0 == q.slot()),
+            "new reverse edge b -> q not added: {:?}",
+            b_deps
+        );
+    }
+
+    #[test]
+    fn removed_dep_no_longer_invalidates_query() {
+        // After a recompute changes the dep set to drop `a`, setting
+        // `a` should NOT mark q dirty (because q no longer reads a).
+        // Setting the dep that's now in the set (`b`) SHOULD mark q
+        // dirty.
+        let rt = Runtime::new();
+        let flag = rt.create_input::<bool>(true);
+        let a = rt.create_input::<u64>(1);
+        let b = rt.create_input::<u64>(2);
+        let q =
+            rt.create_query::<u64, _>(move |rt| if rt.get(flag) { rt.get(a) } else { rt.get(b) });
+
+        // First compute reads a. Second compute (after flag flip)
+        // reads b.
+        assert_eq!(rt.get(q), 1);
+        rt.set(flag, false);
+        assert_eq!(rt.get(q), 2);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Clean);
+
+        // Now setting a should NOT dirty q.
+        rt.set(a, 999);
+        assert_eq!(
+            state_of(&rt, q.slot()),
+            NodeState::Clean,
+            "q should not be dirtied by changes to a (no longer a dep)"
+        );
+
+        // But setting b should.
+        rt.set(b, 888);
+        assert_eq!(state_of(&rt, q.slot()), NodeState::Dirty);
+        assert_eq!(rt.get(q), 888);
+    }
+
+    #[test]
+    fn static_recompute_dep_list_does_not_trigger_reverse_edge_rewrite() {
+        // A recompute whose dep set is identical to the previous
+        // run's should take the fast path and not touch the
+        // dependents vec. Hard to observe directly, but we can
+        // verify the dependents list stays exactly as it was (no
+        // duplicates introduced by a redundant push).
+        let rt = Runtime::new();
+        let input = rt.create_input::<u64>(1);
+        let q = rt.create_query::<u64, _>(move |rt| rt.get(input) + 10);
+
+        assert_eq!(rt.get(q), 11);
+        let dependents_before = collect_dependents_for_slot(&rt, input.slot());
+        assert_eq!(dependents_before.len(), 1);
+        assert_eq!(dependents_before[0].0, q.slot());
+
+        // Change the input to a different value. Same deps on
+        // recompute, but this exercises the dep-diff fast path.
+        rt.set(input, 5);
+        assert_eq!(rt.get(q), 15);
+
+        let dependents_after = collect_dependents_for_slot(&rt, input.slot());
+        assert_eq!(
+            dependents_after.len(),
+            1,
+            "static recompute must not duplicate reverse edges: {:?}",
+            dependents_after
+        );
+        assert_eq!(dependents_after[0].0, q.slot());
+    }
+
+    #[test]
+    fn adding_a_dep_on_recompute_creates_new_reverse_edge() {
+        // Query starts reading just `a`. After flag flip it reads
+        // both `a` and `b`. Verify b's dependents gains q.
+        let rt = Runtime::new();
+        let flag = rt.create_input::<bool>(false);
+        let a = rt.create_input::<u64>(10);
+        let b = rt.create_input::<u64>(20);
+        let q = rt.create_query::<u64, _>(move |rt| {
+            let av = rt.get(a);
+            if rt.get(flag) {
+                av + rt.get(b)
+            } else {
+                av
+            }
+        });
+
+        assert_eq!(rt.get(q), 10);
+        // Only a (and flag) are deps; b is not yet.
+        assert!(!collect_dependents_for_slot(&rt, b.slot())
+            .iter()
+            .any(|d| d.0 == q.slot()));
+
+        rt.set(flag, true);
+        assert_eq!(rt.get(q), 30);
+        // Now b should be a dep.
+        assert!(collect_dependents_for_slot(&rt, b.slot())
+            .iter()
+            .any(|d| d.0 == q.slot()));
+    }
+
+    #[test]
+    fn dep_list_shrinking_across_inline_overflow_boundary() {
+        // Exercise the inline→overflow and overflow→inline
+        // transitions in replace_deps. First compute reads 10
+        // inputs (spills to overflow). Recompute after a conditional
+        // flip reads only 3 inputs (fits in inline). The old
+        // overflow box must be freed.
+        let rt = Runtime::new();
+        let flag = rt.create_input::<bool>(true);
+        let mut inputs: Vec<Incr<u64>> = Vec::new();
+        for i in 0..10 {
+            inputs.push(rt.create_input::<u64>(i));
+        }
+        let inputs_for_closure = inputs.clone();
+        let q = rt.create_query::<u64, _>(move |rt| {
+            if rt.get(flag) {
+                // Wide read: 10 inputs spill to overflow dep list.
+                let mut sum = 0;
+                for inp in &inputs_for_closure {
+                    sum += rt.get(*inp);
+                }
+                sum
+            } else {
+                // Narrow read: 3 inputs fit inline.
+                rt.get(inputs_for_closure[0])
+                    + rt.get(inputs_for_closure[1])
+                    + rt.get(inputs_for_closure[2])
+            }
+        });
+
+        // First compute: 10 deps + flag = 11 deps, overflow.
+        let expected_sum: u64 = (0..10u64).sum();
+        assert_eq!(rt.get(q), expected_sum);
+        assert_eq!(collect_deps_for_slot(&rt, q.slot()).len(), 11);
+
+        // Flip to narrow. Recompute reads flag + 3 deps = 4 deps,
+        // fits inline. The old overflow DepList is reclaimed.
+        rt.set(flag, false);
+        assert_eq!(rt.get(q), 0 + 1 + 2);
+        assert_eq!(collect_deps_for_slot(&rt, q.slot()).len(), 4);
+
+        // Go back to wide. Reallocate overflow.
+        rt.set(flag, true);
+        assert_eq!(rt.get(q), expected_sum);
+        assert_eq!(collect_deps_for_slot(&rt, q.slot()).len(), 11);
     }
 }
