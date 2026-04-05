@@ -22,8 +22,6 @@
 //! ratio of 1.0 means parity; above 1.0 means v2 is slower than
 //! v1 (a regression); below 1.0 means v2 is faster (a win).
 
-#![cfg(test)]
-
 use std::hint::black_box;
 use std::time::Instant;
 

@@ -2231,7 +2231,7 @@ mod tests {
         // Flip to narrow. Recompute reads flag + 3 deps = 4 deps,
         // fits inline. The old overflow DepList is reclaimed.
         rt.set(flag, false);
-        assert_eq!(rt.get(q), 0 + 1 + 2);
+        assert_eq!(rt.get(q), 1 + 2);
         assert_eq!(collect_deps_for_slot(&rt, q.slot()).len(), 4);
 
         // Go back to wide. Reallocate overflow.

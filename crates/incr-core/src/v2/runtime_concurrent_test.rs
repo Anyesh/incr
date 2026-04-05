@@ -23,8 +23,6 @@
 //! need crate-private access to construct handles and check state
 //! that the public API will eventually expose differently.
 
-#![cfg(test)]
-
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

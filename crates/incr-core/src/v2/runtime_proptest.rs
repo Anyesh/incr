@@ -20,8 +20,6 @@
 //! separate piece of work that will be rewritten against v2 in its
 //! own chunk per the spec's section 3 scope notes.
 
-#![cfg(test)]
-
 use super::handle::Incr;
 use super::runtime::Runtime;
 use proptest::prelude::*;

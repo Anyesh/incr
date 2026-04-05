@@ -310,25 +310,27 @@ impl NodeData {
         }
     }
 
-    /// Variant of `replace_deps` that skips reclamation of the old
-    /// overflow list, leaking it instead.
+    /// Variant of `replace_deps` that leaks the old overflow list
+    /// instead of reclaiming it.
     ///
-    /// Used by the Runtime's recompute path after commit U replaced
-    /// the nodes RwLock with SegmentedNodes: without the write lock
-    /// there is no guarantee that concurrent readers have finished
-    /// dereferencing the old overflow pointer when we want to free
-    /// it. Leaking is a memory cost (one `Box<[NodeId]>` per dep
-    /// list replacement) but not a correctness cost. A follow-up
-    /// commit replaces this with epoch-based reclamation so the
-    /// memory is recovered bounded-time after the last reader
-    /// departs.
+    /// Required because SegmentedNodes has no reader/writer
+    /// exclusion on node state, so freeing the old overflow pointer
+    /// while a walker is mid-traversal would UAF. The leak is
+    /// bounded: `NodeData::Drop` reclaims the currently-installed
+    /// overflow list, and this method is only called on the rare
+    /// dynamic-dep path where the dep set changes AND the node has
+    /// more than 7 deps. Static-dep workloads never call it.
     ///
-    /// `Drop` on the `NodeData` itself still reclaims the final
-    /// overflow list via `Box::from_raw`, so leaked overflow lists
-    /// from intermediate `replace_deps` calls are eventually freed
-    /// when the Runtime (and thus the SegmentedNodes, and thus the
-    /// NodeData) drops. The window of leak is bounded by node
-    /// lifetime rather than unbounded.
+    /// Spec section 5.3 calls for epoch-based reclamation here. The
+    /// planned fix (commit X of Gate 4) used `crossbeam-epoch 0.9`,
+    /// which turns out not to be miri-clean due to integer-to-pointer
+    /// casts in its internal thread-local list init. Rather than
+    /// regress the miri-clean invariant for a bounded leak on a
+    /// rarely-hit path, X was dropped from Gate 4 and the leak is
+    /// kept as the permanent post-Gate-4 state. Proper reclamation
+    /// is queued as a dedicated later chunk that will evaluate
+    /// `seize`, `haphazard`, or a custom strict-provenance
+    /// implementation.
     pub(crate) fn replace_deps_leaking_old_overflow(&self, new_deps: &[NodeId]) {
         let count = new_deps.len();
         assert!(

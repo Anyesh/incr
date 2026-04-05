@@ -449,8 +449,6 @@ impl<T: AtomicPrimitive> ErasedArena for AtomicPrimitiveArena<T> {
 // GenericArena: non-primitive values coordinated by the state machine.
 // ---------------------------------------------------------------------------
 
-use std::cell::UnsafeCell;
-
 /// One slot in a `GenericArena`. The inner `Option<T>` starts `None` at
 /// segment allocation and becomes `Some(value)` once the arena's user
 /// writes a value into it.

@@ -261,7 +261,7 @@ mod tests {
         let store = SegmentedNodes::new();
         for i in 0..20 {
             let slot = store.push(NodeData::new_query(0, i));
-            let deps: Vec<NodeId> = (0..(i as u32 + 5)).map(NodeId).collect();
+            let deps: Vec<NodeId> = (0..(i + 5)).map(NodeId).collect();
             store.get(slot).publish_initial_deps(&deps);
         }
         drop(store);
