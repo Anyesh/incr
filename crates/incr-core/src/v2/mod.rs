@@ -32,6 +32,7 @@
 pub(crate) mod arena;
 pub(crate) mod collection;
 pub(crate) mod handle;
+pub(crate) mod sorted_collection;
 pub(crate) mod node;
 pub(crate) mod nodes_store;
 pub(crate) mod registry;
