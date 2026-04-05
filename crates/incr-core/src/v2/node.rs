@@ -320,9 +320,17 @@ impl NodeData {
 
     /// Current generation counter. Handles carry an expected generation
     /// and verify it against this value on every access.
+    ///
+    /// Uses `Acquire` ordering so that a bump from another thread via
+    /// `bump_generation` (which uses `Release`) establishes the required
+    /// happens-before edge: a reader verifying a handle after a slot
+    /// recycle observes the bumped counter and rejects the stale
+    /// handle. Without `Acquire` here, the Release on the bump side
+    /// pairs with nothing and a reader might see the pre-bump value
+    /// indefinitely (addressed review finding C3).
     #[inline]
     pub(crate) fn generation(&self) -> u32 {
-        self.generation.load(Ordering::Relaxed)
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Verify that a handle is valid for this node in a given runtime.

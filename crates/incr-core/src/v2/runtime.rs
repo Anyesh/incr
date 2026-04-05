@@ -65,7 +65,7 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::arena::{ErasedArena, GenericArena};
+use super::arena::GenericArena;
 use super::handle::{Incr, RuntimeId};
 use super::node::NodeData;
 use super::registry::ArenaRegistry;
@@ -90,6 +90,13 @@ pub struct Runtime {
     /// address across vec resizes; the `RwLock` allows concurrent reads
     /// (one briefly per `get`) with exclusive access for the writer
     /// (one briefly per `create_*` append).
+    ///
+    /// `clippy::vec_box` suggests collapsing `Vec<Box<NodeData>>` into
+    /// `Vec<NodeData>`, but that would invalidate pointers into nodes
+    /// on every `Vec` reallocation, which this design relies on
+    /// (`NodeData` carries atomics that cannot be relocated while
+    /// another thread is observing them). The Box is load-bearing.
+    #[allow(clippy::vec_box)]
     nodes: RwLock<Vec<Box<NodeData>>>,
 
     /// Compute closures for query nodes. Indexed the same way as
@@ -195,16 +202,48 @@ impl Runtime {
     }
 
     /// Read the value of a node.
+    ///
+    /// The fast path (observing `Clean`) holds a `nodes.read()` guard
+    /// across the arena read so that no writer can mutate the slot
+    /// concurrently: `set` takes `nodes.write()`, which is mutually
+    /// exclusive with any outstanding `nodes.read()`. This is the
+    /// commit-F correctness fallback for the reader-writer race on
+    /// `GenericArena<T>` slots that was discovered in review finding C1.
+    /// A later commit replaces nodes with a segmented store and uses a
+    /// proper hazard / RCU scheme so reads do not need the RwLock gate.
     pub fn get<T>(&self, handle: Incr<T>) -> T
     where
         T: Clone + Send + Sync + 'static,
     {
         self.check_runtime(handle);
         loop {
-            let (state, arena_slot) = self.verify_and_snapshot(handle);
+            // Fast path (Clean): hold nodes.read() through the arena
+            // read so no writer can mutate the slot in between.
+            {
+                let nodes = self.nodes.read().expect("nodes lock poisoned");
+                let node = &nodes[handle.slot() as usize];
+                node.verify_handle(handle, self.id)
+                    .unwrap_or_else(|e| panic!("{}", e));
+                if node.state() == NodeState::Clean {
+                    let arena_slot = node.arena_slot();
+                    let value: T =
+                        self.with_generic_arena::<T, _, _>(|arena| arena.read(arena_slot));
+                    return value;
+                }
+            }
+
+            // Slow path: not Clean. Release the nodes guard before
+            // calling back into the runtime (CAS, compute, spin) so
+            // std::sync::RwLock is not reentered on this thread (std
+            // RwLock is not guaranteed reentrant).
+            let state = {
+                let nodes = self.nodes.read().expect("nodes lock poisoned");
+                nodes[handle.slot() as usize].state()
+            };
             match state {
                 NodeState::Clean => {
-                    return self.with_generic_arena::<T, _, _>(|arena| arena.read(arena_slot));
+                    // Raced with a compute completion between our fast
+                    // path check and here. Loop to re-enter the fast path.
                 }
                 NodeState::New => {
                     // Try to CAS from New to Computing. If we win we
@@ -241,6 +280,27 @@ impl Runtime {
 
     /// Update an input node's value. Panics if the handle refers to a
     /// query node.
+    ///
+    /// Takes `nodes.write()` rather than `nodes.read()` for the
+    /// duration of the arena mutation. This excludes all concurrent
+    /// `get` callers (which hold `nodes.read()` on their fast path)
+    /// so the writer has exclusive access to the arena slot while
+    /// calling `arena.write(slot, value)`, which for `GenericArena<T>`
+    /// is a plain non-atomic store that drops the old `T` and
+    /// installs a new one. Without this exclusion a concurrent reader
+    /// could observe a torn value (review finding C1).
+    ///
+    /// The RwLock gate is a commit-F fallback: the spec's intended
+    /// model is lock-free reads via a segmented nodes store, where
+    /// reader/writer synchronization on an input slot is carried by
+    /// the dirty walk (which marks dependent queries Dirty with
+    /// Release). That model assumes input values are reached through
+    /// dependent queries, not via direct `rt.get(input_handle)` from
+    /// a concurrent reader, but the public API permits direct reads
+    /// and therefore the runtime has to handle them. The segmented
+    /// store + hazard / RCU approach that replaces this gate lands
+    /// in a later commit; until then, nodes RwLock is the honest
+    /// correctness mechanism.
     pub fn set<T>(&self, handle: Incr<T>, value: T)
     where
         T: Clone + Send + Sync + 'static,
@@ -251,38 +311,34 @@ impl Runtime {
             .lock()
             .expect("runtime write mutex poisoned");
 
-        // Verify handle, check that it is an input (state == Clean
-        // before our update; queries are New until first compute and
-        // not valid `set` targets), and extract the arena slot.
-        let arena_slot = {
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            let node = &nodes[handle.slot() as usize];
-            node.verify_handle(handle, self.id)
-                .unwrap_or_else(|e| panic!("{}", e));
-            assert!(
-                self.compute_fns.read().expect("compute lock poisoned")[handle.slot() as usize]
-                    .is_none(),
-                "set() called on a query node; only input nodes may be set"
-            );
-            node.arena_slot()
-        };
+        // Take nodes.write() to exclude all concurrent readers for
+        // the duration of the arena mutation below. See the method
+        // docs for the reasoning.
+        let nodes = self.nodes.write().expect("nodes lock poisoned");
+        let node = &nodes[handle.slot() as usize];
+        node.verify_handle(handle, self.id)
+            .unwrap_or_else(|e| panic!("{}", e));
+        assert!(
+            self.compute_fns.read().expect("compute lock poisoned")[handle.slot() as usize]
+                .is_none(),
+            "set() called on a query node; only input nodes may be set"
+        );
+        let arena_slot = node.arena_slot();
 
+        // Arena write happens while holding nodes.write(). No reader
+        // can be inside a concurrent arena.read on the same slot,
+        // because readers require nodes.read() which is mutually
+        // exclusive with nodes.write().
         self.with_generic_arena::<T, _, _>(|arena| arena.write(arena_slot, value));
 
-        // Publish. Release-store the input node's state so any reader
-        // that Acquire-loads state after this point observes the new
-        // arena value via the happens-before established here. This is
-        // the "missing Release publish on the input node itself" that
-        // the spec's section 6.4 pseudocode glosses over; without it,
-        // a reader that never touches a dependent query could race
-        // with the writer's Relaxed arena store.
-        {
-            let nodes = self.nodes.read().expect("nodes lock poisoned");
-            nodes[handle.slot() as usize]
-                .state_cell()
-                .store_release(NodeState::Clean);
-        }
+        // State was already Clean and stays Clean; this Release store
+        // is a no-op semantically but anchors the memory ordering
+        // contract for the future lock-free variant. When the RwLock
+        // gate is removed, readers will Acquire-load state to gate
+        // their arena access and this Release is the publish side.
+        node.state_cell().store_release(NodeState::Clean);
 
+        drop(nodes);
         self.revision.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -314,18 +370,6 @@ impl Runtime {
                 self.id
             );
         }
-    }
-
-    /// Verify that `handle` is valid for this runtime and return the
-    /// snapshot of (state, arena_slot) the caller needs to act on.
-    /// Panics with a diagnostic message on verification failure.
-    fn verify_and_snapshot<T: 'static>(&self, handle: Incr<T>) -> (NodeState, u32) {
-        self.check_runtime(handle);
-        let nodes = self.nodes.read().expect("nodes lock poisoned");
-        let node = &nodes[handle.slot() as usize];
-        node.verify_handle(handle, self.id)
-            .unwrap_or_else(|e| panic!("{}", e));
-        (node.state(), node.arena_slot())
     }
 
     /// Run the compute closure for a query node and transition its
@@ -592,6 +636,130 @@ mod tests {
             .collect();
         for h in handles {
             assert_eq!(h.join().unwrap(), 200);
+        }
+    }
+
+    #[test]
+    fn concurrent_get_and_set_on_non_copy_input_is_race_free() {
+        // Regression test for the reader-writer data race on GenericArena
+        // slots identified in review finding C1. Before the fix, concurrent
+        // rt.get and rt.set on the same String input would race on the
+        // UnsafeCell<Option<String>> slot: the writer's plain-non-atomic
+        // `*slot = Some(new)` drops the old String and installs a new one
+        // while the reader is mid-clone, yielding torn data or a segfault.
+        //
+        // The fix uses the nodes RwLock as a synchronization gate: readers
+        // hold nodes.read() across the arena read, writers hold nodes.write()
+        // across the arena write, so reader and writer never touch the slot
+        // simultaneously.
+        //
+        // This test exists to prove the fix works. Under miri, the broken
+        // version of the code flags a data race; the fixed version passes.
+        // Under regular cargo test, the broken version may corrupt strings
+        // or segfault; the fixed version returns valid strings reliably.
+
+        use std::thread;
+
+        // A small set of valid values. Every observation must match one
+        // of these exactly; anything else indicates a torn read.
+        let valid_values: Vec<String> = (0..4)
+            .map(|i| format!("value-{}-with-padding-to-force-heap-allocation", i))
+            .collect();
+
+        let rt = Arc::new(Runtime::new());
+        let input = rt.create_input::<String>(valid_values[0].clone());
+
+        // Spawn readers that loop on get and verify each observed value
+        // is in the valid set. Any torn string will mismatch.
+        const READER_ITERS: usize = 2_000;
+        const READERS: usize = 4;
+        const WRITER_ITERS: usize = 2_000;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader_handles: Vec<_> = (0..READERS)
+            .map(|_| {
+                let rt = rt.clone();
+                let valid = valid_values.clone();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    let mut seen = 0usize;
+                    while !stop.load(Ordering::Relaxed) && seen < READER_ITERS {
+                        let v = rt.get(input);
+                        assert!(
+                            valid.contains(&v),
+                            "observed torn or corrupt value: {:?}",
+                            v
+                        );
+                        seen += 1;
+                    }
+                })
+            })
+            .collect();
+
+        // Writer loop: rotate through the valid values.
+        for i in 0..WRITER_ITERS {
+            let v = &valid_values[i % valid_values.len()];
+            rt.set(input, v.clone());
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        for h in reader_handles {
+            h.join()
+                .expect("reader thread panicked; data race detected");
+        }
+    }
+
+    #[test]
+    fn concurrent_get_and_set_on_vec_input_is_race_free() {
+        // Second shape of the C1 regression: Vec<u64> has both a length
+        // and a pointer in its slot, so a torn read can observe a
+        // length from one Vec and a data pointer from another, leading
+        // to an out-of-bounds read when the cloned Vec is used.
+
+        use std::thread;
+
+        let values: Vec<Vec<u64>> = vec![
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
+            vec![100, 200, 300, 400, 500, 600, 700, 800],
+            vec![9999; 16],
+        ];
+
+        let rt = Arc::new(Runtime::new());
+        let input = rt.create_input::<Vec<u64>>(values[0].clone());
+
+        const ITERS: usize = 2_000;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handles: Vec<_> = (0..3)
+            .map(|_| {
+                let rt = rt.clone();
+                let valid = values.clone();
+                let stop = stop.clone();
+                thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let v = rt.get(input);
+                        // Every observed vec must match one of the valids
+                        // exactly. A torn vec would fail this check OR
+                        // would have faulted in the clone itself.
+                        assert!(
+                            valid.iter().any(|expected| expected == &v),
+                            "observed torn vec: {:?}",
+                            v
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for i in 0..ITERS {
+            rt.set(input, values[i % values.len()].clone());
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        for h in handles {
+            h.join()
+                .expect("reader thread panicked; data race detected");
         }
     }
 }
