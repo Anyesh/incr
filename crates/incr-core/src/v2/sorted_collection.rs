@@ -3,7 +3,7 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-use super::collection::{Delta, IncrCollection};
+use super::collection::{CollectionLog, Delta, IncrCollection};
 use super::handle::Incr;
 use super::runtime::Runtime;
 
@@ -123,6 +123,88 @@ where
     }
 }
 
+impl<T> SortedCollection<T>
+where
+    T: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+{
+    pub fn pairwise(&self, rt: &Runtime) -> IncrCollection<(T, T)> {
+        let sorted_deltas = self.pending_deltas.clone();
+        let sorted_ver = self.version_node;
+        let last_delta_idx = Arc::new(AtomicUsize::new(0));
+
+        let shadow: Arc<RwLock<Vec<T>>> = Arc::new(RwLock::new(Vec::new()));
+        let shadow_ref = shadow.clone();
+
+        let output_log = Arc::new(RwLock::new(CollectionLog::new()));
+        let output_log_ref = output_log.clone();
+
+        let version_node = rt.create_query(move |rt| -> u64 {
+            let _sorted_v = rt.get(sorted_ver);
+
+            let deltas = sorted_deltas.read().unwrap();
+            let start = last_delta_idx.load(Ordering::Relaxed);
+            if start >= deltas.len() {
+                return output_log_ref.read().unwrap().version;
+            }
+
+            let mut shadow = shadow_ref.write().unwrap();
+            let mut output = output_log_ref.write().unwrap();
+
+            for delta in &deltas[start..] {
+                match delta {
+                    SortDelta::Inserted { index, value } => {
+                        let i = *index;
+                        let n_before = shadow.len();
+
+                        if n_before == 0 {
+                            // first element, no pairs
+                        } else if i == 0 {
+                            output.insert((value.clone(), shadow[0].clone()));
+                        } else if i == n_before {
+                            output.insert((shadow[n_before - 1].clone(), value.clone()));
+                        } else {
+                            let left = shadow[i - 1].clone();
+                            let right = shadow[i].clone();
+                            output.delete(&(left.clone(), right.clone()));
+                            output.insert((left, value.clone()));
+                            output.insert((value.clone(), right));
+                        }
+
+                        shadow.insert(i, value.clone());
+                    }
+                    SortDelta::Removed { index, value } => {
+                        let i = *index;
+                        shadow.remove(i);
+                        let n_after = shadow.len();
+
+                        if n_after == 0 {
+                            // was the only element
+                        } else if i == 0 {
+                            output.delete(&(value.clone(), shadow[0].clone()));
+                        } else if i == n_after {
+                            output.delete(&(shadow[n_after - 1].clone(), value.clone()));
+                        } else {
+                            let left = shadow[i - 1].clone();
+                            let right = shadow[i].clone();
+                            output.delete(&(left.clone(), value.clone()));
+                            output.delete(&(value.clone(), right.clone()));
+                            output.insert((left, right));
+                        }
+                    }
+                }
+            }
+
+            last_delta_idx.store(deltas.len(), Ordering::Relaxed);
+            output.version
+        });
+
+        IncrCollection {
+            log: output_log,
+            version_node,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +278,95 @@ mod tests {
 
         let _ = rt.get(sorted.version_node);
         assert_eq!(sorted.entries(), Vec::<i64>::new());
+    }
+
+    // ── pairwise tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn pairwise_basic() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+        let pairs = sorted.pairwise(&rt);
+
+        col.insert(&rt, 10);
+        col.insert(&rt, 20);
+        col.insert(&rt, 30);
+
+        let _ = rt.get(pairs.version_node);
+        let elems = pairs.elements();
+        assert_eq!(elems.len(), 2);
+        assert!(elems.contains(&(10, 20)));
+        assert!(elems.contains(&(20, 30)));
+    }
+
+    #[test]
+    fn pairwise_single_element() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+        let pairs = sorted.pairwise(&rt);
+
+        col.insert(&rt, 10);
+        let _ = rt.get(pairs.version_node);
+        assert_eq!(pairs.elements().len(), 0);
+    }
+
+    #[test]
+    fn pairwise_insert_middle() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+        let pairs = sorted.pairwise(&rt);
+
+        col.insert(&rt, 10);
+        col.insert(&rt, 30);
+        let _ = rt.get(pairs.version_node);
+        assert!(pairs.elements().contains(&(10, 30)));
+
+        col.insert(&rt, 20);
+        let _ = rt.get(pairs.version_node);
+        let elems = pairs.elements();
+        assert_eq!(elems.len(), 2);
+        assert!(elems.contains(&(10, 20)));
+        assert!(elems.contains(&(20, 30)));
+        assert!(!elems.contains(&(10, 30)));
+    }
+
+    #[test]
+    fn pairwise_delete_middle() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+        let pairs = sorted.pairwise(&rt);
+
+        col.insert(&rt, 10);
+        col.insert(&rt, 20);
+        col.insert(&rt, 30);
+        let _ = rt.get(pairs.version_node);
+
+        col.delete(&rt, &20);
+        let _ = rt.get(pairs.version_node);
+        let elems = pairs.elements();
+        assert_eq!(elems.len(), 1);
+        assert!(elems.contains(&(10, 30)));
+    }
+
+    #[test]
+    fn pairwise_delete_to_empty() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+        let pairs = sorted.pairwise(&rt);
+
+        col.insert(&rt, 10);
+        col.insert(&rt, 20);
+        let _ = rt.get(pairs.version_node);
+        assert_eq!(pairs.elements().len(), 1);
+
+        col.delete(&rt, &10);
+        col.delete(&rt, &20);
+        let _ = rt.get(pairs.version_node);
+        assert_eq!(pairs.elements().len(), 0);
     }
 }
