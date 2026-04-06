@@ -75,5 +75,5 @@ If you need to share one computation graph across multiple threads (for example,
 ## Python
 
 ```
-pip install incr
+pip install incr-compute
 ```
