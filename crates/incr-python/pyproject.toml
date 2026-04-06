@@ -1,0 +1,14 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "incr-compute"
+version = "0.1.0"
+description = "The fastest incremental computation engine for Python"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = ["incremental", "computation", "reactive", "dataflow"]
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
