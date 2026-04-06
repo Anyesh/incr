@@ -204,6 +204,47 @@ impl Runtime {
         IncrCollection { log, version_node }
     }
 
+    /// Like `create_collection` but skips the dep_stack assertion. Used internally
+    /// by operators (e.g. group_by) that lazily create sub-collections during
+    /// compute closures. The caller is responsible for not using the resulting
+    /// version_node as a tracked dependency of the current computation.
+    pub(crate) fn create_collection_in_compute<T>(&self) -> IncrCollection<T>
+    where
+        T: Any + Clone + Hash + Eq + 'static,
+    {
+        let log = Rc::new(RefCell::new(CollectionLog::new()));
+        let version_node = self.create_input_in_compute(0_u64);
+        IncrCollection { log, version_node }
+    }
+
+    /// Like `create_input` but skips the dep_stack assertion. Used by operators
+    /// that need to create input nodes during compute closures.
+    pub(crate) fn create_input_in_compute<T>(&self, value: T) -> Incr<T>
+    where
+        T: Any + Clone + PartialEq + 'static,
+    {
+        let revision = self.revision.get();
+        let id = {
+            let mut nodes = self.nodes.borrow_mut();
+            let id = NodeId(nodes.len() as u32);
+            nodes.push(crate::graph::NodeData {
+                state: NodeState::Clean,
+                value: Some(Box::new(value)),
+                verified_at: revision,
+                changed_at: revision,
+                dependents: Vec::new(),
+                dependencies: Vec::new(),
+            });
+            id
+        };
+        self.kinds.borrow_mut().push(NodeKind::Input);
+        self.labels.borrow_mut().push(None);
+        Incr {
+            id,
+            _phantom: PhantomData,
+        }
+    }
+
     // ── Introspection API ───────────────────────────────────────────────────
 
     /// Assign a human-readable label to a node for visualization/debugging.

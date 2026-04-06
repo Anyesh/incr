@@ -124,9 +124,45 @@ impl<T: Clone + Hash + Eq> CollectionLog<T> {
     }
 }
 
+pub struct GroupedCollection<K, T>
+where
+    K: Any + Clone + Hash + Eq + 'static,
+    T: Any + Clone + Hash + Eq + 'static,
+{
+    pub(crate) groups: Rc<RefCell<HashMap<K, IncrCollection<T>>>>,
+    pub(crate) version_node: Incr<u64>,
+}
+
+impl<K, T> GroupedCollection<K, T>
+where
+    K: Any + Clone + Hash + Eq + 'static,
+    T: Any + Clone + Hash + Eq + 'static,
+{
+    pub fn keys(&self) -> Vec<K> {
+        self.groups.borrow().keys().cloned().collect()
+    }
+
+    pub fn get_group(&self, key: &K) -> Option<IncrCollection<T>> {
+        self.groups.borrow().get(key).cloned()
+    }
+
+    pub fn version_node(&self) -> Incr<u64> {
+        self.version_node
+    }
+}
+
 pub struct IncrCollection<T: Any + Clone + Hash + Eq + 'static> {
     pub(crate) log: Rc<RefCell<CollectionLog<T>>>,
     pub(crate) version_node: Incr<u64>,
+}
+
+impl<T: Any + Clone + Hash + Eq + 'static> Clone for IncrCollection<T> {
+    fn clone(&self) -> Self {
+        IncrCollection {
+            log: self.log.clone(),
+            version_node: self.version_node,
+        }
+    }
 }
 
 impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
@@ -306,6 +342,201 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
             let elems = upstream.elements_vec();
             fold_fn(&elems)
         })
+    }
+
+    pub fn group_by<K, F>(&self, rt: &Runtime, key_fn: F) -> GroupedCollection<K, T>
+    where
+        K: Any + Clone + Hash + Eq + 'static,
+        F: Fn(&T) -> K + 'static,
+    {
+        let upstream_log = self.log.clone();
+        let upstream_ver = self.version_node;
+        let last_idx = Rc::new(Cell::new(0_usize));
+        let groups: Rc<RefCell<HashMap<K, IncrCollection<T>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let groups_ref = groups.clone();
+        let key_cache: Rc<RefCell<HashMap<T, K>>> = Rc::new(RefCell::new(HashMap::new()));
+        let key_cache_ref = key_cache.clone();
+        let rt_ptr: *const Runtime = rt;
+
+        let version_counter: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let version_counter_ref = version_counter.clone();
+
+        let version_node = rt.create_query(move |_rt| -> u64 {
+            // SAFETY: rt_ptr points to the Runtime that owns this compute graph.
+            // This closure is only ever called during rt.get(), while the Runtime
+            // is alive, and v1 is single-threaded so no concurrent access occurs.
+            let rt = unsafe { &*rt_ptr };
+            let _upstream_v = rt.get(upstream_ver);
+
+            let upstream = upstream_log.borrow();
+            let start = last_idx.get();
+            if start >= upstream.deltas.len() {
+                return version_counter_ref.get();
+            }
+
+            let mut grps = groups_ref.borrow_mut();
+            let mut kc = key_cache_ref.borrow_mut();
+
+            for vd in &upstream.deltas[start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let k = key_fn(x);
+                        kc.insert(x.clone(), k.clone());
+                        let group = grps
+                            .entry(k)
+                            .or_insert_with(|| rt.create_collection_in_compute::<T>());
+                        let ver = {
+                            let mut log = group.log.borrow_mut();
+                            log.insert(x.clone());
+                            log.version
+                        };
+                        rt.set(group.version_node, ver);
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(k) = kc.remove(x) {
+                            if let Some(group) = grps.get(&k) {
+                                let ver = {
+                                    let mut log = group.log.borrow_mut();
+                                    log.delete(x);
+                                    log.version
+                                };
+                                rt.set(group.version_node, ver);
+                            }
+                        }
+                    }
+                }
+            }
+
+            last_idx.set(upstream.deltas.len());
+            let v = version_counter_ref.get() + 1;
+            version_counter_ref.set(v);
+            v
+        });
+
+        GroupedCollection {
+            groups,
+            version_node,
+        }
+    }
+
+    pub fn join<U, K, FL, FR>(
+        &self,
+        rt: &Runtime,
+        right: &IncrCollection<U>,
+        left_key: FL,
+        right_key: FR,
+    ) -> IncrCollection<(T, U)>
+    where
+        U: Any + Clone + Hash + Eq + 'static,
+        K: Any + Clone + Hash + Eq + 'static,
+        FL: Fn(&T) -> K + 'static,
+        FR: Fn(&U) -> K + 'static,
+    {
+        let left_log = self.log.clone();
+        let right_log = right.log.clone();
+        let left_ver = self.version_node;
+        let right_ver = right.version_node;
+        let left_last = Rc::new(Cell::new(0_usize));
+        let right_last = Rc::new(Cell::new(0_usize));
+
+        let left_index: Rc<RefCell<HashMap<K, Vec<T>>>> = Rc::new(RefCell::new(HashMap::new()));
+        let right_index: Rc<RefCell<HashMap<K, Vec<U>>>> = Rc::new(RefCell::new(HashMap::new()));
+        let left_key_cache: Rc<RefCell<HashMap<T, K>>> = Rc::new(RefCell::new(HashMap::new()));
+        let right_key_cache: Rc<RefCell<HashMap<U, K>>> = Rc::new(RefCell::new(HashMap::new()));
+
+        let left_idx_ref = left_index.clone();
+        let right_idx_ref = right_index.clone();
+        let left_kc_ref = left_key_cache.clone();
+        let right_kc_ref = right_key_cache.clone();
+
+        let output_log = Rc::new(RefCell::new(CollectionLog::new_multiset()));
+        let output_log_ref = output_log.clone();
+
+        let version_node = rt.create_query(move |rt| -> u64 {
+            let _lv = rt.get(left_ver);
+            let _rv = rt.get(right_ver);
+
+            let left_up = left_log.borrow();
+            let right_up = right_log.borrow();
+            let l_start = left_last.get();
+            let r_start = right_last.get();
+
+            if l_start >= left_up.deltas.len() && r_start >= right_up.deltas.len() {
+                return output_log_ref.borrow().version;
+            }
+
+            let mut li = left_idx_ref.borrow_mut();
+            let mut ri = right_idx_ref.borrow_mut();
+            let mut lkc = left_kc_ref.borrow_mut();
+            let mut rkc = right_kc_ref.borrow_mut();
+            let mut output = output_log_ref.borrow_mut();
+
+            // Process left deltas
+            for vd in &left_up.deltas[l_start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let k = left_key(x);
+                        lkc.insert(x.clone(), k.clone());
+                        li.entry(k.clone()).or_default().push(x.clone());
+                        if let Some(rights) = ri.get(&k) {
+                            for r in rights {
+                                output.insert((x.clone(), r.clone()));
+                            }
+                        }
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(k) = lkc.remove(x) {
+                            if let Some(lefts) = li.get_mut(&k) {
+                                lefts.retain(|l| l != x);
+                            }
+                            if let Some(rights) = ri.get(&k) {
+                                for r in rights {
+                                    output.delete(&(x.clone(), r.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Process right deltas
+            for vd in &right_up.deltas[r_start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let k = right_key(x);
+                        rkc.insert(x.clone(), k.clone());
+                        ri.entry(k.clone()).or_default().push(x.clone());
+                        if let Some(lefts) = li.get(&k) {
+                            for l in lefts {
+                                output.insert((l.clone(), x.clone()));
+                            }
+                        }
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(k) = rkc.remove(x) {
+                            if let Some(rights) = ri.get_mut(&k) {
+                                rights.retain(|r| r != x);
+                            }
+                            if let Some(lefts) = li.get(&k) {
+                                for l in lefts {
+                                    output.delete(&(l.clone(), x.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            left_last.set(left_up.deltas.len());
+            right_last.set(right_up.deltas.len());
+            output.version
+        });
+
+        IncrCollection {
+            log: output_log,
+            version_node,
+        }
     }
 
     pub fn sort_by_key<K, F>(&self, rt: &Runtime, key_fn: F) -> SortedCollection<T>
@@ -771,5 +1002,74 @@ mod tests {
         col.insert(&rt, 3); // doesn't change max
         assert_eq!(rt.get(label), "max=Some(5)");
         assert_eq!(downstream_count.get(), 1); // early cutoff!
+    }
+
+    // ── group_by tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn group_by_basic() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<(String, i64)>();
+        let grouped = col.group_by(&rt, |x: &(String, i64)| x.0.clone());
+        col.insert(&rt, ("a".to_string(), 1));
+        col.insert(&rt, ("b".to_string(), 2));
+        col.insert(&rt, ("a".to_string(), 3));
+        let _ = rt.get(grouped.version_node);
+        let groups = grouped.groups.borrow();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.get("a").unwrap().elements().len(), 2);
+        assert_eq!(groups.get("b").unwrap().elements().len(), 1);
+    }
+
+    #[test]
+    fn group_by_delete() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<(String, i64)>();
+        let grouped = col.group_by(&rt, |x: &(String, i64)| x.0.clone());
+        col.insert(&rt, ("a".to_string(), 1));
+        col.insert(&rt, ("a".to_string(), 2));
+        let _ = rt.get(grouped.version_node);
+        col.delete(&rt, &("a".to_string(), 1));
+        let _ = rt.get(grouped.version_node);
+        let groups = grouped.groups.borrow();
+        assert_eq!(groups.get("a").unwrap().elements().len(), 1);
+    }
+
+    // ── join tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn join_basic() {
+        let rt = Runtime::new();
+        let left = rt.create_collection::<(String, i64)>();
+        let right = rt.create_collection::<(String, String)>();
+        let joined = left.join(
+            &rt,
+            &right,
+            |l: &(String, i64)| l.0.clone(),
+            |r: &(String, String)| r.0.clone(),
+        );
+        left.insert(&rt, ("a".to_string(), 1));
+        left.insert(&rt, ("b".to_string(), 2));
+        right.insert(&rt, ("a".to_string(), "x".to_string()));
+        right.insert(&rt, ("c".to_string(), "y".to_string()));
+        let _ = rt.get(joined.version_node);
+        let elems = joined.elements();
+        assert_eq!(elems.len(), 1);
+        assert!(elems.contains(&(("a".to_string(), 1), ("a".to_string(), "x".to_string()))));
+    }
+
+    #[test]
+    fn join_delete_propagates() {
+        let rt = Runtime::new();
+        let left = rt.create_collection::<(i64, i64)>();
+        let right = rt.create_collection::<(i64, i64)>();
+        let joined = left.join(&rt, &right, |l: &(i64, i64)| l.0, |r: &(i64, i64)| r.0);
+        left.insert(&rt, (1, 10));
+        right.insert(&rt, (1, 100));
+        let _ = rt.get(joined.version_node);
+        assert_eq!(joined.elements().len(), 1);
+        left.delete(&rt, &(1, 10));
+        let _ = rt.get(joined.version_node);
+        assert_eq!(joined.elements().len(), 0);
     }
 }
