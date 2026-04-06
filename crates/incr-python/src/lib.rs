@@ -69,14 +69,14 @@ impl Ord for PyValue {
 unsafe impl Send for PyValue {}
 unsafe impl Sync for PyValue {}
 
-incr_core::impl_value!(PyValue);
+incr_concurrent::impl_value!(PyValue);
 
 // ── PyNodeId: typed handle exposed to Python ────────────────────────────────
 
 #[pyclass(name = "NodeId")]
 #[derive(Clone)]
 struct PyNodeId {
-    inner: incr_core::Incr<PyValue>,
+    inner: incr_concurrent::Incr<PyValue>,
 }
 
 #[pymethods]
@@ -91,7 +91,7 @@ impl PyNodeId {
 
 #[pyclass(name = "RuntimeRef", unsendable)]
 struct PyRuntimeRef {
-    ptr: *const incr_core::Runtime,
+    ptr: *const incr_concurrent::Runtime,
 }
 
 #[pymethods]
@@ -112,8 +112,8 @@ impl PyRuntimeRef {
 
 #[pyclass(name = "Collection", unsendable)]
 struct PyCollection {
-    inner: incr_core::IncrCollection<PyValue>,
-    rt_ptr: *const incr_core::Runtime,
+    inner: incr_concurrent::IncrCollection<PyValue>,
+    rt_ptr: *const incr_concurrent::Runtime,
 }
 
 #[pymethods]
@@ -166,7 +166,7 @@ impl PyCollection {
 
     fn count(&self) -> PyResult<PyNodeId> {
         let rt = unsafe { &*self.rt_ptr };
-        let count_node: incr_core::Incr<u64> = self.inner.count(rt);
+        let count_node: incr_concurrent::Incr<u64> = self.inner.count(rt);
         // Bridge u64 -> PyValue via a query
         let node = rt.create_query(move |rt| -> PyValue {
             let c: u64 = rt.get(count_node);
@@ -178,7 +178,7 @@ impl PyCollection {
     fn reduce(&self, fold_fn: PyObject) -> PyResult<PyNodeId> {
         let rt = unsafe { &*self.rt_ptr };
         let fold_fn = SyncPyObject(fold_fn);
-        let reduce_node: incr_core::Incr<PyValue> =
+        let reduce_node: incr_concurrent::Incr<PyValue> =
             self.inner.reduce(rt, move |elements| -> PyValue {
                 Python::with_gil(|py| {
                     let py_list = pyo3::types::PyList::empty(py);
@@ -291,8 +291,8 @@ impl PyCollection {
 
 #[pyclass(name = "SortedCollection", unsendable)]
 struct PySortedCollection {
-    inner: incr_core::SortedCollection<PyValue>,
-    rt_ptr: *const incr_core::Runtime,
+    inner: incr_concurrent::SortedCollection<PyValue>,
+    rt_ptr: *const incr_concurrent::Runtime,
 }
 
 #[pymethods]
@@ -363,8 +363,8 @@ impl PySortedCollection {
 
 #[pyclass(name = "GroupedCollection", unsendable)]
 struct PyGroupedCollection {
-    inner: incr_core::GroupedCollection<PyValue, PyValue>,
-    rt_ptr: *const incr_core::Runtime,
+    inner: incr_concurrent::GroupedCollection<PyValue, PyValue>,
+    rt_ptr: *const incr_concurrent::Runtime,
 }
 
 #[pymethods]
@@ -401,7 +401,7 @@ impl PyGroupedCollection {
 
 #[pyclass(name = "Runtime", unsendable)]
 struct PyRuntime {
-    inner: incr_core::Runtime,
+    inner: incr_concurrent::Runtime,
 }
 
 #[pymethods]
@@ -409,7 +409,7 @@ impl PyRuntime {
     #[new]
     fn new() -> Self {
         PyRuntime {
-            inner: incr_core::Runtime::new(),
+            inner: incr_concurrent::Runtime::new(),
         }
     }
 
@@ -431,7 +431,7 @@ impl PyRuntime {
         let py_func = SyncPyObject(py_func);
         let node = self
             .inner
-            .create_query(move |rt: &incr_core::Runtime| -> PyValue {
+            .create_query(move |rt: &incr_concurrent::Runtime| -> PyValue {
                 Python::with_gil(|py| {
                     let rt_ref = Py::new(
                         py,
@@ -454,7 +454,7 @@ impl PyRuntime {
 
     fn create_collection(&self) -> PyCollection {
         let col = self.inner.create_collection::<PyValue>();
-        let rt_ptr: *const incr_core::Runtime = &self.inner;
+        let rt_ptr: *const incr_concurrent::Runtime = &self.inner;
         PyCollection { inner: col, rt_ptr }
     }
 
@@ -473,7 +473,7 @@ impl PyRuntime {
     }
 
     fn get_traced(&self, node: PyNodeId) -> PyResult<(PyObject, PyObject)> {
-        let (val, trace): (PyValue, incr_core::PropagationTrace) =
+        let (val, trace): (PyValue, incr_concurrent::PropagationTrace) =
             self.inner.get_traced(node.inner);
         Python::with_gil(|py| {
             let trace_dict = pyo3::types::PyDict::new(py);
@@ -490,11 +490,11 @@ impl PyRuntime {
                 d.set_item(
                     "action",
                     match &nt.action {
-                        incr_core::TraceAction::VerifiedClean => "verified_clean",
-                        incr_core::TraceAction::Recomputed {
+                        incr_concurrent::TraceAction::VerifiedClean => "verified_clean",
+                        incr_concurrent::TraceAction::Recomputed {
                             value_changed: true,
                         } => "recomputed_changed",
-                        incr_core::TraceAction::Recomputed {
+                        incr_concurrent::TraceAction::Recomputed {
                             value_changed: false,
                         } => "recomputed_cutoff",
                     },
@@ -517,8 +517,8 @@ impl PyRuntime {
                 d.set_item(
                     "kind",
                     match info.kind {
-                        incr_core::NodeKindInfo::Input => "input",
-                        incr_core::NodeKindInfo::Compute => "compute",
+                        incr_concurrent::NodeKindInfo::Input => "input",
+                        incr_concurrent::NodeKindInfo::Compute => "compute",
                     },
                 )?;
                 d.set_item("label", &info.label)?;

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use incr_core::Runtime;
+use incr_concurrent::Runtime;
 
 /// Batch: sort N timestamps, compute pairwise gaps, sum them.
 fn batch_travel_premium(timestamps: &[i64]) -> i64 {
@@ -14,8 +14,8 @@ fn setup_incremental(
     n: usize,
 ) -> (
     Runtime,
-    incr_core::IncrCollection<i64>,
-    incr_core::Incr<i64>,
+    incr_concurrent::IncrCollection<i64>,
+    incr_concurrent::Incr<i64>,
 ) {
     let rt = Runtime::new();
     let col = rt.create_collection::<i64>();

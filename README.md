@@ -84,7 +84,7 @@ We use proptest to generate thousands of random computation graphs, apply random
 Rust:
 ```toml
 [dependencies]
-incr-core = { path = "crates/incr-core" }
+incr-concurrent = { path = "crates/incr-concurrent" }
 ```
 
 Python (not on PyPI yet, build from source):
@@ -98,9 +98,9 @@ python -c "from incr import Runtime; print('ok')"
 
 Running the tests:
 ```bash
-cargo test -p incr-core       # rust
+cargo test -p incr-concurrent       # rust
 pytest ./examples/tests/python/        # python
-cargo bench -p incr-core       # benchmarks
+cargo bench -p incr-concurrent       # benchmarks
 ```
 
 ## Where this is at

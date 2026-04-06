@@ -1,4 +1,4 @@
-// crates/incr-core/benches/contended_concurrency.rs
+// crates/incr-concurrent/benches/contended_concurrency.rs
 //
 // Multi-threaded contended benchmark for atomic-field node access.
 //

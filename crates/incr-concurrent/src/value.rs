@@ -317,7 +317,7 @@ where
 /// Public macro for implementing Value for user-defined types.
 /// Routes the type to GenericArena.
 ///
-/// Usage: `incr_core::impl_value!(MyStruct);`
+/// Usage: `incr_concurrent::impl_value!(MyStruct);`
 #[macro_export]
 macro_rules! impl_value {
     ($t:ty) => {

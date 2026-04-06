@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-incr-core = { path = "../../crates/incr-core" }
+incr-concurrent = { path = "../../crates/incr-concurrent" }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

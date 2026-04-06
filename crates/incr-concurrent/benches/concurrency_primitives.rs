@@ -1,4 +1,4 @@
-// crates/incr-core/benches/concurrency_primitives.rs
+// crates/incr-concurrent/benches/concurrency_primitives.rs
 //
 // Microbenchmark: the cost of node access under different concurrency primitives.
 //

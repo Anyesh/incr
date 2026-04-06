@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use incr_core::Runtime;
+use incr_concurrent::Runtime;
 use salsa::Setter;
 
 // ============================================================================
@@ -7,7 +7,13 @@ use salsa::Setter;
 // Measures per-node propagation cost.
 // ============================================================================
 
-fn incr_chain_propagate(size: usize) -> (Runtime, incr_core::Incr<i64>, incr_core::Incr<i64>) {
+fn incr_chain_propagate(
+    size: usize,
+) -> (
+    Runtime,
+    incr_concurrent::Incr<i64>,
+    incr_concurrent::Incr<i64>,
+) {
     let rt = Runtime::new();
     let input = rt.create_input(1_i64);
     let mut prev = input;
@@ -57,7 +63,11 @@ fn salsa_chain_4(db: &dyn salsa::Database, input: SalsaInput) -> i64 {
 // Measures handling of shared dependencies.
 // ============================================================================
 
-fn incr_diamond_propagate() -> (Runtime, incr_core::Incr<i64>, incr_core::Incr<i64>) {
+fn incr_diamond_propagate() -> (
+    Runtime,
+    incr_concurrent::Incr<i64>,
+    incr_concurrent::Incr<i64>,
+) {
     let rt = Runtime::new();
     let input = rt.create_input(1_i64);
     let a = {
@@ -108,12 +118,13 @@ fn salsa_after_clamp(db: &dyn salsa::Database, input: SalsaInput) -> i64 {
 // Batch baseline: compute from scratch each time.
 // ============================================================================
 
-fn batch_collection_insert(
-    elements: &mut std::collections::HashSet<i64>,
-    new_val: i64,
-) -> usize {
+fn batch_collection_insert(elements: &mut std::collections::HashSet<i64>, new_val: i64) -> usize {
     elements.insert(new_val);
-    elements.iter().filter(|x| *x % 2 == 0).map(|x| x * 2).count()
+    elements
+        .iter()
+        .filter(|x| *x % 2 == 0)
+        .map(|x| x * 2)
+        .count()
 }
 
 // ============================================================================
@@ -125,19 +136,15 @@ fn bench_chain_comparison(c: &mut Criterion) {
 
     // incr: propagate through chain
     for size in [10, 100] {
-        group.bench_with_input(
-            BenchmarkId::new("incr", size),
-            &size,
-            |b, &size| {
-                let (rt, input, output) = incr_chain_propagate(size);
-                let mut val = 1_i64;
-                b.iter(|| {
-                    val += 1;
-                    rt.set(input, val);
-                    black_box(rt.get(output));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("incr", size), &size, |b, &size| {
+            let (rt, input, output) = incr_chain_propagate(size);
+            let mut val = 1_i64;
+            b.iter(|| {
+                val += 1;
+                rt.set(input, val);
+                black_box(rt.get(output));
+            });
+        });
     }
 
     // salsa: single query re-evaluation (the comparable unit of work)
@@ -249,48 +256,40 @@ fn bench_collection_vs_batch(c: &mut Criterion) {
 
     for size in [1_000, 10_000, 100_000] {
         // incr: delta-based pipeline
-        group.bench_with_input(
-            BenchmarkId::new("incr", size),
-            &size,
-            |b, &size| {
-                let rt = Runtime::new();
-                let col = rt.create_collection::<i64>();
-                let filtered = col.filter(&rt, |x| x % 2 == 0);
-                let mapped = filtered.map(&rt, |x| x * 2);
-                let count = mapped.count(&rt);
+        group.bench_with_input(BenchmarkId::new("incr", size), &size, |b, &size| {
+            let rt = Runtime::new();
+            let col = rt.create_collection::<i64>();
+            let filtered = col.filter(&rt, |x| x % 2 == 0);
+            let mapped = filtered.map(&rt, |x| x * 2);
+            let count = mapped.count(&rt);
 
-                for i in 0..size {
-                    col.insert(&rt, i);
-                }
-                let _ = rt.get(count);
+            for i in 0..size {
+                col.insert(&rt, i);
+            }
+            let _ = rt.get(count);
 
-                let mut next = size;
-                b.iter(|| {
-                    col.insert(&rt, next);
-                    next += 1;
-                    black_box(rt.get(count));
-                });
-            },
-        );
+            let mut next = size;
+            b.iter(|| {
+                col.insert(&rt, next);
+                next += 1;
+                black_box(rt.get(count));
+            });
+        });
 
         // batch: recompute from scratch
-        group.bench_with_input(
-            BenchmarkId::new("batch", size),
-            &size,
-            |b, &size| {
-                let mut elements = std::collections::HashSet::new();
-                for i in 0..size {
-                    elements.insert(i);
-                }
+        group.bench_with_input(BenchmarkId::new("batch", size), &size, |b, &size| {
+            let mut elements = std::collections::HashSet::new();
+            for i in 0..size {
+                elements.insert(i);
+            }
 
-                let mut next = size;
-                b.iter(|| {
-                    let result = batch_collection_insert(&mut elements, next);
-                    next += 1;
-                    black_box(result);
-                });
-            },
-        );
+            let mut next = size;
+            b.iter(|| {
+                let result = batch_collection_insert(&mut elements, next);
+                next += 1;
+                black_box(result);
+            });
+        });
     }
 
     group.finish();

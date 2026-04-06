@@ -1,6 +1,6 @@
-// crates/incr-core/benches/performance.rs
+// crates/incr-concurrent/benches/performance.rs
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use incr_core::{Incr, Runtime};
+use incr_concurrent::{Incr, Runtime};
 
 /// Build a linear chain: input -> n1 -> n2 -> ... -> output
 fn build_chain(size: usize) -> (Runtime, Incr<i64>, Incr<i64>) {
@@ -131,19 +131,15 @@ fn bench_overhead_vs_batch(c: &mut Criterion) {
             },
         );
 
-        group.bench_with_input(
-            BenchmarkId::new("batch_plain", size),
-            &size,
-            |b, &size| {
-                b.iter(|| {
-                    let mut val = 1_i64;
-                    for _ in 0..size {
-                        val = val.wrapping_add(1);
-                    }
-                    black_box(val);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("batch_plain", size), &size, |b, &size| {
+            b.iter(|| {
+                let mut val = 1_i64;
+                for _ in 0..size {
+                    val = val.wrapping_add(1);
+                }
+                black_box(val);
+            });
+        });
     }
 
     group.finish();

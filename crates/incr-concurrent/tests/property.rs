@@ -1,5 +1,5 @@
-// crates/incr-core/tests/property.rs
-use incr_core::{Incr, Runtime};
+// crates/incr-concurrent/tests/property.rs
+use incr_concurrent::{Incr, Runtime};
 use proptest::prelude::*;
 
 /// Build a layered graph of the given shape, run it incrementally,
@@ -95,7 +95,8 @@ fn verify_incremental_matches_batch(
 
     // --- The critical assertion ---
     assert_eq!(
-        incremental_result, batch_result,
+        incremental_result,
+        batch_result,
         "Incremental result {} != batch result {} with {} inputs, {} layers, {} mutations",
         incremental_result,
         batch_result,
@@ -130,10 +131,10 @@ fn property_specific_diamond_cutoff() {
         3,
         vec![10, 20, 30],
         vec![
-            vec![(0, 1), (1, 2)],  // Layer 1: node3=in0+in1, node4=in1+in2
-            vec![(0, 1)],          // Layer 2: node5=node3+node4
+            vec![(0, 1), (1, 2)], // Layer 1: node3=in0+in1, node4=in1+in2
+            vec![(0, 1)],         // Layer 2: node5=node3+node4
         ],
-        vec![(0, 10), (1, 25)],  // Change input 0 (same!), change input 1
+        vec![(0, 10), (1, 25)], // Change input 0 (same!), change input 1
     );
 }
 

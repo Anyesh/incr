@@ -654,7 +654,7 @@ mod tests {
 /// Run with:
 ///
 /// ```text
-/// cargo test --release -p incr-core v2::registry::bench -- --ignored --nocapture
+/// cargo test --release -p incr-concurrent v2::registry::bench -- --ignored --nocapture
 /// ```
 ///
 /// The output reports nanoseconds per call for each variant.

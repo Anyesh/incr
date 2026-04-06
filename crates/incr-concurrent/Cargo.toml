@@ -1,9 +1,12 @@
 [package]
-name = "incr-core"
+name = "incr-concurrent"
 version = "0.1.0"
 edition = "2021"
-description = "General-purpose incremental computation engine"
-license = "Apache-2.0"
+description = "Incremental computation engine with Send+Sync runtime for multi-threaded services"
+license = "MIT"
+repository = "https://github.com/Anyesh/incr"
+keywords = ["incremental", "computation", "reactive", "concurrent", "dataflow"]
+categories = ["algorithms", "data-structures", "concurrency"]
 
 [dependencies]
 rustc-hash = "2"

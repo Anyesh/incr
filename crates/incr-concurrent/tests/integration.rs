@@ -1,5 +1,5 @@
-// crates/incr-core/tests/integration.rs
-use incr_core::{IncrCollection, Runtime};
+// crates/incr-concurrent/tests/integration.rs
+use incr_concurrent::{IncrCollection, Runtime};
 
 #[test]
 fn spec_example_width_height_area() {

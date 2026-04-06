@@ -1,6 +1,6 @@
 //! Proptest suite for the v2 Runtime.
 //!
-//! Mirrors `crates/incr-core/tests/property.rs` (which targets v1)
+//! Mirrors `crates/incr-concurrent/tests/property.rs` (which targets v1)
 //! but runs against `v2::Runtime` through crate-private access. The
 //! goal is spec Gate 2: v2 passes the same property tests as v1 in
 //! single-threaded mode, establishing correctness equivalence

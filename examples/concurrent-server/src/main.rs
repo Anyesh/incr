@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use axum::extract::State;
 use axum::routing::get;
 use axum::Json;
-use incr_core::{Incr, Runtime};
+use incr_concurrent::{Incr, Runtime};
 use rand::Rng;
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
