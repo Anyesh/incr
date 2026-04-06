@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>incr spreadsheet</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:wght@400;600&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Source Sans 3', sans-serif;
+    background: #faf8f5;
+    color: #2d2a26;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+
+  h1 {
+    font-family: 'Crimson Pro', serif;
+    font-weight: 600;
+    font-size: 2rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .subtitle {
+    font-size: 0.9rem;
+    color: #888;
+    margin-bottom: 1.5rem;
+  }
+
+  .formula-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    max-width: 900px;
+    margin-bottom: 0.5rem;
+    padding: 0.4rem 0.6rem;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+  }
+
+  .cell-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 500;
+    font-size: 0.85rem;
+    color: #5c6bc0;
+    min-width: 2.5rem;
+    text-align: center;
+  }
+
+  .formula-input {
+    flex: 1;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: #2d2a26;
+  }
+
+  .grid-wrapper {
+    overflow-x: auto;
+    width: 100%;
+    max-width: 900px;
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    background: #fff;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    overflow: hidden;
+    table-layout: fixed;
+  }
+
+  th {
+    background: #f5f3f0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: #999;
+    padding: 0.3rem 0.4rem;
+    border: 1px solid #e0ddd8;
+    text-align: center;
+    user-select: none;
+  }
+
+  th.row-header {
+    width: 2.5rem;
+    min-width: 2.5rem;
+  }
+
+  td {
+    padding: 0;
+    border: 1px solid #e8e5e0;
+    height: 1.8rem;
+    position: relative;
+    cursor: cell;
+    transition: background-color 0.3s ease;
+  }
+
+  td.selected {
+    outline: 2px solid #5c6bc0;
+    outline-offset: -1px;
+    z-index: 1;
+  }
+
+  td.flash {
+    animation: cell-flash 0.6s ease-out;
+  }
+
+  @keyframes cell-flash {
+    0% { background-color: #c8e6c9; }
+    100% { background-color: transparent; }
+  }
+
+  .cell-display {
+    width: 100%;
+    height: 100%;
+    padding: 0.2rem 0.4rem;
+    font-family: 'Source Sans 3', sans-serif;
+    font-size: 0.8rem;
+    line-height: 1.4rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .cell-display.number {
+    text-align: right;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.78rem;
+  }
+
+  .cell-display.text {
+    text-align: left;
+    color: #555;
+  }
+
+  .cell-display.error {
+    text-align: center;
+    color: #e53935;
+    font-size: 0.7rem;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .status-bar {
+    display: flex;
+    justify-content: space-between;
+    width: 100%;
+    max-width: 900px;
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    color: #aaa;
+    padding: 0 0.2rem;
+  }
+
+  .status-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-right: 0.3rem;
+    vertical-align: middle;
+  }
+  .status-dot.connected { background: #66bb6a; }
+  .status-dot.disconnected { background: #ef5350; }
+
+  .hint {
+    font-size: 0.78rem;
+    color: #bbb;
+    margin-top: 1.5rem;
+    max-width: 600px;
+    text-align: center;
+    line-height: 1.5;
+  }
+</style>
+</head>
+<body>
+
+<h1>incr spreadsheet</h1>
+<p class="subtitle">Powered by incr-concurrent. Edit a cell and watch dependent formulas update.</p>
+
+<div class="formula-bar">
+  <span class="cell-label" id="active-cell-label">A1</span>
+  <input class="formula-input" id="formula-input" placeholder="Enter a value or formula (e.g. =A2*B2)" />
+</div>
+
+<div class="grid-wrapper">
+  <table id="grid">
+    <thead>
+      <tr>
+        <th class="row-header"></th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+</div>
+
+<div class="status-bar">
+  <span id="connection-status"></span>
+  <span id="node-count"></span>
+</div>
+
+<p class="hint">
+  Try editing a price (A2, A3, A4) or quantity (B2, B3, B4) and watch the totals cascade.<br>
+  Formulas: <code>=A2*B2</code>, <code>=SUM(C2:C4)</code>, <code>=IF(A1>0, B1, C1)</code>. Open two tabs to see real-time sync.
+</p>
+
+<script>
+const COLS = 10;
+const ROWS = 20;
+const COL_LETTERS = 'ABCDEFGHIJ';
+
+const cellContents = {};
+const cellValues = {};
+let selectedCell = null;
+let ws = null;
+
+const grid = document.getElementById('grid');
+const thead = grid.querySelector('thead tr');
+const tbody = grid.querySelector('tbody');
+const formulaInput = document.getElementById('formula-input');
+const activeCellLabel = document.getElementById('active-cell-label');
+const connectionStatus = document.getElementById('connection-status');
+const nodeCountEl = document.getElementById('node-count');
+
+function setConnectionStatus(connected) {
+  connectionStatus.textContent = '';
+  const dot = document.createElement('span');
+  dot.className = 'status-dot ' + (connected ? 'connected' : 'disconnected');
+  connectionStatus.appendChild(dot);
+  connectionStatus.appendChild(
+    document.createTextNode(connected ? 'connected' : 'reconnecting...')
+  );
+}
+
+function buildGrid() {
+  for (let c = 0; c < COLS; c++) {
+    const th = document.createElement('th');
+    th.textContent = COL_LETTERS[c];
+    thead.appendChild(th);
+  }
+
+  for (let r = 1; r <= ROWS; r++) {
+    const tr = document.createElement('tr');
+    const th = document.createElement('th');
+    th.className = 'row-header';
+    th.textContent = r;
+    tr.appendChild(th);
+
+    for (let c = 0; c < COLS; c++) {
+      const td = document.createElement('td');
+      const name = COL_LETTERS[c] + r;
+      td.id = 'cell-' + name;
+      td.dataset.cell = name;
+
+      const display = document.createElement('div');
+      display.className = 'cell-display';
+      td.appendChild(display);
+
+      td.addEventListener('click', () => selectCell(name));
+      td.addEventListener('dblclick', () => {
+        selectCell(name);
+        formulaInput.focus();
+      });
+
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+}
+
+function cellName(col, row) {
+  return COL_LETTERS[col] + row;
+}
+
+function formatValue(val, content) {
+  if (content && !content.startsWith('=') && isNaN(parseFloat(content))) {
+    return { text: content, cls: 'text' };
+  }
+  if (val === null || val === undefined) return { text: '', cls: '' };
+  if (isNaN(val)) return { text: '#ERR', cls: 'error' };
+  if (!isFinite(val)) return { text: '#DIV/0', cls: 'error' };
+  if (val === Math.floor(val) && Math.abs(val) < 1e15) {
+    return { text: val.toString(), cls: 'number' };
+  }
+  return { text: val.toFixed(2), cls: 'number' };
+}
+
+function renderCell(name) {
+  const td = document.getElementById('cell-' + name);
+  if (!td) return;
+  const display = td.querySelector('.cell-display');
+  const content = cellContents[name] || '';
+  const value = cellValues[name];
+  const fmt = formatValue(value, content);
+  display.textContent = fmt.text;
+  display.className = 'cell-display ' + fmt.cls;
+}
+
+function flashCell(name) {
+  const td = document.getElementById('cell-' + name);
+  if (!td) return;
+  td.classList.remove('flash');
+  void td.offsetWidth;
+  td.classList.add('flash');
+}
+
+function selectCell(name) {
+  if (selectedCell) {
+    const prev = document.getElementById('cell-' + selectedCell);
+    if (prev) prev.classList.remove('selected');
+  }
+  selectedCell = name;
+  const td = document.getElementById('cell-' + name);
+  if (td) td.classList.add('selected');
+  activeCellLabel.textContent = name;
+  formulaInput.value = cellContents[name] || '';
+  formulaInput.focus();
+}
+
+formulaInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (selectedCell && ws && ws.readyState === WebSocket.OPEN) {
+      const content = formulaInput.value;
+      ws.send(JSON.stringify({ cell: selectedCell, content: content }));
+      cellContents[selectedCell] = content;
+      const col = selectedCell.charCodeAt(0) - 65;
+      const row = parseInt(selectedCell.slice(1));
+      if (row < ROWS) selectCell(cellName(col, row + 1));
+    }
+  } else if (e.key === 'Tab') {
+    e.preventDefault();
+    if (selectedCell) {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ cell: selectedCell, content: formulaInput.value }));
+        cellContents[selectedCell] = formulaInput.value;
+      }
+      const col = selectedCell.charCodeAt(0) - 65;
+      const row = parseInt(selectedCell.slice(1));
+      if (col < COLS - 1) {
+        selectCell(cellName(col + 1, row));
+      } else if (row < ROWS) {
+        selectCell(cellName(0, row + 1));
+      }
+    }
+  } else if (e.key === 'Escape') {
+    formulaInput.value = cellContents[selectedCell] || '';
+    formulaInput.blur();
+  }
+});
+
+function connect() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(protocol + '//' + location.host + '/ws');
+
+  ws.onopen = () => setConnectionStatus(true);
+
+  ws.onclose = () => {
+    setConnectionStatus(false);
+    setTimeout(connect, 2000);
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+
+    if (msg.type === 'full_state') {
+      for (const cell of msg.cells) {
+        cellContents[cell.cell] = cell.content;
+        cellValues[cell.cell] = cell.value;
+        renderCell(cell.cell);
+      }
+      if (msg.node_count) {
+        nodeCountEl.textContent = msg.node_count + ' incr nodes';
+      }
+      if (!selectedCell) selectCell('A1');
+    }
+
+    if (msg.type === 'update') {
+      for (const cell of msg.changed) {
+        if (cell.content) cellContents[cell.cell] = cell.content;
+        cellValues[cell.cell] = cell.value;
+        renderCell(cell.cell);
+        flashCell(cell.cell);
+      }
+      if (selectedCell && cellContents[selectedCell] !== undefined) {
+        if (document.activeElement !== formulaInput) {
+          formulaInput.value = cellContents[selectedCell] || '';
+        }
+      }
+    }
+  };
+}
+
+buildGrid();
+setConnectionStatus(false);
+connect();
+</script>
+</body>
+</html>
