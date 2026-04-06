@@ -229,7 +229,7 @@ unsafe impl Sync for SegmentedNodes {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::v2::node::NodeData;
+    use crate::node::NodeData;
 
     #[test]
     fn push_then_get_returns_stable_reference() {
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn drop_frees_overflow_deps_from_every_node() {
-        use crate::v2::node::NodeId;
+        use crate::node::NodeId;
         // Push nodes, give some of them overflow deps, drop the
         // store, and rely on miri / valgrind to confirm no leaks.
         let store = SegmentedNodes::new();

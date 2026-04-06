@@ -1,15 +1,24 @@
-// v1 modules kept private for now; Task 14 deletes them.
-mod collection;
-mod graph;
-mod runtime;
-mod sorted_collection;
-mod types;
+pub mod arena;
+pub mod collection;
+pub mod handle;
+pub mod runtime;
+pub mod sorted_collection;
+pub mod value;
 
-// v2 is the public surface.
-pub mod v2;
+pub(crate) mod node;
+pub(crate) mod nodes_store;
+pub(crate) mod registry;
+pub(crate) mod state;
 
-pub use v2::collection::{Delta, GroupedCollection, IncrCollection};
-pub use v2::handle::{Incr, RuntimeId};
-pub use v2::runtime::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, Runtime, TraceAction};
-pub use v2::sorted_collection::{SortDelta, SortedCollection};
-pub use v2::value::Value;
+#[cfg(test)]
+mod collection_proptest;
+#[cfg(test)]
+mod runtime_concurrent_test;
+#[cfg(test)]
+mod runtime_proptest;
+
+pub use collection::{Delta, GroupedCollection, IncrCollection};
+pub use handle::{Incr, RuntimeId};
+pub use runtime::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, Runtime, TraceAction};
+pub use sorted_collection::{SortDelta, SortedCollection};
+pub use value::Value;

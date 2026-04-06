@@ -323,33 +323,33 @@ macro_rules! impl_value {
     ($t:ty) => {
         impl $crate::Value for $t {
             #[inline]
-            fn create_arena() -> Box<dyn $crate::v2::arena::ErasedArena> {
-                Box::new($crate::v2::arena::GenericArena::<$t>::new())
+            fn create_arena() -> Box<dyn $crate::arena::ErasedArena> {
+                Box::new($crate::arena::GenericArena::<$t>::new())
             }
 
             #[inline]
-            fn reserve_with(arena: &dyn $crate::v2::arena::ErasedArena, initial: Self) -> u32 {
-                $crate::v2::value::downcast_generic::<$t>(arena).reserve_with(initial)
+            fn reserve_with(arena: &dyn $crate::arena::ErasedArena, initial: Self) -> u32 {
+                $crate::value::downcast_generic::<$t>(arena).reserve_with(initial)
             }
 
             #[inline]
-            fn reserve_empty(arena: &dyn $crate::v2::arena::ErasedArena) -> u32 {
-                $crate::v2::value::downcast_generic::<$t>(arena).reserve()
+            fn reserve_empty(arena: &dyn $crate::arena::ErasedArena) -> u32 {
+                $crate::value::downcast_generic::<$t>(arena).reserve()
             }
 
             #[inline]
-            fn read(arena: &dyn $crate::v2::arena::ErasedArena, slot: u32) -> Self {
-                $crate::v2::value::downcast_generic::<$t>(arena).read(slot)
+            fn read(arena: &dyn $crate::arena::ErasedArena, slot: u32) -> Self {
+                $crate::value::downcast_generic::<$t>(arena).read(slot)
             }
 
             #[inline]
-            fn try_read(arena: &dyn $crate::v2::arena::ErasedArena, slot: u32) -> Option<Self> {
-                $crate::v2::value::downcast_generic::<$t>(arena).try_read(slot)
+            fn try_read(arena: &dyn $crate::arena::ErasedArena, slot: u32) -> Option<Self> {
+                $crate::value::downcast_generic::<$t>(arena).try_read(slot)
             }
 
             #[inline]
-            fn write(arena: &dyn $crate::v2::arena::ErasedArena, slot: u32, value: Self) {
-                $crate::v2::value::downcast_generic::<$t>(arena).write(slot, value);
+            fn write(arena: &dyn $crate::arena::ErasedArena, slot: u32, value: Self) {
+                $crate::value::downcast_generic::<$t>(arena).write(slot, value);
             }
         }
     };
