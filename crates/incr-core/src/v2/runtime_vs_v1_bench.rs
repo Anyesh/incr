@@ -25,8 +25,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use crate::runtime::Runtime as V1Runtime;
 use crate::v2::runtime::Runtime as V2Runtime;
-use crate::Runtime as V1Runtime;
 
 /// How many iterations to run each benchmark inner loop. Large
 /// enough that timer resolution (~1 µs on Linux) is well below
@@ -142,7 +142,7 @@ fn bench_propagate_chain_1000() {
     //   "performance/propagate_single_change/1000: currently
     //    ~175 µs. Target: ≤175 µs."
 
-    fn build_v1(size: usize) -> (V1Runtime, crate::Incr<i64>, crate::Incr<i64>) {
+    fn build_v1(size: usize) -> (V1Runtime, crate::types::Incr<i64>, crate::types::Incr<i64>) {
         let rt = V1Runtime::new();
         let input = rt.create_input::<i64>(1);
         let mut prev = input;
@@ -210,7 +210,7 @@ fn bench_propagate_chain_1000_stable_intermediate() {
     // short-circuit every level past q0 because q0's changed_at
     // never moves. v1 has the same mechanism; v2 should match it.
 
-    fn build_v1(size: usize) -> (V1Runtime, crate::Incr<i64>, crate::Incr<i64>) {
+    fn build_v1(size: usize) -> (V1Runtime, crate::types::Incr<i64>, crate::types::Incr<i64>) {
         let rt = V1Runtime::new();
         let input = rt.create_input::<i64>(1);
         let q0 = rt.create_query::<i64, _>(move |rt| {

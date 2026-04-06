@@ -40,24 +40,24 @@ fn spec_example_incremental_updates() {
 
 #[test]
 fn complex_graph_with_early_cutoff() {
-    use std::cell::Cell;
-    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     let rt = Runtime::new();
 
     let raw_score = rt.create_input(85_i64);
 
-    let normalize_count = Rc::new(Cell::new(0_u32));
+    let normalize_count = Arc::new(AtomicU32::new(0));
     let nc = normalize_count.clone();
     let normalized = rt.create_query(move |rt| {
-        nc.set(nc.get() + 1);
+        nc.fetch_add(1, Ordering::Relaxed);
         rt.get(raw_score).clamp(0, 100)
     });
 
-    let format_count = Rc::new(Cell::new(0_u32));
+    let format_count = Arc::new(AtomicU32::new(0));
     let fc = format_count.clone();
     let display = rt.create_query(move |rt| {
-        fc.set(fc.get() + 1);
+        fc.fetch_add(1, Ordering::Relaxed);
         let score = rt.get(normalized);
         if score >= 90 {
             "A".to_string()
@@ -69,24 +69,24 @@ fn complex_graph_with_early_cutoff() {
     });
 
     assert_eq!(rt.get(display), "B");
-    assert_eq!(normalize_count.get(), 1);
-    assert_eq!(format_count.get(), 1);
+    assert_eq!(normalize_count.load(Ordering::Relaxed), 1);
+    assert_eq!(format_count.load(Ordering::Relaxed), 1);
 
     rt.set(raw_score, 95);
     assert_eq!(rt.get(display), "A");
-    assert_eq!(normalize_count.get(), 2);
-    assert_eq!(format_count.get(), 2);
+    assert_eq!(normalize_count.load(Ordering::Relaxed), 2);
+    assert_eq!(format_count.load(Ordering::Relaxed), 2);
 
     rt.set(raw_score, 150);
     assert_eq!(rt.get(display), "A");
-    assert_eq!(normalize_count.get(), 3);
-    assert_eq!(format_count.get(), 3);
+    assert_eq!(normalize_count.load(Ordering::Relaxed), 3);
+    assert_eq!(format_count.load(Ordering::Relaxed), 3);
 
     // Early cutoff: 200 clamped to 100, same as 150 clamped to 100
     rt.set(raw_score, 200);
     assert_eq!(rt.get(display), "A");
-    assert_eq!(normalize_count.get(), 4);
-    assert_eq!(format_count.get(), 3); // NOT recomputed — early cutoff!
+    assert_eq!(normalize_count.load(Ordering::Relaxed), 4);
+    assert_eq!(format_count.load(Ordering::Relaxed), 3); // NOT recomputed — early cutoff!
 }
 
 #[test]
@@ -242,8 +242,8 @@ fn sort_pairwise_map_reduce_pipeline() {
 fn pipeline_early_cutoff() {
     // Verify that early cutoff works through the full pipeline:
     // if total doesn't change, downstream isn't recomputed
-    use std::cell::Cell;
-    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
 
     let rt = Runtime::new();
     let visits = rt.create_collection::<i64>();
@@ -252,10 +252,10 @@ fn pipeline_early_cutoff() {
     let gaps = pairs.map(&rt, |(a, b): &(i64, i64)| b - a);
     let total_gap = gaps.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
 
-    let downstream_evals = Rc::new(Cell::new(0_u32));
+    let downstream_evals = Arc::new(AtomicU32::new(0));
     let dc = downstream_evals.clone();
     let label = rt.create_query(move |rt| {
-        dc.set(dc.get() + 1);
+        dc.fetch_add(1, Ordering::Relaxed);
         format!("total={}", rt.get(total_gap))
     });
 
@@ -263,11 +263,11 @@ fn pipeline_early_cutoff() {
     visits.insert(&rt, 30);
     visits.insert(&rt, 50);
     assert_eq!(rt.get(label), "total=40");
-    assert_eq!(downstream_evals.get(), 1);
+    assert_eq!(downstream_evals.load(Ordering::Relaxed), 1);
 
     // Insert 20 between 10 and 30: total gap is still 40
     visits.insert(&rt, 20);
     assert_eq!(rt.get(label), "total=40");
     // Early cutoff: total_gap unchanged, so label shouldn't recompute
-    assert_eq!(downstream_evals.get(), 1);
+    assert_eq!(downstream_evals.load(Ordering::Relaxed), 1);
 }

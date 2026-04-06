@@ -407,7 +407,7 @@ impl<T: Any + Clone + Hash + Eq + 'static> IncrCollection<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Runtime;
+    use crate::runtime::Runtime;
 
     #[test]
     fn log_insert() {

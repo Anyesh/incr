@@ -42,7 +42,7 @@ fn verify_collection_incremental_matches_batch(ops: Vec<Op>) {
         .collect();
 
     assert_eq!(
-        incr_count,
+        incr_count as usize,
         batch_elements.len(),
         "Count mismatch: incr={}, batch={}",
         incr_count,

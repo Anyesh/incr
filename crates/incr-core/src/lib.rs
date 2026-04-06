@@ -1,17 +1,15 @@
+// v1 modules kept private for now; Task 14 deletes them.
 mod collection;
 mod graph;
 mod runtime;
 mod sorted_collection;
 mod types;
 
-// Concurrent core rewrite. See crates/incr-core/src/v2/mod.rs for status.
-// v2 is not publicly exported yet; it lives alongside v1 until it passes
-// all milestone gates in the rewrite sequencing spec.
-mod v2;
+// v2 is the public surface.
+pub mod v2;
 
-pub use collection::IncrCollection;
-pub use runtime::Runtime;
-pub use sorted_collection::{SortDelta, SortedCollection};
-pub use types::{
-    Incr, NodeId, NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, Revision, TraceAction,
-};
+pub use v2::collection::{Delta, GroupedCollection, IncrCollection};
+pub use v2::handle::{Incr, RuntimeId};
+pub use v2::runtime::Runtime;
+pub use v2::sorted_collection::{SortDelta, SortedCollection};
+pub use v2::value::Value;

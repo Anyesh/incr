@@ -27,23 +27,21 @@
 //! are still exercised by their own unit tests. The allow comes off when
 //! v2 is wired into `lib.rs` at Gate 5 per the spec.
 
-#![allow(dead_code)]
-
 pub mod arena;
-pub(crate) mod collection;
+pub mod collection;
 #[cfg(test)]
 mod collection_proptest;
 pub mod handle;
 pub(crate) mod node;
 pub(crate) mod nodes_store;
 pub(crate) mod registry;
-pub(crate) mod runtime;
+pub mod runtime;
 #[cfg(test)]
 mod runtime_concurrent_test;
 #[cfg(test)]
 mod runtime_proptest;
 #[cfg(test)]
 mod runtime_vs_v1_bench;
-pub(crate) mod sorted_collection;
+pub mod sorted_collection;
 pub(crate) mod state;
 pub mod value;
