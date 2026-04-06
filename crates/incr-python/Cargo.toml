@@ -2,13 +2,14 @@
 name = "incr-python"
 version = "0.1.0"
 edition = "2021"
-description = "Python bindings for the incr incremental computation engine"
+description = "Python bindings for the incr single-threaded incremental computation engine"
 license = "Apache-2.0"
+publish = false
 
 [lib]
 name = "incr"
 crate-type = ["cdylib"]
 
 [dependencies]
+incr_st = { package = "incr", path = "../incr" }
 pyo3 = { version = "0.23", features = ["extension-module"] }
-incr-concurrent = { path = "../incr-concurrent" }

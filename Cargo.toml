@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/incr", "crates/incr-concurrent", "crates/incr-python", "examples/concurrent-server"]
+members = ["crates/incr", "crates/incr-concurrent", "crates/incr-python", "crates/incr-concurrent-python", "examples/concurrent-server"]
