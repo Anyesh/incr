@@ -62,6 +62,7 @@ pub struct RuntimeId(u64);
 
 impl RuntimeId {
     /// The sentinel runtime id. Never assigned to a real runtime.
+    #[allow(dead_code)]
     pub(crate) const SENTINEL: RuntimeId = RuntimeId(0);
 
     /// Wrap a raw counter value. Called by the arena registry when a new

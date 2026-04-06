@@ -14,6 +14,7 @@ pub enum Delta<T> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct VersionedDelta<T> {
+    #[allow(dead_code)]
     pub version: u64,
     pub delta: Delta<T>,
 }
@@ -161,6 +162,7 @@ where
 {
     pub(crate) groups: Arc<RwLock<HashMap<K, IncrCollection<T>>>>,
     pub(crate) version_node: Incr<u64>,
+    #[allow(dead_code)]
     rt_ptr: *const Runtime,
 }
 

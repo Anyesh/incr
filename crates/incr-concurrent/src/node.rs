@@ -260,6 +260,7 @@ impl NodeData {
     /// Computing → Clean transition at the end of `run_compute`),
     /// which publishes these writes to subsequent readers via the
     /// standard Release-Acquire chain on state.
+    #[allow(dead_code)]
     pub(crate) fn replace_deps(&self, new_deps: &[NodeId]) {
         let count = new_deps.len();
         assert!(
@@ -440,6 +441,7 @@ impl NodeData {
     }
 
     /// Type tag for the arena holding this node's value. Immutable.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn type_tag(&self) -> u16 {
         self.type_tag

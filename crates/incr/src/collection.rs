@@ -16,6 +16,7 @@ pub enum Delta<T> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct VersionedDelta<T> {
+    #[allow(dead_code)]
     pub version: u64,
     pub delta: Delta<T>,
 }

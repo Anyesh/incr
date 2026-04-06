@@ -102,6 +102,7 @@ impl AtomicNodeState {
     /// has already established happens-before via another Acquire load.
     /// Do not use it on the hot path before reading a node's value.
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn load_relaxed(&self) -> NodeState {
         NodeState::from_u8(self.cell.load(Ordering::Relaxed))
     }

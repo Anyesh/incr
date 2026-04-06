@@ -1,10 +1,9 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::hash::Hash;
 use std::rc::Rc;
 
-use crate::collection::{CollectionLog, Delta, IncrCollection, VersionedDelta};
+use crate::collection::{CollectionLog, IncrCollection};
 use crate::runtime::Runtime;
 use crate::types::Incr;
 

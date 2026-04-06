@@ -155,6 +155,7 @@ impl ArenaRegistry {
     /// checks); production get/set paths should use
     /// [`ArenaRegistry::ensure_arena`] so a missing arena is a bug,
     /// not a silent `None`.
+    #[allow(dead_code)]
     pub(crate) fn lookup<T: 'static>(&self) -> Option<*const dyn ErasedArena> {
         let tid = TypeId::of::<T>();
 

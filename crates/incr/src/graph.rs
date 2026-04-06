@@ -28,12 +28,14 @@ pub(crate) struct ComputeEntry {
     pub eq_fn: Box<dyn Fn(&dyn Any, &dyn Any) -> bool>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct Graph {
     pub nodes: Vec<NodeData>,
     pub kinds: Vec<NodeKind>,
     pub funcs: Vec<ComputeEntry>,
 }
 
+#[allow(dead_code)]
 impl Graph {
     pub fn new() -> Self {
         Graph {
