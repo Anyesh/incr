@@ -23,3 +23,7 @@ harness = false
 [[bench]]
 name = "collection_operators"
 harness = false
+
+[[bench]]
+name = "regression"
+harness = false
