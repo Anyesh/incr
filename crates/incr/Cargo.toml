@@ -1,0 +1,25 @@
+[package]
+name = "incr"
+version = "0.1.0"
+edition = "2021"
+description = "The fastest incremental computation engine — zero-overhead reactive DAG with incremental collections"
+license = "MIT"
+repository = "https://github.com/Anyesh/incr"
+keywords = ["incremental", "computation", "reactive", "dataflow"]
+categories = ["algorithms", "data-structures"]
+
+[dependencies]
+rustc-hash = "2"
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+[[bench]]
+name = "performance"
+harness = false
+
+[[bench]]
+name = "collection_operators"
+harness = false
