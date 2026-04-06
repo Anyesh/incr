@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use super::handle::Incr;
@@ -116,6 +116,56 @@ where
 {
     pub(crate) log: Arc<RwLock<CollectionLog<T>>>,
     pub(crate) version_node: Incr<u64>,
+}
+
+/// A raw pointer wrapper that is `Send + Sync`.
+///
+/// # Safety
+/// The caller must ensure the pointer is only dereferenced during
+/// stabilization, where the Runtime is alive and node execution is
+/// single-threaded per-node (guaranteed by the Computing CAS).
+struct SendSyncPtr<T>(*const T);
+// Manual Copy/Clone impls to avoid the implicit `T: Copy` bound that #[derive] generates.
+impl<T> Copy for SendSyncPtr<T> {}
+impl<T> Clone for SendSyncPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+unsafe impl<T> Send for SendSyncPtr<T> {}
+unsafe impl<T> Sync for SendSyncPtr<T> {}
+impl<T> SendSyncPtr<T> {
+    /// # Safety
+    /// Caller must ensure the pointee is alive and no mutable alias exists.
+    unsafe fn as_ref(&self) -> &T {
+        &*self.0
+    }
+}
+
+pub struct GroupedCollection<K, T>
+where
+    K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+    T: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+{
+    pub(crate) groups: Arc<RwLock<HashMap<K, IncrCollection<T>>>>,
+    pub(crate) version_node: Incr<u64>,
+    rt_ptr: *const Runtime,
+}
+
+// SAFETY: All fields except rt_ptr are Send+Sync. rt_ptr is only
+// dereferenced inside compute closures during stabilization (which
+// is single-threaded per-node by the state machine's Computing CAS).
+unsafe impl<K, T> Send for GroupedCollection<K, T>
+where
+    K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+    T: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+{
+}
+unsafe impl<K, T> Sync for GroupedCollection<K, T>
+where
+    K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+    T: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+{
 }
 
 impl<T> IncrCollection<T>
@@ -308,6 +358,76 @@ where
             let elems = upstream.elements_vec();
             fold_fn(&elems)
         })
+    }
+
+    pub fn group_by<K, F>(&self, rt: &Runtime, key_fn: F) -> GroupedCollection<K, T>
+    where
+        K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+        F: Fn(&T) -> K + Send + Sync + 'static,
+    {
+        let upstream_log = self.log.clone();
+        let upstream_ver = self.version_node;
+        let last_idx = Arc::new(AtomicUsize::new(0));
+        let groups: Arc<RwLock<HashMap<K, IncrCollection<T>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let groups_ref = groups.clone();
+        let key_cache: Arc<RwLock<HashMap<T, K>>> = Arc::new(RwLock::new(HashMap::new()));
+        let key_cache_ref = key_cache.clone();
+        let rt_ptr = SendSyncPtr(rt as *const Runtime);
+
+        let version_counter = Arc::new(AtomicU64::new(0));
+        let version_counter_ref = version_counter.clone();
+
+        let version_node = rt.create_query(move |_rt| -> u64 {
+            let rt = unsafe { rt_ptr.as_ref() };
+            let _upstream_v = rt.get(upstream_ver);
+
+            let upstream = upstream_log.read().unwrap();
+            let start = last_idx.load(Ordering::Relaxed);
+            if start >= upstream.deltas.len() {
+                return version_counter_ref.load(Ordering::Relaxed);
+            }
+
+            let mut grps = groups_ref.write().unwrap();
+            let mut kc = key_cache_ref.write().unwrap();
+
+            for vd in &upstream.deltas[start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let k = key_fn(x);
+                        kc.insert(x.clone(), k.clone());
+                        let group = grps.entry(k).or_insert_with(|| rt.create_collection::<T>());
+                        let ver = {
+                            let mut log = group.log.write().unwrap();
+                            log.insert(x.clone());
+                            log.version
+                        };
+                        rt.set(group.version_node, ver);
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(k) = kc.remove(x) {
+                            if let Some(group) = grps.get(&k) {
+                                let ver = {
+                                    let mut log = group.log.write().unwrap();
+                                    log.delete(x);
+                                    log.version
+                                };
+                                rt.set(group.version_node, ver);
+                            }
+                        }
+                    }
+                }
+            }
+
+            last_idx.store(upstream.deltas.len(), Ordering::Relaxed);
+            version_counter_ref.fetch_add(1, Ordering::Relaxed) + 1
+        });
+
+        GroupedCollection {
+            groups,
+            version_node,
+            rt_ptr: rt_ptr.0,
+        }
     }
 }
 
@@ -653,5 +773,40 @@ mod tests {
         col.insert(&rt, 3);
         col.insert(&rt, 4);
         assert_eq!(rt.get(sum), 6);
+    }
+
+    // ── group_by tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn group_by_basic() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<(String, i64)>();
+        let grouped = col.group_by(&rt, |x: &(String, i64)| x.0.clone());
+
+        col.insert(&rt, ("a".to_string(), 1));
+        col.insert(&rt, ("b".to_string(), 2));
+        col.insert(&rt, ("a".to_string(), 3));
+
+        let _ = rt.get(grouped.version_node);
+        let groups = grouped.groups.read().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.get("a").unwrap().elements().len(), 2);
+        assert_eq!(groups.get("b").unwrap().elements().len(), 1);
+    }
+
+    #[test]
+    fn group_by_delete() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<(String, i64)>();
+        let grouped = col.group_by(&rt, |x: &(String, i64)| x.0.clone());
+
+        col.insert(&rt, ("a".to_string(), 1));
+        col.insert(&rt, ("a".to_string(), 2));
+        let _ = rt.get(grouped.version_node);
+
+        col.delete(&rt, &("a".to_string(), 1));
+        let _ = rt.get(grouped.version_node);
+        let groups = grouped.groups.read().unwrap();
+        assert_eq!(groups.get("a").unwrap().elements().len(), 1);
     }
 }
