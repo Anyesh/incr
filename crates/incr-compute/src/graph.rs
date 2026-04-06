@@ -23,6 +23,7 @@ pub(crate) struct NodeData {
     pub dependencies: Vec<NodeId>, // Backward edges: who do I depend on
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) struct ComputeEntry {
     pub func: Box<dyn Fn(&crate::runtime::Runtime) -> Box<dyn Any>>,
     pub eq_fn: Box<dyn Fn(&dyn Any, &dyn Any) -> bool>,

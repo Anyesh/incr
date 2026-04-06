@@ -36,6 +36,12 @@ pub struct Runtime {
     trace_log: RefCell<Vec<NodeTrace>>,
 }
 
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Runtime {
     pub fn new() -> Self {
         Runtime {

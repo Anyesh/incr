@@ -499,6 +499,12 @@ pub struct GenericArena<T: Clone + Send + Sync + 'static> {
     len: AtomicU32,
 }
 
+impl<T: Clone + Send + Sync + 'static> Default for GenericArena<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
     /// Construct an empty arena.
     pub fn new() -> Self {

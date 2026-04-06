@@ -163,7 +163,6 @@ impl<T: Any + Clone + Hash + Eq + 'static> SortedCollection<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::Runtime;
 
     #[test]

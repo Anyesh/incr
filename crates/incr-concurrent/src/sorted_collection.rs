@@ -111,8 +111,7 @@ where
             }
 
             last_idx.store(upstream.deltas.len(), Ordering::Relaxed);
-            let ver = version_counter_ref.fetch_add(1, Ordering::Relaxed) + 1;
-            ver
+            version_counter_ref.fetch_add(1, Ordering::Relaxed) + 1
         });
 
         SortedCollection {

@@ -120,7 +120,7 @@ impl<T: Clone + Hash + Eq> CollectionLog<T> {
     pub fn elements_vec(&self) -> Vec<T> {
         self.elements
             .iter()
-            .flat_map(|(v, &count)| std::iter::repeat(v.clone()).take(count))
+            .flat_map(|(v, &count)| std::iter::repeat_n(v.clone(), count))
             .collect()
     }
 }
