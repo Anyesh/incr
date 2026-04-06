@@ -1,4 +1,4 @@
-use incr::Runtime;
+use incr_compute::Runtime;
 use proptest::prelude::*;
 
 #[derive(Clone, Debug)]

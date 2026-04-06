@@ -1,4 +1,4 @@
-use incr::{Incr, Runtime};
+use incr_compute::{Incr, Runtime};
 use proptest::prelude::*;
 
 /// Build a layered graph of the given shape, run it incrementally,

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use incr::{Incr, Runtime};
+use incr_compute::{Incr, Runtime};
 
 /// Build a linear chain: input -> n1 -> n2 -> ... -> output
 fn build_chain(size: usize) -> (Runtime, Incr<i64>, Incr<i64>) {

@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use incr::Runtime;
+use incr_compute::Runtime;
 
 fn hot_read_input(c: &mut Criterion) {
     let rt = Runtime::new();

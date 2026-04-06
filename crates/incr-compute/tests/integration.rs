@@ -1,4 +1,4 @@
-use incr::{IncrCollection, Runtime};
+use incr_compute::{IncrCollection, Runtime};
 
 #[test]
 fn spec_example_width_height_area() {

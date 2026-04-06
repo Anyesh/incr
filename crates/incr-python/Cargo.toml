@@ -11,5 +11,5 @@ name = "incr"
 crate-type = ["cdylib"]
 
 [dependencies]
-incr_st = { package = "incr", path = "../incr" }
+incr_st = { package = "incr-compute", path = "../incr-compute" }
 pyo3 = { version = "0.23", features = ["extension-module"] }

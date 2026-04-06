@@ -7,13 +7,13 @@ Single-threaded, zero-overhead incremental computation.
 ## Install
 
 ```
-cargo add incr
+cargo add incr-compute
 ```
 
 ## Quick start
 
 ```rust
-use incr::Runtime;
+use incr_compute::Runtime;
 
 let rt = Runtime::new();
 
@@ -34,7 +34,7 @@ Dependencies are tracked automatically. When you call `rt.get(width)` inside a q
 Incremental collections let you build data pipelines that update incrementally as elements are inserted or removed.
 
 ```rust
-use incr::{Runtime, IncrCollection};
+use incr_compute::{Runtime, IncrCollection};
 
 let rt = Runtime::new();
 let scores = rt.create_collection::<i64>();

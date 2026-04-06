@@ -1,5 +1,5 @@
 [package]
-name = "incr"
+name = "incr-compute"
 version = "0.1.0"
 edition = "2021"
 description = "The fastest incremental computation engine — zero-overhead reactive DAG with incremental collections"

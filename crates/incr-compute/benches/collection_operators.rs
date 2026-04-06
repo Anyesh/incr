@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use incr::Runtime;
+use incr_compute::Runtime;
 
 /// Batch: sort N timestamps, compute pairwise gaps, sum them.
 fn batch_travel_premium(timestamps: &[i64]) -> i64 {
@@ -10,7 +10,13 @@ fn batch_travel_premium(timestamps: &[i64]) -> i64 {
 
 /// Set up an incremental pipeline with N elements already inserted.
 /// Returns (runtime, collection, reduce_node) ready for mutation benchmarks.
-fn setup_incremental(n: usize) -> (Runtime, incr::IncrCollection<i64>, incr::Incr<i64>) {
+fn setup_incremental(
+    n: usize,
+) -> (
+    Runtime,
+    incr_compute::IncrCollection<i64>,
+    incr_compute::Incr<i64>,
+) {
     let rt = Runtime::new();
     let col = rt.create_collection::<i64>();
     let sorted = col.sort_by_key(&rt, |t: &i64| *t);
