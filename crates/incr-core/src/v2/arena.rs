@@ -113,7 +113,7 @@ const _: () = assert!(1 << SEGMENT_SHIFT == SEGMENT_SIZE);
 /// the type parameter statically. The trait surface is intentionally
 /// minimal: type identification only. Concrete operations (reserve, read,
 /// write) live on the concrete arena types and are reached via downcast.
-pub(crate) trait ErasedArena: Send + Sync {
+pub trait ErasedArena: Send + Sync {
     /// Returns the `TypeId` of the value type this arena holds.
     fn erased_type_id(&self) -> TypeId;
 
@@ -494,14 +494,14 @@ impl<T> GenericSlot<T> {
 /// segment allocation via CAS. Only the slot body differs: generic values
 /// live in `UnsafeCell<Option<T>>` cells, and access safety depends on
 /// external coordination rather than atomicity.
-pub(crate) struct GenericArena<T: Clone + Send + Sync + 'static> {
+pub struct GenericArena<T: Clone + Send + Sync + 'static> {
     segments: Box<[AtomicPtr<Segment<GenericSlot<T>>>]>,
     len: AtomicU32,
 }
 
 impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
     /// Construct an empty arena.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let segments = (0..MAX_SEGMENTS)
             .map(|_| AtomicPtr::new(std::ptr::null_mut()))
             .collect::<Vec<_>>()
@@ -522,7 +522,7 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
     /// could observe the handle before the slot is populated).
     ///
     /// Panics on exhaustion, same contract as `AtomicPrimitiveArena`.
-    pub(crate) fn reserve(&self) -> u32 {
+    pub fn reserve(&self) -> u32 {
         let idx = self.len.fetch_add(1, Ordering::Relaxed);
         if idx >= MAX_SLOTS {
             self.len.fetch_sub(1, Ordering::Relaxed);
@@ -544,7 +544,7 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
     /// Used by the runtime's `create_input` path where the initial value
     /// is known at node creation time. Equivalent to `reserve()` followed
     /// by `write(slot, initial)`, but saves one segment lookup.
-    pub(crate) fn reserve_with(&self, initial: T) -> u32 {
+    pub fn reserve_with(&self, initial: T) -> u32 {
         let idx = self.reserve();
         self.write(idx, initial);
         idx
@@ -556,7 +556,7 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
     /// contained value, and releases. Commit U changed this from
     /// unsafe UnsafeCell access to mutex-guarded access; see the
     /// `GenericSlot` doc comment for the rationale.
-    pub(crate) fn read(&self, slot: u32) -> T {
+    pub fn read(&self, slot: u32) -> T {
         debug_assert!(
             slot < self.len.load(Ordering::Relaxed),
             "read of unreserved slot {} (len {})",
@@ -591,7 +591,7 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
     /// Clone the value at `slot` if it exists, returning `None` if
     /// the slot has never been written. Used by the Runtime's
     /// early-cutoff path for Failed-retry recomputes.
-    pub(crate) fn try_read(&self, slot: u32) -> Option<T> {
+    pub fn try_read(&self, slot: u32) -> Option<T> {
         if slot >= self.len.load(Ordering::Relaxed) {
             return None;
         }
@@ -614,7 +614,7 @@ impl<T: Clone + Send + Sync + 'static> GenericArena<T> {
     /// Takes the per-slot mutex, replaces the contained Option with
     /// `Some(value)` (dropping any previous value in place), and
     /// releases. Concurrent readers block briefly on the mutex.
-    pub(crate) fn write(&self, slot: u32, value: T) {
+    pub fn write(&self, slot: u32, value: T) {
         debug_assert!(
             slot < self.len.load(Ordering::Relaxed),
             "write to unreserved slot {} (len {})",

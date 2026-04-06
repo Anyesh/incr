@@ -153,7 +153,7 @@ impl<T: 'static> Incr<T> {
 
     /// The slot index this handle refers to.
     #[inline]
-    pub(crate) fn slot(self) -> u32 {
+    pub fn slot(self) -> u32 {
         self.slot
     }
 

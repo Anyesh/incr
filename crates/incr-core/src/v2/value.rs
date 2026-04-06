@@ -52,7 +52,7 @@ use super::arena::{AtomicPrimitive, AtomicPrimitiveArena, ErasedArena, GenericAr
 /// (the registry enforces this by keying on `TypeId::of::<T>()`).
 /// A panic from the downcast indicates a library bug, not a user
 /// error.
-pub(crate) trait Value: Clone + PartialEq + Send + Sync + 'static {
+pub trait Value: Clone + PartialEq + Send + Sync + 'static {
     /// Construct the concrete arena for this value type. Called once
     /// per type by `ArenaRegistry::ensure_arena` the first time the
     /// runtime sees a node of this type.
@@ -187,9 +187,12 @@ macro_rules! impl_value_generic {
     };
 }
 
-/// Internal: concrete downcast helper for the generic Value impls.
+/// Concrete downcast helper for the generic Value impls. Public so that
+/// `impl_value!` expansions in downstream crates can call it.
 #[inline]
-fn downcast_generic<T: Clone + Send + Sync + 'static>(arena: &dyn ErasedArena) -> &GenericArena<T> {
+pub fn downcast_generic<T: Clone + Send + Sync + 'static>(
+    arena: &dyn ErasedArena,
+) -> &GenericArena<T> {
     arena
         .as_any()
         .downcast_ref::<GenericArena<T>>()
@@ -273,4 +276,81 @@ where
     fn write(arena: &dyn ErasedArena, slot: u32, value: Self) {
         downcast_generic::<Option<T>>(arena).write(slot, value);
     }
+}
+
+impl<A, B> Value for (A, B)
+where
+    A: Clone + PartialEq + Send + Sync + 'static,
+    B: Clone + PartialEq + Send + Sync + 'static,
+{
+    #[inline]
+    fn create_arena() -> Box<dyn ErasedArena> {
+        Box::new(GenericArena::<(A, B)>::new())
+    }
+
+    #[inline]
+    fn reserve_with(arena: &dyn ErasedArena, initial: Self) -> u32 {
+        downcast_generic::<(A, B)>(arena).reserve_with(initial)
+    }
+
+    #[inline]
+    fn reserve_empty(arena: &dyn ErasedArena) -> u32 {
+        downcast_generic::<(A, B)>(arena).reserve()
+    }
+
+    #[inline]
+    fn read(arena: &dyn ErasedArena, slot: u32) -> Self {
+        downcast_generic::<(A, B)>(arena).read(slot)
+    }
+
+    #[inline]
+    fn try_read(arena: &dyn ErasedArena, slot: u32) -> Option<Self> {
+        downcast_generic::<(A, B)>(arena).try_read(slot)
+    }
+
+    #[inline]
+    fn write(arena: &dyn ErasedArena, slot: u32, value: Self) {
+        downcast_generic::<(A, B)>(arena).write(slot, value);
+    }
+}
+
+/// Public macro for implementing Value for user-defined types.
+/// Routes the type to GenericArena.
+///
+/// Usage: `incr_core::impl_value!(MyStruct);`
+#[macro_export]
+macro_rules! impl_value {
+    ($t:ty) => {
+        impl $crate::Value for $t {
+            #[inline]
+            fn create_arena() -> Box<dyn $crate::v2::arena::ErasedArena> {
+                Box::new($crate::v2::arena::GenericArena::<$t>::new())
+            }
+
+            #[inline]
+            fn reserve_with(arena: &dyn $crate::v2::arena::ErasedArena, initial: Self) -> u32 {
+                $crate::v2::value::downcast_generic::<$t>(arena).reserve_with(initial)
+            }
+
+            #[inline]
+            fn reserve_empty(arena: &dyn $crate::v2::arena::ErasedArena) -> u32 {
+                $crate::v2::value::downcast_generic::<$t>(arena).reserve()
+            }
+
+            #[inline]
+            fn read(arena: &dyn $crate::v2::arena::ErasedArena, slot: u32) -> Self {
+                $crate::v2::value::downcast_generic::<$t>(arena).read(slot)
+            }
+
+            #[inline]
+            fn try_read(arena: &dyn $crate::v2::arena::ErasedArena, slot: u32) -> Option<Self> {
+                $crate::v2::value::downcast_generic::<$t>(arena).try_read(slot)
+            }
+
+            #[inline]
+            fn write(arena: &dyn $crate::v2::arena::ErasedArena, slot: u32, value: Self) {
+                $crate::v2::value::downcast_generic::<$t>(arena).write(slot, value);
+            }
+        }
+    };
 }

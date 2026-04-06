@@ -29,10 +29,11 @@
 
 #![allow(dead_code)]
 
-pub(crate) mod arena;
+pub mod arena;
 pub(crate) mod collection;
-pub(crate) mod handle;
-pub(crate) mod sorted_collection;
+#[cfg(test)]
+mod collection_proptest;
+pub mod handle;
 pub(crate) mod node;
 pub(crate) mod nodes_store;
 pub(crate) mod registry;
@@ -43,7 +44,6 @@ mod runtime_concurrent_test;
 mod runtime_proptest;
 #[cfg(test)]
 mod runtime_vs_v1_bench;
-#[cfg(test)]
-mod collection_proptest;
+pub(crate) mod sorted_collection;
 pub(crate) mod state;
-pub(crate) mod value;
+pub mod value;
