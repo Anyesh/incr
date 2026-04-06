@@ -63,6 +63,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -73,6 +74,54 @@ use super::nodes_store::SegmentedNodes;
 use super::registry::ArenaRegistry;
 use super::state::NodeState;
 use super::value::Value;
+
+// ---------------------------------------------------------------------------
+// Introspection types.
+// ---------------------------------------------------------------------------
+
+/// Whether a node is an input or a computed value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeKindInfo {
+    Input,
+    Compute,
+}
+
+/// Structural metadata about a single node, for visualization/debugging.
+#[derive(Clone, Debug)]
+pub struct NodeInfo {
+    pub slot: u32,
+    pub kind: NodeKindInfo,
+    pub label: String,
+    pub dependencies: Vec<u32>,
+    pub dependents: Vec<u32>,
+}
+
+/// What happened to a node during a traced get() call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TraceAction {
+    /// Node was verified clean without recomputing.
+    VerifiedClean,
+    /// Node was recomputed; `value_changed` is false when early cutoff applied.
+    Recomputed { value_changed: bool },
+}
+
+/// Trace entry for a single node during propagation.
+#[derive(Clone, Debug)]
+pub struct NodeTrace {
+    pub slot: u32,
+    pub action: TraceAction,
+}
+
+/// Summary of what happened during a single get() call.
+#[derive(Clone, Debug)]
+pub struct PropagationTrace {
+    pub target: u32,
+    pub total_nodes: usize,
+    pub nodes_recomputed: usize,
+    pub nodes_cutoff: usize,
+    pub elapsed_ns: u64,
+    pub node_traces: Vec<NodeTrace>,
+}
 
 // ---------------------------------------------------------------------------
 // COMPUTE_STACK: per-thread stack of active compute frames.
@@ -144,6 +193,10 @@ struct RuntimeInner {
     /// Stashed panic message for nodes in the Failed state, else
     /// None. Cleared by the dirty walk on Failed → Dirty.
     failure_messages: Vec<Option<String>>,
+    /// Optional display labels for nodes, keyed by slot.
+    labels: HashMap<u32, String>,
+    /// When true, get_traced() can record trace events (stub for now).
+    tracing: bool,
 }
 
 /// The v2 incremental computation runtime.
@@ -172,6 +225,8 @@ impl Runtime {
                 compute_fns: Vec::new(),
                 dependents: Vec::new(),
                 failure_messages: Vec::new(),
+                labels: HashMap::new(),
+                tracing: false,
             }),
             registry,
             revision: AtomicU64::new(0),
@@ -819,6 +874,81 @@ impl Runtime {
         // Box). The returned reference's lifetime is tied to &self,
         // which outlives the registry.
         unsafe { &*arena_ptr }
+    }
+
+    // -- Introspection API ---------------------------------------------------
+
+    /// Return the number of nodes currently registered in this runtime.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len() as usize
+    }
+
+    /// Assign a human-readable label to a node slot for visualization/debugging.
+    pub fn set_label(&self, slot: u32, label: String) {
+        self.inner
+            .write()
+            .expect("runtime inner lock poisoned")
+            .labels
+            .insert(slot, label);
+    }
+
+    /// Enable or disable execution tracing. When enabled, `get_traced`
+    /// can in principle record which nodes were visited; the current
+    /// implementation is a stub that stores the flag but does not yet
+    /// record per-node trace events.
+    pub fn set_tracing(&self, enabled: bool) {
+        self.inner
+            .write()
+            .expect("runtime inner lock poisoned")
+            .tracing = enabled;
+    }
+
+    /// Like `get`, but also returns a `PropagationTrace` describing the
+    /// propagation. The trace fields `nodes_recomputed`, `nodes_cutoff`,
+    /// and `node_traces` are currently stubs (zero/empty); full trace
+    /// recording is deferred until the dashboard demo requires it.
+    pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, PropagationTrace) {
+        let value = self.get(handle);
+        let trace = PropagationTrace {
+            target: handle.slot(),
+            total_nodes: self.node_count(),
+            nodes_recomputed: 0,
+            nodes_cutoff: 0,
+            elapsed_ns: 0,
+            node_traces: Vec::new(),
+        };
+        (value, trace)
+    }
+
+    /// Return structural metadata about every node in the graph. Useful
+    /// for visualizing the dependency graph in the dashboard demo.
+    pub fn graph_snapshot(&self) -> Vec<NodeInfo> {
+        let inner = self.inner.read().expect("runtime inner lock poisoned");
+        let count = inner.compute_fns.len();
+        let mut infos = Vec::with_capacity(count);
+        for slot in 0..count {
+            let is_compute = inner.compute_fns[slot].is_some();
+            let label = inner
+                .labels
+                .get(&(slot as u32))
+                .cloned()
+                .unwrap_or_default();
+            let node = self.nodes.get(slot as u32);
+            let deps: Vec<u32> = node.collect_deps().iter().map(|d| d.0).collect();
+            let dependents: Vec<u32> = inner.dependents[slot].iter().map(|d| d.0).collect();
+            infos.push(NodeInfo {
+                slot: slot as u32,
+                kind: if is_compute {
+                    NodeKindInfo::Compute
+                } else {
+                    NodeKindInfo::Input
+                },
+                label,
+                dependencies: deps,
+                dependents,
+            });
+        }
+        infos
     }
 }
 
@@ -2238,5 +2368,73 @@ mod tests {
         rt.set(flag, true);
         assert_eq!(rt.get(q), expected_sum);
         assert_eq!(collect_deps_for_slot(&rt, q.slot()).len(), 11);
+    }
+
+    // -- Introspection API tests --------------------------------------------
+
+    #[test]
+    fn node_count_tracks_created_nodes() {
+        let rt = Runtime::new();
+        assert_eq!(rt.node_count(), 0);
+        let _a = rt.create_input::<u64>(1);
+        assert_eq!(rt.node_count(), 1);
+        let _b = rt.create_input::<u64>(2);
+        assert_eq!(rt.node_count(), 2);
+        let _q = rt.create_query::<u64, _>(move |rt_inner| rt_inner.get(_a) + rt_inner.get(_b));
+        assert_eq!(rt.node_count(), 3);
+    }
+
+    #[test]
+    fn set_label_and_graph_snapshot_reflect_labels() {
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(10);
+        let b = rt.create_query::<u64, _>(move |r| r.get(a) * 2);
+        rt.set_label(a.slot(), "input_a".to_string());
+        rt.set_label(b.slot(), "double_a".to_string());
+
+        let snapshot = rt.graph_snapshot();
+        assert_eq!(snapshot.len(), 2);
+
+        let info_a = snapshot.iter().find(|n| n.slot == a.slot()).unwrap();
+        assert_eq!(info_a.label, "input_a");
+        assert_eq!(info_a.kind, NodeKindInfo::Input);
+
+        let info_b = snapshot.iter().find(|n| n.slot == b.slot()).unwrap();
+        assert_eq!(info_b.label, "double_a");
+        assert_eq!(info_b.kind, NodeKindInfo::Compute);
+    }
+
+    #[test]
+    fn graph_snapshot_includes_edges_after_compute() {
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(5);
+        let q = rt.create_query::<u64, _>(move |r| r.get(a) + 1);
+        // Force compute so dep edges are recorded.
+        assert_eq!(rt.get(q), 6);
+
+        let snapshot = rt.graph_snapshot();
+        let info_q = snapshot.iter().find(|n| n.slot == q.slot()).unwrap();
+        assert!(info_q.dependencies.contains(&a.slot()));
+
+        let info_a = snapshot.iter().find(|n| n.slot == a.slot()).unwrap();
+        assert!(info_a.dependents.contains(&q.slot()));
+    }
+
+    #[test]
+    fn get_traced_returns_correct_value_and_stub_trace() {
+        let rt = Runtime::new();
+        let a = rt.create_input::<u64>(7);
+        let (val, trace) = rt.get_traced(a);
+        assert_eq!(val, 7);
+        assert_eq!(trace.target, a.slot());
+        assert_eq!(trace.total_nodes, 1);
+        assert!(trace.node_traces.is_empty());
+    }
+
+    #[test]
+    fn set_tracing_does_not_panic() {
+        let rt = Runtime::new();
+        rt.set_tracing(true);
+        rt.set_tracing(false);
     }
 }
