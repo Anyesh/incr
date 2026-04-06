@@ -36,6 +36,47 @@ impl<T: Clone + 'static> SortedCollection<T> {
 }
 
 impl<T: Any + Clone + Hash + Eq + 'static> SortedCollection<T> {
+    pub fn window(&self, rt: &Runtime, size: usize) -> IncrCollection<Vec<T>>
+    where
+        T: Eq + Hash,
+    {
+        let ordered_values = self.ordered_values.clone();
+        let sorted_ver = self.version_node;
+        let output_log = Rc::new(RefCell::new(CollectionLog::<Vec<T>>::new()));
+        let output_log_ref = output_log.clone();
+        let prev_windows: Rc<RefCell<Vec<Vec<T>>>> = Rc::new(RefCell::new(Vec::new()));
+        let prev_ref = prev_windows.clone();
+
+        let version_node = rt.create_query(move |rt| -> u64 {
+            let _sv = rt.get(sorted_ver);
+
+            let vals = ordered_values.borrow();
+            let mut output = output_log_ref.borrow_mut();
+            let mut prev = prev_ref.borrow_mut();
+
+            // Remove old windows
+            for w in prev.drain(..) {
+                output.delete(&w);
+            }
+
+            // Generate new windows
+            if vals.len() >= size {
+                for i in 0..=(vals.len() - size) {
+                    let w: Vec<T> = vals[i..i + size].to_vec();
+                    output.insert(w.clone());
+                    prev.push(w);
+                }
+            }
+
+            output.version
+        });
+
+        IncrCollection {
+            log: output_log,
+            version_node,
+        }
+    }
+
     pub fn pairwise(&self, rt: &Runtime) -> IncrCollection<(T, T)> {
         let sorted_deltas = self.pending_deltas.clone();
         let sorted_ver = self.version_node;
@@ -393,5 +434,38 @@ mod tests {
         assert_eq!(elems.len(), 2);
         assert!(elems.contains(&(10, 20)));
         assert!(elems.contains(&(20, 30)));
+    }
+
+    // ── window tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn window_basic() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+        let wins = sorted.window(&rt, 3);
+        col.insert(&rt, 10);
+        col.insert(&rt, 20);
+        col.insert(&rt, 30);
+        col.insert(&rt, 40);
+        col.insert(&rt, 50);
+        let _ = rt.get(wins.version_node);
+        let elems = wins.elements();
+        assert_eq!(elems.len(), 3);
+        assert!(elems.contains(&vec![10, 20, 30]));
+        assert!(elems.contains(&vec![20, 30, 40]));
+        assert!(elems.contains(&vec![30, 40, 50]));
+    }
+
+    #[test]
+    fn window_smaller_than_size() {
+        let rt = Runtime::new();
+        let col = rt.create_collection::<i64>();
+        let sorted = col.sort_by_key(&rt, |x: &i64| *x);
+        let wins = sorted.window(&rt, 3);
+        col.insert(&rt, 10);
+        col.insert(&rt, 20);
+        let _ = rt.get(wins.version_node);
+        assert_eq!(wins.elements().len(), 0);
     }
 }
