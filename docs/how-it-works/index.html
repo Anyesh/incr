@@ -1,0 +1,1226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>How incr works</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Crimson+Pro:ital,wght@0,400;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background: #faf8f5;
+  color: #2c2c2c;
+  font-family: 'Source Sans 3', 'Source Sans Pro', system-ui, sans-serif;
+  font-size: 18px;
+  line-height: 1.7;
+  overflow-x: hidden;
+}
+
+::selection {
+  background: #ffe0b2;
+  color: #2c2c2c;
+}
+
+/* ---- Layout ---- */
+
+.container {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+section {
+  padding: 80px 0;
+}
+
+section + section {
+  border-top: 1px solid #e8e4df;
+}
+
+/* ---- Typography ---- */
+
+h1, h2, h3 {
+  font-family: 'Crimson Pro', 'Georgia', serif;
+  font-weight: 700;
+  color: #1a1a1a;
+  letter-spacing: -0.01em;
+}
+
+h1 {
+  font-size: clamp(2.8rem, 6vw, 4.2rem);
+  line-height: 1.1;
+  margin-bottom: 28px;
+}
+
+h2 {
+  font-size: clamp(1.6rem, 3.5vw, 2.2rem);
+  line-height: 1.25;
+  margin-bottom: 20px;
+}
+
+p {
+  margin-bottom: 20px;
+}
+
+p.lead {
+  font-size: 1.15em;
+  color: #444;
+  line-height: 1.75;
+}
+
+code, .mono {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 0.88em;
+}
+
+code {
+  background: #f0ece7;
+  padding: 2px 7px;
+  border-radius: 4px;
+  color: #6d4c41;
+}
+
+/* ---- Hero ---- */
+
+.hero {
+  padding-top: 120px;
+  padding-bottom: 60px;
+  text-align: center;
+}
+
+.hero .subtitle {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: #999;
+  margin-bottom: 16px;
+}
+
+.hero p.lead {
+  max-width: 600px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* ---- Graph Visualizations ---- */
+
+.graph-container {
+  background: #fff;
+  border: 1px solid #e8e4df;
+  border-radius: 12px;
+  padding: 32px 24px;
+  margin: 32px 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.graph-container svg {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  height: auto;
+}
+
+/* SVG node styles */
+.node-group { cursor: default; }
+
+.node-body {
+  rx: 10;
+  ry: 10;
+  stroke-width: 2.5;
+  transition: fill 0.4s ease, stroke 0.4s ease;
+}
+
+.node-label {
+  font-family: 'Source Sans 3', sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  fill: #555;
+  text-anchor: middle;
+  pointer-events: none;
+}
+
+.node-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  font-weight: 500;
+  fill: #1a1a1a;
+  text-anchor: middle;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.node-type {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9.5px;
+  fill: #999;
+  text-anchor: middle;
+  pointer-events: none;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.edge-line {
+  stroke: #ccc;
+  stroke-width: 2;
+  fill: none;
+  transition: stroke 0.4s ease, stroke-width 0.3s ease;
+  marker-end: url(#arrowGray);
+}
+
+.edge-line.active {
+  stroke: #ff9800;
+  stroke-width: 2.8;
+  marker-end: url(#arrowAmber);
+}
+
+.edge-line.cutoff {
+  stroke: #ef5350;
+  stroke-width: 2.8;
+  stroke-dasharray: 6, 4;
+  marker-end: url(#arrowRed);
+}
+
+/* Node state colors */
+.state-clean .node-body   { fill: #e8f5e9; stroke: #4caf50; }
+.state-dirty .node-body   { fill: #fff8e1; stroke: #ff9800; }
+.state-compute .node-body { fill: #e3f2fd; stroke: #2196f3; }
+.state-cutoff .node-body  { fill: #fce4ec; stroke: #ef5350; }
+
+/* ---- Buttons ---- */
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+  margin: 24px 0 8px;
+}
+
+.btn {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82rem;
+  font-weight: 500;
+  padding: 9px 20px;
+  border: 2px solid #ddd;
+  border-radius: 8px;
+  background: #fff;
+  color: #333;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+
+.btn:hover {
+  border-color: #bbb;
+  background: #fafafa;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+
+.btn:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn.primary {
+  background: #1a1a1a;
+  color: #fff;
+  border-color: #1a1a1a;
+}
+
+.btn.primary:hover {
+  background: #333;
+  border-color: #333;
+}
+
+.btn.reset {
+  border-color: #e0e0e0;
+  color: #999;
+}
+
+/* ---- Status badge ---- */
+
+.badge {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 3px 10px;
+  border-radius: 20px;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  position: absolute;
+}
+
+.badge.visible { opacity: 1; }
+
+.badge-done {
+  background: #e8f5e9;
+  color: #2e7d32;
+  border: 1px solid #a5d6a7;
+}
+
+.badge-cutoff {
+  background: #fce4ec;
+  color: #c62828;
+  border: 1px solid #ef9a9a;
+}
+
+.badge-skip {
+  background: #f3e5f5;
+  color: #7b1fa2;
+  border: 1px solid #ce93d8;
+}
+
+/* ---- Action label (rt.get etc) ---- */
+
+.action-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  fill: #2196f3;
+  text-anchor: middle;
+  opacity: 0;
+  transition: opacity 0.35s ease;
+}
+
+.action-label.visible { opacity: 1; }
+
+/* ---- Collections Section ---- */
+
+.pipeline-container {
+  background: #fff;
+  border: 1px solid #e8e4df;
+  border-radius: 12px;
+  padding: 32px 16px;
+  margin: 32px 0;
+  overflow-x: auto;
+}
+
+.pipeline {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  min-width: 680px;
+  padding: 16px 0;
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 120px;
+  position: relative;
+}
+
+.stage-box {
+  width: 130px;
+  min-height: 100px;
+  border: 2px solid #ddd;
+  border-radius: 10px;
+  padding: 10px 8px;
+  background: #fefefe;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  transition: border-color 0.3s ease;
+}
+
+.stage-box.highlight {
+  border-color: #ff9800;
+  box-shadow: 0 0 12px rgba(255,152,0,0.15);
+}
+
+.stage-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+  text-align: center;
+}
+
+.stage-label em {
+  font-style: normal;
+  color: #666;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  justify-content: center;
+  min-height: 28px;
+  align-items: center;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  height: 28px;
+  padding: 0 8px;
+  border-radius: 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: #fff;
+  transition: all 0.4s ease, transform 0.3s ease;
+}
+
+.pill.entering {
+  animation: pillEnter 0.45s ease forwards;
+}
+
+.pill.exiting {
+  animation: pillExit 0.4s ease forwards;
+}
+
+.pill.rejected {
+  animation: pillReject 0.5s ease forwards;
+}
+
+@keyframes pillEnter {
+  from { opacity: 0; transform: scale(0.5) translateY(-8px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes pillExit {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.5) translateY(8px); }
+}
+
+@keyframes pillReject {
+  0%   { opacity: 1; transform: scale(1); }
+  30%  { transform: scale(1.1); background: #ef5350; }
+  100% { opacity: 0; transform: scale(0.3); }
+}
+
+.stage-result {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: #1a1a1a;
+  transition: all 0.3s ease;
+}
+
+.stage-result.updating {
+  color: #ff9800;
+}
+
+.pipeline-arrow {
+  font-size: 1.4rem;
+  color: #ccc;
+  margin: 0 2px;
+  flex-shrink: 0;
+  align-self: center;
+  margin-top: 12px;
+}
+
+/* ---- Explanatory text ---- */
+
+.explain {
+  color: #666;
+  font-size: 0.95em;
+  line-height: 1.7;
+  margin-top: 28px;
+}
+
+/* ---- Footer ---- */
+
+footer {
+  text-align: center;
+  padding: 48px 24px;
+  color: #bbb;
+  font-size: 0.85em;
+  border-top: 1px solid #e8e4df;
+}
+
+footer a {
+  color: #999;
+  text-decoration: none;
+}
+
+footer a:hover { text-decoration: underline; }
+
+/* ---- Responsive ---- */
+
+@media (max-width: 600px) {
+  section { padding: 48px 0; }
+  .hero { padding-top: 72px; }
+  .graph-container { padding: 20px 12px; }
+  .pipeline-container { padding: 20px 8px; }
+  .pipeline { min-width: 540px; }
+  .stage-box { width: 105px; min-height: 80px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ============================================ -->
+<!--  HERO                                        -->
+<!-- ============================================ -->
+<section class="hero">
+  <div class="container">
+    <div class="subtitle">incremental computation</div>
+    <h1>How incr works</h1>
+    <p class="lead">
+      incr is an incremental computation library. Instead of recomputing everything when one thing changes,
+      it tracks which computations depend on which inputs and only reruns what's affected.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!--  SECTION 2: THE COMPUTATION GRAPH            -->
+<!-- ============================================ -->
+<section id="graph">
+  <div class="container">
+    <h2>The computation graph</h2>
+    <p>
+      Every value in incr lives in a <em>node</em>. Inputs hold raw values that you set directly;
+      queries compute their value from other nodes. incr tracks the edges between them automatically,
+      forming a directed acyclic graph.
+    </p>
+
+    <div class="graph-container">
+      <svg id="svg-static" viewBox="0 0 500 220" width="500" height="220">
+        <defs>
+          <marker id="arrowGray" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#ccc"/>
+          </marker>
+          <marker id="arrowAmber" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#ff9800"/>
+          </marker>
+          <marker id="arrowBlue" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#2196f3"/>
+          </marker>
+          <marker id="arrowRed" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+            <polygon points="0 0, 10 3.5, 0 7" fill="#ef5350"/>
+          </marker>
+        </defs>
+
+        <!-- Edges -->
+        <line class="edge-line" x1="145" y1="75" x2="295" y2="145"/>
+        <line class="edge-line" x1="355" y1="75" x2="305" y2="145"/>
+
+        <!-- width node -->
+        <g class="node-group state-clean" transform="translate(80, 35)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">input</text>
+          <text class="node-label" x="65" y="37">width</text>
+          <text class="node-value" x="65" y="56">10</text>
+        </g>
+
+        <!-- height node -->
+        <g class="node-group state-clean" transform="translate(290, 35)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">input</text>
+          <text class="node-label" x="65" y="37">height</text>
+          <text class="node-value" x="65" y="56">5</text>
+        </g>
+
+        <!-- area node -->
+        <g class="node-group state-clean" transform="translate(185, 135)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">query</text>
+          <text class="node-label" x="65" y="37">area</text>
+          <text class="node-value" x="65" y="56">50</text>
+        </g>
+      </svg>
+    </div>
+
+    <p class="explain">
+      Inputs hold values you set directly. Queries compute from their dependencies.
+      incr tracks the edges automatically, so you never have to declare "area depends on width" by hand.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!--  SECTION 3: CHANGE PROPAGATION               -->
+<!-- ============================================ -->
+<section id="propagation">
+  <div class="container">
+    <h2>Change propagation</h2>
+    <p>
+      When you call <code>rt.set(width, 12)</code>, incr doesn't immediately recompute anything.
+      It marks the input as <em>dirty</em> and follows the edges forward, marking every dependent
+      node dirty too. The actual recomputation only happens when you read a result with
+      <code>rt.get(area)</code>.
+    </p>
+
+    <div class="graph-container" style="position:relative;">
+      <svg id="svg-prop" viewBox="0 0 500 240" width="500" height="240">
+        <!-- Edges -->
+        <line id="prop-edge-wa" class="edge-line" x1="145" y1="75" x2="295" y2="145"/>
+        <line id="prop-edge-ha" class="edge-line" x1="355" y1="75" x2="305" y2="145"/>
+
+        <!-- width node -->
+        <g id="prop-width" class="node-group state-clean" transform="translate(80, 35)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">input</text>
+          <text class="node-label" x="65" y="37">width</text>
+          <text id="prop-width-val" class="node-value" x="65" y="56">10</text>
+        </g>
+
+        <!-- height node -->
+        <g id="prop-height" class="node-group state-clean" transform="translate(290, 35)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">input</text>
+          <text class="node-label" x="65" y="37">height</text>
+          <text class="node-value" x="65" y="56">5</text>
+        </g>
+
+        <!-- area node -->
+        <g id="prop-area" class="node-group state-clean" transform="translate(185, 135)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">query</text>
+          <text class="node-label" x="65" y="37">area</text>
+          <text id="prop-area-val" class="node-value" x="65" y="56">50</text>
+        </g>
+
+        <!-- action label -->
+        <text id="prop-action" class="action-label" x="250" y="232"></text>
+      </svg>
+
+      <span id="prop-badge" class="badge badge-done" style="bottom:12px;right:16px;">done</span>
+    </div>
+
+    <div class="controls">
+      <button id="btn-set-width" class="btn primary" onclick="runPropagation()">Set width = 12</button>
+      <button id="btn-reset-prop" class="btn reset" onclick="resetPropagation()" disabled>Reset</button>
+    </div>
+
+    <p class="explain">
+      Dirty marks flow <em>forward</em> along edges. Recomputation flows <em>backward</em> from
+      whatever you read. This lazy evaluation means nodes that nobody reads are never recomputed
+      at all.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!--  SECTION 4: EARLY CUTOFF                     -->
+<!-- ============================================ -->
+<section id="cutoff">
+  <div class="container">
+    <h2>Early cutoff</h2>
+    <p>
+      If a node recomputes and produces the <em>same value</em> it already had, propagation stops right there.
+      Downstream nodes never see the change, so they don't recompute. This lets incr skip entire subtrees
+      of the graph when an upstream change turns out to be a no-op.
+    </p>
+
+    <div class="graph-container" style="position:relative;">
+      <svg id="svg-cutoff" viewBox="0 0 600 200" width="600" height="200">
+        <!-- Edges -->
+        <line id="cut-edge-tc" class="edge-line" x1="165" y1="100" x2="255" y2="100"/>
+        <line id="cut-edge-cl" class="edge-line" x1="385" y1="100" x2="475" y2="100"/>
+
+        <!-- temp node -->
+        <g id="cut-temp" class="node-group state-clean" transform="translate(35, 60)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">input</text>
+          <text class="node-label" x="65" y="37">temp</text>
+          <text id="cut-temp-val" class="node-value" x="65" y="56">50</text>
+        </g>
+
+        <!-- clamped node -->
+        <g id="cut-clamped" class="node-group state-clean" transform="translate(255, 60)">
+          <rect class="node-body" width="130" height="70"/>
+          <text class="node-type" x="65" y="18">query</text>
+          <text class="node-label" x="65" y="37">clamped</text>
+          <text id="cut-clamped-val" class="node-value" x="65" y="56">50</text>
+        </g>
+
+        <!-- label node -->
+        <g id="cut-label" class="node-group state-clean" transform="translate(475, 60)">
+          <rect class="node-body" width="100" height="70"/>
+          <text class="node-type" x="50" y="18">query</text>
+          <text class="node-label" x="50" y="37">label</text>
+          <text id="cut-label-val" class="node-value" x="50" y="56">50°</text>
+        </g>
+
+        <!-- action label -->
+        <text id="cut-action" class="action-label" x="300" y="190"></text>
+      </svg>
+
+      <span id="cut-badge" class="badge" style="bottom:12px;right:16px;"></span>
+    </div>
+
+    <div class="controls">
+      <button id="btn-cut-75" class="btn primary" onclick="runCutoff(75)">Set temp = 75</button>
+      <button id="btn-cut-150" class="btn primary" onclick="runCutoff(150)">Set temp = 150</button>
+      <button id="btn-cut-200" class="btn primary" onclick="runCutoff(200)">Set temp = 200</button>
+      <button id="btn-reset-cut" class="btn reset" onclick="resetCutoff()" disabled>Reset</button>
+    </div>
+
+    <p class="explain">
+      Try them in order. Setting temp to 150 clamps it to 100, and everything propagates normally.
+      Then setting it to 200 clamps it to 100 again, but since that's the same value clamped
+      already had, the label node never recomputes. That's early cutoff.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!--  SECTION 5: INCREMENTAL COLLECTIONS          -->
+<!-- ============================================ -->
+<section id="collections">
+  <div class="container">
+    <h2>Incremental collections</h2>
+    <p>
+      A collection in incr is a set of elements piped through operators like filter, map, and reduce.
+      When you insert or delete a single element, only that element flows through the pipeline. The
+      engine doesn't re-examine anything that hasn't changed.
+    </p>
+
+    <div class="pipeline-container">
+      <div class="pipeline" id="pipeline">
+        <!-- Collection -->
+        <div class="stage">
+          <div class="stage-label">Collection</div>
+          <div class="stage-box" id="stage-col">
+            <div class="pills" id="pills-col"></div>
+          </div>
+        </div>
+
+        <div class="pipeline-arrow">&#x2192;</div>
+
+        <!-- Filter -->
+        <div class="stage">
+          <div class="stage-label"><em>filter</em>(even?)</div>
+          <div class="stage-box" id="stage-filter">
+            <div class="pills" id="pills-filter"></div>
+          </div>
+        </div>
+
+        <div class="pipeline-arrow">&#x2192;</div>
+
+        <!-- Map -->
+        <div class="stage">
+          <div class="stage-label"><em>map</em>(x 2)</div>
+          <div class="stage-box" id="stage-map">
+            <div class="pills" id="pills-map"></div>
+          </div>
+        </div>
+
+        <div class="pipeline-arrow">&#x2192;</div>
+
+        <!-- Reduce -->
+        <div class="stage">
+          <div class="stage-label"><em>reduce</em>(sum)</div>
+          <div class="stage-box" id="stage-reduce">
+            <div class="stage-result" id="reduce-val">24</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="btn-insert-4" class="btn primary" onclick="collInsert(4)">Insert 4</button>
+      <button id="btn-insert-3" class="btn primary" onclick="collInsert(3)">Insert 3</button>
+      <button id="btn-delete-10" class="btn primary" onclick="collDelete(10)">Delete 10</button>
+      <button id="btn-reset-coll" class="btn reset" onclick="resetCollection()">Reset</button>
+    </div>
+
+    <p class="explain">
+      Each pipeline stage does O(1) work per changed element. Insert one item into a 100K-element
+      collection and every stage touches exactly one element, not 100,000.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<!--  FOOTER                                      -->
+<!-- ============================================ -->
+<footer>
+  <div class="container">
+    <a href="https://github.com/anish-shrestha/incr">incr on GitHub</a>
+  </div>
+</footer>
+
+<!-- ============================================ -->
+<!--  SCRIPT                                      -->
+<!-- ============================================ -->
+<script>
+(function() {
+  'use strict';
+
+  // ---- Timing helper ----
+  var STEP = 650;
+
+  function wait(ms) {
+    return new Promise(function(resolve) { setTimeout(resolve, ms); });
+  }
+
+  function setState(el, state) {
+    el.classList.remove('state-clean', 'state-dirty', 'state-compute', 'state-cutoff');
+    el.classList.add('state-' + state);
+  }
+
+  function showBadge(id, cls, text) {
+    var b = document.getElementById(id);
+    b.className = 'badge ' + cls + ' visible';
+    b.textContent = text;
+  }
+
+  function hideBadge(id) {
+    var b = document.getElementById(id);
+    b.classList.remove('visible');
+  }
+
+  function setAction(id, text) {
+    var el = document.getElementById(id);
+    el.textContent = text;
+    if (text) {
+      el.classList.add('visible');
+    } else {
+      el.classList.remove('visible');
+    }
+  }
+
+  function setEdge(id, cls) {
+    var el = document.getElementById(id);
+    el.classList.remove('active', 'cutoff');
+    if (cls) el.classList.add(cls);
+  }
+
+  // ================================================
+  //  Section 3: Change Propagation
+  // ================================================
+  var propRunning = false;
+
+  window.runPropagation = async function() {
+    if (propRunning) return;
+    propRunning = true;
+    document.getElementById('btn-set-width').disabled = true;
+    document.getElementById('btn-reset-prop').disabled = true;
+    hideBadge('prop-badge');
+
+    var widthNode = document.getElementById('prop-width');
+    var areaNode  = document.getElementById('prop-area');
+    var widthVal  = document.getElementById('prop-width-val');
+    var areaVal   = document.getElementById('prop-area-val');
+
+    // Step 1: set width, mark dirty
+    setAction('prop-action', 'rt.set(width, 12)');
+    widthVal.textContent = '12';
+    setState(widthNode, 'dirty');
+    await wait(STEP);
+
+    // Step 2: edge lights up
+    setEdge('prop-edge-wa', 'active');
+    await wait(STEP * 0.6);
+
+    // Step 3: area becomes dirty
+    setState(areaNode, 'dirty');
+    setAction('prop-action', '');
+    await wait(STEP);
+
+    // Step 4: rt.get(area)
+    setAction('prop-action', 'rt.get(area)');
+    await wait(STEP * 0.6);
+
+    // Step 5: computing
+    setState(areaNode, 'compute');
+    await wait(STEP);
+
+    // Step 6: done
+    areaVal.textContent = '60';
+    setState(areaNode, 'clean');
+    setState(widthNode, 'clean');
+    setEdge('prop-edge-wa', '');
+    setAction('prop-action', '');
+    await wait(200);
+
+    showBadge('prop-badge', 'badge-done', 'done');
+    document.getElementById('btn-reset-prop').disabled = false;
+    propRunning = false;
+  };
+
+  window.resetPropagation = function() {
+    if (propRunning) return;
+    setState(document.getElementById('prop-width'), 'clean');
+    setState(document.getElementById('prop-height'), 'clean');
+    setState(document.getElementById('prop-area'), 'clean');
+    document.getElementById('prop-width-val').textContent = '10';
+    document.getElementById('prop-area-val').textContent = '50';
+    setEdge('prop-edge-wa', '');
+    setEdge('prop-edge-ha', '');
+    setAction('prop-action', '');
+    hideBadge('prop-badge');
+    document.getElementById('btn-set-width').disabled = false;
+    document.getElementById('btn-reset-prop').disabled = true;
+  };
+
+  // ================================================
+  //  Section 4: Early Cutoff
+  // ================================================
+  var cutState = { temp: 50, clamped: 50, label: '50\u00B0' };
+  var cutRunning = false;
+
+  function clamp(v) { return Math.max(0, Math.min(100, v)); }
+
+  window.runCutoff = async function(newTemp) {
+    if (cutRunning) return;
+    cutRunning = true;
+    var buttons = document.querySelectorAll('#cutoff .btn');
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = true;
+    hideBadge('cut-badge');
+
+    var tempNode    = document.getElementById('cut-temp');
+    var clampedNode = document.getElementById('cut-clamped');
+    var labelNode   = document.getElementById('cut-label');
+    var tempVal     = document.getElementById('cut-temp-val');
+    var clampedVal  = document.getElementById('cut-clamped-val');
+    var labelVal    = document.getElementById('cut-label-val');
+
+    var oldClamped = cutState.clamped;
+    var newClamped = clamp(newTemp);
+    var valueChanged = newClamped !== oldClamped;
+
+    // Step 1: set temp, mark dirty
+    setAction('cut-action', 'rt.set(temp, ' + newTemp + ')');
+    tempVal.textContent = String(newTemp);
+    setState(tempNode, 'dirty');
+    await wait(STEP);
+
+    // Step 2: edge temp to clamped lights up
+    setEdge('cut-edge-tc', 'active');
+    await wait(STEP * 0.5);
+
+    // Step 3: clamped dirty
+    setState(clampedNode, 'dirty');
+    await wait(STEP * 0.6);
+
+    // Step 4: clamped computing
+    setAction('cut-action', 'rt.get(label)  \u2192  recomputing clamped...');
+    setState(clampedNode, 'compute');
+    await wait(STEP);
+
+    // Step 5: clamped resolves
+    clampedVal.textContent = String(newClamped);
+    setState(clampedNode, 'clean');
+    setState(tempNode, 'clean');
+    setEdge('cut-edge-tc', '');
+    cutState.temp = newTemp;
+    cutState.clamped = newClamped;
+
+    if (valueChanged) {
+      // Full propagation to label
+      await wait(STEP * 0.4);
+      setEdge('cut-edge-cl', 'active');
+      await wait(STEP * 0.5);
+      setState(labelNode, 'dirty');
+      await wait(STEP * 0.5);
+      setAction('cut-action', 'recomputing label...');
+      setState(labelNode, 'compute');
+      await wait(STEP);
+
+      var newLabel = newClamped + '\u00B0';
+      labelVal.textContent = newLabel;
+      cutState.label = newLabel;
+      setState(labelNode, 'clean');
+      setEdge('cut-edge-cl', '');
+      setAction('cut-action', '');
+      await wait(200);
+      showBadge('cut-badge', 'badge-done', 'done');
+    } else {
+      // Early cutoff!
+      await wait(STEP * 0.3);
+      setEdge('cut-edge-cl', 'cutoff');
+      setAction('cut-action', 'same value \u2192 propagation stops');
+      await wait(STEP * 1.2);
+
+      setEdge('cut-edge-cl', '');
+      setAction('cut-action', '');
+      showBadge('cut-badge', 'badge-cutoff', 'cutoff \u2014 label skipped');
+    }
+
+    document.getElementById('btn-reset-cut').disabled = false;
+    updateCutoffButtons();
+    cutRunning = false;
+  };
+
+  function updateCutoffButtons() {
+    // Enable buttons the user hasn't clicked yet in the intended sequence
+    document.getElementById('btn-cut-75').disabled = (cutState.temp >= 75);
+    document.getElementById('btn-cut-150').disabled = (cutState.temp >= 150);
+    document.getElementById('btn-cut-200').disabled = (cutState.temp >= 200);
+  }
+
+  window.resetCutoff = function() {
+    if (cutRunning) return;
+    cutState = { temp: 50, clamped: 50, label: '50\u00B0' };
+    setState(document.getElementById('cut-temp'), 'clean');
+    setState(document.getElementById('cut-clamped'), 'clean');
+    setState(document.getElementById('cut-label'), 'clean');
+    document.getElementById('cut-temp-val').textContent = '50';
+    document.getElementById('cut-clamped-val').textContent = '50';
+    document.getElementById('cut-label-val').textContent = '50\u00B0';
+    setEdge('cut-edge-tc', '');
+    setEdge('cut-edge-cl', '');
+    setAction('cut-action', '');
+    hideBadge('cut-badge');
+    var buttons = document.querySelectorAll('#cutoff .btn');
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = false;
+    document.getElementById('btn-reset-cut').disabled = true;
+  };
+
+  // ================================================
+  //  Section 5: Incremental Collections
+  // ================================================
+  var PILL_COLORS = {
+    2:  '#5c6bc0',
+    3:  '#ef5350',
+    4:  '#26a69a',
+    7:  '#ef5350',
+    10: '#7e57c2',
+    6:  '#42a5f5',
+    8:  '#26a69a',
+    14: '#ef5350',
+    20: '#7e57c2'
+  };
+
+  function pillColor(n) {
+    return PILL_COLORS[n] || '#78909c';
+  }
+
+  var collData = {
+    col:    [2, 7, 10],
+    filter: [2, 10],
+    map:    [4, 20],
+    sum:    24
+  };
+  var collRunning = false;
+
+  function clearChildren(el) {
+    while (el.firstChild) {
+      el.removeChild(el.firstChild);
+    }
+  }
+
+  function createPill(n) {
+    var pill = document.createElement('span');
+    pill.className = 'pill';
+    pill.textContent = String(n);
+    pill.style.background = pillColor(n);
+    pill.dataset.value = String(n);
+    return pill;
+  }
+
+  function renderPills(containerId, items) {
+    var c = document.getElementById(containerId);
+    clearChildren(c);
+    for (var i = 0; i < items.length; i++) {
+      c.appendChild(createPill(items[i]));
+    }
+  }
+
+  function renderCollection() {
+    renderPills('pills-col', collData.col);
+    renderPills('pills-filter', collData.filter);
+    renderPills('pills-map', collData.map);
+    document.getElementById('reduce-val').textContent = String(collData.sum);
+  }
+
+  function addPillAnimated(containerId, n) {
+    var c = document.getElementById(containerId);
+    var pill = createPill(n);
+    pill.classList.add('entering');
+    c.appendChild(pill);
+    pill.addEventListener('animationend', function() {
+      pill.classList.remove('entering');
+    }, { once: true });
+    return pill;
+  }
+
+  function removePillAnimated(containerId, n) {
+    var c = document.getElementById(containerId);
+    var pills = c.querySelectorAll('.pill');
+    for (var i = 0; i < pills.length; i++) {
+      if (parseInt(pills[i].dataset.value, 10) === n) {
+        var p = pills[i];
+        p.classList.add('exiting');
+        p.addEventListener('animationend', function() {
+          if (p.parentNode) p.parentNode.removeChild(p);
+        }, { once: true });
+        return;
+      }
+    }
+  }
+
+  function rejectPillAnimated(containerId, n) {
+    var c = document.getElementById(containerId);
+    var pill = createPill(n);
+    pill.classList.add('rejected');
+    c.appendChild(pill);
+    pill.addEventListener('animationend', function() {
+      if (pill.parentNode) pill.parentNode.removeChild(pill);
+    }, { once: true });
+  }
+
+  function highlightStage(id, on) {
+    document.getElementById(id).classList.toggle('highlight', on);
+  }
+
+  function updateSum(newSum) {
+    var el = document.getElementById('reduce-val');
+    el.classList.add('updating');
+    el.textContent = String(newSum);
+    setTimeout(function() { el.classList.remove('updating'); }, 400);
+  }
+
+  function setCollButtons(disabled) {
+    var buttons = document.querySelectorAll('#collections .btn');
+    for (var i = 0; i < buttons.length; i++) buttons[i].disabled = disabled;
+  }
+
+  window.collInsert = async function(n) {
+    if (collRunning) return;
+    collRunning = true;
+    setCollButtons(true);
+
+    var isEven = n % 2 === 0;
+    var mapped = n * 2;
+
+    // Step 1: insert into collection
+    highlightStage('stage-col', true);
+    collData.col.push(n);
+    addPillAnimated('pills-col', n);
+    await wait(STEP);
+    highlightStage('stage-col', false);
+
+    // Step 2: filter
+    highlightStage('stage-filter', true);
+    if (isEven) {
+      collData.filter.push(n);
+      addPillAnimated('pills-filter', n);
+    } else {
+      rejectPillAnimated('pills-filter', n);
+    }
+    await wait(STEP);
+    highlightStage('stage-filter', false);
+
+    if (isEven) {
+      // Step 3: map
+      highlightStage('stage-map', true);
+      collData.map.push(mapped);
+      addPillAnimated('pills-map', mapped);
+      await wait(STEP);
+      highlightStage('stage-map', false);
+
+      // Step 4: reduce
+      highlightStage('stage-reduce', true);
+      collData.sum += mapped;
+      updateSum(collData.sum);
+      await wait(STEP);
+      highlightStage('stage-reduce', false);
+    }
+
+    setCollButtons(false);
+    updateDeleteButton();
+    collRunning = false;
+  };
+
+  window.collDelete = async function(n) {
+    if (collRunning) return;
+    if (collData.col.indexOf(n) === -1) return;
+    collRunning = true;
+    setCollButtons(true);
+
+    var isEven = n % 2 === 0;
+    var mapped = n * 2;
+
+    // Step 1: remove from collection
+    highlightStage('stage-col', true);
+    collData.col.splice(collData.col.indexOf(n), 1);
+    removePillAnimated('pills-col', n);
+    await wait(STEP);
+    highlightStage('stage-col', false);
+
+    if (isEven) {
+      // Step 2: remove from filter
+      highlightStage('stage-filter', true);
+      collData.filter.splice(collData.filter.indexOf(n), 1);
+      removePillAnimated('pills-filter', n);
+      await wait(STEP);
+      highlightStage('stage-filter', false);
+
+      // Step 3: remove from map
+      highlightStage('stage-map', true);
+      collData.map.splice(collData.map.indexOf(mapped), 1);
+      removePillAnimated('pills-map', mapped);
+      await wait(STEP);
+      highlightStage('stage-map', false);
+
+      // Step 4: reduce
+      highlightStage('stage-reduce', true);
+      collData.sum -= mapped;
+      updateSum(collData.sum);
+      await wait(STEP);
+      highlightStage('stage-reduce', false);
+    }
+
+    setCollButtons(false);
+    updateDeleteButton();
+    collRunning = false;
+  };
+
+  function updateDeleteButton() {
+    document.getElementById('btn-delete-10').disabled = (collData.col.indexOf(10) === -1);
+  }
+
+  window.resetCollection = function() {
+    if (collRunning) return;
+    collData = {
+      col:    [2, 7, 10],
+      filter: [2, 10],
+      map:    [4, 20],
+      sum:    24
+    };
+    renderCollection();
+    setCollButtons(false);
+    updateDeleteButton();
+  };
+
+  // Initial render
+  renderCollection();
+
+})();
+</script>
+
+</body>
+</html>
