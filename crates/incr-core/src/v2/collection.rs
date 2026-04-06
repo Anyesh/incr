@@ -118,6 +118,18 @@ where
     pub(crate) version_node: Incr<u64>,
 }
 
+impl<T> Clone for IncrCollection<T>
+where
+    T: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+{
+    fn clone(&self) -> Self {
+        IncrCollection {
+            log: self.log.clone(),
+            version_node: self.version_node,
+        }
+    }
+}
+
 /// A raw pointer wrapper that is `Send + Sync`.
 ///
 /// # Safety
@@ -166,6 +178,24 @@ where
     K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
     T: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
 {
+}
+
+impl<K, T> GroupedCollection<K, T>
+where
+    K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+    T: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+{
+    pub fn keys(&self) -> Vec<K> {
+        self.groups.read().unwrap().keys().cloned().collect()
+    }
+
+    pub fn get_group(&self, key: &K) -> Option<IncrCollection<T>> {
+        self.groups.read().unwrap().get(key).cloned()
+    }
+
+    pub fn version_node(&self) -> Incr<u64> {
+        self.version_node
+    }
 }
 
 impl<T> IncrCollection<T>
