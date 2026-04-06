@@ -2,7 +2,7 @@
 
 Most software recomputes everything from scratch whenever anything changes. Your CI rebuilds the whole project when you edit one file, your dashboard re-queries the whole database when one row updates. There are domain-specific fixes for this (React diffs the DOM, Salsa caches compiler queries, Materialize does incremental SQL) but if you just want to make your own code incremental, theres nothing to reach for.
 
-incr is a crack at solving that. Its a Rust library (with Python bindings) that tracks dependencies between computations automatically and only reruns what's actually affected by a change.
+incr is a crack at solving that. Its a Rust library (with Python bindings) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. It ships as two crates: `incr-compute` for single-threaded, zero-overhead use, and `incr-concurrent` for multi-threaded programs where the runtime needs to be `Send + Sync`. Both are published on crates.io and PyPI, and they expose the same API surface, so switching between them is a one-line dependency swap.
 
 ![Live dashboard demo showing incr processing API traffic, with dependency graph visualization and real-time incremental vs from-scratch comparison](examples/dashboard/demo.gif)
 
@@ -45,7 +45,20 @@ visits.insert(visit_at_11am_moved_to_noon)
 rt.get(total)  # only recomputes 2 of 3 distances
 ```
 
-The pipeline supports sort, pairwise (consecutive pairs from sorted data), map, filter, reduce, and count. The two APIs share the same dependency graph under the hood so you can have a function query that reads from a collection's reduce and it all stays incremental.
+The pipeline supports filter, map, count, reduce, sort_by_key, pairwise, group_by, join, and window. The two APIs (function DAG and collections) share the same dependency graph under the hood so you can have a function query that reads from a collection's reduce and it all stays incremental.
+
+## Two crates, one API
+
+| | `incr-compute` | `incr-concurrent` |
+|---|---|---|
+| Thread safety | Single-threaded (`!Send`, `!Sync`) | `Send + Sync`, safe to share across threads |
+| Overhead | Zero runtime cost for thread safety | Atomic operations for node state transitions |
+| When to use | Scripts, CLI tools, single-threaded services | HTTP servers, background workers, anything multi-threaded |
+| Rust | `cargo add incr-compute` | `cargo add incr-concurrent` |
+| Python | `pip install incr-compute` | `pip install incr-concurrent` |
+| Python import | `from incr import Runtime` | `from incr_concurrent import Runtime` |
+
+The API is identical between the two. If you start with `incr-compute` and later need thread safety, swap the dependency and everything compiles without changes.
 
 ## Benchmarks
 
@@ -73,54 +86,58 @@ Calling `rt.set()` on an input eagerly marks downstream nodes as potentially dir
 
 For collections its a bit different. Each pipeline stage keeps a read offset into the upstream's change log. When triggered, it just reads entries past that offset, processes them, and advances the pointer. Inserting one row into a 100K collection means each stage does O(1) work regardless of collection size.
 
-## Testing
-
-We use proptest to generate thousands of random computation graphs, apply random mutations, and check that the incremental result matches what you'd get by recomputing everything from scratch. Thats the core correctness guarantee: if those two ever disagree on any random input, proptest shrinks it down to a minimal failing case.
-
-96 tests total across Rust and Python, including 6,000 property-based test cases that verify every operator (filter, map, count, reduce, sort, pairwise) produces the same result incrementally as recomputing from scratch.
-
 ## Getting started
 
-Rust:
+**Rust:**
+
 ```toml
 [dependencies]
-incr-concurrent = { path = "crates/incr-concurrent" }
+incr-compute = "0.1"      # single-threaded
+# or
+incr-concurrent = "0.1"   # multi-threaded (Send + Sync)
 ```
 
-Python (not on PyPI yet, build from source):
+**Python:**
+
 ```bash
-cd incr
-uv venv .venv && uv pip install maturin pytest
-source .venv/Scripts/activate
-maturin develop
-python -c "from incr import Runtime; print('ok')"
+pip install incr-compute        # single-threaded
+# or
+pip install incr-concurrent     # multi-threaded
 ```
 
-Running the tests:
+```python
+from incr import Runtime              # incr-compute
+# or
+from incr_concurrent import Runtime   # incr-concurrent
+```
+
+**Running the tests:**
+
 ```bash
-cargo test -p incr-concurrent       # rust
-pytest ./examples/tests/python/        # python
-cargo bench -p incr-concurrent       # benchmarks
+cargo test -p incr-compute         # single-threaded crate
+cargo test -p incr-concurrent      # concurrent crate
+pytest ./examples/tests/python/    # python bindings
+cargo bench -p incr-compute        # benchmarks (single-threaded)
+cargo bench -p incr-concurrent     # benchmarks (concurrent)
 ```
 
-## Where this is at
+## Testing
 
-Early stage. The engine works and the numbers are good but the API isnt stable yet.
+300+ tests across both Rust crates (unit, property, and integration), plus a Python test suite for the bindings. We use proptest to generate thousands of random computation graphs, apply random mutations, and check that the incremental result matches what you'd get by recomputing everything from scratch. Thats the core correctness guarantee: if those two ever disagree on any random input, proptest shrinks it down to a minimal failing case.
 
-The function DAG with automatic dependency tracking, early cutoff, and dynamic dependencies has been through thousands of property test cases and is solid. Collections support filter, map, count, sort_by_key, pairwise, and reduce, all delta-based. Python bindings work through PyO3.
+The property test suites cover every operator (filter, map, count, reduce, sort_by_key, pairwise, group_by, join, window) in both crates, verifying that incremental evaluation produces the same result as full recomputation across thousands of randomly generated scenarios.
 
-There are two demos that show different aspects of the library:
+## Demos
 
-- `examples/dashboard/` is a live API monitoring dashboard with dependency graph visualization and real-time tracing of which nodes recompute vs get skipped.
-- `examples/travel-premium/` is a mobile worker scheduling demo that computes travel premiums incrementally using the full operator pipeline (sort, pairwise, map, reduce). Its backed by SQLite for persistence, with a distance cache that survives server restarts, and shows 5-8x speedup over batch recomputation when the map step involves expensive operations like distance lookups.
+Three demos show different aspects of the library:
 
-In Rust, per-node propagation costs about 175ns and collection operations stay nearly constant regardless of collection size. The real advantage shows up when pipelines include expensive operations like API calls or complex calculations, because incr tells you exactly which elements changed so you can skip the expensive work for everything else. The combination of function DAGs and incremental collections in one runtime is something the existing tools (Salsa, Differential Dataflow, Jane Street Incremental) dont offer individually.
+- **`examples/travel-premium/`** is a mobile worker scheduling demo (Python) that computes travel premiums incrementally using the full operator pipeline (sort, pairwise, map, reduce). It's backed by SQLite for persistence, with a distance cache that survives server restarts, and shows 5-8x speedup over batch recomputation when the map step involves expensive operations like distance lookups.
+- **`examples/dashboard/`** is a live API monitoring dashboard (Python) with dependency graph visualization and real-time tracing of which nodes recompute vs get skipped.
+- **`examples/concurrent-server/`** is a multi-threaded HTTP server (Rust) that proves the concurrent access model: one writer thread feeds live market data into an incr graph while multiple HTTP handler threads read derived portfolio values simultaneously without blocking.
 
-Through the Python bindings, the per-call overhead of crossing the Rust/Python boundary means incr only outperforms naive Python for larger datasets or pipelines where each element involves real work. For pure in-memory arithmetic on small collections under about 5K elements, batch recomputation is faster because the pipeline traversal overhead dominates.
+## CI
 
-Joins and group-by for collections are not yet implemented, the runtime is single-threaded and the `Runtime` type cannot currently be shared across threads, garbage collection for long-running graphs is an open problem, and we havent published to crates.io or PyPI.
-
-The travel premium demo also validates an integration pattern worth noting: incr graphs work well as ephemeral materialized views over database slices. You load a small scope from the database, build the incr pipeline over it, mutate both the DB and the graph together, and read computed results from incr. Expensive intermediate results (like distance caches) can be persisted separately so that rebuilding the graph after a restart is fast.
+GitHub Actions runs on every push to main and on pull requests: tests for both crates, Python binding builds, benchmarks, clippy, and fmt. Tagging a release (`v*`) triggers automatic publishing to both crates.io and PyPI.
 
 ## Background and references
 
@@ -139,3 +156,7 @@ The systems we benchmark against and learned from:
 Y. Annie Liu's 2024 survey [Incremental Computation: What Is the Essence?](https://arxiv.org/abs/2312.07946) is probably the best current overview of the whole field if you want to understand where all these approaches fit relative to each other. One of her key findings is that fully general incrementalization is provably undecidable, which is why every practical system (including ours) picks a restricted but useful subset of computations to handle.
 
 None of the existing systems combine function DAGs with incremental collections in a single engine, which is what incr tries to do. Whether that actually works out as a general purpose tool is still an open question, but the early results are encouraging.
+
+## License
+
+Apache-2.0
