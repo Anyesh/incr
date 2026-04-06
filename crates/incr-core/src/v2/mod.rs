@@ -43,5 +43,7 @@ mod runtime_concurrent_test;
 mod runtime_proptest;
 #[cfg(test)]
 mod runtime_vs_v1_bench;
+#[cfg(test)]
+mod collection_proptest;
 pub(crate) mod state;
 pub(crate) mod value;
