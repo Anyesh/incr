@@ -429,6 +429,125 @@ where
             rt_ptr: rt_ptr.0,
         }
     }
+
+    pub fn join<U, K, FL, FR>(
+        &self,
+        rt: &Runtime,
+        right: &IncrCollection<U>,
+        left_key: FL,
+        right_key: FR,
+    ) -> IncrCollection<(T, U)>
+    where
+        U: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+        K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+        FL: Fn(&T) -> K + Send + Sync + 'static,
+        FR: Fn(&U) -> K + Send + Sync + 'static,
+    {
+        let left_log = self.log.clone();
+        let right_log = right.log.clone();
+        let left_ver = self.version_node;
+        let right_ver = right.version_node;
+        let left_last = Arc::new(AtomicUsize::new(0));
+        let right_last = Arc::new(AtomicUsize::new(0));
+
+        let left_index: Arc<RwLock<HashMap<K, Vec<T>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let right_index: Arc<RwLock<HashMap<K, Vec<U>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let left_key_cache: Arc<RwLock<HashMap<T, K>>> = Arc::new(RwLock::new(HashMap::new()));
+        let right_key_cache: Arc<RwLock<HashMap<U, K>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let left_idx_ref = left_index.clone();
+        let right_idx_ref = right_index.clone();
+        let left_kc_ref = left_key_cache.clone();
+        let right_kc_ref = right_key_cache.clone();
+
+        let output_log = Arc::new(RwLock::new(CollectionLog::new_multiset()));
+        let output_log_ref = output_log.clone();
+
+        let version_node = rt.create_query(move |rt| -> u64 {
+            let _lv = rt.get(left_ver);
+            let _rv = rt.get(right_ver);
+
+            let left_up = left_log.read().unwrap();
+            let right_up = right_log.read().unwrap();
+            let l_start = left_last.load(Ordering::Relaxed);
+            let r_start = right_last.load(Ordering::Relaxed);
+
+            if l_start >= left_up.deltas.len() && r_start >= right_up.deltas.len() {
+                return output_log_ref.read().unwrap().version;
+            }
+
+            let mut li = left_idx_ref.write().unwrap();
+            let mut ri = right_idx_ref.write().unwrap();
+            let mut lkc = left_kc_ref.write().unwrap();
+            let mut rkc = right_kc_ref.write().unwrap();
+            let mut output = output_log_ref.write().unwrap();
+
+            // Process left deltas
+            for vd in &left_up.deltas[l_start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let k = left_key(x);
+                        lkc.insert(x.clone(), k.clone());
+                        li.entry(k.clone()).or_default().push(x.clone());
+                        if let Some(rights) = ri.get(&k) {
+                            for r in rights {
+                                output.insert((x.clone(), r.clone()));
+                            }
+                        }
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(k) = lkc.remove(x) {
+                            if let Some(lefts) = li.get_mut(&k) {
+                                lefts.retain(|l| l != x);
+                            }
+                            if let Some(rights) = ri.get(&k) {
+                                for r in rights {
+                                    output.delete(&(x.clone(), r.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Process right deltas
+            for vd in &right_up.deltas[r_start..] {
+                match &vd.delta {
+                    Delta::Insert(x) => {
+                        let k = right_key(x);
+                        rkc.insert(x.clone(), k.clone());
+                        ri.entry(k.clone()).or_default().push(x.clone());
+                        if let Some(lefts) = li.get(&k) {
+                            for l in lefts {
+                                output.insert((l.clone(), x.clone()));
+                            }
+                        }
+                    }
+                    Delta::Delete(x) => {
+                        if let Some(k) = rkc.remove(x) {
+                            if let Some(rights) = ri.get_mut(&k) {
+                                rights.retain(|r| r != x);
+                            }
+                            if let Some(lefts) = li.get(&k) {
+                                for l in lefts {
+                                    output.delete(&(l.clone(), x.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            left_last.store(left_up.deltas.len(), Ordering::Relaxed);
+            right_last.store(right_up.deltas.len(), Ordering::Relaxed);
+            output.version
+        });
+
+        IncrCollection {
+            log: output_log,
+            version_node,
+        }
+    }
 }
 
 impl Runtime {
@@ -808,5 +927,66 @@ mod tests {
         let _ = rt.get(grouped.version_node);
         let groups = grouped.groups.read().unwrap();
         assert_eq!(groups.get("a").unwrap().elements().len(), 1);
+    }
+
+    // ── join tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn join_basic() {
+        let rt = Runtime::new();
+        let left = rt.create_collection::<(String, i64)>();
+        let right = rt.create_collection::<(String, String)>();
+
+        let joined = left.join(
+            &rt,
+            &right,
+            |l: &(String, i64)| l.0.clone(),
+            |r: &(String, String)| r.0.clone(),
+        );
+
+        left.insert(&rt, ("a".to_string(), 1));
+        left.insert(&rt, ("b".to_string(), 2));
+        right.insert(&rt, ("a".to_string(), "x".to_string()));
+        right.insert(&rt, ("c".to_string(), "y".to_string()));
+
+        let _ = rt.get(joined.version_node);
+        let elems = joined.elements();
+        assert_eq!(elems.len(), 1);
+        assert!(elems.contains(&(("a".to_string(), 1), ("a".to_string(), "x".to_string()))));
+    }
+
+    #[test]
+    fn join_multiple_matches() {
+        let rt = Runtime::new();
+        let left = rt.create_collection::<(i64, i64)>();
+        let right = rt.create_collection::<(i64, i64)>();
+
+        let joined = left.join(&rt, &right, |l: &(i64, i64)| l.0, |r: &(i64, i64)| r.0);
+
+        left.insert(&rt, (1, 10));
+        left.insert(&rt, (1, 20));
+        right.insert(&rt, (1, 100));
+
+        let _ = rt.get(joined.version_node);
+        let elems = joined.elements();
+        assert_eq!(elems.len(), 2);
+    }
+
+    #[test]
+    fn join_delete_propagates() {
+        let rt = Runtime::new();
+        let left = rt.create_collection::<(i64, i64)>();
+        let right = rt.create_collection::<(i64, i64)>();
+
+        let joined = left.join(&rt, &right, |l: &(i64, i64)| l.0, |r: &(i64, i64)| r.0);
+
+        left.insert(&rt, (1, 10));
+        right.insert(&rt, (1, 100));
+        let _ = rt.get(joined.version_node);
+        assert_eq!(joined.elements().len(), 1);
+
+        left.delete(&rt, &(1, 10));
+        let _ = rt.get(joined.version_node);
+        assert_eq!(joined.elements().len(), 0);
     }
 }
