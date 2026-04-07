@@ -4,7 +4,7 @@ Most software recomputes everything from scratch whenever anything changes. Your
 
 incr is a crack at solving that. Its a Rust library (with Python bindings) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. It ships as two crates: `incr-compute` for single-threaded, zero-overhead use, and `incr-concurrent` for multi-threaded programs where the runtime needs to be `Send + Sync`. Both are published on crates.io and PyPI, and they expose the same API surface, so switching between them is a one-line dependency swap.
 
-![Live dashboard demo showing incr processing API traffic, with dependency graph visualization and real-time incremental vs from-scratch comparison](examples/dashboard/demo.gif)
+![Live spreadsheet demo showing formula cells updating incrementally as values change, powered by incr-concurrent with real-time WebSocket sync](examples/spreadsheet/demo.gif)
 
 ## Quick look
 
