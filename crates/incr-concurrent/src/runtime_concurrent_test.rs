@@ -283,6 +283,12 @@ fn compute_function_runs_at_most_once_per_dirty_cycle() {
         })
     };
 
+    // Force the initial compute synchronously so the `total >= 1` assertion
+    // is deterministic. Without this, a fast writer can finish all sets
+    // and flip `stop` before any reader thread is scheduled, leaving the
+    // counter at 0.
+    rt.get(query);
+
     let stop = Arc::new(AtomicBool::new(false));
     let reader_handles: Vec<_> = (0..READERS)
         .map(|_| {
