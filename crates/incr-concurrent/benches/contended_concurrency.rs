@@ -66,11 +66,9 @@ fn build_nodes(n: usize) -> Arc<Vec<AtomicNode>> {
     Arc::new((0..n as u32).map(AtomicNode::new).collect())
 }
 
-// ============================================================================
-// Workload functions. All operate on a shared &[AtomicNode] and return an
+// Workload functions all operate on a shared &[AtomicNode] and return an
 // aggregated u64 (or nothing for writes) to prevent the compiler from
 // eliminating the work.
-// ============================================================================
 
 #[inline(always)]
 fn read_all_relaxed(nodes: &[AtomicNode]) -> u64 {
@@ -128,11 +126,9 @@ fn publish_value_release(nodes: &[AtomicNode], rev: u64) {
     }
 }
 
-// ============================================================================
-// Generic parallel-timing harness. Takes a closure that receives the thread
+// Generic parallel-timing harness: takes a closure that receives the thread
 // index and does one iteration of work. Returns the total wall-clock duration
 // for `iters` iterations across `threads` threads, all starting at a barrier.
-// ============================================================================
 
 fn run_parallel<F>(iters: u64, threads: usize, work: F) -> Duration
 where
@@ -154,10 +150,6 @@ where
     });
     start.elapsed()
 }
-
-// ============================================================================
-// Benchmarks
-// ============================================================================
 
 const SIZE: usize = 16384;
 const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8];

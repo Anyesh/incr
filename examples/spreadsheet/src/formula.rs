@@ -2,9 +2,7 @@ use std::collections::HashMap;
 
 use incr_concurrent::{Incr, Runtime};
 
-// ---------------------------------------------------------------------------
 // AST
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub enum Expr {
@@ -28,9 +26,7 @@ pub enum Op {
     Eq,
 }
 
-// ---------------------------------------------------------------------------
 // Tokenizer
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
@@ -144,9 +140,7 @@ fn tokenize(input: &str) -> Result<Vec<Token>, ()> {
     Ok(tokens)
 }
 
-// ---------------------------------------------------------------------------
 // Recursive descent parser
-// ---------------------------------------------------------------------------
 
 struct Parser {
     tokens: Vec<Token>,
@@ -256,7 +250,6 @@ impl Parser {
             }
             Some(Token::Ident(name)) => {
                 self.advance();
-                // Check if this is a function call
                 if self.peek() == Some(&Token::LParen) {
                     self.advance(); // consume '('
                     let args = self.parse_fn_args(&name)?;
@@ -315,9 +308,7 @@ impl Parser {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Range expansion
-// ---------------------------------------------------------------------------
 
 fn parse_cell_ref(s: &str) -> Result<(u8, u32), ()> {
     let s = s.to_uppercase();
@@ -351,9 +342,7 @@ fn expand_range(start: &str, end: &str) -> Result<Vec<String>, ()> {
     Ok(cells)
 }
 
-// ---------------------------------------------------------------------------
 // Public API
-// ---------------------------------------------------------------------------
 
 pub fn parse_formula(input: &str) -> Result<Expr, ()> {
     let tokens = tokenize(input)?;

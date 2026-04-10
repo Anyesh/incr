@@ -144,12 +144,10 @@ where
             let mut output = output_log_ref.write().unwrap();
             let mut prev = prev_ref.write().unwrap();
 
-            // Remove old windows
             for w in prev.drain(..) {
                 output.delete(&w);
             }
 
-            // Generate new windows
             if vals.len() >= size {
                 for i in 0..=(vals.len() - size) {
                     let w: Vec<T> = vals[i..i + size].to_vec();
@@ -320,8 +318,6 @@ mod tests {
         assert_eq!(sorted.entries(), Vec::<i64>::new());
     }
 
-    // ── window tests ────────────────────────────────────────────────────────
-
     #[test]
     fn window_basic() {
         let rt = Runtime::new();
@@ -373,8 +369,6 @@ mod tests {
         assert_eq!(elems.len(), 1);
         assert!(elems.contains(&vec![10, 20, 30]));
     }
-
-    // ── pairwise tests ──────────────────────────────────────────────────────
 
     #[test]
     fn pairwise_basic() {

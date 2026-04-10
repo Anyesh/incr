@@ -734,8 +734,6 @@ mod tests {
         assert_eq!(rt.get(col.version_node), 1); // unchanged
     }
 
-    // ── filter tests ────────────────────────────────────────────────────────
-
     #[test]
     fn filter_basic() {
         let rt = Runtime::new();
@@ -802,8 +800,6 @@ mod tests {
         assert_eq!(small.log.borrow().elements.len(), 2);
     }
 
-    // ── map tests ───────────────────────────────────────────────────────────
-
     #[test]
     fn map_basic() {
         let rt = Runtime::new();
@@ -857,8 +853,6 @@ mod tests {
         assert!(elements.contains(&4));
         assert!(elements.contains(&8));
     }
-
-    // ── count tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn count_basic() {
@@ -921,8 +915,6 @@ mod tests {
         assert_eq!(rt.get(label), "1 evens");
         assert_eq!(downstream_count.get(), 1); // early cutoff!
     }
-
-    // ── reduce tests ────────────────────────────────────────────────────────
 
     #[test]
     fn reduce_sum() {
@@ -1005,8 +997,6 @@ mod tests {
         assert_eq!(downstream_count.get(), 1); // early cutoff!
     }
 
-    // ── group_by tests ──────────────────────────────────────────────────────
-
     #[test]
     fn group_by_basic() {
         let rt = Runtime::new();
@@ -1035,8 +1025,6 @@ mod tests {
         let groups = grouped.groups.borrow();
         assert_eq!(groups.get("a").unwrap().elements().len(), 1);
     }
-
-    // ── join tests ──────────────────────────────────────────────────────────
 
     #[test]
     fn join_basic() {

@@ -53,12 +53,10 @@ impl<T: Any + Clone + Hash + Eq + 'static> SortedCollection<T> {
             let mut output = output_log_ref.borrow_mut();
             let mut prev = prev_ref.borrow_mut();
 
-            // Remove old windows
             for w in prev.drain(..) {
                 output.delete(&w);
             }
 
-            // Generate new windows
             if vals.len() >= size {
                 for i in 0..=(vals.len() - size) {
                     let w: Vec<T> = vals[i..i + size].to_vec();
@@ -133,13 +131,10 @@ impl<T: Any + Clone + Hash + Eq + 'static> SortedCollection<T> {
                         if n_after == 0 {
                             // Was the only element; no pairs existed, nothing to remove
                         } else if i == 0 {
-                            // Removed from front: delete pair (removed, new_first)
                             output.delete(&(value.clone(), shadow[0].clone()));
                         } else if i == n_after {
-                            // Removed from end: delete pair (new_last, removed)
                             output.delete(&(shadow[n_after - 1].clone(), value.clone()));
                         } else {
-                            // Removed from middle: delete two pairs, restore neighbor pair
                             let left = shadow[i - 1].clone();
                             let right = shadow[i].clone();
                             output.delete(&(left.clone(), value.clone()));
@@ -254,8 +249,6 @@ mod tests {
         let _ = rt.get(sorted.version_node);
         assert_eq!(sorted.entries(), Vec::<i64>::new());
     }
-
-    // ── pairwise tests ──────────────────────────────────────────────────────
 
     #[test]
     fn pairwise_basic() {
@@ -433,8 +426,6 @@ mod tests {
         assert!(elems.contains(&(10, 20)));
         assert!(elems.contains(&(20, 30)));
     }
-
-    // ── window tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn window_basic() {

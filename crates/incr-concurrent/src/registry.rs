@@ -206,10 +206,6 @@ impl Default for ArenaRegistry {
 // readers of an arena coordinate via the node state machine, which is
 // orthogonal to the registry-level locking.
 
-// ---------------------------------------------------------------------------
-// Thread-local arena pointer cache.
-// ---------------------------------------------------------------------------
-
 /// Number of slots in the TLS cache. Four is a sweet spot: almost all
 /// workloads touch one to four value types on the hot path, and a linear
 /// scan over four entries is ~1 ns even with the array-of-Option branch

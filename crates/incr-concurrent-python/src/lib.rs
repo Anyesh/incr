@@ -1,8 +1,6 @@
 use pyo3::prelude::*;
 use std::hash::{Hash, Hasher};
 
-// ── SyncPyObject: wraps PyObject to assert Sync ────────────────────────────
-//
 // PyObject (pyo3) is Send but not Sync. Closures passed to v2's
 // create_query / filter / map / etc. must be Send + Sync + 'static.
 // All PyObject access goes through Python::with_gil(), which serializes
@@ -14,8 +12,6 @@ struct SyncPyObject(PyObject);
 
 // SAFETY: every access to the inner PyObject goes through with_gil().
 unsafe impl Sync for SyncPyObject {}
-
-// ── PyValue: wraps a Python object for use as a value in the Rust engine ────
 
 struct PyValue(PyObject);
 
@@ -71,8 +67,6 @@ unsafe impl Sync for PyValue {}
 
 incr_conc::impl_value!(PyValue);
 
-// ── PyNodeId: typed handle exposed to Python ────────────────────────────────
-
 #[pyclass(name = "NodeId")]
 #[derive(Clone)]
 struct PyNodeId {
@@ -86,8 +80,6 @@ impl PyNodeId {
         self.inner.slot()
     }
 }
-
-// ── PyRuntimeRef: temporary reference passed into query callbacks ────────────
 
 #[pyclass(name = "RuntimeRef", unsendable)]
 struct PyRuntimeRef {
@@ -107,8 +99,6 @@ impl PyRuntimeRef {
         Ok(val.0)
     }
 }
-
-// ── PyCollection: wraps IncrCollection<PyValue> ─────────────────────────────
 
 #[pyclass(name = "Collection", unsendable)]
 struct PyCollection {
@@ -287,8 +277,6 @@ impl PyCollection {
     }
 }
 
-// ── PySortedCollection: wraps SortedCollection<PyValue> ────────────────────
-
 #[pyclass(name = "SortedCollection", unsendable)]
 struct PySortedCollection {
     inner: incr_conc::SortedCollection<PyValue>,
@@ -359,8 +347,6 @@ impl PySortedCollection {
     }
 }
 
-// ── PyGroupedCollection: wraps GroupedCollection<PyValue, PyValue> ──────────
-
 #[pyclass(name = "GroupedCollection", unsendable)]
 struct PyGroupedCollection {
     inner: incr_conc::GroupedCollection<PyValue, PyValue>,
@@ -396,8 +382,6 @@ impl PyGroupedCollection {
         self.inner.version_node().slot()
     }
 }
-
-// ── PyRuntime: the main runtime exposed to Python ───────────────────────────
 
 #[pyclass(name = "Runtime", unsendable)]
 struct PyRuntime {
@@ -457,8 +441,6 @@ impl PyRuntime {
         let rt_ptr: *const incr_conc::Runtime = &self.inner;
         PyCollection { inner: col, rt_ptr }
     }
-
-    // ── Introspection API ───────────────────────────────────────────────
 
     fn set_label(&self, node: PyNodeId, label: String) {
         self.inner.set_label(node.inner.slot(), label);
@@ -534,8 +516,6 @@ impl PyRuntime {
         self.inner.node_count()
     }
 }
-
-// ── Module definition ───────────────────────────────────────────────────────
 
 #[pymodule]
 fn incr_concurrent(m: &Bound<'_, PyModule>) -> PyResult<()> {

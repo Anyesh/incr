@@ -24,7 +24,6 @@ fn setup_incremental(
     let gaps = pairs.map(&rt, |(a, b): &(i64, i64)| b - a);
     let total = gaps.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
 
-    // Insert N elements with gaps of 10 between them
     for i in 0..n {
         col.insert(&rt, (i as i64) * 10);
     }

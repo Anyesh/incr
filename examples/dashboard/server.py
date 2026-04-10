@@ -36,7 +36,6 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     connected_clients.append(ws)
 
-    # Send the graph structure once on connect
     try:
         await ws.send_json(
             {"type": "graph_structure", "nodes": engine.graph_snapshot()}
@@ -45,7 +44,6 @@ async def websocket_endpoint(ws: WebSocket):
         connected_clients.remove(ws)
         return
 
-    # Listen for control messages from the client
     try:
         while True:
             data = await ws.receive_json()
@@ -66,7 +64,6 @@ async def simulation_loop():
         batch_size = 5 if simulator.mode == "traffic_surge" else 2
         events = simulator.generate_batch(batch_size)
 
-        # Read metrics with tracing (includes trace overhead, used for graph viz)
         metrics, trace = engine.read_all_traced()
 
         # Measure the per-update cost of each approach by doing one more
@@ -85,7 +82,6 @@ async def simulation_loop():
         engine.recompute_from_scratch()
         scratch_us = (time.perf_counter_ns() - start_ns) / 1000
 
-        # Build the trace summary from the traced get() call
         recomputed_ids = set()
         cutoff_ids = set()
         visited_ids = set()
@@ -98,7 +94,6 @@ async def simulation_loop():
             elif nt["action"] == "verified_clean":
                 visited_ids.add(nt["id"])
 
-        # Format recent events for the feed (last 10)
         recent = []
         for ev in simulator.recent_events[-10:]:
             recent.append(
@@ -132,7 +127,6 @@ async def simulation_loop():
             "recent_events": recent,
         }
 
-        # Broadcast to all connected clients
         disconnected = []
         for ws in connected_clients:
             try:

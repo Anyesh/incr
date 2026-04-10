@@ -14,9 +14,6 @@ from dataclasses import dataclass, field
 from incr import Runtime
 
 
-# ── Data Model ───────────────────────────────────────────────────────────────
-
-
 @dataclass
 class Visit:
     id: int
@@ -91,7 +88,6 @@ def generate_schedule(num_visits: int = 14) -> list[Visit]:
     current_time = 7.0  # start at 7am
 
     for i in range(num_visits):
-        # Add a travel gap (10-20 min) between visits
         if i > 0:
             current_time += random.uniform(10, 20) / 60.0
 
@@ -113,13 +109,9 @@ def generate_schedule(num_visits: int = 14) -> list[Visit]:
         )
         visits.append(visit)
 
-        # Advance clock past the end of this visit
         current_time = time_val + duration / 60.0
 
     return visits
-
-
-# ── Database ────────────────────────────────────────────────────────────────
 
 
 class Database:
@@ -244,9 +236,6 @@ class PersistentCache:
         self.conn.close()
 
 
-# ── Distance Service ─────────────────────────────────────────────────────────
-
-
 def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
@@ -307,8 +296,6 @@ class DistanceService:
         return dist, False
 
 
-# ── Premium Rules ────────────────────────────────────────────────────────────
-
 DAILY_CAP = 50.0
 
 
@@ -341,9 +328,6 @@ class Segment:
         )
 
 
-# ── incr Pipeline Engine ─────────────────────────────────────────────────────
-
-
 class TravelPremiumEngine:
     def __init__(
         self, db_path: str = "visits.db", cache_path: str = "distance_cache.db"
@@ -355,7 +339,6 @@ class TravelPremiumEngine:
         self.next_id = 0
         self.startup_info = ""
 
-        # Build the incr pipeline
         self.rt = Runtime()
         self.visit_collection = self.rt.create_collection()
         self.sorted_visits = self.visit_collection.sort_by_key(lambda v: v.time)
@@ -379,7 +362,6 @@ class TravelPremiumEngine:
             lambda segs: min(sum(s.premium for s in segs), DAILY_CAP)
         )
 
-        # Load existing visits from database
         existing = self.db.load_all_visits()
         if existing:
             self.distance_service.reset_stats()
@@ -394,7 +376,6 @@ class TravelPremiumEngine:
                 f"cache: {stats['hits']}/{stats['hits'] + stats['misses']} hits)"
             )
         else:
-            # Fresh database: generate initial schedule
             schedule = generate_schedule(14)
             self.distance_service.reset_stats()
             for v in schedule:
@@ -418,9 +399,7 @@ class TravelPremiumEngine:
                 lng=lng,
             )
         self.next_id = max(self.next_id, visit.id + 1)
-        # Database first
         self.db.insert_visit(visit)
-        # Then incr graph
         self.visit_collection.insert(visit)
         self.visits[visit.id] = visit
         return visit
@@ -432,9 +411,7 @@ class TravelPremiumEngine:
             visit_id = random.choice(list(self.visits.keys()))
         visit = self.visits.pop(visit_id, None)
         if visit:
-            # Database first
             self.db.delete_visit(visit_id)
-            # Then incr graph
             self.visit_collection.delete(visit)
         return visit
 
@@ -455,9 +432,7 @@ class TravelPremiumEngine:
             lat=old.lat,
             lng=old.lng,
         )
-        # Database first
         self.db.update_visit(new)
-        # Then incr graph
         self.visit_collection.delete(old)
         self.visit_collection.insert(new)
         self.visits[new.id] = new

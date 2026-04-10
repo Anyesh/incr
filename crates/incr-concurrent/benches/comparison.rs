@@ -2,10 +2,8 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 use incr_concurrent::Runtime;
 use salsa::Setter;
 
-// ============================================================================
-// Workload 1: Linear chain — input → f1 → f2 → ... → fn
-// Measures per-node propagation cost.
-// ============================================================================
+// Workload 1: Linear chain (input → f1 → f2 → ... → fn). Measures per-node
+// propagation cost.
 
 fn incr_chain_propagate(
     size: usize,
@@ -58,10 +56,8 @@ fn salsa_chain_4(db: &dyn salsa::Database, input: SalsaInput) -> i64 {
     v.wrapping_add(1)
 }
 
-// ============================================================================
-// Workload 2: Diamond — input → [A, B] → output
-// Measures handling of shared dependencies.
-// ============================================================================
+// Workload 2: Diamond (input → [A, B] → output). Measures handling of
+// shared dependencies.
 
 fn incr_diamond_propagate() -> (
     Runtime,
@@ -98,10 +94,8 @@ fn salsa_diamond_out(db: &dyn salsa::Database, input: SalsaInput) -> i64 {
     salsa_diamond_a(db, input).wrapping_add(salsa_diamond_b(db, input))
 }
 
-// ============================================================================
-// Workload 3: Early cutoff — input → clamp → downstream
-// Measures whether early cutoff prevents unnecessary work.
-// ============================================================================
+// Workload 3: Early cutoff (input → clamp → downstream). Measures whether
+// early cutoff prevents unnecessary work.
 
 #[salsa::tracked]
 fn salsa_clamp(db: &dyn salsa::Database, input: SalsaInput) -> i64 {
@@ -113,10 +107,8 @@ fn salsa_after_clamp(db: &dyn salsa::Database, input: SalsaInput) -> i64 {
     salsa_clamp(db, input).wrapping_add(1)
 }
 
-// ============================================================================
 // Workload 4: Collection pipeline — insert into filter → map → count
 // Batch baseline: compute from scratch each time.
-// ============================================================================
 
 fn batch_collection_insert(elements: &mut std::collections::HashSet<i64>, new_val: i64) -> usize {
     elements.insert(new_val);
@@ -127,9 +119,7 @@ fn batch_collection_insert(elements: &mut std::collections::HashSet<i64>, new_va
         .count()
 }
 
-// ============================================================================
 // Benchmarks
-// ============================================================================
 
 fn bench_chain_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("chain_incr_vs_salsa");

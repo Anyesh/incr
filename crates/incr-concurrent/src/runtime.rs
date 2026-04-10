@@ -75,10 +75,6 @@ use super::registry::ArenaRegistry;
 use super::state::NodeState;
 use super::value::Value;
 
-// ---------------------------------------------------------------------------
-// Introspection types.
-// ---------------------------------------------------------------------------
-
 /// Whether a node is an input or a computed value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeKindInfo {
@@ -123,9 +119,7 @@ pub struct PropagationTrace {
     pub node_traces: Vec<NodeTrace>,
 }
 
-// ---------------------------------------------------------------------------
 // COMPUTE_STACK: per-thread stack of active compute frames.
-// ---------------------------------------------------------------------------
 //
 // When the Runtime enters `run_compute` for a node, it pushes a frame onto
 // this thread's compute stack. Every `rt.get` call checks the stack top:
@@ -461,8 +455,6 @@ impl Runtime {
         node.state_cell().store_release(NodeState::Clean);
         self.mark_dependents_dirty(handle.slot());
     }
-
-    // -- internal helpers --------------------------------------------------
 
     /// Append a new node to the store and the parallel vecs in
     /// `inner`, returning the slot. Caller must hold `write_mutex`.
@@ -876,8 +868,6 @@ impl Runtime {
         unsafe { &*arena_ptr }
     }
 
-    // -- Introspection API ---------------------------------------------------
-
     /// Return the number of nodes currently registered in this runtime.
     pub fn node_count(&self) -> usize {
         self.nodes.len() as usize
@@ -1284,9 +1274,7 @@ mod tests {
         }
     }
 
-    // -------------------------------------------------------------------
     // Dependency tracking tests (commit H).
-    // -------------------------------------------------------------------
     //
     // These tests verify that `rt.get` calls inside a compute closure
     // record their handles as dependencies of the currently-computing
@@ -1467,9 +1455,7 @@ mod tests {
         assert!(deps.is_empty(), "got unexpected deps: {:?}", deps);
     }
 
-    // -------------------------------------------------------------------
     // Forward-edge (dependents) tests (commit I).
-    // -------------------------------------------------------------------
 
     #[test]
     fn fresh_input_has_no_dependents() {
@@ -1603,9 +1589,7 @@ mod tests {
         assert_eq!(dependents[0].0, q.slot());
     }
 
-    // -------------------------------------------------------------------
     // Reactivity tests (commit J).
-    // -------------------------------------------------------------------
 
     fn state_of(rt: &Runtime, slot: u32) -> NodeState {
         rt.nodes.get(slot).state()
@@ -1811,9 +1795,7 @@ mod tests {
         assert_eq!(rt.get(greeting), "hi, world");
     }
 
-    // -------------------------------------------------------------------
     // Early cutoff tests (commit K).
-    // -------------------------------------------------------------------
 
     #[test]
     fn set_with_same_value_is_a_noop() {
@@ -1949,9 +1931,7 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
-    // -------------------------------------------------------------------
     // Cycle detection and panic catching tests (commit L).
-    // -------------------------------------------------------------------
 
     /// Read a node's stashed failure message for test assertions.
     fn failure_message_for(rt: &Runtime, slot: u32) -> Option<String> {
@@ -2145,9 +2125,7 @@ mod tests {
         assert_eq!(rt.get(q), 3); // no panic
     }
 
-    // -------------------------------------------------------------------
     // Dynamic dependency tests (commit M).
-    // -------------------------------------------------------------------
 
     #[test]
     fn query_with_conditional_deps_tracks_only_read_branch() {
@@ -2369,8 +2347,6 @@ mod tests {
         assert_eq!(rt.get(q), expected_sum);
         assert_eq!(collect_deps_for_slot(&rt, q.slot()).len(), 11);
     }
-
-    // -- Introspection API tests --------------------------------------------
 
     #[test]
     fn node_count_tracks_created_nodes() {

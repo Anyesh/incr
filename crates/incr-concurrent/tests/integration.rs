@@ -209,7 +209,6 @@ fn sort_pairwise_map_reduce_pipeline() {
     let sorted = visits.sort_by_key(&rt, |t: &i64| *t);
     let pairs = sorted.pairwise(&rt);
 
-    // Map each pair to the gap between them
     let gaps = pairs.map(&rt, |(a, b): &(i64, i64)| b - a);
 
     // Sum all gaps
@@ -233,7 +232,6 @@ fn sort_pairwise_map_reduce_pipeline() {
     visits.insert(&rt, 100);
     assert_eq!(rt.get(total_gap), 90); // (20-10) + (50-20) + (100-50) = 90
 
-    // Delete first visit
     visits.delete(&rt, &10);
     assert_eq!(rt.get(total_gap), 80); // (50-20) + (100-50) = 80
 }

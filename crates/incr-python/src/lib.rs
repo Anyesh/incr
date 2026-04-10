@@ -1,8 +1,6 @@
 use pyo3::prelude::*;
 use std::hash::{Hash, Hasher};
 
-// ── PyValue: wraps a Python object for use as a value in the Rust engine ────
-
 struct PyValue(PyObject);
 
 impl Clone for PyValue {
@@ -50,8 +48,6 @@ impl Ord for PyValue {
     }
 }
 
-// ── PyNodeId: typed handle exposed to Python ────────────────────────────────
-
 #[pyclass(name = "NodeId")]
 #[derive(Clone)]
 struct PyNodeId {
@@ -65,8 +61,6 @@ impl PyNodeId {
         self.inner.node_id().raw()
     }
 }
-
-// ── PyRuntimeRef: temporary reference passed into query callbacks ────────────
 
 #[pyclass(name = "RuntimeRef", unsendable)]
 struct PyRuntimeRef {
@@ -86,8 +80,6 @@ impl PyRuntimeRef {
         Ok(val.0)
     }
 }
-
-// ── PyCollection: wraps IncrCollection<PyValue> ─────────────────────────────
 
 #[pyclass(name = "Collection", unsendable)]
 struct PyCollection {
@@ -251,8 +243,6 @@ impl PyCollection {
     }
 }
 
-// ── PySortedCollection: wraps SortedCollection<PyValue> ────────────────────
-
 #[pyclass(name = "SortedCollection", unsendable)]
 struct PySortedCollection {
     inner: incr_st::SortedCollection<PyValue>,
@@ -323,8 +313,6 @@ impl PySortedCollection {
     }
 }
 
-// ── PyGroupedCollection: wraps GroupedCollection<PyValue, PyValue> ──────────
-
 #[pyclass(name = "GroupedCollection", unsendable)]
 struct PyGroupedCollection {
     inner: incr_st::GroupedCollection<PyValue, PyValue>,
@@ -360,8 +348,6 @@ impl PyGroupedCollection {
         self.inner.version_node().node_id().raw()
     }
 }
-
-// ── PyRuntime: the main runtime exposed to Python ───────────────────────────
 
 #[pyclass(name = "Runtime", unsendable)]
 struct PyRuntime {
@@ -419,8 +405,6 @@ impl PyRuntime {
         let rt_ptr: *const incr_st::Runtime = &self.inner;
         PyCollection { inner: col, rt_ptr }
     }
-
-    // ── Introspection API ───────────────────────────────────────────────
 
     fn set_label(&self, node: PyNodeId, label: String) {
         self.inner.set_label(node.inner.node_id(), label);
@@ -497,8 +481,6 @@ impl PyRuntime {
         self.inner.node_count()
     }
 }
-
-// ── Module definition ───────────────────────────────────────────────────────
 
 #[pymodule]
 fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {

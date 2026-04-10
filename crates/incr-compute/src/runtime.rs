@@ -165,7 +165,6 @@ impl Runtime {
     where
         T: Any + Clone + PartialEq + 'static,
     {
-        // Check if the value actually changed
         {
             let nodes = self.nodes.borrow();
             let node_data = &nodes[node.id.0 as usize];
@@ -178,7 +177,6 @@ impl Runtime {
             }
         }
 
-        // Increment revision
         let mut rev = self.revision.get();
         rev.increment();
         self.revision.set(rev);
@@ -250,8 +248,6 @@ impl Runtime {
             _phantom: PhantomData,
         }
     }
-
-    // ── Introspection API ───────────────────────────────────────────────────
 
     /// Assign a human-readable label to a node for visualization/debugging.
     pub fn set_label(&self, id: NodeId, label: String) {
@@ -424,7 +420,6 @@ impl Runtime {
                 }
             }
 
-            // Check if recomputation is actually needed
             let needs_recompute = match node.state {
                 NodeState::New => true,
                 NodeState::Dirty => {
@@ -492,7 +487,6 @@ impl Runtime {
         let mut nodes = self.nodes.borrow_mut();
         let revision = self.revision.get();
 
-        // Update value and timestamps
         {
             let node = &mut nodes[id.0 as usize];
             if value_changed {
@@ -606,8 +600,6 @@ mod tests {
         assert_eq!(rt.get(d), 112); // (1+10) + (1+100)
     }
 
-    // ── Task 5: Dirty Marking and Incremental Recomputation ──────────────────
-
     #[test]
     fn input_change_triggers_recomputation() {
         let rt = Runtime::new();
@@ -701,8 +693,6 @@ mod tests {
         assert_eq!(compute_count.get(), 2); // Only one recomputation, not three
     }
 
-    // ── Task 6: Early Cutoff ─────────────────────────────────────────────────
-
     #[test]
     fn early_cutoff_stops_propagation() {
         let rt = Runtime::new();
@@ -779,8 +769,6 @@ mod tests {
         assert_eq!(rt.get(d), 110);
         assert_eq!(d_count.get(), 3); // D did not recompute
     }
-
-    // ── Task 7: Dynamic Dependencies ─────────────────────────────────────────
 
     #[test]
     fn dynamic_dependency_switch() {

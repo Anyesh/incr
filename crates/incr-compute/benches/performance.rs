@@ -10,7 +10,6 @@ fn build_chain(size: usize) -> (Runtime, Incr<i64>, Incr<i64>) {
         let dep = prev;
         prev = rt.create_query(move |rt| rt.get(dep).wrapping_add(1));
     }
-    // Initialize by reading the output
     let _ = rt.get(prev);
     (rt, input, prev)
 }
@@ -37,7 +36,6 @@ fn build_fanout(width: usize) -> (Runtime, Incr<i64>, Incr<i64>) {
     (rt, input, output)
 }
 
-/// Build a layered graph with diamond patterns
 fn build_layered(
     num_inputs: usize,
     nodes_per_layer: usize,

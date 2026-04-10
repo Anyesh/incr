@@ -693,8 +693,6 @@ mod tests {
         assert!(elems.contains(&3));
     }
 
-    // ── filter tests ────────────────────────────────────────────────────────
-
     #[test]
     fn filter_basic() {
         let rt = Runtime::new();
@@ -761,8 +759,6 @@ mod tests {
         assert_eq!(small.log.read().unwrap().elements.len(), 2);
     }
 
-    // ── map tests ───────────────────────────────────────────────────────────
-
     #[test]
     fn map_basic() {
         let rt = Runtime::new();
@@ -816,8 +812,6 @@ mod tests {
         assert!(elements.contains(&4));
         assert!(elements.contains(&8));
     }
-
-    // ── count tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn count_basic() {
@@ -876,8 +870,6 @@ mod tests {
         assert_eq!(downstream_count.load(Ordering::Relaxed), 1); // early cutoff
     }
 
-    // ── reduce tests ────────────────────────────────────────────────────────
-
     #[test]
     fn reduce_sum() {
         let rt = Runtime::new();
@@ -926,8 +918,6 @@ mod tests {
         assert_eq!(rt.get(sum), 6);
     }
 
-    // ── group_by tests ──────────────────────────────────────────────────────
-
     #[test]
     fn group_by_basic() {
         let rt = Runtime::new();
@@ -960,8 +950,6 @@ mod tests {
         let groups = grouped.groups.read().unwrap();
         assert_eq!(groups.get("a").unwrap().elements().len(), 1);
     }
-
-    // ── join tests ──────────────────────────────────────────────────────────
 
     #[test]
     fn join_basic() {

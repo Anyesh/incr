@@ -445,10 +445,6 @@ impl<T: AtomicPrimitive> ErasedArena for AtomicPrimitiveArena<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GenericArena: non-primitive values coordinated by the state machine.
-// ---------------------------------------------------------------------------
-
 /// One slot in a `GenericArena`. The inner `Option<T>` starts `None` at
 /// segment allocation and becomes `Some(value)` once the arena's user
 /// writes a value into it.
@@ -926,10 +922,6 @@ mod tests {
         }
         drop(arena);
     }
-
-    // -----------------------------------------------------------------
-    // GenericArena tests
-    // -----------------------------------------------------------------
 
     #[test]
     fn generic_reserve_starts_none_and_write_populates() {

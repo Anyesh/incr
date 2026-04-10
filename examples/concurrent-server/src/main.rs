@@ -123,9 +123,7 @@ struct StockInfo {
     position: f64,
 }
 
-// ---------------------------------------------------------------------------
 // Concurrent mode: readers call rt.get() directly from handler threads
-// ---------------------------------------------------------------------------
 
 async fn portfolio_concurrent(State(graph): State<Arc<Graph>>) -> Json<PortfolioResponse> {
     let start = Instant::now();
@@ -151,9 +149,7 @@ async fn portfolio_concurrent(State(graph): State<Arc<Graph>>) -> Json<Portfolio
     Json(resp)
 }
 
-// ---------------------------------------------------------------------------
 // Serialized mode: all reads funneled through one thread via channel
-// ---------------------------------------------------------------------------
 
 struct SerializedState {
     tx: mpsc::Sender<oneshot::Sender<PortfolioResponse>>,
@@ -190,9 +186,7 @@ fn read_portfolio(graph: &Graph) -> PortfolioResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Writer: simulates a market data feed
-// ---------------------------------------------------------------------------
 
 fn run_writer(graph: &Graph) {
     let mut rng = rand::thread_rng();
@@ -207,9 +201,7 @@ fn run_writer(graph: &Graph) {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Main
-// ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {

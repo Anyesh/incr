@@ -13,8 +13,6 @@ from incr import Runtime
 
 WINDOW_SIZE = 200  # rolling window of last N requests for rate/latency metrics
 
-# ── Endpoint definitions for realistic traffic simulation ────────────────────
-
 ENDPOINTS = [
     ("GET", "/api/users", 0.02, 45),
     ("GET", "/api/products", 0.01, 30),
@@ -56,15 +54,12 @@ class DashboardEngine:
         self._throughput_secs_node = self.rt.create_input(10.0)
         self.rt.set_label(self._throughput_secs_node, "window_secs")
 
-        # Base collection (tracks all-time totals)
         self.all_requests = self.rt.create_collection()
         self.rt.set_label_by_id(self.all_requests.version_node_id, "all_requests")
 
-        # All-time counts via collection pipeline
         self.total_count = self.all_requests.count()
         self.rt.set_label(self.total_count, "total_count")
 
-        # Derived query nodes using windowed inputs
         wc = self._win_count_node
         we = self._win_errors_node
         wl = self._win_latsum_node
@@ -109,22 +104,18 @@ class DashboardEngine:
         # Force initial computation so the graph is wired up
         self.rt.get(self.health)
 
-        # Track window for throughput
         self._throughput_start = time.time()
         self._throughput_count = 0
 
-        # Plain list for from-scratch comparison
         self._all_events = []
 
     def _update_window(self, new_event):
-        # If the window is full, the oldest event is about to be evicted
         evicted = None
         if len(self._recent) == self._recent.maxlen:
             evicted = self._recent[0]
 
         self._recent.append(new_event)
 
-        # Adjust running window aggregates
         status, latency = new_event[4], new_event[5]
         self._win_latency_sum += latency
         if status >= 400:
@@ -140,7 +131,6 @@ class DashboardEngine:
             if old_latency > 500:
                 self._win_slow_count -= 1
 
-        # Push updated window values into incr input nodes
         win_count = len(self._recent)
         self.rt.set(self._win_count_node, win_count)
         self.rt.set(self._win_errors_node, self._win_error_count)
@@ -156,7 +146,6 @@ class DashboardEngine:
 
         self._update_window(event)
 
-        # Update throughput window
         self._throughput_count += 1
         elapsed = time.time() - self._throughput_start
         if elapsed > 0.1:
@@ -251,7 +240,6 @@ class TrafficSimulator:
             event = self.engine.add_request(method, path, status, latency)
             events.append(event)
 
-        # Keep last 50 events for the UI feed
         self.recent_events.extend(events)
         self.recent_events = self.recent_events[-50:]
 

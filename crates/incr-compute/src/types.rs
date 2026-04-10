@@ -46,8 +46,6 @@ impl<T> Clone for Incr<T> {
     }
 }
 
-// ── Introspection types ─────────────────────────────────────────────────────
-
 /// Whether a node is an input or a computed value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NodeKindInfo {

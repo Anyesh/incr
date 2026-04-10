@@ -20,14 +20,12 @@ def main():
 
     python = str(VENV_DIR / "bin" / "python")
 
-    # 1. Create venv if needed
     if not VENV_DIR.exists():
         print("[1/4] Creating virtual environment...")
         run(["uv", "venv", str(VENV_DIR), "--python", "3.12"])
     else:
         print("[1/4] Virtual environment exists")
 
-    # 2. Install deps
     print("[2/4] Installing dependencies...")
     run(
         [
@@ -42,7 +40,6 @@ def main():
         ]
     )
 
-    # 3. Build incr Python bindings
     print("[3/4] Building incr Python bindings...")
     run(
         [python, "-m", "maturin", "develop"],
@@ -50,7 +47,6 @@ def main():
         env={**os.environ, "VIRTUAL_ENV": str(VENV_DIR)},
     )
 
-    # 4. Launch the server
     print("[4/4] Starting server at http://127.0.0.1:8001\n")
     os.chdir(EXAMPLE_DIR)
     os.execvp(

@@ -39,10 +39,8 @@ use rand::SeedableRng;
 use std::cell::RefCell;
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 
-// ============================================================================
-// Node shapes. All variants target ~64 bytes (one cache line) so that cache
-// behavior is comparable across variants.
-// ============================================================================
+// All node variants target ~64 bytes (one cache line) so that cache behavior
+// is comparable across variants.
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -166,10 +164,6 @@ impl EpochSlot {
     }
 }
 
-// ============================================================================
-// Storage builders
-// ============================================================================
-
 fn build_baseline(n: usize) -> Vec<BaselineNode> {
     (0..n as u32).map(BaselineNode::new).collect()
 }
@@ -190,10 +184,8 @@ fn build_epoch(n: usize) -> Vec<EpochSlot> {
     (0..n as u32).map(EpochSlot::new).collect()
 }
 
-// ============================================================================
-// Precomputed access orders. Built once outside the bench loop so that RNG
+// Precomputed access orders, built once outside the bench loop so that RNG
 // cost and chain-building cost do not pollute the measurement.
-// ============================================================================
 
 fn shuffled_indices(n: usize, seed: u64) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..n).collect();
@@ -213,10 +205,6 @@ fn traversal_chain(n: usize, seed: u64) -> Vec<usize> {
     }
     chain
 }
-
-// ============================================================================
-// Workloads - Sequential Read
-// ============================================================================
 
 #[inline(always)]
 fn seq_read_baseline(nodes: &[BaselineNode]) -> u64 {
@@ -288,10 +276,6 @@ fn seq_read_epoch(nodes: &[EpochSlot]) -> u64 {
     }
     acc
 }
-
-// ============================================================================
-// Workloads - Random Read
-// ============================================================================
 
 #[inline(always)]
 fn rand_read_baseline(nodes: &[BaselineNode], order: &[usize]) -> u64 {
@@ -366,11 +350,9 @@ fn rand_read_epoch(nodes: &[EpochSlot], order: &[usize]) -> u64 {
     acc
 }
 
-// ============================================================================
-// Workloads - Traversal. Walks a precomputed chain of next-indices, simulating
-// the ensure_clean pattern where each node read leads to another. The chain
+// Traversal walks a precomputed chain of next-indices, simulating the
+// ensure_clean pattern where each node read leads to another. The chain
 // visits every node exactly once.
-// ============================================================================
 
 #[inline(always)]
 fn traversal_baseline(nodes: &[BaselineNode], chain: &[usize], start: usize) -> u64 {
@@ -437,10 +419,8 @@ fn traversal_epoch(nodes: &[EpochSlot], chain: &[usize], start: usize) -> u64 {
     acc
 }
 
-// ============================================================================
-// Workloads - Write Burst. Simulates mark_dirty: iterate and update the state
-// and verified_at fields of every node.
-// ============================================================================
+// Write Burst simulates mark_dirty: iterate and update the state and
+// verified_at fields of every node.
 
 #[inline(always)]
 fn write_burst_baseline(nodes: &mut [BaselineNode], rev: u64) {
@@ -508,10 +488,6 @@ fn write_burst_epoch(nodes: &[EpochSlot], rev: u64) {
         }
     }
 }
-
-// ============================================================================
-// Criterion harness
-// ============================================================================
 
 // Sizes chosen to span cache hierarchy: 64 nodes (~4KB, L1), 1024 (~64KB, L1 edge),
 // 16384 (~1MB, L2), 65536 (~4MB, L3). The top size was originally 262144 (~16MB)

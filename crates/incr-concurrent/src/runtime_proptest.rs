@@ -42,7 +42,6 @@ fn verify_incremental_matches_batch(
     assert!(num_inputs >= 2);
     assert_eq!(input_values.len(), num_inputs);
 
-    // --- Build incremental graph ---
     let rt = Runtime::new();
     let mut all_nodes: Vec<Incr<i64>> = Vec::new();
 
@@ -93,7 +92,6 @@ fn verify_incremental_matches_batch(
     // Get incremental result.
     let incremental_result = rt.get(last);
 
-    // --- Build batch (from scratch) with final input values ---
     let mut final_values = input_values.clone();
     for &(input_rel, new_val) in &mutations {
         let idx = input_rel % num_inputs;
@@ -128,7 +126,6 @@ fn verify_incremental_matches_batch(
     let last2 = *all_nodes2.last().unwrap();
     let batch_result = rt2.get(last2);
 
-    // --- The critical assertion ---
     assert_eq!(
         incremental_result,
         batch_result,
