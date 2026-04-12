@@ -1,6 +1,4 @@
 # incr
-<!-- incr compute crates.io badge with custom label with package name big one and different colors for the two crates, and PyPI badge with same style ex: https://img.shields.io/badge/build-passing-brightgreen?style=for-the-badge
- -->
  [![crates.io badge for incr-compute](https://img.shields.io/crates/v/incr-compute?label=incr-compute&logo=rust&color=blue)](https://crates.io/crates/incr-compute)
  [![crates.io badge for incr-concurrent](https://img.shields.io/crates/v/incr-concurrent?label=incr-concurrent&logo=rust&color=orange)](https://crates.io/crates/incr-concurrent)
  [![PyPI badge for incr-compute](https://img.shields.io/pypi/v/incr-compute?label=incr-compute&logo=python&color=blue)](https://pypi.org/project/incr-compute/)
