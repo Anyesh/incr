@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct RuntimeId(u64);
 
 impl RuntimeId {
+    #[allow(dead_code)]
     pub(crate) const SENTINEL: RuntimeId = RuntimeId(0);
 
     /// Allocate a fresh runtime id. Called once per `Runtime::new`.
@@ -101,6 +102,7 @@ impl<T: 'static> Incr<T> {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn generation(self) -> u32 {
         self.generation
     }

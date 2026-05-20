@@ -323,7 +323,7 @@ where
 
 // Suppress unused warning until SortDelta consumers ship.
 #[allow(dead_code)]
-fn _sort_delta_keep_used<T: Ord>() -> Ordering {
+fn _sort_delta_keep_used() -> Ordering {
     Ordering::Equal
 }
 
