@@ -1,0 +1,13 @@
+[package]
+name = "incr-core"
+version = "0.2.0-alpha.1"
+edition = "2021"
+description = "Shared core for the incr family. Strategy-parameterized incremental computation engine. Used via incr-compute (single-threaded) or incr-concurrent (Send + Sync)."
+license = "Apache-2.0"
+repository = "https://github.com/Anyesh/incr"
+keywords = ["incremental", "computation", "reactive", "dataflow"]
+categories = ["algorithms", "data-structures"]
+
+[dependencies]
+
+[dev-dependencies]
