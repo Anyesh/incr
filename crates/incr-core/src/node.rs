@@ -37,7 +37,7 @@
 //! after that lifts the segmented node store. Tracking in the
 //! consolidation plan.
 
-use crate::cells::Cells;
+use crate::cells::{Cells, PtrCell};
 use crate::state::NodeState;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,11 +47,28 @@ impl NodeId {
     pub const SENTINEL: NodeId = NodeId(u32::MAX);
 }
 
+/// Heap-allocated overflow dependency list. Used when a node has more
+/// than seven dependencies. Stored behind `NodeData::overflow_deps` as
+/// a raw pointer.
+///
+/// Reclamation policy: when a node's dep set changes and the new list
+/// requires re-allocation, the OLD overflow list is leaked under
+/// `Shared` because there is no hazard-pointer machinery to ensure
+/// safe reclamation while concurrent readers may hold the pointer.
+/// `NodeData::Drop` reclaims the currently-installed list. Long-lived
+/// nodes with churning dep sets accumulate leaked lists in proportion
+/// to the number of dep-set changes that crossed the 7-element
+/// boundary. The `haphazard`-backed reclamation lands in 0.2.1; for
+/// 0.2.0-alpha the leak is documented and bounded.
+pub struct DepList {
+    pub(crate) deps: Box<[NodeId]>,
+}
+
 #[repr(C, align(64))]
 pub struct NodeData<C: Cells> {
     pub(crate) verified_at: C::U64,
     pub(crate) changed_at: C::U64,
-    pub(crate) overflow_deps: C::U64,
+    pub(crate) overflow_deps: C::Ptr<DepList>,
     pub(crate) inline_deps: [C::U32; 7],
     pub(crate) arena_slot: u32,
     pub(crate) type_tag: u16,
@@ -68,7 +85,7 @@ impl<C: Cells> NodeData<C> {
         Self {
             verified_at: C::new_u64(revision),
             changed_at: C::new_u64(revision),
-            overflow_deps: C::new_u64(0),
+            overflow_deps: <C::Ptr<DepList> as PtrCell<DepList>>::new_null(),
             inline_deps: Self::empty_inline_deps(),
             arena_slot,
             type_tag,
@@ -85,7 +102,7 @@ impl<C: Cells> NodeData<C> {
         Self {
             verified_at: C::new_u64(0),
             changed_at: C::new_u64(0),
-            overflow_deps: C::new_u64(0),
+            overflow_deps: <C::Ptr<DepList> as PtrCell<DepList>>::new_null(),
             inline_deps: Self::empty_inline_deps(),
             arena_slot,
             type_tag,
@@ -145,23 +162,76 @@ impl<C: Cells> NodeData<C> {
         C::u32_load_relaxed(&self.generation)
     }
 
+    #[inline(always)]
+    pub fn set_state(&self, v: u8) {
+        C::state_store_release(&self.state, v);
+    }
+
+    /// Install a new dep list. Inline-7 path stores into the inline
+    /// array; overflow path heap-allocates a `DepList` and Release-stores
+    /// the pointer.
+    ///
+    /// Reclamation: under `Shared`, the OLD overflow pointer (if any) is
+    /// LEAKED to avoid use-after-free against concurrent readers. The
+    /// final list is reclaimed in `Drop`. Under `Local`, the OLD overflow
+    /// pointer is also retained (uniform code path); since each node
+    /// drops as the runtime drops, the leak is bounded by the node's
+    /// dep-set-change count. Hazard-pointer reclamation lands in 0.2.1.
+    pub(crate) fn install_deps(&self, new_deps: &[NodeId]) {
+        let count = new_deps.len();
+        assert!(count <= u8::MAX as usize, "dep count exceeds u8");
+        if count <= 7 {
+            for (i, dep) in new_deps.iter().enumerate() {
+                C::u32_store_relaxed(&self.inline_deps[i], dep.0);
+            }
+            // Don't clear overflow_deps; if a previous list lived there
+            // and we shrunk below 8, for_each_dep's count check takes
+            // the inline path and ignores the stale pointer. It is
+            // reclaimed at Drop time.
+            C::u8_store_release(&self.dep_count, count as u8);
+        } else {
+            let list = Box::new(DepList {
+                deps: new_deps.to_vec().into_boxed_slice(),
+            });
+            let new_ptr = Box::into_raw(list);
+            // Release-store so concurrent readers Acquire-loading the
+            // pointer see the fully-initialized DepList.
+            self.overflow_deps.store_release(new_ptr);
+            C::u8_store_release(&self.dep_count, count as u8);
+        }
+    }
+
     /// Iterate over the node's recorded dependencies. The caller must
     /// have observed the node's state via an Acquire load (e.g., through
     /// the state machine) to synchronize with the writer of these deps.
     ///
-    /// First-cut implementation: inline-7 only. Overflow handling (more
-    /// than 7 deps) lands in the next slice with hazard-pointer
-    /// reclamation. Panics if `dep_count > 7` for now to surface the
-    /// limitation early.
+    /// Up to 7 deps live inline; beyond that, `overflow_deps` points at
+    /// a heap-allocated `DepList`. The pointer is loaded with the
+    /// strategy's Acquire ordering on `Shared` (a plain `mov` on x86).
     pub fn for_each_dep(&self, mut f: impl FnMut(NodeId)) {
         let count = C::u8_load_relaxed(&self.dep_count);
-        assert!(
-            count <= 7,
-            "incr-core: dep_count > 7 not yet supported (lands with hazard-pointer overflow path)",
-        );
-        for i in 0..(count as usize) {
-            let raw = C::u32_load_relaxed(&self.inline_deps[i]);
-            f(NodeId(raw));
+        if count <= 7 {
+            for i in 0..(count as usize) {
+                let raw = C::u32_load_relaxed(&self.inline_deps[i]);
+                f(NodeId(raw));
+            }
+        } else {
+            let ptr = self.overflow_deps.load_acquire();
+            debug_assert!(
+                !ptr.is_null(),
+                "incr-core: overflow_deps null with dep_count > 7"
+            );
+            // SAFETY: `ptr` is non-null when count > 7 by the publish
+            // invariant. The list it points at was allocated via
+            // `Box::into_raw` and either stays in this slot for the
+            // node's lifetime (single-publish case) or lives until the
+            // node drops (the leaky-replace case documented on DepList).
+            // The Acquire load synchronizes with the Release store that
+            // installed `ptr`.
+            let list: &DepList = unsafe { &*ptr };
+            for &id in list.deps.iter() {
+                f(id);
+            }
         }
     }
 
@@ -175,6 +245,22 @@ impl<C: Cells> NodeData<C> {
             C::new_u32(NodeId::SENTINEL.0),
             C::new_u32(NodeId::SENTINEL.0),
         ]
+    }
+}
+
+impl<C: Cells> Drop for NodeData<C> {
+    fn drop(&mut self) {
+        // Reclaim whichever overflow list is currently installed. Older
+        // lists that were swapped out during the node's lifetime are
+        // already lost (the leak documented on DepList).
+        let ptr = self.overflow_deps.load_relaxed();
+        if !ptr.is_null() {
+            // SAFETY: `ptr` came from `Box::into_raw` in `install_deps`.
+            // `&mut self` guarantees no concurrent access.
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
     }
 }
 
