@@ -37,8 +37,9 @@
 //! after that lifts the segmented node store. Tracking in the
 //! consolidation plan.
 
-use crate::cells::{Cells, PtrCell};
+use crate::cells::Cells;
 use crate::state::NodeState;
+use haphazard::{AtomicPtr as HzAtomicPtr, HazardPointer};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
@@ -48,18 +49,16 @@ impl NodeId {
 }
 
 /// Heap-allocated overflow dependency list. Used when a node has more
-/// than seven dependencies. Stored behind `NodeData::overflow_deps` as
-/// a raw pointer.
+/// than seven dependencies.
 ///
 /// Reclamation policy: when a node's dep set changes and the new list
-/// requires re-allocation, the OLD overflow list is leaked under
-/// `Shared` because there is no hazard-pointer machinery to ensure
-/// safe reclamation while concurrent readers may hold the pointer.
-/// `NodeData::Drop` reclaims the currently-installed list. Long-lived
-/// nodes with churning dep sets accumulate leaked lists in proportion
-/// to the number of dep-set changes that crossed the 7-element
-/// boundary. The `haphazard`-backed reclamation lands in 0.2.1; for
-/// 0.2.0-alpha the leak is documented and bounded.
+/// requires re-allocation, the OLD overflow list is retired through
+/// the `haphazard` global domain. Hazard-pointer protection in
+/// [`NodeData::for_each_dep`] guarantees concurrent readers can finish
+/// their traversal before the retired list is freed. Memory is
+/// reclaimed during normal operation (not just at runtime drop), so
+/// long-lived runtimes with churning dynamic deps no longer accumulate
+/// retired lists.
 pub struct DepList {
     pub(crate) deps: Box<[NodeId]>,
 }
@@ -68,7 +67,7 @@ pub struct DepList {
 pub struct NodeData<C: Cells> {
     pub(crate) verified_at: C::U64,
     pub(crate) changed_at: C::U64,
-    pub(crate) overflow_deps: C::Ptr<DepList>,
+    pub(crate) overflow_deps: HzAtomicPtr<DepList>,
     pub(crate) inline_deps: [C::U32; 7],
     pub(crate) arena_slot: u32,
     pub(crate) type_tag: u16,
@@ -85,7 +84,7 @@ impl<C: Cells> NodeData<C> {
         Self {
             verified_at: C::new_u64(revision),
             changed_at: C::new_u64(revision),
-            overflow_deps: <C::Ptr<DepList> as PtrCell<DepList>>::new_null(),
+            overflow_deps: unsafe { HzAtomicPtr::new(std::ptr::null_mut()) },
             inline_deps: Self::empty_inline_deps(),
             arena_slot,
             type_tag,
@@ -102,7 +101,7 @@ impl<C: Cells> NodeData<C> {
         Self {
             verified_at: C::new_u64(0),
             changed_at: C::new_u64(0),
-            overflow_deps: <C::Ptr<DepList> as PtrCell<DepList>>::new_null(),
+            overflow_deps: unsafe { HzAtomicPtr::new(std::ptr::null_mut()) },
             inline_deps: Self::empty_inline_deps(),
             arena_slot,
             type_tag,
@@ -171,53 +170,47 @@ impl<C: Cells> NodeData<C> {
     /// array; overflow path heap-allocates a `DepList` and Release-stores
     /// the pointer.
     ///
-    /// Reclamation: under `Shared`, the OLD overflow pointer (if any) is
-    /// retired through the caller-provided graveyard callback. The
-    /// callback is expected to retain the pointer until the runtime
-    /// drops, at which point all retired lists are freed.
-    ///
-    /// This is the bounded-reclamation path: memory held by retired
-    /// overflow lists grows with dep-set-change count over a runtime's
-    /// lifetime but is fully reclaimed at runtime drop, never leaked
-    /// past process scope. The true free-during-runtime path requires
-    /// hazard pointers to coordinate with concurrent readers and lands
-    /// in 0.2.1 via `haphazard`.
-    pub(crate) fn install_deps<F>(&self, new_deps: &[NodeId], mut retire: F)
-    where
-        F: FnMut(*mut DepList),
-    {
+    /// Reclamation: any displaced overflow pointer is retired through
+    /// the `haphazard` global domain. Concurrent readers in
+    /// [`Self::for_each_dep`] hold a `HazardPointer` while
+    /// dereferencing the slot, so the retired list is not freed until
+    /// every protecting reader has finished. Free-during-runtime; no
+    /// graveyard build-up; no leak past process scope.
+    pub(crate) fn install_deps(&self, new_deps: &[NodeId]) {
         let count = new_deps.len();
         assert!(count <= u8::MAX as usize, "dep count exceeds u8");
         if count <= 7 {
             for (i, dep) in new_deps.iter().enumerate() {
                 C::u32_store_relaxed(&self.inline_deps[i], dep.0);
             }
-            // Going inline: capture and retire any stale overflow ptr
-            // so for_each_dep's count<=7 path doesn't reference a list
-            // that won't be freed until the next overflow-overflow
-            // transition. (Without this, an overflow-inline transition
-            // followed by NodeData::Drop on the OWNED ptr is fine; but
-            // an overflow-inline-overflow transition would lose the
-            // first overflow list. Retiring here closes that gap.)
-            let stale = self.overflow_deps.load_relaxed();
-            if !stale.is_null() {
-                self.overflow_deps.store_release(std::ptr::null_mut());
-                retire(stale);
+            // Going inline: swap null in to displace any stale overflow
+            // pointer, then retire it. for_each_dep's count<=7 path
+            // never reads overflow_deps, but a subsequent overflow
+            // install would clobber the stale pointer without retiring
+            // it, leaking memory. Retiring here closes that gap.
+            // SAFETY: swap_ptr with a null target is safe.
+            let displaced = unsafe { self.overflow_deps.swap_ptr(std::ptr::null_mut()) };
+            if let Some(old) = displaced {
+                // SAFETY: `old` came from a Box::into_raw via a previous
+                // install_deps; it is not aliased for writes (the state
+                // machine guarantees single-writer-at-a-time on this
+                // node). Hazard pointers ensure the actual free is
+                // deferred until no reader still references this list.
+                unsafe { old.retire() };
             }
             C::u8_store_release(&self.dep_count, count as u8);
         } else {
             let list = Box::new(DepList {
                 deps: new_deps.to_vec().into_boxed_slice(),
             });
-            let new_ptr = Box::into_raw(list);
-            // Capture the old pointer (if any) for retirement, then
-            // Release-store the new one so concurrent readers
-            // Acquire-loading see the fully-initialized DepList.
-            let old = self.overflow_deps.load_relaxed();
-            self.overflow_deps.store_release(new_ptr);
+            // `swap` takes ownership of the box; the old box (if any)
+            // is wrapped in a `Replaced` whose `retire` defers free
+            // through the global hazard-pointer domain.
+            let replaced = self.overflow_deps.swap(list);
             C::u8_store_release(&self.dep_count, count as u8);
-            if !old.is_null() {
-                retire(old);
+            if let Some(old) = replaced {
+                // SAFETY: same as the inline-path retire above.
+                unsafe { old.retire() };
             }
         }
     }
@@ -227,8 +220,17 @@ impl<C: Cells> NodeData<C> {
     /// the state machine) to synchronize with the writer of these deps.
     ///
     /// Up to 7 deps live inline; beyond that, `overflow_deps` points at
-    /// a heap-allocated `DepList`. The pointer is loaded with the
-    /// strategy's Acquire ordering on `Shared` (a plain `mov` on x86).
+    /// a heap-allocated `DepList` whose load is protected by a
+    /// `HazardPointer`. A concurrent retire by an `install_deps`
+    /// writer will defer the actual free until this reader's hazard
+    /// is released.
+    ///
+    /// The dispatch is intentionally split: the inline fast path is
+    /// `#[inline]`-friendly and stays small enough to be inlined into
+    /// the caller. The cold overflow path is `#[inline(never)]` so
+    /// `HazardPointer::new` (thread_local lookup + potential allocation)
+    /// is not duplicated into every call site.
+    #[inline]
     pub fn for_each_dep(&self, mut f: impl FnMut(NodeId)) {
         let count = C::u8_load_relaxed(&self.dep_count);
         if count <= 7 {
@@ -237,22 +239,22 @@ impl<C: Cells> NodeData<C> {
                 f(NodeId(raw));
             }
         } else {
-            let ptr = self.overflow_deps.load_acquire();
-            debug_assert!(
-                !ptr.is_null(),
-                "incr-core: overflow_deps null with dep_count > 7"
-            );
-            // SAFETY: `ptr` is non-null when count > 7 by the publish
-            // invariant. The list it points at was allocated via
-            // `Box::into_raw` and either stays in this slot for the
-            // node's lifetime (single-publish case) or lives until the
-            // node drops (the leaky-replace case documented on DepList).
-            // The Acquire load synchronizes with the Release store that
-            // installed `ptr`.
-            let list: &DepList = unsafe { &*ptr };
-            for &id in list.deps.iter() {
-                f(id);
-            }
+            self.for_each_overflow_dep(&mut f);
+            return;
+        }
+    }
+
+    #[inline(never)]
+    fn for_each_overflow_dep(&self, f: &mut dyn FnMut(NodeId)) {
+        let mut hazard = HazardPointer::new();
+        // SAFETY: the AtomicPtr is populated by install_deps with
+        // Box-allocated DepLists; retirements go through the global
+        // haphazard domain so safe_load returns a reference that
+        // remains valid for the lifetime of `hazard`.
+        let list_ref: Option<&DepList> = unsafe { self.overflow_deps.load(&mut hazard) };
+        let list = list_ref.expect("overflow_deps null with dep_count > 7");
+        for &id in list.deps.iter() {
+            f(id);
         }
     }
 
@@ -271,16 +273,17 @@ impl<C: Cells> NodeData<C> {
 
 impl<C: Cells> Drop for NodeData<C> {
     fn drop(&mut self) {
-        // Reclaim whichever overflow list is currently installed. Older
-        // lists that were swapped out during the node's lifetime are
-        // already lost (the leak documented on DepList).
-        let ptr = self.overflow_deps.load_relaxed();
-        if !ptr.is_null() {
-            // SAFETY: `ptr` came from `Box::into_raw` in `install_deps`.
-            // `&mut self` guarantees no concurrent access.
-            unsafe {
-                drop(Box::from_raw(ptr));
-            }
+        // Swap null in and retire whatever was installed. The actual
+        // free is deferred through the haphazard global domain, which
+        // reclaims it the next time a domain pass detects no protecting
+        // hazard pointers. For the runtime-drop case all hazards are
+        // already gone, so reclamation is immediate.
+        // SAFETY: swap_ptr to null is safe; the displaced pointer (if
+        // any) came from install_deps's Box::into_raw and goes through
+        // haphazard's retire path.
+        let displaced = unsafe { self.overflow_deps.swap_ptr(std::ptr::null_mut()) };
+        if let Some(old) = displaced {
+            unsafe { old.retire() };
         }
     }
 }
