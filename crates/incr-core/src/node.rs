@@ -145,6 +145,26 @@ impl<C: Cells> NodeData<C> {
         C::u32_load_relaxed(&self.generation)
     }
 
+    /// Iterate over the node's recorded dependencies. The caller must
+    /// have observed the node's state via an Acquire load (e.g., through
+    /// the state machine) to synchronize with the writer of these deps.
+    ///
+    /// First-cut implementation: inline-7 only. Overflow handling (more
+    /// than 7 deps) lands in the next slice with hazard-pointer
+    /// reclamation. Panics if `dep_count > 7` for now to surface the
+    /// limitation early.
+    pub fn for_each_dep(&self, mut f: impl FnMut(NodeId)) {
+        let count = C::u8_load_relaxed(&self.dep_count);
+        assert!(
+            count <= 7,
+            "incr-core: dep_count > 7 not yet supported (lands with hazard-pointer overflow path)",
+        );
+        for i in 0..(count as usize) {
+            let raw = C::u32_load_relaxed(&self.inline_deps[i]);
+            f(NodeId(raw));
+        }
+    }
+
     fn empty_inline_deps() -> [C::U32; 7] {
         [
             C::new_u32(NodeId::SENTINEL.0),

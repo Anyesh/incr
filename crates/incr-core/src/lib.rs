@@ -18,21 +18,27 @@
 //! to a plain `mov` on x86 with no `lock` prefixes or fences.
 
 pub mod arena;
+pub mod arena_registry;
 pub mod cells;
 pub mod dep_stack;
 pub mod generic_arena;
+pub mod handle;
 pub mod locks;
 pub mod node;
+pub mod runtime;
 pub mod segmented_nodes;
 pub mod state;
 pub mod value;
 
 pub use arena::PrimitiveArena;
+pub use arena_registry::{ArenaRegistry, ErasedArena};
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use dep_stack::{DepStack, LocalDepStack, SharedDepStack};
 pub use generic_arena::GenericArena;
+pub use handle::{Incr, RuntimeId};
 pub use locks::{LocalLock, Lock};
 pub use node::{NodeData, NodeId};
+pub use runtime::Runtime;
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use state::NodeState;
 pub use value::Value;
