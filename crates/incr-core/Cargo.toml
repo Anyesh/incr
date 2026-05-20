@@ -11,3 +11,8 @@ categories = ["algorithms", "data-structures"]
 [dependencies]
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "chain"
+harness = false
