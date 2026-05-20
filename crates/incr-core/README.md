@@ -51,6 +51,16 @@ The segmented node store supports up to 1M nodes per runtime (1024 segments × 1
 - **Overflow-dep reclamation**: when a node's dep set crosses the 7-element boundary multiple times during its lifetime, displaced overflow lists are retired to a per-runtime graveyard and reclaimed at runtime drop. Memory held by retired lists is bounded by the total dep-set-change count over the runtime's lifetime; nothing leaks past runtime drop. Free-during-runtime reclamation via hazard pointers ([`haphazard`](https://crates.io/crates/haphazard)) is queued for 0.2.1; it would tighten the bound for very long-lived runtimes with churning dynamic deps.
 - **`get_traced` per-node trace**: records compute, verified-clean, and cutoff events for the current `get` call's compute path. Cross-thread events are not aggregated.
 
+## Soundness
+
+All unsafe code in this crate (segmented node store's `UnsafeCell + MaybeUninit` slots, `NodeData::Drop`'s `Box::from_raw` reclamation, `ArenaRegistry`'s `Arc` downcast via raw-pointer rewrap, the graveyard's deferred reclamation, the `SharedDepStack` thread-local) is exercised under `cargo +nightly miri test -p incr-core --lib`. 79 unit tests pass under miri including:
+
+- 50 dynamic dep-set transitions through the overflow path with runtime drop (`local_dynamic_overflow_deps_retirement`)
+- 16 threads × 200 rounds racing on the state machine's `try_claim_compute` CAS (`shared_concurrent_claim_one_winner`)
+- Cross-segment growth on the segmented node store with reference validity preserved across pushes
+
+No undefined behavior detected.
+
 ## Stability
 
 `0.2.x` is the consolidation milestone. The `Runtime<C>` and `Cells` API is intentionally usable but minimal; user-facing API stability commitments live on the wrapper crates.
