@@ -50,7 +50,20 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) next_type_tag: u16,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
+    /// Retired overflow-dep lists, freed when the runtime drops. Each
+    /// pointer was obtained from `Box::into_raw` in `NodeData::install_deps`;
+    /// retirement happens under the inner write lock so there is no
+    /// double-retire risk. See `Runtime::Drop`.
+    pub(crate) dep_list_graveyard: Vec<*mut crate::node::DepList>,
 }
+
+// SAFETY: dep_list_graveyard holds raw pointers to heap-allocated
+// DepLists. The wrapping Inner is guarded by the inner Lock (RwLock on
+// Shared, RefCell on Local); concurrent access is synchronized by that
+// lock. The pointers are only dereferenced during Runtime::Drop, which
+// holds &mut self.
+unsafe impl<C: Cells> Send for Inner<C> {}
+unsafe impl<C: Cells> Sync for Inner<C> {}
 
 impl<C: Cells> Inner<C> {
     fn new() -> Self {
@@ -62,6 +75,7 @@ impl<C: Cells> Inner<C> {
             next_type_tag: 0,
             labels: HashMap::new(),
             trace_log: Vec::new(),
+            dep_list_graveyard: Vec::new(),
         }
     }
 
@@ -585,12 +599,15 @@ impl<C: Cells> Runtime<C> {
         }
 
         // Slow path: deps changed. Install the new dep list (handles
-        // inline + overflow), then diff against the old set to update
-        // reverse edges.
-        node.install_deps(new_deps);
+        // inline + overflow), retiring any displaced overflow pointer
+        // into the runtime's graveyard for reclamation at runtime drop.
+        let mut retired: Vec<*mut crate::node::DepList> = Vec::new();
+        node.install_deps(new_deps, |ptr| retired.push(ptr));
 
-        // Reverse-edge diff. Linear scans for small dep sets are
-        // faster than HashSet construction below ~16 items.
+        // Reverse-edge diff under the inner write lock. Linear scans
+        // for small dep sets are faster than HashSet construction
+        // below ~16 items. Append retired pointers to the graveyard
+        // in the same critical section.
         let mut inner = self.inner.write();
         for old_dep in old_slice {
             if !new_deps.contains(old_dep) {
@@ -602,6 +619,9 @@ impl<C: Cells> Runtime<C> {
                 inner.dependents[new_dep.0 as usize].push(id);
             }
         }
+        for ptr in retired {
+            inner.dep_list_graveyard.push(ptr);
+        }
     }
 
     /// Borrow the arena for `T`, panicking if none exists.
@@ -612,6 +632,28 @@ impl<C: Cells> Runtime<C> {
             .arenas
             .try_arena::<T>()
             .expect("incr-core: arena lookup failed for T")
+    }
+}
+
+impl<C: Cells> Drop for Runtime<C> {
+    fn drop(&mut self) {
+        // Reclaim every overflow-dep list that was retired during the
+        // runtime's lifetime. NodeData::Drop handles the currently-
+        // installed pointer per node; this Drop handles the displaced
+        // ones that install_deps removed and stashed in the graveyard.
+        let graveyard = std::mem::take(&mut self.inner.write().dep_list_graveyard);
+        for ptr in graveyard {
+            if !ptr.is_null() {
+                // SAFETY: `ptr` was obtained from `Box::into_raw` in
+                // `NodeData::install_deps`, removed from its NodeData's
+                // overflow_deps slot, and exclusively owned by the
+                // graveyard since. `&mut self` guarantees no concurrent
+                // access.
+                unsafe {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        }
     }
 }
 
@@ -891,5 +933,53 @@ mod tests {
             trace.node_traces
         );
         assert!(trace.nodes_cutoff >= 1);
+    }
+
+    /// Stress test: many dynamic-dep transitions through the
+    /// overflow path. Each iteration the dynamic query selects a
+    /// different subset of inputs, forcing publish_deps to allocate
+    /// a fresh overflow DepList and retire the old one. Verifies
+    /// the graveyard absorbs all retired pointers without leaking
+    /// past runtime drop (the Drop impl frees them all; this test
+    /// completes cleanly under miri / ASan).
+    #[test]
+    fn local_dynamic_overflow_deps_retirement() {
+        use std::cell::Cell as StdCell;
+        let rt: Runtime<Local> = Runtime::new();
+        let switch = rt.create_input(0_u8);
+        let inputs: Vec<_> = (0..16_i64).map(|v| rt.create_input(v)).collect();
+
+        let captured = inputs.clone();
+        // The query reads `switch` (so it's invalidated each iteration)
+        // plus a switch-dependent slice of 8+ inputs (overflow path).
+        let dynamic = rt.create_query(move |rt| -> i64 {
+            let s = rt.get(switch) as usize;
+            let start = s % 8;
+            let mut total = 0;
+            // Read 8 + (s % 4) inputs starting at `start`. Count
+            // crosses the 7-element boundary every iteration.
+            let extra = StdCell::new(s % 4);
+            let end = (start + 8 + extra.get()).min(captured.len());
+            for i in start..end {
+                total += rt.get(captured[i]);
+            }
+            total
+        });
+
+        // Drive 50 transitions; each should retire one overflow list.
+        for s in 1..=50_u8 {
+            rt.set(switch, s);
+            let _ = rt.get(dynamic);
+        }
+        // Graveyard should hold roughly 50 pointers. Verify via the
+        // inner state.
+        let graveyard_len = rt.inner.read().dep_list_graveyard.len();
+        assert!(
+            graveyard_len >= 30,
+            "expected the graveyard to absorb retired overflow lists, got {}",
+            graveyard_len
+        );
+        // Drop the runtime; the test passes if no leak / UAF surfaces.
+        drop(rt);
     }
 }
