@@ -48,6 +48,7 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) arenas: ArenaRegistry<C>,
     pub(crate) type_tags: HashMap<TypeId, u16>,
     pub(crate) next_type_tag: u16,
+    pub(crate) labels: HashMap<u32, String>,
 }
 
 impl<C: Cells> Inner<C> {
@@ -58,6 +59,7 @@ impl<C: Cells> Inner<C> {
             arenas: ArenaRegistry::new(),
             type_tags: HashMap::new(),
             next_type_tag: 0,
+            labels: HashMap::new(),
         }
     }
 
@@ -225,6 +227,79 @@ impl<C: Cells> Runtime<C> {
         };
         let node = self.nodes.get(slot);
         arena.read(node.arena_slot())
+    }
+
+    /// Read the current value and return a propagation trace alongside.
+    ///
+    /// Per-node `node_traces` are not yet populated; only `target`,
+    /// `total_nodes`, and `elapsed_ns` carry real data. Full tracing
+    /// lands alongside the dashboard demo work.
+    pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
+        let start = std::time::Instant::now();
+        let value = self.get(handle);
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        let trace = crate::trace::PropagationTrace {
+            target: NodeId(handle.slot()),
+            node_traces: Vec::new(),
+            total_nodes: self.node_count(),
+            nodes_recomputed: 0,
+            nodes_cutoff: 0,
+            elapsed_ns,
+        };
+        (value, trace)
+    }
+
+    /// Number of nodes in the runtime.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len() as usize
+    }
+
+    /// Assign a human-readable label to a node slot. Surfaces in
+    /// `graph_snapshot()` and trace output. Re-assigning replaces.
+    pub fn set_label(&self, slot: u32, label: String) {
+        self.inner.write().labels.insert(slot, label);
+    }
+
+    /// Retrieve the label for a node slot, if any.
+    pub fn label(&self, slot: u32) -> Option<String> {
+        self.inner.read().labels.get(&slot).cloned()
+    }
+
+    /// Structural snapshot of every node. Returns `NodeInfo` with each
+    /// node's dependencies (read from inline-7 storage) and dependents
+    /// (read from the inner state).
+    pub fn graph_snapshot(&self) -> Vec<crate::trace::NodeInfo> {
+        use crate::trace::{NodeInfo, NodeKindInfo};
+        let inner = self.inner.read();
+        let count = self.nodes.len();
+        let mut out = Vec::with_capacity(count as usize);
+        for slot in 0..count {
+            let node = self.nodes.get(slot);
+            let kind = if inner
+                .compute_fns
+                .get(slot as usize)
+                .is_some_and(|f| f.is_some())
+            {
+                NodeKindInfo::Compute
+            } else {
+                NodeKindInfo::Input
+            };
+            let mut dependencies = Vec::new();
+            node.for_each_dep(|d| dependencies.push(d));
+            let dependents = inner
+                .dependents
+                .get(slot as usize)
+                .cloned()
+                .unwrap_or_default();
+            out.push(NodeInfo {
+                id: NodeId(slot),
+                kind,
+                label: inner.labels.get(&slot).cloned(),
+                dependencies,
+                dependents,
+            });
+        }
+        out
     }
 
     /// Set a new value on an input node. Bumps revision and marks all

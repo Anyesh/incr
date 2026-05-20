@@ -30,6 +30,7 @@ pub mod runtime;
 pub mod segmented_nodes;
 pub mod sorted_collection;
 pub mod state;
+pub mod trace;
 pub mod value;
 
 pub use arena::PrimitiveArena;
@@ -45,4 +46,5 @@ pub use runtime::Runtime;
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
+pub use trace::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction};
 pub use value::Value;

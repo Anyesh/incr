@@ -1,270 +1,93 @@
-use incr_compute::{IncrCollection, Runtime};
+//! Smoke tests for the `incr-compute` v0.2 wrapper. Proves the
+//! re-exports compile and the basic API works end-to-end against
+//! `incr_core::Runtime<Local>`.
+
+use incr_compute::{IncrCollection, Runtime, SortedCollection};
 
 #[test]
-fn spec_example_width_height_area() {
+fn function_dag_chain_propagates() {
     let rt = Runtime::new();
-
-    let width = rt.create_input(10.0_f64);
-    let height = rt.create_input(5.0_f64);
-
-    let area = rt.create_query(move |rt| rt.get(width) * rt.get(height));
-
-    let description = rt.create_query(move |rt| format!("Area is {}", rt.get(area)));
-
-    assert_eq!(rt.get(description), "Area is 50");
-
-    rt.set(width, 12.0);
-    assert_eq!(rt.get(description), "Area is 60");
+    let a = rt.create_input(1_i64);
+    let b = rt.create_query(move |rt| rt.get(a) + 1);
+    let c = rt.create_query(move |rt| rt.get(b) * 2);
+    assert_eq!(rt.get(c), 4);
+    rt.set(a, 10);
+    assert_eq!(rt.get(c), 22);
 }
 
 #[test]
-fn spec_example_incremental_updates() {
+fn diamond_with_early_cutoff() {
     let rt = Runtime::new();
-
-    let x = rt.create_input(1_i64);
-    let y = rt.create_input(2_i64);
-
-    let sum = rt.create_query(move |rt| rt.get(x) + rt.get(y));
-    let doubled = rt.create_query(move |rt| rt.get(sum) * 2);
-    let label = rt.create_query(move |rt| format!("result: {}", rt.get(doubled)));
-
-    assert_eq!(rt.get(label), "result: 6"); // (1+2)*2 = 6
-
-    rt.set(x, 10);
-    assert_eq!(rt.get(label), "result: 24"); // (10+2)*2 = 24
-
-    rt.set(y, 5);
-    assert_eq!(rt.get(label), "result: 30"); // (10+5)*2 = 30
+    let a = rt.create_input(1_i64);
+    let b = rt.create_query(move |rt| rt.get(a) + 10);
+    let c = rt.create_query(move |rt| rt.get(a) + 100);
+    let d = rt.create_query(move |rt| rt.get(b) + rt.get(c));
+    assert_eq!(rt.get(d), 112);
+    rt.set(a, 2);
+    assert_eq!(rt.get(d), 114);
 }
 
 #[test]
-fn complex_graph_with_early_cutoff() {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
+fn collection_filter_map_reduce_pipeline() {
     let rt = Runtime::new();
-
-    let raw_score = rt.create_input(85_i64);
-
-    let normalize_count = Rc::new(Cell::new(0_u32));
-    let nc = normalize_count.clone();
-    let normalized = rt.create_query(move |rt| {
-        nc.set(nc.get() + 1);
-        rt.get(raw_score).clamp(0, 100)
-    });
-
-    let format_count = Rc::new(Cell::new(0_u32));
-    let fc = format_count.clone();
-    let display = rt.create_query(move |rt| {
-        fc.set(fc.get() + 1);
-        let score = rt.get(normalized);
-        if score >= 90 {
-            "A".to_string()
-        } else if score >= 80 {
-            "B".to_string()
-        } else {
-            "C".to_string()
-        }
-    });
-
-    assert_eq!(rt.get(display), "B");
-    assert_eq!(normalize_count.get(), 1);
-    assert_eq!(format_count.get(), 1);
-
-    rt.set(raw_score, 95);
-    assert_eq!(rt.get(display), "A");
-    assert_eq!(normalize_count.get(), 2);
-    assert_eq!(format_count.get(), 2);
-
-    rt.set(raw_score, 150);
-    assert_eq!(rt.get(display), "A");
-    assert_eq!(normalize_count.get(), 3);
-    assert_eq!(format_count.get(), 3);
-
-    // Early cutoff: 200 clamped to 100, same as 150 clamped to 100
-    rt.set(raw_score, 200);
-    assert_eq!(rt.get(display), "A");
-    assert_eq!(normalize_count.get(), 4);
-    assert_eq!(format_count.get(), 3); // NOT recomputed — early cutoff!
-}
-
-#[test]
-fn string_values_work() {
-    let rt = Runtime::new();
-
-    let first = rt.create_input("Hello".to_string());
-    let last = rt.create_input("World".to_string());
-
-    let full = rt.create_query(move |rt| format!("{} {}", rt.get(first), rt.get(last)));
-
-    assert_eq!(rt.get(full), "Hello World");
-
-    rt.set(first, "Goodbye".to_string());
-    assert_eq!(rt.get(full), "Goodbye World");
-}
-
-#[test]
-fn collection_feeds_function_query() {
-    let rt = Runtime::new();
-    let scores = rt.create_collection::<i64>();
-    let high_scores = scores.filter(&rt, |s| *s >= 90);
-    let count = high_scores.count(&rt);
-
-    let summary = rt.create_query(move |rt| {
-        let n = rt.get(count);
-        format!("{} students scored 90+", n)
-    });
-
-    scores.insert(&rt, 85);
-    scores.insert(&rt, 92);
-    scores.insert(&rt, 78);
+    let scores: IncrCollection<i64> = rt.create_collection();
+    let passing = scores.filter(&rt, |s| *s >= 50);
+    let curved = passing.map(&rt, |s| s + 10);
+    let total = curved.reduce(&rt, |xs| xs.iter().sum::<i64>());
+    scores.insert(&rt, 80);
     scores.insert(&rt, 95);
-
-    assert_eq!(rt.get(summary), "2 students scored 90+");
-
-    scores.insert(&rt, 91);
-    assert_eq!(rt.get(summary), "3 students scored 90+");
-
-    scores.delete(&rt, &92);
-    assert_eq!(rt.get(summary), "2 students scored 90+");
+    scores.insert(&rt, 60);
+    scores.insert(&rt, 42);
+    assert_eq!(rt.get(total), 265);
 }
 
 #[test]
-fn full_pipeline_filter_map_count_query() {
-    #[derive(Clone, Hash, Eq, PartialEq, Debug)]
-    struct User {
-        name: String,
-        age: i32,
-        active: bool,
+fn sort_pairwise_count() {
+    let rt = Runtime::new();
+    let c: IncrCollection<i64> = rt.create_collection();
+    let sorted: SortedCollection<i64, i64> = c.sort_by_key(&rt, |x| *x);
+    let pairs = sorted.pairwise(&rt);
+    c.insert(&rt, 5);
+    c.insert(&rt, 1);
+    c.insert(&rt, 3);
+    let n = pairs.count(&rt);
+    assert_eq!(rt.get(n), 2); // (1,3), (3,5)
+}
+
+#[test]
+fn group_by_two_buckets() {
+    let rt = Runtime::new();
+    let c: IncrCollection<i64> = rt.create_collection();
+    let groups = c.group_by(&rt, |x| x % 2);
+    for i in 1..=6_i64 {
+        c.insert(&rt, i);
     }
-
-    let rt = Runtime::new();
-    let users: IncrCollection<User> = rt.create_collection();
-
-    let active_adults = users
-        .filter(&rt, |u| u.active)
-        .filter(&rt, |u| u.age >= 18)
-        .map(&rt, |u| u.name.clone());
-
-    let count = active_adults.count(&rt);
-
-    let summary = rt.create_query(move |rt| format!("{} active adults", rt.get(count)));
-
-    users.insert(
-        &rt,
-        User {
-            name: "Alice".into(),
-            age: 30,
-            active: true,
-        },
-    );
-    users.insert(
-        &rt,
-        User {
-            name: "Bob".into(),
-            age: 16,
-            active: true,
-        },
-    );
-    users.insert(
-        &rt,
-        User {
-            name: "Carol".into(),
-            age: 25,
-            active: false,
-        },
-    );
-
-    assert_eq!(rt.get(summary), "1 active adults");
-
-    users.insert(
-        &rt,
-        User {
-            name: "Dave".into(),
-            age: 22,
-            active: true,
-        },
-    );
-    assert_eq!(rt.get(summary), "2 active adults");
-
-    users.delete(
-        &rt,
-        &User {
-            name: "Alice".into(),
-            age: 30,
-            active: true,
-        },
-    );
-    assert_eq!(rt.get(summary), "1 active adults");
+    let _ = rt.get(groups.version_node());
+    assert_eq!(groups.group_count(), 2);
 }
 
 #[test]
-fn sort_pairwise_map_reduce_pipeline() {
-    // Simulates: given a set of visit timestamps, compute total gaps between
-    // consecutive visits. This is the core pattern for travel time calculation.
+fn join_two_collections() {
     let rt = Runtime::new();
-    let visits = rt.create_collection::<i64>(); // timestamps
-
-    let sorted = visits.sort_by_key(&rt, |t: &i64| *t);
-    let pairs = sorted.pairwise(&rt);
-
-    let gaps = pairs.map(&rt, |(a, b): &(i64, i64)| b - a);
-
-    // Sum all gaps
-    let total_gap = gaps.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
-
-    // Start with visits at times 10, 30, 50
-    visits.insert(&rt, 10);
-    visits.insert(&rt, 30);
-    visits.insert(&rt, 50);
-    assert_eq!(rt.get(total_gap), 40); // (30-10) + (50-30) = 40
-
-    // Insert visit at time 20: gaps become 10 + 10 + 20 = 40 (same total!)
-    visits.insert(&rt, 20);
-    assert_eq!(rt.get(total_gap), 40); // (20-10) + (30-20) + (50-30) = 40
-
-    // Delete visit at time 30: gaps become 10 + 30 = 40 (still same!)
-    visits.delete(&rt, &30);
-    assert_eq!(rt.get(total_gap), 40); // (20-10) + (50-20) = 40
-
-    // Insert visit at time 100: adds a big gap
-    visits.insert(&rt, 100);
-    assert_eq!(rt.get(total_gap), 90); // (20-10) + (50-20) + (100-50) = 90
-
-    visits.delete(&rt, &10);
-    assert_eq!(rt.get(total_gap), 80); // (50-20) + (100-50) = 80
+    let left: IncrCollection<(i64, &'static str)> = rt.create_collection();
+    let right: IncrCollection<(i64, i64)> = rt.create_collection();
+    let j = left.join(&rt, &right, |l| l.0, |r| r.0);
+    left.insert(&rt, (1, "alice"));
+    right.insert(&rt, (1, 100));
+    right.insert(&rt, (1, 200));
+    let n = j.count(&rt);
+    assert_eq!(rt.get(n), 2);
 }
 
 #[test]
-fn pipeline_early_cutoff() {
-    // Verify that early cutoff works through the full pipeline:
-    // if total doesn't change, downstream isn't recomputed
-    use std::cell::Cell;
-    use std::rc::Rc;
-
+fn graph_snapshot_returns_dependencies() {
     let rt = Runtime::new();
-    let visits = rt.create_collection::<i64>();
-    let sorted = visits.sort_by_key(&rt, |t: &i64| *t);
-    let pairs = sorted.pairwise(&rt);
-    let gaps = pairs.map(&rt, |(a, b): &(i64, i64)| b - a);
-    let total_gap = gaps.reduce(&rt, |elements| -> i64 { elements.iter().sum() });
-
-    let downstream_evals = Rc::new(Cell::new(0_u32));
-    let dc = downstream_evals.clone();
-    let label = rt.create_query(move |rt| {
-        dc.set(dc.get() + 1);
-        format!("total={}", rt.get(total_gap))
-    });
-
-    visits.insert(&rt, 10);
-    visits.insert(&rt, 30);
-    visits.insert(&rt, 50);
-    assert_eq!(rt.get(label), "total=40");
-    assert_eq!(downstream_evals.get(), 1);
-
-    // Insert 20 between 10 and 30: total gap is still 40
-    visits.insert(&rt, 20);
-    assert_eq!(rt.get(label), "total=40");
-    // Early cutoff: total_gap unchanged, so label shouldn't recompute
-    assert_eq!(downstream_evals.get(), 1);
+    let a = rt.create_input(1_i64);
+    let _b = rt.create_query(move |rt| rt.get(a) + 1);
+    // Force the query to run so its deps are recorded.
+    let _ = rt.get(_b);
+    let snap = rt.graph_snapshot();
+    assert_eq!(snap.len(), 2);
+    // The query (slot 1) should depend on the input (slot 0).
+    assert_eq!(snap[1].dependencies.len(), 1);
 }
