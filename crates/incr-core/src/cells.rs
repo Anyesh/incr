@@ -17,7 +17,7 @@
 //! ownership granted by the state machine.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 /// Strategy trait selecting the synchronization primitives used by every
 /// cell in the engine. Implemented by [`Local`] and [`Shared`].
@@ -25,11 +25,24 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 /// `'static` so cell types can be embedded in trait-object closures
 /// without lifetime gymnastics. `Sized` to allow associated-type
 /// constructors.
+/// Pointer cell trait. Implemented by `Cell<*mut T>` (Local) and
+/// `AtomicPtr<T>` (Shared). Used by the segmented node store and the
+/// overflow dep storage.
+pub trait PtrCell<T: 'static>: 'static {
+    fn new_null() -> Self;
+    fn new(p: *mut T) -> Self;
+    fn load_acquire(&self) -> *mut T;
+    fn store_release(&self, p: *mut T);
+    fn load_relaxed(&self) -> *mut T;
+    fn store_relaxed(&self, p: *mut T);
+}
+
 pub trait Cells: 'static + Sized {
     type U8;
     type U32;
     type U64;
     type State;
+    type Ptr<T: 'static>: PtrCell<T>;
 
     fn new_u8(v: u8) -> Self::U8;
     fn new_u32(v: u32) -> Self::U32;
@@ -54,6 +67,64 @@ pub trait Cells: 'static + Sized {
     fn state_try_transition(c: &Self::State, expected: u8, new: u8) -> Result<(), u8>;
 }
 
+/// Local pointer cell. Wraps `Cell<*mut T>`; not `Sync` (which is the
+/// correct property under the Local strategy).
+pub struct LocalPtrCell<T: 'static>(Cell<*mut T>);
+
+impl<T: 'static> PtrCell<T> for LocalPtrCell<T> {
+    #[inline(always)]
+    fn new_null() -> Self {
+        Self(Cell::new(std::ptr::null_mut()))
+    }
+    #[inline(always)]
+    fn new(p: *mut T) -> Self {
+        Self(Cell::new(p))
+    }
+    #[inline(always)]
+    fn load_acquire(&self) -> *mut T {
+        self.0.get()
+    }
+    #[inline(always)]
+    fn store_release(&self, p: *mut T) {
+        self.0.set(p);
+    }
+    #[inline(always)]
+    fn load_relaxed(&self) -> *mut T {
+        self.0.get()
+    }
+    #[inline(always)]
+    fn store_relaxed(&self, p: *mut T) {
+        self.0.set(p);
+    }
+}
+
+impl<T: 'static> PtrCell<T> for AtomicPtr<T> {
+    #[inline(always)]
+    fn new_null() -> Self {
+        AtomicPtr::new(std::ptr::null_mut())
+    }
+    #[inline(always)]
+    fn new(p: *mut T) -> Self {
+        AtomicPtr::new(p)
+    }
+    #[inline(always)]
+    fn load_acquire(&self) -> *mut T {
+        self.load(Ordering::Acquire)
+    }
+    #[inline(always)]
+    fn store_release(&self, p: *mut T) {
+        self.store(p, Ordering::Release);
+    }
+    #[inline(always)]
+    fn load_relaxed(&self) -> *mut T {
+        self.load(Ordering::Relaxed)
+    }
+    #[inline(always)]
+    fn store_relaxed(&self, p: *mut T) {
+        self.store(p, Ordering::Relaxed);
+    }
+}
+
 /// Single-threaded strategy. Backs every cell with `std::cell::Cell`.
 /// The resulting types are `!Sync` and the runtime built on top of
 /// `Local` is `!Send + !Sync` by composition.
@@ -69,6 +140,7 @@ impl Cells for Local {
     type U32 = Cell<u32>;
     type U64 = Cell<u64>;
     type State = Cell<u8>;
+    type Ptr<T: 'static> = LocalPtrCell<T>;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -155,6 +227,7 @@ impl Cells for Shared {
     type U32 = AtomicU32;
     type U64 = AtomicU64;
     type State = AtomicU8;
+    type Ptr<T: 'static> = AtomicPtr<T>;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
