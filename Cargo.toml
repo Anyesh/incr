@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/incr-compute", "crates/incr-concurrent", "crates/incr-core", "crates/incr-python", "crates/incr-concurrent-python", "examples/concurrent-server", "examples/spreadsheet"]
+members = ["crates/incr-compute", "crates/incr-concurrent", "crates/incr-core", "examples/concurrent-server", "examples/spreadsheet"]
+# Python bindings need to be re-implemented against the v0.2 incr-core API.
+# Tracked for 0.3.0; excluded from the workspace until then so cargo build
+# stays green.
+exclude = ["crates/incr-python", "crates/incr-concurrent-python"]
