@@ -28,6 +28,7 @@ pub mod locks;
 pub mod node;
 pub mod runtime;
 pub mod segmented_nodes;
+pub mod sorted_collection;
 pub mod state;
 pub mod value;
 
@@ -42,5 +43,6 @@ pub use locks::{LocalLock, Lock};
 pub use node::{NodeData, NodeId};
 pub use runtime::Runtime;
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
+pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
 pub use value::Value;
