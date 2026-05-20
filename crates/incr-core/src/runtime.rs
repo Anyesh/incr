@@ -401,30 +401,57 @@ impl<C: Cells> Runtime<C> {
         state::store::<C>(node.state_cell(), NodeState::Clean);
     }
 
-    /// Record dependencies on the node. First-compute path: install via
-    /// inline-7 + overflow ptr; record reverse edges in the inner map.
-    /// Recompute path with changed dep set: same shape for now (the
-    /// hazard-pointer-reclaimed swap lands next).
-    fn publish_deps(&self, id: NodeId, deps: &[NodeId]) {
+    /// Record dependencies on the node and update reverse edges in the
+    /// inner state. Diffs old vs new deps so static-dep queries (the
+    /// common case) skip the inner.write() acquire and the dependents
+    /// vector edits on recompute.
+    ///
+    /// Invariant: `new_deps.len() <= 7`. Overflow handling lands with
+    /// the hazard-pointer reclamation slice.
+    fn publish_deps(&self, id: NodeId, new_deps: &[NodeId]) {
         let node = self.nodes.get(id.0);
-        // For the first cut we only support up-to-7 inline deps via
-        // direct field stores. Overflow handling lands in the next commit.
         assert!(
-            deps.len() <= 7,
+            new_deps.len() <= 7,
             "incr-core: more than 7 deps not yet supported (lands with hazard-pointer overflow path)",
         );
 
-        // Store inline.
-        for (i, dep) in deps.iter().enumerate() {
+        // Read old deps before overwriting (the comparison uses the same
+        // backing storage we're about to write into, so we MUST collect
+        // first).
+        let old_count = C::u8_load_relaxed(&node.dep_count) as usize;
+        let mut old_deps: [NodeId; 7] = [NodeId(0); 7];
+        for i in 0..old_count {
+            old_deps[i] = NodeId(C::u32_load_relaxed(&node.inline_deps[i]));
+        }
+        let old_slice = &old_deps[..old_count];
+
+        // Fast path: static deps. The common case for both inputs and
+        // long-lived queries is that the dep set does not change between
+        // computes. Skip every write if we detect equality.
+        if old_slice.len() == new_deps.len()
+            && old_slice.iter().zip(new_deps.iter()).all(|(a, b)| a == b)
+        {
+            return;
+        }
+
+        // Slow path: deps changed. Store the new dep list inline, then
+        // diff against the old set to update reverse edges.
+        for (i, dep) in new_deps.iter().enumerate() {
             C::u32_store_relaxed(&node.inline_deps[i], dep.0);
         }
-        C::u8_store_release(&node.dep_count, deps.len() as u8);
+        C::u8_store_release(&node.dep_count, new_deps.len() as u8);
 
-        // Add reverse edges: for each dep, append self to dep's dependents.
-        if !deps.is_empty() {
-            let mut inner = self.inner.write();
-            for dep in deps {
-                inner.dependents[dep.0 as usize].push(id);
+        // Diff. For small dep sets we use linear scans; this is faster
+        // than HashSet construction below ~16 items.
+        let mut inner = self.inner.write();
+        for old_dep in old_slice {
+            if !new_deps.contains(old_dep) {
+                inner.dependents[old_dep.0 as usize].retain(|&d| d != id);
+            }
+        }
+        for new_dep in new_deps {
+            if !old_slice.contains(new_dep) {
+                inner.dependents[new_dep.0 as usize].push(id);
             }
         }
     }
