@@ -20,6 +20,7 @@
 pub mod arena;
 pub mod arena_registry;
 pub mod cells;
+pub mod collection;
 pub mod dep_stack;
 pub mod generic_arena;
 pub mod handle;
@@ -33,6 +34,7 @@ pub mod value;
 pub use arena::PrimitiveArena;
 pub use arena_registry::{ArenaRegistry, ErasedArena};
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
+pub use collection::{CollectionLog, Delta, IncrCollection};
 pub use dep_stack::{DepStack, LocalDepStack, SharedDepStack};
 pub use generic_arena::GenericArena;
 pub use handle::{Incr, RuntimeId};
