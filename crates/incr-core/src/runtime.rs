@@ -506,24 +506,18 @@ impl<C: Cells> Runtime<C> {
     /// common case) skip the inner.write() acquire and the dependents
     /// vector edits on recompute.
     ///
-    /// Invariant: `new_deps.len() <= 7`. Overflow handling lands with
-    /// the hazard-pointer reclamation slice.
+    /// Up to 7 deps live inline; beyond that, they live in a heap-allocated
+    /// `DepList`. Old overflow lists are leaked under `Shared` (no
+    /// hazard pointers yet); `NodeData::Drop` reclaims the final one.
     fn publish_deps(&self, id: NodeId, new_deps: &[NodeId]) {
         let node = self.nodes.get(id.0);
-        assert!(
-            new_deps.len() <= 7,
-            "incr-core: more than 7 deps not yet supported (lands with hazard-pointer overflow path)",
-        );
 
         // Read old deps before overwriting (the comparison uses the same
         // backing storage we're about to write into, so we MUST collect
-        // first).
-        let old_count = C::u8_load_relaxed(&node.dep_count) as usize;
-        let mut old_deps: [NodeId; 7] = [NodeId(0); 7];
-        for i in 0..old_count {
-            old_deps[i] = NodeId(C::u32_load_relaxed(&node.inline_deps[i]));
-        }
-        let old_slice = &old_deps[..old_count];
+        // first). Uses for_each_dep which handles inline and overflow.
+        let mut old_deps: Vec<NodeId> = Vec::with_capacity(8);
+        node.for_each_dep(|d| old_deps.push(d));
+        let old_slice = old_deps.as_slice();
 
         // Fast path: static deps. The common case for both inputs and
         // long-lived queries is that the dep set does not change between
@@ -534,15 +528,13 @@ impl<C: Cells> Runtime<C> {
             return;
         }
 
-        // Slow path: deps changed. Store the new dep list inline, then
-        // diff against the old set to update reverse edges.
-        for (i, dep) in new_deps.iter().enumerate() {
-            C::u32_store_relaxed(&node.inline_deps[i], dep.0);
-        }
-        C::u8_store_release(&node.dep_count, new_deps.len() as u8);
+        // Slow path: deps changed. Install the new dep list (handles
+        // inline + overflow), then diff against the old set to update
+        // reverse edges.
+        node.install_deps(new_deps);
 
-        // Diff. For small dep sets we use linear scans; this is faster
-        // than HashSet construction below ~16 items.
+        // Reverse-edge diff. Linear scans for small dep sets are
+        // faster than HashSet construction below ~16 items.
         let mut inner = self.inner.write();
         for old_dep in old_slice {
             if !new_deps.contains(old_dep) {
@@ -732,5 +724,46 @@ mod tests {
         rt.set(a, 300);
         assert_eq!(rt.get(c), 101);
         assert_eq!(c_count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn local_query_with_more_than_seven_deps() {
+        // Exercises the overflow path on NodeData::install_deps and
+        // for_each_dep.
+        let rt: Runtime<Local> = Runtime::new();
+        let inputs: Vec<_> = (0..12_i64).map(|v| rt.create_input(v)).collect();
+        let captured = inputs.clone();
+        let sum = rt.create_query(move |rt| {
+            let mut total = 0_i64;
+            for i in &captured {
+                total += rt.get(*i);
+            }
+            total
+        });
+        // 0+1+2+...+11 = 66
+        assert_eq!(rt.get(sum), 66);
+        // Mutate one input and verify it propagates.
+        rt.set(inputs[5], 100);
+        // 0+1+2+3+4+100+6+7+8+9+10+11 = 161
+        assert_eq!(rt.get(sum), 161);
+    }
+
+    #[test]
+    fn shared_query_with_more_than_seven_deps() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let inputs: Vec<_> = (0..15_i64).map(|v| rt.create_input(v)).collect();
+        let captured = inputs.clone();
+        let sum = rt.create_query(move |rt| {
+            let mut total = 0_i64;
+            for i in &captured {
+                total += rt.get(*i);
+            }
+            total
+        });
+        // sum 0..15 = 105
+        assert_eq!(rt.get(sum), 105);
+        rt.set(inputs[10], 1000);
+        // 0+1+...+9 + 1000 + 11+12+13+14 = 45 + 1000 + 50 = 1095
+        assert_eq!(rt.get(sum), 1095);
     }
 }
