@@ -19,12 +19,16 @@
 
 pub mod arena;
 pub mod cells;
+pub mod generic_arena;
 pub mod node;
 pub mod segmented_nodes;
 pub mod state;
+pub mod value;
 
 pub use arena::PrimitiveArena;
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
+pub use generic_arena::GenericArena;
 pub use node::{NodeData, NodeId};
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use state::NodeState;
+pub use value::Value;
