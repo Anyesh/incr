@@ -335,18 +335,36 @@ where
         }
     }
 
-    /// Count: number of live elements as an `Incr<u64>`.
+    /// Count: number of live elements as an `Incr<u64>`. Maintains a
+    /// running tally incrementally from upstream deltas; O(new deltas)
+    /// per get rather than O(N) sum over the multiset.
     pub fn count(&self, rt: &Runtime<C>) -> Incr<u64> {
-        let log = Arc::clone(&self.log);
+        use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering as MemOrdering};
+
+        let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
+        let last_idx = Arc::new(AtomicUsize::new(0));
+        // Use signed running count so a stray Delete-of-absent that
+        // somehow leaks through doesn't underflow. Cast to u64 on read.
+        let running = Arc::new(AtomicI64::new(0));
+        let running_for_query = Arc::clone(&running);
 
         rt.create_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
-            log.read()
-                .expect("collection log poisoned")
-                .elements
-                .values()
-                .sum::<usize>() as u64
+            let log = upstream_log.read().expect("collection log poisoned");
+            let start = last_idx.load(MemOrdering::Relaxed);
+            if start < log.deltas.len() {
+                let mut delta = 0_i64;
+                for d in &log.deltas[start..] {
+                    match d {
+                        Delta::Insert(_) => delta += 1,
+                        Delta::Delete(_) => delta -= 1,
+                    }
+                }
+                running_for_query.fetch_add(delta, MemOrdering::Relaxed);
+                last_idx.store(log.deltas.len(), MemOrdering::Relaxed);
+            }
+            running_for_query.load(MemOrdering::Relaxed).max(0) as u64
         })
     }
 
