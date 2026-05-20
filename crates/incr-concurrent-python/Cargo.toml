@@ -9,6 +9,7 @@ publish = false
 [lib]
 name = "incr_concurrent"
 crate-type = ["cdylib"]
+doc = false
 
 [dependencies]
 incr_concurrent = { package = "incr-concurrent", version = "0.2.0-beta.1", path = "../incr-concurrent" }

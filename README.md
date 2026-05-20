@@ -124,7 +124,7 @@ cargo bench -p incr-compute         # bench through the wrapper
 
 A concurrent stress test runs 4 reader threads against 1 writer thread for 1000 iterations and asserts no torn reads on derived values.
 
-The unsafe code (segmented store, raw-pointer dep reclamation, hazard-free state machine CAS) is exercised under `cargo +nightly miri test -p incr-core --lib`. 79 unit tests pass under miri including 16-thread CAS races (3,200 concurrent attempts) and 50-iteration dynamic-dep-set churn through the overflow path with runtime drop. Zero undefined behavior detected.
+The unsafe code (segmented store, hazard-pointer dep reclamation via `haphazard`, state machine CAS) is exercised under `cargo +nightly miri test -p incr-core --lib`. Tests pass under miri including 16-thread CAS races (3,200 concurrent attempts) and 50-iteration dynamic-dep-set churn through the overflow path with runtime drop. Zero undefined behavior detected.
 
 ## Demos
 
