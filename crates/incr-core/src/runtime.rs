@@ -49,6 +49,7 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) type_tags: HashMap<TypeId, u16>,
     pub(crate) next_type_tag: u16,
     pub(crate) labels: HashMap<u32, String>,
+    pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
 }
 
 impl<C: Cells> Inner<C> {
@@ -60,6 +61,7 @@ impl<C: Cells> Inner<C> {
             type_tags: HashMap::new(),
             next_type_tag: 0,
             labels: HashMap::new(),
+            trace_log: Vec::new(),
         }
     }
 
@@ -85,6 +87,10 @@ pub struct Runtime<C: Cells> {
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) dep_stack: <C as Cells>::DepStack,
     pub(crate) runtime_id: RuntimeId,
+    /// `1` when `get_traced` is actively recording. Checked on every
+    /// `compute_one` via a Relaxed load (~1 ns when disarmed) so the
+    /// non-tracing hot path pays no measurable cost.
+    pub(crate) tracing_armed: <C as Cells>::U8,
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -101,6 +107,21 @@ impl<C: Cells> Runtime<C> {
             revision: C::new_u64(1),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id: RuntimeId::allocate(),
+            tracing_armed: C::new_u8(0),
+        }
+    }
+
+    #[inline(always)]
+    fn tracing_is_armed(&self) -> bool {
+        C::u8_load_relaxed(&self.tracing_armed) == 1
+    }
+
+    fn record_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
+        if self.tracing_is_armed() {
+            self.inner
+                .write()
+                .trace_log
+                .push(crate::trace::NodeTrace { id, action });
         }
     }
 
@@ -230,20 +251,53 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Read the current value and return a propagation trace alongside.
-    ///
-    /// Per-node `node_traces` are not yet populated; only `target`,
-    /// `total_nodes`, and `elapsed_ns` carry real data. Full tracing
-    /// lands alongside the dashboard demo work.
+    /// Records per-node events (Recomputed { value_changed } or
+    /// VerifiedClean) for every compute or short-circuit that happens
+    /// during this `get`.
     pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
+        use crate::trace::TraceAction;
+
+        // Arm tracing: clear any prior log, then flip the gate so
+        // compute_one starts appending events.
+        {
+            let mut inner = self.inner.write();
+            inner.trace_log.clear();
+        }
+        C::u8_store_release(&self.tracing_armed, 1);
+
         let start = std::time::Instant::now();
         let value = self.get(handle);
         let elapsed_ns = start.elapsed().as_nanos() as u64;
+
+        // Disarm and drain.
+        C::u8_store_release(&self.tracing_armed, 0);
+        let node_traces: Vec<crate::trace::NodeTrace> = {
+            let mut inner = self.inner.write();
+            std::mem::take(&mut inner.trace_log)
+        };
+
+        let nodes_recomputed = node_traces
+            .iter()
+            .filter(|t| matches!(t.action, TraceAction::Recomputed { .. }))
+            .count();
+        let nodes_cutoff = node_traces
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.action,
+                    TraceAction::Recomputed {
+                        value_changed: false
+                    }
+                )
+            })
+            .count();
+
         let trace = crate::trace::PropagationTrace {
             target: NodeId(handle.slot()),
-            node_traces: Vec::new(),
+            node_traces,
             total_nodes: self.node_count(),
-            nodes_recomputed: 0,
-            nodes_cutoff: 0,
+            nodes_recomputed,
+            nodes_cutoff,
             elapsed_ns,
         };
         (value, trace)
@@ -467,6 +521,7 @@ impl<C: Cells> Runtime<C> {
                 let rev = self.current_revision();
                 node.set_verified_at(rev);
                 state::store::<C>(node.state_cell(), NodeState::Clean);
+                self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                 return;
             }
         }
@@ -499,6 +554,7 @@ impl<C: Cells> Runtime<C> {
         }
         node.set_verified_at(rev);
         state::store::<C>(node.state_cell(), NodeState::Clean);
+        self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
     }
 
     /// Record dependencies on the node and update reverse edges in the
@@ -765,5 +821,75 @@ mod tests {
         rt.set(inputs[10], 1000);
         // 0+1+...+9 + 1000 + 11+12+13+14 = 45 + 1000 + 50 = 1095
         assert_eq!(rt.get(sum), 1095);
+    }
+
+    #[test]
+    fn local_get_traced_records_recompute_events() {
+        use crate::trace::TraceAction;
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let b = rt.create_query(move |rt| rt.get(a) + 10);
+        let c = rt.create_query(move |rt| rt.get(b) * 2);
+        let _ = rt.get(c);
+
+        // Set then traced read: every dirty node should appear in the trace.
+        rt.set(a, 5);
+        let (value, trace) = rt.get_traced(c);
+        assert_eq!(value, 30); // (5 + 10) * 2
+        assert_eq!(trace.target, NodeId(c.slot()));
+        assert_eq!(trace.nodes_recomputed, 2); // b and c both recomputed
+        assert_eq!(trace.nodes_cutoff, 0);
+        // Verify the trace has Recomputed events with value_changed=true
+        let recomputed_count = trace
+            .node_traces
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.action,
+                    TraceAction::Recomputed {
+                        value_changed: true
+                    }
+                )
+            })
+            .count();
+        assert_eq!(recomputed_count, 2);
+    }
+
+    #[test]
+    fn local_get_traced_records_early_cutoff() {
+        use crate::trace::TraceAction;
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(200_i64);
+        let clamped = rt.create_query(move |rt| rt.get(input).min(100));
+        let downstream = rt.create_query(move |rt| rt.get(clamped) + 1);
+        let _ = rt.get(downstream);
+
+        // Set input > 100 again; clamped still produces 100, so downstream
+        // gets early-cutoff (Recomputed with value_changed=false on clamped,
+        // VerifiedClean on downstream because its dep didn't change_at).
+        rt.set(input, 300);
+        let (value, trace) = rt.get_traced(downstream);
+        assert_eq!(value, 101);
+
+        // clamped should have a Recomputed event with value_changed=false
+        // (the cutoff).
+        let cutoffs = trace
+            .node_traces
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.action,
+                    TraceAction::Recomputed {
+                        value_changed: false
+                    }
+                )
+            })
+            .count();
+        assert!(
+            cutoffs >= 1,
+            "expected at least one cutoff event, got trace {:?}",
+            trace.node_traces
+        );
+        assert!(trace.nodes_cutoff >= 1);
     }
 }
