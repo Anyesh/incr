@@ -220,6 +220,10 @@ impl<C: Cells> Runtime<C> {
 
     /// Set a new value on an input node. Bumps revision and marks all
     /// transitive dependents dirty.
+    ///
+    /// Panics if the handle refers to a query (compute) node. Setting a
+    /// query node would overwrite its computed value and bypass the
+    /// state machine; the only valid setter is the compute closure itself.
     pub fn set<T: Value>(&self, handle: Incr<T>, value: T) {
         debug_assert_eq!(
             handle.runtime_id(),
@@ -228,13 +232,25 @@ impl<C: Cells> Runtime<C> {
         );
         let slot = handle.slot();
 
-        let arena = {
+        let (arena, is_query) = {
             let inner = self.inner.read();
-            inner
+            let arena = inner
                 .arenas
                 .try_arena::<T>()
-                .expect("incr-core: arena missing for input handle's type")
+                .expect("incr-core: arena missing for input handle's type");
+            let is_query = inner
+                .compute_fns
+                .get(slot as usize)
+                .map(|f| f.is_some())
+                .unwrap_or(false);
+            (arena, is_query)
         };
+
+        assert!(
+            !is_query,
+            "Runtime::set called on a query (compute) node at slot {}; only input nodes can be set",
+            slot,
+        );
 
         // No-op if the value is unchanged.
         let node = self.nodes.get(slot);
