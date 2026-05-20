@@ -145,6 +145,19 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         }
     }
 
+    /// Internal: create a collection from inside a compute closure (used
+    /// by `group_by` for lazy sub-collection creation). Skips the
+    /// dep-stack-empty check; the caller is responsible for ensuring
+    /// the new version_node is not implicitly a dep of the current
+    /// compute.
+    pub(crate) fn new_in_compute(rt: &Runtime<C>) -> Self {
+        Self {
+            log: Arc::new(RwLock::new(CollectionLog::new())),
+            version_node: rt.create_input_unchecked(0_u64),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
     /// Public accessor for the collection's version node. Useful when a
     /// user query wants to depend on the collection without going through
     /// an operator.
@@ -355,6 +368,309 @@ where
             fold_fn(&elements)
         })
     }
+
+    /// Join with another collection on a shared key. Emits the
+    /// cross-product of matching elements as `(T, U)` pairs. Pairs are
+    /// added and removed incrementally as upstream deltas arrive on
+    /// either side.
+    ///
+    /// Both sides maintain a `HashMap<K, Vec<...>>` index keyed by the
+    /// extracted key, plus a per-element key cache so deletes route to
+    /// the correct bucket. When a new element arrives on one side, we
+    /// look up the matching bucket on the other side and emit pairs.
+    /// When an element is deleted, we walk the same bucket and emit
+    /// corresponding pair removals.
+    pub fn join<U, K, FL, FR>(
+        &self,
+        rt: &Runtime<C>,
+        right: &IncrCollection<U, C>,
+        left_key: FL,
+        right_key: FR,
+    ) -> IncrCollection<(T, U), C>
+    where
+        U: Value + Hash + Eq,
+        K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+        FL: Fn(&T) -> K + Send + Sync + 'static,
+        FR: Fn(&U) -> K + Send + Sync + 'static,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering as MemOrdering};
+
+        let left_log = Arc::clone(&self.log);
+        let right_log = Arc::clone(&right.log);
+        let left_version = self.version_node;
+        let right_version = right.version_node;
+        let left_last = Arc::new(AtomicUsize::new(0));
+        let right_last = Arc::new(AtomicUsize::new(0));
+
+        let left_index: Arc<RwLock<HashMap<K, Vec<T>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let right_index: Arc<RwLock<HashMap<K, Vec<U>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let left_key_cache: Arc<RwLock<HashMap<T, K>>> = Arc::new(RwLock::new(HashMap::new()));
+        let right_key_cache: Arc<RwLock<HashMap<U, K>>> = Arc::new(RwLock::new(HashMap::new()));
+
+        let li_for_query = Arc::clone(&left_index);
+        let ri_for_query = Arc::clone(&right_index);
+        let lkc_for_query = Arc::clone(&left_key_cache);
+        let rkc_for_query = Arc::clone(&right_key_cache);
+
+        let output_log: Arc<RwLock<CollectionLog<(T, U)>>> =
+            Arc::new(RwLock::new(CollectionLog::new()));
+        let output_log_for_query = Arc::clone(&output_log);
+
+        let version_node = rt.create_query(move |rt| -> u64 {
+            let _lv = rt.get(left_version);
+            let _rv = rt.get(right_version);
+
+            let left = left_log.read().expect("collection log poisoned");
+            let right = right_log.read().expect("collection log poisoned");
+            let l_start = left_last.load(MemOrdering::Relaxed);
+            let r_start = right_last.load(MemOrdering::Relaxed);
+
+            if l_start >= left.deltas.len() && r_start >= right.deltas.len() {
+                return output_log_for_query
+                    .read()
+                    .expect("collection log poisoned")
+                    .version;
+            }
+
+            let mut li = li_for_query.write().expect("join index poisoned");
+            let mut ri = ri_for_query.write().expect("join index poisoned");
+            let mut lkc = lkc_for_query.write().expect("key cache poisoned");
+            let mut rkc = rkc_for_query.write().expect("key cache poisoned");
+            let mut out = output_log_for_query
+                .write()
+                .expect("collection log poisoned");
+
+            // Process left-side deltas: update left index + key cache,
+            // then emit pairs with all matching right-side elements.
+            for delta in &left.deltas[l_start..] {
+                match delta {
+                    Delta::Insert(v) => {
+                        let k = left_key(v);
+                        lkc.insert(v.clone(), k.clone());
+                        li.entry(k.clone()).or_default().push(v.clone());
+                        if let Some(matches) = ri.get(&k) {
+                            for r in matches {
+                                out.insert((v.clone(), r.clone()));
+                            }
+                        }
+                    }
+                    Delta::Delete(v) => {
+                        if let Some(k) = lkc.remove(v) {
+                            if let Some(bucket) = li.get_mut(&k) {
+                                if let Some(pos) = bucket.iter().position(|x| x == v) {
+                                    bucket.remove(pos);
+                                }
+                                if bucket.is_empty() {
+                                    li.remove(&k);
+                                }
+                            }
+                            if let Some(matches) = ri.get(&k) {
+                                for r in matches {
+                                    out.delete(&(v.clone(), r.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            left_last.store(left.deltas.len(), MemOrdering::Relaxed);
+
+            // Right side, symmetric.
+            for delta in &right.deltas[r_start..] {
+                match delta {
+                    Delta::Insert(u) => {
+                        let k = right_key(u);
+                        rkc.insert(u.clone(), k.clone());
+                        ri.entry(k.clone()).or_default().push(u.clone());
+                        if let Some(matches) = li.get(&k) {
+                            for l in matches {
+                                out.insert((l.clone(), u.clone()));
+                            }
+                        }
+                    }
+                    Delta::Delete(u) => {
+                        if let Some(k) = rkc.remove(u) {
+                            if let Some(bucket) = ri.get_mut(&k) {
+                                if let Some(pos) = bucket.iter().position(|x| x == u) {
+                                    bucket.remove(pos);
+                                }
+                                if bucket.is_empty() {
+                                    ri.remove(&k);
+                                }
+                            }
+                            if let Some(matches) = li.get(&k) {
+                                for l in matches {
+                                    out.delete(&(l.clone(), u.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            right_last.store(right.deltas.len(), MemOrdering::Relaxed);
+
+            out.version
+        });
+
+        IncrCollection {
+            log: output_log,
+            version_node,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Group by an extracted key. Returns a `GroupedCollection<K, T, C>`
+    /// holding one [`IncrCollection<T, C>`] per encountered key. Each
+    /// sub-collection is populated incrementally as upstream deltas
+    /// arrive: an Insert routes to the group keyed by `key_fn(&value)`,
+    /// a Delete removes from the same group.
+    ///
+    /// Sub-collections are created lazily the first time a key is seen
+    /// (via `create_input_unchecked` since the operator runs inside a
+    /// compute closure). Their version_nodes are inputs, so users can
+    /// continue to compose operators on per-group collections.
+    pub fn group_by<K, F>(&self, rt: &Runtime<C>, key_fn: F) -> GroupedCollection<K, T, C>
+    where
+        K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+        F: Fn(&T) -> K + Send + Sync + 'static,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering as MemOrdering};
+
+        let upstream_log = Arc::clone(&self.log);
+        let upstream_version = self.version_node;
+        let last_idx = Arc::new(AtomicUsize::new(0));
+
+        let groups: Arc<RwLock<HashMap<K, IncrCollection<T, C>>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+        let groups_for_query = Arc::clone(&groups);
+
+        // Maps elements to the key they were inserted under, so a Delete
+        // for the same value reaches the right group even if the key
+        // function is expensive or non-deterministic across calls.
+        let key_cache: Arc<RwLock<HashMap<T, K>>> = Arc::new(RwLock::new(HashMap::new()));
+        let key_cache_for_query = Arc::clone(&key_cache);
+
+        let output_version_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let output_version_counter_for_query = Arc::clone(&output_version_counter);
+
+        let version_node = rt.create_query(move |rt| -> u64 {
+            let _uv = rt.get(upstream_version);
+
+            let upstream = upstream_log.read().expect("collection log poisoned");
+            let start = last_idx.load(MemOrdering::Relaxed);
+            if start >= upstream.deltas.len() {
+                return output_version_counter_for_query.load(MemOrdering::Relaxed);
+            }
+
+            let mut grps = groups_for_query.write().expect("grouped state poisoned");
+            let mut kc = key_cache_for_query.write().expect("key cache poisoned");
+
+            for delta in &upstream.deltas[start..] {
+                match delta {
+                    Delta::Insert(v) => {
+                        let k = key_fn(v);
+                        kc.insert(v.clone(), k.clone());
+                        let group = grps
+                            .entry(k)
+                            .or_insert_with(|| IncrCollection::<T, C>::new_in_compute(rt));
+                        let new_ver = group
+                            .log
+                            .write()
+                            .expect("collection log poisoned")
+                            .insert(v.clone());
+                        rt.set(group.version_node, new_ver);
+                    }
+                    Delta::Delete(v) => {
+                        if let Some(k) = kc.remove(v) {
+                            if let Some(group) = grps.get(&k) {
+                                let new_ver = group
+                                    .log
+                                    .write()
+                                    .expect("collection log poisoned")
+                                    .delete(v);
+                                if let Some(ver) = new_ver {
+                                    rt.set(group.version_node, ver);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            last_idx.store(upstream.deltas.len(), MemOrdering::Relaxed);
+            output_version_counter_for_query.fetch_add(1, MemOrdering::Relaxed) + 1
+        });
+
+        GroupedCollection {
+            groups,
+            version_node,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Collection partitioned by key. Each key maps to an [`IncrCollection<T, C>`]
+/// containing only the elements that belong to that key.
+///
+/// `version_node` bumps whenever any group changes; downstream queries
+/// can depend on it to be notified of any group-level change. To depend
+/// on a specific group, use `get_group(&k)` and then depend on that
+/// sub-collection's version_node directly.
+pub struct GroupedCollection<K, T, C>
+where
+    K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+    T: Value + Hash + Eq,
+    C: Cells,
+{
+    pub(crate) groups: Arc<RwLock<HashMap<K, IncrCollection<T, C>>>>,
+    pub(crate) version_node: Incr<u64>,
+    pub(crate) _phantom: std::marker::PhantomData<fn() -> C>,
+}
+
+impl<K, T, C> Clone for GroupedCollection<K, T, C>
+where
+    K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+    T: Value + Hash + Eq,
+    C: Cells,
+{
+    fn clone(&self) -> Self {
+        Self {
+            groups: Arc::clone(&self.groups),
+            version_node: self.version_node,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<K, T, C> GroupedCollection<K, T, C>
+where
+    K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
+    T: Value + Hash + Eq,
+    C: Cells,
+{
+    pub fn version_node(&self) -> Incr<u64> {
+        self.version_node
+    }
+
+    pub fn keys(&self) -> Vec<K> {
+        self.groups
+            .read()
+            .expect("grouped state poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_group(&self, key: &K) -> Option<IncrCollection<T, C>> {
+        self.groups
+            .read()
+            .expect("grouped state poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.groups.read().expect("grouped state poisoned").len()
+    }
 }
 
 #[cfg(test)]
@@ -473,5 +789,111 @@ mod tests {
         assert_eq!(rt.get(n), 100);
         c.insert(&rt, 999);
         assert_eq!(rt.get(n), 101);
+    }
+
+    #[test]
+    fn local_group_by_partitions() {
+        let rt: Runtime<Local> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let groups = c.group_by(&rt, |x| x % 3);
+        c.insert(&rt, 1);
+        c.insert(&rt, 2);
+        c.insert(&rt, 3);
+        c.insert(&rt, 4);
+        c.insert(&rt, 5);
+        c.insert(&rt, 6);
+        let _ = rt.get(groups.version_node);
+        assert_eq!(groups.group_count(), 3);
+        let mut ks = groups.keys();
+        ks.sort();
+        assert_eq!(ks, vec![0, 1, 2]);
+        let g0 = groups.get_group(&0).expect("group 0 missing");
+        let g1 = groups.get_group(&1).expect("group 1 missing");
+        let g2 = groups.get_group(&2).expect("group 2 missing");
+        assert_eq!(g0.snapshot_len(), 2); // 3, 6
+        assert_eq!(g1.snapshot_len(), 2); // 1, 4
+        assert_eq!(g2.snapshot_len(), 2); // 2, 5
+    }
+
+    #[test]
+    fn shared_group_by_per_group_count() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let groups = c.group_by(&rt, |x| if *x >= 0 { "pos" } else { "neg" });
+        c.insert(&rt, 1);
+        c.insert(&rt, -1);
+        c.insert(&rt, 2);
+        c.insert(&rt, -2);
+        c.insert(&rt, 3);
+        let _ = rt.get(groups.version_node);
+        let pos = groups.get_group(&"pos").expect("pos group missing");
+        let neg = groups.get_group(&"neg").expect("neg group missing");
+        let pos_count = pos.count(&rt);
+        let neg_count = neg.count(&rt);
+        assert_eq!(rt.get(pos_count), 3);
+        assert_eq!(rt.get(neg_count), 2);
+    }
+
+    #[test]
+    fn local_group_by_delete_removes_from_group() {
+        let rt: Runtime<Local> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let groups = c.group_by(&rt, |x| x % 2);
+        c.insert(&rt, 2);
+        c.insert(&rt, 4);
+        c.insert(&rt, 6);
+        let _ = rt.get(groups.version_node);
+        let evens = groups.get_group(&0).expect("group 0 missing");
+        assert_eq!(evens.snapshot_len(), 3);
+        c.delete(&rt, &4);
+        let _ = rt.get(groups.version_node);
+        assert_eq!(evens.snapshot_len(), 2);
+    }
+
+    #[test]
+    fn local_join_simple() {
+        let rt: Runtime<Local> = Runtime::new();
+        let users = rt.create_collection::<(i64, String)>(); // (id, name)
+        let orders = rt.create_collection::<(i64, i64)>(); // (user_id, amount)
+        let joined = users.join(&rt, &orders, |u| u.0, |o| o.0);
+        users.insert(&rt, (1, "alice".to_string()));
+        users.insert(&rt, (2, "bob".to_string()));
+        orders.insert(&rt, (1, 100));
+        orders.insert(&rt, (1, 200));
+        orders.insert(&rt, (3, 50)); // no matching user
+        let n = joined.count(&rt);
+        // (alice, 100), (alice, 200) — 2 pairs
+        assert_eq!(rt.get(n), 2);
+    }
+
+    #[test]
+    fn shared_join_symmetric_order() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let a = rt.create_collection::<(i32, &'static str)>();
+        let b = rt.create_collection::<(i32, i32)>();
+        let j = a.join(&rt, &b, |x| x.0, |y| y.0);
+        // Insert b first, then a; pairs should still emit.
+        b.insert(&rt, (1, 100));
+        a.insert(&rt, (1, "x"));
+        a.insert(&rt, (1, "y"));
+        b.insert(&rt, (1, 200));
+        let n = j.count(&rt);
+        // pairs: (x,100), (y,100), (x,200), (y,200) — 4
+        assert_eq!(rt.get(n), 4);
+    }
+
+    #[test]
+    fn local_join_delete_removes_pairs() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_collection::<(i32, i32)>();
+        let b = rt.create_collection::<(i32, i32)>();
+        let j = a.join(&rt, &b, |x| x.0, |y| y.0);
+        a.insert(&rt, (1, 10));
+        b.insert(&rt, (1, 100));
+        b.insert(&rt, (1, 200));
+        let n = j.count(&rt);
+        assert_eq!(rt.get(n), 2);
+        b.delete(&rt, &(1, 100));
+        assert_eq!(rt.get(n), 1);
     }
 }
