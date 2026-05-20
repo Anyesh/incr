@@ -48,8 +48,11 @@ The segmented node store supports up to 1M nodes per runtime (1024 segments × 1
 
 ## Known limitations
 
-- **Overflow-dep reclamation**: when a node's dep set crosses the 7-element boundary multiple times during its lifetime, displaced overflow lists are retired to a per-runtime graveyard and reclaimed at runtime drop. Memory held by retired lists is bounded by the total dep-set-change count over the runtime's lifetime; nothing leaks past runtime drop. Free-during-runtime reclamation via hazard pointers ([`haphazard`](https://crates.io/crates/haphazard)) is queued for 0.2.1; it would tighten the bound for very long-lived runtimes with churning dynamic deps.
 - **`get_traced` per-node trace**: records compute, verified-clean, and cutoff events for the current `get` call's compute path. Cross-thread events are not aggregated.
+
+## Memory reclamation
+
+Overflow-dep lists (the heap allocation a node holds when it has more than 7 dependencies) are retired through the [`haphazard`](https://crates.io/crates/haphazard) global hazard-pointer domain. Concurrent readers in `for_each_dep` hold a `HazardPointer` while dereferencing the slot, so an `install_deps` writer's retire is deferred until no protecting reader remains. Memory is reclaimed during normal operation, not just at runtime drop.
 
 ## Soundness
 
