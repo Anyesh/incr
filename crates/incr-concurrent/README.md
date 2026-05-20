@@ -1,8 +1,8 @@
 # incr-concurrent
 
-Thread-safe incremental computation with `Send + Sync` runtime.
+Thread-safe incremental computation with `Send + Sync` runtime. Since 0.2, this crate is a thin re-export of [`incr-core`](https://crates.io/crates/incr-core) with the `Shared` strategy; the algorithm and operators live in the shared engine.
 
-`incr-concurrent` builds a reactive computation graph that can be shared across threads. One thread mutates inputs while any number of reader threads query derived values concurrently, with no contention on the reader path. Like `incr`, it only recomputes what actually changed and applies early cutoff to skip unnecessary downstream work. The tradeoff is roughly 1.6x slower single-threaded throughput in exchange for safe concurrent access.
+`incr-concurrent` builds a reactive computation graph that can be shared across threads. One thread mutates inputs while any number of reader threads query derived values concurrently. Under the hood every cell is the matching atomic type and state transitions use explicit Acquire/Release for visibility. On x86 (TSO) Acquire compiles to a plain `mov` with no fences, so the lock-free read path costs essentially nothing over the single-threaded variant. ARM/Apple Silicon pays one `dmb ld` per Acquire load, which is the unavoidable cost of cross-thread synchronization on a weak memory model.
 
 ## Install
 
@@ -27,7 +27,7 @@ rt.set(width, 10);
 assert_eq!(rt.get(area), 70);
 ```
 
-The API is identical to `incr`. Dependencies are tracked automatically when your query closure calls `rt.get`.
+The API is identical to `incr-compute`. Dependencies are tracked automatically when your query closure calls `rt.get`.
 
 ## Concurrent access
 
@@ -68,13 +68,13 @@ reader.join().unwrap();
 
 ## Collections
 
-Incremental collections work the same way as in `incr`, and the entire pipeline is `Send + Sync`.
+Incremental collections work the same way as in `incr-compute`, and the entire pipeline is `Send + Sync`.
 
 ```rust
-use incr_concurrent::{Runtime, IncrCollection};
+use incr_concurrent::{IncrCollection, Runtime};
 
 let rt = Runtime::new();
-let scores = rt.create_collection::<i64>();
+let scores: IncrCollection<i64> = rt.create_collection();
 
 scores.insert(&rt, 80);
 scores.insert(&rt, 95);
@@ -85,27 +85,17 @@ let passing = scores.filter(&rt, |s| *s >= 50);
 let curved = passing.map(&rt, |s| s + 10);
 let total = curved.reduce(&rt, |vals| vals.iter().sum::<i64>());
 
-assert_eq!(rt.get(total), 255); // (80+10) + (95+10) + (60+10)
+assert_eq!(rt.get(total), 265);
 ```
 
 ## All operators
 
-- **filter** keeps elements matching a predicate
-- **map** transforms each element
-- **count** tracks the number of elements
-- **reduce** folds all elements into a single value
-- **sort_by_key** produces a sorted view with positional deltas
-- **pairwise** emits consecutive pairs from a sorted collection
-- **group_by** partitions into keyed sub-collections
-- **join** pairs two collections on a shared key
-- **window** emits sliding windows of a given size from a sorted collection
+Same nine as `incr-compute`: filter, map, count, reduce, sort_by_key, pairwise, window, group_by, join. The `count` operator is incremental (O(1) per delta); `reduce` is snapshot-based; everything else is incremental on the delta log.
 
 ## When to use
 
-Use `incr-concurrent` when you need to share a computation graph across threads. If everything runs on a single thread, use [`incr`](https://crates.io/crates/incr) instead for better raw throughput.
+Use `incr-concurrent` when you need to share a computation graph across threads. If everything runs on a single thread, use [`incr-compute`](https://crates.io/crates/incr-compute) instead for the slightly faster uncontended path.
 
 ## Python
 
-```
-pip install incr-concurrent
-```
+Python bindings re-implement against the v0.2 engine in 0.3.

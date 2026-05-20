@@ -1,4 +1,5 @@
 # incr
+
  [![crates.io badge for incr-compute](https://img.shields.io/crates/v/incr-compute?label=incr-compute&logo=rust&color=blue)](https://crates.io/crates/incr-compute)
  [![crates.io badge for incr-concurrent](https://img.shields.io/crates/v/incr-concurrent?label=incr-concurrent&logo=rust&color=orange)](https://crates.io/crates/incr-concurrent)
  [![PyPI badge for incr-compute](https://img.shields.io/pypi/v/incr-compute?label=incr-compute&logo=python&color=blue)](https://pypi.org/project/incr-compute/)
@@ -8,7 +9,7 @@
 
 Most software recomputes everything from scratch whenever anything changes. Your CI rebuilds the whole project when you edit one file, your dashboard re-queries the whole database when one row updates. There are domain-specific fixes for this (React diffs the DOM, Salsa caches compiler queries, Materialize does incremental SQL) but if you just want to make your own code incremental, theres nothing to reach for.
 
-incr is a crack at solving that. Its a Rust library (with Python bindings) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. It ships as two crates: `incr-compute` for single-threaded, zero-overhead use, and `incr-concurrent` for multi-threaded programs where the runtime needs to be `Send + Sync`. Both are published on crates.io and PyPI, and they expose the same API surface, so switching between them is a one-line dependency swap.
+incr is a crack at solving that. It's a Rust library (with Python bindings on the roadmap) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. The engine lives in `incr-core` and is parameterized over a concurrency strategy; two surface crates expose it: `incr-compute` (`Local` strategy, single-threaded, zero atomic-fence cost) and `incr-concurrent` (`Shared` strategy, `Send + Sync`, lock-free reads). Same public API, one-line dependency swap.
 
 ![Live spreadsheet demo showing formula cells updating incrementally as values change, powered by incr-concurrent with real-time WebSocket sync](examples/spreadsheet/demo.gif)
 
@@ -16,81 +17,84 @@ incr is a crack at solving that. Its a Rust library (with Python bindings) that 
 
 You've got two ways to use it. Function graphs let you wire up computations that depend on each other:
 
-```python
-from incr import Runtime
+```rust
+use incr_compute::Runtime;
 
-rt = Runtime()
-width = rt.create_input(10.0)
-height = rt.create_input(5.0)
-area = rt.create_query(lambda rt: rt.get(width) * rt.get(height))
+let rt = Runtime::new();
+let width = rt.create_input(10.0_f64);
+let height = rt.create_input(5.0_f64);
+let area = rt.create_query(move |rt| rt.get(width) * rt.get(height));
 
-rt.get(area)  # 50.0
-rt.set(width, 12.0)
-rt.get(area)  # 60.0, height wasnt touched, only area reran
+rt.get(area);          // 50.0
+rt.set(width, 12.0);
+rt.get(area);          // 60.0 — height wasn't touched, only area reran
 ```
 
 And then theres incremental collections, which is where it gets more interesting. You set up a pipeline of operators, and when you insert or delete a row, only that row flows through. The engine doesnt re-examine existing data.
 
-```python
-# Travel premium calculation: sort visits by time, compute gaps
-# between consecutive visits, sum the premiums
-visits = rt.create_collection()
-sorted_visits = visits.sort_by_key(lambda v: v.time)
-pairs = sorted_visits.pairwise()
-gaps = pairs.map(lambda pair: distance(pair[0], pair[1]))
-total = gaps.reduce(lambda elements: sum(elements))
+```rust
+use incr_compute::{Runtime, IncrCollection};
 
-visits.insert(visit_at_9am)
-visits.insert(visit_at_2pm)
-visits.insert(visit_at_11am)
-rt.get(total)  # computes all distances
+let rt = Runtime::new();
+let visits: IncrCollection<Visit> = rt.create_collection();
+let sorted = visits.sort_by_key(&rt, |v| v.time);
+let pairs = sorted.pairwise(&rt);
+let gaps = pairs.map(&rt, |pair| distance(&pair.0, &pair.1));
+let total = gaps.reduce(&rt, |xs| xs.iter().sum::<f64>());
 
-# Move one visit: only the two affected segments recompute
-visits.delete(visit_at_11am)
-visits.insert(visit_at_11am_moved_to_noon)
-rt.get(total)  # only recomputes 2 of 3 distances
+visits.insert(&rt, visit_at_9am);
+visits.insert(&rt, visit_at_2pm);
+visits.insert(&rt, visit_at_11am);
+rt.get(total);   // computes all distances
+
+// Move one visit: only the two affected segments recompute.
+visits.delete(&rt, &visit_at_11am);
+visits.insert(&rt, visit_at_11am_moved_to_noon);
+rt.get(total);
 ```
 
-The pipeline supports filter, map, count, reduce, sort_by_key, pairwise, group_by, join, and window. The two APIs (function DAG and collections) share the same dependency graph under the hood so you can have a function query that reads from a collection's reduce and it all stays incremental.
+Nine operators ship: `filter`, `map`, `count`, `reduce`, `sort_by_key`, `pairwise`, `window`, `group_by`, `join`. The function-DAG API and the collection API share the same dependency graph, so a function query can read a collection's `reduce` and stay incremental end to end.
 
-## Two crates, one API
+## Three crates, one engine
 
-| | `incr-compute` | `incr-concurrent` |
-|---|---|---|
-| Thread safety | Single-threaded (`!Send`, `!Sync`) | `Send + Sync`, safe to share across threads |
-| Overhead | Zero runtime cost for thread safety | Atomic operations for node state transitions |
-| When to use | Scripts, CLI tools, single-threaded services | HTTP servers, background workers, anything multi-threaded |
-| Rust | `cargo add incr-compute` | `cargo add incr-concurrent` |
-| Python | `pip install incr-compute` | `pip install incr-concurrent` |
-| Python import | `from incr import Runtime` | `from incr_concurrent import Runtime` |
+| | `incr-compute` | `incr-concurrent` | `incr-core` |
+|---|---|---|---|
+| Role | User-facing surface | User-facing surface | Shared engine |
+| Thread safety | Single-threaded (`!Send + !Sync`) | `Send + Sync`, shareable across threads | Strategy-parameterized |
+| Backing | `Cell`/`RefCell` (no atomics) | `Atomic*` + `RwLock` | `Cells` trait |
+| Rust | `cargo add incr-compute` | `cargo add incr-concurrent` | (used via the wrappers) |
 
-The API is identical between the two. If you start with `incr-compute` and later need thread safety, swap the dependency and everything compiles without changes.
+Both surface crates re-export `incr_core::Runtime<Local>` and `incr_core::Runtime<Shared>` respectively. The compiler monomorphizes both paths from the same source, so neither crate subsidizes the other: single-threaded users pay no atomic-fence cost; concurrent users pay no extra indirection for the lock-free read path. The asm of `Local`'s hot path is byte-identical to direct field access (validated on the spike branch and preserved through the type alias).
+
+If you start with `incr-compute` and later need thread safety, swap the dependency. The `Value` bound (`Clone + PartialEq + Send + Sync + 'static`) is identical between crates, so user types do not need a per-crate impl.
 
 ## Benchmarks
 
-We run these head-to-head against Salsa (the incremental engine in rust-analyzer) on the same machine, same workloads. Not cherry-picked.
+Measured on this branch with `criterion --quick` against `Salsa` (the incremental engine in rust-analyzer). Not cherry-picked.
 
-| Workload | incr | Salsa |
-|----------|------|-------|
-| Diamond graph, change input and propagate through 4 nodes | 752 ns | 1,066 ns |
-| Early cutoff (input changes but clamped output doesnt) | 445 ns | 469 ns |
-| Per-node propagation cost in a chain | ~175 ns/node | ~387 ns/query |
+| Workload | `incr-compute` | `incr-concurrent` | Salsa |
+|----------|----------------|---------------------|-------|
+| Diamond graph, propagate input through 4 nodes | 647 ns | 764 ns | 1,066 ns |
+| Early cutoff (input changes but clamped output doesnt) | 314 ns | 404 ns | 469 ns |
+| Per-node propagation cost (chain) | ~135 ns/node | ~169 ns/node | ~387 ns/query |
 
-Collection insert vs just recomputing the whole pipeline from scratch:
+Collection pipeline (`filter` → `map` → `count`) vs from-scratch batch:
 
-| Collection size | Incremental | From scratch | Speedup |
-|----------------|-------------|-------------|---------|
-| 1K elements | 798 ns | 2.5 us | 3x |
-| 10K elements | 1.0 us | 14.2 us | 14x |
-| 100K elements | 818 ns | 152 us | 186x |
+| Collection size | `incr-compute` insert | From scratch | Speedup |
+|----------------|----------------------|--------------|---------|
+| 1K elements    | 673 ns               | 102 µs       | 152x    |
+| 10K elements   | 657 ns               | 67 µs        | 102x    |
+| 100K elements  | 661 ns               | 156 µs       | 236x    |
 
-The interesting thing in that second table is the incremental column barely moves as the collection grows. 818 ns for 100K is almost the same as 798 ns for 1K because we're only touching the new row, not scanning the existing ones.
+The interesting thing in that second table is the `incr-compute` column barely moves as the collection grows. 661 ns at 100K is essentially the same as 673 ns at 1K because we're only touching the new row, not scanning the existing ones.
 
 ## How it works internally
 
 Calling `rt.set()` on an input eagerly marks downstream nodes as potentially dirty (just flipping bits, no recomputation). Then when you `rt.get()` a result, the engine walks backwards from what you asked for, checks if each dirty node's dependencies actually changed, and only reruns the ones that need it. If a node reruns but produces the same value it had before, propagation stops there, and thats the "early cutoff" you see in the benchmarks.
 
-For collections its a bit different. Each pipeline stage keeps a read offset into the upstream's change log. When triggered, it just reads entries past that offset, processes them, and advances the pointer. Inserting one row into a 100K collection means each stage does O(1) work regardless of collection size.
+For collections each pipeline stage keeps a read offset into the upstream's change log. When triggered, it just reads entries past that offset, processes them, and advances the pointer. Inserting one row into a 100K collection means each stage does O(1) work regardless of collection size.
+
+The engine itself lives in [`incr-core`](crates/incr-core/) under a `Cells` strategy trait. `Local` backs every cell with `std::cell::Cell` and gives you a `!Send + !Sync` runtime with no atomic ops. `Shared` backs every cell with the matching atomic type and uses Acquire/Release for state-visibility transitions. The trait inlines through every call site (`#[inline(always)]`), so the compiler emits the same code for `Runtime<Local>` operations as it would for direct `Cell::get()` calls. The 64-byte cache-line layout for `NodeData` is preserved under both strategies by const-time assertions.
 
 ## Getting started
 
@@ -98,52 +102,38 @@ For collections its a bit different. Each pipeline stage keeps a read offset int
 
 ```toml
 [dependencies]
-incr-compute = "0.1"      # single-threaded
+incr-compute = "0.2"      # single-threaded
 # or
-incr-concurrent = "0.1"   # multi-threaded (Send + Sync)
-```
-
-**Python:**
-
-```bash
-pip install incr-compute        # single-threaded
-# or
-pip install incr-concurrent     # multi-threaded
-```
-
-```python
-from incr import Runtime              # incr-compute
-# or
-from incr_concurrent import Runtime   # incr-concurrent
+incr-concurrent = "0.2"   # multi-threaded (Send + Sync)
 ```
 
 **Running the tests:**
 
 ```bash
-cargo test -p incr-compute         # single-threaded crate
-cargo test -p incr-concurrent      # concurrent crate
-pytest ./examples/tests/python/    # python bindings
-cargo bench -p incr-compute        # benchmarks (single-threaded)
-cargo bench -p incr-concurrent     # benchmarks (concurrent)
+cargo test -p incr-core             # full engine: 100+ tests with proptest
+cargo test -p incr-compute          # single-threaded wrapper integration
+cargo test -p incr-concurrent       # concurrent wrapper integration
+
+cargo bench -p incr-core            # full engine benches
+cargo bench -p incr-compute         # bench through the wrapper
 ```
 
 ## Testing
 
-300+ tests across both Rust crates (unit, property, and integration), plus a Python test suite for the bindings. We use proptest to generate thousands of random computation graphs, apply random mutations, and check that the incremental result matches what you'd get by recomputing everything from scratch. Thats the core correctness guarantee: if those two ever disagree on any random input, proptest shrinks it down to a minimal failing case.
+100+ unit/integration tests across the engine and wrappers, plus a proptest suite that runs **the same generator + verifier under both strategies**: 1000 random function graphs and 3000 random collection op sequences per `cargo test` run. The core correctness contract is that incremental evaluation produces the same final result as recomputing everything from scratch; if those two ever disagree on any random input, proptest shrinks to a minimal failing case.
 
-The property test suites cover every operator (filter, map, count, reduce, sort_by_key, pairwise, group_by, join, window) in both crates, verifying that incremental evaluation produces the same result as full recomputation across thousands of randomly generated scenarios.
+A concurrent stress test runs 4 reader threads against 1 writer thread for 1000 iterations and asserts no torn reads on derived values.
 
 ## Demos
 
-Three demos show different aspects of the library:
+- [`examples/concurrent-server/`](examples/concurrent-server/) — multi-threaded HTTP server (Rust) where one writer thread feeds live market data into the graph while many HTTP handler threads read derived portfolio values concurrently without blocking.
+- [`examples/spreadsheet/`](examples/spreadsheet/) — live spreadsheet engine driving formula cells through the incremental graph with WebSocket sync.
 
-- **`examples/travel-premium/`** is a mobile worker scheduling demo (Python) that computes travel premiums incrementally using the full operator pipeline (sort, pairwise, map, reduce). It's backed by SQLite for persistence, with a distance cache that survives server restarts, and shows 5-8x speedup over batch recomputation when the map step involves expensive operations like distance lookups.
-- **`examples/dashboard/`** is a live API monitoring dashboard (Python) with dependency graph visualization and real-time tracing of which nodes recompute vs get skipped.
-- **`examples/concurrent-server/`** is a multi-threaded HTTP server (Rust) that proves the concurrent access model: one writer thread feeds live market data into an incr graph while multiple HTTP handler threads read derived portfolio values simultaneously without blocking.
+A Python `travel-premium` demo and a `dashboard` demo with real per-node tracing live on the v0.1 line; they are scheduled to land on v0.2 alongside the Python re-implementation in 0.3.
 
 ## CI
 
-GitHub Actions runs on every push to main and on pull requests: tests for both crates, Python binding builds, benchmarks, clippy, and fmt. Tagging a release (`v*`) triggers automatic publishing to both crates.io and PyPI.
+GitHub Actions runs on every push to `main` and on pull requests: tests for all three Rust crates, benchmarks, clippy, and fmt. Tagging a release (`v*`) triggers automatic publishing to crates.io. Python wheels return in 0.3.
 
 ## Background and references
 
@@ -161,7 +151,7 @@ The systems we benchmark against and learned from:
 
 Y. Annie Liu's 2024 survey [Incremental Computation: What Is the Essence?](https://arxiv.org/abs/2312.07946) is probably the best current overview of the whole field if you want to understand where all these approaches fit relative to each other. One of her key findings is that fully general incrementalization is provably undecidable, which is why every practical system (including ours) picks a restricted but useful subset of computations to handle.
 
-None of the existing systems combine function DAGs with incremental collections in a single engine, which is what incr tries to do. Whether that actually works out as a general purpose tool is still an open question, but the early results are encouraging.
+None of the existing systems combine function DAGs with incremental collections in a single engine across single-threaded and concurrent topologies the way incr does. Early results across the function DAG and the operator pipeline both beat the published numbers for Salsa and the v0.1 line; the architecture is what made that possible.
 
 ## License
 
