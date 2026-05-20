@@ -12,6 +12,7 @@ pub fn cell_name(col: u8, row: u32) -> String {
     format!("{}{}", (b'A' + col) as char, row)
 }
 
+#[allow(dead_code)]
 pub fn parse_cell_name(name: &str) -> Option<(u8, u32)> {
     let name = name.to_uppercase();
     let col_char = name.chars().next()?;
@@ -23,7 +24,7 @@ pub fn parse_cell_name(name: &str) -> Option<(u8, u32)> {
         return None;
     }
     let row: u32 = name[1..].parse().ok()?;
-    if row < 1 || row > ROWS {
+    if !(1..=ROWS).contains(&row) {
         return None;
     }
     Some((col, row))
@@ -38,6 +39,7 @@ pub struct SpreadsheetEngine {
     pub rt: Runtime,
     cells: HashMap<String, CellNodes>,
     /// Shared map of value nodes so query closures can look up references.
+    #[allow(dead_code)]
     value_nodes: Arc<RwLock<HashMap<String, Incr<f64>>>>,
     /// Cache of last-known cell values for diffing.
     prev_values: RwLock<HashMap<String, f64>>,
@@ -73,12 +75,11 @@ impl SpreadsheetEngine {
                             }
                             Err(_) => f64::NAN,
                         }
-                    } else if let Ok(n) = raw.parse::<f64>() {
-                        n
                     } else {
                         // Text content: display as NAN (the UI will show
                         // the raw text instead via the content field).
-                        f64::NAN
+                        // Numeric strings parse as their value.
+                        raw.parse::<f64>().unwrap_or(f64::NAN)
                     }
                 });
 
