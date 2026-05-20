@@ -9,6 +9,7 @@ keywords = ["incremental", "computation", "reactive", "dataflow"]
 categories = ["algorithms", "data-structures"]
 
 [dependencies]
+haphazard = "0.1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
