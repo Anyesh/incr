@@ -17,3 +17,7 @@ proptest = "1"
 [[bench]]
 name = "chain"
 harness = false
+
+[[bench]]
+name = "operators"
+harness = false
