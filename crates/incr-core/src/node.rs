@@ -172,32 +172,53 @@ impl<C: Cells> NodeData<C> {
     /// the pointer.
     ///
     /// Reclamation: under `Shared`, the OLD overflow pointer (if any) is
-    /// LEAKED to avoid use-after-free against concurrent readers. The
-    /// final list is reclaimed in `Drop`. Under `Local`, the OLD overflow
-    /// pointer is also retained (uniform code path); since each node
-    /// drops as the runtime drops, the leak is bounded by the node's
-    /// dep-set-change count. Hazard-pointer reclamation lands in 0.2.1.
-    pub(crate) fn install_deps(&self, new_deps: &[NodeId]) {
+    /// retired through the caller-provided graveyard callback. The
+    /// callback is expected to retain the pointer until the runtime
+    /// drops, at which point all retired lists are freed.
+    ///
+    /// This is the bounded-reclamation path: memory held by retired
+    /// overflow lists grows with dep-set-change count over a runtime's
+    /// lifetime but is fully reclaimed at runtime drop, never leaked
+    /// past process scope. The true free-during-runtime path requires
+    /// hazard pointers to coordinate with concurrent readers and lands
+    /// in 0.2.1 via `haphazard`.
+    pub(crate) fn install_deps<F>(&self, new_deps: &[NodeId], mut retire: F)
+    where
+        F: FnMut(*mut DepList),
+    {
         let count = new_deps.len();
         assert!(count <= u8::MAX as usize, "dep count exceeds u8");
         if count <= 7 {
             for (i, dep) in new_deps.iter().enumerate() {
                 C::u32_store_relaxed(&self.inline_deps[i], dep.0);
             }
-            // Don't clear overflow_deps; if a previous list lived there
-            // and we shrunk below 8, for_each_dep's count check takes
-            // the inline path and ignores the stale pointer. It is
-            // reclaimed at Drop time.
+            // Going inline: capture and retire any stale overflow ptr
+            // so for_each_dep's count<=7 path doesn't reference a list
+            // that won't be freed until the next overflow-overflow
+            // transition. (Without this, an overflow-inline transition
+            // followed by NodeData::Drop on the OWNED ptr is fine; but
+            // an overflow-inline-overflow transition would lose the
+            // first overflow list. Retiring here closes that gap.)
+            let stale = self.overflow_deps.load_relaxed();
+            if !stale.is_null() {
+                self.overflow_deps.store_release(std::ptr::null_mut());
+                retire(stale);
+            }
             C::u8_store_release(&self.dep_count, count as u8);
         } else {
             let list = Box::new(DepList {
                 deps: new_deps.to_vec().into_boxed_slice(),
             });
             let new_ptr = Box::into_raw(list);
-            // Release-store so concurrent readers Acquire-loading the
-            // pointer see the fully-initialized DepList.
+            // Capture the old pointer (if any) for retirement, then
+            // Release-store the new one so concurrent readers
+            // Acquire-loading see the fully-initialized DepList.
+            let old = self.overflow_deps.load_relaxed();
             self.overflow_deps.store_release(new_ptr);
             C::u8_store_release(&self.dep_count, count as u8);
+            if !old.is_null() {
+                retire(old);
+            }
         }
     }
 
