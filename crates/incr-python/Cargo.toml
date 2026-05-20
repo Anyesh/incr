@@ -1,6 +1,6 @@
 [package]
 name = "incr-python"
-version = "0.1.0"
+version = "0.2.0-beta.1"
 edition = "2021"
 description = "Python bindings for the incr single-threaded incremental computation engine"
 license = "Apache-2.0"
@@ -11,5 +11,5 @@ name = "incr"
 crate-type = ["cdylib"]
 
 [dependencies]
-incr_st = { package = "incr-compute", path = "../incr-compute" }
+incr_compute = { package = "incr-compute", version = "0.2.0-beta.1", path = "../incr-compute" }
 pyo3 = { version = "0.23", features = ["extension-module"] }
