@@ -16,8 +16,11 @@
 //! `Computing` slot). Other integer cells are written under exclusive
 //! ownership granted by the state machine.
 
+use crate::dep_stack::{DepStack, LocalDepStack, SharedDepStack};
+use crate::locks::{LocalLock, Lock};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::RwLock;
 
 /// Strategy trait selecting the synchronization primitives used by every
 /// cell in the engine. Implemented by [`Local`] and [`Shared`].
@@ -43,6 +46,8 @@ pub trait Cells: 'static + Sized {
     type U64;
     type State;
     type Ptr<T: 'static>: PtrCell<T>;
+    type Lock<T: 'static>: Lock<T>;
+    type DepStack: DepStack;
 
     fn new_u8(v: u8) -> Self::U8;
     fn new_u32(v: u32) -> Self::U32;
@@ -141,6 +146,8 @@ impl Cells for Local {
     type U64 = Cell<u64>;
     type State = Cell<u8>;
     type Ptr<T: 'static> = LocalPtrCell<T>;
+    type Lock<T: 'static> = LocalLock<T>;
+    type DepStack = LocalDepStack;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -228,6 +235,8 @@ impl Cells for Shared {
     type U64 = AtomicU64;
     type State = AtomicU8;
     type Ptr<T: 'static> = AtomicPtr<T>;
+    type Lock<T: 'static> = RwLock<T>;
+    type DepStack = SharedDepStack;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
