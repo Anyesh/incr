@@ -240,7 +240,6 @@ impl<C: Cells> NodeData<C> {
             }
         } else {
             self.for_each_overflow_dep(&mut f);
-            return;
         }
     }
 
