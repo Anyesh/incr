@@ -122,7 +122,16 @@ impl<C: Cells> Runtime<C> {
             !self.dep_stack.current_frame_active(),
             "create_input called during compute; not permitted",
         );
+        self.create_input_unchecked(value)
+    }
 
+    /// Internal: create an input without the dep-stack-empty check.
+    /// Used by operators like `group_by` that need to allocate
+    /// sub-collection version nodes lazily from inside a compute closure.
+    /// The caller is responsible for ensuring the new node is not a dep
+    /// of the currently-computing node (i.e., the new node is downstream
+    /// of the operator, not upstream).
+    pub(crate) fn create_input_unchecked<T: Value>(&self, value: T) -> Incr<T> {
         let revision = self.current_revision();
         let (slot, type_tag, generation) = {
             let mut inner = self.inner.write();
