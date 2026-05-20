@@ -1,6 +1,6 @@
 [package]
 name = "incr-core"
-version = "0.2.0-alpha.1"
+version = "0.2.0-beta.1"
 edition = "2021"
 description = "Shared core for the incr family. Strategy-parameterized incremental computation engine. Used via incr-compute (single-threaded) or incr-concurrent (Send + Sync)."
 license = "Apache-2.0"
