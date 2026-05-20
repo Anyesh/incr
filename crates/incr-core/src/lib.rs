@@ -19,7 +19,9 @@
 
 pub mod arena;
 pub mod cells;
+pub mod dep_stack;
 pub mod generic_arena;
+pub mod locks;
 pub mod node;
 pub mod segmented_nodes;
 pub mod state;
@@ -27,7 +29,9 @@ pub mod value;
 
 pub use arena::PrimitiveArena;
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
+pub use dep_stack::{DepStack, LocalDepStack, SharedDepStack};
 pub use generic_arena::GenericArena;
+pub use locks::{LocalLock, Lock};
 pub use node::{NodeData, NodeId};
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use state::NodeState;
