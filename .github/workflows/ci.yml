@@ -66,6 +66,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release -p incr-concurrent-server -p incr-spreadsheet
 
+  python:
+    name: Python wheels
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest:
+          - crates/incr-python/Cargo.toml
+          - crates/incr-concurrent-python/Cargo.toml
+    env:
+      MANIFEST: ${{ matrix.manifest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - run: pip install maturin
+      - run: maturin build --release --manifest-path "$MANIFEST"
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

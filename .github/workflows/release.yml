@@ -42,5 +42,26 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p incr-concurrent --no-verify
 
-  # PyPI publish is restored when the Python bindings are re-implemented
-  # against the v0.2 incr-core API in 0.3.
+  publish-pypi:
+    name: Publish to PyPI
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        manifest:
+          - crates/incr-python/Cargo.toml
+          - crates/incr-concurrent-python/Cargo.toml
+    env:
+      MANIFEST: ${{ matrix.manifest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install maturin
+      - name: Build and publish
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: maturin publish --manifest-path "$MANIFEST" --no-sdist
