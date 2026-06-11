@@ -220,14 +220,28 @@ impl<C: Cells> Runtime<C> {
         Incr::new(slot, generation, self.runtime_id)
     }
 
+    /// Reject handles minted by a different runtime. A real branch, not
+    /// a debug_assert: in release a foreign handle would silently read
+    /// or write another node's slot in the same type arena, which is
+    /// silent data corruption. Cost is one always-predicted compare on
+    /// the hot path.
+    #[inline(always)]
+    fn check_handle<T: Value>(&self, handle: Incr<T>) {
+        if handle.runtime_id() != self.runtime_id {
+            panic!(
+                "incr-core: Incr<{}> handle from a foreign runtime (handle was minted by \
+                 runtime {}, used on runtime {})",
+                std::any::type_name::<T>(),
+                handle.runtime_id().get(),
+                self.runtime_id.get(),
+            );
+        }
+    }
+
     /// Read the current value of a node. Triggers recomputation of the
     /// minimum necessary subgraph if anything is dirty.
     pub fn get<T: Value>(&self, handle: Incr<T>) -> T {
-        debug_assert_eq!(
-            handle.runtime_id(),
-            self.runtime_id,
-            "Incr<T> handle from a foreign runtime",
-        );
+        self.check_handle(handle);
         let slot = handle.slot();
 
         // Record dep if we're inside a compute closure.
@@ -369,11 +383,7 @@ impl<C: Cells> Runtime<C> {
     /// query node would overwrite its computed value and bypass the
     /// state machine; the only valid setter is the compute closure itself.
     pub fn set<T: Value>(&self, handle: Incr<T>, value: T) {
-        debug_assert_eq!(
-            handle.runtime_id(),
-            self.runtime_id,
-            "Incr<T> handle from a foreign runtime",
-        );
+        self.check_handle(handle);
         let slot = handle.slot();
 
         let (arena, is_query) = {
@@ -1219,6 +1229,24 @@ mod tests {
             r.join().unwrap();
         }
         assert_eq!(rt.get(doubled), 2000);
+    }
+
+    #[test]
+    #[should_panic(expected = "foreign runtime")]
+    fn get_with_foreign_handle_panics() {
+        let rt1: Runtime<Local> = Runtime::new();
+        let rt2: Runtime<Local> = Runtime::new();
+        let a = rt1.create_input(1_i64);
+        let _ = rt2.get(a);
+    }
+
+    #[test]
+    #[should_panic(expected = "foreign runtime")]
+    fn set_with_foreign_handle_panics() {
+        let rt1: Runtime<Shared> = Runtime::new();
+        let rt2: Runtime<Shared> = Runtime::new();
+        let a = rt1.create_input(1_i64);
+        rt2.set(a, 2);
     }
 
     /// A panicking compute closure must mark the node Failed, propagate
