@@ -106,7 +106,7 @@ def test_sort_by_key():
     col.insert(20)
 
     rt.get(sorted_col.version_node)
-    assert sorted_col.entries() == [10, 20, 30]
+    assert sorted_col.snapshot() == [10, 20, 30]
 
 
 def test_sort_by_key_delete():
@@ -118,11 +118,11 @@ def test_sort_by_key_delete():
     col.insert(20)
     col.insert(30)
     rt.get(sorted_col.version_node)
-    assert sorted_col.entries() == [10, 20, 30]
+    assert sorted_col.snapshot() == [10, 20, 30]
 
     col.delete(20)
     rt.get(sorted_col.version_node)
-    assert sorted_col.entries() == [10, 30]
+    assert sorted_col.snapshot() == [10, 30]
 
 
 def test_pairwise():
