@@ -333,14 +333,14 @@ where
             Arc::new(OpLock::new(CollectionLog::new()));
 
         // Bootstrap: seed the output from the live snapshot; the cursor
-        // starts past everything the snapshot covered.
+        // starts past everything the snapshot covered. The predicate
+        // runs before the output lock is taken (stage-then-apply).
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         {
+            let kept: Vec<&T> = bootstrap.iter().filter(|v| pred(v)).collect();
             let mut out = output_log.write();
-            for v in &bootstrap {
-                if pred(v) {
-                    out.insert(v.clone());
-                }
+            for v in kept {
+                out.insert(v.clone());
             }
         }
 
@@ -400,9 +400,10 @@ where
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         {
+            let mapped: Vec<U> = bootstrap.iter().map(&f).collect();
             let mut out = output_log.write();
-            for v in &bootstrap {
-                out.insert(f(v));
+            for v in mapped {
+                out.insert(v);
             }
         }
 
@@ -622,14 +623,15 @@ where
         let output_log: Arc<OpLock<CollectionLog<(T, U)>, C>> =
             Arc::new(OpLock::new(CollectionLog::new()));
         {
+            // Key extraction (user code) happens before the output lock.
+            let left_keyed: Vec<(&T, K)> = left_boot.iter().map(|l| (l, left_key(l))).collect();
+            let right_keyed: Vec<(&U, K)> = right_boot.iter().map(|r| (r, right_key(r))).collect();
             let mut out = output_log.write();
-            for l in &left_boot {
-                let k = left_key(l);
+            for (l, k) in left_keyed {
                 st.left_keys.insert(l.clone(), k.clone());
                 st.left_index.entry(k).or_default().push(l.clone());
             }
-            for r in &right_boot {
-                let k = right_key(r);
+            for (r, k) in right_keyed {
                 st.right_keys.insert(r.clone(), k.clone());
                 if let Some(ls) = st.left_index.get(&k) {
                     for l in ls {
@@ -786,15 +788,12 @@ where
         let output_version_counter = Arc::new(AtomicU64::new(0));
 
         {
-            // Bootstrap groups for pre-existing elements. Runs at
-            // creation time (outside any compute), so plain create_input
-            // semantics via new() would assert; sub-collections are
-            // derived and use the unchecked constructor inside
-            // route_into_group either way.
+            // Bootstrap groups for pre-existing elements. Key extraction
+            // (user code) happens before the group locks are taken.
+            let keyed: Vec<(&T, K)> = bootstrap.iter().map(|v| (v, key_fn(v))).collect();
             let mut grps = groups.write();
             let mut kc = key_cache.write();
-            for v in &bootstrap {
-                let k = key_fn(v);
+            for (v, k) in keyed {
                 kc.insert(v.clone(), k.clone());
                 let group = grps
                     .entry(k)
