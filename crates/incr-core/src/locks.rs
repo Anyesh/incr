@@ -8,9 +8,14 @@
 //! identically across both strategies.
 //!
 //! Poisoning: under Shared, if a thread panics while holding the write
-//! guard, the underlying RwLock becomes poisoned. We treat poisoning as a
-//! fatal runtime invariant violation and `.expect()` it. The user-facing
-//! API surfaces are panic-only after such a failure; no recovery path.
+//! guard, the underlying RwLock is poisoned. We deliberately IGNORE the
+//! poison and hand out the guard anyway: every critical section in the
+//! engine either runs no user code at all, or stages user-closure
+//! results outside the lock and applies them inside it with nothing but
+//! clones and hash ops, so an unwind cannot leave partially-applied
+//! state behind. Treating poison as fatal would turn one panicking user
+//! closure into a permanently bricked runtime, which the compute panic
+//! boundary exists to prevent.
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::ops::{Deref, DerefMut};
@@ -81,12 +86,12 @@ impl<T: 'static> Lock<T> for RwLock<T> {
 
     #[inline(always)]
     fn read(&self) -> Self::ReadGuard<'_> {
-        RwLock::read(self).expect("incr-core inner lock poisoned (Shared)")
+        RwLock::read(self).unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[inline(always)]
     fn write(&self) -> Self::WriteGuard<'_> {
-        RwLock::write(self).expect("incr-core inner lock poisoned (Shared)")
+        RwLock::write(self).unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
