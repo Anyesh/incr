@@ -1,0 +1,15 @@
+[package]
+name = "incr-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Comparison benchmarks for incr against other incremental engines. Not published; exists so the README's numbers are reproducible from the repo."
+
+[dev-dependencies]
+incr-core = { path = "../incr-core" }
+salsa = "0.27"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "salsa_compare"
+harness = false
