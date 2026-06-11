@@ -14,6 +14,12 @@
 //! - [`NodeState::Clean`]: value is current and readable.
 //! - [`NodeState::Failed`]: last compute panicked. Transitions to `Dirty`
 //!   when a dependency changes.
+//! - [`NodeState::ComputingDirty`]: a dependency changed while a thread
+//!   was mid-compute. The dirty walk CASes `Computing -> ComputingDirty`
+//!   so the in-flight compute cannot swallow the change: the computing
+//!   thread's finishing CAS (`Computing -> Clean`) fails and it stores
+//!   `Dirty` instead, forcing the next reader to recompute. Not a valid
+//!   claim source (the original computer still owns the node).
 //!
 //! Transitions into `Computing` happen via [`Cells::state_try_transition`]
 //! (CAS on `Shared`, conditional check on `Local`). Transitions out of
@@ -35,6 +41,7 @@ pub enum NodeState {
     Computing = 2,
     Clean = 3,
     Failed = 4,
+    ComputingDirty = 5,
 }
 
 impl NodeState {
@@ -46,6 +53,7 @@ impl NodeState {
             2 => Self::Computing,
             3 => Self::Clean,
             4 => Self::Failed,
+            5 => Self::ComputingDirty,
             other => panic!("invalid NodeState value: {}", other),
         }
     }
@@ -87,18 +95,20 @@ pub fn try_transition<C: Cells>(
 /// Claim the right to compute this node by transitioning to `Computing`
 /// from one of the valid source states (`New` or `Dirty`). `Failed` is
 /// not a valid source: a `Failed` node stays `Failed` until the writer's
-/// dirty walk transitions it to `Dirty` first.
+/// dirty walk transitions it to `Dirty` first. `ComputingDirty` is not a
+/// valid source either: the original computer still owns the node.
 ///
-/// Returns `Ok(())` if this caller now owns compute, or `Err(observed)`
-/// with the state we actually saw. Under `Shared`, exactly one of many
-/// racing threads succeeds.
+/// Returns `Ok(source)` with the state we claimed from (so the caller
+/// knows whether this is a first compute or a recompute without a racy
+/// separate load), or `Err(observed)` with the state we actually saw.
+/// Under `Shared`, exactly one of many racing threads succeeds.
 #[inline(always)]
-pub fn try_claim_compute<C: Cells>(cell: &C::State) -> Result<(), NodeState> {
+pub fn try_claim_compute<C: Cells>(cell: &C::State) -> Result<NodeState, NodeState> {
     // Try Dirty first (more common in steady state), then New.
     if try_transition::<C>(cell, NodeState::Dirty, NodeState::Computing).is_ok() {
-        return Ok(());
+        return Ok(NodeState::Dirty);
     }
-    try_transition::<C>(cell, NodeState::New, NodeState::Computing)
+    try_transition::<C>(cell, NodeState::New, NodeState::Computing).map(|_| NodeState::New)
 }
 
 #[cfg(test)]
@@ -109,15 +119,31 @@ mod tests {
     #[test]
     fn local_claim_from_dirty() {
         let s = Local::new_state(NodeState::Dirty.as_u8());
-        assert!(try_claim_compute::<Local>(&s).is_ok());
+        assert_eq!(try_claim_compute::<Local>(&s), Ok(NodeState::Dirty));
         assert_eq!(load::<Local>(&s), NodeState::Computing);
     }
 
     #[test]
     fn local_claim_from_new() {
         let s = Local::new_state(NodeState::New.as_u8());
-        assert!(try_claim_compute::<Local>(&s).is_ok());
+        assert_eq!(try_claim_compute::<Local>(&s), Ok(NodeState::New));
         assert_eq!(load::<Local>(&s), NodeState::Computing);
+    }
+
+    #[test]
+    fn computing_dirty_is_not_claimable() {
+        let s = Shared::new_state(NodeState::ComputingDirty.as_u8());
+        assert_eq!(
+            try_claim_compute::<Shared>(&s),
+            Err(NodeState::ComputingDirty)
+        );
+        assert_eq!(load::<Shared>(&s), NodeState::ComputingDirty);
+    }
+
+    #[test]
+    fn computing_dirty_roundtrips_through_u8() {
+        assert_eq!(NodeState::from_u8(5), NodeState::ComputingDirty);
+        assert_eq!(NodeState::ComputingDirty.as_u8(), 5);
     }
 
     #[test]

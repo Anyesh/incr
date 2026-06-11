@@ -32,6 +32,7 @@ pub mod sorted_collection;
 pub mod state;
 pub mod trace;
 pub mod value;
+pub mod value_slot;
 
 pub use arena::PrimitiveArena;
 pub use arena_registry::{ArenaRegistry, ErasedArena};
@@ -48,3 +49,4 @@ pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
 pub use trace::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction};
 pub use value::Value;
+pub use value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};

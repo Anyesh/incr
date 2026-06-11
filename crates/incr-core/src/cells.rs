@@ -13,11 +13,16 @@
 //!
 //! `compare_exchange` is exposed only on the state cell because that is
 //! the only place CAS is meaningful (one thread races to claim a node's
-//! `Computing` slot). Other integer cells are written under exclusive
+//! `Computing` slot). The u64 cells additionally expose `fetch_add` (the
+//! global revision counter must not lose increments under concurrent
+//! `set`) and `fetch_max` (timestamp stamps must be monotonic when two
+//! threads race); all other integer cells are written under exclusive
 //! ownership granted by the state machine.
 
 use crate::dep_stack::{DepStack, LocalDepStack, SharedDepStack};
 use crate::locks::{LocalLock, Lock};
+use crate::value::Value;
+use crate::value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::RwLock;
@@ -48,6 +53,7 @@ pub trait Cells: 'static + Sized {
     type Ptr<T: 'static>: PtrCell<T>;
     type Lock<T: 'static>: Lock<T>;
     type DepStack: DepStack;
+    type ValueSlot<T: Value>: ValueSlot<T>;
 
     fn new_u8(v: u8) -> Self::U8;
     fn new_u32(v: u32) -> Self::U32;
@@ -66,6 +72,15 @@ pub trait Cells: 'static + Sized {
     fn u64_store_release(c: &Self::U64, v: u64);
     fn u64_load_relaxed(c: &Self::U64) -> u64;
     fn u64_store_relaxed(c: &Self::U64, v: u64);
+    /// Atomic add; returns the previous value. AcqRel under Shared.
+    fn u64_fetch_add(c: &Self::U64, v: u64) -> u64;
+    /// Atomic max; returns the previous value. AcqRel under Shared.
+    fn u64_fetch_max(c: &Self::U64, v: u64) -> u64;
+    /// Atomic compare-exchange; AcqRel/Acquire under Shared. Needed by
+    /// the changed_at pending-marker protocol, which must replace the
+    /// marker with a concrete revision without regressing a concurrent
+    /// setter's higher revision.
+    fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64>;
 
     fn state_load_acquire(c: &Self::State) -> u8;
     fn state_store_release(c: &Self::State, v: u8);
@@ -148,6 +163,7 @@ impl Cells for Local {
     type Ptr<T: 'static> = LocalPtrCell<T>;
     type Lock<T: 'static> = LocalLock<T>;
     type DepStack = LocalDepStack;
+    type ValueSlot<T: Value> = LocalValueSlot<T>;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -208,6 +224,30 @@ impl Cells for Local {
     fn u64_store_relaxed(c: &Self::U64, v: u64) {
         c.set(v);
     }
+    #[inline(always)]
+    fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
+        let prev = c.get();
+        c.set(prev.wrapping_add(v));
+        prev
+    }
+    #[inline(always)]
+    fn u64_fetch_max(c: &Self::U64, v: u64) -> u64 {
+        let prev = c.get();
+        if v > prev {
+            c.set(v);
+        }
+        prev
+    }
+    #[inline(always)]
+    fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64> {
+        let prev = c.get();
+        if prev == current {
+            c.set(new);
+            Ok(prev)
+        } else {
+            Err(prev)
+        }
+    }
 
     #[inline(always)]
     fn state_load_acquire(c: &Self::State) -> u8 {
@@ -237,6 +277,7 @@ impl Cells for Shared {
     type Ptr<T: 'static> = AtomicPtr<T>;
     type Lock<T: 'static> = RwLock<T>;
     type DepStack = SharedDepStack;
+    type ValueSlot<T: Value> = SharedValueSlot<T>;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -297,6 +338,18 @@ impl Cells for Shared {
     fn u64_store_relaxed(c: &Self::U64, v: u64) {
         c.store(v, Ordering::Relaxed);
     }
+    #[inline(always)]
+    fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
+        c.fetch_add(v, Ordering::AcqRel)
+    }
+    #[inline(always)]
+    fn u64_fetch_max(c: &Self::U64, v: u64) -> u64 {
+        c.fetch_max(v, Ordering::AcqRel)
+    }
+    #[inline(always)]
+    fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64> {
+        c.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+    }
 
     #[inline(always)]
     fn state_load_acquire(c: &Self::State) -> u8 {
@@ -333,6 +386,48 @@ mod tests {
         assert_eq!(Shared::u64_load_acquire(&c), 7);
         Shared::u64_store_release(&c, 11);
         assert_eq!(Shared::u64_load_acquire(&c), 11);
+    }
+
+    #[test]
+    fn local_fetch_add_and_max() {
+        let c = Local::new_u64(5);
+        assert_eq!(Local::u64_fetch_add(&c, 3), 5);
+        assert_eq!(Local::u64_load_relaxed(&c), 8);
+        assert_eq!(Local::u64_fetch_max(&c, 4), 8);
+        assert_eq!(Local::u64_load_relaxed(&c), 8);
+        assert_eq!(Local::u64_fetch_max(&c, 11), 8);
+        assert_eq!(Local::u64_load_relaxed(&c), 11);
+    }
+
+    #[test]
+    fn shared_fetch_add_and_max() {
+        let c = Shared::new_u64(5);
+        assert_eq!(Shared::u64_fetch_add(&c, 3), 5);
+        assert_eq!(Shared::u64_load_relaxed(&c), 8);
+        assert_eq!(Shared::u64_fetch_max(&c, 4), 8);
+        assert_eq!(Shared::u64_load_relaxed(&c), 8);
+        assert_eq!(Shared::u64_fetch_max(&c, 11), 8);
+        assert_eq!(Shared::u64_load_relaxed(&c), 11);
+    }
+
+    #[test]
+    fn shared_fetch_add_no_lost_updates() {
+        use std::sync::Arc;
+        let c = Arc::new(Shared::new_u64(0));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let c = Arc::clone(&c);
+                std::thread::spawn(move || {
+                    for _ in 0..1000 {
+                        Shared::u64_fetch_add(&c, 1);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(Shared::u64_load_relaxed(&c), 8000);
     }
 
     #[test]

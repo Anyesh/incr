@@ -151,6 +151,60 @@ impl<C: Cells> NodeData<C> {
         C::u64_store_release(&self.changed_at, v);
     }
 
+    /// Raise `verified_at` to `v` if `v` is larger. Protocol stamps must
+    /// use max, not store: two threads can race to stamp (a verifier and
+    /// a computer) and a plain store could regress the timestamp, masking
+    /// a change from a later verifier.
+    #[inline(always)]
+    pub fn max_verified_at(&self, v: u64) {
+        C::u64_fetch_max(&self.verified_at, v);
+    }
+
+    /// Raise `changed_at` to `v` if `v` is larger. See [`Self::max_verified_at`].
+    #[inline(always)]
+    pub fn max_changed_at(&self, v: u64) {
+        C::u64_fetch_max(&self.changed_at, v);
+    }
+
+    /// Sentinel meaning "a set() is in flight on this input". Any
+    /// verifier comparing `changed_at > my_verified` sees the marker as
+    /// infinitely new and recomputes instead of verifying clean. Without
+    /// it there is a mask window: a setter that has bumped the global
+    /// revision but not yet stamped `changed_at` lets a concurrent
+    /// verifier stamp `verified_at` at or above the setter's revision
+    /// while having read the old stamp, after which the change is
+    /// invisible forever.
+    pub const CHANGED_PENDING: u64 = u64::MAX;
+
+    /// Enter the pending-marker state. Must happen BEFORE the value swap
+    /// and revision bump in `set()`; see [`Self::CHANGED_PENDING`].
+    #[inline(always)]
+    pub fn mark_changed_pending(&self) {
+        C::u64_fetch_max(&self.changed_at, Self::CHANGED_PENDING);
+    }
+
+    /// Replace the pending marker with the setter's concrete revision,
+    /// without regressing a concurrent setter's higher revision and
+    /// without erasing a concurrent setter's fresh marker more than
+    /// necessary (max semantics among concrete revisions).
+    pub fn settle_changed_at(&self, r: u64) {
+        let mut cur = C::u64_load_acquire(&self.changed_at);
+        loop {
+            let target = if cur == Self::CHANGED_PENDING || r > cur {
+                r
+            } else {
+                return;
+            };
+            match C::u64_compare_exchange(&self.changed_at, cur, target) {
+                Ok(_) => return,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Raw dep-count cell value: exact count for 0..=7 (inline storage),
+    /// [`Self::OVERFLOW_MARKER`] when deps live in the overflow list
+    /// (whose length is authoritative).
     #[inline(always)]
     pub fn dep_count(&self) -> u8 {
         C::u8_load_relaxed(&self.dep_count)
@@ -178,7 +232,6 @@ impl<C: Cells> NodeData<C> {
     /// graveyard build-up; no leak past process scope.
     pub(crate) fn install_deps(&self, new_deps: &[NodeId]) {
         let count = new_deps.len();
-        assert!(count <= u8::MAX as usize, "dep count exceeds u8");
         if count <= 7 {
             for (i, dep) in new_deps.iter().enumerate() {
                 C::u32_store_relaxed(&self.inline_deps[i], dep.0);
@@ -207,13 +260,21 @@ impl<C: Cells> NodeData<C> {
             // is wrapped in a `Replaced` whose `retire` defers free
             // through the global hazard-pointer domain.
             let replaced = self.overflow_deps.swap(list);
-            C::u8_store_release(&self.dep_count, count as u8);
+            // The cell is one byte, so counts above 7 are encoded as a
+            // marker and the DepList length is authoritative. This is
+            // what lifts the old 255-dep ceiling: a query may read any
+            // number of inputs.
+            C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER);
             if let Some(old) = replaced {
                 // SAFETY: same as the inline-path retire above.
                 unsafe { old.retire() };
             }
         }
     }
+
+    /// Sentinel stored in `dep_count` when the dep list lives in
+    /// `overflow_deps`. Any value above 7 would do; 8 is the smallest.
+    pub const OVERFLOW_MARKER: u8 = 8;
 
     /// Iterate over the node's recorded dependencies. The caller must
     /// have observed the node's state via an Acquire load (e.g., through
@@ -232,7 +293,12 @@ impl<C: Cells> NodeData<C> {
     /// is not duplicated into every call site.
     #[inline]
     pub fn for_each_dep(&self, mut f: impl FnMut(NodeId)) {
-        let count = C::u8_load_relaxed(&self.dep_count);
+        // Acquire pairs with install_deps's Release store on dep_count:
+        // a reader that observes the new count must also observe the
+        // inline entries (or the overflow pointer) written before it.
+        // Relaxed here could yield a count ahead of the entries and index
+        // sentinel garbage.
+        let count = C::u8_load_acquire(&self.dep_count);
         if count <= 7 {
             for i in 0..(count as usize) {
                 let raw = C::u32_load_relaxed(&self.inline_deps[i]);
@@ -355,5 +421,57 @@ mod tests {
         let n: NodeData<Shared> = NodeData::new_query(0, 99);
         assert_eq!(n.state(), NodeState::New);
         assert_eq!(n.dep_count(), 0);
+    }
+
+    #[test]
+    fn max_stamps_are_monotonic() {
+        let n: NodeData<Shared> = NodeData::new_input(0, 0, 10);
+        n.max_verified_at(7);
+        assert_eq!(n.verified_at(), 10);
+        n.max_verified_at(12);
+        assert_eq!(n.verified_at(), 12);
+        n.max_changed_at(11);
+        assert_eq!(n.changed_at(), 11);
+        n.max_changed_at(5);
+        assert_eq!(n.changed_at(), 11);
+    }
+
+    #[test]
+    fn deps_beyond_255_roundtrip() {
+        for_both_strategies_deps(300);
+        for_both_strategies_deps(8);
+        for_both_strategies_deps(7);
+    }
+
+    fn for_both_strategies_deps(n: u32) {
+        let local: NodeData<Local> = NodeData::new_query(0, 0);
+        let shared: NodeData<Shared> = NodeData::new_query(0, 0);
+        let deps: Vec<NodeId> = (0..n).map(NodeId).collect();
+        local.install_deps(&deps);
+        shared.install_deps(&deps);
+        for node_deps in [collect_deps(&local) as Vec<NodeId>, collect_deps(&shared)] {
+            assert_eq!(node_deps, deps, "roundtrip failed for n={}", n);
+        }
+        if n > 7 {
+            assert_eq!(local.dep_count(), NodeData::<Local>::OVERFLOW_MARKER);
+        }
+    }
+
+    fn collect_deps<C: crate::cells::Cells>(node: &NodeData<C>) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        node.for_each_dep(|d| out.push(d));
+        out
+    }
+
+    #[test]
+    fn shrink_from_overflow_back_to_inline() {
+        let n: NodeData<Local> = NodeData::new_query(0, 0);
+        let big: Vec<NodeId> = (0..20).map(NodeId).collect();
+        n.install_deps(&big);
+        assert_eq!(collect_deps(&n), big);
+        let small: Vec<NodeId> = (0..3).map(NodeId).collect();
+        n.install_deps(&small);
+        assert_eq!(collect_deps(&n), small);
+        assert_eq!(n.dep_count(), 3);
     }
 }

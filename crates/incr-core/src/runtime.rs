@@ -131,12 +131,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     fn bump_revision(&self) -> u64 {
-        let cur = C::u64_load_acquire(&self.revision);
-        let next = cur
-            .checked_add(1)
-            .expect("incr-core: revision counter overflow");
-        C::u64_store_release(&self.revision, next);
-        next
+        // fetch_add, not load+store: two concurrent set() calls must not
+        // collapse into one revision or the cutoff protocol conflates
+        // their changes.
+        C::u64_fetch_add(&self.revision, 1) + 1
     }
 
     /// Create an input node with an initial value.
@@ -204,14 +202,13 @@ impl<C: Cells> Runtime<C> {
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
                     if is_recompute {
-                        if let Some(old) = arena_inner.try_read(node.arena_slot()) {
-                            if old == new_value {
-                                return false; // early cutoff
-                            }
-                        }
+                        // Compare-and-publish in one slot session; the
+                        // false return is the early cutoff.
+                        arena_inner.write_if_changed(node.arena_slot(), new_value)
+                    } else {
+                        arena_inner.write(node.arena_slot(), new_value);
+                        true
                     }
-                    arena_inner.write(node.arena_slot(), new_value);
-                    true
                 },
             );
 
@@ -390,25 +387,36 @@ impl<C: Cells> Runtime<C> {
             slot,
         );
 
-        // No-op if the value is unchanged.
+        // No-op if the value is unchanged. Racy against a concurrent
+        // set(), but benignly: the no-op linearizes before the other
+        // setter.
         let node = self.nodes.get(slot);
-        if let Some(old) = arena.try_read(node.arena_slot()) {
-            if old == value {
-                return;
-            }
+        if arena.eq_current(node.arena_slot(), &value) {
+            return;
         }
 
-        let new_rev = self.bump_revision();
+        // Publication order is the protocol's backbone:
+        // 1. pending marker, so no verifier can stamp past this change
+        //    while the concrete revision is still unknown;
+        // 2. value swap, so any thread that later observes the bumped
+        //    revision also observes the new value (swap is sequenced
+        //    before the AcqRel fetch_add);
+        // 3. revision bump;
+        // 4. settle changed_at to the concrete revision;
+        // 5. dirty walk, whose Release stores publish all of the above
+        //    to claimants that Acquire the Dirty state.
+        node.mark_changed_pending();
         arena.write(node.arena_slot(), value);
-        node.set_changed_at(new_rev);
-        node.set_verified_at(new_rev);
+        let new_rev = self.bump_revision();
+        node.settle_changed_at(new_rev);
+        node.max_verified_at(new_rev);
 
         self.mark_dependents_dirty(NodeId(slot));
     }
 
     /// BFS forward walk from `start`'s dependents, marking each Clean
-    /// node as Dirty. Stops at already-Dirty/New nodes (they're already
-    /// in the dirty set).
+    /// node as Dirty. Every transition is a CAS so the walk can never
+    /// clobber a `Computing` claim it raced with.
     fn mark_dependents_dirty(&self, start: NodeId) {
         let mut queue: Vec<NodeId> = {
             let inner = self.inner.read();
@@ -417,18 +425,44 @@ impl<C: Cells> Runtime<C> {
 
         while let Some(id) = queue.pop() {
             let node = self.nodes.get(id.0);
-            let cur = state::load::<C>(node.state_cell());
-            match cur {
-                NodeState::Clean | NodeState::Failed => {
-                    // Transition to Dirty so the next reader recomputes.
-                    state::store::<C>(node.state_cell(), NodeState::Dirty);
-                    let inner = self.inner.read();
-                    for &dep in &inner.dependents[id.0 as usize] {
-                        queue.push(dep);
+            loop {
+                let cur = state::load::<C>(node.state_cell());
+                match cur {
+                    NodeState::Clean | NodeState::Failed => {
+                        if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
+                            .is_ok()
+                        {
+                            let inner = self.inner.read();
+                            queue.extend(inner.dependents[id.0 as usize].iter().copied());
+                            break;
+                        }
+                        // The state moved under us (a claim or another
+                        // walk); re-examine.
                     }
-                }
-                NodeState::New | NodeState::Dirty | NodeState::Computing => {
-                    // Already dirty (or being computed); don't re-enqueue.
+                    NodeState::Computing => {
+                        // An in-flight compute may have read the old
+                        // input value and will stamp timestamps that
+                        // predate this set. Flag it so its finishing CAS
+                        // fails and it lands Dirty, and walk through to
+                        // its dependents, which would otherwise stay
+                        // Clean against a stale parent.
+                        if state::try_transition::<C>(
+                            node.state_cell(),
+                            NodeState::Computing,
+                            NodeState::ComputingDirty,
+                        )
+                        .is_ok()
+                        {
+                            let inner = self.inner.read();
+                            queue.extend(inner.dependents[id.0 as usize].iter().copied());
+                            break;
+                        }
+                    }
+                    NodeState::New | NodeState::Dirty | NodeState::ComputingDirty => {
+                        // Already flagged; the walk that flagged it also
+                        // covered its dependents.
+                        break;
+                    }
                 }
             }
         }
@@ -447,114 +481,196 @@ impl<C: Cells> Runtime<C> {
         // visited=true: all deps clean now, run this node's compute.
         let mut work: Vec<(NodeId, bool)> = vec![(id, false)];
 
+        // Cycle backstop for the walk itself. A DAG bounds first-visit
+        // expansions by the dirty subgraph's edge count, which dep_count
+        // caps at 255 per node plus one self-push each, so a DAG can
+        // never exhaust this budget; an all-Dirty cycle re-expands
+        // forever and always will. Cycles that pass through a compute
+        // are caught exactly in compute_one via the frame stack; this
+        // catches the remaining walk-only case.
+        let mut budget: u64 = 1024 + 256 * u64::from(self.nodes.len());
+
         while let Some((cur, visited)) = work.pop() {
             if visited {
                 self.compute_one(cur);
                 continue;
             }
 
-            let node = self.nodes.get(cur.0);
-            let cur_state = state::load::<C>(node.state_cell());
-            if cur_state == NodeState::Clean {
-                continue;
+            budget -= 1;
+            if budget == 0 {
+                panic!(
+                    "incr-core: dependency cycle detected: ensure_clean({}) exceeded its \
+                     traversal budget, which no acyclic graph can",
+                    id.0,
+                );
             }
 
-            // First visit: push self (to process after deps) then push
-            // any non-clean deps.
-            work.push((cur, true));
-            node.for_each_dep(|dep| {
-                let dep_node = self.nodes.get(dep.0);
-                let dep_state = state::load::<C>(dep_node.state_cell());
-                if dep_state != NodeState::Clean {
-                    work.push((dep, false));
+            let node = self.nodes.get(cur.0);
+            match state::load::<C>(node.state_cell()) {
+                NodeState::Clean => continue,
+                NodeState::Computing | NodeState::ComputingDirty => {
+                    // Another thread owns this subtree and is cleaning
+                    // its deps itself; expanding them here would tear
+                    // through a dep list mid-rewrite. Just wait for the
+                    // owner in compute_one.
+                    work.push((cur, true));
                 }
-            });
+                _ => {
+                    // First visit: push self (to process after deps)
+                    // then push any non-clean deps.
+                    work.push((cur, true));
+                    node.for_each_dep(|dep| {
+                        let dep_node = self.nodes.get(dep.0);
+                        let dep_state = state::load::<C>(dep_node.state_cell());
+                        if dep_state != NodeState::Clean {
+                            work.push((dep, false));
+                        }
+                    });
+                }
+            }
         }
     }
 
     /// Compute (or verify) a single node, assuming all its known deps
     /// are already clean. Handles state-machine transitions and red/green
     /// early cutoff.
+    ///
+    /// Protocol invariants (see the shared-read-protocol-v2 decision):
+    /// - every transition is a CAS; nothing ever clobbers a Computing
+    ///   claim;
+    /// - a thread observing Computing waits for the owner, unless the
+    ///   node is on its own frame stack, which is a dependency cycle;
+    /// - stamps use the revision captured BEFORE verify/compute via
+    ///   fetch_max, so a concurrent set() invalidates rather than masks.
     fn compute_one(&self, id: NodeId) {
         let node = self.nodes.get(id.0);
+        let mut spins: u32 = 0;
 
-        // If something else cleaned us in the meantime, we're done.
-        if state::load::<C>(node.state_cell()) == NodeState::Clean {
+        loop {
+            let observed = state::load::<C>(node.state_cell());
+            match observed {
+                NodeState::Clean => return,
+                NodeState::Computing | NodeState::ComputingDirty => {
+                    if self.dep_stack.is_computing(id) {
+                        panic!(
+                            "incr-core: dependency cycle detected: node {} was read while \
+                             its own compute was in progress",
+                            id.0,
+                        );
+                    }
+                    // Another thread owns the compute; wait for it.
+                    // Bounded spin first (computes are usually short),
+                    // then yield. Local never reaches this arm: single-
+                    // threaded Computing always means a cycle.
+                    //
+                    // Known limitation: a cyclic graph whose cycle spans
+                    // two threads' in-flight computes spins here forever
+                    // instead of panicking; cross-thread cycle detection
+                    // needs a waits-for graph and is not implemented.
+                    spins += 1;
+                    if spins < 64 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                    continue;
+                }
+                NodeState::Failed => {
+                    // No code path produces Failed yet; the compute
+                    // panic boundary that does lands next and replaces
+                    // this arm with read-of-failed semantics.
+                    unreachable!("NodeState::Failed has no producer yet");
+                }
+                NodeState::New | NodeState::Dirty => {}
+            }
+
+            // Distinguish input vs query: inputs don't compute, they
+            // just need their state stamped clean.
+            let compute = {
+                let inner = self.inner.read();
+                inner.compute_fns.get(id.0 as usize).and_then(|f| f.clone())
+            };
+            let compute = match compute {
+                Some(f) => f,
+                None => {
+                    node.max_verified_at(self.current_revision());
+                    if state::try_transition::<C>(node.state_cell(), observed, NodeState::Clean)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            // Capture the revision BEFORE verifying or computing. If a
+            // set() bumps it mid-flight, our stamps stay below the new
+            // changed_at and the next reader re-verifies; stamping the
+            // post-compute revision would mask the change forever.
+            let start_rev = self.current_revision();
+
+            // Red/green check: if no dep's changed_at exceeds our
+            // verified_at, we can skip the closure entirely. Only valid
+            // from Dirty: a New node has nothing to verify against.
+            if observed == NodeState::Dirty {
+                let my_verified = node.verified_at();
+                let mut any_changed = false;
+                node.for_each_dep(|dep| {
+                    if any_changed {
+                        return;
+                    }
+                    if self.nodes.get(dep.0).changed_at() > my_verified {
+                        any_changed = true;
+                    }
+                });
+                if !any_changed {
+                    node.max_verified_at(start_rev);
+                    if state::try_transition::<C>(
+                        node.state_cell(),
+                        NodeState::Dirty,
+                        NodeState::Clean,
+                    )
+                    .is_ok()
+                    {
+                        self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
+                        return;
+                    }
+                    continue;
+                }
+            }
+
+            // Full compute path. Claim Computing first; the claim source
+            // tells us exactly whether this is a recompute.
+            let claimed_from = match state::try_claim_compute::<C>(node.state_cell()) {
+                Ok(src) => src,
+                Err(_) => continue,
+            };
+            let is_recompute = claimed_from == NodeState::Dirty;
+
+            // Track deps via the strategy's dep stack.
+            self.dep_stack.push_frame(id);
+            let value_changed = (compute)(self, id.0, is_recompute);
+            let recorded_deps = self.dep_stack.pop_frame();
+
+            self.publish_deps(id, &recorded_deps);
+
+            if value_changed || !is_recompute {
+                node.max_changed_at(start_rev);
+            }
+            node.max_verified_at(start_rev);
+
+            // Finish. If a set() flagged us ComputingDirty mid-compute,
+            // land Dirty so the next reader recomputes against the newer
+            // input; the value we just produced is still a consistent
+            // pre-set snapshot, so returning it is linearizable.
+            if state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Clean)
+                .is_err()
+            {
+                state::store::<C>(node.state_cell(), NodeState::Dirty);
+            }
+            self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
             return;
         }
-
-        // Distinguish input vs query: inputs don't compute, they just
-        // need their state stamped clean.
-        let compute = {
-            let inner = self.inner.read();
-            inner.compute_fns.get(id.0 as usize).and_then(|f| f.clone())
-        };
-        let compute = match compute {
-            Some(f) => f,
-            None => {
-                // Input node: state machine bookkeeping only.
-                let rev = self.current_revision();
-                node.set_verified_at(rev);
-                state::store::<C>(node.state_cell(), NodeState::Clean);
-                return;
-            }
-        };
-
-        let is_recompute = !matches!(state::load::<C>(node.state_cell()), NodeState::New,);
-
-        // Red/green check: if no dep's changed_at exceeds our verified_at,
-        // we can skip the closure entirely.
-        if is_recompute {
-            let my_verified = node.verified_at();
-            let mut any_changed = false;
-            node.for_each_dep(|dep| {
-                if any_changed {
-                    return;
-                }
-                if self.nodes.get(dep.0).changed_at() > my_verified {
-                    any_changed = true;
-                }
-            });
-            if !any_changed {
-                // Verified clean: bump verified_at, leave changed_at alone
-                // so downstream cutoffs also work.
-                let rev = self.current_revision();
-                node.set_verified_at(rev);
-                state::store::<C>(node.state_cell(), NodeState::Clean);
-                self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
-                return;
-            }
-        }
-
-        // Full compute path. Claim Computing first.
-        if state::try_claim_compute::<C>(node.state_cell()).is_err() {
-            // Lost the race (Shared) or already cleaned (Local). Re-check
-            // and bail; the caller's ensure_clean loop will see Clean and
-            // move on.
-            return;
-        }
-
-        // Track deps via the strategy's dep stack.
-        self.dep_stack.push_frame();
-        let value_changed = (compute)(self, id.0, is_recompute);
-        let recorded_deps = self.dep_stack.pop_frame();
-
-        // Update dep edges. For the first compute (is_recompute=false)
-        // there are no old deps; for recompute we diff against the old
-        // set. NodeData stores deps via publish_initial_deps; for now
-        // we always treat deps as initial (the leaky overflow-replace
-        // path lands in the next commit alongside hazard-pointer
-        // reclamation).
-        self.publish_deps(id, &recorded_deps);
-
-        // Update timestamps and transition to Clean.
-        let rev = self.current_revision();
-        if value_changed || !is_recompute {
-            node.set_changed_at(rev);
-        }
-        node.set_verified_at(rev);
-        state::store::<C>(node.state_cell(), NodeState::Clean);
-        self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
     }
 
     /// Record dependencies on the node and update reverse edges in the
@@ -893,6 +1009,173 @@ mod tests {
             trace.node_traces
         );
         assert!(trace.nodes_cutoff >= 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "dependency cycle")]
+    fn local_direct_cycle_panics() {
+        use std::sync::OnceLock;
+        let rt: Runtime<Local> = Runtime::new();
+        let own: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let captured = own.clone();
+        let q = rt.create_query(move |rt| rt.get(*captured.get().unwrap()) + 1);
+        own.set(q).unwrap();
+        let _ = rt.get(q);
+    }
+
+    #[test]
+    #[should_panic(expected = "dependency cycle")]
+    fn shared_direct_cycle_panics() {
+        use std::sync::OnceLock;
+        let rt: Runtime<Shared> = Runtime::new();
+        let own: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let captured = own.clone();
+        let q = rt.create_query(move |rt| rt.get(*captured.get().unwrap()) + 1);
+        own.set(q).unwrap();
+        let _ = rt.get(q);
+    }
+
+    #[test]
+    #[should_panic(expected = "dependency cycle")]
+    fn local_transitive_cycle_panics() {
+        use std::sync::OnceLock;
+        let rt: Runtime<Local> = Runtime::new();
+        let q1_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let q1_for_q2 = q1_cell.clone();
+        let q2 = rt.create_query(move |rt| rt.get(*q1_for_q2.get().unwrap()) * 2);
+        let q1 = rt.create_query(move |rt| rt.get(q2) + 1);
+        q1_cell.set(q1).unwrap();
+        let _ = rt.get(q1);
+    }
+
+    /// A cycle that only forms after a set() makes a query start reading
+    /// a node that transitively reads it back. The cycle is reached
+    /// mid-compute, so the frame-stack check fires.
+    #[test]
+    #[should_panic(expected = "dependency cycle")]
+    fn local_cycle_formed_by_dynamic_deps_panics() {
+        use std::sync::OnceLock;
+        let rt: Runtime<Local> = Runtime::new();
+        let s = rt.create_input(0_i64);
+        let q1_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let q1_for_q2 = q1_cell.clone();
+        let q2 = rt.create_query(move |rt| {
+            if rt.get(s) == 1 {
+                rt.get(*q1_for_q2.get().unwrap())
+            } else {
+                0
+            }
+        });
+        let q1 = rt.create_query(move |rt| if rt.get(s) == 1 { rt.get(q2) } else { 0 });
+        q1_cell.set(q1).unwrap();
+        assert_eq!(rt.get(q1), 0);
+        rt.set(s, 1);
+        let _ = rt.get(q1);
+    }
+
+    /// Many threads race the FIRST get of the same query chain. Before
+    /// the wait-on-Computing protocol, claim losers fell through to the
+    /// arena read and hit an uninitialized slot.
+    #[test]
+    fn shared_first_get_claim_race_returns_correct_value() {
+        use std::sync::Barrier;
+        for _ in 0..50 {
+            let rt: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+            let a = rt.create_input(3_i64);
+            let b = rt.create_query(move |rt| rt.get(a) * 7);
+            let c = rt.create_query(move |rt| rt.get(b) + 1);
+            let barrier = Arc::new(Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let rt = Arc::clone(&rt);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        rt.get(c)
+                    })
+                })
+                .collect();
+            for h in handles {
+                assert_eq!(h.join().unwrap(), 22);
+            }
+        }
+    }
+
+    /// Concurrent setters on distinct inputs must not lose revision
+    /// increments or strand stale cutoffs: the sum must be exact after
+    /// all writers join.
+    #[test]
+    fn shared_concurrent_setters_converge() {
+        let rt: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+        let inputs: Vec<_> = (0..8).map(|_| rt.create_input(0_i64)).collect();
+        let captured = inputs.clone();
+        let sum = rt.create_query(move |rt| captured.iter().map(|i| rt.get(*i)).sum::<i64>());
+        assert_eq!(rt.get(sum), 0);
+
+        let handles: Vec<_> = inputs
+            .iter()
+            .map(|&input| {
+                let rt = Arc::clone(&rt);
+                std::thread::spawn(move || {
+                    for v in 1..=500_i64 {
+                        rt.set(input, v);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(rt.get(sum), 500 * 8);
+    }
+
+    /// Readers hammer a query while a writer mutates its input. Every
+    /// observed value must be a consistent function of SOME input the
+    /// writer published, and reads must never go backwards once the
+    /// writer is done.
+    #[test]
+    fn shared_reader_writer_hammer_observes_consistent_values() {
+        let rt: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+        let input = rt.create_input(0_i64);
+        let doubled = rt.create_query(move |rt| rt.get(input) * 2);
+        assert_eq!(rt.get(doubled), 0);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let rt = Arc::clone(&rt);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let v = rt.get(doubled);
+                        assert!(v % 2 == 0 && (0..=2000).contains(&v), "torn read: {}", v);
+                    }
+                })
+            })
+            .collect();
+
+        for v in 1..=1000_i64 {
+            rt.set(input, v);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert_eq!(rt.get(doubled), 2000);
+    }
+
+    /// A query may read more than 255 inputs; the u8 dep-count cell uses
+    /// an overflow marker and the DepList length is authoritative.
+    #[test]
+    fn local_query_with_300_deps_propagates() {
+        let rt: Runtime<Local> = Runtime::new();
+        let inputs: Vec<_> = (0..300_i64).map(|v| rt.create_input(v)).collect();
+        let captured = inputs.clone();
+        let sum = rt.create_query(move |rt| captured.iter().map(|i| rt.get(*i)).sum::<i64>());
+        let expected: i64 = (0..300).sum();
+        assert_eq!(rt.get(sum), expected);
+        rt.set(inputs[123], 10_000);
+        assert_eq!(rt.get(sum), expected - 123 + 10_000);
     }
 
     /// Stress test: many dynamic-dep transitions through the

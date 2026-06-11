@@ -1,47 +1,24 @@
-//! `GenericArena<T, C>`: typed value storage parameterized over both the
-//! value type and the [`Cells`] strategy.
+//! `GenericArena<T, C>`: typed value storage for every node of value
+//! type `T`, parameterized over the [`Cells`] strategy.
 //!
-//! Slot layout: `UnsafeCell<Option<T>>`. The `Option` allows two states:
-//! - `None`: slot reserved but never written (e.g., a query node whose
-//!   compute hasn't run yet).
-//! - `Some(value)`: slot holds the current value.
+//! The arena is a growable vector of [`ValueSlot`]s. The vector itself
+//! is guarded by the strategy lock (`C::Lock`): readers take the read
+//! side to index, growth takes the write side. Under `Local` that is a
+//! `RefCell` borrow (no atomics); under `Shared` it is an uncontended
+//! `RwLock` read.
 //!
-//! Exclusive access to a slot is gated by the node state machine, NOT by
-//! Rust's borrow checker: the slot's `Computing` state is held by
-//! exactly one thread (CAS-claimed on Shared, single-threaded on Local).
-//! Readers reach a slot only when the corresponding node is `Clean`, so
-//! they observe the writer's data through the Acquire load on state.
-//!
-//! Reads clone `T` rather than returning a reference because the runtime
-//! may need to drop the slot (or recompute through it) after the read
-//! returns; tying a reference's lifetime to the read call would prevent
-//! that. Clone cost is part of the user's `T` impl.
-//!
-//! The segmented production primitive arenas (`AtomicPrimitiveArena<T>`
-//! for u64/f64/etc.) are deferred. Primitives go through the generic
-//! arena for now; the specialization that gives 5-10 ns per-get on
-//! primitives lands in a follow-up commit once the rest of the engine
-//! is in place.
+//! Per-slot synchronization lives entirely in the slot type
+//! (in-place cell under `Local`, hazard-protected pointer swap under
+//! `Shared`); see the `value_slot` module for the soundness argument.
+//! The arena therefore needs no unsafe code of its own.
 
 use crate::cells::Cells;
+use crate::locks::Lock;
 use crate::value::Value;
-use std::cell::UnsafeCell;
-use std::marker::PhantomData;
-use std::sync::RwLock;
+use crate::value_slot::ValueSlot;
 
-/// Typed arena for `T` values, parameterized over the strategy.
-///
-/// Under `Shared`, the slots vector is behind an `RwLock` (the runtime's
-/// write-side lock guards all arena growth). Under `Local`, the same
-/// RwLock is morally a `RefCell`; we use `RwLock` uniformly for the
-/// first cut to avoid duplicating arena code per strategy. The cost on
-/// Local is one uncontended lock acquire per arena op, which is
-/// significant on the hot path. The follow-up commit replaces this with
-/// a `C`-parameterized inner-lock primitive (`Cells::RwLock<Vec<...>>`)
-/// to remove the cost on Local.
 pub struct GenericArena<T: Value, C: Cells> {
-    slots: RwLock<Vec<Box<UnsafeCell<Option<T>>>>>,
-    _phantom: PhantomData<C>,
+    slots: C::Lock<Vec<C::ValueSlot<T>>>,
 }
 
 impl<T: Value, C: Cells> Default for GenericArena<T, C> {
@@ -53,65 +30,62 @@ impl<T: Value, C: Cells> Default for GenericArena<T, C> {
 impl<T: Value, C: Cells> GenericArena<T, C> {
     pub fn new() -> Self {
         Self {
-            slots: RwLock::new(Vec::new()),
-            _phantom: PhantomData,
+            slots: <C::Lock<Vec<C::ValueSlot<T>>> as Lock<_>>::new(Vec::new()),
         }
     }
 
-    /// Append a new slot initialized to `Some(initial)`. Caller holds
-    /// the runtime's write lock.
+    /// Append a new slot initialized to `Some(initial)`. Growth holds
+    /// the write side of the strategy lock, so it cannot race a reader
+    /// mid-index.
     pub fn reserve_with(&self, initial: T) -> u32 {
-        let mut slots = self.slots.write().expect("arena slots lock poisoned");
+        let mut slots = self.slots.write();
         let id = slots.len() as u32;
-        slots.push(Box::new(UnsafeCell::new(Some(initial))));
+        slots.push(<C::ValueSlot<T> as ValueSlot<T>>::new_with(initial));
         id
     }
 
-    /// Append an uninitialized slot (`None`). Used by query nodes whose
-    /// compute will populate the slot on first run.
+    /// Append an uninitialized slot. Used by query nodes whose compute
+    /// will populate the slot on first run.
     pub fn reserve(&self) -> u32 {
-        let mut slots = self.slots.write().expect("arena slots lock poisoned");
+        let mut slots = self.slots.write();
         let id = slots.len() as u32;
-        slots.push(Box::new(UnsafeCell::new(None)));
+        slots.push(<C::ValueSlot<T> as ValueSlot<T>>::new_empty());
         id
     }
 
-    /// Read the value at `slot`. Panics if the slot is `None` (caller
-    /// should use [`try_read`](Self::try_read) if they need to handle
-    /// uninitialized slots).
+    /// Clone the value at `slot` out. Panics if the slot was never
+    /// written (callers reach values only through the state machine,
+    /// which guarantees the first compute completed).
     pub fn read(&self, slot: u32) -> T {
-        let slots = self.slots.read().expect("arena slots lock poisoned");
-        let cell = &slots[slot as usize];
-        // SAFETY: exclusive access to this slot is governed by the
-        // node state machine: a reader only reaches here when the
-        // node is Clean (Acquire-synchronized with the writer's
-        // Release store on state). No mutable alias is in flight.
-        unsafe {
-            (*cell.get())
-                .as_ref()
-                .expect("GenericArena::read on uninitialized slot")
-                .clone()
-        }
+        self.slots.read()[slot as usize].read()
     }
 
     pub fn try_read(&self, slot: u32) -> Option<T> {
-        let slots = self.slots.read().expect("arena slots lock poisoned");
-        let cell = &slots[slot as usize];
-        unsafe { (*cell.get()).as_ref().cloned() }
+        self.slots.read()[slot as usize].try_read()
     }
 
-    /// Overwrite the value at `slot`. Caller must own exclusive access
-    /// via the Computing state.
+    /// Publish a new value at `slot`. Under `Shared` this is an atomic
+    /// pointer swap; concurrent readers finish their clone against the
+    /// displaced value, which is hazard-protected until they do.
     pub fn write(&self, slot: u32, value: T) {
-        let slots = self.slots.read().expect("arena slots lock poisoned");
-        let cell = &slots[slot as usize];
-        unsafe {
-            *cell.get() = Some(value);
-        }
+        self.slots.read()[slot as usize].write(value);
+    }
+
+    /// Compare the current value at `slot` against `v` without cloning.
+    /// False for never-written slots.
+    pub fn eq_current(&self, slot: u32, v: &T) -> bool {
+        self.slots.read()[slot as usize].eq_current(v)
+    }
+
+    /// Write `value` unless the slot already holds an equal value.
+    /// Returns true iff the value changed. One slot session for the
+    /// recompute hot path's compare+publish.
+    pub fn write_if_changed(&self, slot: u32, value: T) -> bool {
+        self.slots.read()[slot as usize].write_if_changed(value)
     }
 
     pub fn len(&self) -> usize {
-        self.slots.read().expect("arena slots lock poisoned").len()
+        self.slots.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -119,13 +93,21 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
     }
 }
 
-// SAFETY: `T: Send + Sync` (from Value bound), `Box<UnsafeCell<Option<T>>>`
-// is Send when `T: Send`. Sync is the question: UnsafeCell is !Sync, but
-// access to the cell is governed by the runtime's state machine (which
-// provides exclusive access via the Computing CAS) and the RwLock around
-// the vector (which prevents concurrent push during reads). The
-// combination is sound when used as documented; we assert Send + Sync
-// manually because UnsafeCell blocks the auto-derive.
+// SAFETY: the blanket impls exist because the registry bound
+// (`ErasedArena<C>: Send + Sync`) and the compute-closure bound
+// (`ComputeFn<C>: Send + Sync`) are uniform across strategies, and in a
+// generic `C` context the compiler cannot resolve the per-strategy auto
+// traits. The claim is sound per strategy:
+// - Shared: vacuously true. `RwLock<Vec<SharedValueSlot<T>>>` is
+//   genuinely Send + Sync for `T: Value` (the slot holds a
+//   haphazard::AtomicPtr); the test below asserts it without these
+//   impls being load-bearing.
+// - Local: the marker is never exercised across threads. Every path to
+//   a Local arena runs through `Runtime<Local>`, which is !Send + !Sync
+//   by composition (RefCell dep stack, Cell-backed segment pointers,
+//   RefCell inner lock), so no two threads can ever alias this arena.
+//   Code outside the runtime must not export `Arc<GenericArena<T,
+//   Local>>` to user-held types that are Send.
 unsafe impl<T: Value, C: Cells> Send for GenericArena<T, C> {}
 unsafe impl<T: Value, C: Cells> Sync for GenericArena<T, C> {}
 
@@ -173,10 +155,55 @@ mod tests {
     }
 
     #[test]
+    fn eq_current_compares_without_cloning() {
+        let a: GenericArena<String, Shared> = GenericArena::new();
+        let s = a.reserve();
+        assert!(!a.eq_current(s, &"x".to_string()));
+        a.write(s, "x".to_string());
+        assert!(a.eq_current(s, &"x".to_string()));
+        assert!(!a.eq_current(s, &"y".to_string()));
+    }
+
+    #[test]
     fn shared_arena_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<GenericArena<u64, Shared>>();
         assert_send_sync::<GenericArena<String, Shared>>();
         assert_send_sync::<GenericArena<Vec<u8>, Shared>>();
+    }
+
+    /// Concurrent set-style writes and reads on the same slot with a
+    /// heap value. This is the exact shape Miri flagged as UB against
+    /// the old in-place arena.
+    #[test]
+    fn shared_concurrent_write_read_same_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let iters = if cfg!(miri) { 30 } else { 1000 };
+        let a: Arc<GenericArena<String, Shared>> = Arc::new(GenericArena::new());
+        let slot = a.reserve_with("s0000".to_string());
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let a = Arc::clone(&a);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let v = a.read(slot);
+                        assert!(v.starts_with('s') && v.len() == 5, "torn value {:?}", v);
+                    }
+                })
+            })
+            .collect();
+
+        for i in 0..iters {
+            a.write(slot, format!("s{:04}", i % 10_000));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
     }
 }

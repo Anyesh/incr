@@ -31,8 +31,10 @@ pub trait DepStack: 'static {
     fn new() -> Self;
 
     /// Push a fresh frame at the top of the stack. Called when entering
-    /// a compute closure.
-    fn push_frame(&self);
+    /// a compute closure; `node` is the node being computed so cycle
+    /// detection can ask whether a given node is already on this
+    /// thread's compute stack.
+    fn push_frame(&self, node: NodeId);
 
     /// Pop the top frame and return its recorded deps. Called when
     /// exiting a compute closure.
@@ -46,11 +48,33 @@ pub trait DepStack: 'static {
     /// True iff at least one frame is active (i.e., we're inside a
     /// compute closure).
     fn current_frame_active(&self) -> bool;
+
+    /// True iff `node` is currently being computed by THIS thread
+    /// (Shared) or this runtime (Local). Observing `Computing` on such a
+    /// node means the dependency graph has a cycle: the only way to
+    /// re-reach a node we are mid-computing is through its own deps.
+    fn is_computing(&self, node: NodeId) -> bool;
+}
+
+/// One in-flight compute: the node being computed and the deps recorded
+/// so far on its behalf.
+struct Frame {
+    node: NodeId,
+    deps: Vec<NodeId>,
+}
+
+impl Frame {
+    fn new(node: NodeId) -> Self {
+        Self {
+            node,
+            deps: Vec::with_capacity(4),
+        }
+    }
 }
 
 /// Local strategy: RefCell-backed stack on the runtime.
 pub struct LocalDepStack {
-    stack: RefCell<Vec<Vec<NodeId>>>,
+    stack: RefCell<Vec<Frame>>,
 }
 
 impl DepStack for LocalDepStack {
@@ -60,8 +84,8 @@ impl DepStack for LocalDepStack {
         }
     }
 
-    fn push_frame(&self) {
-        self.stack.borrow_mut().push(Vec::with_capacity(4));
+    fn push_frame(&self, node: NodeId) {
+        self.stack.borrow_mut().push(Frame::new(node));
     }
 
     fn pop_frame(&self) -> Vec<NodeId> {
@@ -69,17 +93,22 @@ impl DepStack for LocalDepStack {
             .borrow_mut()
             .pop()
             .expect("LocalDepStack::pop_frame on empty stack")
+            .deps
     }
 
     fn record_dep(&self, dep: NodeId) {
         let mut frames = self.stack.borrow_mut();
         if let Some(frame) = frames.last_mut() {
-            frame.push(dep);
+            frame.deps.push(dep);
         }
     }
 
     fn current_frame_active(&self) -> bool {
         !self.stack.borrow().is_empty()
+    }
+
+    fn is_computing(&self, node: NodeId) -> bool {
+        self.stack.borrow().iter().any(|f| f.node == node)
     }
 }
 
@@ -92,7 +121,7 @@ impl DepStack for LocalDepStack {
 pub struct SharedDepStack;
 
 thread_local! {
-    static SHARED_FRAMES: RefCell<Vec<Vec<NodeId>>> = const { RefCell::new(Vec::new()) };
+    static SHARED_FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
 }
 
 impl DepStack for SharedDepStack {
@@ -100,8 +129,8 @@ impl DepStack for SharedDepStack {
         Self
     }
 
-    fn push_frame(&self) {
-        SHARED_FRAMES.with(|f| f.borrow_mut().push(Vec::with_capacity(4)));
+    fn push_frame(&self, node: NodeId) {
+        SHARED_FRAMES.with(|f| f.borrow_mut().push(Frame::new(node)));
     }
 
     fn pop_frame(&self) -> Vec<NodeId> {
@@ -109,6 +138,7 @@ impl DepStack for SharedDepStack {
             f.borrow_mut()
                 .pop()
                 .expect("SharedDepStack::pop_frame on empty stack")
+                .deps
         })
     }
 
@@ -116,13 +146,17 @@ impl DepStack for SharedDepStack {
         SHARED_FRAMES.with(|f| {
             let mut frames = f.borrow_mut();
             if let Some(frame) = frames.last_mut() {
-                frame.push(dep);
+                frame.deps.push(dep);
             }
         });
     }
 
     fn current_frame_active(&self) -> bool {
         SHARED_FRAMES.with(|f| !f.borrow().is_empty())
+    }
+
+    fn is_computing(&self, node: NodeId) -> bool {
+        SHARED_FRAMES.with(|f| f.borrow().iter().any(|fr| fr.node == node))
     }
 }
 
@@ -134,7 +168,7 @@ mod tests {
     fn local_push_pop_records() {
         let s = LocalDepStack::new();
         assert!(!s.current_frame_active());
-        s.push_frame();
+        s.push_frame(NodeId(100));
         assert!(s.current_frame_active());
         s.record_dep(NodeId(0));
         s.record_dep(NodeId(1));
@@ -147,9 +181,9 @@ mod tests {
     #[test]
     fn local_nested_frames_are_independent() {
         let s = LocalDepStack::new();
-        s.push_frame();
+        s.push_frame(NodeId(100));
         s.record_dep(NodeId(1));
-        s.push_frame();
+        s.push_frame(NodeId(101));
         s.record_dep(NodeId(2));
         s.record_dep(NodeId(3));
         let inner = s.pop_frame();
@@ -166,12 +200,42 @@ mod tests {
     }
 
     #[test]
+    fn local_is_computing_tracks_open_frames() {
+        let s = LocalDepStack::new();
+        assert!(!s.is_computing(NodeId(7)));
+        s.push_frame(NodeId(7));
+        s.push_frame(NodeId(8));
+        assert!(s.is_computing(NodeId(7)));
+        assert!(s.is_computing(NodeId(8)));
+        assert!(!s.is_computing(NodeId(9)));
+        s.pop_frame();
+        assert!(!s.is_computing(NodeId(8)));
+        assert!(s.is_computing(NodeId(7)));
+        s.pop_frame();
+        assert!(!s.is_computing(NodeId(7)));
+    }
+
+    #[test]
     fn shared_push_pop_records() {
         let s = SharedDepStack::new();
-        s.push_frame();
+        s.push_frame(NodeId(100));
         s.record_dep(NodeId(7));
         s.record_dep(NodeId(11));
         let frame = s.pop_frame();
         assert_eq!(frame, vec![NodeId(7), NodeId(11)]);
+    }
+
+    #[test]
+    fn shared_is_computing_is_thread_local() {
+        let s = SharedDepStack::new();
+        s.push_frame(NodeId(5));
+        assert!(s.is_computing(NodeId(5)));
+        std::thread::spawn(|| {
+            let s2 = SharedDepStack::new();
+            assert!(!s2.is_computing(NodeId(5)));
+        })
+        .join()
+        .unwrap();
+        s.pop_frame();
     }
 }
