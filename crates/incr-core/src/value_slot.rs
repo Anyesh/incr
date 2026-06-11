@@ -57,6 +57,11 @@ pub trait ValueSlot<T: Value>: 'static {
     /// session instead of an eq_current + write pair, which matters
     /// under Shared where each session costs a hazard acquire.
     fn write_if_changed(&self, v: T) -> bool;
+
+    /// Drop the held value, returning the slot to the never-written
+    /// state. Used when a node is deleted and its arena slot goes on
+    /// the free list.
+    fn clear(&self);
 }
 
 /// Local strategy: in-place storage.
@@ -133,6 +138,14 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
             *self.0.get() = Some(v);
         }
         true
+    }
+
+    #[inline(always)]
+    fn clear(&self) {
+        // SAFETY: see write().
+        unsafe {
+            *self.0.get() = None;
+        }
     }
 }
 
@@ -221,6 +234,17 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         }
         self.write(v);
         true
+    }
+
+    fn clear(&self) {
+        // SAFETY: swap_ptr with null is always safe; the displaced
+        // pointer goes through the standard retire path, so concurrent
+        // readers finish their clone before the free.
+        let displaced = unsafe { self.0.swap_ptr(std::ptr::null_mut()) };
+        if let Some(old) = displaced {
+            // SAFETY: displaced exactly once; readers are hazard-protected.
+            unsafe { old.retire() };
+        }
     }
 }
 

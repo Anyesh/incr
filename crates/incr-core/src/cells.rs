@@ -47,6 +47,7 @@ pub trait PtrCell<T: 'static>: 'static {
 
 pub trait Cells: 'static + Sized {
     type U8;
+    type U16;
     type U32;
     type U64;
     type State;
@@ -56,9 +57,13 @@ pub trait Cells: 'static + Sized {
     type ValueSlot<T: Value>: ValueSlot<T>;
 
     fn new_u8(v: u8) -> Self::U8;
+    fn new_u16(v: u16) -> Self::U16;
     fn new_u32(v: u32) -> Self::U32;
     fn new_u64(v: u64) -> Self::U64;
     fn new_state(v: u8) -> Self::State;
+
+    fn u16_load_relaxed(c: &Self::U16) -> u16;
+    fn u16_store_relaxed(c: &Self::U16, v: u16);
 
     fn u8_load_acquire(c: &Self::U8) -> u8;
     fn u8_store_release(c: &Self::U8, v: u8);
@@ -157,6 +162,7 @@ pub struct Shared;
 
 impl Cells for Local {
     type U8 = Cell<u8>;
+    type U16 = Cell<u16>;
     type U32 = Cell<u32>;
     type U64 = Cell<u64>;
     type State = Cell<u8>;
@@ -168,6 +174,18 @@ impl Cells for Local {
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
         Cell::new(v)
+    }
+    #[inline(always)]
+    fn new_u16(v: u16) -> Self::U16 {
+        Cell::new(v)
+    }
+    #[inline(always)]
+    fn u16_load_relaxed(c: &Self::U16) -> u16 {
+        c.get()
+    }
+    #[inline(always)]
+    fn u16_store_relaxed(c: &Self::U16, v: u16) {
+        c.set(v);
     }
     #[inline(always)]
     fn new_u32(v: u32) -> Self::U32 {
@@ -271,6 +289,7 @@ impl Cells for Local {
 
 impl Cells for Shared {
     type U8 = AtomicU8;
+    type U16 = std::sync::atomic::AtomicU16;
     type U32 = AtomicU32;
     type U64 = AtomicU64;
     type State = AtomicU8;
@@ -282,6 +301,18 @@ impl Cells for Shared {
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
         AtomicU8::new(v)
+    }
+    #[inline(always)]
+    fn new_u16(v: u16) -> Self::U16 {
+        std::sync::atomic::AtomicU16::new(v)
+    }
+    #[inline(always)]
+    fn u16_load_relaxed(c: &Self::U16) -> u16 {
+        c.load(Ordering::Relaxed)
+    }
+    #[inline(always)]
+    fn u16_store_relaxed(c: &Self::U16, v: u16) {
+        c.store(v, Ordering::Relaxed);
     }
     #[inline(always)]
     fn new_u32(v: u32) -> Self::U32 {

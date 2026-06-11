@@ -69,8 +69,11 @@ pub struct NodeData<C: Cells> {
     pub(crate) changed_at: C::U64,
     pub(crate) overflow_deps: HzAtomicPtr<DepList>,
     pub(crate) inline_deps: [C::U32; 7],
-    pub(crate) arena_slot: u32,
-    pub(crate) type_tag: u16,
+    // Cells (not plain fields) so delete_node can recycle a slot in
+    // place through &self: a recycled slot may host a different value
+    // type and points at a different arena slot.
+    pub(crate) arena_slot: C::U32,
+    pub(crate) type_tag: C::U16,
     pub(crate) state: C::State,
     pub(crate) dep_count: C::U8,
     pub(crate) generation: C::U32,
@@ -86,8 +89,8 @@ impl<C: Cells> NodeData<C> {
             changed_at: C::new_u64(revision),
             overflow_deps: unsafe { HzAtomicPtr::new(std::ptr::null_mut()) },
             inline_deps: Self::empty_inline_deps(),
-            arena_slot,
-            type_tag,
+            arena_slot: C::new_u32(arena_slot),
+            type_tag: C::new_u16(type_tag),
             state: C::new_state(NodeState::Clean.as_u8()),
             dep_count: C::new_u8(0),
             generation: C::new_u32(0),
@@ -103,22 +106,58 @@ impl<C: Cells> NodeData<C> {
             changed_at: C::new_u64(0),
             overflow_deps: unsafe { HzAtomicPtr::new(std::ptr::null_mut()) },
             inline_deps: Self::empty_inline_deps(),
-            arena_slot,
-            type_tag,
+            arena_slot: C::new_u32(arena_slot),
+            type_tag: C::new_u16(type_tag),
             state: C::new_state(NodeState::New.as_u8()),
             dep_count: C::new_u8(0),
             generation: C::new_u32(0),
         }
     }
 
+    /// Tear down a node for deletion: clear deps, bump the generation so
+    /// stale handles are rejected, and Release-store Dead. The caller
+    /// (delete_node) owns the transition; the slot stays allocated and
+    /// is reinitialized by [`Self::reinit_recycled`].
+    pub(crate) fn retire_for_delete(&self) {
+        self.install_deps(&[]);
+        C::u32_store_relaxed(&self.generation, self.generation().wrapping_add(1));
+        C::state_store_release(&self.state, NodeState::Dead.as_u8());
+    }
+
+    /// Reinitialize a recycled (Dead) slot in place for a new node.
+    /// Field stores are relaxed; the final Release store on `state` is
+    /// the publication point, and pairs with readers' Acquire state
+    /// loads. The generation was already bumped by retire_for_delete, so
+    /// handles minted now carry the new generation and stale ones fail
+    /// the check.
+    pub(crate) fn reinit_recycled(
+        &self,
+        type_tag: u16,
+        arena_slot: u32,
+        revision: u64,
+        is_input: bool,
+    ) {
+        C::u64_store_relaxed(&self.verified_at, if is_input { revision } else { 0 });
+        C::u64_store_relaxed(&self.changed_at, if is_input { revision } else { 0 });
+        C::u32_store_relaxed(&self.arena_slot, arena_slot);
+        C::u16_store_relaxed(&self.type_tag, type_tag);
+        C::u8_store_relaxed(&self.dep_count, 0);
+        let initial = if is_input {
+            NodeState::Clean
+        } else {
+            NodeState::New
+        };
+        C::state_store_release(&self.state, initial.as_u8());
+    }
+
     #[inline(always)]
     pub fn arena_slot(&self) -> u32 {
-        self.arena_slot
+        C::u32_load_relaxed(&self.arena_slot)
     }
 
     #[inline(always)]
     pub fn type_tag(&self) -> u16 {
-        self.type_tag
+        C::u16_load_relaxed(&self.type_tag)
     }
 
     #[inline(always)]

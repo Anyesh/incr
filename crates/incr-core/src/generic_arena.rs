@@ -17,8 +17,13 @@ use crate::locks::Lock;
 use crate::value::Value;
 use crate::value_slot::ValueSlot;
 
+struct ArenaInner<T: Value, C: Cells> {
+    slots: Vec<C::ValueSlot<T>>,
+    free: Vec<u32>,
+}
+
 pub struct GenericArena<T: Value, C: Cells> {
-    slots: C::Lock<Vec<C::ValueSlot<T>>>,
+    inner: C::Lock<ArenaInner<T, C>>,
 }
 
 impl<T: Value, C: Cells> Default for GenericArena<T, C> {
@@ -30,62 +35,85 @@ impl<T: Value, C: Cells> Default for GenericArena<T, C> {
 impl<T: Value, C: Cells> GenericArena<T, C> {
     pub fn new() -> Self {
         Self {
-            slots: <C::Lock<Vec<C::ValueSlot<T>>> as Lock<_>>::new(Vec::new()),
+            inner: <C::Lock<ArenaInner<T, C>> as Lock<_>>::new(ArenaInner {
+                slots: Vec::new(),
+                free: Vec::new(),
+            }),
         }
     }
 
-    /// Append a new slot initialized to `Some(initial)`. Growth holds
-    /// the write side of the strategy lock, so it cannot race a reader
-    /// mid-index.
+    /// Allocate a slot initialized to `Some(initial)`, reusing a
+    /// released slot when one is free. Growth holds the write side of
+    /// the strategy lock, so it cannot race a reader mid-index.
     pub fn reserve_with(&self, initial: T) -> u32 {
-        let mut slots = self.slots.write();
-        let id = slots.len() as u32;
-        slots.push(<C::ValueSlot<T> as ValueSlot<T>>::new_with(initial));
+        let mut inner = self.inner.write();
+        if let Some(id) = inner.free.pop() {
+            inner.slots[id as usize].write(initial);
+            return id;
+        }
+        let id = inner.slots.len() as u32;
+        inner
+            .slots
+            .push(<C::ValueSlot<T> as ValueSlot<T>>::new_with(initial));
         id
     }
 
-    /// Append an uninitialized slot. Used by query nodes whose compute
+    /// Allocate an uninitialized slot. Used by query nodes whose compute
     /// will populate the slot on first run.
     pub fn reserve(&self) -> u32 {
-        let mut slots = self.slots.write();
-        let id = slots.len() as u32;
-        slots.push(<C::ValueSlot<T> as ValueSlot<T>>::new_empty());
+        let mut inner = self.inner.write();
+        if let Some(id) = inner.free.pop() {
+            // Released slots were cleared on release.
+            return id;
+        }
+        let id = inner.slots.len() as u32;
+        inner
+            .slots
+            .push(<C::ValueSlot<T> as ValueSlot<T>>::new_empty());
         id
+    }
+
+    /// Return a slot to the free list, dropping its value (deferred via
+    /// hazard retire under Shared, so concurrent readers finish first).
+    pub fn release(&self, slot: u32) {
+        let mut inner = self.inner.write();
+        inner.slots[slot as usize].clear();
+        inner.free.push(slot);
     }
 
     /// Clone the value at `slot` out. Panics if the slot was never
     /// written (callers reach values only through the state machine,
     /// which guarantees the first compute completed).
     pub fn read(&self, slot: u32) -> T {
-        self.slots.read()[slot as usize].read()
+        self.inner.read().slots[slot as usize].read()
     }
 
     pub fn try_read(&self, slot: u32) -> Option<T> {
-        self.slots.read()[slot as usize].try_read()
+        self.inner.read().slots[slot as usize].try_read()
     }
 
     /// Publish a new value at `slot`. Under `Shared` this is an atomic
     /// pointer swap; concurrent readers finish their clone against the
     /// displaced value, which is hazard-protected until they do.
     pub fn write(&self, slot: u32, value: T) {
-        self.slots.read()[slot as usize].write(value);
+        self.inner.read().slots[slot as usize].write(value);
     }
 
     /// Compare the current value at `slot` against `v` without cloning.
     /// False for never-written slots.
     pub fn eq_current(&self, slot: u32, v: &T) -> bool {
-        self.slots.read()[slot as usize].eq_current(v)
+        self.inner.read().slots[slot as usize].eq_current(v)
     }
 
     /// Write `value` unless the slot already holds an equal value.
     /// Returns true iff the value changed. One slot session for the
     /// recompute hot path's compare+publish.
     pub fn write_if_changed(&self, slot: u32, value: T) -> bool {
-        self.slots.read()[slot as usize].write_if_changed(value)
+        self.inner.read().slots[slot as usize].write_if_changed(value)
     }
 
     pub fn len(&self) -> usize {
-        self.slots.read().len()
+        self.inner.read().slots.len()
     }
 
     pub fn is_empty(&self) -> bool {

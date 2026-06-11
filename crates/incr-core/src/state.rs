@@ -42,6 +42,11 @@ pub enum NodeState {
     Clean = 3,
     Failed = 4,
     ComputingDirty = 5,
+    /// Deleted via `delete_node`; the slot is on the free list awaiting
+    /// recycling. Readers can only reach Dead through internal walks
+    /// racing a delete (stale user handles are rejected by the
+    /// generation check before any state load).
+    Dead = 6,
 }
 
 impl NodeState {
@@ -54,6 +59,7 @@ impl NodeState {
             3 => Self::Clean,
             4 => Self::Failed,
             5 => Self::ComputingDirty,
+            6 => Self::Dead,
             other => panic!("invalid NodeState value: {}", other),
         }
     }

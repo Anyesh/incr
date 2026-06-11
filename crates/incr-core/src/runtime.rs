@@ -50,6 +50,8 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) next_type_tag: u16,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
+    /// Node slots released by delete_node, awaiting recycling.
+    pub(crate) free_nodes: Vec<u32>,
 }
 
 impl<C: Cells> Inner<C> {
@@ -62,6 +64,7 @@ impl<C: Cells> Inner<C> {
             next_type_tag: 0,
             labels: HashMap::new(),
             trace_log: Vec::new(),
+            free_nodes: Vec::new(),
         }
     }
 
@@ -154,19 +157,25 @@ impl<C: Cells> Runtime<C> {
     /// of the operator, not upstream).
     pub(crate) fn create_input_unchecked<T: Value>(&self, value: T) -> Incr<T> {
         let revision = self.current_revision();
-        let (slot, type_tag, generation) = {
+        let (slot, generation) = {
             let mut inner = self.inner.write();
             let type_tag = inner.type_tag_for::<T>();
             let arena = inner.arenas.ensure_arena::<T>();
             let arena_slot = arena.reserve_with(value);
-            let node = NodeData::<C>::new_input(type_tag, arena_slot, revision);
-            let slot = self.nodes.push(node);
-            inner.compute_fns.push(None);
-            inner.dependents.push(Vec::new());
-            let generation = self.nodes.get(slot).generation();
-            (slot, type_tag, generation)
+            let slot = if let Some(slot) = inner.free_nodes.pop() {
+                self.nodes
+                    .get(slot)
+                    .reinit_recycled(type_tag, arena_slot, revision, true);
+                slot
+            } else {
+                let node = NodeData::<C>::new_input(type_tag, arena_slot, revision);
+                let slot = self.nodes.push(node);
+                inner.compute_fns.push(None);
+                inner.dependents.push(Vec::new());
+                slot
+            };
+            (slot, self.nodes.get(slot).generation())
         };
-        let _ = type_tag;
         Incr::new(slot, generation, self.runtime_id)
     }
 
@@ -183,13 +192,23 @@ impl<C: Cells> Runtime<C> {
             "create_query called during compute; not permitted",
         );
 
-        let (slot, generation, _type_tag) = {
+        let (slot, generation) = {
             let mut inner = self.inner.write();
             let type_tag = inner.type_tag_for::<T>();
             let arena = inner.arenas.ensure_arena::<T>();
             let arena_slot = arena.reserve();
-            let node = NodeData::<C>::new_query(type_tag, arena_slot);
-            let slot = self.nodes.push(node);
+            let slot = if let Some(slot) = inner.free_nodes.pop() {
+                self.nodes
+                    .get(slot)
+                    .reinit_recycled(type_tag, arena_slot, 0, false);
+                slot
+            } else {
+                let node = NodeData::<C>::new_query(type_tag, arena_slot);
+                let slot = self.nodes.push(node);
+                inner.compute_fns.push(None);
+                inner.dependents.push(Vec::new());
+                slot
+            };
 
             // Compute closure: invokes f, writes value, returns whether
             // the value changed (for early cutoff). `is_recompute=false`
@@ -212,19 +231,18 @@ impl<C: Cells> Runtime<C> {
                 },
             );
 
-            inner.compute_fns.push(Some(compute));
-            inner.dependents.push(Vec::new());
-            let generation = self.nodes.get(slot).generation();
-            (slot, generation, type_tag)
+            inner.compute_fns[slot as usize] = Some(compute);
+            (slot, self.nodes.get(slot).generation())
         };
         Incr::new(slot, generation, self.runtime_id)
     }
 
-    /// Reject handles minted by a different runtime. A real branch, not
-    /// a debug_assert: in release a foreign handle would silently read
-    /// or write another node's slot in the same type arena, which is
-    /// silent data corruption. Cost is one always-predicted compare on
-    /// the hot path.
+    /// Reject handles minted by a different runtime and handles whose
+    /// node was deleted (the slot's generation moved past the handle's).
+    /// Real branches, not debug_asserts: in release a foreign or stale
+    /// handle would silently read or write another node's slot in the
+    /// same type arena, which is silent data corruption. Cost is two
+    /// always-predicted compares on the hot path.
     #[inline(always)]
     fn check_handle<T: Value>(&self, handle: Incr<T>) {
         if handle.runtime_id() != self.runtime_id {
@@ -236,6 +254,93 @@ impl<C: Cells> Runtime<C> {
                 self.runtime_id.get(),
             );
         }
+        let node = self.nodes.get(handle.slot());
+        if node.generation() != handle.generation() {
+            panic!(
+                "incr-core: stale Incr<{}> handle: the node at slot {} was deleted (handle \
+                 generation {}, slot generation {})",
+                std::any::type_name::<T>(),
+                handle.slot(),
+                handle.generation(),
+                node.generation(),
+            );
+        }
+    }
+
+    /// Delete a node and recycle its slot. The node must have no
+    /// dependents (delete downstream nodes first) and must not be
+    /// deleted from inside its own compute. Any in-flight compute on the
+    /// node is waited out, exactly like a reader. After deletion every
+    /// surviving copy of the handle panics with a stale-handle message
+    /// on use; the slot and its arena storage are reused by future
+    /// create calls under a bumped generation.
+    pub fn delete_node<T: Value>(&self, handle: Incr<T>) {
+        self.check_handle(handle);
+        let slot = handle.slot();
+        let id = NodeId(slot);
+        let node = self.nodes.get(slot);
+
+        assert!(
+            !self.dep_stack.is_computing(id),
+            "incr-core: delete_node called from inside node {}'s own compute",
+            slot,
+        );
+
+        let mut spins: u32 = 0;
+        loop {
+            let cur = state::load::<C>(node.state_cell());
+            match cur {
+                NodeState::Computing | NodeState::ComputingDirty => {
+                    spins += 1;
+                    if spins < 64 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                NodeState::Dead => {
+                    // Two racing deletes: the generation check above
+                    // passed before the other delete bumped it.
+                    panic!("incr-core: node {} deleted twice concurrently", slot);
+                }
+                _ => {
+                    {
+                        let inner = self.inner.read();
+                        assert!(
+                            inner.dependents[slot as usize].is_empty(),
+                            "incr-core: delete_node on node {} which still has dependents; \
+                             delete downstream nodes first",
+                            slot,
+                        );
+                    }
+                    if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // We own the Dead node now. Capture deps before clearing them,
+        // then unhook reverse edges and recycle storage.
+        let mut old_deps: Vec<NodeId> = Vec::new();
+        node.for_each_dep(|d| old_deps.push(d));
+        let arena_slot = node.arena_slot();
+        node.retire_for_delete();
+
+        let mut inner = self.inner.write();
+        for d in &old_deps {
+            inner.dependents[d.0 as usize].retain(|&x| x != id);
+        }
+        inner.compute_fns[slot as usize] = None;
+        inner.dependents[slot as usize].clear();
+        inner.labels.remove(&slot);
+        let arena = inner
+            .arenas
+            .try_arena::<T>()
+            .expect("incr-core: arena missing for deleted handle's type");
+        inner.free_nodes.push(slot);
+        drop(inner);
+        arena.release(arena_slot);
     }
 
     /// Read the current value of a node. Triggers recomputation of the
@@ -323,9 +428,11 @@ impl<C: Cells> Runtime<C> {
         (value, trace)
     }
 
-    /// Number of nodes in the runtime.
+    /// Number of live nodes in the runtime (deleted-and-not-yet-recycled
+    /// slots excluded).
     pub fn node_count(&self) -> usize {
-        self.nodes.len() as usize
+        let free = self.inner.read().free_nodes.len();
+        self.nodes.len() as usize - free
     }
 
     /// Assign a human-readable label to a node slot. Surfaces in
@@ -349,6 +456,9 @@ impl<C: Cells> Runtime<C> {
         let mut out = Vec::with_capacity(count as usize);
         for slot in 0..count {
             let node = self.nodes.get(slot);
+            if state::load::<C>(node.state_cell()) == NodeState::Dead {
+                continue;
+            }
             let kind = if inner
                 .compute_fns
                 .get(slot as usize)
@@ -482,6 +592,12 @@ impl<C: Cells> Runtime<C> {
                         // covered its dependents.
                         break;
                     }
+                    NodeState::Dead => {
+                        // Raced a delete through a not-yet-unhooked
+                        // edge; a deleted node has no dependents to
+                        // propagate to.
+                        break;
+                    }
                 }
             }
         }
@@ -598,6 +714,13 @@ impl<C: Cells> Runtime<C> {
                     panic!(
                         "incr-core: node {} read but its last compute panicked; it stays \
                          Failed until a dependency changes (set an upstream input to retry)",
+                        id.0,
+                    );
+                }
+                NodeState::Dead => {
+                    panic!(
+                        "incr-core: node {} was deleted while a read was reaching it (a \
+                         compute raced delete_node on one of its recorded dependencies)",
                         id.0,
                     );
                 }
@@ -1229,6 +1352,104 @@ mod tests {
             r.join().unwrap();
         }
         assert_eq!(rt.get(doubled), 2000);
+    }
+
+    #[test]
+    fn delete_node_recycles_slot_and_rejects_stale_handles() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_input(1_i64);
+        let b = rt.create_input(2_i64);
+        assert_eq!(rt.node_count(), 2);
+
+        rt.delete_node(a);
+        assert_eq!(rt.node_count(), 1);
+
+        // The freed slot is recycled, under a new generation.
+        let c = rt.create_input(30_i64);
+        assert_eq!(c.slot(), a.slot());
+        assert_ne!(c, a);
+        assert_eq!(rt.node_count(), 2);
+        assert_eq!(rt.get(c), 30);
+        assert_eq!(rt.get(b), 2);
+
+        let stale = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(a)));
+        let msg = *stale.unwrap_err().downcast::<String>().unwrap();
+        assert!(msg.contains("stale"), "got: {}", msg);
+    }
+
+    #[test]
+    fn delete_query_then_input_unhooks_edges() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(5_i64);
+        let q = rt.create_query(move |rt| rt.get(input) * 2);
+        assert_eq!(rt.get(q), 10);
+
+        rt.delete_node(q);
+        // The input no longer has dependents, so it can go too.
+        rt.delete_node(input);
+        assert_eq!(rt.node_count(), 0);
+
+        // set on the deleted input must fail, not corrupt a recycled slot.
+        let fresh = rt.create_input("hello".to_string());
+        assert_eq!(rt.get(fresh), "hello");
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.set(input, 9))).is_err()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "still has dependents")]
+    fn delete_node_with_dependents_panics() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(5_i64);
+        let _q = rt.create_query(move |rt| rt.get(input) * 2);
+        let _ = rt.get(_q);
+        rt.delete_node(input);
+    }
+
+    #[test]
+    fn deleted_slot_recycles_across_value_types() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_input(7_i64);
+        rt.delete_node(a);
+        let s = rt.create_input("typed".to_string());
+        assert_eq!(s.slot(), a.slot());
+        assert_eq!(rt.get(s), "typed");
+        rt.set(s, "retyped".to_string());
+        assert_eq!(rt.get(s), "retyped");
+    }
+
+    #[test]
+    fn shared_delete_and_recycle_under_reads() {
+        let rt: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+        let stable = rt.create_input(100_i64);
+        let q = rt.create_query(move |rt| rt.get(stable) + 1);
+        assert_eq!(rt.get(q), 101);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let rt = Arc::clone(&rt);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        assert_eq!(rt.get(q), 101);
+                    }
+                })
+            })
+            .collect();
+
+        // Churn unrelated nodes through delete/recreate while readers run.
+        for i in 0..500_i64 {
+            let tmp = rt.create_input(i);
+            assert_eq!(rt.get(tmp), i);
+            rt.delete_node(tmp);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        assert_eq!(rt.node_count(), 2);
     }
 
     #[test]
