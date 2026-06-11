@@ -262,12 +262,21 @@ impl<C: Cells> Runtime<C> {
         }
         C::u8_store_release(&self.tracing_armed, 1);
 
+        // Disarm on every exit path: a panicking compute inside the
+        // traced get must not leave tracing armed forever.
+        struct Disarm<'a, C2: Cells>(&'a Runtime<C2>);
+        impl<C2: Cells> Drop for Disarm<'_, C2> {
+            fn drop(&mut self) {
+                C2::u8_store_release(&self.0.tracing_armed, 0);
+            }
+        }
+        let disarm = Disarm(self);
+
         let start = std::time::Instant::now();
         let value = self.get(handle);
         let elapsed_ns = start.elapsed().as_nanos() as u64;
 
-        // Disarm and drain.
-        C::u8_store_release(&self.tracing_armed, 0);
+        drop(disarm);
         let node_traces: Vec<crate::trace::NodeTrace> = {
             let mut inner = self.inner.write();
             std::mem::take(&mut inner.trace_log)
@@ -576,10 +585,11 @@ impl<C: Cells> Runtime<C> {
                     continue;
                 }
                 NodeState::Failed => {
-                    // No code path produces Failed yet; the compute
-                    // panic boundary that does lands next and replaces
-                    // this arm with read-of-failed semantics.
-                    unreachable!("NodeState::Failed has no producer yet");
+                    panic!(
+                        "incr-core: node {} read but its last compute panicked; it stays \
+                         Failed until a dependency changes (set an upstream input to retry)",
+                        id.0,
+                    );
                 }
                 NodeState::New | NodeState::Dirty => {}
             }
@@ -647,10 +657,57 @@ impl<C: Cells> Runtime<C> {
             };
             let is_recompute = claimed_from == NodeState::Dirty;
 
-            // Track deps via the strategy's dep stack.
+            // Track deps via the strategy's dep stack. The closure runs
+            // under a panic boundary: a panicking user closure must not
+            // strand the node in Computing (wedging every future reader)
+            // or leak its dep frame. AssertUnwindSafe is justified
+            // because the only state the closure can reach is the
+            // runtime's, and the Failed transition plus the frame pop
+            // below restore every invariant the unwind could have
+            // interrupted; no lock is held while user code runs.
             self.dep_stack.push_frame(id);
-            let value_changed = (compute)(self, id.0, is_recompute);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (compute)(self, id.0, is_recompute)
+            }));
             let recorded_deps = self.dep_stack.pop_frame();
+
+            let value_changed = match result {
+                Ok(changed) => changed,
+                Err(payload) => {
+                    // Publish the union of the old deps and whatever was
+                    // recorded before the panic. Without the recorded
+                    // subset, a first-compute panic leaves no reverse
+                    // edges at all and no set() can ever flip the node
+                    // out of Failed; without the old set, a recompute
+                    // panic would lose recovery paths through deps the
+                    // failed run had not reached yet. Extra edges only
+                    // cause spurious re-verification, never staleness.
+                    let mut union_deps: Vec<NodeId> = Vec::with_capacity(recorded_deps.len() + 8);
+                    node.for_each_dep(|d| union_deps.push(d));
+                    for d in &recorded_deps {
+                        if !union_deps.contains(d) {
+                            union_deps.push(*d);
+                        }
+                    }
+                    self.publish_deps(id, &union_deps);
+
+                    // verified_at was not raised, so once a dependency
+                    // changes, the dirty walk flips Failed -> Dirty and
+                    // red/green sees the change and recomputes for real.
+                    // If a set() already flagged us mid-compute, land
+                    // Dirty now so the next reader retries immediately.
+                    if state::try_transition::<C>(
+                        node.state_cell(),
+                        NodeState::Computing,
+                        NodeState::Failed,
+                    )
+                    .is_err()
+                    {
+                        state::store::<C>(node.state_cell(), NodeState::Dirty);
+                    }
+                    std::panic::resume_unwind(payload);
+                }
+            };
 
             self.publish_deps(id, &recorded_deps);
 
@@ -1162,6 +1219,74 @@ mod tests {
             r.join().unwrap();
         }
         assert_eq!(rt.get(doubled), 2000);
+    }
+
+    /// A panicking compute closure must mark the node Failed, propagate
+    /// the panic, keep the runtime usable, and recover once an upstream
+    /// input changes.
+    #[test]
+    fn local_compute_panic_marks_failed_then_recovers() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(0_i64);
+        let q = rt.create_query(move |rt| {
+            let v = rt.get(input);
+            assert!(v != 0, "intentional test panic");
+            v * 10
+        });
+        let other = rt.create_query(move |rt| rt.get(input) + 1);
+
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q)));
+        assert!(first.is_err());
+
+        // Unrelated nodes still work; the dep stack was unwound cleanly.
+        assert_eq!(rt.get(other), 1);
+
+        // Reading the failed node again is a deliberate panic with a
+        // recognizable message, not a deadlock.
+        let again = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q)));
+        let msg = *again.unwrap_err().downcast::<String>().unwrap();
+        assert!(msg.contains("last compute panicked"), "got: {}", msg);
+
+        // A dependency change flips Failed -> Dirty and the recompute
+        // succeeds.
+        rt.set(input, 7);
+        assert_eq!(rt.get(q), 70);
+        assert_eq!(rt.get(other), 8);
+    }
+
+    #[test]
+    fn shared_compute_panic_marks_failed_then_recovers() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let input = rt.create_input(0_i64);
+        let q = rt.create_query(move |rt| {
+            let v = rt.get(input);
+            assert!(v != 0, "intentional test panic");
+            v * 10
+        });
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(q))).is_err());
+        rt.set(input, 3);
+        assert_eq!(rt.get(q), 30);
+    }
+
+    /// A panic mid-chain must fail both the panicking node and let its
+    /// parent's frame unwind; recovery recomputes the whole chain.
+    #[test]
+    fn local_nested_compute_panic_unwinds_both_frames() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(0_i64);
+        let child = rt.create_query(move |rt| {
+            let v = rt.get(input);
+            assert!(v != 0, "intentional test panic");
+            v + 1
+        });
+        let parent = rt.create_query(move |rt| rt.get(child) * 2);
+
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(parent))).is_err());
+        assert!(!rt.dep_stack.current_frame_active());
+
+        rt.set(input, 5);
+        assert_eq!(rt.get(parent), 12);
     }
 
     /// A query may read more than 255 inputs; the u8 dep-count cell uses
