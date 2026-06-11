@@ -9,7 +9,7 @@
 
 Most software recomputes everything from scratch whenever anything changes. Your CI rebuilds the whole project when you edit one file, your dashboard re-queries the whole database when one row updates. There are domain-specific fixes for this (React diffs the DOM, Salsa caches compiler queries, Materialize does incremental SQL) but if you just want to make your own code incremental, theres nothing to reach for.
 
-incr is a crack at solving that. It's a Rust library (with Python bindings on the roadmap) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. The engine lives in `incr-core` and is parameterized over a concurrency strategy; two surface crates expose it: `incr-compute` (`Local` strategy, single-threaded, zero atomic-fence cost) and `incr-concurrent` (`Shared` strategy, `Send + Sync`, lock-free reads). Same public API, one-line dependency swap.
+incr is a crack at solving that. It's a Rust library (with Python bindings, `pip install incr-compute` or `incr-concurrent`) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. The engine lives in `incr-core` and is parameterized over a concurrency strategy; two surface crates expose it: `incr-compute` (`Local` strategy, single-threaded, zero atomic-fence cost) and `incr-concurrent` (`Shared` strategy, `Send + Sync`: reader threads pull values while a writer mutates, with hazard-pointer-protected reads that can never tear). Same public API, one-line dependency swap.
 
 ![Live spreadsheet demo showing formula cells updating incrementally as values change, powered by incr-concurrent with real-time WebSocket sync](examples/spreadsheet/demo.gif)
 
@@ -40,7 +40,7 @@ let visits: IncrCollection<Visit> = rt.create_collection();
 let sorted = visits.sort_by_key(&rt, |v| v.time);
 let pairs = sorted.pairwise(&rt);
 let gaps = pairs.map(&rt, |pair| distance(&pair.0, &pair.1));
-let total = gaps.reduce(&rt, |xs| xs.iter().sum::<f64>());
+let total = gaps.aggregate(&rt, 0.0, |g| *g, |a, b| a + b);
 
 visits.insert(&rt, visit_at_9am);
 visits.insert(&rt, visit_at_2pm);
@@ -53,7 +53,9 @@ visits.insert(&rt, visit_at_11am_moved_to_noon);
 rt.get(total);
 ```
 
-Nine operators ship: `filter`, `map`, `count`, `reduce`, `sort_by_key`, `pairwise`, `window`, `group_by`, `join`. The function-DAG API and the collection API share the same dependency graph, so a function query can read a collection's `reduce` and stay incremental end to end.
+Ten operators ship: `filter`, `map`, `count`, `aggregate`, `reduce`, `sort_by_key`, `pairwise`, `window`, `group_by`, `join`. All of them do work proportional to the change, not the collection: `aggregate` maintains a balanced tree of partial folds (O(log n) per row, even for non-invertible folds like max), and `pairwise`/`window` consume positional deltas so one row touches a constant number of pairs. The one deliberate exception is `reduce`, which runs an arbitrary fold over a snapshot, because an arbitrary fold has no structure to exploit; reach for `aggregate` when your fold is associative. The function-DAG API and the collection API share the same dependency graph, so a function query can read a collection's `aggregate` and stay incremental end to end.
+
+Beyond operators: nodes can be deleted (`delete_node`, with generation-checked handles so stale handles fail loudly and slots recycle), and `observe`/`stabilize` give you batch change notifications without polling individual nodes.
 
 ## Three crates, one engine
 
@@ -70,29 +72,33 @@ If you start with `incr-compute` and later need thread safety, swap the dependen
 
 ## Benchmarks
 
-Measured on this branch with `criterion --quick` against `Salsa` (the incremental engine in rust-analyzer). Not cherry-picked.
+Reproducible from this repo: `cargo bench -p incr-bench --bench salsa_compare` runs the same workloads through incr and through [Salsa](https://salsa-rs.github.io/salsa/) 0.27 (the incremental engine in rust-analyzer). Numbers below are from that harness with `--quick` on one machine; rerun it on yours.
 
 | Workload | `incr-compute` | `incr-concurrent` | Salsa |
 |----------|----------------|---------------------|-------|
-| Diamond graph, propagate input through 4 nodes | 647 ns | 764 ns | 1,066 ns |
-| Early cutoff (input changes but clamped output doesnt) | 314 ns | 404 ns | 469 ns |
-| Per-node propagation cost (chain) | ~135 ns/node | ~169 ns/node | ~387 ns/query |
+| Chain propagation, 100 nodes | 10.8 µs (~108 ns/node) | 34.8 µs (~348 ns/node) | 37.5 µs (~375 ns/query) |
+| Diamond graph, propagate through 4 nodes | 499 ns | 1.39 µs | 795 ns |
+| Early cutoff (input changes, clamped output doesn't) | 268 ns | 685 ns | 383 ns |
 
-Collection pipeline (`filter` → `map` → `count`) vs from-scratch batch:
+Read it honestly: `incr-compute` beats Salsa 1.4x to 3.5x on every shape. `incr-concurrent` lands at Salsa parity on propagation and behind it on small graphs, and that cost buys something Salsa rules out by construction: Salsa mutation takes `&mut db` (no readers during writes), while `incr-concurrent` serves concurrent readers throughout, with every value read tear-free behind hazard pointers. If you do not need concurrent readers, use `incr-compute` and keep the speed.
+
+Collection pipeline (`filter` → `map` → `count`), one insert vs from-scratch batch (`cargo bench -p incr-core --bench operators`):
 
 | Collection size | `incr-compute` insert | From scratch | Speedup |
 |----------------|----------------------|--------------|---------|
-| 1K elements    | 673 ns               | 102 µs       | 152x    |
-| 10K elements   | 657 ns               | 67 µs        | 102x    |
-| 100K elements  | 661 ns               | 156 µs       | 236x    |
+| 1K elements    | 557 ns               | 101 µs       | ~180x   |
+| 10K elements   | 632 ns               | 66 µs        | ~105x   |
+| 100K elements  | 662 ns               | 146 µs       | ~220x   |
 
-The interesting thing in that second table is the `incr-compute` column barely moves as the collection grows. 661 ns at 100K is essentially the same as 673 ns at 1K because we're only touching the new row, not scanning the existing ones.
+The interesting thing in that second table is the `incr-compute` column barely moves as the collection grows. 662 ns at 100K is essentially the same as 557 ns at 1K because we're only touching the new row, not scanning the existing ones.
 
 ## How it works internally
 
 Calling `rt.set()` on an input eagerly marks downstream nodes as potentially dirty (just flipping bits, no recomputation). Then when you `rt.get()` a result, the engine walks backwards from what you asked for, checks if each dirty node's dependencies actually changed, and only reruns the ones that need it. If a node reruns but produces the same value it had before, propagation stops there, and thats the "early cutoff" you see in the benchmarks.
 
-For collections each pipeline stage keeps a read offset into the upstream's change log. When triggered, it just reads entries past that offset, processes them, and advances the pointer. Inserting one row into a 100K collection means each stage does O(1) work regardless of collection size.
+For collections each pipeline stage keeps a read offset into the upstream's change log. When triggered, it just reads entries past that offset, processes them, and advances the pointer. Inserting one row into a 100K collection means each stage does O(1) work regardless of collection size. The logs do not grow forever: stages register their cursors with the upstream log, which periodically drops the prefix every consumer has passed (and drops everything if no consumer is attached), so log memory is bounded by consumer lag, not collection lifetime. A stage attached to an already-populated collection bootstraps from a snapshot instead of replaying history.
+
+User closures (predicates, mappers, key extractors) never run while an engine lock is held: each stage clones the pending deltas out, evaluates your code, and applies the staged results plus the cursor advance together. A closure that panics (or raises, in Python) applies nothing and the batch replays exactly once after recovery.
 
 The engine itself lives in [`incr-core`](crates/incr-core/) under a `Cells` strategy trait. `Local` backs every cell with `std::cell::Cell` and gives you a `!Send + !Sync` runtime with no atomic ops. `Shared` backs every cell with the matching atomic type and uses Acquire/Release for state-visibility transitions. The trait inlines through every call site (`#[inline(always)]`), so the compiler emits the same code for `Runtime<Local>` operations as it would for direct `Cell::get()` calls. The 64-byte cache-line layout for `NodeData` is preserved under both strategies by const-time assertions.
 
@@ -120,22 +126,26 @@ cargo bench -p incr-compute         # bench through the wrapper
 
 ## Testing
 
-100+ unit/integration tests across the engine and wrappers, plus a proptest suite that runs **the same generator + verifier under both strategies**: 1000 random function graphs and 3000 random collection op sequences per `cargo test` run. The core correctness contract is that incremental evaluation produces the same final result as recomputing everything from scratch; if those two ever disagree on any random input, proptest shrinks to a minimal failing case.
+160+ unit/integration tests across the engine and wrappers (plus 33 Python tests), including a proptest suite that runs **the same generator + verifier under both strategies**: 1000 random function graphs and 3000 random collection op sequences per `cargo test` run. The core correctness contract is that incremental evaluation produces the same final result as recomputing everything from scratch; if those two ever disagree on any random input, proptest shrinks to a minimal failing case.
 
-A concurrent stress test runs 4 reader threads against 1 writer thread for 1000 iterations and asserts no torn reads on derived values.
+Concurrency is validated three ways in CI:
 
-The unsafe code (segmented store, hazard-pointer dep reclamation via `haphazard`, state machine CAS) is exercised under `cargo +nightly miri test -p incr-core --lib`. Tests pass under miri including 16-thread CAS races (3,200 concurrent attempts) and 50-iteration dynamic-dep-set churn through the overflow path with runtime drop. Zero undefined behavior detected.
+- **Miri's race detector** runs the threaded reader/writer hammer tests (readers cloning heap values while writers swap them, claim races on first computes, concurrent setters). Miri flagged the original implementation's set/get data race; the current protocol runs clean.
+- **ThreadSanitizer** runs the same suite plus a mixed-workload stress test: writers mutating String inputs, readers pulling derived queries, a thread churning node create/delete through slot recycling, and collection traffic, all concurrently.
+- A panic-injection suite asserts that a panicking user closure lands its node in `Failed`, the runtime stays usable, and the work replays exactly once after recovery.
+
+Loom model checking is not wired up because the value slots and dep lists build on `haphazard`, which has no loom support; the Miri + TSan + stress combination tests the real code instead of a model.
 
 ## Demos
 
 - [`examples/concurrent-server/`](examples/concurrent-server/) — multi-threaded HTTP server (Rust) where one writer thread feeds live market data into the graph while many HTTP handler threads read derived portfolio values concurrently without blocking.
 - [`examples/spreadsheet/`](examples/spreadsheet/) — live spreadsheet engine driving formula cells through the incremental graph with WebSocket sync.
 
-A Python `travel-premium` demo and a `dashboard` demo with real per-node tracing live on the v0.1 line; they are scheduled to land on v0.2 alongside the Python re-implementation in 0.3.
+A Python `travel-premium` demo and a `dashboard` demo with real per-node tracing live on the v0.1 line; porting them to v0.2 is open.
 
 ## CI
 
-GitHub Actions runs on every push to `main` and on pull requests: tests for all three Rust crates, benchmarks, clippy, and fmt. Tagging a release (`v*`) triggers automatic publishing to crates.io. Python wheels return in 0.3.
+GitHub Actions runs on every push to `main` and on pull requests: tests for all three Rust crates, Miri (including the threaded stress tests), ThreadSanitizer, the Python test suite on CPython 3.10 and 3.14, benchmarks, clippy, and fmt. Tagging a release (`v*`) publishes the Rust crates to crates.io and abi3 wheels (CPython 3.10+) to PyPI.
 
 ## Background and references
 
@@ -153,7 +163,7 @@ The systems we benchmark against and learned from:
 
 Y. Annie Liu's 2024 survey [Incremental Computation: What Is the Essence?](https://arxiv.org/abs/2312.07946) is probably the best current overview of the whole field if you want to understand where all these approaches fit relative to each other. One of her key findings is that fully general incrementalization is provably undecidable, which is why every practical system (including ours) picks a restricted but useful subset of computations to handle.
 
-None of the existing systems combine function DAGs with incremental collections in a single engine across single-threaded and concurrent topologies the way incr does. Early results across the function DAG and the operator pipeline both beat the published numbers for Salsa and the v0.1 line; the architecture is what made that possible.
+None of the existing systems combine function DAGs with incremental collections in a single engine across single-threaded and concurrent topologies the way incr does. The single-threaded engine beats Salsa on every workload in the in-repo comparison harness; the concurrent engine trades single-thread latency for sound concurrent reads, a combination Salsa's `&mut db` mutation model does not offer.
 
 ## License
 

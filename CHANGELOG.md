@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.2] — 2026-06-12
+
+### Soundness
+
+A full audit of the Shared protocol found and fixed undefined behavior that Miri's race detector confirms on beta.1:
+
+- **Value storage is now tear-free under concurrency.** Shared value slots are hazard-pointer-protected pointer swaps instead of in-place `UnsafeCell` writes; a `get` racing a `set` (or a recompute) on the same node was a data race on heap values, with use-after-free potential. Local keeps in-place storage and got faster (RefCell + inline slots replace an RwLock + Box indirection).
+- **Every state transition is a CAS.** The verified-clean path could clobber another thread's `Computing` claim and run two computes on one node; claim losers now wait for the owner instead of reading stale or empty slots (two threads racing the first `get` of a query could read an uninitialized slot).
+- **A `set` racing an in-flight compute can no longer be swallowed.** A new `ComputingDirty` state plus pending-marker `changed_at` stamping and compute-start-revision `fetch_max` stamps close several stale-forever windows; revision bumps are atomic (two concurrent `set` calls could collapse into one revision).
+- **Compute closures have a panic boundary.** A panicking closure lands its node in `Failed` (previously: wedged in `Computing` forever, deadlocking all future readers), keeps the runtime usable, and recovers when a dependency changes. Lock poisoning is no longer fatal; operators stage user-closure results outside locks so an unwind cannot half-apply a batch.
+- **Dependency cycles panic with a diagnostic** instead of hanging or overflowing the stack. (Known limitation: a cycle spanning two threads' in-flight computes livelocks; cross-thread cycle detection needs a waits-for graph.)
+- **Foreign-runtime and stale handles are rejected in release builds** (was: debug_assert only; release silently corrupted whichever node shared the slot).
+- **Python collections no longer dangle.** They held a raw pointer into the runtime object; dropping the runtime first left use-after-free on `insert`. They now hold strong references.
+
+### Added
+
+- **`delete_node`**: nodes can be deleted (leaves first); slots and arena storage recycle under a bumped generation, so long-lived dynamic graphs no longer grow without bound. Stale handles panic with a clear message.
+- **`aggregate` operator**: incrementally maintained monoid fold over a balanced aggregation tree, O(log n) per change, correct for non-invertible folds (max, min). `reduce` keeps snapshot semantics for arbitrary folds and says so in its docs.
+- **Incremental `pairwise`/`window`**: consume positional sort deltas; one upstream row produces O(1) / O(size) output deltas instead of a full rebuild.
+- **Observers**: `observe(handle, callback)` + `stabilize()` for batch change notifications on the pull model; `unobserve` to detach.
+- **Delta-log compaction**: collection logs drop the prefix all registered consumers have passed (everything, if no consumer is attached); operators attached to populated collections bootstrap from a snapshot. Log memory is bounded by consumer lag, not collection lifetime.
+- **Queries may read any number of inputs** (was: panic above 255 dependencies).
+- **In-repo Salsa comparison harness** (`crates/incr-bench`): the README's numbers are reproducible with `cargo bench -p incr-bench --bench salsa_compare`.
+- **ThreadSanitizer CI job** and a mixed-workload concurrent stress suite; Miri runs the threaded hammer tests.
+- **Python**: real exception propagation (callbacks re-raise the original Python exception), `delete_node`/`observe`/`stabilize`/`aggregate` bindings, abi3 wheels for CPython 3.10+, pytest suite wired into CI on 3.10 and 3.14. The `incr_concurrent` classes are genuinely shareable across Python threads and release the GIL around computing calls (was: everything `unsendable`, defeating the crate's purpose).
+
+### Changed
+
+- Collections use the strategy lock: single-threaded users no longer pay RwLock acquires per collection op.
+- Shared `get` costs two hazard-pointer atomics per value read and Shared writes allocate (the price of tear-free lock-free reads); chain propagation is ~108 ns/node Local, ~348 ns/node Shared on the bench machine. beta.1's faster Shared numbers were measured on the racy code.
+- pyo3 0.23 → 0.26; Python floor is now 3.10.
+- Workspace version is centralized; release publishing verifies crates (no `--no-verify`) and ships sdists + abi3 wheels.
+
 ## [0.2.0-beta.1] — 2026-05-20
 
 ### Architecture
@@ -64,8 +97,7 @@ The "incremental cost is constant in collection size" property holds. Production
 
 ### Architecture decisions
 
-- See [`wiki/projects/incr/decisions/unification-into-incr-core.md`](https://github.com/Anyesh/incr/) for the architectural reset that motivated v0.2.
-- See [`wiki/projects/incr/plans/incr-core-consolidation.md`](https://github.com/Anyesh/incr/) for the migration plan.
+- The architectural reset and migration plan are documented in the project's internal wiki (`wiki/projects/incr/decisions/unification-into-incr-core.md` and `wiki/projects/incr/plans/incr-core-consolidation.md`).
 - 21 commits on the `v0.2-rewrite` branch (cut from main 2026-05-20).
 
 ## [0.1.x]

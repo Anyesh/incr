@@ -35,7 +35,20 @@ jobs:
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly miri test -p incr-core --lib -- --test-threads=1
+      - run: cargo +nightly miri test -p incr-core --lib --test stress -- --test-threads=1
+
+  tsan:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: -Zsanitizer=thread
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p incr-core --lib --test stress
 
   bench:
     name: Benchmark
@@ -67,25 +80,23 @@ jobs:
       - run: cargo build --release -p incr-concurrent-server -p incr-spreadsheet
 
   python:
-    name: Python wheels
+    name: Python tests
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        manifest:
-          - crates/incr-python/Cargo.toml
-          - crates/incr-concurrent-python/Cargo.toml
-    env:
-      MANIFEST: ${{ matrix.manifest }}
+        python-version: ["3.10", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - uses: Swatinem/rust-cache@v2
-      - run: pip install maturin
-      - run: maturin build --release --manifest-path "$MANIFEST"
+      - run: python -m venv .ci-venv && .ci-venv/bin/pip install maturin pytest
+      - run: .ci-venv/bin/maturin develop --release --manifest-path crates/incr-python/Cargo.toml
+      - run: .ci-venv/bin/maturin develop --release --manifest-path crates/incr-concurrent-python/Cargo.toml
+      - run: .ci-venv/bin/python -m pytest examples/tests/python/ -q
 
   clippy:
     name: Clippy
