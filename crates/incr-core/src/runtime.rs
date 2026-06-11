@@ -52,6 +52,17 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
     /// Node slots released by delete_node, awaiting recycling.
     pub(crate) free_nodes: Vec<u32>,
+    pub(crate) observers: HashMap<u64, ObserverEntry<C>>,
+    pub(crate) next_observer_id: u64,
+}
+
+/// One registered observer: which slot it watches, the changed_at stamp
+/// it last fired for, and a type-erased runner that ensures the node is
+/// clean and invokes the user callback if the value changed.
+pub(crate) struct ObserverEntry<C: Cells> {
+    pub(crate) slot: u32,
+    pub(crate) last_seen: u64,
+    pub(crate) run: Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>,
 }
 
 impl<C: Cells> Inner<C> {
@@ -65,6 +76,8 @@ impl<C: Cells> Inner<C> {
             labels: HashMap::new(),
             trace_log: Vec::new(),
             free_nodes: Vec::new(),
+            observers: HashMap::new(),
+            next_observer_id: 1,
         }
     }
 
@@ -82,6 +95,10 @@ impl<C: Cells> Inner<C> {
         tag
     }
 }
+
+/// Token returned by [`Runtime::observe`]; pass to [`Runtime::unobserve`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ObserverId(u64);
 
 /// The runtime.
 pub struct Runtime<C: Cells> {
@@ -267,6 +284,94 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Register a callback fired by [`Self::stabilize`] whenever the
+    /// node's value has changed since the last firing. Observation does
+    /// not change the engine's pull model: nothing runs until someone
+    /// calls `stabilize` (or `get`); the observer registry is a batch
+    /// poll with last-seen bookkeeping, the same shape as Jane Street
+    /// Incremental's observers.
+    ///
+    /// A node that has never computed fires on the first stabilize. A
+    /// stabilize racing a concurrent `set` may fire twice for one
+    /// change; it can never miss one.
+    pub fn observe<T: Value, F>(&self, handle: Incr<T>, callback: F) -> ObserverId
+    where
+        F: Fn(&T) + Send + Sync + 'static,
+    {
+        self.check_handle(handle);
+        let slot = handle.slot();
+        let node = self.nodes.get(slot);
+        // Fire-baseline: if the node already has a clean value, only
+        // future changes fire; a never-computed node starts at 0 so the
+        // first stabilize computes and fires.
+        let last_seen = match state::load::<C>(node.state_cell()) {
+            NodeState::New => 0,
+            _ => node.changed_at().min(self.current_revision()),
+        };
+
+        let run = Arc::new(move |rt: &Runtime<C>, last_seen: u64| -> Option<u64> {
+            rt.ensure_clean(NodeId(handle.slot()));
+            let node = rt.nodes.get(handle.slot());
+            // A pending set() marker reads as u64::MAX; clamp to the
+            // current revision so last_seen stays passable and the
+            // settled stamp can still exceed it (duplicate, not lost).
+            let stamp = node.changed_at().min(rt.current_revision());
+            if stamp > last_seen {
+                let value = rt.get(handle);
+                callback(&value);
+                Some(stamp)
+            } else {
+                None
+            }
+        });
+
+        let mut inner = self.inner.write();
+        let id = inner.next_observer_id;
+        inner.next_observer_id += 1;
+        inner.observers.insert(
+            id,
+            ObserverEntry {
+                slot,
+                last_seen,
+                run,
+            },
+        );
+        ObserverId(id)
+    }
+
+    /// Remove an observer. Safe to call with an already-removed id.
+    pub fn unobserve(&self, id: ObserverId) {
+        self.inner.write().observers.remove(&id.0);
+    }
+
+    /// Bring every observed node up to date and fire callbacks for the
+    /// ones whose values changed since they last fired. Callbacks run
+    /// with no engine lock held; they may read from the runtime but must
+    /// not call `stabilize` reentrantly from another thread if duplicate
+    /// notifications matter.
+    pub fn stabilize(&self) {
+        let entries: Vec<(
+            u64,
+            u64,
+            Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>,
+        )> = {
+            let inner = self.inner.read();
+            inner
+                .observers
+                .iter()
+                .map(|(&id, e)| (id, e.last_seen, Arc::clone(&e.run)))
+                .collect()
+        };
+        for (id, last_seen, run) in entries {
+            if let Some(new_stamp) = run(self, last_seen) {
+                let mut inner = self.inner.write();
+                if let Some(e) = inner.observers.get_mut(&id) {
+                    e.last_seen = e.last_seen.max(new_stamp);
+                }
+            }
+        }
+    }
+
     /// Delete a node and recycle its slot. The node must have no
     /// dependents (delete downstream nodes first) and must not be
     /// deleted from inside its own compute. Any in-flight compute on the
@@ -334,6 +439,7 @@ impl<C: Cells> Runtime<C> {
         inner.compute_fns[slot as usize] = None;
         inner.dependents[slot as usize].clear();
         inner.labels.remove(&slot);
+        inner.observers.retain(|_, e| e.slot != slot);
         let arena = inner
             .arenas
             .try_arena::<T>()
@@ -1352,6 +1458,75 @@ mod tests {
             r.join().unwrap();
         }
         assert_eq!(rt.get(doubled), 2000);
+    }
+
+    #[test]
+    fn observe_and_stabilize_fire_on_change_only() {
+        use std::sync::Mutex;
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(1_i64);
+        let doubled = rt.create_query(move |rt| rt.get(input) * 2);
+
+        let seen: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        let id = rt.observe(doubled, move |v| seen_cb.lock().unwrap().push(*v));
+
+        // Never-computed node fires on first stabilize.
+        rt.stabilize();
+        assert_eq!(*seen.lock().unwrap(), vec![2]);
+
+        // No change, no fire.
+        rt.stabilize();
+        assert_eq!(*seen.lock().unwrap(), vec![2]);
+
+        // Change fires once per stabilize, with the new value.
+        rt.set(input, 5);
+        rt.stabilize();
+        rt.stabilize();
+        assert_eq!(*seen.lock().unwrap(), vec![2, 10]);
+
+        // Unobserve stops notifications.
+        rt.unobserve(id);
+        rt.set(input, 9);
+        rt.stabilize();
+        assert_eq!(*seen.lock().unwrap(), vec![2, 10]);
+    }
+
+    #[test]
+    fn observe_respects_early_cutoff() {
+        use std::sync::Mutex;
+        let rt: Runtime<Shared> = Runtime::new();
+        let input = rt.create_input(200_i64);
+        let clamped = rt.create_query(move |rt| rt.get(input).min(100));
+        let _ = rt.get(clamped);
+
+        let seen: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_cb = Arc::clone(&seen);
+        rt.observe(clamped, move |v| seen_cb.lock().unwrap().push(*v));
+
+        // Input changes but the clamped value does not: cutoff, no fire.
+        rt.set(input, 300);
+        rt.stabilize();
+        assert_eq!(seen.lock().unwrap().len(), 0);
+
+        rt.set(input, 50);
+        rt.stabilize();
+        assert_eq!(*seen.lock().unwrap(), vec![50]);
+    }
+
+    #[test]
+    fn delete_node_drops_its_observers() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(1_i64);
+        let fired = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fired_cb = Arc::clone(&fired);
+        rt.observe(input, move |_| {
+            fired_cb.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        rt.delete_node(input);
+        // The observer is gone; stabilize must not touch the dead slot.
+        rt.stabilize();
+        assert_eq!(fired.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

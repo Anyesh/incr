@@ -43,7 +43,7 @@ pub use generic_arena::GenericArena;
 pub use handle::{Incr, RuntimeId};
 pub use locks::{LocalLock, Lock};
 pub use node::{NodeData, NodeId};
-pub use runtime::Runtime;
+pub use runtime::{ObserverId, Runtime};
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
