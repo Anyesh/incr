@@ -30,8 +30,7 @@ pub use incr_core::{
     Delta, GroupedCollection as GroupedCollectionInner, Incr,
     IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace,
     ObserverId, PropagationTrace, RuntimeId, SortDelta, SortedCollection as SortedCollectionInner,
-    TraceAction,
-    Value,
+    TraceAction, Value,
 };
 
 /// Single-threaded runtime: `Runtime<Local>`. Not `Send`/`Sync`. Use the

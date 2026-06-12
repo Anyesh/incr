@@ -93,10 +93,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - uses: Swatinem/rust-cache@v2
-      - run: python -m venv .ci-venv && .ci-venv/bin/pip install maturin pytest
-      - run: .ci-venv/bin/maturin develop --release --manifest-path crates/incr-python/Cargo.toml
-      - run: .ci-venv/bin/maturin develop --release --manifest-path crates/incr-concurrent-python/Cargo.toml
-      - run: .ci-venv/bin/python -m pytest examples/tests/python/ -q
+      # maturin develop resolves the target environment from VIRTUAL_ENV,
+      # so the venv must be activated, not merely invoked by path.
+      - run: |
+          python -m venv .ci-venv
+          source .ci-venv/bin/activate
+          pip install maturin pytest
+          maturin develop --release --manifest-path crates/incr-python/Cargo.toml
+          maturin develop --release --manifest-path crates/incr-concurrent-python/Cargo.toml
+          python -m pytest examples/tests/python/ -q
 
   clippy:
     name: Clippy
