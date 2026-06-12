@@ -319,9 +319,7 @@ impl PyCollection {
                 Python::attach(|py| PyValue(call_stashing(py, &left_key, (val.0.clone_ref(py),))))
             },
             move |val: &PyValue| -> PyValue {
-                Python::attach(|py| {
-                    PyValue(call_stashing(py, &right_key, (val.0.clone_ref(py),)))
-                })
+                Python::attach(|py| PyValue(call_stashing(py, &right_key, (val.0.clone_ref(py),))))
             },
         );
         let mapped = joined.map(&self.rt, |pair: &(PyValue, PyValue)| -> PyValue {
