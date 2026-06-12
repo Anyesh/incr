@@ -56,13 +56,17 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) next_observer_id: u64,
 }
 
+/// Type-erased observer runner: takes the runtime and the observer's
+/// last-seen stamp, returns the new stamp if the callback fired.
+type ObserverRunFn<C> = Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>;
+
 /// One registered observer: which slot it watches, the changed_at stamp
 /// it last fired for, and a type-erased runner that ensures the node is
 /// clean and invokes the user callback if the value changed.
 pub(crate) struct ObserverEntry<C: Cells> {
     pub(crate) slot: u32,
     pub(crate) last_seen: u64,
-    pub(crate) run: Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>,
+    pub(crate) run: ObserverRunFn<C>,
 }
 
 impl<C: Cells> Inner<C> {
@@ -350,11 +354,7 @@ impl<C: Cells> Runtime<C> {
     /// not call `stabilize` reentrantly from another thread if duplicate
     /// notifications matter.
     pub fn stabilize(&self) {
-        let entries: Vec<(
-            u64,
-            u64,
-            Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>,
-        )> = {
+        let entries: Vec<(u64, u64, ObserverRunFn<C>)> = {
             let inner = self.inner.read();
             inner
                 .observers

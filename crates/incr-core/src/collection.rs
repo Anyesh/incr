@@ -779,8 +779,7 @@ where
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
 
-        let groups: Arc<OpLock<HashMap<K, IncrCollection<T, C>>, C>> =
-            Arc::new(OpLock::new(HashMap::new()));
+        let groups: GroupMap<K, T, C> = Arc::new(OpLock::new(HashMap::new()));
         // Maps elements to the key they were inserted under, so a Delete
         // for the same value reaches the right group even if the key
         // function is expensive or non-deterministic across calls.
@@ -990,10 +989,14 @@ where
     T: Value + Hash + Eq,
     C: Cells,
 {
-    pub(crate) groups: Arc<OpLock<HashMap<K, IncrCollection<T, C>>, C>>,
+    pub(crate) groups: GroupMap<K, T, C>,
     pub(crate) version_node: Incr<u64>,
     pub(crate) _confine: std::marker::PhantomData<C::Ptr<()>>,
 }
+
+/// Shared map from group key to that key's derived sub-collection,
+/// shared between the group_by operator closure and the handle.
+type GroupMap<K, T, C> = Arc<OpLock<HashMap<K, IncrCollection<T, C>>, C>>;
 
 impl<K, T, C> Clone for GroupedCollection<K, T, C>
 where
