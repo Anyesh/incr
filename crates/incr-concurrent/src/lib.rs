@@ -4,7 +4,7 @@
 //! [`Shared`] strategy. The `Runtime` type is `Send + Sync`: wrap it in
 //! `Arc`, share it across threads, have one writer thread call `set`
 //! while many reader threads call `get` on derived nodes. Same API
-//! surface as the single-threaded sibling [`incr-compute`]: switching
+//! surface as the single-threaded sibling [incr-compute](https://crates.io/crates/incr-compute): switching
 //! is a one-line dependency swap.
 //!
 //! ## API status

@@ -57,12 +57,15 @@ assert_eq!(rt.get(total), 265);
 - **filter** keeps elements matching a predicate
 - **map** transforms each element
 - **count** tracks the number of elements (incremental, O(1) per insert/delete)
-- **reduce** folds all elements into a single value
+- **aggregate** incrementally maintained monoid fold over a balanced tree (O(log n) per change, correct for non-invertible folds like max)
+- **reduce** folds all elements via an arbitrary function over a snapshot (O(n) per change by construction; prefer `aggregate` for associative folds)
 - **sort_by_key** produces a sorted view with positional deltas
-- **pairwise** emits consecutive pairs from a sorted collection
+- **pairwise** emits consecutive pairs from a sorted collection (O(1) output deltas per change)
 - **window** emits sliding windows of a given size from a sorted collection
 - **group_by** partitions into per-key sub-collections
 - **join** pairs two collections on a shared key
+
+Beyond operators: `delete_node` removes nodes and recycles their slots (stale handles panic with a clear message), and `observe`/`stabilize` deliver batch change notifications without polling.
 
 ## When to use incr-compute vs incr-concurrent
 
@@ -76,4 +79,4 @@ User types stored in the runtime must implement `Value`, which is `Clone + Parti
 
 ## Python
 
-Python bindings re-implement against the v0.2 engine in 0.3.
+`pip install incr-compute` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr import Runtime`).

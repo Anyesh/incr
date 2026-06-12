@@ -4,7 +4,7 @@
 //! [`Local`] strategy. The `Runtime` type is single-threaded (`!Sync`),
 //! pays no atomic-fence cost on its hot path, and has zero atomic ops in
 //! its uncontended access patterns. Same API surface as the concurrent
-//! sibling [`incr-concurrent`]: switching is a one-line dependency swap.
+//! sibling [incr-concurrent](https://crates.io/crates/incr-concurrent): switching is a one-line dependency swap.
 //!
 //! ## API status
 //!
@@ -19,7 +19,7 @@
 //!   (was undefined behavior in v0.1).
 //!
 //! Migration from 0.1: a single import. Closure bounds tightened to
-//! `Fn + Send + Sync + 'static` for uniformity with [`incr-concurrent`];
+//! `Fn + Send + Sync + 'static` for uniformity with [incr-concurrent](https://crates.io/crates/incr-concurrent);
 //! most user types already meet these bounds.
 
 #![doc(html_no_source)]

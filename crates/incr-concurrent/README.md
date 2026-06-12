@@ -2,7 +2,7 @@
 
 Thread-safe incremental computation with `Send + Sync` runtime. Since 0.2, this crate is a thin re-export of [`incr-core`](https://crates.io/crates/incr-core) with the `Shared` strategy; the algorithm and operators live in the shared engine.
 
-`incr-concurrent` builds a reactive computation graph that can be shared across threads. One thread mutates inputs while any number of reader threads query derived values concurrently. Under the hood every cell is the matching atomic type and state transitions use explicit Acquire/Release for visibility. On x86 (TSO) Acquire compiles to a plain `mov` with no fences, so the lock-free read path costs essentially nothing over the single-threaded variant. ARM/Apple Silicon pays one `dmb ld` per Acquire load, which is the unavoidable cost of cross-thread synchronization on a weak memory model.
+`incr-concurrent` builds a reactive computation graph that can be shared across threads. One thread mutates inputs while any number of reader threads query derived values concurrently. State transitions are CAS-based with Acquire/Release ordering, and values live behind hazard-pointer-protected pointer swaps, so a read can never observe a torn value and the displaced value cannot be freed under a reader: this holds for heap values (String, Vec, your structs), not just machine words. The price relative to `incr-compute` is a pair of hazard-pointer atomics per value read and one allocation plus a deferred free per changed value write; the in-repo benchmarks quantify it (roughly 3x `incr-compute` on chain propagation, at parity with Salsa, which does not allow concurrent readers at all).
 
 ## Install
 
@@ -90,7 +90,7 @@ assert_eq!(rt.get(total), 265);
 
 ## All operators
 
-Same nine as `incr-compute`: filter, map, count, reduce, sort_by_key, pairwise, window, group_by, join. The `count` operator is incremental (O(1) per delta); `reduce` is snapshot-based; everything else is incremental on the delta log.
+Same ten as `incr-compute`: filter, map, count, aggregate, reduce, sort_by_key, pairwise, window, group_by, join. `count` and `aggregate` are incremental (O(1) and O(log n) per delta); `reduce` is snapshot-based for arbitrary folds; everything else is incremental on the delta log. `delete_node` and `observe`/`stabilize` are available here too.
 
 ## When to use
 
@@ -98,4 +98,4 @@ Use `incr-concurrent` when you need to share a computation graph across threads.
 
 ## Python
 
-Python bindings re-implement against the v0.2 engine in 0.3.
+`pip install incr-concurrent` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr_concurrent import Runtime`); its classes are shareable across Python threads and the GIL is released around computing calls.
