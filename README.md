@@ -1,3 +1,5 @@
+
+
 # incr
 
  [![crates.io badge for incr-compute](https://img.shields.io/crates/v/incr-compute?label=incr-compute&logo=rust&color=blue)](https://crates.io/crates/incr-compute)
@@ -122,6 +124,7 @@ cargo test -p incr-concurrent       # concurrent wrapper integration
 
 cargo bench -p incr-core            # full engine benches
 cargo bench -p incr-compute         # bench through the wrapper
+pytest examples/tests/python/       # Python bindings integration
 ```
 
 ## Testing
