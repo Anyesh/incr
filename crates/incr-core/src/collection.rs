@@ -301,9 +301,44 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         }
     }
 
+    /// Replace `old` (if present) with `new` as a single atomic step:
+    /// both deltas are pushed under one log guard and only one `rt.set`
+    /// is issued, so a reader can never observe `old` as transiently
+    /// absent between the delete and the insert the way two separate
+    /// `delete` + `insert` calls would expose. Returns whether the
+    /// delete side recorded a delta (same contract as `delete`).
+    ///
+    /// Panics if this collection is the output of an operator.
+    pub fn replace(&self, rt: &Runtime<C>, old: Option<&T>, new: T) -> bool {
+        self.check_mutable();
+        let mut log = self.log.write();
+        let deleted = match old {
+            Some(v) => log.delete(v).is_some(),
+            None => false,
+        };
+        let new_version = log.insert(new);
+        drop(log);
+        rt.set(self.version_node, new_version);
+        deleted
+    }
+
     /// Number of live elements (with multiset duplicates counted).
     pub fn snapshot_len(&self) -> usize {
         self.log.read().elements.values().sum()
+    }
+
+    /// A derived view of this collection: same underlying log, but
+    /// `insert`/`delete`/`replace` panic on it the way an operator
+    /// output's do. Lets a wrapper type hand out read/operator access
+    /// to its source collection without letting the caller bypass an
+    /// index the wrapper maintains alongside it.
+    pub fn as_view(&self) -> Self {
+        Self {
+            log: Arc::clone(&self.log),
+            version_node: self.version_node,
+            derived: true,
+            _confine: std::marker::PhantomData,
+        }
     }
 }
 
@@ -832,27 +867,50 @@ where
             let mut grps = groups_for_query.write();
             let mut kc = key_cache_for_query.write();
 
+            // Bucket by destination group first, mutating key_cache in
+            // log order as we go (a Delete's group comes only from the
+            // cache, so a same-batch Insert-then-Delete of the same
+            // value must see the Insert's cache write before the
+            // Delete looks it up). Then apply each touched group's
+            // deltas under one log guard and issue one `rt.set`, so a
+            // same-group replace (Delete old + Insert new landing in
+            // the same group) can't expose the group's count as
+            // transiently short by one the way per-delta `rt.set` did.
+            let mut by_group: HashMap<K, Vec<Delta<T>>> = HashMap::new();
             for (d, k) in keyed {
                 match d {
                     Delta::Insert(v) => {
                         let k = k.expect("insert delta staged without key");
                         kc.insert(v.clone(), k.clone());
-                        let group = grps
-                            .entry(k)
-                            .or_insert_with(|| IncrCollection::<T, C>::new_in_compute(rt));
-                        let new_ver = group.log.write().insert(v.clone());
-                        rt.set(group.version_node, new_ver);
+                        by_group.entry(k).or_default().push(Delta::Insert(v));
                     }
                     Delta::Delete(v) => {
                         if let Some(k) = kc.remove(&v) {
-                            if let Some(group) = grps.get(&k) {
-                                let new_ver = group.log.write().delete(&v);
-                                if let Some(ver) = new_ver {
-                                    rt.set(group.version_node, ver);
-                                }
+                            by_group.entry(k).or_default().push(Delta::Delete(v));
+                        }
+                    }
+                }
+            }
+
+            for (k, deltas) in by_group {
+                let group = grps
+                    .entry(k)
+                    .or_insert_with(|| IncrCollection::<T, C>::new_in_compute(rt));
+                let mut log = group.log.write();
+                let mut last_version = None;
+                for d in deltas {
+                    match d {
+                        Delta::Insert(v) => last_version = Some(log.insert(v)),
+                        Delta::Delete(v) => {
+                            if let Some(ver) = log.delete(&v) {
+                                last_version = Some(ver);
                             }
                         }
                     }
+                }
+                drop(log);
+                if let Some(ver) = last_version {
+                    rt.set(group.version_node, ver);
                 }
             }
             cursor.store(from + pending.len() as u64, MemOrdering::Release);
@@ -1059,6 +1117,122 @@ mod tests {
         c.insert(&rt, 20);
         c.insert(&rt, 30);
         assert_eq!(c.snapshot_len(), 3);
+    }
+
+    #[test]
+    fn shared_replace_basic() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        c.insert(&rt, 1);
+        let n = c.count(&rt);
+        assert_eq!(rt.get(n), 1);
+
+        let deleted = c.replace(&rt, Some(&1), 2);
+        assert!(deleted, "replace should report the old value was found");
+        assert_eq!(rt.get(n), 1);
+        assert_eq!(c.snapshot_len(), 1);
+
+        let deleted = c.replace(&rt, Some(&99), 3);
+        assert!(!deleted, "replace should report a missing old value");
+        assert_eq!(rt.get(n), 2);
+    }
+
+    #[test]
+    fn shared_as_view_reads_through() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        c.insert(&rt, 1);
+        c.insert(&rt, 2);
+        let view = c.as_view();
+        assert_eq!(view.snapshot_len(), 2);
+        let n = view.count(&rt);
+        assert_eq!(rt.get(n), 2);
+        c.insert(&rt, 3);
+        assert_eq!(rt.get(n), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "derived collection")]
+    fn shared_as_view_panics_on_insert() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let view = c.as_view();
+        view.insert(&rt, 1);
+    }
+
+    #[test]
+    fn shared_replace_never_transiently_drops_count() {
+        let rt: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+        let c = rt.create_collection::<i64>();
+        c.insert(&rt, 0);
+        let n = c.count(&rt);
+        assert_eq!(rt.get(n), 1);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let rt = Arc::clone(&rt);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    assert_eq!(rt.get(n), 1, "replace exposed a transient count");
+                }
+            })
+        };
+
+        let iters = if cfg!(miri) { 20 } else { 2000 };
+        let mut current = 0_i64;
+        for _ in 0..iters {
+            let next = current + 1;
+            c.replace(&rt, Some(&current), next);
+            current = next;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        assert_eq!(rt.get(n), 1);
+    }
+
+    #[test]
+    fn shared_replace_group_by_never_transiently_drops_group_count() {
+        let rt: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+        let c = rt.create_collection::<i64>();
+        c.insert(&rt, 0);
+        let groups = c.group_by(&rt, |x| x % 2);
+        let _ = rt.get(groups.version_node);
+        let evens = groups.get_group(&0).expect("group 0 missing");
+        let n = evens.count(&rt);
+        assert_eq!(rt.get(n), 1);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let rt = Arc::clone(&rt);
+            let stop = Arc::clone(&stop);
+            let groups_version = groups.version_node;
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = rt.get(groups_version);
+                    assert_eq!(
+                        rt.get(n),
+                        1,
+                        "group_by replace exposed a transient group count"
+                    );
+                }
+            })
+        };
+
+        // Same-key replace whose old and new value both hash to group 0
+        // (even), so every replace is a same-group operation, the case
+        // the batched-apply fix targets.
+        let iters = if cfg!(miri) { 20 } else { 2000 };
+        let mut current = 0_i64;
+        for _ in 0..iters {
+            let next = current + 2;
+            c.replace(&rt, Some(&current), next);
+            current = next;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().unwrap();
+        let _ = rt.get(groups.version_node);
+        assert_eq!(rt.get(n), 1);
     }
 
     #[test]
