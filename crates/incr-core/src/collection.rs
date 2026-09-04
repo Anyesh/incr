@@ -327,6 +327,22 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         self.log.read().elements.values().sum()
     }
 
+    /// Current elements, with multiset duplicates expanded. Forces
+    /// `version_node` first, so an operator output (a `filter`/`map`
+    /// result, say) is brought up to date with its upstream before the
+    /// read, the same way `count`/`reduce` force it via their own query
+    /// closures.
+    ///
+    /// This does *not* extend to a `group_by` sub-collection: its
+    /// `version_node` is an input the operator sets directly, not a
+    /// query `rt.get` can force, so `values()` on a group only reflects
+    /// whatever the group last observed. Force `GroupedCollection`'s own
+    /// `version_node()` first if a group's contents need to be current.
+    pub fn values(&self, rt: &Runtime<C>) -> Vec<T> {
+        rt.get(self.version_node);
+        self.log.read().elements_vec()
+    }
+
     /// A derived view of this collection: same underlying log, but
     /// `insert`/`delete`/`replace` panic on it the way an operator
     /// output's do. Lets a wrapper type hand out read/operator access
@@ -1135,6 +1151,25 @@ mod tests {
         let deleted = c.replace(&rt, Some(&99), 3);
         assert!(!deleted, "replace should report a missing old value");
         assert_eq!(rt.get(n), 2);
+    }
+
+    #[test]
+    fn shared_values_reads_current_elements_including_through_a_derived_view() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        c.insert(&rt, 1);
+        c.insert(&rt, 2);
+        c.insert(&rt, 3);
+
+        let evens = c.filter(&rt, |v| v % 2 == 0);
+        let mut got = evens.values(&rt);
+        got.sort_unstable();
+        assert_eq!(got, vec![2]);
+
+        c.insert(&rt, 4);
+        let mut got = evens.values(&rt);
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 4]);
     }
 
     #[test]
