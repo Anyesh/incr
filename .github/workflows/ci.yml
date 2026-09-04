@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [incr-core, incr-compute, incr-concurrent]
+        crate: [incr-core, incr-compute, incr-concurrent, incr-kube]
     env:
       CRATE: ${{ matrix.crate }}
     steps:
@@ -29,26 +29,37 @@ jobs:
   miri:
     name: Miri
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [incr-core, incr-kube]
+    env:
+      CRATE: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly miri test -p incr-core --lib --test stress -- --test-threads=1
+      - run: cargo +nightly miri test -p "$CRATE" --lib --test stress -- --test-threads=1
 
   tsan:
     name: ThreadSanitizer
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [incr-core, incr-kube]
     env:
       RUSTFLAGS: -Zsanitizer=thread
+      CRATE: ${{ matrix.crate }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p incr-core --lib --test stress
+      - run: cargo +nightly test -Zbuild-std --target x86_64-unknown-linux-gnu -p "$CRATE" --lib --test stress
 
   bench:
     name: Benchmark
@@ -56,18 +67,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        bench: [chain, operators]
+        include:
+          - crate: incr-core
+            bench: chain
+          - crate: incr-core
+            bench: operators
+          - crate: incr-kube
+            bench: keyed_upsert
     env:
+      CRATE: ${{ matrix.crate }}
       BENCH: ${{ matrix.bench }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo bench -p incr-core --bench "$BENCH" -- --output-format bencher | tee bench-output.txt
+      - run: cargo bench -p "$CRATE" --bench "$BENCH" -- --output-format bencher | tee bench-output.txt
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.bench }}
+          name: bench-${{ matrix.crate }}-${{ matrix.bench }}
           path: bench-output.txt
 
   examples:
