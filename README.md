@@ -2,6 +2,7 @@
 
  [![crates.io badge for incr-compute](https://img.shields.io/crates/v/incr-compute?label=incr-compute&logo=rust&color=blue)](https://crates.io/crates/incr-compute)
  [![crates.io badge for incr-concurrent](https://img.shields.io/crates/v/incr-concurrent?label=incr-concurrent&logo=rust&color=orange)](https://crates.io/crates/incr-concurrent)
+ [![crates.io badge for incr-kube](https://img.shields.io/crates/v/incr-kube?label=incr-kube&logo=rust&color=green)](https://crates.io/crates/incr-kube)
  [![PyPI badge for incr-compute](https://img.shields.io/pypi/v/incr-compute?label=incr-compute&logo=python&color=blue)](https://pypi.org/project/incr-compute/)
  [![PyPI badge for incr-concurrent](https://img.shields.io/pypi/v/incr-concurrent?label=incr-concurrent&logo=python&color=orange)](https://pypi.org/project/incr-concurrent/)
 [![CI](https://github.com/Anyesh/incr/workflows/CI/badge.svg)](https://github.com/Anyesh/incr/actions?query=workflow%3ACI)
@@ -142,6 +143,10 @@ Loom model checking is not wired up because the value slots and dep lists build 
 - [`examples/spreadsheet/`](examples/spreadsheet/) — live spreadsheet engine driving formula cells through the incremental graph with WebSocket sync.
 
 A Python `travel-premium` demo and a `dashboard` demo with real per-node tracing live on the v0.1 line; porting them to v0.2 is open.
+
+## Integrations
+
+[`incr-kube`](crates/incr-kube/) replaces kube-rs's reflector `Store<K>` with an incrementally-maintained view, so a controller's hot queries stop scanning the whole cache under a read lock. Its own [README](crates/incr-kube/README.md) has the numbers and a worked conversion of a real operator.
 
 ## CI
 
