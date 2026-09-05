@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "incr-concurrent"
-version = "0.2.0b2"
+version = "0.2.0b3"
 description = "Incremental computation engine with thread-safe runtime for Python"
 requires-python = ">=3.10"
 license = "Apache-2.0"
