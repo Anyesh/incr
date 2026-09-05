@@ -85,21 +85,24 @@ pub async fn drive_reflector<K, S>(
     while let Some(event) = stream.next().await {
         match event {
             Ok(ev) => {
-                on_event(&ev);
-                match ev {
+                // Matches on `&ev` (cloning `obj` into `apply`/`upsert`
+                // rather than moving it out of `ev`) so `ev` is still
+                // whole for `on_event` below, after the update it
+                // describes has actually landed in `keyed`.
+                match &ev {
                     watcher::Event::Apply(obj) => {
-                        let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
-                        apply(keyed, rt, &mut counter, key, obj);
+                        let key = ObjectRef::from_obj_with(obj, dyntype.clone());
+                        apply(keyed, rt, &mut counter, key, obj.clone());
                     }
                     watcher::Event::Delete(obj) => {
-                        let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
+                        let key = ObjectRef::from_obj_with(obj, dyntype.clone());
                         keyed.remove(rt, &key);
                     }
                     watcher::Event::Init => {
                         seen = Some(HashSet::new());
                     }
                     watcher::Event::InitApply(obj) => {
-                        let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
+                        let key = ObjectRef::from_obj_with(obj, dyntype.clone());
                         // Unconditional: recorded as seen regardless of
                         // whether `apply` below skips the upsert as
                         // unchanged. Skipping this insert for unchanged
@@ -109,7 +112,7 @@ pub async fn drive_reflector<K, S>(
                         if let Some(seen) = seen.as_mut() {
                             seen.insert(key.clone());
                         }
-                        apply(keyed, rt, &mut counter, key, obj);
+                        apply(keyed, rt, &mut counter, key, obj.clone());
                     }
                     watcher::Event::InitDone => {
                         if let Some(seen) = seen.take() {
@@ -117,6 +120,7 @@ pub async fn drive_reflector<K, S>(
                         }
                     }
                 }
+                on_event(&ev);
             }
             Err(err) => on_error(err),
         }

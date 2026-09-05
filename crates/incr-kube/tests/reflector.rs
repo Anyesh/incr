@@ -223,3 +223,56 @@ async fn on_event_fires_for_every_ok_event_not_for_errors() {
         "on_event should fire once per Ok event, in order, skipping the Err in between"
     );
 }
+
+#[tokio::test]
+async fn on_event_sees_keyed_already_updated() {
+    let rt = Runtime::new();
+    let keyed: KeyedCollection<ObjectRef<Pod>, Pod> = KeyedCollection::new(&rt);
+    let foo = testpod("foo", "1");
+    let bar = testpod("bar", "1");
+
+    let events = stream::iter([
+        Ok(Event::Apply(foo.clone())),
+        Ok(Event::Init),
+        Ok(Event::InitApply(bar.clone())),
+        Ok(Event::InitDone),
+        Ok(Event::Delete(bar.clone())),
+    ]);
+
+    let mut apply_saw_foo_stored = false;
+    let mut init_done_saw_foo_pruned = false;
+    let mut delete_saw_bar_gone = false;
+    drive_reflector(
+        &keyed,
+        &rt,
+        (),
+        events,
+        |ev| match ev {
+            Event::Apply(_) => {
+                apply_saw_foo_stored = keyed.get(&ObjectRef::from(&foo)).is_some();
+            }
+            Event::InitDone => {
+                init_done_saw_foo_pruned = keyed.get(&ObjectRef::from(&foo)).is_none();
+            }
+            Event::Delete(_) => {
+                delete_saw_bar_gone = keyed.get(&ObjectRef::from(&bar)).is_none();
+            }
+            _ => {}
+        },
+        |_| {},
+    )
+    .await;
+
+    assert!(
+        apply_saw_foo_stored,
+        "on_event for Apply should see the object already upserted into keyed"
+    );
+    assert!(
+        init_done_saw_foo_pruned,
+        "on_event for InitDone should see foo already pruned by retain, since it was never re-listed"
+    );
+    assert!(
+        delete_saw_bar_gone,
+        "on_event for Delete should see the object already removed from keyed"
+    );
+}

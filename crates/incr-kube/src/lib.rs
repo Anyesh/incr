@@ -9,11 +9,7 @@
 //! engine layer. [`drive_reflector`] is the kube-rs integration built on
 //! top of it: it consumes a raw `watcher()`/`reflector()` event stream
 //! directly, not `store_shared()`/`ReflectHandle` (see the [`reflector`]
-//! module docs for why). Still not in this crate: the milestone's
-//! published 50k-object benchmark against `Store::state_filter`, and a
-//! worked conversion of a real public operator; both need a live or
-//! synthetic cluster-scale watch feed this crate's own test suite
-//! doesn't set up.
+//! module docs for why).
 //!
 //! Hardcoded to `Shared` mode (`incr_concurrent`'s re-export), not
 //! generic over strategy: kube-rs controllers are inherently
@@ -36,6 +32,18 @@
 //!   [`drive_reflector`] calls it on every `InitDone`, but a caller
 //!   using `KeyedCollection` directly, without `drive_reflector`, gets
 //!   no automatic reconciliation.
+//! - **Mid-relist reads see a mix of old and fresh state, not an atomic
+//!   snapshot swap.** kube-rs's own `Store` buffers `InitApply` into a
+//!   side map and swaps it in on `InitDone`, so a reader sees the
+//!   previous complete listing until the relist finishes.
+//!   [`drive_reflector`] applies each `InitApply` live and only prunes
+//!   on `InitDone`, so a reader mid-relist sees old objects not yet
+//!   re-listed sitting alongside already-relisted fresh ones, and on a
+//!   watcher's first start sees a partially-filled collection rather
+//!   than an empty one. Harmless for a caller that only reads `keyed`
+//!   outside a relist window or tolerates a stale-or-fresh read either
+//!   way; a caller that depends on relist snapshot atomicity does not
+//!   get it here.
 //!
 //! Two gaps named after the previous chunk are now closed rather than
 //! deferred again: `resourceVersion` parsing turned out not to be
