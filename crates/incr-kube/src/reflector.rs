@@ -28,13 +28,19 @@ use crate::keyed::{KeyedCollection, UpsertOutcome};
 /// `stream` is anything shaped like `watcher()`'s output; production
 /// callers build one against a live `Api<K>` and pass it straight in,
 /// tests pass a synthetic `futures::stream::iter([...])`, mirroring
-/// kube-runtime's own test pattern for the same stream type. `on_error`
-/// is invoked for every `Err` the stream yields; the loop keeps polling
-/// afterward rather than returning, matching how a production
-/// controller logs and continues past a transient watch error. Note
-/// that `drive_reflector` applies no backoff of its own: if `stream`
-/// isn't wrapped with `.default_backoff()` (or equivalent) by the
-/// caller, a persistent error spins this loop hot with no delay.
+/// kube-runtime's own test pattern for the same stream type. `on_event`
+/// is invoked once per successfully received event, after `keyed` has
+/// already been updated for it: a caller that needs to log every event
+/// or detect `InitDone` to signal its own readiness (both common in a
+/// real controller's startup sequence) has a hook for it without
+/// needing its own copy of this loop. `on_error` is invoked for every
+/// `Err` the stream yields instead, and does not also trigger
+/// `on_event`; the loop keeps polling afterward rather than returning,
+/// matching how a production controller logs and continues past a
+/// transient watch error. Note that `drive_reflector` applies no
+/// backoff of its own: if `stream` isn't wrapped with
+/// `.default_backoff()` (or equivalent) by the caller, a persistent
+/// error spins this loop hot with no delay.
 ///
 /// Versioning is a loop-owned monotonic counter, not a parse of
 /// Kubernetes' `resourceVersion` string: a single watch stream already
@@ -66,6 +72,7 @@ pub async fn drive_reflector<K, S>(
     rt: &Runtime,
     dyntype: K::DynamicType,
     mut stream: S,
+    mut on_event: impl FnMut(&watcher::Event<K>),
     mut on_error: impl FnMut(watcher::Error),
 ) where
     K: Resource + Clone + Send + Sync + 'static,
@@ -77,32 +84,38 @@ pub async fn drive_reflector<K, S>(
 
     while let Some(event) = stream.next().await {
         match event {
-            Ok(watcher::Event::Apply(obj)) => {
-                let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
-                apply(keyed, rt, &mut counter, key, obj);
-            }
-            Ok(watcher::Event::Delete(obj)) => {
-                let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
-                keyed.remove(rt, &key);
-            }
-            Ok(watcher::Event::Init) => {
-                seen = Some(HashSet::new());
-            }
-            Ok(watcher::Event::InitApply(obj)) => {
-                let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
-                // Unconditional: recorded as seen regardless of whether
-                // `apply` below skips the upsert as unchanged. Skipping
-                // this insert for unchanged objects would mean `retain`
-                // prunes everything InitDone didn't re-upsert, which on
-                // a healthy cluster is nearly the whole collection.
-                if let Some(seen) = seen.as_mut() {
-                    seen.insert(key.clone());
-                }
-                apply(keyed, rt, &mut counter, key, obj);
-            }
-            Ok(watcher::Event::InitDone) => {
-                if let Some(seen) = seen.take() {
-                    keyed.retain(rt, |k| seen.contains(k));
+            Ok(ev) => {
+                on_event(&ev);
+                match ev {
+                    watcher::Event::Apply(obj) => {
+                        let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
+                        apply(keyed, rt, &mut counter, key, obj);
+                    }
+                    watcher::Event::Delete(obj) => {
+                        let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
+                        keyed.remove(rt, &key);
+                    }
+                    watcher::Event::Init => {
+                        seen = Some(HashSet::new());
+                    }
+                    watcher::Event::InitApply(obj) => {
+                        let key = ObjectRef::from_obj_with(&obj, dyntype.clone());
+                        // Unconditional: recorded as seen regardless of
+                        // whether `apply` below skips the upsert as
+                        // unchanged. Skipping this insert for unchanged
+                        // objects would mean `retain` prunes everything
+                        // InitDone didn't re-upsert, which on a healthy
+                        // cluster is nearly the whole collection.
+                        if let Some(seen) = seen.as_mut() {
+                            seen.insert(key.clone());
+                        }
+                        apply(keyed, rt, &mut counter, key, obj);
+                    }
+                    watcher::Event::InitDone => {
+                        if let Some(seen) = seen.take() {
+                            keyed.retain(rt, |k| seen.contains(k));
+                        }
+                    }
                 }
             }
             Err(err) => on_error(err),

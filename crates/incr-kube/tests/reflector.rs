@@ -24,7 +24,7 @@ async fn apply_then_get() {
     let foo = testpod("foo", "1");
 
     let events = stream::iter([Ok(Event::Apply(foo.clone()))]);
-    drive_reflector(&keyed, &rt, (), events, |_| {}).await;
+    drive_reflector(&keyed, &rt, (), events, |_| {}, |_| {}).await;
 
     assert!(keyed.get(&ObjectRef::from(&foo)).is_some());
 }
@@ -39,7 +39,7 @@ async fn delete_removes() {
         Ok(Event::Apply(foo.clone())),
         Ok(Event::Delete(foo.clone())),
     ]);
-    drive_reflector(&keyed, &rt, (), events, |_| {}).await;
+    drive_reflector(&keyed, &rt, (), events, |_| {}, |_| {}).await;
 
     assert!(keyed.get(&ObjectRef::from(&foo)).is_none());
 }
@@ -58,7 +58,7 @@ async fn relist_prunes_key_not_relisted() {
         Ok(Event::InitApply(bar.clone())),
         Ok(Event::InitDone),
     ]);
-    drive_reflector(&keyed, &rt, (), events, |_| {}).await;
+    drive_reflector(&keyed, &rt, (), events, |_| {}, |_| {}).await;
 
     assert!(
         keyed.get(&ObjectRef::from(&foo)).is_none(),
@@ -89,7 +89,7 @@ async fn relist_restart_resets_seen_set() {
     ]);
 
     let mut error_count = 0;
-    drive_reflector(&keyed, &rt, (), events, |_| error_count += 1).await;
+    drive_reflector(&keyed, &rt, (), events, |_| {}, |_| error_count += 1).await;
 
     assert_eq!(error_count, 1);
     assert!(
@@ -110,7 +110,7 @@ async fn error_does_not_stop_later_events() {
         Ok(Event::Apply(foo.clone())),
     ]);
     let mut error_count = 0;
-    drive_reflector(&keyed, &rt, (), events, |_| error_count += 1).await;
+    drive_reflector(&keyed, &rt, (), events, |_| {}, |_| error_count += 1).await;
 
     assert_eq!(error_count, 1);
     assert!(keyed.get(&ObjectRef::from(&foo)).is_some());
@@ -136,7 +136,7 @@ async fn unchanged_relist_skips_upsert_but_still_counts_as_seen() {
         Ok(Event::InitApply(bar.clone())),
         Ok(Event::InitDone),
     ]);
-    drive_reflector(&keyed, &rt, (), events, |_| {}).await;
+    drive_reflector(&keyed, &rt, (), events, |_| {}, |_| {}).await;
 
     let deltas = rt.get(keyed.collection().version_node());
     assert_eq!(
@@ -168,10 +168,10 @@ async fn restart_seeds_counter_above_stored_high_water_mark() {
     // gets rejected as `Stale` against what the first call already
     // stored.
     let first = stream::iter([Ok(Event::Apply(foo.clone()))]);
-    drive_reflector(&keyed, &rt, (), first, |_| {}).await;
+    drive_reflector(&keyed, &rt, (), first, |_| {}, |_| {}).await;
 
     let second = stream::iter([Ok(Event::Apply(foo_v2.clone()))]);
-    drive_reflector(&keyed, &rt, (), second, |_| {}).await;
+    drive_reflector(&keyed, &rt, (), second, |_| {}, |_| {}).await;
 
     let stored = keyed
         .get(&ObjectRef::from(&foo))
@@ -180,5 +180,46 @@ async fn restart_seeds_counter_above_stored_high_water_mark() {
         stored.metadata.resource_version.as_deref(),
         Some("2"),
         "second call's Apply should have replaced the first call's stored value"
+    );
+}
+
+#[tokio::test]
+async fn on_event_fires_for_every_ok_event_not_for_errors() {
+    let rt = Runtime::new();
+    let keyed: KeyedCollection<ObjectRef<Pod>, Pod> = KeyedCollection::new(&rt);
+    let foo = testpod("foo", "1");
+
+    let events = stream::iter([
+        Ok(Event::Apply(foo.clone())),
+        Err(watcher::Error::NoResourceVersion),
+        Ok(Event::Init),
+        Ok(Event::InitApply(foo.clone())),
+        Ok(Event::InitDone),
+        Ok(Event::Delete(foo.clone())),
+    ]);
+
+    let mut seen_kinds = Vec::new();
+    drive_reflector(
+        &keyed,
+        &rt,
+        (),
+        events,
+        |ev| {
+            seen_kinds.push(match ev {
+                Event::Apply(_) => "Apply",
+                Event::Delete(_) => "Delete",
+                Event::Init => "Init",
+                Event::InitApply(_) => "InitApply",
+                Event::InitDone => "InitDone",
+            });
+        },
+        |_| {},
+    )
+    .await;
+
+    assert_eq!(
+        seen_kinds,
+        vec!["Apply", "Init", "InitApply", "InitDone", "Delete"],
+        "on_event should fire once per Ok event, in order, skipping the Err in between"
     );
 }
