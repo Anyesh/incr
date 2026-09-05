@@ -28,25 +28,25 @@ jobs:
       - name: Publish incr-core
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p incr-core
+        run: scripts/publish-or-confirm.sh incr-core
       - name: Wait for crates.io index
         run: sleep 30
       - name: Publish incr-compute
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p incr-compute
+        run: scripts/publish-or-confirm.sh incr-compute
       - name: Wait for crates.io index
         run: sleep 30
       - name: Publish incr-concurrent
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p incr-concurrent
+        run: scripts/publish-or-confirm.sh incr-concurrent
       - name: Wait for crates.io index
         run: sleep 30
       - name: Publish incr-kube
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p incr-kube
+        run: scripts/publish-or-confirm.sh incr-kube
 
   publish-pypi:
     name: Publish to PyPI
