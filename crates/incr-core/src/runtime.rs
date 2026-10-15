@@ -1270,6 +1270,35 @@ impl<C: Cells> Runtime<C> {
         self.nodes.get(handle.slot()).state()
     }
 
+    /// Every installed dep of a node that is not `Dead` is alive and has
+    /// the node in its dependents. Covers `Dirty`, `Failed` and recovered
+    /// `New` nodes, where a missing edge would otherwise surface only
+    /// after the node's next fast-path publish.
+    pub(crate) fn assert_edges_complete(&self) {
+        let inner = self.inner.read();
+        for x in 0..self.nodes.len() {
+            let node = self.nodes.get(x);
+            if node.state() == NodeState::Dead {
+                continue;
+            }
+            node.for_each_dep(|s| {
+                assert!(
+                    self.nodes.get(s.0).state() != NodeState::Dead
+                        && !inner.free_nodes.contains(&s.0),
+                    "node {x} ({:?}) has dead dep {}",
+                    node.state(),
+                    s.0
+                );
+                assert!(
+                    inner.dependents[s.0 as usize].contains(&NodeId(x)),
+                    "node {x} ({:?}) is missing from dependents[{}]",
+                    node.state(),
+                    s.0
+                );
+            });
+        }
+    }
+
     pub(crate) fn assert_walks_complete(&self) {
         assert_eq!(
             C::walked(&self.walk, &self.revision),

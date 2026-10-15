@@ -3,6 +3,7 @@
 //! compute closure) and acts from another while it is parked. Every test
 //! ends by checking invariant (I) and the value a fresh read returns.
 
+use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -12,6 +13,7 @@ use std::time::Duration;
 
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
+use crate::collection::{GroupedCollection, IncrCollection};
 use crate::handle::Incr;
 use crate::node::NodeId;
 use crate::state::NodeState;
@@ -582,4 +584,202 @@ fn lagging_watermark_costs_a_recompute_not_a_stale_value() {
     assert_eq!(rt.get(d), 60);
     rt.set(x, 6);
     assert_eq!(rt.get(d), 70);
+}
+
+fn iters(full: usize) -> usize {
+    if cfg!(miri) {
+        full / 100
+    } else {
+        full
+    }
+}
+
+/// xorshift64, so every sweep thread draws a reproducible sequence.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self, bound: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % bound
+    }
+}
+
+/// The sweep's workload: an early-cutoff chain, a diamond, and a
+/// collection feeding a `group_by`, over four inputs. Every query is a
+/// known pure function of the inputs, so a final read checks (V).
+struct Sweep<C: Cells> {
+    x: [Incr<u64>; 4],
+    chain: Incr<u64>,
+    diamond: Incr<u64>,
+    col: IncrCollection<u64, C>,
+    groups: GroupedCollection<u64, u64, C>,
+    total: Incr<u64>,
+}
+
+impl<C: Cells> Sweep<C> {
+    fn build(rt: &Runtime<C>) -> Self {
+        let x = [0, 1, 2, 3].map(|i| rt.create_input(i as u64));
+        let [x0, x1, x2, _] = x;
+        let q1 = rt.create_query(move |rt: &Runtime<C>| rt.get(x0) / 2);
+        let q2 = rt.create_query(move |rt: &Runtime<C>| rt.get(q1) + rt.get(x1));
+        let chain = rt.create_query(move |rt: &Runtime<C>| rt.get(q2) / 3);
+        let a = rt.create_query(move |rt: &Runtime<C>| rt.get(x2) + 1);
+        let b = rt.create_query(move |rt: &Runtime<C>| rt.get(x2) * 2);
+        let diamond = rt.create_query(move |rt: &Runtime<C>| rt.get(a) + rt.get(b));
+        let col = rt.create_collection::<u64>();
+        let groups = col.group_by(rt, |v| v % 3);
+        let total = col.count(rt);
+        Self {
+            x,
+            chain,
+            diamond,
+            col,
+            groups,
+            total,
+        }
+    }
+
+    /// One delete-and-recycle cycle: an input and a query over it and
+    /// x[3], read, then deleted downstream first.
+    fn churn(&self, rt: &Runtime<C>, value: u64) {
+        let x3 = self.x[3];
+        let v = rt.create_input(value);
+        let w = rt.create_query(move |rt: &Runtime<C>| rt.get(v) + rt.get(x3));
+        rt.get(w);
+        rt.delete_node(w);
+        rt.delete_node(v);
+    }
+
+    fn mutate(&self, rt: &Runtime<C>, rng: &mut Rng, present: &mut HashSet<u64>, next: &mut u64) {
+        match rng.next(4) {
+            0 => rt.set(self.x[rng.next(4) as usize], rng.next(50)),
+            1 => self.churn(rt, rng.next(50)),
+            2 => {
+                *next += 1;
+                self.col.insert(rt, *next);
+                present.insert(*next);
+            }
+            _ => {
+                if let Some(&v) = present.iter().next() {
+                    assert!(self.col.delete(rt, &v));
+                    present.remove(&v);
+                }
+            }
+        }
+    }
+
+    /// (I), edge completeness and the watermark, then (V) for the
+    /// scalar queries and the collection count.
+    fn check(&self, rt: &Runtime<C>, present: &HashSet<u64>) {
+        rt.assert_invariant_i();
+        rt.assert_edges_complete();
+        rt.assert_walks_complete();
+        let [x0, x1, x2, _] = self.x.map(|h| rt.get(h));
+        assert_eq!(rt.get(self.chain), (x0 / 2 + x1) / 3, "(V): chain");
+        assert_eq!(rt.get(self.diamond), (x2 + 1) + x2 * 2, "(V): diamond");
+        assert_eq!(rt.get(self.total), present.len() as u64, "(V): count");
+    }
+
+    /// Group counts are queries created on demand, so the sweep checks
+    /// them once, at the end.
+    fn check_groups(&self, rt: &Runtime<C>, present: &HashSet<u64>) {
+        // The group_by operator applies upstream deltas when its version
+        // node is read.
+        rt.get(self.groups.version_node());
+        for key in 0..3 {
+            let expected = present.iter().filter(|v| *v % 3 == key).count() as u64;
+            let got = self
+                .groups
+                .get_group(&key)
+                .map_or(0, |g| rt.get(g.count(rt)));
+            assert_eq!(got, expected, "(V): group {key}");
+        }
+    }
+}
+
+#[test]
+fn sweep_local() {
+    let rt = LocalRt::new();
+    let sweep = Sweep::build(&rt);
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let mut present = HashSet::new();
+    let mut next = 0;
+    for i in 0..iters(4000) {
+        sweep.mutate(&rt, &mut rng, &mut present, &mut next);
+        if rng.next(3) == 0 {
+            rt.get(sweep.chain);
+            rt.get(sweep.diamond);
+            rt.get(sweep.groups.version_node());
+        }
+        if i % 97 == 0 {
+            sweep.check(&rt, &present);
+        }
+    }
+    sweep.check(&rt, &present);
+    sweep.check_groups(&rt, &present);
+}
+
+#[test]
+fn sweep_shared() {
+    let rt = Arc::new(Rt::new());
+    let sweep = Arc::new(Sweep::build(&rt));
+    let n = iters(30000);
+    let mut handles = Vec::new();
+
+    for seed in 1..=2_u64 {
+        let (rt, sweep) = (Arc::clone(&rt), Arc::clone(&sweep));
+        handles.push(thread::spawn(move || {
+            let mut rng = Rng(seed * 0x2545_f491_4f6c_dd1d);
+            for _ in 0..n {
+                rt.set(sweep.x[rng.next(4) as usize], rng.next(50));
+            }
+        }));
+    }
+    for _ in 0..2 {
+        let (rt, sweep) = (Arc::clone(&rt), Arc::clone(&sweep));
+        handles.push(thread::spawn(move || {
+            for _ in 0..n {
+                rt.get(sweep.chain);
+                rt.get(sweep.diamond);
+                rt.get(sweep.total);
+                rt.get(sweep.groups.version_node());
+            }
+        }));
+    }
+    {
+        let (rt, sweep) = (Arc::clone(&rt), Arc::clone(&sweep));
+        handles.push(thread::spawn(move || {
+            for i in 0..n as u64 {
+                sweep.churn(&rt, i);
+            }
+        }));
+    }
+    let writer = {
+        let (rt, sweep) = (Arc::clone(&rt), Arc::clone(&sweep));
+        thread::spawn(move || {
+            let mut rng = Rng(0xdead_beef_cafe_f00d);
+            let mut present = HashSet::new();
+            for i in 0..n as u64 {
+                if rng.next(3) == 0 {
+                    if let Some(&v) = present.iter().next() {
+                        assert!(sweep.col.delete(&rt, &v));
+                        present.remove(&v);
+                    }
+                } else {
+                    sweep.col.insert(&rt, i);
+                    present.insert(i);
+                }
+            }
+            present
+        })
+    };
+    for h in handles {
+        h.join().unwrap();
+    }
+    let present = writer.join().unwrap();
+
+    sweep.check(&rt, &present);
+    sweep.check_groups(&rt, &present);
 }
