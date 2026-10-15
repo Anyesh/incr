@@ -160,6 +160,54 @@ impl DepStack for SharedDepStack {
     }
 }
 
+/// Loom strategy: the same per-thread stack as [`SharedDepStack`], on
+/// `loom::thread_local!`. Loom runs every modeled thread on one OS
+/// thread, so a `std::thread_local!` stack would be shared by all of
+/// them and mix their frames.
+#[cfg(loom)]
+pub struct LoomDepStack;
+
+#[cfg(loom)]
+loom::thread_local! {
+    static LOOM_FRAMES: RefCell<Vec<Frame>> = RefCell::new(Vec::new());
+}
+
+#[cfg(loom)]
+impl DepStack for LoomDepStack {
+    fn new() -> Self {
+        Self
+    }
+
+    fn push_frame(&self, node: NodeId) {
+        LOOM_FRAMES.with(|f| f.borrow_mut().push(Frame::new(node)));
+    }
+
+    fn pop_frame(&self) -> Vec<NodeId> {
+        LOOM_FRAMES.with(|f| {
+            f.borrow_mut()
+                .pop()
+                .expect("LoomDepStack::pop_frame on empty stack")
+                .deps
+        })
+    }
+
+    fn record_dep(&self, dep: NodeId) {
+        LOOM_FRAMES.with(|f| {
+            if let Some(frame) = f.borrow_mut().last_mut() {
+                frame.deps.push(dep);
+            }
+        });
+    }
+
+    fn current_frame_active(&self) -> bool {
+        LOOM_FRAMES.with(|f| !f.borrow().is_empty())
+    }
+
+    fn is_computing(&self, node: NodeId) -> bool {
+        LOOM_FRAMES.with(|f| f.borrow().iter().any(|fr| fr.node == node))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

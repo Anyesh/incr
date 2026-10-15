@@ -25,6 +25,10 @@ pub mod dep_stack;
 pub mod generic_arena;
 pub mod handle;
 pub mod locks;
+#[cfg(loom)]
+pub mod loom_cells;
+#[cfg(all(test, loom))]
+mod loom_models;
 pub mod node;
 pub mod runtime;
 pub mod segmented_nodes;
