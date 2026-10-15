@@ -6,6 +6,7 @@
 //! Run with:
 //! `RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 LOOM_MAX_BRANCHES=100000 cargo test -p incr-core --release --lib loom_`
 
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
@@ -18,23 +19,29 @@ use crate::state::NodeState;
 
 type Rt = Runtime<Loom>;
 
-/// Runtime panics that a model expects on a racing thread (stale handle,
-/// read of a deleted node, read of a cleared slot) would otherwise print
-/// once per explored execution. Everything else, including the models'
-/// own assertion failures, still reaches the default hook.
+loom::thread_local! {
+    static EXPECTING_UNWIND: Cell<bool> = Cell::new(false);
+}
+
+/// Run `f` on a racing thread where the runtime may legitimately unwind
+/// (stale handle, read of a deleted node, read of a cleared slot).
+/// Returns `None` on unwind.
+fn may_unwind<R>(f: impl FnOnce() -> R) -> Option<R> {
+    EXPECTING_UNWIND.with(|e| e.set(true));
+    let out = catch_unwind(AssertUnwindSafe(f)).ok();
+    EXPECTING_UNWIND.with(|e| e.set(false));
+    out
+}
+
+/// Panics inside [`may_unwind`] would otherwise print once per explored
+/// execution. Every other panic, including a runtime panic on a model's
+/// final reads, still reaches the default hook.
 fn silence_expected_panics() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let msg = info
-                .payload()
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| info.payload().downcast_ref::<&str>().copied())
-                .unwrap_or("");
-            let expected =
-                msg.starts_with("incr-core:") || msg.starts_with("ValueSlot::read on a slot");
+            let expected = EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false);
             if !expected {
                 default(info);
             }
@@ -152,12 +159,12 @@ fn loom_compute_races_delete() {
 
         let reader = {
             let rt = Arc::clone(&rt);
-            thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(q))).ok())
+            thread::spawn(move || may_unwind(|| rt.get(q)))
         };
         let deleter = {
             let rt = Arc::clone(&rt);
             thread::spawn(move || {
-                let deleted = catch_unwind(AssertUnwindSafe(|| rt.delete_node(v))).is_ok();
+                let deleted = may_unwind(|| rt.delete_node(v)).is_some();
                 let recycled = deleted.then(|| rt.create_input(99_u64));
                 (deleted, recycled)
             })
@@ -212,13 +219,13 @@ fn loom_recovered_node_under_set() {
         let reader = {
             let rt = Arc::clone(&rt);
             thread::spawn(move || {
-                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(p)));
+                may_unwind(|| rt.get(p));
             })
         };
         let deleter = {
             let rt = Arc::clone(&rt);
             thread::spawn(move || {
-                let deleted = catch_unwind(AssertUnwindSafe(|| rt.delete_node(v))).is_ok();
+                let deleted = may_unwind(|| rt.delete_node(v)).is_some();
                 deleted.then(|| rt.create_input(99_u64))
             })
         };
