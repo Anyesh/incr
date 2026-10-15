@@ -42,7 +42,7 @@ pub use arena::PrimitiveArena;
 pub use arena_registry::{ArenaRegistry, ErasedArena};
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use collection::{CollectionLog, Delta, GroupedCollection, IncrCollection};
-pub use dep_stack::{DepStack, LocalDepStack, SharedDepStack};
+pub use dep_stack::{DepStack, LocalDepStack, PoppedFrame, SharedDepStack};
 pub use generic_arena::GenericArena;
 pub use handle::{Incr, RuntimeId};
 pub use locks::{LocalLock, Lock};

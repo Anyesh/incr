@@ -36,9 +36,13 @@ pub trait DepStack: 'static {
     /// thread's compute stack.
     fn push_frame(&self, node: NodeId);
 
-    /// Pop the top frame and return its recorded deps, each with the
-    /// generation it was read at. Called when exiting a compute closure.
-    fn pop_frame(&self) -> Vec<(NodeId, u32)>;
+    /// Pop the top frame and return what it recorded. Called when exiting
+    /// a compute closure.
+    fn pop_frame(&self) -> PoppedFrame;
+
+    /// Mark the top frame (if any) as having read a dep that did not land
+    /// `Clean`, so its compute must not land `Clean` either.
+    fn poison_current_frame(&self);
 
     /// Record `dep`, read at `generation`, as a dependency of the
     /// currently-computing node. Called by `rt.get()` whenever a frame is
@@ -58,11 +62,21 @@ pub trait DepStack: 'static {
     fn is_computing(&self, node: NodeId) -> bool;
 }
 
+/// What a finished compute frame recorded.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PoppedFrame {
+    /// Each dep read, with the generation it was read at.
+    pub deps: Vec<(NodeId, u32)>,
+    /// True if a dep read inside the frame did not land `Clean`.
+    pub poisoned: bool,
+}
+
 /// One in-flight compute: the node being computed and the deps recorded
 /// so far on its behalf.
 struct Frame {
     node: NodeId,
     deps: Vec<(NodeId, u32)>,
+    poisoned: bool,
 }
 
 impl Frame {
@@ -70,6 +84,14 @@ impl Frame {
         Self {
             node,
             deps: Vec::with_capacity(4),
+            poisoned: false,
+        }
+    }
+
+    fn finish(self) -> PoppedFrame {
+        PoppedFrame {
+            deps: self.deps,
+            poisoned: self.poisoned,
         }
     }
 }
@@ -90,18 +112,24 @@ impl DepStack for LocalDepStack {
         self.stack.borrow_mut().push(Frame::new(node));
     }
 
-    fn pop_frame(&self) -> Vec<(NodeId, u32)> {
+    fn pop_frame(&self) -> PoppedFrame {
         self.stack
             .borrow_mut()
             .pop()
             .expect("LocalDepStack::pop_frame on empty stack")
-            .deps
+            .finish()
     }
 
     fn record_dep(&self, dep: NodeId, generation: u32) {
         let mut frames = self.stack.borrow_mut();
         if let Some(frame) = frames.last_mut() {
             frame.deps.push((dep, generation));
+        }
+    }
+
+    fn poison_current_frame(&self) {
+        if let Some(frame) = self.stack.borrow_mut().last_mut() {
+            frame.poisoned = true;
         }
     }
 
@@ -135,12 +163,12 @@ impl DepStack for SharedDepStack {
         SHARED_FRAMES.with(|f| f.borrow_mut().push(Frame::new(node)));
     }
 
-    fn pop_frame(&self) -> Vec<(NodeId, u32)> {
+    fn pop_frame(&self) -> PoppedFrame {
         SHARED_FRAMES.with(|f| {
             f.borrow_mut()
                 .pop()
                 .expect("SharedDepStack::pop_frame on empty stack")
-                .deps
+                .finish()
         })
     }
 
@@ -149,6 +177,14 @@ impl DepStack for SharedDepStack {
             let mut frames = f.borrow_mut();
             if let Some(frame) = frames.last_mut() {
                 frame.deps.push((dep, generation));
+            }
+        });
+    }
+
+    fn poison_current_frame(&self) {
+        SHARED_FRAMES.with(|f| {
+            if let Some(frame) = f.borrow_mut().last_mut() {
+                frame.poisoned = true;
             }
         });
     }
@@ -184,12 +220,12 @@ impl DepStack for LoomDepStack {
         LOOM_FRAMES.with(|f| f.borrow_mut().push(Frame::new(node)));
     }
 
-    fn pop_frame(&self) -> Vec<(NodeId, u32)> {
+    fn pop_frame(&self) -> PoppedFrame {
         LOOM_FRAMES.with(|f| {
             f.borrow_mut()
                 .pop()
                 .expect("LoomDepStack::pop_frame on empty stack")
-                .deps
+                .finish()
         })
     }
 
@@ -197,6 +233,14 @@ impl DepStack for LoomDepStack {
         LOOM_FRAMES.with(|f| {
             if let Some(frame) = f.borrow_mut().last_mut() {
                 frame.deps.push((dep, generation));
+            }
+        });
+    }
+
+    fn poison_current_frame(&self) {
+        LOOM_FRAMES.with(|f| {
+            if let Some(frame) = f.borrow_mut().last_mut() {
+                frame.poisoned = true;
             }
         });
     }
@@ -223,7 +267,7 @@ mod tests {
         s.record_dep(NodeId(0), 0);
         s.record_dep(NodeId(1), 0);
         s.record_dep(NodeId(2), 0);
-        let frame = s.pop_frame();
+        let frame = s.pop_frame().deps;
         assert_eq!(frame, vec![(NodeId(0), 0), (NodeId(1), 0), (NodeId(2), 0)]);
         assert!(!s.current_frame_active());
     }
@@ -236,10 +280,21 @@ mod tests {
         s.push_frame(NodeId(101));
         s.record_dep(NodeId(2), 0);
         s.record_dep(NodeId(3), 0);
-        let inner = s.pop_frame();
+        let inner = s.pop_frame().deps;
         assert_eq!(inner, vec![(NodeId(2), 0), (NodeId(3), 0)]);
-        let outer = s.pop_frame();
+        let outer = s.pop_frame().deps;
         assert_eq!(outer, vec![(NodeId(1), 0)]);
+    }
+
+    #[test]
+    fn local_poison_marks_only_the_top_frame() {
+        let s = LocalDepStack::new();
+        s.push_frame(NodeId(100));
+        s.push_frame(NodeId(101));
+        s.poison_current_frame();
+        assert!(s.pop_frame().poisoned);
+        assert!(!s.pop_frame().poisoned);
+        s.poison_current_frame();
     }
 
     #[test]
@@ -271,7 +326,7 @@ mod tests {
         s.push_frame(NodeId(100));
         s.record_dep(NodeId(7), 0);
         s.record_dep(NodeId(11), 0);
-        let frame = s.pop_frame();
+        let frame = s.pop_frame().deps;
         assert_eq!(frame, vec![(NodeId(7), 0), (NodeId(11), 0)]);
     }
 

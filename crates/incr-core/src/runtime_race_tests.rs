@@ -511,3 +511,52 @@ fn b2_local_panic_after_self_delete_lands_new() {
         "the walk must pass through New Q"
     );
 }
+
+#[test]
+fn nested_superseded_dep_poisons_fast_path_publisher() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(0_u64);
+    let s = rt.create_input(0_u64);
+    let y = rt.create_input(0_u64);
+    let q_gate = Gate::new();
+    let q = {
+        let q_gate = q_gate.clone();
+        rt.create_query(move |rt: &Rt| {
+            let xv = rt.get(x);
+            if xv == 0 {
+                return 0;
+            }
+            let sv = rt.get(s);
+            q_gate.park();
+            xv + sv
+        })
+    };
+    let d = rt.create_query(move |rt: &Rt| rt.get(q) + rt.get(y) + 100);
+    assert_eq!(rt.get(d), 100);
+    // D Dirty through y while Q stays Clean, so ensure_clean leaves Q to
+    // D's closure.
+    rt.set(y, 1);
+
+    let d_gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::BeforeComputeOne(id(d)), d_gate.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    d_gate.wait_parked();
+    rt.set(x, 1);
+    q_gate.arm();
+    d_gate.release();
+    q_gate.wait_parked();
+    // s is a new dep of Q with no reverse edge yet, so this walk reaches
+    // neither Q nor D. Only Q's publish validation sees it.
+    rt.set(s, 5);
+    q_gate.release();
+    reader.join().unwrap();
+
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 107);
+}

@@ -967,7 +967,7 @@ impl<C: Cells> Runtime<C> {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 (compute)(self, id.0, is_recompute)
             }));
-            let recorded_deps = self.dep_stack.pop_frame();
+            let frame = self.dep_stack.pop_frame();
 
             let value_changed = match result {
                 Ok(changed) => changed,
@@ -980,7 +980,7 @@ impl<C: Cells> Runtime<C> {
                     // panic would lose recovery paths through deps the
                     // failed run had not reached yet. Extra edges only
                     // cause spurious re-verification, never staleness.
-                    let landing = match self.publish_deps(id, &recorded_deps, true, start_rev) {
+                    let landing = match self.publish_deps(id, &frame.deps, true, start_rev) {
                         // A stale dep's slot may already belong to another
                         // node, so no union is published. The old deps keep
                         // their reverse edges.
@@ -1002,11 +1002,14 @@ impl<C: Cells> Runtime<C> {
                         };
                         state::store::<C>(node.state_cell(), flagged);
                     }
+                    // An enclosing closure that catches the unwind has
+                    // still read a dep that did not land Clean.
+                    self.dep_stack.poison_current_frame();
                     std::panic::resume_unwind(payload);
                 }
             };
 
-            let outcome = self.publish_deps(id, &recorded_deps, false, start_rev);
+            let outcome = self.publish_deps(id, &frame.deps, false, start_rev);
 
             // The closure has already written its value into the slot, and
             // the next recompute's early cutoff compares against it, so a
@@ -1034,17 +1037,28 @@ impl<C: Cells> Runtime<C> {
 
             node.max_verified_at(start_rev);
 
-            // Finish. If a set() flagged us ComputingDirty mid-compute, or
-            // a new dep changed after we read it, land Dirty so the next
-            // reader recomputes against the newer input.
-            let target = if outcome == Publish::Superseded {
+            // Finish. Land Dirty instead of Clean if a set() flagged us
+            // ComputingDirty mid-compute, if a new dep changed after we
+            // read it, or if a dep we read did not itself land Clean, so
+            // the next reader recomputes against the newer input.
+            let target = if outcome == Publish::Superseded || frame.poisoned {
                 NodeState::Dirty
             } else {
                 NodeState::Clean
             };
-            if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_err()
-            {
-                state::store::<C>(node.state_cell(), NodeState::Dirty);
+            let landed_clean =
+                match state::try_transition::<C>(node.state_cell(), NodeState::Computing, target) {
+                    Ok(()) => target == NodeState::Clean,
+                    Err(_) => {
+                        state::store::<C>(node.state_cell(), NodeState::Dirty);
+                        false
+                    }
+                };
+            if !landed_clean {
+                // The enclosing compute read this node through a non-Clean
+                // landing. Its own publish may take the fast path, where
+                // nothing else would catch that.
+                self.dep_stack.poison_current_frame();
             }
             self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
             return;
