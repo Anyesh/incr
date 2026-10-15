@@ -104,6 +104,25 @@ impl<C: Cells> Inner<C> {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ObserverId(u64);
 
+/// Named points in the protocol where a race test can park one thread
+/// while another acts. Outside `cfg(test)` [`Runtime::park`] is an empty
+/// inline function, so these compile away.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ParkPoint {
+    /// In `ensure_clean`, just before `compute_one` on a visited node.
+    BeforeComputeOne(NodeId),
+    /// In red/green verification, after the dep scan found no change and
+    /// before the landing CAS.
+    VerifyAfterScan(NodeId),
+    /// In `set`, after `bump_revision` and before the dirty walk.
+    SetAfterBump,
+    /// In `delete_node`, after the dependents check's lock is released.
+    DeleteAfterCheck(NodeId),
+}
+
+#[cfg(test)]
+pub(crate) type ParkHook = Box<dyn Fn(ParkPoint) + Send + Sync>;
+
 /// The runtime.
 pub struct Runtime<C: Cells> {
     pub(crate) nodes: SegmentedNodes<C>,
@@ -115,6 +134,8 @@ pub struct Runtime<C: Cells> {
     /// `compute_one` via a Relaxed load (~1 ns when disarmed) so the
     /// non-tracing hot path pays no measurable cost.
     pub(crate) tracing_armed: <C as Cells>::U8,
+    #[cfg(test)]
+    pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -132,8 +153,21 @@ impl<C: Cells> Runtime<C> {
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id: RuntimeId::allocate(),
             tracing_armed: C::new_u8(0),
+            #[cfg(test)]
+            park_hook: std::sync::OnceLock::new(),
         }
     }
+
+    #[cfg(test)]
+    fn park(&self, point: ParkPoint) {
+        if let Some(hook) = self.park_hook.get() {
+            hook(point);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn park(&self, _point: ParkPoint) {}
 
     #[inline(always)]
     fn tracing_is_armed(&self) -> bool {
@@ -414,6 +448,7 @@ impl<C: Cells> Runtime<C> {
                             slot,
                         );
                     }
+                    self.park(ParkPoint::DeleteAfterCheck(id));
                     if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok() {
                         break;
                     }
@@ -639,6 +674,7 @@ impl<C: Cells> Runtime<C> {
         node.mark_changed_pending();
         arena.write(node.arena_slot(), value);
         let new_rev = self.bump_revision();
+        self.park(ParkPoint::SetAfterBump);
         node.settle_changed_at(new_rev);
         node.max_verified_at(new_rev);
 
@@ -729,6 +765,7 @@ impl<C: Cells> Runtime<C> {
 
         while let Some((cur, visited)) = work.pop() {
             if visited {
+                self.park(ParkPoint::BeforeComputeOne(cur));
                 self.compute_one(cur);
                 continue;
             }
@@ -865,6 +902,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 });
                 if !any_changed {
+                    self.park(ParkPoint::VerifyAfterScan(id));
                     node.max_verified_at(start_rev);
                     if state::try_transition::<C>(
                         node.state_cell(),
@@ -1026,6 +1064,61 @@ impl<C: Cells> Runtime<C> {
 // uses Cell/RefCell-backed cells through the Local strategy and is
 // !Send + !Sync by auto-derive. We rely on auto traits here; no manual
 // impls needed.
+
+#[cfg(test)]
+impl<C: Cells> Runtime<C> {
+    /// Invariant (I) of the shared-protocol plan, checked at quiescence:
+    /// every installed dep S of a `Clean` node X is alive, has X in
+    /// `dependents[S]`, and is itself `Clean`. Also checks that no freed
+    /// slot still carries reverse edges.
+    pub(crate) fn assert_invariant_i(&self) {
+        let inner = self.inner.read();
+        for x in 0..self.nodes.len() {
+            let node = self.nodes.get(x);
+            if node.state() != NodeState::Clean {
+                continue;
+            }
+            node.for_each_dep(|s| {
+                let dep = self.nodes.get(s.0);
+                assert!(
+                    dep.state() != NodeState::Dead && !inner.free_nodes.contains(&s.0),
+                    "(I) violated: Clean node {x} has dead dep {}",
+                    s.0
+                );
+                assert!(
+                    inner.dependents[s.0 as usize].contains(&NodeId(x)),
+                    "(I) violated: Clean node {x} is missing from dependents[{}]",
+                    s.0
+                );
+                assert_eq!(
+                    dep.state(),
+                    NodeState::Clean,
+                    "(I) violated: Clean node {x} has non-Clean dep {}",
+                    s.0
+                );
+            });
+        }
+        for &slot in &inner.free_nodes {
+            assert!(
+                inner.dependents[slot as usize].is_empty(),
+                "freed slot {slot} still has reverse edges {:?}",
+                inner.dependents[slot as usize]
+            );
+        }
+    }
+
+    pub(crate) fn has_reverse_edge<T, U>(&self, dep: Incr<T>, dependent: Incr<U>) -> bool {
+        self.inner.read().dependents[dep.slot() as usize].contains(&NodeId(dependent.slot()))
+    }
+
+    pub(crate) fn state_of<T>(&self, handle: Incr<T>) -> NodeState {
+        self.nodes.get(handle.slot()).state()
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_race_tests.rs"]
+mod race_tests;
 
 #[cfg(test)]
 mod tests {

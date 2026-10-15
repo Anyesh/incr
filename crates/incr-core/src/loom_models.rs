@@ -12,10 +12,7 @@ use std::sync::Once;
 use loom::sync::Arc;
 use loom::thread;
 
-use crate::handle::Incr;
-use crate::locks::Lock;
 use crate::loom_cells::Loom;
-use crate::node::NodeId;
 use crate::runtime::Runtime;
 use crate::state::NodeState;
 
@@ -48,49 +45,6 @@ fn silence_expected_panics() {
 fn run(f: impl Fn() + Sync + Send + 'static) {
     silence_expected_panics();
     loom::model(f);
-}
-
-/// (I): at quiescence, every installed dep S of a `Clean` node X is alive,
-/// has X in `dependents[S]`, and is itself `Clean`. Also checks that no
-/// freed slot still carries reverse edges.
-fn assert_structural_invariant(rt: &Rt) {
-    let inner = rt.inner.read();
-    for x in 0..rt.nodes.len() {
-        let node = rt.nodes.get(x);
-        if node.state() != NodeState::Clean {
-            continue;
-        }
-        node.for_each_dep(|s| {
-            let dep = rt.nodes.get(s.0);
-            assert!(
-                dep.state() != NodeState::Dead && !inner.free_nodes.contains(&s.0),
-                "(I) violated: Clean node {x} has dead dep {}",
-                s.0
-            );
-            assert!(
-                inner.dependents[s.0 as usize].contains(&NodeId(x)),
-                "(I) violated: Clean node {x} is missing from dependents[{}]",
-                s.0
-            );
-            assert_eq!(
-                dep.state(),
-                NodeState::Clean,
-                "(I) violated: Clean node {x} has non-Clean dep {}",
-                s.0
-            );
-        });
-    }
-    for &slot in &inner.free_nodes {
-        assert!(
-            inner.dependents[slot as usize].is_empty(),
-            "freed slot {slot} still has reverse edges {:?}",
-            inner.dependents[slot as usize]
-        );
-    }
-}
-
-fn has_edge<T, U>(rt: &Rt, from: Incr<T>, to: Incr<U>) -> bool {
-    rt.inner.read().dependents[from.slot() as usize].contains(&NodeId(to.slot()))
 }
 
 /// x -> Q (early cutoff) -> D. One setter performs two sets, a second
@@ -127,7 +81,7 @@ fn loom_chain_cutoff() {
         setter_b.join().unwrap();
         reader.join().unwrap();
 
-        assert_structural_invariant(&rt);
+        rt.assert_invariant_i();
         let xv = rt.get(x);
         assert_eq!(
             rt.get(d),
@@ -175,7 +129,7 @@ fn loom_fan_out() {
         r1.join().unwrap();
         r2.join().unwrap();
 
-        assert_structural_invariant(&rt);
+        rt.assert_invariant_i();
         let qv = rt.get(x) / 2;
         assert_eq!(rt.get(d1), qv + 100, "(V) violated: D1 stale");
         assert_eq!(rt.get(d2), qv * 10, "(V) violated: D2 stale");
@@ -215,16 +169,16 @@ fn loom_compute_races_delete() {
                 "(V) violated: Q returned a value not computed from v"
             );
         }
-        assert_structural_invariant(&rt);
+        rt.assert_invariant_i();
         if let Some(new) = recycled {
             assert!(
-                !has_edge(&rt, new, q),
+                !rt.has_reverse_edge(new, q),
                 "phantom edge: Q landed on the recycled slot's dependents"
             );
         }
         if deleted {
             assert_ne!(
-                rt.nodes.get(q.slot()).state(),
+                rt.state_of(q),
                 NodeState::Clean,
                 "Q is Clean over a deleted dep"
             );
@@ -273,10 +227,10 @@ fn loom_recovered_node_under_set() {
         let recycled = deleter.join().unwrap();
         setter.join().unwrap();
 
-        assert_structural_invariant(&rt);
+        rt.assert_invariant_i();
         if let Some(new) = recycled {
             assert!(
-                !has_edge(&rt, new, q),
+                !rt.has_reverse_edge(new, q),
                 "phantom edge: Q landed on the recycled slot's dependents"
             );
         }
