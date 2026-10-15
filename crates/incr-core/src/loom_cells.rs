@@ -19,6 +19,7 @@ use crate::locks::Lock;
 use crate::node::{DepList, DepListCell};
 use crate::value::Value;
 use crate::value_slot::ValueSlot;
+use crate::walk_ring::WalkRing;
 use loom::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use loom::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -164,6 +165,10 @@ impl Cells for Loom {
     type DepStack = LoomDepStack;
     type ValueSlot<T: Value> = LoomValueSlot<T>;
     type DepListCell = LoomDepListCell;
+    // Two slots, so a model with three revisions reaches slot reuse and
+    // the wait path; a full-size ring would also put a loom atomic per
+    // slot into every execution.
+    type Watermark = WalkRing<Loom, 2>;
 
     fn new_u8(v: u8) -> Self::U8 {
         AtomicU8::new(v)
@@ -220,6 +225,12 @@ impl Cells for Loom {
     fn u64_store_relaxed(c: &Self::U64, v: u64) {
         c.store(v, Ordering::Relaxed);
     }
+    fn u64_load_seqcst(c: &Self::U64) -> u64 {
+        c.load(Ordering::SeqCst)
+    }
+    fn u64_store_seqcst(c: &Self::U64, v: u64) {
+        c.store(v, Ordering::SeqCst);
+    }
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
         c.fetch_add(v, Ordering::AcqRel)
     }
@@ -228,6 +239,16 @@ impl Cells for Loom {
     }
     fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64> {
         c.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+    }
+
+    fn new_watermark(initial_revision: u64) -> Self::Watermark {
+        WalkRing::new(initial_revision)
+    }
+    fn walked(w: &Self::Watermark, _revision: &Self::U64) -> u64 {
+        w.walked()
+    }
+    fn complete_walk(w: &Self::Watermark, rev: u64) {
+        w.complete(rev);
     }
 
     fn state_load_acquire(c: &Self::State) -> u8 {

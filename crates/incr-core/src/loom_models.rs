@@ -82,6 +82,7 @@ fn loom_chain_cutoff() {
         reader.join().unwrap();
 
         rt.assert_invariant_i();
+        rt.assert_walks_complete();
         let xv = rt.get(x);
         assert_eq!(
             rt.get(d),
@@ -130,6 +131,7 @@ fn loom_fan_out() {
         r2.join().unwrap();
 
         rt.assert_invariant_i();
+        rt.assert_walks_complete();
         let qv = rt.get(x) / 2;
         assert_eq!(rt.get(d1), qv + 100, "(V) violated: D1 stale");
         assert_eq!(rt.get(d2), qv * 10, "(V) violated: D2 stale");
@@ -170,6 +172,7 @@ fn loom_compute_races_delete() {
             );
         }
         rt.assert_invariant_i();
+        rt.assert_walks_complete();
         if let Some(new) = recycled {
             assert!(
                 !rt.has_reverse_edge(new, q),
@@ -228,6 +231,7 @@ fn loom_recovered_node_under_set() {
         setter.join().unwrap();
 
         rt.assert_invariant_i();
+        rt.assert_walks_complete();
         if let Some(new) = recycled {
             assert!(
                 !rt.has_reverse_edge(new, q),

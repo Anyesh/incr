@@ -220,7 +220,6 @@ fn b6_graph(rt: &Rt, d_gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u6
 }
 
 #[test]
-#[ignore = "fails until fix 7 (walked-revision watermark)"]
 fn b6_verified_at_names_unwalked_revision_flagged_mid_compute() {
     let rt = Arc::new(Rt::new());
     let d_gate = Gate::new();
@@ -251,7 +250,6 @@ fn b6_verified_at_names_unwalked_revision_flagged_mid_compute() {
 }
 
 #[test]
-#[ignore = "fails until fix 7 (walked-revision watermark)"]
 fn b6_verified_at_names_unwalked_revision_landed_clean() {
     let rt = Arc::new(Rt::new());
     let d_gate = Gate::new();
@@ -556,4 +554,32 @@ fn nested_superseded_dep_poisons_fast_path_publisher() {
 
     rt.assert_invariant_i();
     assert_eq!(rt.get(d), 107);
+}
+
+#[test]
+fn lagging_watermark_costs_a_recompute_not_a_stale_value() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(0_u64);
+    let q = rt.create_query(move |rt: &Rt| rt.get(x) + 1);
+    let d = rt.create_query(move |rt: &Rt| rt.get(q) * 10);
+    assert_eq!(rt.get(d), 10);
+
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::SetAfterWalk, gate.clone())]);
+    let setter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set(x, 5))
+    };
+    gate.wait_parked();
+    // The walk is done but not recorded, so these computes stamp
+    // verified_at below Q's new changed_at.
+    assert_eq!(rt.get(d), 60);
+    gate.release();
+    setter.join().unwrap();
+
+    rt.assert_walks_complete();
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 60);
+    rt.set(x, 6);
+    assert_eq!(rt.get(d), 70);
 }

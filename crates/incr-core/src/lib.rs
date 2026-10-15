@@ -37,6 +37,7 @@ pub mod state;
 pub mod trace;
 pub mod value;
 pub mod value_slot;
+pub mod walk_ring;
 
 pub use arena::PrimitiveArena;
 pub use arena_registry::{ArenaRegistry, ErasedArena};

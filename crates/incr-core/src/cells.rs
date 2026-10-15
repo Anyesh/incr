@@ -24,6 +24,7 @@ use crate::locks::{LocalLock, Lock};
 use crate::node::{DepListCell, HzDepListCell};
 use crate::value::Value;
 use crate::value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
+use crate::walk_ring::WalkRing;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::RwLock;
@@ -57,6 +58,8 @@ pub trait Cells: 'static + Sized {
     type DepStack: DepStack;
     type ValueSlot<T: Value>: ValueSlot<T>;
     type DepListCell: DepListCell;
+    /// The walked-revision watermark; see [`crate::walk_ring`].
+    type Watermark: 'static;
 
     fn new_u8(v: u8) -> Self::U8;
     fn new_u16(v: u16) -> Self::U16;
@@ -79,6 +82,8 @@ pub trait Cells: 'static + Sized {
     fn u64_store_release(c: &Self::U64, v: u64);
     fn u64_load_relaxed(c: &Self::U64) -> u64;
     fn u64_store_relaxed(c: &Self::U64, v: u64);
+    fn u64_load_seqcst(c: &Self::U64) -> u64;
+    fn u64_store_seqcst(c: &Self::U64, v: u64);
     /// Atomic add; returns the previous value. AcqRel under Shared.
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64;
     /// Atomic max; returns the previous value. AcqRel under Shared.
@@ -92,6 +97,15 @@ pub trait Cells: 'static + Sized {
     fn state_load_acquire(c: &Self::State) -> u8;
     fn state_store_release(c: &Self::State, v: u8);
     fn state_try_transition(c: &Self::State, expected: u8, new: u8) -> Result<(), u8>;
+
+    fn new_watermark(initial_revision: u64) -> Self::Watermark;
+    /// The highest revision every revision at or below which has finished
+    /// its dirty walk. `revision` is the runtime's revision cell, which
+    /// `Local` returns directly because its walks finish before `set`
+    /// returns.
+    fn walked(w: &Self::Watermark, revision: &Self::U64) -> u64;
+    /// Record that revision `rev`'s dirty walk has finished.
+    fn complete_walk(w: &Self::Watermark, rev: u64);
 
     /// One step of a wait on another thread's progress; `spins` counts
     /// the steps taken so far. A bounded spin, then yield. The loom
@@ -187,6 +201,7 @@ impl Cells for Local {
     type DepStack = LocalDepStack;
     type ValueSlot<T: Value> = LocalValueSlot<T>;
     type DepListCell = HzDepListCell;
+    type Watermark = ();
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -260,6 +275,14 @@ impl Cells for Local {
         c.set(v);
     }
     #[inline(always)]
+    fn u64_load_seqcst(c: &Self::U64) -> u64 {
+        c.get()
+    }
+    #[inline(always)]
+    fn u64_store_seqcst(c: &Self::U64, v: u64) {
+        c.set(v);
+    }
+    #[inline(always)]
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
         let prev = c.get();
         c.set(prev.wrapping_add(v));
@@ -283,6 +306,15 @@ impl Cells for Local {
             Err(prev)
         }
     }
+
+    #[inline(always)]
+    fn new_watermark(_initial_revision: u64) -> Self::Watermark {}
+    #[inline(always)]
+    fn walked(_w: &Self::Watermark, revision: &Self::U64) -> u64 {
+        revision.get()
+    }
+    #[inline(always)]
+    fn complete_walk(_w: &Self::Watermark, _rev: u64) {}
 
     #[inline(always)]
     fn state_load_acquire(c: &Self::State) -> u8 {
@@ -315,6 +347,7 @@ impl Cells for Shared {
     type DepStack = SharedDepStack;
     type ValueSlot<T: Value> = SharedValueSlot<T>;
     type DepListCell = HzDepListCell;
+    type Watermark = WalkRing<Shared, 1024>;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -388,6 +421,14 @@ impl Cells for Shared {
         c.store(v, Ordering::Relaxed);
     }
     #[inline(always)]
+    fn u64_load_seqcst(c: &Self::U64) -> u64 {
+        c.load(Ordering::SeqCst)
+    }
+    #[inline(always)]
+    fn u64_store_seqcst(c: &Self::U64, v: u64) {
+        c.store(v, Ordering::SeqCst);
+    }
+    #[inline(always)]
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
         c.fetch_add(v, Ordering::AcqRel)
     }
@@ -398,6 +439,17 @@ impl Cells for Shared {
     #[inline(always)]
     fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64> {
         c.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+    }
+
+    fn new_watermark(initial_revision: u64) -> Self::Watermark {
+        WalkRing::new(initial_revision)
+    }
+    #[inline(always)]
+    fn walked(w: &Self::Watermark, _revision: &Self::U64) -> u64 {
+        w.walked()
+    }
+    fn complete_walk(w: &Self::Watermark, rev: u64) {
+        w.complete(rev);
     }
 
     #[inline(always)]

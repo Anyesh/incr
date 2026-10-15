@@ -116,8 +116,25 @@ pub(crate) enum ParkPoint {
     VerifyAfterScan(NodeId),
     /// In `set`, after `bump_revision` and before the dirty walk.
     SetAfterBump,
+    /// In `set`, after the dirty walk and before the revision is recorded
+    /// as walked.
+    SetAfterWalk,
     /// In `delete_node`, after the dependents check and the `Dead` claim.
     DeleteAfterCheck(NodeId),
+}
+
+/// Records `rev` as walked when dropped. A drop guard rather than a call
+/// at the end of `set`, because an unwind that skipped the completion
+/// would stall the watermark, and with it every later `set`, for good.
+struct WalkDone<'a, C: Cells> {
+    rt: &'a Runtime<C>,
+    rev: u64,
+}
+
+impl<C: Cells> Drop for WalkDone<'_, C> {
+    fn drop(&mut self) {
+        C::complete_walk(&self.rt.walk, self.rev);
+    }
 }
 
 /// What `publish_deps` found when it validated a compute's recorded deps.
@@ -143,6 +160,7 @@ pub struct Runtime<C: Cells> {
     pub(crate) nodes: SegmentedNodes<C>,
     pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
     pub(crate) revision: <C as Cells>::U64,
+    pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) dep_stack: <C as Cells>::DepStack,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
@@ -165,6 +183,7 @@ impl<C: Cells> Runtime<C> {
             nodes: SegmentedNodes::new(),
             inner: <<C as Cells>::Lock<Inner<C>> as Lock<Inner<C>>>::new(Inner::new()),
             revision: C::new_u64(1),
+            walk: C::new_watermark(1),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id: RuntimeId::allocate(),
             tracing_armed: C::new_u8(0),
@@ -694,11 +713,17 @@ impl<C: Cells> Runtime<C> {
         node.mark_changed_pending();
         arena.write(node.arena_slot(), value);
         let new_rev = self.bump_revision();
+        let walk_done = WalkDone {
+            rt: self,
+            rev: new_rev,
+        };
         self.park(ParkPoint::SetAfterBump);
         node.settle_changed_at(new_rev);
         node.max_verified_at(new_rev);
 
         self.mark_dependents_dirty(NodeId(slot));
+        self.park(ParkPoint::SetAfterWalk);
+        drop(walk_done);
     }
 
     /// BFS forward walk from `start`'s dependents, marking each Clean
@@ -924,11 +949,18 @@ impl<C: Cells> Runtime<C> {
                 }
             };
 
-            // Capture the revision BEFORE verifying or computing. If a
-            // set() bumps it mid-flight, our stamps stay below the new
-            // changed_at and the next reader re-verifies; stamping the
+            // Capture the revisions BEFORE verifying or computing. If a
+            // set() bumps the revision mid-flight, our stamps stay below
+            // its changed_at and the next reader re-verifies; stamping the
             // post-compute revision would mask the change forever.
-            let start_rev = self.current_revision();
+            //
+            // changed_at uses the current revision, so a value changed by
+            // an in-flight set is never under-stamped. verified_at uses the
+            // walked watermark instead: a set bumps the revision before its
+            // walk, and a verified_at naming a revision whose walk had not
+            // dirtied our deps yet would let us verify Clean past it (B6).
+            let stamp_rev = self.current_revision();
+            let verify_rev = C::walked(&self.walk, &self.revision);
 
             // Red/green verification, only from Dirty: a New node has
             // nothing to verify against. Verification claims the node, so
@@ -955,7 +987,7 @@ impl<C: Cells> Runtime<C> {
                 });
                 if !any_changed {
                     self.park(ParkPoint::VerifyAfterScan(id));
-                    node.max_verified_at(start_rev);
+                    node.max_verified_at(verify_rev);
                     if self.land(node, NodeState::Clean, NodeState::Dirty) == NodeState::Clean {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                     } else {
@@ -1000,7 +1032,7 @@ impl<C: Cells> Runtime<C> {
                     // panic would lose recovery paths through deps the
                     // failed run had not reached yet. Extra edges only
                     // cause spurious re-verification, never staleness.
-                    let landing = match self.publish_deps(id, &frame.deps, true, start_rev) {
+                    let landing = match self.publish_deps(id, &frame.deps, true, stamp_rev) {
                         // A stale dep's slot may already belong to another
                         // node, so no union is published. The old deps keep
                         // their reverse edges.
@@ -1025,13 +1057,13 @@ impl<C: Cells> Runtime<C> {
                 }
             };
 
-            let outcome = self.publish_deps(id, &frame.deps, false, start_rev);
+            let outcome = self.publish_deps(id, &frame.deps, false, stamp_rev);
 
             // The closure has already written its value into the slot, and
             // the next recompute's early cutoff compares against it, so a
             // changed value is stamped even when it is never returned.
             if value_changed || !is_recompute {
-                node.max_changed_at(start_rev);
+                node.max_changed_at(stamp_rev);
             }
 
             if outcome == Publish::Stale {
@@ -1043,7 +1075,7 @@ impl<C: Cells> Runtime<C> {
                 continue;
             }
 
-            node.max_verified_at(start_rev);
+            node.max_verified_at(verify_rev);
 
             // Finish. Land Dirty instead of Clean if a set() flagged us
             // ComputingDirty mid-compute, if a new dep changed after we
@@ -1236,6 +1268,14 @@ impl<C: Cells> Runtime<C> {
 
     pub(crate) fn state_of<T>(&self, handle: Incr<T>) -> NodeState {
         self.nodes.get(handle.slot()).state()
+    }
+
+    pub(crate) fn assert_walks_complete(&self) {
+        assert_eq!(
+            C::walked(&self.walk, &self.revision),
+            self.current_revision(),
+            "the walked watermark lags the revision at quiescence"
+        );
     }
 }
 
