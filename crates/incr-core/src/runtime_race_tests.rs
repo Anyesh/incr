@@ -109,7 +109,6 @@ fn chain(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
 }
 
 #[test]
-#[ignore = "fails until fix 1 (verify claims and checks dep state)"]
 fn b5_set_lands_between_verify_scan_and_cas() {
     let rt = Arc::new(Rt::new());
     let (x, _q, d) = chain(&rt);
@@ -131,7 +130,6 @@ fn b5_set_lands_between_verify_scan_and_cas() {
 }
 
 #[test]
-#[ignore = "fails until fix 1 (verify claims and checks dep state)"]
 fn b5_set_lands_before_dependent_claim() {
     let rt = Arc::new(Rt::new());
     let (x, _q, d) = chain(&rt);
@@ -156,7 +154,6 @@ fn b5_set_lands_before_dependent_claim() {
 }
 
 #[test]
-#[ignore = "fails until fix 1 (verify claims and checks dep state)"]
 fn b4_computing_dirty_cutoff_strands_dependent() {
     let rt = Arc::new(Rt::new());
     let x = rt.create_input(1_u64);

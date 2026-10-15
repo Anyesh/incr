@@ -749,15 +749,29 @@ impl<C: Cells> Runtime<C> {
                         // A node that recovered from a stale dep lands New
                         // but keeps its old reverse edges, so a Failed
                         // dependent can only be reached through it.
-                        // Never-run queries have no dependents.
-                        let inner = self.inner.read();
-                        queue.extend(inner.dependents[id.0 as usize].iter().copied());
-                        break;
+                        // Never-run queries have no dependents. The visit
+                        // is an RMW for the reason given on the Dirty arm.
+                        if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
+                            let inner = self.inner.read();
+                            queue.extend(inner.dependents[id.0 as usize].iter().copied());
+                            break;
+                        }
                     }
                     NodeState::Dirty | NodeState::ComputingDirty => {
                         // Already flagged; the walk that flagged it also
-                        // covered its dependents.
-                        break;
+                        // covered its dependents. The visit must still be
+                        // an RMW, not a plain load: this walk stores a
+                        // dep's Dirty and then reaches the node, while a
+                        // verifier claims the node and then loads its deps'
+                        // states. With a plain load here that is the Dekker
+                        // pattern, and both sides may read the old value.
+                        // As an RMW the visit sits in the node's
+                        // modification order, so the verifier's claim either
+                        // reads from it (and sees the dep Dirty) or this CAS
+                        // fails on the claim and the next pass flags it.
+                        if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
+                            break;
+                        }
                     }
                     NodeState::Dead => {
                         // Raced a delete through a not-yet-unhooked
@@ -916,44 +930,50 @@ impl<C: Cells> Runtime<C> {
             // post-compute revision would mask the change forever.
             let start_rev = self.current_revision();
 
-            // Red/green check: if no dep's changed_at exceeds our
-            // verified_at, we can skip the closure entirely. Only valid
-            // from Dirty: a New node has nothing to verify against.
-            if observed == NodeState::Dirty {
+            // Red/green verification, only from Dirty: a New node has
+            // nothing to verify against. Verification claims the node, so
+            // a walk that arrives meanwhile flags ComputingDirty and blocks
+            // the Clean landing. It counts a dep that is not Clean as
+            // changed, which catches a walk that passed this node before
+            // the claim, and a dep that landed Dirty without a new stamp.
+            let is_recompute = if observed == NodeState::Dirty {
+                if state::try_transition::<C>(
+                    node.state_cell(),
+                    NodeState::Dirty,
+                    NodeState::Computing,
+                )
+                .is_err()
+                {
+                    continue;
+                }
                 let my_verified = node.verified_at();
                 let mut any_changed = false;
                 node.for_each_dep(|dep| {
-                    if any_changed {
-                        return;
-                    }
-                    if self.nodes.get(dep.0).changed_at() > my_verified {
+                    if !any_changed && !self.observed_clean(dep, my_verified) {
                         any_changed = true;
                     }
                 });
                 if !any_changed {
                     self.park(ParkPoint::VerifyAfterScan(id));
                     node.max_verified_at(start_rev);
-                    if state::try_transition::<C>(
-                        node.state_cell(),
-                        NodeState::Dirty,
-                        NodeState::Clean,
-                    )
-                    .is_ok()
-                    {
+                    if self.land(node, NodeState::Clean, NodeState::Dirty) == NodeState::Clean {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
-                        return;
+                    } else {
+                        self.dep_stack.poison_current_frame();
                     }
-                    continue;
+                    return;
                 }
-            }
-
-            // Full compute path. Claim Computing first; the claim source
-            // tells us exactly whether this is a recompute.
-            let claimed_from = match state::try_claim_compute::<C>(node.state_cell()) {
-                Ok(src) => src,
-                Err(_) => continue,
+                // Keep the claim and recompute; the closure's nested reads
+                // clean the changed deps.
+                true
+            } else {
+                // The claim source tells us exactly whether this is a
+                // recompute: the node may have gone Dirty since `observed`.
+                match state::try_claim_compute::<C>(node.state_cell()) {
+                    Ok(src) => src == NodeState::Dirty,
+                    Err(_) => continue,
+                }
             };
-            let is_recompute = claimed_from == NodeState::Dirty;
 
             // Track deps via the strategy's dep stack. The closure runs
             // under a panic boundary: a panicking user closure must not
@@ -992,16 +1012,12 @@ impl<C: Cells> Runtime<C> {
                         // Dirty now so the next reader retries immediately.
                         Publish::Published | Publish::Superseded => NodeState::Failed,
                     };
-                    if state::try_transition::<C>(node.state_cell(), NodeState::Computing, landing)
-                        .is_err()
-                    {
-                        let flagged = if landing == NodeState::New {
-                            NodeState::New
-                        } else {
-                            NodeState::Dirty
-                        };
-                        state::store::<C>(node.state_cell(), flagged);
-                    }
+                    let flagged = if landing == NodeState::New {
+                        NodeState::New
+                    } else {
+                        NodeState::Dirty
+                    };
+                    self.land(node, landing, flagged);
                     // An enclosing closure that catches the unwind has
                     // still read a dep that did not land Clean.
                     self.dep_stack.poison_current_frame();
@@ -1023,15 +1039,7 @@ impl<C: Cells> Runtime<C> {
                 // released or recycled under the closure, so it is never
                 // returned: land New and recompute. The retry either stops
                 // reading the dep or panics on its stale handle.
-                if state::try_transition::<C>(
-                    node.state_cell(),
-                    NodeState::Computing,
-                    NodeState::New,
-                )
-                .is_err()
-                {
-                    state::store::<C>(node.state_cell(), NodeState::New);
-                }
+                self.land(node, NodeState::New, NodeState::New);
                 continue;
             }
 
@@ -1046,15 +1054,7 @@ impl<C: Cells> Runtime<C> {
             } else {
                 NodeState::Clean
             };
-            let landed_clean =
-                match state::try_transition::<C>(node.state_cell(), NodeState::Computing, target) {
-                    Ok(()) => target == NodeState::Clean,
-                    Err(_) => {
-                        state::store::<C>(node.state_cell(), NodeState::Dirty);
-                        false
-                    }
-                };
-            if !landed_clean {
+            if self.land(node, target, NodeState::Dirty) != NodeState::Clean {
                 // The enclosing compute read this node through a non-Clean
                 // landing. Its own publish may take the fast path, where
                 // nothing else would catch that.
@@ -1063,6 +1063,28 @@ impl<C: Cells> Runtime<C> {
             self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
             return;
         }
+    }
+
+    /// Leave this thread's `Computing` claim for `target`, or for `flagged`
+    /// if a walk raised `ComputingDirty` meanwhile, and return the state
+    /// landed. Both moves are CASes, never a plain store: a failed CAS is
+    /// only a load and need not read the newest walker's flag, and a
+    /// plain store would end the walkers' release sequence. The second
+    /// CAS, as an RMW, reads the newest value, so every walker's earlier
+    /// writes happen-before the next claim. Loom and Miri both treat a
+    /// failed CAS as reading the newest value, so neither would catch a
+    /// regression here.
+    fn land(&self, node: &NodeData<C>, target: NodeState, flagged: NodeState) -> NodeState {
+        if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
+            return target;
+        }
+        let owned =
+            state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, flagged);
+        debug_assert!(
+            owned.is_ok(),
+            "only the claim's owner leaves ComputingDirty"
+        );
+        flagged
     }
 
     /// Validate a compute's recorded deps, then install them and update
