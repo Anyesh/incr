@@ -116,7 +116,7 @@ pub(crate) enum ParkPoint {
     VerifyAfterScan(NodeId),
     /// In `set`, after `bump_revision` and before the dirty walk.
     SetAfterBump,
-    /// In `delete_node`, after the dependents check's lock is released.
+    /// In `delete_node`, after the dependents check and the `Dead` claim.
     DeleteAfterCheck(NodeId),
 }
 
@@ -439,7 +439,11 @@ impl<C: Cells> Runtime<C> {
                     panic!("incr-core: node {} deleted twice concurrently", slot);
                 }
                 _ => {
-                    {
+                    // The check and the claim share one read hold so no
+                    // publish (which pushes reverse edges under the write
+                    // lock) can land between them; clearing dependents
+                    // below would otherwise drop its edge silently.
+                    let claimed = {
                         let inner = self.inner.read();
                         assert!(
                             inner.dependents[slot as usize].is_empty(),
@@ -447,9 +451,10 @@ impl<C: Cells> Runtime<C> {
                              delete downstream nodes first",
                             slot,
                         );
-                    }
-                    self.park(ParkPoint::DeleteAfterCheck(id));
-                    if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok() {
+                        state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok()
+                    };
+                    if claimed {
+                        self.park(ParkPoint::DeleteAfterCheck(id));
                         break;
                     }
                 }

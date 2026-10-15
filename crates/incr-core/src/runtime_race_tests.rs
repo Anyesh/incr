@@ -341,7 +341,6 @@ fn b3_query_dep_dirtied_after_first_read() {
 }
 
 #[test]
-#[ignore = "fails until fix 3 (delete check and claim under one hold)"]
 fn b1_publish_lands_between_delete_check_and_claim() {
     let rt = Arc::new(Rt::new());
     let v = rt.create_input(7_u64);
