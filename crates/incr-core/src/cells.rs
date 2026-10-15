@@ -21,6 +21,7 @@
 
 use crate::dep_stack::{DepStack, LocalDepStack, SharedDepStack};
 use crate::locks::{LocalLock, Lock};
+use crate::node::{DepListCell, HzDepListCell};
 use crate::value::Value;
 use crate::value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
 use std::cell::Cell;
@@ -55,6 +56,7 @@ pub trait Cells: 'static + Sized {
     type Lock<T: 'static>: Lock<T>;
     type DepStack: DepStack;
     type ValueSlot<T: Value>: ValueSlot<T>;
+    type DepListCell: DepListCell;
 
     fn new_u8(v: u8) -> Self::U8;
     fn new_u16(v: u16) -> Self::U16;
@@ -90,6 +92,20 @@ pub trait Cells: 'static + Sized {
     fn state_load_acquire(c: &Self::State) -> u8;
     fn state_store_release(c: &Self::State, v: u8);
     fn state_try_transition(c: &Self::State, expected: u8, new: u8) -> Result<(), u8>;
+
+    /// One step of a wait on another thread's progress; `spins` counts
+    /// the steps taken so far. A bounded spin, then yield. The loom
+    /// strategy overrides this with `loom::thread::yield_now`, because
+    /// a modeled spin that never yields to the scheduler exhausts the
+    /// branch budget instead of letting the awaited thread run.
+    #[inline]
+    fn backoff(spins: u32) {
+        if spins < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// Local pointer cell. Wraps `Cell<*mut T>`; not `Sync` (which is the
@@ -170,6 +186,7 @@ impl Cells for Local {
     type Lock<T: 'static> = LocalLock<T>;
     type DepStack = LocalDepStack;
     type ValueSlot<T: Value> = LocalValueSlot<T>;
+    type DepListCell = HzDepListCell;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -297,6 +314,7 @@ impl Cells for Shared {
     type Lock<T: 'static> = RwLock<T>;
     type DepStack = SharedDepStack;
     type ValueSlot<T: Value> = SharedValueSlot<T>;
+    type DepListCell = HzDepListCell;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {

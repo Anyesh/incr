@@ -63,11 +63,66 @@ pub struct DepList {
     pub(crate) deps: Box<[NodeId]>,
 }
 
+/// Holder for a node's overflow [`DepList`], selected per strategy
+/// through `Cells::DepListCell` so the loom strategy can swap out the
+/// hazard-pointer cell that `Local` and `Shared` share.
+pub trait DepListCell: 'static {
+    fn new_null() -> Self;
+    /// Install `list` (or null), retiring any displaced list. The caller
+    /// must be the node's single writer, which the state machine grants.
+    fn replace(&self, list: Option<Box<DepList>>);
+    /// Run `f` on the installed list. Panics if none is installed; the
+    /// caller must have observed an overflow `dep_count` with Acquire.
+    fn with_list(&self, f: &mut dyn FnMut(&DepList));
+}
+
+/// Hazard-pointer overflow cell used by `Local` and `Shared`.
+pub struct HzDepListCell(HzAtomicPtr<DepList>);
+
+impl DepListCell for HzDepListCell {
+    fn new_null() -> Self {
+        // SAFETY: a null pointer is always a valid initial value.
+        Self(unsafe { HzAtomicPtr::new(std::ptr::null_mut()) })
+    }
+
+    fn replace(&self, list: Option<Box<DepList>>) {
+        let displaced = match list {
+            Some(list) => self.0.swap(list),
+            // SAFETY: swap_ptr with a null target is safe.
+            None => unsafe { self.0.swap_ptr(std::ptr::null_mut()) },
+        };
+        if let Some(old) = displaced {
+            // SAFETY: `old` came from a Box installed by a previous
+            // replace and is not aliased for writes (single writer per
+            // node). Hazard pointers defer the free until no reader in
+            // with_list still references it.
+            unsafe { old.retire() };
+        }
+    }
+
+    fn with_list(&self, f: &mut dyn FnMut(&DepList)) {
+        let mut hazard = HazardPointer::new();
+        // SAFETY: the pointer is populated by replace with Box-allocated
+        // DepLists; retirements go through the global haphazard domain,
+        // so the reference stays valid for the lifetime of `hazard`.
+        let list: Option<&DepList> = unsafe { self.0.load(&mut hazard) };
+        f(list.expect("overflow_deps null with dep_count > 7"));
+    }
+}
+
+impl Drop for HzDepListCell {
+    fn drop(&mut self) {
+        // For the runtime-drop case all hazards are already gone, so the
+        // retire reclaims immediately.
+        self.replace(None);
+    }
+}
+
 #[repr(C, align(64))]
 pub struct NodeData<C: Cells> {
     pub(crate) verified_at: C::U64,
     pub(crate) changed_at: C::U64,
-    pub(crate) overflow_deps: HzAtomicPtr<DepList>,
+    pub(crate) overflow_deps: C::DepListCell,
     pub(crate) inline_deps: [C::U32; 7],
     // Cells (not plain fields) so delete_node can recycle a slot in
     // place through &self: a recycled slot may host a different value
@@ -87,7 +142,7 @@ impl<C: Cells> NodeData<C> {
         Self {
             verified_at: C::new_u64(revision),
             changed_at: C::new_u64(revision),
-            overflow_deps: unsafe { HzAtomicPtr::new(std::ptr::null_mut()) },
+            overflow_deps: C::DepListCell::new_null(),
             inline_deps: Self::empty_inline_deps(),
             arena_slot: C::new_u32(arena_slot),
             type_tag: C::new_u16(type_tag),
@@ -104,7 +159,7 @@ impl<C: Cells> NodeData<C> {
         Self {
             verified_at: C::new_u64(0),
             changed_at: C::new_u64(0),
-            overflow_deps: unsafe { HzAtomicPtr::new(std::ptr::null_mut()) },
+            overflow_deps: C::DepListCell::new_null(),
             inline_deps: Self::empty_inline_deps(),
             arena_slot: C::new_u32(arena_slot),
             type_tag: C::new_u16(type_tag),
@@ -263,8 +318,9 @@ impl<C: Cells> NodeData<C> {
     /// array; overflow path heap-allocates a `DepList` and Release-stores
     /// the pointer.
     ///
-    /// Reclamation: any displaced overflow pointer is retired through
-    /// the `haphazard` global domain. Concurrent readers in
+    /// Reclamation: any displaced overflow list is retired through
+    /// `C::DepListCell`, which under `Local` and `Shared` is the
+    /// `haphazard` global domain. Concurrent readers in
     /// [`Self::for_each_dep`] hold a `HazardPointer` while
     /// dereferencing the slot, so the retired list is not freed until
     /// every protecting reader has finished. Free-during-runtime; no
@@ -275,39 +331,22 @@ impl<C: Cells> NodeData<C> {
             for (i, dep) in new_deps.iter().enumerate() {
                 C::u32_store_relaxed(&self.inline_deps[i], dep.0);
             }
-            // Going inline: swap null in to displace any stale overflow
-            // pointer, then retire it. for_each_dep's count<=7 path
-            // never reads overflow_deps, but a subsequent overflow
-            // install would clobber the stale pointer without retiring
-            // it, leaking memory. Retiring here closes that gap.
-            // SAFETY: swap_ptr with a null target is safe.
-            let displaced = unsafe { self.overflow_deps.swap_ptr(std::ptr::null_mut()) };
-            if let Some(old) = displaced {
-                // SAFETY: `old` came from a Box::into_raw via a previous
-                // install_deps; it is not aliased for writes (the state
-                // machine guarantees single-writer-at-a-time on this
-                // node). Hazard pointers ensure the actual free is
-                // deferred until no reader still references this list.
-                unsafe { old.retire() };
-            }
+            // Going inline: displace and retire any stale overflow list.
+            // for_each_dep's count<=7 path never reads overflow_deps, but
+            // keeping the stale list would hold its memory until the next
+            // overflow install or the node's drop.
+            self.overflow_deps.replace(None);
             C::u8_store_release(&self.dep_count, count as u8);
         } else {
             let list = Box::new(DepList {
                 deps: new_deps.to_vec().into_boxed_slice(),
             });
-            // `swap` takes ownership of the box; the old box (if any)
-            // is wrapped in a `Replaced` whose `retire` defers free
-            // through the global hazard-pointer domain.
-            let replaced = self.overflow_deps.swap(list);
+            self.overflow_deps.replace(Some(list));
             // The cell is one byte, so counts above 7 are encoded as a
             // marker and the DepList length is authoritative. This is
             // what lifts the old 255-dep ceiling: a query may read any
             // number of inputs.
             C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER);
-            if let Some(old) = replaced {
-                // SAFETY: same as the inline-path retire above.
-                unsafe { old.retire() };
-            }
         }
     }
 
@@ -320,8 +359,8 @@ impl<C: Cells> NodeData<C> {
     /// the state machine) to synchronize with the writer of these deps.
     ///
     /// Up to 7 deps live inline; beyond that, `overflow_deps` points at
-    /// a heap-allocated `DepList` whose load is protected by a
-    /// `HazardPointer`. A concurrent retire by an `install_deps`
+    /// a heap-allocated `DepList` whose load is protected (by a
+    /// `HazardPointer` under `Local` and `Shared`). A concurrent retire by an `install_deps`
     /// writer will defer the actual free until this reader's hazard
     /// is released.
     ///
@@ -350,16 +389,11 @@ impl<C: Cells> NodeData<C> {
 
     #[inline(never)]
     fn for_each_overflow_dep(&self, f: &mut dyn FnMut(NodeId)) {
-        let mut hazard = HazardPointer::new();
-        // SAFETY: the AtomicPtr is populated by install_deps with
-        // Box-allocated DepLists; retirements go through the global
-        // haphazard domain so safe_load returns a reference that
-        // remains valid for the lifetime of `hazard`.
-        let list_ref: Option<&DepList> = unsafe { self.overflow_deps.load(&mut hazard) };
-        let list = list_ref.expect("overflow_deps null with dep_count > 7");
-        for &id in list.deps.iter() {
-            f(id);
-        }
+        self.overflow_deps.with_list(&mut |list| {
+            for &id in list.deps.iter() {
+                f(id);
+            }
+        });
     }
 
     fn empty_inline_deps() -> [C::U32; 7] {
@@ -372,23 +406,6 @@ impl<C: Cells> NodeData<C> {
             C::new_u32(NodeId::SENTINEL.0),
             C::new_u32(NodeId::SENTINEL.0),
         ]
-    }
-}
-
-impl<C: Cells> Drop for NodeData<C> {
-    fn drop(&mut self) {
-        // Swap null in and retire whatever was installed. The actual
-        // free is deferred through the haphazard global domain, which
-        // reclaims it the next time a domain pass detects no protecting
-        // hazard pointers. For the runtime-drop case all hazards are
-        // already gone, so reclamation is immediate.
-        // SAFETY: swap_ptr to null is safe; the displaced pointer (if
-        // any) came from install_deps's Box::into_raw and goes through
-        // haphazard's retire path.
-        let displaced = unsafe { self.overflow_deps.swap_ptr(std::ptr::null_mut()) };
-        if let Some(old) = displaced {
-            unsafe { old.retire() };
-        }
     }
 }
 

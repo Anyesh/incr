@@ -397,11 +397,7 @@ impl<C: Cells> Runtime<C> {
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
                     spins += 1;
-                    if spins < 64 {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
+                    C::backoff(spins);
                 }
                 NodeState::Dead => {
                     // Two racing deletes: the generation check above
@@ -809,11 +805,7 @@ impl<C: Cells> Runtime<C> {
                     // instead of panicking; cross-thread cycle detection
                     // needs a waits-for graph and is not implemented.
                     spins += 1;
-                    if spins < 64 {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
+                    C::backoff(spins);
                     continue;
                 }
                 NodeState::Failed => {
