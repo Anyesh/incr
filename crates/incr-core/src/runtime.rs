@@ -120,6 +120,21 @@ pub(crate) enum ParkPoint {
     DeleteAfterCheck(NodeId),
 }
 
+/// What `publish_deps` found when it validated a compute's recorded deps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Publish {
+    /// Edges are current; the compute may land `Clean`.
+    Published,
+    /// A newly added dep was not observed `Clean` at or below the
+    /// compute's stamp revision, so a concurrent change may have missed
+    /// this node, which had no reverse edge yet (B3). Edges are
+    /// published; the compute must land `Dirty`.
+    Superseded,
+    /// A recorded dep was deleted, and possibly recycled, after the read
+    /// (B2). Nothing was published.
+    Stale,
+}
+
 #[cfg(test)]
 pub(crate) type ParkHook = Box<dyn Fn(ParkPoint) + Send + Sync>;
 
@@ -492,7 +507,7 @@ impl<C: Cells> Runtime<C> {
         let slot = handle.slot();
 
         // Record dep if we're inside a compute closure.
-        self.dep_stack.record_dep(NodeId(slot));
+        self.dep_stack.record_dep(NodeId(slot), handle.generation());
 
         // Ensure clean, then read.
         self.ensure_clean(NodeId(slot));
@@ -956,46 +971,69 @@ impl<C: Cells> Runtime<C> {
                     // panic would lose recovery paths through deps the
                     // failed run had not reached yet. Extra edges only
                     // cause spurious re-verification, never staleness.
-                    let mut union_deps: Vec<NodeId> = Vec::with_capacity(recorded_deps.len() + 8);
-                    node.for_each_dep(|d| union_deps.push(d));
-                    for d in &recorded_deps {
-                        if !union_deps.contains(d) {
-                            union_deps.push(*d);
-                        }
-                    }
-                    self.publish_deps(id, &union_deps);
-
-                    // verified_at was not raised, so once a dependency
-                    // changes, the dirty walk flips Failed -> Dirty and
-                    // red/green sees the change and recomputes for real.
-                    // If a set() already flagged us mid-compute, land
-                    // Dirty now so the next reader retries immediately.
-                    if state::try_transition::<C>(
-                        node.state_cell(),
-                        NodeState::Computing,
-                        NodeState::Failed,
-                    )
-                    .is_err()
+                    let landing = match self.publish_deps(id, &recorded_deps, true, start_rev) {
+                        // A stale dep's slot may already belong to another
+                        // node, so no union is published. The old deps keep
+                        // their reverse edges.
+                        Publish::Stale => NodeState::New,
+                        // verified_at was not raised, so once a dependency
+                        // changes, the dirty walk flips Failed -> Dirty and
+                        // red/green sees the change and recomputes for real.
+                        // If a set() already flagged us mid-compute, land
+                        // Dirty now so the next reader retries immediately.
+                        Publish::Published | Publish::Superseded => NodeState::Failed,
+                    };
+                    if state::try_transition::<C>(node.state_cell(), NodeState::Computing, landing)
+                        .is_err()
                     {
-                        state::store::<C>(node.state_cell(), NodeState::Dirty);
+                        let flagged = if landing == NodeState::New {
+                            NodeState::New
+                        } else {
+                            NodeState::Dirty
+                        };
+                        state::store::<C>(node.state_cell(), flagged);
                     }
                     std::panic::resume_unwind(payload);
                 }
             };
 
-            self.publish_deps(id, &recorded_deps);
+            let outcome = self.publish_deps(id, &recorded_deps, false, start_rev);
 
+            // The closure has already written its value into the slot, and
+            // the next recompute's early cutoff compares against it, so a
+            // changed value is stamped even when it is never returned.
             if value_changed || !is_recompute {
                 node.max_changed_at(start_rev);
             }
+
+            if outcome == Publish::Stale {
+                // The value may have been read from a dep slot that was
+                // released or recycled under the closure, so it is never
+                // returned: land New and recompute. The retry either stops
+                // reading the dep or panics on its stale handle.
+                if state::try_transition::<C>(
+                    node.state_cell(),
+                    NodeState::Computing,
+                    NodeState::New,
+                )
+                .is_err()
+                {
+                    state::store::<C>(node.state_cell(), NodeState::New);
+                }
+                continue;
+            }
+
             node.max_verified_at(start_rev);
 
-            // Finish. If a set() flagged us ComputingDirty mid-compute,
-            // land Dirty so the next reader recomputes against the newer
-            // input; the value we just produced is still a consistent
-            // pre-set snapshot, so returning it is linearizable.
-            if state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Clean)
-                .is_err()
+            // Finish. If a set() flagged us ComputingDirty mid-compute, or
+            // a new dep changed after we read it, land Dirty so the next
+            // reader recomputes against the newer input.
+            let target = if outcome == Publish::Superseded {
+                NodeState::Dirty
+            } else {
+                NodeState::Clean
+            };
+            if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_err()
             {
                 state::store::<C>(node.state_cell(), NodeState::Dirty);
             }
@@ -1004,53 +1042,88 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Record dependencies on the node and update reverse edges in the
-    /// inner state. Diffs old vs new deps so static-dep queries (the
-    /// common case) skip the inner.write() acquire and the dependents
-    /// vector edits on recompute.
+    /// Validate a compute's recorded deps, then install them and update
+    /// reverse edges. With `keep_old` (the panic path) the installed list
+    /// is the union of the old deps and the recorded ones. Diffs old vs
+    /// new deps so static-dep queries (the common case) skip the
+    /// inner.write() acquire and the dependents vector edits on
+    /// recompute.
     ///
-    /// Up to 7 deps live inline; beyond that, they live in a heap-allocated
-    /// `DepList`. Old overflow lists are leaked under `Shared` (no
-    /// hazard pointers yet); `NodeData::Drop` reclaims the final one.
-    fn publish_deps(&self, id: NodeId, new_deps: &[NodeId]) {
+    /// The fast path needs no validation: its deps already have reverse
+    /// edges, so a strict delete refuses them and a dirty walk reaches
+    /// this node. The slow path validates, installs and diffs inside one
+    /// `inner.write()` hold. That ordering is part of the contract: a
+    /// delete claims `Dead` under `inner.read()`, and a set's walk flips a
+    /// dep before reading its dependents under `inner.read()`, so each
+    /// either finishes before validation sees it or sees this node's new
+    /// edge.
+    fn publish_deps(
+        &self,
+        id: NodeId,
+        recorded: &[(NodeId, u32)],
+        keep_old: bool,
+        stamp_rev: u64,
+    ) -> Publish {
         let node = self.nodes.get(id.0);
 
-        // Read old deps before overwriting (the comparison uses the same
-        // backing storage we're about to write into, so we MUST collect
-        // first). Uses for_each_dep which handles inline and overflow.
         let mut old_deps: Vec<NodeId> = Vec::with_capacity(8);
         node.for_each_dep(|d| old_deps.push(d));
-        let old_slice = old_deps.as_slice();
+        let new_deps: Vec<NodeId> = if keep_old {
+            let mut union = old_deps.clone();
+            for &(d, _) in recorded {
+                if !union.contains(&d) {
+                    union.push(d);
+                }
+            }
+            union
+        } else {
+            recorded.iter().map(|&(d, _)| d).collect()
+        };
 
-        // Fast path: static deps. The common case for both inputs and
-        // long-lived queries is that the dep set does not change between
-        // computes. Skip every write if we detect equality.
-        if old_slice.len() == new_deps.len()
-            && old_slice.iter().zip(new_deps.iter()).all(|(a, b)| a == b)
-        {
-            return;
+        if old_deps == new_deps {
+            return Publish::Published;
         }
 
-        // Slow path: deps changed. Install the new dep list (handles
-        // inline + overflow). Any displaced overflow DepList is retired
-        // internally through the haphazard global domain so concurrent
-        // readers finish their traversal safely before the actual free.
-        node.install_deps(new_deps);
-
-        // Reverse-edge diff under the inner write lock. Linear scans
-        // for small dep sets are faster than HashSet construction
-        // below ~16 items.
         let mut inner = self.inner.write();
-        for old_dep in old_slice {
+        let stale = recorded.iter().any(|&(d, generation)| {
+            let dep = self.nodes.get(d.0);
+            dep.generation() != generation || dep.state() == NodeState::Dead
+        });
+        if stale {
+            return Publish::Stale;
+        }
+        let superseded = new_deps
+            .iter()
+            .any(|d| !old_deps.contains(d) && !self.observed_clean(*d, stamp_rev));
+
+        node.install_deps(&new_deps);
+
+        // Linear scans for small dep sets are faster than HashSet
+        // construction below ~16 items.
+        for old_dep in &old_deps {
             if !new_deps.contains(old_dep) {
                 inner.dependents[old_dep.0 as usize].retain(|&d| d != id);
             }
         }
-        for new_dep in new_deps {
-            if !old_slice.contains(new_dep) {
+        for new_dep in &new_deps {
+            if !old_deps.contains(new_dep) {
                 inner.dependents[new_dep.0 as usize].push(id);
             }
         }
+        if superseded {
+            Publish::Superseded
+        } else {
+            Publish::Published
+        }
+    }
+
+    /// True iff `dep` is `Clean` with `changed_at <= rev`. The state is
+    /// loaded first because the Release that publishes a recompute's
+    /// `changed_at` stamp is its finishing state CAS: reading the stamp
+    /// first could pair an old stamp with a newer `Clean`.
+    fn observed_clean(&self, dep: NodeId, rev: u64) -> bool {
+        let node = self.nodes.get(dep.0);
+        node.state() == NodeState::Clean && node.changed_at() <= rev
     }
 
     /// Borrow the arena for `T`, panicking if none exists.

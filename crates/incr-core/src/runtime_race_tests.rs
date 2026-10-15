@@ -277,7 +277,6 @@ fn b6_verified_at_names_unwalked_revision_landed_clean() {
 }
 
 #[test]
-#[ignore = "fails until fix 4 (generation-tagged deps, validated publish)"]
 fn b3_input_dep_set_after_first_read() {
     let rt = Arc::new(Rt::new());
     let x = rt.create_input(1_u64);
@@ -308,7 +307,6 @@ fn b3_input_dep_set_after_first_read() {
 }
 
 #[test]
-#[ignore = "fails until fix 4 (generation-tagged deps, validated publish)"]
 fn b3_query_dep_dirtied_after_first_read() {
     let rt = Arc::new(Rt::new());
     let x = rt.create_input(0_u64);
@@ -372,7 +370,6 @@ fn b1_publish_lands_between_delete_check_and_claim() {
 }
 
 #[test]
-#[ignore = "fails until fixes 4-6 (stale detection, recovery, walk through New)"]
 fn b2_delete_and_recycle_while_publisher_is_parked() {
     let rt = Arc::new(Rt::new());
     let v = rt.create_input(7_u64);
@@ -438,7 +435,6 @@ fn self_deleting_query(
 }
 
 #[test]
-#[ignore = "fails until fixes 4-6 (stale detection, recovery, walk through New)"]
 fn b2_local_self_delete_retries_and_panics_stale() {
     let rt = LocalRt::new();
     let (q, recycled) = self_deleting_query(&rt, false);
@@ -454,7 +450,6 @@ fn b2_local_self_delete_retries_and_panics_stale() {
 }
 
 #[test]
-#[ignore = "fails until fixes 4-6 (stale detection, recovery, walk through New)"]
 fn b2_local_retry_that_stops_reading_publishes_cleanly() {
     let rt = LocalRt::new();
     let (q, recycled) = self_deleting_query(&rt, true);
@@ -471,7 +466,6 @@ fn b2_local_retry_that_stops_reading_publishes_cleanly() {
 }
 
 #[test]
-#[ignore = "fails until fixes 4-6 (stale detection, recovery, walk through New)"]
 fn b2_local_nested_self_delete_leaves_both_non_clean() {
     let rt = LocalRt::new();
     let (q, _recycled) = self_deleting_query(&rt, false);
@@ -484,7 +478,7 @@ fn b2_local_nested_self_delete_leaves_both_non_clean() {
 }
 
 #[test]
-#[ignore = "fails until fixes 4-6 (stale detection, recovery, walk through New)"]
+#[ignore = "fails until fix 6 (walk through New)"]
 fn b2_local_panic_after_self_delete_lands_new() {
     let rt = LocalRt::new();
     let x = rt.create_input(0_u64);

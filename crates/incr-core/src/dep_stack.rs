@@ -36,14 +36,16 @@ pub trait DepStack: 'static {
     /// thread's compute stack.
     fn push_frame(&self, node: NodeId);
 
-    /// Pop the top frame and return its recorded deps. Called when
-    /// exiting a compute closure.
-    fn pop_frame(&self) -> Vec<NodeId>;
+    /// Pop the top frame and return its recorded deps, each with the
+    /// generation it was read at. Called when exiting a compute closure.
+    fn pop_frame(&self) -> Vec<(NodeId, u32)>;
 
-    /// Record `dep` as a dependency of the currently-computing node. Called
-    /// by `rt.get()` whenever a frame is active. No-op when no frame is
-    /// active (e.g., a top-level `get` from user code).
-    fn record_dep(&self, dep: NodeId);
+    /// Record `dep`, read at `generation`, as a dependency of the
+    /// currently-computing node. Called by `rt.get()` whenever a frame is
+    /// active. No-op when no frame is active (e.g., a top-level `get` from
+    /// user code). The generation lets publish detect a dep that was
+    /// deleted, and possibly recycled, after the read.
+    fn record_dep(&self, dep: NodeId, generation: u32);
 
     /// True iff at least one frame is active (i.e., we're inside a
     /// compute closure).
@@ -60,7 +62,7 @@ pub trait DepStack: 'static {
 /// so far on its behalf.
 struct Frame {
     node: NodeId,
-    deps: Vec<NodeId>,
+    deps: Vec<(NodeId, u32)>,
 }
 
 impl Frame {
@@ -88,7 +90,7 @@ impl DepStack for LocalDepStack {
         self.stack.borrow_mut().push(Frame::new(node));
     }
 
-    fn pop_frame(&self) -> Vec<NodeId> {
+    fn pop_frame(&self) -> Vec<(NodeId, u32)> {
         self.stack
             .borrow_mut()
             .pop()
@@ -96,10 +98,10 @@ impl DepStack for LocalDepStack {
             .deps
     }
 
-    fn record_dep(&self, dep: NodeId) {
+    fn record_dep(&self, dep: NodeId, generation: u32) {
         let mut frames = self.stack.borrow_mut();
         if let Some(frame) = frames.last_mut() {
-            frame.deps.push(dep);
+            frame.deps.push((dep, generation));
         }
     }
 
@@ -133,7 +135,7 @@ impl DepStack for SharedDepStack {
         SHARED_FRAMES.with(|f| f.borrow_mut().push(Frame::new(node)));
     }
 
-    fn pop_frame(&self) -> Vec<NodeId> {
+    fn pop_frame(&self) -> Vec<(NodeId, u32)> {
         SHARED_FRAMES.with(|f| {
             f.borrow_mut()
                 .pop()
@@ -142,11 +144,11 @@ impl DepStack for SharedDepStack {
         })
     }
 
-    fn record_dep(&self, dep: NodeId) {
+    fn record_dep(&self, dep: NodeId, generation: u32) {
         SHARED_FRAMES.with(|f| {
             let mut frames = f.borrow_mut();
             if let Some(frame) = frames.last_mut() {
-                frame.deps.push(dep);
+                frame.deps.push((dep, generation));
             }
         });
     }
@@ -182,7 +184,7 @@ impl DepStack for LoomDepStack {
         LOOM_FRAMES.with(|f| f.borrow_mut().push(Frame::new(node)));
     }
 
-    fn pop_frame(&self) -> Vec<NodeId> {
+    fn pop_frame(&self) -> Vec<(NodeId, u32)> {
         LOOM_FRAMES.with(|f| {
             f.borrow_mut()
                 .pop()
@@ -191,10 +193,10 @@ impl DepStack for LoomDepStack {
         })
     }
 
-    fn record_dep(&self, dep: NodeId) {
+    fn record_dep(&self, dep: NodeId, generation: u32) {
         LOOM_FRAMES.with(|f| {
             if let Some(frame) = f.borrow_mut().last_mut() {
-                frame.deps.push(dep);
+                frame.deps.push((dep, generation));
             }
         });
     }
@@ -218,11 +220,11 @@ mod tests {
         assert!(!s.current_frame_active());
         s.push_frame(NodeId(100));
         assert!(s.current_frame_active());
-        s.record_dep(NodeId(0));
-        s.record_dep(NodeId(1));
-        s.record_dep(NodeId(2));
+        s.record_dep(NodeId(0), 0);
+        s.record_dep(NodeId(1), 0);
+        s.record_dep(NodeId(2), 0);
         let frame = s.pop_frame();
-        assert_eq!(frame, vec![NodeId(0), NodeId(1), NodeId(2)]);
+        assert_eq!(frame, vec![(NodeId(0), 0), (NodeId(1), 0), (NodeId(2), 0)]);
         assert!(!s.current_frame_active());
     }
 
@@ -230,20 +232,20 @@ mod tests {
     fn local_nested_frames_are_independent() {
         let s = LocalDepStack::new();
         s.push_frame(NodeId(100));
-        s.record_dep(NodeId(1));
+        s.record_dep(NodeId(1), 0);
         s.push_frame(NodeId(101));
-        s.record_dep(NodeId(2));
-        s.record_dep(NodeId(3));
+        s.record_dep(NodeId(2), 0);
+        s.record_dep(NodeId(3), 0);
         let inner = s.pop_frame();
-        assert_eq!(inner, vec![NodeId(2), NodeId(3)]);
+        assert_eq!(inner, vec![(NodeId(2), 0), (NodeId(3), 0)]);
         let outer = s.pop_frame();
-        assert_eq!(outer, vec![NodeId(1)]);
+        assert_eq!(outer, vec![(NodeId(1), 0)]);
     }
 
     #[test]
     fn local_record_outside_frame_is_noop() {
         let s = LocalDepStack::new();
-        s.record_dep(NodeId(42));
+        s.record_dep(NodeId(42), 0);
         assert!(!s.current_frame_active());
     }
 
@@ -267,10 +269,10 @@ mod tests {
     fn shared_push_pop_records() {
         let s = SharedDepStack::new();
         s.push_frame(NodeId(100));
-        s.record_dep(NodeId(7));
-        s.record_dep(NodeId(11));
+        s.record_dep(NodeId(7), 0);
+        s.record_dep(NodeId(11), 0);
         let frame = s.pop_frame();
-        assert_eq!(frame, vec![NodeId(7), NodeId(11)]);
+        assert_eq!(frame, vec![(NodeId(7), 0), (NodeId(11), 0)]);
     }
 
     #[test]
