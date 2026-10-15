@@ -46,25 +46,30 @@ impl<C: Cells, const N: usize> WalkRing<C, N> {
             spins += 1;
             C::backoff(spins);
         }
-        C::u64_store_seqcst(&self.slots[Self::index(rev)], rev);
+        // Release, so the advancing thread's Acquire load of this slot
+        // carries this walk's Clean -> Dirty CASes on to `walked`.
+        C::u64_store_release(&self.slots[Self::index(rev)], rev);
+        // Setter A (rev 5) stores slot 5 and then loads slot 4, while
+        // setter B (rev 4) stores slot 4, advances to 4, and loads slot 5.
+        // With only Release/Acquire both loads may miss the other's store
+        // (store buffering), leaving `walked` at 4 after rev 5's walk
+        // finished, and every compute until the next `set` would recompute
+        // against a dep stamped 5. A SeqCst fence between each setter's
+        // slot store and its loads guarantees at least one of the two sees
+        // the other, so the last setter to finish always advances past
+        // every finished revision. A fence rather than SeqCst accesses
+        // because loom models SeqCst loads and stores as AcqRel, and would
+        // report this stall as reachable.
+        C::fence_seqcst();
         self.advance();
     }
 
     /// Move `walked` over every recorded slot that follows it.
-    ///
-    /// The slot store above and the slot load here must be SeqCst. Setter
-    /// A (rev 5) stores slot 5 and then loads slot 4, while setter B
-    /// (rev 4) stores slot 4, advances to 4, and loads slot 5. With
-    /// Release/Acquire both loads may miss the other's store, leaving
-    /// `walked` at 4 after rev 5's walk finished, and every compute until
-    /// the next `set` would recompute against a dep stamped 5. SeqCst
-    /// guarantees at least one of the two sees the other, so the last
-    /// setter to finish always advances past every finished revision.
     fn advance(&self) {
         loop {
             let w = self.walked();
             let next = w + 1;
-            if C::u64_load_seqcst(&self.slots[Self::index(next)]) != next {
+            if C::u64_load_acquire(&self.slots[Self::index(next)]) != next {
                 return;
             }
             // A failed CAS means another thread advanced; re-examine.

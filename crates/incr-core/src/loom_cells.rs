@@ -225,12 +225,6 @@ impl Cells for Loom {
     fn u64_store_relaxed(c: &Self::U64, v: u64) {
         c.store(v, Ordering::Relaxed);
     }
-    fn u64_load_seqcst(c: &Self::U64) -> u64 {
-        c.load(Ordering::SeqCst)
-    }
-    fn u64_store_seqcst(c: &Self::U64, v: u64) {
-        c.store(v, Ordering::SeqCst);
-    }
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
         c.fetch_add(v, Ordering::AcqRel)
     }
@@ -249,6 +243,9 @@ impl Cells for Loom {
     }
     fn complete_walk(w: &Self::Watermark, rev: u64) {
         w.complete(rev);
+    }
+    fn fence_seqcst() {
+        loom::sync::atomic::fence(Ordering::SeqCst);
     }
 
     fn state_load_acquire(c: &Self::State) -> u8 {

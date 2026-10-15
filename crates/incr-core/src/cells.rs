@@ -82,8 +82,6 @@ pub trait Cells: 'static + Sized {
     fn u64_store_release(c: &Self::U64, v: u64);
     fn u64_load_relaxed(c: &Self::U64) -> u64;
     fn u64_store_relaxed(c: &Self::U64, v: u64);
-    fn u64_load_seqcst(c: &Self::U64) -> u64;
-    fn u64_store_seqcst(c: &Self::U64, v: u64);
     /// Atomic add; returns the previous value. AcqRel under Shared.
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64;
     /// Atomic max; returns the previous value. AcqRel under Shared.
@@ -106,6 +104,9 @@ pub trait Cells: 'static + Sized {
     fn walked(w: &Self::Watermark, revision: &Self::U64) -> u64;
     /// Record that revision `rev`'s dirty walk has finished.
     fn complete_walk(w: &Self::Watermark, rev: u64);
+
+    /// A SeqCst fence; a no-op under `Local`.
+    fn fence_seqcst();
 
     /// One step of a wait on another thread's progress; `spins` counts
     /// the steps taken so far. A bounded spin, then yield. The loom
@@ -275,14 +276,6 @@ impl Cells for Local {
         c.set(v);
     }
     #[inline(always)]
-    fn u64_load_seqcst(c: &Self::U64) -> u64 {
-        c.get()
-    }
-    #[inline(always)]
-    fn u64_store_seqcst(c: &Self::U64, v: u64) {
-        c.set(v);
-    }
-    #[inline(always)]
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
         let prev = c.get();
         c.set(prev.wrapping_add(v));
@@ -315,6 +308,8 @@ impl Cells for Local {
     }
     #[inline(always)]
     fn complete_walk(_w: &Self::Watermark, _rev: u64) {}
+    #[inline(always)]
+    fn fence_seqcst() {}
 
     #[inline(always)]
     fn state_load_acquire(c: &Self::State) -> u8 {
@@ -421,14 +416,6 @@ impl Cells for Shared {
         c.store(v, Ordering::Relaxed);
     }
     #[inline(always)]
-    fn u64_load_seqcst(c: &Self::U64) -> u64 {
-        c.load(Ordering::SeqCst)
-    }
-    #[inline(always)]
-    fn u64_store_seqcst(c: &Self::U64, v: u64) {
-        c.store(v, Ordering::SeqCst);
-    }
-    #[inline(always)]
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64 {
         c.fetch_add(v, Ordering::AcqRel)
     }
@@ -450,6 +437,10 @@ impl Cells for Shared {
     }
     fn complete_walk(w: &Self::Watermark, rev: u64) {
         w.complete(rev);
+    }
+    #[inline(always)]
+    fn fence_seqcst() {
+        std::sync::atomic::fence(Ordering::SeqCst);
     }
 
     #[inline(always)]
