@@ -745,7 +745,16 @@ impl<C: Cells> Runtime<C> {
                             break;
                         }
                     }
-                    NodeState::New | NodeState::Dirty | NodeState::ComputingDirty => {
+                    NodeState::New => {
+                        // A node that recovered from a stale dep lands New
+                        // but keeps its old reverse edges, so a Failed
+                        // dependent can only be reached through it.
+                        // Never-run queries have no dependents.
+                        let inner = self.inner.read();
+                        queue.extend(inner.dependents[id.0 as usize].iter().copied());
+                        break;
+                    }
+                    NodeState::Dirty | NodeState::ComputingDirty => {
                         // Already flagged; the walk that flagged it also
                         // covered its dependents.
                         break;

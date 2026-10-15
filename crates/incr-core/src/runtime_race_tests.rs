@@ -478,7 +478,6 @@ fn b2_local_nested_self_delete_leaves_both_non_clean() {
 }
 
 #[test]
-#[ignore = "fails until fix 6 (walk through New)"]
 fn b2_local_panic_after_self_delete_lands_new() {
     let rt = LocalRt::new();
     let x = rt.create_input(0_u64);
