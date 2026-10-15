@@ -498,15 +498,28 @@ fn b2_local_panic_after_self_delete_lands_new() {
         !rt.has_reverse_edge(v, q),
         "edge left on the deleted dep's slot"
     );
-    assert_eq!(rt.state_of(d), NodeState::Failed);
+    // D's new dep Q is a pending recompute, which a walk may already have
+    // passed before D's edge existed, so D lands Dirty rather than Failed.
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
     rt.assert_invariant_i();
+    rt.assert_edges_complete();
+}
 
-    rt.set(x, 2);
-    assert_eq!(
-        rt.state_of(d),
-        NodeState::Dirty,
-        "the walk must pass through New Q"
-    );
+#[test]
+fn walk_passes_through_new_to_failed_dependent() {
+    let rt = LocalRt::new();
+    let x = rt.create_input(0_u64);
+    let q = rt.create_query(move |rt: &LocalRt| rt.get(x) + 1);
+    let d = rt.create_query(move |rt: &LocalRt| rt.get(q) + 100);
+    assert_eq!(rt.get(d), 101);
+    // The shape a stale recovery leaves behind: Q New with its old edges,
+    // and a Failed dependent reachable only through Q.
+    rt.nodes.get(q.slot()).set_state(NodeState::New.as_u8());
+    rt.nodes.get(d.slot()).set_state(NodeState::Failed.as_u8());
+
+    rt.set(x, 1);
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert_eq!(rt.get(d), 102);
 }
 
 #[test]

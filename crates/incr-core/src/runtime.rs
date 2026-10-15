@@ -1037,12 +1037,18 @@ impl<C: Cells> Runtime<C> {
                         // node, so no union is published. The old deps keep
                         // their reverse edges.
                         Publish::Stale => NodeState::New,
+                        // A new dep had a change in flight when we published,
+                        // and that change's walk may have read the dep's
+                        // dependents before our edge existed. Nothing would
+                        // ever flip us out of Failed, so land Dirty and let
+                        // the next reader retry.
+                        Publish::Superseded => NodeState::Dirty,
                         // verified_at was not raised, so once a dependency
                         // changes, the dirty walk flips Failed -> Dirty and
                         // red/green sees the change and recomputes for real.
                         // If a set() already flagged us mid-compute, land
                         // Dirty now so the next reader retries immediately.
-                        Publish::Published | Publish::Superseded => NodeState::Failed,
+                        Publish::Published => NodeState::Failed,
                     };
                     let flagged = if landing == NodeState::New {
                         NodeState::New
@@ -1120,8 +1126,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Validate a compute's recorded deps, then install them and update
-    /// reverse edges. With `keep_old` (the panic path) the installed list
-    /// is the union of the old deps and the recorded ones. Diffs old vs
+    /// reverse edges. With `panicked` the installed list is the union of
+    /// the old deps and the recorded ones, and a new dep that is `Failed`
+    /// does not supersede: the compute that read it fails with it, and the
+    /// dep's own recovery walk reaches this node through the new edge. Diffs old vs
     /// new deps so static-dep queries (the common case) skip the
     /// inner.write() acquire and the dependents vector edits on
     /// recompute.
@@ -1138,14 +1146,14 @@ impl<C: Cells> Runtime<C> {
         &self,
         id: NodeId,
         recorded: &[(NodeId, u32)],
-        keep_old: bool,
+        panicked: bool,
         stamp_rev: u64,
     ) -> Publish {
         let node = self.nodes.get(id.0);
 
         let mut old_deps: Vec<NodeId> = Vec::with_capacity(8);
         node.for_each_dep(|d| old_deps.push(d));
-        let new_deps: Vec<NodeId> = if keep_old {
+        let new_deps: Vec<NodeId> = if panicked {
             let mut union = old_deps.clone();
             for &(d, _) in recorded {
                 if !union.contains(&d) {
@@ -1169,9 +1177,12 @@ impl<C: Cells> Runtime<C> {
         if stale {
             return Publish::Stale;
         }
-        let superseded = new_deps
-            .iter()
-            .any(|d| !old_deps.contains(d) && !self.observed_clean(*d, stamp_rev));
+        let settled = |d: &NodeId| {
+            old_deps.contains(d)
+                || self.observed_clean(*d, stamp_rev)
+                || (panicked && self.nodes.get(d.0).state() == NodeState::Failed)
+        };
+        let superseded = !new_deps.iter().all(settled);
 
         node.install_deps(&new_deps);
 
