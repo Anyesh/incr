@@ -408,7 +408,10 @@ impl<C: Cells> Runtime<C> {
 
     /// Remove an observer. Safe to call with an already-removed id.
     pub fn unobserve(&self, id: ObserverId) {
-        self.inner.write().observers.remove(&id.0);
+        // Bound to a local so the entry, whose callback is user code,
+        // drops after the write guard does.
+        let removed = self.inner.write().observers.remove(&id.0);
+        drop(removed);
     }
 
     /// Bring every observed node up to date and fire callbacks for the
@@ -564,15 +567,22 @@ impl<C: Cells> Runtime<C> {
             inner.dependents[d.0 as usize].retain(|&x| x != id);
         }
         inner.dependents[slot as usize].clear();
-        // Before the closures below are dropped, because their captures'
-        // Drop impls are user code and may delete this same handle again.
         node.bump_generation();
-        inner.compute_fns[slot as usize] = None;
+        // The closures are dropped only after the lock is released,
+        // because their captures' Drop impls are user code that may call
+        // back into the runtime.
+        let compute = inner.compute_fns[slot as usize].take();
+        let observers: Vec<ObserverEntry<C>> = inner
+            .observers
+            .extract_if(|_, e| e.slot == slot)
+            .map(|(_, e)| e)
+            .collect();
         inner.labels.remove(&slot);
-        inner.observers.retain(|_, e| e.slot != slot);
         let arena = Arc::clone(inner.arenas.erased(type_tag));
         inner.free_nodes.push(slot);
         drop(inner);
+        drop(compute);
+        drop(observers);
         arena.release(arena_slot);
         DeleteOutcome::Deleted
     }
@@ -1939,6 +1949,82 @@ mod tests {
         let _q = rt.create_query(move |rt| rt.get(input) * 2);
         let _ = rt.get(_q);
         rt.delete_node(input);
+    }
+
+    struct RtPtr<C: Cells>(*const Runtime<C>);
+    // SAFETY: test-only. Every runtime outlives the closures holding its
+    // pointer, and a Local runtime's pointer never leaves its thread.
+    unsafe impl<C: Cells> Send for RtPtr<C> {}
+    unsafe impl<C: Cells> Sync for RtPtr<C> {}
+
+    /// Runs runtime calls from its Drop, as a user capture might.
+    struct TouchOnDrop<C: Cells> {
+        rt: RtPtr<C>,
+        probe: Incr<i64>,
+        victim: Incr<i64>,
+        dropped: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl<C: Cells> Drop for TouchOnDrop<C> {
+        fn drop(&mut self) {
+            // SAFETY: see RtPtr.
+            let rt = unsafe { &*self.rt.0 };
+            assert!(rt.is_alive(self.probe));
+            rt.delete_node(self.victim);
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn closures_drop_outside_the_lock<C: Cells>(rt: &Runtime<C>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let probe = rt.create_input(1_i64);
+        let victims = [2, 3, 4].map(|v| rt.create_input(v as i64));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let guard = |victim| TouchOnDrop {
+            rt: RtPtr(rt as *const Runtime<C>),
+            probe,
+            victim,
+            dropped: Arc::clone(&dropped),
+        };
+
+        let g = guard(victims[0]);
+        let q = rt.create_query(move |rt| {
+            let _keep = &g;
+            rt.get(probe)
+        });
+        assert_eq!(rt.get(q), 1);
+        let g = guard(victims[1]);
+        rt.observe(q, move |_| {
+            let _keep = &g;
+        });
+        let g = guard(victims[2]);
+        let watcher = rt.observe(probe, move |_| {
+            let _keep = &g;
+        });
+
+        rt.unobserve(watcher);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        rt.delete_node(q);
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        assert!(victims.iter().all(|&v| !rt.is_alive(v)));
+        assert!(rt.is_alive(probe));
+    }
+
+    #[test]
+    fn local_closures_drop_outside_the_lock() {
+        closures_drop_outside_the_lock(&Runtime::<Local>::new());
+    }
+
+    #[test]
+    fn shared_closures_drop_outside_the_lock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            closures_drop_outside_the_lock(&Runtime::<Shared>::new());
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a closure drop deadlocked or panicked under the runtime lock");
     }
 
     #[test]
