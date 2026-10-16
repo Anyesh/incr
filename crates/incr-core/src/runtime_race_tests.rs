@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::{DeleteOutcome, ParkPoint, Runtime};
+use super::{DeleteError, DeleteOutcome, ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
 use crate::handle::Incr;
@@ -522,6 +522,167 @@ fn concurrent_typed_delete_panics_deleted_twice() {
         .downcast::<String>()
         .unwrap();
     assert!(msg.contains("deleted twice concurrently"), "got: {msg}");
+}
+
+/// The race `try_delete_node` closes: a dependent attaching after a
+/// caller checked for dependents. Checking at entry, as the removed
+/// `has_dependents` let callers do, would pass here and the strict delete
+/// would then panic. The check is part of the claim, so it sees Q.
+#[test]
+fn try_delete_reports_a_dependent_attached_after_its_entry() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let q = rt.create_query(move |rt: &Rt| rt.get(v) + 1);
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::DeleteAfterHandleCheck(id(v)), gate.clone())],
+    );
+
+    let deleter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.try_delete_node(v))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.get(q), 8);
+    gate.release();
+
+    assert_eq!(deleter.join().unwrap(), Err(DeleteError::HasDependents));
+    assert!(rt.is_alive(v));
+    rt.set(v, 9);
+    assert_eq!(rt.get(q), 10);
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn try_delete_claim_leaves_no_edge_for_a_compute_that_follows() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let q = rt.create_query(move |rt: &Rt| rt.get(v) + 1);
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::DeleteAfterCheck(id(v)), gate.clone())],
+    );
+
+    let deleter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.try_delete_node(v))
+    };
+    gate.wait_parked();
+    let read = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+    gate.release();
+
+    assert_eq!(deleter.join().unwrap(), Ok(()));
+    if let Ok(value) = read {
+        assert_eq!(value, 8);
+    }
+    assert_ne!(rt.state_of(q), NodeState::Clean);
+    rt.assert_invariant_i();
+}
+
+/// A router whose groups were created before it ran, all Clean.
+fn grouped(rt: &Rt) -> (Incr<u64>, Vec<Incr<u64>>) {
+    let c: IncrCollection<i64, Shared> = rt.create_collection();
+    c.insert(rt, 3);
+    c.insert(rt, 4);
+    let groups = c.group_by(rt, |x| x % 3);
+    let _ = rt.get(groups.version_node());
+    let versions = groups
+        .keys()
+        .iter()
+        .map(|k| groups.get_group(k).unwrap().version_node())
+        .collect();
+    (groups.version_node(), versions)
+}
+
+/// A strict delete of a router finds one of its groups claimed by a
+/// parked delete of that group. It waits that delete out instead of
+/// claiming around it, then deletes the rest.
+#[test]
+fn strict_delete_of_an_owner_waits_out_a_claimed_owned_node() {
+    let rt = Arc::new(Rt::new());
+    let (router, versions) = grouped(&rt);
+    let group = versions[0];
+    let claimed = Gate::new();
+    let waiter = Gate::new();
+    park_at(
+        &rt,
+        vec![
+            (ParkPoint::DeleteAfterCheck(id(group)), claimed.clone()),
+            (ParkPoint::DeleteWaitsOnClaim(id(group)), waiter.clone()),
+        ],
+    );
+    let group_delete = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.delete_node(group))
+    };
+    claimed.wait_parked();
+
+    let router_delete = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.try_delete_node(router))
+    };
+    waiter.wait_parked();
+    waiter.release();
+    thread::sleep(Duration::from_millis(50));
+    assert!(!router_delete.is_finished());
+    assert!(rt.is_alive(router), "the router was claimed around a group");
+
+    claimed.release();
+    group_delete.join().unwrap();
+    assert_eq!(router_delete.join().unwrap(), Ok(()));
+    assert!(!rt.is_alive(router));
+    assert!(versions.iter().all(|&v| !rt.is_alive(v)));
+    assert_eq!(rt.node_count(), 1, "only the source is left");
+    rt.assert_invariant_i();
+}
+
+/// Another delete claims a group after the router's strict delete checked
+/// it but before it claimed it. The router delete must not release the
+/// router until that delete has unhooked the group from it.
+#[test]
+fn strict_delete_of_an_owner_survives_an_owned_node_claimed_mid_claim() {
+    let rt = Arc::new(Rt::new());
+    let (router, versions) = grouped(&rt);
+    let group = versions[0];
+    let owner_claimed = Gate::new();
+    let group_claimed = Gate::new();
+    park_at(
+        &rt,
+        vec![
+            (
+                ParkPoint::DeleteBeforeOwnedClaims(id(router)),
+                owner_claimed.clone(),
+            ),
+            (
+                ParkPoint::DeleteAfterCheck(id(group)),
+                group_claimed.clone(),
+            ),
+        ],
+    );
+    let router_delete = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.try_delete_node(router))
+    };
+    owner_claimed.wait_parked();
+    let group_delete = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.delete_node(group))
+    };
+    group_claimed.wait_parked();
+    owner_claimed.release();
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !router_delete.is_finished(),
+        "the router delete finished before the group's delete released it"
+    );
+
+    group_claimed.release();
+    group_delete.join().unwrap();
+    assert_eq!(router_delete.join().unwrap(), Ok(()));
+    assert!(versions.iter().all(|&v| !rt.is_alive(v)));
+    rt.assert_invariant_i();
 }
 
 type LocalRt = Runtime<Local>;

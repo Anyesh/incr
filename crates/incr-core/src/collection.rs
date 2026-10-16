@@ -1130,6 +1130,7 @@ where
 mod tests {
     use super::*;
     use crate::cells::{Local, Shared};
+    use crate::runtime::DeleteError;
 
     #[test]
     fn local_collection_basic_insert() {
@@ -1718,6 +1719,36 @@ mod tests {
     #[test]
     fn shared_deleting_router_with_group_consumer_panics() {
         deleting_router_with_group_consumer_panics(&Runtime::<Shared>::new());
+    }
+
+    fn try_delete_of_a_router_is_all_or_nothing<C: Cells>(rt: &Runtime<C>) {
+        let (groups, versions) = grouped_with_late_group(rt);
+        let n = groups.get_group(&2).unwrap().count(rt);
+        assert_eq!(rt.get(n), 1);
+
+        assert_eq!(
+            rt.try_delete_node(groups.version_node()),
+            Err(DeleteError::HasDependents)
+        );
+        assert!(rt.is_alive(groups.version_node()));
+        assert!(versions.iter().all(|&v| rt.is_alive(v)));
+
+        rt.delete_node(n);
+        let before = rt.node_count();
+        assert_eq!(rt.try_delete_node(groups.version_node()), Ok(()));
+        assert!(versions.iter().all(|&v| !rt.is_alive(v)));
+        assert_eq!(rt.node_count(), before - 4);
+        rt.assert_invariant_i();
+    }
+
+    #[test]
+    fn local_try_delete_of_a_router_is_all_or_nothing() {
+        try_delete_of_a_router_is_all_or_nothing(&Runtime::<Local>::new());
+    }
+
+    #[test]
+    fn shared_try_delete_of_a_router_is_all_or_nothing() {
+        try_delete_of_a_router_is_all_or_nothing(&Runtime::<Shared>::new());
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! AcqRel, overflow-dep reclamation).
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use crate::arena_registry::ArenaRegistry;
@@ -112,13 +113,17 @@ pub(crate) enum ParkPoint {
     /// In `set`, after the dirty walk and before the revision is recorded
     /// as walked.
     SetAfterWalk,
-    /// In `delete_erased`, after the dependents check and the `Dead` claim.
+    /// In a delete, after the dependents check and the `Dead` claim, with
+    /// no guard held.
     DeleteAfterCheck(NodeId),
-    /// In `delete_erased`, on finding the node claimed `Dead` by another
-    /// delete that has not bumped its generation yet.
+    /// In a delete, on finding the node claimed `Dead` by another delete
+    /// that has not bumped its generation yet.
     DeleteWaitsOnClaim(NodeId),
-    /// In `delete_node`, after the handle check and before any read hold.
+    /// In a strict delete, after the handle check and before any read hold.
     DeleteAfterHandleCheck(NodeId),
+    /// In a strict delete of an owner, under the read hold, after the
+    /// owner's `Dead` claim and before the claims of the nodes it owns.
+    DeleteBeforeOwnedClaims(NodeId),
 }
 
 /// What [`Runtime::delete_erased`] did with a node.
@@ -130,6 +135,55 @@ pub(crate) enum DeleteOutcome {
     AlreadyGone,
     /// The node has a dependent. Nothing changed.
     HasDependents,
+}
+
+/// Why [`Runtime::try_delete_node`] deleted nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeleteError {
+    /// The node, or a node it owns, has a dependent: a query that
+    /// computed against it. Delete the dependents first, or use
+    /// [`Runtime::delete_with_dependents`].
+    HasDependents,
+    /// The handle names no live node of this runtime: the node was
+    /// deleted, possibly by a concurrent delete, or the handle comes from
+    /// another runtime. These are the handles [`Runtime::is_alive`]
+    /// reports false for.
+    NotAlive,
+}
+
+impl fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            DeleteError::HasDependents => "the node or a node it owns still has dependents",
+            DeleteError::NotAlive => "the handle names no live node of this runtime",
+        })
+    }
+}
+
+impl std::error::Error for DeleteError {}
+
+/// Why a strict delete refused. Nothing changed.
+enum StrictRefusal {
+    /// The node was already deleted, or a concurrent delete finished it.
+    Gone,
+    /// The node at this slot, the root or one it owns, has a dependent.
+    HasDependents(u32),
+}
+
+/// One attempt of a strict delete to claim its whole ownership tree under
+/// a single read hold.
+enum TreeClaim {
+    /// The root and every owned node are `Dead` and claimed. `owned` are
+    /// this delete's claims, owners before the nodes they own; `foreign`
+    /// were claimed by another delete after this one checked them.
+    Claimed {
+        owned: Vec<ErasedIncr>,
+        foreign: Vec<ErasedIncr>,
+    },
+    /// The root's state moved between its load and the claim.
+    Retry,
+    /// This owned node is claimed by another delete; wait it out first.
+    WaitFor(ErasedIncr),
 }
 
 /// Records `rev` as walked when dropped. A drop guard rather than a call
@@ -457,34 +511,50 @@ impl<C: Cells> Runtime<C> {
     /// surviving copy of the handle panics with a stale-handle message
     /// on use; the slot and its arena storage are reused by future
     /// create calls under a bumped generation.
+    ///
+    /// Panics where [`Runtime::try_delete_node`] returns an error, and on
+    /// a handle that is stale or from another runtime.
     pub fn delete_node<T: Value>(&self, handle: Incr<T>) {
         self.check_handle(handle);
         let root = handle.erase();
-        self.assert_not_own_compute(NodeId(root.slot()));
-        self.park(ParkPoint::DeleteAfterHandleCheck(NodeId(root.slot())));
-        let owned = match self.owned_for_strict_delete(root) {
-            Ok(owned) => owned,
-            Err(slot) if slot == root.slot() => Self::panic_has_dependents(root.slot()),
-            Err(child) => panic!(
+        match self.delete_strict(root) {
+            Ok(()) => {}
+            // check_handle passed, so a concurrent delete got there first.
+            Err(StrictRefusal::Gone) => {
+                panic!("incr-core: node {} deleted twice concurrently", root.slot())
+            }
+            Err(StrictRefusal::HasDependents(slot)) if slot == root.slot() => {
+                Self::panic_has_dependents(root.slot())
+            }
+            Err(StrictRefusal::HasDependents(child)) => panic!(
                 "incr-core: delete_node on node {} whose owned node {} still has \
                  dependents; delete downstream nodes first",
                 root.slot(),
                 child,
             ),
-        };
-        for child in owned {
-            if self.delete_erased(child) == DeleteOutcome::HasDependents {
-                Self::panic_has_dependents(child.slot());
-            }
         }
-        match self.delete_erased(root) {
-            DeleteOutcome::Deleted => {}
-            // check_handle passed, so a concurrent delete got there first.
-            DeleteOutcome::AlreadyGone => {
-                panic!("incr-core: node {} deleted twice concurrently", root.slot())
-            }
-            DeleteOutcome::HasDependents => Self::panic_has_dependents(root.slot()),
+    }
+
+    /// Delete a node and every node it owns, like
+    /// [`Runtime::delete_node`], or report why not and change nothing.
+    ///
+    /// The dependents checks and the claims of all those nodes happen
+    /// under one lock hold, so under `Shared` a query that computes
+    /// against the node concurrently either lands before the check, and
+    /// this returns [`DeleteError::HasDependents`] with the node intact,
+    /// or after the claim, and finds the node deleted. A query that was
+    /// created but never ran has no edge yet and does not count.
+    ///
+    /// Panics if called from inside the node's own compute.
+    pub fn try_delete_node(&self, handle: impl Into<ErasedIncr>) -> Result<(), DeleteError> {
+        let root = handle.into();
+        if root.runtime_id() != self.runtime_id {
+            return Err(DeleteError::NotAlive);
         }
+        self.delete_strict(root).map_err(|refusal| match refusal {
+            StrictRefusal::Gone => DeleteError::NotAlive,
+            StrictRefusal::HasDependents(_) => DeleteError::HasDependents,
+        })
     }
 
     fn panic_has_dependents(slot: u32) -> ! {
@@ -503,34 +573,128 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
-    /// Everything `root` owns, transitively, ordered so each node comes
-    /// before its owner. `Err(slot)` names the first node found, `root`
-    /// included, that has a dependent. Checking everything up front
-    /// means a strict delete that panics has released nothing, unless a
-    /// dependent attaches concurrently after this check. Empty when
-    /// `root` is already gone, so `delete_erased` reports that.
-    fn owned_for_strict_delete(&self, root: ErasedIncr) -> Result<Vec<ErasedIncr>, u32> {
-        let inner = self.inner.read();
-        // Rechecked under the hold: the handle check ran before it, and
-        // the slot may since hold a new node with dependents of its own.
-        if self.nodes.get(root.slot()).generation() != root.generation() {
-            return Ok(Vec::new());
+    /// The strict delete behind `delete_node` and `try_delete_node`:
+    /// `root` and everything it owns, transitively, or nothing.
+    ///
+    /// The whole tree is checked for dependents and claimed `Dead` under
+    /// one read hold, the root first. Owned nodes are inputs (see
+    /// [`Runtime::adopt`]), whose state only ever moves to `Dead`, so once
+    /// the root's claim succeeds no owned claim can fail, except to
+    /// another delete claiming that node concurrently. Such a node is
+    /// waited out before the root is released, so the root's owned list
+    /// is empty by then.
+    fn delete_strict(&self, root: ErasedIncr) -> Result<(), StrictRefusal> {
+        debug_assert_eq!(root.runtime_id(), self.runtime_id);
+        let id = NodeId(root.slot());
+        let node = self.nodes.get(root.slot());
+        if node.generation() != root.generation() {
+            return Err(StrictRefusal::Gone);
         }
-        let mut out = Vec::new();
+        self.assert_not_own_compute(id);
+        self.park(ParkPoint::DeleteAfterHandleCheck(id));
+
+        let mut spins: u32 = 0;
+        let (owned, foreign) = loop {
+            let cur = state::load::<C>(node.state_cell());
+            if node.generation() != root.generation() {
+                return Err(StrictRefusal::Gone);
+            }
+            match cur {
+                NodeState::Computing | NodeState::ComputingDirty => {
+                    spins += 1;
+                    C::backoff(spins);
+                    continue;
+                }
+                NodeState::Dead => {
+                    self.wait_out_claim(root, &mut spins);
+                    return Err(StrictRefusal::Gone);
+                }
+                _ => {}
+            }
+            match self.claim_tree(root, cur)? {
+                TreeClaim::Claimed { owned, foreign } => break (owned, foreign),
+                TreeClaim::Retry => {}
+                TreeClaim::WaitFor(child) => self.wait_out_claim(child, &mut spins),
+            }
+        };
+        self.park(ParkPoint::DeleteAfterCheck(id));
+        for child in foreign {
+            self.wait_out_claim(child, &mut spins);
+        }
+        for child in owned.into_iter().rev() {
+            self.release_claimed(child);
+        }
+        self.release_claimed(root);
+        Ok(())
+    }
+
+    /// One claim attempt of [`Runtime::delete_strict`], with the root's
+    /// state last loaded as `cur`.
+    fn claim_tree(&self, root: ErasedIncr, cur: NodeState) -> Result<TreeClaim, StrictRefusal> {
+        let inner = self.inner.read();
+        // Rechecked under the hold: a delete and recycle since the load of
+        // `cur` would otherwise let the CAS claim the slot's next occupant.
+        if self.nodes.get(root.slot()).generation() != root.generation() {
+            return Err(StrictRefusal::Gone);
+        }
+        let mut owned = Vec::new();
         let mut stack = vec![root.slot()];
         while let Some(slot) = stack.pop() {
             if !inner.dependents[slot as usize].is_empty() {
-                return Err(slot);
+                return Err(StrictRefusal::HasDependents(slot));
             }
             if slot != root.slot() {
-                out.push(self.erased_at(slot));
+                let child = self.erased_at(slot);
+                if self.nodes.get(slot).state() == NodeState::Dead {
+                    return Ok(TreeClaim::WaitFor(child));
+                }
+                owned.push(child);
             }
             if let Some(children) = inner.owned.get(&slot) {
                 stack.extend(children.iter().map(|c| c.0));
             }
         }
-        out.reverse();
-        Ok(out)
+        let root_node = self.nodes.get(root.slot());
+        if state::try_transition::<C>(root_node.state_cell(), cur, NodeState::Dead).is_err() {
+            return Ok(TreeClaim::Retry);
+        }
+        self.park(ParkPoint::DeleteBeforeOwnedClaims(NodeId(root.slot())));
+        let mut claimed = Vec::with_capacity(owned.len());
+        let mut foreign = Vec::new();
+        for child in owned {
+            let cell = self.nodes.get(child.slot()).state_cell();
+            loop {
+                let s = state::load::<C>(cell);
+                if s == NodeState::Dead {
+                    foreign.push(child);
+                    break;
+                }
+                debug_assert!(
+                    !matches!(s, NodeState::Computing | NodeState::ComputingDirty),
+                    "incr-core: owned node {} is computing; owned nodes must be inputs",
+                    child.slot(),
+                );
+                if state::try_transition::<C>(cell, s, NodeState::Dead).is_ok() {
+                    claimed.push(child);
+                    break;
+                }
+            }
+        }
+        Ok(TreeClaim::Claimed {
+            owned: claimed,
+            foreign,
+        })
+    }
+
+    /// Waits, with no guard held, until the delete that claimed `handle`'s
+    /// node `Dead` has bumped its generation under the write lock.
+    fn wait_out_claim(&self, handle: ErasedIncr, spins: &mut u32) {
+        self.park(ParkPoint::DeleteWaitsOnClaim(NodeId(handle.slot())));
+        let node = self.nodes.get(handle.slot());
+        while node.generation() == handle.generation() {
+            *spins += 1;
+            C::backoff(*spins);
+        }
     }
 
     /// The handle of the node currently at `slot`. Only meaningful under
@@ -610,7 +774,9 @@ impl<C: Cells> Runtime<C> {
     /// Record `child` as owned by `owner`: it is deleted with the owner,
     /// by strict delete and by the cascade. Both must be live, and the
     /// owner must not depend on the child, or the cascade would walk the
-    /// cycle forever.
+    /// cycle forever. The child must be an input, because a strict delete
+    /// claims owned nodes after their owner and relies on an input's
+    /// state never moving except to `Dead`.
     pub(crate) fn adopt(&self, owner: ErasedIncr, child: ErasedIncr) {
         let mut inner = self.inner.write();
         for h in [owner, child] {
@@ -620,6 +786,11 @@ impl<C: Cells> Runtime<C> {
                 h.slot()
             );
         }
+        assert!(
+            inner.compute_fns[child.slot() as usize].is_none(),
+            "incr-core: adopt of node {}, which is not an input",
+            child.slot()
+        );
         let previous = inner.owner_of.insert(child.slot(), NodeId(owner.slot()));
         assert!(
             previous.is_none(),
@@ -688,11 +859,7 @@ impl<C: Cells> Runtime<C> {
                     // generation under its next write lock. Returning now
                     // would let a cascade re-find this slot in its
                     // parent's dependents and spin on it instead.
-                    self.park(ParkPoint::DeleteWaitsOnClaim(id));
-                    while node.generation() == handle.generation() {
-                        spins += 1;
-                        C::backoff(spins);
-                    }
+                    self.wait_out_claim(handle, &mut spins);
                     return DeleteOutcome::AlreadyGone;
                 }
                 _ => {
@@ -723,9 +890,16 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
+        self.release_claimed(handle);
+        DeleteOutcome::Deleted
+    }
 
-        // We own the Dead node now. Capture deps before clearing them,
-        // then unhook reverse edges and recycle storage.
+    /// Unhooks and recycles a node this thread claimed `Dead`. The node
+    /// must own nothing by now: its owned nodes are released first.
+    fn release_claimed(&self, handle: ErasedIncr) {
+        let slot = handle.slot();
+        let id = NodeId(slot);
+        let node = self.nodes.get(slot);
         let mut old_deps: Vec<NodeId> = Vec::new();
         node.for_each_dep(|d| old_deps.push(d));
         let arena_slot = node.arena_slot();
@@ -733,6 +907,11 @@ impl<C: Cells> Runtime<C> {
         node.retire_for_delete();
 
         let mut inner = self.inner.write();
+        debug_assert!(
+            !inner.owned.contains_key(&slot),
+            "incr-core: released node {} still owns nodes",
+            slot,
+        );
         for d in &old_deps {
             inner.dependents[d.0 as usize].retain(|&x| x != id);
         }
@@ -764,7 +943,6 @@ impl<C: Cells> Runtime<C> {
         drop(compute);
         drop(observers);
         arena.release(arena_slot);
-        DeleteOutcome::Deleted
     }
 
     /// Read the current value of a node. Triggers recomputation of the
@@ -2312,6 +2490,81 @@ mod tests {
         assert_eq!(rt.delete_erased(q.erase()), DeleteOutcome::AlreadyGone);
         assert_eq!(rt.delete_erased(input.erase()), DeleteOutcome::Deleted);
         assert_eq!(rt.node_count(), 0);
+    }
+
+    fn try_delete_removes_nodes_without_dependents<C: Cells>(rt: &Runtime<C>) {
+        let input = rt.create_input(5_i64);
+        let q = rt.create_query(move |rt| rt.get(input) * 2);
+        assert_eq!(rt.get(q), 10);
+
+        assert_eq!(rt.try_delete_node(q), Ok(()));
+        assert!(!rt.is_alive(q));
+        assert_eq!(rt.try_delete_node(input.erase()), Ok(()));
+        assert_eq!(rt.node_count(), 0);
+        assert_eq!(rt.try_delete_node(input), Err(DeleteError::NotAlive));
+    }
+
+    #[test]
+    fn local_try_delete_removes_nodes_without_dependents() {
+        try_delete_removes_nodes_without_dependents(&Runtime::<Local>::new());
+    }
+
+    #[test]
+    fn shared_try_delete_removes_nodes_without_dependents() {
+        try_delete_removes_nodes_without_dependents(&Runtime::<Shared>::new());
+    }
+
+    fn try_delete_with_dependents_keeps_the_node<C: Cells>(rt: &Runtime<C>) {
+        let input = rt.create_input(5_i64);
+        let _never_ran = rt.create_query(move |rt| rt.get(input) * 2);
+        assert_eq!(
+            rt.try_delete_node(input),
+            Ok(()),
+            "a query that never ran has no edge"
+        );
+
+        let input = rt.create_input(5_i64);
+        let q2 = rt.create_query(move |rt| rt.get(input) * 2);
+        assert_eq!(rt.get(q2), 10);
+        assert_eq!(rt.try_delete_node(input), Err(DeleteError::HasDependents));
+        assert!(rt.is_alive(input));
+        rt.set(input, 6);
+        assert_eq!(rt.get(q2), 12);
+        rt.assert_invariant_i();
+    }
+
+    #[test]
+    fn local_try_delete_with_dependents_keeps_the_node() {
+        try_delete_with_dependents_keeps_the_node(&Runtime::<Local>::new());
+    }
+
+    #[test]
+    fn shared_try_delete_with_dependents_keeps_the_node() {
+        try_delete_with_dependents_keeps_the_node(&Runtime::<Shared>::new());
+    }
+
+    fn try_delete_of_a_dead_handle_is_not_alive<C: Cells>(rt: &Runtime<C>, other: &Runtime<C>) {
+        let a = rt.create_input(1_i64);
+        rt.delete_node(a);
+        let b = rt.create_input(2_i64);
+        assert_eq!(b.slot(), a.slot());
+        assert_eq!(rt.try_delete_node(a), Err(DeleteError::NotAlive));
+        assert!(rt.is_alive(b), "a stale handle deleted the recycled node");
+
+        let foreign = other.create_input(3_i64);
+        assert_eq!(foreign.slot(), b.slot());
+        assert_eq!(rt.try_delete_node(foreign), Err(DeleteError::NotAlive));
+        assert!(rt.is_alive(b) && other.is_alive(foreign));
+    }
+
+    #[test]
+    fn local_try_delete_of_a_dead_handle_is_not_alive() {
+        try_delete_of_a_dead_handle_is_not_alive(&Runtime::<Local>::new(), &Runtime::new());
+    }
+
+    #[test]
+    fn shared_try_delete_of_a_dead_handle_is_not_alive() {
+        try_delete_of_a_dead_handle_is_not_alive(&Runtime::<Shared>::new(), &Runtime::new());
     }
 
     #[test]
