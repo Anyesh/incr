@@ -1,4 +1,4 @@
-use crate::Position;
+use crate::{Kind, Position};
 
 /// Shorthand for results whose error is this crate's [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -51,4 +51,30 @@ pub enum Error {
     /// A failure from a backend implemented outside this crate.
     #[error("backend failure")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+
+    /// A store write failed after its records reached the log, so the store
+    /// can no longer tell which of them it has applied. Every later call
+    /// fails with this until the log is opened again, which replays it.
+    #[error("store is poisoned by a failure after a write reached the log; reopen it")]
+    Poisoned,
+
+    /// A key holds a value of a different type than the one requested: its
+    /// logged bytes do not decode as that type, or this store already bound
+    /// the key with another type. `postcard` is not self-describing, so a
+    /// mismatch whose bytes happen to decode goes undetected.
+    #[error("key {key:?} holds a value of a different type than requested")]
+    TypeMismatch {
+        key: String,
+        #[source]
+        source: Option<postcard::Error>,
+    },
+
+    /// A key was requested as one kind (input or collection) but the log
+    /// declares it as the other.
+    #[error("key {key:?} is declared as a {declared:?}")]
+    KindMismatch { key: String, declared: Kind },
+
+    /// A handle passed to a store was not issued by that store.
+    #[error("handle was not issued by this store")]
+    UnknownHandle,
 }

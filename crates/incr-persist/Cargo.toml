@@ -13,6 +13,7 @@ backend-tests = []
 sqlite = ["dep:rusqlite"]
 
 [dependencies]
+incr-core.workspace = true
 serde = { version = "1.0.229", features = ["derive"] }
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 thiserror = "2.0.21"
