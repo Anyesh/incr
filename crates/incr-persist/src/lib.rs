@@ -16,8 +16,12 @@ pub mod conformance;
 mod error;
 mod memory;
 mod record;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 pub use backend::{Backend, Position, ReadOutcome};
 pub use error::{Error, Result};
 pub use memory::MemoryBackend;
 pub use record::{Kind, Record};
+#[cfg(feature = "sqlite")]
+pub use sqlite::{SqliteBackend, SqliteDurability, SqliteOptions};
