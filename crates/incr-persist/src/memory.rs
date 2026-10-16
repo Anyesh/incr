@@ -22,6 +22,20 @@ struct Log {
     records: Vec<(Position, Record)>,
 }
 
+impl Log {
+    /// The index in `records` of the first record after `after`. Appends
+    /// take the positions right after the tail and compaction drops only a
+    /// prefix, so the positions held are contiguous and the index follows
+    /// from the first one, without a search.
+    fn index_after(&self, after: Position) -> usize {
+        let Some((first, _)) = self.records.first() else {
+            return 0;
+        };
+        let index = (after.0 + 1).saturating_sub(first.0);
+        index.min(self.records.len() as u64) as usize
+    }
+}
+
 impl MemoryBackend {
     /// Creates an empty log and a writable handle on it.
     pub fn new() -> Self {
@@ -85,7 +99,7 @@ impl Backend for MemoryBackend {
                 return Ok(ReadOutcome::Compacted { snapshot_at });
             }
         }
-        let start = log.records.partition_point(|(at, _)| *at <= after);
+        let start = log.index_after(after);
         out.extend_from_slice(&log.records[start..]);
         Ok(ReadOutcome::Records)
     }
@@ -105,7 +119,7 @@ impl Backend for MemoryBackend {
                 tail: log.tail,
             });
         }
-        let keep_from = log.records.partition_point(|(at, _)| *at <= upto);
+        let keep_from = log.index_after(upto);
         log.records.drain(..keep_from);
         log.snapshot = Some((upto, folded));
         Ok(())
