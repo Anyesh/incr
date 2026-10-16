@@ -524,10 +524,9 @@ fn concurrent_typed_delete_panics_deleted_twice() {
     assert!(msg.contains("deleted twice concurrently"), "got: {msg}");
 }
 
-/// The race `try_delete_node` closes: a dependent attaching after a
-/// caller checked for dependents. Checking at entry, as the removed
-/// `has_dependents` let callers do, would pass here and the strict delete
-/// would then panic. The check is part of the claim, so it sees Q.
+/// Q attaches while the delete is parked at its entry. A dependents check
+/// made there, before a strict delete, would pass and the delete would
+/// then panic; `try_delete_node` checks as part of its claim, so it sees Q.
 #[test]
 fn try_delete_reports_a_dependent_attached_after_its_entry() {
     let rt = Arc::new(Rt::new());
