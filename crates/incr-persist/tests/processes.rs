@@ -87,7 +87,7 @@ mod sqlite {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use incr_persist::SqliteBackend;
+    use incr_persist::{SqliteBackend, SqliteDurability, SqliteOptions};
 
     use super::*;
 
@@ -175,6 +175,122 @@ mod sqlite {
             mine,
             "a fresh open agrees with both processes"
         );
+    }
+
+    const CONTENDERS: usize = 3;
+    const CONTENTION_WINDOW: Duration = Duration::from_secs(4);
+
+    // Shorter than the default so that a writer shut out of the lock fails
+    // inside the window instead of after it.
+    const CONTENTION_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// Opens the log, runs `wait_for_start`, then appends in a tight loop
+    /// for the window. Returns the appends that succeeded, the ones that
+    /// failed, and the first failure.
+    fn contend(path: &Path, wait_for_start: impl FnOnce()) -> (u64, u64, String) {
+        let backend = SqliteBackend::open_with(
+            path,
+            SqliteOptions {
+                durability: SqliteDurability::Full,
+                busy_timeout: CONTENTION_BUSY_TIMEOUT,
+                ..SqliteOptions::default()
+            },
+        )
+        .unwrap();
+        let record = Record::Set {
+            key: "contended".into(),
+            value: vec![0; 16],
+        };
+        wait_for_start();
+        let start = Instant::now();
+        let (mut appended, mut failed, mut first_error) = (0, 0, String::new());
+        while start.elapsed() < CONTENTION_WINDOW {
+            match backend.append(std::slice::from_ref(&record)) {
+                Ok(_) => appended += 1,
+                Err(e) => {
+                    if failed == 0 {
+                        first_error = format!("{e:?}");
+                    }
+                    failed += 1;
+                }
+            }
+        }
+        (appended, failed, first_error)
+    }
+
+    /// Writers appending back to back under `synchronous=FULL` each leave
+    /// the lock free for microseconds between commits that take
+    /// milliseconds, so a writer that only retries on a timer keeps finding
+    /// it held. Every writer must still get a fair share of turns.
+    #[test]
+    fn sqlite_writer_processes_appending_continuously_all_progress() {
+        if let Some(role) = child_role() {
+            if role == "sqlite-contender" {
+                let path = child_dir().join("log.sqlite");
+                let (appended, failed, first_error) = contend(&path, || {
+                    say("ready");
+                    let mut go = String::new();
+                    std::io::stdin().read_line(&mut go).unwrap();
+                });
+                say(&format!("{appended} {failed} {first_error}"));
+            }
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.sqlite");
+        SqliteBackend::open(&path).unwrap();
+        let mut peers: Vec<Peer> = (0..CONTENDERS)
+            .map(|_| {
+                Peer::spawn(
+                    "sqlite::sqlite_writer_processes_appending_continuously_all_progress",
+                    "sqlite-contender",
+                    dir.path(),
+                )
+            })
+            .collect();
+        for peer in &mut peers {
+            assert_eq!(peer.expect(), "ready");
+        }
+        for peer in &mut peers {
+            peer.send("go");
+        }
+        let reports: Vec<(u64, u64, String)> = peers
+            .iter_mut()
+            .map(|peer| {
+                let report = peer.expect();
+                let mut fields = report.splitn(3, ' ');
+                let appended = fields.next().unwrap().parse().unwrap();
+                let failed = fields.next().unwrap().parse().unwrap();
+                (appended, failed, fields.next().unwrap_or("").to_owned())
+            })
+            .collect();
+        for peer in peers {
+            peer.finish();
+        }
+
+        let total: u64 = reports.iter().map(|(appended, ..)| appended).sum();
+        let counts: Vec<_> = reports
+            .iter()
+            .map(|(appended, failed, _)| (appended, failed))
+            .collect();
+        for (appended, failed, first_error) in &reports {
+            assert_eq!(
+                *failed, 0,
+                "a writer failed {failed} appends ({first_error}); \
+                 (appended, failed) per writer: {counts:?}"
+            );
+            assert!(
+                *appended * 4 * CONTENDERS as u64 >= total,
+                "a writer got under a quarter of an even share; \
+                 (appended, failed) per writer: {counts:?}"
+            );
+        }
+        let mut out = Vec::new();
+        SqliteBackend::open_read_only(&path)
+            .unwrap()
+            .read_from(Position::ZERO, &mut out)
+            .unwrap();
+        assert_eq!(out.len() as u64, total);
     }
 }
 
