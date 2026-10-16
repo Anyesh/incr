@@ -141,6 +141,7 @@ Loom model checking is not wired up because the value slots and dep lists build 
 
 - [`examples/concurrent-server/`](examples/concurrent-server/) — multi-threaded HTTP server (Rust) where one writer thread feeds live market data into the graph while many HTTP handler threads read derived portfolio values concurrently without blocking.
 - [`examples/spreadsheet/`](examples/spreadsheet/) — live spreadsheet engine driving formula cells through the incremental graph with WebSocket sync.
+- [`examples/persist-config/`](examples/persist-config/): a pricing config and an order log kept in an incr-persist file log, with a revenue query over both and a test that kills the writer with SIGKILL mid-write and checks every acknowledged write survives the restart.
 
 A Python `travel-premium` demo and a `dashboard` demo with real per-node tracing live on the v0.1 line; porting them to v0.2 is open.
 
