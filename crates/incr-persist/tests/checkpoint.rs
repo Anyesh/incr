@@ -347,6 +347,55 @@ fn a_key_deleted_back_to_its_default_is_forgotten_and_can_be_declared_afresh() {
     );
 }
 
+/// The values of `k`, `s` and `u`, declared with a default no store uses
+/// elsewhere, so a store that missed a live `Declare` would show it.
+fn kus<C: Cells, B: Backend>(store: &Store<C, B>) -> [u32; 3] {
+    ["k", "s", "u"].map(|key| {
+        let input = store.input(key, 99u32).unwrap();
+        store.runtime().get(input.handle())
+    })
+}
+
+/// A store already at the position another writer compacts to reads
+/// nothing of the compaction, yet when a forgotten key is declared afresh
+/// it must adopt the new `Declare`, as a restart replaying the snapshot
+/// does, rather than keep the old one the snapshot dropped.
+#[test]
+fn a_store_at_the_compacted_position_adopts_a_fresh_declare_of_a_key_forgotten_there() {
+    let log = MemoryBackend::new();
+    let a = open::<Local, _>(log.clone());
+    let k = a.input("k", 1u32).unwrap();
+    let s = a.input("s", 1u32).unwrap();
+    a.set(s, 1).unwrap();
+    let b = open::<Local, _>(log.clone());
+    b.input("u", 1u32).unwrap();
+    let applied = a.refresh().unwrap();
+    assert_eq!(a.restored_keys("").unwrap(), ["u"]);
+    assert_eq!(b.checkpoint().unwrap(), applied);
+    let (_, snapshot) = snapshot_by_key(&log);
+    assert!(snapshot.is_empty(), "every key was at its default");
+
+    let c = open::<Local, _>(log.clone());
+    for key in ["k", "s", "u"] {
+        c.input(key, 5u32).unwrap();
+    }
+    a.refresh().unwrap();
+    assert_eq!(kus(&a), [5; 3], "the store at the compacted position");
+    assert_eq!(kus(&b), [5; 3], "the store that compacted");
+    assert_eq!(kus(&c), [5; 3], "the store that declared afresh");
+    assert_eq!(kus(&open::<Local, _>(log.clone())), [5; 3], "a restart");
+
+    a.delete(k).unwrap();
+    a.set(s, 8).unwrap();
+    c.delete("s").unwrap();
+    let expected = [5, 5, 5];
+    for store in [&a, &b, &c] {
+        store.refresh().unwrap();
+        assert_eq!(kus(store), expected);
+    }
+    assert_eq!(kus(&open::<Local, _>(log)), expected);
+}
+
 /// Runs `race` inside the next `compact`, before forwarding it, the way
 /// another writer compacting between this store's catch-up and its
 /// compaction would.

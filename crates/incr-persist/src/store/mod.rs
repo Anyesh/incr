@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result};
 
 use binding::{decode, encode, Binding, InputBinding};
-use logged::{changes_between, fold, is_element_change, Declared, LoggedKeys};
+use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
 pub use collection::PersistedCollection;
 
@@ -812,7 +812,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 
     /// Applies `record`, the log's record at `position`, and reports it to
-    /// subscribers as coming from `origin`.
+    /// subscribers as coming from `origin`. A record at or below
+    /// `state.applied` is skipped: settling a `Declare` can cross a
+    /// compaction that folded it and the records read after it.
     fn apply_at(
         &self,
         state: &mut State<C>,
@@ -820,6 +822,16 @@ impl<C: Cells, B: Backend> Store<C, B> {
         record: Record,
         origin: Origin,
     ) -> Result<()> {
+        if position > state.applied {
+            if let Record::Declare { key, .. } = &record {
+                if state.logged.get(key).is_some_and(|k| k.declared.is_some()) {
+                    self.settle_redeclare(state, key)?;
+                }
+            }
+        }
+        if position <= state.applied {
+            return Ok(());
+        }
         // Cloned only for subscribers, because applying moves the record's
         // bytes into the folded log.
         let notice = (!state.subscribers.is_empty()).then(|| record.clone());
@@ -830,6 +842,71 @@ impl<C: Cells, B: Backend> Store<C, B> {
             state.notify(position, &record, origin);
         }
         Ok(())
+    }
+
+    /// Brings `key` to the state a restart reaches at `state.applied`,
+    /// before a `Declare` for it applies while this store holds a live one.
+    ///
+    /// That `Declare` either lost a race with the live one, and changes
+    /// nothing, or follows a compaction that forgot the key. A store
+    /// already at the compacted position reads nothing of such a
+    /// compaction, so it still holds the forgotten `Declare` (and possibly
+    /// a `Set` of the old default) and would reject the fresh one that
+    /// every other process adopts. The event is rare, so this rebuilds the
+    /// key from the backend's snapshot and the records after it. A snapshot
+    /// beyond `state.applied` is crossed whole instead, as `catch_up`
+    /// would, which may cover the `Declare` itself.
+    fn settle_redeclare(&self, state: &mut State<C>, key: &str) -> Result<()> {
+        loop {
+            let Some((at, snapshot)) = self.backend.load_snapshot()? else {
+                return Ok(());
+            };
+            if at > state.applied {
+                return self.replace_with(state, at, snapshot);
+            }
+            let mut later = Vec::new();
+            if let ReadOutcome::Compacted { .. } = self.backend.read_from(at, &mut later)? {
+                continue;
+            }
+            // A compaction at the same position between the two loads
+            // would pair this read with a snapshot that may have forgotten
+            // more, so the pair is only trusted when the snapshot held.
+            let held = self
+                .backend
+                .load_snapshot()?
+                .is_some_and(|(now_at, now)| now_at == at && now == snapshot);
+            if !held {
+                continue;
+            }
+            let applied = state.applied;
+            if at < applied && later.last().is_none_or(|(last, _)| *last < applied) {
+                return Err(Error::Corrupt(
+                    "backend read stopped short of a position already applied",
+                ));
+            }
+            let read = later
+                .into_iter()
+                .take_while(|(position, _)| *position <= applied)
+                .map(|(_, record)| record);
+            let mut restarted = LoggedKeys::new();
+            for record in snapshot.into_iter().chain(read) {
+                if record.key() == key {
+                    fold(&mut restarted, record);
+                }
+            }
+            let mut restarted = restarted.remove(key);
+            let mut changes = Vec::new();
+            let sink = (!state.subscribers.is_empty()).then_some(&mut changes);
+            self.replace_key(state, key, restarted.as_mut(), sink)?;
+            match restarted {
+                Some(logged) => state.logged.insert(key.to_owned(), logged),
+                None => state.logged.remove(key),
+            };
+            for record in &changes {
+                state.notify(applied, record, Origin::Snapshot);
+            }
+            return Ok(());
+        }
     }
 
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
@@ -882,25 +959,10 @@ impl<C: Cells, B: Backend> Store<C, B> {
         };
         let mut changes = Vec::new();
         for key in &keys {
-            let id = state.bound.get(key).copied();
-            if notify {
-                let bound_collection =
-                    id.is_some_and(|id| state.bindings[&id].kind() == Kind::Collection);
-                changes_between(
-                    key,
-                    state.logged.get(key),
-                    logged.get(key),
-                    !bound_collection,
-                    &mut changes,
-                );
-            }
-            if let Some(id) = id {
-                let binding = bound_binding(&mut state.bindings, id);
-                let sink = notify.then_some(&mut changes);
-                if let Err(e) = binding.replace(&self.runtime, logged.get_mut(key), sink) {
-                    state.poisoned = true;
-                    return Err(e);
-                }
+            let sink = notify.then_some(&mut changes);
+            if let Err(e) = self.replace_key(state, key, logged.get_mut(key), sink) {
+                state.poisoned = true;
+                return Err(e);
             }
         }
         state.logged = logged;
@@ -908,6 +970,35 @@ impl<C: Cells, B: Backend> Store<C, B> {
         state.since_checkpoint = 0;
         for record in &changes {
             state.notify(at, record, Origin::Snapshot);
+        }
+        Ok(())
+    }
+
+    /// Moves `key`'s bound node, if any, from the key's folded state to
+    /// `new`, pushing onto `changes`, when given, the records that take a
+    /// subscriber there. The caller stores `new` as the folded state after.
+    /// A failing binding has changed nothing.
+    fn replace_key(
+        &self,
+        state: &mut State<C>,
+        key: &str,
+        new: Option<&mut LoggedKey>,
+        mut changes: Option<&mut Vec<Record>>,
+    ) -> Result<()> {
+        let id = state.bound.get(key).copied();
+        if let Some(changes) = changes.as_deref_mut() {
+            let bound_collection =
+                id.is_some_and(|id| state.bindings[&id].kind() == Kind::Collection);
+            changes_between(
+                key,
+                state.logged.get(key),
+                new.as_deref(),
+                !bound_collection,
+                changes,
+            );
+        }
+        if let Some(id) = id {
+            bound_binding(&mut state.bindings, id).replace(&self.runtime, new, changes)?;
         }
         Ok(())
     }
