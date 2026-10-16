@@ -106,6 +106,13 @@ impl<C: Cells> ArenaRegistry<C> {
         downcast_arc::<T, C>(self.by_tag[tag as usize].clone())
     }
 
+    /// The arena behind `tag` if it holds `T`, `None` otherwise. Hot
+    /// paths use this with the tag the node already stores, because
+    /// hashing `TypeId` on every read cost more than the read itself.
+    pub fn tagged_arena<T: Value>(&self, tag: u16) -> Option<Arc<GenericArena<T, C>>> {
+        downcast_arc::<T, C>(self.by_tag.get(tag as usize)?.clone())
+    }
+
     /// The arena behind `tag`. Panics on a tag this registry never
     /// handed out.
     pub fn erased(&self, tag: u16) -> &Arc<dyn ErasedArena<C>> {
@@ -185,6 +192,17 @@ mod tests {
         r.erased(t_u64).release(s);
         assert_eq!(a.reserve_with(9), s, "erased release must free the slot");
         assert_eq!(a.read(s), 9);
+    }
+
+    #[test]
+    fn tagged_arena_checks_the_type_behind_the_tag() {
+        let mut r: ArenaRegistry<Shared> = ArenaRegistry::new();
+        let (t_u64, a) = r.ensure_tagged::<u64>();
+        let (t_str, _) = r.ensure_tagged::<String>();
+        let s = a.reserve_with(7);
+        assert_eq!(r.tagged_arena::<u64>(t_u64).unwrap().read(s), 7);
+        assert!(r.tagged_arena::<u64>(t_str).is_none());
+        assert!(r.tagged_arena::<u64>(t_str + 1).is_none());
     }
 
     #[test]
