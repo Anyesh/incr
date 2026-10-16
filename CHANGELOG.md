@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.5] - unreleased
+
+### Added
+
+- **`incr-persist`, a new opt-in crate for durable, shareable state.** A `Store` keeps a runtime's inputs and collections in sync with an ordered operation log held by a pluggable `Backend`, and incr-core gains no serde dependency. It ships three backends: memory (several stores in one process, for tests), file (single writer and many readers, torn-tail recovery, crash-safe compaction) and SQLite behind the `sqlite` feature (many writers across processes, WAL mode). A conformance suite behind `backend-tests` holds any backend, including your own, to the same contract.
+  - `store.input(key, default)` and `store.collection(key)` declare persisted keys; the first declaration in the log wins, so every process agrees on defaults. `restored_keys(prefix)` lists keys known from the log that this process has not declared yet.
+  - `set`, collection `insert`/`delete`/`replace` and `batch` append to the log before applying, with `Durability::Sync` (the default) or `Buffered`. An error after the append poisons the store until it is reopened, so a retry can never double-apply.
+  - `checkpoint` compacts the log, forgetting keys that are back at their default; `refresh` applies other writers' records, and a store that fell behind a compaction catches up from the snapshot while user queries over its keys survive.
+  - `store.delete(key)` resets a key for every process, `store.undeclare(key)` removes it from this process's graph only, and `subscribe` reports every applied record in log order with its origin.
+  - Debug builds report a write that bypassed the store through a raw handle.
+- **Cascading delete and erased handles in incr-core.** `ErasedIncr` names a node of any value type; `delete_with_dependents` removes a node and everything that computed against it or is owned by it, returning the count; `is_alive` checks a handle without panicking; `try_delete_node` is a strict delete that returns `DeleteError::{HasDependents, NotAlive}` instead of panicking. All three are in the Python bindings too.
+- An example, `examples/persist-config`, whose test kills a writer with SIGKILL mid-write sixteen times and checks that every acknowledged write survives each restart.
+
+### Changed
+
+- **Contract change: `group_by` owns its group nodes.** Deleting a `group_by` router now releases its groups too, and panics with "still has dependents" if any group has consumers (delete those first, or use `delete_with_dependents`). Before, the delete succeeded and leaked the groups. After a router is deleted, every `IncrCollection` in its `GroupedCollection` is stale.
+- `get` and `set` find a node's value arena by the type tag the node already stores instead of hashing its `TypeId`, so propagation runs 9 to 12% fewer instructions under `Local` and 5 to 8% fewer under `Shared`.
+- Deleting a node drops its compute closure and observers after releasing the runtime lock, so a `Drop` that touches the runtime no longer deadlocks `Shared` or double-borrows `Local`.
+
+### Fixed
+
+- `delete_node` could claim the next occupant of a slot that another thread deleted and recycled between its state check and its claim.
+- In Python, each read of a collection's `.version_node` created a new node that was never freed; every collection now shares one, and `NodeId` compares and hashes by node identity.
+
 ## [0.2.0-beta.4] - 2026-10-16
 
 ### Soundness
