@@ -51,6 +51,14 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) free_nodes: Vec<u32>,
     pub(crate) observers: HashMap<u64, ObserverEntry<C>>,
     pub(crate) next_observer_id: u64,
+    /// Nodes an operator created for its own output and adopted: it sets
+    /// them but never reads them, so no reverse edge records them.
+    /// Sparse, because only operators like `group_by` own nodes. Kept in
+    /// step with `owner_of` and unhooked by the child's delete under the
+    /// same write hold as its generation bump, so an entry always names
+    /// the node that was adopted.
+    pub(crate) owned: HashMap<u32, Vec<NodeId>>,
+    pub(crate) owner_of: HashMap<u32, NodeId>,
 }
 
 /// Type-erased observer runner: takes the runtime and the observer's
@@ -77,6 +85,8 @@ impl<C: Cells> Inner<C> {
             free_nodes: Vec::new(),
             observers: HashMap::new(),
             next_observer_id: 1,
+            owned: HashMap::new(),
+            owner_of: HashMap::new(),
         }
     }
 }
@@ -447,19 +457,102 @@ impl<C: Cells> Runtime<C> {
     /// create calls under a bumped generation.
     pub fn delete_node<T: Value>(&self, handle: Incr<T>) {
         self.check_handle(handle);
-        let slot = handle.slot();
-        match self.delete_erased(handle.erase()) {
+        let root = handle.erase();
+        self.assert_not_own_compute(NodeId(root.slot()));
+        let owned = match self.owned_for_strict_delete(root) {
+            Ok(owned) => owned,
+            Err(slot) if slot == root.slot() => Self::panic_has_dependents(root.slot()),
+            Err(child) => panic!(
+                "incr-core: delete_node on node {} whose owned node {} still has \
+                 dependents; delete downstream nodes first",
+                root.slot(),
+                child,
+            ),
+        };
+        for child in owned {
+            if self.delete_erased(child) == DeleteOutcome::HasDependents {
+                Self::panic_has_dependents(child.slot());
+            }
+        }
+        match self.delete_erased(root) {
             DeleteOutcome::Deleted => {}
             // check_handle passed, so a concurrent delete got there first.
             DeleteOutcome::AlreadyGone => {
-                panic!("incr-core: node {} deleted twice concurrently", slot)
+                panic!("incr-core: node {} deleted twice concurrently", root.slot())
             }
-            DeleteOutcome::HasDependents => panic!(
-                "incr-core: delete_node on node {} which still has dependents; \
-                 delete downstream nodes first",
-                slot,
-            ),
+            DeleteOutcome::HasDependents => Self::panic_has_dependents(root.slot()),
         }
+    }
+
+    fn panic_has_dependents(slot: u32) -> ! {
+        panic!(
+            "incr-core: delete_node on node {} which still has dependents; \
+             delete downstream nodes first",
+            slot,
+        )
+    }
+
+    fn assert_not_own_compute(&self, id: NodeId) {
+        assert!(
+            !self.dep_stack.is_computing(id),
+            "incr-core: delete_node called from inside node {}'s own compute",
+            id.0,
+        );
+    }
+
+    /// Everything `root` owns, transitively, ordered so each node comes
+    /// before its owner. `Err(slot)` names the first node found, `root`
+    /// included, that has a dependent. Checking everything up front
+    /// means a strict delete that panics has released nothing, unless a
+    /// dependent attaches concurrently after this check.
+    fn owned_for_strict_delete(&self, root: ErasedIncr) -> Result<Vec<ErasedIncr>, u32> {
+        let inner = self.inner.read();
+        let mut out = Vec::new();
+        let mut stack = vec![root.slot()];
+        while let Some(slot) = stack.pop() {
+            if !inner.dependents[slot as usize].is_empty() {
+                return Err(slot);
+            }
+            if slot != root.slot() {
+                out.push(self.erased_at(slot));
+            }
+            if let Some(children) = inner.owned.get(&slot) {
+                stack.extend(children.iter().map(|c| c.0));
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// The handle of the node currently at `slot`. Only meaningful under
+    /// an `inner` hold, where the dependents and owned invariants make
+    /// the slot's generation the linked node's.
+    fn erased_at(&self, slot: u32) -> ErasedIncr {
+        ErasedIncr::new(slot, self.nodes.get(slot).generation(), self.runtime_id)
+    }
+
+    /// Record `child` as owned by `owner`: it is deleted with the owner,
+    /// by strict delete and by the cascade. Both must be live.
+    pub(crate) fn adopt(&self, owner: ErasedIncr, child: ErasedIncr) {
+        let mut inner = self.inner.write();
+        for h in [owner, child] {
+            assert!(
+                self.is_alive(h),
+                "incr-core: adopt of deleted node {}",
+                h.slot()
+            );
+        }
+        let previous = inner.owner_of.insert(child.slot(), NodeId(owner.slot()));
+        assert!(
+            previous.is_none(),
+            "incr-core: node {} adopted twice",
+            child.slot()
+        );
+        inner
+            .owned
+            .entry(owner.slot())
+            .or_default()
+            .push(NodeId(child.slot()));
     }
 
     /// True iff `handle` names a node of this runtime that has not been
@@ -480,12 +573,13 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The deletion path behind every public delete. Never panics on a
-    /// dependent or on a node that is already gone; it reports them.
+    /// dependent or on a node that is already gone; it reports them. An
+    /// owned node counts as a dependent: callers delete owned nodes first.
     ///
-    /// Invariant: a slot listed in any `dependents` list carries the
-    /// generation of the node linked there. That is why the generation is
-    /// bumped under `inner.write()`, together with the unhooking, and not
-    /// at the claim.
+    /// Invariant: a slot listed in any `dependents` or `owned` list
+    /// carries the generation of the node linked there. That is why the
+    /// generation is bumped under `inner.write()`, together with the
+    /// unhooking, and not at the claim.
     pub(crate) fn delete_erased(&self, handle: ErasedIncr) -> DeleteOutcome {
         assert_eq!(
             handle.runtime_id(),
@@ -498,11 +592,7 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != handle.generation() {
             return DeleteOutcome::AlreadyGone;
         }
-        assert!(
-            !self.dep_stack.is_computing(id),
-            "incr-core: delete_node called from inside node {}'s own compute",
-            slot,
-        );
+        self.assert_not_own_compute(id);
 
         let mut spins: u32 = 0;
         loop {
@@ -541,7 +631,9 @@ impl<C: Cells> Runtime<C> {
                         if node.generation() != handle.generation() {
                             return DeleteOutcome::AlreadyGone;
                         }
-                        if !inner.dependents[slot as usize].is_empty() {
+                        if !inner.dependents[slot as usize].is_empty()
+                            || inner.owned.contains_key(&slot)
+                        {
                             return DeleteOutcome::HasDependents;
                         }
                         state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok()
@@ -567,6 +659,16 @@ impl<C: Cells> Runtime<C> {
             inner.dependents[d.0 as usize].retain(|&x| x != id);
         }
         inner.dependents[slot as usize].clear();
+        if let Some(owner) = inner.owner_of.remove(&slot) {
+            let siblings = inner
+                .owned
+                .get_mut(&owner.0)
+                .expect("incr-core: owner_of names an owner with no owned list");
+            siblings.retain(|&c| c != id);
+            if siblings.is_empty() {
+                inner.owned.remove(&owner.0);
+            }
+        }
         node.bump_generation();
         // The closures are dropped only after the lock is released,
         // because their captures' Drop impls are user code that may call
