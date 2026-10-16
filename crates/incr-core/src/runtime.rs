@@ -1166,6 +1166,21 @@ impl<C: Cells> Runtime<C> {
     ) -> Publish {
         let node = self.nodes.get(id.0);
 
+        // Compared in place so the static-dep fast path, the common case,
+        // allocates nothing; under Local an allocation pair per compute
+        // was the bulk of propagation cost.
+        if !panicked {
+            let mut seen = 0;
+            let mut same = true;
+            node.for_each_dep(|d| {
+                same = same && recorded.get(seen).is_some_and(|&(r, _)| r == d);
+                seen += 1;
+            });
+            if same && seen == recorded.len() {
+                return Publish::Published;
+            }
+        }
+
         let mut old_deps: Vec<NodeId> = Vec::with_capacity(8);
         node.for_each_dep(|d| old_deps.push(d));
         let new_deps: Vec<NodeId> = if panicked {
