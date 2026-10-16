@@ -137,3 +137,63 @@ def test_delete_with_dependents_inside_a_query_raises(make_rt):
     with pytest.raises(RuntimeError, match="during compute"):
         rt.get(q)
     assert rt.is_alive(x)
+
+
+def _versioned_wrappers(rt):
+    col = rt.create_collection()
+    col.insert(1)
+    col.insert(2)
+    grouped = col.group_by(lambda x: x % 2)
+    rt.get(grouped.version_node)
+    return {
+        "collection": lambda: col,
+        "grouped": lambda: grouped,
+        "sorted": lambda: col.sort_by_key(lambda x: x),
+        "group": lambda: grouped.get_group(1),
+    }
+
+
+@BOTH_RUNTIMES
+@pytest.mark.parametrize("kind", ["collection", "grouped", "sorted", "group"])
+def test_version_node_is_one_node_per_collection(make_rt, kind):
+    rt = make_rt()
+    wrapper = _versioned_wrappers(rt)[kind]
+    target = wrapper()
+    first = target.version_node
+    rt.get(first)
+    nodes = rt.node_count()
+
+    for _ in range(5):
+        again = wrapper().version_node if kind == "group" else target.version_node
+        assert again == first
+        assert hash(again) == hash(first)
+        rt.get(again)
+    assert rt.node_count() == nodes
+
+
+@BOTH_RUNTIMES
+def test_deleted_version_node_goes_stale_and_is_recreated(make_rt):
+    rt = make_rt()
+    col = rt.create_collection()
+    col.insert(1)
+    old = col.version_node
+    before = rt.get(old)
+    rt.delete_node(old)
+    with pytest.raises(RuntimeError, match="stale"):
+        rt.get(old)
+
+    fresh = col.version_node
+    assert fresh != old
+    assert rt.is_alive(fresh)
+    assert rt.get(fresh) == before
+    assert col.version_node == fresh
+
+
+@BOTH_RUNTIMES
+def test_node_ids_compare_by_node(make_rt):
+    rt = make_rt()
+    a = rt.create_input(1)
+    b = rt.create_input(1)
+    assert a == a and a != b
+    assert a != 1
+    assert len({a, b, a}) == 2

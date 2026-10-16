@@ -29,6 +29,7 @@
 
 use pyo3::prelude::*;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use incr_compute::{
@@ -148,6 +149,16 @@ impl PyNodeId {
 
     fn __repr__(&self) -> String {
         format!("NodeId(slot={})", self.inner.slot())
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+
+    fn __hash__(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.inner.hash(&mut h);
+        h.finish()
     }
 }
 
@@ -365,14 +376,11 @@ impl PyCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
-        let bridge = self.with_rt(py, |rt| {
-            let v: Incr<u64> = self.inner.version_node();
-            rt.create_query(move |rt| -> PyValue {
-                let n: u64 = rt.get(v);
-                Python::attach(|py| PyValue(n.into_pyobject(py).unwrap().into_any().unbind()))
-            })
-        });
-        Ok(PyNodeId { inner: bridge })
+        Ok(self
+            .rt
+            .bind(py)
+            .borrow()
+            .version_bridge(self.inner.version_node()))
     }
 }
 
@@ -440,13 +448,11 @@ impl PySortedCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
-        let rt_ref = self.rt.bind(py).borrow();
-        let ver_node: Incr<u64> = self.inner.version_node();
-        let bridge = rt_ref.inner.create_query(move |rt| -> PyValue {
-            let v: u64 = rt.get(ver_node);
-            Python::attach(|py| PyValue(v.into_pyobject(py).unwrap().into_any().unbind()))
-        });
-        Ok(PyNodeId { inner: bridge })
+        Ok(self
+            .rt
+            .bind(py)
+            .borrow()
+            .version_bridge(self.inner.version_node()))
     }
 }
 
@@ -486,19 +492,41 @@ impl PyGroupedCollection {
 
     #[getter]
     fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
-        let rt_ref = self.rt.bind(py).borrow();
-        let ver_node: Incr<u64> = self.inner.version_node();
-        let bridge = rt_ref.inner.create_query(move |rt| -> PyValue {
-            let v: u64 = rt.get(ver_node);
-            Python::attach(|py| PyValue(v.into_pyobject(py).unwrap().into_any().unbind()))
-        });
-        Ok(PyNodeId { inner: bridge })
+        Ok(self
+            .rt
+            .bind(py)
+            .borrow()
+            .version_bridge(self.inner.version_node()))
     }
 }
 
 #[pyclass(name = "Runtime", unsendable)]
 struct PyRuntime {
     inner: Runtime,
+    /// The query each collection's `version_node` getter hands out,
+    /// keyed by the collection's internal version node, so repeated
+    /// access and every wrapper of one collection share a single node.
+    version_bridges: RefCell<HashMap<Incr<u64>, Incr<PyValue>>>,
+}
+
+impl PyRuntime {
+    /// The Python-visible node mirroring `version`. Created on first use
+    /// and again only if the user deleted the previous one, whose handle
+    /// then stays stale like any deleted node's.
+    fn version_bridge(&self, version: Incr<u64>) -> PyNodeId {
+        let mut bridges = self.version_bridges.borrow_mut();
+        if let Some(&bridge) = bridges.get(&version) {
+            if self.inner.is_alive(bridge) {
+                return PyNodeId { inner: bridge };
+            }
+        }
+        let bridge = self.inner.create_query(move |rt| -> PyValue {
+            let n: u64 = rt.get(version);
+            Python::attach(|py| PyValue(n.into_pyobject(py).unwrap().into_any().unbind()))
+        });
+        bridges.insert(version, bridge);
+        PyNodeId { inner: bridge }
+    }
 }
 
 #[pymethods]
@@ -507,6 +535,7 @@ impl PyRuntime {
     fn new() -> Self {
         PyRuntime {
             inner: Runtime::new(),
+            version_bridges: RefCell::new(HashMap::new()),
         }
     }
 

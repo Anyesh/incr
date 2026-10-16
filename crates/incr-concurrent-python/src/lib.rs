@@ -29,8 +29,9 @@
 
 use pyo3::prelude::*;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ::incr_concurrent as engine;
 use engine::{
@@ -150,6 +151,46 @@ impl PyNodeId {
     fn __repr__(&self) -> String {
         format!("NodeId(slot={})", self.inner.slot())
     }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+
+    fn __hash__(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.inner.hash(&mut h);
+        h.finish()
+    }
+}
+
+/// The query each collection's `version_node` getter hands out, keyed by
+/// the collection's internal version node, so repeated access and every
+/// wrapper of one collection share a single node. One per runtime,
+/// shared by its collection wrappers.
+#[derive(Default)]
+struct VersionBridges(Mutex<HashMap<Incr<u64>, Incr<PyValue>>>);
+
+impl VersionBridges {
+    /// The Python-visible node mirroring `version`. Created on first use
+    /// and again only if the user deleted the previous one, whose handle
+    /// then stays stale like any deleted node's.
+    fn get(&self, rt: &Runtime, version: Incr<u64>) -> PyNodeId {
+        // Held across create_query so two threads cannot both create a
+        // bridge for one collection. Poison is ignored because the map
+        // is only ever inserted into whole.
+        let mut bridges = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&bridge) = bridges.get(&version) {
+            if rt.is_alive(bridge) {
+                return PyNodeId { inner: bridge };
+            }
+        }
+        let bridge = rt.create_query(move |rt| -> PyValue {
+            let n: u64 = rt.get(version);
+            Python::attach(|py| PyValue(n.into_pyobject(py).unwrap().into_any().unbind()))
+        });
+        bridges.insert(version, bridge);
+        PyNodeId { inner: bridge }
+    }
 }
 
 /// Token for an observer registration; pass to `Runtime.unobserve`.
@@ -191,6 +232,7 @@ impl PyRuntimeRef {
 struct PyCollection {
     inner: IncrCollection<PyValue>,
     rt: Arc<Runtime>,
+    bridges: Arc<VersionBridges>,
 }
 
 #[pymethods]
@@ -220,6 +262,7 @@ impl PyCollection {
         Ok(PyCollection {
             inner: filtered,
             rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
         })
     }
 
@@ -230,6 +273,7 @@ impl PyCollection {
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
         })
     }
 
@@ -291,6 +335,7 @@ impl PyCollection {
         Ok(PySortedCollection {
             inner: sorted,
             rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
         })
     }
 
@@ -303,6 +348,7 @@ impl PyCollection {
         Ok(PyGroupedCollection {
             inner: grouped,
             rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
         })
     }
 
@@ -335,17 +381,13 @@ impl PyCollection {
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
         })
     }
 
     #[getter]
     fn version_node(&self) -> PyResult<PyNodeId> {
-        let v: Incr<u64> = self.inner.version_node();
-        let bridge = self.rt.create_query(move |rt| -> PyValue {
-            let n: u64 = rt.get(v);
-            Python::attach(|py| PyValue(n.into_pyobject(py).unwrap().into_any().unbind()))
-        });
-        Ok(PyNodeId { inner: bridge })
+        Ok(self.bridges.get(&self.rt, self.inner.version_node()))
     }
 }
 
@@ -353,6 +395,7 @@ impl PyCollection {
 struct PySortedCollection {
     inner: SortedCollection<PyValue, PyValue>,
     rt: Arc<Runtime>,
+    bridges: Arc<VersionBridges>,
 }
 
 #[pymethods]
@@ -372,6 +415,7 @@ impl PySortedCollection {
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
         })
     }
 
@@ -389,6 +433,7 @@ impl PySortedCollection {
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
         })
     }
 
@@ -409,12 +454,7 @@ impl PySortedCollection {
 
     #[getter]
     fn version_node(&self) -> PyResult<PyNodeId> {
-        let ver_node: Incr<u64> = self.inner.version_node();
-        let bridge = self.rt.create_query(move |rt| -> PyValue {
-            let v: u64 = rt.get(ver_node);
-            Python::attach(|py| PyValue(v.into_pyobject(py).unwrap().into_any().unbind()))
-        });
-        Ok(PyNodeId { inner: bridge })
+        Ok(self.bridges.get(&self.rt, self.inner.version_node()))
     }
 }
 
@@ -422,6 +462,7 @@ impl PySortedCollection {
 struct PyGroupedCollection {
     inner: engine::GroupedCollection<PyValue, PyValue>,
     rt: Arc<Runtime>,
+    bridges: Arc<VersionBridges>,
 }
 
 #[pymethods]
@@ -443,6 +484,7 @@ impl PyGroupedCollection {
             Some(collection) => Ok(Some(PyCollection {
                 inner: collection,
                 rt: Arc::clone(&self.rt),
+                bridges: Arc::clone(&self.bridges),
             })),
             None => Ok(None),
         }
@@ -454,18 +496,14 @@ impl PyGroupedCollection {
 
     #[getter]
     fn version_node(&self) -> PyResult<PyNodeId> {
-        let ver_node: Incr<u64> = self.inner.version_node();
-        let bridge = self.rt.create_query(move |rt| -> PyValue {
-            let v: u64 = rt.get(ver_node);
-            Python::attach(|py| PyValue(v.into_pyobject(py).unwrap().into_any().unbind()))
-        });
-        Ok(PyNodeId { inner: bridge })
+        Ok(self.bridges.get(&self.rt, self.inner.version_node()))
     }
 }
 
 #[pyclass(name = "Runtime")]
 struct PyRuntime {
     inner: Arc<Runtime>,
+    bridges: Arc<VersionBridges>,
 }
 
 #[pymethods]
@@ -474,6 +512,7 @@ impl PyRuntime {
     fn new() -> Self {
         PyRuntime {
             inner: Arc::new(Runtime::new()),
+            bridges: Arc::default(),
         }
     }
 
@@ -559,6 +598,7 @@ impl PyRuntime {
         PyCollection {
             inner: col,
             rt: Arc::clone(&self.inner),
+            bridges: Arc::clone(&self.bridges),
         }
     }
 
