@@ -25,3 +25,11 @@ impl Harness for MemoryHarness {
 }
 
 incr_persist::backend_conformance!(MemoryHarness);
+
+#[test]
+fn default_is_a_writable_handle_like_new() {
+    use incr_persist::Backend;
+    let backend = MemoryBackend::default();
+    assert!(backend.writable());
+    backend.append(&[]).unwrap();
+}

@@ -9,7 +9,7 @@ use crate::{Backend, Error, Position, ReadOutcome, Record, Result};
 /// [`MemoryBackend::read_only`] yields a handle that can only read. The log
 /// lives as long as any handle does. `sync` is a no-op: the log is as
 /// durable as the process.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MemoryBackend {
     log: Arc<Mutex<Log>>,
     writable: bool,
@@ -54,6 +54,12 @@ impl MemoryBackend {
         } else {
             Err(Error::ReadOnly)
         }
+    }
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
