@@ -30,4 +30,4 @@ pub use memory::MemoryBackend;
 pub use record::{Kind, Record};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBackend, SqliteDurability, SqliteOptions};
-pub use store::{Batch, Durability, Input, Options, PersistValue, Store};
+pub use store::{Batch, Durability, Input, Options, PersistValue, PersistedCollection, Store};

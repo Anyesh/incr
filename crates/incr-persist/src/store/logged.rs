@@ -13,13 +13,36 @@ pub(crate) struct Declared {
 /// order, as serialized bytes. Kept for every key the log knows, bound in
 /// this process or not, so binding a key later, folding a snapshot and
 /// listing restored keys all read the same state.
+///
+/// The elements of a collection bound in this process are held by its
+/// binding, by decoded value, so `elements` stays empty for such a key.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LoggedKey {
     pub declared: Option<Declared>,
     /// The latest `Set` since the key was declared or last deleted.
     pub value: Option<Vec<u8>>,
-    /// The element multiset of a collection, by serialized element.
-    pub elements: HashMap<Vec<u8>, usize>,
+    pub elements: Elements,
+}
+
+/// A collection's elements folded without knowing their type.
+///
+/// Two equal elements may serialize to different bytes (a `HashMap` field
+/// iterates in an arbitrary order), so a `Remove` whose bytes match no live
+/// element might still remove one by value. Up to the first such `Remove`
+/// the byte multiset is exact, because equal bytes always decode to equal
+/// values; from it on, element records are kept raw in `tail` until a
+/// binding decodes them or a `Delete` clears them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Elements {
+    live: HashMap<Vec<u8>, usize>,
+    tail: Vec<ElementOp>,
+}
+
+/// One element change kept raw in [`Elements`]' tail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ElementOp {
+    Insert(Vec<u8>),
+    Remove(Vec<u8>),
 }
 
 impl LoggedKey {
@@ -33,17 +56,17 @@ impl LoggedKey {
                 }
             }
             Record::Set { value, .. } => self.value = Some(value),
-            Record::Insert { element, .. } => self.insert(element),
-            Record::Remove { element, .. } => self.remove(&element),
+            Record::Insert { element, .. } => self.elements.insert(element),
+            Record::Remove { element, .. } => self.elements.remove(element),
             Record::Replace { old, new, .. } => {
                 if let Some(old) = old {
-                    self.remove(&old);
+                    self.elements.remove(old);
                 }
-                self.insert(new);
+                self.elements.insert(new);
             }
             Record::Delete { .. } => {
                 self.value = None;
-                self.elements.clear();
+                self.elements = Elements::default();
             }
         }
     }
@@ -55,19 +78,50 @@ impl LoggedKey {
             .as_deref()
             .or(self.declared.as_ref().map(|d| d.default.as_slice()))
     }
+}
+
+impl Elements {
+    /// Live elements by serialized bytes with their multiplicity. Apply
+    /// [`Elements::tail`] after them to reach the current state.
+    pub fn live(&self) -> impl Iterator<Item = (&[u8], usize)> {
+        self.live
+            .iter()
+            .map(|(bytes, &count)| (bytes.as_slice(), count))
+    }
+
+    pub fn tail(&self) -> &[ElementOp] {
+        &self.tail
+    }
 
     fn insert(&mut self, element: Vec<u8>) {
-        *self.elements.entry(element).or_insert(0) += 1;
-    }
-
-    fn remove(&mut self, element: &[u8]) {
-        if let Some(count) = self.elements.get_mut(element) {
-            *count -= 1;
-            if *count == 0 {
-                self.elements.remove(element);
-            }
+        if self.tail.is_empty() {
+            *self.live.entry(element).or_insert(0) += 1;
+        } else {
+            self.tail.push(ElementOp::Insert(element));
         }
     }
+
+    fn remove(&mut self, element: Vec<u8>) {
+        if !self.tail.is_empty() {
+            self.tail.push(ElementOp::Remove(element));
+        } else if let Some(count) = self.live.get_mut(&element) {
+            *count -= 1;
+            if *count == 0 {
+                self.live.remove(&element);
+            }
+        } else if !self.live.is_empty() {
+            self.tail.push(ElementOp::Remove(element));
+        }
+    }
+}
+
+/// Whether `record` changes a collection's elements, as opposed to its
+/// declaration, its value or the whole key.
+pub(crate) fn is_element_change(record: &Record) -> bool {
+    matches!(
+        record,
+        Record::Insert { .. } | Record::Remove { .. } | Record::Replace { .. }
+    )
 }
 
 /// Every key the log knows, by name.
@@ -145,10 +199,6 @@ mod tests {
                 key: "c".into(),
                 element: vec![2],
             },
-            Record::Remove {
-                key: "c".into(),
-                element: vec![7],
-            },
             Record::Replace {
                 key: "c".into(),
                 old: Some(vec![1]),
@@ -163,8 +213,47 @@ mod tests {
             fold(&mut keys, record);
         }
         let expected = HashMap::from([(vec![1], 1), (vec![3], 2)]);
-        assert_eq!(keys["c"].elements, expected);
+        assert_eq!(keys["c"].elements.live, expected);
+        assert!(keys["c"].elements.tail.is_empty());
         fold(&mut keys, Record::Delete { key: "c".into() });
-        assert!(keys["c"].elements.is_empty());
+        assert_eq!(keys["c"].elements, Elements::default());
+    }
+
+    #[test]
+    fn a_remove_matching_no_live_bytes_keeps_later_changes_raw() {
+        let mut keys = LoggedKeys::new();
+        let remove = |element: u8| Record::Remove {
+            key: "c".into(),
+            element: vec![element],
+        };
+        for record in [insert(1), insert(2), remove(3), insert(1), remove(1)] {
+            fold(&mut keys, record);
+        }
+        let elements = &keys["c"].elements;
+        assert_eq!(elements.live, HashMap::from([(vec![1], 1), (vec![2], 1)]));
+        assert_eq!(
+            elements.tail,
+            [
+                ElementOp::Remove(vec![3]),
+                ElementOp::Insert(vec![1]),
+                ElementOp::Remove(vec![1]),
+            ]
+        );
+
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert_eq!(keys["c"].elements, Elements::default());
+    }
+
+    #[test]
+    fn a_remove_from_no_elements_is_dropped() {
+        let mut keys = LoggedKeys::new();
+        fold(
+            &mut keys,
+            Record::Remove {
+                key: "c".into(),
+                element: vec![5],
+            },
+        );
+        assert_eq!(keys["c"].elements, Elements::default());
     }
 }

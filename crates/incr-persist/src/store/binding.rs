@@ -5,17 +5,21 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::logged::LoggedKey;
-use crate::{Error, Record, Result};
+use crate::{Error, Kind, Record, Result};
 
 /// A key this process declared, tied to the runtime node that mirrors it.
 pub(crate) trait Binding<C: Cells>: Send + Sync {
+    fn kind(&self) -> Kind;
+
     /// Applies `record`, one of this key's records in position order, to the
     /// node. `before` is the key's logged state without the record.
     fn apply(&self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>) -> Result<()>;
 
     /// Sets the node to exactly what `logged` holds, or to the binding's
-    /// default when the log no longer knows the key.
-    fn replace(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()>;
+    /// default when the log no longer knows the key. A collection binding
+    /// holds its elements itself, so it takes them out of `logged`, but only
+    /// once they all decoded; on an error nothing has changed.
+    fn replace(&self, rt: &Runtime<C>, logged: Option<&mut LoggedKey>) -> Result<()>;
 
     fn as_any(&self) -> &dyn Any;
 }
@@ -38,6 +42,10 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
 }
 
 impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
+    fn kind(&self) -> Kind {
+        Kind::Input
+    }
+
     fn apply(&self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>) -> Result<()> {
         let value = match record {
             Record::Set { value, .. } => decode(&self.key, value)?,
@@ -57,8 +65,8 @@ impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
         Ok(())
     }
 
-    fn replace(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()> {
-        rt.set(self.handle, self.value_of(logged)?);
+    fn replace(&self, rt: &Runtime<C>, logged: Option<&mut LoggedKey>) -> Result<()> {
+        rt.set(self.handle, self.value_of(logged.as_deref())?);
         Ok(())
     }
 

@@ -9,9 +9,12 @@ use serde::Serialize;
 use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result};
 
 use binding::{decode, encode, Binding, InputBinding};
-use logged::{fold, LoggedKeys};
+use logged::{fold, is_element_change, Declared, LoggedKeys};
+
+pub use collection::PersistedCollection;
 
 mod binding;
+mod collection;
 mod logged;
 
 /// The bound on values a [`Store`] persists: a runtime [`Value`] that serde
@@ -71,6 +74,13 @@ pub struct Batch<'s, C: Cells, B: Backend> {
 ///
 /// Store methods must not be called from inside a query's compute, because
 /// they create and set runtime inputs.
+///
+/// A `Store<Local, _>` is confined to its thread like its runtime:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<incr_persist::Store<incr_persist::Local, incr_persist::MemoryBackend>>();
+/// ```
 pub struct Store<C: Cells, B: Backend> {
     runtime: Runtime<C>,
     backend: B,
@@ -124,17 +134,42 @@ impl<C: Cells, B: Backend> Batch<'_, C, B> {
     /// poisoned store, a value that fails to serialize) is kept and returned
     /// by [`Store::batch`], which then appends nothing.
     pub fn set<T: PersistValue>(&mut self, input: Input<T>, value: T) -> &mut Self {
+        self.push(|state| set_record(state, input, &value))
+    }
+
+    fn push(&mut self, record: impl FnOnce(&State<C>) -> Result<Record>) -> &mut Self {
         if self.error.is_none() {
-            let record = self
-                .store
-                .state()
-                .and_then(|state| set_record(&state, input, &value));
-            match record {
+            match self.store.state().and_then(|state| record(&state)) {
                 Ok(record) => self.records.push(record),
                 Err(e) => self.error = Some(e),
             }
         }
         self
+    }
+}
+
+impl<C: Cells> State<C> {
+    /// The id under which this store bound `key`, if it did. Fails with
+    /// [`Error::KindMismatch`] when the key is bound as the other kind.
+    fn bound_id(&self, key: &str, kind: Kind) -> Result<Option<u32>> {
+        let Some(&id) = self.bound.get(key) else {
+            return Ok(None);
+        };
+        let declared = self.bindings[id as usize].kind();
+        if declared != kind {
+            return Err(Error::KindMismatch {
+                key: key.to_owned(),
+                declared,
+            });
+        }
+        Ok(Some(id))
+    }
+
+    fn bind(&mut self, key: &str, binding: Box<dyn Binding<C>>) -> u32 {
+        let id = self.bindings.len() as u32;
+        self.bindings.push(binding);
+        self.bound.insert(key.to_owned(), id);
+        id
     }
 }
 
@@ -186,7 +221,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     pub fn input<T: PersistValue>(&self, key: &str, default: T) -> Result<Input<T>> {
         let mut guard = self.state()?;
         let state = &mut *guard;
-        if let Some(&id) = state.bound.get(key) {
+        if let Some(id) = state.bound_id(key, Kind::Input)? {
             return state.bindings[id as usize]
                 .as_any()
                 .downcast_ref::<InputBinding<T>>()
@@ -199,38 +234,21 @@ impl<C: Cells, B: Backend> Store<C, B> {
                     source: None,
                 });
         }
-        // A loop because a concurrent compaction may fold away a Declare
-        // whose key still held its default, forgetting the key again.
-        let declared = loop {
-            if let Some(declared) = state.logged.get(key).and_then(|k| k.declared.as_ref()) {
-                break declared;
-            }
-            let record = Record::Declare {
-                key: key.to_owned(),
-                kind: Kind::Input,
-                default: encode(&default)?,
-            };
-            self.write(state, &[record])?;
-        };
-        if declared.kind != Kind::Input {
-            return Err(Error::KindMismatch {
-                key: key.to_owned(),
-                declared: declared.kind,
-            });
-        }
+        let declared = self.declare(state, key, Kind::Input, || encode(&default))?;
         let logged_default: T = decode(key, &declared.default)?;
         let value = match &state.logged[key].value {
             Some(bytes) => decode(key, bytes)?,
             None => logged_default.clone(),
         };
         let handle = self.runtime.create_input(value);
-        let id = state.bindings.len() as u32;
-        state.bindings.push(Box::new(InputBinding {
-            key: key.to_owned(),
-            handle,
-            default: logged_default,
-        }));
-        state.bound.insert(key.to_owned(), id);
+        let id = state.bind(
+            key,
+            Box::new(InputBinding {
+                key: key.to_owned(),
+                handle,
+                default: logged_default,
+            }),
+        );
         Ok(Input { id, handle })
     }
 
@@ -243,9 +261,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// after it (from `sync`, reading the log back, or applying a record)
     /// poisons the store.
     pub fn set<T: PersistValue>(&self, input: Input<T>, value: T) -> Result<Position> {
-        let mut state = self.state()?;
-        let record = set_record(&state, input, &value)?;
-        self.write(&mut state, &[record])
+        self.write_with(|state| set_record(state, input, &value))
     }
 
     /// Runs `f` to collect writes, then appends them as one run with one
@@ -283,6 +299,44 @@ impl<C: Cells, B: Backend> Store<C, B> {
             .filter(|key| !state.bound.contains_key(*key))
             .cloned()
             .collect())
+    }
+
+    /// Returns the key's live `Declare`, first appending one of `kind` with
+    /// the default `default` produces when the log has none. Fails with
+    /// [`Error::KindMismatch`] when the live `Declare` is of the other kind.
+    fn declare(
+        &self,
+        state: &mut State<C>,
+        key: &str,
+        kind: Kind,
+        default: impl Fn() -> Result<Vec<u8>>,
+    ) -> Result<Declared> {
+        // A loop because a concurrent compaction may fold away a Declare
+        // whose key still held its default, forgetting the key again.
+        let declared = loop {
+            if let Some(declared) = state.logged.get(key).and_then(|k| k.declared.as_ref()) {
+                break declared.clone();
+            }
+            let record = Record::Declare {
+                key: key.to_owned(),
+                kind,
+                default: default()?,
+            };
+            self.write(state, &[record])?;
+        };
+        if declared.kind != kind {
+            return Err(Error::KindMismatch {
+                key: key.to_owned(),
+                declared: declared.kind,
+            });
+        }
+        Ok(declared)
+    }
+
+    fn write_with(&self, record: impl FnOnce(&State<C>) -> Result<Record>) -> Result<Position> {
+        let mut state = self.state()?;
+        let record = record(&state)?;
+        self.write(&mut state, &[record])
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State<C>>> {
@@ -349,11 +403,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
 
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
         if let Some(&id) = state.bound.get(record.key()) {
-            state.bindings[id as usize].apply(
-                &self.runtime,
-                &record,
-                state.logged.get(record.key()),
-            )?;
+            let binding = &state.bindings[id as usize];
+            binding.apply(&self.runtime, &record, state.logged.get(record.key()))?;
+            // A bound collection holds its elements by decoded value; folding
+            // them by bytes as well would let the two disagree.
+            if binding.kind() == Kind::Collection && is_element_change(&record) {
+                return Ok(());
+            }
         }
         fold(&mut state.logged, record);
         Ok(())
@@ -373,7 +429,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             fold(&mut logged, record);
         }
         for (key, &id) in &state.bound {
-            state.bindings[id as usize].replace(&self.runtime, logged.get(key))?;
+            state.bindings[id as usize].replace(&self.runtime, logged.get_mut(key))?;
         }
         state.logged = logged;
         state.applied = at;
