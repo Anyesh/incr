@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
 use std::sync::{Mutex, MutexGuard};
 
-use incr_core::{Cells, Incr, Runtime, Value};
+use incr_core::{Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -412,19 +412,19 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// fails with [`Error::UnknownHandle`].
     ///
     /// The node goes through the runtime's strict
-    /// [`delete_node`](incr_core::Runtime::delete_node), so queries over it
-    /// must be deleted first. While any remain this fails with
-    /// [`Error::HasDependents`] and changes nothing. Under `Shared`, a query
-    /// over `input` first computed on another thread while this runs can
-    /// still make that strict delete panic, so undeclare only an input no
-    /// thread is building queries over.
+    /// [`try_delete_node`](incr_core::Runtime::try_delete_node), so queries
+    /// over it must be deleted first. While any remain this fails with
+    /// [`Error::HasDependents`] and changes nothing; under `Shared`, a query
+    /// computing over `input` concurrently either counts as a dependent or
+    /// finds the node deleted. A node already deleted through the runtime
+    /// just has its key released.
     pub fn undeclare<T: Value>(&self, input: Input<T>) -> Result<()> {
         let mut state = self.state()?;
         let key = input_binding(&state, input)?.key.clone();
-        if self.runtime.has_dependents(input.handle) {
-            return Err(Error::HasDependents { key });
+        match self.runtime.try_delete_node(input.handle) {
+            Ok(()) | Err(DeleteError::NotAlive) => {}
+            Err(DeleteError::HasDependents) => return Err(Error::HasDependents { key }),
         }
-        self.runtime.delete_node(input.handle);
         state.bindings.remove(&input.id);
         state.bound.remove(&key);
         Ok(())

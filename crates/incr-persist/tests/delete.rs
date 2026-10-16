@@ -242,11 +242,10 @@ fn deleting_a_handle_from_another_store_is_rejected() {
     assert!(matches!(result, Err(Error::UnknownHandle)));
 }
 
-#[test]
-fn undeclare_errors_while_dependents_remain_and_is_not_persisted() {
+fn undeclare_errors_while_dependents_remain_and_is_not_persisted<C: Cells>() {
     let log = MemoryBackend::new();
-    let store = open::<Local, _>(log.clone());
-    let other = open::<Local, _>(log.clone());
+    let store = open::<C, _>(log.clone());
+    let other = open::<C, _>(log.clone());
     let x = store.input("x", 1u32).unwrap();
     store.set(x, 4).unwrap();
     let rt = store.runtime();
@@ -291,7 +290,30 @@ fn undeclare_errors_while_dependents_remain_and_is_not_persisted() {
     assert!(store.restored_keys("").unwrap().is_empty());
 
     drop(store);
-    let reopened = open::<Local, _>(log);
+    let reopened = open::<C, _>(log);
     let x = reopened.input("x", 0u32).unwrap();
     assert_eq!(reopened.runtime().get(x.handle()), 7);
+}
+
+#[test]
+fn local_undeclare_errors_while_dependents_remain_and_is_not_persisted() {
+    undeclare_errors_while_dependents_remain_and_is_not_persisted::<Local>();
+}
+
+#[test]
+fn shared_undeclare_errors_while_dependents_remain_and_is_not_persisted() {
+    undeclare_errors_while_dependents_remain_and_is_not_persisted::<Shared>();
+}
+
+#[test]
+fn undeclare_releases_an_input_whose_node_was_deleted_through_the_runtime() {
+    let store = open::<Local, _>(MemoryBackend::new());
+    let x = store.input("x", 1u32).unwrap();
+    store.set(x, 3).unwrap();
+    store.runtime().delete_node(x.handle());
+
+    store.undeclare(x).unwrap();
+    assert_eq!(store.restored_keys("").unwrap(), ["x"]);
+    let again = store.input("x", 0u32).unwrap();
+    assert_eq!(store.runtime().get(again.handle()), 3);
 }
