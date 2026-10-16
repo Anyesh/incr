@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::{ParkPoint, Runtime};
+use super::{DeleteOutcome, ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
 use crate::handle::Incr;
@@ -403,6 +403,95 @@ fn b2_delete_and_recycle_while_publisher_is_parked() {
         "phantom edge on the recycled slot"
     );
     rt.assert_invariant_i();
+}
+
+/// Parks a `delete_node(v)` at `DeleteAfterCheck`, so `v` is claimed
+/// `Dead` but its generation is not bumped and its slot not released.
+/// The returned waiter gate parks a second delete of `v` once it reaches
+/// the wait on that claim.
+fn park_delete_after_claim(rt: &Arc<Rt>, v: Incr<u64>) -> (Gate, Gate, thread::JoinHandle<()>) {
+    let claimed = Gate::new();
+    let waiter = Gate::new();
+    park_at(
+        rt,
+        vec![
+            (ParkPoint::DeleteAfterCheck(id(v)), claimed.clone()),
+            (ParkPoint::DeleteWaitsOnClaim(id(v)), waiter.clone()),
+        ],
+    );
+    let deleter = {
+        let rt = Arc::clone(rt);
+        thread::spawn(move || rt.delete_node(v))
+    };
+    claimed.wait_parked();
+    (claimed, waiter, deleter)
+}
+
+#[test]
+fn is_alive_is_false_while_dead_but_not_yet_released() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let (claimed, _, deleter) = park_delete_after_claim(&rt, v);
+
+    assert_eq!(rt.state_of(v), NodeState::Dead);
+    assert_eq!(
+        rt.nodes.get(v.slot()).generation(),
+        v.erase().generation(),
+        "the generation must not move before the write lock"
+    );
+    assert!(!rt.is_alive(v));
+
+    claimed.release();
+    deleter.join().unwrap();
+    assert!(!rt.is_alive(v));
+}
+
+#[test]
+fn delete_erased_waits_out_a_claimed_delete_then_reports_gone() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let (claimed, waiter, deleter) = park_delete_after_claim(&rt, v);
+
+    let second = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.delete_erased(v.erase()))
+    };
+    waiter.wait_parked();
+    waiter.release();
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        !second.is_finished(),
+        "a second delete returned while the first still held its claim"
+    );
+
+    claimed.release();
+    deleter.join().unwrap();
+    assert_eq!(second.join().unwrap(), DeleteOutcome::AlreadyGone);
+    assert_eq!(rt.node_count(), 0);
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn concurrent_typed_delete_panics_deleted_twice() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let (claimed, waiter, deleter) = park_delete_after_claim(&rt, v);
+
+    let second = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.delete_node(v))))
+    };
+    waiter.wait_parked();
+    claimed.release();
+    deleter.join().unwrap();
+    waiter.release();
+    let msg = *second
+        .join()
+        .unwrap()
+        .unwrap_err()
+        .downcast::<String>()
+        .unwrap();
+    assert!(msg.contains("deleted twice concurrently"), "got: {msg}");
 }
 
 type LocalRt = Runtime<Local>;

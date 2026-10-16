@@ -169,20 +169,26 @@ impl<C: Cells> NodeData<C> {
         }
     }
 
-    /// Tear down a node for deletion: clear deps, bump the generation so
-    /// stale handles are rejected, and Release-store Dead. The caller
-    /// (delete_node) owns the transition; the slot stays allocated and
-    /// is reinitialized by [`Self::reinit_recycled`].
+    /// Tear down a node for deletion: clear deps and Release-store Dead.
+    /// The caller (`delete_erased`) owns the transition; the slot stays
+    /// allocated and is reinitialized by [`Self::reinit_recycled`].
     pub(crate) fn retire_for_delete(&self) {
         self.install_deps(&[]);
-        C::u32_store_relaxed(&self.generation, self.generation().wrapping_add(1));
         C::state_store_release(&self.state, NodeState::Dead.as_u8());
+    }
+
+    /// Move the slot to a new generation so handles to the deleted node
+    /// are rejected. Must run under `inner.write()`, after the reverse
+    /// edges naming this slot are unhooked, so no `dependents` list ever
+    /// pairs this slot with a generation it does not carry.
+    pub(crate) fn bump_generation(&self) {
+        C::u32_store_relaxed(&self.generation, self.generation().wrapping_add(1));
     }
 
     /// Reinitialize a recycled (Dead) slot in place for a new node.
     /// Field stores are relaxed; the final Release store on `state` is
     /// the publication point, and pairs with readers' Acquire state
-    /// loads. The generation was already bumped by retire_for_delete, so
+    /// loads. The generation was already bumped by the delete, so
     /// handles minted now carry the new generation and stale ones fail
     /// the check.
     pub(crate) fn reinit_recycled(

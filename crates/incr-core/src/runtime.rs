@@ -26,7 +26,7 @@ use crate::arena_registry::ArenaRegistry;
 use crate::cells::Cells;
 use crate::dep_stack::DepStack;
 use crate::generic_arena::GenericArena;
-use crate::handle::{Incr, RuntimeId};
+use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
 use crate::node::{NodeData, NodeId};
 use crate::segmented_nodes::SegmentedNodes;
@@ -102,8 +102,22 @@ pub(crate) enum ParkPoint {
     /// In `set`, after the dirty walk and before the revision is recorded
     /// as walked.
     SetAfterWalk,
-    /// In `delete_node`, after the dependents check and the `Dead` claim.
+    /// In `delete_erased`, after the dependents check and the `Dead` claim.
     DeleteAfterCheck(NodeId),
+    /// In `delete_erased`, on finding the node claimed `Dead` by another
+    /// delete that has not bumped its generation yet.
+    DeleteWaitsOnClaim(NodeId),
+}
+
+/// What [`Runtime::delete_erased`] did with a node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    Deleted,
+    /// The handle's node was already deleted, by this caller earlier or
+    /// by a concurrent delete that has now finished.
+    AlreadyGone,
+    /// The node has a dependent. Nothing changed.
+    HasDependents,
 }
 
 /// Records `rev` as walked when dropped. A drop guard rather than a call
@@ -431,9 +445,56 @@ impl<C: Cells> Runtime<C> {
     pub fn delete_node<T: Value>(&self, handle: Incr<T>) {
         self.check_handle(handle);
         let slot = handle.slot();
+        match self.delete_erased(handle.erase()) {
+            DeleteOutcome::Deleted => {}
+            // check_handle passed, so a concurrent delete got there first.
+            DeleteOutcome::AlreadyGone => {
+                panic!("incr-core: node {} deleted twice concurrently", slot)
+            }
+            DeleteOutcome::HasDependents => panic!(
+                "incr-core: delete_node on node {} which still has dependents; \
+                 delete downstream nodes first",
+                slot,
+            ),
+        }
+    }
+
+    /// True iff `handle` names a node of this runtime that has not been
+    /// deleted. A handle from another runtime is simply not alive here.
+    /// The answer is a snapshot: a concurrent delete can end the node
+    /// right after it returns.
+    pub fn is_alive(&self, handle: impl Into<ErasedIncr>) -> bool {
+        let handle = handle.into();
+        if handle.runtime_id() != self.runtime_id {
+            return false;
+        }
+        let node = self.nodes.get(handle.slot());
+        // State before generation: a recycle bumps the generation before
+        // it Release-stores the new occupant's state, so if the Acquire
+        // load below sees that occupant, the generation load sees the bump.
+        let state = node.state();
+        state != NodeState::Dead && node.generation() == handle.generation()
+    }
+
+    /// The deletion path behind every public delete. Never panics on a
+    /// dependent or on a node that is already gone; it reports them.
+    ///
+    /// Invariant: a slot listed in any `dependents` list carries the
+    /// generation of the node linked there. That is why the generation is
+    /// bumped under `inner.write()`, together with the unhooking, and not
+    /// at the claim.
+    pub(crate) fn delete_erased(&self, handle: ErasedIncr) -> DeleteOutcome {
+        assert_eq!(
+            handle.runtime_id(),
+            self.runtime_id,
+            "incr-core: delete of a handle from a foreign runtime",
+        );
+        let slot = handle.slot();
         let id = NodeId(slot);
         let node = self.nodes.get(slot);
-
+        if node.generation() != handle.generation() {
+            return DeleteOutcome::AlreadyGone;
+        }
         assert!(
             !self.dep_stack.is_computing(id),
             "incr-core: delete_node called from inside node {}'s own compute",
@@ -443,29 +504,43 @@ impl<C: Cells> Runtime<C> {
         let mut spins: u32 = 0;
         loop {
             let cur = state::load::<C>(node.state_cell());
+            if node.generation() != handle.generation() {
+                return DeleteOutcome::AlreadyGone;
+            }
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
                     spins += 1;
                     C::backoff(spins);
                 }
                 NodeState::Dead => {
-                    // Two racing deletes: the generation check above
-                    // passed before the other delete bumped it.
-                    panic!("incr-core: node {} deleted twice concurrently", slot);
+                    // Another delete claimed the node and will bump the
+                    // generation under its next write lock. Returning now
+                    // would let a cascade re-find this slot in its
+                    // parent's dependents and spin on it instead.
+                    self.park(ParkPoint::DeleteWaitsOnClaim(id));
+                    while node.generation() == handle.generation() {
+                        spins += 1;
+                        C::backoff(spins);
+                    }
+                    return DeleteOutcome::AlreadyGone;
                 }
                 _ => {
                     // The check and the claim share one read hold so no
                     // publish (which pushes reverse edges under the write
                     // lock) can land between them; clearing dependents
-                    // below would otherwise drop its edge silently.
+                    // below would otherwise drop its edge silently. The
+                    // generation is rechecked under the hold because a
+                    // delete and recycle between the load of `cur` and
+                    // the CAS would otherwise let the CAS claim the
+                    // slot's next occupant.
                     let claimed = {
                         let inner = self.inner.read();
-                        assert!(
-                            inner.dependents[slot as usize].is_empty(),
-                            "incr-core: delete_node on node {} which still has dependents; \
-                             delete downstream nodes first",
-                            slot,
-                        );
+                        if node.generation() != handle.generation() {
+                            return DeleteOutcome::AlreadyGone;
+                        }
+                        if !inner.dependents[slot as usize].is_empty() {
+                            return DeleteOutcome::HasDependents;
+                        }
                         state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok()
                     };
                     if claimed {
@@ -481,23 +556,25 @@ impl<C: Cells> Runtime<C> {
         let mut old_deps: Vec<NodeId> = Vec::new();
         node.for_each_dep(|d| old_deps.push(d));
         let arena_slot = node.arena_slot();
+        let type_tag = node.type_tag();
         node.retire_for_delete();
 
         let mut inner = self.inner.write();
         for d in &old_deps {
             inner.dependents[d.0 as usize].retain(|&x| x != id);
         }
-        inner.compute_fns[slot as usize] = None;
         inner.dependents[slot as usize].clear();
+        // Before the closures below are dropped, because their captures'
+        // Drop impls are user code and may delete this same handle again.
+        node.bump_generation();
+        inner.compute_fns[slot as usize] = None;
         inner.labels.remove(&slot);
         inner.observers.retain(|_, e| e.slot != slot);
-        let arena = inner
-            .arenas
-            .try_arena::<T>()
-            .expect("incr-core: arena missing for deleted handle's type");
+        let arena = Arc::clone(inner.arenas.erased(type_tag));
         inner.free_nodes.push(slot);
         drop(inner);
         arena.release(arena_slot);
+        DeleteOutcome::Deleted
     }
 
     /// Read the current value of a node. Triggers recomputation of the
@@ -1862,6 +1939,84 @@ mod tests {
         let _q = rt.create_query(move |rt| rt.get(input) * 2);
         let _ = rt.get(_q);
         rt.delete_node(input);
+    }
+
+    #[test]
+    fn is_alive_tracks_delete_and_recycle() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_input(1_i64);
+        assert!(rt.is_alive(a));
+        assert!(rt.is_alive(a.erase()));
+
+        rt.delete_node(a);
+        assert!(!rt.is_alive(a));
+
+        let b = rt.create_input("recycled".to_string());
+        assert_eq!(b.slot(), a.slot());
+        assert!(!rt.is_alive(a), "a stale handle matches a recycled slot");
+        assert!(rt.is_alive(b));
+    }
+
+    #[test]
+    fn is_alive_is_false_for_a_foreign_handle() {
+        let rt1: Runtime<Shared> = Runtime::new();
+        let rt2: Runtime<Shared> = Runtime::new();
+        let a = rt1.create_input(1_i64);
+        let _same_slot = rt2.create_input(2_i64);
+        assert!(!rt2.is_alive(a));
+    }
+
+    #[test]
+    #[should_panic(expected = "stale")]
+    fn delete_node_twice_panics_stale() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_input(1_i64);
+        rt.delete_node(a);
+        rt.delete_node(a);
+    }
+
+    #[test]
+    #[should_panic(expected = "foreign runtime")]
+    fn delete_node_with_foreign_handle_panics() {
+        let rt1: Runtime<Local> = Runtime::new();
+        let rt2: Runtime<Local> = Runtime::new();
+        let a = rt1.create_input(1_i64);
+        let _ = rt2.create_input(2_i64);
+        rt2.delete_node(a);
+    }
+
+    #[test]
+    #[should_panic(expected = "own compute")]
+    fn delete_node_from_its_own_compute_panics() {
+        let rt: Runtime<Local> = Runtime::new();
+        let me: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+        let me_in = Arc::clone(&me);
+        let q = rt.create_query(move |rt| {
+            rt.delete_node(*me_in.get().unwrap());
+            0_i64
+        });
+        me.set(q).unwrap();
+        let _ = rt.get(q);
+    }
+
+    #[test]
+    fn delete_erased_reports_dependents_without_panicking() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(5_i64);
+        let q = rt.create_query(move |rt| rt.get(input) * 2);
+        assert_eq!(rt.get(q), 10);
+
+        assert_eq!(
+            rt.delete_erased(input.erase()),
+            DeleteOutcome::HasDependents
+        );
+        assert!(rt.is_alive(input));
+        assert_eq!(rt.get(q), 10);
+
+        assert_eq!(rt.delete_erased(q.erase()), DeleteOutcome::Deleted);
+        assert_eq!(rt.delete_erased(q.erase()), DeleteOutcome::AlreadyGone);
+        assert_eq!(rt.delete_erased(input.erase()), DeleteOutcome::Deleted);
+        assert_eq!(rt.node_count(), 0);
     }
 
     #[test]
