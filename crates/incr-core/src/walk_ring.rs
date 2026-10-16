@@ -128,3 +128,62 @@ mod tests {
         assert_eq!(ring.walked(), 1 + 8 * 500);
     }
 }
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::*;
+    use crate::loom_cells::Loom;
+    use loom::cell::UnsafeCell;
+    use loom::sync::atomic::{AtomicU64, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// Three setters finish revisions 2..=4 in any order on the two-slot
+    /// ring, so one of them reaches the wait path. The runtime models do
+    /// at most two sets each and rely on this model for slot reuse. Each
+    /// setter's walk is a write to `walks`; an observer that sees
+    /// `walked = r` and reads walk r without a happens-before edge is a
+    /// race loom reports. The observer must be a spawned thread: loom never
+    /// preempts the model's main thread between its spawns and its next
+    /// access, so a check on main only ever sees the initial `walked`.
+    #[test]
+    fn loom_walk_ring() {
+        loom::model(|| {
+            let ring = Arc::new(WalkRing::<Loom, 2>::new(1));
+            let next = Arc::new(AtomicU64::new(2));
+            let walks: Arc<[UnsafeCell<bool>; 3]> =
+                Arc::new(std::array::from_fn(|_| UnsafeCell::new(false)));
+            let setters: Vec<_> = (0..3)
+                .map(|_| {
+                    let (ring, next, walks) =
+                        (Arc::clone(&ring), Arc::clone(&next), Arc::clone(&walks));
+                    thread::spawn(move || {
+                        let rev = next.fetch_add(1, Ordering::AcqRel);
+                        // SAFETY: each setter owns a distinct revision and
+                        // so a distinct cell.
+                        walks[(rev - 2) as usize].with_mut(|w| unsafe { *w = true });
+                        ring.complete(rev);
+                    })
+                })
+                .collect();
+            let observer = {
+                let (ring, walks) = (Arc::clone(&ring), Arc::clone(&walks));
+                thread::spawn(move || {
+                    let seen = ring.walked();
+                    for rev in 2..=seen {
+                        // SAFETY: `walked >= rev` was read with Acquire;
+                        // loom reports this read if that does not order it
+                        // after the walk's write.
+                        let walked = walks[(rev - 2) as usize].with(|w| unsafe { *w });
+                        assert!(walked, "walked = {seen} before walk {rev} finished");
+                    }
+                })
+            };
+            observer.join().unwrap();
+            for s in setters {
+                s.join().unwrap();
+            }
+            assert_eq!(ring.walked(), 4, "walked stalled below the last revision");
+        });
+    }
+}
