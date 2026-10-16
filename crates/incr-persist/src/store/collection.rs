@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 
-use incr_core::{Cells, IncrCollection, Runtime, Value};
+use incr_core::{Cells, Incr, IncrCollection, Runtime, Value};
 use serde::de::DeserializeOwned;
 
 use super::binding::{decode, encode, Binding};
 use super::logged::{ElementOp, Elements, LoggedKey};
-use super::{Batch, PersistValue, State, Store};
+use super::{Batch, KeyRef, PersistValue, State, Store};
 use crate::{Backend, Error, Kind, Position, Record, Result};
 
 /// A persisted collection: a key in the log bound to a multiset collection
@@ -131,6 +131,12 @@ impl<T: Value + Hash + Eq, C: Cells> fmt::Debug for PersistedCollection<T, C> {
     }
 }
 
+impl<'a, T: Value + Hash + Eq, C: Cells> From<&'a PersistedCollection<T, C>> for KeyRef<'a> {
+    fn from(collection: &'a PersistedCollection<T, C>) -> Self {
+        KeyRef::handle(collection.id, collection.view.version_node())
+    }
+}
+
 impl<C: Cells, B: Backend> Batch<'_, C, B> {
     /// Adds an insert of `value` into `collection` to the batch. Failures
     /// are kept as for [`Batch::set`].
@@ -245,6 +251,14 @@ where
 {
     fn kind(&self) -> Kind {
         Kind::Collection
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn is_handle(&self, handle: &dyn Any) -> bool {
+        handle.downcast_ref::<Incr<u64>>() == Some(&self.collection.version_node())
     }
 
     fn apply(&self, rt: &Runtime<C>, record: &Record, _before: Option<&LoggedKey>) -> Result<()> {

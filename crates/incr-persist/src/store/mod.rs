@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 use std::sync::{Mutex, MutexGuard};
@@ -54,6 +55,18 @@ pub struct Options {
 pub struct Input<T: 'static> {
     id: u32,
     handle: Incr<T>,
+}
+
+/// Names one key of a store, for [`Store::delete`] and [`Batch::delete_key`]:
+/// an [`Input`], a `&`[`PersistedCollection`], or the key's name as a
+/// string. A name reaches any key, declared in this process or not; a
+/// handle is checked against the store, which rejects one it did not issue
+/// with [`Error::UnknownHandle`].
+pub struct KeyRef<'a>(Target<'a>);
+
+enum Target<'a> {
+    Name(&'a str),
+    Handle { id: u32, node: Box<dyn Any> },
 }
 
 /// Records collected by [`Store::batch`] for one append.
@@ -136,12 +149,47 @@ impl<T: 'static> std::fmt::Debug for Input<T> {
     }
 }
 
+impl KeyRef<'_> {
+    fn handle<T: 'static>(id: u32, node: Incr<T>) -> Self {
+        KeyRef(Target::Handle {
+            id,
+            node: Box::new(node),
+        })
+    }
+}
+
+impl<T: 'static> From<Input<T>> for KeyRef<'_> {
+    fn from(input: Input<T>) -> Self {
+        KeyRef::handle(input.id, input.handle)
+    }
+}
+
+impl<'a> From<&'a str> for KeyRef<'a> {
+    fn from(key: &'a str) -> Self {
+        KeyRef(Target::Name(key))
+    }
+}
+
+impl<'a> From<&'a String> for KeyRef<'a> {
+    fn from(key: &'a String) -> Self {
+        KeyRef(Target::Name(key))
+    }
+}
+
 impl<C: Cells, B: Backend> Batch<'_, C, B> {
     /// Adds a `Set` of `input` to the batch. A failure (an unknown handle, a
     /// poisoned store, a value that fails to serialize) is kept and returned
     /// by [`Store::batch`], which then appends nothing.
     pub fn set<T: PersistValue>(&mut self, input: Input<T>, value: T) -> &mut Self {
         self.push(|state| set_record(state, input, &value))
+    }
+
+    /// Adds a `Delete` of `key` to the batch, as [`Store::delete`] would
+    /// write it. Named `delete_key` because [`Batch::delete`] removes one
+    /// element from a collection.
+    pub fn delete_key<'k>(&mut self, key: impl Into<KeyRef<'k>>) -> &mut Self {
+        let key = key.into();
+        self.push(|state| delete_record(state, &key))
     }
 
     fn push(&mut self, record: impl FnOnce(&State<C>) -> Result<Record>) -> &mut Self {
@@ -170,6 +218,20 @@ impl<C: Cells> State<C> {
             });
         }
         Ok(Some(id))
+    }
+
+    /// The name of the key `target` refers to. Fails with
+    /// [`Error::UnknownHandle`] for a handle this store did not issue.
+    fn key_of(&self, target: &KeyRef<'_>) -> Result<String> {
+        match &target.0 {
+            Target::Name(key) => Ok((*key).to_owned()),
+            Target::Handle { id, node } => self
+                .bindings
+                .get(*id as usize)
+                .filter(|binding| binding.is_handle(node.as_ref()))
+                .map(|binding| binding.key().to_owned())
+                .ok_or(Error::UnknownHandle),
+        }
     }
 
     fn bind(&mut self, key: &str, binding: Box<dyn Binding<C>>) -> u32 {
@@ -273,6 +335,27 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// poisons the store.
     pub fn set<T: PersistValue>(&self, input: Input<T>, value: T) -> Result<Position> {
         self.write_with(|state| set_record(state, input, &value))
+    }
+
+    /// Resets `key` to its logged default, or empties it if it is a
+    /// collection, by appending a `Delete` through the write path; returns
+    /// the record's position.
+    ///
+    /// The default comes from the key's first `Declare` in the log, so
+    /// every process applying the `Delete`, and every restart replaying it,
+    /// reaches the same state. Queries over the key, here and in other
+    /// processes once they apply the record, recompute as after any write.
+    /// The runtime node stays; [`Store::undeclare`] removes it from this
+    /// process. A key held at its default is forgotten by the next
+    /// [`Store::checkpoint`].
+    ///
+    /// `key` is an [`Input`], a `&`[`PersistedCollection`], or a name,
+    /// which may name a key this store never declared. A `Delete` of a key
+    /// the log does not know changes nothing. Errors behave as for
+    /// [`Store::set`].
+    pub fn delete<'k>(&self, key: impl Into<KeyRef<'k>>) -> Result<Position> {
+        let key = key.into();
+        self.write_with(|state| delete_record(state, &key))
     }
 
     /// Runs `f` to collect writes, then appends them as one run with one
@@ -608,5 +691,11 @@ fn set_record<C: Cells, T: PersistValue>(
     Ok(Record::Set {
         key: binding.key.clone(),
         value: encode(value)?,
+    })
+}
+
+fn delete_record<C: Cells>(state: &State<C>, key: &KeyRef<'_>) -> Result<Record> {
+    Ok(Record::Delete {
+        key: state.key_of(key)?,
     })
 }

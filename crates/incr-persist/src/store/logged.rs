@@ -71,6 +71,10 @@ impl LoggedKey {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.declared.is_none() && self.value.is_none() && self.elements.is_empty()
+    }
+
     /// The bytes an input currently holds: its latest value, else its
     /// logged default. `None` when the log has neither.
     pub fn current(&self) -> Option<&[u8]> {
@@ -182,15 +186,23 @@ pub(crate) fn is_element_change(record: &Record) -> bool {
 /// Every key the log knows, by name.
 pub(crate) type LoggedKeys = BTreeMap<String, LoggedKey>;
 
-/// Folds `record` into the entry for its key, creating the entry if needed,
-/// and returns the key.
-pub(crate) fn fold(keys: &mut LoggedKeys, mut record: Record) -> String {
+/// Folds `record` into the entry for its key, creating the entry if needed
+/// and dropping it when the record leaves it holding nothing, as a `Delete`
+/// of a key without a `Declare` does, so the key stops counting as known.
+pub(crate) fn fold(keys: &mut LoggedKeys, mut record: Record) {
     let key = take_key(&mut record);
-    if !keys.contains_key(&key) {
-        keys.insert(key.clone(), LoggedKey::default());
+    if let Some(logged) = keys.get_mut(&key) {
+        logged.apply(record);
+        if logged.is_empty() {
+            keys.remove(&key);
+        }
+    } else {
+        let mut logged = LoggedKey::default();
+        logged.apply(record);
+        if !logged.is_empty() {
+            keys.insert(key, logged);
+        }
     }
-    keys.get_mut(&key).expect("inserted above").apply(record);
-    key
 }
 
 // Moves the key out instead of cloning it, because every applied record
@@ -271,7 +283,7 @@ mod tests {
         assert_eq!(keys["c"].elements.live, expected);
         assert!(keys["c"].elements.tail.is_empty());
         fold(&mut keys, Record::Delete { key: "c".into() });
-        assert!(keys["c"].elements.is_empty());
+        assert!(!keys.contains_key("c"), "nothing is left without a Declare");
     }
 
     #[test]
@@ -302,11 +314,11 @@ mod tests {
         assert_eq!(refolded["c"], keys["c"]);
 
         fold(&mut keys, Record::Delete { key: "c".into() });
-        assert!(keys["c"].elements.is_empty());
+        assert!(!keys.contains_key("c"), "nothing is left without a Declare");
     }
 
     #[test]
-    fn a_remove_from_no_elements_is_dropped() {
+    fn a_record_that_leaves_a_key_holding_nothing_drops_it() {
         let mut keys = LoggedKeys::new();
         fold(
             &mut keys,
@@ -315,7 +327,12 @@ mod tests {
                 element: vec![5],
             },
         );
-        assert!(keys["c"].elements.is_empty());
+        assert!(keys.is_empty());
+        fold(&mut keys, insert(1));
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert!(keys.is_empty());
+        fold(&mut keys, Record::Delete { key: "c".into() });
+        assert!(keys.is_empty());
     }
 
     #[test]

@@ -11,6 +11,12 @@ use crate::{Error, Kind, Record, Result};
 pub(crate) trait Binding<C: Cells>: Send + Sync {
     fn kind(&self) -> Kind;
 
+    fn key(&self) -> &str;
+
+    /// Whether `handle`, a runtime handle erased by [`KeyRef`](crate::KeyRef),
+    /// is the node this binding mirrors.
+    fn is_handle(&self, handle: &dyn Any) -> bool;
+
     /// Applies `record`, one of this key's records in position order, to the
     /// node. `before` is the key's logged state without the record.
     fn apply(&self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>) -> Result<()>;
@@ -49,6 +55,14 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
 impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
     fn kind(&self) -> Kind {
         Kind::Input
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn is_handle(&self, handle: &dyn Any) -> bool {
+        handle.downcast_ref::<Incr<T>>() == Some(&self.handle)
     }
 
     fn apply(&self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>) -> Result<()> {
