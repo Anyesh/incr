@@ -59,14 +59,16 @@ impl Default for SqliteOptions {
 /// A log in an SQLite database file, shared by any number of writers in
 /// any number of processes.
 ///
-/// Records live one per row in `log(pos INTEGER PRIMARY KEY AUTOINCREMENT,
-/// rec BLOB)`, each as [`Record::encode`] bytes, and the snapshot lives in
-/// the single row of `snapshot(pos, recs)`. The database runs in WAL mode,
-/// so readers never wait for writers. `append` and `compact` take SQLite's
-/// write lock with `BEGIN IMMEDIATE` and hold it until commit, so positions
-/// increase in commit order. A read sees a prefix of the commits, which is
-/// therefore a prefix of the positions, and that is what makes `read_from`
-/// gap-free across processes.
+/// Records live one per row in `log(pos INTEGER PRIMARY KEY, rec BLOB)`,
+/// each as [`Record::encode`] bytes, and the snapshot lives in the single
+/// row of `snapshot(pos, recs)`. An append numbers its records from just
+/// above the last row, or above the snapshot's position when compaction
+/// left no rows, so no position is handed out twice. The database runs in
+/// WAL mode, so readers never wait for writers. `append` and `compact` take
+/// SQLite's write lock with `BEGIN IMMEDIATE` and hold it until commit, so
+/// positions increase in commit order. A read sees a prefix of the commits,
+/// which is therefore a prefix of the positions, and that is what makes
+/// `read_from` gap-free across processes.
 ///
 /// Each handle owns one connection and runs its calls on it one at a time.
 /// Threads that should append in parallel open a handle each. A call that
@@ -97,7 +99,7 @@ struct Inner {
 // followed by its bytes. `user_version` versions this layout and the
 // tables together.
 const SCHEMA: &str = "
-    CREATE TABLE log (pos INTEGER PRIMARY KEY AUTOINCREMENT, rec BLOB NOT NULL);
+    CREATE TABLE log (pos INTEGER PRIMARY KEY, rec BLOB NOT NULL);
     CREATE TABLE snapshot (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         pos INTEGER NOT NULL,
@@ -195,15 +197,16 @@ impl Backend for SqliteBackend {
             .collect::<Result<Vec<_>>>()?;
         let mut inner = self.lock();
         let tx = inner.begin_write()?;
+        let mut last = sql_position(tail(&tx)?);
         {
             let mut insert = tx
-                .prepare_cached("INSERT INTO log (rec) VALUES (?1)")
+                .prepare_cached("INSERT INTO log (pos, rec) VALUES (?1, ?2)")
                 .map_err(sql)?;
             for rec in &encoded {
-                insert.execute([rec]).map_err(sql)?;
+                last += 1;
+                insert.execute(params![last, rec]).map_err(sql)?;
             }
         }
-        let last = tx.last_insert_rowid();
         tx.commit().map_err(sql)?;
         position(last)
     }
@@ -492,19 +495,22 @@ fn unsupported_schema(found: i64) -> Error {
     )
 }
 
-/// The highest position ever handed out, compacted ones included.
-/// AUTOINCREMENT keeps it in `sqlite_sequence`, which deleting rows does not
-/// lower.
+/// The highest position ever handed out, compacted ones included: the last
+/// row, or the snapshot's position when there are no rows, because
+/// compaction drops only rows at or below the position it records.
+///
+/// Computed rather than kept by AUTOINCREMENT, whose `sqlite_sequence`
+/// update would add a page to the write-ahead log on every commit.
 fn tail(conn: &Connection) -> Result<Position> {
-    let seq: Option<i64> = conn
-        .query_row(
-            "SELECT seq FROM sqlite_sequence WHERE name = 'log'",
-            [],
-            |row| row.get(0),
+    let at = conn
+        .prepare_cached(
+            "SELECT max(ifnull((SELECT max(pos) FROM log), 0), \
+                        ifnull((SELECT pos FROM snapshot), 0))",
         )
-        .optional()
+        .map_err(sql)?
+        .query_row([], |row| row.get(0))
         .map_err(sql)?;
-    position(seq.unwrap_or(0))
+    position(at)
 }
 
 fn snapshot_position(conn: &Connection) -> Result<Option<Position>> {
