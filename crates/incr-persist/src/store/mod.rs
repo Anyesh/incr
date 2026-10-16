@@ -394,8 +394,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// issued, and in debug builds with [`Error::Bypassed`] when the input
     /// was written through the runtime directly; neither appends anything.
     /// An error from `append` leaves the store usable; an error
-    /// after it (from `sync`, reading the log back, or applying a record)
-    /// poisons the store.
+    /// after it (from `sync`, reading records other writers appended first,
+    /// or applying a record) poisons the store.
     pub fn set<T: PersistValue>(&self, input: Input<T>, value: T) -> Result<Position> {
         self.write_with(|state| set_record(state, &self.runtime, input, &value))
     }
@@ -486,7 +486,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if records.is_empty() {
             return Ok(state.applied);
         }
-        self.write(&mut state, &records)
+        self.write(&mut state, records)
     }
 
     /// Calls `f` with every record this store applies from now on, local
@@ -694,7 +694,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 kind,
                 default: default()?,
             };
-            self.write(state, &[record])?;
+            self.write(state, vec![record])?;
         };
         if declared.kind != kind {
             return Err(Error::KindMismatch {
@@ -708,7 +708,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     fn write_with(&self, record: impl FnOnce(&State<C>) -> Result<Record>) -> Result<Position> {
         let mut state = self.state()?;
         let record = record(&state)?;
-        self.write(&mut state, &[record])
+        self.write(&mut state, vec![record])
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State<C>>> {
@@ -725,21 +725,18 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// everything up to the appended records. Any failure after the append
     /// poisons the store, because a retry would append the records again
     /// and a collection insert is not idempotent.
-    fn write(&self, state: &mut State<C>, records: &[Record]) -> Result<Position> {
+    fn write(&self, state: &mut State<C>, records: Vec<Record>) -> Result<Position> {
         if let Some(threshold) = self.options.auto_checkpoint_records {
             if state.since_checkpoint >= threshold {
                 self.checkpoint_locked(state)?;
             }
         }
-        let last = self.backend.append(records)?;
-        // Appends are contiguous, so the run is exactly the positions
-        // ending at `last`, which is how catch-up tells local from foreign.
-        let first = Position(last.0 + 1 - records.len() as u64);
+        let last = self.backend.append(&records)?;
         let landed = (|| {
             if self.options.durability == Durability::Sync {
                 self.backend.sync(last)?;
             }
-            self.catch_up(state, Some(first..=last))
+            self.apply_appended(state, last, records)
         })();
         match landed {
             Ok(()) => Ok(last),
@@ -748,6 +745,35 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 Err(e)
             }
         }
+    }
+
+    /// Applies everything after `state.applied` through `last`, where the
+    /// append of `records` ended.
+    ///
+    /// Appends are contiguous, so the run is exactly the positions ending at
+    /// `last`. When it starts right after `applied`, no other writer's
+    /// record lies before it and the records are applied as held, without
+    /// reading them back. Otherwise the log is read from `applied`, which
+    /// picks up the foreign records and crosses any compaction another
+    /// writer ran past `applied`. A compaction at `applied`, or over the
+    /// run after it landed, folds only records this store applies anyway,
+    /// so it is not crossed, just as `read_from` at the snapshot position
+    /// reports none.
+    fn apply_appended(
+        &self,
+        state: &mut State<C>,
+        last: Position,
+        records: Vec<Record>,
+    ) -> Result<()> {
+        let len = records.len() as u64;
+        let first = Position(last.0 + 1 - len);
+        if state.applied.0 + len != last.0 {
+            return self.catch_up(state, Some(first..=last));
+        }
+        for (position, record) in (first.0..).map(Position).zip(records) {
+            self.apply_at(state, position, record, Origin::Local)?;
+        }
+        Ok(())
     }
 
     /// Applies records after `state.applied` until reaching the end of
@@ -764,19 +790,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 ReadOutcome::Records => {
                     let progressed = !read.is_empty();
                     for (position, record) in read.drain(..) {
-                        // Cloned only for subscribers, because applying
-                        // moves the record's bytes into the folded log.
-                        let notice = (!state.subscribers.is_empty()).then(|| record.clone());
-                        self.apply(state, record)?;
-                        state.applied = position;
-                        state.since_checkpoint += 1;
-                        if let Some(record) = notice {
-                            let origin = match &own {
-                                Some(run) if run.contains(&position) => Origin::Local,
-                                _ => Origin::Foreign,
-                            };
-                            state.notify(position, &record, origin);
-                        }
+                        let origin = match &own {
+                            Some(run) if run.contains(&position) => Origin::Local,
+                            _ => Origin::Foreign,
+                        };
+                        self.apply_at(state, position, record, origin)?;
                     }
                     match own.as_ref().map(|run| *run.end()) {
                         Some(target) if state.applied < target => {
@@ -791,6 +809,27 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 }
             }
         }
+    }
+
+    /// Applies `record`, the log's record at `position`, and reports it to
+    /// subscribers as coming from `origin`.
+    fn apply_at(
+        &self,
+        state: &mut State<C>,
+        position: Position,
+        record: Record,
+        origin: Origin,
+    ) -> Result<()> {
+        // Cloned only for subscribers, because applying moves the record's
+        // bytes into the folded log.
+        let notice = (!state.subscribers.is_empty()).then(|| record.clone());
+        self.apply(state, record)?;
+        state.applied = position;
+        state.since_checkpoint += 1;
+        if let Some(record) = notice {
+            state.notify(position, &record, origin);
+        }
+        Ok(())
     }
 
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {

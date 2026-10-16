@@ -280,6 +280,7 @@ struct Faulty {
     fail_read: Arc<AtomicBool>,
     appends: Arc<AtomicUsize>,
     syncs: Arc<AtomicUsize>,
+    reads: Arc<AtomicUsize>,
 }
 
 fn injected(flag: &AtomicBool) -> Result<(), Error> {
@@ -309,6 +310,7 @@ impl Backend for Faulty {
         out: &mut Vec<(Position, Record)>,
     ) -> incr_persist::Result<ReadOutcome> {
         injected(&self.fail_read)?;
+        self.reads.fetch_add(1, Ordering::SeqCst);
         self.inner.read_from(after, out)
     }
 
@@ -338,6 +340,15 @@ fn a_failure_after_append_poisons_the_store_until_reopened() {
         let backend = Faulty::default();
         let store = open::<Local, _>(backend.clone());
         let x = store.input("x", 0u32).unwrap();
+        // A write reads the log back only when another writer's record
+        // precedes its own, so this one gives it something to read.
+        backend
+            .inner
+            .append(&[Record::Set {
+                key: "other".into(),
+                value: vec![1],
+            }])
+            .unwrap();
         let flag = if fail_sync {
             &backend.fail_sync
         } else {
@@ -365,6 +376,28 @@ fn a_failure_after_append_poisons_the_store_until_reopened() {
         store.set(x, 8).unwrap();
         assert_eq!(store.runtime().get(x.handle()), 8);
     }
+}
+
+#[test]
+fn a_write_reads_the_log_only_when_another_writer_appended_first() {
+    let backend = Faulty::default();
+    let store = open::<Local, _>(backend.clone());
+    let x = store.input("x", 0u32).unwrap();
+    let reads = backend.reads.load(Ordering::SeqCst);
+    store.set(x, 1).unwrap();
+    store
+        .batch(|b| {
+            b.set(x, 2).delete_key("x");
+        })
+        .unwrap();
+    assert_eq!(backend.reads.load(Ordering::SeqCst), reads);
+
+    let other = open::<Local, _>(backend.inner.clone());
+    let other_x = other.input("x", 0u32).unwrap();
+    other.set(other_x, 3).unwrap();
+    store.set(x, 4).unwrap();
+    assert_eq!(backend.reads.load(Ordering::SeqCst), reads + 1);
+    assert_eq!(store.runtime().get(x.handle()), 4);
 }
 
 #[test]
