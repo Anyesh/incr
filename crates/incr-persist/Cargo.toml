@@ -1,0 +1,17 @@
+[package]
+name = "incr-persist"
+version.workspace = true
+edition = "2021"
+description = "Durable, shareable state for incr: keeps a runtime's inputs in sync with an ordered operation log held by a pluggable backend."
+license = "Apache-2.0"
+repository = "https://github.com/Anyesh/incr"
+keywords = ["incremental", "persistence", "event-sourcing", "log"]
+categories = ["algorithms", "database"]
+
+[features]
+backend-tests = []
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+thiserror = "2.0.21"

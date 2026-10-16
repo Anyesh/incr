@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/incr-bench", "crates/incr-compute", "crates/incr-concurrent", "crates/incr-concurrent-python", "crates/incr-core", "crates/incr-kube", "crates/incr-python", "examples/concurrent-server", "examples/spreadsheet"]
+members = ["crates/incr-bench", "crates/incr-compute", "crates/incr-concurrent", "crates/incr-concurrent-python", "crates/incr-core", "crates/incr-kube", "crates/incr-persist", "crates/incr-python", "examples/concurrent-server", "examples/spreadsheet"]
 
 [workspace.package]
 version = "0.2.0-beta.3"
