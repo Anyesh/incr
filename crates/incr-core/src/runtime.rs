@@ -111,6 +111,8 @@ pub struct ObserverId(u64);
 pub(crate) enum ParkPoint {
     /// In `ensure_clean`, just before `compute_one` on a visited node.
     BeforeComputeOne(NodeId),
+    /// In `compute_one`, after the state load and before the claim CAS.
+    BeforeClaim(NodeId),
     /// In red/green verification, after the dep scan found no change and
     /// before the landing CAS.
     VerifyAfterScan(NodeId),
@@ -949,10 +951,41 @@ impl<C: Cells> Runtime<C> {
                 }
             };
 
-            // Capture the revisions BEFORE verifying or computing. If a
-            // set() bumps the revision mid-flight, our stamps stay below
-            // its changed_at and the next reader re-verifies; stamping the
-            // post-compute revision would mask the change forever.
+            self.park(ParkPoint::BeforeClaim(id));
+
+            // Verification claims the node too, so a walk that arrives
+            // meanwhile flags ComputingDirty and blocks the Clean landing.
+            // The claim source tells us exactly whether this is a
+            // recompute: the node may have gone Dirty since `observed`.
+            let verifying = observed == NodeState::Dirty;
+            let claimed_dirty = if verifying {
+                if state::try_transition::<C>(
+                    node.state_cell(),
+                    NodeState::Dirty,
+                    NodeState::Computing,
+                )
+                .is_err()
+                {
+                    continue;
+                }
+                true
+            } else {
+                match state::try_claim_compute::<C>(node.state_cell()) {
+                    Ok(src) => src == NodeState::Dirty,
+                    Err(_) => continue,
+                }
+            };
+
+            // Capture the revisions after the claim and BEFORE verifying or
+            // computing. If a set() bumps the revision mid-flight, our
+            // stamps stay below its changed_at and the next reader
+            // re-verifies; stamping the post-compute revision would mask
+            // the change forever. Before the claim is too early: the claim
+            // can succeed on a later Dirty than `observed` (another reader
+            // cleans the node, a second set dirties it again), and a change
+            // stamped below that set hides it from dependents verified in
+            // between. The claim reads from the walk that made the node
+            // Dirty, so the loads below see that walk's revision bump.
             //
             // changed_at uses the current revision, so a value changed by
             // an in-flight set is never under-stamped. verified_at uses the
@@ -963,21 +996,10 @@ impl<C: Cells> Runtime<C> {
             let verify_rev = C::walked(&self.walk, &self.revision);
 
             // Red/green verification, only from Dirty: a New node has
-            // nothing to verify against. Verification claims the node, so
-            // a walk that arrives meanwhile flags ComputingDirty and blocks
-            // the Clean landing. It counts a dep that is not Clean as
-            // changed, which catches a walk that passed this node before
+            // nothing to verify against. It counts a dep that is not Clean
+            // as changed, which catches a walk that passed this node before
             // the claim, and a dep that landed Dirty without a new stamp.
-            let is_recompute = if observed == NodeState::Dirty {
-                if state::try_transition::<C>(
-                    node.state_cell(),
-                    NodeState::Dirty,
-                    NodeState::Computing,
-                )
-                .is_err()
-                {
-                    continue;
-                }
+            if verifying {
                 let my_verified = node.verified_at();
                 let mut any_changed = false;
                 node.for_each_dep(|dep| {
@@ -997,15 +1019,8 @@ impl<C: Cells> Runtime<C> {
                 }
                 // Keep the claim and recompute; the closure's nested reads
                 // clean the changed deps.
-                true
-            } else {
-                // The claim source tells us exactly whether this is a
-                // recompute: the node may have gone Dirty since `observed`.
-                match state::try_claim_compute::<C>(node.state_cell()) {
-                    Ok(src) => src == NodeState::Dirty,
-                    Err(_) => continue,
-                }
-            };
+            }
+            let is_recompute = claimed_dirty;
 
             // Track deps via the strategy's dep stack. The closure runs
             // under a panic boundary: a panicking user closure must not

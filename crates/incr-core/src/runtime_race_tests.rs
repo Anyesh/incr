@@ -571,6 +571,34 @@ fn nested_superseded_dep_poisons_fast_path_publisher() {
     assert_eq!(rt.get(d), 107);
 }
 
+/// A reader loads Q `Dirty` and stops before its claim. Meanwhile another
+/// reader cleans Q by cutoff and verifies D at revision 2, and a second
+/// set dirties both again. The stopped reader's claim then succeeds on
+/// the newer `Dirty`, so revisions captured before the claim predate the
+/// second set: Q's change would be stamped 2 and D, verified at 2, would
+/// stay Clean over it.
+#[test]
+fn claim_on_a_later_dirty_stamps_that_dirty_revision() {
+    let rt = Arc::new(Rt::new());
+    let (x, q, d) = chain(&rt);
+    rt.set(x, 1);
+
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::BeforeClaim(id(q)), gate.clone())]);
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(q))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.get(d), 100);
+    rt.set(x, 2);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 1);
+
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 101);
+}
+
 #[test]
 fn lagging_watermark_costs_a_recompute_not_a_stale_value() {
     let rt = Arc::new(Rt::new());
