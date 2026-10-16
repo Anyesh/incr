@@ -540,8 +540,77 @@ impl<C: Cells> Runtime<C> {
         ErasedIncr::new(slot, self.nodes.get(slot).generation(), self.runtime_id)
     }
 
+    /// Delete `root` together with every node that depends on it,
+    /// transitively, and every node any of them owns (such as the groups
+    /// of a `group_by` router). Returns how many nodes this call deleted;
+    /// a root that is already gone counts as done and returns 0.
+    ///
+    /// Dependents are found through the reverse edges a compute records,
+    /// so a query that was created but has never run is not reached: it
+    /// survives and panics with a stale-handle message on its first
+    /// compute. Concurrent cascades and plain deletes over the same nodes
+    /// are safe, and a node deleted by one of them is not counted here.
+    /// A cascade does not terminate while other threads keep attaching
+    /// new dependents to its nodes faster than it removes them.
+    ///
+    /// Panics if called from inside a compute closure: the computing
+    /// node may depend on `root`, and the cascade would wait on it
+    /// forever.
+    pub fn delete_with_dependents(&self, root: impl Into<ErasedIncr>) -> usize {
+        let root = root.into();
+        assert!(
+            !self.dep_stack.current_frame_active(),
+            "incr-core: delete_with_dependents called during compute; not permitted",
+        );
+        if root.runtime_id() != self.runtime_id {
+            panic!(
+                "incr-core: delete_with_dependents with a handle from a foreign runtime \
+                 (handle was minted by runtime {}, used on runtime {})",
+                root.runtime_id().get(),
+                self.runtime_id.get(),
+            );
+        }
+
+        let mut deleted = 0;
+        let mut stack = vec![root];
+        while let Some(&top) = stack.last() {
+            // Captured under the same hold that yields the slot, so the
+            // generation is the linked node's (see delete_erased).
+            let next = {
+                let inner = self.inner.read();
+                if self.nodes.get(top.slot()).generation() != top.generation() {
+                    stack.pop();
+                    continue;
+                }
+                let slot = top.slot() as usize;
+                inner.dependents[slot]
+                    .first()
+                    .or_else(|| inner.owned.get(&top.slot()).and_then(|o| o.first()))
+                    .map(|n| self.erased_at(n.0))
+            };
+            if let Some(child) = next {
+                stack.push(child);
+                continue;
+            }
+            match self.delete_erased(top) {
+                DeleteOutcome::Deleted => {
+                    deleted += 1;
+                    stack.pop();
+                }
+                DeleteOutcome::AlreadyGone => {
+                    stack.pop();
+                }
+                // A dependent attached after the hint; walk to it next.
+                DeleteOutcome::HasDependents => {}
+            }
+        }
+        deleted
+    }
+
     /// Record `child` as owned by `owner`: it is deleted with the owner,
-    /// by strict delete and by the cascade. Both must be live.
+    /// by strict delete and by the cascade. Both must be live, and the
+    /// owner must not depend on the child, or the cascade would walk the
+    /// cycle forever.
     pub(crate) fn adopt(&self, owner: ErasedIncr, child: ErasedIncr) {
         let mut inner = self.inner.write();
         for h in [owner, child] {
@@ -1514,6 +1583,10 @@ impl<C: Cells> Runtime<C> {
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_race_tests.rs"]
 mod race_tests;
+
+#[cfg(test)]
+#[path = "runtime_cascade_tests.rs"]
+mod cascade_tests;
 
 #[cfg(test)]
 mod tests {
