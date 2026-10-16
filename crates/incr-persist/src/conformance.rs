@@ -545,8 +545,11 @@ pub fn forgotten_keys_leave_snapshot_and_log<H: Harness>(mut h: H) {
 }
 
 /// A read-only handle reports `writable() == false`, rejects `append` and
-/// `compact` with [`Error::ReadOnly`], and sees what a writer appends and
-/// compacts. Skipped for backends without a read-only mode.
+/// `compact` with [`Error::ReadOnly`], and follows a writer across a
+/// compaction: below the snapshot it either reports `Compacted` or returns
+/// exactly the compacted records, at the snapshot it continues with later
+/// appends, and a handle opened after the compaction reports `Compacted`.
+/// Skipped for backends without a read-only mode.
 pub fn read_only_handle_rejects_writes_and_follows_writer<H: Harness>(mut h: H) {
     let log = h.new_log();
     let writer = h.open(&log);
@@ -572,9 +575,25 @@ pub fn read_only_handle_rejects_writes_and_follows_writer<H: Harness>(mut h: H) 
     assert_eq!(read_all(&reader, first), vec![(second, set("a", 3))]);
 
     writer.compact(second, vec![set("a", 3)]).unwrap();
-    assert_compacted(&reader, first, second);
+    let mut out = Vec::new();
+    match reader.read_from(first, &mut out).unwrap() {
+        ReadOutcome::Compacted { snapshot_at } => {
+            assert_eq!(snapshot_at, second);
+            assert!(out.is_empty(), "a Compacted read must push nothing");
+        }
+        ReadOutcome::Records => assert_eq!(
+            out,
+            vec![(second, set("a", 3))],
+            "records served from before a compaction must be the compacted ones"
+        ),
+    }
+    assert!(read_all(&reader, second).is_empty());
+    let later = writer.append(&[set("a", 4)]).unwrap();
+    assert_eq!(read_all(&reader, second), vec![(later, set("a", 4))]);
     assert_eq!(
         reader.load_snapshot().unwrap(),
         Some((second, vec![set("a", 3)]))
     );
+    let fresh = h.open_read_only(&log).expect("read-only mode");
+    assert_compacted(&fresh, first, second);
 }

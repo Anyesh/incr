@@ -69,9 +69,14 @@ pub trait Backend: Send + Sync {
     /// or may not be included.
     ///
     /// If `after` is below the snapshot position, some records the caller
-    /// has not seen are only in the snapshot. Nothing is pushed and the
-    /// result is [`ReadOutcome::Compacted`]. This holds even when compaction
-    /// left no log records at all.
+    /// has not seen may survive only in the snapshot. Unless this handle can
+    /// still supply every one of them, nothing is pushed and the result is
+    /// [`ReadOutcome::Compacted`], even when compaction left no log records
+    /// at all. A handle that still holds them, such as a file-backend reader
+    /// draining a journal it opened before the compaction, may return them
+    /// as `Records` instead, so callers must accept either outcome there.
+    /// `Compacted` is never returned for `after` at or above the snapshot
+    /// position.
     fn read_from(&self, after: Position, out: &mut Vec<(Position, Record)>) -> Result<ReadOutcome>;
 
     /// Returns the current snapshot and the position it covers, or `None`
