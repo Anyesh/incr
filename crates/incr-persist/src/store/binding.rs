@@ -19,7 +19,8 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
 
     /// Applies `record`, one of this key's records in position order, to the
     /// node. `before` is the key's logged state without the record.
-    fn apply(&self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>) -> Result<()>;
+    fn apply(&mut self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>)
+        -> Result<()>;
 
     /// Sets the node to exactly what `logged` holds, or to the binding's
     /// default when the log no longer knows the key. A collection binding
@@ -29,11 +30,16 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// `Insert` onto it per element occurrence it changed; an input's change
     /// is visible in the logged state alone, so input bindings push nothing.
     fn replace(
-        &self,
+        &mut self,
         rt: &Runtime<C>,
         logged: Option<&mut LoggedKey>,
         changes: Option<&mut Vec<Record>>,
     ) -> Result<()>;
+
+    /// Fails with [`Error::Bypassed`] when the node holds something other
+    /// than what `logged`, the key's logged state, says it holds.
+    #[cfg(debug_assertions)]
+    fn check_bypass(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()>;
 
     /// The records a snapshot keeps for this key, given its logged state.
     /// Empty when the key holds only its logged default, compared by
@@ -46,8 +52,9 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
 pub(crate) struct InputBinding<T: 'static> {
     pub key: String,
     pub handle: Incr<T>,
-    /// The logged default as of binding, used when the log no longer
-    /// declares the key.
+    /// The default of the key's live `Declare`, or of the last one when
+    /// compaction has since forgotten the key, which is what the key holds
+    /// then.
     pub default: T,
 }
 
@@ -60,7 +67,7 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
     }
 }
 
-impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
+impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBinding<T> {
     fn kind(&self) -> Kind {
         Kind::Input
     }
@@ -73,18 +80,25 @@ impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
         handle.downcast_ref::<Incr<T>>() == Some(&self.handle)
     }
 
-    fn apply(&self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>) -> Result<()> {
+    fn apply(
+        &mut self,
+        rt: &Runtime<C>,
+        record: &Record,
+        before: Option<&LoggedKey>,
+    ) -> Result<()> {
         let value = match record {
             Record::Set { value, .. } => decode(&self.key, value)?,
-            Record::Delete { .. } => {
-                let declared = before.and_then(|logged| logged.declared.as_ref());
-                match declared {
-                    Some(declared) => decode(&self.key, &declared.default)?,
-                    None => self.default.clone(),
+            Record::Delete { .. } => self.default.clone(),
+            // Only the first Declare since the key was last forgotten is
+            // live, as in the folded log.
+            Record::Declare { default, .. }
+                if before.is_none_or(|logged| logged.declared.is_none()) =>
+            {
+                self.default = decode(&self.key, default)?;
+                if before.and_then(LoggedKey::current).is_some() {
+                    return Ok(());
                 }
-            }
-            Record::Declare { default, .. } if before.and_then(LoggedKey::current).is_none() => {
-                decode(&self.key, default)?
+                self.default.clone()
             }
             _ => return Ok(()),
         };
@@ -93,13 +107,36 @@ impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
     }
 
     fn replace(
-        &self,
+        &mut self,
         rt: &Runtime<C>,
         logged: Option<&mut LoggedKey>,
         _changes: Option<&mut Vec<Record>>,
     ) -> Result<()> {
-        rt.set(self.handle, self.value_of(logged.as_deref())?);
+        let logged = logged.as_deref();
+        let declared = logged.and_then(|logged| logged.declared.as_ref());
+        let default = declared
+            .map(|declared| decode(&self.key, &declared.default))
+            .transpose()?;
+        let value = self.value_of(logged)?;
+        if let Some(default) = default {
+            self.default = default;
+        }
+        rt.set(self.handle, value);
         Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn check_bypass(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()> {
+        let held = rt.get(self.handle);
+        let applied = self.value_of(logged)?;
+        // Equal bytes cover values unequal to themselves, such as NaN.
+        if held == applied || encode(&held)? == encode(&applied)? {
+            Ok(())
+        } else {
+            Err(Error::Bypassed {
+                key: self.key.clone(),
+            })
+        }
     }
 
     fn fold(&self, _rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {

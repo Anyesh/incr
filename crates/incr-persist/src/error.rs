@@ -79,6 +79,14 @@ pub enum Error {
     #[error("key {key:?} still has dependents in this process; delete them before undeclaring it")]
     HasDependents { key: String },
 
+    /// An input holds a value in the runtime that differs from the last
+    /// record the store applied to it, because something wrote it through
+    /// the runtime instead of the store. The log never saw that write, so a
+    /// restart would lose it. Reported by `Store::set`, `Batch::set` and
+    /// `Store::checkpoint` in debug builds only.
+    #[error("input {key:?} was written through the runtime, bypassing the store's log")]
+    Bypassed { key: String },
+
     /// A handle passed to a store was not issued by that store.
     #[error("handle was not issued by this store")]
     UnknownHandle,

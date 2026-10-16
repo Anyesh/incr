@@ -291,7 +291,12 @@ where
         handle.downcast_ref::<Incr<u64>>() == Some(&self.collection.version_node())
     }
 
-    fn apply(&self, rt: &Runtime<C>, record: &Record, _before: Option<&LoggedKey>) -> Result<()> {
+    fn apply(
+        &mut self,
+        rt: &Runtime<C>,
+        record: &Record,
+        _before: Option<&LoggedKey>,
+    ) -> Result<()> {
         match record {
             Record::Insert { element, .. } => {
                 self.collection.insert(rt, decode(&self.key, element)?);
@@ -314,7 +319,7 @@ where
     }
 
     fn replace(
-        &self,
+        &mut self,
         rt: &Runtime<C>,
         logged: Option<&mut LoggedKey>,
         changes: Option<&mut Vec<Record>>,
@@ -328,6 +333,13 @@ where
             None => HashMap::new(),
         };
         self.converge(rt, target, changes)
+    }
+
+    // The handle a PersistedCollection exposes is a view whose mutators
+    // panic, so a collection cannot be written around the store.
+    #[cfg(debug_assertions)]
+    fn check_bypass(&self, _rt: &Runtime<C>, _logged: Option<&LoggedKey>) -> Result<()> {
+        Ok(())
     }
 
     fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {

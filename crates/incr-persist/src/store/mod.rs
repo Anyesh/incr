@@ -148,7 +148,10 @@ struct State<C: Cells> {
 
 impl<T: 'static> Input<T> {
     /// The runtime node holding the input's value, for reads and queries.
-    /// Write through [`Store::set`], not through this handle.
+    /// Write through [`Store::set`], not through this handle: the log never
+    /// sees a direct write, and debug builds report one as
+    /// [`Error::Bypassed`] at the input's next [`Store::set`] or at the next
+    /// [`Store::checkpoint`].
     pub fn handle(self) -> Incr<T> {
         self.handle
     }
@@ -211,7 +214,8 @@ impl<C: Cells, B: Backend> Batch<'_, C, B> {
     /// poisoned store, a value that fails to serialize) is kept and returned
     /// by [`Store::batch`], which then appends nothing.
     pub fn set<T: PersistValue>(&mut self, input: Input<T>, value: T) -> &mut Self {
-        self.push(|state| set_record(state, input, &value))
+        let rt = &self.store.runtime;
+        self.push(|state| set_record(state, rt, input, &value))
     }
 
     /// Adds a `Delete` of `key` to the batch, as [`Store::delete`] would
@@ -370,11 +374,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// record up to that position.
     ///
     /// Fails with [`Error::UnknownHandle`] for a handle another store
-    /// issued. An error from `append` leaves the store usable; an error
+    /// issued, and in debug builds with [`Error::Bypassed`] when the input
+    /// was written through the runtime directly; neither appends anything.
+    /// An error from `append` leaves the store usable; an error
     /// after it (from `sync`, reading the log back, or applying a record)
     /// poisons the store.
     pub fn set<T: PersistValue>(&self, input: Input<T>, value: T) -> Result<Position> {
-        self.write_with(|state| set_record(state, input, &value))
+        self.write_with(|state| set_record(state, &self.runtime, input, &value))
     }
 
     /// Resets `key` to its logged default, or empties it if it is a
@@ -526,6 +532,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// Declared keys compare by decoded value; keys this store has not
     /// declared compare by bytes.
     ///
+    /// In debug builds it first fails with [`Error::Bypassed`] if any
+    /// declared input was written through the runtime directly.
+    ///
     /// When another writer compacts past this store's position between its
     /// catch-up and its compaction, the backend rejects the stale fold with
     /// [`Error::InvalidCompaction`]; the store catches up across that
@@ -542,6 +551,10 @@ impl<C: Cells, B: Backend> Store<C, B> {
     fn checkpoint_locked(&self, state: &mut State<C>) -> Result<Position> {
         loop {
             self.catch_up(state, None)?;
+            #[cfg(debug_assertions)]
+            for (key, id) in &state.bound {
+                state.bindings[id].check_bypass(&self.runtime, state.logged.get(key))?;
+            }
             let upto = state.applied;
             let (folded, forgotten) = self.fold_snapshot(state)?;
             match self.backend.compact(upto, folded) {
@@ -745,7 +758,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
 
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
         if let Some(&id) = state.bound.get(record.key()) {
-            let binding = &state.bindings[&id];
+            let binding = bound_binding(&mut state.bindings, id);
             binding.apply(&self.runtime, &record, state.logged.get(record.key()))?;
             // A bound collection holds its elements by decoded value; folding
             // them by bytes as well would let the two disagree.
@@ -793,9 +806,10 @@ impl<C: Cells, B: Backend> Store<C, B> {
         };
         let mut changes = Vec::new();
         for key in &keys {
-            let binding = state.bound.get(key).map(|id| &state.bindings[id]);
+            let id = state.bound.get(key).copied();
             if notify {
-                let bound_collection = binding.is_some_and(|b| b.kind() == Kind::Collection);
+                let bound_collection =
+                    id.is_some_and(|id| state.bindings[&id].kind() == Kind::Collection);
                 changes_between(
                     key,
                     state.logged.get(key),
@@ -804,7 +818,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
                     &mut changes,
                 );
             }
-            if let Some(binding) = binding {
+            if let Some(id) = id {
+                let binding = bound_binding(&mut state.bindings, id);
                 let sink = notify.then_some(&mut changes);
                 if let Err(e) = binding.replace(&self.runtime, logged.get_mut(key), sink) {
                     state.poisoned = true;
@@ -822,6 +837,16 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 }
 
+fn bound_binding<C: Cells>(
+    bindings: &mut HashMap<u32, Box<dyn Binding<C>>>,
+    id: u32,
+) -> &mut dyn Binding<C> {
+    bindings
+        .get_mut(&id)
+        .expect("every id in `bound` has a binding")
+        .as_mut()
+}
+
 /// The binding `input` was issued for, or [`Error::UnknownHandle`] when this
 /// store did not issue it or has since undeclared it.
 fn input_binding<C: Cells, T: Value>(
@@ -836,13 +861,21 @@ fn input_binding<C: Cells, T: Value>(
         .ok_or(Error::UnknownHandle)
 }
 
+/// The `Set` record writing `value` to `input`. In debug builds it first
+/// checks that nothing wrote the input around the store.
 fn set_record<C: Cells, T: PersistValue>(
     state: &State<C>,
+    rt: &Runtime<C>,
     input: Input<T>,
     value: &T,
 ) -> Result<Record> {
+    let binding = input_binding(state, input)?;
+    #[cfg(debug_assertions)]
+    Binding::<C>::check_bypass(binding, rt, state.logged.get(&binding.key))?;
+    #[cfg(not(debug_assertions))]
+    let _ = rt;
     Ok(Record::Set {
-        key: input_binding(state, input)?.key.clone(),
+        key: binding.key.clone(),
         value: encode(value)?,
     })
 }
