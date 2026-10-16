@@ -471,6 +471,36 @@ fn delete_erased_waits_out_a_claimed_delete_then_reports_gone() {
     rt.assert_invariant_i();
 }
 
+/// A strict delete passes its handle check, then loses the node to
+/// another delete and its slot to a recycled node that has a dependent.
+/// It must report the lost race, not the new occupant's dependents.
+#[test]
+fn strict_delete_that_lost_its_slot_to_a_recycle_reports_gone() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::DeleteAfterHandleCheck(id(v)), gate.clone())],
+    );
+    let late = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.delete_node(v))))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.delete_erased(v.erase()), DeleteOutcome::Deleted);
+    let recycled = rt.create_input(1_u64);
+    assert_eq!(recycled.slot(), v.slot());
+    let reader = rt.create_query(move |rt: &Rt| rt.get(recycled));
+    assert_eq!(rt.get(reader), 1);
+    gate.release();
+
+    let err = late.join().unwrap().unwrap_err();
+    let msg = err.downcast_ref::<String>().unwrap();
+    assert!(msg.contains("deleted twice concurrently"), "got: {msg}");
+    assert!(rt.is_alive(recycled) && rt.is_alive(reader));
+}
+
 #[test]
 fn concurrent_typed_delete_panics_deleted_twice() {
     let rt = Arc::new(Rt::new());

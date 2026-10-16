@@ -117,6 +117,8 @@ pub(crate) enum ParkPoint {
     /// In `delete_erased`, on finding the node claimed `Dead` by another
     /// delete that has not bumped its generation yet.
     DeleteWaitsOnClaim(NodeId),
+    /// In `delete_node`, after the handle check and before any read hold.
+    DeleteAfterHandleCheck(NodeId),
 }
 
 /// What [`Runtime::delete_erased`] did with a node.
@@ -459,6 +461,7 @@ impl<C: Cells> Runtime<C> {
         self.check_handle(handle);
         let root = handle.erase();
         self.assert_not_own_compute(NodeId(root.slot()));
+        self.park(ParkPoint::DeleteAfterHandleCheck(NodeId(root.slot())));
         let owned = match self.owned_for_strict_delete(root) {
             Ok(owned) => owned,
             Err(slot) if slot == root.slot() => Self::panic_has_dependents(root.slot()),
@@ -504,9 +507,15 @@ impl<C: Cells> Runtime<C> {
     /// before its owner. `Err(slot)` names the first node found, `root`
     /// included, that has a dependent. Checking everything up front
     /// means a strict delete that panics has released nothing, unless a
-    /// dependent attaches concurrently after this check.
+    /// dependent attaches concurrently after this check. Empty when
+    /// `root` is already gone, so `delete_erased` reports that.
     fn owned_for_strict_delete(&self, root: ErasedIncr) -> Result<Vec<ErasedIncr>, u32> {
         let inner = self.inner.read();
+        // Rechecked under the hold: the handle check ran before it, and
+        // the slot may since hold a new node with dependents of its own.
+        if self.nodes.get(root.slot()).generation() != root.generation() {
+            return Ok(Vec::new());
+        }
         let mut out = Vec::new();
         let mut stack = vec![root.slot()];
         while let Some(slot) = stack.pop() {
