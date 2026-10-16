@@ -1,5 +1,11 @@
+import incr
+import incr_concurrent
 import pytest
 from incr import Runtime
+
+BOTH_RUNTIMES = pytest.mark.parametrize(
+    "make_rt", [incr.Runtime, incr_concurrent.Runtime], ids=["local", "concurrent"]
+)
 
 
 def test_query_exception_propagates_as_original():
@@ -93,3 +99,41 @@ def test_cycle_detection_raises():
     holder["q"] = q
     with pytest.raises(RuntimeError, match="cycle"):
         rt.get(q)
+
+
+@BOTH_RUNTIMES
+def test_is_alive_tracks_delete_and_foreign_runtimes(make_rt):
+    rt = make_rt()
+    a = rt.create_input(1)
+    assert rt.is_alive(a)
+    assert not make_rt().is_alive(a)
+    rt.delete_node(a)
+    assert not rt.is_alive(a)
+
+
+@BOTH_RUNTIMES
+def test_delete_with_dependents_removes_the_subgraph(make_rt):
+    rt = make_rt()
+    x = rt.create_input(1)
+    left = rt.create_query(lambda r: r.get(x) + 1)
+    right = rt.create_query(lambda r: r.get(x) + 2)
+    both = rt.create_query(lambda r: r.get(left) + r.get(right))
+    other = rt.create_input(10)
+    assert rt.get(both) == 5
+
+    assert rt.delete_with_dependents(x) == 4
+    assert not any(rt.is_alive(n) for n in (x, left, right, both))
+    assert rt.is_alive(other) and rt.get(other) == 10
+    with pytest.raises(RuntimeError, match="stale"):
+        rt.get(both)
+    assert rt.delete_with_dependents(x) == 0
+
+
+@BOTH_RUNTIMES
+def test_delete_with_dependents_inside_a_query_raises(make_rt):
+    rt = make_rt()
+    x = rt.create_input(1)
+    q = rt.create_query(lambda r: rt.delete_with_dependents(x))
+    with pytest.raises(RuntimeError, match="during compute"):
+        rt.get(q)
+    assert rt.is_alive(x)

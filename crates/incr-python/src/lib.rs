@@ -532,6 +532,20 @@ impl PyRuntime {
         pyerr_boundary(|| self.inner.delete_node(node.inner))
     }
 
+    /// Delete the node, every node that depends on it (transitively)
+    /// and every node an operator created for them. Returns how many
+    /// nodes were deleted; 0 if the node was already gone. A query that
+    /// has never run is not reached, and raises as stale on first use.
+    fn delete_with_dependents(&self, node: PyNodeId) -> PyResult<usize> {
+        pyerr_boundary(|| self.inner.delete_with_dependents(node.inner))
+    }
+
+    /// True while the node exists in this runtime. False after it is
+    /// deleted, and for a node from another runtime.
+    fn is_alive(&self, node: PyNodeId) -> bool {
+        self.inner.is_alive(node.inner)
+    }
+
     /// Register `callback` to fire on `stabilize()` whenever the node's
     /// value changed since the last firing.
     fn observe(&self, node: PyNodeId, callback: Py<PyAny>) -> PyResult<PyObserverId> {
