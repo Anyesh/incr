@@ -31,8 +31,10 @@ const COMPACTION_STEPS: u8 = 5;
 /// handle's lifetime, so at most one writable handle exists per log across
 /// all processes. Read-only handles take no lock and follow the writer,
 /// including across compactions: a reader keeps reading a journal that
-/// compaction unlinked through its open file, and moves to the new journal
-/// once it has read everything the snapshot covers.
+/// compaction unlinked through its open file, and moves on to the new
+/// journal within the same read once it has read everything the snapshot
+/// covers. A reader that fell behind more than one compaction gets
+/// [`ReadOutcome::Compacted`] instead.
 ///
 /// `append` writes without fsync; [`Backend::sync`] fsyncs the journal.
 #[derive(Debug)]
@@ -131,10 +133,16 @@ impl Journal {
         Ok(buf)
     }
 
-    fn read_after(&mut self, after: u64, out: &mut Vec<(Position, Record)>) -> Result<()> {
+    /// Pushes every committed record above `after`, which must be at or
+    /// above the snapshot position, and returns the last position read.
+    fn read_to_tail(&mut self, after: u64, out: &mut Vec<(Position, Record)>) -> Result<u64> {
+        let tail = self.tail();
+        if after >= tail {
+            return Ok(after);
+        }
         let records = decode_frames(&self.frames_after(after)?)?;
         out.extend((after + 1..).map(Position).zip(records));
-        Ok(())
+        Ok(tail)
     }
 }
 
@@ -400,7 +408,8 @@ impl Backend for FileBackend {
     }
 
     fn read_from(&self, after: Position, out: &mut Vec<(Position, Record)>) -> Result<ReadOutcome> {
-        let after = after.0;
+        let mut after = after.0;
+        let pushed = out.len();
         let writable = self.writable();
         let mut guard = self.state()?;
         let state = &mut *guard;
@@ -412,25 +421,25 @@ impl Backend for FileBackend {
                 if !writable && self.switch_to_latest(state)? {
                     continue;
                 }
+                // Whatever this call drained from an older journal is folded
+                // into the snapshot too, and the contract pushes nothing
+                // alongside Compacted.
+                out.truncate(pushed);
                 return Ok(ReadOutcome::Compacted {
                     snapshot_at: Position(state.journal.snapshot_at()),
                 });
             }
-            if after < state.journal.tail() {
-                state.journal.read_after(after, out)?;
-                return Ok(ReadOutcome::Records);
-            }
+            after = state.journal.read_to_tail(after, out)?;
             if writable || read_current(&self.dir)? == state.generation {
                 return Ok(ReadOutcome::Records);
             }
             // CURRENT has moved on, so the writer appends nothing more to
-            // this journal: drain it before switching, so a reader that was
-            // behind when compaction ran continues instead of reloading.
+            // this journal: drain it, then carry on in the journal CURRENT
+            // names, so a reader that was behind when compaction ran
+            // continues instead of reloading, and one read still reaches the
+            // tail.
             state.journal.catch_up()?;
-            if after < state.journal.tail() {
-                state.journal.read_after(after, out)?;
-                return Ok(ReadOutcome::Records);
-            }
+            after = state.journal.read_to_tail(after, out)?;
             self.switch_to_latest(state)?;
         }
     }

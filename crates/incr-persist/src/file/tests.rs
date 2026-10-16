@@ -322,6 +322,28 @@ fn reader_drains_its_unlinked_journal_then_continues_on_the_new_one() {
 }
 
 #[test]
+fn one_read_drains_the_old_journal_and_continues_into_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = FileBackend::open(dir.path()).unwrap();
+    writer.append(&[declare("a"), set("a", 1)]).unwrap();
+    let reader = FileBackend::open_read_only(dir.path()).unwrap();
+    assert_eq!(read_all(&reader, Position::ZERO).len(), 2);
+
+    writer.append(&[set("a", 2), set("a", 3)]).unwrap();
+    writer.compact(Position(4), vec![set("a", 3)]).unwrap();
+    writer.append(&[set("a", 4), set("a", 5)]).unwrap();
+    assert_eq!(
+        read_all(&reader, Position(2)),
+        vec![
+            (Position(3), set("a", 2)),
+            (Position(4), set("a", 3)),
+            (Position(5), set("a", 4)),
+            (Position(6), set("a", 5)),
+        ]
+    );
+}
+
+#[test]
 fn reader_whose_journal_ends_below_the_newest_snapshot_gets_compacted() {
     let dir = tempfile::tempdir().unwrap();
     let writer = FileBackend::open(dir.path()).unwrap();
@@ -334,10 +356,16 @@ fn reader_whose_journal_ends_below_the_newest_snapshot_gets_compacted() {
     writer.append(&[set("a", 3)]).unwrap();
     writer.compact(Position(4), vec![set("a", 3)]).unwrap();
 
+    // Position 3 is still in the reader's unlinked journal, but position 4
+    // survives only in the snapshot, so the drained part is not returned.
+    let mut out = vec![(Position(1), declare("kept"))];
     assert_eq!(
-        read_all(&reader, Position(2)),
-        vec![(Position(3), set("a", 2))]
+        reader.read_from(Position(2), &mut out).unwrap(),
+        ReadOutcome::Compacted {
+            snapshot_at: Position(4)
+        }
     );
+    assert_eq!(out, vec![(Position(1), declare("kept"))]);
     let mut out = Vec::new();
     assert_eq!(
         reader.read_from(Position(3), &mut out).unwrap(),
