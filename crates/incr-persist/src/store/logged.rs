@@ -121,6 +121,15 @@ impl LoggedKey {
 }
 
 impl Elements {
+    /// The multiset of `elements`, one occurrence per item.
+    pub fn from_encoded(elements: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        let mut out = Elements::default();
+        for element in elements {
+            out.insert(element);
+        }
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.live.is_empty() && self.tail.is_empty()
     }

@@ -74,8 +74,8 @@ pub enum Error {
     #[error("key {key:?} is declared as a {declared:?}")]
     KindMismatch { key: String, declared: Kind },
 
-    /// [`Store::undeclare`](crate::Store::undeclare) was asked to remove an
-    /// input that queries in this process still depend on.
+    /// [`Store::undeclare`](crate::Store::undeclare) was asked to remove a
+    /// key that queries in this process still depend on.
     #[error("key {key:?} still has dependents in this process; delete them before undeclaring it")]
     HasDependents { key: String },
 

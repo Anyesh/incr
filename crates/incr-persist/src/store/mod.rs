@@ -82,9 +82,9 @@ pub struct SubscriptionId(u64);
 
 type Subscriber = Box<dyn FnMut(Position, &Record, Origin) + Send>;
 
-/// Names one key of a store, for [`Store::delete`] and [`Batch::delete_key`]:
-/// an [`Input`], a `&`[`PersistedCollection`], or the key's name as a
-/// string. A name reaches any key, declared in this process or not; a
+/// Names one key of a store, for [`Store::delete`], [`Batch::delete_key`]
+/// and [`Store::undeclare`]: an [`Input`], a `&`[`PersistedCollection`], or
+/// the key's name as a string. A name reaches any key, declared in this process or not; a
 /// handle is checked against the store, which rejects one it did not issue
 /// with [`Error::UnknownHandle`].
 pub struct KeyRef<'a>(Target<'a>);
@@ -259,13 +259,30 @@ impl<C: Cells> State<C> {
     fn key_of(&self, target: &KeyRef<'_>) -> Result<String> {
         match &target.0 {
             Target::Name(key) => Ok((*key).to_owned()),
-            Target::Handle { id, node } => self
-                .bindings
-                .get(id)
-                .filter(|binding| binding.is_handle(node.as_ref()))
-                .map(|binding| binding.key().to_owned())
-                .ok_or(Error::UnknownHandle),
+            Target::Handle { id, node } => {
+                Ok(self.handle_binding(*id, node.as_ref())?.key().to_owned())
+            }
         }
+    }
+
+    /// The id of the binding `target` refers to; `None` for a name this
+    /// store has not declared. Fails as [`State::key_of`] does.
+    fn binding_id(&self, target: &KeyRef<'_>) -> Result<Option<u32>> {
+        match &target.0 {
+            Target::Name(key) => Ok(self.bound.get(*key).copied()),
+            Target::Handle { id, node } => {
+                self.handle_binding(*id, node.as_ref()).map(|_| Some(*id))
+            }
+        }
+    }
+
+    /// The binding issued as `id` for the runtime handle `node`.
+    fn handle_binding(&self, id: u32, node: &dyn Any) -> Result<&dyn Binding<C>> {
+        self.bindings
+            .get(&id)
+            .filter(|binding| binding.is_handle(node))
+            .map(|binding| binding.as_ref())
+            .ok_or(Error::UnknownHandle)
     }
 
     fn notify(&mut self, position: Position, record: &Record, origin: Origin) {
@@ -404,29 +421,49 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.write_with(|state| delete_record(state, &key))
     }
 
-    /// Removes `input`'s node from this process's runtime and releases the
-    /// key, so [`Store::restored_keys`] lists it again and a later
-    /// [`Store::input`] binds it afresh. Nothing is written to the log: the
-    /// key keeps its logged value, other processes are unaffected, and
-    /// records for it go on folding here. Afterwards every use of `input`
-    /// fails with [`Error::UnknownHandle`].
+    /// Removes a declared key's node from this process's runtime and
+    /// releases the key, so [`Store::restored_keys`] lists it again and a
+    /// later [`Store::input`] or [`Store::collection`] binds it afresh.
+    /// Nothing is written to the log: the key keeps its logged value or
+    /// elements, other processes are unaffected, and records for it go on
+    /// folding here. Afterwards every use of the handle fails with
+    /// [`Error::UnknownHandle`].
     ///
-    /// The node goes through the runtime's strict
+    /// `key` is an [`Input`], a `&`[`PersistedCollection`], or a name. A
+    /// name undeclares the key if this store declared it and, like a
+    /// [`Store::delete`] of a key the log does not know, changes nothing
+    /// otherwise.
+    ///
+    /// The node (a collection's version node, the only node it creates) goes
+    /// through the runtime's strict
     /// [`try_delete_node`](incr_core::Runtime::try_delete_node), so queries
-    /// over it must be deleted first. While any remain this fails with
-    /// [`Error::HasDependents`] and changes nothing; under `Shared`, a query
-    /// computing over `input` concurrently either counts as a dependent or
-    /// finds the node deleted. A node already deleted through the runtime
-    /// just has its key released.
-    pub fn undeclare<T: Value>(&self, input: Input<T>) -> Result<()> {
-        let mut state = self.state()?;
-        let key = input_binding(&state, input)?.key.clone();
-        match self.runtime.try_delete_node(input.handle) {
+    /// and operators over it must be deleted first. While any remain this
+    /// fails with [`Error::HasDependents`] and changes nothing; under
+    /// `Shared`, a query computing over the key concurrently either counts
+    /// as a dependent or finds the node deleted. An input whose node was
+    /// already deleted through the runtime just has its key released, but
+    /// such a collection fails with [`Error::UnknownHandle`] and stays
+    /// bound, because only its node could hand its elements back to the
+    /// folded log.
+    pub fn undeclare<'k>(&self, key: impl Into<KeyRef<'k>>) -> Result<()> {
+        let target = key.into();
+        let mut guard = self.state()?;
+        let state = &mut *guard;
+        let Some(id) = state.binding_id(&target)? else {
+            return Ok(());
+        };
+        let binding = &state.bindings[&id];
+        let key = binding.key().to_owned();
+        let held = binding.unbind(&self.runtime)?;
+        match self.runtime.try_delete_node(binding.node()) {
             Ok(()) | Err(DeleteError::NotAlive) => {}
             Err(DeleteError::HasDependents) => return Err(Error::HasDependents { key }),
         }
-        state.bindings.remove(&input.id);
+        state.bindings.remove(&id);
         state.bound.remove(&key);
+        if let Some(elements) = held.filter(|elements| !elements.is_empty()) {
+            state.logged.entry(key).or_default().elements = elements;
+        }
         Ok(())
     }
 

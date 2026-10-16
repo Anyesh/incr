@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 
-use incr_core::{Cells, Incr, IncrCollection, Runtime, Value};
+use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, Runtime, Value};
 use serde::de::DeserializeOwned;
 
 use super::binding::{decode, encode, Binding};
@@ -289,6 +289,23 @@ where
 
     fn is_handle(&self, handle: &dyn Any) -> bool {
         handle.downcast_ref::<Incr<u64>>() == Some(&self.collection.version_node())
+    }
+
+    fn node(&self) -> ErasedIncr {
+        self.collection.version_node().erase()
+    }
+
+    fn unbind(&self, rt: &Runtime<C>) -> Result<Option<Elements>> {
+        if !rt.is_alive(self.node()) {
+            return Err(Error::UnknownHandle);
+        }
+        let encoded = self
+            .collection
+            .values(rt)
+            .iter()
+            .map(encode)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(Elements::from_encoded(encoded)))
     }
 
     fn apply(

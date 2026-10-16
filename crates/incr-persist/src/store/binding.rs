@@ -1,10 +1,10 @@
 use std::any::Any;
 
-use incr_core::{Cells, Incr, Runtime, Value};
+use incr_core::{Cells, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use super::logged::LoggedKey;
+use super::logged::{Elements, LoggedKey};
 use crate::{Error, Kind, Record, Result};
 
 /// A key this process declared, tied to the runtime node that mirrors it.
@@ -16,6 +16,17 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// Whether `handle`, a runtime handle erased by [`KeyRef`](crate::KeyRef),
     /// is the node this binding mirrors.
     fn is_handle(&self, handle: &dyn Any) -> bool;
+
+    /// The runtime node mirroring the key, which undeclaring deletes.
+    fn node(&self) -> ErasedIncr;
+
+    /// The elements to hand back to the key's logged state when the
+    /// binding goes, for a binding that holds them itself (see
+    /// [`Binding::replace`]); `None` for one that holds nothing the log
+    /// lacks. Taken before anything is removed, so a failure, such as
+    /// [`Error::UnknownHandle`] for a collection whose node was deleted
+    /// through the runtime and can no longer be read, changes nothing.
+    fn unbind(&self, rt: &Runtime<C>) -> Result<Option<Elements>>;
 
     /// Applies `record`, one of this key's records in position order, to the
     /// node. `before` is the key's logged state without the record.
@@ -78,6 +89,14 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
 
     fn is_handle(&self, handle: &dyn Any) -> bool {
         handle.downcast_ref::<Incr<T>>() == Some(&self.handle)
+    }
+
+    fn node(&self) -> ErasedIncr {
+        self.handle.erase()
+    }
+
+    fn unbind(&self, _rt: &Runtime<C>) -> Result<Option<Elements>> {
+        Ok(None)
     }
 
     fn apply(

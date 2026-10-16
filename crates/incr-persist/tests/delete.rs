@@ -317,3 +317,115 @@ fn undeclare_releases_an_input_whose_node_was_deleted_through_the_runtime() {
     let again = store.input("x", 0u32).unwrap();
     assert_eq!(store.runtime().get(again.handle()), 3);
 }
+
+fn undeclare_a_collection<C: Cells>() {
+    let log = MemoryBackend::new();
+    let store = open::<C, _>(log.clone());
+    let other = open::<C, _>(log.clone());
+    let items = store.collection::<u32>("items").unwrap();
+    for value in [1, 1, 2] {
+        items.insert(&store, value).unwrap();
+    }
+    let rt = store.runtime();
+    let count = items.handle().count(rt);
+    assert_eq!(rt.get(count), 3);
+    let nodes = rt.node_count();
+
+    assert!(matches!(
+        store.undeclare(&items),
+        Err(Error::HasDependents { key }) if key == "items"
+    ));
+    items.insert(&store, 3).unwrap();
+    assert_eq!(rt.get(count), 4, "a refused undeclare changes nothing");
+
+    rt.delete_node(count);
+    let records = log_records(&log).len();
+    store.undeclare(&items).unwrap();
+    assert_eq!(rt.node_count(), nodes - 2);
+    assert_eq!(
+        log_records(&log).len(),
+        records,
+        "undeclare appends nothing"
+    );
+    assert!(matches!(items.insert(&store, 9), Err(Error::UnknownHandle)));
+    assert!(matches!(store.undeclare(&items), Err(Error::UnknownHandle)));
+    assert_eq!(store.restored_keys("").unwrap(), ["items"]);
+
+    let other_items = other.collection::<u32>("items").unwrap();
+    other_items.insert(&other, 5).unwrap();
+    other_items.delete(&other, &1).unwrap();
+    store.refresh().unwrap();
+    store.checkpoint().unwrap();
+    let again = store.collection::<u32>("items").unwrap();
+    let mut values = again.handle().values(rt);
+    values.sort();
+    assert_eq!(
+        values,
+        [1, 2, 3, 5],
+        "elements held while declared and records applied while undeclared both fold"
+    );
+    assert!(store.restored_keys("").unwrap().is_empty());
+
+    drop(store);
+    let reopened = open::<C, _>(log);
+    let items = reopened.collection::<u32>("items").unwrap();
+    let mut values = items.handle().values(reopened.runtime());
+    values.sort();
+    assert_eq!(values, [1, 2, 3, 5]);
+}
+
+#[test]
+fn local_undeclare_a_collection() {
+    undeclare_a_collection::<Local>();
+}
+
+#[test]
+fn shared_undeclare_a_collection() {
+    undeclare_a_collection::<Shared>();
+}
+
+#[test]
+fn undeclare_a_collection_errors_while_a_group_by_reads_it() {
+    let store = open::<Shared, _>(MemoryBackend::new());
+    let items = store.collection::<u32>("items").unwrap();
+    items.insert(&store, 4).unwrap();
+    let rt = store.runtime();
+    let groups = items.handle().group_by(rt, |x| x % 2);
+    let _ = rt.get(groups.version_node());
+
+    assert!(matches!(
+        store.undeclare(&items),
+        Err(Error::HasDependents { .. })
+    ));
+    items.insert(&store, 7).unwrap();
+    let _ = rt.get(groups.version_node());
+    assert_eq!(groups.group_count(), 2);
+
+    rt.delete_node(groups.version_node());
+    store.undeclare(&items).unwrap();
+    assert_eq!(rt.node_count(), 0);
+}
+
+#[test]
+fn undeclare_by_name_releases_a_bound_key_and_ignores_unknown_ones() {
+    let store = open::<Local, _>(MemoryBackend::new());
+    let x = store.input("x", 1u32).unwrap();
+    store.undeclare("never-declared").unwrap();
+    store.undeclare("x").unwrap();
+    assert!(matches!(store.set(x, 2), Err(Error::UnknownHandle)));
+    assert_eq!(store.restored_keys("").unwrap(), ["x"]);
+}
+
+#[test]
+fn undeclare_keeps_a_collection_whose_node_was_deleted_through_the_runtime() {
+    let store = open::<Local, _>(MemoryBackend::new());
+    let items = store.collection::<u32>("items").unwrap();
+    items.insert(&store, 1).unwrap();
+    store.runtime().delete_node(items.handle().version_node());
+
+    assert!(matches!(store.undeclare(&items), Err(Error::UnknownHandle)));
+    assert!(
+        store.restored_keys("").unwrap().is_empty(),
+        "the key stays bound rather than lose its elements"
+    );
+}
