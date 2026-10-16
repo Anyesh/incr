@@ -70,9 +70,12 @@ pub enum Origin {
     /// snapshot's position, records that take each changed key from its old
     /// state to the snapshot's: a `Declare` for a new declaration, a `Set`
     /// for a new value, a `Delete` for a value reset to its default, and a
-    /// `Remove` or `Insert` per differing element occurrence. A collection
-    /// this store did not declare whose elements cannot be compared by
-    /// bytes is reported as a `Delete` followed by its full contents.
+    /// `Remove` or `Insert` per differing element occurrence. A key the
+    /// snapshot forgot is a [`Record::Forget`], and one whose `Declare` was
+    /// forgotten or changed is a `Forget` followed by the key's full state,
+    /// since a first-wins fold ignores a second `Declare`. A collection this
+    /// store did not declare whose elements cannot be compared by bytes is
+    /// reported as a `Delete` followed by its full contents.
     Snapshot,
 }
 
@@ -986,10 +989,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
         mut changes: Option<&mut Vec<Record>>,
     ) -> Result<()> {
         let id = state.bound.get(key).copied();
+        let mut rebuilt = false;
         if let Some(changes) = changes.as_deref_mut() {
             let bound_collection =
                 id.is_some_and(|id| state.bindings[&id].kind() == Kind::Collection);
-            changes_between(
+            rebuilt = changes_between(
                 key,
                 state.logged.get(key),
                 new.as_deref(),
@@ -998,6 +1002,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             );
         }
         if let Some(id) = id {
+            let changes = if rebuilt { None } else { changes };
             bound_binding(&mut state.bindings, id).replace(&self.runtime, new, changes)?;
         }
         Ok(())

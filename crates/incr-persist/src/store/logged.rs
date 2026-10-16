@@ -68,6 +68,7 @@ impl LoggedKey {
                 self.value = None;
                 self.elements = Elements::default();
             }
+            Record::Forget { .. } => *self = LoggedKey::default(),
         }
     }
 
@@ -223,15 +224,29 @@ pub(crate) fn is_element_change(record: &Record) -> bool {
 /// for a collection bound in this process, whose binding reports its own
 /// element changes and whose value is meaningless, so only its `Declare`
 /// is compared here.
+///
+/// A first-wins fold never replaces a live `Declare`, so a key the snapshot
+/// dropped, or whose `Declare` it dropped or changed, is reported as a
+/// `Forget` followed by the key's full new state, elements included even
+/// when `elements` is false. Returns whether it did so, in which case a
+/// binding must not report its own element changes on top.
 pub(crate) fn changes_between(
     key: &str,
     old: Option<&LoggedKey>,
     new: Option<&LoggedKey>,
     elements: bool,
     out: &mut Vec<Record>,
-) {
+) -> bool {
     let none = LoggedKey::default();
     let (old, new) = (old.unwrap_or(&none), new.unwrap_or(&none));
+    let undeclared = old.declared.is_some() && new.declared != old.declared;
+    if !old.is_empty() && (new.is_empty() || undeclared) {
+        out.push(Record::Forget {
+            key: key.to_owned(),
+        });
+        out.extend(new.records(key));
+        return true;
+    }
     if new.declared != old.declared {
         if let Some(Declared { kind, default }) = &new.declared {
             out.push(Record::Declare {
@@ -242,7 +257,7 @@ pub(crate) fn changes_between(
         }
     }
     if !elements {
-        return;
+        return false;
     }
     let elements_changed = old.elements != new.elements;
     let raw = !old.elements.tail.is_empty() || !new.elements.tail.is_empty();
@@ -259,7 +274,7 @@ pub(crate) fn changes_between(
             });
         }
         new.elements.records(key, out);
-        return;
+        return false;
     }
     if new.value != old.value {
         if let Some(value) = &new.value {
@@ -272,6 +287,7 @@ pub(crate) fn changes_between(
     if elements_changed {
         old.elements.diff(key, &new.elements, out);
     }
+    false
 }
 
 /// Every key the log knows, by name.
@@ -305,7 +321,8 @@ fn take_key(record: &mut Record) -> String {
         | Record::Insert { key, .. }
         | Record::Remove { key, .. }
         | Record::Replace { key, .. }
-        | Record::Delete { key } => std::mem::take(key),
+        | Record::Delete { key }
+        | Record::Forget { key } => std::mem::take(key),
     }
 }
 
@@ -435,14 +452,19 @@ mod tests {
     }
 
     // Folding the reported changes over the old state must reach the new
-    // one, which is what lets a subscriber mirror a catch-up it never saw
-    // record by record.
+    // one, declaration included, which is what lets a subscriber mirror a
+    // catch-up it never saw record by record.
     #[test]
     fn changes_between_take_the_old_state_to_the_new() {
         let declare = Record::Declare {
             key: "c".into(),
             kind: Kind::Collection,
             default: vec![],
+        };
+        let declare_input = |default: u8| Record::Declare {
+            key: "c".into(),
+            kind: Kind::Input,
+            default: vec![default],
         };
         let set = |value: u8| Record::Set {
             key: "c".into(),
@@ -464,6 +486,12 @@ mod tests {
             (with_tail.to_vec(), vec![insert(1)]),
             (vec![], vec![declare.clone(), set(4), insert(5)]),
             (vec![declare.clone(), insert(5)], vec![]),
+            (vec![declare_input(1)], vec![]),
+            (vec![declare_input(1), set(3)], vec![declare_input(2)]),
+            (vec![declare_input(1)], vec![declare_input(2), set(3)]),
+            (vec![declare.clone(), insert(5)], vec![insert(5), insert(6)]),
+            (vec![declare_input(1)], vec![declare.clone(), insert(5)]),
+            (vec![set(1), insert(2)], vec![]),
         ];
         for (old, new) in cases {
             let (old, new) = (folded(&old), folded(&new));
@@ -473,11 +501,7 @@ mod tests {
             for record in changes {
                 replayed.apply(record);
             }
-            assert_eq!(replayed.value, new.value, "{old:?} -> {new:?}");
-            assert_eq!(replayed.elements, new.elements, "{old:?} -> {new:?}");
-            if new.declared.is_some() {
-                assert_eq!(replayed.declared, new.declared);
-            }
+            assert_eq!(replayed, new, "{old:?} -> {new:?}");
         }
         let same = folded(&[declare, set(1), insert(2)]);
         let mut changes = Vec::new();

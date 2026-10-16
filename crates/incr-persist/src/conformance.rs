@@ -253,6 +253,7 @@ pub fn records_roundtrip_unchanged<H: Harness>(mut h: H) {
         Record::Delete {
             key: "naïve/キー/\u{0}".into(),
         },
+        Record::Forget { key: "coll".into() },
     ];
     let log = h.new_log();
     {

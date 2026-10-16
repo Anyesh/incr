@@ -329,7 +329,9 @@ where
                 let new = decode(&self.key, new)?;
                 self.collection.replace(rt, old.as_ref(), new);
             }
-            Record::Delete { .. } => self.converge(rt, HashMap::new(), None)?,
+            Record::Delete { .. } | Record::Forget { .. } => {
+                self.converge(rt, HashMap::new(), None)?
+            }
             Record::Declare { .. } | Record::Set { .. } => {}
         }
         Ok(())

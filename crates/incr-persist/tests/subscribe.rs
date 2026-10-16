@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -192,6 +192,8 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
         raw.insert(&writer, item).unwrap();
     }
     writer.input("same", 4u32).unwrap();
+    let kept = writer.input("kept", 0u32).unwrap();
+    writer.set(kept, 2).unwrap();
 
     let reader = open::<Local, _>(log.read_only());
     let r_x = reader.input("x", 0u32).unwrap();
@@ -230,7 +232,8 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
     );
     assert_eq!(
         for_key(&seen, "gone"),
-        [Record::Delete { key: "gone".into() }]
+        [Record::Forget { key: "gone".into() }],
+        "a key deleted back to its default is forgotten"
     );
     assert_eq!(
         sorted_records(for_key(&seen, "items")),
@@ -273,8 +276,135 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
             },
         ]
     );
+    assert_eq!(
+        for_key(&seen, "same"),
+        [Record::Forget { key: "same".into() }],
+        "a key left at its default is forgotten"
+    );
     assert!(
-        for_key(&seen, "same").is_empty(),
+        for_key(&seen, "kept").is_empty(),
         "unchanged keys are not reported"
     );
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct Mirrored {
+    declared: Option<(Kind, Vec<u8>)>,
+    value: Option<Vec<u8>>,
+    elements: BTreeMap<Vec<u8>, usize>,
+}
+
+fn take_one(elements: &mut BTreeMap<Vec<u8>, usize>, element: &[u8]) {
+    if let Some(count) = elements.get_mut(element) {
+        *count -= 1;
+        if *count == 0 {
+            elements.remove(element);
+        }
+    }
+}
+
+/// Folds records by the log's own rules: the first live `Declare` wins, a
+/// `Delete` resets the key to it, and a `Forget` drops the key, `Declare`
+/// included.
+fn mirror(keys: &mut BTreeMap<String, Mirrored>, records: impl IntoIterator<Item = Record>) {
+    for record in records {
+        let key = record.key().to_owned();
+        let entry = keys.entry(key.clone()).or_default();
+        match record {
+            Record::Declare { kind, default, .. } => {
+                entry.declared.get_or_insert((kind, default));
+            }
+            Record::Set { value, .. } => entry.value = Some(value),
+            Record::Insert { element, .. } => *entry.elements.entry(element).or_default() += 1,
+            Record::Remove { element, .. } => take_one(&mut entry.elements, &element),
+            Record::Replace { old, new, .. } => {
+                if let Some(old) = old {
+                    take_one(&mut entry.elements, &old);
+                }
+                *entry.elements.entry(new).or_default() += 1;
+            }
+            Record::Delete { .. } => {
+                entry.value = None;
+                entry.elements.clear();
+            }
+            Record::Forget { .. } => *entry = Mirrored::default(),
+        }
+        if *entry == Mirrored::default() {
+            keys.remove(&key);
+        }
+    }
+}
+
+/// What a store opened on `backend` now would fold: its snapshot, then the
+/// records after it.
+fn restart_state(backend: &impl Backend) -> BTreeMap<String, Mirrored> {
+    let (at, snapshot) = backend
+        .load_snapshot()
+        .unwrap()
+        .unwrap_or((Position::ZERO, Vec::new()));
+    let later = log_after(backend, at).into_iter().map(|(_, record)| record);
+    let mut keys = BTreeMap::new();
+    mirror(&mut keys, snapshot.into_iter().chain(later));
+    keys
+}
+
+/// Folds everything a subscriber registered on a store over an empty log
+/// saw.
+fn mirrored(seen: &Seen) -> BTreeMap<String, Mirrored> {
+    let mut keys = BTreeMap::new();
+    mirror(
+        &mut keys,
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|(_, record, _)| record.clone()),
+    );
+    keys
+}
+
+#[test]
+fn folding_what_a_subscriber_saw_across_a_compaction_reaches_the_restart_state() {
+    let log = MemoryBackend::new();
+    let reader = open::<Local, _>(log.read_only());
+    let seen = subscribe(&reader);
+    let writer = open::<Local, _>(log.clone());
+    let k = writer.input("k", 1u32).unwrap();
+    let s = writer.input("s", 1u32).unwrap();
+    let items = writer.collection::<u32>("items").unwrap();
+    let loose = writer.collection::<u32>("loose").unwrap();
+    writer.set(k, 3).unwrap();
+    writer.set(s, 4).unwrap();
+    items.insert(&writer, 1).unwrap();
+    loose.insert(&writer, 2).unwrap();
+    reader.refresh().unwrap();
+    reader.input("k", 0u32).unwrap();
+    reader.collection::<u32>("items").unwrap();
+
+    writer.delete(k).unwrap();
+    items.delete(&writer, &1).unwrap();
+    loose.delete(&writer, &2).unwrap();
+    writer.set(s, 6).unwrap();
+    writer.checkpoint().unwrap();
+    let other = open::<Local, _>(log.clone());
+    let k2 = other.input("k", 9u32).unwrap();
+    other.set(k2, 10).unwrap();
+    other
+        .collection::<u32>("items")
+        .unwrap()
+        .insert(&other, 5)
+        .unwrap();
+    let loose_input = other.input("loose", 2u32).unwrap();
+    other.set(loose_input, 3).unwrap();
+    other.checkpoint().unwrap();
+
+    reader.refresh().unwrap();
+    assert!(seen
+        .lock()
+        .unwrap()
+        .iter()
+        .any(
+            |(_, record, origin)| matches!(record, Record::Forget { .. })
+                && *origin == Origin::Snapshot
+        ));
+    assert_eq!(mirrored(&seen), restart_state(&log));
 }

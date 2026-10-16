@@ -46,6 +46,14 @@ pub enum Record {
     /// Resets `key` to its declared default, or empties it if it is a
     /// collection.
     Delete { key: String },
+    /// Drops everything `key` holds, its `Declare` included, the way a
+    /// compaction forgets a key left at its default, so that the next
+    /// `Declare` wins afresh. A [`Store`](crate::Store) never appends one: it
+    /// reports one to subscribers, as an
+    /// [`Origin::Snapshot`](crate::Origin::Snapshot) change, for a key a
+    /// compaction forgot. A log that holds one folds as if the key was
+    /// forgotten at that position.
+    Forget { key: String },
 }
 
 impl Record {
@@ -57,7 +65,8 @@ impl Record {
             | Record::Insert { key, .. }
             | Record::Remove { key, .. }
             | Record::Replace { key, .. }
-            | Record::Delete { key } => key,
+            | Record::Delete { key }
+            | Record::Forget { key } => key,
         }
     }
 
@@ -131,6 +140,9 @@ mod tests {
             Record::Delete {
                 key: "naïve/キー".into(),
             },
+            Record::Forget {
+                key: "naïve/キー".into(),
+            },
         ]
     }
 
@@ -166,6 +178,8 @@ mod tests {
         assert_eq!(declare.encode().unwrap(), [1, 0, 1, b'k', 1, 0]);
         let delete = Record::Delete { key: "k".into() };
         assert_eq!(delete.encode().unwrap(), [1, 5, 1, b'k']);
+        let forget = Record::Forget { key: "k".into() };
+        assert_eq!(forget.encode().unwrap(), [1, 6, 1, b'k']);
     }
 
     #[test]
@@ -211,7 +225,7 @@ mod tests {
     fn key_names_the_record_key() {
         for record in every_variant() {
             let expected = match &record {
-                Record::Delete { .. } => "naïve/キー",
+                Record::Delete { .. } | Record::Forget { .. } => "naïve/キー",
                 Record::Declare {
                     kind: Kind::Input, ..
                 }

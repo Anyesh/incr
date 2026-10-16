@@ -107,7 +107,9 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
     ) -> Result<()> {
         let value = match record {
             Record::Set { value, .. } => decode(&self.key, value)?,
-            Record::Delete { .. } => self.default.clone(),
+            // A forgotten key holds the default it last had, as after a
+            // compaction forgot it.
+            Record::Delete { .. } | Record::Forget { .. } => self.default.clone(),
             // Only the first Declare since the key was last forgotten is
             // live, as in the folded log.
             Record::Declare { default, .. }
