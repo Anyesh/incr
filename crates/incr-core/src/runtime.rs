@@ -613,6 +613,16 @@ impl<C: Cells> Runtime<C> {
         self.nodes.len() as usize - free
     }
 
+    /// Whether any node computed against `handle` and still depends on it,
+    /// which is when [`Runtime::delete_node`] would panic. A query that was
+    /// created but never ran has no edge yet and does not count. Under
+    /// `Shared` the answer can change as soon as it is returned, if another
+    /// thread computes a query over the node.
+    pub fn has_dependents<T: Value>(&self, handle: Incr<T>) -> bool {
+        self.check_handle(handle);
+        !self.inner.read().dependents[handle.slot() as usize].is_empty()
+    }
+
     /// Assign a human-readable label to a node slot. Surfaces in
     /// `graph_snapshot()` and trace output. Re-assigning replaces.
     pub fn set_label(&self, slot: u32, label: String) {
@@ -1882,6 +1892,24 @@ mod tests {
         let input = rt.create_input(5_i64);
         let _q = rt.create_query(move |rt| rt.get(input) * 2);
         let _ = rt.get(_q);
+        rt.delete_node(input);
+    }
+
+    #[test]
+    fn has_dependents_tracks_queries_that_read_the_node() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(5_i64);
+        assert!(!rt.has_dependents(input));
+        let q = rt.create_query(move |rt| rt.get(input) * 2);
+        assert!(
+            !rt.has_dependents(input),
+            "a query that never ran has no edge"
+        );
+        assert_eq!(rt.get(q), 10);
+        assert!(rt.has_dependents(input));
+        assert!(!rt.has_dependents(q));
+        rt.delete_node(q);
+        assert!(!rt.has_dependents(input));
         rt.delete_node(input);
     }
 
