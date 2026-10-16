@@ -14,10 +14,12 @@ mod backend;
 #[cfg(feature = "backend-tests")]
 pub mod conformance;
 mod error;
+mod file;
 mod memory;
 mod record;
 
 pub use backend::{Backend, Position, ReadOutcome};
 pub use error::{Error, Result};
+pub use file::FileBackend;
 pub use memory::MemoryBackend;
 pub use record::{Kind, Record};
