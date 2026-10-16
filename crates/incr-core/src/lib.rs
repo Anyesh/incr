@@ -45,7 +45,7 @@ pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use collection::{CollectionLog, Delta, GroupedCollection, IncrCollection};
 pub use dep_stack::{DepStack, LocalDepStack, PoppedFrame, SharedDepStack};
 pub use generic_arena::GenericArena;
-pub use handle::{Incr, RuntimeId};
+pub use handle::{ErasedIncr, Incr, RuntimeId};
 pub use locks::{LocalLock, Lock};
 pub use node::{NodeData, NodeId};
 pub use runtime::{ObserverId, Runtime};

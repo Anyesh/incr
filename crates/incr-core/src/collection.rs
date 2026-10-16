@@ -33,10 +33,10 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering as MemOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::cells::Cells;
-use crate::handle::Incr;
+use crate::handle::{ErasedIncr, Incr};
 use crate::locks::Lock;
 use crate::runtime::Runtime;
 use crate::value::Value;
@@ -856,6 +856,11 @@ where
         let groups_for_query = Arc::clone(&groups);
         let key_cache_for_query = Arc::clone(&key_cache);
         let output_version_counter_for_query = Arc::clone(&output_version_counter);
+        // The routing closure adopts the groups it creates, but it has to
+        // exist before the router it belongs to. Filled right after
+        // create_query, and a query never runs before its first read.
+        let router: Arc<OnceLock<ErasedIncr>> = Arc::new(OnceLock::new());
+        let router_for_query = Arc::clone(&router);
 
         let version_node = rt.create_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
@@ -909,9 +914,14 @@ where
             }
 
             for (k, deltas) in by_group {
-                let group = grps
-                    .entry(k)
-                    .or_insert_with(|| IncrCollection::<T, C>::new_in_compute(rt));
+                let group = grps.entry(k).or_insert_with(|| {
+                    let group = IncrCollection::<T, C>::new_in_compute(rt);
+                    let router = *router_for_query
+                        .get()
+                        .expect("group_by router ran before its handle was recorded");
+                    rt.adopt(router, group.version_node.erase());
+                    group
+                });
                 let mut log = group.log.write();
                 let mut last_version = None;
                 for d in deltas {
@@ -932,6 +942,12 @@ where
             cursor.store(from + pending.len() as u64, MemOrdering::Release);
             output_version_counter_for_query.fetch_add(1, MemOrdering::Relaxed) + 1
         });
+        router
+            .set(version_node.erase())
+            .expect("group_by router recorded twice");
+        for group in groups.read().values() {
+            rt.adopt(version_node.erase(), group.version_node.erase());
+        }
 
         GroupedCollection {
             groups,
@@ -1629,6 +1645,95 @@ mod tests {
         assert_eq!(rt.get(n), 2);
         b.delete(&rt, &(1, 100));
         assert_eq!(rt.get(n), 1);
+    }
+
+    /// Source with keys 0 and 1 present before `group_by` (bootstrap
+    /// groups), then key 2 inserted after the router ran once (a group
+    /// created by the routing closure). Returns the grouping and every
+    /// group's version node.
+    fn grouped_with_late_group<C: Cells>(
+        rt: &Runtime<C>,
+    ) -> (GroupedCollection<i64, i64, C>, Vec<Incr<u64>>) {
+        let c = rt.create_collection::<i64>();
+        c.insert(rt, 3);
+        c.insert(rt, 4);
+        let groups = c.group_by(rt, |x| x % 3);
+        let _ = rt.get(groups.version_node());
+        c.insert(rt, 5);
+        let _ = rt.get(groups.version_node());
+        assert_eq!(groups.group_count(), 3);
+        let versions = (0..3)
+            .map(|k| groups.get_group(&k).unwrap().version_node())
+            .collect();
+        (groups, versions)
+    }
+
+    fn deleting_router_releases_its_groups<C: Cells>(rt: &Runtime<C>) {
+        let (groups, versions) = grouped_with_late_group(rt);
+        let before = rt.node_count();
+        rt.delete_node(groups.version_node());
+        assert!(!rt.is_alive(groups.version_node()));
+        assert!(versions.iter().all(|&v| !rt.is_alive(v)));
+        assert_eq!(rt.node_count(), before - 4);
+    }
+
+    #[test]
+    fn local_deleting_router_releases_its_groups() {
+        deleting_router_releases_its_groups(&Runtime::<Local>::new());
+    }
+
+    #[test]
+    fn shared_deleting_router_releases_its_groups() {
+        deleting_router_releases_its_groups(&Runtime::<Shared>::new());
+    }
+
+    fn deleting_router_with_group_consumer_panics<C: Cells>(rt: &Runtime<C>) {
+        let (groups, versions) = grouped_with_late_group(rt);
+        let late = groups.get_group(&2).unwrap();
+        let n = late.count(rt);
+        assert_eq!(rt.get(n), 1);
+
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.delete_node(groups.version_node())
+        }))
+        .unwrap_err();
+        let msg = err.downcast_ref::<String>().unwrap();
+        assert!(msg.contains("still has dependents"), "got: {msg}");
+        assert!(rt.is_alive(groups.version_node()));
+        assert!(
+            versions.iter().all(|&v| rt.is_alive(v)),
+            "a failed strict delete released some groups"
+        );
+
+        rt.delete_node(n);
+        rt.delete_node(groups.version_node());
+        assert!(versions.iter().all(|&v| !rt.is_alive(v)));
+    }
+
+    #[test]
+    fn local_deleting_router_with_group_consumer_panics() {
+        deleting_router_with_group_consumer_panics(&Runtime::<Local>::new());
+    }
+
+    #[test]
+    fn shared_deleting_router_with_group_consumer_panics() {
+        deleting_router_with_group_consumer_panics(&Runtime::<Shared>::new());
+    }
+
+    #[test]
+    fn deleting_an_owned_group_directly_unhooks_it_from_the_router() {
+        let rt: Runtime<Local> = Runtime::new();
+        let (groups, versions) = grouped_with_late_group(&rt);
+        rt.delete_node(versions[1]);
+        let recycled = rt.create_input(0_u64);
+        assert_eq!(recycled.slot(), versions[1].slot());
+
+        rt.delete_node(groups.version_node());
+        assert!(
+            rt.is_alive(recycled),
+            "the recycled slot was taken as owned"
+        );
+        assert!(!rt.is_alive(versions[0]) && !rt.is_alive(versions[2]));
     }
 
     #[test]

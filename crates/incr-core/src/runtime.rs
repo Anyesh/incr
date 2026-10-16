@@ -19,7 +19,6 @@
 //! collection operators, soundness fixes (race-detection ordering with
 //! AcqRel, overflow-dep reclamation).
 
-use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -27,7 +26,7 @@ use crate::arena_registry::ArenaRegistry;
 use crate::cells::Cells;
 use crate::dep_stack::DepStack;
 use crate::generic_arena::GenericArena;
-use crate::handle::{Incr, RuntimeId};
+use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
 use crate::node::{NodeData, NodeId};
 use crate::segmented_nodes::SegmentedNodes;
@@ -46,14 +45,20 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) compute_fns: Vec<Option<ComputeFn<C>>>,
     pub(crate) dependents: Vec<Vec<NodeId>>,
     pub(crate) arenas: ArenaRegistry<C>,
-    pub(crate) type_tags: HashMap<TypeId, u16>,
-    pub(crate) next_type_tag: u16,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
     /// Node slots released by delete_node, awaiting recycling.
     pub(crate) free_nodes: Vec<u32>,
     pub(crate) observers: HashMap<u64, ObserverEntry<C>>,
     pub(crate) next_observer_id: u64,
+    /// Nodes an operator created for its own output and adopted: it sets
+    /// them but never reads them, so no reverse edge records them.
+    /// Sparse, because only operators like `group_by` own nodes. Kept in
+    /// step with `owner_of` and unhooked by the child's delete under the
+    /// same write hold as its generation bump, so an entry always names
+    /// the node that was adopted.
+    pub(crate) owned: HashMap<u32, Vec<NodeId>>,
+    pub(crate) owner_of: HashMap<u32, NodeId>,
 }
 
 /// Type-erased observer runner: takes the runtime and the observer's
@@ -75,28 +80,14 @@ impl<C: Cells> Inner<C> {
             compute_fns: Vec::new(),
             dependents: Vec::new(),
             arenas: ArenaRegistry::new(),
-            type_tags: HashMap::new(),
-            next_type_tag: 0,
             labels: HashMap::new(),
             trace_log: Vec::new(),
             free_nodes: Vec::new(),
             observers: HashMap::new(),
             next_observer_id: 1,
+            owned: HashMap::new(),
+            owner_of: HashMap::new(),
         }
-    }
-
-    fn type_tag_for<T: Value>(&mut self) -> u16 {
-        let id = TypeId::of::<T>();
-        if let Some(&tag) = self.type_tags.get(&id) {
-            return tag;
-        }
-        let tag = self.next_type_tag;
-        self.next_type_tag = self
-            .next_type_tag
-            .checked_add(1)
-            .expect("incr-core: more than u16::MAX distinct value types in one runtime");
-        self.type_tags.insert(id, tag);
-        tag
     }
 }
 
@@ -121,8 +112,24 @@ pub(crate) enum ParkPoint {
     /// In `set`, after the dirty walk and before the revision is recorded
     /// as walked.
     SetAfterWalk,
-    /// In `delete_node`, after the dependents check and the `Dead` claim.
+    /// In `delete_erased`, after the dependents check and the `Dead` claim.
     DeleteAfterCheck(NodeId),
+    /// In `delete_erased`, on finding the node claimed `Dead` by another
+    /// delete that has not bumped its generation yet.
+    DeleteWaitsOnClaim(NodeId),
+    /// In `delete_node`, after the handle check and before any read hold.
+    DeleteAfterHandleCheck(NodeId),
+}
+
+/// What [`Runtime::delete_erased`] did with a node.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeleteOutcome {
+    Deleted,
+    /// The handle's node was already deleted, by this caller earlier or
+    /// by a concurrent delete that has now finished.
+    AlreadyGone,
+    /// The node has a dependent. Nothing changed.
+    HasDependents,
 }
 
 /// Records `rev` as walked when dropped. A drop guard rather than a call
@@ -250,8 +257,7 @@ impl<C: Cells> Runtime<C> {
         let revision = self.current_revision();
         let (slot, generation) = {
             let mut inner = self.inner.write();
-            let type_tag = inner.type_tag_for::<T>();
-            let arena = inner.arenas.ensure_arena::<T>();
+            let (type_tag, arena) = inner.arenas.ensure_tagged::<T>();
             let arena_slot = arena.reserve_with(value);
             let slot = if let Some(slot) = inner.free_nodes.pop() {
                 self.nodes
@@ -285,8 +291,7 @@ impl<C: Cells> Runtime<C> {
 
         let (slot, generation) = {
             let mut inner = self.inner.write();
-            let type_tag = inner.type_tag_for::<T>();
-            let arena = inner.arenas.ensure_arena::<T>();
+            let (type_tag, arena) = inner.arenas.ensure_tagged::<T>();
             let arena_slot = arena.reserve();
             let slot = if let Some(slot) = inner.free_nodes.pop() {
                 self.nodes
@@ -415,7 +420,10 @@ impl<C: Cells> Runtime<C> {
 
     /// Remove an observer. Safe to call with an already-removed id.
     pub fn unobserve(&self, id: ObserverId) {
-        self.inner.write().observers.remove(&id.0);
+        // Bound to a local so the entry, whose callback is user code,
+        // drops after the write guard does.
+        let removed = self.inner.write().observers.remove(&id.0);
+        drop(removed);
     }
 
     /// Bring every observed node up to date and fire callbacks for the
@@ -451,42 +459,261 @@ impl<C: Cells> Runtime<C> {
     /// create calls under a bumped generation.
     pub fn delete_node<T: Value>(&self, handle: Incr<T>) {
         self.check_handle(handle);
-        let slot = handle.slot();
-        let id = NodeId(slot);
-        let node = self.nodes.get(slot);
+        let root = handle.erase();
+        self.assert_not_own_compute(NodeId(root.slot()));
+        self.park(ParkPoint::DeleteAfterHandleCheck(NodeId(root.slot())));
+        let owned = match self.owned_for_strict_delete(root) {
+            Ok(owned) => owned,
+            Err(slot) if slot == root.slot() => Self::panic_has_dependents(root.slot()),
+            Err(child) => panic!(
+                "incr-core: delete_node on node {} whose owned node {} still has \
+                 dependents; delete downstream nodes first",
+                root.slot(),
+                child,
+            ),
+        };
+        for child in owned {
+            if self.delete_erased(child) == DeleteOutcome::HasDependents {
+                Self::panic_has_dependents(child.slot());
+            }
+        }
+        match self.delete_erased(root) {
+            DeleteOutcome::Deleted => {}
+            // check_handle passed, so a concurrent delete got there first.
+            DeleteOutcome::AlreadyGone => {
+                panic!("incr-core: node {} deleted twice concurrently", root.slot())
+            }
+            DeleteOutcome::HasDependents => Self::panic_has_dependents(root.slot()),
+        }
+    }
 
+    fn panic_has_dependents(slot: u32) -> ! {
+        panic!(
+            "incr-core: delete_node on node {} which still has dependents; \
+             delete downstream nodes first",
+            slot,
+        )
+    }
+
+    fn assert_not_own_compute(&self, id: NodeId) {
         assert!(
             !self.dep_stack.is_computing(id),
             "incr-core: delete_node called from inside node {}'s own compute",
-            slot,
+            id.0,
         );
+    }
+
+    /// Everything `root` owns, transitively, ordered so each node comes
+    /// before its owner. `Err(slot)` names the first node found, `root`
+    /// included, that has a dependent. Checking everything up front
+    /// means a strict delete that panics has released nothing, unless a
+    /// dependent attaches concurrently after this check. Empty when
+    /// `root` is already gone, so `delete_erased` reports that.
+    fn owned_for_strict_delete(&self, root: ErasedIncr) -> Result<Vec<ErasedIncr>, u32> {
+        let inner = self.inner.read();
+        // Rechecked under the hold: the handle check ran before it, and
+        // the slot may since hold a new node with dependents of its own.
+        if self.nodes.get(root.slot()).generation() != root.generation() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut stack = vec![root.slot()];
+        while let Some(slot) = stack.pop() {
+            if !inner.dependents[slot as usize].is_empty() {
+                return Err(slot);
+            }
+            if slot != root.slot() {
+                out.push(self.erased_at(slot));
+            }
+            if let Some(children) = inner.owned.get(&slot) {
+                stack.extend(children.iter().map(|c| c.0));
+            }
+        }
+        out.reverse();
+        Ok(out)
+    }
+
+    /// The handle of the node currently at `slot`. Only meaningful under
+    /// an `inner` hold, where the dependents and owned invariants make
+    /// the slot's generation the linked node's.
+    fn erased_at(&self, slot: u32) -> ErasedIncr {
+        ErasedIncr::new(slot, self.nodes.get(slot).generation(), self.runtime_id)
+    }
+
+    /// Delete `root` together with every node that depends on it,
+    /// transitively, and every node any of them owns (such as the groups
+    /// of a `group_by` router). Returns how many nodes this call deleted;
+    /// a root that is already gone counts as done and returns 0.
+    ///
+    /// Dependents are found through the reverse edges a compute records,
+    /// so a query that was created but has never run is not reached: it
+    /// survives and panics with a stale-handle message on its first
+    /// compute. Concurrent cascades and plain deletes over the same nodes
+    /// are safe, and a node deleted by one of them is not counted here.
+    /// A cascade does not terminate while other threads keep attaching
+    /// new dependents to its nodes faster than it removes them.
+    ///
+    /// Panics if called from inside a compute closure: the computing
+    /// node may depend on `root`, and the cascade would wait on it
+    /// forever.
+    pub fn delete_with_dependents(&self, root: impl Into<ErasedIncr>) -> usize {
+        let root = root.into();
+        assert!(
+            !self.dep_stack.current_frame_active(),
+            "incr-core: delete_with_dependents called during compute; not permitted",
+        );
+        if root.runtime_id() != self.runtime_id {
+            panic!(
+                "incr-core: delete_with_dependents with a handle from a foreign runtime \
+                 (handle was minted by runtime {}, used on runtime {})",
+                root.runtime_id().get(),
+                self.runtime_id.get(),
+            );
+        }
+
+        let mut deleted = 0;
+        let mut stack = vec![root];
+        while let Some(&top) = stack.last() {
+            // Captured under the same hold that yields the slot, so the
+            // generation is the linked node's (see delete_erased).
+            let next = {
+                let inner = self.inner.read();
+                if self.nodes.get(top.slot()).generation() != top.generation() {
+                    stack.pop();
+                    continue;
+                }
+                let slot = top.slot() as usize;
+                inner.dependents[slot]
+                    .first()
+                    .or_else(|| inner.owned.get(&top.slot()).and_then(|o| o.first()))
+                    .map(|n| self.erased_at(n.0))
+            };
+            if let Some(child) = next {
+                stack.push(child);
+                continue;
+            }
+            match self.delete_erased(top) {
+                DeleteOutcome::Deleted => {
+                    deleted += 1;
+                    stack.pop();
+                }
+                DeleteOutcome::AlreadyGone => {
+                    stack.pop();
+                }
+                // A dependent attached after the hint; walk to it next.
+                DeleteOutcome::HasDependents => {}
+            }
+        }
+        deleted
+    }
+
+    /// Record `child` as owned by `owner`: it is deleted with the owner,
+    /// by strict delete and by the cascade. Both must be live, and the
+    /// owner must not depend on the child, or the cascade would walk the
+    /// cycle forever.
+    pub(crate) fn adopt(&self, owner: ErasedIncr, child: ErasedIncr) {
+        let mut inner = self.inner.write();
+        for h in [owner, child] {
+            assert!(
+                self.is_alive(h),
+                "incr-core: adopt of deleted node {}",
+                h.slot()
+            );
+        }
+        let previous = inner.owner_of.insert(child.slot(), NodeId(owner.slot()));
+        assert!(
+            previous.is_none(),
+            "incr-core: node {} adopted twice",
+            child.slot()
+        );
+        inner
+            .owned
+            .entry(owner.slot())
+            .or_default()
+            .push(NodeId(child.slot()));
+    }
+
+    /// True iff `handle` names a node of this runtime that has not been
+    /// deleted. A handle from another runtime is simply not alive here.
+    /// The answer is a snapshot: a concurrent delete can end the node
+    /// right after it returns.
+    pub fn is_alive(&self, handle: impl Into<ErasedIncr>) -> bool {
+        let handle = handle.into();
+        if handle.runtime_id() != self.runtime_id {
+            return false;
+        }
+        let node = self.nodes.get(handle.slot());
+        // State before generation: a recycle bumps the generation before
+        // it Release-stores the new occupant's state, so if the Acquire
+        // load below sees that occupant, the generation load sees the bump.
+        let state = node.state();
+        state != NodeState::Dead && node.generation() == handle.generation()
+    }
+
+    /// The deletion path behind every public delete. Never panics on a
+    /// dependent or on a node that is already gone; it reports them. An
+    /// owned node counts as a dependent: callers delete owned nodes first.
+    ///
+    /// Invariant: a slot listed in any `dependents` or `owned` list
+    /// carries the generation of the node linked there. That is why the
+    /// generation is bumped under `inner.write()`, together with the
+    /// unhooking, and not at the claim.
+    pub(crate) fn delete_erased(&self, handle: ErasedIncr) -> DeleteOutcome {
+        assert_eq!(
+            handle.runtime_id(),
+            self.runtime_id,
+            "incr-core: delete of a handle from a foreign runtime",
+        );
+        let slot = handle.slot();
+        let id = NodeId(slot);
+        let node = self.nodes.get(slot);
+        if node.generation() != handle.generation() {
+            return DeleteOutcome::AlreadyGone;
+        }
+        self.assert_not_own_compute(id);
 
         let mut spins: u32 = 0;
         loop {
             let cur = state::load::<C>(node.state_cell());
+            if node.generation() != handle.generation() {
+                return DeleteOutcome::AlreadyGone;
+            }
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
                     spins += 1;
                     C::backoff(spins);
                 }
                 NodeState::Dead => {
-                    // Two racing deletes: the generation check above
-                    // passed before the other delete bumped it.
-                    panic!("incr-core: node {} deleted twice concurrently", slot);
+                    // Another delete claimed the node and will bump the
+                    // generation under its next write lock. Returning now
+                    // would let a cascade re-find this slot in its
+                    // parent's dependents and spin on it instead.
+                    self.park(ParkPoint::DeleteWaitsOnClaim(id));
+                    while node.generation() == handle.generation() {
+                        spins += 1;
+                        C::backoff(spins);
+                    }
+                    return DeleteOutcome::AlreadyGone;
                 }
                 _ => {
                     // The check and the claim share one read hold so no
                     // publish (which pushes reverse edges under the write
                     // lock) can land between them; clearing dependents
-                    // below would otherwise drop its edge silently.
+                    // below would otherwise drop its edge silently. The
+                    // generation is rechecked under the hold because a
+                    // delete and recycle between the load of `cur` and
+                    // the CAS would otherwise let the CAS claim the
+                    // slot's next occupant.
                     let claimed = {
                         let inner = self.inner.read();
-                        assert!(
-                            inner.dependents[slot as usize].is_empty(),
-                            "incr-core: delete_node on node {} which still has dependents; \
-                             delete downstream nodes first",
-                            slot,
-                        );
+                        if node.generation() != handle.generation() {
+                            return DeleteOutcome::AlreadyGone;
+                        }
+                        if !inner.dependents[slot as usize].is_empty()
+                            || inner.owned.contains_key(&slot)
+                        {
+                            return DeleteOutcome::HasDependents;
+                        }
                         state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok()
                     };
                     if claimed {
@@ -502,23 +729,42 @@ impl<C: Cells> Runtime<C> {
         let mut old_deps: Vec<NodeId> = Vec::new();
         node.for_each_dep(|d| old_deps.push(d));
         let arena_slot = node.arena_slot();
+        let type_tag = node.type_tag();
         node.retire_for_delete();
 
         let mut inner = self.inner.write();
         for d in &old_deps {
             inner.dependents[d.0 as usize].retain(|&x| x != id);
         }
-        inner.compute_fns[slot as usize] = None;
         inner.dependents[slot as usize].clear();
+        if let Some(owner) = inner.owner_of.remove(&slot) {
+            let siblings = inner
+                .owned
+                .get_mut(&owner.0)
+                .expect("incr-core: owner_of names an owner with no owned list");
+            siblings.retain(|&c| c != id);
+            if siblings.is_empty() {
+                inner.owned.remove(&owner.0);
+            }
+        }
+        node.bump_generation();
+        // The closures are dropped only after the lock is released,
+        // because their captures' Drop impls are user code that may call
+        // back into the runtime.
+        let compute = inner.compute_fns[slot as usize].take();
+        let observers: Vec<ObserverEntry<C>> = inner
+            .observers
+            .extract_if(|_, e| e.slot == slot)
+            .map(|(_, e)| e)
+            .collect();
         inner.labels.remove(&slot);
-        inner.observers.retain(|_, e| e.slot != slot);
-        let arena = inner
-            .arenas
-            .try_arena::<T>()
-            .expect("incr-core: arena missing for deleted handle's type");
+        let arena = Arc::clone(inner.arenas.erased(type_tag));
         inner.free_nodes.push(slot);
         drop(inner);
+        drop(compute);
+        drop(observers);
         arena.release(arena_slot);
+        DeleteOutcome::Deleted
     }
 
     /// Read the current value of a node. Triggers recomputation of the
@@ -1349,6 +1595,10 @@ impl<C: Cells> Runtime<C> {
 mod race_tests;
 
 #[cfg(test)]
+#[path = "runtime_cascade_tests.rs"]
+mod cascade_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::cells::{Local, Shared};
@@ -1893,6 +2143,160 @@ mod tests {
         let _q = rt.create_query(move |rt| rt.get(input) * 2);
         let _ = rt.get(_q);
         rt.delete_node(input);
+    }
+
+    struct RtPtr<C: Cells>(*const Runtime<C>);
+    // SAFETY: test-only. Every runtime outlives the closures holding its
+    // pointer, and a Local runtime's pointer never leaves its thread.
+    unsafe impl<C: Cells> Send for RtPtr<C> {}
+    unsafe impl<C: Cells> Sync for RtPtr<C> {}
+
+    /// Runs runtime calls from its Drop, as a user capture might.
+    struct TouchOnDrop<C: Cells> {
+        rt: RtPtr<C>,
+        probe: Incr<i64>,
+        victim: Incr<i64>,
+        dropped: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl<C: Cells> Drop for TouchOnDrop<C> {
+        fn drop(&mut self) {
+            // SAFETY: see RtPtr.
+            let rt = unsafe { &*self.rt.0 };
+            assert!(rt.is_alive(self.probe));
+            rt.delete_node(self.victim);
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn closures_drop_outside_the_lock<C: Cells>(rt: &Runtime<C>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let probe = rt.create_input(1_i64);
+        let victims = [2, 3, 4].map(|v| rt.create_input(v as i64));
+        let dropped = Arc::new(AtomicU32::new(0));
+        let guard = |victim| TouchOnDrop {
+            rt: RtPtr(rt as *const Runtime<C>),
+            probe,
+            victim,
+            dropped: Arc::clone(&dropped),
+        };
+
+        let g = guard(victims[0]);
+        let q = rt.create_query(move |rt| {
+            let _keep = &g;
+            rt.get(probe)
+        });
+        assert_eq!(rt.get(q), 1);
+        let g = guard(victims[1]);
+        rt.observe(q, move |_| {
+            let _keep = &g;
+        });
+        let g = guard(victims[2]);
+        let watcher = rt.observe(probe, move |_| {
+            let _keep = &g;
+        });
+
+        rt.unobserve(watcher);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        rt.delete_node(q);
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+        assert!(victims.iter().all(|&v| !rt.is_alive(v)));
+        assert!(rt.is_alive(probe));
+    }
+
+    #[test]
+    fn local_closures_drop_outside_the_lock() {
+        closures_drop_outside_the_lock(&Runtime::<Local>::new());
+    }
+
+    #[test]
+    fn shared_closures_drop_outside_the_lock() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            closures_drop_outside_the_lock(&Runtime::<Shared>::new());
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a closure drop deadlocked or panicked under the runtime lock");
+    }
+
+    #[test]
+    fn is_alive_tracks_delete_and_recycle() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_input(1_i64);
+        assert!(rt.is_alive(a));
+        assert!(rt.is_alive(a.erase()));
+
+        rt.delete_node(a);
+        assert!(!rt.is_alive(a));
+
+        let b = rt.create_input("recycled".to_string());
+        assert_eq!(b.slot(), a.slot());
+        assert!(!rt.is_alive(a), "a stale handle matches a recycled slot");
+        assert!(rt.is_alive(b));
+    }
+
+    #[test]
+    fn is_alive_is_false_for_a_foreign_handle() {
+        let rt1: Runtime<Shared> = Runtime::new();
+        let rt2: Runtime<Shared> = Runtime::new();
+        let a = rt1.create_input(1_i64);
+        let _same_slot = rt2.create_input(2_i64);
+        assert!(!rt2.is_alive(a));
+    }
+
+    #[test]
+    #[should_panic(expected = "stale")]
+    fn delete_node_twice_panics_stale() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_input(1_i64);
+        rt.delete_node(a);
+        rt.delete_node(a);
+    }
+
+    #[test]
+    #[should_panic(expected = "foreign runtime")]
+    fn delete_node_with_foreign_handle_panics() {
+        let rt1: Runtime<Local> = Runtime::new();
+        let rt2: Runtime<Local> = Runtime::new();
+        let a = rt1.create_input(1_i64);
+        let _ = rt2.create_input(2_i64);
+        rt2.delete_node(a);
+    }
+
+    #[test]
+    #[should_panic(expected = "own compute")]
+    fn delete_node_from_its_own_compute_panics() {
+        let rt: Runtime<Local> = Runtime::new();
+        let me: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+        let me_in = Arc::clone(&me);
+        let q = rt.create_query(move |rt| {
+            rt.delete_node(*me_in.get().unwrap());
+            0_i64
+        });
+        me.set(q).unwrap();
+        let _ = rt.get(q);
+    }
+
+    #[test]
+    fn delete_erased_reports_dependents_without_panicking() {
+        let rt: Runtime<Local> = Runtime::new();
+        let input = rt.create_input(5_i64);
+        let q = rt.create_query(move |rt| rt.get(input) * 2);
+        assert_eq!(rt.get(q), 10);
+
+        assert_eq!(
+            rt.delete_erased(input.erase()),
+            DeleteOutcome::HasDependents
+        );
+        assert!(rt.is_alive(input));
+        assert_eq!(rt.get(q), 10);
+
+        assert_eq!(rt.delete_erased(q.erase()), DeleteOutcome::Deleted);
+        assert_eq!(rt.delete_erased(q.erase()), DeleteOutcome::AlreadyGone);
+        assert_eq!(rt.delete_erased(input.erase()), DeleteOutcome::Deleted);
+        assert_eq!(rt.node_count(), 0);
     }
 
     #[test]

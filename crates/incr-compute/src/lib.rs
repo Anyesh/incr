@@ -27,7 +27,7 @@
 use incr_core::Local;
 
 pub use incr_core::{
-    Delta, GroupedCollection as GroupedCollectionInner, Incr,
+    Delta, ErasedIncr, GroupedCollection as GroupedCollectionInner, Incr,
     IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace,
     ObserverId, PropagationTrace, RuntimeId, SortDelta, SortedCollection as SortedCollectionInner,
     TraceAction, Value,
