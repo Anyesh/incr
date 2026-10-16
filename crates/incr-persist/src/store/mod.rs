@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Bound;
 use std::sync::{Mutex, MutexGuard};
 
@@ -41,6 +41,12 @@ pub struct Options {
     /// Whether writes sync before they are applied. Defaults to
     /// [`Durability::Sync`].
     pub durability: Durability,
+    /// When set to `Some(n)`, a write first runs [`Store::checkpoint`] once
+    /// the store has applied `n` records since it last checkpointed or
+    /// caught up across a compaction. The checkpoint runs before the write
+    /// appends anything, so its failure fails the write and leaves the log
+    /// unchanged. `None`, the default, compacts only on explicit calls.
+    pub auto_checkpoint_records: Option<u64>,
 }
 
 /// A persisted input: a key in the log bound to an input node of the
@@ -91,6 +97,7 @@ pub struct Store<C: Cells, B: Backend> {
 struct State<C: Cells> {
     applied: Position,
     poisoned: bool,
+    since_checkpoint: u64,
     logged: LoggedKeys,
     bound: HashMap<String, u32>,
     bindings: Vec<Box<dyn Binding<C>>>,
@@ -187,6 +194,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             state: Mutex::new(State {
                 applied: Position::ZERO,
                 poisoned: false,
+                since_checkpoint: 0,
                 logged: LoggedKeys::new(),
                 bound: HashMap::new(),
                 bindings: Vec::new(),
@@ -301,6 +309,124 @@ impl<C: Cells, B: Backend> Store<C, B> {
             .collect())
     }
 
+    /// Applies every record appended since this store last read the log,
+    /// including records from other writers, and returns the position it
+    /// has applied through. Behind a compaction it first replaces its state
+    /// with the snapshot's: inputs take their folded values, keys missing
+    /// from the snapshot reset to their default, and collections change by
+    /// only the occurrences that differ, so queries over them survive and
+    /// recompute.
+    ///
+    /// An error leaves the store at the last record it applied, except a
+    /// failure partway through replacing from a snapshot, which poisons it.
+    pub fn refresh(&self) -> Result<Position> {
+        let mut state = self.state()?;
+        self.catch_up(&mut state, None)?;
+        Ok(state.applied)
+    }
+
+    /// Folds the log through every record this store has applied into a new
+    /// snapshot, compacts the backend to it, and returns the position the
+    /// snapshot covers. It catches up first, so records other writers
+    /// appended before the call are folded in.
+    ///
+    /// Each key folds to its first `Declare`, then its latest `Set`, then
+    /// one `Insert` per element occurrence; records before a `Delete` are
+    /// gone. A key holding only its logged default (an input at its default
+    /// value, an empty collection) folds to nothing, `Declare` included, so
+    /// it disappears from [`Store::restored_keys`] and the next declaration
+    /// appends a fresh first-wins `Declare`, possibly with another default.
+    /// Declared keys compare by decoded value; keys this store has not
+    /// declared compare by bytes.
+    ///
+    /// When another writer compacts past this store's position between its
+    /// catch-up and its compaction, the backend rejects the stale fold with
+    /// [`Error::InvalidCompaction`]; the store catches up across that
+    /// compaction and folds again. Fails with [`Error::ReadOnly`] on a
+    /// read-only backend. After any other compaction error the store cannot
+    /// tell whether the snapshot was replaced, so it reloads its state from
+    /// the backend before returning the error, and is poisoned only if that
+    /// reload fails too.
+    pub fn checkpoint(&self) -> Result<Position> {
+        let mut state = self.state()?;
+        self.checkpoint_locked(&mut state)
+    }
+
+    fn checkpoint_locked(&self, state: &mut State<C>) -> Result<Position> {
+        loop {
+            self.catch_up(state, None)?;
+            let upto = state.applied;
+            let (folded, forgotten) = self.fold_snapshot(state)?;
+            match self.backend.compact(upto, folded) {
+                Ok(()) => {
+                    for key in forgotten {
+                        state.logged.remove(&key);
+                    }
+                    state.since_checkpoint = 0;
+                    return Ok(upto);
+                }
+                Err(Error::InvalidCompaction { snapshot_at, .. }) if snapshot_at > upto => {
+                    self.catch_up(state, None)?;
+                    if state.applied < snapshot_at {
+                        return Err(Error::Corrupt(
+                            "backend rejected a compaction below its snapshot but reads continue before it",
+                        ));
+                    }
+                }
+                Err(e @ (Error::InvalidCompaction { .. } | Error::ReadOnly)) => return Err(e),
+                Err(e) => {
+                    if self.resync(state).is_err() {
+                        state.poisoned = true;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// The snapshot of everything applied so far, and the keys it forgets:
+    /// those the log knows but that fold to nothing.
+    fn fold_snapshot(&self, state: &State<C>) -> Result<(Vec<Record>, Vec<String>)> {
+        let keys: BTreeSet<&str> = state
+            .logged
+            .keys()
+            .chain(state.bound.keys())
+            .map(String::as_str)
+            .collect();
+        let mut folded = Vec::new();
+        let mut forgotten = Vec::new();
+        for key in keys {
+            let logged = state.logged.get(key);
+            let records = match state.bound.get(key) {
+                Some(&id) => state.bindings[id as usize].fold(&self.runtime, logged)?,
+                None => match logged {
+                    Some(logged) if !logged.at_default() => logged.records(key),
+                    _ => Vec::new(),
+                },
+            };
+            if records.is_empty() {
+                if logged.is_some() {
+                    forgotten.push(key.to_owned());
+                }
+            } else {
+                folded.extend(records);
+            }
+        }
+        Ok((folded, forgotten))
+    }
+
+    /// Rebuilds the folded log and every bound node from the backend's
+    /// current snapshot and the records after it, for when the store cannot
+    /// tell what a failed backend call changed.
+    fn resync(&self, state: &mut State<C>) -> Result<()> {
+        let (at, records) = self
+            .backend
+            .load_snapshot()?
+            .unwrap_or((Position::ZERO, Vec::new()));
+        self.replace_with(state, at, records)?;
+        self.catch_up(state, None)
+    }
+
     /// Returns the key's live `Declare`, first appending one of `kind` with
     /// the default `default` produces when the log has none. Fails with
     /// [`Error::KindMismatch`] when the live `Declare` is of the other kind.
@@ -354,6 +480,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// poisons the store, because a retry would append the records again
     /// and a collection insert is not idempotent.
     fn write(&self, state: &mut State<C>, records: &[Record]) -> Result<Position> {
+        if let Some(threshold) = self.options.auto_checkpoint_records {
+            if state.since_checkpoint >= threshold {
+                self.checkpoint_locked(state)?;
+            }
+        }
         let last = self.backend.append(records)?;
         let landed = (|| {
             if self.options.durability == Durability::Sync {
@@ -385,6 +516,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                     for (position, record) in read.drain(..) {
                         self.apply(state, record)?;
                         state.applied = position;
+                        state.since_checkpoint += 1;
                     }
                     match until {
                         Some(target) if state.applied < target => {
@@ -424,15 +556,28 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 "backend reported compaction below the position already applied",
             ));
         }
+        self.replace_with(state, at, records)
+    }
+
+    /// Replaces the folded log and every bound node with the fold of
+    /// `records`, a snapshot covering through `at`. A binding that fails
+    /// after others were replaced leaves the store between two states, so
+    /// that failure poisons it.
+    fn replace_with(&self, state: &mut State<C>, at: Position, records: Vec<Record>) -> Result<()> {
         let mut logged = LoggedKeys::new();
         for record in records {
             fold(&mut logged, record);
         }
         for (key, &id) in &state.bound {
-            state.bindings[id as usize].replace(&self.runtime, logged.get_mut(key))?;
+            let replaced = state.bindings[id as usize].replace(&self.runtime, logged.get_mut(key));
+            if let Err(e) = replaced {
+                state.poisoned = true;
+                return Err(e);
+            }
         }
         state.logged = logged;
         state.applied = at;
+        state.since_checkpoint = 0;
         Ok(())
     }
 }

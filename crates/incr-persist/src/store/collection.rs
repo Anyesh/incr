@@ -281,6 +281,22 @@ where
         Ok(())
     }
 
+    fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {
+        let elements = self.collection.values(rt);
+        let has_value = logged.is_some_and(|logged| logged.value.is_some());
+        if elements.is_empty() && !has_value {
+            return Ok(Vec::new());
+        }
+        let mut out = logged.map_or_else(Vec::new, |logged| logged.records(&self.key));
+        for element in &elements {
+            out.push(Record::Insert {
+                key: self.key.clone(),
+                element: encode(element)?,
+            });
+        }
+        Ok(out)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -349,6 +349,7 @@ fn durability_decides_whether_writes_sync() {
         backend.clone(),
         Options {
             durability: Durability::Buffered,
+            ..Options::default()
         },
     )
     .unwrap();

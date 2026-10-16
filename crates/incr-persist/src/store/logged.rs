@@ -78,9 +78,64 @@ impl LoggedKey {
             .as_deref()
             .or(self.declared.as_ref().map(|d| d.default.as_slice()))
     }
+
+    /// Whether the key holds nothing beyond its logged default, compared
+    /// by bytes, so that compaction may forget it. A key without a
+    /// `Declare` has no default and never qualifies.
+    pub fn at_default(&self) -> bool {
+        let Some(declared) = &self.declared else {
+            return false;
+        };
+        self.elements.is_empty()
+            && self
+                .value
+                .as_ref()
+                .is_none_or(|value| *value == declared.default)
+    }
+
+    /// The records a snapshot keeps for this key: its `Declare`, its latest
+    /// `Set`, then one `Insert` per live element occurrence followed by the
+    /// raw tail. Folding them back reproduces this state.
+    pub fn records(&self, key: &str) -> Vec<Record> {
+        let mut out = Vec::new();
+        if let Some(Declared { kind, default }) = &self.declared {
+            out.push(Record::Declare {
+                key: key.to_owned(),
+                kind: *kind,
+                default: default.clone(),
+            });
+        }
+        if let Some(value) = &self.value {
+            out.push(Record::Set {
+                key: key.to_owned(),
+                value: value.clone(),
+            });
+        }
+        for (element, &count) in &self.elements.live {
+            out.extend((0..count).map(|_| Record::Insert {
+                key: key.to_owned(),
+                element: element.clone(),
+            }));
+        }
+        out.extend(self.elements.tail.iter().map(|op| match op {
+            ElementOp::Insert(element) => Record::Insert {
+                key: key.to_owned(),
+                element: element.clone(),
+            },
+            ElementOp::Remove(element) => Record::Remove {
+                key: key.to_owned(),
+                element: element.clone(),
+            },
+        }));
+        out
+    }
 }
 
 impl Elements {
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty() && self.tail.is_empty()
+    }
+
     /// Live elements by serialized bytes with their multiplicity. Apply
     /// [`Elements::tail`] after them to reach the current state.
     pub fn live(&self) -> impl Iterator<Item = (&[u8], usize)> {
@@ -216,7 +271,7 @@ mod tests {
         assert_eq!(keys["c"].elements.live, expected);
         assert!(keys["c"].elements.tail.is_empty());
         fold(&mut keys, Record::Delete { key: "c".into() });
-        assert_eq!(keys["c"].elements, Elements::default());
+        assert!(keys["c"].elements.is_empty());
     }
 
     #[test]
@@ -240,8 +295,14 @@ mod tests {
             ]
         );
 
+        let mut refolded = LoggedKeys::new();
+        for record in keys["c"].records("c") {
+            fold(&mut refolded, record);
+        }
+        assert_eq!(refolded["c"], keys["c"]);
+
         fold(&mut keys, Record::Delete { key: "c".into() });
-        assert_eq!(keys["c"].elements, Elements::default());
+        assert!(keys["c"].elements.is_empty());
     }
 
     #[test]
@@ -254,6 +315,36 @@ mod tests {
                 element: vec![5],
             },
         );
-        assert_eq!(keys["c"].elements, Elements::default());
+        assert!(keys["c"].elements.is_empty());
+    }
+
+    #[test]
+    fn at_default_needs_a_declare_and_nothing_beyond_its_default() {
+        let declare = Record::Declare {
+            key: "k".into(),
+            kind: Kind::Input,
+            default: vec![1],
+        };
+        let set = |value: u8| Record::Set {
+            key: "k".into(),
+            value: vec![value],
+        };
+        let mut keys = LoggedKeys::new();
+        fold(&mut keys, set(1));
+        assert!(!keys["k"].at_default(), "no Declare, so no default");
+        fold(&mut keys, declare);
+        assert!(keys["k"].at_default());
+        fold(&mut keys, set(2));
+        assert!(!keys["k"].at_default());
+        fold(&mut keys, Record::Delete { key: "k".into() });
+        assert!(keys["k"].at_default());
+        fold(
+            &mut keys,
+            Record::Insert {
+                key: "k".into(),
+                element: vec![0],
+            },
+        );
+        assert!(!keys["k"].at_default());
     }
 }

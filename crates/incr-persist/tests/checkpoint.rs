@@ -1,0 +1,541 @@
+use std::collections::BTreeMap;
+use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use incr_persist::{
+    Backend, Cells, Error, FileBackend, Kind, Local, MemoryBackend, Options, Position, ReadOutcome,
+    Record, Shared, Store,
+};
+
+fn open<C: Cells, B: Backend>(backend: B) -> Store<C, B> {
+    Store::open(backend, Options::default()).unwrap()
+}
+
+fn enc<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    postcard::to_stdvec(value).unwrap()
+}
+
+fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort();
+    values
+}
+
+fn records_after(backend: &impl Backend, after: Position) -> Vec<Record> {
+    let mut out = Vec::new();
+    assert_eq!(
+        backend.read_from(after, &mut out).unwrap(),
+        ReadOutcome::Records
+    );
+    out.into_iter().map(|(_, record)| record).collect()
+}
+
+/// The snapshot's records grouped by key, each group in a canonical order
+/// so that element order, which follows hash iteration, does not matter.
+fn snapshot_by_key(backend: &impl Backend) -> (Position, BTreeMap<String, Vec<Vec<u8>>>) {
+    let (at, records) = backend.load_snapshot().unwrap().expect("a snapshot");
+    let mut keys: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();
+    for record in records {
+        keys.entry(record.key().to_owned())
+            .or_default()
+            .push(record.encode().unwrap());
+    }
+    for group in keys.values_mut() {
+        group.sort();
+    }
+    (at, keys)
+}
+
+fn group(records: &[Record]) -> Vec<Vec<u8>> {
+    sorted(records.iter().map(|r| r.encode().unwrap()).collect())
+}
+
+fn declare(key: &str, kind: Kind, default: Vec<u8>) -> Record {
+    Record::Declare {
+        key: key.into(),
+        kind,
+        default,
+    }
+}
+
+fn set(key: &str, value: Vec<u8>) -> Record {
+    Record::Set {
+        key: key.into(),
+        value,
+    }
+}
+
+fn insert(key: &str, element: Vec<u8>) -> Record {
+    Record::Insert {
+        key: key.into(),
+        element,
+    }
+}
+
+#[test]
+fn checkpoint_folds_each_key_per_the_folding_rules() {
+    let log = MemoryBackend::new();
+    let store = open::<Local, _>(log.clone());
+    let price = store.input("price", 0.0f64).unwrap();
+    store.set(price, 1.0).unwrap();
+    store.set(price, 2.5).unwrap();
+    let back = store.input("back", 5u32).unwrap();
+    store.set(back, 6).unwrap();
+    store.set(back, 5).unwrap();
+    store.input("idle", 1u32).unwrap();
+    let tags = store.collection::<String>("tags").unwrap();
+    for tag in ["a", "a", "b"] {
+        tags.insert(&store, tag.to_owned()).unwrap();
+    }
+    tags.delete(&store, &"b".to_owned()).unwrap();
+    let emptied = store.collection::<u32>("emptied").unwrap();
+    emptied.insert(&store, 1).unwrap();
+    emptied.delete(&store, &1).unwrap();
+
+    log.append(&[
+        declare("raw/in", Kind::Input, enc(&0u32)),
+        set("raw/in", enc(&1u32)),
+        set("raw/in", enc(&2u32)),
+        declare("raw/del", Kind::Input, enc(&0u32)),
+        set("raw/del", enc(&3u32)),
+        Record::Delete {
+            key: "raw/del".into(),
+        },
+        set("raw/undeclared", enc(&4u32)),
+        declare("raw/col", Kind::Collection, vec![]),
+        insert("raw/col", vec![1]),
+        insert("raw/col", vec![1]),
+        Record::Remove {
+            key: "raw/col".into(),
+            element: vec![1],
+        },
+        insert("raw/col", vec![2]),
+    ])
+    .unwrap();
+
+    let at = store.checkpoint().unwrap();
+    assert_eq!(at, log.append(&[]).unwrap(), "folds through the tail");
+    assert!(records_after(&log, at).is_empty());
+
+    let (snapshot_at, keys) = snapshot_by_key(&log);
+    assert_eq!(snapshot_at, at);
+    let expected = BTreeMap::from([
+        (
+            "price".to_owned(),
+            group(&[
+                declare("price", Kind::Input, enc(&0.0f64)),
+                set("price", enc(&2.5f64)),
+            ]),
+        ),
+        (
+            "tags".to_owned(),
+            group(&[
+                declare("tags", Kind::Collection, vec![]),
+                insert("tags", enc(&"a")),
+                insert("tags", enc(&"a")),
+            ]),
+        ),
+        (
+            "raw/in".to_owned(),
+            group(&[
+                declare("raw/in", Kind::Input, enc(&0u32)),
+                set("raw/in", enc(&2u32)),
+            ]),
+        ),
+        (
+            "raw/undeclared".to_owned(),
+            group(&[set("raw/undeclared", enc(&4u32))]),
+        ),
+        (
+            "raw/col".to_owned(),
+            group(&[
+                declare("raw/col", Kind::Collection, vec![]),
+                insert("raw/col", vec![1]),
+                insert("raw/col", vec![2]),
+            ]),
+        ),
+    ]);
+    assert_eq!(keys, expected);
+    assert_eq!(
+        store.restored_keys("").unwrap(),
+        ["raw/col", "raw/in", "raw/undeclared"]
+    );
+
+    drop(store);
+    let store = open::<Local, _>(log);
+    let rt = store.runtime();
+    assert_eq!(rt.get(store.input("price", 9.0f64).unwrap().handle()), 2.5);
+    assert_eq!(rt.get(store.input("back", 9u32).unwrap().handle()), 9);
+    assert_eq!(rt.get(store.input("idle", 9u32).unwrap().handle()), 9);
+    let tags = store.collection::<String>("tags").unwrap();
+    assert_eq!(tags.handle().values(rt), ["a", "a"]);
+    assert_eq!(
+        store.restored_keys("").unwrap(),
+        ["raw/col", "raw/in", "raw/undeclared"]
+    );
+}
+
+fn reader_behind_compaction<B: Backend>(writer_log: B, reader_log: B) {
+    let writer = open::<Local, _>(writer_log);
+    let items = writer.collection::<u32>("items").unwrap();
+    let x = writer.input("x", 0u32).unwrap();
+    for item in [1, 1, 2, 3] {
+        items.insert(&writer, item).unwrap();
+    }
+    writer.set(x, 5).unwrap();
+
+    let reader = open::<Local, _>(reader_log);
+    let r_items = reader.collection::<u32>("items").unwrap();
+    let r_x = reader.input("x", 0u32).unwrap();
+    let rt = reader.runtime();
+    let count = r_items.handle().count(rt);
+    let sum = r_items
+        .handle()
+        .reduce(rt, |elements: &[u32]| elements.iter().sum::<u32>());
+    let doubled = rt.create_query(move |rt| rt.get(sum) * 2);
+    assert_eq!(sorted(r_items.handle().values(rt)), [1, 1, 2, 3]);
+    assert_eq!(
+        (rt.get(count), rt.get(doubled), rt.get(r_x.handle())),
+        (4, 14, 5)
+    );
+    let version = rt.get(r_items.handle().version_node());
+
+    items.delete(&writer, &1).unwrap();
+    items.insert(&writer, 2).unwrap();
+    items.insert(&writer, 4).unwrap();
+    items.delete(&writer, &3).unwrap();
+    writer.set(x, 0).unwrap();
+    let at = writer.checkpoint().unwrap();
+
+    reader.refresh().unwrap();
+    assert!(reader.refresh().unwrap() >= at);
+    assert_eq!(sorted(r_items.handle().values(rt)), [1, 2, 2, 4]);
+    assert_eq!(
+        rt.get(r_items.handle().version_node()) - version,
+        4,
+        "only the four differing occurrences change"
+    );
+    assert_eq!(
+        (rt.get(count), rt.get(doubled), rt.get(r_x.handle())),
+        (4, 18, 0)
+    );
+
+    items.insert(&writer, 7).unwrap();
+    reader.refresh().unwrap();
+    assert_eq!(sorted(r_items.handle().values(rt)), [1, 2, 2, 4, 7]);
+    assert_eq!(rt.get(doubled), 32);
+}
+
+#[test]
+fn a_reader_behind_compaction_ends_with_the_snapshot_multiset_on_memory() {
+    let log = MemoryBackend::new();
+    reader_behind_compaction(log.clone(), log.read_only());
+}
+
+#[test]
+fn a_reader_behind_compaction_ends_with_the_snapshot_multiset_on_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = FileBackend::open(dir.path()).unwrap();
+    let reader = FileBackend::open_read_only(dir.path()).unwrap();
+    reader_behind_compaction(writer, reader);
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_reader_behind_compaction_ends_with_the_snapshot_multiset_on_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log.sqlite");
+    let writer = incr_persist::SqliteBackend::open(&path).unwrap();
+    let reader = incr_persist::SqliteBackend::open_read_only(&path).unwrap();
+    reader_behind_compaction(writer, reader);
+}
+
+#[test]
+fn a_checkpoint_on_file_restarts_to_the_same_state() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = open::<Local, _>(FileBackend::open(dir.path()).unwrap());
+        let x = store.input("x", 0u32).unwrap();
+        let items = store.collection::<String>("items").unwrap();
+        for value in 1..=5 {
+            store.set(x, value).unwrap();
+            items.insert(&store, format!("v{}", value % 2)).unwrap();
+        }
+        store.checkpoint().unwrap();
+        items.delete(&store, &"v0".to_owned()).unwrap();
+    }
+    let store = open::<Local, _>(FileBackend::open(dir.path()).unwrap());
+    let x = store.input("x", 0u32).unwrap();
+    let items = store.collection::<String>("items").unwrap();
+    assert_eq!(store.runtime().get(x.handle()), 5);
+    assert_eq!(
+        sorted(items.handle().values(store.runtime())),
+        ["v0", "v1", "v1", "v1"]
+    );
+}
+
+#[test]
+fn a_reader_replaces_a_collection_over_a_shared_runtime() {
+    let log = MemoryBackend::new();
+    let writer = open::<Shared, _>(log.clone());
+    let reader = open::<Shared, _>(log.read_only());
+    let items = writer.collection::<u32>("items").unwrap();
+    for item in [1, 1, 2] {
+        items.insert(&writer, item).unwrap();
+    }
+    reader.refresh().unwrap();
+    let r_items = reader.collection::<u32>("items").unwrap();
+    let count = r_items.handle().count(reader.runtime());
+    assert_eq!(reader.runtime().get(count), 3);
+    items.delete(&writer, &1).unwrap();
+    items.delete(&writer, &1).unwrap();
+    writer.checkpoint().unwrap();
+    reader.refresh().unwrap();
+    assert_eq!(r_items.handle().values(reader.runtime()), [2]);
+    assert_eq!(reader.runtime().get(count), 1);
+}
+
+#[test]
+fn a_key_deleted_back_to_its_default_is_forgotten_and_can_be_declared_afresh() {
+    let log = MemoryBackend::new();
+    let a = open::<Local, _>(log.clone());
+    let k = a.input("k", 3u32).unwrap();
+    a.set(k, 9).unwrap();
+    {
+        let b = open::<Local, _>(log.clone());
+        b.input("j", 0u32).unwrap();
+        let gone = b.collection::<u32>("gone").unwrap();
+        gone.insert(&b, 1).unwrap();
+    }
+    log.append(&[
+        Record::Delete { key: "k".into() },
+        Record::Delete { key: "gone".into() },
+    ])
+    .unwrap();
+    a.refresh().unwrap();
+    assert_eq!(a.runtime().get(k.handle()), 3);
+    assert_eq!(a.restored_keys("").unwrap(), ["gone", "j"]);
+
+    a.checkpoint().unwrap();
+    let (_, snapshot) = snapshot_by_key(&log);
+    assert!(snapshot.is_empty(), "every key is at its default");
+    assert!(a.restored_keys("").unwrap().is_empty());
+
+    let c = open::<Local, _>(log.clone());
+    assert!(c.restored_keys("").unwrap().is_empty());
+    let c_k = c.input("k", 42u32).unwrap();
+    assert_eq!(c.runtime().get(c_k.handle()), 42);
+    let c_j = c.input("j", 7u32).unwrap();
+    assert_eq!(c.runtime().get(c_j.handle()), 7);
+    let gone = c.collection::<String>("gone").unwrap();
+    assert!(gone.handle().values(c.runtime()).is_empty());
+    let (snapshot_at, _) = log.load_snapshot().unwrap().unwrap();
+    assert_eq!(
+        records_after(&log, snapshot_at)
+            .iter()
+            .filter(|r| matches!(r, Record::Declare { .. }))
+            .count(),
+        3,
+        "each forgotten key gets a fresh Declare"
+    );
+
+    a.refresh().unwrap();
+    assert_eq!(
+        a.runtime().get(k.handle()),
+        42,
+        "the fresh first-wins Declare is adopted by every store"
+    );
+}
+
+/// Runs `race` inside the next `compact`, before forwarding it, the way
+/// another writer compacting between this store's catch-up and its
+/// compaction would.
+struct Racing {
+    inner: MemoryBackend,
+    race: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl Backend for Racing {
+    fn append(&self, records: &[Record]) -> incr_persist::Result<Position> {
+        self.inner.append(records)
+    }
+
+    fn sync(&self, upto: Position) -> incr_persist::Result<()> {
+        self.inner.sync(upto)
+    }
+
+    fn read_from(
+        &self,
+        after: Position,
+        out: &mut Vec<(Position, Record)>,
+    ) -> incr_persist::Result<ReadOutcome> {
+        self.inner.read_from(after, out)
+    }
+
+    fn load_snapshot(&self) -> incr_persist::Result<Option<(Position, Vec<Record>)>> {
+        self.inner.load_snapshot()
+    }
+
+    fn compact(&self, upto: Position, folded: Vec<Record>) -> incr_persist::Result<()> {
+        let race = self.race.lock().unwrap().take();
+        if let Some(race) = race {
+            race();
+        }
+        self.inner.compact(upto, folded)
+    }
+
+    fn writable(&self) -> bool {
+        self.inner.writable()
+    }
+}
+
+#[test]
+fn a_compaction_by_another_writer_is_caught_up_and_retried() {
+    let log = MemoryBackend::new();
+    let other = Arc::new(open::<Shared, _>(log.clone()));
+    let other_x = other.input("x", 0u32).unwrap();
+    other.set(other_x, 1).unwrap();
+
+    let racer = Arc::clone(&other);
+    let store = open::<Local, _>(Racing {
+        inner: log.clone(),
+        race: Mutex::new(Some(Box::new(move || {
+            racer.set(other_x, 2).unwrap();
+            racer.checkpoint().unwrap();
+        }))),
+    });
+    let x = store.input("x", 0u32).unwrap();
+    let doubled = {
+        let x = x.handle();
+        store.runtime().create_query(move |rt| rt.get(x) * 2)
+    };
+    assert_eq!(store.runtime().get(doubled), 2);
+
+    let at = store.checkpoint().unwrap();
+    let (snapshot_at, snapshot) = snapshot_by_key(&log);
+    assert_eq!(at, snapshot_at);
+    assert_eq!(
+        snapshot["x"],
+        group(&[declare("x", Kind::Input, enc(&0u32)), set("x", enc(&2u32))])
+    );
+    assert_eq!(store.runtime().get(doubled), 4);
+    store.set(x, 3).unwrap();
+    assert_eq!(store.runtime().get(doubled), 6);
+}
+
+/// Fails `compact` with an I/O error, either before forwarding it or after
+/// the inner backend already compacted, the two outcomes a caller cannot
+/// tell apart.
+struct FailingCompact {
+    inner: MemoryBackend,
+    after_compacting: bool,
+    armed: AtomicBool,
+}
+
+impl Backend for FailingCompact {
+    fn append(&self, records: &[Record]) -> incr_persist::Result<Position> {
+        self.inner.append(records)
+    }
+
+    fn sync(&self, upto: Position) -> incr_persist::Result<()> {
+        self.inner.sync(upto)
+    }
+
+    fn read_from(
+        &self,
+        after: Position,
+        out: &mut Vec<(Position, Record)>,
+    ) -> incr_persist::Result<ReadOutcome> {
+        self.inner.read_from(after, out)
+    }
+
+    fn load_snapshot(&self) -> incr_persist::Result<Option<(Position, Vec<Record>)>> {
+        self.inner.load_snapshot()
+    }
+
+    fn compact(&self, upto: Position, folded: Vec<Record>) -> incr_persist::Result<()> {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return self.inner.compact(upto, folded);
+        }
+        if self.after_compacting {
+            self.inner.compact(upto, folded)?;
+        }
+        Err(Error::Io(io::Error::other("injected compaction failure")))
+    }
+
+    fn writable(&self) -> bool {
+        self.inner.writable()
+    }
+}
+
+#[test]
+fn a_failed_compaction_leaves_the_store_in_step_with_the_log() {
+    for after_compacting in [false, true] {
+        let log = MemoryBackend::new();
+        open::<Local, _>(log.clone()).input("idle", 0u32).unwrap();
+        let store = open::<Local, _>(FailingCompact {
+            inner: log.clone(),
+            after_compacting,
+            armed: AtomicBool::new(true),
+        });
+        let x = store.input("x", 0u32).unwrap();
+        store.set(x, 4).unwrap();
+
+        assert!(matches!(store.checkpoint(), Err(Error::Io(_))));
+        let expected: &[&str] = if after_compacting { &[] } else { &["idle"] };
+        assert_eq!(store.restored_keys("").unwrap(), expected);
+        store.set(x, 5).unwrap();
+        assert_eq!(store.runtime().get(x.handle()), 5);
+
+        store.checkpoint().unwrap();
+        assert!(store.restored_keys("").unwrap().is_empty());
+        let reopened = open::<Local, _>(log);
+        let x = reopened.input("x", 0u32).unwrap();
+        assert_eq!(reopened.runtime().get(x.handle()), 5);
+    }
+}
+
+#[test]
+fn checkpoint_on_a_read_only_store_fails_without_poisoning() {
+    let log = MemoryBackend::new();
+    let writer = open::<Local, _>(log.clone());
+    let x = writer.input("x", 0u32).unwrap();
+    writer.set(x, 1).unwrap();
+    let reader = open::<Local, _>(log.read_only());
+    assert!(matches!(reader.checkpoint(), Err(Error::ReadOnly)));
+    let x = reader.input("x", 0u32).unwrap();
+    assert_eq!(reader.runtime().get(x.handle()), 1);
+}
+
+#[test]
+fn auto_checkpoint_compacts_at_the_next_write_past_the_threshold() {
+    let log = MemoryBackend::new();
+    let options = Options {
+        auto_checkpoint_records: Some(4),
+        ..Options::default()
+    };
+    {
+        let store = Store::<Local, _>::open(log.clone(), options.clone()).unwrap();
+        let x = store.input("x", 0u32).unwrap();
+        for value in 1..=10 {
+            store.set(x, value).unwrap();
+        }
+    }
+    let (at, _) = log.load_snapshot().unwrap().expect("a checkpoint ran");
+    assert!(records_after(&log, at).len() < 4);
+
+    let store = Store::<Local, _>::open(log.clone(), options).unwrap();
+    let x = store.input("x", 0u32).unwrap();
+    assert_eq!(store.runtime().get(x.handle()), 10);
+}
+
+#[test]
+fn checkpoint_without_auto_threshold_never_runs_on_its_own() {
+    let log = MemoryBackend::new();
+    let store = open::<Local, _>(log.clone());
+    let x = store.input("x", 0u32).unwrap();
+    for value in 1..=100 {
+        store.set(x, value).unwrap();
+    }
+    assert!(log.load_snapshot().unwrap().is_none());
+}

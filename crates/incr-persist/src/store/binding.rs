@@ -21,6 +21,11 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// once they all decoded; on an error nothing has changed.
     fn replace(&self, rt: &Runtime<C>, logged: Option<&mut LoggedKey>) -> Result<()>;
 
+    /// The records a snapshot keeps for this key, given its logged state.
+    /// Empty when the key holds only its logged default, compared by
+    /// decoded value, which is how compaction forgets it.
+    fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>>;
+
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -68,6 +73,25 @@ impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
     fn replace(&self, rt: &Runtime<C>, logged: Option<&mut LoggedKey>) -> Result<()> {
         rt.set(self.handle, self.value_of(logged.as_deref())?);
         Ok(())
+    }
+
+    fn fold(&self, _rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {
+        let Some(logged) = logged else {
+            return Ok(Vec::new());
+        };
+        let at_default = match (&logged.declared, &logged.value) {
+            (Some(_), _) if !logged.elements.is_empty() => false,
+            (Some(_), None) => true,
+            (Some(declared), Some(value)) => {
+                decode::<T>(&self.key, value)? == decode::<T>(&self.key, &declared.default)?
+            }
+            (None, _) => false,
+        };
+        Ok(if at_default {
+            Vec::new()
+        } else {
+            logged.records(&self.key)
+        })
     }
 
     fn as_any(&self) -> &dyn Any {

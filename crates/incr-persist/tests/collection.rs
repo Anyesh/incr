@@ -328,3 +328,33 @@ fn a_collection_declared_while_records_arrive_folds_them_by_value() {
     let items = reader.collection::<Loose>("loose").unwrap();
     assert_eq!(ids(items.handle().values(reader.runtime())), live);
 }
+
+#[test]
+fn checkpoints_fold_loose_elements_by_value_whether_bound_or_not() {
+    let log = MemoryBackend::new();
+    let live = {
+        let store = open::<Local, _>(log.clone());
+        let live = write_loose_history(&store);
+        store.checkpoint().unwrap();
+        live
+    };
+    let (_, snapshot) = log.load_snapshot().unwrap().unwrap();
+    let inserts = snapshot
+        .iter()
+        .filter(|r| matches!(r, Record::Insert { .. }))
+        .count();
+    assert_eq!(inserts, live.len(), "a bound collection folds by value");
+    let store = open::<Local, _>(log.clone());
+    let items = store.collection::<Loose>("loose").unwrap();
+    assert_eq!(ids(items.handle().values(store.runtime())), live);
+
+    let log = MemoryBackend::new();
+    let live = {
+        let store = open::<Local, _>(log.clone());
+        write_loose_history(&store)
+    };
+    open::<Local, _>(log.clone()).checkpoint().unwrap();
+    let store = open::<Local, _>(log);
+    let items = store.collection::<Loose>("loose").unwrap();
+    assert_eq!(ids(items.handle().values(store.runtime())), live);
+}
