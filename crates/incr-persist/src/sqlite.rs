@@ -11,9 +11,9 @@ use rusqlite::{
     params, Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
 };
 
-use crate::{Backend, Error, Position, ReadOutcome, Record, Result};
+use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// How much a committed append survives, chosen when a writable
 /// [`SqliteBackend`] is opened.
@@ -61,9 +61,10 @@ impl Default for SqliteOptions {
 ///
 /// Records live one per row in `log(pos INTEGER PRIMARY KEY, rec BLOB)`,
 /// each as [`Record::encode`] bytes, and the snapshot lives in the single
-/// row of `snapshot(pos, recs)`. An append numbers its records from just
-/// above the last row, or above the snapshot's position when compaction
-/// left no rows, so no position is handed out twice. The database runs in
+/// row of `snapshot(pos, generation, recs)`, where `generation` counts
+/// compactions. An append numbers its records from just above the last
+/// row, or above the snapshot's position when compaction left no rows, so
+/// no position is handed out twice. The database runs in
 /// WAL mode, so readers never wait for writers. `append` and `compact` take
 /// SQLite's write lock with `BEGIN IMMEDIATE` and hold it until commit, so
 /// positions increase in commit order. A read sees a prefix of the commits,
@@ -103,6 +104,7 @@ const SCHEMA: &str = "
     CREATE TABLE snapshot (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         pos INTEGER NOT NULL,
+        generation INTEGER NOT NULL,
         recs BLOB NOT NULL
     );
 ";
@@ -234,6 +236,26 @@ impl Backend for SqliteBackend {
         pushed.map(|()| ReadOutcome::Records)
     }
 
+    fn snapshot_id(&self) -> Result<Option<SnapshotId>> {
+        let row: Option<(i64, i64)> = self
+            .lock()
+            .conn
+            .prepare_cached("SELECT pos, generation FROM snapshot")
+            .map_err(sql)?
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .map_err(sql)?;
+        row.map(|(at, generation)| {
+            Ok(SnapshotId {
+                position: position(at)?,
+                generation: generation
+                    .try_into()
+                    .map_err(|_| Error::Corrupt("negative snapshot generation"))?,
+            })
+        })
+        .transpose()
+    }
+
     fn load_snapshot(&self) -> Result<Option<(Position, Vec<Record>)>> {
         let row: Option<(i64, Vec<u8>)> = self
             .lock()
@@ -265,7 +287,8 @@ impl Backend for SqliteBackend {
         tx.execute("DELETE FROM log WHERE pos <= ?1", [upto_sql])
             .map_err(sql)?;
         tx.execute(
-            "INSERT OR REPLACE INTO snapshot (id, pos, recs) VALUES (0, ?1, ?2)",
+            "INSERT OR REPLACE INTO snapshot (id, pos, generation, recs) \
+             VALUES (0, ?1, ifnull((SELECT generation FROM snapshot), 0) + 1, ?2)",
             params![upto_sql, recs],
         )
         .map_err(sql)?;

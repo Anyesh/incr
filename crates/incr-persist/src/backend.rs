@@ -33,6 +33,17 @@ pub enum ReadOutcome {
     Compacted { snapshot_at: Position },
 }
 
+/// Names one snapshot of a log, as [`Backend::snapshot_id`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SnapshotId {
+    /// The position the snapshot covers.
+    pub position: Position,
+    /// How many compactions the log had seen once this snapshot replaced
+    /// the previous one: 1 for the first, one more for each after it, a
+    /// replacement at the same position included.
+    pub generation: u64,
+}
+
 /// Storage for one totally ordered log of [`Record`]s and the snapshot that
 /// folds its prefix.
 ///
@@ -84,6 +95,16 @@ pub trait Backend: Send + Sync {
     /// `Some((position, vec![]))`.
     fn load_snapshot(&self) -> Result<Option<(Position, Vec<Record>)>>;
 
+    /// Names the current snapshot without loading it, or returns `None` for
+    /// a log that was never compacted. Cheap enough to call on every
+    /// catch-up.
+    ///
+    /// The position alone cannot tell snapshots apart, because `compact`
+    /// may replace a snapshot at its own position, so the id carries the
+    /// generation too. Every handle on the log, read-only ones included,
+    /// reports the same id, and a reopen reports it again.
+    fn snapshot_id(&self) -> Result<Option<SnapshotId>>;
+
     /// Replaces the snapshot with `folded`, recorded as covering every
     /// position through `upto`, and drops the log records at or below
     /// `upto`. Records above `upto`, such as ones other writers appended
@@ -99,6 +120,8 @@ pub trait Backend: Send + Sync {
     /// [`Error::InvalidCompaction`](crate::Error::InvalidCompaction) when
     /// `upto` is below the current snapshot position or beyond the tail.
     /// `upto` equal to the current snapshot position replaces the snapshot.
+    /// A successful compaction advances the [`SnapshotId::generation`] by
+    /// exactly one; a failed one leaves it unchanged.
     fn compact(&self, upto: Position, folded: Vec<Record>) -> Result<()>;
 
     /// `false` for a read-only open, on which `append` and `compact` fail.

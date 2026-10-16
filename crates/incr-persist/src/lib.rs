@@ -22,7 +22,7 @@ mod record;
 mod sqlite;
 mod store;
 
-pub use backend::{Backend, Position, ReadOutcome};
+pub use backend::{Backend, Position, ReadOutcome, SnapshotId};
 pub use error::{Error, Result};
 pub use file::FileBackend;
 pub use incr_core::{Cells, Local, Shared};

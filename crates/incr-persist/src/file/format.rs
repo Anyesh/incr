@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(not(unix))]
 use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
@@ -62,6 +62,15 @@ pub(super) fn parse_header(bytes: &[u8], magic: [u8; 8]) -> Result<u64> {
         });
     }
     Ok(u64::from_le_bytes(bytes[9..].try_into().expect("8 bytes")))
+}
+
+/// Reads only the header of the file at `path` and returns its position.
+pub(super) fn read_header(path: &Path, magic: [u8; 8]) -> Result<u64> {
+    let mut bytes = Vec::with_capacity(HEADER_LEN);
+    File::open(path)?
+        .take(HEADER_LEN as u64)
+        .read_to_end(&mut bytes)?;
+    parse_header(&bytes, magic)
 }
 
 /// Appends one frame per record, `u32 len | u32 crc32 | record bytes`, and

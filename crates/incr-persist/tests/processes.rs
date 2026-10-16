@@ -326,6 +326,10 @@ impl Backend for Counting {
         self.inner.load_snapshot()
     }
 
+    fn snapshot_id(&self) -> incr_persist::Result<Option<incr_persist::SnapshotId>> {
+        self.inner.snapshot_id()
+    }
+
     fn compact(&self, upto: Position, folded: Vec<Record>) -> incr_persist::Result<()> {
         self.inner.compact(upto, folded)
     }

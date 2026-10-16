@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::thread;
 
-use crate::{Backend, Error, Kind, Position, ReadOutcome, Record};
+use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, SnapshotId};
 
 /// Creates logs and opens handles onto them for the suite.
 pub trait Harness {
@@ -67,6 +67,9 @@ macro_rules! backend_conformance {
             compaction_rejects_positions_outside_snapshot_and_tail,
             forgotten_keys_leave_snapshot_and_log,
             read_only_handle_rejects_writes_and_follows_writer,
+            snapshot_id_names_each_compaction,
+            snapshot_id_survives_reopen,
+            read_only_handle_sees_the_snapshot_id,
         );
     };
     (@cases $harness:expr; $($case:ident),+ $(,)?) => {
@@ -596,4 +599,95 @@ pub fn read_only_handle_rejects_writes_and_follows_writer<H: Harness>(mut h: H) 
     );
     let fresh = h.open_read_only(&log).expect("read-only mode");
     assert_compacted(&fresh, first, second);
+}
+
+fn id(position: Position, generation: u64) -> Option<SnapshotId> {
+    Some(SnapshotId {
+        position,
+        generation,
+    })
+}
+
+/// `snapshot_id` is `None` until the first compaction, then names the
+/// position `load_snapshot` reports and counts compactions, so replacing a
+/// snapshot at its own position still yields a new id.
+pub fn snapshot_id_names_each_compaction<H: Harness>(mut h: H) {
+    let log = h.new_log();
+    let backend = h.open(&log);
+    assert_eq!(backend.snapshot_id().unwrap(), None);
+    let first = backend.append(&[declare("a"), set("a", 1)]).unwrap();
+    assert_eq!(backend.snapshot_id().unwrap(), None);
+
+    backend
+        .compact(first, vec![declare("a"), set("a", 1)])
+        .unwrap();
+    assert_eq!(backend.snapshot_id().unwrap(), id(first, 1));
+    let (at, _) = backend.load_snapshot().unwrap().expect("snapshot");
+    assert_eq!(at, first);
+
+    backend.compact(first, vec![declare("a")]).unwrap();
+    assert_eq!(
+        backend.snapshot_id().unwrap(),
+        id(first, 2),
+        "a replacement at the same position is a new snapshot"
+    );
+
+    let later = backend.append(&[set("a", 2)]).unwrap();
+    assert!(backend.compact(Position::ZERO, vec![]).is_err());
+    assert_eq!(
+        backend.snapshot_id().unwrap(),
+        id(first, 2),
+        "a rejected compaction changes nothing"
+    );
+    backend.compact(later, vec![set("a", 2)]).unwrap();
+    assert_eq!(backend.snapshot_id().unwrap(), id(later, 3));
+}
+
+/// A reopen sees the same snapshot id, and the count carries on from it.
+pub fn snapshot_id_survives_reopen<H: Harness>(mut h: H) {
+    let log = h.new_log();
+    let at = {
+        let backend = h.open(&log);
+        let at = backend.append(&[declare("a"), set("a", 1)]).unwrap();
+        backend.sync(at).unwrap();
+        backend
+            .compact(at, vec![declare("a"), set("a", 1)])
+            .unwrap();
+        backend
+            .compact(at, vec![declare("a"), set("a", 1)])
+            .unwrap();
+        at
+    };
+    let backend = h.open(&log);
+    assert_eq!(backend.snapshot_id().unwrap(), id(at, 2));
+    let later = backend.append(&[set("a", 2)]).unwrap();
+    backend.sync(later).unwrap();
+    backend.compact(later, vec![set("a", 2)]).unwrap();
+    assert_eq!(backend.snapshot_id().unwrap(), id(later, 3));
+}
+
+/// A read-only handle reports the writer's snapshot id, whether it was
+/// opened before the compaction or after it, without reading the log first.
+/// Skipped for backends without a read-only mode.
+pub fn read_only_handle_sees_the_snapshot_id<H: Harness>(mut h: H) {
+    let log = h.new_log();
+    let writer = h.open(&log);
+    let Some(reader) = h.open_read_only(&log) else {
+        return;
+    };
+    assert_eq!(reader.snapshot_id().unwrap(), None);
+    let first = writer.append(&[declare("a"), set("a", 1)]).unwrap();
+    writer.sync(first).unwrap();
+    writer
+        .compact(first, vec![declare("a"), set("a", 1)])
+        .unwrap();
+    assert_eq!(reader.snapshot_id().unwrap(), id(first, 1));
+
+    let second = writer.append(&[set("a", 2)]).unwrap();
+    writer.sync(second).unwrap();
+    writer.compact(second, vec![set("a", 2)]).unwrap();
+    writer.compact(second, vec![set("a", 2)]).unwrap();
+    assert_eq!(reader.snapshot_id().unwrap(), id(second, 3));
+    let fresh = h.open_read_only(&log).expect("read-only mode");
+    assert_eq!(fresh.snapshot_id().unwrap(), id(second, 3));
 }

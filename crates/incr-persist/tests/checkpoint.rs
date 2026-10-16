@@ -425,6 +425,10 @@ impl Backend for Racing {
         self.inner.load_snapshot()
     }
 
+    fn snapshot_id(&self) -> incr_persist::Result<Option<incr_persist::SnapshotId>> {
+        self.inner.snapshot_id()
+    }
+
     fn compact(&self, upto: Position, folded: Vec<Record>) -> incr_persist::Result<()> {
         let race = self.race.lock().unwrap().take();
         if let Some(race) = race {
@@ -500,6 +504,10 @@ impl Backend for FailingCompact {
 
     fn load_snapshot(&self) -> incr_persist::Result<Option<(Position, Vec<Record>)>> {
         self.inner.load_snapshot()
+    }
+
+    fn snapshot_id(&self) -> incr_persist::Result<Option<incr_persist::SnapshotId>> {
+        self.inner.snapshot_id()
     }
 
     fn compact(&self, upto: Position, folded: Vec<Record>) -> incr_persist::Result<()> {

@@ -3,12 +3,12 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use crate::{Backend, Error, Position, ReadOutcome, Record, Result};
+use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use format::{
-    decode_frames, header, journal_path, parse_header, push_frames, read_current, remove_stale,
-    scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current, write_synced, HEADER_LEN,
-    JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
+    decode_frames, header, journal_path, parse_header, push_frames, read_current, read_header,
+    remove_stale, scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current,
+    write_synced, HEADER_LEN, JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
 };
 
 mod format;
@@ -437,6 +437,46 @@ impl Backend for FileBackend {
             state.journal.catch_up()?;
             after = state.journal.read_to_tail(after, out)?;
             self.switch_to_latest(state)?;
+        }
+    }
+
+    /// The generation is the `N` that `CURRENT` names, since every
+    /// compaction moves it on by one. A writer answers from memory, as no
+    /// other handle can compact; a reader reads `CURRENT` and, when it names
+    /// a generation other than the journal it holds, that snapshot's header.
+    fn snapshot_id(&self) -> Result<Option<SnapshotId>> {
+        let state = self.state()?;
+        let held = |generation: u64| SnapshotId {
+            position: Position(state.journal.snapshot_at()),
+            generation,
+        };
+        if self.writable() && !state.failed {
+            return Ok((state.generation > 0).then(|| held(state.generation)));
+        }
+        let mut generation = read_current(&self.dir)?;
+        loop {
+            if generation == 0 {
+                return Ok(None);
+            }
+            if generation == state.generation {
+                return Ok(Some(held(generation)));
+            }
+            match read_header(&snapshot_path(&self.dir, generation), SNAPSHOT_MAGIC) {
+                Ok(at) => {
+                    return Ok(Some(SnapshotId {
+                        position: Position(at),
+                        generation,
+                    }))
+                }
+                Err(Error::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
+                    let now = read_current(&self.dir)?;
+                    if now == generation {
+                        return Err(Error::Io(e));
+                    }
+                    generation = now;
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
 

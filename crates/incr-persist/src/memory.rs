@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::{Backend, Error, Position, ReadOutcome, Record, Result};
+use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 /// A log held in process memory.
 ///
@@ -19,6 +19,7 @@ pub struct MemoryBackend {
 struct Log {
     tail: Position,
     snapshot: Option<(Position, Vec<Record>)>,
+    generation: u64,
     records: Vec<(Position, Record)>,
 }
 
@@ -104,6 +105,14 @@ impl Backend for MemoryBackend {
         Ok(ReadOutcome::Records)
     }
 
+    fn snapshot_id(&self) -> Result<Option<SnapshotId>> {
+        let log = self.lock();
+        Ok(log.snapshot.as_ref().map(|(position, _)| SnapshotId {
+            position: *position,
+            generation: log.generation,
+        }))
+    }
+
     fn load_snapshot(&self) -> Result<Option<(Position, Vec<Record>)>> {
         Ok(self.lock().snapshot.clone())
     }
@@ -122,6 +131,7 @@ impl Backend for MemoryBackend {
         let keep_from = log.index_after(upto);
         log.records.drain(..keep_from);
         log.snapshot = Some((upto, folded));
+        log.generation += 1;
         Ok(())
     }
 
