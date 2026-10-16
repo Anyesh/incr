@@ -19,7 +19,6 @@
 //! collection operators, soundness fixes (race-detection ordering with
 //! AcqRel, overflow-dep reclamation).
 
-use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -46,8 +45,6 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) compute_fns: Vec<Option<ComputeFn<C>>>,
     pub(crate) dependents: Vec<Vec<NodeId>>,
     pub(crate) arenas: ArenaRegistry<C>,
-    pub(crate) type_tags: HashMap<TypeId, u16>,
-    pub(crate) next_type_tag: u16,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
     /// Node slots released by delete_node, awaiting recycling.
@@ -75,28 +72,12 @@ impl<C: Cells> Inner<C> {
             compute_fns: Vec::new(),
             dependents: Vec::new(),
             arenas: ArenaRegistry::new(),
-            type_tags: HashMap::new(),
-            next_type_tag: 0,
             labels: HashMap::new(),
             trace_log: Vec::new(),
             free_nodes: Vec::new(),
             observers: HashMap::new(),
             next_observer_id: 1,
         }
-    }
-
-    fn type_tag_for<T: Value>(&mut self) -> u16 {
-        let id = TypeId::of::<T>();
-        if let Some(&tag) = self.type_tags.get(&id) {
-            return tag;
-        }
-        let tag = self.next_type_tag;
-        self.next_type_tag = self
-            .next_type_tag
-            .checked_add(1)
-            .expect("incr-core: more than u16::MAX distinct value types in one runtime");
-        self.type_tags.insert(id, tag);
-        tag
     }
 }
 
@@ -250,8 +231,7 @@ impl<C: Cells> Runtime<C> {
         let revision = self.current_revision();
         let (slot, generation) = {
             let mut inner = self.inner.write();
-            let type_tag = inner.type_tag_for::<T>();
-            let arena = inner.arenas.ensure_arena::<T>();
+            let (type_tag, arena) = inner.arenas.ensure_tagged::<T>();
             let arena_slot = arena.reserve_with(value);
             let slot = if let Some(slot) = inner.free_nodes.pop() {
                 self.nodes
@@ -285,8 +265,7 @@ impl<C: Cells> Runtime<C> {
 
         let (slot, generation) = {
             let mut inner = self.inner.write();
-            let type_tag = inner.type_tag_for::<T>();
-            let arena = inner.arenas.ensure_arena::<T>();
+            let (type_tag, arena) = inner.arenas.ensure_tagged::<T>();
             let arena_slot = arena.reserve();
             let slot = if let Some(slot) = inner.free_nodes.pop() {
                 self.nodes
