@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -7,8 +7,8 @@ use crate::{Backend, Error, Position, ReadOutcome, Record, Result};
 
 use format::{
     decode_frames, header, journal_path, parse_header, push_frames, read_current, remove_stale,
-    scan, snapshot_path, snapshot_tmp_path, write_current, write_synced, HEADER_LEN, JOURNAL_MAGIC,
-    LOCK, SNAPSHOT_MAGIC,
+    scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current, write_synced, HEADER_LEN,
+    JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
 };
 
 mod format;
@@ -373,11 +373,7 @@ impl Backend for FileBackend {
         let offsets = push_frames(&mut frames, records)?;
         let journal = &mut state.journal;
         let at = journal.end;
-        let written = journal
-            .file
-            .seek(SeekFrom::Start(at))
-            .and_then(|_| journal.file.write_all(&frames));
-        if let Err(e) = written {
+        if let Err(e) = write_all_at(&journal.file, &frames, at) {
             // Readers never index an incomplete append, but a partial one
             // must not stay on disk where the next append would land.
             if journal.file.set_len(at).is_err() {

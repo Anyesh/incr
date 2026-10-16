@@ -1,5 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+#[cfg(not(unix))]
+use std::io::{Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::{Error, Record, Result};
@@ -196,6 +200,20 @@ pub(super) fn sync_dir(dir: &Path) -> Result<()> {
 #[cfg(not(unix))]
 pub(super) fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Writes all of `bytes` at `offset` in `file`, as one positioned write
+/// where the platform has one rather than a seek and a write. `file` must
+/// not be open in append mode, in which Linux ignores the offset.
+#[cfg(unix)]
+pub(super) fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    file.write_all_at(bytes, offset)
+}
+
+#[cfg(not(unix))]
+pub(super) fn write_all_at(mut file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)
 }
 
 /// Removes temp files and every generation's files except `keep`'s.
