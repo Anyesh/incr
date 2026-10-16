@@ -1,0 +1,32 @@
+name: Loom weekly
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  loom:
+    name: Loom (${{ matrix.model }}, bound 3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - "loom_models::loom_chain_cutoff"
+    env:
+      RUSTFLAGS: --cfg loom -D warnings
+      LOOM_MAX_PREEMPTIONS: 3
+      LOOM_MAX_BRANCHES: 100000
+      MODEL: ${{ matrix.model }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - run: cargo test -p incr-core --release --lib -- --exact "$MODEL"

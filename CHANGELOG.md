@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.4] - 2026-10-16
+
+### Soundness
+
+Seven races in the `Shared` protocol, all present in 0.2.0-beta.3, are fixed. Each one has a deterministic test that parks a thread at a named point in the protocol, and loom models now run the real runtime over every interleaving up to a preemption bound, in CI on every push.
+
+- **A delete could remove a node that a compute had just started depending on (B1).** `delete_node` checked for dependents and claimed the node in two steps, so a publish could land between them and its edge was dropped. Both now happen under one lock hold.
+- **A compute that raced a delete could add a reverse edge to the recycled slot's next occupant (B2).** Recorded deps now carry the slot's generation and are validated under the publish lock, and a compute that read a deleted dep discards its value and runs again.
+- **A dep read for the first time could miss a concurrent `set` (B3).** Its reverse edge did not exist until publish, so the set's walk could not reach the reader. A publish that finds a new dep changed since the read now lands the node `Dirty`.
+- **An early-cutoff compute flagged mid-flight could strand its dependents (B4), and red/green verification could verify a node `Clean` past a concurrent `set` (B5).** Both left a node `Clean` over a `Dirty` dep, returning a stale value forever. Verification now claims the node and treats a dep that is not `Clean` as changed, and a compute that read a dep landing non-`Clean` lands `Dirty` itself.
+- **`verified_at` could name a revision whose dirty walk had not run yet (B6).** It now uses a walked-revision watermark that only passes revisions whose walks have finished.
+- **A compute could stamp a change below the `set` that caused it (B7).** Its revisions were captured before its claim, and the claim can succeed on a later `Dirty` than the one it observed. The loom models found this one.
+- The dirty walk passes through `New` nodes, so a `Failed` dependent behind a node recovering from a stale dep still recovers, and a panicking compute whose new dep had a change in flight lands `Dirty` rather than staying `Failed` with no walk left to wake it.
+
+### Changed
+
+- Readers of a `Dirty` node now wait while another thread verifies it, as they already did during a recompute.
+- Propagation runs fewer instructions per `set` and `get` than 0.2.0-beta.3, 8 to 11% fewer on `Local` chains and 2 to 6% fewer on `Shared`, because a compute whose deps did not change now publishes without allocating. `Shared` also gains atomic read-modify-writes in verification and in the dirty walk, whose cost shows up in cycles rather than instructions.
+- **Breaking for custom strategies and dep stacks.** `Cells` gains `DepListCell`, `Watermark`, `new_watermark`, `walked`, `complete_walk`, `fence_seqcst` and a defaulted `backoff`. `DepStack::record_dep` takes the dep's generation, `pop_frame` returns a `PoppedFrame` carrying a poison flag, and `DepStack` gains `poison_current_frame`. Code that only uses `Local` or `Shared` is unaffected.
+
 ## [0.2.0-beta.2] — 2026-06-12
 
 ### Soundness

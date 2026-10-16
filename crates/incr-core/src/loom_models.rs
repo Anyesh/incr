@@ -3,8 +3,14 @@
 //! of every explored execution, checks the structural invariant (I) and
 //! the value invariant (V) against an oracle.
 //!
-//! Run with:
-//! `RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 LOOM_MAX_BRANCHES=100000 cargo test -p incr-core --release --lib loom_`
+//! Run one model with:
+//! `RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=2 LOOM_MAX_BRANCHES=100000 cargo test -p incr-core --release --lib -- --exact loom_models::loom_fan_out`
+//!
+//! Each preemption of bound costs roughly 30x, so CI runs every model to
+//! completion at bound 2 on each push and the models that finish at bound
+//! 3 within the hour (`loom.yml`) weekly. A bound run to completion beats a
+//! larger one cut off by a timeout: B7 sat at bound 2 while a bound-3 run
+//! of the same model spent three hours elsewhere in the search.
 
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -54,10 +60,12 @@ fn run(f: impl Fn() + Sync + Send + 'static) {
     loom::model(f);
 }
 
-/// x -> Q (early cutoff) -> D. One setter performs two sets, a second
-/// setter one, and a reader verifies D. Targets B4, B5 and B6: a reader
-/// that lands D `Clean` past a concurrent set leaves D `Clean` over a
-/// non-Clean Q, or stale against x.
+/// x -> Q (early cutoff) -> D. Two setters race a reader of D, and their
+/// walks can finish out of order. Targets B4, B5 and B6: a reader that
+/// lands D `Clean` past a concurrent set leaves D `Clean` over a
+/// non-Clean Q, or stale against x. Slot reuse in the ring is covered by
+/// `walk_ring::loom_tests` instead, because a third set here puts the
+/// model out of reach at preemption bound 3.
 #[test]
 fn loom_chain_cutoff() {
     run(|| {
@@ -69,14 +77,11 @@ fn loom_chain_cutoff() {
 
         let setter_a = {
             let rt = Arc::clone(&rt);
-            thread::spawn(move || {
-                rt.set(x, 1);
-                rt.set(x, 2);
-            })
+            thread::spawn(move || rt.set(x, 1))
         };
         let setter_b = {
             let rt = Arc::clone(&rt);
-            thread::spawn(move || rt.set(x, 3))
+            thread::spawn(move || rt.set(x, 2))
         };
         let reader = {
             let rt = Arc::clone(&rt);
@@ -89,6 +94,7 @@ fn loom_chain_cutoff() {
         reader.join().unwrap();
 
         rt.assert_invariant_i();
+        rt.assert_edges_complete();
         rt.assert_walks_complete();
         let xv = rt.get(x);
         assert_eq!(
@@ -102,7 +108,10 @@ fn loom_chain_cutoff() {
 /// x -> Q (early cutoff) -> {D1, D2}, one setter and one reader per
 /// dependent. The shape that reaches fix 1's state-then-changed_at load
 /// order: a verifier of D1 observes Q while the reader of D2 recomputes
-/// it.
+/// it. The first set cuts off at Q and the second changes it, which is
+/// what B7 needs: one reader observes Q `Dirty` from the first set and
+/// claims it on the second, while the other cleans Q and verifies D1 in
+/// between. Found at preemption bound 2.
 #[test]
 fn loom_fan_out() {
     run(|| {
@@ -138,6 +147,7 @@ fn loom_fan_out() {
         r2.join().unwrap();
 
         rt.assert_invariant_i();
+        rt.assert_edges_complete();
         rt.assert_walks_complete();
         let qv = rt.get(x) / 2;
         assert_eq!(rt.get(d1), qv + 100, "(V) violated: D1 stale");
@@ -179,6 +189,7 @@ fn loom_compute_races_delete() {
             );
         }
         rt.assert_invariant_i();
+        rt.assert_edges_complete();
         rt.assert_walks_complete();
         if let Some(new) = recycled {
             assert!(
@@ -238,6 +249,7 @@ fn loom_recovered_node_under_set() {
         setter.join().unwrap();
 
         rt.assert_invariant_i();
+        rt.assert_edges_complete();
         rt.assert_walks_complete();
         if let Some(new) = recycled {
             assert!(

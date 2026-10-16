@@ -43,6 +43,32 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly miri test -p "$CRATE" --lib --test stress -- --test-threads=1
 
+  loom:
+    name: Loom (${{ matrix.model }}, bound ${{ matrix.bound }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { model: "loom_models::loom_chain_cutoff", bound: 2 }
+          - { model: "loom_models::loom_fan_out", bound: 2 }
+          - { model: "walk_ring::loom_tests::loom_walk_ring", bound: 2 }
+          - { model: "loom_models::loom_compute_races_delete", bound: 3 }
+          - { model: "loom_models::loom_recovered_node_under_set", bound: 3 }
+    env:
+      RUSTFLAGS: --cfg loom -D warnings
+      LOOM_MAX_PREEMPTIONS: ${{ matrix.bound }}
+      LOOM_MAX_BRANCHES: 100000
+      MODEL: ${{ matrix.model }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - run: cargo test -p incr-core --release --lib -- --exact "$MODEL"
+
   tsan:
     name: ThreadSanitizer
     runs-on: ubuntu-latest
