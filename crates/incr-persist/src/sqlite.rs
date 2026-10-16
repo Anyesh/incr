@@ -1,8 +1,9 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 
 use crate::{Backend, Error, Position, ReadOutcome, Record, Result};
 
@@ -123,14 +124,7 @@ impl SqliteBackend {
                 other => return Err(unsupported_schema(other)),
             }
         } else {
-            let mode: String = conn
-                .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
-                .map_err(sql)?;
-            if !mode.eq_ignore_ascii_case("wal") {
-                return Err(Error::Backend(
-                    format!("SQLite refused WAL mode and stayed in {mode} mode").into(),
-                ));
-            }
+            enable_wal(&conn, options.busy_timeout)?;
             let synchronous = match options.durability {
                 SqliteDurability::Full => "FULL",
                 SqliteDurability::Buffered => "NORMAL",
@@ -254,6 +248,32 @@ impl Backend for SqliteBackend {
 
     fn writable(&self) -> bool {
         self.writable
+    }
+}
+
+fn enable_wal(conn: &Connection, busy_timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + busy_timeout;
+    let mode: String = loop {
+        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)) {
+            Ok(mode) => break mode,
+            // Leaving rollback mode needs an exclusive lock, and when
+            // concurrent first opens contend for it SQLite reports
+            // SQLITE_BUSY at once instead of calling the busy handler, so
+            // the wait busy_timeout promises has to happen here.
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == ErrorCode::DatabaseBusy && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => return Err(sql(e)),
+        }
+    };
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(Error::Backend(
+            format!("SQLite refused WAL mode and stayed in {mode} mode").into(),
+        ))
     }
 }
 
