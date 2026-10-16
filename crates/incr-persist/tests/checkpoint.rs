@@ -396,6 +396,125 @@ fn a_store_at_the_compacted_position_adopts_a_fresh_declare_of_a_key_forgotten_t
     assert_eq!(kus(&open::<Local, _>(log)), expected);
 }
 
+/// A store at the position another writer compacts to reads no record of
+/// the compaction, yet it must stop listing the keys the snapshot forgot,
+/// as a restart does.
+#[test]
+fn a_store_at_the_compacted_position_stops_listing_keys_forgotten_there() {
+    let log = MemoryBackend::new();
+    let a = open::<Local, _>(log.clone());
+    let refreshed = open::<Local, _>(log.clone());
+    let b = open::<Local, _>(log.clone());
+    let gone = b.input("visit/gone", 1u32).unwrap();
+    let kept = b.input("visit/kept", 1u32).unwrap();
+    b.set(gone, 2).unwrap();
+    b.set(kept, 2).unwrap();
+    b.delete(gone).unwrap();
+    let applied = a.refresh().unwrap();
+    refreshed.refresh().unwrap();
+    assert_eq!(
+        a.restored_keys("visit/").unwrap(),
+        ["visit/gone", "visit/kept"]
+    );
+
+    assert_eq!(b.checkpoint().unwrap(), applied);
+    assert_eq!(a.restored_keys("visit/").unwrap(), ["visit/kept"]);
+    assert_eq!(refreshed.refresh().unwrap(), applied);
+    assert_eq!(refreshed.restored_keys("visit/").unwrap(), ["visit/kept"]);
+    let restart = open::<Local, _>(log);
+    assert_eq!(restart.restored_keys("visit/").unwrap(), ["visit/kept"]);
+}
+
+/// Declaring a key a compaction at the store's position forgot appends a
+/// fresh `Declare` with the caller's default, as a restart would, instead
+/// of binding the default the snapshot dropped.
+#[test]
+fn declaring_a_key_forgotten_at_the_store_position_appends_a_fresh_declare() {
+    let log = MemoryBackend::new();
+    let a = open::<Local, _>(log.clone());
+    let b = open::<Local, _>(log.clone());
+    let b_k = b.input("k", 1u32).unwrap();
+    let b_items = b.collection::<u32>("items").unwrap();
+    b_items.insert(&b, 3).unwrap();
+    b_items.delete(&b, &3).unwrap();
+    let applied = a.refresh().unwrap();
+    assert_eq!(b.checkpoint().unwrap(), applied);
+
+    let k = a.input("k", 5u32).unwrap();
+    assert_eq!(a.runtime().get(k.handle()), 5);
+    let items = a.collection::<u32>("items").unwrap();
+    items.insert(&a, 4).unwrap();
+    assert_eq!(
+        records_after(&log, applied),
+        [
+            declare("k", Kind::Input, enc(&5u32)),
+            declare("items", Kind::Collection, vec![]),
+            insert("items", enc(&4u32)),
+        ]
+    );
+
+    let restart = open::<Local, _>(log.clone());
+    let r_k = restart.input("k", 7u32).unwrap();
+    assert_eq!(restart.runtime().get(r_k.handle()), 5);
+    b.refresh().unwrap();
+    assert_eq!(b.runtime().get(b_k.handle()), 5, "the fresh Declare wins");
+    b.delete(b_k).unwrap();
+    a.refresh().unwrap();
+    assert_eq!(a.runtime().get(k.handle()), 5);
+    assert_eq!(b.runtime().get(b_k.handle()), 5);
+}
+
+/// A file reader behind a compaction may read through it record by record
+/// instead of loading the snapshot; it still learns what the snapshot
+/// forgot, including a key declared afresh right after it.
+#[test]
+fn a_file_reader_that_reads_through_a_compaction_learns_what_it_forgot() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = open::<Local, _>(FileBackend::open(dir.path()).unwrap());
+    let reader = open::<Local, _>(FileBackend::open_read_only(dir.path()).unwrap());
+    let k = writer.input("k", 1u32).unwrap();
+    let x = writer.input("x", 0u32).unwrap();
+    writer.input("j", 2u32).unwrap();
+    reader.refresh().unwrap();
+    let r_k = reader.input("k", 0u32).unwrap();
+    assert_eq!(reader.restored_keys("").unwrap(), ["j", "x"]);
+    writer.set(x, 1).unwrap();
+    let at = writer.checkpoint().unwrap();
+    writer.undeclare(k).unwrap();
+    writer.input("k", 6u32).unwrap();
+
+    assert!(reader.refresh().unwrap() > at);
+    assert_eq!(reader.runtime().get(r_k.handle()), 6);
+    assert_eq!(reader.restored_keys("").unwrap(), ["x"]);
+    let restart = open::<Local, _>(FileBackend::open_read_only(dir.path()).unwrap());
+    let restarted = restart.input("k", 0u32).unwrap();
+    assert_eq!(restart.runtime().get(restarted.handle()), 6);
+}
+
+/// A snapshot replaced at the same position may forget more than the one it
+/// replaced: a store that declared a key compares its value with the default
+/// by decoded value, one that did not by bytes, and `-0.0` equals `0.0` only
+/// by value. A store that accounted for the first snapshot must still learn
+/// what the second forgot.
+#[test]
+fn a_snapshot_replaced_at_the_same_position_is_taken_into_account_too() {
+    let log = MemoryBackend::new();
+    let declarer = open::<Local, _>(log.clone());
+    let z = declarer.input("z", 0.0f64).unwrap();
+    declarer.set(z, -0.0).unwrap();
+    let other = open::<Local, _>(log.clone());
+    let at = other.checkpoint().unwrap();
+    let (_, snapshot) = snapshot_by_key(&log);
+    assert!(snapshot.contains_key("z"), "bytes differ from the default");
+    assert_eq!(other.restored_keys("").unwrap(), ["z"]);
+
+    assert_eq!(declarer.checkpoint().unwrap(), at);
+    let (_, snapshot) = snapshot_by_key(&log);
+    assert!(!snapshot.contains_key("z"), "equal to the default by value");
+    assert!(other.restored_keys("").unwrap().is_empty());
+    assert!(open::<Local, _>(log).restored_keys("").unwrap().is_empty());
+}
+
 /// Runs `race` inside the next `compact`, before forwarding it, the way
 /// another writer compacting between this store's catch-up and its
 /// compaction would.

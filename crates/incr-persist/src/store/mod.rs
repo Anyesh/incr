@@ -7,7 +7,7 @@ use incr_core::{Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result};
+use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use binding::{decode, encode, Binding, InputBinding};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
@@ -68,14 +68,18 @@ pub enum Origin {
     /// Not a log record. The store caught up across a compaction, so it
     /// never saw the folded records one by one; instead it reports, at the
     /// snapshot's position, records that take each changed key from its old
-    /// state to the snapshot's: a `Declare` for a new declaration, a `Set`
-    /// for a new value, a `Delete` for a value reset to its default, and a
-    /// `Remove` or `Insert` per differing element occurrence. A key the
-    /// snapshot forgot is a [`Record::Forget`], and one whose `Declare` was
-    /// forgotten or changed is a `Forget` followed by the key's full state,
-    /// since a first-wins fold ignores a second `Declare`. A collection this
-    /// store did not declare whose elements cannot be compared by bytes is
-    /// reported as a `Delete` followed by its full contents.
+    /// state to the snapshot's. It does the same, at the position it had
+    /// applied through, when it finds a compaction at or below that
+    /// position which it never crossed, chiefly to report the keys that
+    /// compaction forgot. The records are a `Declare` for a new
+    /// declaration, a `Set` for a new value, a `Delete` for a value reset to
+    /// its default, and a `Remove` or `Insert` per differing element
+    /// occurrence. A key the snapshot forgot is a [`Record::Forget`], and
+    /// one whose `Declare` was forgotten or changed is a `Forget` followed
+    /// by the key's full state, since a first-wins fold ignores a second
+    /// `Declare`. A collection this store did not declare whose elements
+    /// cannot be compared by bytes is reported as a `Delete` followed by its
+    /// full contents.
     Snapshot,
 }
 
@@ -137,6 +141,11 @@ pub struct Store<C: Cells, B: Backend> {
 
 struct State<C: Cells> {
     applied: Position,
+    /// The backend snapshot the folded log and bound nodes account for:
+    /// one this store crossed, compacted to, or reconciled with. Any other
+    /// snapshot at or below `applied` may have forgotten keys this store
+    /// still holds.
+    snapshot: Option<SnapshotId>,
     poisoned: bool,
     since_checkpoint: u64,
     logged: LoggedKeys,
@@ -316,6 +325,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             options,
             state: Mutex::new(State {
                 applied: Position::ZERO,
+                snapshot: None,
                 poisoned: false,
                 since_checkpoint: 0,
                 logged: LoggedKeys::new(),
@@ -345,11 +355,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// live `Declare` for `key`, appends one carrying `default` through the
     /// write path, so a read-only store can declare any key another writer
     /// declared without calling [`Store::refresh`]. The first `Declare` in
-    /// log order
-    /// wins: its default, not necessarily `default`, is what the key resets
-    /// to, in every process. The input starts at the key's latest logged
-    /// value, else at that logged default. Declaring a key this store
-    /// already declared returns the same handle.
+    /// log order wins: its default, not necessarily `default`, is what the
+    /// key resets to, in every process. The input starts at the key's
+    /// latest logged value, else at that logged default. Declaring a key
+    /// this store already declared returns the same handle. A key that a
+    /// compaction at or below this store's position forgot has no live
+    /// `Declare`, so it is declared afresh, as after a restart.
     ///
     /// Fails with [`Error::TypeMismatch`] when the logged bytes do not
     /// decode as `T` or the key is already bound to another type, and with
@@ -504,8 +515,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// poisons the store until it is reopened.
     ///
     /// Records this store applied before subscribing are not replayed.
-    /// When a catch-up crosses a compaction, the records folded into the
-    /// snapshot are reported as [`Origin::Snapshot`] changes instead.
+    /// When a catch-up crosses a compaction, or finds one at or below its
+    /// position that it never crossed, the records folded into the snapshot
+    /// are reported as [`Origin::Snapshot`] changes instead. Folding
+    /// everything `f` receives over the store's state at subscription, by
+    /// the log's own rules (the first live `Declare` wins, `Delete` resets a
+    /// key to it, [`Record::Forget`] drops the key), yields the state a
+    /// restart replaying the log reaches at the store's position.
     pub fn subscribe(
         &self,
         f: impl FnMut(Position, &Record, Origin) + Send + 'static,
@@ -530,8 +546,14 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// Keys the log knows that this store has not declared, in order,
     /// filtered to those starting with `prefix`. Applications whose keys
     /// come from data use this to find what to declare after a restart.
+    ///
+    /// The log is as of the last record this store applied; nothing newer
+    /// is read. A compaction another writer ran at or below that position
+    /// is taken into account first, so keys it forgot are not listed, as
+    /// they would not be after a restart.
     pub fn restored_keys(&self, prefix: &str) -> Result<Vec<String>> {
-        let state = self.state()?;
+        let mut state = self.state()?;
+        self.reconcile(&mut state)?;
         Ok(state
             .logged
             .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
@@ -548,7 +570,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// with the snapshot's: inputs take their folded values, keys missing
     /// from the snapshot reset to their default, and collections change by
     /// only the occurrences that differ, so queries over them survive and
-    /// recompute.
+    /// recompute. A compaction at or below its position, of which reading
+    /// shows nothing, is taken into account the same way, so the keys it
+    /// forgot are forgotten here too.
     ///
     /// An error leaves the store at the last record it applied, except a
     /// failure partway through replacing from a snapshot, which poisons it.
@@ -603,6 +627,19 @@ impl<C: Cells, B: Backend> Store<C, B> {
                         state.logged.remove(&key);
                     }
                     state.since_checkpoint = 0;
+                    // The new snapshot is this store's own fold, so it needs
+                    // no reconciling. It is the one right after the snapshot
+                    // the store accounted for unless another writer compacted
+                    // in between; a failed or mismatched lookup leaves it
+                    // unaccounted, and the next catch-up reconciles with it,
+                    // which is correct, only slower.
+                    let own = SnapshotId {
+                        position: upto,
+                        generation: state.snapshot.map_or(0, |id| id.generation) + 1,
+                    };
+                    if matches!(self.backend.snapshot_id(), Ok(Some(id)) if id == own) {
+                        state.snapshot = Some(own);
+                    }
                     return Ok(upto);
                 }
                 Err(Error::InvalidCompaction { snapshot_at, .. }) if snapshot_at > upto => {
@@ -659,11 +696,13 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// current snapshot and the records after it, for when the store cannot
     /// tell what a failed backend call changed.
     fn resync(&self, state: &mut State<C>) -> Result<()> {
-        let (at, records) = self
-            .backend
-            .load_snapshot()?
-            .unwrap_or((Position::ZERO, Vec::new()));
+        let (id, records) = match self.snapshot_with_id()? {
+            Some((id, records)) => (Some(id), records),
+            None => (None, Vec::new()),
+        };
+        let at = id.map_or(Position::ZERO, |id| id.position);
         self.replace_with(state, at, records)?;
+        state.snapshot = id;
         self.catch_up(state, None)
     }
 
@@ -677,6 +716,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         kind: Kind,
         default: impl Fn() -> Result<Vec<u8>>,
     ) -> Result<Declared> {
+        // A compaction at or below `applied` may have forgotten the key,
+        // which a restart would then declare afresh.
+        self.reconcile(state)?;
         // A loop because a concurrent compaction may fold away a Declare
         // whose key still held its default, forgetting the key again.
         let mut caught_up = false;
@@ -760,8 +802,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// picks up the foreign records and crosses any compaction another
     /// writer ran past `applied`. A compaction at `applied`, or over the
     /// run after it landed, folds only records this store applies anyway,
-    /// so it is not crossed, just as `read_from` at the snapshot position
-    /// reports none.
+    /// so it is not crossed here, just as `read_from` at the snapshot
+    /// position reports none; the next catch-up reconciles with whatever it
+    /// forgot, keeping a backend query off this path.
     fn apply_appended(
         &self,
         state: &mut State<C>,
@@ -784,7 +827,15 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// back when `own` is `None`, notifying subscribers after each. A read
     /// behind the snapshot replaces the folded log and every bound node
     /// with the snapshot's content first.
+    ///
+    /// It reconciles with a snapshot at or below `applied` before reading,
+    /// so that records after it, such as a fresh `Declare` of a key it
+    /// forgot, apply to the state a restart holds, and again after reading
+    /// when it advanced, because a handle may read through a compaction
+    /// record by record instead of reporting it.
     fn catch_up(&self, state: &mut State<C>, own: Option<RangeInclusive<Position>>) -> Result<()> {
+        self.reconcile(state)?;
+        let start = state.applied;
         let mut read = Vec::new();
         loop {
             read.clear();
@@ -807,17 +858,19 @@ impl<C: Cells, B: Backend> Store<C, B> {
                                 ));
                             }
                         }
-                        _ => return Ok(()),
+                        _ => break,
                     }
                 }
             }
         }
+        if state.applied != start {
+            self.reconcile(state)?;
+        }
+        Ok(())
     }
 
     /// Applies `record`, the log's record at `position`, and reports it to
-    /// subscribers as coming from `origin`. A record at or below
-    /// `state.applied` is skipped: settling a `Declare` can cross a
-    /// compaction that folded it and the records read after it.
+    /// subscribers as coming from `origin`.
     fn apply_at(
         &self,
         state: &mut State<C>,
@@ -825,16 +878,6 @@ impl<C: Cells, B: Backend> Store<C, B> {
         record: Record,
         origin: Origin,
     ) -> Result<()> {
-        if position > state.applied {
-            if let Record::Declare { key, .. } = &record {
-                if state.logged.get(key).is_some_and(|k| k.declared.is_some()) {
-                    self.settle_redeclare(state, key)?;
-                }
-            }
-        }
-        if position <= state.applied {
-            return Ok(());
-        }
         // Cloned only for subscribers, because applying moves the record's
         // bytes into the folded log.
         let notice = (!state.subscribers.is_empty()).then(|| record.clone());
@@ -847,68 +890,81 @@ impl<C: Cells, B: Backend> Store<C, B> {
         Ok(())
     }
 
-    /// Brings `key` to the state a restart reaches at `state.applied`,
-    /// before a `Declare` for it applies while this store holds a live one.
+    /// Brings the folded log and every bound node to the state a restart
+    /// reaches at `state.applied`, when the backend holds a snapshot at or
+    /// below that position which this store has not accounted for.
     ///
-    /// That `Declare` either lost a race with the live one, and changes
-    /// nothing, or follows a compaction that forgot the key. A store
-    /// already at the compacted position reads nothing of such a
-    /// compaction, so it still holds the forgotten `Declare` (and possibly
-    /// a `Set` of the old default) and would reject the fresh one that
-    /// every other process adopts. The event is rare, so this rebuilds the
-    /// key from the backend's snapshot and the records after it. A snapshot
-    /// beyond `state.applied` is crossed whole instead, as `catch_up`
-    /// would, which may cover the `Declare` itself.
-    fn settle_redeclare(&self, state: &mut State<C>, key: &str) -> Result<()> {
+    /// Such a snapshot folds only records the store already applied, so
+    /// reading from `applied` reports nothing of it, yet it may have
+    /// forgotten keys: a key at its logged default folds to nothing,
+    /// `Declare` included. The store would go on listing such a key, bind it
+    /// with the dropped default instead of declaring it afresh, and reject
+    /// the fresh `Declare` every other process adopts. So the state is
+    /// rebuilt from the snapshot and the log records after it through
+    /// `applied`, and the changes are reported to subscribers at `applied`
+    /// as [`Origin::Snapshot`] records. A snapshot beyond `applied` is left
+    /// to `catch_up`, which crosses it.
+    fn reconcile(&self, state: &mut State<C>) -> Result<()> {
         loop {
-            let Some((at, snapshot)) = self.backend.load_snapshot()? else {
+            let Some(id) = self
+                .backend
+                .snapshot_id()?
+                .filter(|id| Some(*id) != state.snapshot && id.position <= state.applied)
+            else {
                 return Ok(());
             };
-            if at > state.applied {
-                return self.replace_with(state, at, snapshot);
-            }
+            let loaded = self.backend.load_snapshot()?;
             let mut later = Vec::new();
-            if let ReadOutcome::Compacted { .. } = self.backend.read_from(at, &mut later)? {
+            let outcome = self.backend.read_from(id.position, &mut later)?;
+            // The same id on both sides of the load and the read means both
+            // saw this snapshot, not one a racing compaction put in its place.
+            if self.backend.snapshot_id()? != Some(id) {
                 continue;
             }
-            // A compaction at the same position between the two loads
-            // would pair this read with a snapshot that may have forgotten
-            // more, so the pair is only trusted when the snapshot held.
-            let held = self
-                .backend
-                .load_snapshot()?
-                .is_some_and(|(now_at, now)| now_at == at && now == snapshot);
-            if !held {
-                continue;
-            }
+            let snapshot = match (loaded, outcome) {
+                (Some((at, snapshot)), ReadOutcome::Records) if at == id.position => snapshot,
+                _ => {
+                    return Err(Error::Corrupt(
+                        "backend's snapshot disagrees with the snapshot id it reports",
+                    ))
+                }
+            };
             let applied = state.applied;
-            if at < applied && later.last().is_none_or(|(last, _)| *last < applied) {
+            if id.position < applied && later.last().is_none_or(|(last, _)| *last < applied) {
                 return Err(Error::Corrupt(
                     "backend read stopped short of a position already applied",
                 ));
             }
-            let read = later
+            let later: Vec<Record> = later
                 .into_iter()
                 .take_while(|(position, _)| *position <= applied)
-                .map(|(_, record)| record);
-            let mut restarted = LoggedKeys::new();
-            for record in snapshot.into_iter().chain(read) {
-                if record.key() == key {
-                    fold(&mut restarted, record);
-                }
-            }
-            let mut restarted = restarted.remove(key);
-            let mut changes = Vec::new();
-            let sink = (!state.subscribers.is_empty()).then_some(&mut changes);
-            self.replace_key(state, key, restarted.as_mut(), sink)?;
-            match restarted {
-                Some(logged) => state.logged.insert(key.to_owned(), logged),
-                None => state.logged.remove(key),
-            };
-            for record in &changes {
-                state.notify(applied, record, Origin::Snapshot);
-            }
+                .map(|(_, record)| record)
+                .collect();
+            let since = later.len() as u64;
+            self.replace_with(state, applied, snapshot.into_iter().chain(later))?;
+            state.snapshot = Some(id);
+            state.since_checkpoint = since;
             return Ok(());
+        }
+    }
+
+    /// The backend's snapshot and its id, read between two equal ids so that
+    /// a compaction racing the load cannot pair one snapshot's records with
+    /// another's id.
+    fn snapshot_with_id(&self) -> Result<Option<(SnapshotId, Vec<Record>)>> {
+        loop {
+            let id = self.backend.snapshot_id()?;
+            let loaded = self.backend.load_snapshot()?;
+            if self.backend.snapshot_id()? != id {
+                continue;
+            }
+            return match (id, loaded) {
+                (None, None) => Ok(None),
+                (Some(id), Some((at, records))) if at == id.position => Ok(Some((id, records))),
+                _ => Err(Error::Corrupt(
+                    "backend's snapshot disagrees with the snapshot id it reports",
+                )),
+            };
         }
     }
 
@@ -927,23 +983,30 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 
     fn replace_from_snapshot(&self, state: &mut State<C>) -> Result<()> {
-        let (at, records) = self.backend.load_snapshot()?.ok_or(Error::Corrupt(
+        let (id, records) = self.snapshot_with_id()?.ok_or(Error::Corrupt(
             "backend reported compaction but has no snapshot",
         ))?;
-        if at <= state.applied {
+        if id.position <= state.applied {
             return Err(Error::Corrupt(
                 "backend reported compaction below the position already applied",
             ));
         }
-        self.replace_with(state, at, records)
+        self.replace_with(state, id.position, records)?;
+        state.snapshot = Some(id);
+        Ok(())
     }
 
     /// Replaces the folded log and every bound node with the fold of
-    /// `records`, a snapshot covering through `at`, and reports the changes
-    /// to subscribers as [`Origin::Snapshot`] records. A binding that fails
-    /// after others were replaced leaves the store between two states, so
-    /// that failure poisons it.
-    fn replace_with(&self, state: &mut State<C>, at: Position, records: Vec<Record>) -> Result<()> {
+    /// `records`, the log's content through `at`, and reports the changes
+    /// to subscribers as [`Origin::Snapshot`] records at `at`. A binding that
+    /// fails after others were replaced leaves the store between two
+    /// states, so that failure poisons it.
+    fn replace_with(
+        &self,
+        state: &mut State<C>,
+        at: Position,
+        records: impl IntoIterator<Item = Record>,
+    ) -> Result<()> {
         let mut logged = LoggedKeys::new();
         for record in records {
             fold(&mut logged, record);

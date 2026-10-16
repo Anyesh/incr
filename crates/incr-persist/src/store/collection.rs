@@ -175,10 +175,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
     ///
     /// If neither this store nor the log, read to its tail first, has a
     /// live `Declare` for `key`, appends one through the write path; a
-    /// collection's default is empty. The collection starts
-    /// with the key's logged elements, folded by decoded `T`. Declaring a
-    /// key this store already declared returns a handle to the same
-    /// collection.
+    /// collection's default is empty. As for [`Store::input`], a key that a
+    /// compaction at or below this store's position forgot has none. The
+    /// collection starts with the key's logged elements, folded by decoded
+    /// `T`. Declaring a key this store already declared returns a handle to
+    /// the same collection.
     ///
     /// Fails with [`Error::TypeMismatch`] when a logged element does not
     /// decode as `T` or the key is already bound to another element type,

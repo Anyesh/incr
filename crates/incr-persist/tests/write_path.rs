@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use incr_persist::{
@@ -38,12 +39,14 @@ fn log_after(backend: &impl Backend, after: Position) -> Vec<(Position, Record)>
 
 /// A memory log whose `append` and `sync` first run a hook, standing in for
 /// another writer that acts between a store's catch-up and its append, or
-/// between its append and its apply.
+/// between its append and its apply. It counts the calls that query the
+/// log, its snapshot or the snapshot's id.
 #[derive(Clone, Default)]
 struct Hooked {
     inner: MemoryBackend,
     before_append: Arc<Mutex<Option<Hook>>>,
     before_sync: Arc<Mutex<Option<Hook>>>,
+    queries: Arc<AtomicUsize>,
 }
 
 impl Hooked {
@@ -79,14 +82,17 @@ impl Backend for Hooked {
         after: Position,
         out: &mut Vec<(Position, Record)>,
     ) -> incr_persist::Result<ReadOutcome> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
         self.inner.read_from(after, out)
     }
 
     fn load_snapshot(&self) -> incr_persist::Result<Option<(Position, Vec<Record>)>> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
         self.inner.load_snapshot()
     }
 
     fn snapshot_id(&self) -> incr_persist::Result<Option<incr_persist::SnapshotId>> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
         self.inner.snapshot_id()
     }
 
@@ -369,4 +375,32 @@ fn a_written_value_reads_back_as_replaying_the_log_decodes_it() {
         restarted.runtime().get(replayed.handle()),
         store.runtime().get(doc.handle())
     );
+}
+
+/// Own writes with nothing foreign before them apply as held, without
+/// querying the backend, even once another writer has compacted at the
+/// store's position; the next catch-up deals with that compaction.
+#[test]
+fn own_writes_with_nothing_foreign_before_them_query_the_backend_for_nothing() {
+    let backend = Hooked::default();
+    let a = open::<Local, _>(backend.clone());
+    let x = a.input("x", 0u64).unwrap();
+    let items = a.collection::<u64>("items").unwrap();
+    let applied = a.refresh().unwrap();
+    assert_eq!(
+        open::<Local, _>(backend.inner.clone())
+            .checkpoint()
+            .unwrap(),
+        applied
+    );
+
+    backend.queries.store(0, Ordering::SeqCst);
+    a.set(x, 1).unwrap();
+    items.insert(&a, 2).unwrap();
+    a.batch(|batch| {
+        batch.set(x, 3).delete_key("items");
+    })
+    .unwrap();
+    a.delete(x).unwrap();
+    assert_eq!(backend.queries.load(Ordering::SeqCst), 0);
 }

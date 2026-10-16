@@ -408,3 +408,48 @@ fn folding_what_a_subscriber_saw_across_a_compaction_reaches_the_restart_state()
         ));
     assert_eq!(mirrored(&seen), restart_state(&log));
 }
+
+/// A store already at the position another writer compacts to reads no
+/// record of the compaction; its subscribers must still be told what it
+/// forgot, so that folding what they saw reaches the restart state.
+#[test]
+fn folding_what_a_subscriber_saw_across_a_compaction_at_its_position_reaches_the_restart_state() {
+    let log = MemoryBackend::new();
+    let a = open::<Local, _>(log.clone());
+    let seen = subscribe(&a);
+    let k = a.input("k", 1u32).unwrap();
+    let items = a.collection::<u32>("items").unwrap();
+    a.set(k, 3).unwrap();
+    items.insert(&a, 1).unwrap();
+    let b = open::<Local, _>(log.clone());
+    b.input("u", 1u32).unwrap();
+    b.input("v", 1u32).unwrap();
+    b.delete("k").unwrap();
+    b.delete("items").unwrap();
+    let applied = a.refresh().unwrap();
+    assert_eq!(b.checkpoint().unwrap(), applied);
+
+    let c = open::<Local, _>(log.clone());
+    let c_k = c.input("k", 9u32).unwrap();
+    c.set(c_k, 10).unwrap();
+    c.collection::<u32>("items").unwrap().insert(&c, 5).unwrap();
+    c.input("u", 4u32).unwrap();
+    a.refresh().unwrap();
+
+    let forgotten: BTreeSet<String> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, record, origin)| {
+            matches!(record, Record::Forget { .. }) && *origin == Origin::Snapshot
+        })
+        .map(|(_, record, _)| record.key().to_owned())
+        .collect();
+    assert_eq!(
+        forgotten,
+        BTreeSet::from(["items", "k", "u", "v"].map(str::to_owned))
+    );
+    assert_eq!(mirrored(&seen), restart_state(&log));
+    assert_eq!(a.runtime().get(k.handle()), 10);
+    assert_eq!(items.handle().values(a.runtime()), [5]);
+}
