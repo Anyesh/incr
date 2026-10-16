@@ -115,27 +115,70 @@ fn first_declare_wins_across_stores_and_later_stores_adopt_it() {
     let b = open::<Local, _>(log.clone());
 
     let limit_a = a.input("limit", 10u32).unwrap();
-    let limit_b = b.input("limit", 20u32).unwrap();
+    // A process that declared concurrently, after `a`'s Declare landed but
+    // before it read the log, appends a second, competing Declare.
+    log.append(&[Record::Declare {
+        key: "limit".into(),
+        kind: Kind::Input,
+        default: postcard::to_stdvec(&20u32).unwrap(),
+    }])
+    .unwrap();
+    let limit_b = b.input("limit", 30u32).unwrap();
     assert_eq!(a.runtime().get(limit_a.handle()), 10);
     assert_eq!(
         b.runtime().get(limit_b.handle()),
         10,
-        "the earlier Declare in log order must win over this store's own"
+        "the earlier Declare in log order must win over later ones and this store's own"
     );
-    let declares = log_records(&log)
-        .iter()
-        .filter(|r| matches!(r, Record::Declare { .. }))
-        .count();
-    assert_eq!(declares, 2);
+    assert_eq!(log_records(&log).len(), 2);
 
     let c = open::<Local, _>(log.clone());
-    let limit_c = c.input("limit", 30u32).unwrap();
+    let limit_c = c.input("limit", 40u32).unwrap();
     assert_eq!(c.runtime().get(limit_c.handle()), 10);
     assert_eq!(
         log_records(&log).len(),
         2,
         "a key with a live Declare must not be declared again"
     );
+}
+
+#[test]
+fn declaring_a_key_another_store_declared_appends_no_second_declare() {
+    let log = MemoryBackend::new();
+    let a = open::<Local, _>(log.clone());
+    let b = open::<Local, _>(log.clone());
+    let x_a = a.input("x", 1u32).unwrap();
+    a.set(x_a, 5).unwrap();
+    a.collection::<u32>("items").unwrap();
+
+    let x_b = b.input("x", 2u32).unwrap();
+    b.collection::<u32>("items").unwrap();
+    assert_eq!(b.runtime().get(x_b.handle()), 5);
+    let declares = log_records(&log)
+        .iter()
+        .filter(|r| matches!(r, Record::Declare { .. }))
+        .count();
+    assert_eq!(
+        declares, 2,
+        "one Declare per key, from the store that came first"
+    );
+}
+
+#[test]
+fn a_read_only_store_declares_keys_another_store_wrote_without_refresh() {
+    let log = MemoryBackend::new();
+    let reader = open::<Local, _>(log.read_only());
+    let writer = open::<Local, _>(log.clone());
+    let x = writer.input("x", 1u32).unwrap();
+    writer.set(x, 5).unwrap();
+    let items = writer.collection::<u32>("items").unwrap();
+    items.insert(&writer, 3).unwrap();
+
+    let r_x = reader.input("x", 0u32).unwrap();
+    assert_eq!(reader.runtime().get(r_x.handle()), 5);
+    let r_items = reader.collection::<u32>("items").unwrap();
+    assert_eq!(r_items.handle().values(reader.runtime()), [3]);
+    assert!(matches!(reader.input("y", 0u32), Err(Error::ReadOnly)));
 }
 
 #[test]

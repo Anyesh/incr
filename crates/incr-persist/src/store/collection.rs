@@ -167,8 +167,9 @@ impl<C: Cells, B: Backend> Batch<'_, C, B> {
 impl<C: Cells, B: Backend> Store<C, B> {
     /// Declares the collection `key` and returns its handle.
     ///
-    /// If the log has no live `Declare` for `key`, appends one through the
-    /// write path; a collection's default is empty. The collection starts
+    /// If neither this store nor the log, read to its tail first, has a
+    /// live `Declare` for `key`, appends one through the write path; a
+    /// collection's default is empty. The collection starts
     /// with the key's logged elements, folded by decoded `T`. Declaring a
     /// key this store already declared returns a handle to the same
     /// collection.

@@ -215,8 +215,11 @@ impl<C: Cells, B: Backend> Store<C, B> {
 
     /// Declares the input `key` and returns its handle.
     ///
-    /// If the log has no live `Declare` for `key`, appends one carrying
-    /// `default` through the write path. The first `Declare` in log order
+    /// If neither this store nor the log, read to its tail first, has a
+    /// live `Declare` for `key`, appends one carrying `default` through the
+    /// write path, so a read-only store can declare any key another writer
+    /// declared without calling [`Store::refresh`]. The first `Declare` in
+    /// log order
     /// wins: its default, not necessarily `default`, is what the key resets
     /// to, in every process. The input starts at the key's latest logged
     /// value, else at that logged default. Declaring a key this store
@@ -439,9 +442,18 @@ impl<C: Cells, B: Backend> Store<C, B> {
     ) -> Result<Declared> {
         // A loop because a concurrent compaction may fold away a Declare
         // whose key still held its default, forgetting the key again.
+        let mut caught_up = false;
         let declared = loop {
             if let Some(declared) = state.logged.get(key).and_then(|k| k.declared.as_ref()) {
                 break declared.clone();
+            }
+            // Another writer may have declared the key since this store last
+            // read the log; appending without looking would add a redundant
+            // Declare, and fail outright on a read-only store.
+            if !caught_up {
+                self.catch_up(state, None)?;
+                caught_up = true;
+                continue;
             }
             let record = Record::Declare {
                 key: key.to_owned(),
