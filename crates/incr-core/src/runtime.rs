@@ -779,14 +779,14 @@ impl<C: Cells> Runtime<C> {
         // Ensure clean, then read.
         self.ensure_clean(NodeId(slot));
 
+        let node = self.nodes.get(slot);
         let arena = {
             let inner = self.inner.read();
             inner
                 .arenas
-                .try_arena::<T>()
+                .tagged_arena::<T>(node.type_tag())
                 .expect("incr-core: arena missing for handle's type; this should be impossible")
         };
-        let node = self.nodes.get(slot);
         arena.read(node.arena_slot())
     }
 
@@ -920,11 +920,12 @@ impl<C: Cells> Runtime<C> {
         self.check_handle(handle);
         let slot = handle.slot();
 
+        let node = self.nodes.get(slot);
         let (arena, is_query) = {
             let inner = self.inner.read();
             let arena = inner
                 .arenas
-                .try_arena::<T>()
+                .tagged_arena::<T>(node.type_tag())
                 .expect("incr-core: arena missing for input handle's type");
             let is_query = inner
                 .compute_fns
@@ -943,7 +944,6 @@ impl<C: Cells> Runtime<C> {
         // No-op if the value is unchanged. Racy against a concurrent
         // set(), but benignly: the no-op linearizes before the other
         // setter.
-        let node = self.nodes.get(slot);
         if arena.eq_current(node.arena_slot(), &value) {
             return;
         }
