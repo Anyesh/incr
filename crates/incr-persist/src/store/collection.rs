@@ -105,7 +105,7 @@ impl<T: PersistValue + Hash + Eq, C: Cells> PersistedCollection<T, C> {
     fn key_in(&self, state: &State<C>) -> Result<String> {
         state
             .bindings
-            .get(self.id as usize)
+            .get(&self.id)
             .and_then(|binding| binding.as_any().downcast_ref::<CollectionBinding<T, C>>())
             .filter(|binding| binding.collection.version_node() == self.view.version_node())
             .map(|binding| binding.key.clone())
@@ -191,7 +191,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let mut guard = self.state()?;
         let state = &mut *guard;
         if let Some(id) = state.bound_id(key, Kind::Collection)? {
-            return state.bindings[id as usize]
+            return state.bindings[&id]
                 .as_any()
                 .downcast_ref::<CollectionBinding<T, C>>()
                 .map(|binding| PersistedCollection {

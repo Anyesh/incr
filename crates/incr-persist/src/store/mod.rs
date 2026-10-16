@@ -113,7 +113,10 @@ struct State<C: Cells> {
     since_checkpoint: u64,
     logged: LoggedKeys,
     bound: HashMap<String, u32>,
-    bindings: Vec<Box<dyn Binding<C>>>,
+    /// Bindings by id. Ids are never reused, so a handle whose key was
+    /// undeclared finds nothing rather than a later binding.
+    bindings: HashMap<u32, Box<dyn Binding<C>>>,
+    next_id: u32,
 }
 
 impl<T: 'static> Input<T> {
@@ -210,7 +213,7 @@ impl<C: Cells> State<C> {
         let Some(&id) = self.bound.get(key) else {
             return Ok(None);
         };
-        let declared = self.bindings[id as usize].kind();
+        let declared = self.bindings[&id].kind();
         if declared != kind {
             return Err(Error::KindMismatch {
                 key: key.to_owned(),
@@ -227,7 +230,7 @@ impl<C: Cells> State<C> {
             Target::Name(key) => Ok((*key).to_owned()),
             Target::Handle { id, node } => self
                 .bindings
-                .get(*id as usize)
+                .get(id)
                 .filter(|binding| binding.is_handle(node.as_ref()))
                 .map(|binding| binding.key().to_owned())
                 .ok_or(Error::UnknownHandle),
@@ -235,8 +238,9 @@ impl<C: Cells> State<C> {
     }
 
     fn bind(&mut self, key: &str, binding: Box<dyn Binding<C>>) -> u32 {
-        let id = self.bindings.len() as u32;
-        self.bindings.push(binding);
+        let id = self.next_id;
+        self.next_id += 1;
+        self.bindings.insert(id, binding);
         self.bound.insert(key.to_owned(), id);
         id
     }
@@ -259,7 +263,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 since_checkpoint: 0,
                 logged: LoggedKeys::new(),
                 bound: HashMap::new(),
-                bindings: Vec::new(),
+                bindings: HashMap::new(),
+                next_id: 0,
             }),
         };
         {
@@ -295,7 +300,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let mut guard = self.state()?;
         let state = &mut *guard;
         if let Some(id) = state.bound_id(key, Kind::Input)? {
-            return state.bindings[id as usize]
+            return state.bindings[&id]
                 .as_any()
                 .downcast_ref::<InputBinding<T>>()
                 .map(|binding| Input {
@@ -356,6 +361,32 @@ impl<C: Cells, B: Backend> Store<C, B> {
     pub fn delete<'k>(&self, key: impl Into<KeyRef<'k>>) -> Result<Position> {
         let key = key.into();
         self.write_with(|state| delete_record(state, &key))
+    }
+
+    /// Removes `input`'s node from this process's runtime and releases the
+    /// key, so [`Store::restored_keys`] lists it again and a later
+    /// [`Store::input`] binds it afresh. Nothing is written to the log: the
+    /// key keeps its logged value, other processes are unaffected, and
+    /// records for it go on folding here. Afterwards every use of `input`
+    /// fails with [`Error::UnknownHandle`].
+    ///
+    /// The node goes through the runtime's strict
+    /// [`delete_node`](incr_core::Runtime::delete_node), so queries over it
+    /// must be deleted first. While any remain this fails with
+    /// [`Error::HasDependents`] and changes nothing. Under `Shared`, a query
+    /// over `input` first computed on another thread while this runs can
+    /// still make that strict delete panic, so undeclare only an input no
+    /// thread is building queries over.
+    pub fn undeclare<T: Value>(&self, input: Input<T>) -> Result<()> {
+        let mut state = self.state()?;
+        let key = input_binding(&state, input)?.key.clone();
+        if self.runtime.has_dependents(input.handle) {
+            return Err(Error::HasDependents { key });
+        }
+        self.runtime.delete_node(input.handle);
+        state.bindings.remove(&input.id);
+        state.bound.remove(&key);
+        Ok(())
     }
 
     /// Runs `f` to collect writes, then appends them as one run with one
@@ -484,7 +515,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         for key in keys {
             let logged = state.logged.get(key);
             let records = match state.bound.get(key) {
-                Some(&id) => state.bindings[id as usize].fold(&self.runtime, logged)?,
+                Some(&id) => state.bindings[&id].fold(&self.runtime, logged)?,
                 None => match logged {
                     Some(logged) if !logged.at_default() => logged.records(key),
                     _ => Vec::new(),
@@ -630,7 +661,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
 
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
         if let Some(&id) = state.bound.get(record.key()) {
-            let binding = &state.bindings[id as usize];
+            let binding = &state.bindings[&id];
             binding.apply(&self.runtime, &record, state.logged.get(record.key()))?;
             // A bound collection holds its elements by decoded value; folding
             // them by bytes as well would let the two disagree.
@@ -664,7 +695,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             fold(&mut logged, record);
         }
         for (key, &id) in &state.bound {
-            let replaced = state.bindings[id as usize].replace(&self.runtime, logged.get_mut(key));
+            let replaced = state.bindings[&id].replace(&self.runtime, logged.get_mut(key));
             if let Err(e) = replaced {
                 state.poisoned = true;
                 return Err(e);
@@ -677,19 +708,27 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 }
 
+/// The binding `input` was issued for, or [`Error::UnknownHandle`] when this
+/// store did not issue it or has since undeclared it.
+fn input_binding<C: Cells, T: Value>(
+    state: &State<C>,
+    input: Input<T>,
+) -> Result<&InputBinding<T>> {
+    state
+        .bindings
+        .get(&input.id)
+        .and_then(|binding| binding.as_any().downcast_ref::<InputBinding<T>>())
+        .filter(|binding| binding.handle == input.handle)
+        .ok_or(Error::UnknownHandle)
+}
+
 fn set_record<C: Cells, T: PersistValue>(
     state: &State<C>,
     input: Input<T>,
     value: &T,
 ) -> Result<Record> {
-    let binding = state
-        .bindings
-        .get(input.id as usize)
-        .and_then(|binding| binding.as_any().downcast_ref::<InputBinding<T>>())
-        .filter(|binding| binding.handle == input.handle)
-        .ok_or(Error::UnknownHandle)?;
     Ok(Record::Set {
-        key: binding.key.clone(),
+        key: input_binding(state, input)?.key.clone(),
         value: encode(value)?,
     })
 }

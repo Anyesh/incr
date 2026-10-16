@@ -241,3 +241,57 @@ fn deleting_a_handle_from_another_store_is_rejected() {
     });
     assert!(matches!(result, Err(Error::UnknownHandle)));
 }
+
+#[test]
+fn undeclare_errors_while_dependents_remain_and_is_not_persisted() {
+    let log = MemoryBackend::new();
+    let store = open::<Local, _>(log.clone());
+    let other = open::<Local, _>(log.clone());
+    let x = store.input("x", 1u32).unwrap();
+    store.set(x, 4).unwrap();
+    let rt = store.runtime();
+    let doubled = {
+        let x = x.handle();
+        rt.create_query(move |rt| rt.get(x) * 2)
+    };
+    assert_eq!(rt.get(doubled), 8);
+    let nodes = rt.node_count();
+
+    assert!(matches!(
+        store.undeclare(x),
+        Err(Error::HasDependents { key }) if key == "x"
+    ));
+    store.set(x, 5).unwrap();
+    assert_eq!(rt.get(doubled), 10, "a refused undeclare changes nothing");
+
+    rt.delete_node(doubled);
+    let records = log_records(&log).len();
+    store.undeclare(x).unwrap();
+    assert_eq!(rt.node_count(), nodes - 2);
+    assert_eq!(
+        log_records(&log).len(),
+        records,
+        "undeclare appends nothing"
+    );
+    assert!(matches!(store.set(x, 6), Err(Error::UnknownHandle)));
+    assert!(matches!(store.delete(x), Err(Error::UnknownHandle)));
+    assert!(matches!(store.undeclare(x), Err(Error::UnknownHandle)));
+    assert_eq!(store.restored_keys("").unwrap(), ["x"]);
+
+    let other_x = other.input("x", 0u32).unwrap();
+    other.set(other_x, 7).unwrap();
+    store.refresh().unwrap();
+    let again = store.input("x", 0u32).unwrap();
+    assert_ne!(again, x);
+    assert_eq!(
+        rt.get(again.handle()),
+        7,
+        "records applied while undeclared still fold"
+    );
+    assert!(store.restored_keys("").unwrap().is_empty());
+
+    drop(store);
+    let reopened = open::<Local, _>(log);
+    let x = reopened.input("x", 0u32).unwrap();
+    assert_eq!(reopened.runtime().get(x.handle()), 7);
+}

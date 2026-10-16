@@ -74,6 +74,11 @@ pub enum Error {
     #[error("key {key:?} is declared as a {declared:?}")]
     KindMismatch { key: String, declared: Kind },
 
+    /// [`Store::undeclare`](crate::Store::undeclare) was asked to remove an
+    /// input that queries in this process still depend on.
+    #[error("key {key:?} still has dependents in this process; delete them before undeclaring it")]
+    HasDependents { key: String },
+
     /// A handle passed to a store was not issued by that store.
     #[error("handle was not issued by this store")]
     UnknownHandle,
