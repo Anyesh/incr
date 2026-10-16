@@ -115,22 +115,7 @@ impl LoggedKey {
                 value: value.clone(),
             });
         }
-        for (element, &count) in &self.elements.live {
-            out.extend((0..count).map(|_| Record::Insert {
-                key: key.to_owned(),
-                element: element.clone(),
-            }));
-        }
-        out.extend(self.elements.tail.iter().map(|op| match op {
-            ElementOp::Insert(element) => Record::Insert {
-                key: key.to_owned(),
-                element: element.clone(),
-            },
-            ElementOp::Remove(element) => Record::Remove {
-                key: key.to_owned(),
-                element: element.clone(),
-            },
-        }));
+        self.elements.records(key, &mut out);
         out
     }
 }
@@ -150,6 +135,46 @@ impl Elements {
 
     pub fn tail(&self) -> &[ElementOp] {
         &self.tail
+    }
+
+    /// Pushes one `Insert` per live element occurrence, then the raw tail,
+    /// the records that fold back to these elements from none.
+    fn records(&self, key: &str, out: &mut Vec<Record>) {
+        for (element, &count) in &self.live {
+            out.extend((0..count).map(|_| Record::Insert {
+                key: key.to_owned(),
+                element: element.clone(),
+            }));
+        }
+        out.extend(self.tail.iter().map(|op| match op {
+            ElementOp::Insert(element) => Record::Insert {
+                key: key.to_owned(),
+                element: element.clone(),
+            },
+            ElementOp::Remove(element) => Record::Remove {
+                key: key.to_owned(),
+                element: element.clone(),
+            },
+        }));
+    }
+
+    /// Pushes a `Remove` or `Insert` per occurrence that differs between
+    /// `self` and `new`. Exact only while neither has a raw tail.
+    fn diff(&self, key: &str, new: &Elements, out: &mut Vec<Record>) {
+        for (element, &have) in &self.live {
+            let want = new.live.get(element).copied().unwrap_or(0);
+            out.extend((want..have).map(|_| Record::Remove {
+                key: key.to_owned(),
+                element: element.clone(),
+            }));
+        }
+        for (element, &want) in &new.live {
+            let have = self.live.get(element).copied().unwrap_or(0);
+            out.extend((have..want).map(|_| Record::Insert {
+                key: key.to_owned(),
+                element: element.clone(),
+            }));
+        }
     }
 
     fn insert(&mut self, element: Vec<u8>) {
@@ -181,6 +206,63 @@ pub(crate) fn is_element_change(record: &Record) -> bool {
         record,
         Record::Insert { .. } | Record::Remove { .. } | Record::Replace { .. }
     )
+}
+
+/// Pushes records onto `out` that take a subscriber from `old`, one key's
+/// state, to `new`, its state in a snapshot; `None` is a key the log does
+/// not know. Nothing is pushed for an unchanged key. `elements` is false
+/// for a collection bound in this process, whose binding reports its own
+/// element changes and whose value is meaningless, so only its `Declare`
+/// is compared here.
+pub(crate) fn changes_between(
+    key: &str,
+    old: Option<&LoggedKey>,
+    new: Option<&LoggedKey>,
+    elements: bool,
+    out: &mut Vec<Record>,
+) {
+    let none = LoggedKey::default();
+    let (old, new) = (old.unwrap_or(&none), new.unwrap_or(&none));
+    if new.declared != old.declared {
+        if let Some(Declared { kind, default }) = &new.declared {
+            out.push(Record::Declare {
+                key: key.to_owned(),
+                kind: *kind,
+                default: default.clone(),
+            });
+        }
+    }
+    if !elements {
+        return;
+    }
+    let elements_changed = old.elements != new.elements;
+    let raw = !old.elements.tail.is_empty() || !new.elements.tail.is_empty();
+    // A value going back to unset has no Set to express it, and raw tails
+    // cannot be diffed by bytes; both are a Delete and the full new state.
+    if (old.value.is_some() && new.value.is_none()) || (elements_changed && raw) {
+        out.push(Record::Delete {
+            key: key.to_owned(),
+        });
+        if let Some(value) = &new.value {
+            out.push(Record::Set {
+                key: key.to_owned(),
+                value: value.clone(),
+            });
+        }
+        new.elements.records(key, out);
+        return;
+    }
+    if new.value != old.value {
+        if let Some(value) = &new.value {
+            out.push(Record::Set {
+                key: key.to_owned(),
+                value: value.clone(),
+            });
+        }
+    }
+    if elements_changed {
+        old.elements.diff(key, &new.elements, out);
+    }
 }
 
 /// Every key the log knows, by name.
@@ -333,6 +415,65 @@ mod tests {
         assert!(keys.is_empty());
         fold(&mut keys, Record::Delete { key: "c".into() });
         assert!(keys.is_empty());
+    }
+
+    fn folded(records: &[Record]) -> LoggedKey {
+        let mut keys = LoggedKeys::new();
+        for record in records {
+            fold(&mut keys, record.clone());
+        }
+        keys.remove("c").unwrap_or_default()
+    }
+
+    // Folding the reported changes over the old state must reach the new
+    // one, which is what lets a subscriber mirror a catch-up it never saw
+    // record by record.
+    #[test]
+    fn changes_between_take_the_old_state_to_the_new() {
+        let declare = Record::Declare {
+            key: "c".into(),
+            kind: Kind::Collection,
+            default: vec![],
+        };
+        let set = |value: u8| Record::Set {
+            key: "c".into(),
+            value: vec![value],
+        };
+        let remove = |element: u8| Record::Remove {
+            key: "c".into(),
+            element: vec![element],
+        };
+        let with_tail = [insert(1), insert(2), remove(3), insert(4)];
+        let cases: Vec<(Vec<Record>, Vec<Record>)> = vec![
+            (vec![set(1)], vec![set(2)]),
+            (vec![set(1)], vec![]),
+            (
+                vec![insert(1), insert(1), insert(2)],
+                vec![insert(1), insert(3)],
+            ),
+            (vec![insert(1)], with_tail.to_vec()),
+            (with_tail.to_vec(), vec![insert(1)]),
+            (vec![], vec![declare.clone(), set(4), insert(5)]),
+            (vec![declare.clone(), insert(5)], vec![]),
+        ];
+        for (old, new) in cases {
+            let (old, new) = (folded(&old), folded(&new));
+            let mut changes = Vec::new();
+            changes_between("c", Some(&old), Some(&new), true, &mut changes);
+            let mut replayed = old.clone();
+            for record in changes {
+                replayed.apply(record);
+            }
+            assert_eq!(replayed.value, new.value, "{old:?} -> {new:?}");
+            assert_eq!(replayed.elements, new.elements, "{old:?} -> {new:?}");
+            if new.declared.is_some() {
+                assert_eq!(replayed.declared, new.declared);
+            }
+        }
+        let same = folded(&[declare, set(1), insert(2)]);
+        let mut changes = Vec::new();
+        changes_between("c", Some(&same), Some(&same), true, &mut changes);
+        assert!(changes.is_empty());
     }
 
     #[test]

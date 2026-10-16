@@ -216,7 +216,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             key: key.to_owned(),
             collection: self.runtime.create_collection(),
         };
-        binding.converge(&self.runtime, elements);
+        binding.converge(&self.runtime, elements, None)?;
         let view = binding.collection.as_view();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedCollection { id, view })
@@ -226,21 +226,51 @@ impl<C: Cells, B: Backend> Store<C, B> {
 impl<T: Value + Hash + Eq, C: Cells> CollectionBinding<T, C> {
     /// Brings the collection to exactly `target` by applying only the
     /// multiplicity differences, removes first, so queries over it see one
-    /// change per differing occurrence rather than a rebuild.
-    fn converge(&self, rt: &Runtime<C>, target: HashMap<T, usize>) {
+    /// change per differing occurrence rather than a rebuild. Each change is
+    /// also pushed onto `changes`, when given, as the record that makes it.
+    fn converge(
+        &self,
+        rt: &Runtime<C>,
+        target: HashMap<T, usize>,
+        mut changes: Option<&mut Vec<Record>>,
+    ) -> Result<()>
+    where
+        T: serde::Serialize,
+    {
         let current = count(self.collection.values(rt));
         for (value, &have) in &current {
             let want = target.get(value).copied().unwrap_or(0);
+            if want >= have {
+                continue;
+            }
+            if let Some(changes) = changes.as_deref_mut() {
+                let element = encode(value)?;
+                changes.extend((want..have).map(|_| Record::Remove {
+                    key: self.key.clone(),
+                    element: element.clone(),
+                }));
+            }
             for _ in want..have {
                 self.collection.delete(rt, value);
             }
         }
         for (value, want) in target {
             let have = current.get(&value).copied().unwrap_or(0);
+            if have >= want {
+                continue;
+            }
+            if let Some(changes) = changes.as_deref_mut() {
+                let element = encode(&value)?;
+                changes.extend((have..want).map(|_| Record::Insert {
+                    key: self.key.clone(),
+                    element: element.clone(),
+                }));
+            }
             for _ in have..want {
                 self.collection.insert(rt, value.clone());
             }
         }
+        Ok(())
     }
 }
 
@@ -277,13 +307,18 @@ where
                 let new = decode(&self.key, new)?;
                 self.collection.replace(rt, old.as_ref(), new);
             }
-            Record::Delete { .. } => self.converge(rt, HashMap::new()),
+            Record::Delete { .. } => self.converge(rt, HashMap::new(), None)?,
             Record::Declare { .. } | Record::Set { .. } => {}
         }
         Ok(())
     }
 
-    fn replace(&self, rt: &Runtime<C>, logged: Option<&mut LoggedKey>) -> Result<()> {
+    fn replace(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&mut LoggedKey>,
+        changes: Option<&mut Vec<Record>>,
+    ) -> Result<()> {
         let target = match logged {
             Some(logged) => {
                 let target = decode_elements(&self.key, &logged.elements)?;
@@ -292,8 +327,7 @@ where
             }
             None => HashMap::new(),
         };
-        self.converge(rt, target);
-        Ok(())
+        self.converge(rt, target, changes)
     }
 
     fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {

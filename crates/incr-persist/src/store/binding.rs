@@ -24,8 +24,16 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// Sets the node to exactly what `logged` holds, or to the binding's
     /// default when the log no longer knows the key. A collection binding
     /// holds its elements itself, so it takes them out of `logged`, but only
-    /// once they all decoded; on an error nothing has changed.
-    fn replace(&self, rt: &Runtime<C>, logged: Option<&mut LoggedKey>) -> Result<()>;
+    /// once they all decoded; on an error nothing has changed. When
+    /// `changes` is given, a collection binding pushes a `Remove` or
+    /// `Insert` onto it per element occurrence it changed; an input's change
+    /// is visible in the logged state alone, so input bindings push nothing.
+    fn replace(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&mut LoggedKey>,
+        changes: Option<&mut Vec<Record>>,
+    ) -> Result<()>;
 
     /// The records a snapshot keeps for this key, given its logged state.
     /// Empty when the key holds only its logged default, compared by
@@ -84,7 +92,12 @@ impl<C: Cells, T: Value + DeserializeOwned> Binding<C> for InputBinding<T> {
         Ok(())
     }
 
-    fn replace(&self, rt: &Runtime<C>, logged: Option<&mut LoggedKey>) -> Result<()> {
+    fn replace(
+        &self,
+        rt: &Runtime<C>,
+        logged: Option<&mut LoggedKey>,
+        _changes: Option<&mut Vec<Record>>,
+    ) -> Result<()> {
         rt.set(self.handle, self.value_of(logged.as_deref())?);
         Ok(())
     }

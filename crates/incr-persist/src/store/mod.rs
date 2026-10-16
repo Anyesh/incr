@@ -1,6 +1,6 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
-use std::ops::Bound;
+use std::ops::{Bound, RangeInclusive};
 use std::sync::{Mutex, MutexGuard};
 
 use incr_core::{Cells, Incr, Runtime, Value};
@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result};
 
 use binding::{decode, encode, Binding, InputBinding};
-use logged::{fold, is_element_change, Declared, LoggedKeys};
+use logged::{changes_between, fold, is_element_change, Declared, LoggedKeys};
 
 pub use collection::PersistedCollection;
 
@@ -56,6 +56,31 @@ pub struct Input<T: 'static> {
     id: u32,
     handle: Incr<T>,
 }
+
+/// Where a record passed to a [`Store::subscribe`] callback came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Origin {
+    /// Appended by a write through this store.
+    Local,
+    /// Appended by another writer and read by [`Store::refresh`] or by a
+    /// write catching up before its own records.
+    Foreign,
+    /// Not a log record. The store caught up across a compaction, so it
+    /// never saw the folded records one by one; instead it reports, at the
+    /// snapshot's position, records that take each changed key from its old
+    /// state to the snapshot's: a `Declare` for a new declaration, a `Set`
+    /// for a new value, a `Delete` for a value reset to its default, and a
+    /// `Remove` or `Insert` per differing element occurrence. A collection
+    /// this store did not declare whose elements cannot be compared by
+    /// bytes is reported as a `Delete` followed by its full contents.
+    Snapshot,
+}
+
+/// Names a subscription for [`Store::unsubscribe`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SubscriptionId(u64);
+
+type Subscriber = Box<dyn FnMut(Position, &Record, Origin) + Send>;
 
 /// Names one key of a store, for [`Store::delete`] and [`Batch::delete_key`]:
 /// an [`Input`], a `&`[`PersistedCollection`], or the key's name as a
@@ -117,6 +142,8 @@ struct State<C: Cells> {
     /// undeclared finds nothing rather than a later binding.
     bindings: HashMap<u32, Box<dyn Binding<C>>>,
     next_id: u32,
+    subscribers: Vec<(SubscriptionId, Subscriber)>,
+    next_subscription: u64,
 }
 
 impl<T: 'static> Input<T> {
@@ -237,6 +264,12 @@ impl<C: Cells> State<C> {
         }
     }
 
+    fn notify(&mut self, position: Position, record: &Record, origin: Origin) {
+        for (_, subscriber) in &mut self.subscribers {
+            subscriber(position, record, origin);
+        }
+    }
+
     fn bind(&mut self, key: &str, binding: Box<dyn Binding<C>>) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -265,6 +298,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 bound: HashMap::new(),
                 bindings: HashMap::new(),
                 next_id: 0,
+                subscribers: Vec::new(),
+                next_subscription: 0,
             }),
         };
         {
@@ -409,6 +444,41 @@ impl<C: Cells, B: Backend> Store<C, B> {
             return Ok(state.applied);
         }
         self.write(&mut state, &records)
+    }
+
+    /// Calls `f` with every record this store applies from now on, local
+    /// and foreign alike, in position order, together with its position and
+    /// [`Origin`]. Returns an id for [`Store::unsubscribe`].
+    ///
+    /// `f` runs after the record is applied, so the runtime already
+    /// reflects it, and it runs under the store mutex. A slow subscriber
+    /// therefore blocks every writer and reader of this store; hand records
+    /// off to a channel when the work is not trivial. `f` must not call
+    /// back into the store, which would deadlock, and a panic in `f`
+    /// poisons the store until it is reopened.
+    ///
+    /// Records this store applied before subscribing are not replayed.
+    /// When a catch-up crosses a compaction, the records folded into the
+    /// snapshot are reported as [`Origin::Snapshot`] changes instead.
+    pub fn subscribe(
+        &self,
+        f: impl FnMut(Position, &Record, Origin) + Send + 'static,
+    ) -> Result<SubscriptionId> {
+        let mut state = self.state()?;
+        let id = SubscriptionId(state.next_subscription);
+        state.next_subscription += 1;
+        state.subscribers.push((id, Box::new(f)));
+        Ok(id)
+    }
+
+    /// Stops the subscription `id`, so its callback is never called again
+    /// and is dropped. An id already unsubscribed is ignored.
+    pub fn unsubscribe(&self, id: SubscriptionId) -> Result<()> {
+        let mut state = self.state()?;
+        state
+            .subscribers
+            .retain(|(subscribed, _)| *subscribed != id);
+        Ok(())
     }
 
     /// Keys the log knows that this store has not declared, in order,
@@ -612,11 +682,14 @@ impl<C: Cells, B: Backend> Store<C, B> {
             }
         }
         let last = self.backend.append(records)?;
+        // Appends are contiguous, so the run is exactly the positions
+        // ending at `last`, which is how catch-up tells local from foreign.
+        let first = Position(last.0 + 1 - records.len() as u64);
         let landed = (|| {
             if self.options.durability == Durability::Sync {
                 self.backend.sync(last)?;
             }
-            self.catch_up(state, Some(last))
+            self.catch_up(state, Some(first..=last))
         })();
         match landed {
             Ok(()) => Ok(last),
@@ -627,11 +700,12 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
     }
 
-    /// Applies records after `state.applied` until reaching `until`, or
-    /// until one read comes back when `until` is `None`. A read behind the
-    /// snapshot replaces the folded log and every bound node with the
-    /// snapshot's content first.
-    fn catch_up(&self, state: &mut State<C>, until: Option<Position>) -> Result<()> {
+    /// Applies records after `state.applied` until reaching the end of
+    /// `own`, the run this store just appended, or until one read comes
+    /// back when `own` is `None`, notifying subscribers after each. A read
+    /// behind the snapshot replaces the folded log and every bound node
+    /// with the snapshot's content first.
+    fn catch_up(&self, state: &mut State<C>, own: Option<RangeInclusive<Position>>) -> Result<()> {
         let mut read = Vec::new();
         loop {
             read.clear();
@@ -640,11 +714,21 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 ReadOutcome::Records => {
                     let progressed = !read.is_empty();
                     for (position, record) in read.drain(..) {
+                        // Cloned only for subscribers, because applying
+                        // moves the record's bytes into the folded log.
+                        let notice = (!state.subscribers.is_empty()).then(|| record.clone());
                         self.apply(state, record)?;
                         state.applied = position;
                         state.since_checkpoint += 1;
+                        if let Some(record) = notice {
+                            let origin = match &own {
+                                Some(run) if run.contains(&position) => Origin::Local,
+                                _ => Origin::Foreign,
+                            };
+                            state.notify(position, &record, origin);
+                        }
                     }
-                    match until {
+                    match own.as_ref().map(|run| *run.end()) {
                         Some(target) if state.applied < target => {
                             if !progressed {
                                 return Err(Error::Corrupt(
@@ -686,7 +770,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
     }
 
     /// Replaces the folded log and every bound node with the fold of
-    /// `records`, a snapshot covering through `at`. A binding that fails
+    /// `records`, a snapshot covering through `at`, and reports the changes
+    /// to subscribers as [`Origin::Snapshot`] records. A binding that fails
     /// after others were replaced leaves the store between two states, so
     /// that failure poisons it.
     fn replace_with(&self, state: &mut State<C>, at: Position, records: Vec<Record>) -> Result<()> {
@@ -694,16 +779,45 @@ impl<C: Cells, B: Backend> Store<C, B> {
         for record in records {
             fold(&mut logged, record);
         }
-        for (key, &id) in &state.bound {
-            let replaced = state.bindings[&id].replace(&self.runtime, logged.get_mut(key));
-            if let Err(e) = replaced {
-                state.poisoned = true;
-                return Err(e);
+        let notify = !state.subscribers.is_empty();
+        let keys: Vec<String> = if notify {
+            let all: BTreeSet<&String> = state
+                .logged
+                .keys()
+                .chain(logged.keys())
+                .chain(state.bound.keys())
+                .collect();
+            all.into_iter().cloned().collect()
+        } else {
+            state.bound.keys().cloned().collect()
+        };
+        let mut changes = Vec::new();
+        for key in &keys {
+            let binding = state.bound.get(key).map(|id| &state.bindings[id]);
+            if notify {
+                let bound_collection = binding.is_some_and(|b| b.kind() == Kind::Collection);
+                changes_between(
+                    key,
+                    state.logged.get(key),
+                    logged.get(key),
+                    !bound_collection,
+                    &mut changes,
+                );
+            }
+            if let Some(binding) = binding {
+                let sink = notify.then_some(&mut changes);
+                if let Err(e) = binding.replace(&self.runtime, logged.get_mut(key), sink) {
+                    state.poisoned = true;
+                    return Err(e);
+                }
             }
         }
         state.logged = logged;
         state.applied = at;
         state.since_checkpoint = 0;
+        for record in &changes {
+            state.notify(at, record, Origin::Snapshot);
+        }
         Ok(())
     }
 }

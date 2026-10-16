@@ -31,5 +31,6 @@ pub use record::{Kind, Record};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBackend, SqliteDurability, SqliteOptions};
 pub use store::{
-    Batch, Durability, Input, KeyRef, Options, PersistValue, PersistedCollection, Store,
+    Batch, Durability, Input, KeyRef, Options, Origin, PersistValue, PersistedCollection, Store,
+    SubscriptionId,
 };
