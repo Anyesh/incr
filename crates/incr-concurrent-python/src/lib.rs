@@ -52,14 +52,19 @@ fn call_stashing<'py>(
     f: &Py<PyAny>,
     args: impl pyo3::call::PyCallArgs<'py>,
 ) -> Py<PyAny> {
-    match f.call1(py, args) {
-        Ok(v) => v,
-        Err(e) => {
-            let msg = e.to_string();
-            PENDING_PYERR.with(|c| *c.borrow_mut() = Some(e));
-            panic!("incr: python callback raised: {}", msg);
-        }
-    }
+    or_stash(f.call1(py, args))
+}
+
+/// Unwraps the result of Python code the engine runs: a callback, or a
+/// value's `__eq__`, `__hash__` or `__lt__`. An exception is stashed for
+/// `pyerr_boundary` to re-raise as itself, and the panic unwinds the
+/// engine as any user panic does, so it is never read as "not equal".
+fn or_stash<T>(r: PyResult<T>) -> T {
+    r.unwrap_or_else(|e| {
+        let msg = e.to_string();
+        PENDING_PYERR.with(|c| *c.borrow_mut() = Some(e));
+        panic!("incr: python code raised: {}", msg);
+    })
 }
 
 /// Run an engine entry point that may execute Python callbacks. A
@@ -97,7 +102,7 @@ impl Clone for PyValue {
 
 impl PartialEq for PyValue {
     fn eq(&self, other: &Self) -> bool {
-        Python::attach(|py| self.0.bind(py).eq(other.0.bind(py)).unwrap_or(false))
+        Python::attach(|py| or_stash(self.0.bind(py).eq(other.0.bind(py))))
     }
 }
 
@@ -106,7 +111,7 @@ impl Eq for PyValue {}
 impl Hash for PyValue {
     fn hash<H: Hasher>(&self, state: &mut H) {
         Python::attach(|py| {
-            let h: isize = self.0.bind(py).hash().unwrap_or(0);
+            let h: isize = or_stash(self.0.bind(py).hash());
             state.write_isize(h);
         });
     }
@@ -123,9 +128,9 @@ impl Ord for PyValue {
         Python::attach(|py| {
             let self_ref = self.0.bind(py);
             let other_ref = other.0.bind(py);
-            if self_ref.lt(other_ref).unwrap_or(false) {
+            if or_stash(self_ref.lt(other_ref)) {
                 std::cmp::Ordering::Less
-            } else if self_ref.eq(other_ref).unwrap_or(false) {
+            } else if or_stash(self_ref.eq(other_ref)) {
                 std::cmp::Ordering::Equal
             } else {
                 std::cmp::Ordering::Greater
@@ -480,14 +485,12 @@ impl PyGroupedCollection {
 
     fn get_group(&self, key: Py<PyAny>) -> PyResult<Option<PyCollection>> {
         let py_key = PyValue(key);
-        match self.inner.get_group(&py_key) {
-            Some(collection) => Ok(Some(PyCollection {
-                inner: collection,
-                rt: Arc::clone(&self.rt),
-                bridges: Arc::clone(&self.bridges),
-            })),
-            None => Ok(None),
-        }
+        let group = pyerr_boundary(|| self.inner.get_group(&py_key))?;
+        Ok(group.map(|collection| PyCollection {
+            inner: collection,
+            rt: Arc::clone(&self.rt),
+            bridges: Arc::clone(&self.bridges),
+        }))
     }
 
     fn group_count(&self) -> usize {
