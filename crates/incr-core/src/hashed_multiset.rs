@@ -53,8 +53,10 @@ pub(crate) struct Located {
     add: Option<AddAt>,
 }
 
+/// Where one added occurrence lands, as found by
+/// [`HashedMultiset::locate_add`]. Valid until the next `reserve`.
 #[derive(Clone, Copy, Debug)]
-enum AddAt {
+pub(crate) enum AddAt {
     Existing(usize),
     Absent(u64),
 }
@@ -196,7 +198,8 @@ impl<T> HashedMultiset<T> {
 
     /// Decrement the count at `i`, removing the entry and handing its
     /// value back (for the caller to drop) when the count reaches zero.
-    fn decrement_or_remove(&mut self, i: usize) -> Option<T> {
+    /// Runs no user code.
+    pub(crate) fn decrement_or_remove(&mut self, i: usize) -> Option<T> {
         let entry = self.entry_mut(i);
         if entry.count > 1 {
             entry.count -= 1;
@@ -261,6 +264,35 @@ impl<T> HashedMultiset<T> {
         Located { remove, add }
     }
 
+    /// Locate one added occurrence of `value`: reserves room, then runs
+    /// the lookup (user `Eq`). Changes no element.
+    pub(crate) fn locate_add(&mut self, hash: u64, value: &T) -> AddAt
+    where
+        T: PartialEq,
+    {
+        self.reserve(1);
+        match self.find(hash, value) {
+            Some(i) => AddAt::Existing(i),
+            None => AddAt::Absent(hash),
+        }
+    }
+
+    /// Add one occurrence at `at`. Runs no user code. Hands `value` back
+    /// when an equal element was already stored, for the caller to drop
+    /// when it is safe to run user `Drop`.
+    pub(crate) fn add(&mut self, at: AddAt, value: T) -> Option<T> {
+        match at {
+            AddAt::Existing(i) => {
+                self.increment(i);
+                Some(value)
+            }
+            AddAt::Absent(hash) => {
+                self.insert_absent(hash, value);
+                None
+            }
+        }
+    }
+
     /// Apply a located change, with `add` the value to store if the added
     /// element is new. Runs no user code. Returns the values the change
     /// displaced, for the caller to drop when it is safe to run user
@@ -286,11 +318,7 @@ impl<T> HashedMultiset<T> {
                 });
                 return displaced;
             }
-            (Some(AddAt::Existing(i)), Some(value)) => {
-                self.increment(i);
-                displaced[0] = Some(value);
-            }
-            (Some(AddAt::Absent(hash)), Some(value)) => self.insert_absent(hash, value),
+            (Some(at), Some(value)) => displaced[0] = self.add(at, value),
             _ => {}
         }
         if let Some(i) = at.remove {
@@ -407,6 +435,22 @@ mod tests {
         (removed, displaced)
     }
 
+    /// The single-sided paths the collection mutations take.
+    fn add_one(set: &mut HashedMultiset<V>, hashing: Hashing, k: u8, id: u32) -> (bool, Vec<u32>) {
+        let value = v(k, id);
+        let at = set.locate_add(hash(hashing, k), &value);
+        let displaced = set.add(at, value).map(|d| *d.id);
+        (false, displaced.into_iter().collect())
+    }
+
+    fn remove_one(set: &mut HashedMultiset<V>, hashing: Hashing, k: u8) -> (bool, Vec<u32>) {
+        let Some(i) = set.find(hash(hashing, k), &v(k, u32::MAX)) else {
+            return (false, Vec::new());
+        };
+        let displaced = set.decrement_or_remove(i).map(|d| *d.id);
+        (true, displaced.into_iter().collect())
+    }
+
     fn model_change(
         model: &mut Model,
         remove: Option<u8>,
@@ -476,11 +520,11 @@ mod tests {
         for op in ops {
             match *op {
                 Op::Insert(k, id) => {
-                    let got = change(&mut set, hashing, None, Some((k, id)));
+                    let got = add_one(&mut set, hashing, k, id);
                     assert_eq!(got, model_change(&mut model, None, Some((k, id))), "{op:?}");
                 }
                 Op::Remove(k) => {
-                    let got = change(&mut set, hashing, Some(k), None);
+                    let got = remove_one(&mut set, hashing, k);
                     assert_eq!(got, model_change(&mut model, Some(k), None), "{op:?}");
                 }
                 Op::Replace(old, k, id) => {
