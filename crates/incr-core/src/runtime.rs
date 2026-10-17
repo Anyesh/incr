@@ -976,6 +976,10 @@ impl<C: Cells> Runtime<C> {
     /// deletes a member then panics as stale instead of waiting on this
     /// thread's own claim (bug h).
     fn release_tree(&self, owned: Vec<ErasedIncr>, root: ErasedIncr, bag: &mut Deferred<C>) {
+        if owned.is_empty() {
+            self.release_claimed(root, bag);
+            return;
+        }
         let retired: Vec<Retired<C>> = owned
             .into_iter()
             .rev()
@@ -1288,6 +1292,7 @@ impl<C: Cells> Runtime<C> {
     /// must own nothing by now: its owned nodes are released first. Its
     /// closure, observers, value and displaced dep list go into `bag`,
     /// which the delete drains once it holds no lock.
+    #[inline(always)]
     fn release_claimed(&self, handle: ErasedIncr, bag: &mut Deferred<C>) {
         let retired = self.retire_claimed(handle);
         let (drops, dep_list) = {
