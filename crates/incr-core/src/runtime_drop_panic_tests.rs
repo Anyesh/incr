@@ -502,9 +502,50 @@ fn shared_stale_path_drain_panic_under_a_swallowing_parent_lands_dirty() {
             assert_eq!(ARMED.load(SeqCst), i64::MIN, "the retire did not run");
             assert_eq!(rt.state_of(q), NodeState::Clean);
             assert_eq!(rt.state_of(p), NodeState::Dirty);
-            // The Dirty landing makes the next reader re-verify P; with
-            // Q Clean that verification settles P without a recompute.
-            let _ = rt.get(p);
+            // P's -1 came from the swallowed panic, not from Q's value,
+            // so the next read must recompute P over Q rather than
+            // verify it Clean against a Q whose stamps did not move.
+            assert_eq!(rt.get(p), 15);
+            assert_eq!(rt.state_of(p), NodeState::Clean);
+            rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
+/// Q lands Clean and its normal-path drain retires the displaced dep
+/// list, whose reclaim panics. P swallows that panic and lands Dirty;
+/// its next read must recompute from Q's real value, not re-verify Clean
+/// over the swallowed result.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_drain_panic_under_a_swallowing_parent_recomputes_on_the_next_read() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_drain_panic_under_a_swallowing_parent_recomputes_on_the_next_read",
+        || {
+            let rt = Rt::new();
+            prime_reclaim_timer(&rt);
+            reclaim_probe::force(RetireSite::DepListRetire);
+            let (switch, _inputs, q) = overflow_query(&rt);
+            let reads_q = rt.create_input(0_u8);
+            let p = rt.create_query(move |rt| {
+                if rt.get(reads_q) == 0 {
+                    return 0;
+                }
+                catch_unwind(AssertUnwindSafe(|| rt.get(q))).unwrap_or(-1)
+            });
+            assert_eq!(rt.get(q), 28);
+            assert_eq!(rt.get(p), 0);
+
+            retire_armed_boom(&rt);
+            rt.set(switch, 1);
+            rt.set(reads_q, 1);
+            assert_eq!(rt.get(p), -1);
+            assert_eq!(ARMED.load(SeqCst), i64::MIN, "the retire did not run");
+            assert_eq!(rt.state_of(q), NodeState::Clean);
+            assert_eq!(rt.state_of(p), NodeState::Dirty);
+
+            assert_eq!(rt.get(p), 36);
             assert_eq!(rt.state_of(p), NodeState::Clean);
             rt.assert_invariant_i();
         },

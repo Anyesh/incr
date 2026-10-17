@@ -1988,7 +1988,18 @@ impl<C: Cells> Runtime<C> {
                 continue;
             }
 
-            node.max_verified_at(verify_rev);
+            if frame.poisoned {
+                // The value may be built on a result the closure
+                // swallowed from a dep that did not land Clean or whose
+                // cleanup failed, and that dep's stamps need not have
+                // moved, so a verified_at at or above them would let the
+                // next read verify this node Clean over that value.
+                // Zero fails verification against every Clean dep
+                // (revisions start at 1), so the next read recomputes.
+                node.set_verified_at(0);
+            } else {
+                node.max_verified_at(verify_rev);
+            }
 
             // Finish. Land Dirty instead of Clean if a set() flagged us
             // ComputingDirty mid-compute, if a new dep changed after we
