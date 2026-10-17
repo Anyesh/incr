@@ -221,11 +221,39 @@ pub(crate) type ParkHook = Box<dyn Fn(ParkPoint) + Send + Sync>;
 /// First visits after which an `ensure_clean` walk switches to exact mode.
 const EXACT_MODE_AT: u32 = 4096;
 
-/// The stack of `ensure_clean`'s post-order walk. An entry `(x, false)` is
-/// a visit that expands `x`'s non-Clean deps; `(x, true)` is pushed on the
-/// first visit and runs `x`'s compute once they are done.
+/// How `compute_one` treats the node it was handed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Visit {
+    /// A walk root or an untainted walk entry: verify, and recompute if
+    /// that fails.
+    Full,
+    /// A tainted walk entry (`Walk::taint`): verify, and if that fails
+    /// leave the node Dirty for the root's own compute to re-read. The
+    /// payload is the depth of the frame that owns the taint.
+    VerifyOnly(u32),
+}
+
+/// `Entry::taint` of an entry no skipped dep has reached.
+const NO_TAINT: u32 = u32::MAX;
+
+/// One entry of `ensure_clean`'s walk. A visit (`pending == false`)
+/// expands `x`'s non-Clean deps; the pending entry is pushed on the first
+/// visit and runs `x`'s compute once they are done.
+#[derive(Copy, Clone)]
+struct Entry {
+    id: NodeId,
+    pending: bool,
+    /// Lowest frame depth among the Computing deps this thread holds that
+    /// were skipped under this entry, or `NO_TAINT`. A tainted node is
+    /// reachable only through edges that may be stale, so the walk must
+    /// not run its closure: the parent's closure decides whether it is
+    /// still read.
+    taint: u32,
+}
+
+/// The stack of `ensure_clean`'s post-order walk.
 struct Walk {
-    work: Vec<(NodeId, bool)>,
+    work: Vec<Entry>,
     first_visits: u32,
     /// Exact mode: every node with a `(x, true)` entry on `work`, kept
     /// from the switch on so a popped `(x, false)` of one of them is
@@ -237,14 +265,22 @@ struct Walk {
 impl Walk {
     fn new(root: NodeId) -> Self {
         Self {
-            work: vec![(root, false)],
+            work: vec![Entry {
+                id: root,
+                pending: false,
+                taint: NO_TAINT,
+            }],
             first_visits: 0,
             visited: None,
         }
     }
 
     fn visit(&mut self, id: NodeId) {
-        self.work.push((id, true));
+        self.work.push(Entry {
+            id,
+            pending: true,
+            taint: NO_TAINT,
+        });
         self.first_visits += 1;
         match &mut self.visited {
             Some(visited) => {
@@ -254,8 +290,8 @@ impl Walk {
                 self.visited = Some(
                     self.work
                         .iter()
-                        .filter(|(_, pending)| *pending)
-                        .map(|(x, _)| *x)
+                        .filter(|e| e.pending)
+                        .map(|e| e.id)
                         .collect(),
                 );
             }
@@ -263,8 +299,25 @@ impl Walk {
         }
     }
 
+    fn expand(&mut self, dep: NodeId) {
+        self.work.push(Entry {
+            id: dep,
+            pending: false,
+            taint: NO_TAINT,
+        });
+    }
+
     fn is_visited(&self, id: NodeId) -> bool {
         self.visited.as_ref().is_some_and(|v| v.contains(&id))
+    }
+
+    /// Taint the entry whose deps are being processed: the nearest
+    /// pending entry from the top, because everything above it is a
+    /// sibling visit or a finished subtree.
+    fn taint(&mut self, owner: u32) {
+        if let Some(parent) = self.work.iter_mut().rev().find(|e| e.pending) {
+            parent.taint = parent.taint.min(owner);
+        }
     }
 }
 
@@ -1312,6 +1365,14 @@ impl<C: Cells> Runtime<C> {
     /// the ring forever, costs one pass over the ring past the switch
     /// instead of a traversal budget. Cycles themselves are caught in
     /// `compute_one` via the frame stack.
+    ///
+    /// A non-root dep found Computing on this thread's own held set is a
+    /// stale recorded edge or a real cycle. The walk skips it and taints
+    /// the path to it; a tainted node is verified but never recomputed by
+    /// the walk, so only a closure that still reads it, and so re-enters
+    /// the held node through a nested `get`, reports a cycle. The root is
+    /// exempt because its caller reads its slot as soon as the walk
+    /// returns.
     fn ensure_clean(&self, id: NodeId) {
         // Fast path: already clean.
         if state::load::<C>(self.nodes.get(id.0).state_cell()) == NodeState::Clean {
@@ -1320,10 +1381,21 @@ impl<C: Cells> Runtime<C> {
 
         let mut walk = Walk::new(id);
 
-        while let Some((cur, pending)) = walk.work.pop() {
+        while let Some(Entry {
+            id: cur,
+            pending,
+            taint,
+        }) = walk.work.pop()
+        {
+            let is_root = walk.work.is_empty();
             if pending {
                 self.park(ParkPoint::BeforeComputeOne(cur));
-                self.compute_one(cur);
+                if taint == NO_TAINT || is_root {
+                    self.compute_one(cur, Visit::Full);
+                } else {
+                    self.compute_one(cur, Visit::VerifyOnly(taint));
+                    walk.taint(taint);
+                }
                 continue;
             }
             if walk.is_visited(cur) {
@@ -1334,6 +1406,12 @@ impl<C: Cells> Runtime<C> {
             match state::load::<C>(node.state_cell()) {
                 NodeState::Clean => continue,
                 NodeState::Computing | NodeState::ComputingDirty => {
+                    if !is_root {
+                        if let Some(depth) = self.own_claim_depth(cur) {
+                            walk.taint(depth as u32);
+                            continue;
+                        }
+                    }
                     // Another thread owns this subtree and is cleaning
                     // its deps itself; expanding them here would tear
                     // through a dep list mid-rewrite. Just wait for the
@@ -1346,7 +1424,7 @@ impl<C: Cells> Runtime<C> {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
                         if dep_state != NodeState::Clean {
-                            walk.work.push((dep, false));
+                            walk.expand(dep);
                         }
                     });
                 }
@@ -1371,7 +1449,7 @@ impl<C: Cells> Runtime<C> {
     ///   node is on its own frame stack, which is a dependency cycle;
     /// - stamps use the revision captured BEFORE verify/compute via
     ///   fetch_max, so a concurrent set() invalidates rather than masks.
-    fn compute_one(&self, id: NodeId) {
+    fn compute_one(&self, id: NodeId, visit: Visit) {
         let node = self.nodes.get(id.0);
         let mut spins: u32 = 0;
 
@@ -1414,7 +1492,14 @@ impl<C: Cells> Runtime<C> {
                         id.0,
                     );
                 }
-                NodeState::New | NodeState::Dirty => {}
+                NodeState::New => {
+                    // Nothing to verify against, and the walk must not run
+                    // the closure of a tainted node.
+                    if let Visit::VerifyOnly(_) = visit {
+                        return;
+                    }
+                }
+                NodeState::Dirty => {}
             }
 
             // Distinguish input vs query: inputs don't compute, they
@@ -1500,6 +1585,14 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         self.dep_stack.poison_current_frame();
                     }
+                    return;
+                }
+                if let Visit::VerifyOnly(_) = visit {
+                    // The root's own compute re-reads this node through a
+                    // nested get if it still needs it, and that read
+                    // poisons where needed; a poison here would cost the
+                    // root a Clean landing for an edge it may have dropped.
+                    self.land(node, NodeState::Dirty, NodeState::Dirty);
                     return;
                 }
                 // Keep the claim and recompute; the closure's nested reads
@@ -1601,6 +1694,14 @@ impl<C: Cells> Runtime<C> {
             self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
             return;
         }
+    }
+
+    /// The depth of the frame on this thread (or, under `Local`, this
+    /// runtime) that holds `id`'s `Computing` claim. This is the walk's
+    /// own held set; `set`'s claimed entries join it when `set` claims
+    /// its input.
+    fn own_claim_depth(&self, id: NodeId) -> Option<usize> {
+        self.dep_stack.frame_depth(id)
     }
 
     /// Leave this thread's `Computing` claim for `target`, or for `flagged`

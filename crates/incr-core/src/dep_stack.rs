@@ -60,6 +60,11 @@ pub trait DepStack: 'static {
     /// node means the dependency graph has a cycle: the only way to
     /// re-reach a node we are mid-computing is through its own deps.
     fn is_computing(&self, node: NodeId) -> bool;
+
+    /// The depth of this thread's (Shared) or this runtime's (Local)
+    /// frame that is computing `node`, if one is. Depth 0 is the
+    /// outermost frame.
+    fn frame_depth(&self, node: NodeId) -> Option<usize>;
 }
 
 /// What a finished compute frame recorded.
@@ -140,6 +145,10 @@ impl DepStack for LocalDepStack {
     fn is_computing(&self, node: NodeId) -> bool {
         self.stack.borrow().iter().any(|f| f.node == node)
     }
+
+    fn frame_depth(&self, node: NodeId) -> Option<usize> {
+        self.stack.borrow().iter().position(|f| f.node == node)
+    }
 }
 
 /// Shared strategy: thread-local stack. The `SharedDepStack` value
@@ -196,6 +205,10 @@ impl DepStack for SharedDepStack {
     fn is_computing(&self, node: NodeId) -> bool {
         SHARED_FRAMES.with(|f| f.borrow().iter().any(|fr| fr.node == node))
     }
+
+    fn frame_depth(&self, node: NodeId) -> Option<usize> {
+        SHARED_FRAMES.with(|f| f.borrow().iter().position(|fr| fr.node == node))
+    }
 }
 
 /// Loom strategy: the same per-thread stack as [`SharedDepStack`], on
@@ -251,6 +264,10 @@ impl DepStack for LoomDepStack {
 
     fn is_computing(&self, node: NodeId) -> bool {
         LOOM_FRAMES.with(|f| f.borrow().iter().any(|fr| fr.node == node))
+    }
+
+    fn frame_depth(&self, node: NodeId) -> Option<usize> {
+        LOOM_FRAMES.with(|f| f.borrow().iter().position(|fr| fr.node == node))
     }
 }
 

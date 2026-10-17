@@ -129,3 +129,100 @@ fn local_cycle_recovery_is_bounded() {
 fn shared_cycle_recovery_is_bounded() {
     on_deep_stack(cycle_recovery_is_bounded::<Shared>);
 }
+
+/// A recomputing `a` reads `c`, whose recorded edge to `a` is stale: `c`
+/// stopped reading `a` when `s` changed, but has not recomputed yet. The
+/// walk for `c` finds `a` Computing on this thread's own frame through
+/// that edge.
+fn direct_stale_edge_is_not_a_cycle<C: Cells>(rt: &Runtime<C>) {
+    let s = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let i = rt.create_input(10_i64);
+    let j = rt.create_input(20_i64);
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let cell = cell.clone();
+        rt.create_query(move |rt| {
+            if rt.get(t) == 0 {
+                rt.get(i)
+            } else {
+                rt.get(*cell.get().unwrap()) + 1
+            }
+        })
+    };
+    let c = rt.create_query(move |rt| {
+        if rt.get(s) == 0 {
+            rt.get(a) * 2
+        } else {
+            rt.get(j)
+        }
+    });
+    cell.set(c).unwrap();
+    assert_eq!(rt.get(c), 20);
+
+    rt.set(s, 1);
+    rt.set(t, 1);
+    assert_eq!(rt.get(a), 21);
+    assert_eq!(rt.get(c), 20);
+    rt.set(j, 30);
+    assert_eq!(rt.get(a), 31);
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn local_direct_stale_edge_is_not_a_cycle() {
+    direct_stale_edge_is_not_a_cycle(&Runtime::<Local>::new());
+}
+
+#[test]
+fn shared_direct_stale_edge_is_not_a_cycle() {
+    direct_stale_edge_is_not_a_cycle(&Runtime::<Shared>::new());
+}
+
+/// The stale edge through an intermediate node: `c` read `x`, `x` reads
+/// `a`, `a` read `i`. Setting `j` makes `c` read only `j`, and setting
+/// `i` makes `a` read `c`; neither `c` nor `x` has recomputed, so the walk
+/// for `c` expands `x` and finds `a` Computing through `x`'s edge. The
+/// stale edges are `c -> x` and `x -> a`; `x` is never recomputed.
+fn intermediate_stale_edge_is_not_a_cycle<C: Cells>(rt: &Runtime<C>) {
+    let i = rt.create_input(0_i64);
+    let j = rt.create_input(0_i64);
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let cell = cell.clone();
+        rt.create_query(move |rt| {
+            if rt.get(i) == 0 {
+                100
+            } else {
+                rt.get(*cell.get().unwrap()) + 1
+            }
+        })
+    };
+    let x = rt.create_query(move |rt| rt.get(a) * 2);
+    let c = rt.create_query(move |rt| {
+        if rt.get(j) == 0 {
+            rt.get(x) + 1
+        } else {
+            rt.get(j)
+        }
+    });
+    cell.set(c).unwrap();
+    assert_eq!(rt.get(c), 201);
+
+    rt.set(j, 5);
+    rt.set(i, 1);
+    assert_eq!(rt.get(a), 6);
+    assert_eq!(rt.get(c), 5);
+    assert_eq!(rt.get(x), 12);
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn local_intermediate_stale_edge_is_not_a_cycle() {
+    intermediate_stale_edge_is_not_a_cycle(&Runtime::<Local>::new());
+}
+
+#[test]
+fn shared_intermediate_stale_edge_is_not_a_cycle() {
+    intermediate_stale_edge_is_not_a_cycle(&Runtime::<Shared>::new());
+}
