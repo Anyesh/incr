@@ -559,13 +559,20 @@ impl<C: Cells> Runtime<C> {
         C::u8_load_relaxed(&self.tracing_armed) == 1
     }
 
+    #[inline(always)]
     fn record_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
         if self.tracing_is_armed() {
-            self.inner
-                .write()
-                .trace_log
-                .push(crate::trace::NodeTrace { id, action });
+            self.push_trace(id, action);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
+        self.inner
+            .write()
+            .trace_log
+            .push(crate::trace::NodeTrace { id, action });
     }
 
     #[inline]
