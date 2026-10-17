@@ -369,12 +369,14 @@ struct Walk {
 }
 
 impl Walk {
+    /// `pending` starts the walk at the root's compute, skipping its
+    /// expansion.
     #[inline]
-    fn new(root: NodeId) -> Self {
+    fn new(root: NodeId, pending: bool) -> Self {
         Self {
             work: vec![Entry {
                 id: root,
-                pending: false,
+                pending,
                 taint: NO_TAINT,
             }],
             first_visits: 0,
@@ -1886,11 +1888,10 @@ impl<C: Cells> Runtime<C> {
             return Computed::Done;
         }
 
-        if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
-            return self.compute_one(id, Visit::Direct, Some(gen));
-        }
-
-        let mut walk = Walk::new(id);
+        // A memoized root is computed directly, as the walk's only
+        // entry, so `compute_one` keeps a single call site and inlines.
+        let direct = word != 0 && taint_memo::memoized(word, self.runtime_id, id);
+        let mut walk = Walk::new(id, direct);
         let mut root = Computed::Done;
 
         while let Some(Entry {
@@ -1901,13 +1902,20 @@ impl<C: Cells> Runtime<C> {
         {
             let is_root = walk.work.is_empty();
             if pending {
-                self.park(ParkPoint::BeforeComputeOne(cur));
-                if is_root {
-                    root = self.compute_one(cur, Visit::Full, Some(gen));
-                } else if taint == NO_TAINT {
-                    self.compute_one(cur, Visit::Full, None);
+                let visit = if direct {
+                    Visit::Direct
                 } else {
-                    self.compute_one(cur, Visit::VerifyOnly(taint), None);
+                    self.park(ParkPoint::BeforeComputeOne(cur));
+                    if is_root || taint == NO_TAINT {
+                        Visit::Full
+                    } else {
+                        Visit::VerifyOnly(taint)
+                    }
+                };
+                let computed = self.compute_one(cur, visit, is_root.then_some(gen));
+                if is_root {
+                    root = computed;
+                } else if taint != NO_TAINT {
                     walk.taint(taint);
                 }
                 continue;
@@ -1983,6 +1991,7 @@ impl<C: Cells> Runtime<C> {
     /// nothing included (`Gone`, the input arm, a retry that found the
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
+    #[inline(always)]
     fn compute_one(&self, id: NodeId, visit: Visit, gen: Option<u32>) -> Computed {
         let mut bag = Deferred::new();
         let computed = self.compute_attempts(id, visit, gen, &mut bag);
@@ -1990,6 +1999,7 @@ impl<C: Cells> Runtime<C> {
         computed
     }
 
+    #[inline(always)]
     fn compute_attempts(
         &self,
         id: NodeId,
