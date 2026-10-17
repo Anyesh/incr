@@ -13,6 +13,7 @@ All notable changes to this project are documented here. Format roughly follows 
 ### Fixed
 
 - A `set` that raced a delete and recycle of its input could write its value into the node that reused the slot, stamp that node and walk dependents it never had a handle to. It now panics as stale and leaves the new occupant untouched.
+- A `set` of an owned input (a `group_by` group's version node) no longer loses its claim to a concurrent delete of the owner: the delete waits for the `set` to land. Before, the delete stole the claim (a debug assertion in debug builds).
 - Under `Local`, a `Drop` of the value a `set` displaced that panicked left the slot holding the dropped value; the slot now holds the new value before the old one is dropped.
 
 ## [0.2.0-beta.5] - unreleased

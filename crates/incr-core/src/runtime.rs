@@ -889,11 +889,11 @@ impl<C: Cells> Runtime<C> {
     ///
     /// The whole tree is checked for dependents and claimed `Dead` under
     /// one read hold, the root first. Owned nodes are inputs (see
-    /// [`Runtime::adopt`]), whose state only ever moves to `Dead`, so once
-    /// the root's claim succeeds no owned claim can fail, except to
-    /// another delete claiming that node concurrently. Such a node is
-    /// waited out before the root is released, so the root's owned list
-    /// is empty by then.
+    /// [`Runtime::adopt`]), whose state only moves to `Dead` or through a
+    /// `set`'s claim, so once the root's claim succeeds no owned claim can
+    /// fail, except to another delete claiming that node concurrently.
+    /// Such a node is waited out before the root is released, so the
+    /// root's owned list is empty by then.
     fn delete_strict(&self, root: ErasedIncr) -> Result<(), StrictRefusal> {
         debug_assert_eq!(root.runtime_id(), self.runtime_id);
         value_code::check();
@@ -1000,22 +1000,30 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::DeleteBeforeOwnedClaims(NodeId(root.slot())));
         let mut claimed = Vec::with_capacity(owned.len());
         let mut foreign = Vec::new();
+        let mut spins: u32 = 0;
         for child in owned {
             let cell = self.nodes.get(child.slot()).state_cell();
             loop {
                 let s = state::load::<C>(cell);
-                if s == NodeState::Dead {
-                    foreign.push(child);
-                    break;
-                }
-                debug_assert!(
-                    !matches!(s, NodeState::Computing | NodeState::ComputingDirty),
-                    "incr-core: owned node {} is computing; owned nodes must be inputs",
-                    child.slot(),
-                );
-                if state::try_transition::<C>(cell, s, NodeState::Dead).is_ok() {
-                    claimed.push(child);
-                    break;
+                match s {
+                    NodeState::Dead => {
+                        foreign.push(child);
+                        break;
+                    }
+                    NodeState::Computing | NodeState::ComputingDirty => {
+                        // Owned nodes are inputs, so this is a set's
+                        // claim. Its holder never takes `inner` or waits
+                        // while claimed, so it lands under this hold.
+                        self.refuse_wait_on_own_claim(NodeId(child.slot()));
+                        spins += 1;
+                        C::backoff(spins);
+                    }
+                    _ => {
+                        if state::try_transition::<C>(cell, s, NodeState::Dead).is_ok() {
+                            claimed.push(child);
+                            break;
+                        }
+                    }
                 }
             }
         }

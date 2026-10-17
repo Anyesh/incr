@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::race_tests::{id, panic_message, park_at, Gate};
+use super::race_tests::{grouped, id, panic_message, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::state::NodeState;
@@ -263,5 +263,43 @@ fn reader_of_an_input_under_a_set_claim_waits_for_the_landing() {
     gate.release();
     setter.join().unwrap();
     assert_eq!(reader.join().unwrap(), 5);
+    rt.assert_invariant_i();
+}
+
+/// A strict delete of a router finds one of its group version nodes
+/// under a parked `set`'s claim. It must wait for the set to land instead
+/// of stealing the claim.
+#[test]
+fn delete_of_an_owner_waits_for_a_set_of_an_owned_input() {
+    let rt = Arc::new(Rt::new());
+    let (router, versions) = grouped(&rt);
+    let group = versions[0];
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::SetAfterClaim(id(group)), gate.clone())],
+    );
+
+    let setter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set(group, 99))
+    };
+    gate.wait_parked();
+    let deleter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.try_delete_node(router))
+    };
+    thread::sleep(SETTLE);
+    assert!(
+        !deleter.is_finished(),
+        "the router delete finished under the group's set claim"
+    );
+    assert!(rt.is_alive(group), "the group's set claim was stolen");
+
+    gate.release();
+    setter.join().unwrap();
+    assert_eq!(deleter.join().unwrap(), Ok(()));
+    assert!(!rt.is_alive(router));
+    assert!(versions.iter().all(|&v| !rt.is_alive(v)));
     rt.assert_invariant_i();
 }
