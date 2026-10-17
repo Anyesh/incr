@@ -116,6 +116,17 @@ impl<C: Cells> Deferred<C> {
         }
     }
 
+    /// Reserve for a batch of `nodes` node pushes and `dep_lists` token
+    /// pushes, less the typed slots still free to take the first of each.
+    pub(crate) fn reserve_batch(&mut self, nodes: usize, dep_lists: usize) {
+        let spilled_nodes = nodes.saturating_sub(usize::from(self.node.is_none()));
+        let spilled_lists = dep_lists.saturating_sub(usize::from(self.dep_list.is_none()));
+        let items = spilled_nodes + spilled_lists;
+        if items > 0 {
+            self.reserve(items);
+        }
+    }
+
     pub(crate) fn push_erased(&mut self, item: ErasedDrop) {
         let spill = self.spill_mut();
         if spill.len() == spill.capacity() {

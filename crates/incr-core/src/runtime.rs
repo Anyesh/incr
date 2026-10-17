@@ -31,7 +31,7 @@ use crate::dep_stack::DepStack;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
-use crate::node::{NodeData, NodeId};
+use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::segmented_nodes::SegmentedNodes;
 use crate::state::{self, NodeState};
@@ -187,6 +187,16 @@ enum StrictRefusal {
     Gone,
     /// The node at this slot, the root or one it owns, has a dependent.
     HasDependents(u32),
+}
+
+/// A node a delete claimed `Dead` and cleared under that claim, waiting
+/// for the write hold that unhooks and recycles it.
+struct Retired<C: Cells> {
+    handle: ErasedIncr,
+    old_deps: Vec<NodeId>,
+    arena_slot: u32,
+    type_tag: u16,
+    dep_list: Option<RetiredDeps<C>>,
 }
 
 /// One attempt of a strict delete to claim its whole ownership tree under
@@ -867,20 +877,37 @@ impl<C: Cells> Runtime<C> {
         for child in foreign {
             self.wait_out_claim(child, &mut spins);
         }
-        // One bag for the whole tree: every closure, observer and value
-        // Drop runs after every member is unhooked and recycled. The
-        // first node's drops take the typed slot; the rest spill, and the
-        // batch reserves for them once.
         let mut bag = Deferred::new();
-        if !owned.is_empty() {
-            bag.reserve(owned.len());
-        }
-        for child in owned.into_iter().rev() {
-            self.release_claimed(child, &mut bag);
-        }
-        self.release_claimed(root, &mut bag);
+        self.release_tree(owned, root, &mut bag);
         bag.drain(self);
         Ok(())
+    }
+
+    /// Unhooks and recycles an owned tree this thread claimed `Dead`,
+    /// deepest members first and the root last, under one write hold.
+    /// So every member's generation is bumped before any closure,
+    /// observer or value `Drop` runs at the bag's drain: a `Drop` that
+    /// deletes a member then panics as stale instead of waiting on this
+    /// thread's own claim (bug h).
+    fn release_tree(&self, owned: Vec<ErasedIncr>, root: ErasedIncr, bag: &mut Deferred<C>) {
+        let retired: Vec<Retired<C>> = owned
+            .into_iter()
+            .rev()
+            .chain(std::iter::once(root))
+            .map(|member| self.retire_claimed(member))
+            .collect();
+        let dep_lists = retired.iter().filter(|r| r.dep_list.is_some()).count();
+        let mut inner = self.inner.write();
+        // Counted and reserved under the hold, so the batch's pushes
+        // grow the spill at most once.
+        bag.reserve_batch(retired.len(), dep_lists);
+        for member in retired {
+            let (drops, dep_list) = self.unhook_retired(&mut inner, member);
+            bag.push_node(drops);
+            if let Some(dep_list) = dep_list {
+                bag.push_dep_list(dep_list);
+            }
+        }
     }
 
     /// One claim attempt of [`Runtime::delete_strict`], with the root's
@@ -947,6 +974,14 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::DeleteWaitsOnClaim(NodeId(handle.slot())));
         let node = self.nodes.get(handle.slot());
         while node.generation() == handle.generation() {
+            if C::SINGLE_THREADED {
+                panic!(
+                    "incr-core: node {} is claimed by a delete on this thread that has not \
+                     unhooked it yet; a Drop or callback must not delete a node whose own \
+                     delete is in progress",
+                    handle.slot(),
+                );
+            }
             *spins += 1;
             C::backoff(*spins);
         }
@@ -1159,25 +1194,53 @@ impl<C: Cells> Runtime<C> {
     /// closure, observers, value and displaced dep list go into `bag`,
     /// which the delete drains once it holds no lock.
     fn release_claimed(&self, handle: ErasedIncr, bag: &mut Deferred<C>) {
-        let slot = handle.slot();
-        let id = NodeId(slot);
-        let node = self.nodes.get(slot);
+        let retired = self.retire_claimed(handle);
+        let (drops, dep_list) = {
+            let mut inner = self.inner.write();
+            self.unhook_retired(&mut inner, retired)
+        };
+        bag.push_node(drops);
+        if let Some(dep_list) = dep_list {
+            bag.push_dep_list(dep_list);
+        }
+    }
+
+    /// The part of a release that runs under the delete's claim and
+    /// before the hold: the deps and the Dead state are cleared before
+    /// the slot can reach the free list, and the displaced list is
+    /// retired only at the bag's drain.
+    fn retire_claimed(&self, handle: ErasedIncr) -> Retired<C> {
+        let node = self.nodes.get(handle.slot());
         let mut old_deps: Vec<NodeId> = Vec::new();
         node.for_each_dep(|d| old_deps.push(d));
-        let arena_slot = node.arena_slot();
-        let type_tag = node.type_tag();
-        // Under the claim and before the hold, so the deps and the Dead
-        // state are cleared before the slot can reach the free list; the
-        // displaced list is retired only after the hold, below.
-        let dep_list = node.retire_for_delete();
+        Retired {
+            handle,
+            old_deps,
+            arena_slot: node.arena_slot(),
+            type_tag: node.type_tag(),
+            dep_list: node.retire_for_delete(),
+        }
+    }
 
-        let mut inner = self.inner.write();
+    /// The part of a release that runs under `inner.write()`: unhook the
+    /// node's edges and ownership, bump its generation and take what the
+    /// bag drops later. The closures, observers and value are dropped
+    /// only at the bag's drain, after the lock is released, because their
+    /// Drop impls are user code that may call back into the runtime.
+    fn unhook_retired(
+        &self,
+        inner: &mut Inner<C>,
+        retired: Retired<C>,
+    ) -> (NodeDrops<C>, Option<RetiredDeps<C>>) {
+        let slot = retired.handle.slot();
+        let id = NodeId(slot);
+        let node = self.nodes.get(slot);
         debug_assert!(
             !inner.owned.contains_key(&slot),
             "incr-core: released node {} still owns nodes",
             slot,
         );
-        for d in &old_deps {
+        for d in &retired.old_deps {
             inner.dependents[d.0 as usize].retain(|&x| x != id);
         }
         inner.dependents[slot as usize].clear();
@@ -1192,9 +1255,6 @@ impl<C: Cells> Runtime<C> {
             }
         }
         node.bump_generation();
-        // The closures, observers and value are dropped only at the
-        // bag's drain, after the lock is released, because their Drop
-        // impls are user code that may call back into the runtime.
         let compute = inner.compute_fns[slot as usize].take();
         let observers: Vec<ObserverEntry<C>> = inner
             .observers
@@ -1202,18 +1262,15 @@ impl<C: Cells> Runtime<C> {
             .map(|(_, e)| e)
             .collect();
         inner.labels.remove(&slot);
-        let arena = Arc::clone(inner.arenas.erased(type_tag));
+        let arena = Arc::clone(inner.arenas.erased(retired.type_tag));
         inner.free_nodes.push(slot);
-        drop(inner);
-        bag.push_node(NodeDrops {
+        let drops = NodeDrops {
             compute,
             observers,
             arena,
-            arena_slot,
-        });
-        if let Some(dep_list) = dep_list {
-            bag.push_dep_list(dep_list);
-        }
+            arena_slot: retired.arena_slot,
+        };
+        (drops, retired.dep_list)
     }
 
     /// Read the current value of a node. Triggers recomputation of the

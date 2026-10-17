@@ -648,3 +648,120 @@ fn local_delete_spill_grows_at_most_once_per_batch() {
     assert!((1..=2).contains(&growths), "spill grew {growths} times");
     assert!(!rt.is_alive(router));
 }
+
+struct RtPtr(*const Runtime<Local>);
+// SAFETY: test-only. The runtime outlives the observers holding its
+// pointer, and a Local runtime's pointer never leaves its thread.
+unsafe impl Send for RtPtr {}
+unsafe impl Sync for RtPtr {}
+
+impl RtPtr {
+    fn rt(&self) -> &Runtime<Local> {
+        // SAFETY: see the impls above.
+        unsafe { &*self.0 }
+    }
+}
+
+/// A router over three groups, all Clean, whose version nodes it owns.
+fn local_grouped(rt: &Runtime<Local>) -> (Incr<u64>, Vec<Incr<u64>>) {
+    use crate::collection::IncrCollection;
+    let c: IncrCollection<i64, Local> = rt.create_collection();
+    for v in [3, 4, 5] {
+        c.insert(rt, v);
+    }
+    let groups = c.group_by(rt, |x| x % 3);
+    let _ = rt.get(groups.version_node());
+    let versions = groups
+        .keys()
+        .iter()
+        .map(|k| groups.get_group(k).unwrap().version_node())
+        .collect();
+    (groups.version_node(), versions)
+}
+
+/// A member's `Drop` deletes the root and a sibling of the owned tree it
+/// is deleted with. Every member's generation is bumped before any
+/// `Drop` runs, so both deletes panic as stale instead of waiting on a
+/// claim this thread holds, which under Local would never end.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_owned_tree_drop_that_deletes_the_root_panics_stale() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_owned_tree_drop_that_deletes_the_root_panics_stale",
+        || {
+            let rt = Runtime::<Local>::new();
+            let (router, versions) = local_grouped(&rt);
+            let rt_ptr = RtPtr(&rt);
+            let sibling = versions[1];
+            let deleter = OnDrop::armed(1, move || {
+                let rt = rt_ptr.rt();
+                let root = catch_unwind(AssertUnwindSafe(|| rt.delete_node(router))).unwrap_err();
+                assert!(panic_message(root).contains("stale Incr"));
+                rt.delete_node(sibling);
+            });
+            rt.observe(versions[0], move |_| {
+                let _keep = &deleter;
+            });
+            rt.delete_node(router);
+        },
+    )
+    .assert_panicked_with("stale Incr");
+}
+
+/// A strict delete of an owned tree whose first version-node observer
+/// has a panicking `Drop`: the panic arrives after the whole tree is
+/// deleted, and the other observers still drop.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_owned_tree_observer_drop_panic_arrives_after_the_delete() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_owned_tree_observer_drop_panic_arrives_after_the_delete",
+        || {
+            let rt = Runtime::<Local>::new();
+            let (router, versions) = local_grouped(&rt);
+            let rt_ptr = RtPtr(&rt);
+            let members = versions.clone();
+            let boom = OnDrop::armed(1, move || {
+                let rt = rt_ptr.rt();
+                assert!(!rt.is_alive(router));
+                assert!(members.iter().all(|&v| !rt.is_alive(v)));
+                panic!("observer drop panicked on purpose");
+            });
+            rt.observe(versions[0], move |_| {
+                let _keep = &boom;
+            });
+            let dropped = Arc::new(AtomicU32::new(0));
+            for &v in &versions[1..] {
+                let counter = CountOnDrop(Arc::clone(&dropped));
+                rt.observe(v, move |_| {
+                    let _keep = &counter;
+                });
+            }
+
+            let err = catch_unwind(AssertUnwindSafe(|| rt.delete_node(router))).unwrap_err();
+            assert!(panic_message(err).contains("observer drop panicked on purpose"));
+            assert_eq!(dropped.load(SeqCst), versions.len() as u32 - 1);
+            assert_eq!(rt.node_count(), 1, "only the source is left");
+            rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
+/// Under Local no other thread can finish a claim, so a delete that finds
+/// a node Dead at its own generation panics instead of spinning for the
+/// bump it is itself waiting to do.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_delete_of_a_node_claimed_dead_panics_instead_of_spinning() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_delete_of_a_node_claimed_dead_panics_instead_of_spinning",
+        || {
+            let rt = Runtime::<Local>::new();
+            let x = rt.create_input(1_i64);
+            rt.nodes.get(x.slot()).set_state(NodeState::Dead.as_u8());
+            rt.delete_node(x);
+        },
+    )
+    .assert_panicked_with("claimed by a delete on this thread");
+}

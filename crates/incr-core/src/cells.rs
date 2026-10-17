@@ -48,6 +48,12 @@ pub trait PtrCell<T: 'static>: 'static {
 }
 
 pub trait Cells: 'static + Sized {
+    /// True when no other thread can ever make progress on this runtime,
+    /// so a wait on another claim's progress is a contract violation by
+    /// the caller (a `Drop` or callback reaching a node its own delete
+    /// holds) and must panic instead of spinning.
+    const SINGLE_THREADED: bool = false;
+
     type U8;
     type U16;
     type U32;
@@ -200,6 +206,8 @@ pub struct Local;
 pub struct Shared;
 
 impl Cells for Local {
+    const SINGLE_THREADED: bool = true;
+
     type U8 = Cell<u8>;
     type U16 = Cell<u16>;
     type U32 = Cell<u32>;
