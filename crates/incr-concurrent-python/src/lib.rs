@@ -259,9 +259,7 @@ impl PyCollection {
     fn filter(&self, predicate: Py<PyAny>) -> PyResult<PyCollection> {
         let filtered = self.inner.filter(&self.rt, move |val: &PyValue| -> bool {
             Python::attach(|py| {
-                call_stashing(py, &predicate, (val.0.clone_ref(py),))
-                    .is_truthy(py)
-                    .unwrap_or(false)
+                or_stash(call_stashing(py, &predicate, (val.0.clone_ref(py),)).is_truthy(py))
             })
         });
         Ok(PyCollection {

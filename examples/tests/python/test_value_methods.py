@@ -110,3 +110,19 @@ def test_raising_group_key_hash_propagates_out_of_get_group(make_rt):
     with pytest.raises(TypeError, match="unhashable"):
         grouped.get_group([1])
     assert grouped.group_count() == 1
+
+
+class Ambiguous:
+    def __bool__(self):
+        raise ValueError("predicate result __bool__ raised")
+
+
+@BOTH_RUNTIMES
+def test_raising_predicate_result_bool_propagates_out_of_the_read(make_rt):
+    rt = make_rt()
+    col = rt.create_collection()
+    kept = col.filter(lambda x: Ambiguous())
+    count = kept.count()
+    col.insert(1)
+    with pytest.raises(ValueError, match="__bool__ raised"):
+        rt.get(count)
