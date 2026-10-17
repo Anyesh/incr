@@ -2223,8 +2223,8 @@ impl<C: Cells> Runtime<C> {
                 (compute)(self, id.0, is_recompute, &wrote)
             }));
             let frame = self.dep_stack.pop_frame();
-            if frame.memo_owner {
-                taint_memo::clear_from(frame.depth);
+            if value_code::thread_word() & value_code::MEMO_BIT != 0 {
+                taint_memo::clear_from(self.dep_stack.depth() as u32);
             }
 
             let value_changed = match result {
@@ -2344,7 +2344,6 @@ impl<C: Cells> Runtime<C> {
     /// `owner`, whose pop clears the entry.
     fn memoize(&self, id: NodeId, owner: u32) {
         taint_memo::memoize(self.runtime_id, id, owner);
-        self.dep_stack.mark_memo_owner(owner as usize);
     }
 
     /// Leave this thread's `Computing` claim for `target`, or for `flagged`

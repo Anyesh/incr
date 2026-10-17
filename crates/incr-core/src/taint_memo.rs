@@ -6,7 +6,10 @@
 //!
 //! Entries are owned by the frame of the node whose skip tainted them
 //! (the lowest such frame when there are several) and cleared when it
-//! pops. Clearing early is sound: a node with no entry is walked and
+//! pops. A pop finds the memo through the thread word's bit alone, so a
+//! frame that never tainted carries no owner flag; while the memo is
+//! non-empty, every pop compares its depth with the deepest owner, and
+//! only an owner's pop scans the entries. Clearing early is sound: a node with no entry is walked and
 //! verified as it would be without the memo, and computing a memoized
 //! node directly is always a legal landing, so an entry can only cost a
 //! closure run where a verify would have passed, never a wrong value.
@@ -23,21 +26,28 @@ use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::value_code::{self, MEMO_BIT};
 
+#[derive(Default)]
+struct Memo {
+    owners: HashMap<(RuntimeId, NodeId), u32>,
+    /// At least every entry's owner, so a pop above it skips the scan.
+    deepest: u32,
+}
+
 #[cfg(not(loom))]
 thread_local! {
-    static MEMO: RefCell<HashMap<(RuntimeId, NodeId), u32>> = RefCell::new(HashMap::new());
+    static MEMO: RefCell<Memo> = RefCell::new(Memo::default());
 }
 
 #[cfg(loom)]
 loom::thread_local! {
-    static MEMO: RefCell<HashMap<(RuntimeId, NodeId), u32>> = RefCell::new(HashMap::new());
+    static MEMO: RefCell<Memo> = RefCell::new(Memo::default());
 }
 
 /// Whether `id` of `rt` is memoized, given a non-zero `word`.
 #[cold]
 #[inline(never)]
 pub(crate) fn memoized(word: u64, rt: RuntimeId, id: NodeId) -> bool {
-    word & MEMO_BIT != 0 && MEMO.with(|m| m.borrow().contains_key(&(rt, id)))
+    word & MEMO_BIT != 0 && MEMO.with(|m| m.borrow().owners.contains_key(&(rt, id)))
 }
 
 /// Memoize `id` of `rt` under the frame at depth `owner`; an existing
@@ -45,19 +55,27 @@ pub(crate) fn memoized(word: u64, rt: RuntimeId, id: NodeId) -> bool {
 pub(crate) fn memoize(rt: RuntimeId, id: NodeId, owner: u32) {
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
-        let entry = m.entry((rt, id)).or_insert(owner);
+        let entry = m.owners.entry((rt, id)).or_insert(owner);
         *entry = (*entry).min(owner);
+        let kept = *entry;
+        m.deepest = m.deepest.max(kept);
     });
     value_code::set_memo_bit();
 }
 
 /// Clear the entries owned by the frame at `depth` or deeper, when that
-/// frame pops.
+/// frame pops with the memo bit set.
+#[cold]
+#[inline(never)]
 pub(crate) fn clear_from(depth: u32) {
     MEMO.with(|m| {
         let mut m = m.borrow_mut();
-        m.retain(|_, owner| *owner < depth);
-        if m.is_empty() {
+        if m.deepest < depth {
+            return;
+        }
+        m.owners.retain(|_, owner| *owner < depth);
+        m.deepest = m.owners.values().copied().max().unwrap_or(0);
+        if m.owners.is_empty() {
             value_code::clear_memo_bit();
         }
     });

@@ -66,10 +66,9 @@ pub trait DepStack: 'static {
     /// outermost frame.
     fn frame_depth(&self, node: NodeId) -> Option<usize>;
 
-    /// Record that the frame at `depth` owns taint memo entries, so its
-    /// pop reports `memo_owner` and the owner clears them. The flag lives
-    /// on the frame so a pop that owns nothing tests nothing else.
-    fn mark_memo_owner(&self, depth: usize);
+    /// The number of active frames on this thread (Shared) or this
+    /// runtime (Local); right after a pop, the popped frame's depth.
+    fn depth(&self) -> usize;
 }
 
 /// What a finished compute frame recorded.
@@ -79,10 +78,6 @@ pub struct PoppedFrame {
     pub deps: Vec<(NodeId, u32)>,
     /// True if a dep read inside the frame did not land `Clean`.
     pub poisoned: bool,
-    /// The frame's depth; 0 is the outermost frame.
-    pub depth: u32,
-    /// True if the frame owns taint memo entries (`mark_memo_owner`).
-    pub memo_owner: bool,
 }
 
 /// One in-flight compute: the node being computed and the deps recorded
@@ -91,7 +86,6 @@ struct Frame {
     node: NodeId,
     deps: Vec<(NodeId, u32)>,
     poisoned: bool,
-    memo_owner: bool,
 }
 
 impl Frame {
@@ -100,25 +94,15 @@ impl Frame {
             node,
             deps: Vec::with_capacity(4),
             poisoned: false,
-            memo_owner: false,
         }
     }
 
-    fn finish(self, depth: usize) -> PoppedFrame {
+    fn finish(self) -> PoppedFrame {
         PoppedFrame {
             deps: self.deps,
             poisoned: self.poisoned,
-            depth: depth as u32,
-            memo_owner: self.memo_owner,
         }
     }
-}
-
-fn pop(frames: &mut Vec<Frame>, what: &str) -> PoppedFrame {
-    let frame = frames
-        .pop()
-        .unwrap_or_else(|| panic!("{what}::pop_frame on empty stack"));
-    frame.finish(frames.len())
 }
 
 /// Local strategy: RefCell-backed stack on the runtime.
@@ -138,7 +122,11 @@ impl DepStack for LocalDepStack {
     }
 
     fn pop_frame(&self) -> PoppedFrame {
-        pop(&mut self.stack.borrow_mut(), "LocalDepStack")
+        self.stack
+            .borrow_mut()
+            .pop()
+            .expect("LocalDepStack::pop_frame on empty stack")
+            .finish()
     }
 
     fn record_dep(&self, dep: NodeId, generation: u32) {
@@ -166,8 +154,8 @@ impl DepStack for LocalDepStack {
         self.stack.borrow().iter().position(|f| f.node == node)
     }
 
-    fn mark_memo_owner(&self, depth: usize) {
-        self.stack.borrow_mut()[depth].memo_owner = true;
+    fn depth(&self) -> usize {
+        self.stack.borrow().len()
     }
 }
 
@@ -193,7 +181,12 @@ impl DepStack for SharedDepStack {
     }
 
     fn pop_frame(&self) -> PoppedFrame {
-        SHARED_FRAMES.with(|f| pop(&mut f.borrow_mut(), "SharedDepStack"))
+        SHARED_FRAMES.with(|f| {
+            f.borrow_mut()
+                .pop()
+                .expect("SharedDepStack::pop_frame on empty stack")
+                .finish()
+        })
     }
 
     fn record_dep(&self, dep: NodeId, generation: u32) {
@@ -225,8 +218,8 @@ impl DepStack for SharedDepStack {
         SHARED_FRAMES.with(|f| f.borrow().iter().position(|fr| fr.node == node))
     }
 
-    fn mark_memo_owner(&self, depth: usize) {
-        SHARED_FRAMES.with(|f| f.borrow_mut()[depth].memo_owner = true);
+    fn depth(&self) -> usize {
+        SHARED_FRAMES.with(|f| f.borrow().len())
     }
 }
 
@@ -253,7 +246,12 @@ impl DepStack for LoomDepStack {
     }
 
     fn pop_frame(&self) -> PoppedFrame {
-        LOOM_FRAMES.with(|f| pop(&mut f.borrow_mut(), "LoomDepStack"))
+        LOOM_FRAMES.with(|f| {
+            f.borrow_mut()
+                .pop()
+                .expect("LoomDepStack::pop_frame on empty stack")
+                .finish()
+        })
     }
 
     fn record_dep(&self, dep: NodeId, generation: u32) {
@@ -284,8 +282,8 @@ impl DepStack for LoomDepStack {
         LOOM_FRAMES.with(|f| f.borrow().iter().position(|fr| fr.node == node))
     }
 
-    fn mark_memo_owner(&self, depth: usize) {
-        LOOM_FRAMES.with(|f| f.borrow_mut()[depth].memo_owner = true);
+    fn depth(&self) -> usize {
+        LOOM_FRAMES.with(|f| f.borrow().len())
     }
 }
 
