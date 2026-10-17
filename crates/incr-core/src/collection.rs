@@ -35,6 +35,7 @@
 //! claim protocol guarantees a single thread executes a given operator
 //! closure at a time.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, RandomState};
 use std::sync::atomic::{AtomicU64, Ordering as MemOrdering};
@@ -753,8 +754,8 @@ where
         struct JoinState<T2, U2, K2> {
             left_index: HashMap<K2, Vec<T2>>,
             right_index: HashMap<K2, Vec<U2>>,
-            left_keys: HashMap<T2, K2>,
-            right_keys: HashMap<U2, K2>,
+            left_keys: KeyCache<T2, K2>,
+            right_keys: KeyCache<U2, K2>,
         }
 
         let left_log = Arc::clone(&self.log);
@@ -768,8 +769,8 @@ where
         let mut st = JoinState::<T, U, K> {
             left_index: HashMap::new(),
             right_index: HashMap::new(),
-            left_keys: HashMap::new(),
-            right_keys: HashMap::new(),
+            left_keys: KeyCache::new(),
+            right_keys: KeyCache::new(),
         };
         let output_log: Arc<OpLock<CollectionLog<(T, U)>, C>> =
             Arc::new(OpLock::new(CollectionLog::new()));
@@ -779,11 +780,11 @@ where
             let right_keyed: Vec<(&U, K)> = right_boot.iter().map(|r| (r, right_key(r))).collect();
             let mut out = output_log.write();
             for (l, k) in left_keyed {
-                st.left_keys.insert(l.clone(), k.clone());
+                let k = st.left_keys.insert(l.clone(), k);
                 st.left_index.entry(k).or_default().push(l.clone());
             }
             for (r, k) in right_keyed {
-                st.right_keys.insert(r.clone(), k.clone());
+                let k = st.right_keys.insert(r.clone(), k);
                 if let Some(ls) = st.left_index.get(&k) {
                     for l in ls {
                         out.insert((l.clone(), r.clone()));
@@ -825,23 +826,20 @@ where
                 return output_log_for_query.read().version;
             }
 
-            // Stage: key extraction (user code) with no lock held.
-            let l_keyed: Vec<(Delta<T>, K)> = l_pending
+            // Stage: key extraction (user code) with no lock held. Deletes
+            // use the key their insert was filed under instead.
+            let l_keyed: Vec<(Delta<T>, Option<K>)> = l_pending
                 .iter()
-                .map(|d| {
-                    let k = match d {
-                        Delta::Insert(v) | Delta::Delete(v) => left_key(v),
-                    };
-                    (d.clone(), k)
+                .map(|d| match d {
+                    Delta::Insert(v) => (d.clone(), Some(left_key(v))),
+                    Delta::Delete(_) => (d.clone(), None),
                 })
                 .collect();
-            let r_keyed: Vec<(Delta<U>, K)> = r_pending
+            let r_keyed: Vec<(Delta<U>, Option<K>)> = r_pending
                 .iter()
-                .map(|d| {
-                    let k = match d {
-                        Delta::Insert(u) | Delta::Delete(u) => right_key(u),
-                    };
-                    (d.clone(), k)
+                .map(|d| match d {
+                    Delta::Insert(u) => (d.clone(), Some(right_key(u))),
+                    Delta::Delete(_) => (d.clone(), None),
                 })
                 .collect();
 
@@ -851,7 +849,8 @@ where
             for (d, k) in l_keyed {
                 match d {
                     Delta::Insert(v) => {
-                        st.left_keys.insert(v.clone(), k.clone());
+                        let k = k.expect("insert delta staged without key");
+                        let k = st.left_keys.insert(v.clone(), k);
                         if let Some(matches) = st.right_index.get(&k) {
                             for r in matches {
                                 out.insert((v.clone(), r.clone()));
@@ -860,7 +859,7 @@ where
                         st.left_index.entry(k).or_default().push(v);
                     }
                     Delta::Delete(v) => {
-                        if st.left_keys.remove(&v).is_some() {
+                        if let Some(k) = st.left_keys.remove(&v) {
                             if let Some(bucket) = st.left_index.get_mut(&k) {
                                 if let Some(pos) = bucket.iter().position(|x| x == &v) {
                                     bucket.remove(pos);
@@ -881,7 +880,8 @@ where
             for (d, k) in r_keyed {
                 match d {
                     Delta::Insert(u) => {
-                        st.right_keys.insert(u.clone(), k.clone());
+                        let k = k.expect("insert delta staged without key");
+                        let k = st.right_keys.insert(u.clone(), k);
                         if let Some(matches) = st.left_index.get(&k) {
                             for l in matches {
                                 out.insert((l.clone(), u.clone()));
@@ -890,7 +890,7 @@ where
                         st.right_index.entry(k).or_default().push(u);
                     }
                     Delta::Delete(u) => {
-                        if st.right_keys.remove(&u).is_some() {
+                        if let Some(k) = st.right_keys.remove(&u) {
                             if let Some(bucket) = st.right_index.get_mut(&k) {
                                 if let Some(pos) = bucket.iter().position(|x| x == &u) {
                                     bucket.remove(pos);
@@ -931,10 +931,7 @@ where
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
 
         let groups: GroupMap<K, T, C> = Arc::new(OpLock::new(HashMap::new()));
-        // Maps elements to the key they were inserted under, so a Delete
-        // for the same value reaches the right group even if the key
-        // function is expensive or non-deterministic across calls.
-        let key_cache: Arc<OpLock<HashMap<T, K>, C>> = Arc::new(OpLock::new(HashMap::new()));
+        let key_cache: Arc<OpLock<KeyCache<T, K>, C>> = Arc::new(OpLock::new(KeyCache::new()));
         let output_version_counter = Arc::new(AtomicU64::new(0));
 
         {
@@ -944,7 +941,7 @@ where
             let mut grps = groups.write();
             let mut kc = key_cache.write();
             for (v, k) in keyed {
-                kc.insert(v.clone(), k.clone());
+                let k = kc.insert(v.clone(), k);
                 let group = grps
                     .entry(k)
                     .or_insert_with(|| IncrCollection::<T, C>::new_in_compute(rt));
@@ -1002,7 +999,7 @@ where
                 match d {
                     Delta::Insert(v) => {
                         let k = k.expect("insert delta staged without key");
-                        kc.insert(v.clone(), k.clone());
+                        let k = kc.insert(v.clone(), k);
                         by_group.entry(k).or_default().push(Delta::Insert(v));
                     }
                     Delta::Delete(v) => {
@@ -1054,6 +1051,38 @@ where
             version_node,
             _confine: std::marker::PhantomData,
         }
+    }
+}
+
+/// The key each live element was filed under, counted per copy, so every
+/// copy's delete reaches the bucket its insert used even when the key
+/// function is expensive or non-deterministic across calls.
+struct KeyCache<T, K>(HashMap<T, (K, usize)>);
+
+impl<T: Hash + Eq, K: Clone> KeyCache<T, K> {
+    fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    /// Records one copy of `value` and returns the key to file it under:
+    /// `key` for its first copy, and the first copy's key after that.
+    fn insert(&mut self, value: T, key: K) -> K {
+        match self.0.entry(value) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().1 += 1;
+                e.get().0.clone()
+            }
+            Entry::Vacant(e) => e.insert((key, 1)).0.clone(),
+        }
+    }
+
+    fn remove(&mut self, value: &T) -> Option<K> {
+        let (key, copies) = self.0.get_mut(value)?;
+        if *copies > 1 {
+            *copies -= 1;
+            return Some(key.clone());
+        }
+        self.0.remove(value).map(|(key, _)| key)
     }
 }
 
@@ -1746,6 +1775,40 @@ mod tests {
         assert_eq!(rt.get(n), 2);
         b.delete(&rt, &(1, 100));
         assert_eq!(rt.get(n), 1);
+    }
+
+    #[test]
+    fn group_by_deletes_every_copy_of_a_duplicate() {
+        let rt: Runtime<Local> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let groups = c.group_by(&rt, |x| x % 2);
+        c.insert(&rt, 4);
+        c.insert(&rt, 4);
+        let _ = rt.get(groups.version_node);
+        c.delete(&rt, &4);
+        c.delete(&rt, &4);
+        let _ = rt.get(groups.version_node);
+        let evens = groups.get_group(&0).expect("group 0 missing");
+        assert_eq!(evens.snapshot_len(), 0);
+    }
+
+    #[test]
+    fn join_deletes_every_copy_of_a_duplicate() {
+        let rt: Runtime<Local> = Runtime::new();
+        let a = rt.create_collection::<(i32, i32)>();
+        let b = rt.create_collection::<(i32, i32)>();
+        let j = a.join(&rt, &b, |x| x.0, |y| y.0);
+        let n = j.count(&rt);
+        a.insert(&rt, (1, 7));
+        b.insert(&rt, (1, 100));
+        for side in [&a, &b] {
+            side.insert(&rt, (1, 10));
+            side.insert(&rt, (1, 10));
+            assert_eq!(rt.get(n), 3);
+            side.delete(&rt, &(1, 10));
+            side.delete(&rt, &(1, 10));
+            assert_eq!(rt.get(n), 1);
+        }
     }
 
     /// Source with keys 0 and 1 present before `group_by` (bootstrap
