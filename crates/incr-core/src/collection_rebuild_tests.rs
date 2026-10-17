@@ -42,6 +42,15 @@ fn pairs(values: Vec<(Bomb, Bomb)>) -> Vec<(i64, i64)> {
     out
 }
 
+fn windows(values: Vec<Vec<Bomb>>) -> Vec<Vec<i64>> {
+    let mut out: Vec<Vec<i64>> = values
+        .iter()
+        .map(|w| w.iter().map(|b| b.0).collect())
+        .collect();
+    out.sort_unstable();
+    out
+}
+
 fn filter_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     let out = s.left.filter(rt, |b| {
         tick(Call::Closure);
@@ -134,6 +143,53 @@ fn join_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     }
 }
 
+fn sort_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
+    let view = s.left.sort_by_key(rt, |b| {
+        tick(Call::Closure);
+        b.0
+    });
+    let down = view.pairwise(rt);
+    Probe {
+        node: view.version_node,
+        upstream: None,
+        read: Box::new(move |rt| {
+            let _ = rt.get(view.version_node);
+            let order: Vec<i64> = view.snapshot().iter().map(|b| b.0).collect();
+            format!("{order:?} / {:?}", pairs(down.values(rt)))
+        }),
+    }
+}
+
+fn pairwise_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
+    let view = s.left.sort_by_key(rt, |b| b.0);
+    let out = view.pairwise(rt);
+    let down = out.filter(rt, |_| true);
+    Probe {
+        node: out.version_node,
+        upstream: Some(view.version_node),
+        read: Box::new(move |rt| {
+            format!("{:?} / {:?}", pairs(out.values(rt)), pairs(down.values(rt)))
+        }),
+    }
+}
+
+fn window_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
+    let view = s.left.sort_by_key(rt, |b| b.0);
+    let out = view.window(rt, 3);
+    let down = out.filter(rt, |_| true);
+    Probe {
+        node: out.version_node,
+        upstream: Some(view.version_node),
+        read: Box::new(move |rt| {
+            format!(
+                "{:?} / {:?}",
+                windows(out.values(rt)),
+                windows(down.values(rt))
+            )
+        }),
+    }
+}
+
 fn aggregate_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     let sum = s.left.aggregate(
         rt,
@@ -154,12 +210,15 @@ fn aggregate_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     }
 }
 
-fn operators<C: Cells>() -> [(&'static str, Build<C>); 5] {
+fn operators<C: Cells>() -> [(&'static str, Build<C>); 8] {
     [
         ("filter", filter_op::<C>),
         ("map", map_op::<C>),
         ("group_by", group_by_op::<C>),
         ("join", join_op::<C>),
+        ("sort_by_key", sort_op::<C>),
+        ("pairwise", pairwise_op::<C>),
+        ("window", window_op::<C>),
         ("aggregate", aggregate_op::<C>),
     ]
 }

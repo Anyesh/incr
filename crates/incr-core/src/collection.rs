@@ -16,14 +16,22 @@
 //!
 //! ## Stage-then-apply
 //!
-//! User closures (predicates, mappers, key extractors, lift/combine)
-//! run with NO lock held: each operator clones the pending delta slice
-//! out of the upstream log, evaluates user code into staged effects, and
-//! only then takes its output lock to apply clones and hash operations
-//! plus the cursor advance. A panicking user closure therefore applies
-//! nothing, the cursor stays put, and the compute panic boundary retries
-//! the whole batch cleanly. Panics inside user `Hash`/`Eq` impls during
-//! an operator's apply phase are outside this guarantee.
+//! User closures (predicates, mappers, key extractors, `lift`) run with
+//! NO lock held: each operator clones the pending delta slice out of the
+//! upstream log, evaluates user code into staged effects, and only then
+//! takes its own locks to apply them and advance the cursor. A panicking
+//! closure therefore applies nothing, the cursor stays put, and the
+//! compute panic boundary retries the whole batch cleanly. The exception
+//! is `aggregate`'s `combine`, which runs under the aggregate's state
+//! lock; only that aggregate's compute ever takes it.
+//!
+//! The apply phase still runs user `Hash`, `Eq`, `Clone` and `Drop`, and
+//! `combine`. A panic there leaves the batch partly applied, so the
+//! operator marks itself for a rebuild (`NeedsRebuild`). Its next run
+//! reads each upstream's snapshot and end under one guard, rebuilds its
+//! state into fresh structures, converges each output log to the
+//! recomputed contents with ordinary deltas, and moves the cursor to the
+//! snapshot's end.
 //!
 //! Source mutations (`insert`, `delete`, `replace`) hash and clone with
 //! no lock held, run their lookups (user `Eq`) before changing anything,
@@ -1341,7 +1349,7 @@ enum AggChange<T, U> {
 }
 
 /// Pairs each value with `f` of it, run with no lock held.
-fn paired_with<T, U>(f: &impl Fn(&T) -> U, values: Vec<T>) -> Vec<(T, U)> {
+pub(crate) fn paired_with<T, U>(f: &impl Fn(&T) -> U, values: Vec<T>) -> Vec<(T, U)> {
     values
         .into_iter()
         .map(|v| {
