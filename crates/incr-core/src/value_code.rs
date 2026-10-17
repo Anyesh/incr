@@ -1,0 +1,134 @@
+//! The per-thread word behind two checks that share one load on the
+//! non-Clean get path: its low bits count the user trait calls the
+//! engine is inside (`Clone`, `PartialEq`, `Hash`, `Ord`, `Serialize`
+//! and so on, of a value, key or element type), and its top bit says
+//! the taint memo has entries.
+//!
+//! Every engine path that can claim, wait, lock or create panics while
+//! the counter is non-zero, because such a call from inside a user trait
+//! method would re-enter a lock its own thread holds or wait on a claim
+//! it cannot release. Operator closures are compute code, not value
+//! code, and run outside the counter; so does user `Drop`, which the
+//! engine cannot wrap because a retire may run it on any thread.
+
+use std::cell::Cell;
+
+/// Set while the taint memo has entries.
+pub(crate) const MEMO_BIT: u64 = 1 << 63;
+
+/// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
+/// so a live memo never trips the contract panic.
+pub(crate) const COUNTER_MASK: u64 = !MEMO_BIT;
+
+pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
+
+#[cfg(not(loom))]
+thread_local! {
+    static THREAD_WORD: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(loom)]
+loom::thread_local! {
+    static THREAD_WORD: Cell<u64> = Cell::new(0);
+}
+
+#[inline(always)]
+pub(crate) fn thread_word() -> u64 {
+    THREAD_WORD.with(Cell::get)
+}
+
+pub(crate) fn set_memo_bit() {
+    THREAD_WORD.with(|w| w.set(w.get() | MEMO_BIT));
+}
+
+pub(crate) fn clear_memo_bit() {
+    THREAD_WORD.with(|w| w.set(w.get() & COUNTER_MASK));
+}
+
+/// Holds one count on the counter; dropping it, by a panic included,
+/// gives the count back.
+pub(crate) struct ValueCode(());
+
+impl Drop for ValueCode {
+    #[inline(always)]
+    fn drop(&mut self) {
+        THREAD_WORD.with(|w| w.set(w.get() - 1));
+    }
+}
+
+/// Enter value code for the guard's lifetime: the engine is about to
+/// call a user trait method of a value, key or element type.
+#[inline(always)]
+pub(crate) fn enter() -> ValueCode {
+    THREAD_WORD.with(|w| w.set(w.get() + 1));
+    ValueCode(())
+}
+
+/// Run `f`, a call into user trait methods, inside the counter.
+#[inline(always)]
+pub(crate) fn run<R>(f: impl FnOnce() -> R) -> R {
+    let _guard = enter();
+    f()
+}
+
+/// Runs `f` as value code, so that a call it makes into the runtime
+/// panics with the contract message instead of deadlocking. For the
+/// crates that serialize and compare values on the engine's behalf.
+#[doc(hidden)]
+pub fn with_value_code<R>(f: impl FnOnce() -> R) -> R {
+    run(f)
+}
+
+/// The contract panic of a checked path reached from value code.
+#[cold]
+#[inline(never)]
+pub(crate) fn contract_panic() -> ! {
+    panic!("incr-core: {}", CONTRACT_MESSAGE);
+}
+
+/// Panics if the current thread is inside value code. One load and
+/// branch; the panic is out of line.
+#[inline(always)]
+pub(crate) fn check() {
+    if thread_word() & COUNTER_MASK != 0 {
+        contract_panic();
+    }
+}
+
+/// The cold arm of a site that already found `word` non-zero: tells a
+/// live memo from a value-code count and panics for the count.
+#[cold]
+#[inline(never)]
+pub(crate) fn check_nonzero(word: u64) {
+    if word & COUNTER_MASK != 0 {
+        contract_panic();
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_counter_balances_across_a_panic_and_leaves_the_memo_bit() {
+        assert_eq!(thread_word(), 0);
+        set_memo_bit();
+        let outer = enter();
+        assert_eq!(thread_word(), MEMO_BIT | 1);
+        let unwound = std::panic::catch_unwind(|| {
+            let _inner = enter();
+            assert_eq!(thread_word(), MEMO_BIT | 2);
+            check();
+        });
+        assert!(unwound.is_err());
+        assert_eq!(thread_word(), MEMO_BIT | 1);
+        drop(outer);
+        assert_eq!(thread_word(), MEMO_BIT);
+        check();
+        check_nonzero(thread_word());
+        clear_memo_bit();
+        assert_eq!(thread_word(), 0);
+        assert_eq!(with_value_code(thread_word), 1);
+        assert_eq!(thread_word(), 0);
+    }
+}

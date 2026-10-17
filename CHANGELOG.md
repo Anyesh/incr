@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-beta.6] - unreleased
+
+### Changed
+
+- **Contract change: value and key methods must not call into the runtime.** A `Clone`, `PartialEq`, `Hash`, `Eq` or `Ord` that the runtime calls on a value, a collection element or a key now panics with "value and key methods must not call into the runtime" if it reads or writes any node or collection, under `Local` and `Shared` alike. Clean nodes included: beta.5 returned the value there, but under `Shared` that read held a type arena's read lock across the user `clone`, so a `clone` that read another node of the same type could deadlock behind a queued writer. A later release restores reads of Clean nodes, and of inputs another thread is setting, from value code. `Drop` is under the same contract but is not checked, because a displaced value may be reclaimed on any thread; a `Drop` that calls into the runtime may panic or deadlock, never corrupt the graph. Operator closures are unaffected.
+
 ## [0.2.0-beta.5] - unreleased
 
 ### Added

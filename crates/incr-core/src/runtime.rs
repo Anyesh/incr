@@ -34,6 +34,7 @@ use crate::segmented_nodes::SegmentedNodes;
 use crate::state::{self, NodeState};
 use crate::taint_memo;
 use crate::value::Value;
+use crate::value_code;
 
 /// Compute closure: takes a borrow of the runtime, the node's slot, and
 /// whether this is a recompute (true) or first compute (false). Returns
@@ -456,6 +457,7 @@ impl<C: Cells> Runtime<C> {
     /// of the currently-computing node (i.e., the new node is downstream
     /// of the operator, not upstream).
     pub(crate) fn create_input_unchecked<T: Value>(&self, value: T) -> Incr<T> {
+        value_code::check();
         let revision = self.current_revision();
         let (slot, generation) = {
             let mut inner = self.inner.write();
@@ -490,6 +492,7 @@ impl<C: Cells> Runtime<C> {
             !self.dep_stack.current_frame_active(),
             "create_query called during compute; not permitted",
         );
+        value_code::check();
 
         let (slot, generation) = {
             let mut inner = self.inner.write();
@@ -614,6 +617,7 @@ impl<C: Cells> Runtime<C> {
     where
         F: Fn(&T) + Send + Sync + 'static,
     {
+        value_code::check();
         self.check_handle(handle);
         let slot = handle.slot();
         let node = self.nodes.get(slot);
@@ -659,6 +663,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Remove an observer. Safe to call with an already-removed id.
     pub fn unobserve(&self, id: ObserverId) {
+        value_code::check();
         // Bound to a local so the entry, whose callback is user code,
         // drops after the write guard does.
         let removed = self.inner.write().observers.remove(&id.0);
@@ -671,6 +676,7 @@ impl<C: Cells> Runtime<C> {
     /// not call `stabilize` reentrantly from another thread if duplicate
     /// notifications matter.
     pub fn stabilize(&self) {
+        value_code::check();
         let entries: Vec<(u64, u64, ObserverRunFn<C>)> = {
             let inner = self.inner.read();
             inner
@@ -770,6 +776,7 @@ impl<C: Cells> Runtime<C> {
     /// is empty by then.
     fn delete_strict(&self, root: ErasedIncr) -> Result<(), StrictRefusal> {
         debug_assert_eq!(root.runtime_id(), self.runtime_id);
+        value_code::check();
         let id = NodeId(root.slot());
         let node = self.nodes.get(root.slot());
         if node.generation() != root.generation() {
@@ -906,6 +913,7 @@ impl<C: Cells> Runtime<C> {
     /// node may depend on `root`, and the cascade would wait on it
     /// forever.
     pub fn delete_with_dependents(&self, root: impl Into<ErasedIncr>) -> usize {
+        value_code::check();
         let root = root.into();
         assert!(
             !self.dep_stack.current_frame_active(),
@@ -963,6 +971,7 @@ impl<C: Cells> Runtime<C> {
     /// claims owned nodes after their owner and relies on an input's
     /// state never moving except to `Dead`.
     pub(crate) fn adopt(&self, owner: ErasedIncr, child: ErasedIncr) {
+        value_code::check();
         let mut inner = self.inner.write();
         for h in [owner, child] {
             assert!(
@@ -1020,6 +1029,7 @@ impl<C: Cells> Runtime<C> {
             self.runtime_id,
             "incr-core: delete of a handle from a foreign runtime",
         );
+        value_code::check();
         let slot = handle.slot();
         let id = NodeId(slot);
         let node = self.nodes.get(slot);
@@ -1144,6 +1154,10 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
 
         if state::load::<C>(node.state_cell()) == NodeState::Clean {
+            // Until the Clean read stops taking locks, value code is
+            // refused here too, where `get_slow` refuses it through
+            // `ensure_clean`.
+            value_code::check();
             // Seqlock order: the fields first, then the generation under
             // an Acquire fence, so a generation that still matches the
             // handle says the fields are this node's, not an occupant's
@@ -1198,7 +1212,7 @@ impl<C: Cells> Runtime<C> {
             let inner = self.inner.read();
             inner.arenas.tagged_arena::<T>(type_tag)
         };
-        let value = arena.and_then(|arena| arena.try_read(arena_slot));
+        let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)));
         C::fence_acquire();
         if self.nodes.get(slot).generation() == handle.generation() {
             if let Some(value) = value {
@@ -1342,6 +1356,7 @@ impl<C: Cells> Runtime<C> {
     /// query node would overwrite its computed value and bypass the
     /// state machine; the only valid setter is the compute closure itself.
     pub fn set<T: Value>(&self, handle: Incr<T>, value: T) {
+        value_code::check();
         self.check_handle(handle);
         let slot = handle.slot();
 
@@ -1369,7 +1384,7 @@ impl<C: Cells> Runtime<C> {
         // No-op if the value is unchanged. Racy against a concurrent
         // set(), but benignly: the no-op linearizes before the other
         // setter.
-        if arena.eq_current(node.arena_slot(), &value) {
+        if value_code::run(|| arena.eq_current(node.arena_slot(), &value)) {
             return;
         }
 
@@ -1507,12 +1522,20 @@ impl<C: Cells> Runtime<C> {
     /// recorded it sees the dead dep at its publish. A root found
     /// recycled is reported as `Gone` for the caller's stale panic.
     fn ensure_clean(&self, id: NodeId, gen: u32) -> Computed {
+        // One load serves the value-code check and the memo: a non-zero
+        // word is either, and only then does the cold arm tell them apart.
+        // The check precedes the fast path because a Clean read still
+        // takes locks in this release.
+        let word = value_code::thread_word();
+        if word != 0 {
+            value_code::check_nonzero(word);
+        }
+
         // Fast path: already clean.
         if state::load::<C>(self.nodes.get(id.0).state_cell()) == NodeState::Clean {
             return Computed::Done;
         }
 
-        let word = taint_memo::thread_word();
         if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
             return self.compute_one(id, Visit::Direct, Some(gen));
         }
@@ -2140,6 +2163,10 @@ mod cascade_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_walk_tests.rs"]
 mod walk_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_value_code_tests.rs"]
+pub(crate) mod value_code_tests;
 
 #[cfg(test)]
 mod tests {

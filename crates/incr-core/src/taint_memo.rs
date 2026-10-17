@@ -11,39 +11,26 @@
 //! node directly is always a legal landing, so an entry can only cost a
 //! closure run where a verify would have passed, never a wrong value.
 //!
-//! The memo's non-empty state is a bit of `THREAD_WORD`, whose low bits
-//! are reserved for the value-code counter, so a single load and compare
-//! against zero on the non-Clean get path covers both and only a
-//! non-zero word takes the cold path that tells them apart.
+//! The memo's non-empty state is a bit of the thread word in
+//! `value_code`, whose low bits count value-code calls, so a single load
+//! and compare against zero on the non-Clean get path covers both and
+//! only a non-zero word takes the cold path that tells them apart.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
-
-/// Set in `THREAD_WORD` while the memo has entries.
-const MEMO_BIT: u64 = 1 << 63;
-
-/// The value-code counter's bits of `THREAD_WORD`. Its check sites test
-/// `word & COUNTER_MASK`, so a live memo never trips the contract panic.
-pub(crate) const COUNTER_MASK: u64 = !MEMO_BIT;
+use crate::value_code::{self, MEMO_BIT};
 
 #[cfg(not(loom))]
 thread_local! {
-    static THREAD_WORD: Cell<u64> = const { Cell::new(0) };
     static MEMO: RefCell<HashMap<(RuntimeId, NodeId), u32>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(loom)]
 loom::thread_local! {
-    static THREAD_WORD: Cell<u64> = Cell::new(0);
     static MEMO: RefCell<HashMap<(RuntimeId, NodeId), u32>> = RefCell::new(HashMap::new());
-}
-
-#[inline(always)]
-pub(crate) fn thread_word() -> u64 {
-    THREAD_WORD.with(Cell::get)
 }
 
 /// Whether `id` of `rt` is memoized, given a non-zero `word`.
@@ -61,7 +48,7 @@ pub(crate) fn memoize(rt: RuntimeId, id: NodeId, owner: u32) {
         let entry = m.entry((rt, id)).or_insert(owner);
         *entry = (*entry).min(owner);
     });
-    THREAD_WORD.with(|w| w.set(w.get() | MEMO_BIT));
+    value_code::set_memo_bit();
 }
 
 /// Clear the entries owned by the frame at `depth` or deeper, when that
@@ -71,7 +58,7 @@ pub(crate) fn clear_from(depth: u32) {
         let mut m = m.borrow_mut();
         m.retain(|_, owner| *owner < depth);
         if m.is_empty() {
-            THREAD_WORD.with(|w| w.set(w.get() & COUNTER_MASK));
+            value_code::clear_memo_bit();
         }
     });
 }
@@ -79,6 +66,7 @@ pub(crate) fn clear_from(depth: u32) {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+    use crate::value_code::thread_word;
 
     #[test]
     fn entries_keep_the_lowest_owner_and_clear_from_a_depth() {

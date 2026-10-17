@@ -35,6 +35,7 @@ use std::cell::{RefCell, UnsafeCell};
 use haphazard::{AtomicPtr as HzAtomicPtr, HazardPointer};
 
 use crate::value::Value;
+use crate::value_code;
 
 /// Storage for one node's value, parameterized by the `Cells` strategy
 /// through `Cells::ValueSlot<T>`.
@@ -127,7 +128,7 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
         let unchanged = unsafe {
             (*self.0.get())
                 .as_ref()
-                .map(|cur| cur == &v)
+                .map(|cur| value_code::run(|| cur == &v))
                 .unwrap_or(false)
         };
         if unchanged {
@@ -226,7 +227,7 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         let unchanged = with_pooled_hazard(|hp| {
             // SAFETY: see read().
             unsafe { self.0.load(hp) }
-                .map(|cur| cur == &v)
+                .map(|cur| value_code::run(|| cur == &v))
                 .unwrap_or(false)
         });
         if unchanged {

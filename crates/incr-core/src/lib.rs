@@ -40,6 +40,7 @@ mod taint_memo;
 mod test_size;
 pub mod trace;
 pub mod value;
+mod value_code;
 pub mod value_slot;
 pub mod walk_ring;
 
@@ -58,6 +59,8 @@ pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
 pub use trace::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction};
 pub use value::Value;
+#[doc(hidden)]
+pub use value_code::with_value_code;
 pub use value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
 
 #[cfg(test)]
