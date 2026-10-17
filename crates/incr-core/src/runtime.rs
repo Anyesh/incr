@@ -369,11 +369,14 @@ struct Walk {
 }
 
 impl Walk {
-    fn new(root: NodeId) -> Self {
+    /// `pending` starts the walk at the root's compute, skipping its
+    /// expansion.
+    #[inline]
+    fn new(root: NodeId, pending: bool) -> Self {
         Self {
             work: vec![Entry {
                 id: root,
-                pending: false,
+                pending,
                 taint: NO_TAINT,
             }],
             first_visits: 0,
@@ -381,6 +384,7 @@ impl Walk {
         }
     }
 
+    #[inline]
     fn visit(&mut self, id: NodeId) {
         self.work.push(Entry {
             id,
@@ -388,11 +392,19 @@ impl Walk {
             taint: NO_TAINT,
         });
         self.first_visits += 1;
+        if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
+            self.visit_exact(id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn visit_exact(&mut self, id: NodeId) {
         match &mut self.visited {
             Some(visited) => {
                 visited.insert(id);
             }
-            None if self.first_visits == EXACT_MODE_AT => {
+            None => {
                 self.visited = Some(
                     self.work
                         .iter()
@@ -401,10 +413,10 @@ impl Walk {
                         .collect(),
                 );
             }
-            None => {}
         }
     }
 
+    #[inline]
     fn expand(&mut self, dep: NodeId) {
         self.work.push(Entry {
             id: dep,
@@ -413,8 +425,18 @@ impl Walk {
         });
     }
 
+    #[inline]
     fn is_visited(&self, id: NodeId) -> bool {
-        self.visited.as_ref().is_some_and(|v| v.contains(&id))
+        match &self.visited {
+            Some(visited) => Self::contains(visited, id),
+            None => false,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn contains(visited: &HashSet<NodeId>, id: NodeId) -> bool {
+        visited.contains(&id)
     }
 
     /// Taint the entry whose deps are being processed: the nearest
@@ -537,13 +559,20 @@ impl<C: Cells> Runtime<C> {
         C::u8_load_relaxed(&self.tracing_armed) == 1
     }
 
+    #[inline(always)]
     fn record_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
         if self.tracing_is_armed() {
-            self.inner
-                .write()
-                .trace_log
-                .push(crate::trace::NodeTrace { id, action });
+            self.push_trace(id, action);
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
+        self.inner
+            .write()
+            .trace_log
+            .push(crate::trace::NodeTrace { id, action });
     }
 
     #[inline]
@@ -947,6 +976,10 @@ impl<C: Cells> Runtime<C> {
     /// deletes a member then panics as stale instead of waiting on this
     /// thread's own claim (bug h).
     fn release_tree(&self, owned: Vec<ErasedIncr>, root: ErasedIncr, bag: &mut Deferred<C>) {
+        if owned.is_empty() {
+            self.release_claimed(root, bag);
+            return;
+        }
         let retired: Vec<Retired<C>> = owned
             .into_iter()
             .rev()
@@ -1259,6 +1292,7 @@ impl<C: Cells> Runtime<C> {
     /// must own nothing by now: its owned nodes are released first. Its
     /// closure, observers, value and displaced dep list go into `bag`,
     /// which the delete drains once it holds no lock.
+    #[inline(always)]
     fn release_claimed(&self, handle: ErasedIncr, bag: &mut Deferred<C>) {
         let retired = self.retire_claimed(handle);
         let (drops, dep_list) = {
@@ -1275,6 +1309,7 @@ impl<C: Cells> Runtime<C> {
     /// before the hold: the deps and the Dead state are cleared before
     /// the slot can reach the free list, and the displaced list is
     /// retired only at the bag's drain.
+    #[inline(always)]
     fn retire_claimed(&self, handle: ErasedIncr) -> Retired<C> {
         let node = self.nodes.get(handle.slot());
         let mut old_deps: Vec<NodeId> = Vec::new();
@@ -1293,6 +1328,7 @@ impl<C: Cells> Runtime<C> {
     /// bag drops later. The closures, observers and value are dropped
     /// only at the bag's drain, after the lock is released, because their
     /// Drop impls are user code that may call back into the runtime.
+    #[inline(always)]
     fn unhook_retired(
         &self,
         inner: &mut Inner<C>,
@@ -1369,7 +1405,7 @@ impl<C: Cells> Runtime<C> {
                 self.stale_handle(handle);
             }
             self.dep_stack.record_dep(NodeId(slot), handle.generation());
-            return self.read_slot(handle, type_tag, arena_slot);
+            return self.read_slot(handle, node, type_tag, arena_slot);
         }
         self.get_slow(handle)
     }
@@ -1384,7 +1420,9 @@ impl<C: Cells> Runtime<C> {
         }
         self.dep_stack.record_dep(NodeId(slot), handle.generation());
 
-        if self.ensure_clean(NodeId(slot), handle.generation()) == Computed::Gone {
+        // `get` found the node not Clean, so the walk starts at once.
+        let word = value_code::checked_word();
+        if self.clean_walk(NodeId(slot), handle.generation(), word) == Computed::Gone {
             self.stale_handle(handle);
         }
 
@@ -1394,7 +1432,7 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != handle.generation() {
             self.stale_handle(handle);
         }
-        self.read_slot(handle, type_tag, arena_slot)
+        self.read_slot(handle, node, type_tag, arena_slot)
     }
 
     /// Clone the value behind a node's tag and arena slot, both read
@@ -1404,16 +1442,21 @@ impl<C: Cells> Runtime<C> {
     /// writes the slot under the arena lock the read takes, after the
     /// bump, so a reader of the occupant's value sees the bump too.
     #[inline(always)]
-    fn read_slot<T: Value>(&self, handle: Incr<T>, type_tag: u16, arena_slot: u32) -> T {
-        let slot = handle.slot();
-        self.park(ParkPoint::GetBeforeRead(NodeId(slot)));
+    fn read_slot<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+    ) -> T {
+        self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
         let arena = {
             let inner = self.inner.read();
             inner.arenas.tagged_arena::<T>(type_tag)
         };
         let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)));
         C::fence_acquire();
-        if self.nodes.get(slot).generation() == handle.generation() {
+        if node.generation() == handle.generation() {
             if let Some(value) = value {
                 return value;
             }
@@ -1851,26 +1894,27 @@ impl<C: Cells> Runtime<C> {
     /// recycled under the walk is dropped, because the parent that
     /// recorded it sees the dead dep at its publish. A root found
     /// recycled is reported as `Gone` for the caller's stale panic.
+    #[inline]
     fn ensure_clean(&self, id: NodeId, gen: u32) -> Computed {
-        // One load serves the value-code check and the memo: a non-zero
-        // word is either, and only then does the cold arm tell them apart.
         // The check precedes the fast path because a Clean read still
         // takes locks in this release.
-        let word = value_code::thread_word();
-        if word != 0 {
-            value_code::check_nonzero(word);
-        }
+        let word = value_code::checked_word();
 
         // Fast path: already clean.
         if state::load::<C>(self.nodes.get(id.0).state_cell()) == NodeState::Clean {
             return Computed::Done;
         }
+        self.clean_walk(id, gen, word)
+    }
 
-        if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
-            return self.compute_one(id, Visit::Direct, Some(gen));
-        }
-
-        let mut walk = Walk::new(id);
+    /// [`Self::ensure_clean`] past its fast path, for a caller that took
+    /// `word` from `value_code::checked_word` and found `id` not Clean.
+    /// A root that went Clean since is left at its first pop.
+    fn clean_walk(&self, id: NodeId, gen: u32, word: u64) -> Computed {
+        // A memoized root is computed directly, as the walk's only
+        // entry, so `compute_one` keeps a single call site and inlines.
+        let direct = word != 0 && taint_memo::memoized(word, self.runtime_id, id);
+        let mut walk = Walk::new(id, direct);
         let mut root = Computed::Done;
 
         while let Some(Entry {
@@ -1881,13 +1925,20 @@ impl<C: Cells> Runtime<C> {
         {
             let is_root = walk.work.is_empty();
             if pending {
-                self.park(ParkPoint::BeforeComputeOne(cur));
-                if is_root {
-                    root = self.compute_one(cur, Visit::Full, Some(gen));
-                } else if taint == NO_TAINT {
-                    self.compute_one(cur, Visit::Full, None);
+                let visit = if direct {
+                    Visit::Direct
                 } else {
-                    self.compute_one(cur, Visit::VerifyOnly(taint), None);
+                    self.park(ParkPoint::BeforeComputeOne(cur));
+                    if is_root || taint == NO_TAINT {
+                        Visit::Full
+                    } else {
+                        Visit::VerifyOnly(taint)
+                    }
+                };
+                let computed = self.compute_one(cur, visit, is_root.then_some(gen));
+                if is_root {
+                    root = computed;
+                } else if taint != NO_TAINT {
                     walk.taint(taint);
                 }
                 continue;
@@ -1963,6 +2014,7 @@ impl<C: Cells> Runtime<C> {
     /// nothing included (`Gone`, the input arm, a retry that found the
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
+    #[inline(always)]
     fn compute_one(&self, id: NodeId, visit: Visit, gen: Option<u32>) -> Computed {
         let mut bag = Deferred::new();
         let computed = self.compute_attempts(id, visit, gen, &mut bag);
@@ -1970,6 +2022,7 @@ impl<C: Cells> Runtime<C> {
         computed
     }
 
+    #[inline(always)]
     fn compute_attempts(
         &self,
         id: NodeId,
