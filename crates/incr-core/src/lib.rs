@@ -34,6 +34,7 @@ pub mod runtime;
 pub mod segmented_nodes;
 pub mod sorted_collection;
 pub mod state;
+mod taint_memo;
 #[cfg(test)]
 mod test_size;
 pub mod trace;

@@ -32,6 +32,7 @@ use crate::locks::Lock;
 use crate::node::{NodeData, NodeId};
 use crate::segmented_nodes::SegmentedNodes;
 use crate::state::{self, NodeState};
+use crate::taint_memo;
 use crate::value::Value;
 
 /// Compute closure: takes a borrow of the runtime, the node's slot, and
@@ -231,6 +232,9 @@ enum Visit {
     /// leave the node Dirty for the root's own compute to re-read. The
     /// payload is the depth of the frame that owns the taint.
     VerifyOnly(u32),
+    /// A root the taint memo holds: claim and run the closure without
+    /// verifying, because its verify already failed under taint.
+    Direct,
 }
 
 /// `Entry::taint` of an entry no skipped dep has reached.
@@ -337,6 +341,8 @@ pub struct Runtime<C: Cells> {
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
     first_visits: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    expansions: std::sync::atomic::AtomicU64,
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -359,6 +365,8 @@ impl<C: Cells> Runtime<C> {
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
             first_visits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            expansions: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -366,6 +374,12 @@ impl<C: Cells> Runtime<C> {
     #[cfg(all(test, not(loom)))]
     pub(crate) fn first_visits(&self) -> u64 {
         self.first_visits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Dep expansions made by every `ensure_clean` walk on this runtime so far.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn expansions(&self) -> u64 {
+        self.expansions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1379,6 +1393,12 @@ impl<C: Cells> Runtime<C> {
             return;
         }
 
+        let word = taint_memo::thread_word();
+        if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
+            self.compute_one(id, Visit::Direct);
+            return;
+        }
+
         let mut walk = Walk::new(id);
 
         while let Some(Entry {
@@ -1419,6 +1439,9 @@ impl<C: Cells> Runtime<C> {
                     walk.visit(cur);
                 }
                 _ => {
+                    #[cfg(test)]
+                    self.expansions
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     walk.visit(cur);
                     node.for_each_dep(|dep| {
                         let dep_node = self.nodes.get(dep.0);
@@ -1495,7 +1518,8 @@ impl<C: Cells> Runtime<C> {
                 NodeState::New => {
                     // Nothing to verify against, and the walk must not run
                     // the closure of a tainted node.
-                    if let Visit::VerifyOnly(_) = visit {
+                    if let Visit::VerifyOnly(owner) = visit {
+                        self.memoize(id, owner);
                         return;
                     }
                 }
@@ -1527,7 +1551,7 @@ impl<C: Cells> Runtime<C> {
             // meanwhile flags ComputingDirty and blocks the Clean landing.
             // The claim source tells us exactly whether this is a
             // recompute: the node may have gone Dirty since `observed`.
-            let verifying = observed == NodeState::Dirty;
+            let verifying = observed == NodeState::Dirty && visit != Visit::Direct;
             let claimed_dirty = if verifying {
                 if state::try_transition::<C>(
                     node.state_cell(),
@@ -1587,12 +1611,13 @@ impl<C: Cells> Runtime<C> {
                     }
                     return;
                 }
-                if let Visit::VerifyOnly(_) = visit {
+                if let Visit::VerifyOnly(owner) = visit {
                     // The root's own compute re-reads this node through a
                     // nested get if it still needs it, and that read
                     // poisons where needed; a poison here would cost the
                     // root a Clean landing for an edge it may have dropped.
                     self.land(node, NodeState::Dirty, NodeState::Dirty);
+                    self.memoize(id, owner);
                     return;
                 }
                 // Keep the claim and recompute; the closure's nested reads
@@ -1613,6 +1638,9 @@ impl<C: Cells> Runtime<C> {
                 (compute)(self, id.0, is_recompute)
             }));
             let frame = self.dep_stack.pop_frame();
+            if frame.memo_owner {
+                taint_memo::clear_from(frame.depth);
+            }
 
             let value_changed = match result {
                 Ok(changed) => changed,
@@ -1702,6 +1730,13 @@ impl<C: Cells> Runtime<C> {
     /// its input.
     fn own_claim_depth(&self, id: NodeId) -> Option<usize> {
         self.dep_stack.frame_depth(id)
+    }
+
+    /// Memoize a node verify-only left non-Clean under the frame at depth
+    /// `owner`, whose pop clears the entry.
+    fn memoize(&self, id: NodeId, owner: u32) {
+        taint_memo::memoize(self.runtime_id, id, owner);
+        self.dep_stack.mark_memo_owner(owner as usize);
     }
 
     /// Leave this thread's `Computing` claim for `target`, or for `flagged`
