@@ -36,6 +36,12 @@ struct Probe<C: Cells> {
 type Build<C> = fn(&Runtime<C>, &Sources<C>) -> Probe<C>;
 type Reader<C> = Box<dyn Fn(&Runtime<C>) -> String>;
 
+fn pairs(values: Vec<(Bomb, Bomb)>) -> Vec<(i64, i64)> {
+    let mut out: Vec<(i64, i64)> = values.iter().map(|(a, b)| (a.0, b.0)).collect();
+    out.sort_unstable();
+    out
+}
+
 fn filter_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     let out = s.left.filter(rt, |b| {
         tick(Call::Closure);
@@ -105,6 +111,29 @@ fn group_by_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     }
 }
 
+fn join_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
+    let out = s.left.join(
+        rt,
+        &s.right,
+        |b| {
+            tick(Call::Closure);
+            b.0 % 3
+        },
+        |b| {
+            tick(Call::Closure);
+            b.0 % 3
+        },
+    );
+    let down = out.filter(rt, |_| true);
+    Probe {
+        node: out.version_node,
+        upstream: None,
+        read: Box::new(move |rt| {
+            format!("{:?} / {:?}", pairs(out.values(rt)), pairs(down.values(rt)))
+        }),
+    }
+}
+
 fn aggregate_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     let sum = s.left.aggregate(
         rt,
@@ -125,11 +154,12 @@ fn aggregate_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     }
 }
 
-fn operators<C: Cells>() -> [(&'static str, Build<C>); 4] {
+fn operators<C: Cells>() -> [(&'static str, Build<C>); 5] {
     [
         ("filter", filter_op::<C>),
         ("map", map_op::<C>),
         ("group_by", group_by_op::<C>),
+        ("join", join_op::<C>),
         ("aggregate", aggregate_op::<C>),
     ]
 }

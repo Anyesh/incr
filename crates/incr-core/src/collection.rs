@@ -791,7 +791,7 @@ where
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
-        let state = AggState::build(identity.clone(), lifted(&lift, bootstrap), &combine);
+        let state = AggState::build(identity.clone(), paired_with(&lift, bootstrap), &combine);
         let state: Arc<OpLock<AggState<T, U>, C>> = Arc::new(OpLock::new(state));
 
         let rebuild = NeedsRebuild::new();
@@ -801,7 +801,8 @@ where
 
             if rebuild.is_set() {
                 let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
-                let fresh = AggState::build(identity.clone(), lifted(&lift, snapshot), &combine);
+                let fresh =
+                    AggState::build(identity.clone(), paired_with(&lift, snapshot), &combine);
                 let root = fresh.root().clone();
                 let stale = std::mem::replace(&mut *state_for_query.write(), fresh);
                 cursor.store(end, MemOrdering::Release);
@@ -864,13 +865,6 @@ where
         FL: Fn(&T) -> K + Send + Sync + 'static,
         FR: Fn(&U) -> K + Send + Sync + 'static,
     {
-        struct JoinState<T2, U2, K2> {
-            left_index: HashMap<K2, Vec<T2>>,
-            right_index: HashMap<K2, Vec<U2>>,
-            left_keys: KeyCache<T2, K2>,
-            right_keys: KeyCache<U2, K2>,
-        }
-
         let left_log = Arc::clone(&self.log);
         let right_log = Arc::clone(&right.log);
         let left_version = self.version_node;
@@ -879,40 +873,49 @@ where
         let (left_cursor, left_boot) = left_log.write().register_consumer();
         let (right_cursor, right_boot) = right_log.write().register_consumer();
 
-        let mut st = JoinState::<T, U, K> {
-            left_index: HashMap::new(),
-            right_index: HashMap::new(),
-            left_keys: KeyCache::new(),
-            right_keys: KeyCache::new(),
-        };
+        // Key extraction (user code) happens before the output lock.
+        let (st, pairs) = JoinState::build(
+            paired_with(&left_key, left_boot),
+            paired_with(&right_key, right_boot),
+        );
         let output_log: Arc<OpLock<CollectionLog<(T, U)>, C>> =
             Arc::new(OpLock::new(CollectionLog::new()));
         {
-            // Key extraction (user code) happens before the output lock.
-            let left_keyed: Vec<(&T, K)> = left_boot.iter().map(|l| (l, left_key(l))).collect();
-            let right_keyed: Vec<(&U, K)> = right_boot.iter().map(|r| (r, right_key(r))).collect();
             let mut out = output_log.write();
-            for (l, k) in left_keyed {
-                let k = st.left_keys.insert(l.clone(), k);
-                st.left_index.entry(k).or_default().push(l.clone());
-            }
-            for (r, k) in right_keyed {
-                let k = st.right_keys.insert(r.clone(), k);
-                if let Some(ls) = st.left_index.get(&k) {
-                    for l in ls {
-                        out.insert((l.clone(), r.clone()));
-                    }
-                }
-                st.right_index.entry(k).or_default().push(r.clone());
+            for pair in pairs {
+                out.insert(pair);
             }
         }
         let state: Arc<OpLock<JoinState<T, U, K>, C>> = Arc::new(OpLock::new(st));
 
+        let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
         let output_log_for_query = Arc::clone(&output_log);
         let version_node = rt.create_query(move |rt| -> u64 {
             let _lv = rt.get(left_version);
             let _rv = rt.get(right_version);
+            let mut keep = Vec::new();
+
+            if rebuild.is_set() {
+                let (l_snapshot, l_end) = rebuild_snapshot(rt, &left_log, CollectionLog::snapshot);
+                let (r_snapshot, r_end) = rebuild_snapshot(rt, &right_log, CollectionLog::snapshot);
+                let (fresh, pairs) = JoinState::build(
+                    paired_with(&left_key, l_snapshot),
+                    paired_with(&right_key, r_snapshot),
+                );
+                let mut st = state_for_query.write();
+                let mut out = output_log_for_query.write();
+                out.converge(pairs, &mut keep);
+                let stale = std::mem::replace(&mut *st, fresh);
+                left_cursor.store(l_end, MemOrdering::Release);
+                right_cursor.store(r_end, MemOrdering::Release);
+                rebuild.clear();
+                let version = out.version;
+                drop(out);
+                drop(st);
+                drop(stale);
+                return version;
+            }
 
             let (l_from, l_pending) = {
                 let l = left_log.read();
@@ -938,92 +941,41 @@ where
             if l_pending.is_empty() && r_pending.is_empty() {
                 return output_log_for_query.read().version;
             }
+            let l_to = l_from + l_pending.len() as u64;
+            let r_to = r_from + r_pending.len() as u64;
 
             // Stage: key extraction (user code) with no lock held. Deletes
             // use the key their insert was filed under instead.
-            let l_keyed: Vec<(Delta<T>, Option<K>)> = l_pending
-                .iter()
-                .map(|d| match d {
-                    Delta::Insert(v) => (d.clone(), Some(left_key(v))),
-                    Delta::Delete(_) => (d.clone(), None),
-                })
-                .collect();
-            let r_keyed: Vec<(Delta<U>, Option<K>)> = r_pending
-                .iter()
-                .map(|d| match d {
-                    Delta::Insert(u) => (d.clone(), Some(right_key(u))),
-                    Delta::Delete(_) => (d.clone(), None),
-                })
-                .collect();
+            let l_keyed = keyed_inserts(&left_key, l_pending);
+            let r_keyed = keyed_inserts(&right_key, r_pending);
 
             let mut st = state_for_query.write();
             let mut out = output_log_for_query.write();
-
-            for (d, k) in l_keyed {
-                match d {
-                    Delta::Insert(v) => {
-                        let k = k.expect("insert delta staged without key");
-                        let k = st.left_keys.insert(v.clone(), k);
-                        if let Some(matches) = st.right_index.get(&k) {
-                            for r in matches {
-                                out.insert((v.clone(), r.clone()));
-                            }
-                        }
-                        st.left_index.entry(k).or_default().push(v);
-                    }
-                    Delta::Delete(v) => {
-                        if let Some(k) = st.left_keys.remove(&v) {
-                            if let Some(bucket) = st.left_index.get_mut(&k) {
-                                if let Some(pos) = bucket.iter().position(|x| x == &v) {
-                                    bucket.remove(pos);
-                                }
-                                if bucket.is_empty() {
-                                    st.left_index.remove(&k);
-                                }
-                            }
-                            if let Some(matches) = st.right_index.get(&k) {
-                                for r in matches {
-                                    out.delete(&(v.clone(), r.clone()));
-                                }
-                            }
-                        }
+            rebuild.guard(|| {
+                let JoinState { left, right } = &mut *st;
+                for change in l_keyed {
+                    match change {
+                        Keyed::Insert(v, k) => left.insert(v, k, right, |l, r| {
+                            out.insert_kept((l.clone(), r.clone()), &mut keep);
+                        }),
+                        Keyed::Delete(v) => left.delete(&v, right, |l, r| {
+                            out.delete_kept((l.clone(), r.clone()), &mut keep);
+                        }),
                     }
                 }
-            }
-            for (d, k) in r_keyed {
-                match d {
-                    Delta::Insert(u) => {
-                        let k = k.expect("insert delta staged without key");
-                        let k = st.right_keys.insert(u.clone(), k);
-                        if let Some(matches) = st.left_index.get(&k) {
-                            for l in matches {
-                                out.insert((l.clone(), u.clone()));
-                            }
-                        }
-                        st.right_index.entry(k).or_default().push(u);
-                    }
-                    Delta::Delete(u) => {
-                        if let Some(k) = st.right_keys.remove(&u) {
-                            if let Some(bucket) = st.right_index.get_mut(&k) {
-                                if let Some(pos) = bucket.iter().position(|x| x == &u) {
-                                    bucket.remove(pos);
-                                }
-                                if bucket.is_empty() {
-                                    st.right_index.remove(&k);
-                                }
-                            }
-                            if let Some(matches) = st.left_index.get(&k) {
-                                for l in matches {
-                                    out.delete(&(l.clone(), u.clone()));
-                                }
-                            }
-                        }
+                for change in r_keyed {
+                    match change {
+                        Keyed::Insert(u, k) => right.insert(u, k, left, |r, l| {
+                            out.insert_kept((l.clone(), r.clone()), &mut keep);
+                        }),
+                        Keyed::Delete(u) => right.delete(&u, left, |r, l| {
+                            out.delete_kept((l.clone(), r.clone()), &mut keep);
+                        }),
                     }
                 }
-            }
-            left_cursor.store(l_from + l_pending.len() as u64, MemOrdering::Release);
-            right_cursor.store(r_from + r_pending.len() as u64, MemOrdering::Release);
-
+            });
+            left_cursor.store(l_to, MemOrdering::Release);
+            right_cursor.store(r_to, MemOrdering::Release);
             out.version
         });
 
@@ -1087,16 +1039,9 @@ where
 
             if rebuild.is_set() {
                 let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
-                let keyed: Vec<(T, K)> = snapshot
-                    .into_iter()
-                    .map(|v| {
-                        let k = key_fn(&v);
-                        (v, k)
-                    })
-                    .collect();
                 let mut fresh = KeyCache::new();
                 let mut targets: HashMap<K, Vec<T>> = HashMap::new();
-                for (v, k) in keyed {
+                for (v, k) in paired_with(&key_fn, snapshot) {
                     let k = fresh.insert(v.clone(), k);
                     targets.entry(k).or_default().push(v);
                 }
@@ -1137,16 +1082,7 @@ where
 
             // Stage: key extraction outside the locks. Deletes look up
             // the cached key during apply instead.
-            let keyed: Vec<(Delta<T>, Option<K>)> = pending
-                .into_iter()
-                .map(|d| match d {
-                    Delta::Insert(v) => {
-                        let k = key_fn(&v);
-                        (Delta::Insert(v), Some(k))
-                    }
-                    Delta::Delete(v) => (Delta::Delete(v), None),
-                })
-                .collect();
+            let keyed = keyed_inserts(&key_fn, pending);
 
             let mut grps = groups_for_query.write();
             let mut kc = key_cache_for_query.write();
@@ -1161,14 +1097,13 @@ where
                 // the same group) can't expose the group's count as
                 // transiently short by one the way per-delta `rt.set` did.
                 let mut by_group: HashMap<K, Vec<Delta<T>>> = HashMap::new();
-                for (d, k) in keyed {
-                    match d {
-                        Delta::Insert(v) => {
-                            let k = k.expect("insert delta staged without key");
+                for change in keyed {
+                    match change {
+                        Keyed::Insert(v, k) => {
                             let k = kc.insert(v.clone(), k);
                             by_group.entry(k).or_default().push(Delta::Insert(v));
                         }
-                        Delta::Delete(v) => {
+                        Keyed::Delete(v) => {
                             if let Some(k) = kc.remove(&v) {
                                 by_group.entry(k).or_default().push(Delta::Delete(v));
                             }
@@ -1211,6 +1146,110 @@ where
             _confine: std::marker::PhantomData,
         }
     }
+}
+
+/// One side of a join: its elements by key, and the key each copy was
+/// filed under.
+struct JoinSide<A, K> {
+    index: HashMap<K, Vec<A>>,
+    keys: KeyCache<A, K>,
+}
+
+impl<A: Hash + Eq + Clone, K: Hash + Eq + Clone> JoinSide<A, K> {
+    fn new() -> Self {
+        Self {
+            index: HashMap::new(),
+            keys: KeyCache::new(),
+        }
+    }
+
+    /// Files `value` under `key` and passes it with every element of
+    /// `other` filed under the same key to `matched`.
+    fn insert<B>(
+        &mut self,
+        value: A,
+        key: K,
+        other: &JoinSide<B, K>,
+        mut matched: impl FnMut(&A, &B),
+    ) {
+        let key = self.keys.insert(value.clone(), key);
+        if let Some(matches) = other.index.get(&key) {
+            for m in matches {
+                matched(&value, m);
+            }
+        }
+        self.index.entry(key).or_default().push(value);
+    }
+
+    /// Removes one copy of `value`, if present, and passes it with every
+    /// element of `other` filed under its key to `matched`.
+    fn delete<B>(&mut self, value: &A, other: &JoinSide<B, K>, mut matched: impl FnMut(&A, &B)) {
+        let Some(key) = self.keys.remove(value) else {
+            return;
+        };
+        if let Some(bucket) = self.index.get_mut(&key) {
+            if let Some(pos) = bucket.iter().position(|x| x == value) {
+                bucket.remove(pos);
+            }
+            if bucket.is_empty() {
+                self.index.remove(&key);
+            }
+        }
+        if let Some(matches) = other.index.get(&key) {
+            for m in matches {
+                matched(value, m);
+            }
+        }
+    }
+}
+
+struct JoinState<T, U, K> {
+    left: JoinSide<T, K>,
+    right: JoinSide<U, K>,
+}
+
+impl<T, U, K> JoinState<T, U, K>
+where
+    T: Hash + Eq + Clone,
+    U: Hash + Eq + Clone,
+    K: Hash + Eq + Clone,
+{
+    /// The state over two keyed sides, and the pairs it joins.
+    fn build(left: Vec<(T, K)>, right: Vec<(U, K)>) -> (Self, Vec<(T, U)>) {
+        let mut st = Self {
+            left: JoinSide::new(),
+            right: JoinSide::new(),
+        };
+        let mut pairs = Vec::new();
+        for (l, k) in left {
+            st.left.insert(l, k, &st.right, |_, _| {});
+        }
+        for (r, k) in right {
+            st.right
+                .insert(r, k, &st.left, |r, l| pairs.push((l.clone(), r.clone())));
+        }
+        (st, pairs)
+    }
+}
+
+/// A delta staged with its key: inserts carry the key the user function
+/// gave, deletes take the one their insert was filed under.
+enum Keyed<A, K> {
+    Insert(A, K),
+    Delete(A),
+}
+
+fn keyed_inserts<A, K>(key: &impl Fn(&A) -> K, deltas: Vec<Delta<A>>) -> Vec<Keyed<A, K>> {
+    deltas
+        .into_iter()
+        .map(|d| match d {
+            Delta::Insert(v) => {
+                let k = key(&v);
+                Keyed::Insert(v, k)
+            }
+            Delta::Delete(v) => Keyed::Delete(v),
+        })
+        .collect()
 }
 
 /// The key each live element was filed under, counted per copy, so every
@@ -1301,12 +1340,13 @@ enum AggChange<T, U> {
     Delete(T),
 }
 
-fn lifted<T, U>(lift: &impl Fn(&T) -> U, values: Vec<T>) -> Vec<(T, U)> {
+/// Pairs each value with `f` of it, run with no lock held.
+fn paired_with<T, U>(f: &impl Fn(&T) -> U, values: Vec<T>) -> Vec<(T, U)> {
     values
         .into_iter()
         .map(|v| {
-            let lifted = lift(&v);
-            (v, lifted)
+            let image = f(&v);
+            (v, image)
         })
         .collect()
 }
