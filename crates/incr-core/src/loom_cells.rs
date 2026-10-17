@@ -118,11 +118,12 @@ impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
     fn eq_current(&self, v: &T) -> bool {
         self.read_guard().as_ref() == Some(v)
     }
-    fn write_if_changed(&self, v: T) -> bool {
+    fn write_if_changed(&self, v: T, wrote: &std::cell::Cell<u8>) -> bool {
         let mut slot = self.write_guard();
         if slot.as_ref() == Some(&v) {
             return false;
         }
+        wrote.set(1);
         *slot = Some(v);
         true
     }

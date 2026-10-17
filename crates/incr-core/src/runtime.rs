@@ -19,6 +19,7 @@
 //! collection operators, soundness fixes (race-detection ordering with
 //! AcqRel, overflow-dep reclamation).
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -30,17 +31,19 @@ use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
 use crate::node::{NodeData, NodeId};
+use crate::reclaim_probe::{self, RetireSite};
 use crate::segmented_nodes::SegmentedNodes;
 use crate::state::{self, NodeState};
 use crate::taint_memo;
 use crate::value::Value;
 use crate::value_code;
 
-/// Compute closure: takes a borrow of the runtime, the node's slot, and
-/// whether this is a recompute (true) or first compute (false). Returns
+/// Compute closure: takes a borrow of the runtime, the node's slot,
+/// whether this is a recompute (true) or first compute (false), and the
+/// attempt's `wrote` cell, set once the slot holds the new value. Returns
 /// `true` if the value actually changed (for early-cutoff propagation),
 /// `false` if it was the same as before.
-type ComputeFn<C> = Arc<dyn Fn(&Runtime<C>, u32, bool) -> bool + Send + Sync + 'static>;
+type ComputeFn<C> = Arc<dyn Fn(&Runtime<C>, u32, bool, &Cell<u8>) -> bool + Send + Sync + 'static>;
 
 /// Per-runtime mutable state guarded by the inner lock. Holds everything
 /// that's not on the per-node `NodeData` and not in an arena.
@@ -518,17 +521,20 @@ impl<C: Cells> Runtime<C> {
             // value via T's PartialEq.
             let arena_inner = arena.clone();
             let compute: ComputeFn<C> = Arc::new(
-                move |rt: &Runtime<C>, slot: u32, is_recompute: bool| -> bool {
+                move |rt: &Runtime<C>, slot: u32, is_recompute: bool, wrote: &Cell<u8>| -> bool {
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
-                    if is_recompute {
+                    let changed = if is_recompute {
                         // Compare-and-publish in one slot session; the
                         // false return is the early cutoff.
-                        arena_inner.write_if_changed(node.arena_slot(), new_value)
+                        arena_inner.write_if_changed(node.arena_slot(), new_value, wrote)
                     } else {
+                        wrote.set(1);
                         arena_inner.write(node.arena_slot(), new_value);
                         true
-                    }
+                    };
+                    reclaim_probe::reached(RetireSite::ComputeWrite);
+                    changed
                 },
             );
 
@@ -1811,9 +1817,10 @@ impl<C: Cells> Runtime<C> {
             // runtime's, and the Failed transition plus the frame pop
             // below restore every invariant the unwind could have
             // interrupted; no lock is held while user code runs.
+            let wrote = Cell::new(0_u8);
             self.dep_stack.push_frame(id);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (compute)(self, id.0, is_recompute)
+                (compute)(self, id.0, is_recompute, &wrote)
             }));
             let frame = self.dep_stack.pop_frame();
             if frame.memo_owner {
@@ -1854,6 +1861,15 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         NodeState::Dirty
                     };
+                    // The slot already holds the new value when the panic
+                    // came after the write (a displaced value's Drop, or
+                    // a reclaim inside its retire). Stamp it: a recompute
+                    // that produces the same value cuts off, and without
+                    // the stamp a dependent verified against the old
+                    // value would stay Clean over the new one.
+                    if wrote.get() != 0 {
+                        node.max_changed_at(stamp_rev);
+                    }
                     self.land(node, landing, flagged);
                     // An enclosing closure that catches the unwind has
                     // still read a dep that did not land Clean.
@@ -2167,6 +2183,10 @@ mod walk_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]
 pub(crate) mod value_code_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_drop_panic_tests.rs"]
+mod drop_panic_tests;
 
 #[cfg(test)]
 mod tests {

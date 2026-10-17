@@ -31,6 +31,7 @@ pub mod loom_cells;
 #[cfg(all(test, loom))]
 mod loom_models;
 pub mod node;
+mod reclaim_probe;
 pub mod runtime;
 pub mod segmented_nodes;
 pub mod sorted_collection;

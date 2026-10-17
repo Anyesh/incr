@@ -30,7 +30,7 @@
 //! that itself reads from the runtime) pop a second pointer from the
 //! pool, so re-entrancy cannot alias a hazard slot.
 
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 
 use haphazard::{AtomicPtr as HzAtomicPtr, HazardPointer};
 
@@ -57,7 +57,10 @@ pub trait ValueSlot<T: Value>: 'static {
     /// true iff the value changed (or the slot was empty). One slot
     /// session instead of an eq_current + write pair, which matters
     /// under Shared where each session costs a hazard acquire.
-    fn write_if_changed(&self, v: T) -> bool;
+    /// `wrote` is set to 1 after the comparison and immediately before
+    /// the store, so a caller that sees it set knows the slot holds `v`
+    /// whatever the displaced value's `Drop` does afterwards.
+    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> bool;
 
     /// Drop the held value, returning the slot to the never-written
     /// state. Used when a node is deleted and its arena slot goes on
@@ -104,10 +107,11 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     #[inline(always)]
     fn write(&self, v: T) {
         // SAFETY: see read(); single-threaded sequential access, no
-        // outstanding reference into the cell can exist here.
-        unsafe {
-            *self.0.get() = Some(v);
-        }
+        // outstanding reference into the cell can exist here. The old
+        // value is moved out before its Drop runs, so the slot owns `v`
+        // whatever that Drop does.
+        let old = unsafe { (*self.0.get()).replace(v) };
+        drop(old);
     }
 
     #[inline(always)]
@@ -122,7 +126,7 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     }
 
     #[inline(always)]
-    fn write_if_changed(&self, v: T) -> bool {
+    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> bool {
         // SAFETY: see read(); the comparison reference is dropped
         // before the write below.
         let unchanged = unsafe {
@@ -134,19 +138,16 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
         if unchanged {
             return false;
         }
-        // SAFETY: see write().
-        unsafe {
-            *self.0.get() = Some(v);
-        }
+        wrote.set(1);
+        self.write(v);
         true
     }
 
     #[inline(always)]
     fn clear(&self) {
         // SAFETY: see write().
-        unsafe {
-            *self.0.get() = None;
-        }
+        let old = unsafe { (*self.0.get()).take() };
+        drop(old);
     }
 }
 
@@ -223,7 +224,7 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         })
     }
 
-    fn write_if_changed(&self, v: T) -> bool {
+    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> bool {
         let unchanged = with_pooled_hazard(|hp| {
             // SAFETY: see read().
             unsafe { self.0.load(hp) }
@@ -233,6 +234,7 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         if unchanged {
             return false;
         }
+        wrote.set(1);
         self.write(v);
         true
     }
@@ -302,6 +304,50 @@ mod tests {
         assert!(!s.eq_current(&7));
         s.write(7);
         assert_eq!(s.read(), 7);
+    }
+
+    /// A value whose `Drop` panics once, for the value `ARMED` names.
+    #[derive(Clone, PartialEq, Debug)]
+    struct Boom(i64);
+
+    static ARMED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+
+    impl Drop for Boom {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering::SeqCst;
+            if ARMED
+                .compare_exchange(self.0, i64::MIN, SeqCst, SeqCst)
+                .is_ok()
+            {
+                panic!("drop of Boom({}) panicked on purpose", self.0);
+            }
+        }
+    }
+
+    /// The slot must own the new value before the displaced one's `Drop`
+    /// runs: an in-place assignment that unwinds leaves the dropped value
+    /// in the slot, and the next write drops it again.
+    #[test]
+    fn local_write_moves_the_old_value_out_before_dropping_it() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::Ordering::SeqCst;
+        let s: LocalValueSlot<Boom> = ValueSlot::new_with(Boom(1));
+        let wrote = std::cell::Cell::new(0_u8);
+        ARMED.store(1, SeqCst);
+        let r = catch_unwind(AssertUnwindSafe(|| s.write_if_changed(Boom(2), &wrote)));
+        assert!(r.is_err());
+        assert_eq!(wrote.get(), 1);
+        assert_eq!(s.read(), Boom(2));
+
+        ARMED.store(2, SeqCst);
+        let r = catch_unwind(AssertUnwindSafe(|| s.write(Boom(3))));
+        assert!(r.is_err());
+        assert_eq!(s.read(), Boom(3));
+
+        ARMED.store(3, SeqCst);
+        let r = catch_unwind(AssertUnwindSafe(|| s.clear()));
+        assert!(r.is_err());
+        assert_eq!(s.try_read(), None);
     }
 
     #[test]

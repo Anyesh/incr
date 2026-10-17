@@ -12,6 +12,8 @@
 //! `Shared`); see the `value_slot` module for the soundness argument.
 //! The arena therefore needs no unsafe code of its own.
 
+use std::cell::Cell;
+
 use crate::cells::Cells;
 use crate::locks::Lock;
 use crate::value::Value;
@@ -111,8 +113,8 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
     /// Write `value` unless the slot already holds an equal value.
     /// Returns true iff the value changed. One slot session for the
     /// recompute hot path's compare+publish.
-    pub fn write_if_changed(&self, slot: u32, value: T) -> bool {
-        self.inner.read().slots[slot as usize].write_if_changed(value)
+    pub fn write_if_changed(&self, slot: u32, value: T, wrote: &Cell<u8>) -> bool {
+        self.inner.read().slots[slot as usize].write_if_changed(value, wrote)
     }
 
     pub fn len(&self) -> usize {
