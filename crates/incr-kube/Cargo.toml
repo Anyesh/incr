@@ -2,6 +2,7 @@
 name = "incr-kube"
 version.workspace = true
 edition = "2021"
+rust-version = "1.89"
 description = "Keyed-upsert layer over incr-concurrent for Kubernetes-style watch-event state (replace/delete by key, staleness rejection)."
 license = "Apache-2.0"
 repository = "https://github.com/Anyesh/incr"

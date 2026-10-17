@@ -2,6 +2,7 @@
 name = "incr-persist"
 version.workspace = true
 edition = "2021"
+rust-version = "1.89"
 description = "Durable, shareable state for incr: keeps a runtime's inputs in sync with an ordered operation log held by a pluggable backend."
 license = "Apache-2.0"
 repository = "https://github.com/Anyesh/incr"

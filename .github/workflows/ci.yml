@@ -61,6 +61,23 @@ jobs:
       - run: cargo test -p incr-wasm-tests --target wasm32-unknown-unknown
       - run: cargo test -p incr-wasm-tests --target wasm32-unknown-unknown --release
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.88 1.89 --profile minimal
+      - run: rustup target add --toolchain 1.88 wasm32-unknown-unknown
+      # pyo3's build script needs an interpreter even for cargo check.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo +1.88 check -p incr-core -p incr-compute -p incr-concurrent -p incr-python -p incr-concurrent-python --all-features --all-targets
+      - run: cargo +1.89 check -p incr-persist -p incr-kube --all-features --all-targets
+      - run: cargo +1.88 check -p incr-core --lib --target wasm32-unknown-unknown
+      - run: cargo +1.88 check -p incr-wasm-tests --all-targets --target wasm32-unknown-unknown
+
   miri:
     name: Miri
     runs-on: ubuntu-latest

@@ -2,6 +2,7 @@
 name = "incr-compute"
 version.workspace = true
 edition = "2021"
+rust-version = "1.88"
 description = "Single-threaded incremental computation engine. Zero-overhead reactive DAG built on incr-core."
 license = "Apache-2.0"
 repository = "https://github.com/Anyesh/incr"

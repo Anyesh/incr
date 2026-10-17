@@ -2,6 +2,7 @@
 name = "incr-python"
 version.workspace = true
 edition = "2021"
+rust-version = "1.88"
 description = "Python bindings for the incr single-threaded incremental computation engine"
 license = "Apache-2.0"
 publish = false

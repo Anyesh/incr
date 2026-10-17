@@ -2,6 +2,7 @@
 name = "incr-core"
 version.workspace = true
 edition = "2021"
+rust-version = "1.88"
 description = "Shared core for the incr family. Strategy-parameterized incremental computation engine. Used via incr-compute (single-threaded) or incr-concurrent (Send + Sync)."
 license = "Apache-2.0"
 repository = "https://github.com/Anyesh/incr"
