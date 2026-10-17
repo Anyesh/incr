@@ -126,3 +126,65 @@ def test_raising_predicate_result_bool_propagates_out_of_the_read(make_rt):
     col.insert(1)
     with pytest.raises(ValueError, match="__bool__ raised"):
         rt.get(count)
+
+
+class AmbiguousTruth:
+    def __init__(self, exc):
+        self.exc = exc
+
+    def __bool__(self):
+        raise self.exc
+
+
+class ArrayLike:
+    def __init__(self, v, exc=ValueError):
+        self.v = v
+        self.exc = exc
+
+    def __eq__(self, other):
+        return AmbiguousTruth(self.exc("truth value is ambiguous"))
+
+    __hash__ = None
+
+
+@BOTH_RUNTIMES
+def test_ambiguous_eq_truth_counts_as_not_equal_on_set(make_rt):
+    rt = make_rt()
+    a = rt.create_input(ArrayLike(1))
+    q = rt.create_query(lambda r: r.get(a).v)
+    assert rt.get(q) == 1
+    rt.set(a, ArrayLike(2))
+    assert rt.get(q) == 2
+
+
+@BOTH_RUNTIMES
+def test_ambiguous_eq_truth_counts_as_not_equal_from_a_compute(make_rt):
+    rt = make_rt()
+    a = rt.create_input(1)
+    arr = rt.create_query(lambda r: ArrayLike(r.get(a)))
+    q = rt.create_query(lambda r: r.get(arr).v)
+    assert rt.get(q) == 1
+    rt.set(a, 2)
+    assert rt.get(q) == 2
+
+
+@BOTH_RUNTIMES
+def test_eq_truth_raising_other_errors_propagates_out_of_set(make_rt):
+    rt = make_rt()
+    a = rt.create_input(ArrayLike(1, TypeError))
+    with pytest.raises(TypeError, match="ambiguous"):
+        rt.set(a, ArrayLike(2, TypeError))
+
+
+@BOTH_RUNTIMES
+def test_eq_itself_raising_value_error_still_propagates_out_of_set(make_rt):
+    class Raises:
+        def __eq__(self, other):
+            raise ValueError("eq itself raised")
+
+        __hash__ = None
+
+    rt = make_rt()
+    a = rt.create_input(Raises())
+    with pytest.raises(ValueError, match="eq itself raised"):
+        rt.set(a, Raises())

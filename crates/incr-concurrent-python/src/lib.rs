@@ -28,6 +28,7 @@
 //! `RuntimeError` carrying the engine's message instead.
 
 use pyo3::prelude::*;
+use pyo3::pyclass::CompareOp;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -102,7 +103,19 @@ impl Clone for PyValue {
 
 impl PartialEq for PyValue {
     fn eq(&self, other: &Self) -> bool {
-        Python::attach(|py| or_stash(self.0.bind(py).eq(other.0.bind(py))))
+        Python::attach(|py| {
+            let result = or_stash(
+                self.0
+                    .bind(py)
+                    .rich_compare(other.0.bind(py), CompareOp::Eq),
+            );
+            match result.is_truthy() {
+                Ok(equal) => equal,
+                // NumPy and pandas raise ValueError for an ambiguous truth value.
+                Err(e) if e.is_instance_of::<pyo3::exceptions::PyValueError>(py) => false,
+                Err(e) => or_stash(Err(e)),
+            }
+        })
     }
 }
 
