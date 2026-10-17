@@ -369,6 +369,7 @@ struct Walk {
 }
 
 impl Walk {
+    #[inline]
     fn new(root: NodeId) -> Self {
         Self {
             work: vec![Entry {
@@ -381,6 +382,7 @@ impl Walk {
         }
     }
 
+    #[inline]
     fn visit(&mut self, id: NodeId) {
         self.work.push(Entry {
             id,
@@ -388,11 +390,19 @@ impl Walk {
             taint: NO_TAINT,
         });
         self.first_visits += 1;
+        if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
+            self.visit_exact(id);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn visit_exact(&mut self, id: NodeId) {
         match &mut self.visited {
             Some(visited) => {
                 visited.insert(id);
             }
-            None if self.first_visits == EXACT_MODE_AT => {
+            None => {
                 self.visited = Some(
                     self.work
                         .iter()
@@ -401,10 +411,10 @@ impl Walk {
                         .collect(),
                 );
             }
-            None => {}
         }
     }
 
+    #[inline]
     fn expand(&mut self, dep: NodeId) {
         self.work.push(Entry {
             id: dep,
@@ -413,8 +423,18 @@ impl Walk {
         });
     }
 
+    #[inline]
     fn is_visited(&self, id: NodeId) -> bool {
-        self.visited.as_ref().is_some_and(|v| v.contains(&id))
+        match &self.visited {
+            Some(visited) => Self::contains(visited, id),
+            None => false,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn contains(visited: &HashSet<NodeId>, id: NodeId) -> bool {
+        visited.contains(&id)
     }
 
     /// Taint the entry whose deps are being processed: the nearest
