@@ -421,15 +421,25 @@ impl NeedsRebuild {
     }
 
     /// Runs the part of a batch that changes state, setting the flag if a
-    /// user panic unwinds out of it, and resuming that panic.
+    /// user panic unwinds out of it. The panic keeps unwinding.
+    #[inline(always)]
     pub(crate) fn guard<R>(&self, batch: impl FnOnce() -> R) -> R {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(batch)) {
-            Ok(r) => r,
-            Err(payload) => {
-                self.0.store(true, MemOrdering::Relaxed);
-                std::panic::resume_unwind(payload)
-            }
-        }
+        let armed = Armed(self);
+        let r = batch();
+        std::mem::forget(armed);
+        r
+    }
+}
+
+/// Sets its flag when dropped, which happens only when a panic unwinds
+/// through [`NeedsRebuild::guard`]: a completed batch forgets it. Cheaper
+/// than `catch_unwind`, which moves the batch behind a call and its
+/// result through memory.
+struct Armed<'a>(&'a NeedsRebuild);
+
+impl Drop for Armed<'_> {
+    fn drop(&mut self) {
+        self.0 .0.store(true, MemOrdering::Relaxed);
     }
 }
 
