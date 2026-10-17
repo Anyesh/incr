@@ -25,6 +25,11 @@ use std::mem::MaybeUninit;
 use crate::cells::{Cells, PtrCell};
 use crate::node::NodeData;
 
+// Four-node segments under loom, so a model can allocate a segment on a
+// racing thread without creating a thousand nodes first.
+#[cfg(loom)]
+const SEGMENT_SHIFT: u32 = 2;
+#[cfg(not(loom))]
 const SEGMENT_SHIFT: u32 = 10;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_SHIFT;
 const SEGMENT_MASK: u32 = (SEGMENT_SIZE as u32) - 1;
@@ -143,13 +148,19 @@ impl<C: Cells> SegmentedNodes<C> {
         let seg_idx = (slot >> SEGMENT_SHIFT) as usize;
         let within = (slot & SEGMENT_MASK) as usize;
 
+        // The Acquire load pairs with the Release store in push. A null
+        // pointer means the caller reached `slot` through a path with no
+        // happens-before with its push, so it is reported instead of
+        // dereferenced.
+        let seg_ptr = self.segments[seg_idx].load_acquire();
+        if seg_ptr.is_null() {
+            segment_not_visible(seg_idx);
+        }
+
         // SAFETY: `slot < len` (debug-asserted) implies the slot has
-        // been initialized via `push` above. The Acquire load on the
-        // segment pointer pairs with the Release store in push; segments
-        // are never freed until Drop.
+        // been initialized via `push` above; the segment pointer is
+        // non-null and segments are never freed until Drop.
         unsafe {
-            let seg_ptr = self.segments[seg_idx].load_acquire();
-            debug_assert!(!seg_ptr.is_null(), "segment {} not allocated", seg_idx);
             let cell: &UnsafeCell<MaybeUninit<NodeData<C>>> = &(*seg_ptr).slots[within];
             (*cell.get()).assume_init_ref()
         }
@@ -163,6 +174,16 @@ impl<C: Cells> SegmentedNodes<C> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
+
+#[cold]
+#[inline(never)]
+fn segment_not_visible(seg_idx: usize) -> ! {
+    panic!(
+        "incr-core: internal invariant violated: segment {} read before its allocation \
+         was published to this thread",
+        seg_idx
+    );
 }
 
 impl<C: Cells> Default for SegmentedNodes<C> {

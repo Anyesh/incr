@@ -206,6 +206,12 @@ impl Cells for Loom {
         c.store(v, Ordering::Relaxed);
     }
 
+    fn u32_load_acquire(c: &Self::U32) -> u32 {
+        c.load(Ordering::Acquire)
+    }
+    fn u32_store_release(c: &Self::U32, v: u32) {
+        c.store(v, Ordering::Release);
+    }
     fn u32_load_relaxed(c: &Self::U32) -> u32 {
         c.load(Ordering::Relaxed)
     }

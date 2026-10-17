@@ -75,6 +75,8 @@ pub trait Cells: 'static + Sized {
     fn u8_load_relaxed(c: &Self::U8) -> u8;
     fn u8_store_relaxed(c: &Self::U8, v: u8);
 
+    fn u32_load_acquire(c: &Self::U32) -> u32;
+    fn u32_store_release(c: &Self::U32, v: u32);
     fn u32_load_relaxed(c: &Self::U32) -> u32;
     fn u32_store_relaxed(c: &Self::U32, v: u32);
 
@@ -251,6 +253,14 @@ impl Cells for Local {
     }
 
     #[inline(always)]
+    fn u32_load_acquire(c: &Self::U32) -> u32 {
+        c.get()
+    }
+    #[inline(always)]
+    fn u32_store_release(c: &Self::U32, v: u32) {
+        c.set(v);
+    }
+    #[inline(always)]
     fn u32_load_relaxed(c: &Self::U32) -> u32 {
         c.get()
     }
@@ -390,6 +400,14 @@ impl Cells for Shared {
         c.store(v, Ordering::Relaxed);
     }
 
+    #[inline(always)]
+    fn u32_load_acquire(c: &Self::U32) -> u32 {
+        c.load(Ordering::Acquire)
+    }
+    #[inline(always)]
+    fn u32_store_release(c: &Self::U32, v: u32) {
+        c.store(v, Ordering::Release);
+    }
     #[inline(always)]
     fn u32_load_relaxed(c: &Self::U32) -> u32 {
         c.load(Ordering::Relaxed)

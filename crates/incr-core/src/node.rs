@@ -334,8 +334,13 @@ impl<C: Cells> NodeData<C> {
     pub(crate) fn install_deps(&self, new_deps: &[NodeId]) {
         let count = new_deps.len();
         if count <= 7 {
+            // Each id is Release-stored on its own, not just covered by
+            // the count's Release below: a scan can read a previous
+            // install's equal count and still read this id, and it must
+            // then see everything this writer knew, the id's segment
+            // allocation included.
             for (i, dep) in new_deps.iter().enumerate() {
-                C::u32_store_relaxed(&self.inline_deps[i], dep.0);
+                C::u32_store_release(&self.inline_deps[i], dep.0);
             }
             // Going inline: displace and retire any stale overflow list.
             // for_each_dep's count<=7 path never reads overflow_deps, but
@@ -360,9 +365,11 @@ impl<C: Cells> NodeData<C> {
     /// `overflow_deps`. Any value above 7 would do; 8 is the smallest.
     pub const OVERFLOW_MARKER: u8 = 8;
 
-    /// Iterate over the node's recorded dependencies. The caller must
-    /// have observed the node's state via an Acquire load (e.g., through
-    /// the state machine) to synchronize with the writer of these deps.
+    /// Iterate over the node's recorded dependencies. A scan may race an
+    /// `install_deps` on another thread (the dirty walk scans without a
+    /// claim); it then sees some install's count and, per id, some
+    /// install's id, and every id it sees names a node whose creation
+    /// happens-before the scan.
     ///
     /// Up to 7 deps live inline; beyond that, `overflow_deps` points at
     /// a heap-allocated `DepList` whose load is protected (by a
@@ -384,12 +391,20 @@ impl<C: Cells> NodeData<C> {
         // sentinel garbage.
         let count = C::u8_load_acquire(&self.dep_count);
         if count <= 7 {
-            for i in 0..(count as usize) {
-                let raw = C::u32_load_relaxed(&self.inline_deps[i]);
-                f(NodeId(raw));
-            }
+            self.for_each_inline_dep(count, &mut f);
         } else {
             self.for_each_overflow_dep(&mut f);
+        }
+    }
+
+    #[inline(always)]
+    fn for_each_inline_dep<F: FnMut(NodeId) + ?Sized>(&self, count: u8, f: &mut F) {
+        for i in 0..(count as usize) {
+            // Acquire pairs with install_deps's Release store of the id,
+            // so the scan has happens-before with the id's creation even
+            // when the count it read predates the install.
+            let raw = C::u32_load_acquire(&self.inline_deps[i]);
+            f(NodeId(raw));
         }
     }
 

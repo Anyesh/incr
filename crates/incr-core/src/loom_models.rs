@@ -16,9 +16,10 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
-use loom::sync::Arc;
+use loom::sync::{Arc, Mutex};
 use loom::thread;
 
+use crate::handle::Incr;
 use crate::loom_cells::Loom;
 use crate::runtime::Runtime;
 use crate::state::NodeState;
@@ -261,6 +262,58 @@ fn loom_recovered_node_under_set() {
             rt.get(p),
             101,
             "(V) violated: P did not recover after x = 1"
+        );
+    });
+}
+
+/// Q reads whichever input `pick` names, m until a thread points it at a
+/// node it created. Main dirties Q and P through m, then thread A creates
+/// n in a fresh segment (segments hold four nodes under loom) and
+/// recomputes Q, installing [n] over [m]: the same dep count. Thread B
+/// walks P and scans Q's deps without a claim, so it can read the old
+/// count and the new id; it must not index n's segment before it has
+/// happens-before with n's creation. Targets bug i's inline half.
+#[test]
+fn loom_walk_scan_after_same_count_install() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let m = rt.create_input(1_u64);
+        let pick: Arc<Mutex<Option<Incr<u64>>>> = Arc::new(Mutex::new(None));
+        let q = {
+            let pick = Arc::clone(&pick);
+            rt.create_query(move |rt: &Rt| {
+                let chosen = pick.lock().unwrap().unwrap_or(m);
+                rt.get(chosen)
+            })
+        };
+        let p = rt.create_query(move |rt: &Rt| rt.get(q) + 100);
+        let _fills_segment_zero = rt.create_input(0_u64);
+        assert_eq!(rt.get(p), 101);
+        rt.set(m, 2);
+
+        let installer = {
+            let rt = Arc::clone(&rt);
+            let pick = Arc::clone(&pick);
+            thread::spawn(move || {
+                let n = rt.create_input(5_u64);
+                *pick.lock().unwrap() = Some(n);
+                rt.get(q)
+            })
+        };
+        let walker = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(p))
+        };
+        installer.join().unwrap();
+        walker.join().unwrap();
+
+        rt.assert_invariant_i();
+        rt.assert_edges_complete();
+        rt.assert_walks_complete();
+        let pv = rt.get(p);
+        assert!(
+            pv == 102 || pv == 105,
+            "(V) violated: P = {pv} matches neither pick"
         );
     });
 }
