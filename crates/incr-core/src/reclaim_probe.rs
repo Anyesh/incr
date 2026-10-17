@@ -15,7 +15,7 @@ pub(crate) enum RetireSite {
 #[cfg(test)]
 static FORCED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 pub(crate) fn force(site: RetireSite) {
     FORCED.store(site as u8, std::sync::atomic::Ordering::SeqCst);
 }
