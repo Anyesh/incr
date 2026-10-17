@@ -281,6 +281,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// One change of an operator's batch: applies `staged` and keeps what
     /// it displaced in `keep`, for the caller to drop once it releases its
     /// guards. Returns the new version, if a delta was recorded.
+    #[inline]
     pub(crate) fn apply_kept(
         &mut self,
         staged: Staged<T>,
@@ -485,10 +486,12 @@ impl NeedsRebuild {
         Self(AtomicBool::new(false))
     }
 
+    #[inline]
     pub(crate) fn is_set(&self) -> bool {
         self.0.load(MemOrdering::Relaxed)
     }
 
+    #[inline]
     pub(crate) fn clear(&self) {
         self.0.store(false, MemOrdering::Relaxed);
     }
