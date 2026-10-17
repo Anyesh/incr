@@ -34,10 +34,12 @@ use crate::locks::Lock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::segmented_nodes::SegmentedNodes;
+use crate::set_stack::{self, SetEntry};
 use crate::state::{self, NodeState};
 use crate::taint_memo;
 use crate::value::Value;
 use crate::value_code;
+use crate::value_slot::Displaced;
 
 /// Compute closure: takes a borrow of the runtime, the node's slot,
 /// whether this is a recompute (true) or first compute (false), and the
@@ -115,6 +117,10 @@ pub(crate) enum ParkPoint {
     /// In red/green verification, after the dep scan found no change and
     /// before the landing CAS.
     VerifyAfterScan(NodeId),
+    /// In `set`, after the no-op check and before the claim CAS.
+    SetBeforeClaim(NodeId),
+    /// In `set`, under its claim, before the generation is compared.
+    SetAfterClaim(NodeId),
     /// In `set`, after `bump_revision` and before the dirty walk.
     SetAfterBump,
     /// In `set`, after the dirty walk and before the revision is recorded
@@ -226,6 +232,56 @@ struct WalkDone<'a, C: Cells> {
 impl<C: Cells> Drop for WalkDone<'_, C> {
     fn drop(&mut self) {
         C::complete_walk(&self.rt.walk, self.rev);
+    }
+}
+
+/// `set`'s claim on its input, from the claim CAS to the landing. On an
+/// unwind before the write (a `PartialEq` panic) it lands the input as it
+/// found it; after the write it finishes the bump, the settle, the
+/// landing and the walk, none of which runs user code, so the written
+/// value is never left unpublished.
+struct SetClaim<'a, C: Cells> {
+    rt: &'a Runtime<C>,
+    node: &'a NodeData<C>,
+    id: NodeId,
+    entry: &'a SetEntry,
+    phase: SetPhase,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum SetPhase {
+    Claimed,
+    Written,
+    Done,
+}
+
+impl<C: Cells> SetClaim<'_, C> {
+    fn finish(&mut self) {
+        match std::mem::replace(&mut self.phase, SetPhase::Done) {
+            SetPhase::Done => {}
+            SetPhase::Claimed => {
+                self.rt.land(self.node, NodeState::Clean, NodeState::Dirty);
+                self.entry.set_claimed(false);
+            }
+            SetPhase::Written => {
+                let rev = self.rt.bump_revision();
+                let walk_done = WalkDone { rt: self.rt, rev };
+                self.rt.park(ParkPoint::SetAfterBump);
+                self.node.settle_changed_at(rev);
+                self.node.max_verified_at(rev);
+                self.rt.land(self.node, NodeState::Clean, NodeState::Clean);
+                self.entry.set_claimed(false);
+                self.rt.mark_dependents_dirty(self.id);
+                self.rt.park(ParkPoint::SetAfterWalk);
+                drop(walk_done);
+            }
+        }
+    }
+}
+
+impl<C: Cells> Drop for SetClaim<'_, C> {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -857,6 +913,7 @@ impl<C: Cells> Runtime<C> {
             }
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
+                    self.refuse_wait_on_own_claim(id);
                     spins += 1;
                     C::backoff(spins);
                     continue;
@@ -1144,6 +1201,7 @@ impl<C: Cells> Runtime<C> {
             }
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
+                    self.refuse_wait_on_own_claim(id);
                     spins += 1;
                     C::backoff(spins);
                 }
@@ -1488,37 +1546,134 @@ impl<C: Cells> Runtime<C> {
     /// Panics if the handle refers to a query (compute) node. Setting a
     /// query node would overwrite its computed value and bypass the
     /// state machine; the only valid setter is the compute closure itself.
+    ///
+    /// A value-changing `set` holds the input's `Computing` claim across
+    /// its compare and its write, so a delete waits for it and a reader
+    /// waits as it would for a compute; a `set` holder never waits while
+    /// claimed. A delete and recycle that lands anywhere inside the call
+    /// makes it panic as stale; it never writes into the occupant.
     pub fn set<T: Value>(&self, handle: Incr<T>, value: T) {
         value_code::check();
-        self.check_handle(handle);
+        self.check_runtime(handle);
         let slot = handle.slot();
-
         let node = self.nodes.get(slot);
-        let (arena, is_query) = {
+
+        // A recycle needs `inner.write()`, so under the hold the
+        // generation compare is exact and the fields read are this node's.
+        let (arena, arena_slot) = {
             let inner = self.inner.read();
+            if node.generation() != handle.generation() {
+                drop(inner);
+                self.stale_handle(handle);
+            }
+            let is_query = inner
+                .compute_fns
+                .get(slot as usize)
+                .is_some_and(|f| f.is_some());
+            assert!(
+                !is_query,
+                "Runtime::set called on a query (compute) node at slot {}; only input nodes can be set",
+                slot,
+            );
             let arena = inner
                 .arenas
                 .tagged_arena::<T>(node.type_tag())
                 .expect("incr-core: arena missing for input handle's type");
-            let is_query = inner
-                .compute_fns
-                .get(slot as usize)
-                .map(|f| f.is_some())
-                .unwrap_or(false);
-            (arena, is_query)
+            (arena, node.arena_slot())
         };
 
-        assert!(
-            !is_query,
-            "Runtime::set called on a query (compute) node at slot {}; only input nodes can be set",
-            slot,
-        );
+        let entry = set_stack::push(self.runtime_id, slot);
+        let displaced = self.set_under_entry(handle, &entry, &arena, arena_slot, value);
+        drop(entry);
+        // The old value's user `Drop`, or the reclaim its retire may run,
+        // happens with no claim held and none of the locks this set took.
+        drop(displaced);
+        reclaim_probe::reached(RetireSite::SetRetire);
+    }
 
-        // No-op if the value is unchanged. Racy against a concurrent
-        // set(), but benignly: the no-op linearizes before the other
-        // setter.
-        if value_code::run(|| arena.eq_current(node.arena_slot(), &value)) {
-            return;
+    /// `set` from its no-op check to its walk, under the set-stack
+    /// `entry`. Returns what the write displaced, if it wrote.
+    fn set_under_entry<T: Value>(
+        &self,
+        handle: Incr<T>,
+        entry: &SetEntry,
+        arena: &GenericArena<T, C>,
+        arena_slot: u32,
+        value: T,
+    ) -> Option<Displaced<T, C>> {
+        let slot = handle.slot();
+        let id = NodeId(slot);
+        let node = self.nodes.get(slot);
+
+        // Racy no-op check, so an unchanged value never blocks readers.
+        // An equal value whose change has not walked yet belongs to a
+        // set still in flight, and this call must not return before that
+        // change is visible to its caller's dependents.
+        let equal = value_code::run(|| arena.eq_current(arena_slot, &value));
+        C::fence_acquire();
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
+        if equal {
+            let changed_at = node.changed_at();
+            if changed_at != NodeData::<C>::CHANGED_PENDING
+                && changed_at <= C::walked(&self.walk, &self.revision)
+            {
+                return None;
+            }
+        }
+
+        self.park(ParkPoint::SetBeforeClaim(id));
+        let mut spins: u32 = 0;
+        loop {
+            match state::try_transition::<C>(
+                node.state_cell(),
+                NodeState::Clean,
+                NodeState::Computing,
+            ) {
+                Ok(()) => break,
+                Err(observed) => {
+                    // Classified by the state the CAS returned, never by a
+                    // fresh load, so a delete that landed between the two
+                    // is seen as the generation bump it made.
+                    C::fence_acquire();
+                    if node.generation() != handle.generation() {
+                        self.stale_handle(handle);
+                    }
+                    match observed {
+                        NodeState::Computing | NodeState::ComputingDirty => {
+                            self.refuse_wait_on_own_claim(id);
+                            spins += 1;
+                            C::backoff(spins);
+                        }
+                        NodeState::Dead if C::SINGLE_THREADED => value_code::contract_panic(),
+                        NodeState::Dead => self.stale_handle(handle),
+                        other => self.input_state_broken(id, other),
+                    }
+                }
+            }
+        }
+        entry.set_claimed(true);
+        let mut claim = SetClaim {
+            rt: self,
+            node,
+            id,
+            entry,
+            phase: SetPhase::Claimed,
+        };
+        self.park(ParkPoint::SetAfterClaim(id));
+        if node.generation() != handle.generation() {
+            // The claim landed on the slot's next occupant; leave it as a
+            // walk may have flagged it (an input is never flagged).
+            drop(claim);
+            self.stale_handle(handle);
+        }
+
+        if value_code::run(|| arena.eq_current(arena_slot, &value)) {
+            let changed_at = node.changed_at();
+            drop(claim);
+            self.wait_walked(changed_at);
+            return None;
         }
 
         // Publication order is the protocol's backbone:
@@ -1529,23 +1684,56 @@ impl<C: Cells> Runtime<C> {
         //    before the AcqRel fetch_add);
         // 3. revision bump;
         // 4. settle changed_at to the concrete revision;
-        // 5. dirty walk, whose Release stores publish all of the above
-        //    to claimants that Acquire the Dirty state.
+        // 5. landing, then the dirty walk, whose Release stores publish
+        //    all of the above to claimants that Acquire the Dirty state.
         node.mark_changed_pending();
-        let displaced = arena.write(node.arena_slot(), value);
-        drop(displaced);
-        let new_rev = self.bump_revision();
-        let walk_done = WalkDone {
-            rt: self,
-            rev: new_rev,
-        };
-        self.park(ParkPoint::SetAfterBump);
-        node.settle_changed_at(new_rev);
-        node.max_verified_at(new_rev);
+        let displaced = arena.write(arena_slot, value);
+        claim.phase = SetPhase::Written;
+        claim.finish();
+        displaced
+    }
 
-        self.mark_dependents_dirty(NodeId(slot));
-        self.park(ParkPoint::SetAfterWalk);
-        drop(walk_done);
+    /// Spin until revision `rev`'s walk is recorded. Under `Local` the
+    /// watermark is the revision, so this never spins.
+    fn wait_walked(&self, rev: u64) {
+        debug_assert_ne!(rev, NodeData::<C>::CHANGED_PENDING);
+        let mut spins: u32 = 0;
+        while C::walked(&self.walk, &self.revision) < rev {
+            spins += 1;
+            C::backoff(spins);
+        }
+    }
+
+    /// Before waiting on `id`'s `Computing` holder: a claim this thread
+    /// holds through its set stack is never released by waiting, and
+    /// under `Local` no other thread exists to release any claim, so a
+    /// `Computing` node that is on neither this runtime's frames nor its
+    /// set stack is an invariant broken by user code.
+    fn refuse_wait_on_own_claim(&self, id: NodeId) {
+        if set_stack::holds(self.runtime_id, id.0) {
+            panic!(
+                "incr-core: node {} was reached while this thread's set of it was in progress",
+                id.0,
+            );
+        }
+        if C::SINGLE_THREADED {
+            panic!(
+                "incr-core: internal invariant violated: node {} is Computing but no compute \
+                 or set of it is in progress on this runtime; a Drop, Clone or PartialEq \
+                 that calls into the runtime is the likely cause",
+                id.0,
+            );
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn input_state_broken(&self, id: NodeId, state: NodeState) -> ! {
+        panic!(
+            "incr-core: internal invariant violated: input {} is {:?}; an input is Clean, \
+             Computing under a set, or Dead",
+            id.0, state,
+        );
     }
 
     /// BFS forward walk from `start`'s dependents, marking each Clean
@@ -1797,15 +1985,17 @@ impl<C: Cells> Runtime<C> {
                             id.0,
                         );
                     }
-                    // Another thread owns the compute; wait for it.
-                    // Bounded spin first (computes are usually short),
-                    // then yield. Local never reaches this arm: single-
-                    // threaded Computing always means a cycle.
+                    // Another thread owns the compute, or a set holds the
+                    // input; wait for it. Bounded spin first (computes
+                    // are usually short), then yield. Local never waits
+                    // here: single-threaded Computing is a cycle, this
+                    // thread's own set, or a broken invariant.
                     //
                     // Known limitation: a cyclic graph whose cycle spans
                     // two threads' in-flight computes spins here forever
                     // instead of panicking; cross-thread cycle detection
                     // needs a waits-for graph and is not implemented.
+                    self.refuse_wait_on_own_claim(id);
                     spins += 1;
                     C::backoff(spins);
                     continue;
@@ -2080,8 +2270,10 @@ impl<C: Cells> Runtime<C> {
 
     /// The depth of the frame on this thread (or, under `Local`, this
     /// runtime) that holds `id`'s `Computing` claim. This is the walk's
-    /// own held set; `set`'s claimed entries join it when `set` claims
-    /// its input.
+    /// own held set. A claim held through the set stack has no frame to
+    /// own its taint, and no walk can reach one: nothing but value code
+    /// runs under a set's claim, and `ensure_clean` refuses value code at
+    /// entry. `refuse_wait_on_own_claim` covers the wait arms instead.
     fn own_claim_depth(&self, id: NodeId) -> Option<usize> {
         self.dep_stack.frame_depth(id)
     }
@@ -2337,6 +2529,10 @@ impl<C: Cells> Runtime<C> {
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_race_tests.rs"]
 mod race_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_set_tests.rs"]
+mod set_tests;
 
 #[cfg(test)]
 #[path = "runtime_cascade_tests.rs"]

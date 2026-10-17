@@ -10,6 +10,8 @@ pub(crate) enum RetireSite {
     DepListRetire = 2,
     /// A delete's retires after it released `inner`.
     DeleteRetire = 3,
+    /// `set`'s drop of its displaced value, after its set-stack pop.
+    SetRetire = 4,
 }
 
 #[cfg(test)]

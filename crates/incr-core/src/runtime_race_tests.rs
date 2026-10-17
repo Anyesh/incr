@@ -633,7 +633,7 @@ fn try_delete_claim_leaves_no_edge_for_a_compute_that_follows() {
 }
 
 /// A router whose groups were created before it ran, all Clean.
-fn grouped(rt: &Rt) -> (Incr<u64>, Vec<Incr<u64>>) {
+pub(super) fn grouped(rt: &Rt) -> (Incr<u64>, Vec<Incr<u64>>) {
     let c: IncrCollection<i64, Shared> = rt.create_collection();
     c.insert(rt, 3);
     c.insert(rt, 4);
@@ -1154,7 +1154,7 @@ fn sweep_shared() {
     sweep.check_groups(&rt, &present);
 }
 
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(super) fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
         Ok(s) => *s,
         Err(payload) => match payload.downcast::<&'static str>() {

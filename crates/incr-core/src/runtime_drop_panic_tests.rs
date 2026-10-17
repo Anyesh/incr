@@ -51,7 +51,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// The global domain reclaims on the first retire of the process and
 /// then every two seconds; one throwaway retire here starts that clock,
 /// so a value retired next stays pending until a site is forced.
-fn prime_reclaim_timer<C: Cells>(rt: &Runtime<C>) {
+pub(super) fn prime_reclaim_timer<C: Cells>(rt: &Runtime<C>) {
     let w = rt.create_input(String::new());
     rt.set(w, "primed".to_string());
 }
@@ -105,8 +105,8 @@ fn shared_drop_panic_after_write_stamps_changed_at() {
 }
 
 /// The Superseded variant: Q's failing recompute also reads a new dep
-/// whose `set` is still in flight, so the `Err` path publishes
-/// Superseded and lands Dirty. Without the stamp the next recompute
+/// whose `set` has landed but not yet recorded its walk, so the `Err`
+/// path publishes Superseded and lands Dirty. Without the stamp the next recompute
 /// would cut off over v2 and leave D verified Clean against v1.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -129,8 +129,10 @@ fn shared_drop_panic_after_write_lands_dirty_when_superseded() {
             let d = rt.create_query(move |rt| rt.get(q).0 * 10);
             assert_eq!(rt.get(d), 10);
 
+            // Parked after the landing: a read of `late` under the set's
+            // claim would wait, and the walk is still unrecorded here.
             let set_gate = Gate::new();
-            park_at(&rt, vec![(ParkPoint::SetAfterBump, set_gate.clone())]);
+            park_at(&rt, vec![(ParkPoint::SetAfterWalk, set_gate.clone())]);
             let setter = {
                 let rt = Arc::clone(&rt);
                 thread::spawn(move || rt.set(late, 6))
@@ -328,8 +330,10 @@ fn shared_swallowed_drop_panic_over_a_superseded_node_lands_dirty() {
             assert_eq!(rt.get(q), 28);
             assert_eq!(rt.get(p), 0);
 
+            // Parked after the landing: a read of `late` under the set's
+            // claim would wait, and the walk is still unrecorded here.
             let set_gate = Gate::new();
-            park_at(&rt, vec![(ParkPoint::SetAfterBump, set_gate.clone())]);
+            park_at(&rt, vec![(ParkPoint::SetAfterWalk, set_gate.clone())]);
             let setter = {
                 let rt = Arc::clone(&rt);
                 thread::spawn(move || rt.set(late, 6))

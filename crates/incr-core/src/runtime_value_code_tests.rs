@@ -8,8 +8,13 @@ use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
+use super::drop_panic_tests::prime_reclaim_timer;
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
+use crate::child_test::run_in_child;
+use crate::reclaim_probe::{self, RetireSite};
+use crate::set_stack;
+use crate::state::NodeState;
 use crate::value_code::CONTRACT_MESSAGE;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -17,6 +22,7 @@ enum Op {
     Clone,
     Eq,
     Hash,
+    Drop,
 }
 
 struct Hook {
@@ -56,7 +62,9 @@ fn calls() -> u32 {
 }
 
 fn fire(op: Op) {
-    let taken = HOOK.with(|h| {
+    // `try_with`, because a hook's captures hold values whose `Drop`
+    // fires again while the thread-locals are being destroyed.
+    let taken = HOOK.try_with(|h| {
         let mut h = h.borrow_mut();
         match h.as_mut() {
             Some(hook) if hook.on == op => {
@@ -66,7 +74,7 @@ fn fire(op: Op) {
             _ => None,
         }
     });
-    if let Some(mut hook) = taken {
+    if let Ok(Some(mut hook)) = taken {
         CALLS.with(|c| c.set(c.get() + 1));
         (hook.f)();
         hook.nth = 1;
@@ -97,6 +105,12 @@ impl Hash for Hooked {
     fn hash<H: Hasher>(&self, state: &mut H) {
         fire(Op::Hash);
         self.0.hash(state);
+    }
+}
+
+impl Drop for Hooked {
+    fn drop(&mut self) {
+        fire(Op::Drop);
     }
 }
 
@@ -131,13 +145,19 @@ fn ids<C: Cells>(rt: &Runtime<C>, c: &crate::IncrCollection<Hooked, C>) -> Vec<u
     out
 }
 
+/// `set` compares twice: once before its claim and once under it.
+const SET_COMPARES: std::ops::RangeInclusive<u32> = 1..=2;
+
 fn partial_eq_that_deletes_the_input<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
-    let hooked = Rc::clone(&rt);
-    arm(Op::Eq, move || hooked.delete_node(a));
-    assert_contract_panic("delete from PartialEq", || rt.set(a, Hooked(2)));
-    assert!(rt.is_alive(a));
-    assert_eq!(rt.get(a).0, 1);
+    for nth in SET_COMPARES {
+        let hooked = Rc::clone(&rt);
+        arm_nth(Op::Eq, nth, move || hooked.delete_node(a));
+        assert_contract_panic("delete from PartialEq", || rt.set(a, Hooked(2)));
+        assert!(rt.is_alive(a));
+        assert_eq!(rt.state_of(a), NodeState::Clean);
+        assert_eq!(rt.get(a).0, 1);
+    }
     rt.set(a, Hooked(3));
     assert_eq!(rt.get(a).0, 3);
 }
@@ -145,11 +165,14 @@ fn partial_eq_that_deletes_the_input<C: Cells>(rt: Rc<Runtime<C>>) {
 fn partial_eq_that_sets_another_input<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
     let b = rt.create_input(10u32);
-    let hooked = Rc::clone(&rt);
-    arm(Op::Eq, move || hooked.set(b, 11));
-    assert_contract_panic("set from PartialEq", || rt.set(a, Hooked(2)));
-    assert_eq!(rt.get(b), 10);
-    assert_eq!(rt.get(a).0, 1);
+    for nth in SET_COMPARES {
+        let hooked = Rc::clone(&rt);
+        arm_nth(Op::Eq, nth, move || hooked.set(b, 11));
+        assert_contract_panic("set from PartialEq", || rt.set(a, Hooked(2)));
+        assert_eq!(rt.get(b), 10);
+        assert_eq!(rt.state_of(a), NodeState::Clean);
+        assert_eq!(rt.get(a).0, 1);
+    }
     rt.set(a, Hooked(3));
     assert_eq!(rt.get(a).0, 3);
 }
@@ -157,14 +180,68 @@ fn partial_eq_that_sets_another_input<C: Cells>(rt: Rc<Runtime<C>>) {
 fn partial_eq_that_inserts_into_a_collection<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
     let c = rt.create_collection::<u32>();
-    let hooked = Rc::clone(&rt);
-    let target = c.clone();
-    arm(Op::Eq, move || target.insert(&hooked, 7));
-    assert_contract_panic("insert from PartialEq", || rt.set(a, Hooked(2)));
-    assert_eq!(c.snapshot_len(), 0);
-    assert_eq!(rt.get(a).0, 1);
+    for nth in SET_COMPARES {
+        let hooked = Rc::clone(&rt);
+        let target = c.clone();
+        arm_nth(Op::Eq, nth, move || target.insert(&hooked, 7));
+        assert_contract_panic("insert from PartialEq", || rt.set(a, Hooked(2)));
+        assert_eq!(c.snapshot_len(), 0);
+        assert_eq!(rt.state_of(a), NodeState::Clean);
+        assert_eq!(rt.get(a).0, 1);
+    }
     c.insert(&rt, 7);
     assert_eq!(c.values(&rt), vec![7]);
+}
+
+/// A `PartialEq` that panics on either of `set`'s compares leaves the
+/// input Clean on its old value, and the next set goes through.
+fn partial_eq_that_panics_during_set<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    for nth in SET_COMPARES {
+        arm_nth(Op::Eq, nth, || panic!("eq bomb"));
+        let err =
+            catch_unwind(AssertUnwindSafe(|| rt.set(a, Hooked(2)))).expect_err("set returned");
+        assert!(panic_message(err).contains("eq bomb"));
+        disarm();
+        assert_eq!(rt.state_of(a), NodeState::Clean);
+        assert_eq!(rt.get(a).0, 1);
+    }
+    rt.set(a, Hooked(3));
+    assert_eq!(rt.get(a).0, 3);
+}
+
+/// A `Drop` of the value a `set` displaced runs at step 7, after the
+/// landing, the walk and the set-stack pop: the hook records that the
+/// input is Clean on the new value and no longer held by this thread's
+/// set stack. Its panic leaves `set` with the input Clean on the new
+/// value, and the next set goes through. Under `Shared` the drop runs
+/// at the retire's reclaim, which the child forces at that site.
+fn drop_that_panics_during_set<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let d = rt.create_query(move |rt: &Runtime<C>| rt.get(a).0 + 10);
+    assert_eq!(rt.get(d), 11);
+    let seen = Rc::new(Cell::new(None));
+    let hooked = Rc::clone(&rt);
+    let record = Rc::clone(&seen);
+    arm(Op::Drop, move || {
+        let held = set_stack::holds(hooked.runtime_id, a.slot());
+        record.set(Some((hooked.state_of(a), held, hooked.get(a).0)));
+        panic!("drop bomb");
+    });
+    let err = catch_unwind(AssertUnwindSafe(|| rt.set(a, Hooked(2)))).expect_err("set returned");
+    assert_eq!(panic_message(err), "drop bomb");
+    assert_eq!(calls(), 1, "the displaced value's Drop did not run");
+    assert_eq!(
+        seen.get(),
+        Some((NodeState::Clean, false, 2)),
+        "the displaced value dropped before the set landed and popped"
+    );
+    disarm();
+    assert_eq!(rt.state_of(a), NodeState::Clean);
+    assert_eq!(rt.get(a).0, 2);
+    assert_eq!(rt.get(d), 12);
+    rt.set(a, Hooked(3));
+    assert_eq!(rt.get(d), 13);
 }
 
 fn clone_that_reads_a_clean_node<C: Cells>(rt: Rc<Runtime<C>>) {
@@ -535,6 +612,7 @@ both!(
     partial_eq_that_deletes_the_input,
     partial_eq_that_sets_another_input,
     partial_eq_that_inserts_into_a_collection,
+    partial_eq_that_panics_during_set,
     clone_that_reads_a_clean_node,
     clone_that_creates_a_node,
     partial_eq_of_a_recompute_that_reads_a_node,
@@ -546,6 +624,32 @@ both!(
     hash_that_reads_a_node_in_a_join_batch_and_its_rebuild,
     clone_that_reads_a_node_in_a_sort_batch,
 );
+
+mod drop_that_panics_during_set {
+    use super::*;
+
+    #[test]
+    fn local() {
+        super::drop_that_panics_during_set(Rc::new(Runtime::<Local>::new()));
+    }
+
+    /// In a child, because the forced reclaim would otherwise drop the
+    /// armed value on whichever test thread retires next.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared() {
+        run_in_child(
+            "runtime::value_code_tests::drop_that_panics_during_set::shared",
+            || {
+                let rt = Rc::new(Runtime::<Shared>::new());
+                prime_reclaim_timer(&rt);
+                reclaim_probe::force(RetireSite::SetRetire);
+                super::drop_that_panics_during_set(rt);
+            },
+        )
+        .assert_clean();
+    }
+}
 
 mod every_engine_path_is_refused {
     use super::*;

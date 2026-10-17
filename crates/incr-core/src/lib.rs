@@ -35,6 +35,7 @@ pub mod node;
 mod reclaim_probe;
 pub mod runtime;
 pub mod segmented_nodes;
+mod set_stack;
 pub mod sorted_collection;
 pub mod state;
 mod taint_memo;
