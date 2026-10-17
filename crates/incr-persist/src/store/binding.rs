@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use incr_core::{Cells, ErasedIncr, Incr, Runtime, Value};
+use incr_core::{with_value_code, Cells, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -73,7 +73,7 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
     fn value_of(&self, logged: Option<&LoggedKey>) -> Result<T> {
         match logged.and_then(LoggedKey::current) {
             Some(bytes) => decode(&self.key, bytes),
-            None => Ok(self.default.clone()),
+            None => Ok(with_value_code(|| self.default.clone())),
         }
     }
 }
@@ -109,7 +109,9 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
             Record::Set { value, .. } => decode(&self.key, value)?,
             // A forgotten key holds the default it last had, as after a
             // compaction forgot it.
-            Record::Delete { .. } | Record::Forget { .. } => self.default.clone(),
+            Record::Delete { .. } | Record::Forget { .. } => {
+                with_value_code(|| self.default.clone())
+            }
             // Only the first Declare since the key was last forgotten is
             // live, as in the folded log.
             Record::Declare { default, .. }
@@ -119,7 +121,7 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
                 if before.and_then(LoggedKey::current).is_some() {
                     return Ok(());
                 }
-                self.default.clone()
+                with_value_code(|| self.default.clone())
             }
             _ => return Ok(()),
         };
@@ -151,7 +153,7 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         let held = rt.get(self.handle);
         let applied = self.value_of(logged)?;
         // Equal bytes cover values unequal to themselves, such as NaN.
-        if held == applied || encode(&held)? == encode(&applied)? {
+        if with_value_code(|| held == applied) || encode(&held)? == encode(&applied)? {
             Ok(())
         } else {
             Err(Error::Bypassed {
@@ -168,7 +170,9 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
             (Some(_), _) if !logged.elements.is_empty() => false,
             (Some(_), None) => true,
             (Some(declared), Some(value)) => {
-                decode::<T>(&self.key, value)? == decode::<T>(&self.key, &declared.default)?
+                let value = decode::<T>(&self.key, value)?;
+                let default = decode::<T>(&self.key, &declared.default)?;
+                with_value_code(|| value == default)
             }
             (None, _) => false,
         };
@@ -185,13 +189,13 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
 }
 
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    postcard::to_stdvec(value).map_err(Error::Encode)
+    with_value_code(|| postcard::to_stdvec(value)).map_err(Error::Encode)
 }
 
 /// Decodes a value logged under `key`, rejecting bytes left over, since
 /// leftovers mean the bytes were written as some other type.
 pub(crate) fn decode<T: DeserializeOwned>(key: &str, bytes: &[u8]) -> Result<T> {
-    match postcard::take_from_bytes(bytes) {
+    match with_value_code(|| postcard::take_from_bytes(bytes)) {
         Ok((value, [])) => Ok(value),
         Ok(_) => Err(Error::TypeMismatch {
             key: key.to_owned(),

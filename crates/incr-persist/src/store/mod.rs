@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
 use std::sync::{Mutex, MutexGuard};
 
-use incr_core::{Cells, DeleteError, Incr, Runtime, Value};
+use incr_core::{with_value_code, Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -386,7 +386,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let logged_default: T = decode(key, &declared.default)?;
         let value = match &state.logged[key].value {
             Some(bytes) => decode(key, bytes)?,
-            None => logged_default.clone(),
+            None => with_value_code(|| logged_default.clone()),
         };
         let handle = self.runtime.create_input(value);
         let id = state.bind(

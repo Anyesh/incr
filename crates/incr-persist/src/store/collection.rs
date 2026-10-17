@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 
-use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, Runtime, Value};
+use incr_core::{with_value_code, Cells, ErasedIncr, Incr, IncrCollection, Runtime, Value};
 use serde::de::DeserializeOwned;
 
 use super::binding::{decode, encode, Binding};
@@ -240,7 +240,7 @@ impl<T: Value + Hash + Eq, C: Cells> CollectionBinding<T, C> {
     {
         let current = count(self.collection.values(rt));
         for (value, &have) in &current {
-            let want = target.get(value).copied().unwrap_or(0);
+            let want = with_value_code(|| target.get(value).copied()).unwrap_or(0);
             if want >= have {
                 continue;
             }
@@ -256,7 +256,7 @@ impl<T: Value + Hash + Eq, C: Cells> CollectionBinding<T, C> {
             }
         }
         for (value, want) in target {
-            let have = current.get(&value).copied().unwrap_or(0);
+            let have = with_value_code(|| current.get(&value).copied()).unwrap_or(0);
             if have >= want {
                 continue;
             }
@@ -268,7 +268,8 @@ impl<T: Value + Hash + Eq, C: Cells> CollectionBinding<T, C> {
                 }));
             }
             for _ in have..want {
-                self.collection.insert(rt, value.clone());
+                self.collection
+                    .insert(rt, with_value_code(|| value.clone()));
             }
         }
         Ok(())
@@ -385,9 +386,11 @@ where
 
 fn count<T: Hash + Eq>(values: Vec<T>) -> HashMap<T, usize> {
     let mut counts = HashMap::new();
-    for value in values {
-        *counts.entry(value).or_insert(0) += 1;
-    }
+    with_value_code(|| {
+        for value in values {
+            *counts.entry(value).or_insert(0) += 1;
+        }
+    });
     counts
 }
 
@@ -398,22 +401,25 @@ fn decode_elements<T: Hash + Eq + DeserializeOwned>(
     elements: &Elements,
 ) -> Result<HashMap<T, usize>> {
     let mut counts = HashMap::new();
-    for (bytes, n) in elements.live() {
-        *counts.entry(decode(key, bytes)?).or_insert(0) += n;
-    }
-    for op in elements.tail() {
-        match op {
-            ElementOp::Insert(bytes) => *counts.entry(decode(key, bytes)?).or_insert(0) += 1,
-            ElementOp::Remove(bytes) => {
-                let value: T = decode(key, bytes)?;
-                if let Some(n) = counts.get_mut(&value) {
-                    *n -= 1;
-                    if *n == 0 {
-                        counts.remove(&value);
+    with_value_code(|| -> Result<()> {
+        for (bytes, n) in elements.live() {
+            *counts.entry(decode(key, bytes)?).or_insert(0) += n;
+        }
+        for op in elements.tail() {
+            match op {
+                ElementOp::Insert(bytes) => *counts.entry(decode(key, bytes)?).or_insert(0) += 1,
+                ElementOp::Remove(bytes) => {
+                    let value: T = decode(key, bytes)?;
+                    if let Some(n) = counts.get_mut(&value) {
+                        *n -= 1;
+                        if *n == 0 {
+                            counts.remove(&value);
+                        }
                     }
                 }
             }
         }
-    }
+        Ok(())
+    })?;
     Ok(counts)
 }

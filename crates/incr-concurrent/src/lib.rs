@@ -26,6 +26,8 @@
 
 use incr_core::Shared;
 
+#[doc(hidden)]
+pub use incr_core::with_value_code;
 pub use incr_core::{
     DeleteError, Delta, ErasedIncr, GroupedCollection as GroupedCollectionInner, Incr,
     IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace,
@@ -45,3 +47,44 @@ pub type GroupedCollection<K, T> = GroupedCollectionInner<K, T, Shared>;
 
 /// Thread-safe sorted collection: `SortedCollection<T, K, Shared>`.
 pub type SortedCollection<T, K> = SortedCollectionInner<T, K, Shared>;
+
+#[cfg(test)]
+mod reexports {
+    /// Names every item the facade re-exports from incr-core, so a
+    /// missing one fails to compile.
+    #[test]
+    fn every_incr_core_item_is_reexported() {
+        use crate::{
+            with_value_code, DeleteError, Delta, ErasedIncr, GroupedCollection,
+            GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner, NodeId, NodeInfo,
+            NodeKindInfo, NodeState, NodeTrace, ObserverId, PropagationTrace, Runtime, RuntimeId,
+            SortDelta, SortedCollection, SortedCollectionInner, TraceAction, Value,
+        };
+
+        fn named<T: ?Sized>() {}
+        fn value<T: Value>() {}
+        named::<DeleteError>();
+        named::<Delta<u32>>();
+        named::<ErasedIncr>();
+        named::<GroupedCollection<u32, u32>>();
+        named::<GroupedCollectionInner<u32, u32, incr_core::Shared>>();
+        named::<Incr<u32>>();
+        named::<IncrCollection<u32>>();
+        named::<IncrCollectionInner<u32, incr_core::Shared>>();
+        named::<NodeId>();
+        named::<NodeInfo>();
+        named::<NodeKindInfo>();
+        named::<NodeState>();
+        named::<NodeTrace>();
+        named::<ObserverId>();
+        named::<PropagationTrace>();
+        named::<Runtime>();
+        named::<RuntimeId>();
+        named::<SortDelta<u32>>();
+        named::<SortedCollection<u32, u32>>();
+        named::<SortedCollectionInner<u32, u32, incr_core::Shared>>();
+        named::<TraceAction>();
+        value::<u32>();
+        with_value_code(|| ());
+    }
+}
