@@ -207,8 +207,8 @@ enum Publish {
     /// Edges are current; the compute may land `Clean`.
     Published,
     /// A newly added dep was not observed `Clean` at or below the
-    /// compute's stamp revision, so a concurrent change may have missed
-    /// this node, which had no reverse edge yet (B3). Edges are
+    /// walked watermark captured at the claim, so a concurrent change may
+    /// have missed this node, which had no reverse edge yet (B3). Edges are
     /// published; the compute must land `Dirty`.
     Superseded,
     /// A recorded dep was deleted, and possibly recycled, after the read
@@ -1653,7 +1653,7 @@ impl<C: Cells> Runtime<C> {
                     // panic would lose recovery paths through deps the
                     // failed run had not reached yet. Extra edges only
                     // cause spurious re-verification, never staleness.
-                    let landing = match self.publish_deps(id, &frame.deps, true, stamp_rev) {
+                    let landing = match self.publish_deps(id, &frame.deps, true, verify_rev) {
                         // A stale dep's slot may already belong to another
                         // node, so no union is published. The old deps keep
                         // their reverse edges.
@@ -1684,7 +1684,7 @@ impl<C: Cells> Runtime<C> {
                 }
             };
 
-            let outcome = self.publish_deps(id, &frame.deps, false, stamp_rev);
+            let outcome = self.publish_deps(id, &frame.deps, false, verify_rev);
 
             // The closure has already written its value into the slot, and
             // the next recompute's early cutoff compares against it, so a
@@ -1783,7 +1783,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         recorded: &[(NodeId, u32)],
         panicked: bool,
-        stamp_rev: u64,
+        verify_rev: u64,
     ) -> Publish {
         let node = self.nodes.get(id.0);
 
@@ -1828,9 +1828,13 @@ impl<C: Cells> Runtime<C> {
         if stale {
             return Publish::Stale;
         }
+        // Against the walked watermark, not the stamp revision: a set
+        // bumped but not yet walked at the claim can't reach this node
+        // through an edge it lacks, and a dep recomputed for that set
+        // lands Clean with a changed_at up to the stamp revision.
         let settled = |d: &NodeId| {
             old_deps.contains(d)
-                || self.observed_clean(*d, stamp_rev)
+                || self.observed_clean(*d, verify_rev)
                 || (panicked && self.nodes.get(d.0).state() == NodeState::Failed)
         };
         let superseded = !new_deps.iter().all(settled);

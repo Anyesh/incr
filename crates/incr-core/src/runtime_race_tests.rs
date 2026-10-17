@@ -335,6 +335,58 @@ fn b3_query_dep_dirtied_after_first_read() {
     assert_eq!(rt.get(d), 60);
 }
 
+/// D's first compute claims after a set's bump and before its walk, then
+/// reads P Clean. The walk can't reach D, whose edge isn't published, and
+/// P recomputed on another thread lands Clean with a `changed_at` equal to
+/// D's stamp revision. Settled against the stamp revision, D would land
+/// Clean over the old P for good (bug l).
+#[test]
+fn b3_dep_recomputed_for_an_unwalked_set_supersedes_new_dependent() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let p = rt.create_query(move |rt: &Rt| rt.get(x) + 1);
+    assert_eq!(rt.get(p), 2);
+    let d_gate = Gate::new();
+    let d = {
+        let d_gate = d_gate.clone();
+        rt.create_query(move |rt: &Rt| {
+            let v = rt.get(p) * 10;
+            d_gate.park();
+            v
+        })
+    };
+
+    let set_gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::SetAfterBump, set_gate.clone())]);
+    let setter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set(x, 5))
+    };
+    set_gate.wait_parked();
+
+    d_gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    d_gate.wait_parked();
+    set_gate.release();
+    setter.join().unwrap();
+    assert_eq!(rt.state_of(p), NodeState::Dirty);
+    let recompute = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(p))
+    };
+    assert_eq!(recompute.join().unwrap(), 6);
+    d_gate.release();
+    assert_eq!(reader.join().unwrap(), 20);
+
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert!(rt.has_reverse_edge(p, d));
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 60);
+}
+
 #[test]
 fn b1_publish_lands_between_delete_check_and_claim() {
     let rt = Arc::new(Rt::new());

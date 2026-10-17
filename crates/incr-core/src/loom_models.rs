@@ -156,6 +156,46 @@ fn loom_fan_out() {
     });
 }
 
+/// x -> P -> D with D New, so D's edge to P is not published yet. A
+/// setter races D's first compute and a reader of P. Targets bug l: D
+/// reads P Clean after the set's bump and before its walk, P recomputes
+/// on the other thread, and D's publish must not count P settled.
+#[test]
+fn loom_new_dependent_races_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(1_u64);
+        let p = rt.create_query(move |rt: &Rt| rt.get(x) + 1);
+        let d = rt.create_query(move |rt: &Rt| rt.get(p) * 10);
+        assert_eq!(rt.get(p), 2);
+
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 5))
+        };
+        let reader_d = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.get(d);
+            })
+        };
+        let reader_p = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.get(p);
+            })
+        };
+        setter.join().unwrap();
+        reader_d.join().unwrap();
+        reader_p.join().unwrap();
+
+        rt.assert_invariant_i();
+        rt.assert_edges_complete();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(d), 60, "(V) violated: D stale against x = 5");
+    });
+}
+
 /// Q's first compute reads v while another thread deletes v and recycles
 /// its slot into a new input. Targets B1 and B2. The reader may unwind
 /// (stale handle, `Dead` arm, cleared slot); when its `get` returns, the
