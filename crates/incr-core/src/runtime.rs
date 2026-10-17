@@ -237,6 +237,18 @@ enum Visit {
     Direct,
 }
 
+/// How `compute_one` left the node it was handed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Computed {
+    /// The node is as settled as the visit allows.
+    Done,
+    /// The slot's generation moved during the call: the node was deleted
+    /// and its slot recycled, so the closure read under the hold belongs
+    /// to a node that no longer exists. Any claim taken was released
+    /// with the discard landing, and nothing ran against the occupant.
+    Gone,
+}
+
 /// `Entry::taint` of an entry no skipped dep has reached.
 const NO_TAINT: u32 = u32::MAX;
 
@@ -522,26 +534,43 @@ impl<C: Cells> Runtime<C> {
     /// always-predicted compares on the hot path.
     #[inline(always)]
     fn check_handle<T: Value>(&self, handle: Incr<T>) {
-        if handle.runtime_id() != self.runtime_id {
-            panic!(
-                "incr-core: Incr<{}> handle from a foreign runtime (handle was minted by \
-                 runtime {}, used on runtime {})",
-                std::any::type_name::<T>(),
-                handle.runtime_id().get(),
-                self.runtime_id.get(),
-            );
-        }
+        self.check_runtime(handle);
         let node = self.nodes.get(handle.slot());
         if node.generation() != handle.generation() {
-            panic!(
-                "incr-core: stale Incr<{}> handle: the node at slot {} was deleted (handle \
-                 generation {}, slot generation {})",
-                std::any::type_name::<T>(),
-                handle.slot(),
-                handle.generation(),
-                node.generation(),
-            );
+            self.stale_handle(handle);
         }
+    }
+
+    #[inline(always)]
+    fn check_runtime<T: Value>(&self, handle: Incr<T>) {
+        if handle.runtime_id() != self.runtime_id {
+            self.foreign_handle(handle);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn foreign_handle<T: Value>(&self, handle: Incr<T>) -> ! {
+        panic!(
+            "incr-core: Incr<{}> handle from a foreign runtime (handle was minted by \
+             runtime {}, used on runtime {})",
+            std::any::type_name::<T>(),
+            handle.runtime_id().get(),
+            self.runtime_id.get(),
+        );
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn stale_handle<T: Value>(&self, handle: Incr<T>) -> ! {
+        panic!(
+            "incr-core: stale Incr<{}> handle: the node at slot {} was deleted (handle \
+             generation {}, slot generation {})",
+            std::any::type_name::<T>(),
+            handle.slot(),
+            handle.generation(),
+            self.nodes.get(handle.slot()).generation(),
+        );
     }
 
     /// Register a callback fired by [`Self::stabilize`] whenever the
@@ -570,7 +599,9 @@ impl<C: Cells> Runtime<C> {
         };
 
         let run = Arc::new(move |rt: &Runtime<C>, last_seen: u64| -> Option<u64> {
-            rt.ensure_clean(NodeId(handle.slot()));
+            if rt.ensure_clean(NodeId(handle.slot()), handle.generation()) == Computed::Gone {
+                rt.stale_handle(handle);
+            }
             let node = rt.nodes.get(handle.slot());
             // A pending set() marker reads as u64::MAX; clamp to the
             // current revision so last_seen stays passable and the
@@ -1081,8 +1112,9 @@ impl<C: Cells> Runtime<C> {
         // Record dep if we're inside a compute closure.
         self.dep_stack.record_dep(NodeId(slot), handle.generation());
 
-        // Ensure clean, then read.
-        self.ensure_clean(NodeId(slot));
+        if self.ensure_clean(NodeId(slot), handle.generation()) == Computed::Gone {
+            self.stale_handle(handle);
+        }
 
         let node = self.nodes.get(slot);
         let arena = {
@@ -1387,19 +1419,25 @@ impl<C: Cells> Runtime<C> {
     /// the held node through a nested `get`, reports a cycle. The root is
     /// exempt because its caller reads its slot as soon as the walk
     /// returns.
-    fn ensure_clean(&self, id: NodeId) {
+    ///
+    /// `gen` is the caller's handle generation for the root. A walk entry
+    /// carries none (installed deps are ids only); one whose slot is
+    /// recycled under the walk is dropped, because the parent that
+    /// recorded it sees the dead dep at its publish. A root found
+    /// recycled is reported as `Gone` for the caller's stale panic.
+    fn ensure_clean(&self, id: NodeId, gen: u32) -> Computed {
         // Fast path: already clean.
         if state::load::<C>(self.nodes.get(id.0).state_cell()) == NodeState::Clean {
-            return;
+            return Computed::Done;
         }
 
         let word = taint_memo::thread_word();
         if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
-            self.compute_one(id, Visit::Direct);
-            return;
+            return self.compute_one(id, Visit::Direct, Some(gen));
         }
 
         let mut walk = Walk::new(id);
+        let mut root = Computed::Done;
 
         while let Some(Entry {
             id: cur,
@@ -1410,10 +1448,12 @@ impl<C: Cells> Runtime<C> {
             let is_root = walk.work.is_empty();
             if pending {
                 self.park(ParkPoint::BeforeComputeOne(cur));
-                if taint == NO_TAINT || is_root {
-                    self.compute_one(cur, Visit::Full);
+                if is_root {
+                    root = self.compute_one(cur, Visit::Full, Some(gen));
+                } else if taint == NO_TAINT {
+                    self.compute_one(cur, Visit::Full, None);
                 } else {
-                    self.compute_one(cur, Visit::VerifyOnly(taint));
+                    self.compute_one(cur, Visit::VerifyOnly(taint), None);
                     walk.taint(taint);
                 }
                 continue;
@@ -1459,6 +1499,7 @@ impl<C: Cells> Runtime<C> {
             u64::from(walk.first_visits),
             std::sync::atomic::Ordering::Relaxed,
         );
+        root
     }
 
     /// Compute (or verify) a single node, assuming all its known deps
@@ -1472,14 +1513,24 @@ impl<C: Cells> Runtime<C> {
     ///   node is on its own frame stack, which is a dependency cycle;
     /// - stamps use the revision captured BEFORE verify/compute via
     ///   fetch_max, so a concurrent set() invalidates rather than masks.
-    fn compute_one(&self, id: NodeId, visit: Visit) {
+    ///
+    /// `gen` is the root's handle generation, `None` for a walk entry.
+    /// The closure and the generation `g0` are read together under the
+    /// read hold, and a claim counts only while the generation is still
+    /// `g0` after the CAS (which reads from the recycle's Release store):
+    /// a delete and recycle between the hold and the claim would
+    /// otherwise run the dead node's closure against the occupant, and a
+    /// root compares `g0` with `gen` first, since the recycle may have
+    /// landed before the hold.
+    fn compute_one(&self, id: NodeId, visit: Visit, gen: Option<u32>) -> Computed {
         let node = self.nodes.get(id.0);
         let mut spins: u32 = 0;
+        let mut g0 = gen;
 
         loop {
             let observed = state::load::<C>(node.state_cell());
             match observed {
-                NodeState::Clean => return,
+                NodeState::Clean => return Computed::Done,
                 NodeState::Computing | NodeState::ComputingDirty => {
                     if self.dep_stack.is_computing(id) {
                         panic!(
@@ -1509,6 +1560,11 @@ impl<C: Cells> Runtime<C> {
                     );
                 }
                 NodeState::Dead => {
+                    // A bumped generation under Dead is a delete that has
+                    // unhooked the node but not recycled the slot yet.
+                    if g0.is_some_and(|g| g != node.generation()) {
+                        return Computed::Gone;
+                    }
                     panic!(
                         "incr-core: node {} was deleted while a read was reaching it (a \
                          compute raced delete_node on one of its recorded dependencies)",
@@ -1520,7 +1576,7 @@ impl<C: Cells> Runtime<C> {
                     // the closure of a tainted node.
                     if let Visit::VerifyOnly(owner) = visit {
                         self.memoize(id, owner);
-                        return;
+                        return Computed::Done;
                     }
                 }
                 NodeState::Dirty => {}
@@ -1528,10 +1584,15 @@ impl<C: Cells> Runtime<C> {
 
             // Distinguish input vs query: inputs don't compute, they
             // just need their state stamped clean.
-            let compute = {
+            let (compute, g) = {
                 let inner = self.inner.read();
-                inner.compute_fns.get(id.0 as usize).and_then(|f| f.clone())
+                let compute = inner.compute_fns.get(id.0 as usize).and_then(|f| f.clone());
+                (compute, node.generation())
             };
+            if g0.is_some_and(|g0| g0 != g) {
+                return Computed::Gone;
+            }
+            g0 = Some(g);
             let compute = match compute {
                 Some(f) => f,
                 None => {
@@ -1539,7 +1600,7 @@ impl<C: Cells> Runtime<C> {
                     if state::try_transition::<C>(node.state_cell(), observed, NodeState::Clean)
                         .is_ok()
                     {
-                        return;
+                        return Computed::Done;
                     }
                     continue;
                 }
@@ -1569,6 +1630,19 @@ impl<C: Cells> Runtime<C> {
                     Err(_) => continue,
                 }
             };
+
+            if node.generation() != g {
+                // The claim landed on the slot's next occupant, so leave
+                // it as found: New from New, Dirty otherwise, because a
+                // computed occupant must keep its early cutoff.
+                let discard = if claimed_dirty {
+                    NodeState::Dirty
+                } else {
+                    NodeState::New
+                };
+                self.land(node, discard, discard);
+                return Computed::Gone;
+            }
 
             // Capture the revisions after the claim and BEFORE verifying or
             // computing. If a set() bumps the revision mid-flight, our
@@ -1609,7 +1683,7 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         self.dep_stack.poison_current_frame();
                     }
-                    return;
+                    return Computed::Done;
                 }
                 if let Visit::VerifyOnly(owner) = visit {
                     // The root's own compute re-reads this node through a
@@ -1618,7 +1692,7 @@ impl<C: Cells> Runtime<C> {
                     // root a Clean landing for an edge it may have dropped.
                     self.land(node, NodeState::Dirty, NodeState::Dirty);
                     self.memoize(id, owner);
-                    return;
+                    return Computed::Done;
                 }
                 // Keep the claim and recompute; the closure's nested reads
                 // clean the changed deps.
@@ -1720,7 +1794,7 @@ impl<C: Cells> Runtime<C> {
                 self.dep_stack.poison_current_frame();
             }
             self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
-            return;
+            return Computed::Done;
         }
     }
 

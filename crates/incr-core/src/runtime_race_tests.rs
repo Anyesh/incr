@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1152,4 +1152,113 @@ fn sweep_shared() {
 
     sweep.check(&rt, &present);
     sweep.check_groups(&rt, &present);
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(s) => *s,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(s) => (*s).to_string(),
+            Err(_) => "<non-string panic payload>".to_string(),
+        },
+    }
+}
+
+/// A query over `x` whose closure counts its runs.
+fn counted_query(rt: &Rt, x: Incr<u64>, add: u64) -> (Incr<u64>, Arc<AtomicUsize>) {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let q = {
+        let runs = Arc::clone(&runs);
+        rt.create_query(move |rt: &Rt| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            rt.get(x) + add
+        })
+    };
+    (q, runs)
+}
+
+/// Bug (d), the root: Q is deleted and its slot recycled while its first
+/// compute is parked between the closure clone and the claim. The old
+/// closure must not run against the new occupant, and the read of the
+/// stale handle panics as stale.
+#[test]
+fn compute_vs_delete_recycle() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(7_u64);
+    let (q, old_runs) = counted_query(&rt, x, 1);
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::BeforeClaim(id(q)), gate.clone())]);
+
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(q))))
+    };
+    gate.wait_parked();
+    rt.delete_node(q);
+    let (new, new_runs) = counted_query(&rt, x, 1000);
+    assert_eq!(
+        new.slot(),
+        q.slot(),
+        "the delete should free Q's slot for reuse"
+    );
+    gate.release();
+
+    let outcome = reader.join().unwrap();
+    let msg = panic_message(outcome.expect_err("the read of a deleted node returned a value"));
+    assert!(msg.contains("stale"), "got: {msg}");
+    assert_eq!(
+        old_runs.load(Ordering::SeqCst),
+        0,
+        "the deleted query's closure ran against the recycled slot"
+    );
+    assert_eq!(new_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(rt.state_of(new), NodeState::New);
+    assert_eq!(rt.get(new), 1007);
+    rt.assert_invariant_i();
+}
+
+/// Bug (d), a walk entry: the Dirty transitive dep D of the root R is
+/// deleted (with P and R) and its slot recycled while the walk's compute
+/// of D is parked between the hold read and the claim. The old closure
+/// must not run against the new occupant.
+#[test]
+fn walk_entry_vs_delete_recycle() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(0_u64);
+    let (d, d_runs) = counted_query(&rt, x, 1);
+    let p = rt.create_query(move |rt: &Rt| rt.get(d) + 10);
+    let r = rt.create_query(move |rt: &Rt| rt.get(p) + 100);
+    assert_eq!(rt.get(r), 111);
+    rt.set(x, 1);
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::BeforeClaim(id(d)), gate.clone())]);
+
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(r))))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.delete_with_dependents(d), 3);
+    let (new, new_runs) = counted_query(&rt, x, 1000);
+    assert_eq!(
+        new.slot(),
+        d.slot(),
+        "the cascade frees D's slot last, so it is reused first"
+    );
+    gate.release();
+
+    let outcome = reader.join().unwrap();
+    assert!(
+        outcome.is_err(),
+        "the read of a deleted root returned a value"
+    );
+    assert_eq!(
+        d_runs.load(Ordering::SeqCst),
+        1,
+        "the deleted dep's closure ran against the recycled slot"
+    );
+    assert_eq!(new_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(rt.state_of(new), NodeState::New);
+    assert_eq!(rt.get(new), 1001);
+    rt.assert_invariant_i();
 }
