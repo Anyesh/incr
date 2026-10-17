@@ -95,11 +95,23 @@ pub(crate) fn check() {
     }
 }
 
+/// The thread word, after refusing value code. One load serves the
+/// check and a caller's memo test: a non-zero word is either, and only
+/// then does the cold arm tell them apart.
+#[inline(always)]
+pub(crate) fn checked_word() -> u64 {
+    let word = thread_word();
+    if word != 0 {
+        check_nonzero(word);
+    }
+    word
+}
+
 /// The cold arm of a site that already found `word` non-zero: tells a
 /// live memo from a value-code count and panics for the count.
 #[cold]
 #[inline(never)]
-pub(crate) fn check_nonzero(word: u64) {
+fn check_nonzero(word: u64) {
     if word & COUNTER_MASK != 0 {
         contract_panic();
     }

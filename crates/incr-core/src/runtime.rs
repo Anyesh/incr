@@ -1405,7 +1405,7 @@ impl<C: Cells> Runtime<C> {
                 self.stale_handle(handle);
             }
             self.dep_stack.record_dep(NodeId(slot), handle.generation());
-            return self.read_slot(handle, type_tag, arena_slot);
+            return self.read_slot(handle, node, type_tag, arena_slot);
         }
         self.get_slow(handle)
     }
@@ -1420,7 +1420,9 @@ impl<C: Cells> Runtime<C> {
         }
         self.dep_stack.record_dep(NodeId(slot), handle.generation());
 
-        if self.ensure_clean(NodeId(slot), handle.generation()) == Computed::Gone {
+        // `get` found the node not Clean, so the walk starts at once.
+        let word = value_code::checked_word();
+        if self.clean_walk(NodeId(slot), handle.generation(), word) == Computed::Gone {
             self.stale_handle(handle);
         }
 
@@ -1430,7 +1432,7 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != handle.generation() {
             self.stale_handle(handle);
         }
-        self.read_slot(handle, type_tag, arena_slot)
+        self.read_slot(handle, node, type_tag, arena_slot)
     }
 
     /// Clone the value behind a node's tag and arena slot, both read
@@ -1440,16 +1442,21 @@ impl<C: Cells> Runtime<C> {
     /// writes the slot under the arena lock the read takes, after the
     /// bump, so a reader of the occupant's value sees the bump too.
     #[inline(always)]
-    fn read_slot<T: Value>(&self, handle: Incr<T>, type_tag: u16, arena_slot: u32) -> T {
-        let slot = handle.slot();
-        self.park(ParkPoint::GetBeforeRead(NodeId(slot)));
+    fn read_slot<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+    ) -> T {
+        self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
         let arena = {
             let inner = self.inner.read();
             inner.arenas.tagged_arena::<T>(type_tag)
         };
         let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)));
         C::fence_acquire();
-        if self.nodes.get(slot).generation() == handle.generation() {
+        if node.generation() == handle.generation() {
             if let Some(value) = value {
                 return value;
             }
@@ -1887,21 +1894,23 @@ impl<C: Cells> Runtime<C> {
     /// recycled under the walk is dropped, because the parent that
     /// recorded it sees the dead dep at its publish. A root found
     /// recycled is reported as `Gone` for the caller's stale panic.
+    #[inline]
     fn ensure_clean(&self, id: NodeId, gen: u32) -> Computed {
-        // One load serves the value-code check and the memo: a non-zero
-        // word is either, and only then does the cold arm tell them apart.
         // The check precedes the fast path because a Clean read still
         // takes locks in this release.
-        let word = value_code::thread_word();
-        if word != 0 {
-            value_code::check_nonzero(word);
-        }
+        let word = value_code::checked_word();
 
         // Fast path: already clean.
         if state::load::<C>(self.nodes.get(id.0).state_cell()) == NodeState::Clean {
             return Computed::Done;
         }
+        self.clean_walk(id, gen, word)
+    }
 
+    /// [`Self::ensure_clean`] past its fast path, for a caller that took
+    /// `word` from `value_code::checked_word` and found `id` not Clean.
+    /// A root that went Clean since is left at its first pop.
+    fn clean_walk(&self, id: NodeId, gen: u32, word: u64) -> Computed {
         // A memoized root is computed directly, as the walk's only
         // entry, so `compute_one` keeps a single call site and inlines.
         let direct = word != 0 && taint_memo::memoized(word, self.runtime_id, id);
