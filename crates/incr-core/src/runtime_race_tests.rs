@@ -28,9 +28,9 @@ const PARK_TIMEOUT: Duration = Duration::from_secs(10);
 /// gate only parks once it is armed, so a closure can carry one through
 /// setup computes without stopping.
 #[derive(Clone)]
-struct Gate(Arc<GateInner>);
+pub(super) struct Gate(Arc<GateInner>);
 
-struct GateInner {
+pub(super) struct GateInner {
     armed: AtomicBool,
     reached_tx: Mutex<Sender<()>>,
     reached_rx: Mutex<Receiver<()>>,
@@ -39,7 +39,7 @@ struct GateInner {
 }
 
 impl Gate {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         Self(Arc::new(GateInner {
@@ -51,11 +51,11 @@ impl Gate {
         }))
     }
 
-    fn arm(&self) {
+    pub(super) fn arm(&self) {
         self.0.armed.store(true, Ordering::SeqCst);
     }
 
-    fn park(&self) {
+    pub(super) fn park(&self) {
         if !self.0.armed.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -68,7 +68,7 @@ impl Gate {
             .expect("parked thread was never released");
     }
 
-    fn wait_parked(&self) {
+    pub(super) fn wait_parked(&self) {
         self.0
             .reached_rx
             .lock()
@@ -77,13 +77,13 @@ impl Gate {
             .expect("thread never reached its park point");
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.0.release_tx.lock().unwrap().send(()).unwrap();
     }
 }
 
 /// Install the runtime's park hook with armed gates at `points`.
-fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>) {
+pub(super) fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>) {
     for (_, gate) in &points {
         gate.arm();
     }
@@ -97,7 +97,7 @@ fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>) {
     assert!(installed.is_ok(), "park hook installed twice");
 }
 
-fn id<T>(h: Incr<T>) -> NodeId {
+pub(super) fn id<T>(h: Incr<T>) -> NodeId {
     NodeId(h.slot())
 }
 

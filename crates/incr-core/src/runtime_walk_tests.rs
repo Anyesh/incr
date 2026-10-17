@@ -4,8 +4,10 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::Duration;
 
-use super::{Runtime, EXACT_MODE_AT};
+use super::race_tests::{id, park_at, Gate};
+use super::{ParkPoint, Runtime, EXACT_MODE_AT};
 use crate::cells::{Cells, Local, Shared};
 use crate::handle::Incr;
 use crate::test_size::test_size;
@@ -353,4 +355,82 @@ fn local_taint_chain_recomputes_in_linear_expansions() {
 #[cfg_attr(miri, ignore)]
 fn shared_taint_chain_recomputes_in_linear_expansions() {
     on_deep_stack(taint_chain_recomputes_in_linear_expansions::<Shared>);
+}
+
+/// A reader's thread stack when the chain is recomputed through the walk.
+const READER_STACK: usize = 256 << 10;
+
+/// x -> q_0 -> q_1 -> ... -> q_{n-1}, made Clean by ascending gets. After
+/// a set on x, one thread recomputes q_0 with a closure parked inside it
+/// while a second thread, on a small stack, gets the top: its walk waits
+/// on the first thread's claim, then recomputes the chain iteratively.
+fn deep_contended_chain(nested: bool) {
+    let n = test_size(100_000);
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let x = rt.create_input(0_i64);
+    let slow = Gate::new();
+    let bottom = {
+        let slow = slow.clone();
+        rt.create_query(move |rt| {
+            let v = rt.get(x);
+            slow.park();
+            v
+        })
+    };
+    let mut chain = vec![bottom];
+    for k in 1..n {
+        let below = chain[k - 1];
+        chain.push(rt.create_query(move |rt| rt.get(below) + 1));
+    }
+    for &q in &chain {
+        rt.get(q);
+    }
+    let top = chain[n - 1];
+    let outer = rt.create_query(move |rt| rt.get(top) * 2);
+    assert_eq!(rt.get(outer), 2 * (n as i64 - 1));
+
+    rt.set(x, 5);
+    slow.arm();
+    let recompute = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(bottom))
+    };
+    slow.wait_parked();
+
+    let wait = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::BeforeComputeOne(id(bottom)), wait.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .stack_size(READER_STACK)
+            .spawn(move || if nested { rt.get(outer) } else { rt.get(top) })
+            .unwrap()
+    };
+    wait.wait_parked();
+    wait.release();
+    thread::sleep(Duration::from_millis(50));
+    slow.release();
+
+    assert_eq!(recompute.join().unwrap(), 5);
+    let expected = 5 + n as i64 - 1;
+    assert_eq!(
+        reader.join().unwrap(),
+        if nested { 2 * expected } else { expected }
+    );
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_deep_contended_chain_reader_waits_at_depth_0() {
+    deep_contended_chain(false);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_deep_contended_chain_reader_waits_inside_a_compute() {
+    deep_contended_chain(true);
 }
