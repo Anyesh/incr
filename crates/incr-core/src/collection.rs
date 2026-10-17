@@ -55,6 +55,7 @@ use crate::hashed_multiset::{HashedMultiset, Located};
 use crate::locks::Lock;
 use crate::runtime::{ParkPoint, Runtime};
 use crate::value::Value;
+use crate::value_code;
 
 #[cfg(test)]
 pub(crate) fn park<C: Cells>(rt: &Runtime<C>, point: ParkPoint) {
@@ -153,6 +154,12 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         &self.deltas[(from - self.base) as usize..]
     }
 
+    /// A copy of the pending deltas (user `Clone`), for a consumer to
+    /// stage outside this guard.
+    pub(crate) fn pending_cloned(&self, from: u64) -> Vec<Delta<T>> {
+        value_code::run(|| self.pending_from(from).to_vec())
+    }
+
     /// Register a new consumer: returns its cursor (positioned at the
     /// current end) and a bootstrap snapshot of the live multiset that
     /// stands in for the compacted history.
@@ -192,10 +199,12 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// the lookups (user `Eq`). Changes nothing, so a panic here leaves
     /// the log as it was.
     pub(crate) fn locate(&mut self, staged: &Staged<T>) -> Located {
-        self.elements.locate(
-            staged.remove.as_ref().map(|(hash, value)| (*hash, value)),
-            staged.add.as_ref().map(|(hash, value, _)| (*hash, value)),
-        )
+        value_code::run(|| {
+            self.elements.locate(
+                staged.remove.as_ref().map(|(hash, value)| (*hash, value)),
+                staged.add.as_ref().map(|(hash, value, _)| (*hash, value)),
+            )
+        })
     }
 
     /// Phase 3 of a mutation: apply the located change and push its
@@ -275,25 +284,27 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// Returns the new version, if anything changed.
     pub(crate) fn converge(&mut self, target: Vec<T>, keep: &mut Vec<Displaced<T>>) -> Option<u64> {
         let mut wanted: HashMap<T, usize> = HashMap::new();
-        for value in target {
-            *wanted.entry(value).or_default() += 1;
-        }
         let mut surplus = Vec::new();
-        for (value, have) in self.elements.iter() {
-            let kept = wanted.get_mut(value).map_or(0, |want| {
-                let kept = have.min(*want);
-                *want -= kept;
-                kept
-            });
-            surplus.extend(std::iter::repeat_n(value, have - kept).cloned());
-        }
+        value_code::run(|| {
+            for value in target {
+                *wanted.entry(value).or_default() += 1;
+            }
+            for (value, have) in self.elements.iter() {
+                let kept = wanted.get_mut(value).map_or(0, |want| {
+                    let kept = have.min(*want);
+                    *want -= kept;
+                    kept
+                });
+                surplus.extend(std::iter::repeat_n(value, have - kept).cloned());
+            }
+        });
         let mut version = None;
         for value in surplus {
             version = self.delete_kept(value, keep).or(version);
         }
         for (value, missing) in wanted {
             for _ in 0..missing {
-                version = self.insert_kept(value.clone(), keep).or(version);
+                version = self.insert_kept(cloned(&value), keep).or(version);
             }
         }
         version
@@ -316,11 +327,13 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// Snapshot of all live elements, with multiset duplicates expanded.
     pub fn elements_vec(&self) -> Vec<T> {
         let mut out = Vec::with_capacity(self.len());
-        for (val, count) in self.elements.iter() {
-            for _ in 0..count {
-                out.push(val.clone());
+        value_code::run(|| {
+            for (val, count) in self.elements.iter() {
+                for _ in 0..count {
+                    out.push(val.clone());
+                }
             }
-        }
+        });
         out
     }
 
@@ -339,19 +352,19 @@ pub(crate) struct Staged<T> {
 
 impl<T: Hash + Clone> Staged<T> {
     pub(crate) fn new(hasher: &RandomState, remove: Option<&T>, add: Option<T>) -> Self {
-        Self {
+        value_code::run(|| Self {
             remove: remove.map(|value| (hasher.hash_one(value), value.clone())),
             add: add.map(|value| (hasher.hash_one(&value), value.clone(), value)),
-        }
+        })
     }
 
     /// Like [`Staged::new`], with the removed value owned, so it becomes
     /// the delete delta without a copy.
     pub(crate) fn owned(hasher: &RandomState, remove: Option<T>, add: Option<T>) -> Self {
-        Self {
+        value_code::run(|| Self {
             remove: remove.map(|value| (hasher.hash_one(&value), value)),
             add: add.map(|value| (hasher.hash_one(&value), value.clone(), value)),
-        }
+        })
     }
 
     pub(crate) fn delta(hasher: &RandomState, delta: Delta<T>) -> Self {
@@ -560,6 +573,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     /// and user `Drop` of what the change displaced runs only after it.
     fn mutate(&self, rt: &Runtime<C>, remove: Option<&T>, add: Option<T>) -> bool {
         self.check_mutable();
+        value_code::check();
         let staged = Staged::new(&self.hasher, remove, add);
         let mut log = self.log.write();
         let at = log.locate(&staged);
@@ -574,6 +588,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
 
     /// Number of live elements (with multiset duplicates counted).
     pub fn snapshot_len(&self) -> usize {
+        value_code::check();
         self.log.read().len()
     }
 
@@ -589,6 +604,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     /// whatever the group last observed. Force `GroupedCollection`'s own
     /// `version_node()` first if a group's contents need to be current.
     pub fn values(&self, rt: &Runtime<C>) -> Vec<T> {
+        value_code::check();
         rt.get(self.version_node);
         self.log.read().elements_vec()
     }
@@ -650,6 +666,7 @@ where
         U: Value + Hash + Eq,
         I: Fn(T) -> Option<U> + Send + Sync + 'static,
     {
+        value_code::check();
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
@@ -691,7 +708,7 @@ where
                     drop(up);
                     return output_log_for_query.read().version;
                 }
-                (from, up.pending_from(from).to_vec())
+                (from, up.pending_cloned(from))
             };
             let to = from + pending.len() as u64;
 
@@ -722,6 +739,7 @@ where
     pub fn count(&self, rt: &Runtime<C>) -> Incr<u64> {
         use std::sync::atomic::AtomicI64;
 
+        value_code::check();
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
@@ -761,6 +779,7 @@ where
         U: Value,
         F: Fn(&[T]) -> U + Send + Sync + 'static,
     {
+        value_code::check();
         let log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
@@ -795,11 +814,12 @@ where
         L: Fn(&T) -> U + Send + Sync + 'static,
         Cmb: Fn(&U, &U) -> U + Send + Sync + 'static,
     {
+        value_code::check();
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
-        let state = AggState::build(identity.clone(), paired_with(&lift, bootstrap), &combine);
+        let state = AggState::build(cloned(&identity), paired_with(&lift, bootstrap), &combine);
         let state: Arc<OpLock<AggState<T, U>, C>> = Arc::new(OpLock::new(state));
 
         let rebuild = NeedsRebuild::new();
@@ -810,8 +830,8 @@ where
             if rebuild.is_set() {
                 let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
                 let fresh =
-                    AggState::build(identity.clone(), paired_with(&lift, snapshot), &combine);
-                let root = fresh.root().clone();
+                    AggState::build(cloned(&identity), paired_with(&lift, snapshot), &combine);
+                let root = fresh.cloned_root();
                 let stale = std::mem::replace(&mut *state_for_query.write(), fresh);
                 cursor.store(end, MemOrdering::Release);
                 rebuild.clear();
@@ -824,9 +844,9 @@ where
                 let from = cursor.load(MemOrdering::Acquire);
                 if from >= up.end() {
                     drop(up);
-                    return state_for_query.read().root().clone();
+                    return state_for_query.read().cloned_root();
                 }
-                (from, up.pending_from(from).to_vec())
+                (from, up.pending_cloned(from))
             };
             let to = from + pending.len() as u64;
 
@@ -853,7 +873,7 @@ where
                 }
             });
             cursor.store(to, MemOrdering::Release);
-            st.root().clone()
+            st.cloned_root()
         })
     }
 
@@ -873,6 +893,7 @@ where
         FL: Fn(&T) -> K + Send + Sync + 'static,
         FR: Fn(&U) -> K + Send + Sync + 'static,
     {
+        value_code::check();
         let left_log = Arc::clone(&self.log);
         let right_log = Arc::clone(&right.log);
         let left_version = self.version_node;
@@ -931,7 +952,7 @@ where
                 let p = if from >= l.end() {
                     Vec::new()
                 } else {
-                    l.pending_from(from).to_vec()
+                    l.pending_cloned(from)
                 };
                 (from, p)
             };
@@ -941,7 +962,7 @@ where
                 let p = if from >= r.end() {
                     Vec::new()
                 } else {
-                    r.pending_from(from).to_vec()
+                    r.pending_cloned(from)
                 };
                 (from, p)
             };
@@ -998,6 +1019,7 @@ where
         K: Clone + PartialEq + Eq + Hash + Send + Sync + 'static,
         F: Fn(&T) -> K + Send + Sync + 'static,
     {
+        value_code::check();
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
@@ -1014,11 +1036,10 @@ where
             let mut grps = groups.write();
             let mut kc = key_cache.write();
             for (v, k) in keyed {
-                let k = kc.insert(v.clone(), k);
-                let group = grps
-                    .entry(k)
+                let k = kc.insert(cloned(v), k);
+                let group = value_code::run(|| grps.entry(k))
                     .or_insert_with(|| IncrCollection::<T, C>::new_in_compute(rt));
-                let new_ver = group.log.write().insert(v.clone());
+                let new_ver = group.log.write().insert(cloned(v));
                 rt.set(group.version_node, new_ver);
             }
         }
@@ -1050,19 +1071,21 @@ where
                 let mut fresh = KeyCache::new();
                 let mut targets: HashMap<K, Vec<T>> = HashMap::new();
                 for (v, k) in paired_with(&key_fn, snapshot) {
-                    let k = fresh.insert(v.clone(), k);
-                    targets.entry(k).or_default().push(v);
+                    let k = fresh.insert(cloned(&v), k);
+                    value_code::run(|| targets.entry(k).or_default()).push(v);
                 }
 
                 let mut grps = groups_for_query.write();
                 let mut kc = key_cache_for_query.write();
-                for k in grps.keys() {
-                    if !targets.contains_key(k) {
-                        targets.insert(k.clone(), Vec::new());
+                value_code::run(|| {
+                    for k in grps.keys() {
+                        if !targets.contains_key(k) {
+                            targets.insert(k.clone(), Vec::new());
+                        }
                     }
-                }
+                });
                 for (k, target) in targets {
-                    let group = grps.entry(k).or_insert_with(new_group);
+                    let group = value_code::run(|| grps.entry(k)).or_insert_with(new_group);
                     let version = group.log.write().converge(target, &mut keep);
                     if let Some(version) = version {
                         rt.set(group.version_node, version);
@@ -1084,7 +1107,7 @@ where
                     drop(up);
                     return output_version_counter_for_query.load(MemOrdering::Relaxed);
                 }
-                (from, up.pending_from(from).to_vec())
+                (from, up.pending_cloned(from))
             };
             let to = from + pending.len() as u64;
 
@@ -1108,19 +1131,21 @@ where
                 for change in keyed {
                     match change {
                         Keyed::Insert(v, k) => {
-                            let k = kc.insert(v.clone(), k);
-                            by_group.entry(k).or_default().push(Delta::Insert(v));
+                            let k = kc.insert(cloned(&v), k);
+                            value_code::run(|| by_group.entry(k).or_default())
+                                .push(Delta::Insert(v));
                         }
                         Keyed::Delete(v) => {
                             if let Some(k) = kc.remove(&v) {
-                                by_group.entry(k).or_default().push(Delta::Delete(v));
+                                value_code::run(|| by_group.entry(k).or_default())
+                                    .push(Delta::Delete(v));
                             }
                         }
                     }
                 }
 
                 for (k, deltas) in by_group {
-                    let group = grps.entry(k).or_insert_with(new_group);
+                    let group = value_code::run(|| grps.entry(k)).or_insert_with(new_group);
                     let mut log = group.log.write();
                     let mut last_version = None;
                     for d in deltas {
@@ -1180,6 +1205,7 @@ impl<A: Hash + Eq + Clone, K: Hash + Eq + Clone> JoinSide<A, K> {
         other: &JoinSide<B, K>,
         mut matched: impl FnMut(&A, &B),
     ) {
+        let _guard = value_code::enter();
         let key = self.keys.insert(value.clone(), key);
         if let Some(matches) = other.index.get(&key) {
             for m in matches {
@@ -1192,12 +1218,14 @@ impl<A: Hash + Eq + Clone, K: Hash + Eq + Clone> JoinSide<A, K> {
     /// Removes one copy of `value`, if present, and passes it with every
     /// element of `other` filed under its key to `matched`.
     fn delete<B>(&mut self, value: &A, other: &JoinSide<B, K>, mut matched: impl FnMut(&A, &B)) {
+        let guard = value_code::enter();
         let Some(key) = self.keys.remove(value) else {
             return;
         };
+        let mut removed = None;
         if let Some(bucket) = self.index.get_mut(&key) {
             if let Some(pos) = bucket.iter().position(|x| x == value) {
-                bucket.remove(pos);
+                removed = Some(bucket.remove(pos));
             }
             if bucket.is_empty() {
                 self.index.remove(&key);
@@ -1208,6 +1236,8 @@ impl<A: Hash + Eq + Clone, K: Hash + Eq + Clone> JoinSide<A, K> {
                 matched(value, m);
             }
         }
+        drop(guard);
+        drop(removed);
     }
 }
 
@@ -1273,22 +1303,24 @@ impl<T: Hash + Eq, K: Clone> KeyCache<T, K> {
     /// Records one copy of `value` and returns the key to file it under:
     /// `key` for its first copy, and the first copy's key after that.
     fn insert(&mut self, value: T, key: K) -> K {
-        match self.0.entry(value) {
+        value_code::run(|| match self.0.entry(value) {
             Entry::Occupied(mut e) => {
                 e.get_mut().1 += 1;
                 e.get().0.clone()
             }
             Entry::Vacant(e) => e.insert((key, 1)).0.clone(),
-        }
+        })
     }
 
     fn remove(&mut self, value: &T) -> Option<K> {
-        let (key, copies) = self.0.get_mut(value)?;
-        if *copies > 1 {
-            *copies -= 1;
-            return Some(key.clone());
-        }
-        self.0.remove(value).map(|(key, _)| key)
+        value_code::run(|| {
+            let (key, copies) = self.0.get_mut(value)?;
+            if *copies > 1 {
+                *copies -= 1;
+                return Some(key.clone());
+            }
+            self.0.remove(value).map(|(key, _)| key)
+        })
     }
 }
 
@@ -1305,14 +1337,14 @@ struct AggTree<U> {
 impl<U: Clone> AggTree<U> {
     fn new(identity: U) -> Self {
         Self {
-            nodes: vec![identity.clone(); 2],
+            nodes: value_code::run(|| vec![identity.clone(); 2]),
             cap: 1,
             identity,
         }
     }
 
-    fn root(&self) -> &U {
-        &self.nodes[1]
+    fn cloned_root(&self) -> U {
+        cloned(&self.nodes[1])
     }
 
     fn set_leaf(&mut self, slot: usize, value: U, combine: &impl Fn(&U, &U) -> U) {
@@ -1326,8 +1358,12 @@ impl<U: Clone> AggTree<U> {
 
     fn grow(&mut self, combine: &impl Fn(&U, &U) -> U) {
         let new_cap = self.cap * 2;
-        let mut nodes = vec![self.identity.clone(); 2 * new_cap];
-        nodes[new_cap..new_cap + self.cap].clone_from_slice(&self.nodes[self.cap..2 * self.cap]);
+        let mut nodes = value_code::run(|| {
+            let mut nodes = vec![self.identity.clone(); 2 * new_cap];
+            nodes[new_cap..new_cap + self.cap]
+                .clone_from_slice(&self.nodes[self.cap..2 * self.cap]);
+            nodes
+        });
         for i in (1..new_cap).rev() {
             nodes[i] = combine(&nodes[2 * i], &nodes[2 * i + 1]);
         }
@@ -1346,6 +1382,11 @@ struct AggState<T: Hash + Eq + Clone, U> {
 enum AggChange<T, U> {
     Insert(T, U),
     Delete(T),
+}
+
+/// A user `Clone` made by the engine, inside the value-code counter.
+pub(crate) fn cloned<T: Clone>(value: &T) -> T {
+    value_code::run(|| value.clone())
 }
 
 /// Pairs each value with `f` of it, run with no lock held.
@@ -1377,8 +1418,8 @@ impl<T: Hash + Eq + Clone, U: Clone> AggState<T, U> {
         state
     }
 
-    fn root(&self) -> &U {
-        self.tree.root()
+    fn cloned_root(&self) -> U {
+        self.tree.cloned_root()
     }
 
     fn insert(&mut self, value: T, lifted: U, combine: &impl Fn(&U, &U) -> U) {
@@ -1390,22 +1431,23 @@ impl<T: Hash + Eq + Clone, U: Clone> AggState<T, U> {
             self.high_water += 1;
             s
         });
-        self.slots.entry(value).or_default().push(slot);
+        value_code::run(|| self.slots.entry(value).or_default()).push(slot);
         self.tree.set_leaf(slot, lifted, combine);
     }
 
     fn delete(&mut self, value: &T, combine: &impl Fn(&U, &U) -> U) {
+        let guard = value_code::enter();
         let Some(bucket) = self.slots.get_mut(value) else {
             return;
         };
         let Some(slot) = bucket.pop() else {
             return;
         };
-        if bucket.is_empty() {
-            self.slots.remove(value);
-        }
-        self.tree
-            .set_leaf(slot, self.tree.identity.clone(), combine);
+        let emptied = bucket.is_empty().then(|| self.slots.remove_entry(value));
+        let identity = self.tree.identity.clone();
+        drop(guard);
+        drop(emptied);
+        self.tree.set_leaf(slot, identity, combine);
         self.free.push(slot);
     }
 }
@@ -1457,14 +1499,19 @@ where
     }
 
     pub fn keys(&self) -> Vec<K> {
-        self.groups.read().keys().cloned().collect()
+        value_code::check();
+        let groups = self.groups.read();
+        value_code::run(|| groups.keys().cloned().collect())
     }
 
     pub fn get_group(&self, key: &K) -> Option<IncrCollection<T, C>> {
-        self.groups.read().get(key).cloned()
+        value_code::check();
+        let groups = self.groups.read();
+        value_code::run(|| groups.get(key)).cloned()
     }
 
     pub fn group_count(&self) -> usize {
+        value_code::check();
         self.groups.read().len()
     }
 }

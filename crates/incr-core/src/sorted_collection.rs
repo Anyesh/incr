@@ -27,12 +27,13 @@ use std::sync::Arc;
 
 use crate::cells::Cells;
 use crate::collection::{
-    paired_with, rebuild_snapshot, CollectionLog, Delta, Displaced, IncrCollection, NeedsRebuild,
-    OpLock,
+    cloned, paired_with, rebuild_snapshot, CollectionLog, Delta, Displaced, IncrCollection,
+    NeedsRebuild, OpLock,
 };
 use crate::handle::Incr;
 use crate::runtime::Runtime;
 use crate::value::Value;
+use crate::value_code;
 
 /// Positional delta on a sorted view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,9 +77,15 @@ impl<T: Clone, K> SortedState<T, K> {
         &self.deltas[(from - self.base) as usize..]
     }
 
+    /// A copy of the pending deltas (user `Clone`), for a consumer to
+    /// stage outside this guard.
+    fn pending_cloned(&self, from: u64) -> Vec<SortDelta<T>> {
+        value_code::run(|| self.pending_from(from).to_vec())
+    }
+
     /// The current order and the log's end, under one guard.
     fn snapshot(&self) -> (Vec<T>, u64) {
-        let order = self.sorted.iter().map(|(_, t)| t.clone()).collect();
+        let order = value_code::run(|| self.sorted.iter().map(|(_, t)| t.clone()).collect());
         (order, self.end())
     }
 
@@ -120,8 +127,10 @@ impl<T: Clone, K> SortedState<T, K> {
     where
         K: Ord,
     {
-        let pos = self.sorted.partition_point(|(k2, _)| k2 <= &key);
-        let delta = value.clone();
+        let (pos, delta) = value_code::run(|| {
+            let pos = self.sorted.partition_point(|(k2, _)| k2 <= &key);
+            (pos, value.clone())
+        });
         self.sorted.insert(pos, (key, value));
         self.push_delta(SortDelta::Insert { pos, value: delta });
     }
@@ -142,28 +151,38 @@ impl<T: Clone, K> SortedState<T, K> {
         K: Ord,
     {
         let mut wanted: HashMap<T, Vec<K>> = HashMap::new();
-        for (value, key) in target {
-            wanted.entry(value).or_default().push(key);
-        }
         let mut surplus = Vec::new();
-        for (pos, (key, value)) in self.sorted.iter().enumerate() {
-            let kept = wanted.get_mut(value).and_then(|keys| {
-                let at = keys.iter().position(|k| k == key)?;
-                Some(keys.swap_remove(at))
-            });
-            if kept.is_none() {
-                surplus.push(pos);
+        value_code::run(|| {
+            for (value, key) in target {
+                wanted.entry(value).or_default().push(key);
             }
-        }
+            for (pos, (key, value)) in self.sorted.iter().enumerate() {
+                let kept = wanted.get_mut(value).and_then(|keys| {
+                    let at = keys.iter().position(|k| k == key)?;
+                    Some(keys.swap_remove(at))
+                });
+                if kept.is_none() {
+                    surplus.push(pos);
+                }
+            }
+        });
         for pos in surplus.into_iter().rev() {
             self.remove(pos);
         }
         for (value, keys) in wanted {
             for key in keys {
-                self.insert(value.clone(), key);
+                self.insert(cloned(&value), key);
             }
         }
     }
+}
+
+fn pair<T: Clone>(a: &T, b: &T) -> (T, T) {
+    value_code::run(|| (a.clone(), b.clone()))
+}
+
+fn window_of<T: Clone>(window: &[T]) -> Vec<T> {
+    value_code::run(|| window.to_vec())
 }
 
 /// Sorted view of an upstream collection.
@@ -206,15 +225,12 @@ where
     /// Snapshot of the current sorted view. A clone of the entire vec;
     /// do not call in inner loops.
     pub fn snapshot(&self) -> Vec<T> {
-        self.state
-            .read()
-            .sorted
-            .iter()
-            .map(|(_, t)| t.clone())
-            .collect()
+        value_code::check();
+        self.state.read().snapshot().0
     }
 
     pub fn snapshot_len(&self) -> usize {
+        value_code::check();
         self.state.read().sorted.len()
     }
 }
@@ -233,6 +249,7 @@ where
         K: Ord + Clone + Send + Sync + 'static,
         F: Fn(&T) -> K + Send + Sync + 'static,
     {
+        value_code::check();
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
@@ -265,7 +282,7 @@ where
                     drop(up);
                     return state_for_query.read().version;
                 }
-                (from, up.pending_from(from).to_vec())
+                (from, up.pending_cloned(from))
             };
             let to = from + pending.len() as u64;
 
@@ -287,9 +304,11 @@ where
                     match d {
                         Delta::Insert(v) => st.insert(v, key),
                         Delta::Delete(v) => {
-                            let range_start = st.sorted.partition_point(|(k2, _)| k2 < &key);
-                            let range_end = st.sorted.partition_point(|(k2, _)| k2 <= &key);
-                            let found = (range_start..range_end).find(|&i| st.sorted[i].1 == v);
+                            let found = value_code::run(|| {
+                                let range_start = st.sorted.partition_point(|(k2, _)| k2 < &key);
+                                let range_end = st.sorted.partition_point(|(k2, _)| k2 <= &key);
+                                (range_start..range_end).find(|&i| st.sorted[i].1 == v)
+                            });
                             if let Some(pos) = found {
                                 st.remove(pos);
                             }
@@ -323,37 +342,34 @@ where
     /// produces O(1) output deltas regardless of collection size.
     pub fn pairwise(&self, rt: &Runtime<C>) -> IncrCollection<(T, T), C> {
         let pairs = |mirror: &[T]| -> Vec<(T, T)> {
-            mirror
-                .windows(2)
-                .map(|w| (w[0].clone(), w[1].clone()))
-                .collect()
+            mirror.windows(2).map(|w| pair(&w[0], &w[1])).collect()
         };
         self.positional(rt, pairs, |mirror, out, d, keep| match d {
             SortDelta::Insert { pos, value } => {
                 let pos = *pos;
                 let len = mirror.len();
                 if pos > 0 && pos < len {
-                    out.delete_kept((mirror[pos - 1].clone(), mirror[pos].clone()), keep);
+                    out.delete_kept(pair(&mirror[pos - 1], &mirror[pos]), keep);
                 }
                 if pos > 0 {
-                    out.insert_kept((mirror[pos - 1].clone(), value.clone()), keep);
+                    out.insert_kept(pair(&mirror[pos - 1], value), keep);
                 }
                 if pos < len {
-                    out.insert_kept((value.clone(), mirror[pos].clone()), keep);
+                    out.insert_kept(pair(value, &mirror[pos]), keep);
                 }
-                mirror.insert(pos, value.clone());
+                mirror.insert(pos, cloned(value));
             }
             SortDelta::Remove { pos, .. } => {
                 let pos = *pos;
-                let v = mirror[pos].clone();
+                let v = cloned(&mirror[pos]);
                 if pos > 0 {
-                    out.delete_kept((mirror[pos - 1].clone(), v.clone()), keep);
+                    out.delete_kept(pair(&mirror[pos - 1], &v), keep);
                 }
                 if pos + 1 < mirror.len() {
-                    out.delete_kept((v.clone(), mirror[pos + 1].clone()), keep);
+                    out.delete_kept(pair(&v, &mirror[pos + 1]), keep);
                 }
                 if pos > 0 && pos + 1 < mirror.len() {
-                    out.insert_kept((mirror[pos - 1].clone(), mirror[pos + 1].clone()), keep);
+                    out.insert_kept(pair(&mirror[pos - 1], &mirror[pos + 1]), keep);
                 }
                 mirror.remove(pos);
             }
@@ -367,9 +383,8 @@ where
     /// overlap its position, O(size) windows of O(size) elements each.
     pub fn window(&self, rt: &Runtime<C>, size: usize) -> IncrCollection<Vec<T>, C> {
         assert!(size > 0, "window size must be positive");
-        let windows = move |mirror: &[T]| -> Vec<Vec<T>> {
-            mirror.windows(size).map(<[T]>::to_vec).collect()
-        };
+        let windows =
+            move |mirror: &[T]| -> Vec<Vec<T>> { mirror.windows(size).map(window_of).collect() };
         self.positional(rt, windows, move |mirror, out, d, keep| match d {
             SortDelta::Insert { pos, value } => {
                 let pos = *pos;
@@ -380,14 +395,14 @@ where
                 // are added. Both bands are at most `size` wide.
                 if pos >= 1 && old_len >= size {
                     for s in lo..=(pos - 1).min(old_len - size) {
-                        out.delete_kept(mirror[s..s + size].to_vec(), keep);
+                        out.delete_kept(window_of(&mirror[s..s + size]), keep);
                     }
                 }
-                mirror.insert(pos, value.clone());
+                mirror.insert(pos, cloned(value));
                 let new_len = mirror.len();
                 if new_len >= size {
                     for s in lo..=pos.min(new_len - size) {
-                        out.insert_kept(mirror[s..s + size].to_vec(), keep);
+                        out.insert_kept(window_of(&mirror[s..s + size]), keep);
                     }
                 }
             }
@@ -397,14 +412,14 @@ where
                 let lo = pos.saturating_sub(size - 1);
                 if old_len >= size {
                     for s in lo..=pos.min(old_len - size) {
-                        out.delete_kept(mirror[s..s + size].to_vec(), keep);
+                        out.delete_kept(window_of(&mirror[s..s + size]), keep);
                     }
                 }
                 mirror.remove(pos);
                 let new_len = mirror.len();
                 if pos >= 1 && new_len >= size {
                     for s in lo..=(pos - 1).min(new_len - size) {
-                        out.insert_kept(mirror[s..s + size].to_vec(), keep);
+                        out.insert_kept(window_of(&mirror[s..s + size]), keep);
                     }
                 }
             }
@@ -428,6 +443,7 @@ where
             + Sync
             + 'static,
     {
+        value_code::check();
         let state = Arc::clone(&self.state);
         let upstream_version = self.version_node;
 
@@ -435,8 +451,9 @@ where
         let output_log: Arc<OpLock<CollectionLog<O>, C>> =
             Arc::new(OpLock::new(CollectionLog::new()));
         {
+            let seeded = value_code::run(|| outputs(&bootstrap));
             let mut out = output_log.write();
-            for o in outputs(&bootstrap) {
+            for o in seeded {
                 out.insert(o);
             }
         }
@@ -450,7 +467,7 @@ where
 
             if rebuild.is_set() {
                 let (snapshot, end) = rebuild_snapshot(rt, &state, SortedState::snapshot);
-                let target = outputs(&snapshot);
+                let target = value_code::run(|| outputs(&snapshot));
                 let mut mirror = mirror.write();
                 let mut out = output_log_for_query.write();
                 out.converge(target, &mut keep);
@@ -471,7 +488,7 @@ where
                     drop(st);
                     return output_log_for_query.read().version;
                 }
-                (from, st.pending_from(from).to_vec())
+                (from, st.pending_cloned(from))
             };
 
             let mut mirror = mirror.write();

@@ -125,6 +125,12 @@ fn assert_contract_panic(what: &str, op: impl FnOnce()) {
     disarm();
 }
 
+fn ids<C: Cells>(rt: &Runtime<C>, c: &crate::IncrCollection<Hooked, C>) -> Vec<u32> {
+    let mut out: Vec<u32> = c.values(rt).iter().map(|h| h.0).collect();
+    out.sort_unstable();
+    out
+}
+
 fn partial_eq_that_deletes_the_input<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
     let hooked = Rc::clone(&rt);
@@ -146,6 +152,19 @@ fn partial_eq_that_sets_another_input<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_eq!(rt.get(a).0, 1);
     rt.set(a, Hooked(3));
     assert_eq!(rt.get(a).0, 3);
+}
+
+fn partial_eq_that_inserts_into_a_collection<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let c = rt.create_collection::<u32>();
+    let hooked = Rc::clone(&rt);
+    let target = c.clone();
+    arm(Op::Eq, move || target.insert(&hooked, 7));
+    assert_contract_panic("insert from PartialEq", || rt.set(a, Hooked(2)));
+    assert_eq!(c.snapshot_len(), 0);
+    assert_eq!(rt.get(a).0, 1);
+    c.insert(&rt, 7);
+    assert_eq!(c.values(&rt), vec![7]);
 }
 
 fn clone_that_reads_a_clean_node<C: Cells>(rt: Rc<Runtime<C>>) {
@@ -205,6 +224,8 @@ struct Fixture<C: Cells> {
     victim: crate::Incr<u32>,
     observer: crate::ObserverId,
     c: crate::IncrCollection<u32, C>,
+    grouped: crate::GroupedCollection<u32, u32, C>,
+    sorted: crate::SortedCollection<u32, u32, C>,
 }
 
 impl<C: Cells> Fixture<C> {
@@ -215,9 +236,13 @@ impl<C: Cells> Fixture<C> {
         let victim = rt.create_input(0u32);
         let observer = rt.observe(clean, |_| {});
         let c = rt.create_collection::<u32>();
+        let grouped = c.group_by(rt, |v| v % 2);
+        let sorted = c.sort_by_key(rt, |v| *v);
         c.insert(rt, 1);
         rt.get(clean);
         rt.get(dirty);
+        rt.get(grouped.version_node());
+        rt.get(sorted.version_node());
         Self {
             clean,
             source,
@@ -225,6 +250,8 @@ impl<C: Cells> Fixture<C> {
             victim,
             observer,
             c,
+            grouped,
+            sorted,
         }
     }
 }
@@ -264,6 +291,69 @@ fn engine_paths<C: Cells>() -> Vec<Path<C>> {
     ]
 }
 
+fn collection_paths<C: Cells>() -> Vec<Path<C>> {
+    vec![
+        ("insert", |rt, f| f.c.insert(rt, 2)),
+        ("delete", |rt, f| {
+            f.c.delete(rt, &1);
+        }),
+        ("replace", |rt, f| {
+            f.c.replace(rt, Some(&1), 2);
+        }),
+        ("values", |rt, f| {
+            f.c.values(rt);
+        }),
+        ("snapshot_len", |_, f| {
+            f.c.snapshot_len();
+        }),
+        ("filter", |rt, f| {
+            f.c.filter(rt, |_| true);
+        }),
+        ("map", |rt, f| {
+            f.c.map(rt, |v| *v);
+        }),
+        ("count", |rt, f| {
+            f.c.count(rt);
+        }),
+        ("reduce", |rt, f| {
+            f.c.reduce(rt, |v| v.len());
+        }),
+        ("aggregate", |rt, f| {
+            f.c.aggregate(rt, 0u32, |v| *v, |a, b| a + b);
+        }),
+        ("join", |rt, f| {
+            f.c.join(rt, &f.c, |v| *v, |v| *v);
+        }),
+        ("group_by", |rt, f| {
+            f.c.group_by(rt, |v| *v);
+        }),
+        ("keys", |_, f| {
+            f.grouped.keys();
+        }),
+        ("get_group", |_, f| {
+            f.grouped.get_group(&1);
+        }),
+        ("group_count", |_, f| {
+            f.grouped.group_count();
+        }),
+        ("sort_by_key", |rt, f| {
+            f.c.sort_by_key(rt, |v| *v);
+        }),
+        ("sorted snapshot", |_, f| {
+            f.sorted.snapshot();
+        }),
+        ("sorted snapshot_len", |_, f| {
+            f.sorted.snapshot_len();
+        }),
+        ("pairwise", |rt, f| {
+            f.sorted.pairwise(rt);
+        }),
+        ("window", |rt, f| {
+            f.sorted.window(rt, 2);
+        }),
+    ]
+}
+
 /// Each path, called from the `PartialEq` of a `set`, panics with the
 /// contract message before changing anything, and the engine serves the
 /// next call normally.
@@ -284,6 +374,141 @@ fn every_path_is_refused<C: Cells>(rt: Rc<Runtime<C>>, paths: Vec<Path<C>>) {
         rt.set(a, Hooked(3));
         assert_eq!(rt.get(a).0, 3, "{name}");
     }
+}
+
+fn hash_that_reads_a_node_on_insert<C: Cells>(rt: Rc<Runtime<C>>) {
+    let b = rt.create_input(5u32);
+    let c = rt.create_collection::<Hooked>();
+    let hooked = Rc::clone(&rt);
+    arm(Op::Hash, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Hash on insert", || c.insert(&rt, Hooked(1)));
+    assert_eq!(c.snapshot_len(), 0);
+    c.insert(&rt, Hooked(1));
+    assert_eq!(ids(&rt, &c), vec![1]);
+}
+
+fn eq_that_reads_a_node_on_insert<C: Cells>(rt: Rc<Runtime<C>>) {
+    let b = rt.create_input(5u32);
+    let c = rt.create_collection::<Hooked>();
+    c.insert(&rt, Hooked(1));
+    let hooked = Rc::clone(&rt);
+    arm(Op::Eq, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Eq on insert", || c.insert(&rt, Hooked(1)));
+    assert_eq!(c.snapshot_len(), 1);
+    c.insert(&rt, Hooked(1));
+    assert_eq!(ids(&rt, &c), vec![1, 1]);
+}
+
+fn clone_that_reads_a_node_on_values<C: Cells>(rt: Rc<Runtime<C>>) {
+    let b = rt.create_input(5u32);
+    let c = rt.create_collection::<Hooked>();
+    c.insert(&rt, Hooked(1));
+    let hooked = Rc::clone(&rt);
+    arm(Op::Clone, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Clone on values", || {
+        c.values(&rt);
+    });
+    assert_eq!(ids(&rt, &c), vec![1]);
+}
+
+fn clone_that_reads_a_node_in_a_filter_batch<C: Cells>(rt: Rc<Runtime<C>>) {
+    let b = rt.create_input(5u32);
+    let c = rt.create_collection::<Hooked>();
+    let evens = c.filter(&rt, |h| h.0 % 2 == 0);
+    c.insert(&rt, Hooked(2));
+    let hooked = Rc::clone(&rt);
+    arm(Op::Clone, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Clone in a filter batch", || {
+        rt.get(evens.version_node());
+    });
+    c.insert(&rt, Hooked(4));
+    assert_eq!(ids(&rt, &evens), vec![2, 4]);
+}
+
+fn hash_that_reads_a_node_in_a_group_by_batch<C: Cells>(rt: Rc<Runtime<C>>) {
+    let b = rt.create_input(5u32);
+    let c = rt.create_collection::<Hooked>();
+    let grouped = c.group_by(&rt, |h| h.0 % 2);
+    c.insert(&rt, Hooked(2));
+    let hooked = Rc::clone(&rt);
+    arm(Op::Hash, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Hash in the group_by key cache", || {
+        rt.get(grouped.version_node());
+    });
+    c.insert(&rt, Hooked(3));
+    rt.get(grouped.version_node());
+    assert_eq!(ids(&rt, &grouped.get_group(&0).unwrap()), vec![2]);
+    assert_eq!(ids(&rt, &grouped.get_group(&1).unwrap()), vec![3]);
+}
+
+fn hash_that_reads_a_node_in_a_join_batch_and_its_rebuild<C: Cells>(rt: Rc<Runtime<C>>) {
+    let b = rt.create_input(5u32);
+    let left = rt.create_collection::<Hooked>();
+    let right = rt.create_collection::<Hooked>();
+    let joined = left.join(&rt, &right, |h| h.0, |h| h.0);
+    left.insert(&rt, Hooked(1));
+    right.insert(&rt, Hooked(1));
+    let hooked = Rc::clone(&rt);
+    arm(Op::Hash, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Hash in the join key cache", || {
+        rt.get(joined.version_node());
+    });
+    // The panic landed inside the batch, so the next run rebuilds: the
+    // first two hashes file the sides, the third is the output converge.
+    left.insert(&rt, Hooked(2));
+    let hooked = Rc::clone(&rt);
+    arm_nth(Op::Hash, 3, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Hash in a rebuild's converge", || {
+        rt.get(joined.version_node());
+    });
+    right.insert(&rt, Hooked(2));
+    let mut pairs: Vec<(u32, u32)> = joined.values(&rt).iter().map(|(l, r)| (l.0, r.0)).collect();
+    pairs.sort_unstable();
+    assert_eq!(pairs, vec![(1, 1), (2, 2)]);
+}
+
+fn clone_that_reads_a_node_in_a_sort_batch<C: Cells>(rt: Rc<Runtime<C>>) {
+    let b = rt.create_input(5u32);
+    let c = rt.create_collection::<Hooked>();
+    let sorted = c.sort_by_key(&rt, |h| h.0);
+    let pairs = sorted.pairwise(&rt);
+    c.insert(&rt, Hooked(2));
+    // The first clone stages the pending delta, the second files the
+    // element in the sorted view.
+    let hooked = Rc::clone(&rt);
+    arm_nth(Op::Clone, 2, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Clone in the sorted view", || {
+        rt.get(sorted.version_node());
+    });
+    c.insert(&rt, Hooked(1));
+    rt.get(sorted.version_node());
+    let hooked = Rc::clone(&rt);
+    arm(Op::Clone, move || {
+        hooked.get(b);
+    });
+    assert_contract_panic("get from Clone in a pairwise batch", || {
+        rt.get(pairs.version_node());
+    });
+    c.insert(&rt, Hooked(3));
+    let mut out: Vec<(u32, u32)> = pairs.values(&rt).iter().map(|(l, r)| (l.0, r.0)).collect();
+    out.sort_unstable();
+    assert_eq!(out, vec![(1, 2), (2, 3)]);
 }
 
 macro_rules! both {
@@ -309,9 +534,17 @@ macro_rules! both {
 both!(
     partial_eq_that_deletes_the_input,
     partial_eq_that_sets_another_input,
+    partial_eq_that_inserts_into_a_collection,
     clone_that_reads_a_clean_node,
     clone_that_creates_a_node,
     partial_eq_of_a_recompute_that_reads_a_node,
+    hash_that_reads_a_node_on_insert,
+    eq_that_reads_a_node_on_insert,
+    clone_that_reads_a_node_on_values,
+    clone_that_reads_a_node_in_a_filter_batch,
+    hash_that_reads_a_node_in_a_group_by_batch,
+    hash_that_reads_a_node_in_a_join_batch_and_its_rebuild,
+    clone_that_reads_a_node_in_a_sort_batch,
 );
 
 mod every_engine_path_is_refused {
@@ -325,5 +558,19 @@ mod every_engine_path_is_refused {
     #[test]
     fn shared() {
         every_path_is_refused(Rc::new(Runtime::<Shared>::new()), engine_paths());
+    }
+}
+
+mod every_collection_path_is_refused {
+    use super::*;
+
+    #[test]
+    fn local() {
+        every_path_is_refused(Rc::new(Runtime::<Local>::new()), collection_paths());
+    }
+
+    #[test]
+    fn shared() {
+        every_path_is_refused(Rc::new(Runtime::<Shared>::new()), collection_paths());
     }
 }
