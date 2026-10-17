@@ -24,6 +24,7 @@ pub mod collection;
 pub mod dep_stack;
 pub mod generic_arena;
 pub mod handle;
+mod hashed_multiset;
 pub mod locks;
 #[cfg(loom)]
 pub mod loom_cells;

@@ -31,12 +31,13 @@
 //! closure at a time.
 
 use std::collections::HashMap;
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash, RandomState};
 use std::sync::atomic::{AtomicU64, Ordering as MemOrdering};
 use std::sync::{Arc, OnceLock};
 
 use crate::cells::Cells;
 use crate::handle::{ErasedIncr, Incr};
+use crate::hashed_multiset::HashedMultiset;
 use crate::locks::Lock;
 use crate::runtime::Runtime;
 use crate::value::Value;
@@ -98,7 +99,8 @@ pub struct CollectionLog<T: Hash + Eq + Clone> {
     pub(crate) deltas: Vec<Delta<T>>,
     pub(crate) base: u64,
     pub(crate) cursors: Vec<Arc<AtomicU64>>,
-    pub(crate) elements: HashMap<T, usize>,
+    pub(crate) elements: HashedMultiset<T>,
+    pub(crate) hasher: RandomState,
     pub(crate) version: u64,
 }
 
@@ -108,7 +110,8 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             deltas: Vec::new(),
             base: 0,
             cursors: Vec::new(),
-            elements: HashMap::new(),
+            elements: HashedMultiset::new(),
+            hasher: RandomState::new(),
             version: 0,
         }
     }
@@ -157,7 +160,10 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// Insert `value`. Always accepted; multiset count for the element
     /// is incremented. Returns the new version.
     pub fn insert(&mut self, value: T) -> u64 {
-        *self.elements.entry(value.clone()).or_insert(0) += 1;
+        let hash = self.hasher.hash_one(&value);
+        let stored = value.clone();
+        let at = self.elements.locate(None, Some((hash, &value)));
+        self.elements.apply(at, Some(stored));
         self.deltas.push(Delta::Insert(value));
         self.version += 1;
         self.maybe_compact();
@@ -168,11 +174,12 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// the element was present and a delete was recorded; `None` if the
     /// element was not in the collection (no delta recorded).
     pub fn delete(&mut self, value: &T) -> Option<u64> {
-        let count = self.elements.get_mut(value)?;
-        *count -= 1;
-        if *count == 0 {
-            self.elements.remove(value);
+        let hash = self.hasher.hash_one(value);
+        let at = self.elements.locate(Some((hash, value)), None);
+        if !at.removes() {
+            return None;
         }
+        self.elements.apply(at, None);
         self.deltas.push(Delta::Delete(value.clone()));
         self.version += 1;
         self.maybe_compact();
@@ -181,13 +188,18 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
 
     /// Snapshot of all live elements, with multiset duplicates expanded.
     pub fn elements_vec(&self) -> Vec<T> {
-        let mut out = Vec::with_capacity(self.elements.values().sum());
-        for (val, &count) in &self.elements {
+        let mut out = Vec::with_capacity(self.len());
+        for (val, count) in self.elements.iter() {
             for _ in 0..count {
                 out.push(val.clone());
             }
         }
         out
+    }
+
+    /// Number of live elements, with multiset duplicates counted.
+    pub(crate) fn len(&self) -> usize {
+        self.elements.iter().map(|(_, count)| count).sum()
     }
 }
 
@@ -324,7 +336,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
 
     /// Number of live elements (with multiset duplicates counted).
     pub fn snapshot_len(&self) -> usize {
-        self.log.read().elements.values().sum()
+        self.log.read().len()
     }
 
     /// Current elements, with multiset duplicates expanded. Forces
