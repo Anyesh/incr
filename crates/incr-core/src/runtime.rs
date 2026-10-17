@@ -2729,8 +2729,8 @@ mod tests {
             let mut total = 0;
             let extra = StdCell::new(s % 4);
             let end = (start + 8 + extra.get()).min(captured.len());
-            for i in start..end {
-                total += rt.get(captured[i]);
+            for &node in &captured[start..end] {
+                total += rt.get(node);
             }
             total
         });

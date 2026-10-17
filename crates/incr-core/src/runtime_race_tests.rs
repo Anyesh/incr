@@ -685,13 +685,11 @@ fn strict_delete_of_an_owner_survives_an_owned_node_claimed_mid_claim() {
 }
 
 type LocalRt = Runtime<Local>;
+type RecycledSlot = Arc<Mutex<Option<Incr<u64>>>>;
 
 /// Q reads v, deletes it, and recycles its slot inside its own compute.
 /// Returns (q, the recycled input once Q has run).
-fn self_deleting_query(
-    rt: &LocalRt,
-    stop_reading_on_retry: bool,
-) -> (Incr<u64>, Arc<Mutex<Option<Incr<u64>>>>) {
+fn self_deleting_query(rt: &LocalRt, stop_reading_on_retry: bool) -> (Incr<u64>, RecycledSlot) {
     let v = rt.create_input(7_u64);
     let recycled = Arc::new(Mutex::new(None));
     let first = AtomicBool::new(true);
