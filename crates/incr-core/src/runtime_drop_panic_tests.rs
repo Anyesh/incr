@@ -14,6 +14,7 @@ use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
 use crate::deferred::{ErasedDrop, SPILL_ALLOCS};
 use crate::handle::Incr;
+use crate::locks::Lock;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::state::NodeState;
 
@@ -651,6 +652,56 @@ fn local_delete_spill_grows_at_most_once_per_batch() {
     let growths = SPILL_ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
     assert!((1..=2).contains(&growths), "spill grew {growths} times");
     assert!(!rt.is_alive(router));
+}
+
+/// A value holding a probe `Arc`, so a test can count the values still
+/// alive in their arena slots.
+#[derive(Clone)]
+struct Held(Arc<()>);
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// An owned-tree delete is a batch: the first member's drops take the
+/// bag's typed slot and the rest spill. Every member's value leaves its
+/// arena slot at the drain, and the slots are reused.
+#[test]
+fn local_owned_tree_delete_releases_every_member_value() {
+    let rt = Runtime::<Local>::new();
+    let probe = Arc::new(());
+    let owner = rt.create_input(Held(Arc::clone(&probe)));
+    for _ in 0..3 {
+        let child = rt.create_input(Held(Arc::clone(&probe)));
+        rt.adopt(owner.erase(), child.erase());
+    }
+    assert_eq!(Arc::strong_count(&probe), 5);
+    let tag = rt.nodes.get(owner.slot()).type_tag();
+    let arena_len = || {
+        rt.inner
+            .read()
+            .arenas
+            .tagged_arena::<Held>(tag)
+            .unwrap()
+            .len()
+    };
+    let slots = arena_len();
+    rt.delete_node(owner);
+    assert_eq!(
+        Arc::strong_count(&probe),
+        1,
+        "a member's value was never released"
+    );
+    for _ in 0..4 {
+        rt.create_input(Held(Arc::clone(&probe)));
+    }
+    assert_eq!(
+        arena_len(),
+        slots,
+        "a released member's arena slot was not reused"
+    );
 }
 
 struct RtPtr(*const Runtime<Local>);

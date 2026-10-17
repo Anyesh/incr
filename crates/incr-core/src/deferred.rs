@@ -102,7 +102,7 @@ impl<C: Cells> Deferred<C> {
         if self.node.is_none() {
             self.node = Some(drops);
         } else {
-            self.push_erased(Box::new(drops));
+            self.push_erased(Box::new(SpilledNode(Some(drops))));
         }
     }
 
@@ -163,10 +163,7 @@ impl<C: Cells> Deferred<C> {
         {
             step(rt, mode, || drop(compute));
             step(rt, mode, || drop(observers));
-            step(rt, mode, || {
-                arena.release(arena_slot);
-                reclaim_probe::reached(RetireSite::DeleteRetire);
-            });
+            step(rt, mode, || release_arena_slot(&*arena, arena_slot));
         }
         if let Some(token) = self.dep_list.take() {
             step(rt, mode, || retire_dep_list::<C>(token));
@@ -190,6 +187,31 @@ fn step<C: Cells>(rt: &Runtime<C>, mode: Mode, step: impl FnOnce()) {
         Mode::Normal => drain_step(rt, step),
         Mode::Carried => isolate(step),
     }
+}
+
+/// A node's drops spilled behind the typed slot; its drop runs the
+/// typed slot's steps in the same order, the arena release included.
+struct SpilledNode<C: Cells>(Option<NodeDrops<C>>);
+
+impl<C: Cells> Drop for SpilledNode<C> {
+    fn drop(&mut self) {
+        if let Some(NodeDrops {
+            compute,
+            observers,
+            arena,
+            arena_slot,
+        }) = self.0.take()
+        {
+            drop(compute);
+            drop(observers);
+            release_arena_slot(&*arena, arena_slot);
+        }
+    }
+}
+
+fn release_arena_slot<C: Cells>(arena: &dyn ErasedArena<C>, slot: u32) {
+    arena.release(slot);
+    reclaim_probe::reached(RetireSite::DeleteRetire);
 }
 
 /// A second displaced dep list in one bag, spilled as an erased item;
