@@ -23,8 +23,13 @@
 //! plus the cursor advance. A panicking user closure therefore applies
 //! nothing, the cursor stays put, and the compute panic boundary retries
 //! the whole batch cleanly. Panics inside user `Hash`/`Eq` impls during
-//! the apply phase are outside this guarantee and are documented as
-//! unsupported on `Value`.
+//! an operator's apply phase are outside this guarantee.
+//!
+//! Source mutations (`insert`, `delete`, `replace`) hash and clone with
+//! no lock held, run their lookups (user `Eq`) before changing anything,
+//! and drop what they displaced only after the version node is set, so a
+//! panic in any user impl leaves the collection either untouched or
+//! fully changed and published.
 //!
 //! The exactly-once cursor discipline is safe because the runtime's
 //! claim protocol guarantees a single thread executes a given operator
@@ -37,7 +42,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::cells::Cells;
 use crate::handle::{ErasedIncr, Incr};
-use crate::hashed_multiset::HashedMultiset;
+use crate::hashed_multiset::{HashedMultiset, Located};
 use crate::locks::Lock;
 use crate::runtime::Runtime;
 use crate::value::Value;
@@ -137,12 +142,13 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         (cursor, self.elements_vec())
     }
 
-    /// Drop the delta prefix every registered consumer has passed.
-    /// Consumers whose cursor Arc was dropped (operator gone) are
-    /// pruned. With no consumers the whole log is dropped eagerly.
-    fn maybe_compact(&mut self) {
+    /// Cut off the delta prefix every registered consumer has passed and
+    /// return it, for the caller to drop when running user `Drop` is
+    /// safe. Consumers whose cursor Arc was dropped (operator gone) are
+    /// pruned. With no consumers the whole log is cut eagerly.
+    fn maybe_compact(&mut self) -> Vec<Delta<T>> {
         if self.deltas.len() < COMPACT_EVERY {
-            return;
+            return Vec::new();
         }
         self.cursors.retain(|c| Arc::strong_count(c) > 1);
         let min_cursor = self
@@ -151,39 +157,78 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             .map(|c| c.load(MemOrdering::Acquire))
             .min()
             .unwrap_or_else(|| self.end());
-        if min_cursor > self.base {
-            self.deltas.drain(..(min_cursor - self.base) as usize);
-            self.base = min_cursor;
+        if min_cursor <= self.base {
+            return Vec::new();
         }
+        let cut = (min_cursor - self.base) as usize;
+        let capacity = self.deltas.capacity();
+        let mut compacted = std::mem::replace(&mut self.deltas, Vec::with_capacity(capacity));
+        self.deltas.extend(compacted.drain(cut..));
+        self.base = min_cursor;
+        compacted
+    }
+
+    /// Phase 2 of a mutation, under the log guard: reserve room and run
+    /// the lookups (user `Eq`). Changes nothing, so a panic here leaves
+    /// the log as it was.
+    pub(crate) fn locate(&mut self, staged: &Staged<T>) -> Located {
+        self.elements.locate(
+            staged.remove.as_ref().map(|(hash, value)| (*hash, value)),
+            staged.add.as_ref().map(|(hash, value, _)| (*hash, value)),
+        )
+    }
+
+    /// Phase 3 of a mutation: apply the located change and push its
+    /// deltas. Runs no user code; everything it displaces comes back in
+    /// [`Committed::displaced`].
+    pub(crate) fn commit(&mut self, at: Located, staged: Staged<T>) -> Committed<T> {
+        let removed = at.removes();
+        let (add_delta, add_stored) = match staged.add {
+            Some((_, delta, stored)) => (Some(delta), Some(stored)),
+            None => (None, None),
+        };
+        let [first, second] = self.elements.apply(at, add_stored);
+        let mut unused = None;
+        let before = self.version;
+        match staged.remove {
+            Some((_, delta)) if removed => {
+                self.deltas.push(Delta::Delete(delta));
+                self.version += 1;
+            }
+            other => unused = other.map(|(_, delta)| delta),
+        }
+        if let Some(delta) = add_delta {
+            self.deltas.push(Delta::Insert(delta));
+            self.version += 1;
+        }
+        Committed {
+            removed,
+            version: (self.version != before).then_some(self.version),
+            displaced: Displaced {
+                _values: [first, second, unused],
+                _compacted: self.maybe_compact(),
+            },
+        }
+    }
+
+    fn mutate(&mut self, remove: Option<&T>, add: Option<T>) -> Committed<T> {
+        let staged = Staged::new(&self.hasher, remove, add);
+        let at = self.locate(&staged);
+        self.commit(at, staged)
     }
 
     /// Insert `value`. Always accepted; multiset count for the element
     /// is incremented. Returns the new version.
     pub fn insert(&mut self, value: T) -> u64 {
-        let hash = self.hasher.hash_one(&value);
-        let stored = value.clone();
-        let at = self.elements.locate(None, Some((hash, &value)));
-        self.elements.apply(at, Some(stored));
-        self.deltas.push(Delta::Insert(value));
-        self.version += 1;
-        self.maybe_compact();
-        self.version
+        let committed = self.mutate(None, Some(value));
+        committed.version.expect("an insert always records a delta")
     }
 
     /// Delete one occurrence of `value`. Returns `Some(new_version)` if
     /// the element was present and a delete was recorded; `None` if the
     /// element was not in the collection (no delta recorded).
     pub fn delete(&mut self, value: &T) -> Option<u64> {
-        let hash = self.hasher.hash_one(value);
-        let at = self.elements.locate(Some((hash, value)), None);
-        if !at.removes() {
-            return None;
-        }
-        self.elements.apply(at, None);
-        self.deltas.push(Delta::Delete(value.clone()));
-        self.version += 1;
-        self.maybe_compact();
-        Some(self.version)
+        self.mutate(Some(value), None).version
     }
 
     /// Snapshot of all live elements, with multiset duplicates expanded.
@@ -203,6 +248,39 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     }
 }
 
+/// Phase 1 of a mutation, computed with no lock held: the hashes (user
+/// `Hash`) and the copies the deltas and the multiset need (user `Clone`).
+pub(crate) struct Staged<T> {
+    remove: Option<(u64, T)>,
+    add: Option<(u64, T, T)>,
+}
+
+impl<T: Hash + Clone> Staged<T> {
+    pub(crate) fn new(hasher: &RandomState, remove: Option<&T>, add: Option<T>) -> Self {
+        Self {
+            remove: remove.map(|value| (hasher.hash_one(value), value.clone())),
+            add: add.map(|value| (hasher.hash_one(&value), value.clone(), value)),
+        }
+    }
+}
+
+pub(crate) struct Committed<T> {
+    /// Whether the remove side found its element.
+    pub(crate) removed: bool,
+    /// The new log version, if any delta was recorded.
+    pub(crate) version: Option<u64>,
+    pub(crate) displaced: Displaced<T>,
+}
+
+/// Elements and compacted deltas a mutation displaced. Dropping them
+/// runs user `Drop`, so a caller drops them only after releasing the log
+/// guard and setting the version node.
+#[must_use]
+pub(crate) struct Displaced<T> {
+    _values: [Option<T>; 3],
+    _compacted: Vec<Delta<T>>,
+}
+
 impl<T: Hash + Eq + Clone> Default for CollectionLog<T> {
     fn default() -> Self {
         Self::new()
@@ -218,6 +296,8 @@ impl<T: Hash + Eq + Clone> Default for CollectionLog<T> {
 /// `Send + Sync`.
 pub struct IncrCollection<T: Value + Hash + Eq, C: Cells> {
     pub(crate) log: Arc<OpLock<CollectionLog<T>, C>>,
+    /// A copy of the log's hasher, so mutations hash with no lock held.
+    hasher: RandomState,
     pub(crate) version_node: Incr<u64>,
     /// True for operator outputs (filter/map/join/...) and group_by
     /// sub-collections. Direct mutation of those would set a query node
@@ -230,6 +310,7 @@ impl<T: Value + Hash + Eq, C: Cells> Clone for IncrCollection<T, C> {
     fn clone(&self) -> Self {
         Self {
             log: Arc::clone(&self.log),
+            hasher: self.hasher.clone(),
             version_node: self.version_node,
             derived: self.derived,
             _confine: std::marker::PhantomData,
@@ -239,8 +320,10 @@ impl<T: Value + Hash + Eq, C: Cells> Clone for IncrCollection<T, C> {
 
 impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     pub(crate) fn new(rt: &Runtime<C>) -> Self {
+        let log = CollectionLog::new();
         Self {
-            log: Arc::new(OpLock::new(CollectionLog::new())),
+            hasher: log.hasher.clone(),
+            log: Arc::new(OpLock::new(log)),
             version_node: rt.create_input(0_u64),
             derived: false,
             _confine: std::marker::PhantomData,
@@ -251,8 +334,10 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         log: Arc<OpLock<CollectionLog<T>, C>>,
         version_node: Incr<u64>,
     ) -> Self {
+        let hasher = log.read().hasher.clone();
         Self {
             log,
+            hasher,
             version_node,
             derived: true,
             _confine: std::marker::PhantomData,
@@ -263,8 +348,10 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     /// (used by `group_by`). Marked derived: only the routing operator
     /// may mutate it.
     pub(crate) fn new_in_compute(rt: &Runtime<C>) -> Self {
+        let log = CollectionLog::new();
         Self {
-            log: Arc::new(OpLock::new(CollectionLog::new())),
+            hasher: log.hasher.clone(),
+            log: Arc::new(OpLock::new(log)),
             version_node: rt.create_input_unchecked(0_u64),
             derived: true,
             _confine: std::marker::PhantomData,
@@ -292,9 +379,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     ///
     /// Panics if this collection is the output of an operator.
     pub fn insert(&self, rt: &Runtime<C>, value: T) {
-        self.check_mutable();
-        let new_version = self.log.write().insert(value);
-        rt.set(self.version_node, new_version);
+        self.mutate(rt, None, Some(value));
     }
 
     /// Delete one occurrence. No-op (no log delta, no version bump) if
@@ -302,15 +387,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     ///
     /// Panics if this collection is the output of an operator.
     pub fn delete(&self, rt: &Runtime<C>, value: &T) -> bool {
-        self.check_mutable();
-        let new_version = self.log.write().delete(value);
-        match new_version {
-            Some(v) => {
-                rt.set(self.version_node, v);
-                true
-            }
-            None => false,
-        }
+        self.mutate(rt, Some(value), None)
     }
 
     /// Replace `old` (if present) with `new` as a single atomic step:
@@ -322,16 +399,26 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     ///
     /// Panics if this collection is the output of an operator.
     pub fn replace(&self, rt: &Runtime<C>, old: Option<&T>, new: T) -> bool {
+        self.mutate(rt, old, Some(new))
+    }
+
+    /// Remove one `remove` and add one `add` as one step. User `Hash` and
+    /// `Clone` run before the guard is taken and user `Eq` before the
+    /// first change, so a panic in either leaves the collection as it
+    /// was. From the first change to the version set no user code runs,
+    /// and user `Drop` of what the change displaced runs only after it.
+    fn mutate(&self, rt: &Runtime<C>, remove: Option<&T>, add: Option<T>) -> bool {
         self.check_mutable();
+        let staged = Staged::new(&self.hasher, remove, add);
         let mut log = self.log.write();
-        let deleted = match old {
-            Some(v) => log.delete(v).is_some(),
-            None => false,
-        };
-        let new_version = log.insert(new);
+        let at = log.locate(&staged);
+        let committed = log.commit(at, staged);
         drop(log);
-        rt.set(self.version_node, new_version);
-        deleted
+        if let Some(version) = committed.version {
+            rt.set(self.version_node, version);
+        }
+        drop(committed.displaced);
+        committed.removed
     }
 
     /// Number of live elements (with multiset duplicates counted).
@@ -363,6 +450,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     pub fn as_view(&self) -> Self {
         Self {
             log: Arc::clone(&self.log),
+            hasher: self.hasher.clone(),
             version_node: self.version_node,
             derived: true,
             _confine: std::marker::PhantomData,
@@ -1788,5 +1876,297 @@ mod tests {
         // assertion is not expressible in stable Rust; the unsendable
         // marker is exercised by the doc-comment contract and by the
         // Python bindings, which wrap Local collections as unsendable.)
+    }
+
+    mod user_code_panics {
+        use super::*;
+        use std::cell::Cell;
+        use std::hash::Hasher;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        #[derive(Clone, Copy, PartialEq, Debug)]
+        enum Call {
+            Hash,
+            Eq,
+            Clone,
+            Drop,
+        }
+
+        const CALLS: [Call; 4] = [Call::Hash, Call::Eq, Call::Clone, Call::Drop];
+
+        thread_local! {
+            static ARMED: Cell<Option<(Call, usize)>> = const { Cell::new(None) };
+        }
+
+        fn tick(call: Call) {
+            ARMED.with(|armed| {
+                if let Some((armed_call, n)) = armed.get() {
+                    if armed_call == call {
+                        // Fires once, so a second armed call during the
+                        // unwind cannot turn the panic into an abort.
+                        if n == 1 {
+                            armed.set(None);
+                            panic!("chosen {call:?} call");
+                        }
+                        armed.set(Some((armed_call, n - 1)));
+                    }
+                }
+            });
+        }
+
+        fn arm(call: Call, nth: usize) {
+            ARMED.with(|armed| armed.set(Some((call, nth))));
+        }
+
+        fn disarm() {
+            ARMED.with(|armed| armed.set(None));
+        }
+
+        #[derive(Debug)]
+        struct Bomb(i64);
+
+        impl Clone for Bomb {
+            fn clone(&self) -> Self {
+                tick(Call::Clone);
+                Bomb(self.0)
+            }
+        }
+
+        impl PartialEq for Bomb {
+            fn eq(&self, other: &Self) -> bool {
+                tick(Call::Eq);
+                self.0 == other.0
+            }
+        }
+
+        impl Eq for Bomb {}
+
+        impl Hash for Bomb {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                tick(Call::Hash);
+                self.0.hash(state);
+            }
+        }
+
+        impl Drop for Bomb {
+            fn drop(&mut self) {
+                tick(Call::Drop);
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        enum Mutation {
+            Insert(i64),
+            Delete(i64),
+            Replace(Option<i64>, i64),
+        }
+
+        fn model(mut elements: Vec<i64>, mutation: Mutation) -> Vec<i64> {
+            let mut remove = |x: i64| {
+                if let Some(i) = elements.iter().position(|&e| e == x) {
+                    elements.remove(i);
+                }
+            };
+            match mutation {
+                Mutation::Insert(x) => elements.push(x),
+                Mutation::Delete(x) => remove(x),
+                Mutation::Replace(old, new) => {
+                    if let Some(old) = old {
+                        remove(old);
+                    }
+                    elements.push(new);
+                }
+            }
+            elements.sort_unstable();
+            elements
+        }
+
+        fn sorted(values: Vec<Bomb>) -> Vec<i64> {
+            let mut out: Vec<i64> = values.iter().map(|b| b.0).collect();
+            out.sort_unstable();
+            out
+        }
+
+        fn mutate<C: Cells>(rt: &Runtime<C>, c: &IncrCollection<Bomb, C>, mutation: Mutation) {
+            match mutation {
+                Mutation::Insert(x) => c.insert(rt, Bomb(x)),
+                Mutation::Delete(x) => {
+                    c.delete(rt, &Bomb(x));
+                }
+                Mutation::Replace(old, new) => {
+                    c.replace(rt, old.map(Bomb).as_ref(), Bomb(new));
+                }
+            }
+        }
+
+        fn populated<C: Cells>(rt: &Runtime<C>, initial: &[i64]) -> IncrCollection<Bomb, C> {
+            let c = rt.create_collection::<Bomb>();
+            for &x in initial {
+                c.insert(rt, Bomb(x));
+            }
+            c
+        }
+
+        /// Asserts the collection holds `expected` and that a `count` and a
+        /// `filter` built before the mutation agree with it, before and
+        /// after one more insert.
+        fn assert_agree<C: Cells>(
+            rt: &Runtime<C>,
+            c: &IncrCollection<Bomb, C>,
+            count: Incr<u64>,
+            all: &IncrCollection<Bomb, C>,
+            expected: &[i64],
+            context: &str,
+        ) {
+            let state = sorted(c.values(rt));
+            assert_eq!(state, expected, "collection after {context}");
+            assert_eq!(
+                c.snapshot_len(),
+                state.len(),
+                "snapshot_len after {context}"
+            );
+            assert_eq!(rt.get(count), state.len() as u64, "count after {context}");
+            assert_eq!(
+                sorted(all.values(rt)),
+                state,
+                "filter output after {context}"
+            );
+
+            c.insert(rt, Bomb(-1));
+            let len = state.len() as u64 + 1;
+            assert_eq!(rt.get(count), len, "count after a later insert, {context}");
+            assert_eq!(
+                all.values(rt).len() as u64,
+                len,
+                "filter after a later insert, {context}"
+            );
+        }
+
+        fn failure(run: impl FnOnce()) -> Option<String> {
+            catch_unwind(AssertUnwindSafe(run)).err().map(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            })
+        }
+
+        fn assert_no_failures(failures: Vec<String>, runs: usize) {
+            assert!(
+                failures.is_empty(),
+                "{} of {runs} runs left the collection and its readers disagreeing:\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
+        }
+
+        /// Runs `mutation` over `initial` with the `nth` call of `call`
+        /// panicking. A panic in `Hash`, `Eq` or `Clone` must leave the
+        /// collection untouched, and user `Drop` must run only once the
+        /// change is complete. Either way its readers must agree with it.
+        fn check<C: Cells>(initial: &[i64], mutation: Mutation, call: Call, nth: usize) {
+            let rt: Runtime<C> = Runtime::new();
+            let c = populated(&rt, initial);
+            let count = c.count(&rt);
+            let all = c.filter(&rt, |_| true);
+            let _ = rt.get(count);
+            let _ = all.values(&rt);
+
+            let mut before = initial.to_vec();
+            before.sort_unstable();
+            let after = model(before.clone(), mutation);
+
+            arm(call, nth);
+            let panicked = failure(|| mutate(&rt, &c, mutation)).is_some();
+            disarm();
+
+            let expected = if panicked && call != Call::Drop {
+                &before
+            } else {
+                &after
+            };
+            let shown = if initial.len() > 8 {
+                format!("{} elements", initial.len())
+            } else {
+                format!("{initial:?}")
+            };
+            let context =
+                format!("{mutation:?} over {shown}, {call:?} call {nth} (panicked: {panicked})");
+            assert_agree(&rt, &c, count, &all, expected, &context);
+        }
+
+        fn mutations_are_atomic_under_user_panics<C: Cells>() {
+            use Mutation::*;
+            let cases: &[(&[i64], Mutation)] = &[
+                (&[1, 2], Insert(3)),
+                (&[1, 2], Insert(2)),
+                (&[1, 2], Delete(2)),
+                (&[1, 2, 2], Delete(2)),
+                (&[1, 2], Delete(9)),
+                (&[1, 2], Replace(Some(2), 3)),
+                (&[1, 2], Replace(Some(1), 2)),
+                (&[1, 2], Replace(Some(2), 2)),
+                (&[2, 2], Replace(Some(2), 2)),
+                (&[1], Replace(Some(9), 3)),
+                (&[1], Replace(None, 1)),
+                (&[1], Replace(None, 4)),
+            ];
+            let mut failures = Vec::new();
+            let combos = cases
+                .iter()
+                .flat_map(|&case| CALLS.into_iter().map(move |call| (case, call)))
+                .flat_map(|(case, call)| (1..=6).map(move |nth| (case, call, nth)));
+            // Miri runs about a second per combination, so it samples every
+            // 13th; the stride is prime to the inner loop sizes, so the
+            // sample still spans every case and every call.
+            let stride = if cfg!(miri) { 13 } else { 1 };
+            let mut runs = 0;
+            for ((initial, mutation), call, nth) in combos.step_by(stride) {
+                runs += 1;
+                failures.extend(failure(|| check::<C>(initial, mutation, call, nth)));
+            }
+            assert_no_failures(failures, runs);
+        }
+
+        #[test]
+        fn local_mutations_are_atomic_under_user_panics() {
+            mutations_are_atomic_under_user_panics::<Local>();
+        }
+
+        #[test]
+        fn shared_mutations_are_atomic_under_user_panics() {
+            mutations_are_atomic_under_user_panics::<Shared>();
+        }
+
+        /// The mutation that brings the log to `COMPACT_EVERY` deltas drops
+        /// the compacted prefix, running user `Drop` on each delta.
+        fn compaction_drops_after_the_version_set<C: Cells>() {
+            let initial: Vec<i64> = (0..COMPACT_EVERY as i64 - 1).collect();
+            let mutations = [
+                Mutation::Insert(5000),
+                Mutation::Delete(5),
+                Mutation::Replace(Some(5), 5001),
+            ];
+            let mut failures = Vec::new();
+            for mutation in mutations {
+                for nth in [1, 2] {
+                    failures.extend(failure(|| check::<C>(&initial, mutation, Call::Drop, nth)));
+                }
+            }
+            assert_no_failures(failures, mutations.len() * 2);
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn local_compaction_drops_after_the_version_set() {
+            compaction_drops_after_the_version_set::<Local>();
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn shared_compaction_drops_after_the_version_set() {
+            compaction_drops_after_the_version_set::<Shared>();
+        }
     }
 }
