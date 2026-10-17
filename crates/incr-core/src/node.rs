@@ -71,9 +71,11 @@ pub trait DepListCell: 'static {
     /// Install `list` (or null), retiring any displaced list. The caller
     /// must be the node's single writer, which the state machine grants.
     fn replace(&self, list: Option<Box<DepList>>);
-    /// Run `f` on the installed list. Panics if none is installed; the
-    /// caller must have observed an overflow `dep_count` with Acquire.
-    fn with_list(&self, f: &mut dyn FnMut(&DepList));
+    /// Run `f` on the installed list and return true, or return false
+    /// without calling `f` when none is installed. The caller must have
+    /// observed an overflow `dep_count` with Acquire; a null list under
+    /// that count is an inline install in progress.
+    fn with_list(&self, f: &mut dyn FnMut(&DepList)) -> bool;
 }
 
 /// Hazard-pointer overflow cell used by `Local` and `Shared`.
@@ -100,13 +102,19 @@ impl DepListCell for HzDepListCell {
         }
     }
 
-    fn with_list(&self, f: &mut dyn FnMut(&DepList)) {
+    fn with_list(&self, f: &mut dyn FnMut(&DepList)) -> bool {
         let mut hazard = HazardPointer::new();
         // SAFETY: the pointer is populated by replace with Box-allocated
         // DepLists; retirements go through the global haphazard domain,
         // so the reference stays valid for the lifetime of `hazard`.
         let list: Option<&DepList> = unsafe { self.0.load(&mut hazard) };
-        f(list.expect("overflow_deps null with dep_count > 7"));
+        match list {
+            Some(list) => {
+                f(list);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -345,7 +353,9 @@ impl<C: Cells> NodeData<C> {
             // Going inline: displace and retire any stale overflow list.
             // for_each_dep's count<=7 path never reads overflow_deps, but
             // keeping the stale list would hold its memory until the next
-            // overflow install or the node's drop.
+            // overflow install or the node's drop. A scan that read the
+            // overflow marker before this store finds the null and
+            // retries on the count stored next.
             self.overflow_deps.replace(None);
             C::u8_store_release(&self.dep_count, count as u8);
         } else {
@@ -408,13 +418,31 @@ impl<C: Cells> NodeData<C> {
         }
     }
 
+    /// A null list under the overflow marker is an inline install that
+    /// has swapped the list out and not yet stored its count: a scan
+    /// without a claim can see that window. The count is reloaded and
+    /// the scan retried until it lands on either arm; the installer
+    /// stores the inline count right after the swap, so the retry ends.
     #[inline(never)]
     fn for_each_overflow_dep(&self, f: &mut dyn FnMut(NodeId)) {
-        self.overflow_deps.with_list(&mut |list| {
-            for &id in list.deps.iter() {
-                f(id);
+        let mut spins = 0;
+        loop {
+            let scanned = self.overflow_deps.with_list(&mut |list| {
+                for &id in list.deps.iter() {
+                    f(id);
+                }
+            });
+            if scanned {
+                return;
             }
-        });
+            C::backoff(spins);
+            spins += 1;
+            let count = C::u8_load_acquire(&self.dep_count);
+            if count <= 7 {
+                self.for_each_inline_dep(count, f);
+                return;
+            }
+        }
     }
 
     fn empty_inline_deps() -> [C::U32; 7] {

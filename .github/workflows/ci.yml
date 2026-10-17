@@ -109,6 +109,7 @@ jobs:
           - { model: "loom_models::loom_compute_races_delete", bound: 3 }
           - { model: "loom_models::loom_recovered_node_under_set", bound: 3 }
           - { model: "loom_models::loom_walk_scan_after_same_count_install", bound: 3 }
+          - { model: "loom_models::loom_walk_scan_after_overflow_to_inline_install", bound: 3 }
     env:
       RUSTFLAGS: --cfg loom -D warnings
       LOOM_MAX_PREEMPTIONS: ${{ matrix.bound }}

@@ -317,3 +317,47 @@ fn loom_walk_scan_after_same_count_install() {
         );
     });
 }
+
+/// Q reads x and, while x is 0, seven more inputs, so its deps overflow
+/// the inline array. Main sets x to 1, which dirties Q and P. Thread A
+/// recomputes Q, whose deps shrink to [x, i0] and move back inline.
+/// Thread B walks P and scans Q's deps without a claim, so it can read
+/// the overflow marker after the installer has swapped the list out and
+/// before it has stored the inline count. Targets bug i's overflow half.
+#[test]
+fn loom_walk_scan_after_overflow_to_inline_install() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(0_u64);
+        let inputs: Vec<Incr<u64>> = (1..=7).map(|v| rt.create_input(v)).collect();
+        let q = {
+            let inputs = inputs.clone();
+            rt.create_query(move |rt: &Rt| {
+                if rt.get(x) == 0 {
+                    inputs.iter().map(|&i| rt.get(i)).sum()
+                } else {
+                    rt.get(inputs[0])
+                }
+            })
+        };
+        let p = rt.create_query(move |rt: &Rt| rt.get(q) + 100);
+        assert_eq!(rt.get(p), 128);
+        rt.set(x, 1);
+
+        let installer = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(q))
+        };
+        let walker = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(p))
+        };
+        assert_eq!(installer.join().unwrap(), 1);
+        assert_eq!(walker.join().unwrap(), 101);
+
+        rt.assert_invariant_i();
+        rt.assert_edges_complete();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(p), 101, "(V) violated: P stale after x = 1");
+    });
+}

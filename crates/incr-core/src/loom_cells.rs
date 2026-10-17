@@ -143,14 +143,18 @@ impl DepListCell for LoomDepListCell {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = list;
     }
-    fn with_list(&self, f: &mut dyn FnMut(&DepList)) {
+    fn with_list(&self, f: &mut dyn FnMut(&DepList)) -> bool {
         let guard = self
             .0
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        f(guard
-            .as_deref()
-            .expect("overflow_deps null with dep_count > 7"));
+        match guard.as_deref() {
+            Some(list) => {
+                f(list);
+                true
+            }
+            None => false,
+        }
     }
 }
 
