@@ -21,6 +21,7 @@ pub mod arena;
 pub mod arena_registry;
 pub mod cells;
 pub mod collection;
+mod deferred;
 pub mod dep_stack;
 pub mod generic_arena;
 pub mod handle;

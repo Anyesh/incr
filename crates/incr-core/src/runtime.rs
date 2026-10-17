@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use crate::arena_registry::ArenaRegistry;
 use crate::cells::Cells;
+use crate::deferred::Deferred;
 use crate::dep_stack::DepStack;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
@@ -530,7 +531,7 @@ impl<C: Cells> Runtime<C> {
                         arena_inner.write_if_changed(node.arena_slot(), new_value, wrote)
                     } else {
                         wrote.set(1);
-                        arena_inner.write(node.arena_slot(), new_value);
+                        drop(arena_inner.write(node.arena_slot(), new_value));
                         true
                     };
                     reclaim_probe::reached(RetireSite::ComputeWrite);
@@ -1105,7 +1106,10 @@ impl<C: Cells> Runtime<C> {
         node.for_each_dep(|d| old_deps.push(d));
         let arena_slot = node.arena_slot();
         let type_tag = node.type_tag();
-        node.retire_for_delete();
+        // Under the claim and before the hold, so the deps and the Dead
+        // state are cleared before the slot can reach the free list; the
+        // displaced list is retired only after the hold, below.
+        let dep_list = node.retire_for_delete();
 
         let mut inner = self.inner.write();
         debug_assert!(
@@ -1144,6 +1148,8 @@ impl<C: Cells> Runtime<C> {
         drop(compute);
         drop(observers);
         arena.release(arena_slot);
+        drop(dep_list);
+        reclaim_probe::reached(RetireSite::DeleteRetire);
     }
 
     /// Read the current value of a node. Triggers recomputation of the
@@ -1405,7 +1411,8 @@ impl<C: Cells> Runtime<C> {
         // 5. dirty walk, whose Release stores publish all of the above
         //    to claimants that Acquire the Dirty state.
         node.mark_changed_pending();
-        arena.write(node.arena_slot(), value);
+        let displaced = arena.write(node.arena_slot(), value);
+        drop(displaced);
         let new_rev = self.bump_revision();
         let walk_done = WalkDone {
             rt: self,
@@ -1632,7 +1639,27 @@ impl<C: Cells> Runtime<C> {
     /// otherwise run the dead node's closure against the occupant, and a
     /// root compares `g0` with `gen` first, since the recycle may have
     /// landed before the hold.
+    ///
+    /// The call owns one [`Deferred`] bag for every attempt it makes (a
+    /// Stale retry carries it), and every exit that returns drains it
+    /// after that exit's landing CAS and poison, the exits that land
+    /// nothing included (`Gone`, the input arm, a retry that found the
+    /// node computed by another thread). The `Err` path drains in
+    /// carried mode before it resumes the panic.
     fn compute_one(&self, id: NodeId, visit: Visit, gen: Option<u32>) -> Computed {
+        let mut bag = Deferred::new();
+        let computed = self.compute_attempts(id, visit, gen, &mut bag);
+        bag.drain(self);
+        computed
+    }
+
+    fn compute_attempts(
+        &self,
+        id: NodeId,
+        visit: Visit,
+        gen: Option<u32>,
+        bag: &mut Deferred<C>,
+    ) -> Computed {
         let node = self.nodes.get(id.0);
         let mut spins: u32 = 0;
         let mut g0 = gen;
@@ -1838,7 +1865,7 @@ impl<C: Cells> Runtime<C> {
                     // panic would lose recovery paths through deps the
                     // failed run had not reached yet. Extra edges only
                     // cause spurious re-verification, never staleness.
-                    let landing = match self.publish_deps(id, &frame.deps, true, verify_rev) {
+                    let landing = match self.publish_deps(id, &frame.deps, true, verify_rev, bag) {
                         // A stale dep's slot may already belong to another
                         // node, so no union is published. The old deps keep
                         // their reverse edges.
@@ -1874,11 +1901,11 @@ impl<C: Cells> Runtime<C> {
                     // An enclosing closure that catches the unwind has
                     // still read a dep that did not land Clean.
                     self.dep_stack.poison_current_frame();
-                    std::panic::resume_unwind(payload);
+                    bag.drain_carried(payload);
                 }
             };
 
-            let outcome = self.publish_deps(id, &frame.deps, false, verify_rev);
+            let outcome = self.publish_deps(id, &frame.deps, false, verify_rev, bag);
 
             // The closure has already written its value into the slot, and
             // the next recompute's early cutoff compares against it, so a
@@ -1978,6 +2005,7 @@ impl<C: Cells> Runtime<C> {
         recorded: &[(NodeId, u32)],
         panicked: bool,
         verify_rev: u64,
+        bag: &mut Deferred<C>,
     ) -> Publish {
         let node = self.nodes.get(id.0);
 
@@ -2033,7 +2061,12 @@ impl<C: Cells> Runtime<C> {
         };
         let superseded = !new_deps.iter().all(settled);
 
-        node.install_deps(&new_deps);
+        // The displaced list is retired at the attempt's drain, after its
+        // landing: a retire can reclaim pending values and run their
+        // `Drop` under this hold otherwise.
+        if let Some(displaced) = node.install_deps(&new_deps) {
+            bag.push_dep_list(displaced);
+        }
 
         // Linear scans for small dep sets are faster than HashSet
         // construction below ~16 items.

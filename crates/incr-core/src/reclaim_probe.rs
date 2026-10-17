@@ -6,6 +6,10 @@
 pub(crate) enum RetireSite {
     /// The compute wrapper's value write, before the landing.
     ComputeWrite = 1,
+    /// A displaced dep list's retire at a `Deferred` drain.
+    DepListRetire = 2,
+    /// A delete's retires after it released `inner`.
+    DeleteRetire = 3,
 }
 
 #[cfg(test)]

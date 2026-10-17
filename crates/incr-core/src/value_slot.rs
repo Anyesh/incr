@@ -32,14 +32,21 @@
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 
-use haphazard::{AtomicPtr as HzAtomicPtr, HazardPointer};
+use haphazard::{AtomicPtr as HzAtomicPtr, Global, HazardPointer, Replaced};
 
+use crate::cells::Cells;
 use crate::value::Value;
 use crate::value_code;
 
 /// Storage for one node's value, parameterized by the `Cells` strategy
 /// through `Cells::ValueSlot<T>`.
 pub trait ValueSlot<T: Value>: 'static {
+    /// What a write hands back for the value it displaced: the value
+    /// itself under `Local`, a retire token under `Shared`. Dropping it
+    /// runs the value's `Drop`, or retires it so hazard-protected readers
+    /// finish first, so the caller drops it outside every lock.
+    type Displaced;
+
     fn new_empty() -> Self;
     fn new_with(v: T) -> Self;
     /// Clone the current value out. Panics if the slot was never written
@@ -47,31 +54,48 @@ pub trait ValueSlot<T: Value>: 'static {
     /// any reader reaches its slot).
     fn read(&self) -> T;
     fn try_read(&self) -> Option<T>;
-    fn write(&self, v: T);
+    /// Store `v` and hand back the displaced value. The slot owns `v`
+    /// before the displaced value can run any user code.
+    #[must_use]
+    fn write(&self, v: T) -> Option<Self::Displaced>;
     /// Compare the current value against `v` without cloning. False if
     /// the slot is empty. Used by the early-cutoff and set() no-op
     /// checks, where cloning heap values just to compare is waste.
     fn eq_current(&self, v: &T) -> bool;
 
-    /// Write `v` unless the current value already equals it. Returns
-    /// true iff the value changed (or the slot was empty). One slot
+    /// Write `v` unless the current value already equals it. One slot
     /// session instead of an eq_current + write pair, which matters
-    /// under Shared where each session costs a hazard acquire.
-    /// `wrote` is set to 1 after the comparison and immediately before
-    /// the store, so a caller that sees it set knows the slot holds `v`
+    /// under Shared where each session costs a hazard acquire. `wrote`
+    /// is set to 1 after the comparison and immediately before the
+    /// store, so a caller that sees it set knows the slot holds `v`
     /// whatever the displaced value's `Drop` does afterwards.
-    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> bool;
+    #[must_use]
+    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> Compared<T, Self::Displaced>;
 
-    /// Drop the held value, returning the slot to the never-written
+    /// Take the held value, returning the slot to the never-written
     /// state. Used when a node is deleted and its arena slot goes on
     /// the free list.
-    fn clear(&self);
+    #[must_use]
+    fn clear(&self) -> Option<Self::Displaced>;
 }
+
+/// What [`ValueSlot::write_if_changed`] did.
+pub enum Compared<T, D> {
+    /// The slot already held an equal value; `T` is the rejected one.
+    Equal(T),
+    /// The slot now holds the new value; the payload is what it displaced.
+    Replaced(Option<D>),
+}
+
+/// The displaced type of `C`'s slot for `T`.
+pub type Displaced<T, C> = <<C as Cells>::ValueSlot<T> as ValueSlot<T>>::Displaced;
 
 /// Local strategy: in-place storage.
 pub struct LocalValueSlot<T>(UnsafeCell<Option<T>>);
 
 impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
+    type Displaced = T;
+
     #[inline(always)]
     fn new_empty() -> Self {
         Self(UnsafeCell::new(None))
@@ -105,13 +129,12 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     }
 
     #[inline(always)]
-    fn write(&self, v: T) {
+    fn write(&self, v: T) -> Option<T> {
         // SAFETY: see read(); single-threaded sequential access, no
         // outstanding reference into the cell can exist here. The old
-        // value is moved out before its Drop runs, so the slot owns `v`
-        // whatever that Drop does.
-        let old = unsafe { (*self.0.get()).replace(v) };
-        drop(old);
+        // value is moved out, so the slot owns `v` whatever its Drop
+        // does later.
+        unsafe { (*self.0.get()).replace(v) }
     }
 
     #[inline(always)]
@@ -126,7 +149,7 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     }
 
     #[inline(always)]
-    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> bool {
+    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> Compared<T, T> {
         // SAFETY: see read(); the comparison reference is dropped
         // before the write below.
         let unchanged = unsafe {
@@ -136,18 +159,16 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
                 .unwrap_or(false)
         };
         if unchanged {
-            return false;
+            return Compared::Equal(v);
         }
         wrote.set(1);
-        self.write(v);
-        true
+        Compared::Replaced(self.write(v))
     }
 
     #[inline(always)]
-    fn clear(&self) {
+    fn clear(&self) -> Option<T> {
         // SAFETY: see write().
-        let old = unsafe { (*self.0.get()).take() };
-        drop(old);
+        unsafe { (*self.0.get()).take() }
     }
 }
 
@@ -174,6 +195,8 @@ fn with_pooled_hazard<R>(f: impl FnOnce(&mut HazardPointer<'static>) -> R) -> R 
 pub struct SharedValueSlot<T: Value>(HzAtomicPtr<T>);
 
 impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
+    type Displaced = RetiredValue<T>;
+
     fn new_empty() -> Self {
         // SAFETY: null is the documented empty encoding; load() treats
         // it as None and never dereferences it.
@@ -204,15 +227,8 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         })
     }
 
-    fn write(&self, v: T) {
-        let replaced = self.0.swap(Box::new(v));
-        if let Some(old) = replaced {
-            // SAFETY: `old` came from Box::into_raw via a previous
-            // new_with/write on this slot and is displaced exactly once
-            // (swap is atomic); hazard pointers defer the actual free
-            // until no reader still references it.
-            unsafe { old.retire() };
-        }
+    fn write(&self, v: T) -> Option<RetiredValue<T>> {
+        self.0.swap(Box::new(v)).map(RetiredValue)
     }
 
     fn eq_current(&self, v: &T) -> bool {
@@ -224,7 +240,7 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         })
     }
 
-    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> bool {
+    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> Compared<T, RetiredValue<T>> {
         let unchanged = with_pooled_hazard(|hp| {
             // SAFETY: see read().
             unsafe { self.0.load(hp) }
@@ -232,35 +248,39 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
                 .unwrap_or(false)
         });
         if unchanged {
-            return false;
+            return Compared::Equal(v);
         }
         wrote.set(1);
-        self.write(v);
-        true
+        Compared::Replaced(self.write(v))
     }
 
-    fn clear(&self) {
+    fn clear(&self) -> Option<RetiredValue<T>> {
         // SAFETY: swap_ptr with null is always safe; the displaced
         // pointer goes through the standard retire path, so concurrent
         // readers finish their clone before the free.
-        let displaced = unsafe { self.0.swap_ptr(std::ptr::null_mut()) };
-        if let Some(old) = displaced {
-            // SAFETY: displaced exactly once; readers are hazard-protected.
-            unsafe { old.retire() };
-        }
+        unsafe { self.0.swap_ptr(std::ptr::null_mut()) }.map(RetiredValue)
     }
 }
 
 impl<T: Value> Drop for SharedValueSlot<T> {
     fn drop(&mut self) {
-        // SAFETY: swap_ptr with null is always safe; the displaced
-        // pointer (if any) came from Box::into_raw and goes through the
-        // haphazard retire path like every other displacement.
-        let displaced = unsafe { self.0.swap_ptr(std::ptr::null_mut()) };
-        if let Some(old) = displaced {
-            // SAFETY: displaced exactly once; readers are hazard-protected.
-            unsafe { old.retire() };
-        }
+        drop(self.clear());
+    }
+}
+
+/// The retire token of a value displaced from a [`SharedValueSlot`].
+/// Dropping it retires the value through the global haphazard domain,
+/// which runs its `Drop` once no reader still references it.
+pub struct RetiredValue<T: Value>(Replaced<T, Global, Box<T>>);
+
+impl<T: Value> Drop for RetiredValue<T> {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from Box::into_raw via new_with/write
+        // on its slot, was displaced exactly once by the atomic swap that
+        // made this token, and is never loaded from the slot again;
+        // hazard pointers defer the actual free until no reader still
+        // references it.
+        unsafe { self.0.retire() };
     }
 }
 
@@ -273,7 +293,7 @@ mod tests {
         let s: LocalValueSlot<String> = ValueSlot::new_with("a".to_string());
         assert_eq!(s.read(), "a");
         assert!(s.eq_current(&"a".to_string()));
-        s.write("b".to_string());
+        drop(s.write("b".to_string()));
         assert_eq!(s.try_read(), Some("b".to_string()));
         assert!(!s.eq_current(&"a".to_string()));
     }
@@ -283,7 +303,7 @@ mod tests {
         let s: LocalValueSlot<u64> = ValueSlot::new_empty();
         assert_eq!(s.try_read(), None);
         assert!(!s.eq_current(&7));
-        s.write(7);
+        let _ = s.write(7);
         assert_eq!(s.read(), 7);
     }
 
@@ -292,7 +312,7 @@ mod tests {
         let s: SharedValueSlot<String> = ValueSlot::new_with("a".to_string());
         assert_eq!(s.read(), "a");
         assert!(s.eq_current(&"a".to_string()));
-        s.write("b".to_string());
+        drop(s.write("b".to_string()));
         assert_eq!(s.try_read(), Some("b".to_string()));
         assert!(!s.eq_current(&"a".to_string()));
     }
@@ -302,7 +322,7 @@ mod tests {
         let s: SharedValueSlot<u64> = ValueSlot::new_empty();
         assert_eq!(s.try_read(), None);
         assert!(!s.eq_current(&7));
-        s.write(7);
+        let _ = s.write(7);
         assert_eq!(s.read(), 7);
     }
 
@@ -324,9 +344,9 @@ mod tests {
         }
     }
 
-    /// The slot must own the new value before the displaced one's `Drop`
-    /// runs: an in-place assignment that unwinds leaves the dropped value
-    /// in the slot, and the next write drops it again.
+    /// The slot owns the new value before the displaced one's `Drop`
+    /// runs, and that `Drop` runs where the caller drops the displaced
+    /// value, never inside the slot operation.
     #[test]
     fn local_write_moves_the_old_value_out_before_dropping_it() {
         use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -334,20 +354,31 @@ mod tests {
         let s: LocalValueSlot<Boom> = ValueSlot::new_with(Boom(1));
         let wrote = std::cell::Cell::new(0_u8);
         ARMED.store(1, SeqCst);
-        let r = catch_unwind(AssertUnwindSafe(|| s.write_if_changed(Boom(2), &wrote)));
-        assert!(r.is_err());
+        let Compared::Replaced(old) = s.write_if_changed(Boom(2), &wrote) else {
+            panic!("a different value must be written");
+        };
         assert_eq!(wrote.get(), 1);
         assert_eq!(s.read(), Boom(2));
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(old))).is_err());
 
         ARMED.store(2, SeqCst);
-        let r = catch_unwind(AssertUnwindSafe(|| s.write(Boom(3))));
-        assert!(r.is_err());
+        let old = s.write(Boom(3));
         assert_eq!(s.read(), Boom(3));
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(old))).is_err());
 
         ARMED.store(3, SeqCst);
-        let r = catch_unwind(AssertUnwindSafe(|| s.clear()));
-        assert!(r.is_err());
+        let old = s.clear();
         assert_eq!(s.try_read(), None);
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(old))).is_err());
+
+        assert!(
+            s.write(Boom(4)).is_none(),
+            "a cleared slot displaces nothing"
+        );
+        let Compared::Equal(rejected) = s.write_if_changed(Boom(4), &wrote) else {
+            panic!("an equal value must be rejected");
+        };
+        assert_eq!(rejected, Boom(4));
     }
 
     #[test]
@@ -387,7 +418,7 @@ mod tests {
             .collect();
 
         for i in 0..iters {
-            slot.write(format!("v{:04}", i % 10_000));
+            drop(slot.write(format!("v{:04}", i % 10_000)));
         }
         stop.store(true, Ordering::Relaxed);
         for r in readers {

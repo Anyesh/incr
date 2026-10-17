@@ -34,7 +34,10 @@ use crate::value::Value;
 pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
 
-    /// [`GenericArena::release`] without knowing `T`.
+    /// [`GenericArena::release`] without knowing `T`. The displaced value
+    /// is dropped (retired under Shared) here, after the arena lock is
+    /// released, so a delete that calls this at its drain point runs the
+    /// value's `Drop` at that point and under no lock.
     fn release(&self, slot: u32);
 }
 
@@ -44,7 +47,7 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
     }
 
     fn release(&self, slot: u32) {
-        GenericArena::release(self, slot)
+        drop(GenericArena::release(self, slot));
     }
 }
 

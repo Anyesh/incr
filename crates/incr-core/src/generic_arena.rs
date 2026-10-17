@@ -17,7 +17,7 @@ use std::cell::Cell;
 use crate::cells::Cells;
 use crate::locks::Lock;
 use crate::value::Value;
-use crate::value_slot::ValueSlot;
+use crate::value_slot::{Compared, Displaced, ValueSlot};
 
 struct ArenaInner<T: Value, C: Cells> {
     slots: Vec<C::ValueSlot<T>>,
@@ -50,7 +50,10 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
     pub fn reserve_with(&self, initial: T) -> u32 {
         let mut inner = self.inner.write();
         if let Some(id) = inner.free.pop() {
-            inner.slots[id as usize].write(initial);
+            // Released slots were cleared on release, so nothing is
+            // displaced and nothing runs user code under the lock.
+            let stale = inner.slots[id as usize].write(initial);
+            debug_assert!(stale.is_none(), "a free arena slot still held a value");
             return id;
         }
         let id = inner.slots.len() as u32;
@@ -75,12 +78,16 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         id
     }
 
-    /// Return a slot to the free list, dropping its value (deferred via
-    /// hazard retire under Shared, so concurrent readers finish first).
-    pub fn release(&self, slot: u32) {
+    /// Return a slot to the free list and hand back its value (a retire
+    /// token under Shared, so concurrent readers finish first). The
+    /// caller drops it after this returns, so its `Drop` runs outside
+    /// the arena lock.
+    #[must_use]
+    pub fn release(&self, slot: u32) -> Option<Displaced<T, C>> {
         let mut inner = self.inner.write();
-        inner.slots[slot as usize].clear();
+        let displaced = inner.slots[slot as usize].clear();
         inner.free.push(slot);
+        displaced
     }
 
     /// Clone the value at `slot` out. Panics if the slot was never
@@ -97,11 +104,15 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         self.inner.read().slots.get(slot as usize)?.try_read()
     }
 
-    /// Publish a new value at `slot`. Under `Shared` this is an atomic
-    /// pointer swap; concurrent readers finish their clone against the
-    /// displaced value, which is hazard-protected until they do.
-    pub fn write(&self, slot: u32, value: T) {
-        self.inner.read().slots[slot as usize].write(value);
+    /// Publish a new value at `slot` and hand back the displaced one.
+    /// Under `Shared` this is an atomic pointer swap; concurrent readers
+    /// finish their clone against the displaced value, which is
+    /// hazard-protected until they do. The caller drops the displaced
+    /// value after this returns, so its `Drop` (or the reclaim its
+    /// retire may run) happens outside the arena lock.
+    #[must_use]
+    pub fn write(&self, slot: u32, value: T) -> Option<Displaced<T, C>> {
+        self.inner.read().slots[slot as usize].write(value)
     }
 
     /// Compare the current value at `slot` against `v` without cloning.
@@ -112,9 +123,22 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
 
     /// Write `value` unless the slot already holds an equal value.
     /// Returns true iff the value changed. One slot session for the
-    /// recompute hot path's compare+publish.
+    /// recompute hot path's compare+publish. The displaced value, or the
+    /// rejected equal one, is dropped here after the lock is released:
+    /// this is the compute wrapper's write, which drops before its
+    /// landing by design, with `wrote` set so the landing stamps it.
     pub fn write_if_changed(&self, slot: u32, value: T, wrote: &Cell<u8>) -> bool {
-        self.inner.read().slots[slot as usize].write_if_changed(value, wrote)
+        let compared = self.inner.read().slots[slot as usize].write_if_changed(value, wrote);
+        match compared {
+            Compared::Equal(rejected) => {
+                drop(rejected);
+                false
+            }
+            Compared::Replaced(displaced) => {
+                drop(displaced);
+                true
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -154,7 +178,7 @@ mod tests {
         let a: GenericArena<String, Local> = GenericArena::new();
         let s = a.reserve_with("hello".to_string());
         assert_eq!(a.read(s), "hello");
-        a.write(s, "world".to_string());
+        drop(a.write(s, "world".to_string()));
         assert_eq!(a.read(s), "world");
     }
 
@@ -163,7 +187,7 @@ mod tests {
         let a: GenericArena<String, Shared> = GenericArena::new();
         let s = a.reserve_with("hello".to_string());
         assert_eq!(a.read(s), "hello");
-        a.write(s, "world".to_string());
+        drop(a.write(s, "world".to_string()));
         assert_eq!(a.read(s), "world");
     }
 
@@ -172,7 +196,7 @@ mod tests {
         let a: GenericArena<u64, Local> = GenericArena::new();
         let s = a.reserve();
         assert_eq!(a.try_read(s), None);
-        a.write(s, 42);
+        let _ = a.write(s, 42);
         assert_eq!(a.try_read(s), Some(42));
         assert_eq!(a.read(s), 42);
     }
@@ -182,7 +206,7 @@ mod tests {
         let a: GenericArena<u64, Shared> = GenericArena::new();
         let s = a.reserve();
         assert_eq!(a.try_read(s), None);
-        a.write(s, 42);
+        let _ = a.write(s, 42);
         assert_eq!(a.try_read(s), Some(42));
         assert_eq!(a.read(s), 42);
     }
@@ -192,7 +216,7 @@ mod tests {
         let a: GenericArena<String, Shared> = GenericArena::new();
         let s = a.reserve();
         assert!(!a.eq_current(s, &"x".to_string()));
-        a.write(s, "x".to_string());
+        drop(a.write(s, "x".to_string()));
         assert!(a.eq_current(s, &"x".to_string()));
         assert!(!a.eq_current(s, &"y".to_string()));
     }
@@ -232,7 +256,7 @@ mod tests {
             .collect();
 
         for i in 0..iters {
-            a.write(slot, format!("s{:04}", i % 10_000));
+            drop(a.write(slot, format!("s{:04}", i % 10_000)));
         }
         stop.store(true, Ordering::Relaxed);
         for r in readers {

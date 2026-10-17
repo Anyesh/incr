@@ -18,7 +18,7 @@ use crate::dep_stack::LoomDepStack;
 use crate::locks::Lock;
 use crate::node::{DepList, DepListCell};
 use crate::value::Value;
-use crate::value_slot::ValueSlot;
+use crate::value_slot::{Compared, ValueSlot};
 use crate::walk_ring::WalkRing;
 use loom::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use loom::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -97,6 +97,7 @@ impl<T: Value> LoomValueSlot<T> {
 }
 
 impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
+    type Displaced = T;
     fn new_empty() -> Self {
         Self(RwLock::new(None))
     }
@@ -112,37 +113,40 @@ impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
     fn try_read(&self) -> Option<T> {
         self.read_guard().clone()
     }
-    fn write(&self, v: T) {
-        *self.write_guard() = Some(v);
+    fn write(&self, v: T) -> Option<T> {
+        self.write_guard().replace(v)
     }
     fn eq_current(&self, v: &T) -> bool {
         self.read_guard().as_ref() == Some(v)
     }
-    fn write_if_changed(&self, v: T, wrote: &std::cell::Cell<u8>) -> bool {
+    fn write_if_changed(&self, v: T, wrote: &std::cell::Cell<u8>) -> Compared<T, T> {
         let mut slot = self.write_guard();
         if slot.as_ref() == Some(&v) {
-            return false;
+            return Compared::Equal(v);
         }
         wrote.set(1);
-        *slot = Some(v);
-        true
+        Compared::Replaced(slot.replace(v))
     }
-    fn clear(&self) {
-        *self.write_guard() = None;
+    fn clear(&self) -> Option<T> {
+        self.write_guard().take()
     }
 }
 
 pub struct LoomDepListCell(RwLock<Option<Box<DepList>>>);
 
 impl DepListCell for LoomDepListCell {
+    type Retired = Box<DepList>;
     fn new_null() -> Self {
         Self(RwLock::new(None))
     }
-    fn replace(&self, list: Option<Box<DepList>>) {
-        *self
-            .0
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = list;
+    fn replace(&self, list: Option<Box<DepList>>) -> Option<Box<DepList>> {
+        std::mem::replace(
+            &mut *self
+                .0
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            list,
+        )
     }
     fn with_list(&self, f: &mut dyn FnMut(&DepList)) -> bool {
         let guard = self

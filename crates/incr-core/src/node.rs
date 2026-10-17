@@ -39,7 +39,7 @@
 
 use crate::cells::Cells;
 use crate::state::NodeState;
-use haphazard::{AtomicPtr as HzAtomicPtr, HazardPointer};
+use haphazard::{AtomicPtr as HzAtomicPtr, Global, HazardPointer, Replaced};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
@@ -67,10 +67,17 @@ pub struct DepList {
 /// through `Cells::DepListCell` so the loom strategy can swap out the
 /// hazard-pointer cell that `Local` and `Shared` share.
 pub trait DepListCell: 'static {
+    /// What [`Self::replace`] hands back for the displaced list. Dropping
+    /// it frees the list once no reader can still be iterating it.
+    type Retired;
     fn new_null() -> Self;
-    /// Install `list` (or null), retiring any displaced list. The caller
-    /// must be the node's single writer, which the state machine grants.
-    fn replace(&self, list: Option<Box<DepList>>);
+    /// Install `list` (or null) and hand back the displaced list's retire
+    /// token. The retire itself may run user code (haphazard reclaims
+    /// pending values inside any retire), so the caller drops the token
+    /// at a safe point, never under an incr lock or before its landing.
+    /// The caller must be the node's single writer, which the state
+    /// machine grants.
+    fn replace(&self, list: Option<Box<DepList>>) -> Option<Self::Retired>;
     /// Run `f` on the installed list and return true, or return false
     /// without calling `f` when none is installed. The caller must have
     /// observed an overflow `dep_count` with Acquire; a null list under
@@ -78,28 +85,41 @@ pub trait DepListCell: 'static {
     fn with_list(&self, f: &mut dyn FnMut(&DepList)) -> bool;
 }
 
+/// The retire token of a dep list displaced from an [`HzDepListCell`].
+/// Dropping it retires the list through the global haphazard domain,
+/// which frees it once no reader in `with_list` still references it.
+pub struct RetiredDepList(Replaced<DepList, Global, Box<DepList>>);
+
+impl Drop for RetiredDepList {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from a Box installed by a previous
+        // replace, was displaced exactly once by the swap that made this
+        // token, and is never loaded from the cell again.
+        unsafe { self.0.retire() };
+    }
+}
+
+/// The retire token type of `C`'s dep-list cell.
+pub(crate) type RetiredDeps<C> = <<C as Cells>::DepListCell as DepListCell>::Retired;
+
 /// Hazard-pointer overflow cell used by `Local` and `Shared`.
 pub struct HzDepListCell(HzAtomicPtr<DepList>);
 
 impl DepListCell for HzDepListCell {
+    type Retired = RetiredDepList;
+
     fn new_null() -> Self {
         // SAFETY: a null pointer is always a valid initial value.
         Self(unsafe { HzAtomicPtr::new(std::ptr::null_mut()) })
     }
 
-    fn replace(&self, list: Option<Box<DepList>>) {
+    fn replace(&self, list: Option<Box<DepList>>) -> Option<RetiredDepList> {
         let displaced = match list {
             Some(list) => self.0.swap(list),
             // SAFETY: swap_ptr with a null target is safe.
             None => unsafe { self.0.swap_ptr(std::ptr::null_mut()) },
         };
-        if let Some(old) = displaced {
-            // SAFETY: `old` came from a Box installed by a previous
-            // replace and is not aliased for writes (single writer per
-            // node). Hazard pointers defer the free until no reader in
-            // with_list still references it.
-            unsafe { old.retire() };
-        }
+        displaced.map(RetiredDepList)
     }
 
     fn with_list(&self, f: &mut dyn FnMut(&DepList)) -> bool {
@@ -122,7 +142,7 @@ impl Drop for HzDepListCell {
     fn drop(&mut self) {
         // For the runtime-drop case all hazards are already gone, so the
         // retire reclaims immediately.
-        self.replace(None);
+        drop(self.replace(None));
     }
 }
 
@@ -178,11 +198,15 @@ impl<C: Cells> NodeData<C> {
     }
 
     /// Tear down a node for deletion: clear deps and Release-store Dead.
-    /// The caller (`delete_erased`) owns the transition; the slot stays
-    /// allocated and is reinitialized by [`Self::reinit_recycled`].
-    pub(crate) fn retire_for_delete(&self) {
-        self.install_deps(&[]);
+    /// The caller (`release_claimed`) owns the transition; the slot stays
+    /// allocated and is reinitialized by [`Self::reinit_recycled`]. The
+    /// displaced dep list's retire token is handed back, to be dropped
+    /// after the delete has released `inner`.
+    #[must_use]
+    pub(crate) fn retire_for_delete(&self) -> Option<RetiredDeps<C>> {
+        let displaced = self.install_deps(&[]);
         C::state_store_release(&self.state, NodeState::Dead.as_u8());
+        displaced
     }
 
     /// Move the slot to a new generation so handles to the deleted node
@@ -336,14 +360,16 @@ impl<C: Cells> NodeData<C> {
     /// array; overflow path heap-allocates a `DepList` and Release-stores
     /// the pointer.
     ///
-    /// Reclamation: any displaced overflow list is retired through
-    /// `C::DepListCell`, which under `Local` and `Shared` is the
-    /// `haphazard` global domain. Concurrent readers in
-    /// [`Self::for_each_dep`] hold a `HazardPointer` while
-    /// dereferencing the slot, so the retired list is not freed until
-    /// every protecting reader has finished. Free-during-runtime; no
-    /// graveyard build-up; no leak past process scope.
-    pub(crate) fn install_deps(&self, new_deps: &[NodeId]) {
+    /// Reclamation: any displaced overflow list's retire token is handed
+    /// back, and dropping it retires the list through `C::DepListCell`,
+    /// which under `Local` and `Shared` is the `haphazard` global domain.
+    /// Concurrent readers in [`Self::for_each_dep`] hold a
+    /// `HazardPointer` while dereferencing the slot, so the retired list
+    /// is not freed until every protecting reader has finished. Nothing
+    /// in here retires, so nothing in here can panic between the swap
+    /// and the count store.
+    #[must_use]
+    pub(crate) fn install_deps(&self, new_deps: &[NodeId]) -> Option<RetiredDeps<C>> {
         let count = new_deps.len();
         if count <= 7 {
             // Each id is Release-stored on its own, not just covered by
@@ -354,24 +380,26 @@ impl<C: Cells> NodeData<C> {
             for (i, dep) in new_deps.iter().enumerate() {
                 C::u32_store_release(&self.inline_deps[i], dep.0);
             }
-            // Going inline: displace and retire any stale overflow list.
+            // Going inline: displace any stale overflow list.
             // for_each_dep's count<=7 path never reads overflow_deps, but
             // keeping the stale list would hold its memory until the next
             // overflow install or the node's drop. A scan that read the
             // overflow marker before this store finds the null and
             // retries on the count stored next.
-            self.overflow_deps.replace(None);
+            let displaced = self.overflow_deps.replace(None);
             C::u8_store_release(&self.dep_count, count as u8);
+            displaced
         } else {
             let list = Box::new(DepList {
                 deps: new_deps.to_vec().into_boxed_slice(),
             });
-            self.overflow_deps.replace(Some(list));
+            let displaced = self.overflow_deps.replace(Some(list));
             // The cell is one byte, so counts above 7 are encoded as a
             // marker and the DepList length is authoritative. This is
             // what lifts the old 255-dep ceiling: a query may read any
             // number of inputs.
             C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER);
+            displaced
         }
     }
 
@@ -556,8 +584,8 @@ mod tests {
         let local: NodeData<Local> = NodeData::new_query(0, 0);
         let shared: NodeData<Shared> = NodeData::new_query(0, 0);
         let deps: Vec<NodeId> = (0..n).map(NodeId).collect();
-        local.install_deps(&deps);
-        shared.install_deps(&deps);
+        drop(local.install_deps(&deps));
+        drop(shared.install_deps(&deps));
         for node_deps in [collect_deps(&local) as Vec<NodeId>, collect_deps(&shared)] {
             assert_eq!(node_deps, deps, "roundtrip failed for n={}", n);
         }
@@ -576,10 +604,10 @@ mod tests {
     fn shrink_from_overflow_back_to_inline() {
         let n: NodeData<Local> = NodeData::new_query(0, 0);
         let big: Vec<NodeId> = (0..20).map(NodeId).collect();
-        n.install_deps(&big);
+        drop(n.install_deps(&big));
         assert_eq!(collect_deps(&n), big);
         let small: Vec<NodeId> = (0..3).map(NodeId).collect();
-        n.install_deps(&small);
+        drop(n.install_deps(&small));
         assert_eq!(collect_deps(&n), small);
         assert_eq!(n.dep_count(), 3);
     }
