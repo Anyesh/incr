@@ -28,3 +28,7 @@ harness = false
 [[bench]]
 name = "operators"
 harness = false
+
+[[bench]]
+name = "graph"
+harness = false

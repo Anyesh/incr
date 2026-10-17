@@ -12,44 +12,20 @@
 //! consolidated `incr-core` should land within noise of that under
 //! `Shared` and faster (no atomic-fence cost) under `Local`.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use incr_core::{Incr, Local, Runtime, Shared};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use incr_core::{Local, Shared};
+use workloads::{Chain, Diamond, EarlyCutoff};
 
-fn build_chain_local(n: usize) -> (Runtime<Local>, Incr<i64>, Incr<i64>) {
-    let rt: Runtime<Local> = Runtime::new();
-    let input = rt.create_input(1_i64);
-    let mut prev = input;
-    for _ in 0..n {
-        let dep = prev;
-        prev = rt.create_query(move |rt| rt.get(dep).wrapping_add(1));
-    }
-    let _ = rt.get(prev);
-    (rt, input, prev)
-}
-
-fn build_chain_shared(n: usize) -> (Runtime<Shared>, Incr<i64>, Incr<i64>) {
-    let rt: Runtime<Shared> = Runtime::new();
-    let input = rt.create_input(1_i64);
-    let mut prev = input;
-    for _ in 0..n {
-        let dep = prev;
-        prev = rt.create_query(move |rt| rt.get(dep).wrapping_add(1));
-    }
-    let _ = rt.get(prev);
-    (rt, input, prev)
-}
+// Allowed because each bench target uses only its own slice of the
+// shared workloads.
+#[allow(dead_code)]
+mod workloads;
 
 fn bench_chain_local(c: &mut Criterion) {
     let mut group = c.benchmark_group("chain_local");
     for size in [4_usize, 10, 100] {
         group.bench_with_input(BenchmarkId::new("propagate", size), &size, |b, &size| {
-            let (rt, input, output) = build_chain_local(size);
-            let mut val = 1_i64;
-            b.iter(|| {
-                val = val.wrapping_add(1);
-                rt.set(input, val);
-                black_box(rt.get(output));
-            });
+            workloads::steady(b, &Chain::<Local>::new(size));
         });
     }
     group.finish();
@@ -59,98 +35,30 @@ fn bench_chain_shared(c: &mut Criterion) {
     let mut group = c.benchmark_group("chain_shared");
     for size in [4_usize, 10, 100] {
         group.bench_with_input(BenchmarkId::new("propagate", size), &size, |b, &size| {
-            let (rt, input, output) = build_chain_shared(size);
-            let mut val = 1_i64;
-            b.iter(|| {
-                val = val.wrapping_add(1);
-                rt.set(input, val);
-                black_box(rt.get(output));
-            });
+            workloads::steady(b, &Chain::<Shared>::new(size));
         });
     }
     group.finish();
 }
 
 fn bench_diamond_local(c: &mut Criterion) {
-    let rt: Runtime<Local> = Runtime::new();
-    let input = rt.create_input(1_i64);
-    let a = {
-        let dep = input;
-        rt.create_query(move |rt| rt.get(dep).wrapping_add(10))
-    };
-    let b = {
-        let dep = input;
-        rt.create_query(move |rt| rt.get(dep).wrapping_add(100))
-    };
-    let out = rt.create_query(move |rt| rt.get(a).wrapping_add(rt.get(b)));
-    let _ = rt.get(out);
-
-    c.bench_function("diamond_local", |bencher| {
-        let mut val = 1_i64;
-        bencher.iter(|| {
-            val = val.wrapping_add(1);
-            rt.set(input, val);
-            black_box(rt.get(out));
-        });
-    });
+    let w = Diamond::<Local>::new();
+    c.bench_function("diamond_local", |b| workloads::steady(b, &w));
 }
 
 fn bench_diamond_shared(c: &mut Criterion) {
-    let rt: Runtime<Shared> = Runtime::new();
-    let input = rt.create_input(1_i64);
-    let a = {
-        let dep = input;
-        rt.create_query(move |rt| rt.get(dep).wrapping_add(10))
-    };
-    let b = {
-        let dep = input;
-        rt.create_query(move |rt| rt.get(dep).wrapping_add(100))
-    };
-    let out = rt.create_query(move |rt| rt.get(a).wrapping_add(rt.get(b)));
-    let _ = rt.get(out);
-
-    c.bench_function("diamond_shared", |bencher| {
-        let mut val = 1_i64;
-        bencher.iter(|| {
-            val = val.wrapping_add(1);
-            rt.set(input, val);
-            black_box(rt.get(out));
-        });
-    });
+    let w = Diamond::<Shared>::new();
+    c.bench_function("diamond_shared", |b| workloads::steady(b, &w));
 }
 
 fn bench_early_cutoff_local(c: &mut Criterion) {
-    let rt: Runtime<Local> = Runtime::new();
-    let input = rt.create_input(200_i64);
-    let clamped = rt.create_query(move |rt| rt.get(input).min(100));
-    let after = rt.create_query(move |rt| rt.get(clamped).wrapping_add(1));
-    let _ = rt.get(after);
-
-    c.bench_function("early_cutoff_local", |bencher| {
-        let mut val = 200_i64;
-        bencher.iter(|| {
-            val = val.wrapping_add(1);
-            rt.set(input, val); // always > 100, clamp produces 100, early cutoff
-            black_box(rt.get(after));
-        });
-    });
+    let w = EarlyCutoff::<Local>::new();
+    c.bench_function("early_cutoff_local", |b| workloads::steady(b, &w));
 }
 
 fn bench_early_cutoff_shared(c: &mut Criterion) {
-    let rt: Runtime<Shared> = Runtime::new();
-    let input = rt.create_input(200_i64);
-    let clamped = rt.create_query(move |rt| rt.get(input).min(100));
-    let after = rt.create_query(move |rt| rt.get(clamped).wrapping_add(1));
-    let _ = rt.get(after);
-
-    c.bench_function("early_cutoff_shared", |bencher| {
-        let mut val = 200_i64;
-        bencher.iter(|| {
-            val = val.wrapping_add(1);
-            rt.set(input, val);
-            black_box(rt.get(after));
-        });
-    });
+    let w = EarlyCutoff::<Shared>::new();
+    c.bench_function("early_cutoff_shared", |b| workloads::steady(b, &w));
 }
 
 criterion_group!(
