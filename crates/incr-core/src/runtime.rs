@@ -19,7 +19,7 @@
 //! collection operators, soundness fixes (race-detection ordering with
 //! AcqRel, overflow-dep reclamation).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -218,6 +218,56 @@ enum Publish {
 #[cfg(test)]
 pub(crate) type ParkHook = Box<dyn Fn(ParkPoint) + Send + Sync>;
 
+/// First visits after which an `ensure_clean` walk switches to exact mode.
+const EXACT_MODE_AT: u32 = 4096;
+
+/// The stack of `ensure_clean`'s post-order walk. An entry `(x, false)` is
+/// a visit that expands `x`'s non-Clean deps; `(x, true)` is pushed on the
+/// first visit and runs `x`'s compute once they are done.
+struct Walk {
+    work: Vec<(NodeId, bool)>,
+    first_visits: u32,
+    /// Exact mode: every node with a `(x, true)` entry on `work`, kept
+    /// from the switch on so a popped `(x, false)` of one of them is
+    /// skipped instead of expanded again. `None` below the switch, which
+    /// keeps the walk free of set operations for small graphs.
+    visited: Option<HashSet<NodeId>>,
+}
+
+impl Walk {
+    fn new(root: NodeId) -> Self {
+        Self {
+            work: vec![(root, false)],
+            first_visits: 0,
+            visited: None,
+        }
+    }
+
+    fn visit(&mut self, id: NodeId) {
+        self.work.push((id, true));
+        self.first_visits += 1;
+        match &mut self.visited {
+            Some(visited) => {
+                visited.insert(id);
+            }
+            None if self.first_visits == EXACT_MODE_AT => {
+                self.visited = Some(
+                    self.work
+                        .iter()
+                        .filter(|(_, pending)| *pending)
+                        .map(|(x, _)| *x)
+                        .collect(),
+                );
+            }
+            None => {}
+        }
+    }
+
+    fn is_visited(&self, id: NodeId) -> bool {
+        self.visited.as_ref().is_some_and(|v| v.contains(&id))
+    }
+}
+
 /// The runtime.
 pub struct Runtime<C: Cells> {
     pub(crate) nodes: SegmentedNodes<C>,
@@ -232,6 +282,8 @@ pub struct Runtime<C: Cells> {
     pub(crate) tracing_armed: <C as Cells>::U8,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
+    #[cfg(test)]
+    first_visits: std::sync::atomic::AtomicU64,
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -252,7 +304,15 @@ impl<C: Cells> Runtime<C> {
             tracing_armed: C::new_u8(0),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            first_visits: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// First visits made by every `ensure_clean` walk on this runtime so far.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn first_visits(&self) -> u64 {
+        self.first_visits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1244,40 +1304,30 @@ impl<C: Cells> Runtime<C> {
 
     /// Ensure the node at `id` is Clean, recomputing the minimum
     /// necessary subgraph.
+    ///
+    /// Iterative post-order walk over the non-Clean subgraph. A node is
+    /// expanded on every pop until the walk has made `EXACT_MODE_AT` first
+    /// visits; from then on each node is expanded at most once (exact
+    /// mode), so a cycle of Dirty nodes, whose recorded edges re-expand
+    /// the ring forever, costs one pass over the ring past the switch
+    /// instead of a traversal budget. Cycles themselves are caught in
+    /// `compute_one` via the frame stack.
     fn ensure_clean(&self, id: NodeId) {
         // Fast path: already clean.
         if state::load::<C>(self.nodes.get(id.0).state_cell()) == NodeState::Clean {
             return;
         }
 
-        // Iterative post-order walk. Each stack entry is (node, visited).
-        // visited=false: first visit, push self and push dirty deps.
-        // visited=true: all deps clean now, run this node's compute.
-        let mut work: Vec<(NodeId, bool)> = vec![(id, false)];
+        let mut walk = Walk::new(id);
 
-        // Cycle backstop for the walk itself. A DAG bounds first-visit
-        // expansions by the dirty subgraph's edge count, which dep_count
-        // caps at 255 per node plus one self-push each, so a DAG can
-        // never exhaust this budget; an all-Dirty cycle re-expands
-        // forever and always will. Cycles that pass through a compute
-        // are caught exactly in compute_one via the frame stack; this
-        // catches the remaining walk-only case.
-        let mut budget: u64 = 1024 + 256 * u64::from(self.nodes.len());
-
-        while let Some((cur, visited)) = work.pop() {
-            if visited {
+        while let Some((cur, pending)) = walk.work.pop() {
+            if pending {
                 self.park(ParkPoint::BeforeComputeOne(cur));
                 self.compute_one(cur);
                 continue;
             }
-
-            budget -= 1;
-            if budget == 0 {
-                panic!(
-                    "incr-core: dependency cycle detected: ensure_clean({}) exceeded its \
-                     traversal budget, which no acyclic graph can",
-                    id.0,
-                );
+            if walk.is_visited(cur) {
+                continue;
             }
 
             let node = self.nodes.get(cur.0);
@@ -1288,22 +1338,26 @@ impl<C: Cells> Runtime<C> {
                     // its deps itself; expanding them here would tear
                     // through a dep list mid-rewrite. Just wait for the
                     // owner in compute_one.
-                    work.push((cur, true));
+                    walk.visit(cur);
                 }
                 _ => {
-                    // First visit: push self (to process after deps)
-                    // then push any non-clean deps.
-                    work.push((cur, true));
+                    walk.visit(cur);
                     node.for_each_dep(|dep| {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
                         if dep_state != NodeState::Clean {
-                            work.push((dep, false));
+                            walk.work.push((dep, false));
                         }
                     });
                 }
             }
         }
+
+        #[cfg(test)]
+        self.first_visits.fetch_add(
+            u64::from(walk.first_visits),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Compute (or verify) a single node, assuming all its known deps
@@ -1787,6 +1841,10 @@ mod race_tests;
 #[cfg(test)]
 #[path = "runtime_cascade_tests.rs"]
 mod cascade_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_walk_tests.rs"]
+mod walk_tests;
 
 #[cfg(test)]
 mod tests {
