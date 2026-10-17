@@ -3,10 +3,11 @@
 //! The table stores each element's hash next to it, so `reserve` and the
 //! rehash it may trigger move entries by their stored hashes and never run
 //! user code. Lookup is the only operation that calls user `Eq`; every
-//! mutation takes an index that a lookup returned (or a hash known to be
-//! absent), so a caller can run all user code first and then mutate
-//! without any user code running in between. `T` carries no `Hash` bound
-//! at all, which makes "the table never hashes" a compile-time fact.
+//! mutation takes an index that a lookup returned (for an absent value,
+//! the first free slot on its probe run), so a caller can run all user
+//! code first and then mutate without any user code running in between.
+//! `T` carries no `Hash` bound at all, which makes "the table never
+//! hashes" a compile-time fact.
 //!
 //! Removal leaves a tombstone (or an empty slot when no probe run can pass
 //! through it) and never moves another entry, and only `reserve` rehashes,
@@ -54,11 +55,16 @@ pub(crate) struct Located {
 }
 
 /// Where one added occurrence lands, as found by
-/// [`HashedMultiset::locate_add`]. Valid until the next `reserve`.
+/// [`HashedMultiset::locate_add`]. Valid until the multiset next changes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AddAt {
     Existing(usize),
-    Absent(u64),
+    /// No entry equals the value; `slot` is the first free slot on its
+    /// probe run, where it is stored.
+    Absent {
+        hash: u64,
+        slot: usize,
+    },
 }
 
 impl Located {
@@ -156,22 +162,49 @@ impl<T> HashedMultiset<T> {
         if self.ctrl.is_empty() {
             return None;
         }
+        self.probe(hash, value).ok()
+    }
+
+    /// `Ok` with the index of the entry equal to `value`, or `Err` with
+    /// the first free slot on its probe run, the slot an insert of it
+    /// takes. Requires a non-empty table.
+    #[inline(always)]
+    fn probe(&self, hash: u64, value: &T) -> Result<usize, usize>
+    where
+        T: PartialEq,
+    {
         let mask = self.ctrl.len() - 1;
         let tag = tag(hash);
         let mut i = hash as usize & mask;
+        let mut free = usize::MAX;
         loop {
             let c = self.ctrl[i];
-            if c == EMPTY {
-                return None;
-            }
             if c == tag {
                 // SAFETY: a tag byte has FULL set, so the entry is initialised.
                 let e = unsafe { self.entries[i].assume_init_ref() };
                 if e.hash == hash && e.value == *value {
-                    return Some(i);
+                    return Ok(i);
+                }
+            } else if c & FULL == 0 {
+                if c == EMPTY {
+                    return Err(if free == usize::MAX { i } else { free });
+                }
+                if free == usize::MAX {
+                    free = i;
                 }
             }
             i = (i + 1) & mask;
+        }
+    }
+
+    /// Requires a prior `reserve(1)`, so the table is not empty.
+    fn locate_one(&self, hash: u64, value: &T) -> AddAt
+    where
+        T: PartialEq,
+    {
+        match self.probe(hash, value) {
+            Ok(i) => AddAt::Existing(i),
+            Err(slot) => AddAt::Absent { hash, slot },
         }
     }
 
@@ -221,18 +254,17 @@ impl<T> HashedMultiset<T> {
         Some(unsafe { self.entries[i].assume_init_read() }.value)
     }
 
-    /// Insert `value`, which no entry equals, with count 1. Requires a
-    /// prior `reserve(1)`.
-    fn insert_absent(&mut self, hash: u64, value: T) {
+    /// Insert `value`, which no entry equals, with count 1 at `i`, the
+    /// free slot its lookup returned. Requires a prior `reserve(1)`.
+    fn insert_absent(&mut self, hash: u64, i: usize, value: T) {
         assert!(
             self.growth_left > 0,
             "incr-core: multiset insert without a reserve"
         );
-        let mask = self.ctrl.len() - 1;
-        let mut i = hash as usize & mask;
-        while self.ctrl[i] & FULL != 0 {
-            i = (i + 1) & mask;
-        }
+        assert!(
+            self.ctrl[i] & FULL == 0,
+            "incr-core: multiset slot {i} is not free"
+        );
         if self.ctrl[i] == EMPTY {
             self.growth_left -= 1;
         }
@@ -257,37 +289,33 @@ impl<T> HashedMultiset<T> {
             self.reserve(1);
         }
         let remove = remove.and_then(|(hash, value)| self.find(hash, value));
-        let add = add.map(|(hash, value)| match self.find(hash, value) {
-            Some(i) => AddAt::Existing(i),
-            None => AddAt::Absent(hash),
-        });
+        let add = add.map(|(hash, value)| self.locate_one(hash, value));
         Located { remove, add }
     }
 
     /// Locate one added occurrence of `value`: reserves room, then runs
     /// the lookup (user `Eq`). Changes no element.
+    #[inline]
     pub(crate) fn locate_add(&mut self, hash: u64, value: &T) -> AddAt
     where
         T: PartialEq,
     {
         self.reserve(1);
-        match self.find(hash, value) {
-            Some(i) => AddAt::Existing(i),
-            None => AddAt::Absent(hash),
-        }
+        self.locate_one(hash, value)
     }
 
     /// Add one occurrence at `at`. Runs no user code. Hands `value` back
     /// when an equal element was already stored, for the caller to drop
     /// when it is safe to run user `Drop`.
+    #[inline]
     pub(crate) fn add(&mut self, at: AddAt, value: T) -> Option<T> {
         match at {
             AddAt::Existing(i) => {
                 self.increment(i);
                 Some(value)
             }
-            AddAt::Absent(hash) => {
-                self.insert_absent(hash, value);
+            AddAt::Absent { hash, slot } => {
+                self.insert_absent(hash, slot, value);
                 None
             }
         }
