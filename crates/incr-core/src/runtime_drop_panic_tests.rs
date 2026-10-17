@@ -4,14 +4,15 @@
 //! batch, and the child keeps the test binary's global domain clean.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 
-use super::race_tests::{park_at, Gate};
+use super::race_tests::{id, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
+use crate::deferred::{ErasedDrop, SPILL_ALLOCS};
 use crate::handle::Incr;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::state::NodeState;
@@ -427,4 +428,182 @@ fn shared_delete_retire_drop_can_recycle_the_freed_slot() {
         },
     )
     .assert_clean();
+}
+/// Counts its drops, as a bag item a test hook plants.
+struct CountOnDrop(Arc<AtomicU32>);
+
+impl Drop for CountOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, SeqCst);
+    }
+}
+
+/// Q's first attempt reads a dep that is deleted under it, lands New and
+/// retries; the retry's publish displaces Q's overflow list and the
+/// drain's retire panics. P reaches Q through its own nested get and
+/// swallows the panic, and must land Dirty, not Clean.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stale_path_drain_panic_under_a_swallowing_parent_lands_dirty() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_stale_path_drain_panic_under_a_swallowing_parent_lands_dirty",
+        || {
+            let rt = Arc::new(Rt::new());
+            prime_reclaim_timer(&rt);
+            reclaim_probe::force(RetireSite::DepListRetire);
+            let switch = rt.create_input(0_u8);
+            let z = rt.create_input(100_i64);
+            let inputs: Vec<_> = (0..8_i64).map(|v| rt.create_input(v)).collect();
+            let z_gate = Gate::new();
+            let attempts = Arc::new(AtomicU32::new(0));
+            let q = {
+                let captured = inputs.clone();
+                let z_gate = z_gate.clone();
+                let attempts = Arc::clone(&attempts);
+                rt.create_query(move |rt| {
+                    if rt.get(switch) == 0 {
+                        return captured.iter().map(|&i| rt.get(i)).sum::<i64>();
+                    }
+                    if attempts.fetch_add(1, SeqCst) == 0 {
+                        let v = rt.get(z);
+                        z_gate.park();
+                        v
+                    } else {
+                        captured[..6].iter().map(|&i| rt.get(i)).sum::<i64>()
+                    }
+                })
+            };
+            let reads_q = rt.create_input(0_u8);
+            let p = rt.create_query(move |rt| {
+                if rt.get(reads_q) == 0 {
+                    return 0;
+                }
+                catch_unwind(AssertUnwindSafe(|| rt.get(q))).unwrap_or(-1)
+            });
+            assert_eq!(rt.get(q), 28);
+            assert_eq!(rt.get(p), 0);
+
+            retire_armed_boom(&rt);
+            rt.set(switch, 1);
+            rt.set(reads_q, 1);
+            z_gate.arm();
+            let deleter = {
+                let rt = Arc::clone(&rt);
+                let z_gate = z_gate.clone();
+                thread::spawn(move || {
+                    z_gate.wait_parked();
+                    rt.delete_node(z);
+                    z_gate.release();
+                })
+            };
+            assert_eq!(rt.get(p), -1);
+            deleter.join().unwrap();
+            assert_eq!(attempts.load(SeqCst), 2, "the Stale attempt must retry");
+            assert_eq!(ARMED.load(SeqCst), i64::MIN, "the retire did not run");
+            assert_eq!(rt.state_of(q), NodeState::Clean);
+            assert_eq!(rt.state_of(p), NodeState::Dirty);
+            // The Dirty landing makes the next reader re-verify P; with
+            // Q Clean that verification settles P without a recompute.
+            let _ = rt.get(p);
+            assert_eq!(rt.state_of(p), NodeState::Clean);
+            rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
+/// A Stale retry carries its bag; when the retry's claim lands on the
+/// slot's next occupant, the `Gone` exit drains it exactly once.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_gone_exit_after_a_recycle_drops_its_bag_item_once() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_gone_exit_after_a_recycle_drops_its_bag_item_once",
+        || {
+            let rt = Arc::new(Rt::new());
+            let z = rt.create_input(1_i64);
+            let z_gate = Gate::new();
+            let claim_gate = Gate::new();
+            let q = {
+                let (z_gate, claim_gate) = (z_gate.clone(), claim_gate.clone());
+                rt.create_query(move |rt| {
+                    let v = rt.get(z);
+                    claim_gate.arm();
+                    z_gate.park();
+                    v
+                })
+            };
+            let hook_gate = claim_gate.clone();
+            rt.park_hook
+                .set(Box::new(move |p| {
+                    if p == ParkPoint::BeforeClaim(id(q)) {
+                        hook_gate.park();
+                    }
+                }))
+                .ok()
+                .expect("park hook installed twice");
+            let dropped = Arc::new(AtomicU32::new(0));
+            let planted = Arc::clone(&dropped);
+            rt.bag_hook
+                .set(Box::new(move |p| {
+                    (p == ParkPoint::StaleRetry(id(q)))
+                        .then(|| Box::new(CountOnDrop(Arc::clone(&planted))) as ErasedDrop)
+                }))
+                .ok()
+                .expect("bag hook installed twice");
+            z_gate.arm();
+            let driver = {
+                let rt = Arc::clone(&rt);
+                let (z_gate, claim_gate) = (z_gate.clone(), claim_gate.clone());
+                thread::spawn(move || {
+                    z_gate.wait_parked();
+                    rt.delete_node(z);
+                    z_gate.release();
+                    claim_gate.wait_parked();
+                    rt.delete_node(q);
+                    let occupant = rt.create_query(|_| 0_i64);
+                    assert_eq!(
+                        occupant.slot(),
+                        q.slot(),
+                        "the occupant must recycle q's slot"
+                    );
+                    claim_gate.release();
+                    occupant
+                })
+            };
+            let msg = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(q))).unwrap_err());
+            assert!(msg.contains("stale Incr"), "got: {msg}");
+            let occupant = driver.join().unwrap();
+            assert_eq!(dropped.load(SeqCst), 1);
+            assert_eq!(rt.state_of(occupant), NodeState::New);
+            assert_eq!(rt.get(occupant), 0);
+            rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
+/// A single-node delete uses the bag's typed slots and never touches the
+/// spill; an owned-tree delete of 100 groups is one batch, which grows
+/// the spill at most once.
+#[test]
+fn local_delete_spill_grows_at_most_once_per_batch() {
+    use crate::collection::IncrCollection;
+    let rt = Runtime::<Local>::new();
+    let col: IncrCollection<i64, Local> = rt.create_collection();
+    for i in 0..100_i64 {
+        col.insert(&rt, i);
+    }
+    let router = col.group_by(&rt, |x| *x).version_node();
+    let _ = rt.get(router);
+    let lone = rt.create_input(0_i64);
+
+    SPILL_ALLOCS.store(0, std::sync::atomic::Ordering::Relaxed);
+    rt.delete_node(lone);
+    assert_eq!(SPILL_ALLOCS.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    rt.delete_node(router);
+    let growths = SPILL_ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+    assert!((1..=2).contains(&growths), "spill grew {growths} times");
+    assert!(!rt.is_alive(router));
 }

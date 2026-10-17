@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::arena_registry::ArenaRegistry;
 use crate::cells::Cells;
-use crate::deferred::Deferred;
+use crate::deferred::{Deferred, NodeDrops};
 use crate::dep_stack::DepStack;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
@@ -44,7 +44,8 @@ use crate::value_code;
 /// attempt's `wrote` cell, set once the slot holds the new value. Returns
 /// `true` if the value actually changed (for early-cutoff propagation),
 /// `false` if it was the same as before.
-type ComputeFn<C> = Arc<dyn Fn(&Runtime<C>, u32, bool, &Cell<u8>) -> bool + Send + Sync + 'static>;
+pub(crate) type ComputeFn<C> =
+    Arc<dyn Fn(&Runtime<C>, u32, bool, &Cell<u8>) -> bool + Send + Sync + 'static>;
 
 /// Per-runtime mutable state guarded by the inner lock. Holds everything
 /// that's not on the per-node `NodeData` and not in an arena.
@@ -139,6 +140,9 @@ pub(crate) enum ParkPoint {
     /// In a collection operator's rebuild, just after it read an
     /// upstream's snapshot and released that upstream's guard.
     RebuildAfterSnapshot,
+    /// In `compute_one`, after a Stale publish landed `New` and before
+    /// the retry, with the attempt's bag carried along.
+    StaleRetry(NodeId),
 }
 
 /// What [`Runtime::delete_erased`] did with a node.
@@ -232,6 +236,12 @@ enum Publish {
 
 #[cfg(test)]
 pub(crate) type ParkHook = Box<dyn Fn(ParkPoint) + Send + Sync>;
+
+/// Test hook that hands an item to the bag carried past a park point, so
+/// a test can put a counting item where no real path puts one yet.
+#[cfg(test)]
+pub(crate) type BagHook =
+    Box<dyn Fn(ParkPoint) -> Option<crate::deferred::ErasedDrop> + Send + Sync>;
 
 /// First visits after which an `ensure_clean` walk switches to exact mode.
 const EXACT_MODE_AT: u32 = 4096;
@@ -352,6 +362,26 @@ impl Walk {
 }
 
 /// The runtime.
+///
+/// # Panics in user code
+///
+/// A panic in a user `Hash`, `Eq`, `PartialEq`, `Clone`, `Serialize` or
+/// closure leaves the runtime consistent: the node lands `Failed`, Dirty
+/// or New, its edges are published, and no lock is held while user code
+/// runs. The rule for a user `Drop` is std's own. One that panics on a
+/// normal path propagates as an ordinary panic after the operation has
+/// landed (a value or dep list displaced by a compute is dropped at the
+/// compute's exit, a deleted node's closure, observers and value at the
+/// delete's exit). One that panics on an exit already carrying a panic
+/// is swallowed, so the original panic arrives unchanged. One that panics
+/// while the thread is already unwinding aborts the process, exactly as a
+/// panicking `Drop` inside a `Vec` does.
+///
+/// Under `Shared`, displaced values are reclaimed through hazard
+/// pointers, so a value's `Drop` may run inside a later, unrelated
+/// retire on any thread. When such a `Drop` panics, the rest of that
+/// reclaim batch is leaked, never dropped and never freed; the runtime
+/// stays usable.
 pub struct Runtime<C: Cells> {
     pub(crate) nodes: SegmentedNodes<C>,
     pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
@@ -365,6 +395,8 @@ pub struct Runtime<C: Cells> {
     pub(crate) tracing_armed: <C as Cells>::U8,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
+    #[cfg(test)]
+    pub(crate) bag_hook: std::sync::OnceLock<BagHook>,
     #[cfg(test)]
     first_visits: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -389,6 +421,8 @@ impl<C: Cells> Runtime<C> {
             tracing_armed: C::new_u8(0),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            bag_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
             first_visits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -418,6 +452,19 @@ impl<C: Cells> Runtime<C> {
     #[cfg(not(test))]
     #[inline(always)]
     fn park(&self, _point: ParkPoint) {}
+
+    /// [`Self::park`] at a point the attempt's bag is carried past.
+    #[cfg(test)]
+    fn park_with_bag(&self, point: ParkPoint, bag: &mut Deferred<C>) {
+        self.park(point);
+        if let Some(item) = self.bag_hook.get().and_then(|hook| hook(point)) {
+            bag.push_erased(item);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn park_with_bag(&self, _point: ParkPoint, _bag: &mut Deferred<C>) {}
 
     #[inline(always)]
     fn tracing_is_armed(&self) -> bool {
@@ -820,10 +867,19 @@ impl<C: Cells> Runtime<C> {
         for child in foreign {
             self.wait_out_claim(child, &mut spins);
         }
-        for child in owned.into_iter().rev() {
-            self.release_claimed(child);
+        // One bag for the whole tree: every closure, observer and value
+        // Drop runs after every member is unhooked and recycled. The
+        // first node's drops take the typed slot; the rest spill, and the
+        // batch reserves for them once.
+        let mut bag = Deferred::new();
+        if !owned.is_empty() {
+            bag.reserve(owned.len());
         }
-        self.release_claimed(root);
+        for child in owned.into_iter().rev() {
+            self.release_claimed(child, &mut bag);
+        }
+        self.release_claimed(root, &mut bag);
+        bag.drain(self);
         Ok(())
     }
 
@@ -1092,13 +1148,17 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
-        self.release_claimed(handle);
+        let mut bag = Deferred::new();
+        self.release_claimed(handle, &mut bag);
+        bag.drain(self);
         DeleteOutcome::Deleted
     }
 
     /// Unhooks and recycles a node this thread claimed `Dead`. The node
-    /// must own nothing by now: its owned nodes are released first.
-    fn release_claimed(&self, handle: ErasedIncr) {
+    /// must own nothing by now: its owned nodes are released first. Its
+    /// closure, observers, value and displaced dep list go into `bag`,
+    /// which the delete drains once it holds no lock.
+    fn release_claimed(&self, handle: ErasedIncr, bag: &mut Deferred<C>) {
         let slot = handle.slot();
         let id = NodeId(slot);
         let node = self.nodes.get(slot);
@@ -1132,9 +1192,9 @@ impl<C: Cells> Runtime<C> {
             }
         }
         node.bump_generation();
-        // The closures are dropped only after the lock is released,
-        // because their captures' Drop impls are user code that may call
-        // back into the runtime.
+        // The closures, observers and value are dropped only at the
+        // bag's drain, after the lock is released, because their Drop
+        // impls are user code that may call back into the runtime.
         let compute = inner.compute_fns[slot as usize].take();
         let observers: Vec<ObserverEntry<C>> = inner
             .observers
@@ -1145,11 +1205,15 @@ impl<C: Cells> Runtime<C> {
         let arena = Arc::clone(inner.arenas.erased(type_tag));
         inner.free_nodes.push(slot);
         drop(inner);
-        drop(compute);
-        drop(observers);
-        arena.release(arena_slot);
-        drop(dep_list);
-        reclaim_probe::reached(RetireSite::DeleteRetire);
+        bag.push_node(NodeDrops {
+            compute,
+            observers,
+            arena,
+            arena_slot,
+        });
+        if let Some(dep_list) = dep_list {
+            bag.push_dep_list(dep_list);
+        }
     }
 
     /// Read the current value of a node. Triggers recomputation of the
@@ -1901,7 +1965,7 @@ impl<C: Cells> Runtime<C> {
                     // An enclosing closure that catches the unwind has
                     // still read a dep that did not land Clean.
                     self.dep_stack.poison_current_frame();
-                    bag.drain_carried(payload);
+                    bag.drain_carried(self, payload);
                 }
             };
 
@@ -1920,6 +1984,7 @@ impl<C: Cells> Runtime<C> {
                 // returned: land New and recompute. The retry either stops
                 // reading the dep or panics on its stale handle.
                 self.land(node, NodeState::New, NodeState::New);
+                self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                 continue;
             }
 
