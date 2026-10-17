@@ -57,3 +57,10 @@ pub use state::NodeState;
 pub use trace::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction};
 pub use value::Value;
 pub use value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
+
+#[cfg(test)]
+#[path = "../tests/common/child.rs"]
+pub(crate) mod child_test;
+
+#[cfg(test)]
+mod child_selftest;
