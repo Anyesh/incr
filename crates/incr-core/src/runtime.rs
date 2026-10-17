@@ -1309,6 +1309,7 @@ impl<C: Cells> Runtime<C> {
     /// before the hold: the deps and the Dead state are cleared before
     /// the slot can reach the free list, and the displaced list is
     /// retired only at the bag's drain.
+    #[inline(always)]
     fn retire_claimed(&self, handle: ErasedIncr) -> Retired<C> {
         let node = self.nodes.get(handle.slot());
         let mut old_deps: Vec<NodeId> = Vec::new();
@@ -1327,6 +1328,7 @@ impl<C: Cells> Runtime<C> {
     /// bag drops later. The closures, observers and value are dropped
     /// only at the bag's drain, after the lock is released, because their
     /// Drop impls are user code that may call back into the runtime.
+    #[inline(always)]
     fn unhook_retired(
         &self,
         inner: &mut Inner<C>,
