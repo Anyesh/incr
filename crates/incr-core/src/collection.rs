@@ -173,10 +173,17 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// return it, for the caller to drop when running user `Drop` is
     /// safe. Consumers whose cursor Arc was dropped (operator gone) are
     /// pruned. With no consumers the whole log is cut eagerly.
+    #[inline(always)]
     fn maybe_compact(&mut self) -> Vec<Delta<T>> {
         if self.deltas.len() < COMPACT_EVERY {
             return Vec::new();
         }
+        self.compact()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn compact(&mut self) -> Vec<Delta<T>> {
         self.cursors.retain(|c| Arc::strong_count(c) > 1);
         let min_cursor = self
             .cursors
