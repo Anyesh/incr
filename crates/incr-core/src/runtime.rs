@@ -993,9 +993,16 @@ impl<C: Cells> Runtime<C> {
         }
         let disarm = Disarm(self);
 
-        let start = std::time::Instant::now();
-        let value = self.get(handle);
-        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        // std has no clock on wasm32-unknown-unknown and `Instant::now()`
+        // panics there, so the trace reports no elapsed time.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let (value, elapsed_ns) = {
+            let start = std::time::Instant::now();
+            let value = self.get(handle);
+            (value, start.elapsed().as_nanos() as u64)
+        };
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let (value, elapsed_ns) = (self.get(handle), 0);
 
         drop(disarm);
         let node_traces: Vec<crate::trace::NodeTrace> = {

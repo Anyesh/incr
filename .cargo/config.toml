@@ -13,3 +13,8 @@ rustflags = ["-C", "link-arg=/STACK:67108864"]
 
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "link-arg=-Wl,--stack,67108864"]
+
+# Must match the wasm-bindgen version incr-wasm-tests resolves to (0.2.129),
+# because the runner refuses a module built by any other version.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

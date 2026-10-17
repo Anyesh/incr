@@ -34,6 +34,8 @@ pub mod runtime;
 pub mod segmented_nodes;
 pub mod sorted_collection;
 pub mod state;
+#[cfg(test)]
+mod test_size;
 pub mod trace;
 pub mod value;
 pub mod value_slot;

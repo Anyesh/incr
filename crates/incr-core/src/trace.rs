@@ -49,5 +49,6 @@ pub struct PropagationTrace {
     pub total_nodes: usize,
     pub nodes_recomputed: usize,
     pub nodes_cutoff: usize,
+    /// Always 0 on wasm32-unknown-unknown, which has no clock std can read.
     pub elapsed_ns: u64,
 }

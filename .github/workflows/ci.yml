@@ -30,6 +30,37 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p "$CRATE" --release $FEATURES
 
+  # The release job above never runs the debug-only lock-order check, so
+  # this covers every crate's tests in debug. The Python crates are
+  # extension-module cdylibs tested by the Python job, and incr-wasm-tests
+  # runs in the wasm job.
+  test-debug:
+    name: Test (debug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-wasm-tests --features incr-persist/sqlite
+
+  wasm:
+    name: wasm32 (Node)
+    runs-on: ubuntu-latest
+    env:
+      # wasm-bindgen-test-runner passes these to node; together with the
+      # crate's 8 MiB shadow stack this lets debug nest 5,000 levels.
+      NODE_ARGS: --stack-size=7000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # Must match the wasm-bindgen version incr-wasm-tests resolves to.
+      - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
+      - run: cargo test -p incr-wasm-tests --target wasm32-unknown-unknown
+      - run: cargo test -p incr-wasm-tests --target wasm32-unknown-unknown --release
+
   miri:
     name: Miri
     runs-on: ubuntu-latest
@@ -83,6 +114,9 @@ jobs:
     env:
       RUSTFLAGS: -Zsanitizer=thread
       CRATE: ${{ matrix.crate }}
+      # Large tests take their size from test_size, which shrinks them here
+      # because a sanitized debug build is too slow at full size.
+      INCR_TEST_REDUCED: 1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
