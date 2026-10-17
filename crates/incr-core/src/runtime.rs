@@ -1015,21 +1015,26 @@ impl<C: Cells> Runtime<C> {
         if self.nodes.get(root.slot()).generation() != root.generation() {
             return Err(StrictRefusal::Gone);
         }
+        if !inner.dependents[root.slot() as usize].is_empty() {
+            return Err(StrictRefusal::HasDependents(root.slot()));
+        }
         let mut owned = Vec::new();
-        let mut stack = vec![root.slot()];
-        while let Some(slot) = stack.pop() {
-            if !inner.dependents[slot as usize].is_empty() {
-                return Err(StrictRefusal::HasDependents(slot));
-            }
-            if slot != root.slot() {
+        // The walk's stack starts from the root's children, so a root that
+        // owns nothing allocates nothing.
+        if let Some(children) = inner.owned.get(&root.slot()) {
+            let mut stack: Vec<u32> = children.iter().map(|c| c.0).collect();
+            while let Some(slot) = stack.pop() {
+                if !inner.dependents[slot as usize].is_empty() {
+                    return Err(StrictRefusal::HasDependents(slot));
+                }
                 let child = self.erased_at(slot);
                 if self.nodes.get(slot).state() == NodeState::Dead {
                     return Ok(TreeClaim::WaitFor(child));
                 }
                 owned.push(child);
-            }
-            if let Some(children) = inner.owned.get(&slot) {
-                stack.extend(children.iter().map(|c| c.0));
+                if let Some(children) = inner.owned.get(&slot) {
+                    stack.extend(children.iter().map(|c| c.0));
+                }
             }
         }
         let root_node = self.nodes.get(root.slot());
