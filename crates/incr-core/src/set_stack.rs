@@ -1,9 +1,8 @@
-//! The per-thread stack of inputs being set. `set` pushes an entry
-//! before it runs any user code and pops it through a guard; the entry
-//! is marked claimed while `set` holds the input's `Computing` claim.
-//! Only claimed entries count as held by this thread, so a `set` waiting
-//! on another thread's claim never mistakes its own unclaimed entry for
-//! a claim it holds.
+//! The per-thread stack of inputs whose `Computing` claim a `set` on
+//! this thread holds. `set` pushes an entry once its claim CAS succeeds
+//! and pops it when it releases the claim, so every entry is a held
+//! claim, and a `set` waiting on another thread's claim has no entry of
+//! its own to mistake for one.
 
 use std::cell::RefCell;
 
@@ -12,7 +11,6 @@ use crate::handle::RuntimeId;
 struct Entry {
     rt: RuntimeId,
     slot: u32,
-    claimed: bool,
 }
 
 #[cfg(not(loom))]
@@ -25,46 +23,29 @@ loom::thread_local! {
     static SET_STACK: RefCell<Vec<Entry>> = RefCell::new(Vec::new());
 }
 
-/// One `set` in progress on this thread; pops its entry when dropped.
-pub(crate) struct SetEntry {
-    depth: usize,
+/// Record that a `set` on this thread now holds the claim on `slot` of
+/// `rt`. Claims nest only inside one another, so the matching [`pop`]
+/// always finds this entry on top.
+#[inline]
+pub(crate) fn push(rt: RuntimeId, slot: u32) {
+    SET_STACK.with(|s| s.borrow_mut().push(Entry { rt, slot }));
 }
 
-pub(crate) fn push(rt: RuntimeId, slot: u32) -> SetEntry {
+/// Release the entry [`push`] made for `slot` of `rt`.
+#[inline]
+pub(crate) fn pop(rt: RuntimeId, slot: u32) {
     SET_STACK.with(|s| {
-        let mut s = s.borrow_mut();
-        s.push(Entry {
-            rt,
-            slot,
-            claimed: false,
-        });
-        SetEntry { depth: s.len() - 1 }
-    })
-}
-
-impl SetEntry {
-    pub(crate) fn set_claimed(&self, claimed: bool) {
-        SET_STACK.with(|s| s.borrow_mut()[self.depth].claimed = claimed);
-    }
-}
-
-impl Drop for SetEntry {
-    fn drop(&mut self) {
-        SET_STACK.with(|s| {
-            let mut s = s.borrow_mut();
-            debug_assert_eq!(s.len(), self.depth + 1, "set stack popped out of order");
-            s.pop();
-        });
-    }
+        let top = s.borrow_mut().pop();
+        debug_assert!(
+            top.is_some_and(|e| e.rt == rt && e.slot == slot),
+            "set stack popped out of order"
+        );
+    });
 }
 
 /// True iff a `set` on this thread holds the claim on `slot` of `rt`.
 pub(crate) fn holds(rt: RuntimeId, slot: u32) -> bool {
-    SET_STACK.with(|s| {
-        s.borrow()
-            .iter()
-            .any(|e| e.claimed && e.rt == rt && e.slot == slot)
-    })
+    SET_STACK.with(|s| s.borrow().iter().any(|e| e.rt == rt && e.slot == slot))
 }
 
 #[cfg(all(test, not(loom)))]
@@ -72,18 +53,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_claimed_entries_are_held_and_the_guard_pops() {
+    fn an_entry_is_held_from_push_to_pop() {
         let rt = RuntimeId::allocate();
-        let entry = push(rt, 3);
         assert!(!holds(rt, 3));
-        entry.set_claimed(true);
+        push(rt, 3);
         assert!(holds(rt, 3));
         assert!(!holds(rt, 4));
         assert!(!holds(RuntimeId::allocate(), 3));
-        entry.set_claimed(false);
-        assert!(!holds(rt, 3));
-        entry.set_claimed(true);
-        drop(entry);
+        push(rt, 4);
+        assert!(holds(rt, 3) && holds(rt, 4));
+        pop(rt, 4);
+        assert!(holds(rt, 3) && !holds(rt, 4));
+        pop(rt, 3);
         assert!(!holds(rt, 3));
     }
 }

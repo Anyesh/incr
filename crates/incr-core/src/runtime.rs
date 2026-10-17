@@ -34,7 +34,7 @@ use crate::locks::Lock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::segmented_nodes::SegmentedNodes;
-use crate::set_stack::{self, SetEntry};
+use crate::set_stack;
 use crate::state::{self, NodeState};
 use crate::taint_memo;
 use crate::value::Value;
@@ -235,16 +235,16 @@ impl<C: Cells> Drop for WalkDone<'_, C> {
     }
 }
 
-/// `set`'s claim on its input, from the claim CAS to the landing. On an
-/// unwind before the write (a `PartialEq` panic) it lands the input as it
-/// found it; after the write it finishes the bump, the settle, the
-/// landing and the walk, none of which runs user code, so the written
-/// value is never left unpublished.
+/// `set`'s claim on its input, from the claim CAS to the landing, with
+/// the claim's set-stack entry. On an unwind before the write (a
+/// `PartialEq` panic) it lands the input as it found it; after the write
+/// it finishes the bump, the settle, the landing and the walk, none of
+/// which runs user code, so the written value is never left unpublished.
+/// Either way the entry pops with the landing.
 struct SetClaim<'a, C: Cells> {
     rt: &'a Runtime<C>,
     node: &'a NodeData<C>,
     id: NodeId,
-    entry: &'a SetEntry,
     phase: SetPhase,
 }
 
@@ -261,7 +261,7 @@ impl<C: Cells> SetClaim<'_, C> {
             SetPhase::Done => {}
             SetPhase::Claimed => {
                 self.rt.land(self.node, NodeState::Clean, NodeState::Dirty);
-                self.entry.set_claimed(false);
+                set_stack::pop(self.rt.runtime_id, self.id.0);
             }
             SetPhase::Written => {
                 let rev = self.rt.bump_revision();
@@ -270,7 +270,7 @@ impl<C: Cells> SetClaim<'_, C> {
                 self.node.settle_changed_at(rev);
                 self.node.max_verified_at(rev);
                 self.rt.land(self.node, NodeState::Clean, NodeState::Clean);
-                self.entry.set_claimed(false);
+                set_stack::pop(self.rt.runtime_id, self.id.0);
                 self.rt.mark_dependents_dirty(self.id);
                 self.rt.park(ParkPoint::SetAfterWalk);
                 drop(walk_done);
@@ -1634,21 +1634,18 @@ impl<C: Cells> Runtime<C> {
             (arena, node.arena_slot())
         };
 
-        let entry = set_stack::push(self.runtime_id, slot);
-        let displaced = self.set_under_entry(handle, &entry, &arena, arena_slot, value);
-        drop(entry);
+        let displaced = self.set_value(handle, &arena, arena_slot, value);
         // The old value's user `Drop`, or the reclaim its retire may run,
         // happens with no claim held and none of the locks this set took.
         drop(displaced);
         reclaim_probe::reached(RetireSite::SetRetire);
     }
 
-    /// `set` from its no-op check to its walk, under the set-stack
-    /// `entry`. Returns what the write displaced, if it wrote.
-    fn set_under_entry<T: Value>(
+    /// `set` from its no-op check to its walk. Returns what the write
+    /// displaced, if it wrote.
+    fn set_value<T: Value>(
         &self,
         handle: Incr<T>,
-        entry: &SetEntry,
         arena: &GenericArena<T, C>,
         arena_slot: u32,
         value: T,
@@ -1705,12 +1702,11 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
-        entry.set_claimed(true);
+        set_stack::push(self.runtime_id, slot);
         let mut claim = SetClaim {
             rt: self,
             node,
             id,
-            entry,
             phase: SetPhase::Claimed,
         };
         self.park(ParkPoint::SetAfterClaim(id));
