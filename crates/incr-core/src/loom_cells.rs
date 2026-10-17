@@ -257,6 +257,12 @@ impl Cells for Loom {
     fn fence_seqcst() {
         loom::sync::atomic::fence(Ordering::SeqCst);
     }
+    fn fence_acquire() {
+        loom::sync::atomic::fence(Ordering::Acquire);
+    }
+    fn fence_release() {
+        loom::sync::atomic::fence(Ordering::Release);
+    }
 
     fn state_load_acquire(c: &Self::State) -> u8 {
         c.load(Ordering::Acquire)

@@ -109,6 +109,12 @@ pub trait Cells: 'static + Sized {
 
     /// A SeqCst fence; a no-op under `Local`.
     fn fence_seqcst();
+    /// An Acquire fence; a no-op under `Local` and a plain compiler
+    /// barrier on x86.
+    fn fence_acquire();
+    /// A Release fence; a no-op under `Local` and a plain compiler
+    /// barrier on x86.
+    fn fence_release();
 
     /// One step of a wait on another thread's progress; `spins` counts
     /// the steps taken so far. A bounded spin, then yield. The loom
@@ -320,6 +326,10 @@ impl Cells for Local {
     fn complete_walk(_w: &Self::Watermark, _rev: u64) {}
     #[inline(always)]
     fn fence_seqcst() {}
+    #[inline(always)]
+    fn fence_acquire() {}
+    #[inline(always)]
+    fn fence_release() {}
 
     #[inline(always)]
     fn state_load_acquire(c: &Self::State) -> u8 {
@@ -459,6 +469,14 @@ impl Cells for Shared {
     #[inline(always)]
     fn fence_seqcst() {
         std::sync::atomic::fence(Ordering::SeqCst);
+    }
+    #[inline(always)]
+    fn fence_acquire() {
+        std::sync::atomic::fence(Ordering::Acquire);
+    }
+    #[inline(always)]
+    fn fence_release() {
+        std::sync::atomic::fence(Ordering::Release);
     }
 
     #[inline(always)]

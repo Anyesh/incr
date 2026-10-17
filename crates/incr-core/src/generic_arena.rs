@@ -88,8 +88,11 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         self.inner.read().slots[slot as usize].read()
     }
 
+    /// Clone the value at `slot` out, or `None` if the slot is out of
+    /// range or was never written. A stale handle can name a slot that
+    /// another arena never allocated, so the bound is a real branch.
     pub fn try_read(&self, slot: u32) -> Option<T> {
-        self.inner.read().slots[slot as usize].try_read()
+        self.inner.read().slots.get(slot as usize)?.try_read()
     }
 
     /// Publish a new value at `slot`. Under `Shared` this is an atomic

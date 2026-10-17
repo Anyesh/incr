@@ -125,6 +125,12 @@ pub(crate) enum ParkPoint {
     /// In a strict delete of an owner, under the read hold, after the
     /// owner's `Dead` claim and before the claims of the nodes it owns.
     DeleteBeforeOwnedClaims(NodeId),
+    /// In `get`, after the handle's runtime check and before its
+    /// generation is compared.
+    GetAfterHandleCheck(NodeId),
+    /// In `get`, after the node was found Clean and before its value is
+    /// read from the arena.
+    GetBeforeRead(NodeId),
 }
 
 /// What [`Runtime::delete_erased`] did with a node.
@@ -570,6 +576,24 @@ impl<C: Cells> Runtime<C> {
             handle.slot(),
             handle.generation(),
             self.nodes.get(handle.slot()).generation(),
+        );
+    }
+
+    /// The read of a Clean node found no value behind its tag and arena
+    /// slot, or found one under a moved generation. A moved generation
+    /// is a stale handle; an unmoved one means the fields and the arena
+    /// disagree, which no delete can cause.
+    #[cold]
+    #[inline(never)]
+    fn read_failed<T: Value>(&self, handle: Incr<T>) -> ! {
+        if self.nodes.get(handle.slot()).generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
+        panic!(
+            "incr-core: internal invariant violated: node {} is Clean but its Incr<{}> \
+             value is missing from the arena",
+            handle.slot(),
+            std::any::type_name::<T>(),
         );
     }
 
@@ -1105,26 +1129,80 @@ impl<C: Cells> Runtime<C> {
 
     /// Read the current value of a node. Triggers recomputation of the
     /// minimum necessary subgraph if anything is dirty.
+    ///
+    /// A delete and recycle of the node that lands anywhere inside the
+    /// call makes it return the old node's value, read before the delete,
+    /// or panic as stale; it never returns the new occupant's value and
+    /// never runs a closure against the occupant.
     pub fn get<T: Value>(&self, handle: Incr<T>) -> T {
-        self.check_handle(handle);
+        self.check_runtime(handle);
         let slot = handle.slot();
+        let node = self.nodes.get(slot);
+        self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
 
-        // Record dep if we're inside a compute closure.
+        if state::load::<C>(node.state_cell()) == NodeState::Clean {
+            // Seqlock order: the fields first, then the generation under
+            // an Acquire fence, so a generation that still matches the
+            // handle says the fields are this node's, not an occupant's
+            // (the recycle bumps the generation before its Release fence
+            // and the field stores, `reinit_recycled`).
+            let type_tag = node.type_tag();
+            let arena_slot = node.arena_slot();
+            C::fence_acquire();
+            if node.generation() != handle.generation() {
+                self.stale_handle(handle);
+            }
+            self.dep_stack.record_dep(NodeId(slot), handle.generation());
+            return self.read_slot(handle, type_tag, arena_slot);
+        }
+        self.get_slow(handle)
+    }
+
+    /// The non-Clean arm of [`Self::get`]: walk, then read.
+    #[inline(never)]
+    fn get_slow<T: Value>(&self, handle: Incr<T>) -> T {
+        let slot = handle.slot();
+        let node = self.nodes.get(slot);
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
         self.dep_stack.record_dep(NodeId(slot), handle.generation());
 
         if self.ensure_clean(NodeId(slot), handle.generation()) == Computed::Gone {
             self.stale_handle(handle);
         }
 
-        let node = self.nodes.get(slot);
+        let type_tag = node.type_tag();
+        let arena_slot = node.arena_slot();
+        C::fence_acquire();
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
+        self.read_slot(handle, type_tag, arena_slot)
+    }
+
+    /// Clone the value behind a node's tag and arena slot, both read
+    /// under a generation that matched the handle. The arena may still
+    /// have released or reassigned the slot since, so the value counts
+    /// only if the generation is unmoved after the read: a recycle
+    /// writes the slot under the arena lock the read takes, after the
+    /// bump, so a reader of the occupant's value sees the bump too.
+    #[inline(always)]
+    fn read_slot<T: Value>(&self, handle: Incr<T>, type_tag: u16, arena_slot: u32) -> T {
+        let slot = handle.slot();
+        self.park(ParkPoint::GetBeforeRead(NodeId(slot)));
         let arena = {
             let inner = self.inner.read();
-            inner
-                .arenas
-                .tagged_arena::<T>(node.type_tag())
-                .expect("incr-core: arena missing for handle's type; this should be impossible")
+            inner.arenas.tagged_arena::<T>(type_tag)
         };
-        arena.read(node.arena_slot())
+        let value = arena.and_then(|arena| arena.try_read(arena_slot));
+        C::fence_acquire();
+        if self.nodes.get(slot).generation() == handle.generation() {
+            if let Some(value) = value {
+                return value;
+            }
+        }
+        self.read_failed(handle)
     }
 
     /// Read the current value and return a propagation trace alongside.

@@ -401,3 +401,84 @@ fn loom_walk_scan_after_overflow_to_inline_install() {
         assert_eq!(rt.get(p), 101, "(V) violated: P stale after x = 1");
     });
 }
+
+/// A Clean read of v races a delete of v and a recycle of its slot by an
+/// input of the same type, which reuses v's arena slot too. The read
+/// returns v's value or unwinds as stale; it never returns the new
+/// occupant's value. Targets bug (d)'s read half.
+#[test]
+fn loom_clean_get_vs_recycle() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let v = rt.create_input(7_u64);
+
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || may_unwind(|| rt.get(v)))
+        };
+        let recycler = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.delete_node(v);
+                rt.create_input(99_u64)
+            })
+        };
+        let read = reader.join().unwrap();
+        let new = recycler.join().unwrap();
+
+        assert_eq!(new.slot(), v.slot(), "the recycle reused v's slot");
+        if let Some(value) = read {
+            assert_eq!(
+                value, 7,
+                "(V) violated: the read returned the new occupant's value"
+            );
+        }
+        assert_eq!(rt.get(new), 99);
+        rt.assert_invariant_i();
+    });
+}
+
+/// As above, but the recycler first reuses v's node slot for an input of
+/// another type, so v's arena slot is taken by a node in the segment the
+/// recycler allocates (segments hold four nodes under loom). The stale
+/// read's node slot and its arena slot then belong to different nodes.
+#[test]
+fn loom_clean_get_vs_recycle_new_segment() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let v = rt.create_input(7_u64);
+        let _fills_segment_zero: Vec<Incr<u64>> = (1..=3).map(|k| rt.create_input(k)).collect();
+
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || may_unwind(|| rt.get(v)))
+        };
+        let recycler = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.delete_node(v);
+                let other = rt.create_input("s".to_string());
+                let new = rt.create_input(99_u64);
+                (other, new)
+            })
+        };
+        let read = reader.join().unwrap();
+        let (other, new) = recycler.join().unwrap();
+
+        assert_eq!(other.slot(), v.slot(), "the recycle reused v's node slot");
+        assert_eq!(
+            new.slot(),
+            4,
+            "the u64 occupant lives in the second segment"
+        );
+        if let Some(value) = read {
+            assert_eq!(
+                value, 7,
+                "(V) violated: the read returned the new occupant's value"
+            );
+        }
+        assert_eq!(rt.get(new), 99);
+        assert_eq!(rt.get(other), "s");
+        rt.assert_invariant_i();
+    });
+}

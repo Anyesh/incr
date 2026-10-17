@@ -198,7 +198,10 @@ impl<C: Cells> NodeData<C> {
     /// the publication point, and pairs with readers' Acquire state
     /// loads. The generation was already bumped by the delete, so
     /// handles minted now carry the new generation and stale ones fail
-    /// the check.
+    /// the check. The Release fence before the first field store pairs
+    /// with the Acquire fence a lock-free reader issues between its
+    /// field loads and its generation compare, so a reader that saw any
+    /// of the new fields also sees the bump.
     pub(crate) fn reinit_recycled(
         &self,
         type_tag: u16,
@@ -206,6 +209,7 @@ impl<C: Cells> NodeData<C> {
         revision: u64,
         is_input: bool,
     ) {
+        C::fence_release();
         C::u64_store_relaxed(&self.verified_at, if is_input { revision } else { 0 });
         C::u64_store_relaxed(&self.changed_at, if is_input { revision } else { 0 });
         C::u32_store_relaxed(&self.arena_slot, arena_slot);

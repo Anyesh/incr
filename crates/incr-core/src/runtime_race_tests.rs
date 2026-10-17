@@ -1262,3 +1262,124 @@ fn walk_entry_vs_delete_recycle() {
     assert_eq!(rt.get(new), 1001);
     rt.assert_invariant_i();
 }
+
+/// Bug (d) under `Local`: D's recompute deletes the walk root Q and
+/// recycles its slot as an input of the same type, so the walk's root
+/// entry and the read that follows it both meet a different node.
+#[test]
+fn local_dep_that_recycles_the_walk_root_panics_stale() {
+    let rt = LocalRt::new();
+    let x = rt.create_input(0_u64);
+    let target: Arc<Mutex<Option<Incr<u64>>>> = Arc::new(Mutex::new(None));
+    let recycled: RecycledSlot = Arc::new(Mutex::new(None));
+    let d = {
+        let target = Arc::clone(&target);
+        let recycled = Arc::clone(&recycled);
+        rt.create_query(move |rt: &LocalRt| {
+            let xv = rt.get(x);
+            if xv == 1 {
+                let q = target
+                    .lock()
+                    .unwrap()
+                    .expect("the target is set before the recompute");
+                rt.delete_node(q);
+                *recycled.lock().unwrap() = Some(rt.create_input_unchecked(5_u64));
+            }
+            xv + 1
+        })
+    };
+    let q_runs = Arc::new(AtomicUsize::new(0));
+    let q = {
+        let q_runs = Arc::clone(&q_runs);
+        rt.create_query(move |rt: &LocalRt| {
+            q_runs.fetch_add(1, Ordering::SeqCst);
+            rt.get(d) + 10
+        })
+    };
+    *target.lock().unwrap() = Some(q);
+    assert_eq!(rt.get(q), 11);
+    rt.set(x, 1);
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+    let msg = panic_message(outcome.expect_err("the read returned a value from the recycled slot"));
+    assert!(msg.contains("stale"), "got: {msg}");
+    let new = recycled.lock().unwrap().expect("D's recompute ran");
+    assert_eq!(new.slot(), q.slot());
+    assert_eq!(
+        q_runs.load(Ordering::SeqCst),
+        1,
+        "the deleted query's closure ran against the recycled slot"
+    );
+    assert_eq!(rt.get(new), 5);
+    assert_eq!(rt.get(d), 2);
+    rt.assert_invariant_i();
+}
+
+/// Parks a `get(v)` on another thread at `point`; the join handle yields
+/// the value or the panic message.
+fn park_get(
+    rt: &Arc<Rt>,
+    v: Incr<u64>,
+    point: ParkPoint,
+) -> (Gate, thread::JoinHandle<Result<u64, String>>) {
+    let gate = Gate::new();
+    park_at(rt, vec![(point, gate.clone())]);
+    let reader = {
+        let rt = Arc::clone(rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(v))).map_err(panic_message))
+    };
+    gate.wait_parked();
+    (gate, reader)
+}
+
+#[test]
+fn get_after_handle_check_vs_delete_recycle() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let (gate, reader) = park_get(&rt, v, ParkPoint::GetAfterHandleCheck(id(v)));
+    rt.delete_node(v);
+    let new = rt.create_input(99_u64);
+    assert_eq!(new.slot(), v.slot());
+    gate.release();
+
+    let msg = reader
+        .join()
+        .unwrap()
+        .expect_err("the read returned the recycled slot's value");
+    assert!(msg.contains("stale"), "got: {msg}");
+    assert_eq!(rt.get(new), 99);
+}
+
+#[test]
+fn get_before_read_vs_delete() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let (gate, reader) = park_get(&rt, v, ParkPoint::GetBeforeRead(id(v)));
+    rt.delete_node(v);
+    gate.release();
+
+    let msg = reader
+        .join()
+        .unwrap()
+        .expect_err("the read of a deleted node returned a value");
+    assert!(msg.contains("stale"), "got: {msg}");
+    assert!(!msg.contains("never written"), "got: {msg}");
+}
+
+#[test]
+fn get_before_read_vs_delete_recycle() {
+    let rt = Arc::new(Rt::new());
+    let v = rt.create_input(7_u64);
+    let (gate, reader) = park_get(&rt, v, ParkPoint::GetBeforeRead(id(v)));
+    rt.delete_node(v);
+    let new = rt.create_input(99_u64);
+    assert_eq!(new.slot(), v.slot());
+    gate.release();
+
+    let msg = reader
+        .join()
+        .unwrap()
+        .expect_err("the read returned the recycled slot's value");
+    assert!(msg.contains("stale"), "got: {msg}");
+    assert_eq!(rt.get(new), 99);
+}
