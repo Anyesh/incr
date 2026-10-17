@@ -1072,8 +1072,57 @@ where
         let router: Arc<OnceLock<ErasedIncr>> = Arc::new(OnceLock::new());
         let router_for_query = Arc::clone(&router);
 
+        let rebuild = NeedsRebuild::new();
         let version_node = rt.create_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
+            let new_group = || {
+                let group = IncrCollection::<T, C>::new_in_compute(rt);
+                let router = *router_for_query
+                    .get()
+                    .expect("group_by router ran before its handle was recorded");
+                rt.adopt(router, group.version_node.erase());
+                group
+            };
+            let mut keep = Vec::new();
+
+            if rebuild.is_set() {
+                let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
+                let keyed: Vec<(T, K)> = snapshot
+                    .into_iter()
+                    .map(|v| {
+                        let k = key_fn(&v);
+                        (v, k)
+                    })
+                    .collect();
+                let mut fresh = KeyCache::new();
+                let mut targets: HashMap<K, Vec<T>> = HashMap::new();
+                for (v, k) in keyed {
+                    let k = fresh.insert(v.clone(), k);
+                    targets.entry(k).or_default().push(v);
+                }
+
+                let mut grps = groups_for_query.write();
+                let mut kc = key_cache_for_query.write();
+                for k in grps.keys() {
+                    if !targets.contains_key(k) {
+                        targets.insert(k.clone(), Vec::new());
+                    }
+                }
+                for (k, target) in targets {
+                    let group = grps.entry(k).or_insert_with(new_group);
+                    let version = group.log.write().converge(target, &mut keep);
+                    if let Some(version) = version {
+                        rt.set(group.version_node, version);
+                    }
+                }
+                let stale = std::mem::replace(&mut *kc, fresh);
+                cursor.store(end, MemOrdering::Release);
+                rebuild.clear();
+                drop(kc);
+                drop(grps);
+                drop(stale);
+                return output_version_counter_for_query.fetch_add(1, MemOrdering::Relaxed) + 1;
+            }
 
             let (from, pending) = {
                 let up = upstream_log.read();
@@ -1084,72 +1133,69 @@ where
                 }
                 (from, up.pending_from(from).to_vec())
             };
+            let to = from + pending.len() as u64;
 
             // Stage: key extraction outside the locks. Deletes look up
             // the cached key during apply instead.
             let keyed: Vec<(Delta<T>, Option<K>)> = pending
-                .iter()
+                .into_iter()
                 .map(|d| match d {
-                    Delta::Insert(v) => (d.clone(), Some(key_fn(v))),
-                    Delta::Delete(_) => (d.clone(), None),
+                    Delta::Insert(v) => {
+                        let k = key_fn(&v);
+                        (Delta::Insert(v), Some(k))
+                    }
+                    Delta::Delete(v) => (Delta::Delete(v), None),
                 })
                 .collect();
 
             let mut grps = groups_for_query.write();
             let mut kc = key_cache_for_query.write();
-
-            // Bucket by destination group first, mutating key_cache in
-            // log order as we go (a Delete's group comes only from the
-            // cache, so a same-batch Insert-then-Delete of the same
-            // value must see the Insert's cache write before the
-            // Delete looks it up). Then apply each touched group's
-            // deltas under one log guard and issue one `rt.set`, so a
-            // same-group replace (Delete old + Insert new landing in
-            // the same group) can't expose the group's count as
-            // transiently short by one the way per-delta `rt.set` did.
-            let mut by_group: HashMap<K, Vec<Delta<T>>> = HashMap::new();
-            for (d, k) in keyed {
-                match d {
-                    Delta::Insert(v) => {
-                        let k = k.expect("insert delta staged without key");
-                        let k = kc.insert(v.clone(), k);
-                        by_group.entry(k).or_default().push(Delta::Insert(v));
-                    }
-                    Delta::Delete(v) => {
-                        if let Some(k) = kc.remove(&v) {
-                            by_group.entry(k).or_default().push(Delta::Delete(v));
-                        }
-                    }
-                }
-            }
-
-            for (k, deltas) in by_group {
-                let group = grps.entry(k).or_insert_with(|| {
-                    let group = IncrCollection::<T, C>::new_in_compute(rt);
-                    let router = *router_for_query
-                        .get()
-                        .expect("group_by router ran before its handle was recorded");
-                    rt.adopt(router, group.version_node.erase());
-                    group
-                });
-                let mut log = group.log.write();
-                let mut last_version = None;
-                for d in deltas {
+            rebuild.guard(|| {
+                // Bucket by destination group first, mutating key_cache in
+                // log order as we go (a Delete's group comes only from the
+                // cache, so a same-batch Insert-then-Delete of the same
+                // value must see the Insert's cache write before the
+                // Delete looks it up). Then apply each touched group's
+                // deltas under one log guard and issue one `rt.set`, so a
+                // same-group replace (Delete old + Insert new landing in
+                // the same group) can't expose the group's count as
+                // transiently short by one the way per-delta `rt.set` did.
+                let mut by_group: HashMap<K, Vec<Delta<T>>> = HashMap::new();
+                for (d, k) in keyed {
                     match d {
-                        Delta::Insert(v) => last_version = Some(log.insert(v)),
+                        Delta::Insert(v) => {
+                            let k = k.expect("insert delta staged without key");
+                            let k = kc.insert(v.clone(), k);
+                            by_group.entry(k).or_default().push(Delta::Insert(v));
+                        }
                         Delta::Delete(v) => {
-                            if let Some(ver) = log.delete(&v) {
-                                last_version = Some(ver);
+                            if let Some(k) = kc.remove(&v) {
+                                by_group.entry(k).or_default().push(Delta::Delete(v));
                             }
                         }
                     }
                 }
-                drop(log);
-                if let Some(ver) = last_version {
-                    rt.set(group.version_node, ver);
+
+                for (k, deltas) in by_group {
+                    let group = grps.entry(k).or_insert_with(new_group);
+                    let mut log = group.log.write();
+                    let mut last_version = None;
+                    for d in deltas {
+                        let version = match d {
+                            Delta::Insert(v) => log.insert_kept(v, &mut keep),
+                            Delta::Delete(v) => log.delete_kept(v, &mut keep),
+                        };
+                        last_version = version.or(last_version);
+                    }
+                    drop(log);
+                    if let Some(ver) = last_version {
+                        rt.set(group.version_node, ver);
+                    }
                 }
-            }
-            cursor.store(from + pending.len() as u64, MemOrdering::Release);
+            });
+            cursor.store(to, MemOrdering::Release);
+            drop(kc);
+            drop(grps);
             output_version_counter_for_query.fetch_add(1, MemOrdering::Relaxed) + 1
         });
         router

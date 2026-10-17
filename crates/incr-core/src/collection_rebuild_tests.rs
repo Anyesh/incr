@@ -74,6 +74,37 @@ fn map_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     }
 }
 
+fn group_by_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
+    let grouped = s.left.group_by(rt, |b| {
+        tick(Call::Closure);
+        b.0 % 3
+    });
+    let _ = rt.get(grouped.version_node);
+    let down = grouped
+        .get_group(&0)
+        .expect("the sources start with a multiple of 3")
+        .filter(rt, |_| true);
+    Probe {
+        node: grouped.version_node,
+        upstream: None,
+        read: Box::new(move |rt| {
+            let _ = rt.get(grouped.version_node);
+            let mut keys = grouped.keys();
+            keys.sort_unstable();
+            let groups: Vec<(i64, Vec<i64>)> = keys
+                .into_iter()
+                .map(|k| {
+                    let group = grouped.get_group(&k).expect("listed group");
+                    let values = group.log.read().elements_vec();
+                    (k, sorted(values))
+                })
+                .filter(|(_, values)| !values.is_empty())
+                .collect();
+            format!("{groups:?} / {:?}", sorted(down.values(rt)))
+        }),
+    }
+}
+
 fn aggregate_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     let sum = s.left.aggregate(
         rt,
@@ -94,10 +125,11 @@ fn aggregate_op<C: Cells>(rt: &Runtime<C>, s: &Sources<C>) -> Probe<C> {
     }
 }
 
-fn operators<C: Cells>() -> [(&'static str, Build<C>); 3] {
+fn operators<C: Cells>() -> [(&'static str, Build<C>); 4] {
     [
         ("filter", filter_op::<C>),
         ("map", map_op::<C>),
+        ("group_by", group_by_op::<C>),
         ("aggregate", aggregate_op::<C>),
     ]
 }
