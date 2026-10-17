@@ -1,5 +1,5 @@
-//! `Deferred`: the items an engine operation removed and must not drop
-//! until it has landed.
+//! `Deferred` and `DeleteBag`: the items an engine operation removed and
+//! must not drop until it has landed.
 //!
 //! Dropping a displaced dep list, value, closure or observer can run user
 //! code (a `Drop` impl, or any pending reclaim haphazard folds into a
@@ -8,29 +8,34 @@
 //! operation's landing CAS: the operation puts the item in its bag and
 //! drains the bag at its exit, after the landing and after any
 //! `poison_current_frame()` that exit does. The owner is a `compute_one`
-//! call (one bag across its attempts) or a delete.
+//! call (one `Deferred` across its attempts) or a delete (a `DeleteBag`).
 //!
-//! The common items have typed inline slots, so the hot path boxes and
-//! allocates nothing: constructing a bag is three null stores and a
-//! drain of an empty bag is three null tests. Batch releases push
-//! type-erased items into a spill `Vec` (`None` until first use, which
-//! allocates nothing) and reserve it per batch, so each batch costs at
-//! most one buffer growth.
+//! Each bag holds only what its owner can defer, in typed inline slots,
+//! so the hot path boxes and allocates nothing. A compute's `Deferred` is
+//! a dep-list slot and a spill pointer, and draining an empty one is two
+//! null tests. A delete's bag is built around the first released node's
+//! drops, so a single-node delete never tests for an empty node slot.
+//! Batch releases push type-erased items into the spill `Vec` (`None`
+//! until first use, which allocates nothing) and reserve it per batch, so
+//! each batch costs at most one buffer growth.
 //!
 //! The drain has two modes, chosen by the exit and never by
 //! `std::thread::panicking()`. On an exit that returns normally, items
-//! drop one at a time; the first panic poisons the reading frame (so an
+//! drop one at a time under one unwind guard, each leaving the bag only
+//! as it drops; the first panic poisons the reading frame (so an
 //! enclosing closure that swallows it cannot land Clean over a node whose
 //! cleanup failed) and then resumes as an ordinary panic, after which the
-//! remaining items drop by ordinary drop glue as the bag unwinds. On an
-//! exit that already carries a panic payload, every item drops under
-//! [`isolate`], so a cleanup panic never replaces the carried payload, and
-//! the payload then resumes. A user `Drop` that panics while the thread is
-//! already unwinding aborts the process, as in std's own containers; the
-//! bag's own drop glue runs only when an unwind passes straight through
-//! the owner, since every normal and carried exit drains explicitly.
+//! remaining items drop, in order, by ordinary drop glue as the bag
+//! unwinds. On an exit that already carries a panic payload, every item
+//! drops under [`isolate`], so a cleanup panic never replaces the carried
+//! payload, and the payload then resumes. A user `Drop` that panics while
+//! the thread is already unwinding aborts the process, as in std's own
+//! containers; the bag's own drop glue runs only when an unwind passes
+//! straight through the owner, since every normal and carried exit drains
+//! explicitly.
 
 use std::any::Any;
+use std::mem;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -56,13 +61,28 @@ pub(crate) struct NodeDrops<C: Cells> {
     pub(crate) arena_slot: u32,
 }
 
+impl<C: Cells> NodeDrops<C> {
+    /// The closure, then the observers, then the arena release. Each
+    /// part leaves `self` only as it drops, so after a panic the parts
+    /// not yet reached drop with `self`, and the release never runs
+    /// twice because no drop glue runs it.
+    #[inline(always)]
+    fn drop_parts(&mut self) {
+        drop(self.compute.take());
+        drop(mem::take(&mut self.observers));
+        self.arena.release(self.arena_slot);
+        reclaim_probe::reached(RetireSite::DeleteRetire);
+    }
+}
+
+/// What a compute defers: the displaced dep list's retire token, and
+/// spilled items.
 pub(crate) struct Deferred<C: Cells> {
     /// The retire token of a displaced overflow dep list. Lock-free
     /// walkers may still be reading the list under a hazard pointer, so
     /// draining retires it; a plain drop of the list would free memory a
     /// walker is iterating.
     dep_list: Option<RetiredDeps<C>>,
-    node: Option<NodeDrops<C>>,
     spill: Option<Vec<ErasedDrop>>,
 }
 
@@ -85,7 +105,6 @@ impl<C: Cells> Deferred<C> {
     pub(crate) fn new() -> Self {
         Self {
             dep_list: None,
-            node: None,
             spill: None,
         }
     }
@@ -98,32 +117,13 @@ impl<C: Cells> Deferred<C> {
         }
     }
 
-    pub(crate) fn push_node(&mut self, drops: NodeDrops<C>) {
-        if self.node.is_none() {
-            self.node = Some(drops);
-        } else {
-            self.push_erased(Box::new(SpilledNode(Some(drops))));
-        }
-    }
-
     /// Reserve room for a batch's `items` erased pushes, so the batch
     /// costs at most one buffer growth.
-    pub(crate) fn reserve(&mut self, items: usize) {
+    fn reserve(&mut self, items: usize) {
         let spill = self.spill_mut();
         if spill.capacity() - spill.len() < items {
             spill.reserve(items);
             count_spill_alloc();
-        }
-    }
-
-    /// Reserve for a batch of `nodes` node pushes and `dep_lists` token
-    /// pushes, less the typed slots still free to take the first of each.
-    pub(crate) fn reserve_batch(&mut self, nodes: usize, dep_lists: usize) {
-        let spilled_nodes = nodes.saturating_sub(usize::from(self.node.is_none()));
-        let spilled_lists = dep_lists.saturating_sub(usize::from(self.dep_list.is_none()));
-        let items = spilled_nodes + spilled_lists;
-        if items > 0 {
-            self.reserve(items);
         }
     }
 
@@ -139,79 +139,152 @@ impl<C: Cells> Deferred<C> {
         self.spill.get_or_insert_with(Vec::new)
     }
 
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.dep_list.is_none() && self.spill.is_none()
+    }
+
     /// Normal mode: see the module docs.
     #[inline(always)]
-    pub(crate) fn drain(&mut self, rt: &Runtime<C>) {
-        self.drain_in(rt, Mode::Normal);
+    pub(crate) fn drain(self, rt: &Runtime<C>) {
+        if self.is_empty() {
+            mem::forget(self);
+        } else {
+            self.drain_items(rt);
+        }
+    }
+
+    #[inline(never)]
+    fn drain_items(mut self, rt: &Runtime<C>) {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| self.drop_items())) {
+            self.unwind(rt, payload);
+        }
+        self.forget_empty();
+    }
+
+    /// Drops every item, each leaving the bag only as it drops, and
+    /// leaves the bag empty. The spill is reversed so items pop in push
+    /// order; [`Self::unwind`] restores the order of what a panic left.
+    fn drop_items(&mut self) {
+        if let Some(token) = self.dep_list.take() {
+            retire_dep_list::<C>(token);
+        }
+        if let Some(spill) = self.spill.as_mut() {
+            spill.reverse();
+            while let Some(item) = spill.pop() {
+                drop(item);
+            }
+            self.spill = None;
+        }
+    }
+
+    /// The normal-mode panic exit: poison the reading frame and resume,
+    /// leaving the items not yet dropped to drop with the bag.
+    #[cold]
+    fn unwind(&mut self, rt: &Runtime<C>, payload: Box<dyn Any + Send>) -> ! {
+        if let Some(spill) = self.spill.as_mut() {
+            spill.reverse();
+        }
+        rt.dep_stack.poison_current_frame();
+        resume_unwind(payload)
+    }
+
+    fn forget_empty(self) {
+        debug_assert!(self.dep_list.is_none() && self.spill.is_none());
+        mem::forget(self);
     }
 
     /// Carried mode: drops every item under [`isolate`], then resumes
     /// `payload` with its kind restored.
-    pub(crate) fn drain_carried(&mut self, rt: &Runtime<C>, payload: Box<dyn Any + Send>) -> ! {
-        self.drain_in(rt, Mode::Carried);
-        resume_unwind(payload)
-    }
-
-    #[inline(always)]
-    fn drain_in(&mut self, rt: &Runtime<C>, mode: Mode) {
-        if let Some(NodeDrops {
-            compute,
-            observers,
-            arena,
-            arena_slot,
-        }) = self.node.take()
-        {
-            step(rt, mode, || drop(compute));
-            step(rt, mode, || drop(observers));
-            step(rt, mode, || release_arena_slot(&*arena, arena_slot));
-        }
+    #[cold]
+    pub(crate) fn drain_carried(&mut self, payload: Box<dyn Any + Send>) -> ! {
         if let Some(token) = self.dep_list.take() {
-            step(rt, mode, || retire_dep_list::<C>(token));
+            isolate(|| retire_dep_list::<C>(token));
         }
-        if let Some(spill) = self.spill.as_mut() {
-            for item in spill.drain(..) {
-                step(rt, mode, || drop(item));
+        if let Some(spill) = self.spill.take() {
+            for item in spill {
+                isolate(|| drop(item));
             }
         }
+        resume_unwind(payload)
     }
 }
 
-#[derive(Copy, Clone)]
-enum Mode {
-    Normal,
-    Carried,
+/// A delete's bag: the first released node's drops inline, everything
+/// after them in `rest`.
+pub(crate) struct DeleteBag<C: Cells> {
+    node: NodeDrops<C>,
+    rest: Deferred<C>,
 }
 
-fn step<C: Cells>(rt: &Runtime<C>, mode: Mode, step: impl FnOnce()) {
-    match mode {
-        Mode::Normal => drain_step(rt, step),
-        Mode::Carried => isolate(step),
+impl<C: Cells> DeleteBag<C> {
+    #[inline(always)]
+    pub(crate) fn new(node: NodeDrops<C>, dep_list: Option<RetiredDeps<C>>) -> Self {
+        Self {
+            node,
+            rest: Deferred {
+                dep_list,
+                spill: None,
+            },
+        }
+    }
+
+    /// Reserve for a batch's further `nodes` node pushes and `dep_lists`
+    /// token pushes, less the dep-list slot if it is still free.
+    pub(crate) fn reserve_batch(&mut self, nodes: usize, dep_lists: usize) {
+        let spilled_lists = dep_lists.saturating_sub(usize::from(self.rest.dep_list.is_none()));
+        let items = nodes + spilled_lists;
+        if items > 0 {
+            self.rest.reserve(items);
+        }
+    }
+
+    pub(crate) fn push_node(&mut self, drops: NodeDrops<C>, dep_list: Option<RetiredDeps<C>>) {
+        self.rest.push_erased(Box::new(SpilledNode(drops)));
+        if let Some(token) = dep_list {
+            self.rest.push_dep_list(token);
+        }
+    }
+
+    /// Normal mode: see the module docs.
+    #[inline(always)]
+    pub(crate) fn drain(mut self, rt: &Runtime<C>) {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
+            self.node.drop_parts();
+            if !self.rest.is_empty() {
+                self.rest.drop_items();
+            }
+        })) {
+            self.rest.unwind(rt, payload);
+        }
+        let DeleteBag {
+            node:
+                NodeDrops {
+                    compute,
+                    observers,
+                    arena,
+                    ..
+                },
+            rest,
+        } = self;
+        // `drop_parts` left these empty, so forgetting them leaks nothing
+        // and skips their drop glue.
+        debug_assert!(compute.is_none() && observers.capacity() == 0);
+        mem::forget(compute);
+        mem::forget(observers);
+        drop(arena);
+        rest.forget_empty();
     }
 }
 
-/// A node's drops spilled behind the typed slot; its drop runs the
-/// typed slot's steps in the same order, the arena release included.
-struct SpilledNode<C: Cells>(Option<NodeDrops<C>>);
+/// A node's drops spilled behind the bag's inline node; its drop runs
+/// the inline node's steps in the same order, the arena release included.
+struct SpilledNode<C: Cells>(NodeDrops<C>);
 
 impl<C: Cells> Drop for SpilledNode<C> {
     fn drop(&mut self) {
-        if let Some(NodeDrops {
-            compute,
-            observers,
-            arena,
-            arena_slot,
-        }) = self.0.take()
-        {
-            drop(compute);
-            drop(observers);
-            release_arena_slot(&*arena, arena_slot);
-        }
+        self.0.drop_parts();
     }
-}
-
-fn release_arena_slot<C: Cells>(arena: &dyn ErasedArena<C>, slot: u32) {
-    arena.release(slot);
-    reclaim_probe::reached(RetireSite::DeleteRetire);
 }
 
 /// A second displaced dep list in one bag, spilled as an erased item;
@@ -229,16 +302,6 @@ impl<C: Cells> Drop for RetireOnDrop<C> {
 fn retire_dep_list<C: Cells>(token: RetiredDeps<C>) {
     drop(token);
     reclaim_probe::reached(RetireSite::DepListRetire);
-}
-
-/// One item of a normal-mode drain. A panic poisons the reading frame
-/// before it resumes, so a parent that swallows it still lands Dirty.
-#[inline(never)]
-fn drain_step<C: Cells>(rt: &Runtime<C>, step: impl FnOnce()) {
-    if let Err(payload) = catch_unwind(AssertUnwindSafe(step)) {
-        rt.dep_stack.poison_current_frame();
-        resume_unwind(payload);
-    }
 }
 
 /// Runs one cleanup step and swallows its panic, so an exit that already

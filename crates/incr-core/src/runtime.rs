@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use crate::arena_registry::ArenaRegistry;
 use crate::cells::Cells;
-use crate::deferred::{Deferred, NodeDrops};
+use crate::deferred::{Deferred, DeleteBag, NodeDrops};
 use crate::dep_stack::DepStack;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
@@ -963,9 +963,7 @@ impl<C: Cells> Runtime<C> {
         for child in foreign {
             self.wait_out_claim(child, &mut spins);
         }
-        let mut bag = Deferred::new();
-        self.release_tree(owned, root, &mut bag);
-        bag.drain(self);
+        self.release_tree(owned, root).drain(self);
         Ok(())
     }
 
@@ -975,29 +973,37 @@ impl<C: Cells> Runtime<C> {
     /// observer or value `Drop` runs at the bag's drain: a `Drop` that
     /// deletes a member then panics as stale instead of waiting on this
     /// thread's own claim (bug h).
-    fn release_tree(&self, owned: Vec<ErasedIncr>, root: ErasedIncr, bag: &mut Deferred<C>) {
+    fn release_tree(&self, owned: Vec<ErasedIncr>, root: ErasedIncr) -> DeleteBag<C> {
         if owned.is_empty() {
-            self.release_claimed(root, bag);
-            return;
+            return self.release_claimed(root);
         }
-        let retired: Vec<Retired<C>> = owned
+        let mut retired = owned
             .into_iter()
             .rev()
             .chain(std::iter::once(root))
             .map(|member| self.retire_claimed(member))
-            .collect();
-        let dep_lists = retired.iter().filter(|r| r.dep_list.is_some()).count();
+            .collect::<Vec<Retired<C>>>()
+            .into_iter();
+        let dep_lists = retired
+            .as_slice()
+            .iter()
+            .filter(|r| r.dep_list.is_some())
+            .count();
         let mut inner = self.inner.write();
+        let first = retired
+            .next()
+            .expect("incr-core: a batch release has a member");
+        let had_dep_list = first.dep_list.is_some();
+        let (drops, dep_list) = self.unhook_retired(&mut inner, first);
+        let mut bag = DeleteBag::new(drops, dep_list);
         // Counted and reserved under the hold, so the batch's pushes
         // grow the spill at most once.
-        bag.reserve_batch(retired.len(), dep_lists);
+        bag.reserve_batch(retired.len(), dep_lists - usize::from(had_dep_list));
         for member in retired {
             let (drops, dep_list) = self.unhook_retired(&mut inner, member);
-            bag.push_node(drops);
-            if let Some(dep_list) = dep_list {
-                bag.push_dep_list(dep_list);
-            }
+            bag.push_node(drops, dep_list);
         }
+        bag
     }
 
     /// One claim attempt of [`Runtime::delete_strict`], with the root's
@@ -1282,27 +1288,22 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
-        let mut bag = Deferred::new();
-        self.release_claimed(handle, &mut bag);
-        bag.drain(self);
+        self.release_claimed(handle).drain(self);
         DeleteOutcome::Deleted
     }
 
     /// Unhooks and recycles a node this thread claimed `Dead`. The node
     /// must own nothing by now: its owned nodes are released first. Its
-    /// closure, observers, value and displaced dep list go into `bag`,
-    /// which the delete drains once it holds no lock.
+    /// closure, observers, value and displaced dep list go into the
+    /// returned bag, which the delete drains once it holds no lock.
     #[inline(always)]
-    fn release_claimed(&self, handle: ErasedIncr, bag: &mut Deferred<C>) {
+    fn release_claimed(&self, handle: ErasedIncr) -> DeleteBag<C> {
         let retired = self.retire_claimed(handle);
         let (drops, dep_list) = {
             let mut inner = self.inner.write();
             self.unhook_retired(&mut inner, retired)
         };
-        bag.push_node(drops);
-        if let Some(dep_list) = dep_list {
-            bag.push_dep_list(dep_list);
-        }
+        DeleteBag::new(drops, dep_list)
     }
 
     /// The part of a release that runs under the delete's claim and
@@ -2273,7 +2274,7 @@ impl<C: Cells> Runtime<C> {
                     // An enclosing closure that catches the unwind has
                     // still read a dep that did not land Clean.
                     self.dep_stack.poison_current_frame();
-                    bag.drain_carried(self, payload);
+                    bag.drain_carried(payload);
                 }
             };
 
