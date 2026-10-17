@@ -131,6 +131,9 @@ pub(crate) enum ParkPoint {
     /// In `get`, after the node was found Clean and before its value is
     /// read from the arena.
     GetBeforeRead(NodeId),
+    /// In a collection operator's rebuild, just after it read an
+    /// upstream's snapshot and released that upstream's guard.
+    RebuildAfterSnapshot,
 }
 
 /// What [`Runtime::delete_erased`] did with a node.

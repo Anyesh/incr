@@ -38,15 +38,26 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, RandomState};
-use std::sync::atomic::{AtomicU64, Ordering as MemOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as MemOrdering};
 use std::sync::{Arc, OnceLock};
 
 use crate::cells::Cells;
 use crate::handle::{ErasedIncr, Incr};
 use crate::hashed_multiset::{HashedMultiset, Located};
 use crate::locks::Lock;
-use crate::runtime::Runtime;
+use crate::runtime::{ParkPoint, Runtime};
 use crate::value::Value;
+
+#[cfg(test)]
+pub(crate) fn park<C: Cells>(rt: &Runtime<C>, point: ParkPoint) {
+    if let Some(hook) = rt.park_hook.get() {
+        hook(point);
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn park<C: Cells>(_rt: &Runtime<C>, _point: ParkPoint) {}
 
 /// Strategy-parameterized lock for operator state. Under `Local` this is
 /// a `RefCell` (no atomics, which is the point: collection ops on the
@@ -206,8 +217,8 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             removed,
             version: (self.version != before).then_some(self.version),
             displaced: Displaced {
-                _values: [first, second, unused],
-                _compacted: self.maybe_compact(),
+                values: [first, second, unused],
+                compacted: self.maybe_compact(),
             },
         }
     }
@@ -216,6 +227,68 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         let staged = Staged::new(&self.hasher, remove, add);
         let at = self.locate(&staged);
         self.commit(at, staged)
+    }
+
+    /// One change of an operator's batch: applies `staged` and keeps what
+    /// it displaced in `keep`, for the caller to drop once it releases its
+    /// guards. Returns the new version, if a delta was recorded.
+    pub(crate) fn apply_kept(
+        &mut self,
+        staged: Staged<T>,
+        keep: &mut Vec<Displaced<T>>,
+    ) -> Option<u64> {
+        let at = self.locate(&staged);
+        let committed = self.commit(at, staged);
+        if !committed.displaced.is_empty() {
+            keep.push(committed.displaced);
+        }
+        committed.version
+    }
+
+    pub(crate) fn insert_kept(&mut self, value: T, keep: &mut Vec<Displaced<T>>) -> Option<u64> {
+        let staged = Staged::owned(&self.hasher, None, Some(value));
+        self.apply_kept(staged, keep)
+    }
+
+    pub(crate) fn delete_kept(&mut self, value: T, keep: &mut Vec<Displaced<T>>) -> Option<u64> {
+        let staged = Staged::owned(&self.hasher, Some(value), None);
+        self.apply_kept(staged, keep)
+    }
+
+    /// The live elements and the log's end, under one guard, so the deltas
+    /// from the end on are exactly the changes the snapshot lacks.
+    pub(crate) fn snapshot(&self) -> (Vec<T>, u64) {
+        (self.elements_vec(), self.end())
+    }
+
+    /// Pushes the deltas that turn the live contents into `target`, one
+    /// change at a time. Each change is atomic under user panics, so a
+    /// panic part-way leaves a log that a later converge finishes from.
+    /// Returns the new version, if anything changed.
+    pub(crate) fn converge(&mut self, target: Vec<T>, keep: &mut Vec<Displaced<T>>) -> Option<u64> {
+        let mut wanted: HashMap<T, usize> = HashMap::new();
+        for value in target {
+            *wanted.entry(value).or_default() += 1;
+        }
+        let mut surplus = Vec::new();
+        for (value, have) in self.elements.iter() {
+            let kept = wanted.get_mut(value).map_or(0, |want| {
+                let kept = have.min(*want);
+                *want -= kept;
+                kept
+            });
+            surplus.extend(std::iter::repeat_n(value, have - kept).cloned());
+        }
+        let mut version = None;
+        for value in surplus {
+            version = self.delete_kept(value, keep).or(version);
+        }
+        for (value, missing) in wanted {
+            for _ in 0..missing {
+                version = self.insert_kept(value.clone(), keep).or(version);
+            }
+        }
+        version
     }
 
     /// Insert `value`. Always accepted; multiset count for the element
@@ -263,6 +336,22 @@ impl<T: Hash + Clone> Staged<T> {
             add: add.map(|value| (hasher.hash_one(&value), value.clone(), value)),
         }
     }
+
+    /// Like [`Staged::new`], with the removed value owned, so it becomes
+    /// the delete delta without a copy.
+    pub(crate) fn owned(hasher: &RandomState, remove: Option<T>, add: Option<T>) -> Self {
+        Self {
+            remove: remove.map(|value| (hasher.hash_one(&value), value)),
+            add: add.map(|value| (hasher.hash_one(&value), value.clone(), value)),
+        }
+    }
+
+    pub(crate) fn delta(hasher: &RandomState, delta: Delta<T>) -> Self {
+        match delta {
+            Delta::Insert(value) => Self::owned(hasher, None, Some(value)),
+            Delta::Delete(value) => Self::owned(hasher, Some(value), None),
+        }
+    }
 }
 
 pub(crate) struct Committed<T> {
@@ -278,8 +367,61 @@ pub(crate) struct Committed<T> {
 /// guard and setting the version node.
 #[must_use]
 pub(crate) struct Displaced<T> {
-    _values: [Option<T>; 3],
-    _compacted: Vec<Delta<T>>,
+    values: [Option<T>; 3],
+    compacted: Vec<Delta<T>>,
+}
+
+impl<T> Displaced<T> {
+    fn is_empty(&self) -> bool {
+        self.values.iter().all(Option::is_none) && self.compacted.is_empty()
+    }
+}
+
+/// Set when a user panic stopped an operator part-way through a batch,
+/// leaving its state and output logs partly updated. The operator's next
+/// run rebuilds from upstream snapshots instead of applying deltas, and
+/// clears the flag only once the rebuild has fully converged.
+///
+/// Relaxed is enough because only the operator's own compute touches the
+/// flag, and the claim protocol orders one compute before the next.
+pub(crate) struct NeedsRebuild(AtomicBool);
+
+impl NeedsRebuild {
+    pub(crate) fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.load(MemOrdering::Relaxed)
+    }
+
+    pub(crate) fn clear(&self) {
+        self.0.store(false, MemOrdering::Relaxed);
+    }
+
+    /// Runs the part of a batch that changes state, setting the flag if a
+    /// user panic unwinds out of it, and resuming that panic.
+    pub(crate) fn guard<R>(&self, batch: impl FnOnce() -> R) -> R {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(batch)) {
+            Ok(r) => r,
+            Err(payload) => {
+                self.0.store(true, MemOrdering::Relaxed);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+}
+
+/// Reads an upstream for a rebuild under one guard and releases it before
+/// the rebuild runs any user function.
+pub(crate) fn rebuild_snapshot<S: 'static, R, C: Cells>(
+    rt: &Runtime<C>,
+    upstream: &OpLock<S, C>,
+    read: impl FnOnce(&S) -> R,
+) -> R {
+    let snapshot = read(&upstream.read());
+    park(rt, ParkPoint::RebuildAfterSnapshot);
+    snapshot
 }
 
 impl<T: Hash + Eq + Clone> Default for CollectionLog<T> {
@@ -478,63 +620,7 @@ where
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
-        let upstream_log = Arc::clone(&self.log);
-        let upstream_version = self.version_node;
-
-        let output_log: Arc<OpLock<CollectionLog<T>, C>> =
-            Arc::new(OpLock::new(CollectionLog::new()));
-
-        // Bootstrap: seed the output from the live snapshot; the cursor
-        // starts past everything the snapshot covered. The predicate
-        // runs before the output lock is taken (stage-then-apply).
-        let (cursor, bootstrap) = upstream_log.write().register_consumer();
-        {
-            let kept: Vec<&T> = bootstrap.iter().filter(|v| pred(v)).collect();
-            let mut out = output_log.write();
-            for v in kept {
-                out.insert(v.clone());
-            }
-        }
-
-        let output_log_for_query = Arc::clone(&output_log);
-        let version_node = rt.create_query(move |rt| -> u64 {
-            let _uv = rt.get(upstream_version);
-
-            let (from, pending) = {
-                let up = upstream_log.read();
-                let from = cursor.load(MemOrdering::Acquire);
-                if from >= up.end() {
-                    drop(up);
-                    return output_log_for_query.read().version;
-                }
-                (from, up.pending_from(from).to_vec())
-            };
-
-            // Stage: user predicate runs with no lock held.
-            let staged: Vec<Delta<T>> = pending
-                .iter()
-                .filter(|d| match d {
-                    Delta::Insert(v) | Delta::Delete(v) => pred(v),
-                })
-                .cloned()
-                .collect();
-
-            let mut out = output_log_for_query.write();
-            for d in staged {
-                match d {
-                    Delta::Insert(v) => {
-                        out.insert(v);
-                    }
-                    Delta::Delete(v) => {
-                        out.delete(&v);
-                    }
-                }
-            }
-            cursor.store(from + pending.len() as u64, MemOrdering::Release);
-            out.version
-        });
-
-        IncrCollection::derived_with(output_log, version_node)
+        self.per_element(rt, move |v| pred(&v).then_some(v))
     }
 
     /// Map: transform every element via `f`. Returns a new derived
@@ -544,24 +630,51 @@ where
         U: Value + Hash + Eq,
         F: Fn(&T) -> U + Send + Sync + 'static,
     {
+        self.per_element(rt, move |v| Some(f(&v)))
+    }
+
+    /// An operator whose output holds `image(v)` for every element `v`
+    /// with an image, so each upstream delta maps to at most one output
+    /// delta. `image` runs with no lock held, and so do the output's
+    /// hashes and copies.
+    fn per_element<U, I>(&self, rt: &Runtime<C>, image: I) -> IncrCollection<U, C>
+    where
+        U: Value + Hash + Eq,
+        I: Fn(T) -> Option<U> + Send + Sync + 'static,
+    {
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
-        let output_log: Arc<OpLock<CollectionLog<U>, C>> =
-            Arc::new(OpLock::new(CollectionLog::new()));
+        let output = CollectionLog::new();
+        let out_hasher = output.hasher.clone();
+        let output_log: Arc<OpLock<CollectionLog<U>, C>> = Arc::new(OpLock::new(output));
 
+        // Bootstrap: seed the output from the live snapshot; the cursor
+        // starts past everything the snapshot covered.
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         {
-            let mapped: Vec<U> = bootstrap.iter().map(&f).collect();
+            let seeded: Vec<U> = bootstrap.into_iter().filter_map(&image).collect();
             let mut out = output_log.write();
-            for v in mapped {
+            for v in seeded {
                 out.insert(v);
             }
         }
 
+        let rebuild = NeedsRebuild::new();
         let output_log_for_query = Arc::clone(&output_log);
         let version_node = rt.create_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
+            let mut keep = Vec::new();
+
+            if rebuild.is_set() {
+                let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
+                let target: Vec<U> = snapshot.into_iter().filter_map(&image).collect();
+                let mut out = output_log_for_query.write();
+                out.converge(target, &mut keep);
+                cursor.store(end, MemOrdering::Release);
+                rebuild.clear();
+                return out.version;
+            }
 
             let (from, pending) = {
                 let up = upstream_log.read();
@@ -572,33 +685,29 @@ where
                 }
                 (from, up.pending_from(from).to_vec())
             };
+            let to = from + pending.len() as u64;
 
-            let staged: Vec<Delta<U>> = pending
-                .iter()
-                .map(|d| match d {
-                    Delta::Insert(v) => Delta::Insert(f(v)),
-                    Delta::Delete(v) => Delta::Delete(f(v)),
+            let staged: Vec<Staged<U>> = pending
+                .into_iter()
+                .filter_map(|d| match d {
+                    Delta::Insert(v) => image(v).map(Delta::Insert),
+                    Delta::Delete(v) => image(v).map(Delta::Delete),
                 })
+                .map(|d| Staged::delta(&out_hasher, d))
                 .collect();
 
             let mut out = output_log_for_query.write();
-            for d in staged {
-                match d {
-                    Delta::Insert(v) => {
-                        out.insert(v);
-                    }
-                    Delta::Delete(v) => {
-                        out.delete(&v);
-                    }
+            rebuild.guard(|| {
+                for change in staged {
+                    out.apply_kept(change, &mut keep);
                 }
-            }
-            cursor.store(from + pending.len() as u64, MemOrdering::Release);
+            });
+            cursor.store(to, MemOrdering::Release);
             out.version
         });
 
         IncrCollection::derived_with(output_log, version_node)
     }
-
     /// Count: number of live elements as an `Incr<u64>`. Maintains a
     /// running tally incrementally from upstream deltas; O(new deltas)
     /// per get rather than O(N) sum over the multiset.
@@ -682,56 +791,60 @@ where
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
-        let mut state = AggState::new(identity.clone());
-        for v in &bootstrap {
-            state.insert(v.clone(), &lift, &combine);
-        }
+        let state = AggState::build(identity.clone(), lifted(&lift, bootstrap), &combine);
         let state: Arc<OpLock<AggState<T, U>, C>> = Arc::new(OpLock::new(state));
 
+        let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
         rt.create_query(move |rt| -> U {
             let _uv = rt.get(upstream_version);
 
+            if rebuild.is_set() {
+                let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
+                let fresh = AggState::build(identity.clone(), lifted(&lift, snapshot), &combine);
+                let root = fresh.root().clone();
+                let stale = std::mem::replace(&mut *state_for_query.write(), fresh);
+                cursor.store(end, MemOrdering::Release);
+                rebuild.clear();
+                drop(stale);
+                return root;
+            }
+
             let (from, pending) = {
                 let up = upstream_log.read();
                 let from = cursor.load(MemOrdering::Acquire);
-                let pending = if from >= up.end() {
-                    Vec::new()
-                } else {
-                    up.pending_from(from).to_vec()
-                };
-                (from, pending)
+                if from >= up.end() {
+                    drop(up);
+                    return state_for_query.read().root().clone();
+                }
+                (from, up.pending_from(from).to_vec())
             };
+            let to = from + pending.len() as u64;
 
-            if !pending.is_empty() {
-                let mut st = state_for_query.write();
-                if st.needs_rebuild {
-                    // A previous combine/lift panic left the tree
-                    // unspecified; rebuild from the live snapshot and
-                    // skip the pending deltas it already covers.
-                    let snapshot = upstream_log.read().elements_vec();
-                    let end = upstream_log.read().end();
-                    st.rebuild(snapshot, &lift, &combine);
-                    cursor.store(end, MemOrdering::Release);
-                } else {
-                    let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        for d in &pending {
-                            match d {
-                                Delta::Insert(v) => st.insert(v.clone(), &lift, &combine),
-                                Delta::Delete(v) => st.delete(v, &combine),
-                            }
-                        }
-                    }));
-                    match applied {
-                        Ok(()) => cursor.store(from + pending.len() as u64, MemOrdering::Release),
-                        Err(payload) => {
-                            st.needs_rebuild = true;
-                            std::panic::resume_unwind(payload);
-                        }
+            // `lift` runs with no lock held. `combine` runs under the state
+            // lock, which no compute but this one ever takes.
+            let staged: Vec<AggChange<T, U>> = pending
+                .into_iter()
+                .map(|d| match d {
+                    Delta::Insert(v) => {
+                        let lifted = lift(&v);
+                        AggChange::Insert(v, lifted)
+                    }
+                    Delta::Delete(v) => AggChange::Delete(v),
+                })
+                .collect();
+
+            let mut st = state_for_query.write();
+            rebuild.guard(|| {
+                for change in staged {
+                    match change {
+                        AggChange::Insert(v, lifted) => st.insert(v, lifted, &combine),
+                        AggChange::Delete(v) => st.delete(&v, &combine),
                     }
                 }
-            }
-            state_for_query.read().root().clone()
+            });
+            cursor.store(to, MemOrdering::Release);
+            st.root().clone()
         })
     }
 
@@ -1135,7 +1248,21 @@ struct AggState<T: Hash + Eq + Clone, U> {
     slots: HashMap<T, Vec<usize>>,
     free: Vec<usize>,
     high_water: usize,
-    needs_rebuild: bool,
+}
+
+enum AggChange<T, U> {
+    Insert(T, U),
+    Delete(T),
+}
+
+fn lifted<T, U>(lift: &impl Fn(&T) -> U, values: Vec<T>) -> Vec<(T, U)> {
+    values
+        .into_iter()
+        .map(|v| {
+            let lifted = lift(&v);
+            (v, lifted)
+        })
+        .collect()
 }
 
 impl<T: Hash + Eq + Clone, U: Clone> AggState<T, U> {
@@ -1145,16 +1272,22 @@ impl<T: Hash + Eq + Clone, U: Clone> AggState<T, U> {
             slots: HashMap::new(),
             free: Vec::new(),
             high_water: 0,
-            needs_rebuild: false,
         }
+    }
+
+    fn build(identity: U, lifted: Vec<(T, U)>, combine: &impl Fn(&U, &U) -> U) -> Self {
+        let mut state = Self::new(identity);
+        for (value, lifted) in lifted {
+            state.insert(value, lifted, combine);
+        }
+        state
     }
 
     fn root(&self) -> &U {
         self.tree.root()
     }
 
-    fn insert(&mut self, value: T, lift: &impl Fn(&T) -> U, combine: &impl Fn(&U, &U) -> U) {
-        let lifted = lift(&value);
+    fn insert(&mut self, value: T, lifted: U, combine: &impl Fn(&U, &U) -> U) {
         let slot = self.free.pop().unwrap_or_else(|| {
             if self.high_water == self.tree.cap {
                 self.tree.grow(combine);
@@ -1180,19 +1313,6 @@ impl<T: Hash + Eq + Clone, U: Clone> AggState<T, U> {
         self.tree
             .set_leaf(slot, self.tree.identity.clone(), combine);
         self.free.push(slot);
-    }
-
-    fn rebuild(
-        &mut self,
-        snapshot: Vec<T>,
-        lift: &impl Fn(&T) -> U,
-        combine: &impl Fn(&U, &U) -> U,
-    ) {
-        let identity = self.tree.identity.clone();
-        *self = Self::new(identity);
-        for v in snapshot {
-            self.insert(v, lift, combine);
-        }
     }
 }
 
@@ -1254,6 +1374,10 @@ where
         self.groups.read().len()
     }
 }
+
+#[cfg(test)]
+#[path = "collection_rebuild_tests.rs"]
+mod rebuild_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1941,18 +2065,19 @@ mod tests {
         // Python bindings, which wrap Local collections as unsendable.)
     }
 
-    mod user_code_panics {
+    pub(super) mod user_code_panics {
         use super::*;
         use std::cell::Cell;
         use std::hash::Hasher;
         use std::panic::{catch_unwind, AssertUnwindSafe};
 
         #[derive(Clone, Copy, PartialEq, Debug)]
-        enum Call {
+        pub(in crate::collection) enum Call {
             Hash,
             Eq,
             Clone,
             Drop,
+            Closure,
         }
 
         const CALLS: [Call; 4] = [Call::Hash, Call::Eq, Call::Clone, Call::Drop];
@@ -1961,7 +2086,7 @@ mod tests {
             static ARMED: Cell<Option<(Call, usize)>> = const { Cell::new(None) };
         }
 
-        fn tick(call: Call) {
+        pub(in crate::collection) fn tick(call: Call) {
             ARMED.with(|armed| {
                 if let Some((armed_call, n)) = armed.get() {
                     if armed_call == call {
@@ -1977,16 +2102,16 @@ mod tests {
             });
         }
 
-        fn arm(call: Call, nth: usize) {
+        pub(in crate::collection) fn arm(call: Call, nth: usize) {
             ARMED.with(|armed| armed.set(Some((call, nth))));
         }
 
-        fn disarm() {
+        pub(in crate::collection) fn disarm() {
             ARMED.with(|armed| armed.set(None));
         }
 
         #[derive(Debug)]
-        struct Bomb(i64);
+        pub(in crate::collection) struct Bomb(pub(in crate::collection) i64);
 
         impl Clone for Bomb {
             fn clone(&self) -> Self {
@@ -2044,7 +2169,7 @@ mod tests {
             elements
         }
 
-        fn sorted(values: Vec<Bomb>) -> Vec<i64> {
+        pub(in crate::collection) fn sorted(values: Vec<Bomb>) -> Vec<i64> {
             let mut out: Vec<i64> = values.iter().map(|b| b.0).collect();
             out.sort_unstable();
             out
@@ -2062,7 +2187,10 @@ mod tests {
             }
         }
 
-        fn populated<C: Cells>(rt: &Runtime<C>, initial: &[i64]) -> IncrCollection<Bomb, C> {
+        pub(in crate::collection) fn populated<C: Cells>(
+            rt: &Runtime<C>,
+            initial: &[i64],
+        ) -> IncrCollection<Bomb, C> {
             let c = rt.create_collection::<Bomb>();
             for &x in initial {
                 c.insert(rt, Bomb(x));
@@ -2105,7 +2233,7 @@ mod tests {
             );
         }
 
-        fn failure(run: impl FnOnce()) -> Option<String> {
+        pub(in crate::collection) fn failure(run: impl FnOnce()) -> Option<String> {
             catch_unwind(AssertUnwindSafe(run)).err().map(|payload| {
                 payload
                     .downcast_ref::<String>()
