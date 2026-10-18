@@ -50,6 +50,8 @@ struct ArenaInner {
 pub struct GenericArena<T: Value, C: Cells> {
     segments: Directory<Segment<T, C>, C>,
     inner: C::Lock<ArenaInner>,
+    /// What a pending handle of this type reads; set at most once.
+    placeholder: std::sync::OnceLock<T>,
 }
 
 impl<T: Value, C: Cells> Default for GenericArena<T, C> {
@@ -66,7 +68,17 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
                 len: 0,
                 free: Vec::new(),
             }),
+            placeholder: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Stores the placeholder; false if one was set already.
+    pub(crate) fn set_placeholder(&self, value: T) -> bool {
+        self.placeholder.set(value).is_ok()
+    }
+
+    pub(crate) fn placeholder(&self) -> Option<&T> {
+        self.placeholder.get()
     }
 
     /// Allocate a slot initialized to `Some(initial)`, reusing a

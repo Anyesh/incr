@@ -146,7 +146,6 @@ impl Hasher for TypeIdHasher {
 }
 
 impl ArenaTags {
-    #[cfg(test)]
     pub(crate) fn tag<T: Value>(&self) -> Option<u16> {
         self.tags.get(&TypeId::of::<T>()).copied()
     }

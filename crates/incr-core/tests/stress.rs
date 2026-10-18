@@ -304,3 +304,85 @@ fn local_strategy_types_are_not_sync() {
     is_send::<Runtime<Shared>>();
     is_sync::<<Shared as Cells>::ValueSlot<String>>();
 }
+
+/// Eight threads insert, remove, look up and walk one input table, and
+/// create queries through a second table inside computes. Keys 0..32
+/// churn; keys 1000..1008 are inserted first and never removed, so every
+/// `for_each` must visit each of them exactly once, and no pair twice.
+#[test]
+fn shared_table_stress() {
+    const PINNED: std::ops::Range<u64> = 1000..1008;
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let inputs = Arc::new(rt.create_table::<u64, i64>());
+    let queries = Arc::new(rt.create_table::<u64, i64>());
+    for k in PINNED {
+        inputs.get_or_insert_input(&rt, k, || 10 * k as i64);
+    }
+    let workers: Vec<_> = (0..8_u64)
+        .map(|t| {
+            let (rt, inputs, queries) =
+                (Arc::clone(&rt), Arc::clone(&inputs), Arc::clone(&queries));
+            std::thread::spawn(move || {
+                let mut seed = 0x9e37_79b9_7f4a_7c15_u64 ^ (t + 1);
+                let mut next = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                for _ in 0..iters(2000) {
+                    let k = next() % 32;
+                    match next() % 5 {
+                        0 => {
+                            let h = inputs.get_or_insert_input(&rt, k, || 10 * k as i64);
+                            if let Ok(v) = catch_quietly(|| rt.get(h)) {
+                                assert_eq!(v, 10 * k as i64);
+                            }
+                        }
+                        1 => {
+                            let _ = inputs.remove(&rt, &k);
+                        }
+                        2 => {
+                            if let Some(h) = inputs.get(&rt, &k) {
+                                if let Ok(v) = catch_quietly(|| rt.get(h)) {
+                                    assert_eq!(v, 10 * k as i64);
+                                }
+                            }
+                        }
+                        3 => {
+                            let mut seen = Vec::new();
+                            inputs.for_each(&rt, |key, h| seen.push((*key, h)));
+                            let pinned: Vec<u64> = seen
+                                .iter()
+                                .map(|(k, _)| *k)
+                                .filter(|k| PINNED.contains(k))
+                                .collect();
+                            let mut sorted = pinned.clone();
+                            sorted.sort_unstable();
+                            assert_eq!(sorted, PINNED.collect::<Vec<_>>(), "pinned keys once each");
+                            let mut pairs = seen.clone();
+                            pairs.sort_unstable_by_key(|(k, h)| (*k, h.slot()));
+                            pairs.dedup();
+                            assert_eq!(pairs.len(), seen.len(), "no pair twice");
+                        }
+                        _ => {
+                            let p = PINNED.start + k % 8;
+                            let it = Arc::clone(&inputs);
+                            let q = queries.get_or_insert_query(&rt, p, move |rt| {
+                                rt.get(it.get_or_insert_input(rt, p, || 10 * p as i64)) + 1
+                            });
+                            assert_eq!(rt.get(q), 10 * p as i64 + 1);
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for w in workers {
+        w.join().unwrap();
+    }
+    for k in PINNED {
+        let h = inputs.get(&rt, &k).expect("pinned keys stay");
+        assert_eq!(rt.get(h), 10 * k as i64);
+    }
+}

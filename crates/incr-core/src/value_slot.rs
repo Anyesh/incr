@@ -208,7 +208,7 @@ thread_local! {
 /// returning the pointer afterwards. If `f` panics the pointer is
 /// dropped instead of pooled, which releases its protection; nothing
 /// leaks protection past this call.
-fn with_pooled_hazard<R>(f: impl FnOnce(&mut HazardPointer<'static>) -> R) -> R {
+pub(crate) fn with_pooled_hazard<R>(f: impl FnOnce(&mut HazardPointer<'static>) -> R) -> R {
     // One `LocalKey::with` that only takes the address, so the call
     // inlines and the pop and push share its liveness check; with the
     // push inside a second one, the compiler leaves it out of line.

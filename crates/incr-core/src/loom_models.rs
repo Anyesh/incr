@@ -966,3 +966,99 @@ fn loom_wait_deregister() {
         assert_eq!(crate::waits::registered(), 0);
     });
 }
+
+/// Two threads miss on one input key while a third sets another input:
+/// one node is created, both get it, and the losing `init` value is
+/// dropped, not kept or leaked.
+#[test]
+fn table_miss_race_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let table = Arc::new(rt.create_table::<u64, std::sync::Arc<u64>>());
+        let x = rt.create_input(0_u64);
+        let made = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let nodes = rt.node_count();
+        let miss = |n: u64| {
+            let (rt, table, made) = (Arc::clone(&rt), Arc::clone(&table), Arc::clone(&made));
+            thread::spawn(move || {
+                table.get_or_insert_input(&rt, 1, || {
+                    let value = std::sync::Arc::new(n);
+                    made.lock().unwrap().push(std::sync::Arc::downgrade(&value));
+                    value
+                })
+            })
+        };
+        let (a, b) = (miss(1), miss(2));
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 1))
+        };
+        let (a, b) = (a.join().unwrap(), b.join().unwrap());
+        setter.join().unwrap();
+        assert_eq!(a, b, "both missers get the one node");
+        assert_eq!(rt.node_count(), nodes + 1);
+        let alive = made
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|w| w.upgrade().is_some())
+            .count();
+        assert_eq!(alive, 1, "the loser's value was dropped");
+        rt.assert_invariant_i();
+    });
+}
+
+/// A reader looks a key up while another thread's miss publishes it: it
+/// sees a miss, or the published node with its value.
+#[test]
+fn table_hit_vs_publish() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let table = Arc::new(rt.create_table::<u64, u64>());
+        let writer = {
+            let (rt, table) = (Arc::clone(&rt), Arc::clone(&table));
+            thread::spawn(move || table.get_or_insert_input(&rt, 7, || 70))
+        };
+        let reader = {
+            let (rt, table) = (Arc::clone(&rt), Arc::clone(&table));
+            thread::spawn(move || table.get(&rt, &7).map(|h| (h, rt.get(h))))
+        };
+        let h = writer.join().unwrap();
+        if let Some((seen, value)) = reader.join().unwrap() {
+            assert_eq!((seen, value), (h, 70));
+        }
+        rt.assert_invariant_i();
+    });
+}
+
+/// A reader looks a key up while another thread removes a second key
+/// and then inserts a third, which rehashes: the reader gets the live
+/// handle, and loom checks the bucket cells for races.
+#[test]
+fn table_hit_vs_remove_rehash() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let table = Arc::new(rt.create_table::<u64, u64>());
+        let kept = table.get_or_insert_input(&rt, 1, || 10);
+        let removed = table.get_or_insert_input(&rt, 2, || 20);
+        table.get_or_insert_input(&rt, 3, || 30);
+        let writer = {
+            let (rt, table) = (Arc::clone(&rt), Arc::clone(&table));
+            thread::spawn(move || {
+                table.remove(&rt, &2).unwrap();
+                table.get_or_insert_input(&rt, 4, || 40)
+            })
+        };
+        let reader = {
+            let (rt, table) = (Arc::clone(&rt), Arc::clone(&table));
+            thread::spawn(move || (table.get(&rt, &1), table.get(&rt, &2)))
+        };
+        let fourth = writer.join().unwrap();
+        let (one, two) = reader.join().unwrap();
+        assert_eq!(one, Some(kept));
+        assert!(two.is_none() || two == Some(removed));
+        assert_eq!(table.get(&rt, &2), None);
+        assert_eq!(rt.get(fourth), 40);
+        rt.assert_invariant_i();
+    });
+}

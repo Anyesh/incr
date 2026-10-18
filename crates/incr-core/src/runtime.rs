@@ -30,6 +30,7 @@ use crate::cycle_state::{self, EntryDepth, UnwindKind};
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
 use crate::dep_stack::DepStack;
 use crate::dependent_list::DependentList;
+use crate::fx::FxBuildHasher;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
@@ -39,6 +40,7 @@ use crate::segmented_nodes::{SegmentedNodes, HAS_CHILDREN, HAS_STRATEGY, IN_GROU
 use crate::set_stack;
 use crate::slot_vec::SlotVec;
 use crate::state::{self, NodeState};
+use crate::table::{NodeTable, TableKey};
 use crate::taint_memo;
 use crate::value::Value;
 use crate::value_code;
@@ -736,7 +738,8 @@ impl<C: Cells> Runtime<C> {
     pub fn create_input<T: Value>(&self, value: T) -> Incr<T> {
         assert!(
             !self.dep_stack.current_frame_active(self.runtime_id),
-            "create_input called during compute; not permitted",
+            "create_input called during compute; not permitted (a compute creates its \
+             nodes through a NodeTable)",
         );
         self.create_input_unchecked(value)
     }
@@ -816,8 +819,23 @@ impl<C: Cells> Runtime<C> {
     {
         assert!(
             !self.dep_stack.current_frame_active(self.runtime_id),
-            "create_query called during compute; not permitted",
+            "create_query called during compute; not permitted (a compute creates its \
+             nodes through a NodeTable)",
         );
+        self.create_query_unchecked(f, strategy)
+    }
+
+    /// A query created without the dep-stack-empty check, for a table
+    /// miss inside a compute.
+    pub(crate) fn create_query_unchecked<T, F>(
+        &self,
+        f: F,
+        strategy: Option<Arc<dyn ErasedStrategy>>,
+    ) -> Incr<T>
+    where
+        T: Value,
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
         value_code::check();
 
         let (slot, generation) = {
@@ -908,6 +926,15 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn foreign_handle<T: Value>(&self, handle: Incr<T>) -> ! {
+        if handle.runtime_id() == RuntimeId::PENDING {
+            if self.pending_in_reach(handle.erase()) {
+                panic!(
+                    "incr-core: a pending Incr<{}> handle can only be read",
+                    std::any::type_name::<T>(),
+                );
+            }
+            self.pending_out_of_reach();
+        }
         panic!(
             "incr-core: Incr<{}> handle from a foreign runtime (handle was minted by \
              runtime {}, used on runtime {})",
@@ -915,6 +942,108 @@ impl<C: Cells> Runtime<C> {
             handle.runtime_id().get(),
             self.runtime_id.get(),
         );
+    }
+
+    /// `get` and `try_get` of a handle another runtime minted, or of a
+    /// pending one: a pending handle of this runtime read in a doomed
+    /// frame reads its type's placeholder and records no dependency;
+    /// any other panics.
+    #[cold]
+    #[inline(never)]
+    fn read_mismatch<T: Value>(&self, handle: Incr<T>) -> T {
+        if handle.runtime_id() == RuntimeId::PENDING && self.pending_in_reach(handle.erase()) {
+            return self.placeholder::<T>().expect(
+                "incr-core: a pending handle is minted only for a type with a placeholder",
+            );
+        }
+        self.foreign_handle(handle)
+    }
+
+    /// Whether a pending `handle` was minted by this runtime and this
+    /// thread is in a doomed frame of it, the only place it means anything.
+    fn pending_in_reach(&self, handle: ErasedIncr) -> bool {
+        let minted_by = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
+        minted_by == self.runtime_id.get() && self.frame_doomed()
+    }
+
+    #[cold]
+    fn pending_out_of_reach(&self) -> ! {
+        panic!("incr-core: pending handle used outside the replay attempt that produced it");
+    }
+
+    /// Whether this runtime's active frame on this thread is doomed.
+    pub(crate) fn frame_doomed(&self) -> bool {
+        self.dep_stack
+            .active_frame(self.runtime_id)
+            .is_some_and(|(ctl, _)| {
+                // SAFETY: an active frame's control block is live while the
+                // frame is on the stack (see `Frame::ctl`).
+                unsafe { (*ctl).has(cycle::DOOMED) }
+            })
+    }
+
+    /// Dooms this runtime's active frame on this thread.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn doom_active_frame(&self) {
+        let (ctl, _) = self
+            .dep_stack
+            .active_frame(self.runtime_id)
+            .expect("doom_active_frame outside a compute");
+        // SAFETY: as in `frame_doomed`.
+        unsafe { (*ctl).raise(cycle::DOOMED) };
+    }
+
+    /// The handle a table miss in a doomed frame returns: no node, only
+    /// this runtime's id, so it reads `T`'s placeholder inside the frame
+    /// and panics anywhere else. Panics if `T` has no placeholder.
+    pub(crate) fn pending_handle<T: Value>(&self) -> Incr<T> {
+        if self.placeholder::<T>().is_none() {
+            panic!(
+                "incr-core: a table miss in a doomed frame needs a placeholder for {}; \
+                 register one with set_placeholder",
+                std::any::type_name::<T>(),
+            );
+        }
+        let id = self.runtime_id.get();
+        Incr::new(id as u32, (id >> 32) as u32, RuntimeId::PENDING)
+    }
+
+    /// Sets the value a pending handle of type `T` reads. Panics if `T`
+    /// already has one, so readers never race a replacement.
+    pub fn set_placeholder<T: Value>(&self, value: T) {
+        value_code::check();
+        let set = {
+            let mut inner = self.inner.write();
+            let (_, arena) = self.arenas.ensure_tagged::<T>(&mut inner.arena_tags);
+            arena.set_placeholder(value)
+        };
+        assert!(
+            set,
+            "incr-core: placeholder already set for {}",
+            std::any::type_name::<T>(),
+        );
+    }
+
+    /// A clone of `T`'s placeholder, if it has one.
+    pub(crate) fn placeholder<T: Value>(&self) -> Option<T> {
+        let tag = self.inner.read().arena_tags.tag::<T>()?;
+        let arena = self.arenas.tagged_arena::<T>(tag)?;
+        value_code::run(|| arena.placeholder().cloned())
+    }
+
+    /// A [`NodeTable`] bound to this runtime, hashing with
+    /// [`FxBuildHasher`].
+    pub fn create_table<K: TableKey, T: Value>(&self) -> NodeTable<K, T, C> {
+        NodeTable::new(self.runtime_id, FxBuildHasher)
+    }
+
+    /// [`Self::create_table`] with another hasher, such as one resistant
+    /// to chosen collisions for keys from untrusted input.
+    pub fn create_table_with_hasher<K: TableKey, T: Value, S: std::hash::BuildHasher>(
+        &self,
+        hasher: S,
+    ) -> NodeTable<K, T, C, S> {
+        NodeTable::new(self.runtime_id, hasher)
     }
 
     #[cold]
@@ -1324,6 +1453,12 @@ impl<C: Cells> Runtime<C> {
     pub fn delete_with_dependents(&self, root: impl Into<ErasedIncr>) -> usize {
         value_code::check();
         let root = root.into();
+        if root.runtime_id() == RuntimeId::PENDING {
+            panic!(
+                "incr-core: delete_with_dependents with a pending handle {root:?}, which \
+                 names no node",
+            );
+        }
         assert!(
             !self.dep_stack.current_frame_active(self.runtime_id),
             "incr-core: delete_with_dependents called during compute; not permitted",
@@ -1637,7 +1772,9 @@ impl<C: Cells> Runtime<C> {
     /// or panic as stale; it never returns the new occupant's value and
     /// never runs a closure against the occupant.
     pub fn get<T: Value>(&self, handle: Incr<T>) -> T {
-        self.check_runtime(handle);
+        if handle.runtime_id() != self.runtime_id {
+            return self.read_mismatch(handle);
+        }
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
@@ -1668,7 +1805,9 @@ impl<C: Cells> Runtime<C> {
     /// query with no cycle strategy. Nodes with a value, a cycle
     /// strategy's included, read `Ok`.
     pub fn try_get<T: Value>(&self, handle: Incr<T>) -> Result<T, Cycle> {
-        self.check_runtime(handle);
+        if handle.runtime_id() != self.runtime_id {
+            return Ok(self.read_mismatch(handle));
+        }
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         let observed = state::load::<C>(node.state_cell());
@@ -1691,6 +1830,9 @@ impl<C: Cells> Runtime<C> {
     pub fn cycle_of(&self, handle: impl Into<ErasedIncr>) -> Option<Cycle> {
         let handle = handle.into();
         if handle.runtime_id() != self.runtime_id {
+            if handle.runtime_id() == RuntimeId::PENDING && !self.pending_in_reach(handle) {
+                self.pending_out_of_reach();
+            }
             return None;
         }
         let inner = self.inner.read();

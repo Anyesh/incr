@@ -22,6 +22,7 @@
 use crate::dep_stack::{DepStack, LocalDepStack, SharedDepStack};
 use crate::locks::{LocalLock, Lock};
 use crate::node::{DepListCell, HzDepListCell};
+use crate::table::{Array, ArrayCell, DataCell, HzArrayCell, RcArrayCell, StdDataCell, TableKey};
 use crate::value::Value;
 use crate::value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
 use crate::walk_ring::WalkRing;
@@ -66,6 +67,12 @@ pub trait Cells: 'static + Sized {
     type DepListCell: DepListCell;
     /// The walked-revision watermark; see [`crate::walk_ring`].
     type Watermark: 'static;
+    /// A node table's protected array pointer; see [`crate::table`].
+    #[doc(hidden)]
+    type TableArray<K: TableKey>: ArrayCell<Array<K, Self>>;
+    /// A node table bucket's data.
+    #[doc(hidden)]
+    type DataCell<T: Send + Sync + 'static>: DataCell<T>;
 
     fn new_u8(v: u8) -> Self::U8;
     fn new_u16(v: u16) -> Self::U16;
@@ -221,6 +228,8 @@ impl Cells for Local {
     type ValueSlot<T: Value> = LocalValueSlot<T>;
     type DepListCell = HzDepListCell;
     type Watermark = ();
+    type TableArray<K: TableKey> = RcArrayCell<Array<K, Local>>;
+    type DataCell<T: Send + Sync + 'static> = StdDataCell<T>;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {
@@ -379,6 +388,8 @@ impl Cells for Shared {
     type ValueSlot<T: Value> = SharedValueSlot<T>;
     type DepListCell = HzDepListCell;
     type Watermark = WalkRing<Shared, 1024>;
+    type TableArray<K: TableKey> = HzArrayCell<Array<K, Shared>>;
+    type DataCell<T: Send + Sync + 'static> = StdDataCell<T>;
 
     #[inline(always)]
     fn new_u8(v: u8) -> Self::U8 {

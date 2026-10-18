@@ -12,6 +12,8 @@ pub(crate) enum RetireSite {
     DeleteRetire = 3,
     /// `set`'s drop of its displaced value, after its set-stack pop.
     SetRetire = 4,
+    /// A node table's replaced array, after its miss mutex is released.
+    TableRetire = 5,
 }
 
 #[cfg(test)]

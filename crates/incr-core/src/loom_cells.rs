@@ -19,6 +19,7 @@ use crate::cells::{Cells, PtrCell};
 use crate::dep_stack::LoomDepStack;
 use crate::locks::Lock;
 use crate::node::{DepList, DepListCell};
+use crate::table::{Array, ArrayCell, DataCell, TableKey};
 use crate::value::Value;
 use crate::value_code;
 use crate::value_slot::{Compared, ValueSlot};
@@ -202,6 +203,49 @@ impl DepListCell for LoomDepListCell {
     }
 }
 
+/// A node table's array under loom: readers clone the `Arc` under the
+/// read lock, so loom sees every publish and replace.
+pub struct LoomArrayCell<A>(RwLock<loom::sync::Arc<A>>);
+
+impl<A: 'static> ArrayCell<A> for LoomArrayCell<A> {
+    type Retired = loom::sync::Arc<A>;
+
+    fn new(array: A) -> Self {
+        Self(RwLock::new(loom::sync::Arc::new(array)))
+    }
+
+    fn read<R>(&self, f: impl FnOnce(&A) -> R) -> R {
+        let array = self.0.read().unwrap().clone();
+        f(&array)
+    }
+
+    fn replace(&self, array: A) -> loom::sync::Arc<A> {
+        std::mem::replace(&mut *self.0.write().unwrap(), loom::sync::Arc::new(array))
+    }
+}
+
+/// A bucket's data under loom's `UnsafeCell`, so a model checks the key
+/// and handle cells for races.
+pub struct LoomDataCell<T>(loom::cell::UnsafeCell<T>);
+
+// SAFETY: as for `StdDataCell`: written only under the miss mutex before
+// its bucket is published, then only read.
+unsafe impl<T: Send + Sync> Sync for LoomDataCell<T> {}
+
+impl<T: 'static> DataCell<T> for LoomDataCell<T> {
+    fn new(value: T) -> Self {
+        Self(loom::cell::UnsafeCell::new(value))
+    }
+
+    fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+        self.0.with(f)
+    }
+
+    fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+        self.0.with_mut(f)
+    }
+}
+
 impl Cells for Loom {
     type U8 = AtomicU8;
     type U16 = AtomicU16;
@@ -217,6 +261,8 @@ impl Cells for Loom {
     // the wait path; a full-size ring would also put a loom atomic per
     // slot into every execution.
     type Watermark = WalkRing<Loom, 2>;
+    type TableArray<K: TableKey> = LoomArrayCell<Array<K, Loom>>;
+    type DataCell<T: Send + Sync + 'static> = LoomDataCell<T>;
 
     fn new_u8(v: u8) -> Self::U8 {
         AtomicU8::new(v)

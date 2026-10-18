@@ -27,6 +27,7 @@ mod deferred;
 pub mod dep_stack;
 mod dependent_list;
 mod directory;
+pub mod fx;
 pub mod generic_arena;
 pub mod handle;
 mod hashed_multiset;
@@ -43,6 +44,7 @@ mod set_stack;
 mod slot_vec;
 pub mod sorted_collection;
 pub mod state;
+pub mod table;
 mod taint_memo;
 #[cfg(test)]
 mod test_size;
@@ -60,6 +62,7 @@ pub use cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
 #[doc(hidden)]
 pub use cycle_state::{engine_unwind, take_last_cycle};
 pub use dep_stack::{DepStack, LocalDepStack, SharedDepStack};
+pub use fx::{FxBuildHasher, FxHasher};
 pub use generic_arena::GenericArena;
 pub use handle::{ErasedIncr, Incr, RuntimeId};
 pub use locks::{LocalLock, Lock};
@@ -68,6 +71,7 @@ pub use runtime::{DeleteError, ObserverId, Runtime};
 pub use segmented_nodes::{SegmentedNodes, MAX_NODES};
 pub use sorted_collection::{SortDelta, SortedCollection};
 pub use state::NodeState;
+pub use table::{NodeTable, TableKey};
 pub use trace::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction};
 pub use value::Value;
 #[doc(hidden)]

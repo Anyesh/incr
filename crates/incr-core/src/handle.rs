@@ -30,6 +30,10 @@ pub struct RuntimeId(u64);
 
 impl RuntimeId {
     pub(crate) const SENTINEL: RuntimeId = RuntimeId(0);
+    /// The runtime id of a pending handle, which a table miss in a doomed
+    /// frame returns; its slot and generation hold the minting runtime's
+    /// id. No runtime is ever allocated this id.
+    pub(crate) const PENDING: RuntimeId = RuntimeId::SENTINEL;
 
     #[cfg(test)]
     pub(crate) fn for_test(n: u64) -> Self {

@@ -319,6 +319,9 @@ pub(crate) const BUFFERED: u8 = 2;
 pub(crate) const LOW: u8 = 4;
 /// `ComputeCtl::flags`: a dep read in the frame did not land `Clean`.
 pub(crate) const POISONED: u8 = 8;
+/// `ComputeCtl::flags`: the frame is doomed, so a table miss in it
+/// returns a pending handle and creates nothing.
+pub(crate) const DOOMED: u8 = 16;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
