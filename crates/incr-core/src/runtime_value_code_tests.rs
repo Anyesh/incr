@@ -210,6 +210,40 @@ fn partial_eq_that_panics_during_set<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_eq!(rt.get(a).0, 3);
 }
 
+/// A `Drop` that deletes its input while unwinding out of that input's
+/// set is refused before the delete claims anything, so a `Drop` that
+/// catches the refusal leaves the input alive, settable and deletable.
+fn drop_that_deletes_the_input_under_its_set<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let refused = Rc::new(Cell::new(None));
+    let hooked = Rc::clone(&rt);
+    let record = Rc::clone(&refused);
+    arm(Op::Eq, move || {
+        let rt = Rc::clone(&hooked);
+        let record = Rc::clone(&record);
+        arm(Op::Drop, move || {
+            let err = catch_unwind(AssertUnwindSafe(|| rt.delete_node(a)))
+                .expect_err("delete under its own set returned");
+            record.set(Some(panic_message(err)));
+        });
+        panic!("eq bomb");
+    });
+    let err = catch_unwind(AssertUnwindSafe(|| rt.set(a, Hooked(2)))).expect_err("set returned");
+    assert_eq!(panic_message(err), "eq bomb");
+    disarm();
+    let refusal = refused
+        .take()
+        .expect("the incoming value's Drop did not run");
+    assert!(refusal.contains("set of it was in progress"), "{refusal}");
+    assert!(rt.is_alive(a));
+    assert_eq!(rt.state_of(a), NodeState::Clean);
+    assert_eq!(rt.get(a).0, 1);
+    rt.set(a, Hooked(3));
+    assert_eq!(rt.get(a).0, 3);
+    rt.delete_node(a);
+    assert!(!rt.is_alive(a));
+}
+
 /// A `Drop` of the value a `set` displaced runs after the claim's
 /// release, the walk and the set-stack pop: the hook records that the
 /// input is Clean on the new value and no longer held by this thread's
@@ -613,6 +647,7 @@ both!(
     partial_eq_that_sets_another_input,
     partial_eq_that_inserts_into_a_collection,
     partial_eq_that_panics_during_set,
+    drop_that_deletes_the_input_under_its_set,
     clone_that_reads_a_clean_node,
     clone_that_creates_a_node,
     partial_eq_of_a_recompute_that_reads_a_node,

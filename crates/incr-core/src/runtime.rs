@@ -495,6 +495,15 @@ fn is_computing(state: NodeState) -> bool {
     matches!(state, NodeState::Computing | NodeState::ComputingDirty)
 }
 
+#[cold]
+#[inline(never)]
+fn reached_under_own_set(id: NodeId) -> ! {
+    panic!(
+        "incr-core: node {} was reached while this thread's set of it was in progress",
+        id.0,
+    );
+}
+
 /// The runtime.
 ///
 /// # Panics in user code
@@ -979,6 +988,7 @@ impl<C: Cells> Runtime<C> {
             return Err(StrictRefusal::Gone);
         }
         self.assert_not_own_compute(id);
+        self.refuse_delete_under_own_set(id);
         self.park(ParkPoint::DeleteAfterHandleCheck(id));
 
         let mut spins: u32 = 0;
@@ -1069,6 +1079,7 @@ impl<C: Cells> Runtime<C> {
                 if !inner.dependents[slot as usize].is_empty() {
                     return Err(StrictRefusal::HasDependents(slot));
                 }
+                self.refuse_delete_under_own_set(NodeId(slot));
                 let child = self.erased_at(slot);
                 if self.nodes.get(slot).state() == NodeState::Dead {
                     return Ok(TreeClaim::WaitFor(child));
@@ -1288,6 +1299,7 @@ impl<C: Cells> Runtime<C> {
             return DeleteOutcome::AlreadyGone;
         }
         self.assert_not_own_compute(id);
+        self.refuse_delete_under_own_set(id);
 
         let mut spins: u32 = 0;
         loop {
@@ -1832,10 +1844,16 @@ impl<C: Cells> Runtime<C> {
     /// it unwinds from drops the incoming value.
     fn refuse_wait_on_own_set(&self, id: NodeId) {
         if C::SINGLE_THREADED || set_stack::holds(self.runtime_id, id.0) {
-            panic!(
-                "incr-core: node {} was reached while this thread's set of it was in progress",
-                id.0,
-            );
+            reached_under_own_set(id);
+        }
+    }
+
+    /// Before a delete claims input `id`: refused here, while nothing is
+    /// claimed, because a delete that marked the node first would leave
+    /// it `Dead` under a set claim only this thread could release.
+    fn refuse_delete_under_own_set(&self, id: NodeId) {
+        if set_stack::holds(self.runtime_id, id.0) {
+            reached_under_own_set(id);
         }
     }
 
