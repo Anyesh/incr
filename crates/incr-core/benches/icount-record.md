@@ -72,3 +72,204 @@ Reading the counts:
 | `delete_cascade_shared` | 1,000 | 4,427,382.89 | 4,427,380.46 | 2.43 | 0.0001 |
 | `delete_owned_tree_local` | 10,000 | 602,595.26 | 601,803.35 | 791.91 | 0.1314 |
 | `delete_owned_tree_shared` | 10,000 | 1,001,322.01 | 1,002,070.91 | 748.90 | 0.0748 |
+
+## T1 (final)
+
+- Engine: `951ec82` (branch `t1-review-fixes`, the same tree as
+  `spreadsheet-t1`). Its last engine change is `289c1a5`; `951ec82`
+  changes only comments. Machine and toolchain as for T0.
+- T0 is the T0 driver (`3d58829`) run again in the same session as T1;
+  both columns are the mean of two runs of `icount.sh` at the default N.
+  The rerun is within 0.003% of the T0 baseline above, except
+  `delete_owned_tree_*` (up to 0.05%, seeds) and `get_contended_shared`
+  (7.5% lower, scheduling on a loaded machine). The two T1 runs differ by
+  at most 0.016%, except `delete_owned_tree_local` (0.24%) and
+  `get_contended_shared` (4.1%).
+- Attribution: Intel PT on line-table builds of both drivers
+  (`CARGO_PROFILE_BENCH_DEBUG=line-tables-only`; their counts equal the
+  release drivers' to within 1 per iteration), every instruction decoded,
+  N iterations minus 0, divided by N, per symbol, with inlined code counted
+  in its caller. N is about 8 million instructions' worth per workload;
+  the collection workloads were traced at their recorded N with one PT
+  sample every 100 instructions, and `delete_owned_tree_*` at N = 200.
+- "alloc" in the sources column is the recorded delta minus the engine's
+  share, where the engine is every symbol outside glibc, the Rust
+  allocator shims, `RawVec` growth and haphazard. Under Shared it carries
+  the haphazard reclamation and glibc work that changes with N, so it is
+  taken at the recorded N. Most of the negative alloc on the chains is
+  T0's walk vector growing through `realloc`; T1 grows it once through
+  `Walk::grow` to 16 entries ("walk growth", engine code) and then
+  doubles.
+
+| workload | N | T0 | T1 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,582.00 | 4,849.00 | 267.00 | +5.83 | set 62, slow 40, walk growth 62, 4 × step 88, alloc -248 |
+| `chain_local/propagate/10` | 1,000,000 | 10,508.00 | 10,519.00 | 11.00 | +0.10 | set 62, slow 40, walk growth 62, 10 × step 86, alloc -1,014 |
+| `chain_local/propagate/100` | 100,000 | 88,523.03 | 96,328.02 | 7,804.99 | +8.82 | set 62, slow 40, walk growth 248, 100 × step 86, alloc -1,152 |
+| `chain_shared/propagate/4` | 1,000,000 | 9,601.28 | 9,934.42 | 333.14 | +3.47 | set 38, slow 44, walk growth 62, 4 × step 86, alloc -154 |
+| `chain_shared/propagate/10` | 1,000,000 | 21,907.32 | 21,700.28 | -207.03 | -0.95 | set 38, slow 44, walk growth 62, 10 × step 84, alloc -1,192 |
+| `chain_shared/propagate/100` | 100,000 | 191,600.90 | 199,196.11 | 7,595.20 | +3.96 | set 38, slow 44, walk growth 248, 100 × step 84, alloc -1,142 |
+| `diamond_local` | 1,000,000 | 3,995.00 | 4,160.00 | 165.00 | +4.13 | set 62, slow 40, walk growth 62, 3 × step 83, alloc -248 |
+| `diamond_shared` | 1,000,000 | 8,115.61 | 8,346.12 | 230.51 | +2.84 | set 38, slow 44, walk growth 62, 3 × step 88, alloc -177 |
+| `early_cutoff_local` | 1,000,000 | 2,284.00 | 2,350.00 | 66.00 | +2.89 | set 62, slow 40, walk growth 62, recompute and verify-Clean steps 150, alloc -248 |
+| `early_cutoff_shared` | 1,000,000 | 3,693.93 | 3,743.99 | 50.07 | +1.36 | set 38, slow 44, walk growth 62, recompute and verify-Clean steps 141, alloc -235 |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,647.55 | 4,645.65 | -1.90 | -0.04 | set 62, slow 40, walk growth 62, 3 steps 266, collection -183, alloc -249 |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,500.08 | 7,507.92 | 7.84 | +0.10 | set 38, slow 44, walk growth 62, 3 steps 255, collection -184, alloc -207 |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.73 | 92,283.26 | -0.47 | -0.00 | none |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,601.88 | 4,639.21 | 37.33 | +0.81 | set 62, slow 40, walk growth 63, 3 steps 264, collection -144, alloc -247 |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,431.78 | 7,484.15 | 52.37 | +0.70 | set 38, slow 44, walk growth 62, 3 steps 255, collection -146, alloc -200 |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,885.84 | 158,886.08 | 0.23 | +0.00 | none |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,653.55 | 4,647.55 | -5.99 | -0.13 | set 62, slow 40, walk growth 62, 3 steps 266, collection -190, alloc -246 |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,479.60 | 7,489.05 | 9.44 | +0.13 | set 38, slow 44, walk growth 62, 3 steps 252, collection -187, alloc -200 |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,571.21 | 1,490,570.31 | -0.90 | -0.00 | none |
+| `simple_count/local/1000` | 100,000 | 2,117.65 | 2,191.00 | 73.35 | +3.46 | set 62, slow 40, 1 step 86, collection -115, alloc 0 |
+| `simple_count/shared/1000` | 100,000 | 4,217.93 | 4,282.95 | 65.02 | +1.54 | set 38, slow 44, 1 step 91, collection -117, alloc 9 |
+| `simple_count/local/10000` | 100,000 | 2,094.82 | 2,187.23 | 92.41 | +4.41 | set 62, slow 40, 1 step 87, collection -96, alloc 0 |
+| `simple_count/shared/10000` | 100,000 | 4,185.27 | 4,264.98 | 79.70 | +1.90 | set 38, slow 44, 1 step 89, collection -98, alloc 7 |
+| `get_clean_local` | 10,000,000 | 198.00 | 178.00 | -20.00 | -10.10 | get -20 |
+| `get_clean_shared` | 10,000,000 | 309.00 | 302.00 | -7.00 | -2.27 | get -7 |
+| `get_contended_shared` | 2,000 | 12,587,106.04 | 12,515,381.03 | -71,725.01 | -0.57 | get; within the T1 runs' spread (scheduling) |
+| `fanout_local_4` | 100,000 | 18,167.01 | 19,522.00 | 1,354.99 | +7.46 | 5 × first 96, 6 × delete 146, alloc 0 |
+| `fanout_local_5` | 100,000 | 22,590.58 | 24,186.50 | 1,595.92 | +7.06 | 6 × first 97, 7 × delete 145, alloc -1 |
+| `fanout_local_1000` | 1,000 | 7,348,001.73 | 7,590,807.71 | 242,805.98 | +3.30 | 1,001 × first 98, 1,002 × delete 145, alloc -634 |
+| `fanout_shared_4` | 100,000 | 25,215.10 | 26,509.11 | 1,294.01 | +5.13 | 5 × first 87, 6 × delete 144, alloc 0 |
+| `fanout_shared_5` | 100,000 | 30,480.67 | 32,005.07 | 1,524.40 | +5.00 | 6 × first 87, 7 × delete 143, alloc -4 |
+| `fanout_shared_1000` | 1,000 | 8,870,366.36 | 9,101,544.88 | 231,178.52 | +2.61 | 1,001 × first 91, 1,002 × delete 142, alloc -2,230 |
+| `delete_single_local` | 200,000 | 1,331.00 | 1,349.00 | 18.00 | +1.35 | strict 158, alloc -140 |
+| `delete_single_shared` | 200,000 | 2,139.43 | 2,158.24 | 18.81 | +0.88 | strict 166, alloc -147 |
+| `delete_cascade_local` | 1,000 | 3,250,990.79 | 3,493,116.82 | 242,126.03 | +7.45 | 1,000 × first 96, 1,001 × delete 146, alloc 2 |
+| `delete_cascade_shared` | 1,000 | 4,427,362.26 | 4,660,485.05 | 233,122.80 | +5.27 | 1,000 × first 91, 1,001 × delete 142, alloc 0 |
+| `delete_owned_tree_local` | 10,000 | 602,112.15 | 644,420.94 | 42,308.80 | +7.03 | 200 × set 62, collection -362, owned-tree delete and other 22,279, alloc 7,992 |
+| `delete_owned_tree_shared` | 10,000 | 1,002,226.00 | 1,032,661.26 | 30,435.26 | +3.04 | 200 × set 38, collection 5,748, owned-tree delete and other 16,554, alloc 534 |
+
+Measured units, Local / Shared, in instructions against T0:
+
+- **set**, per value-changing `set`: +62 / +38 (Local: the `set` symbol,
+  119 at T0 and 181 at T1; Shared: `set` +70 and its slot work, where
+  `compare_and_write` and one `write_if_changed` session, 141, replace
+  T0's `eq_current` and `write`, 173). Inside it at T1: the claim's take
+  (a load, the flag test and a CAS on `verified_at`) and release (one
+  `fetch_add`) 13 and 13; the set-stack push and pop 34 and 35 inside
+  `set_stack`; the
+  `VALUE_CODE` check and the wrap around the one `PartialEq` call; the
+  generation compares. No icount workload makes a no-op `set`, so its
+  cost (the same claim, compare and release, no write and no walk) is not
+  measured here.
+- **slow**, per top-level non-Clean `get`: +40 / +44: `get_slow`'s frame,
+  its generation compares and the `Gone` test after the walk, net of
+  T0's out-of-line `ensure_clean` entry. Under
+  Shared `try_read` costs 8 more than T0's `read`.
+- **step**, per walk-driven recompute that reads one Clean dep: +86 / +84
+  on the chains (walk growth excluded), 83 to 91 on the diamond and the
+  collection pipelines. Isolated pieces at T1, per compute: the
+  `Deferred` bag 13 (construction 4, the emptiness test at the drain 5,
+  the drain call 4), the `g0` and post-claim generation compares 4, the
+  memo-bit test at frame pop 3, the poisoned-landing branch 3, `wrote`
+  and its argument 1, the first-visit counter and exact-mode test 7. The rest is the walk's restructure (`clean_walk` with
+  `compute_one` inlined, against T0's `ensure_clean`), the compute
+  wrapper's `VALUE_CODE` wrap and `Compared` return (+19 / +23 across
+  the wrapper and the arena write) and the nested Clean `get` with its dep record (+17 /
+  +20).
+- **get**, per Clean `get`: -20 / -7. Its named pieces cost 19: the
+  `VALUE_CODE` check 5, the wrap around `clone` 5, the pre-check and
+  post-read generation compares 7, one segment null test 2. T0 called
+  `ensure_clean` out of line on every `get` (22) and indexed the node
+  three times; T1 tests Clean inline and indexes once.
+- **first**, per query created and first computed through a non-Clean
+  `get`: 96 to 98 Local, 87 to 91 Shared.
+- **delete**, per node removed through `delete_erased`: 145 Local, 142 to
+  144 Shared. At T1, per node: the set-stack check before the claim 36
+  (`set_stack::holds` out of line 31, of which the thread-local scan is
+  21, and its call site 5), `mark_deleted`'s `fetch_or` and branch 7 with
+  the node index it needs 11, the `DeleteBag` construction 14 and its
+  drain 10 outside the drops it runs, the drain's `catch_unwind`.
+- **strict**, per strict delete of a node that owns nothing: +158 / +166
+  engine, against -140 / -147 alloc because T0's `claim_tree` allocated
+  its walk stack on every call.
+- **collection**: the multiset's one user `Hash` per element instead of
+  two, net of its staging and `VALUE_CODE` wraps: -144 to -190 on the
+  three logs of `*_incremental`, -96 to -117 on `simple_count`.
+
+### Since the trimmed T1 engine
+
+Counts at each engine commit after `08c0ea7`, the last engine before
+the set claim moved, for every workload that moved by 1 or more. Each
+commit ran once, which is enough because these workloads repeat to
+within 1 instruction between runs.
+`62f29d7` moves the claim to `verified_at`, `df5ee20` looks up the
+arena before the claim, `289c1a5` refuses a delete under this thread's
+set.
+
+| workload | `08c0ea7` | `62f29d7` | `df5ee20` | `289c1a5` | T1 | T1 - `08c0ea7` |
+|---|--:|--:|--:|--:|--:|--:|
+| `chain_local/propagate/4` | 4,881.00 | 4,852.00 | 4,849.00 | 4,849.00 | 4,849.00 | -32.00 |
+| `chain_local/propagate/10` | 10,539.00 | 10,522.00 | 10,519.00 | 10,519.00 | 10,519.00 | -20.00 |
+| `chain_local/propagate/100` | 96,168.04 | 96,331.03 | 96,328.02 | 96,328.02 | 96,328.02 | +159.98 |
+| `chain_shared/propagate/4` | 10,091.47 | 9,936.42 | 9,934.44 | 9,934.42 | 9,934.42 | -157.05 |
+| `chain_shared/propagate/10` | 21,869.40 | 21,702.28 | 21,700.29 | 21,700.29 | 21,700.28 | -169.12 |
+| `chain_shared/propagate/100` | 199,546.22 | 199,198.02 | 199,196.58 | 199,196.14 | 199,196.11 | -350.11 |
+| `diamond_local` | 4,194.00 | 4,163.00 | 4,160.00 | 4,160.00 | 4,160.00 | -34.00 |
+| `diamond_shared` | 8,500.14 | 8,348.10 | 8,346.14 | 8,346.11 | 8,346.12 | -154.02 |
+| `early_cutoff_local` | 2,386.00 | 2,353.00 | 2,350.00 | 2,350.00 | 2,350.00 | -36.00 |
+| `early_cutoff_shared` | 3,898.01 | 3,745.99 | 3,743.99 | 3,743.99 | 3,743.99 | -154.02 |
+| `collection_insert_then_read/local_incremental/1000` | 4,679.87 | 4,648.58 | 4,645.66 | 4,645.72 | 4,645.65 | -34.22 |
+| `collection_insert_then_read/shared_incremental/1000` | 7,663.31 | 7,510.25 | 7,508.59 | 7,508.45 | 7,507.92 | -155.39 |
+| `collection_insert_then_read/local_incremental/10000` | 4,673.40 | 4,642.89 | 4,639.30 | 4,638.56 | 4,639.21 | -34.19 |
+| `collection_insert_then_read/shared_incremental/10000` | 7,640.05 | 7,485.98 | 7,484.34 | 7,483.78 | 7,484.15 | -155.90 |
+| `collection_insert_then_read/local_incremental/100000` | 4,680.06 | 4,648.29 | 4,646.97 | 4,646.89 | 4,647.55 | -32.51 |
+| `collection_insert_then_read/shared_incremental/100000` | 7,644.93 | 7,491.32 | 7,488.88 | 7,488.50 | 7,489.05 | -155.89 |
+| `simple_count/local/1000` | 2,228.65 | 2,193.76 | 2,190.48 | 2,190.65 | 2,191.00 | -37.65 |
+| `simple_count/shared/1000` | 4,434.50 | 4,284.33 | 4,283.66 | 4,282.97 | 4,282.95 | -151.55 |
+| `simple_count/local/10000` | 2,225.40 | 2,190.82 | 2,187.14 | 2,187.26 | 2,187.23 | -38.17 |
+| `simple_count/shared/10000` | 4,415.57 | 4,266.53 | 4,263.48 | 4,264.64 | 4,264.98 | -150.59 |
+| `fanout_local_4` | 19,210.01 | 19,301.01 | 19,301.00 | 19,522.01 | 19,522.00 | +311.99 |
+| `fanout_local_5` | 23,823.59 | 23,929.59 | 23,929.57 | 24,186.50 | 24,186.50 | +362.91 |
+| `fanout_local_1000` | 7,539,003.62 | 7,553,998.92 | 7,554,231.99 | 7,592,205.25 | 7,590,807.71 | +51,804.09 |
+| `fanout_shared_4` | 26,174.48 | 26,290.36 | 26,290.37 | 26,509.07 | 26,509.11 | +334.63 |
+| `fanout_shared_5` | 31,619.15 | 31,753.05 | 31,753.03 | 32,005.06 | 32,005.07 | +385.92 |
+| `fanout_shared_1000` | 9,048,097.19 | 9,066,123.46 | 9,066,127.04 | 9,101,544.05 | 9,101,544.88 | +53,447.69 |
+| `delete_single_local` | 1,253.00 | 1,316.00 | 1,316.00 | 1,349.00 | 1,349.00 | +96.00 |
+| `delete_single_shared` | 2,045.30 | 2,124.24 | 2,124.24 | 2,158.24 | 2,158.24 | +112.94 |
+| `delete_cascade_local` | 3,441,063.28 | 3,456,078.96 | 3,456,078.74 | 3,493,116.03 | 3,493,116.82 | +52,053.54 |
+| `delete_cascade_shared` | 4,606,441.83 | 4,624,451.11 | 4,624,455.94 | 4,660,489.54 | 4,660,485.05 | +54,043.22 |
+
+Where `set` and delete moved, from Intel PT per symbol and per source
+line, `08c0ea7` against `289c1a5`:
+
+- **set**, per value-changing `set`, `62f29d7`: -37 Local, -141 Shared.
+  The precheck before the claim is gone: under Local its `eq_current`,
+  slot compare, `VALUE_CODE` wrap, arena borrow, node index and
+  generation compare, about 39; under Shared the out-of-line
+  `eq_current` symbols with their hazard-pointer read, 116, and the
+  arena read lock. The claim's take and release on `verified_at` cost 13
+  under both strategies, in place of the state CAS and the landing's
+  CAS, and `claim_input` returning the claim, arena and slot costs 11 /
+  9. `df5ee20` takes 3 / 2 more off `set`.
+- **per compute**, `62f29d7`: masking the claim and delete bits off each
+  `verified_at` load (`& REVISION_BITS`) adds 2 per verified compute
+  under Local, so across the three commits `chain_local/propagate/100`
+  rose by 160 while its `set` fell by 40. Under Shared the walk came out 4 lower per compute and
+  haphazard's `push_list` 2 higher.
+- **delete**, per node through `delete_erased`: +15 Local, +18 Shared at
+  `62f29d7` (`mark_deleted`'s `fetch_or` and branch 7, and the node
+  index it reads 11), and +37 / +36 at `289c1a5`, the set-stack check
+  before the claim (`set_stack::holds` 31 out of line, its call site 5).
+- **strict delete**: +63 Local, +79 Shared at `62f29d7` (the mark loop
+  over the root and its owned members, `once(&root).chain(&owned)`, 30,
+  plus the mark, a node index and, under Shared, the `wait_out_set`
+  test), and +33 / +34 at `289c1a5` (the same set-stack check).
+- The set-stack check runs on every delete, with no set in progress.
+  This thread's set always holds `SET_CLAIM` while its stack entry
+  exists, so testing that bit first would confine the scan to inputs some
+  set holds.
+
+Gates against T0 (T0 **Gate method** and T1 **Gate**):
+
+- Clean `get`: 178 / 302 against 198 / 309, below T0. Holds.
+- The workloads that run no T1 source, `collection_insert_then_read/batch/*`,
+  moved by -0.47, +0.23 and -0.90, within T0's spreads (0.18, 0.78 and
+  2.27). Holds.
+- Every other rise falls in the units above, each of them a source named
+  in T1's section of the plan, which now carries these measured counts in
+  place of its estimates. `get_contended_shared` is within the spread of
+  the two T1 runs; readers no longer wait on a set's claim.
