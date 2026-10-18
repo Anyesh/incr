@@ -64,10 +64,11 @@ fn shared_prefix_sum_dag_is_not_a_cycle() {
 }
 
 /// A ring of n members, each reading the shared gate `g` and, while it is
-/// 0, its successor. The first read nests n levels before the frame-stack
-/// check panics, and every member lands Failed with its ring edge. Setting
-/// `g` breaks the cycle and flips the ring Dirty, so the next walk
-/// re-expands the ring until the exact-mode switch, which bounds the rest.
+/// 0, its successor. The first read nests n levels before the read rules
+/// find the ring's head on the stack with no strategy and raise the
+/// cycle, and every member it unwinds takes the discard landing: New,
+/// with no edges installed. Setting `g` breaks the cycle, and the next
+/// walk visits each member once.
 fn cycle_recovery_is_bounded<C: Cells>() {
     let rt = Runtime::<C>::new();
     let n = test_size(700);
@@ -99,12 +100,8 @@ fn cycle_recovery_is_bounded<C: Cells>() {
     let visits = rt.first_visits() - before;
     let edges = 2 * n as u64;
     assert!(
-        visits <= u64::from(EXACT_MODE_AT) + edges,
+        visits <= edges + n as u64,
         "recovery walk made {visits} first visits for {edges} edges"
-    );
-    assert!(
-        visits >= u64::from(EXACT_MODE_AT),
-        "the ring must re-expand until the switch, got {visits} first visits"
     );
     for (k, &m) in members.iter().enumerate() {
         assert_eq!(rt.get(m), k as i64);

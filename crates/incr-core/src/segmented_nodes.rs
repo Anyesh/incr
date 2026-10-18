@@ -57,6 +57,14 @@ const _: () = assert!(
 /// for it), so deletes look the entry up only when it is set.
 pub(crate) const HAS_CHILDREN: u8 = 1;
 
+/// `NodeFlags` bit: the node is a member of a landed cycle group
+/// (`Inner::member_recs` has an entry for it).
+pub(crate) const IN_GROUP: u8 = 2;
+
+/// `NodeFlags` bit: the node has a cycle strategy
+/// (`Inner::cycle_strategies` has an entry for it).
+pub(crate) const HAS_STRATEGY: u8 = 4;
+
 /// A segment of nodes and, beside them, one flags byte per node. The
 /// bytes are zeroed when the segment is allocated and stored only under
 /// the runtime's write lock, so a Relaxed load anywhere reads a value

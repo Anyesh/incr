@@ -1,8 +1,9 @@
 //! The per-thread word behind two checks that share one load on the
 //! non-Clean get path: its low bits count the user trait calls the
 //! engine is inside (`Clone`, `PartialEq`, `Hash`, `Ord`, `Serialize`
-//! and so on, of a value, key or element type), and its top bit says
-//! the taint memo has entries.
+//! and so on, of a value, key or element type), its top bit says the
+//! taint memo has entries, and the two bits below it hold the kind of an
+//! engine unwind in flight.
 //!
 //! Every engine path that can claim, wait, lock or create panics while
 //! the counter is non-zero, because such a call from inside a user trait
@@ -21,9 +22,15 @@ use std::cell::Cell;
 /// Set while the taint memo has entries.
 pub(crate) const MEMO_BIT: u64 = 1 << 63;
 
+/// The kind of an engine unwind in flight (`cycle_state::UnwindKind`),
+/// kept in the word so that a frame pop tests it with the memo bit in
+/// one load.
+pub(crate) const UNWIND_SHIFT: u32 = 61;
+pub(crate) const UNWIND_MASK: u64 = 3 << UNWIND_SHIFT;
+
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
-/// so a live memo never trips the contract panic.
-pub(crate) const COUNTER_MASK: u64 = !MEMO_BIT;
+/// so a live memo or unwind kind never trips the contract panic.
+pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT | UNWIND_MASK);
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
@@ -47,7 +54,12 @@ pub(crate) fn set_memo_bit() {
 }
 
 pub(crate) fn clear_memo_bit() {
-    THREAD_WORD.with(|w| w.set(w.get() & COUNTER_MASK));
+    THREAD_WORD.with(|w| w.set(w.get() & !MEMO_BIT));
+}
+
+/// Replaces the unwind kind's bits with `bits`, already shifted.
+pub(crate) fn set_unwind_bits(bits: u64) {
+    THREAD_WORD.with(|w| w.set((w.get() & !UNWIND_MASK) | bits));
 }
 
 /// Holds one count on the counter; dropping it, by a panic included,

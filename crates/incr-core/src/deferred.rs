@@ -38,9 +38,12 @@
 use std::any::Any;
 use std::mem;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use crate::arena_registry::ErasedArena;
 use crate::cells::Cells;
+use crate::cycle::ErasedStrategy;
+use crate::cycle_state;
 use crate::dep_stack::DepStack;
 use crate::node::RetiredDeps;
 use crate::reclaim_probe::{self, RetireSite};
@@ -57,19 +60,21 @@ pub(crate) type ErasedDrop = Box<dyn Any>;
 /// the runtime, which frees arenas only when it drops.
 pub(crate) struct NodeDrops<'rt, C: Cells> {
     pub(crate) compute: Option<ComputeFn<C>>,
+    pub(crate) strategy: Option<Arc<dyn ErasedStrategy>>,
     pub(crate) observers: Vec<ObserverEntry<C>>,
     pub(crate) arena: &'rt dyn ErasedArena<C>,
     pub(crate) arena_slot: u32,
 }
 
 impl<C: Cells> NodeDrops<'_, C> {
-    /// The closure, then the observers, then the arena release. Each
+    /// The closure and cycle strategy, then the observers, then the arena release. Each
     /// part leaves `self` only as it drops, so after a panic the parts
     /// not yet reached drop with `self`, and the release never runs
     /// twice because no drop glue runs it.
     #[inline(always)]
     fn drop_parts(&mut self) {
         drop(self.compute.take());
+        drop(self.strategy.take());
         drop(mem::take(&mut self.observers));
         self.arena.release(self.arena_slot);
         reclaim_probe::reached(RetireSite::DeleteRetire);
@@ -176,7 +181,7 @@ impl<C: Cells> Deferred<C> {
         if let Some(spill) = self.spill.as_mut() {
             spill.reverse();
         }
-        rt.dep_stack.poison_current_frame();
+        rt.dep_stack.poison_current_frame(rt.runtime_id);
         resume_unwind(payload)
     }
 
@@ -261,17 +266,22 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
             self.unwind(rt, payload);
         }
         let DeleteBag {
-            node: NodeDrops {
-                compute, observers, ..
-            },
+            node:
+                NodeDrops {
+                    compute,
+                    strategy,
+                    observers,
+                    ..
+                },
             dep_list,
             members,
         } = self;
         // `drop_parts` left these empty, so forgetting them leaks nothing
         // and skips their drop glue.
-        debug_assert!(compute.is_none() && observers.capacity() == 0);
+        debug_assert!(compute.is_none() && strategy.is_none() && observers.capacity() == 0);
         debug_assert!(dep_list.is_none() && members.is_none());
         mem::forget(compute);
+        mem::forget(strategy);
         mem::forget(observers);
         mem::forget(dep_list);
         mem::forget(members);
@@ -301,7 +311,7 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
         if let Some(members) = self.members.as_mut() {
             members.reverse();
         }
-        rt.dep_stack.poison_current_frame();
+        rt.dep_stack.poison_current_frame(rt.runtime_id);
         resume_unwind(payload)
     }
 }
@@ -343,12 +353,14 @@ fn retire_dep_list<C: Cells>(token: RetiredDeps<C>) {
 /// payload is forgotten, not dropped, because its own `Drop` could
 /// panic again.
 ///
-/// T5's thread-local engine unwind kind is saved before the step and
+/// The thread's engine unwind kind is saved before the step and
 /// restored after it here, discarding whatever the step set, so a wound
 /// in flight still arrives as a wound.
 #[inline(never)]
 pub(crate) fn isolate(step: impl FnOnce()) {
+    let kind = cycle_state::unwind_kind();
     if let Err(payload) = catch_unwind(AssertUnwindSafe(step)) {
         std::mem::forget(payload);
     }
+    cycle_state::set_unwind_kind(kind);
 }

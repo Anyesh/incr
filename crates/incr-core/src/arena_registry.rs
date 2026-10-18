@@ -13,7 +13,8 @@
 //! can add an arena. Entries are published with a Release store and
 //! freed, with their arenas, only when the registry drops.
 
-use std::any::TypeId;
+use std::any::{Any, TypeId};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -22,6 +23,7 @@ use crate::cells::{Cells, PtrCell};
 use crate::directory::Directory;
 use crate::generic_arena::GenericArena;
 use crate::value::Value;
+use crate::value_slot::Compared;
 
 /// Object-safe arena interface, for code that holds a node's tag but
 /// not its value type.
@@ -31,11 +33,65 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     /// released, so a delete that calls this at its drain point runs the
     /// value's `Drop` at that point and under no lock.
     fn release(&self, slot: u32);
+
+    /// Writes `value`, which must be of the arena's type, into `slot`:
+    /// unconditionally when `first`, and otherwise only if it differs
+    /// from the slot's value. `wrote` is set immediately before the
+    /// store. Returns whether the value changed, and what to drop once
+    /// the caller's protocol allows: the displaced value or the rejected
+    /// equal one.
+    #[doc(hidden)]
+    fn write_erased(
+        &self,
+        slot: u32,
+        value: Box<dyn Any + Send>,
+        first: bool,
+        wrote: &Cell<u8>,
+    ) -> (bool, Option<Box<dyn Any>>);
+
+    /// Empties `slot` without returning it to the free list, handing back
+    /// the value it held.
+    #[doc(hidden)]
+    fn clear_value(&self, slot: u32) -> Option<Box<dyn Any>>;
+
+    /// Whether `slot` holds a value. Clones it to find out, so it is for
+    /// debug assertions only.
+    #[doc(hidden)]
+    fn has_value(&self, slot: u32) -> bool;
 }
 
 impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
     fn release(&self, slot: u32) {
         drop(GenericArena::release(self, slot));
+    }
+
+    fn write_erased(
+        &self,
+        slot: u32,
+        value: Box<dyn Any + Send>,
+        first: bool,
+        wrote: &Cell<u8>,
+    ) -> (bool, Option<Box<dyn Any>>) {
+        let value = *value
+            .downcast::<T>()
+            .expect("incr-core: an episode value has its node's type");
+        if first {
+            wrote.set(1);
+            let displaced = self.write(slot, value);
+            return (true, displaced.map(|d| Box::new(d) as Box<dyn Any>));
+        }
+        match self.compare_and_write(slot, value, || wrote.set(1)) {
+            Compared::Equal(rejected) => (false, Some(Box::new(rejected))),
+            Compared::Replaced(displaced) => (true, displaced.map(|d| Box::new(d) as Box<dyn Any>)),
+        }
+    }
+
+    fn clear_value(&self, slot: u32) -> Option<Box<dyn Any>> {
+        self.clear(slot).map(|d| Box::new(d) as Box<dyn Any>)
+    }
+
+    fn has_value(&self, slot: u32) -> bool {
+        crate::value_code::run(|| self.try_read(slot).is_some())
     }
 }
 

@@ -133,6 +133,13 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         displaced
     }
 
+    /// Empty the slot and hand back its value, keeping the slot reserved
+    /// for the node that owns it.
+    #[must_use]
+    pub(crate) fn clear(&self, slot: u32) -> Option<Displaced<T, C>> {
+        self.slot_or_panic(slot).clear()
+    }
+
     /// The slot at `slot`, or `None` if no reserve ever reached it.
     #[inline(always)]
     fn slot(&self, slot: u32) -> Option<&C::ValueSlot<T>> {

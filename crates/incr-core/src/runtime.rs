@@ -19,13 +19,14 @@
 //! collection operators, soundness fixes (race-detection ordering with
 //! AcqRel, overflow-dep reclamation).
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
 use crate::arena_registry::{ArenaRegistry, ArenaTags};
 use crate::cells::Cells;
+use crate::cycle::{self, ComputeCtl, Cycle, CycleStrategy, ErasedStrategy, Outcome, QueryOpts};
+use crate::cycle_state::{self, EntryDepth, UnwindKind};
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
 use crate::dep_stack::DepStack;
 use crate::dependent_list::DependentList;
@@ -34,7 +35,7 @@ use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
-use crate::segmented_nodes::{SegmentedNodes, HAS_CHILDREN};
+use crate::segmented_nodes::{SegmentedNodes, HAS_CHILDREN, HAS_STRATEGY, IN_GROUP};
 use crate::set_stack;
 use crate::slot_vec::SlotVec;
 use crate::state::{self, NodeState};
@@ -43,13 +44,13 @@ use crate::value::Value;
 use crate::value_code;
 use crate::value_slot::{Compared, Displaced};
 
-/// Compute closure: takes a borrow of the runtime, the node's slot,
-/// whether this is a recompute (true) or first compute (false), and the
-/// attempt's `wrote` cell, set once the slot holds the new value. Returns
-/// `true` if the value actually changed (for early-cutoff propagation),
-/// `false` if it was the same as before.
+/// Compute closure: takes a borrow of the runtime, the node's slot and
+/// the frame's control block, which says whether this is a recompute
+/// (whose write compares first) and whether the value must be buffered
+/// instead of written, and which records the write. Returns what it did
+/// with the value: `Unchanged` is the early cutoff.
 pub(crate) type ComputeFn<C> =
-    Box<dyn Fn(&Runtime<C>, u32, bool, &Cell<u8>) -> bool + Send + Sync + 'static>;
+    Box<dyn Fn(&Runtime<C>, u32, &ComputeCtl) -> Outcome + Send + Sync + 'static>;
 
 /// Per-runtime mutable state guarded by the inner lock. Holds everything
 /// that's not on the per-node `NodeData` and not in an arena.
@@ -71,6 +72,19 @@ pub(crate) struct Inner<C: Cells> {
     /// the node that was adopted.
     pub(crate) owned: HashMap<u32, Vec<NodeId>>,
     pub(crate) owner_of: HashMap<u32, NodeId>,
+    /// The cycle strategies of the queries that have one, flagged by
+    /// `HAS_STRATEGY`.
+    pub(crate) cycle_strategies: HashMap<u32, Arc<dyn ErasedStrategy>>,
+    /// The group each landed cycle member belongs to, flagged by
+    /// `IN_GROUP`.
+    pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
+}
+
+/// A landed cycle group: its members with the generations they landed
+/// under, sorted by slot, and the cycle readers see.
+pub(crate) struct GroupInfo {
+    pub(crate) members: Vec<(u32, u32)>,
+    pub(crate) cycle: Cycle,
 }
 
 /// Type-erased observer runner: takes the runtime and the observer's
@@ -99,6 +113,8 @@ impl<C: Cells> Inner<C> {
             next_observer_id: 1,
             owned: HashMap::new(),
             owner_of: HashMap::new(),
+            cycle_strategies: HashMap::new(),
+            member_recs: HashMap::new(),
         }
     }
 }
@@ -349,6 +365,18 @@ enum Computed {
     /// to a node that no longer exists. Any claim taken was released
     /// with the discard landing, and nothing ran against the occupant.
     Gone,
+    /// The node read an open cycle: its claim moved to this thread's held
+    /// map, its value is buffered there, and the root of the cycle lands
+    /// it.
+    Deferred,
+}
+
+/// Which read reached a slow path: `get` panics where `try_get` returns
+/// `Err(Cycle)`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadKind {
+    Get,
+    TryGet,
 }
 
 /// `Entry::taint` of a visit entry.
@@ -579,6 +607,9 @@ pub struct Runtime<C: Cells> {
     first_visits: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     expansions: std::sync::atomic::AtomicU64,
+    /// Group verifications failed by a member's `verified_at` of 0.
+    #[cfg(test)]
+    pub(crate) group_zero_fails: std::sync::atomic::AtomicU64,
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -606,6 +637,8 @@ impl<C: Cells> Runtime<C> {
             first_visits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             expansions: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            group_zero_fails: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -681,7 +714,7 @@ impl<C: Cells> Runtime<C> {
     /// Create an input node with an initial value.
     pub fn create_input<T: Value>(&self, value: T) -> Incr<T> {
         assert!(
-            !self.dep_stack.current_frame_active(),
+            !self.dep_stack.current_frame_active(self.runtime_id),
             "create_input called during compute; not permitted",
         );
         self.create_input_unchecked(value)
@@ -725,11 +758,37 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
+        self.create_query_with(f, QueryOpts::default())
+    }
+
+    /// [`Self::create_query`] with a [`CycleStrategy::Fallback`]: in a
+    /// dependency cycle the query's value is `g` of the cycle.
+    pub fn create_query_with_fallback<T, F, G>(&self, f: F, g: G) -> Incr<T>
+    where
+        T: Value,
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+        G: Fn(&Cycle) -> T + Send + Sync + 'static,
+    {
+        self.create_query_with(
+            f,
+            QueryOpts {
+                cycle: CycleStrategy::fallback(g),
+            },
+        )
+    }
+
+    /// [`Self::create_query`] with options: the query's cycle strategy.
+    pub fn create_query_with<T, F>(&self, f: F, opts: QueryOpts<T>) -> Incr<T>
+    where
+        T: Value,
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
         assert!(
-            !self.dep_stack.current_frame_active(),
+            !self.dep_stack.current_frame_active(self.runtime_id),
             "create_query called during compute; not permitted",
         );
         value_code::check();
+        let strategy = cycle::erase(opts.cycle);
 
         let (slot, generation) = {
             let mut inner = self.inner.write();
@@ -748,31 +807,47 @@ impl<C: Cells> Runtime<C> {
                 slot
             };
 
-            // Compute closure: invokes f, writes value, returns whether
-            // the value changed (for early cutoff). `is_recompute=false`
-            // means there's no prior value, so we always treat it as
-            // changed; `is_recompute=true` compares against the stored
-            // value via T's PartialEq.
+            // A first compute writes unconditionally; a recompute
+            // compares and publishes in one slot session, and an equal
+            // value is the early cutoff. A frame that read an open cycle,
+            // or an episode's member run, keeps the value in its control
+            // block instead.
             let arena_inner = arena;
             let compute: ComputeFn<C> = Box::new(
-                move |rt: &Runtime<C>, slot: u32, is_recompute: bool, wrote: &Cell<u8>| -> bool {
+                move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
-                    let changed = if is_recompute {
-                        // Compare-and-publish in one slot session; the
-                        // false return is the early cutoff.
-                        arena_inner.write_if_changed(node.arena_slot(), new_value, wrote)
-                    } else {
-                        wrote.set(1);
-                        drop(arena_inner.write(node.arena_slot(), new_value));
-                        true
-                    };
+                    let outcome =
+                        match ctl.flags.get() & (cycle::RECOMPUTE | cycle::BUFFERED | cycle::LOW) {
+                            0 => {
+                                ctl.wrote.set(1);
+                                drop(arena_inner.write(node.arena_slot(), new_value));
+                                Outcome::Changed
+                            }
+                            cycle::RECOMPUTE => {
+                                if arena_inner.write_if_changed(
+                                    node.arena_slot(),
+                                    new_value,
+                                    &ctl.wrote,
+                                ) {
+                                    Outcome::Changed
+                                } else {
+                                    Outcome::Unchanged
+                                }
+                            }
+                            _ => return ctl.buffer(new_value),
+                        };
                     reclaim_probe::reached(RetireSite::ComputeWrite);
-                    changed
+                    outcome
                 },
             );
 
             inner.compute_fns[slot as usize] = Some(compute);
+            if let Some(strategy) = strategy {
+                inner.cycle_strategies.insert(slot, strategy);
+                let flags = self.nodes.get_with_flags(slot).1;
+                C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | HAS_STRATEGY);
+            }
             (slot, self.nodes.get(slot).generation())
         };
         Incr::new(slot, generation, self.runtime_id)
@@ -917,6 +992,10 @@ impl<C: Cells> Runtime<C> {
     /// notifications matter.
     pub fn stabilize(&self) {
         value_code::check();
+        self.enter(|| self.stabilize_entered());
+    }
+
+    fn stabilize_entered(&self) {
         let entries: Vec<(u64, u64, ObserverRunFn<C>)> = {
             let inner = self.inner.read();
             inner
@@ -998,7 +1077,7 @@ impl<C: Cells> Runtime<C> {
 
     fn assert_not_own_compute(&self, id: NodeId) {
         assert!(
-            !self.dep_stack.is_computing(id),
+            !self.holds_claim(id),
             "incr-core: delete_node called from inside node {}'s own compute",
             id.0,
         );
@@ -1214,7 +1293,7 @@ impl<C: Cells> Runtime<C> {
         value_code::check();
         let root = root.into();
         assert!(
-            !self.dep_stack.current_frame_active(),
+            !self.dep_stack.current_frame_active(self.runtime_id),
             "incr-core: delete_with_dependents called during compute; not permitted",
         );
         if root.runtime_id() != self.runtime_id {
@@ -1485,6 +1564,15 @@ impl<C: Cells> Runtime<C> {
                 C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !HAS_CHILDREN);
             }
         }
+        let bits = C::u8_load_relaxed(flags);
+        let strategy = if bits & HAS_STRATEGY != 0 {
+            inner.cycle_strategies.remove(&slot)
+        } else {
+            None
+        };
+        if bits & IN_GROUP != 0 {
+            inner.member_recs.remove(&slot);
+        }
         C::u8_store_relaxed(flags, 0);
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
@@ -1498,6 +1586,7 @@ impl<C: Cells> Runtime<C> {
         inner.free_nodes.push(slot);
         let drops = NodeDrops {
             compute,
+            strategy,
             observers,
             arena,
             arena_slot: retired.arena_slot,
@@ -1521,7 +1610,8 @@ impl<C: Cells> Runtime<C> {
         let observed = state::load::<C>(node.state_cell());
         if observed == NodeState::Clean {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            self.dep_stack.record_dep(NodeId(slot), handle.generation());
+            self.dep_stack
+                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
             return self.read_slot(handle, node, type_tag, arena_slot);
         }
         self.get_slow(handle, observed)
@@ -1531,23 +1621,107 @@ impl<C: Cells> Runtime<C> {
     /// is the state `get` loaded.
     #[inline(never)]
     fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
+        match self.read_slow(handle, observed, ReadKind::Get) {
+            Ok(value) => value,
+            Err(cycle) => self.raise_cycle(cycle),
+        }
+    }
+
+    /// Read the current value of a node, like [`Self::get`], or the cycle
+    /// that leaves it without one: a node that landed
+    /// [`NodeState::Cyclic`], or a read that closes a cycle through a
+    /// query with no cycle strategy. Nodes with a value, a cycle
+    /// strategy's included, read `Ok`.
+    pub fn try_get<T: Value>(&self, handle: Incr<T>) -> Result<T, Cycle> {
+        self.check_runtime(handle);
+        let slot = handle.slot();
+        let node = self.nodes.get(slot);
+        let observed = state::load::<C>(node.state_cell());
+        if observed == NodeState::Clean {
+            let (type_tag, arena_slot) = self.fields_under(handle, node);
+            self.dep_stack
+                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+            return Ok(self.read_slot(handle, node, type_tag, arena_slot));
+        }
+        self.try_get_slow(handle, observed)
+    }
+
+    #[inline(never)]
+    fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
+        self.read_slow(handle, observed, ReadKind::TryGet)
+    }
+
+    /// The cycle of the group `handle` landed in last, if its last
+    /// landing was as a member of a cycle.
+    pub fn cycle_of(&self, handle: impl Into<ErasedIncr>) -> Option<Cycle> {
+        let handle = handle.into();
+        if handle.runtime_id() != self.runtime_id {
+            return None;
+        }
+        let inner = self.inner.read();
+        if self.nodes.get(handle.slot()).generation() != handle.generation() {
+            return None;
+        }
+        inner
+            .member_recs
+            .get(&handle.slot())
+            .map(|group| group.cycle.clone())
+    }
+
+    /// The slow read shared by `get` and `try_get`: a cycle read, or a
+    /// walk and then the slot.
+    #[inline(always)]
+    fn read_slow<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        kind: ReadKind,
+    ) -> Result<T, Cycle> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         if node.generation() != handle.generation() {
             self.stale_handle(handle);
         }
-        self.dep_stack.record_dep(NodeId(slot), handle.generation());
+        self.dep_stack
+            .record_dep(self.runtime_id, NodeId(slot), handle.generation());
 
         let word = value_code::thread_word();
         if word & value_code::COUNTER_MASK != 0 {
-            return self.value_code_read(handle, node);
+            return Ok(self.value_code_read(handle, node));
+        }
+        if observed == NodeState::Cyclic || is_computing(observed) {
+            if let Some(read) = self.cycle_read(handle, observed, kind) {
+                return read;
+            }
         }
         // `get` found the node not Clean, so the walk starts at once.
-        if self.clean_walk(NodeId(slot), handle.generation(), word, observed) == Computed::Gone {
-            self.stale_handle(handle);
+        let walk = || self.clean_walk(NodeId(slot), handle.generation(), word, observed);
+        match self.entered(kind, walk)? {
+            Computed::Done => {}
+            Computed::Gone => self.stale_handle(handle),
+            Computed::Deferred => {
+                return self
+                    .cycle_read(handle, NodeState::Computing, kind)
+                    .expect("incr-core: a deferred root is held");
+            }
         }
         let (type_tag, arena_slot) = self.fields_under(handle, node);
-        self.read_slot(handle, node, type_tag, arena_slot)
+        match self.try_read_slot(handle, node, type_tag, arena_slot) {
+            Some(value) => Ok(value),
+            None => Err(self.read_missing(handle, node)),
+        }
+    }
+
+    /// A read after a walk found no value: the node landed `Cyclic`.
+    #[cold]
+    #[inline(never)]
+    fn read_missing<T: Value>(&self, handle: Incr<T>, node: &NodeData<C>) -> Cycle {
+        if node.state() == NodeState::Cyclic {
+            if let Some(cycle) = self.cycle_of(handle) {
+                return cycle;
+            }
+        }
+        self.read_failed(handle)
     }
 
     /// [`Self::get_slow`] reached from value code, a trait method of a
@@ -1609,16 +1783,29 @@ impl<C: Cells> Runtime<C> {
         type_tag: u16,
         arena_slot: u32,
     ) -> T {
+        match self.try_read_slot(handle, node, type_tag, arena_slot) {
+            Some(value) => value,
+            None => self.read_failed(handle),
+        }
+    }
+
+    /// [`Self::read_slot`], with `None` for an empty slot.
+    #[inline(always)]
+    fn try_read_slot<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+    ) -> Option<T> {
         self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
         let arena = self.arenas.tagged_arena::<T>(type_tag);
         let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)));
         C::fence_acquire();
-        if node.generation() == handle.generation() {
-            if let Some(value) = value {
-                return value;
-            }
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
         }
-        self.read_failed(handle)
+        value
     }
 
     /// Read the current value and return a propagation trace alongside.
@@ -1913,15 +2100,31 @@ impl<C: Cells> Runtime<C> {
     /// cycle detection needs a waits-for graph and is not implemented.
     #[inline]
     fn wait_on_claim(&self, id: NodeId, spins: u32) {
-        if self.dep_stack.is_computing(id) {
-            panic!(
-                "incr-core: dependency cycle detected: node {} was read while \
-                 its own compute was in progress",
-                id.0,
-            );
+        if self.holds_claim(id) {
+            self.waits_on_own_claim(id);
         }
         self.refuse_wait_on_computing(id);
         C::backoff(spins);
+    }
+
+    /// A wait reached a claim this thread holds, which no wait releases.
+    /// Reads resolve such nodes through the cycle rules before they wait,
+    /// so only a path with no read to answer gets here.
+    #[cold]
+    #[inline(never)]
+    fn waits_on_own_claim(&self, id: NodeId) -> ! {
+        panic!(
+            "incr-core: dependency cycle detected: node {} was reached while \
+             its own compute was in progress",
+            id.0,
+        );
+    }
+
+    /// Whether this thread holds `id`'s compute claim: a frame computing
+    /// it, or a held claim.
+    pub(crate) fn holds_claim(&self, id: NodeId) -> bool {
+        self.dep_stack.is_computing(self.runtime_id, id)
+            || cycle_state::holds(self.runtime_id, id.0)
     }
 
     /// Before waiting on `id`'s `Computing` holder: under `Local` no
@@ -2264,11 +2467,11 @@ impl<C: Cells> Runtime<C> {
         gen: Option<u32>,
         bag: &mut Deferred<C>,
     ) -> Computed {
-        let node = self.nodes.get(id.0);
+        let (node, flags) = self.nodes.get_with_flags(id.0);
         let mut spins: u32 = 0;
         let mut g0 = gen;
 
-        loop {
+        'attempt: loop {
             let observed = state::load::<C>(node.state_cell());
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
@@ -2337,7 +2540,7 @@ impl<C: Cells> Runtime<C> {
             // meanwhile flags ComputingDirty and blocks the Clean landing.
             // The claim source tells us exactly whether this is a
             // recompute: the node may have gone Dirty since `observed`.
-            let verifying = observed == NodeState::Dirty && visit != Visit::Direct;
+            let mut verifying = observed == NodeState::Dirty && visit != Visit::Direct;
             let claimed_dirty = if verifying {
                 if state::try_transition::<C>(
                     node.state_cell(),
@@ -2388,13 +2591,33 @@ impl<C: Cells> Runtime<C> {
             let stamp_rev = self.current_revision();
             let verify_rev = C::walked(&self.walk, &self.revision);
 
+            // The flags byte is loaded only now, after the claim and the
+            // generation recheck: until the claim, another thread's
+            // episode can land the node into a group or a single-node
+            // landing can take it out of one.
+            if verifying && C::u8_load_relaxed(flags) & IN_GROUP != 0 {
+                match self.group_verify(id, g, visit, bag) {
+                    GroupEnd::Done(computed) => return computed,
+                    GroupEnd::Retry => {
+                        self.park_with_bag(ParkPoint::StaleRetry(id), bag);
+                        continue 'attempt;
+                    }
+                    // A member could not be claimed, or the group is no
+                    // longer a cycle: compute, and rediscover any cycle
+                    // that remains.
+                    GroupEnd::Ordinary => verifying = false,
+                }
+            }
+
             // Red/green verification, only from Dirty: a New node has
             // nothing to verify against. It counts a dep that is not Clean
             // as changed, which catches a walk that passed this node before
             // the claim, and a dep that landed Dirty without a new stamp.
+            // A `verified_at` of 0 means never verified, and an empty slot
+            // may sit behind it, so it always fails.
             if verifying {
                 let my_verified = node.verified_at();
-                let mut any_changed = false;
+                let mut any_changed = my_verified == 0;
                 node.for_each_dep(|dep| {
                     if !any_changed && !self.observed_clean(dep, my_verified) {
                         any_changed = true;
@@ -2403,10 +2626,12 @@ impl<C: Cells> Runtime<C> {
                 if !any_changed {
                     self.park(ParkPoint::VerifyAfterScan(id));
                     node.max_verified_at(verify_rev);
-                    if self.land(node, NodeState::Clean, NodeState::Dirty) == NodeState::Clean {
+                    if self.land_single(id, node, flags, NodeState::Clean, NodeState::Dirty)
+                        == NodeState::Clean
+                    {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                     } else {
-                        self.dep_stack.poison_current_frame();
+                        self.dep_stack.poison_current_frame(self.runtime_id);
                     }
                     return Computed::Done;
                 }
@@ -2415,7 +2640,7 @@ impl<C: Cells> Runtime<C> {
                     // nested get if it still needs it, and that read
                     // poisons where needed; a poison here would cost the
                     // root a Clean landing for an edge it may have dropped.
-                    self.land(node, NodeState::Dirty, NodeState::Dirty);
+                    self.land_single(id, node, flags, NodeState::Dirty, NodeState::Dirty);
                     self.memoize(id, owner);
                     return Computed::Done;
                 }
@@ -2423,133 +2648,253 @@ impl<C: Cells> Runtime<C> {
                 // clean the changed deps.
             }
             let is_recompute = claimed_dirty;
+            let first = !claimed_dirty;
 
-            // Track deps via the strategy's dep stack. The closure runs
-            // under a panic boundary: a panicking user closure must not
-            // strand the node in Computing (wedging every future reader)
-            // or leak its dep frame. AssertUnwindSafe is justified
-            // because the only state the closure can reach is the
-            // runtime's, and the Failed transition plus the frame pop
-            // below restore every invariant the unwind could have
-            // interrupted; no lock is held while user code runs.
-            let wrote = Cell::new(0_u8);
-            self.dep_stack.push_frame(id);
-            // SAFETY: the closure was read under the read hold at
-            // generation `g`, and the claim above was rechecked against `g`.
-            // A closure is freed only by `release_claimed`, under a Dead
-            // claim and after the generation bump, and no Dead claim can
-            // succeed while this node is Computing. `SlotVec` never moves
-            // its entries, so the `Box` still points where it was read.
-            let compute = unsafe { &*compute };
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                compute(self, id.0, is_recompute, &wrote)
-            }));
-            let frame = self.dep_stack.pop_frame();
-            if value_code::thread_word() & value_code::MEMO_BIT != 0 {
-                taint_memo::clear_from(self.dep_stack.depth() as u32);
-            }
-
-            let value_changed = match result {
-                Ok(changed) => changed,
-                Err(payload) => {
-                    // Publish the union of the old deps and whatever was
-                    // recorded before the panic. Without the recorded
-                    // subset, a first-compute panic leaves no reverse
-                    // edges at all and no set() can ever flip the node
-                    // out of Failed; without the old set, a recompute
-                    // panic would lose recovery paths through deps the
-                    // failed run had not reached yet. Extra edges only
-                    // cause spurious re-verification, never staleness.
-                    let landing = match self.publish_deps(id, &frame.deps, true, verify_rev, bag) {
-                        // A stale dep's slot may already belong to another
-                        // node, so no union is published. The old deps keep
-                        // their reverse edges.
-                        Publish::Stale => NodeState::New,
-                        // A new dep had a change in flight when we published,
-                        // and that change's walk may have read the dep's
-                        // dependents before our edge existed. Nothing would
-                        // ever flip us out of Failed, so land Dirty and let
-                        // the next reader retry.
-                        Publish::Superseded => NodeState::Dirty,
-                        // verified_at was not raised, so once a dependency
-                        // changes, the dirty walk flips Failed -> Dirty and
-                        // red/green sees the change and recomputes for real.
-                        // If a set() already flagged us mid-compute, land
-                        // Dirty now so the next reader retries immediately.
-                        Publish::Published => NodeState::Failed,
-                    };
-                    let flagged = if landing == NodeState::New {
-                        NodeState::New
-                    } else {
-                        NodeState::Dirty
-                    };
-                    // The slot already holds the new value when the panic
-                    // came after the write (a displaced value's Drop, or
-                    // a reclaim inside its retire). Stamp it: a recompute
-                    // that produces the same value cuts off, and without
-                    // the stamp a dependent verified against the old
-                    // value would stay Clean over the new one.
-                    if wrote.get() != 0 {
-                        node.max_changed_at(stamp_rev);
-                    }
-                    self.land(node, landing, flagged);
-                    // An enclosing closure that catches the unwind has
-                    // still read a dep that did not land Clean.
-                    self.dep_stack.poison_current_frame();
-                    bag.drain_carried(payload);
+            'run: loop {
+                // Track deps via the strategy's dep stack. The closure runs
+                // under a panic boundary: a panicking user closure must not
+                // strand the node in Computing (wedging every future reader)
+                // or leak its dep frame. AssertUnwindSafe is justified
+                // because the only state the closure can reach is the
+                // runtime's, and the Failed transition plus the frame pop
+                // below restore every invariant the unwind could have
+                // interrupted; no lock is held while user code runs.
+                let ctl = ComputeCtl::new(if is_recompute { cycle::RECOMPUTE } else { 0 });
+                let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
+                ctl.lowlink.set(cidx);
+                // SAFETY: the closure was read under the read hold at
+                // generation `g`, and the claim above was rechecked against `g`.
+                // A closure is freed only by `release_claimed`, under a Dead
+                // claim and after the generation bump, and no Dead claim can
+                // succeed while this node is Computing. `SlotVec` never moves
+                // its entries, so the `Box` still points where it was read.
+                let compute = unsafe { &*compute };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    compute(self, id.0, &ctl)
+                }));
+                let deps = self.dep_stack.pop_frame();
+                let word = value_code::thread_word();
+                if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0 {
+                    self.after_pop(word, result.is_ok());
                 }
-            };
 
-            let outcome = self.publish_deps(id, &frame.deps, false, verify_rev, bag);
+                let outcome = match result {
+                    Ok(outcome) => outcome,
+                    Err(payload) => self.compute_panicked(
+                        id,
+                        node,
+                        flags,
+                        Attempt {
+                            first,
+                            cidx,
+                            stamp_rev,
+                            verify_rev,
+                        },
+                        &ctl,
+                        &deps,
+                        bag,
+                        payload,
+                    ),
+                };
 
-            // The closure has already written its value into the slot, and
-            // the next recompute's early cutoff compares against it, so a
-            // changed value is stamped even when it is never returned.
-            if value_changed || !is_recompute {
-                node.max_changed_at(stamp_rev);
+                if ctl.has(cycle::LOW) {
+                    match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
+                        PopEnd::Deferred => return Computed::Deferred,
+                        PopEnd::Landed => return Computed::Done,
+                        PopEnd::Dissolved => continue 'run,
+                        PopEnd::Retry => {
+                            self.park_with_bag(ParkPoint::StaleRetry(id), bag);
+                            continue 'attempt;
+                        }
+                    }
+                }
+                debug_assert_ne!(outcome, Outcome::Buffered);
+                let value_changed = outcome == Outcome::Changed;
+
+                let published = self.publish_deps(id, &deps, false, verify_rev, bag);
+
+                // The closure has already written its value into the slot, and
+                // the next recompute's early cutoff compares against it, so a
+                // changed value is stamped even when it is never returned.
+                if value_changed || !is_recompute {
+                    node.max_changed_at(stamp_rev);
+                }
+
+                if published == Publish::Stale {
+                    // The value may have been read from a dep slot that was
+                    // released or recycled under the closure, so it is never
+                    // returned: land New and recompute. The retry either stops
+                    // reading the dep or panics on its stale handle.
+                    if first && ctl.wrote.get() == 0 {
+                        node.set_verified_at(0);
+                    }
+                    self.land_single(id, node, flags, NodeState::New, NodeState::New);
+                    self.park_with_bag(ParkPoint::StaleRetry(id), bag);
+                    continue 'attempt;
+                }
+
+                let poisoned = ctl.has(cycle::POISONED);
+                if poisoned {
+                    // The value may be built on a result the closure
+                    // swallowed from a dep that did not land Clean or whose
+                    // cleanup failed, and that dep's stamps need not have
+                    // moved, so a verified_at at or above them would let the
+                    // next read verify this node Clean over that value.
+                    // Zero fails verification, so the next read recomputes.
+                    node.set_verified_at(0);
+                } else {
+                    node.max_verified_at(verify_rev);
+                }
+
+                // Finish. Land Dirty instead of Clean if a set() flagged us
+                // ComputingDirty mid-compute, if a new dep changed after we
+                // read it, or if a dep we read did not itself land Clean, so
+                // the next reader recomputes against the newer input.
+                let target = if published == Publish::Superseded || poisoned {
+                    NodeState::Dirty
+                } else {
+                    NodeState::Clean
+                };
+                if self.land_single(id, node, flags, target, NodeState::Dirty) != NodeState::Clean {
+                    // The enclosing compute read this node through a non-Clean
+                    // landing. Its own publish may take the fast path, where
+                    // nothing else would catch that.
+                    self.dep_stack.poison_current_frame(self.runtime_id);
+                }
+                self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
+                return Computed::Done;
             }
-
-            if outcome == Publish::Stale {
-                // The value may have been read from a dep slot that was
-                // released or recycled under the closure, so it is never
-                // returned: land New and recompute. The retry either stops
-                // reading the dep or panics on its stale handle.
-                self.land(node, NodeState::New, NodeState::New);
-                self.park_with_bag(ParkPoint::StaleRetry(id), bag);
-                continue;
-            }
-
-            if frame.poisoned {
-                // The value may be built on a result the closure
-                // swallowed from a dep that did not land Clean or whose
-                // cleanup failed, and that dep's stamps need not have
-                // moved, so a verified_at at or above them would let the
-                // next read verify this node Clean over that value.
-                // Zero fails verification against every Clean dep
-                // (revisions start at 1), so the next read recomputes.
-                node.set_verified_at(0);
-            } else {
-                node.max_verified_at(verify_rev);
-            }
-
-            // Finish. Land Dirty instead of Clean if a set() flagged us
-            // ComputingDirty mid-compute, if a new dep changed after we
-            // read it, or if a dep we read did not itself land Clean, so
-            // the next reader recomputes against the newer input.
-            let target = if outcome == Publish::Superseded || frame.poisoned {
-                NodeState::Dirty
-            } else {
-                NodeState::Clean
-            };
-            if self.land(node, target, NodeState::Dirty) != NodeState::Clean {
-                // The enclosing compute read this node through a non-Clean
-                // landing. Its own publish may take the fast path, where
-                // nothing else would catch that.
-                self.dep_stack.poison_current_frame();
-            }
-            self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
-            return Computed::Done;
         }
+    }
+
+    /// The `Err` arm of a compute: the closure panicked, or an engine
+    /// unwind passed through it. Lands the node and every claim this
+    /// thread held above its frame, then resumes the unwind.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn compute_panicked(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        attempt: Attempt,
+        ctl: &ComputeCtl,
+        deps: &[(NodeId, u32)],
+        bag: &mut Deferred<C>,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> ! {
+        let kind = cycle_state::take_unwind_kind();
+        self.release_held_from(attempt.cidx, kind, bag);
+        let wrote = ctl.wrote.get() != 0;
+        if kind.is_some() {
+            // A cycle or a wound is no fault of this node's: it lands as
+            // if it never ran, never Failed.
+            self.discard_land(id, attempt.first, wrote, attempt.stamp_rev);
+            cycle_state::set_unwind_kind(kind);
+            bag.drain_carried(payload);
+        }
+        // Publish the union of the old deps and whatever was recorded
+        // before the panic. Without the recorded subset, a first-compute
+        // panic leaves no reverse edges at all and no set() can ever flip
+        // the node out of Failed; without the old set, a recompute panic
+        // would lose recovery paths through deps the failed run had not
+        // reached yet. Extra edges only cause spurious re-verification,
+        // never staleness.
+        self.land_failed(id, node, flags, attempt, wrote, deps, bag);
+        // An enclosing closure that catches the unwind has still read a
+        // dep that did not land Clean.
+        self.dep_stack.poison_current_frame(self.runtime_id);
+        bag.drain_carried(payload);
+    }
+
+    /// Fix 5's landing of a claim whose closure panicked: the union of
+    /// the old and recorded deps is published, and the node lands Failed,
+    /// or Dirty or New where publication says the panic may hide a change.
+    #[allow(clippy::too_many_arguments)]
+    fn land_failed(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        attempt: Attempt,
+        wrote: bool,
+        deps: &[(NodeId, u32)],
+        bag: &mut Deferred<C>,
+    ) {
+        let landing = match self.publish_deps(id, deps, true, attempt.verify_rev, bag) {
+            // A stale dep's slot may already belong to another node, so no
+            // union is published. The old deps keep their reverse edges.
+            Publish::Stale => NodeState::New,
+            // A new dep had a change in flight when we published, and that
+            // change's walk may have read the dep's dependents before our
+            // edge existed. Nothing would ever flip us out of Failed, so
+            // land Dirty and let the next reader retry.
+            Publish::Superseded => NodeState::Dirty,
+            // verified_at was not raised, so once a dependency changes, the
+            // dirty walk flips Failed -> Dirty and red/green sees the change
+            // and recomputes for real. If a set() already flagged us
+            // mid-compute, land Dirty now so the next reader retries.
+            Publish::Published => NodeState::Failed,
+        };
+        let flagged = if landing == NodeState::New {
+            NodeState::New
+        } else {
+            NodeState::Dirty
+        };
+        // The slot already holds the new value when the panic came after
+        // the write (a displaced value's Drop, or a reclaim inside its
+        // retire). Stamp it: a recompute that produces the same value cuts
+        // off, and without the stamp a dependent verified against the old
+        // value would stay Clean over the new one. A first compute that
+        // wrote nothing has an empty slot, so it must never verify.
+        if wrote {
+            node.max_changed_at(attempt.stamp_rev);
+        } else if attempt.first {
+            node.set_verified_at(0);
+        }
+        self.land_single(id, node, flags, landing, flagged);
+    }
+
+    /// A frame pop found the memo bit or an unwind kind in the thread
+    /// word. A kind left set after a closure returned normally is an
+    /// engine unwind the closure caught and swallowed.
+    #[cold]
+    #[inline(never)]
+    fn after_pop(&self, word: u64, returned: bool) {
+        if word & value_code::MEMO_BIT != 0 {
+            taint_memo::clear_from(self.dep_stack.depth() as u32);
+        }
+        if returned && !std::thread::panicking() {
+            self.swallowed(cycle_state::UnwindKind::of_word(word));
+        }
+    }
+
+    /// A single-node landing: a node landing outside an episode leaves
+    /// its group, so its `MemberRec` is removed before the landing CAS,
+    /// while the claim is still held. Once the CAS lands the node another
+    /// thread can claim it and write a new record.
+    #[inline(always)]
+    pub(crate) fn land_single(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        target: NodeState,
+        flagged: NodeState,
+    ) -> NodeState {
+        if C::u8_load_relaxed(flags) & IN_GROUP != 0 {
+            self.leave_group(id, flags);
+        }
+        self.land(node, target, flagged)
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn leave_group(&self, id: NodeId, flags: &C::U8) {
+        let mut inner = self.inner.write();
+        inner.member_recs.remove(&id.0);
+        C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !IN_GROUP);
     }
 
     /// The depth of the frame on this thread (or, under `Local`, this
@@ -2557,7 +2902,9 @@ impl<C: Cells> Runtime<C> {
     /// own held set; a set's claim is not on `state`, so it never shows
     /// up here.
     fn own_claim_depth(&self, id: NodeId) -> Option<usize> {
-        self.dep_stack.frame_depth(id)
+        self.dep_stack
+            .frame_depth(self.runtime_id, id)
+            .or_else(|| cycle_state::held_anchor(self.runtime_id, id.0).map(|a| a as usize))
     }
 
     /// Memoize a node verify-only left non-Clean under the frame at depth
@@ -2842,6 +3189,10 @@ impl<C: Cells> Runtime<C> {
     }
 }
 
+#[path = "runtime_cycle.rs"]
+mod cycle_impl;
+use cycle_impl::{Attempt, GroupEnd, PopEnd};
+
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_race_tests.rs"]
 mod race_tests;
@@ -2861,6 +3212,10 @@ mod walk_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_cycle_walk_tests.rs"]
 mod cycle_walk_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_cycle_tests.rs"]
+mod cycle_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]
@@ -3775,7 +4130,7 @@ mod tests {
         let parent = rt.create_query(move |rt| rt.get(child) * 2);
 
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(parent))).is_err());
-        assert!(!rt.dep_stack.current_frame_active());
+        assert!(!rt.dep_stack.current_frame_active(rt.runtime_id));
 
         rt.set(input, 5);
         assert_eq!(rt.get(parent), 12);

@@ -29,8 +29,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct RuntimeId(u64);
 
 impl RuntimeId {
-    #[allow(dead_code)]
     pub(crate) const SENTINEL: RuntimeId = RuntimeId(0);
+
+    #[cfg(test)]
+    pub(crate) fn for_test(n: u64) -> Self {
+        Self(n)
+    }
 
     /// Allocate a fresh runtime id. Called once per `Runtime::new`.
     pub(crate) fn allocate() -> Self {
