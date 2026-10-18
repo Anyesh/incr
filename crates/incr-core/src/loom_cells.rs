@@ -18,6 +18,7 @@ use crate::dep_stack::LoomDepStack;
 use crate::locks::Lock;
 use crate::node::{DepList, DepListCell};
 use crate::value::Value;
+use crate::value_code;
 use crate::value_slot::{Compared, ValueSlot};
 use crate::walk_ring::WalkRing;
 use loom::sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -119,12 +120,12 @@ impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
     fn eq_current(&self, v: &T) -> bool {
         self.read_guard().as_ref() == Some(v)
     }
-    fn write_if_changed(&self, v: T, wrote: &std::cell::Cell<u8>) -> Compared<T, T> {
+    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, T> {
         let mut slot = self.write_guard();
-        if slot.as_ref() == Some(&v) {
+        if value_code::run(|| slot.as_ref() == Some(&v)) {
             return Compared::Equal(v);
         }
-        wrote.set(1);
+        on_write();
         Compared::Replaced(slot.replace(v))
     }
     fn clear(&self) -> Option<T> {

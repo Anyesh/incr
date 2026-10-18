@@ -121,15 +121,28 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         self.inner.read().slots[slot as usize].eq_current(v)
     }
 
-    /// Write `value` unless the slot already holds an equal value.
-    /// Returns true iff the value changed. One slot session for the
-    /// recompute hot path's compare+publish. The displaced value, or the
-    /// rejected equal one, is dropped here after the lock is released:
-    /// this is the compute wrapper's write, which drops before its
-    /// landing by design, with `wrote` set so the landing stamps it.
+    /// Write `value` unless the slot already holds an equal value, in
+    /// one slot session; `on_write` runs between the comparison and the
+    /// store (see [`ValueSlot::write_if_changed`]). The displaced value,
+    /// or the rejected equal one, is handed back after the arena lock is
+    /// released, for the caller to drop where its protocol allows.
+    #[must_use]
+    pub fn compare_and_write(
+        &self,
+        slot: u32,
+        value: T,
+        on_write: impl FnOnce(),
+    ) -> Compared<T, Displaced<T, C>> {
+        self.inner.read().slots[slot as usize].write_if_changed(value, on_write)
+    }
+
+    /// [`Self::compare_and_write`] for the recompute hot path. Returns
+    /// true iff the value changed. The displaced value, or the rejected
+    /// equal one, is dropped here: this is the compute wrapper's write,
+    /// which drops before its landing by design, with `wrote` set so the
+    /// landing stamps it.
     pub fn write_if_changed(&self, slot: u32, value: T, wrote: &Cell<u8>) -> bool {
-        let compared = self.inner.read().slots[slot as usize].write_if_changed(value, wrote);
-        match compared {
+        match self.compare_and_write(slot, value, || wrote.set(1)) {
             Compared::Equal(rejected) => {
                 drop(rejected);
                 false

@@ -30,7 +30,7 @@
 //! that itself reads from the runtime) pop a second pointer from the
 //! pool, so re-entrancy cannot alias a hazard slot.
 
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::cell::{RefCell, UnsafeCell};
 
 use haphazard::{AtomicPtr as HzAtomicPtr, Global, HazardPointer, Replaced};
 
@@ -65,12 +65,13 @@ pub trait ValueSlot<T: Value>: 'static {
 
     /// Write `v` unless the current value already equals it. One slot
     /// session instead of an eq_current + write pair, which matters
-    /// under Shared where each session costs a hazard acquire. `wrote`
-    /// is set to 1 after the comparison and immediately before the
-    /// store, so a caller that sees it set knows the slot holds `v`
-    /// whatever the displaced value's `Drop` does afterwards.
+    /// under Shared where each session costs a hazard acquire.
+    /// `on_write` runs after the comparison and immediately before the
+    /// store, and not at all when the values are equal or the comparison
+    /// panics, so whatever it records is true exactly when the slot holds
+    /// `v`, whatever the displaced value's `Drop` does afterwards.
     #[must_use]
-    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> Compared<T, Self::Displaced>;
+    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, Self::Displaced>;
 
     /// Take the held value, returning the slot to the never-written
     /// state. Used when a node is deleted and its arena slot goes on
@@ -149,7 +150,7 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     }
 
     #[inline(always)]
-    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> Compared<T, T> {
+    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, T> {
         // SAFETY: see read(); the comparison reference is dropped
         // before the write below.
         let unchanged = unsafe {
@@ -161,7 +162,7 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
         if unchanged {
             return Compared::Equal(v);
         }
-        wrote.set(1);
+        on_write();
         Compared::Replaced(self.write(v))
     }
 
@@ -240,7 +241,7 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         })
     }
 
-    fn write_if_changed(&self, v: T, wrote: &Cell<u8>) -> Compared<T, RetiredValue<T>> {
+    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, RetiredValue<T>> {
         let unchanged = with_pooled_hazard(|hp| {
             // SAFETY: see read().
             unsafe { self.0.load(hp) }
@@ -250,7 +251,7 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         if unchanged {
             return Compared::Equal(v);
         }
-        wrote.set(1);
+        on_write();
         Compared::Replaced(self.write(v))
     }
 
@@ -354,7 +355,7 @@ mod tests {
         let s: LocalValueSlot<Boom> = ValueSlot::new_with(Boom(1));
         let wrote = std::cell::Cell::new(0_u8);
         ARMED.store(1, SeqCst);
-        let Compared::Replaced(old) = s.write_if_changed(Boom(2), &wrote) else {
+        let Compared::Replaced(old) = s.write_if_changed(Boom(2), || wrote.set(1)) else {
             panic!("a different value must be written");
         };
         assert_eq!(wrote.get(), 1);
@@ -375,7 +376,7 @@ mod tests {
             s.write(Boom(4)).is_none(),
             "a cleared slot displaces nothing"
         );
-        let Compared::Equal(rejected) = s.write_if_changed(Boom(4), &wrote) else {
+        let Compared::Equal(rejected) = s.write_if_changed(Boom(4), || wrote.set(1)) else {
             panic!("an equal value must be rejected");
         };
         assert_eq!(rejected, Boom(4));

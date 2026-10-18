@@ -39,7 +39,7 @@ use crate::state::{self, NodeState};
 use crate::taint_memo;
 use crate::value::Value;
 use crate::value_code;
-use crate::value_slot::Displaced;
+use crate::value_slot::{Compared, Displaced};
 
 /// Compute closure: takes a borrow of the runtime, the node's slot,
 /// whether this is a recompute (true) or first compute (false), and the
@@ -1732,16 +1732,11 @@ impl<C: Cells> Runtime<C> {
             self.stale_handle(handle);
         }
 
-        if value_code::run(|| arena.eq_current(arena_slot, &value)) {
-            let changed_at = node.changed_at();
-            drop(claim);
-            self.wait_walked(changed_at);
-            return None;
-        }
-
         // Publication order is the protocol's backbone:
         // 1. pending marker, so no verifier can stamp past this change
-        //    while the concrete revision is still unknown;
+        //    while the concrete revision is still unknown; it runs
+        //    between the compare and the swap, so an equal value or a
+        //    panicking `PartialEq` marks nothing;
         // 2. value swap, so any thread that later observes the bumped
         //    revision also observes the new value (swap is sequenced
         //    before the AcqRel fetch_add);
@@ -1749,10 +1744,19 @@ impl<C: Cells> Runtime<C> {
         // 4. settle changed_at to the concrete revision;
         // 5. landing, then the dirty walk, whose Release stores publish
         //    all of the above to claimants that Acquire the Dirty state.
-        node.mark_changed_pending();
-        let displaced = arena.write(arena_slot, value);
-        claim.finish_written();
-        displaced
+        match arena.compare_and_write(arena_slot, value, || node.mark_changed_pending()) {
+            Compared::Equal(rejected) => {
+                let changed_at = node.changed_at();
+                drop(claim);
+                self.wait_walked(changed_at);
+                drop(rejected);
+                None
+            }
+            Compared::Replaced(displaced) => {
+                claim.finish_written();
+                displaced
+            }
+        }
     }
 
     /// Spin until revision `rev`'s walk is recorded. Under `Local` the
