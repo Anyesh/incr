@@ -482,3 +482,40 @@ fn loom_clean_get_vs_recycle_new_segment() {
         rt.assert_invariant_i();
     });
 }
+
+/// A set of v races a delete of v and a recycle of its slot by an input
+/// of the same type. The set's claim on v's `verified_at` either lands
+/// before the delete marks v, which then waits for its release, or is
+/// refused and the set unwinds as stale. It never writes into the new
+/// occupant and never leaves it claimed or marked. Targets bug (g).
+#[test]
+fn loom_set_vs_recycle() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let v = rt.create_input(7_u64);
+
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || may_unwind(|| rt.set(v, 8)))
+        };
+        let recycler = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.delete_node(v);
+                rt.create_input(99_u64)
+            })
+        };
+        setter.join().unwrap();
+        let new = recycler.join().unwrap();
+
+        assert_eq!(new.slot(), v.slot(), "the recycle reused v's slot");
+        assert_eq!(
+            rt.get(new),
+            99,
+            "(V) violated: the set wrote into the occupant"
+        );
+        rt.set(new, 100);
+        assert_eq!(rt.get(new), 100);
+        rt.assert_invariant_i();
+    });
+}

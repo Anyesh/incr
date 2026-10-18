@@ -113,6 +113,7 @@ jobs:
           - { model: "loom_models::loom_new_dependent_races_set", bound: 3 }
           - { model: "loom_models::loom_clean_get_vs_recycle", bound: 3 }
           - { model: "loom_models::loom_clean_get_vs_recycle_new_segment", bound: 3 }
+          - { model: "loom_models::loom_set_vs_recycle", bound: 3 }
     env:
       RUSTFLAGS: --cfg loom -D warnings
       LOOM_MAX_PREEMPTIONS: ${{ matrix.bound }}
