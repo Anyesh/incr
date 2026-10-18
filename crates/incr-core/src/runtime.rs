@@ -1699,12 +1699,14 @@ impl<C: Cells> Runtime<C> {
                     "Runtime::set called on a query (compute) node at slot {}; only input nodes can be set",
                     slot,
                 );
+                // Looked up before the claim so that its panic cannot
+                // leave the claim held with no guard to release it.
+                let arena = inner
+                    .arenas
+                    .tagged_arena::<T>(node.type_tag())
+                    .expect("incr-core: arena missing for input handle's type");
                 match node.try_claim_set() {
                     Ok(base) => {
-                        let arena = inner
-                            .arenas
-                            .tagged_arena::<T>(node.type_tag())
-                            .expect("incr-core: arena missing for input handle's type");
                         let arena_slot = node.arena_slot();
                         drop(inner);
                         set_stack::push(self.runtime_id, slot);
