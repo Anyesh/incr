@@ -19,6 +19,7 @@ use std::sync::Once;
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
+use crate::generic_arena::GenericArena;
 use crate::handle::Incr;
 use crate::loom_cells::Loom;
 use crate::runtime::Runtime;
@@ -517,5 +518,51 @@ fn loom_set_vs_recycle() {
         rt.set(new, 100);
         assert_eq!(rt.get(new), 100);
         rt.assert_invariant_i();
+    });
+}
+
+/// A reader of an arena slot it received through a Release store races
+/// the reserves that allocate the next segments and double the segment
+/// directory twice (one-entry directories and four-slot segments under
+/// loom). Whichever directory the reader loads holds the slot's segment,
+/// so the read finds the value. The lock-free arena read behind every
+/// Clean `get` relies on this.
+#[test]
+fn loom_arena_read_during_growth() {
+    use loom::sync::atomic::{AtomicU32, Ordering};
+    run(|| {
+        let arena: Arc<GenericArena<u64, Loom>> = Arc::new(GenericArena::new());
+        for k in 0..4 {
+            arena.reserve_with(k);
+        }
+        let handoff = Arc::new(AtomicU32::new(u32::MAX));
+
+        let writer = {
+            let arena = Arc::clone(&arena);
+            let handoff = Arc::clone(&handoff);
+            thread::spawn(move || {
+                let s = arena.reserve_with(4);
+                handoff.store(s, Ordering::Release);
+                for k in 5..9 {
+                    arena.reserve_with(k);
+                }
+            })
+        };
+        let reader = {
+            let arena = Arc::clone(&arena);
+            let handoff = Arc::clone(&handoff);
+            thread::spawn(move || {
+                let s = handoff.load(Ordering::Acquire);
+                if s != u32::MAX {
+                    assert_eq!(arena.try_read(s), Some(4), "a handed-off slot was missing");
+                }
+                assert_eq!(arena.try_read(0), Some(0));
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+        for k in 0..9 {
+            assert_eq!(arena.read(k), k as u64);
+        }
     });
 }

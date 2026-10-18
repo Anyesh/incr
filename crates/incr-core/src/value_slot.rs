@@ -78,6 +78,13 @@ pub trait ValueSlot<T: Value>: 'static {
     /// the free list.
     #[must_use]
     fn clear(&self) -> Option<Self::Displaced>;
+
+    /// Panic with the contract message if the thread is inside value
+    /// code, where only a strategy whose readers hold a reference into
+    /// the slot needs it. The arena calls it before a reserve, and the
+    /// slot's own writes call it before they write.
+    #[inline(always)]
+    fn refuse_value_code() {}
 }
 
 /// What [`ValueSlot::write_if_changed`] did.
@@ -94,6 +101,20 @@ pub type Displaced<T, C> = <<C as Cells>::ValueSlot<T> as ValueSlot<T>>::Displac
 /// Local strategy: in-place storage.
 pub struct LocalValueSlot<T>(UnsafeCell<Option<T>>);
 
+impl<T: Value> LocalValueSlot<T> {
+    #[inline(always)]
+    fn replace(&self, v: T) -> Option<T> {
+        // SAFETY: see `ValueSlot::read`; the caller refused value code,
+        // so no reference into the cell is outstanding.
+        unsafe { (*self.0.get()).replace(v) }
+    }
+}
+
+// A Local read clones through a reference into the cell with no borrow
+// flag, and the clone is value code that may call into the runtime. So
+// every write, `write_if_changed` and `clear` refuses value code first:
+// otherwise a `Clone` that sets its own node would replace the value it
+// is cloning from.
 impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     type Displaced = T;
 
@@ -111,10 +132,10 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     fn read(&self) -> T {
         // SAFETY: the Local strategy is confined to one thread
         // (Runtime<Local> is !Send + !Sync), so accesses to this cell
-        // are strictly sequential and the reference created here cannot
-        // overlap a write: `read`, `write`, `try_read`, and `eq_current`
-        // each drop their reference before returning, and user code
-        // never receives a reference into the cell.
+        // are strictly sequential. Only shared references into the cell
+        // exist while user code runs (the clone here, a compare), and
+        // every path that writes the cell refuses value code first, so
+        // no write can happen while one of them is live.
         unsafe {
             (*self.0.get())
                 .as_ref()
@@ -131,11 +152,10 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
 
     #[inline(always)]
     fn write(&self, v: T) -> Option<T> {
-        // SAFETY: see read(); single-threaded sequential access, no
-        // outstanding reference into the cell can exist here. The old
-        // value is moved out, so the slot owns `v` whatever its Drop
-        // does later.
-        unsafe { (*self.0.get()).replace(v) }
+        value_code::check();
+        // The old value is moved out, so the slot owns `v` whatever its
+        // Drop does later.
+        self.replace(v)
     }
 
     #[inline(always)]
@@ -151,6 +171,7 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
 
     #[inline(always)]
     fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, T> {
+        value_code::check();
         // SAFETY: see read(); the comparison reference is dropped
         // before the write below.
         let unchanged = unsafe {
@@ -163,13 +184,19 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
             return Compared::Equal(v);
         }
         on_write();
-        Compared::Replaced(self.write(v))
+        Compared::Replaced(self.replace(v))
     }
 
     #[inline(always)]
     fn clear(&self) -> Option<T> {
-        // SAFETY: see write().
+        value_code::check();
+        // SAFETY: see read().
         unsafe { (*self.0.get()).take() }
+    }
+
+    #[inline(always)]
+    fn refuse_value_code() {
+        value_code::check();
     }
 }
 

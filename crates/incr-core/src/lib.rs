@@ -23,6 +23,7 @@ pub mod cells;
 pub mod collection;
 mod deferred;
 pub mod dep_stack;
+mod directory;
 pub mod generic_arena;
 pub mod handle;
 mod hashed_multiset;
