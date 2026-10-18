@@ -212,7 +212,14 @@ impl DepStack for SharedDepStack {
 
     #[inline(always)]
     fn with<R>(&self, f: impl FnOnce(&mut Frames) -> R) -> R {
-        SHARED_FRAMES.with(|s| f(&mut s.borrow_mut()))
+        // Only the address is taken inside `LocalKey::with`, so that call
+        // stays small enough to inline at every site; with `f` inside it,
+        // the compiler leaves it out of line on the `get` path.
+        let frames: *const RefCell<Frames> = SHARED_FRAMES.with(std::ptr::from_ref);
+        // SAFETY: a thread's locals are destroyed only as the thread
+        // exits, never during a call on that thread, and the reference
+        // does not outlive this call.
+        f(&mut unsafe { &*frames }.borrow_mut())
     }
 }
 

@@ -209,12 +209,18 @@ thread_local! {
 /// dropped instead of pooled, which releases its protection; nothing
 /// leaks protection past this call.
 fn with_pooled_hazard<R>(f: impl FnOnce(&mut HazardPointer<'static>) -> R) -> R {
-    let mut hp = HAZARD_POOL
-        .with(|pool| pool.borrow_mut().pop())
-        .unwrap_or_default();
+    // One `LocalKey::with` that only takes the address, so the call
+    // inlines and the pop and push share its liveness check; with the
+    // push inside a second one, the compiler leaves it out of line.
+    let pool: *const RefCell<Vec<HazardPointer<'static>>> = HAZARD_POOL.with(std::ptr::from_ref);
+    // SAFETY: a thread's locals are destroyed only as the thread exits,
+    // never during a call on that thread, and the reference does not
+    // outlive this call.
+    let pool = unsafe { &*pool };
+    let mut hp = pool.borrow_mut().pop().unwrap_or_default();
     let out = f(&mut hp);
     hp.reset_protection();
-    HAZARD_POOL.with(|pool| pool.borrow_mut().push(hp));
+    pool.borrow_mut().push(hp);
     out
 }
 
