@@ -108,6 +108,9 @@ struct EntryState {
     /// with nothing to reset touches only this block, which has no
     /// destructor and so no liveness check.
     outer_set: Cell<bool>,
+    /// The held map has entries: a check of a thread that holds nothing
+    /// reads this block and not the map, whose access tests liveness.
+    held_any: Cell<bool>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -127,6 +130,7 @@ thread_local! {
             wounded: Cell::new(false),
             failures: Cell::new(0),
             outer_set: Cell::new(false),
+            held_any: Cell::new(false),
         }
     };
     static OUTER: RefCell<Outer> = const {
@@ -146,6 +150,7 @@ loom::thread_local! {
         wounded: Cell::new(false),
         failures: Cell::new(0),
         outer_set: Cell::new(false),
+        held_any: Cell::new(false),
     };
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
@@ -155,7 +160,19 @@ loom::thread_local! {
 
 /// Runs `f` on the held map. `f` must not call user code or the engine.
 pub(crate) fn with_held<R>(f: impl FnOnce(&mut HeldMap) -> R) -> R {
-    HELD.with(|h| f(&mut h.borrow_mut()))
+    HELD.with(|h| {
+        let mut h = h.borrow_mut();
+        // Set first, so that a panic inside `f` leaves it set: a stale
+        // true costs a lookup, a stale false would hide a claim.
+        ENTRY.with(|e| e.held_any.set(true));
+        let r = f(&mut h);
+        ENTRY.with(|e| e.held_any.set(!h.is_empty()));
+        r
+    })
+}
+
+fn held_any() -> bool {
+    ENTRY.with(|e| e.held_any.get())
 }
 
 /// Every claim in the held map, of every runtime.
@@ -164,14 +181,14 @@ pub(crate) fn held_keys() -> Vec<(RuntimeId, u32)> {
 }
 
 pub(crate) fn holds(rt: RuntimeId, slot: u32) -> bool {
-    HELD.with(|h| {
-        let h = h.borrow();
-        !h.is_empty() && h.contains_key(&(rt, slot))
-    })
+    held_any() && HELD.with(|h| h.borrow().contains_key(&(rt, slot)))
 }
 
 /// The anchor of `slot`'s held claim, if this thread holds one.
 pub(crate) fn held_anchor(rt: RuntimeId, slot: u32) -> Option<u32> {
+    if !held_any() {
+        return None;
+    }
     HELD.with(|h| h.borrow().get(&(rt, slot)).map(|e| e.anchor))
 }
 
