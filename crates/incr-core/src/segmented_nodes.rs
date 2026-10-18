@@ -203,6 +203,8 @@ impl<C: Cells> Drop for SegmentedNodes<C> {
 
 // SAFETY (Shared only): `NodeData<Shared>` is `Send + Sync` because all
 // its fields are atomic, and the directory's entries are `AtomicPtr`s.
+// The directory is `Send + Sync` whatever it points at, so the assert
+// below must name `NodeData<Shared>` itself.
 // Under Local, `LocalPtrCell` is `!Sync` (via `Cell`), so the resulting
 // `SegmentedNodes<Local>` is also `!Sync`, which is the correct property
 // for the single-threaded variant. We rely on auto-derived Send/Sync
@@ -211,6 +213,7 @@ impl<C: Cells> Drop for SegmentedNodes<C> {
 
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
+    send_sync::<NodeData<crate::cells::Shared>>();
     send_sync::<SegmentedNodes<crate::cells::Shared>>();
 };
 
