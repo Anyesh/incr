@@ -60,6 +60,8 @@ Beyond operators: nodes can be deleted (`delete_node`, with generation-checked h
 
 Dependency cycles are values, not crashes. A query created with `create_query_with_fallback(f, g)` lands `g(&cycle)` when it turns out to sit on a cycle, and one created with a `Fixpoint` strategy iterates the cycle from an initial value until it converges or reaches its iteration limit. A cycle of queries with no strategy lands every member `Cyclic`: `try_get` returns `Err(Cycle)` naming the participants, `get` panics with "dependency cycle", and `cycle_of` reports the group a node landed in. The result is the same whichever member is read first and on whichever thread, with two documented exceptions: entering a cycle with `get` at a query that has no strategy panics during discovery where `try_get` lands the same values as any other entry, and membership can differ when a query's reads depend on the provisional values a cycle passes around. Under `Shared`, two threads whose claims wait on each other no longer hang: the younger one releases its claims and retries, and the older resolves the cycle alone.
 
+A compute that needs a node per key, such as a spreadsheet cell per address, keeps them in a `NodeTable`: `table.get_or_insert_query(&rt, key, f)` returns the key's node, creating it on the first call from inside or outside a compute, and `rt.get` of the handle records the dependency. Lookups are lock-free, and racing first calls create one node.
+
 ## Three crates, one engine
 
 | | `incr-compute` | `incr-concurrent` | `incr-core` |
