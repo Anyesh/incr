@@ -1062,3 +1062,121 @@ fn table_hit_vs_remove_rehash() {
         rt.assert_invariant_i();
     });
 }
+
+/// A strict delete of an owner races a compute of the query it owns:
+/// `claim_set` finds the child `Computing` and rolls back, or claims the
+/// whole set first and the compute finds its node deleted.
+#[test]
+fn tree_claim_vs_compute() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(2_u64);
+        let owner = rt.create_input(0_u64);
+        let child = rt.create_query(move |rt| rt.get(x) * 10);
+        rt.adopt(owner.erase(), child.erase());
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || may_unwind(|| rt.get(child)))
+        };
+        let deleted = rt.try_delete_node(owner);
+        let read = reader.join().unwrap();
+        assert_eq!(deleted, Ok(()));
+        assert!(read.is_none() || read == Some(20));
+        assert!(!rt.is_alive(owner) && !rt.is_alive(child));
+        assert!(rt.is_alive(x));
+        rt.assert_invariant_i();
+    });
+}
+
+/// A strict delete of an owner finds one of its inputs held by a `set`:
+/// every member it took rolls back, and the delete retries once the set
+/// releases, or it claims first and the set finds the input deleted.
+#[test]
+fn tree_claim_rollback_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let owner = rt.create_input(0_u64);
+        let a = rt.create_input(1_u64);
+        let b = rt.create_input(2_u64);
+        rt.adopt(owner.erase(), a.erase());
+        rt.adopt(owner.erase(), b.erase());
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || may_unwind(|| rt.set(b, 5)))
+        };
+        let deleted = rt.try_delete_node(owner);
+        setter.join().unwrap();
+        assert_eq!(deleted, Ok(()));
+        assert!(!rt.is_alive(owner) && !rt.is_alive(a) && !rt.is_alive(b));
+        rt.assert_invariant_i();
+    });
+}
+
+/// A creator's rerun sweeps a child that another thread reads, and that
+/// thread computes the creator too: the child's read returns its value
+/// or panics as stale, the creator's runs reach its index only under its
+/// claim, and the child is gone at the end.
+#[test]
+fn child_sweep_vs_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(true);
+        let creator = rt.create_query(move |rt| {
+            if rt.get(x) {
+                Some(rt.child_input(1_u32, || 10_u64))
+            } else {
+                None
+            }
+        });
+        let child = rt.get(creator).unwrap();
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                let read = may_unwind(|| rt.get(child));
+                let seen = rt.get(creator);
+                (read, seen)
+            })
+        };
+        rt.set(x, false);
+        assert_eq!(rt.get(creator), None);
+        let (read, seen) = reader.join().unwrap();
+        assert!(read.is_none() || read == Some(10));
+        assert!(seen.is_none() || seen == Some(child));
+        assert!(!rt.is_alive(child));
+        rt.assert_invariant_i();
+    });
+}
+
+/// Two threads run the same creator, one after a `set`: the second run
+/// to claim it finds the index the first created and reuses the child,
+/// whose init runs once.
+#[test]
+fn child_create_and_reuse() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(0_u64);
+        let inits = Arc::new(Mutex::new(0_u32));
+        let creator = {
+            let inits = Arc::clone(&inits);
+            rt.create_query(move |rt| {
+                let _ = rt.get(x);
+                let inits = Arc::clone(&inits);
+                rt.child_input("k", move || {
+                    *inits.lock().unwrap() += 1;
+                    7_u64
+                })
+            })
+        };
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(creator))
+        };
+        rt.set(x, 1);
+        let mine = rt.get(creator);
+        let theirs = other.join().unwrap();
+        assert_eq!(mine, theirs);
+        assert_eq!(*inits.lock().unwrap(), 1);
+        assert_eq!(rt.get(mine), 7);
+        rt.assert_invariant_i();
+    });
+}
