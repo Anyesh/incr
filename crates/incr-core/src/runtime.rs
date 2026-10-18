@@ -253,10 +253,8 @@ impl<C: Cells> SetClaim<'_, C> {
     /// The bump, the settle, the release and the walk, none of which
     /// runs user code, so the written value is never left unpublished.
     /// `held` is cleared first so that an unwind out of this never
-    /// releases the claim a second time. The release precedes the walk,
-    /// which takes `inner.read()`, because a delete waiting on the claim
-    /// may hold `inner.read()` too, and a writer queued between them
-    /// would block the walk.
+    /// releases the claim a second time. The release precedes the walk
+    /// so that a delete or set waiting on the claim is not held up by it.
     #[inline(always)]
     fn finish_written(mut self) {
         self.held = false;
