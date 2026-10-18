@@ -35,6 +35,7 @@ use crate::cells::Cells;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum NodeState {
     New = 0,
     Dirty = 1,
@@ -47,6 +48,10 @@ pub enum NodeState {
     /// racing a delete (stale user handles are rejected by the
     /// generation check before any state load).
     Dead = 6,
+    /// A member of a dependency cycle with no strategy: it has no value,
+    /// and a read gets the cycle. Settled like Clean, so the bit pattern
+    /// `(s | 4) == 7` holds for exactly these two.
+    Cyclic = 7,
 }
 
 impl NodeState {
@@ -60,6 +65,7 @@ impl NodeState {
             4 => Self::Failed,
             5 => Self::ComputingDirty,
             6 => Self::Dead,
+            7 => Self::Cyclic,
             other => panic!("invalid NodeState value: {}", other),
         }
     }
@@ -67,6 +73,12 @@ impl NodeState {
     #[inline]
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+
+    /// Clean or Cyclic: a landed state a dependent can verify against.
+    #[inline(always)]
+    pub fn is_settled(self) -> bool {
+        (self as u8 | 4) == 7
     }
 }
 

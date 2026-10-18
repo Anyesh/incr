@@ -394,6 +394,9 @@ struct Walk {
     /// skipped instead of expanded again. `None` below the switch, which
     /// keeps the walk free of set operations for small graphs.
     visited: Option<HashSet<NodeId>>,
+    /// New nodes with installed deps this walk has expanded, created at
+    /// the first one.
+    new_expanded: Option<HashSet<NodeId>>,
 }
 
 impl Walk {
@@ -406,7 +409,17 @@ impl Walk {
             }],
             first_visits: 0,
             visited: None,
+            new_expanded: None,
         }
+    }
+
+    /// Whether this is the walk's first expansion of the New node `id`.
+    #[cold]
+    #[inline(never)]
+    fn first_new_expansion(&mut self, id: NodeId) -> bool {
+        self.new_expanded
+            .get_or_insert_with(HashSet::default)
+            .insert(id)
     }
 
     #[inline(always)]
@@ -472,8 +485,8 @@ impl Walk {
     fn visit_kind(observed: NodeState) -> u32 {
         // A table, so that the expansion of a dep costs one load and no
         // branch or compare.
-        const KIND: [u32; 7] = {
-            let mut kind = [VISIT; 7];
+        const KIND: [u32; 8] = {
+            let mut kind = [VISIT; 8];
             kind[NodeState::Computing as usize] = VISIT_COMPUTING;
             kind[NodeState::ComputingDirty as usize] = VISIT_COMPUTING;
             kind
@@ -1973,6 +1986,7 @@ impl<C: Cells> Runtime<C> {
             }
         }
 
+        let mut expanded_new: Option<HashSet<NodeId>> = None;
         while let Some(id) = queue.pop() {
             let node = self.nodes.get(id.0);
             loop {
@@ -2014,7 +2028,25 @@ impl<C: Cells> Runtime<C> {
                         // dependent can only be reached through it.
                         // Never-run queries have no dependents. The visit
                         // is an RMW for the reason given on the Dirty arm.
+                        // Former cycle members are New with edges on each
+                        // other, so each is expanded once per walk.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
+                            let inner = self.inner.read();
+                            let list = &inner.dependents[id.0 as usize];
+                            if !list.is_empty()
+                                && expanded_new.get_or_insert_with(HashSet::default).insert(id)
+                            {
+                                list.extend_into(&mut queue);
+                            }
+                            break;
+                        }
+                    }
+                    NodeState::Cyclic => {
+                        // The cycle may break with this set, so its members
+                        // go back to New, which recomputes them.
+                        if state::try_transition::<C>(node.state_cell(), cur, NodeState::New)
+                            .is_ok()
+                        {
                             let inner = self.inner.read();
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
@@ -2131,7 +2163,7 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Computing
             };
             match observed {
-                NodeState::Clean => continue,
+                NodeState::Clean | NodeState::Cyclic => continue,
                 NodeState::Computing | NodeState::ComputingDirty => {
                     if !is_root {
                         if let Some(depth) = self.own_claim_depth(cur) {
@@ -2147,6 +2179,16 @@ impl<C: Cells> Runtime<C> {
                     walk.visit(cur);
                 }
                 _ => {
+                    // New nodes can carry installed edges on each other
+                    // after a cycle breaks, so each is expanded at most
+                    // once per walk. A never-run node has no deps and
+                    // never touches the set.
+                    if observed == NodeState::New
+                        && node.dep_count() != 0
+                        && !walk.first_new_expansion(cur)
+                    {
+                        continue;
+                    }
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2154,7 +2196,7 @@ impl<C: Cells> Runtime<C> {
                     node.for_each_dep(|dep| {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
-                        if dep_state != NodeState::Clean {
+                        if !dep_state.is_settled() {
                             walk.expand(dep, dep_state);
                         }
                     });
@@ -2229,7 +2271,7 @@ impl<C: Cells> Runtime<C> {
         loop {
             let observed = state::load::<C>(node.state_cell());
             match observed {
-                NodeState::Clean => return Computed::Done,
+                NodeState::Clean | NodeState::Cyclic => return Computed::Done,
                 NodeState::Computing | NodeState::ComputingDirty => {
                     spins += 1;
                     self.wait_on_claim(id, spins);
@@ -2660,7 +2702,7 @@ impl<C: Cells> Runtime<C> {
     /// first could pair an old stamp with a newer `Clean`.
     fn observed_clean(&self, dep: NodeId, rev: u64) -> bool {
         let node = self.nodes.get(dep.0);
-        node.state() == NodeState::Clean && node.changed_at() <= rev
+        node.state().is_settled() && node.changed_at() <= rev
     }
 
     #[cfg(test)]
@@ -2679,6 +2721,29 @@ impl<C: Cells> Runtime<C> {
 
 #[cfg(test)]
 impl<C: Cells> Runtime<C> {
+    #[cfg(not(loom))]
+    /// Give `member` installed edges to `extra` on top of its own, with
+    /// the reverse edges, as an episode leaves a cycle's members.
+    pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
+        let mut inner = self.inner.write();
+        let id = NodeId(member.slot());
+        let node = self.nodes.get(id.0);
+        let mut deps = Vec::new();
+        node.for_each_dep(|d| deps.push(d));
+        for e in extra {
+            deps.push(NodeId(e.slot()));
+            inner.dependents[e.slot() as usize].push_unique(id);
+        }
+        if let Some(displaced) = node.install_deps(&deps) {
+            drop(displaced);
+        }
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn force_state_for_test<T>(&self, h: Incr<T>, to: NodeState) {
+        state::store::<C>(self.nodes.get(h.slot()).state_cell(), to);
+    }
+
     /// Invariant (I) of the shared-protocol plan, checked at quiescence:
     /// every installed dep S of a `Clean` node X is alive, has X in
     /// `dependents[S]`, and is itself `Clean`. Also checks that no freed
@@ -2702,11 +2767,11 @@ impl<C: Cells> Runtime<C> {
                     "(I) violated: Clean node {x} is missing from dependents[{}]",
                     s.0
                 );
-                assert_eq!(
-                    dep.state(),
-                    NodeState::Clean,
-                    "(I) violated: Clean node {x} has non-Clean dep {}",
-                    s.0
+                assert!(
+                    dep.state().is_settled(),
+                    "(I) violated: Clean node {x} has dep {} {:?}",
+                    s.0,
+                    dep.state()
                 );
             });
         }
@@ -2792,6 +2857,10 @@ mod cascade_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_walk_tests.rs"]
 mod walk_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_cycle_walk_tests.rs"]
+mod cycle_walk_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]
