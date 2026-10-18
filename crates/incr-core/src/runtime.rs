@@ -236,52 +236,45 @@ impl<C: Cells> Drop for WalkDone<'_, C> {
 }
 
 /// `set`'s claim on its input, from the claim CAS to the landing, with
-/// the claim's set-stack entry. On an unwind before the write (a
-/// `PartialEq` panic) it lands the input as it found it; after the write
-/// it finishes the bump, the settle, the landing and the walk, none of
-/// which runs user code, so the written value is never left unpublished.
-/// Either way the entry pops with the landing.
+/// the claim's set-stack entry. Dropped while `held` (an unwind before
+/// the write, a `PartialEq` panic, or an exit that writes nothing), it
+/// lands the input as it found it and pops the entry. The write's exit
+/// is [`Self::finish_written`].
 struct SetClaim<'a, C: Cells> {
     rt: &'a Runtime<C>,
     node: &'a NodeData<C>,
     id: NodeId,
-    phase: SetPhase,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum SetPhase {
-    Claimed,
-    Written,
-    Done,
+    held: bool,
 }
 
 impl<C: Cells> SetClaim<'_, C> {
-    fn finish(&mut self) {
-        match std::mem::replace(&mut self.phase, SetPhase::Done) {
-            SetPhase::Done => {}
-            SetPhase::Claimed => {
-                self.rt.land(self.node, NodeState::Clean, NodeState::Dirty);
-                set_stack::pop(self.rt.runtime_id, self.id.0);
-            }
-            SetPhase::Written => {
-                let rev = self.rt.bump_revision();
-                let walk_done = WalkDone { rt: self.rt, rev };
-                self.rt.park(ParkPoint::SetAfterBump);
-                self.node.settle_changed_at(rev);
-                self.node.max_verified_at(rev);
-                self.rt.land(self.node, NodeState::Clean, NodeState::Clean);
-                set_stack::pop(self.rt.runtime_id, self.id.0);
-                self.rt.mark_dependents_dirty(self.id);
-                self.rt.park(ParkPoint::SetAfterWalk);
-                drop(walk_done);
-            }
-        }
+    /// The bump, the settle, the landing and the walk, none of which
+    /// runs user code, so the written value is never left unpublished.
+    /// `held` is cleared first so that an unwind out of this never lands
+    /// the claim a second time.
+    #[inline(always)]
+    fn finish_written(mut self) {
+        self.held = false;
+        let rev = self.rt.bump_revision();
+        let walk_done = WalkDone { rt: self.rt, rev };
+        self.rt.park(ParkPoint::SetAfterBump);
+        self.node.settle_changed_at(rev);
+        self.node.max_verified_at(rev);
+        self.rt.land(self.node, NodeState::Clean, NodeState::Clean);
+        set_stack::pop(self.rt.runtime_id, self.id.0);
+        self.rt.mark_dependents_dirty(self.id);
+        self.rt.park(ParkPoint::SetAfterWalk);
+        drop(walk_done);
+        std::mem::forget(self);
     }
 }
 
 impl<C: Cells> Drop for SetClaim<'_, C> {
     fn drop(&mut self) {
-        self.finish();
+        if self.held {
+            self.rt.land(self.node, NodeState::Clean, NodeState::Dirty);
+            set_stack::pop(self.rt.runtime_id, self.id.0);
+        }
     }
 }
 
@@ -1727,11 +1720,11 @@ impl<C: Cells> Runtime<C> {
             }
         }
         set_stack::push(self.runtime_id, slot);
-        let mut claim = SetClaim {
+        let claim = SetClaim {
             rt: self,
             node,
             id,
-            phase: SetPhase::Claimed,
+            held: true,
         };
         self.park(ParkPoint::SetAfterClaim(id));
         if node.generation() != handle.generation() {
@@ -1760,8 +1753,7 @@ impl<C: Cells> Runtime<C> {
         //    all of the above to claimants that Acquire the Dirty state.
         node.mark_changed_pending();
         let displaced = arena.write(arena_slot, value);
-        claim.phase = SetPhase::Written;
-        claim.finish();
+        claim.finish_written();
         displaced
     }
 
