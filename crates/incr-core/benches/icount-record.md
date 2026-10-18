@@ -278,3 +278,95 @@ Gates against T0 (T0 **Gate method** and T1 **Gate**):
   in T1's section of the plan, which now carries these measured counts in
   place of its estimates. `get_contended_shared` is within the spread of
   the two T1 runs; readers no longer wait on a set's claim.
+
+## T2
+
+- Engine: `abb7540` (branch `spreadsheet-t2`); later T2 commits change
+  only tests. Machine and toolchain as for T0.
+- T1 is `main` at `7d8faef` run again in the same session. Both columns
+  are the mean of two runs of `icount.sh` at the default N; the two runs
+  of each differ by at most 0.02%, except `delete_owned_tree_*` (0.28%,
+  seeds) and the T1 `get_contended_shared` (4.3%, scheduling; T2's two
+  runs agree to 0.001%).
+- Attribution: Intel PT on line-table builds of both drivers, as for T1,
+  on `get_clean_*`, `chain_*/propagate/10`, `delete_single_*` and
+  `fanout_shared_4`; the other rows are sums of the same units.
+
+| workload | N | T1 | T2 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,849.00 | 4,577.00 | -272.00 | -5.61 | read and step units, set |
+| `chain_local/propagate/10` | 1,000,000 | 10,519.00 | 9,977.00 | -542.00 | -5.15 | read and step units, set |
+| `chain_local/propagate/100` | 100,000 | 96,328.02 | 91,736.01 | -4,592.01 | -4.77 | read and step units, set |
+| `chain_shared/propagate/4` | 1,000,000 | 9,934.44 | 9,668.43 | -266.01 | -2.68 | read and step units, set |
+| `chain_shared/propagate/10` | 1,000,000 | 21,700.35 | 21,182.30 | -518.05 | -2.39 | read and step units, set |
+| `chain_shared/propagate/100` | 100,000 | 199,196.71 | 194,898.41 | -4,298.30 | -2.16 | read and step units, set |
+| `diamond_local` | 1,000,000 | 4,160.00 | 3,881.00 | -279.00 | -6.71 | read and step units, set |
+| `diamond_shared` | 1,000,000 | 8,346.12 | 8,061.10 | -285.02 | -3.41 | read and step units, set |
+| `early_cutoff_local` | 1,000,000 | 2,350.00 | 2,227.00 | -123.00 | -5.23 | read and step units, set |
+| `early_cutoff_shared` | 1,000,000 | 3,743.98 | 3,607.99 | -135.99 | -3.63 | read and step units, set |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,645.88 | 4,474.50 | -171.38 | -3.69 | read and step units, set |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,508.07 | 7,319.07 | -189.00 | -2.52 | read and step units, set |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.31 | 92,283.06 | -0.25 | -0.00 | none |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,638.95 | 4,468.35 | -170.61 | -3.68 | read and step units, set |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,484.38 | 7,296.00 | -188.37 | -2.52 | read and step units, set |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,885.93 | 158,883.05 | -2.89 | -0.00 | none |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,646.66 | 4,475.51 | -171.15 | -3.68 | read and step units, set |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,488.56 | 7,299.48 | -189.08 | -2.52 | read and step units, set |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,573.37 | 1,490,572.54 | -0.83 | -0.00 | none |
+| `simple_count/local/1000` | 100,000 | 2,190.80 | 2,055.54 | -135.26 | -6.17 | read and step units, set |
+| `simple_count/shared/1000` | 100,000 | 4,282.83 | 4,138.08 | -144.76 | -3.38 | read and step units, set |
+| `simple_count/local/10000` | 100,000 | 2,187.18 | 2,052.27 | -134.91 | -6.17 | read and step units, set |
+| `simple_count/shared/10000` | 100,000 | 4,264.53 | 4,119.24 | -145.29 | -3.41 | read and step units, set |
+| `get_clean_local` | 10,000,000 | 178.00 | 125.00 | -53.00 | -29.78 | read unit -53 |
+| `get_clean_shared` | 10,000,000 | 302.00 | 245.00 | -57.00 | -18.87 | read unit -57 |
+| `get_contended_shared` | 2,000 | 13,172,516.03 | 9,753,051.50 | -3,419,464.53 | -25.96 | read unit; T1 runs spread 4.3% (scheduling) |
+| `fanout_local_4` | 100,000 | 19,424.00 | 17,964.00 | -1,460.00 | -7.52 | create, read and step units, delete |
+| `fanout_local_5` | 100,000 | 24,072.58 | 22,187.44 | -1,885.14 | -7.83 | create, read and step units, delete |
+| `fanout_local_1000` | 1,000 | 7,574,040.92 | 7,305,714.19 | -268,326.73 | -3.54 | create, read and step units, delete |
+| `fanout_shared_4` | 100,000 | 26,386.38 | 24,636.07 | -1,750.31 | -6.63 | create, read and step units, delete |
+| `fanout_shared_5` | 100,000 | 31,865.12 | 29,790.06 | -2,075.07 | -6.51 | create, read and step units, delete |
+| `fanout_shared_1000` | 1,000 | 9,082,157.38 | 8,759,125.55 | -323,031.83 | -3.56 | create, read and step units, delete |
+| `delete_single_local` | 200,000 | 1,335.00 | 1,160.00 | -175.00 | -13.11 | create, delete |
+| `delete_single_shared` | 200,000 | 2,140.24 | 1,954.24 | -186.00 | -8.69 | create, delete |
+| `delete_cascade_local` | 1,000 | 3,477,099.22 | 3,206,925.54 | -270,173.68 | -7.77 | create, read and step units, delete |
+| `delete_cascade_shared` | 1,000 | 4,640,476.78 | 4,315,275.24 | -325,201.53 | -7.01 | create, read and step units, delete |
+| `delete_owned_tree_local` | 10,000 | 641,506.11 | 618,633.56 | -22,872.55 | -3.57 | create, set, delete; seeds |
+| `delete_owned_tree_shared` | 10,000 | 1,028,126.38 | 1,001,632.51 | -26,493.86 | -2.58 | create, set, delete; seeds |
+
+Measured units, Local / Shared, against T1:
+
+- **read**, per Clean `get` (a top-level read, a dep read inside a
+  compute, or `set`'s arena lookup): the registry lookup, out of line in
+  T1 with an `inner` borrow or read lock and an `Arc` clone and drop, -35
+  / -35; the vtable downcast, now a `TypeId` compare, -7 / -7; `get`
+  itself -10 / -6. Under Shared the arena read lock goes too (-29), and
+  the slot read's hazard-pool access stopped inlining into it and runs in
+  `LocalKey::with` (+20 net). `get_clean_*`: -53 / -57.
+- **step**, per compute: Local, the write without the arena borrow -4,
+  and `clean_walk` +11, one instruction on each of about ten lines of the
+  walk (register allocation; no T2 code runs there). Shared, the read and
+  write sessions with no arena lock -7 net of the hazard pool moving out
+  of line, the compute closure +5, `clean_walk` +6.
+- **set**: its arena lookup is now inline, +10 / +18 in `set`, against
+  the read unit's -42 it no longer pays out of line.
+- **create**, per node: the `TypeId`-to-tag map hashed with SipHash in
+  T1 (`hash_one` and `DefaultHasher::write`, 142 per create); it now uses
+  the `TypeId`'s own bits. With the registry's `Arc` clone and downcast
+  gone and the lookup inlined into `create_input` (+42 / +45) and
+  `reserve_with` (+12 / +4), a `create_input` is -172 / -177. A
+  `create_query` takes the arena's `Arc` for its closure
+  (`ensure_tagged_shared`, 71 per query), so it saves less.
+- **delete**, per node: the bag borrows the arena instead of cloning its
+  `Arc` (-8 / -11 in `delete_strict`, -16 per node in `delete_erased`
+  under Shared, -5 / -5 in the drain), and the release looks the slot up
+  before it takes the arena lock (+10 / +7).
+- **value-code arm**: `get_slow`'s value-code test replaces the
+  `checked_word` test it had, and the arm is out of line; no workload
+  takes it.
+
+Gates against T1 and T0 (plan T2 **Gate**):
+
+- Clean `get`: 125 / 245 against T0's 198 / 309. Holds.
+- Every other workload is below T1; the `delete_*` benches needed none of
+  the allowance for the Local `reserve` and `clear` checks, which the
+  create unit absorbs. `get_contended_shared` is 26% below T1. Holds.
