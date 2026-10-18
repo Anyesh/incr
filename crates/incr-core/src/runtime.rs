@@ -372,14 +372,12 @@ struct Walk {
 }
 
 impl Walk {
-    /// `pending` starts the walk at the root's compute, skipping its
-    /// expansion.
     #[inline]
-    fn new(root: NodeId, pending: bool) -> Self {
+    fn new(root: NodeId) -> Self {
         Self {
             work: vec![Entry {
                 id: root,
-                taint: if pending { NO_TAINT } else { VISIT },
+                taint: VISIT,
             }],
             first_visits: 0,
             visited: None,
@@ -1924,24 +1922,20 @@ impl<C: Cells> Runtime<C> {
     /// `word` from `value_code::checked_word` and found `id` not Clean.
     /// A root that went Clean since is left at its first pop.
     fn clean_walk(&self, id: NodeId, gen: u32, word: u64) -> Computed {
-        // A memoized root is computed directly, as the walk's only
-        // entry, so `compute_one` keeps a single call site and inlines.
-        let direct = word != 0 && taint_memo::memoized(word, self.runtime_id, id);
-        let mut walk = Walk::new(id, direct);
+        if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
+            return self.compute_direct(id, gen);
+        }
+        let mut walk = Walk::new(id);
         let mut root = Computed::Done;
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
             if taint != VISIT {
-                let visit = if direct {
-                    Visit::Direct
+                self.park(ParkPoint::BeforeComputeOne(cur));
+                let visit = if is_root || taint == NO_TAINT {
+                    Visit::Full
                 } else {
-                    self.park(ParkPoint::BeforeComputeOne(cur));
-                    if is_root || taint == NO_TAINT {
-                        Visit::Full
-                    } else {
-                        Visit::VerifyOnly(taint)
-                    }
+                    Visit::VerifyOnly(taint)
                 };
                 let computed = self.compute_one(cur, visit, is_root.then_some(gen));
                 if is_root {
@@ -1993,6 +1987,15 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// A root the taint memo holds, computed without a walk. Out of line
+    /// so that the walk's own inlined `compute_one` never tests for
+    /// `Visit::Direct`.
+    #[cold]
+    #[inline(never)]
+    fn compute_direct(&self, id: NodeId, gen: u32) -> Computed {
+        self.compute_one(id, Visit::Direct, Some(gen))
     }
 
     /// Compute (or verify) a single node, assuming all its known deps
