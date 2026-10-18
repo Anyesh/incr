@@ -204,6 +204,21 @@ pub(crate) fn take_unwind_kind() -> Option<UnwindKind> {
     kind
 }
 
+/// For a binding whose boundary catches every unwind, such as one that
+/// runs a closure in another language: whether `payload` is an engine
+/// unwind in flight, which the boundary must carry through the other
+/// language and resume unchanged. `Some(Some(cycle))` for a cycle a
+/// `get` raised, `Some(None)` for a wound, `None` for anything else.
+#[doc(hidden)]
+pub fn engine_unwind(payload: &(dyn std::any::Any + Send)) -> Option<Option<Cycle>> {
+    match unwind_kind()? {
+        UnwindKind::Cycle => payload
+            .downcast_ref::<crate::cycle::CycleUnwind>()
+            .map(|u| Some(u.0.clone())),
+        UnwindKind::Wound => Some(None),
+    }
+}
+
 /// Clears the last reported cycle and returns it.
 pub fn take_last_cycle() -> Option<Cycle> {
     OUTER.with(|o| o.borrow_mut().last_cycle.take())

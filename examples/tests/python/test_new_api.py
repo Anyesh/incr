@@ -197,3 +197,49 @@ def test_node_ids_compare_by_node(make_rt):
     assert a == a and a != b
     assert a != 1
     assert len({a, b, a}) == 2
+
+
+@BOTH_RUNTIMES
+def test_cycle_raises_cycle_error_with_participants(make_rt):
+    rt = make_rt()
+    module = incr if make_rt is incr.Runtime else incr_concurrent
+    holder = {}
+    q = rt.create_query(lambda r: r.get(holder["q"]) + 1)
+    holder["q"] = q
+    with pytest.raises(module.CycleError) as raised:
+        rt.get(q)
+    assert isinstance(raised.value, RuntimeError)
+    message, ids = raised.value.args
+    assert "dependency cycle" in message
+    assert ids == [q.id]
+
+    # A later, unrelated error is not labelled with the old cycle.
+    a = rt.create_input(0)
+    bad = rt.create_query(lambda r: 10 // r.get(a))
+    with pytest.raises(ZeroDivisionError):
+        rt.get(bad)
+
+
+@BOTH_RUNTIMES
+def test_cycle_error_caught_in_a_query_is_an_ordinary_result(make_rt):
+    rt = make_rt()
+    module = incr if make_rt is incr.Runtime else incr_concurrent
+    holder = {}
+
+    def reads_itself(r):
+        try:
+            return r.get(holder["q"]) + 1
+        except module.CycleError:
+            return -1
+
+    q = rt.create_query(reads_itself)
+    holder["q"] = q
+    # Caught, the read is what `try_get` returns in Rust: `q` still reads
+    # itself, so it lands Cyclic, and a top-level read raises.
+    with pytest.raises(module.CycleError):
+        rt.get(q)
+
+    a = rt.create_input(0)
+    bad = rt.create_query(lambda r: 10 // r.get(a))
+    with pytest.raises(ZeroDivisionError):
+        rt.get(bad)

@@ -38,8 +38,19 @@ use incr_compute::{
     TraceAction,
 };
 
+pyo3::create_exception!(
+    incr,
+    CycleError,
+    pyo3::exceptions::PyRuntimeError,
+    "A read closed a dependency cycle that has no value: `args` is the message and the participants' node ids."
+);
+
 thread_local! {
     static PENDING_PYERR: RefCell<Option<PyErr>> = const { RefCell::new(None) };
+    /// An engine unwind a nested boundary caught, carried through the
+    /// Python frames between it and the engine as an exception and
+    /// resumed unchanged where that exception reaches the engine again.
+    static ENGINE_UNWIND: RefCell<Option<Box<dyn std::any::Any + Send>>> = const { RefCell::new(None) };
 }
 
 /// Invoke a Python callable from inside an engine closure. A raised
@@ -60,6 +71,15 @@ fn call_stashing<'py>(
 /// engine as any user panic does, so it is never read as "not equal".
 fn or_stash<T>(r: PyResult<T>) -> T {
     r.unwrap_or_else(|e| {
+        if let Some(payload) = ENGINE_UNWIND.with(|u| u.borrow_mut().take()) {
+            // Only while the engine still has that unwind in flight: a
+            // Python `except` that swallowed it and returned let the
+            // engine end it.
+            if incr_compute::engine_unwind(&*payload).is_some() {
+                drop(e);
+                std::panic::resume_unwind(payload);
+            }
+        }
         let msg = e.to_string();
         PENDING_PYERR.with(|c| *c.borrow_mut() = Some(e));
         panic!("incr: python code raised: {}", msg);
@@ -70,11 +90,39 @@ fn or_stash<T>(r: PyResult<T>) -> T {
 /// stashed Python exception is re-raised as itself; other engine panics
 /// become RuntimeError with the engine's message.
 fn pyerr_boundary<R>(f: impl FnOnce() -> R) -> PyResult<R> {
+    incr_compute::take_last_cycle();
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(v) => Ok(v),
         Err(payload) => {
+            if let Some(cycle) = incr_compute::engine_unwind(&*payload) {
+                let err = match &cycle {
+                    Some(cycle) => CycleError::new_err((
+                        format!("dependency cycle: {cycle}"),
+                        cycle
+                            .participants()
+                            .iter()
+                            .map(|p| p.slot())
+                            .collect::<Vec<u32>>(),
+                    )),
+                    None => {
+                        pyo3::exceptions::PyRuntimeError::new_err("incr: engine retry in flight")
+                    }
+                };
+                ENGINE_UNWIND.with(|u| *u.borrow_mut() = Some(payload));
+                return Err(err);
+            }
+            // Taken on every error, so a cycle panic that Rust code caught
+            // never labels a later error.
+            let cycle = incr_compute::take_last_cycle();
             if let Some(e) = PENDING_PYERR.with(|c| c.borrow_mut().take()) {
                 return Err(e);
+            }
+            if let Some(cycle) = cycle {
+                let ids: Vec<u32> = cycle.participants().iter().map(|p| p.slot()).collect();
+                return Err(CycleError::new_err((
+                    format!("dependency cycle: {cycle}"),
+                    ids,
+                )));
             }
             let msg = if let Some(s) = payload.downcast_ref::<String>() {
                 s.clone()
@@ -207,7 +255,9 @@ impl PyRuntimeRef {
         // the Runtime is borrowed by the runtime's own closure dispatch,
         // so the lifetime is guaranteed to outlive the callback.
         let rt = unsafe { &*self.ptr };
-        let val: PyValue = rt.get(node.inner);
+        // A boundary here too, so an engine unwind crosses the calling
+        // Python frames as an exception instead of a foreign panic.
+        let val: PyValue = pyerr_boundary(|| rt.get(node.inner))?;
         Ok(val.0)
     }
 }
@@ -710,6 +760,7 @@ impl PyRuntime {
 
 #[pymodule]
 fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("CycleError", m.py().get_type::<CycleError>())?;
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyNodeId>()?;
     m.add_class::<PyObserverId>()?;

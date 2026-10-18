@@ -27,7 +27,7 @@
 use incr_core::Local;
 
 #[doc(hidden)]
-pub use incr_core::with_value_code;
+pub use incr_core::{engine_unwind, take_last_cycle, with_value_code};
 pub use incr_core::{
     Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint,
     GroupedCollection as GroupedCollectionInner, Incr, IncrCollection as IncrCollectionInner,
@@ -55,15 +55,16 @@ mod reexports {
     #[test]
     fn every_incr_core_item_is_reexported() {
         use crate::{
-            with_value_code, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint,
-            GroupedCollection, GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner,
-            NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace, ObserverId, PropagationTrace,
-            QueryOpts, Runtime, RuntimeId, SortDelta, SortedCollection, SortedCollectionInner,
-            TraceAction, Value,
+            engine_unwind, take_last_cycle, with_value_code, Cycle, CycleStrategy, DeleteError,
+            Delta, ErasedIncr, Fixpoint, GroupedCollection, GroupedCollectionInner, Incr,
+            IncrCollection, IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
+            NodeTrace, ObserverId, PropagationTrace, QueryOpts, Runtime, RuntimeId, SortDelta,
+            SortedCollection, SortedCollectionInner, TraceAction, Value,
         };
 
         fn named<T: ?Sized>() {}
         fn value<T: Value>() {}
+        let _ = (engine_unwind, take_last_cycle);
         named::<Cycle>();
         named::<CycleStrategy<u32>>();
         named::<Fixpoint<u32>>();

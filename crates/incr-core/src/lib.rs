@@ -58,7 +58,7 @@ pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use collection::{CollectionLog, Delta, GroupedCollection, IncrCollection};
 pub use cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
 #[doc(hidden)]
-pub use cycle_state::take_last_cycle;
+pub use cycle_state::{engine_unwind, take_last_cycle};
 pub use dep_stack::{DepStack, LocalDepStack, SharedDepStack};
 pub use generic_arena::GenericArena;
 pub use handle::{ErasedIncr, Incr, RuntimeId};
