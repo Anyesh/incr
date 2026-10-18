@@ -793,7 +793,37 @@ fn g1_group_verify_falls_back_from_x<C: Cells>() {
     g1_group_verify_falls_back::<C>(true);
 }
 
+/// R reads P with `try_get` and P reads R with `get`. In the episode's
+/// iteration R's `try_get(P)` runs P for its value (R5), and P's `get(R)`
+/// meets R on the stack (R3) and unwinds P's run. That unwind is R's
+/// `try_get`'s `Err`, as a nested compute's would be, so every run of R
+/// returns from its read.
+fn member_run_unwind_is_the_readers_err<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let pc = cell::<i64>();
+    let started = Arc::new(AtomicU32::new(0));
+    let returned = Arc::new(AtomicU32::new(0));
+    let r = {
+        let (pc, started, returned) = (pc.clone(), started.clone(), returned.clone());
+        rt.create_query(move |rt| {
+            started.fetch_add(1, Ordering::Relaxed);
+            let v = rt.try_get(*pc.get().unwrap());
+            returned.fetch_add(1, Ordering::Relaxed);
+            v.unwrap_or(-3)
+        })
+    };
+    let p = rt.create_query(move |rt| rt.get(r));
+    pc.set(p).unwrap();
+    assert!(quiet(|| rt.try_get(p)).unwrap().is_err());
+    assert!(started.load(Ordering::Relaxed) >= 2);
+    assert_eq!(
+        started.load(Ordering::Relaxed),
+        returned.load(Ordering::Relaxed)
+    );
+}
+
 both!(
+    member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
     g1_group_verify_falls_back_from_x,
     rule_a_stores_zero_on_a_new_claim_that_wrote_nothing,

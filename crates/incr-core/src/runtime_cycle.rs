@@ -358,7 +358,6 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         kind: ReadKind,
     ) -> Option<Result<T, Cycle>> {
-        let _ = kind;
         let rt = self.runtime_id;
         let slot = handle.slot();
         if observed == NodeState::Cyclic {
@@ -417,11 +416,29 @@ impl<C: Cells> Runtime<C> {
         if !buffered {
             match self.member_run(slot, anchor) {
                 Ok(low) => ctl.lower(low),
-                Err(payload) => resume_unwind(payload),
+                Err(payload) => {
+                    ctl.lower(anchor);
+                    return Some(Err(self.member_run_unwound(kind, payload)));
+                }
             }
         }
         ctl.lower(anchor);
         Some(Ok(self.held_value::<T>(slot, false)))
+    }
+
+    /// An R5 member run that ended in an unwind: a cycle a `get` in it
+    /// raised is the reading `try_get`'s `Err`, as if the member had been
+    /// read through an engine entry; anything else unwinds on.
+    #[cold]
+    #[inline(never)]
+    fn member_run_unwound(&self, kind: ReadKind, payload: Payload) -> Cycle {
+        if kind == ReadKind::TryGet && cycle_state::unwind_kind() == Some(UnwindKind::Cycle) {
+            if let Some(unwind) = payload.downcast_ref::<CycleUnwind>() {
+                cycle_state::take_unwind_kind();
+                return unwind.0.clone();
+            }
+        }
+        resume_unwind(payload)
     }
 
     /// A clone of a held node's current value (`s`) or buffer.
@@ -492,7 +509,11 @@ impl<C: Cells> Runtime<C> {
                 .expect("incr-core: a member run's node is held");
             e.record_run(deps);
             e.poisoned |= ctl.has(cycle::POISONED);
-            if result.is_err() && cycle_state::failures() == failures {
+            // An engine unwind is no fault of the member's.
+            if result.is_err()
+                && cycle_state::failures() == failures
+                && cycle_state::unwind_kind().is_none()
+            {
                 cycle_state::mark_failed(e);
             }
             std::mem::replace(&mut e.buf, ctl.buf.take())
