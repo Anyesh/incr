@@ -335,18 +335,24 @@ enum Computed {
 /// `Entry::taint` of a visit entry.
 const VISIT: u32 = u32::MAX;
 
-/// `Entry::taint` of a pending entry no skipped dep has reached.
-const NO_TAINT: u32 = u32::MAX - 1;
+/// `Entry::taint` of a visit entry whose node was last loaded Computing,
+/// so the visit takes it as Computing without loading it again. A stale
+/// hint costs one backoff, after which the state is always reloaded;
+/// every load skipped is a branch point fewer in the loom models.
+const VISIT_COMPUTING: u32 = u32::MAX - 1;
 
-/// One entry of `ensure_clean`'s walk. A visit (`taint == VISIT`)
+/// `Entry::taint` of a pending entry no skipped dep has reached.
+const NO_TAINT: u32 = u32::MAX - 2;
+
+/// One entry of `ensure_clean`'s walk. A visit (`taint >= VISIT_COMPUTING`)
 /// expands `x`'s non-Clean deps; the pending entry is pushed on the first
 /// visit and runs `x`'s compute once they are done.
 #[derive(Copy, Clone)]
 struct Entry {
     id: NodeId,
-    /// `VISIT`, or on a pending entry the lowest frame depth among the
-    /// Computing deps this thread holds that were skipped under it, or
-    /// `NO_TAINT`. A tainted node is reachable only through edges that
+    /// `VISIT` or `VISIT_COMPUTING`, or on a pending entry the lowest
+    /// frame depth among the Computing deps this thread holds that were
+    /// skipped under it, or `NO_TAINT`. A tainted node is reachable only through edges that
     /// may be stale, so the walk must not run its closure: the parent's
     /// closure decides whether it is still read. The kind shares the
     /// field so that an entry stays 8 bytes.
@@ -356,7 +362,7 @@ struct Entry {
 impl Entry {
     #[inline(always)]
     fn is_pending(self) -> bool {
-        self.taint != VISIT
+        self.taint < VISIT_COMPUTING
     }
 }
 
@@ -373,11 +379,11 @@ struct Walk {
 
 impl Walk {
     #[inline]
-    fn new(root: NodeId) -> Self {
+    fn new(root: NodeId, root_state: NodeState) -> Self {
         Self {
             work: vec![Entry {
                 id: root,
-                taint: VISIT,
+                taint: Self::visit_kind(root_state),
             }],
             first_visits: 0,
             visited: None,
@@ -436,11 +442,24 @@ impl Walk {
     }
 
     #[inline]
-    fn expand(&mut self, dep: NodeId) {
+    fn expand(&mut self, dep: NodeId, dep_state: NodeState) {
         self.push(Entry {
             id: dep,
-            taint: VISIT,
+            taint: Self::visit_kind(dep_state),
         });
+    }
+
+    #[inline(always)]
+    fn visit_kind(observed: NodeState) -> u32 {
+        // A table, so that the expansion of a dep costs one load and no
+        // branch or compare.
+        const KIND: [u32; 7] = {
+            let mut kind = [VISIT; 7];
+            kind[NodeState::Computing as usize] = VISIT_COMPUTING;
+            kind[NodeState::ComputingDirty as usize] = VISIT_COMPUTING;
+            kind
+        };
+        KIND[observed as usize]
     }
 
     #[inline]
@@ -465,6 +484,11 @@ impl Walk {
             parent.taint = parent.taint.min(owner);
         }
     }
+}
+
+#[inline(always)]
+fn is_computing(state: NodeState) -> bool {
+    matches!(state, NodeState::Computing | NodeState::ComputingDirty)
 }
 
 /// The runtime.
@@ -1404,7 +1428,8 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(slot);
         self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
 
-        if state::load::<C>(node.state_cell()) == NodeState::Clean {
+        let observed = state::load::<C>(node.state_cell());
+        if observed == NodeState::Clean {
             // Until the Clean read stops taking locks, value code is
             // refused here too, where `get_slow` refuses it through
             // `ensure_clean`.
@@ -1423,12 +1448,13 @@ impl<C: Cells> Runtime<C> {
             self.dep_stack.record_dep(NodeId(slot), handle.generation());
             return self.read_slot(handle, node, type_tag, arena_slot);
         }
-        self.get_slow(handle)
+        self.get_slow(handle, observed)
     }
 
-    /// The non-Clean arm of [`Self::get`]: walk, then read.
+    /// The non-Clean arm of [`Self::get`]: walk, then read. `observed`
+    /// is the state `get` loaded.
     #[inline(never)]
-    fn get_slow<T: Value>(&self, handle: Incr<T>) -> T {
+    fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         if node.generation() != handle.generation() {
@@ -1438,7 +1464,7 @@ impl<C: Cells> Runtime<C> {
 
         // `get` found the node not Clean, so the walk starts at once.
         let word = value_code::checked_word();
-        if self.clean_walk(NodeId(slot), handle.generation(), word) == Computed::Gone {
+        if self.clean_walk(NodeId(slot), handle.generation(), word, observed) == Computed::Gone {
             self.stale_handle(handle);
         }
 
@@ -1770,6 +1796,28 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// One backoff on `id`, found `Computing` by a reader. Another thread
+    /// owns the compute, or a set holds the input. Bounded spin first
+    /// (computes are usually short), then yield. Local never waits here:
+    /// single-threaded Computing is a cycle, this thread's own set, or a
+    /// broken invariant.
+    ///
+    /// Known limitation: a cyclic graph whose cycle spans two threads'
+    /// in-flight computes spins forever instead of panicking; cross-thread
+    /// cycle detection needs a waits-for graph and is not implemented.
+    #[inline]
+    fn wait_on_claim(&self, id: NodeId, spins: u32) {
+        if self.dep_stack.is_computing(id) {
+            panic!(
+                "incr-core: dependency cycle detected: node {} was read while \
+                 its own compute was in progress",
+                id.0,
+            );
+        }
+        self.refuse_wait_on_own_claim(id);
+        C::backoff(spins);
+    }
+
     /// Before waiting on `id`'s `Computing` holder: a claim this thread
     /// holds through its set stack is never released by waiting, and
     /// under `Local` no other thread exists to release any claim, so a
@@ -1916,25 +1964,34 @@ impl<C: Cells> Runtime<C> {
         let word = value_code::checked_word();
 
         // Fast path: already clean.
-        if state::load::<C>(self.nodes.get(id.0).state_cell()) == NodeState::Clean {
+        let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
+        if observed == NodeState::Clean {
             return Computed::Done;
         }
-        self.clean_walk(id, gen, word)
+        self.clean_walk(id, gen, word, observed)
     }
 
     /// [`Self::ensure_clean`] past its fast path, for a caller that took
-    /// `word` from `value_code::checked_word` and found `id` not Clean.
-    /// A root that went Clean since is left at its first pop.
-    fn clean_walk(&self, id: NodeId, gen: u32, word: u64) -> Computed {
+    /// `word` from `value_code::checked_word` and loaded `id` as
+    /// `observed`, not Clean. A root that went Clean since is left at its
+    /// first pop, or after one backoff if it was loaded Computing.
+    ///
+    /// A node found Computing is waited on here once before its pending
+    /// entry's compute loads it again, so that no Computing state is
+    /// loaded twice before the first backoff.
+    fn clean_walk(&self, id: NodeId, gen: u32, word: u64, observed: NodeState) -> Computed {
         if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
+            if is_computing(observed) {
+                self.wait_on_claim(id, 1);
+            }
             return self.compute_direct(id, gen);
         }
-        let mut walk = Walk::new(id);
+        let mut walk = Walk::new(id, observed);
         let mut root = Computed::Done;
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
-            if taint != VISIT {
+            if taint < VISIT_COMPUTING {
                 self.park(ParkPoint::BeforeComputeOne(cur));
                 let visit = if is_root || taint == NO_TAINT {
                     Visit::Full
@@ -1954,7 +2011,12 @@ impl<C: Cells> Runtime<C> {
             }
 
             let node = self.nodes.get(cur.0);
-            match state::load::<C>(node.state_cell()) {
+            let observed = if taint == VISIT {
+                state::load::<C>(node.state_cell())
+            } else {
+                NodeState::Computing
+            };
+            match observed {
                 NodeState::Clean => continue,
                 NodeState::Computing | NodeState::ComputingDirty => {
                     if !is_root {
@@ -1966,7 +2028,8 @@ impl<C: Cells> Runtime<C> {
                     // Another thread owns this subtree and is cleaning
                     // its deps itself; expanding them here would tear
                     // through a dep list mid-rewrite. Just wait for the
-                    // owner in compute_one.
+                    // owner, here once and then in compute_one.
+                    self.wait_on_claim(cur, 1);
                     walk.visit(cur);
                 }
                 _ => {
@@ -1978,7 +2041,7 @@ impl<C: Cells> Runtime<C> {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
                         if dep_state != NodeState::Clean {
-                            walk.expand(dep);
+                            walk.expand(dep, dep_state);
                         }
                     });
                 }
@@ -2054,26 +2117,8 @@ impl<C: Cells> Runtime<C> {
             match observed {
                 NodeState::Clean => return Computed::Done,
                 NodeState::Computing | NodeState::ComputingDirty => {
-                    if self.dep_stack.is_computing(id) {
-                        panic!(
-                            "incr-core: dependency cycle detected: node {} was read while \
-                             its own compute was in progress",
-                            id.0,
-                        );
-                    }
-                    // Another thread owns the compute, or a set holds the
-                    // input; wait for it. Bounded spin first (computes
-                    // are usually short), then yield. Local never waits
-                    // here: single-threaded Computing is a cycle, this
-                    // thread's own set, or a broken invariant.
-                    //
-                    // Known limitation: a cyclic graph whose cycle spans
-                    // two threads' in-flight computes spins here forever
-                    // instead of panicking; cross-thread cycle detection
-                    // needs a waits-for graph and is not implemented.
-                    self.refuse_wait_on_own_claim(id);
                     spins += 1;
-                    C::backoff(spins);
+                    self.wait_on_claim(id, spins);
                     continue;
                 }
                 NodeState::Failed => {
