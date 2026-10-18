@@ -370,3 +370,77 @@ Gates against T1 and T0 (plan T2 **Gate**):
 - Every other workload is below T1; the `delete_*` benches needed none of
   the allowance for the Local `reserve` and `clear` checks, which the
   create unit absorbs. `get_contended_shared` is 26% below T1. Holds.
+
+## T3
+
+- Engine: `561774b` (branch `spreadsheet-t3`). Machine and toolchain as
+  for T0.
+- T2 is `main` at `52fc36a` run again in the same session. Both columns
+  are the mean of two runs of `icount.sh` at the default N; the two runs
+  of each agree to 0.001% except the `batch` rows (up to 8 instructions
+  in 1.49M) and `delete_owned_tree_*` (seeds).
+- Attribution: Intel PT on `get_clean_shared` in both drivers; every
+  other row falls, and each node access in it goes through the same
+  indexing.
+
+| workload | N | T2 | T3 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,577.00 | 4,380.00 | -197.00 | -4.30 | node reads |
+| `chain_local/propagate/10` | 1,000,000 | 9,977.00 | 9,504.00 | -473.00 | -4.74 | node reads |
+| `chain_local/propagate/100` | 100,000 | 91,736.01 | 87,123.01 | -4,613.00 | -5.03 | node reads |
+| `chain_shared/propagate/4` | 1,000,000 | 9,668.42 | 9,554.42 | -114.00 | -1.18 | node reads |
+| `chain_shared/propagate/10` | 1,000,000 | 21,182.28 | 20,906.29 | -275.99 | -1.30 | node reads |
+| `chain_shared/propagate/100` | 100,000 | 194,898.10 | 192,192.35 | -2,705.74 | -1.39 | node reads |
+| `diamond_local` | 1,000,000 | 3,881.00 | 3,714.00 | -167.00 | -4.30 | node reads |
+| `diamond_shared` | 1,000,000 | 8,061.09 | 7,965.10 | -95.99 | -1.19 | node reads |
+| `early_cutoff_local` | 1,000,000 | 2,227.00 | 2,139.00 | -88.00 | -3.95 | node reads |
+| `early_cutoff_shared` | 1,000,000 | 3,607.98 | 3,549.98 | -58.00 | -1.61 | node reads |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,475.10 | 4,333.45 | -141.65 | -3.17 | node reads |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,319.41 | 7,234.35 | -85.06 | -1.16 | node reads |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.62 | 92,283.09 | -0.54 | -0.00 | none |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,468.09 | 4,326.25 | -141.84 | -3.17 | node reads |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,295.22 | 7,210.48 | -84.74 | -1.16 | node reads |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,885.96 | 158,886.15 | +0.18 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,475.06 | 4,333.56 | -141.50 | -3.16 | node reads |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,300.51 | 7,214.84 | -85.67 | -1.17 | node reads |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,568.62 | 1,490,573.05 | +4.42 | +0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,055.41 | 1,995.68 | -59.73 | -2.91 | node reads |
+| `simple_count/shared/1000` | 100,000 | 4,137.93 | 4,104.60 | -33.32 | -0.81 | node reads |
+| `simple_count/local/10000` | 100,000 | 2,052.19 | 1,992.28 | -59.91 | -2.92 | node reads |
+| `simple_count/shared/10000` | 100,000 | 4,119.42 | 4,086.39 | -33.03 | -0.80 | node reads |
+| `get_clean_local` | 10,000,000 | 125.00 | 117.00 | -8.00 | -6.40 | node read -8 |
+| `get_clean_shared` | 10,000,000 | 245.00 | 246.00 | +1.00 | +0.41 | node read -5; `record_dep` +6 (codegen units, below) |
+| `get_contended_shared` | 2,000 | 9,753,041.40 | 9,793,050.97 | +40,009.57 | +0.41 | as `get_clean_shared` |
+| `fanout_local_4` | 100,000 | 17,964.00 | 17,367.00 | -597.00 | -3.32 | node reads |
+| `fanout_local_5` | 100,000 | 22,187.44 | 21,490.72 | -696.72 | -3.14 | node reads |
+| `fanout_local_1000` | 1,000 | 7,305,725.69 | 7,189,549.70 | -116,175.99 | -1.59 | node reads |
+| `fanout_shared_4` | 100,000 | 24,635.29 | 24,150.04 | -485.25 | -1.97 | node reads |
+| `fanout_shared_5` | 100,000 | 29,790.06 | 29,210.02 | -580.04 | -1.95 | node reads |
+| `fanout_shared_1000` | 1,000 | 8,758,749.94 | 8,666,647.73 | -92,102.20 | -1.05 | node reads |
+| `delete_single_local` | 200,000 | 1,160.00 | 1,103.00 | -57.00 | -4.91 | node reads |
+| `delete_single_shared` | 200,000 | 1,954.24 | 1,909.24 | -45.00 | -2.30 | node reads |
+| `delete_cascade_local` | 1,000 | 3,206,925.76 | 3,100,879.98 | -106,045.79 | -3.31 | node reads |
+| `delete_cascade_shared` | 1,000 | 4,315,279.22 | 4,232,556.88 | -82,722.35 | -1.92 | node reads |
+| `delete_owned_tree_local` | 10,000 | 620,502.71 | 613,307.09 | -7,195.62 | -1.16 | node reads |
+| `delete_owned_tree_shared` | 10,000 | 1,002,149.55 | 999,631.55 | -2,518.00 | -0.25 | node reads |
+
+- **node read**, per `SegmentedNodes::get`: the directory's length now
+  sits in its header, next to the entries, and a segment is a fixed-size
+  array, so the segment's own slice bounds check (a length load, a
+  compare and a branch) and the load of its slice pointer are gone.
+  Shared `get` is -5 per Clean read; Local `get_clean_local` is -8.
+- **`record_dep` (Shared, +6 per call):** the thread-local
+  closure behind `SharedDepStack::record_dep`, which T3 does not touch,
+  now spills its arguments to the stack on every call. Its source is
+  unchanged; the build's codegen-unit partitioning moved it. With
+  `CARGO_PROFILE_BENCH_CODEGEN_UNITS=1` both drivers compile it the same
+  way, and T3 is below T2: `get_clean_shared` 212 against 215,
+  `get_clean_local` 118 against 125, `get_contended_shared`
+  8,432,857 against 8,552,949 (-1.4%), `delete_single_shared` 1,893
+  against 1,953, `chain_shared/propagate/10` 19,820 against 20,437.
+
+Gate against T2 (plan T3 **Gate**): every workload is at or below T2
+except `get_clean_shared` (+1) and `get_contended_shared` (+0.41%), both
+the `record_dep` codegen-unit shift named above, with T3 below T2 on
+both in a single-unit build. The drops come from the directory's
+indexing.
