@@ -28,6 +28,7 @@ use crate::arena_registry::{ArenaRegistry, ArenaTags};
 use crate::cells::Cells;
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
 use crate::dep_stack::DepStack;
+use crate::dependent_list::DependentList;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
@@ -35,6 +36,7 @@ use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::segmented_nodes::SegmentedNodes;
 use crate::set_stack;
+use crate::slot_vec::SlotVec;
 use crate::state::{self, NodeState};
 use crate::taint_memo;
 use crate::value::Value;
@@ -47,13 +49,13 @@ use crate::value_slot::{Compared, Displaced};
 /// `true` if the value actually changed (for early-cutoff propagation),
 /// `false` if it was the same as before.
 pub(crate) type ComputeFn<C> =
-    Arc<dyn Fn(&Runtime<C>, u32, bool, &Cell<u8>) -> bool + Send + Sync + 'static>;
+    Box<dyn Fn(&Runtime<C>, u32, bool, &Cell<u8>) -> bool + Send + Sync + 'static>;
 
 /// Per-runtime mutable state guarded by the inner lock. Holds everything
 /// that's not on the per-node `NodeData` and not in an arena.
 pub(crate) struct Inner<C: Cells> {
-    pub(crate) compute_fns: Vec<Option<ComputeFn<C>>>,
-    pub(crate) dependents: Vec<Vec<NodeId>>,
+    pub(crate) compute_fns: SlotVec<Option<ComputeFn<C>>>,
+    pub(crate) dependents: SlotVec<DependentList>,
     pub(crate) arena_tags: ArenaTags,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
@@ -87,8 +89,8 @@ pub(crate) struct ObserverEntry<C: Cells> {
 impl<C: Cells> Inner<C> {
     fn new() -> Self {
         Self {
-            compute_fns: Vec::new(),
-            dependents: Vec::new(),
+            compute_fns: SlotVec::new(),
+            dependents: SlotVec::new(),
             arena_tags: ArenaTags::default(),
             labels: HashMap::new(),
             trace_log: Vec::new(),
@@ -690,7 +692,7 @@ impl<C: Cells> Runtime<C> {
                 let node = NodeData::<C>::new_input(type_tag, arena_slot, revision);
                 let slot = self.nodes.push(node);
                 inner.compute_fns.push(None);
-                inner.dependents.push(Vec::new());
+                inner.dependents.push(DependentList::new());
                 slot
             };
             (slot, self.nodes.get(slot).generation())
@@ -725,7 +727,7 @@ impl<C: Cells> Runtime<C> {
                 let node = NodeData::<C>::new_query(type_tag, arena_slot);
                 let slot = self.nodes.push(node);
                 inner.compute_fns.push(None);
-                inner.dependents.push(Vec::new());
+                inner.dependents.push(DependentList::new());
                 slot
             };
 
@@ -735,7 +737,7 @@ impl<C: Cells> Runtime<C> {
             // changed; `is_recompute=true` compares against the stored
             // value via T's PartialEq.
             let arena_inner = arena;
-            let compute: ComputeFn<C> = Arc::new(
+            let compute: ComputeFn<C> = Box::new(
                 move |rt: &Runtime<C>, slot: u32, is_recompute: bool, wrote: &Cell<u8>| -> bool {
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
@@ -1219,9 +1221,17 @@ impl<C: Cells> Runtime<C> {
                     continue;
                 }
                 let slot = top.slot() as usize;
+                // The last dependent, because a delete removes it from this
+                // list by scanning from the back, so tearing down a fan-in
+                // of n stays linear in n.
                 inner.dependents[slot]
-                    .first()
-                    .or_else(|| inner.owned.get(&top.slot()).and_then(|o| o.first()))
+                    .last()
+                    .or_else(|| {
+                        inner
+                            .owned
+                            .get(&top.slot())
+                            .and_then(|o| o.first().copied())
+                    })
                     .map(|n| self.erased_at(n.0))
             };
             if let Some(child) = next {
@@ -1423,7 +1433,7 @@ impl<C: Cells> Runtime<C> {
             slot,
         );
         for d in &retired.old_deps {
-            inner.dependents[d.0 as usize].retain(|&x| x != id);
+            inner.dependents[d.0 as usize].remove(id);
         }
         inner.dependents[slot as usize].clear();
         if let Some(owner) = inner.owner_of.remove(&slot) {
@@ -1647,6 +1657,16 @@ impl<C: Cells> Runtime<C> {
         self.nodes.len() as usize - free
     }
 
+    /// How many dependent lists have outgrown their inline storage into a
+    /// heap block. For memory tests.
+    #[doc(hidden)]
+    pub fn dependent_list_blocks(&self) -> usize {
+        let inner = self.inner.read();
+        (0..self.nodes.len() as usize)
+            .filter(|&slot| inner.dependents[slot].has_block())
+            .count()
+    }
+
     /// Assign a human-readable label to a node slot. Surfaces in
     /// `graph_snapshot()` and trace output. Re-assigning replaces.
     pub fn set_label(&self, slot: u32, label: String) {
@@ -1685,7 +1705,7 @@ impl<C: Cells> Runtime<C> {
             let dependents = inner
                 .dependents
                 .get(slot as usize)
-                .cloned()
+                .map(|l| l.iter().collect())
                 .unwrap_or_default();
             out.push(NodeInfo {
                 id: NodeId(slot),
@@ -1916,7 +1936,7 @@ impl<C: Cells> Runtime<C> {
     fn mark_dependents_dirty(&self, start: NodeId) {
         let mut queue: Vec<NodeId> = {
             let inner = self.inner.read();
-            inner.dependents[start.0 as usize].clone()
+            inner.dependents[start.0 as usize].iter().collect()
         };
 
         while let Some(id) = queue.pop() {
@@ -1929,7 +1949,7 @@ impl<C: Cells> Runtime<C> {
                             .is_ok()
                         {
                             let inner = self.inner.read();
-                            queue.extend(inner.dependents[id.0 as usize].iter().copied());
+                            queue.extend(inner.dependents[id.0 as usize].iter());
                             break;
                         }
                         // The state moved under us (a claim or another
@@ -1950,7 +1970,7 @@ impl<C: Cells> Runtime<C> {
                         .is_ok()
                         {
                             let inner = self.inner.read();
-                            queue.extend(inner.dependents[id.0 as usize].iter().copied());
+                            queue.extend(inner.dependents[id.0 as usize].iter());
                             break;
                         }
                     }
@@ -1962,7 +1982,7 @@ impl<C: Cells> Runtime<C> {
                         // is an RMW for the reason given on the Dirty arm.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
                             let inner = self.inner.read();
-                            queue.extend(inner.dependents[id.0 as usize].iter().copied());
+                            queue.extend(inner.dependents[id.0 as usize].iter());
                             break;
                         }
                     }
@@ -2211,7 +2231,11 @@ impl<C: Cells> Runtime<C> {
             // just need their state stamped clean.
             let (compute, g) = {
                 let inner = self.inner.read();
-                let compute = inner.compute_fns.get(id.0 as usize).and_then(|f| f.clone());
+                let compute = inner
+                    .compute_fns
+                    .get(id.0 as usize)
+                    .and_then(|f| f.as_deref())
+                    .map(std::ptr::from_ref);
                 (compute, node.generation())
             };
             if g0.is_some_and(|g0| g0 != g) {
@@ -2334,8 +2358,15 @@ impl<C: Cells> Runtime<C> {
             // interrupted; no lock is held while user code runs.
             let wrote = Cell::new(0_u8);
             self.dep_stack.push_frame(id);
+            // SAFETY: the closure was read under the read hold at
+            // generation `g`, and the claim above was rechecked against `g`.
+            // A closure is freed only by `release_claimed`, under a Dead
+            // claim and after the generation bump, and no Dead claim can
+            // succeed while this node is Computing. `SlotVec` never moves
+            // its entries, so the `Box` still points where it was read.
+            let compute = unsafe { &*compute };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (compute)(self, id.0, is_recompute, &wrote)
+                compute(self, id.0, is_recompute, &wrote)
             }));
             let frame = self.dep_stack.pop_frame();
             if value_code::thread_word() & value_code::MEMO_BIT != 0 {
@@ -2571,12 +2602,16 @@ impl<C: Cells> Runtime<C> {
         // construction below ~16 items.
         for old_dep in &old_deps {
             if !new_deps.contains(old_dep) {
-                inner.dependents[old_dep.0 as usize].retain(|&d| d != id);
+                inner.dependents[old_dep.0 as usize].remove(id);
             }
         }
+        // A dep read twice is in `new_deps` twice, and its list already
+        // ends with `id` from the first push, so each list holds `id` at
+        // most once and a delete's back-to-front remove finds it.
         for new_dep in &new_deps {
-            if !old_deps.contains(new_dep) {
-                inner.dependents[new_dep.0 as usize].push(id);
+            let list = &mut inner.dependents[new_dep.0 as usize];
+            if !old_deps.contains(new_dep) && list.last() != Some(id) {
+                list.push(id);
             }
         }
         if superseded {
@@ -2630,7 +2665,7 @@ impl<C: Cells> Runtime<C> {
                     s.0
                 );
                 assert!(
-                    inner.dependents[s.0 as usize].contains(&NodeId(x)),
+                    inner.dependents[s.0 as usize].contains(NodeId(x)),
                     "(I) violated: Clean node {x} is missing from dependents[{}]",
                     s.0
                 );
@@ -2642,6 +2677,13 @@ impl<C: Cells> Runtime<C> {
                 );
             });
         }
+        for slot in 0..self.nodes.len() as usize {
+            let mut ids: Vec<NodeId> = inner.dependents[slot].iter().collect();
+            let n = ids.len();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), n, "dependents[{slot}] holds a node twice");
+        }
         for &slot in &inner.free_nodes {
             assert!(
                 inner.dependents[slot as usize].is_empty(),
@@ -2652,7 +2694,7 @@ impl<C: Cells> Runtime<C> {
     }
 
     pub(crate) fn has_reverse_edge<T, U>(&self, dep: Incr<T>, dependent: Incr<U>) -> bool {
-        self.inner.read().dependents[dep.slot() as usize].contains(&NodeId(dependent.slot()))
+        self.inner.read().dependents[dep.slot() as usize].contains(NodeId(dependent.slot()))
     }
 
     pub(crate) fn state_of<T>(&self, handle: Incr<T>) -> NodeState {
@@ -2679,7 +2721,7 @@ impl<C: Cells> Runtime<C> {
                     s.0
                 );
                 assert!(
-                    inner.dependents[s.0 as usize].contains(&NodeId(x)),
+                    inner.dependents[s.0 as usize].contains(NodeId(x)),
                     "node {x} ({:?}) is missing from dependents[{}]",
                     node.state(),
                     s.0
