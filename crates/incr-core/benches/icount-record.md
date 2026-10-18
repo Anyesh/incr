@@ -643,3 +643,90 @@ both strategies. Every other rise is in a symbol that holds one of the
 named sources above, apart from `for_each_dep`, which is code that was
 inlined into `clean_walk` in T4 and is a call now. The collection
 `batch` rows are within run spread.
+
+## T6
+
+- Engine: `91e83c8` (branch `spreadsheet-t6`). Machine and toolchain as
+  for T0.
+- T5 is `main` at `964d070`, built in a worktree at a path of the same
+  length as T6's: built from the main checkout's shorter path, the same
+  commit reads `fanout_local_1000` 6,400 higher, so drivers are compared
+  only at equal path lengths. Both columns are the mean of two runs of
+  `icount.sh` at the default N.
+
+| workload | N | T5 | T6 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,443.00 | 4,437.00 | -6.00 | -0.14 | none |
+| `chain_local/propagate/10` | 1,000,000 | 9,591.00 | 9,579.00 | -12.00 | -0.13 | none |
+| `chain_local/propagate/100` | 100,000 | 87,570.01 | 87,468.01 | -102.01 | -0.12 | none |
+| `chain_shared/propagate/4` | 1,000,000 | 9,268.41 | 9,251.28 | -17.13 | -0.18 | none |
+| `chain_shared/propagate/10` | 1,000,000 | 20,176.27 | 20,140.93 | -35.34 | -0.18 | none |
+| `chain_shared/propagate/100` | 100,000 | 184,811.96 | 184,504.31 | -307.65 | -0.17 | none |
+| `diamond_local` | 1,000,000 | 3,773.00 | 3,767.00 | -6.00 | -0.16 | none |
+| `diamond_shared` | 1,000,000 | 7,737.09 | 7,721.97 | -15.12 | -0.20 | none |
+| `early_cutoff_local` | 1,000,000 | 2,209.00 | 2,206.00 | -3.00 | -0.14 | none |
+| `early_cutoff_shared` | 1,000,000 | 3,502.89 | 3,496.86 | -6.03 | -0.17 | none |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,489.77 | 4,486.07 | -3.70 | -0.08 | none |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,193.55 | 7,182.96 | -10.59 | -0.15 | none |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,272.86 | 92,273.42 | +0.56 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,483.61 | 4,479.75 | -3.86 | -0.09 | none |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,167.06 | 7,158.23 | -8.83 | -0.12 | none |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,876.07 | 158,875.90 | -0.16 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,491.07 | 4,487.65 | -3.43 | -0.08 | none |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,173.01 | 7,162.91 | -10.10 | -0.14 | none |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,560.76 | 1,490,562.31 | +1.55 | +0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,049.49 | 2,046.72 | -2.76 | -0.13 | none |
+| `simple_count/shared/1000` | 100,000 | 4,030.98 | 4,022.86 | -8.12 | -0.20 | none |
+| `simple_count/local/10000` | 100,000 | 2,045.96 | 2,043.47 | -2.49 | -0.12 | none |
+| `simple_count/shared/10000` | 100,000 | 4,010.60 | 4,002.32 | -8.28 | -0.21 | none |
+| `get_clean_local` | 10,000,000 | 98.00 | 97.00 | -1.00 | -1.02 | mismatch test inline in `get` |
+| `get_clean_shared` | 10,000,000 | 200.00 | 199.00 | -1.00 | -0.50 | mismatch test inline in `get` |
+| `get_contended_shared` | 2,000 | 7,953,180.26 | 7,913,174.82 | -40,005.44 | -0.50 | mismatch test inline in `get` |
+| `fanout_local_4` | 100,000 | 18,173.00 | 18,167.01 | -5.99 | -0.03 | none |
+| `fanout_local_5` | 100,000 | 22,889.93 | 22,875.12 | -14.81 | -0.06 | none |
+| `fanout_local_1000` | 1,000 | 3,587,732.03 | 3,591,107.84 | +3,375.81 | +0.09 | allocator drift over the run (below) |
+| `fanout_shared_4` | 100,000 | 24,957.61 | 24,925.97 | -31.65 | -0.13 | none |
+| `fanout_shared_5` | 100,000 | 30,476.01 | 30,437.77 | -38.24 | -0.13 | none |
+| `fanout_shared_1000` | 1,000 | 4,961,266.86 | 4,953,640.85 | -7,626.01 | -0.15 | none |
+| `delete_single_local` | 200,000 | 1,156.00 | 1,155.00 | -1.00 | -0.09 | none |
+| `delete_single_shared` | 200,000 | 2,013.24 | 2,006.30 | -6.94 | -0.34 | none |
+| `delete_cascade_local` | 1,000 | 3,400,636.00 | 3,398,638.59 | -1,997.41 | -0.06 | none |
+| `delete_cascade_shared` | 1,000 | 4,766,672.11 | 4,761,802.05 | -4,870.06 | -0.10 | none |
+| `delete_owned_tree_local` | 10,000 | 605,446.12 | 601,208.88 | -4,237.24 | -0.70 | none |
+| `delete_owned_tree_shared` | 10,000 | 989,330.76 | 982,317.73 | -7,013.03 | -0.71 | none |
+
+New workloads (mean of two runs; the table counts include the driver's
+key arithmetic):
+
+| workload | N | T6 |
+|---|--:|--:|
+| `table_hit_local` | 10,000,000 | 155.14 |
+| `table_hit_shared` | 10,000,000 | 218.14 |
+| `table_hit_sip_local` | 10,000,000 | 300.84 |
+| `table_miss_local` | 100,000 | 866.18 |
+| `table_miss_shared` | 100,000 | 2,175.11 |
+| `value_slot_read_local` | 10,000,000 | 5.00 |
+| `value_slot_read_shared` | 10,000,000 | 87.00 |
+
+- **Hit gate, in cycles** (`icount.sh -e cycles:u`, three runs on a quiet
+  machine): `table_hit_shared − table_hit_local` was 50.05, 46.55 and
+  49.14 against 1.1 × (`value_slot_read_shared − value_slot_read_local`)
+  of 52.81, 56.80 and 52.32.
+- **Probe bound:** a hit's probe loop counts its steps against the
+  capacity, an increment and a compare per step, which the
+  `table_hit_*` counts include.
+- **`get_clean_*`, `get_contended_shared` (−1):** `get` and `try_get` test
+  the handle's runtime id inline and branch to the cold `read_mismatch`,
+  which reads a pending handle's placeholder; T5 called
+  `check_runtime`.
+- **`fanout_local_1000` (+3,376, +0.09%):** no engine symbol rises. Intel
+  PT after 10 warm-up runs puts T6 1,830 below T5 (`get` −2,001), and
+  `perf stat` at N = 100 and 300 puts it 1,950 and 2,560 below; only the
+  default 1,100-iteration run reads higher, so the rise builds up in
+  glibc's allocator over the run, whose layout moved with
+  `GenericArena`'s new placeholder field.
+
+Gate against T5 (plan T6 **Gate**): the Clean `get` is one below T5's
+on both strategies, every other workload is at or below T5 except
+`fanout_local_1000` (allocator, above) and the collection `batch` rows,
+which are within run spread, and the hit gate holds in cycles.
