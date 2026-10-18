@@ -346,6 +346,9 @@ struct Turns {
     /// presumed unable to and are not waited for again.
     ignored_waiters: Option<i64>,
     rng: u64,
+    /// Stand-asides that waited out the whole limit.
+    #[cfg(test)]
+    full_stand_asides: u32,
 }
 
 impl Turns {
@@ -364,6 +367,8 @@ impl Turns {
             ignored_waiters: None,
             // xorshift needs a nonzero state.
             rng: RandomState::new().hash_one(0u8) | 1,
+            #[cfg(test)]
+            full_stand_asides: 0,
         })
     }
 
@@ -427,6 +432,10 @@ impl Turns {
             }
         }
         self.ignored_waiters = Some(version);
+        #[cfg(test)]
+        {
+            self.full_stand_asides += 1;
+        }
         Ok(())
     }
 
@@ -668,7 +677,17 @@ mod tests {
                     let (path, barrier) = (&path, &barrier);
                     s.spawn(move || {
                         barrier.wait();
-                        let backend = SqliteBackend::open(path).unwrap();
+                        // The opens queue behind each other's fsyncs, which
+                        // on a loaded disk can outlast the default 5 s; the
+                        // test is about sharing one log, not latency.
+                        let backend = SqliteBackend::open_with(
+                            path,
+                            SqliteOptions {
+                                busy_timeout: Duration::from_secs(60),
+                                ..SqliteOptions::default()
+                            },
+                        )
+                        .unwrap();
                         backend.append(&[set(i as u8)]).unwrap()
                     })
                 })
@@ -798,15 +817,16 @@ mod tests {
             .unwrap();
         stalled.lock_shared().unwrap();
 
-        let start = Instant::now();
         for value in 0..APPENDS {
             thread::sleep(TURN);
             backend.append(&[set(value as u8)]).unwrap();
         }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < STAND_ASIDE_LIMIT * APPENDS / 2,
-            "{APPENDS} appends a turn apart took {elapsed:?}"
+        // Counted rather than timed, because on a loaded machine fifty
+        // appends a turn apart can outlast the stand-asides they skip.
+        let stood_aside = backend.lock().turns.as_ref().unwrap().full_stand_asides;
+        assert_eq!(
+            stood_aside, 1,
+            "{APPENDS} appends stood aside {stood_aside} times"
         );
     }
 
