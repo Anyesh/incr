@@ -7,8 +7,10 @@ import pytest
 # Each reproduction runs in a child killed after 10 s, because a thread
 # that holds the GIL inside native code cannot be stopped from inside the
 # process. The main thread holds the GIL in a binding method that does not
-# detach and waits on an engine lock, while the other thread holds that
-# lock across a PyValue method that waits for the GIL.
+# detach and waits on an engine lock, while the other thread would hold
+# that lock across a PyValue method that waits for the GIL. A Clean get
+# holds no lock, so the arena form cannot deadlock; the collection form
+# still can.
 
 ARENA_CHILD = textwrap.dedent(
     """
@@ -95,13 +97,6 @@ def run_child(source):
     return proc.returncode
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="bug (f), arena form: a Clean get holds the arena read lock across "
-    "PyValue clone, which waits for the GIL held by create_input waiting on the "
-    "arena write lock",
-)
 def test_get_racing_create_input_does_not_deadlock_on_the_gil():
     assert run_child(ARENA_CHILD) is not None, "child deadlocked, killed after 10 s"
 
