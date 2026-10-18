@@ -535,3 +535,111 @@ below T3 except `get_clean_local` (+1, register allocation). The
 `compute_one` decides on exists before T5. The rises on `fanout_*_4`,
 `fanout_*_5`, `delete_single_*` and `delete_cascade_*` are the create
 and delete table costs and the allocator effect named above.
+
+## T5
+
+- Engine: `82f19f6` (branch `spreadsheet-t5`). Machine and toolchain as
+  for T0.
+- T4 is `main` at `26e14c0`, run twice in the same session as T5's two
+  runs; both columns are the mean of two runs of `icount.sh` at the
+  default N.
+- Attribution: Intel PT on both drivers at steady state (a warm-up of
+  10,000 iterations, or 2,000 and 10 on the fan-out and cascade
+  workloads), per symbol, the per-iteration count being the difference
+  between two traced N. Each traced total matches its `icount.sh` row,
+  except the collection workloads', whose count depends on N.
+
+| workload | N | T4 | T5 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,326.00 | 4,443.00 | +117.00 | +2.70 | compute and entry (below) |
+| `chain_local/propagate/10` | 1,000,000 | 9,360.00 | 9,591.00 | +231.00 | +2.47 | compute and entry (below) |
+| `chain_local/propagate/100` | 100,000 | 85,629.01 | 87,570.01 | +1,941.00 | +2.27 | compute and entry (below) |
+| `chain_shared/propagate/4` | 1,000,000 | 9,227.22 | 9,268.41 | +41.19 | +0.45 | compute and entry (below) |
+| `chain_shared/propagate/10` | 1,000,000 | 20,146.81 | 20,176.27 | +29.46 | +0.15 | compute and entry (below) |
+| `chain_shared/propagate/100` | 100,000 | 184,950.35 | 184,811.96 | -138.39 | -0.07 | compute and entry (below) |
+| `diamond_local` | 1,000,000 | 3,682.00 | 3,773.00 | +91.00 | +2.47 | compute and entry (below) |
+| `diamond_shared` | 1,000,000 | 7,693.95 | 7,737.09 | +43.14 | +0.56 | compute and entry (below) |
+| `early_cutoff_local` | 1,000,000 | 2,122.00 | 2,209.00 | +87.00 | +4.10 | compute and entry (below) |
+| `early_cutoff_shared` | 1,000,000 | 3,426.84 | 3,502.89 | +76.05 | +2.22 | compute and entry (below) |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,301.35 | 4,489.77 | +188.43 | +4.38 | compute and entry (below) |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,037.67 | 7,193.55 | +155.88 | +2.21 | compute and entry (below) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.65 | 92,272.86 | -10.79 | -0.01 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,293.49 | 4,483.61 | +190.12 | +4.43 | compute and entry (below) |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,011.93 | 7,167.06 | +155.13 | +2.21 | compute and entry (below) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,886.35 | 158,876.07 | -10.29 | -0.01 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,301.99 | 4,491.07 | +189.08 | +4.40 | compute and entry (below) |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,016.07 | 7,173.01 | +156.93 | +2.24 | compute and entry (below) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,574.65 | 1,490,560.76 | -13.89 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 1,986.97 | 2,049.49 | +62.52 | +3.15 | compute and entry (below) |
+| `simple_count/shared/1000` | 100,000 | 3,981.57 | 4,030.98 | +49.42 | +1.24 | compute and entry (below) |
+| `simple_count/local/10000` | 100,000 | 1,983.26 | 2,045.96 | +62.70 | +3.16 | compute and entry (below) |
+| `simple_count/shared/10000` | 100,000 | 3,961.20 | 4,010.60 | +49.39 | +1.25 | compute and entry (below) |
+| `get_clean_local` | 10,000,000 | 118.00 | 98.00 | -20.00 | -16.95 | thread-local address outside `with`; `record_dep` inline |
+| `get_clean_shared` | 10,000,000 | 220.00 | 200.00 | -20.00 | -9.09 | thread-local address outside `with`; `record_dep` inline |
+| `get_contended_shared` | 2,000 | 8,753,056.38 | 7,953,180.26 | -799,876.12 | -9.14 | thread-local address outside `with`; `record_dep` inline |
+| `fanout_local_4` | 100,000 | 17,786.00 | 18,173.00 | +387.00 | +2.18 | compute and entry (below); delete entry, strategy and own-held checks |
+| `fanout_local_5` | 100,000 | 22,432.14 | 22,889.93 | +457.79 | +2.04 | compute and entry (below); delete entry, strategy and own-held checks |
+| `fanout_local_1000` | 1,000 | 3,527,052.35 | 3,587,732.03 | +60,679.68 | +1.72 | compute and entry (below); delete entry, strategy and own-held checks |
+| `fanout_shared_4` | 100,000 | 24,377.32 | 24,957.61 | +580.29 | +2.38 | compute and entry (below); delete entry, strategy and own-held checks |
+| `fanout_shared_5` | 100,000 | 29,802.73 | 30,476.01 | +673.28 | +2.26 | compute and entry (below); delete entry, strategy and own-held checks |
+| `fanout_shared_1000` | 1,000 | 4,864,336.72 | 4,961,266.86 | +96,930.14 | +1.99 | compute and entry (below); delete entry, strategy and own-held checks |
+| `delete_single_local` | 200,000 | 1,106.00 | 1,156.00 | +50.00 | +4.52 | compute and entry (below); delete entry, strategy and own-held checks |
+| `delete_single_shared` | 200,000 | 1,933.25 | 2,013.24 | +79.99 | +4.14 | compute and entry (below); delete entry, strategy and own-held checks |
+| `delete_cascade_local` | 1,000 | 3,328,988.05 | 3,400,636.00 | +71,647.95 | +2.15 | delete entry, strategy and own-held checks; compute and entry |
+| `delete_cascade_shared` | 1,000 | 4,666,877.80 | 4,766,672.11 | +99,794.31 | +2.14 | delete entry, strategy and own-held checks; compute and entry |
+| `delete_owned_tree_local` | 10,000 | 602,328.28 | 605,446.12 | +3,117.84 | +0.52 | delete entry, strategy and own-held checks; compute and entry |
+| `delete_owned_tree_shared` | 10,000 | 986,251.05 | 989,330.76 | +3,079.71 | +0.31 | delete entry, strategy and own-held checks; compute and entry |
+
+- **compute**, per compute: the `ComputeCtl` stores, the frame's `rt`,
+  `ctl` and `cidx`, and the wrapper's flag test; the flags reload after
+  the claim and the `IN_GROUP` tests at verify and landing; the
+  `verified_at == 0` compare; the walk's `IN_GROUP` test per Dirty visit
+  and its Cyclic and New arms; the entry-depth counter around
+  `compute_one`; and at the walk's drop, the one test of the box that
+  holds its New and group sets. The dep-stack methods are now inlined,
+  so T4's out-of-line `push_frame`, `pop_frame` and `record_dep` move
+  into `clean_walk` and `get`, and `for_each_dep` moves out of
+  `clean_walk` into its own symbol. On `chain_local/propagate/4`
+  (+117): `clean_walk` with `for_each_dep` and the walk's drop +399
+  against `push_frame` and `pop_frame` -240, `get` +103 against
+  `record_dep` -180, `get_slow` +38. Net per compute on
+  `chain_local/propagate/100` is +19.4; under Shared it is -1.4, because
+  `record_dep`'s thread-local access got cheaper (below).
+- **entry**, per outermost entry (a top-level non-Clean `get`, a `set`,
+  a delete): the entry-depth increment and decrement, the test of the
+  flag that says the outermost reset has anything to clear, and the
+  `catch_unwind` call, whose landing pad is out of line. `get_slow` +38
+  Local.
+- **Clean `get`** (hard gate: equal to T4's): 98 Local and 200 Shared,
+  against 118 and 220. Under Shared, `record_dep` and the hazard-pool
+  pop and push each take only the thread-local's address inside
+  `LocalKey::with` and work on it outside; with the work inside the
+  closure, T5's larger callers left `LocalKey::with` and its liveness
+  check out of line, which had put the count at 269. Under Local,
+  `record_dep` is inlined into `get`. `get_contended_shared` falls by
+  the same path.
+- **delete entry, strategy and own-held checks** (`fanout_*`,
+  `delete_*`): each delete is a public entry (depth counter and
+  `catch_unwind` call, `delete_node` +36), `delete_with_dependents`
+  enters once per node it deletes (+145 on `fanout_local_4`), and
+  `delete_erased` and `delete_strict` test `HAS_STRATEGY` and check the
+  wider own-held set, which compares `rt` per frame and tests a
+  held-map flag before the map (`delete_erased` +82, `delete_strict`
+  +23, Local). `create_query` passes no strategy, so it builds and
+  erases no `CycleStrategy`; `create_query_with` erases the one it is
+  given.
+- **`delete_cascade_*`, `delete_owned_tree_*`, `fanout_*_1000`:** each
+  iteration also builds and first-computes its subgraph, which pays the
+  compute and entry sources per node. On `delete_cascade_local`
+  (+71,648): the build's `create_query`, closure and `clean_walk`
+  symbols account for most of it, and the teardown for
+  `delete_with_dependents` +23,030 (an entry per cascaded node),
+  `delete_erased` +14,012 and `cycle_state::holds` +10,010 (the
+  own-held check, about 10 per node). The glibc symbols move by under
+  0.4%. `delete_owned_tree_*` rises by about one T4 run spread.
+
+Gate against T4 (plan T5 **Gate**): the Clean `get` is below T4's on
+both strategies. Every other rise is in a symbol that holds one of the
+named sources above, apart from `for_each_dep`, which is code that was
+inlined into `clean_walk` in T4 and is a call now. The collection
+`batch` rows are within run spread.
