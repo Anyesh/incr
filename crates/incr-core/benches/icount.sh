@@ -3,23 +3,27 @@
 # (instructions:u at N iterations - instructions:u at 0) / N, per workload.
 # Prints CSV: workload,iterations,count_n,count_0,per_iteration.
 #
-# usage: icount.sh [-n iterations] [-w warm-up] [workload ...]
+# usage: icount.sh [-n iterations] [-w warm-up] [-e event] [workload ...]
 #   -n  iterations for every workload, instead of each one's default
 #   -w  warm-up iterations, run at both N and 0 (default 100)
+#   -e  the perf event to count instead of instructions:u, such as
+#       cycles:u for T6's table-hit gate
 #   With no workloads named, runs every one the driver lists.
 set -euo pipefail
 
 usage() {
-	echo "usage: icount.sh [-n iterations] [-w warm-up] [workload ...]" >&2
+	echo "usage: icount.sh [-n iterations] [-w warm-up] [-e event] [workload ...]" >&2
 	exit 2
 }
 
 iterations=""
 warmup=100
-while getopts "n:w:h" opt; do
+event=instructions:u
+while getopts "n:w:e:h" opt; do
 	case $opt in
 	n) iterations=$OPTARG ;;
 	w) warmup=$OPTARG ;;
+	e) event=$OPTARG ;;
 	*) usage ;;
 	esac
 done
@@ -48,8 +52,8 @@ out=$(mktemp)
 trap 'rm -f "$out"' EXIT
 
 count() {
-	perf stat -x, -e instructions:u -o "$out" -- "$driver" "$1" "$2" "$warmup" >/dev/null
-	awk -F, '$3 ~ /^instructions/ { print $1 }' "$out"
+	perf stat -x, -e "$event" -o "$out" -- "$driver" "$1" "$2" "$warmup" >/dev/null
+	awk -F, -v e="${event%%:*}" '$3 ~ "^" e { print $1 }' "$out"
 }
 
 echo "workload,iterations,count_n,count_0,per_iteration"

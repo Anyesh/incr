@@ -458,3 +458,110 @@ impl<C: Cells> Workload for DeleteOwnedTree<C> {
         }
     }
 }
+
+const TABLE_KEYS: u64 = 1024;
+
+/// A table hit: `get_or_insert_input` on one of 1024 present keys, in
+/// turn, so the probe is not served from one bucket.
+pub struct TableHit<C: Cells, S: std::hash::BuildHasher = incr_core::FxBuildHasher> {
+    rt: Runtime<C>,
+    table: incr_core::NodeTable<u64, i64, C, S>,
+    next: Cell<u64>,
+}
+
+impl<C: Cells> TableHit<C> {
+    pub fn new() -> Self {
+        Self::with_hasher(incr_core::FxBuildHasher)
+    }
+}
+
+impl<C: Cells, S: std::hash::BuildHasher> TableHit<C, S> {
+    pub fn with_hasher(hasher: S) -> Self {
+        let rt: Runtime<C> = Runtime::new();
+        let table = rt.create_table_with_hasher::<u64, i64, S>(hasher);
+        for k in 0..TABLE_KEYS {
+            table.get_or_insert_input(&rt, k, || k as i64);
+        }
+        Self {
+            rt,
+            table,
+            next: Cell::new(0),
+        }
+    }
+}
+
+impl<C: Cells, S: std::hash::BuildHasher> Workload for TableHit<C, S> {
+    type Input = ();
+    type Output<'a>
+        = Incr<i64>
+    where
+        Self: 'a;
+    fn setup(&self) {}
+    fn run(&self, (): ()) -> Incr<i64> {
+        let k = self.next.get();
+        self.next.set((k + 1) % TABLE_KEYS);
+        black_box(
+            self.table
+                .get_or_insert_input(&self.rt, k, || unreachable!("every key is present")),
+        )
+    }
+}
+
+/// A table miss: `get_or_insert_input` of a key not yet present, which
+/// creates its input node. The table grows by one entry per iteration, so
+/// the count, rehashes included, holds only at the N recorded.
+pub struct TableMiss<C: Cells> {
+    rt: Runtime<C>,
+    table: incr_core::NodeTable<u64, i64, C>,
+    next: Cell<u64>,
+}
+
+impl<C: Cells> TableMiss<C> {
+    pub fn new() -> Self {
+        let rt: Runtime<C> = Runtime::new();
+        let table = rt.create_table::<u64, i64>();
+        Self {
+            rt,
+            table,
+            next: Cell::new(0),
+        }
+    }
+}
+
+impl<C: Cells> Workload for TableMiss<C> {
+    type Input = ();
+    type Output<'a> = Incr<i64>;
+    fn setup(&self) {}
+    fn run(&self, (): ()) -> Incr<i64> {
+        let k = self.next.get();
+        self.next.set(k + 1);
+        black_box(self.table.get_or_insert_input(&self.rt, k, || k as i64))
+    }
+}
+
+/// One read of a value slot outside the runtime: the protect, clone and
+/// release a Clean `get` pays for its value, against which the table's
+/// hit gate is set.
+pub struct ValueSlotRead<C: Cells> {
+    slot: C::ValueSlot<i64>,
+}
+
+impl<C: Cells> ValueSlotRead<C> {
+    pub fn new() -> Self {
+        Self {
+            slot: <C::ValueSlot<i64> as incr_core::ValueSlot<i64>>::new_with(1),
+        }
+    }
+}
+
+impl<C: Cells> Workload for ValueSlotRead<C> {
+    type Input = ();
+    type Output<'a>
+        = i64
+    where
+        Self: 'a;
+    fn setup(&self) {}
+    fn run(&self, (): ()) -> i64 {
+        black_box(incr_core::ValueSlot::read(&self.slot))
+    }
+}

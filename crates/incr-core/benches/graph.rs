@@ -5,7 +5,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use incr_core::{Cells, Local, Shared};
 use workloads::{
-    DeleteCascade, DeleteOwnedTree, DeleteSingle, Fanout, GetClean, GetContended, Workload,
+    DeleteCascade, DeleteOwnedTree, DeleteSingle, Fanout, GetClean, GetContended, TableHit,
+    TableMiss, ValueSlotRead, Workload,
 };
 
 // Allowed because each bench target uses only its own slice of the
@@ -20,6 +21,26 @@ fn bench_get(c: &mut Criterion) {
     c.bench_function("get_clean_shared", |b| workloads::steady(b, &shared));
     let contended = GetContended::new();
     c.bench_function("get_contended_shared", |b| workloads::steady(b, &contended));
+}
+
+/// Table hits and misses beside the value-slot read the hit gate
+/// compares against, and the Fx hasher against std's SipHash.
+fn bench_table(c: &mut Criterion) {
+    let hit = TableHit::<Local>::new();
+    c.bench_function("table_hit_local", |b| workloads::steady(b, &hit));
+    let hit = TableHit::<Shared>::new();
+    c.bench_function("table_hit_shared", |b| workloads::steady(b, &hit));
+    let sip =
+        TableHit::<Local, std::collections::hash_map::RandomState>::with_hasher(Default::default());
+    c.bench_function("table_hit_sip_local", |b| workloads::steady(b, &sip));
+    let miss = TableMiss::<Local>::new();
+    c.bench_function("table_miss_local", |b| workloads::steady(b, &miss));
+    let miss = TableMiss::<Shared>::new();
+    c.bench_function("table_miss_shared", |b| workloads::steady(b, &miss));
+    let read = ValueSlotRead::<Local>::new();
+    c.bench_function("value_slot_read_local", |b| workloads::steady(b, &read));
+    let read = ValueSlotRead::<Shared>::new();
+    c.bench_function("value_slot_read_shared", |b| workloads::steady(b, &read));
 }
 
 fn bench_fanout_with<C: Cells>(c: &mut Criterion, strategy: &str) {
@@ -63,5 +84,11 @@ fn bench_delete(c: &mut Criterion) {
     bench_delete_with::<Shared>(c, "shared");
 }
 
-criterion_group!(graph_benches, bench_get, bench_fanout, bench_delete);
+criterion_group!(
+    graph_benches,
+    bench_get,
+    bench_table,
+    bench_fanout,
+    bench_delete
+);
 criterion_main!(graph_benches);
