@@ -424,11 +424,17 @@ struct Walk {
     /// skipped instead of expanded again. `None` below the switch, which
     /// keeps the walk free of set operations for small graphs.
     visited: Option<HashSet<NodeId>>,
-    /// New nodes with installed deps this walk has expanded, created at
-    /// the first one.
-    new_expanded: Option<HashSet<NodeId>>,
-    /// The cycle groups this walk has expanded whole.
-    groups: Option<Vec<Arc<GroupInfo>>>,
+    /// Created at the walk's first New expansion or group expansion, in
+    /// one box so that a walk with neither tests one pointer at its drop.
+    expanded: Option<Box<Expanded>>,
+}
+
+#[derive(Default)]
+struct Expanded {
+    /// New nodes with installed deps the walk has expanded.
+    new: HashSet<NodeId>,
+    /// The cycle groups the walk has expanded whole.
+    groups: Vec<Arc<GroupInfo>>,
 }
 
 impl Walk {
@@ -441,8 +447,7 @@ impl Walk {
             }],
             first_visits: 0,
             visited: None,
-            new_expanded: None,
-            groups: None,
+            expanded: None,
         }
     }
 
@@ -450,8 +455,9 @@ impl Walk {
     #[cold]
     #[inline(never)]
     fn first_new_expansion(&mut self, id: NodeId) -> bool {
-        self.new_expanded
-            .get_or_insert_with(HashSet::default)
+        self.expanded
+            .get_or_insert_with(Box::default)
+            .new
             .insert(id)
     }
 
@@ -2490,7 +2496,7 @@ impl<C: Cells> Runtime<C> {
         {
             return false;
         }
-        let groups = walk.groups.get_or_insert_with(Vec::new);
+        let groups = &mut walk.expanded.get_or_insert_with(Box::default).groups;
         if groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
             return true;
         }
