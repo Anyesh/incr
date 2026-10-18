@@ -565,3 +565,89 @@ impl<C: Cells> Workload for ValueSlotRead<C> {
         black_box(incr_core::ValueSlot::read(&self.slot))
     }
 }
+
+/// A creator with `n` child inputs whose input moves every iteration:
+/// the rerun finds every child in its index and the sweep scans the
+/// index and deletes nothing.
+pub struct ChildrenRerun<C: Cells> {
+    rt: Runtime<C>,
+    x: Incr<u64>,
+    creator: Incr<u64>,
+    val: Cell<u64>,
+}
+
+impl<C: Cells> ChildrenRerun<C> {
+    pub fn new(n: u64) -> Self {
+        let rt: Runtime<C> = Runtime::new();
+        let x = rt.create_input(0_u64);
+        let creator = rt.create_query(move |rt| {
+            let v = rt.get(x);
+            for k in 0..n {
+                rt.child_input(k, move || k);
+            }
+            v
+        });
+        rt.get(creator);
+        Self {
+            rt,
+            x,
+            creator,
+            val: Cell::new(0),
+        }
+    }
+}
+
+impl<C: Cells> Workload for ChildrenRerun<C> {
+    type Input = ();
+    type Output<'a> = u64;
+    fn setup(&self) {}
+    fn run(&self, (): ()) -> u64 {
+        let v = self.val.get() + 1;
+        self.val.set(v);
+        self.rt.set(self.x, v);
+        black_box(self.rt.get(self.creator))
+    }
+}
+
+/// A creator whose children are the 16 keys from its input up: each
+/// iteration moves the window by one, so the rerun creates one child
+/// and the sweep deletes one.
+pub struct ChildrenChurn<C: Cells> {
+    rt: Runtime<C>,
+    x: Incr<u64>,
+    creator: Incr<u64>,
+    val: Cell<u64>,
+}
+
+impl<C: Cells> ChildrenChurn<C> {
+    pub fn new() -> Self {
+        let rt: Runtime<C> = Runtime::new();
+        let x = rt.create_input(0_u64);
+        let creator = rt.create_query(move |rt| {
+            let v = rt.get(x);
+            for k in v..v + 16 {
+                rt.child_input(k, move || k);
+            }
+            v
+        });
+        rt.get(creator);
+        Self {
+            rt,
+            x,
+            creator,
+            val: Cell::new(0),
+        }
+    }
+}
+
+impl<C: Cells> Workload for ChildrenChurn<C> {
+    type Input = ();
+    type Output<'a> = u64;
+    fn setup(&self) {}
+    fn run(&self, (): ()) -> u64 {
+        let v = self.val.get() + 1;
+        self.val.set(v);
+        self.rt.set(self.x, v);
+        black_box(self.rt.get(self.creator))
+    }
+}

@@ -5,8 +5,8 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use incr_core::{Cells, Local, Shared};
 use workloads::{
-    DeleteCascade, DeleteOwnedTree, DeleteSingle, Fanout, GetClean, GetContended, TableHit,
-    TableMiss, ValueSlotRead, Workload,
+    ChildrenChurn, ChildrenRerun, DeleteCascade, DeleteOwnedTree, DeleteSingle, Fanout, GetClean,
+    GetContended, TableHit, TableMiss, ValueSlotRead, Workload,
 };
 
 // Allowed because each bench target uses only its own slice of the
@@ -41,6 +41,19 @@ fn bench_table(c: &mut Criterion) {
     c.bench_function("value_slot_read_local", |b| workloads::steady(b, &read));
     let read = ValueSlotRead::<Shared>::new();
     c.bench_function("value_slot_read_shared", |b| workloads::steady(b, &read));
+}
+
+/// A creator's rerun over a thousand children it reuses, and a rerun
+/// that creates one child and sweeps one.
+fn bench_children(c: &mut Criterion) {
+    let rerun = ChildrenRerun::<Local>::new(1_000);
+    c.bench_function("children_rerun_1k_local", |b| workloads::steady(b, &rerun));
+    let rerun = ChildrenRerun::<Shared>::new(1_000);
+    c.bench_function("children_rerun_1k_shared", |b| workloads::steady(b, &rerun));
+    let churn = ChildrenChurn::<Local>::new();
+    c.bench_function("children_churn_local", |b| workloads::steady(b, &churn));
+    let churn = ChildrenChurn::<Shared>::new();
+    c.bench_function("children_churn_shared", |b| workloads::steady(b, &churn));
 }
 
 fn bench_fanout_with<C: Cells>(c: &mut Criterion, strategy: &str) {
@@ -88,6 +101,7 @@ criterion_group!(
     graph_benches,
     bench_get,
     bench_table,
+    bench_children,
     bench_fanout,
     bench_delete
 );

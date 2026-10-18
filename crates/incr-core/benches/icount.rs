@@ -11,8 +11,9 @@ use incr_core::{Local, Shared};
 use std::hint::black_box;
 use std::process::ExitCode;
 use workloads::{
-    BatchRebuild, Chain, DeleteCascade, DeleteOwnedTree, DeleteSingle, Diamond, EarlyCutoff,
-    Fanout, GetClean, GetContended, InsertThenRead, TableHit, TableMiss, ValueSlotRead, Workload,
+    BatchRebuild, Chain, ChildrenChurn, ChildrenRerun, DeleteCascade, DeleteOwnedTree,
+    DeleteSingle, Diamond, EarlyCutoff, Fanout, GetClean, GetContended, InsertThenRead, TableHit,
+    TableMiss, ValueSlotRead, Workload,
 };
 
 // Allowed because the criterion helpers in the shared workloads are
@@ -103,6 +104,10 @@ registry! {
     "table_miss_shared", 100_000 => TableMiss::<Shared>::new();
     "value_slot_read_local", 10_000_000 => ValueSlotRead::<Local>::new();
     "value_slot_read_shared", 10_000_000 => ValueSlotRead::<Shared>::new();
+    "children_rerun_1k_local", 10_000 => ChildrenRerun::<Local>::new(1_000);
+    "children_rerun_1k_shared", 10_000 => ChildrenRerun::<Shared>::new(1_000);
+    "children_churn_local", 100_000 => ChildrenChurn::<Local>::new();
+    "children_churn_shared", 100_000 => ChildrenChurn::<Shared>::new();
 }
 
 fn usage() -> ExitCode {
