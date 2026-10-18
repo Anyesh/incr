@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 use crate::cells::Cells;
 use crate::collection::{
-    cloned, paired_with, rebuild_snapshot, CollectionLog, Delta, Displaced, IncrCollection,
-    NeedsRebuild, OpLock,
+    cloned, paired_with, rebuild_snapshot, release_kept, CollectionLog, Delta, Displaced,
+    IncrCollection, NeedsRebuild, OpLock,
 };
 use crate::handle::Incr;
 use crate::runtime::Runtime;
@@ -499,7 +499,12 @@ where
                 }
             });
             cursor.store(from + pending.len() as u64, MemOrdering::Release);
-            out.version
+            let version = out.version;
+            drop(out);
+            drop(mirror);
+            drop(pending);
+            release_kept(&output_log_for_query, keep);
+            version
         });
 
         IncrCollection::derived_with(output_log, version_node)

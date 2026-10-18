@@ -123,6 +123,8 @@ const COMPACT_EVERY: usize = 1024;
 /// validate deletes and to bootstrap new consumers.
 pub struct CollectionLog<T: Hash + Eq + Clone> {
     pub(crate) deltas: Vec<Delta<T>>,
+    /// An empty buffer the next compaction moves the kept deltas into.
+    pub(crate) spare: Vec<Delta<T>>,
     pub(crate) base: u64,
     pub(crate) cursors: Vec<Arc<AtomicU64>>,
     pub(crate) elements: HashedMultiset<T>,
@@ -134,6 +136,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     pub fn new() -> Self {
         Self {
             deltas: Vec::new(),
+            spare: Vec::new(),
             base: 0,
             cursors: Vec::new(),
             elements: HashedMultiset::new(),
@@ -195,11 +198,22 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
             return Vec::new();
         }
         let cut = (min_cursor - self.base) as usize;
-        let capacity = self.deltas.capacity();
-        let mut compacted = std::mem::replace(&mut self.deltas, Vec::with_capacity(capacity));
-        self.deltas.extend(compacted.drain(cut..));
+        let mut kept = std::mem::take(&mut self.spare);
+        kept.reserve(self.deltas.capacity());
+        kept.extend(self.deltas.drain(cut..));
+        let compacted = std::mem::replace(&mut self.deltas, kept);
         self.base = min_cursor;
         compacted
+    }
+
+    /// Takes back a compaction's buffer once the caller has dropped its
+    /// deltas. Reusing it spares each compaction a large allocation, which
+    /// would make glibc consolidate its fastbins and slow later small ones.
+    fn recycle(&mut self, buffer: Vec<Delta<T>>) {
+        debug_assert!(buffer.is_empty());
+        if buffer.capacity() > self.spare.capacity() {
+            self.spare = buffer;
+        }
     }
 
     /// Phases 2 and 3 of an insert, under the log guard. The lookup (user
@@ -470,6 +484,60 @@ impl<T, const N: usize> Displaced<T, N> {
     fn is_empty(&self) -> bool {
         self.values.iter().all(Option::is_none) && self.compacted.is_empty()
     }
+
+    /// Drops everything displaced, at a point the type's rule allows, and
+    /// gives a compaction's emptied buffer back to `log` for its next
+    /// compaction.
+    #[inline(always)]
+    fn release<C: Cells>(self, log: &OpLock<CollectionLog<T>, C>)
+    where
+        T: Hash + Eq + Clone,
+    {
+        if self.compacted.capacity() == 0 {
+            drop(self);
+        } else {
+            release_each(log, [self]);
+        }
+    }
+
+    fn into_buffer(self) -> Vec<Delta<T>> {
+        let Self {
+            values,
+            mut compacted,
+        } = self;
+        drop(values);
+        compacted.clear();
+        compacted
+    }
+}
+
+/// [`Displaced::release`] for an operator's batch of changes to `log`.
+#[inline(always)]
+pub(crate) fn release_kept<T: Hash + Eq + Clone, C: Cells>(
+    log: &OpLock<CollectionLog<T>, C>,
+    keep: Vec<Displaced<T>>,
+) {
+    if !keep.is_empty() {
+        release_each(log, keep);
+    }
+}
+
+/// Keeps the largest buffer when one batch compacted more than once.
+#[inline(never)]
+fn release_each<T: Hash + Eq + Clone, C: Cells, const N: usize>(
+    log: &OpLock<CollectionLog<T>, C>,
+    displaced: impl IntoIterator<Item = Displaced<T, N>>,
+) {
+    let mut buffer = Vec::new();
+    for d in displaced {
+        let emptied = d.into_buffer();
+        if emptied.capacity() > buffer.capacity() {
+            buffer = emptied;
+        }
+    }
+    if buffer.capacity() != 0 {
+        log.write().recycle(buffer);
+    }
 }
 
 /// Set when a user panic stopped an operator part-way through a batch,
@@ -681,7 +749,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         if let Some(version) = committed.version {
             rt.set(self.version_node, version);
         }
-        drop(committed.displaced);
+        committed.displaced.release(&self.log);
         committed.removed
     }
 
@@ -827,7 +895,10 @@ where
                 }
             });
             cursor.store(to, MemOrdering::Release);
-            out.version
+            let version = out.version;
+            drop(out);
+            release_kept(&output_log_for_query, keep);
+            version
         });
 
         IncrCollection::derived_with(output_log, version_node)
@@ -1104,7 +1175,11 @@ where
             });
             left_cursor.store(l_to, MemOrdering::Release);
             right_cursor.store(r_to, MemOrdering::Release);
-            out.version
+            let version = out.version;
+            drop(out);
+            drop(st);
+            release_kept(&output_log_for_query, keep);
+            version
         });
 
         IncrCollection::derived_with(output_log, version_node)
@@ -1971,6 +2046,59 @@ mod tests {
             "consumerless log retained {} deltas",
             log.deltas.len(),
         );
+    }
+
+    /// Steps until `log` compacts, three times, and checks that the buffer
+    /// its deltas filled comes back as the spare the next compaction
+    /// fills, so a compaction in steady state allocates nothing.
+    fn assert_compaction_recycles<T: Hash + Eq + Clone>(
+        log: &OpLock<CollectionLog<T>, Shared>,
+        mut step: impl FnMut(),
+    ) {
+        for _ in 0..3 {
+            let base = log.read().base;
+            let mut filled = log.read().deltas.as_ptr();
+            while log.read().base == base {
+                filled = log.read().deltas.as_ptr();
+                step();
+            }
+            let log = log.read();
+            assert!(
+                log.spare.capacity() >= COMPACT_EVERY,
+                "no spare after a compaction"
+            );
+            assert_eq!(
+                log.spare.as_ptr(),
+                filled,
+                "the filled buffer is not the spare"
+            );
+            assert!(log.spare.is_empty());
+        }
+    }
+
+    #[test]
+    fn source_compaction_recycles_its_buffer() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let mut next = 0;
+        assert_compaction_recycles(&c.log, || {
+            c.insert(&rt, next);
+            next += 1;
+        });
+    }
+
+    #[test]
+    fn operator_compaction_recycles_its_buffer() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let doubled = c.map(&rt, |x| x * 2);
+        let count = doubled.count(&rt);
+        let mut next = 0;
+        assert_compaction_recycles(&doubled.log, || {
+            c.insert(&rt, next);
+            next += 1;
+            let _ = rt.get(count);
+        });
     }
 
     /// A panicking predicate must not poison the pipeline or corrupt the
