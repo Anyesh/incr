@@ -1961,10 +1961,17 @@ impl<C: Cells> Runtime<C> {
     /// node as Dirty. Every transition is a CAS so the walk can never
     /// clobber a `Computing` claim it raced with.
     fn mark_dependents_dirty(&self, start: NodeId) {
-        // Sized up front so a short walk allocates once and never takes
-        // the grow path.
-        let mut queue: Vec<NodeId> = Vec::with_capacity(8);
-        self.inner.read().dependents[start.0 as usize].extend_into(&mut queue);
+        let mut queue: Vec<NodeId> = Vec::new();
+        {
+            let inner = self.inner.read();
+            let first = &inner.dependents[start.0 as usize];
+            // Sized up front so a short walk allocates once and never
+            // takes the grow path; a node nothing reads allocates nothing.
+            if !first.is_empty() {
+                queue = Vec::with_capacity(8);
+                first.extend_into(&mut queue);
+            }
+        }
 
         while let Some(id) = queue.pop() {
             let node = self.nodes.get(id.0);
