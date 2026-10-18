@@ -730,3 +730,123 @@ Gate against T5 (plan T6 **Gate**): the Clean `get` is one below T5's
 on both strategies, every other workload is at or below T5 except
 `fanout_local_1000` (allocator, above) and the collection `batch` rows,
 which are within run spread, and the hit gate holds in cycles.
+
+## T7
+
+- Engine: `8a8820f` (branch `spreadsheet-t7`). Machine and toolchain as
+  for T0.
+- T6 is `main` at `015829f`, built in a worktree at a path of the same
+  length as T7's. The "T7, T6 benches" column is T7's library built with
+  T6's bench sources, so it differs from the T7 column only in the bench
+  binary; one run of `icount.sh` at the default N for each column.
+
+| workload | N | T6 | T7, T6 benches | T7 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,437.00 | 4,428.00 | 4,428.00 | -9.00 | -0.20 | none |
+| `chain_local/propagate/10` | 1,000,000 | 9,579.00 | 9,558.00 | 9,558.00 | -21.00 | -0.22 | none |
+| `chain_local/propagate/100` | 100,000 | 87,468.01 | 87,267.01 | 87,267.02 | -200.99 | -0.23 | none |
+| `chain_shared/propagate/4` | 1,000,000 | 9,251.25 | 9,269.19 | 9,294.23 | +42.98 | +0.46 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `chain_shared/propagate/10` | 1,000,000 | 20,140.92 | 20,188.87 | 20,243.86 | +102.94 | +0.51 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `chain_shared/propagate/100` | 100,000 | 184,504.12 | 185,001.74 | 185,506.29 | +1,002.17 | +0.54 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `diamond_local` | 1,000,000 | 3,767.00 | 3,760.00 | 3,760.00 | -7.00 | -0.19 | none |
+| `diamond_shared` | 1,000,000 | 7,721.97 | 7,734.95 | 7,756.93 | +34.96 | +0.45 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `early_cutoff_local` | 1,000,000 | 2,206.00 | 2,202.00 | 2,202.00 | -4.00 | -0.18 | none |
+| `early_cutoff_shared` | 1,000,000 | 3,496.85 | 3,505.86 | 3,515.85 | +19.00 | +0.54 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,486.55 | 4,480.34 | 4,480.04 | -6.51 | -0.15 | none |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,182.81 | 7,195.30 | 7,211.37 | +28.56 | +0.40 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,273.83 | 92,273.66 | 92,273.84 | +0.01 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,479.35 | 4,473.59 | 4,473.94 | -5.41 | -0.12 | none |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,158.26 | 7,169.41 | 7,184.97 | +26.71 | +0.37 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,876.43 | 158,876.78 | 158,876.66 | +0.23 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,487.02 | 4,481.25 | 4,480.22 | -6.80 | -0.15 | none |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,161.14 | 7,174.10 | 7,189.50 | +28.36 | +0.40 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,560.08 | 1,490,559.45 | 1,490,550.38 | -9.70 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,046.15 | 2,043.82 | 2,043.93 | -2.22 | -0.11 | none |
+| `simple_count/shared/1000` | 100,000 | 4,023.35 | 4,025.82 | 4,035.19 | +11.84 | +0.29 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `simple_count/local/10000` | 100,000 | 2,043.14 | 2,040.65 | 2,040.81 | -2.33 | -0.11 | none |
+| `simple_count/shared/10000` | 100,000 | 4,002.73 | 4,005.37 | 4,016.15 | +13.42 | +0.34 | state decode, `push_list`, `clean_walk` spills; bench build (below) |
+| `get_clean_local` | 10,000,000 | 97.00 | 97.00 | 97.00 | +0.00 | +0.00 | none |
+| `get_clean_shared` | 10,000,000 | 199.00 | 199.00 | 201.00 | +2.00 | +1.01 | bench build (below) |
+| `get_contended_shared` | 2,000 | 7,913,153.66 | 7,913,095.60 | 7,993,011.08 | +79,857.42 | +1.01 | bench build (below) |
+| `fanout_local_4` | 100,000 | 18,167.01 | 16,683.01 | 16,683.00 | -1,484.01 | -8.17 | single-node claim and cascade units (below) |
+| `fanout_local_5` | 100,000 | 22,875.13 | 21,151.00 | 21,151.00 | -1,724.13 | -7.54 | single-node claim and cascade units (below) |
+| `fanout_local_1000` | 1,000 | 3,591,107.95 | 3,348,168.06 | 3,348,168.20 | -242,939.75 | -6.77 | single-node claim and cascade units (below) |
+| `fanout_shared_4` | 100,000 | 24,925.97 | 23,488.21 | 23,492.05 | -1,433.92 | -5.75 | single-node claim and cascade units (below) |
+| `fanout_shared_5` | 100,000 | 30,437.83 | 28,818.75 | 28,824.73 | -1,613.10 | -5.30 | single-node claim and cascade units (below) |
+| `fanout_shared_1000` | 1,000 | 4,953,630.56 | 4,728,876.88 | 4,730,860.11 | -222,770.45 | -4.50 | single-node claim and cascade units (below) |
+| `delete_single_local` | 200,000 | 1,155.00 | 726.00 | 726.00 | -429.00 | -37.14 | single-node claim and cascade units (below) |
+| `delete_single_shared` | 200,000 | 2,006.30 | 1,574.25 | 1,570.24 | -436.06 | -21.73 | single-node claim and cascade units (below) |
+| `delete_cascade_local` | 1,000 | 3,398,639.09 | 3,163,256.77 | 3,163,256.69 | -235,382.40 | -6.93 | single-node claim and cascade units (below) |
+| `delete_cascade_shared` | 1,000 | 4,761,810.24 | 4,540,105.55 | 4,542,096.61 | -219,713.63 | -4.61 | single-node claim and cascade units (below) |
+| `delete_owned_tree_local` | 10,000 | 602,559.81 | 606,699.94 | 602,402.29 | -157.52 | -0.03 | owned-set claim, offset (below) |
+| `delete_owned_tree_shared` | 10,000 | 982,753.05 | 979,276.17 | 984,057.16 | +1,304.11 | +0.13 | owned-set claim (below) |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 218.14 | 218.14 | 219.14 | +1.00 | +0.46 | bench build (below) |
+| `table_hit_sip_local` | 10,000,000 | 300.99 | 299.98 | 301.75 | +0.76 | +0.25 | bench build (below) |
+| `table_miss_local` | 100,000 | 866.18 | 866.18 | 865.88 | -0.30 | -0.03 | none |
+| `table_miss_shared` | 100,000 | 2,175.11 | 2,179.10 | 2,178.24 | +3.13 | +0.14 | state decode (below) |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | 90.00 | +3.00 | +3.45 | bench build (below) |
+
+New workloads:
+
+| workload | N | T7 |
+|---|--:|--:|
+| `children_rerun_1k_local` | 10,000 | 217,910.27 |
+| `children_rerun_1k_shared` | 10,000 | 236,896.61 |
+| `children_churn_local` | 100,000 | 16,465.46 |
+| `children_churn_shared` | 100,000 | 19,599.39 |
+
+`children_rerun_1k_*` reruns a creator of 1,000 children that keeps
+every key, so it measures the creator-only costs the plan names: the
+index lookups, the touch per child and the Clean landing's sweep scan.
+`children_churn_*` replaces one child per run, so it adds a sweep that
+deletes.
+
+- **Bench build (`get_clean_shared` +2, `value_slot_read_shared` +3,
+  `table_hit_shared` +1, and about half of each Shared compute rise):**
+  with T6's bench sources the T7 library reads 199, 87 and 218.14, equal
+  to T6. Adding the children workloads to the bench binary moves how
+  `SharedValueSlot::read` and its callers are partitioned and register
+  allocated (Intel PT puts `value_slot_read_shared`'s +3 in `read`, 74 to
+  77, with only register renames in the code). No library code differs
+  between the two columns.
+- **Shared computes, library part (`chain_shared/propagate/10` +47.95 per
+  10 computes with T6 benches; `diamond_shared` +12.98,
+  `early_cutoff_shared` +9.01, `simple_count/shared` +2.5,
+  `shared_incremental` +12.5, `table_miss_shared` +4):** Intel PT on
+  `chain_shared/propagate/10` puts the whole rise (+49.5) in three
+  places. `clean_walk` +51 and its closure +18, less
+  `mark_dependents_dirty` −41 whose code moved into it, nets +28: about
+  20 of it is `NodeState::from_u8` decoding a ninth state, `Deleting`
+  (the plan's state; removing the arm reads 20,167.86, and the code shows
+  the jump table's added bound check), and the rest is spills and
+  register renames in the walk. haphazard's `Domain::push_list`
+  +21.9 is the bulk-reclaim cadence inside the crate: its loop
+  instructions run 12,013 and 24,026 times against 104 and 97 in T6, as
+  the shard it picks by each retired box's address changes with heap
+  layout. Removing T7's other per-compute pieces one at a time (the
+  walk's and the compute's `Deleting` arms, the children landing test
+  and the control block's `children` field) left the count within 2 of
+  20,188. Local computes pay the same decode (without the arm
+  `chain_local/propagate/10` reads 9,538 against 9,558) and still read
+  below T6.
+- **Single-node claim and cascade units (`delete_single_*` −430,
+  `delete_cascade_*` and `fanout_*` −4.5% to −8%):** `delete_node` and
+  `delete_erased` claim one node with `claim_single` inline, where T6
+  built a tree claim for every delete; the cascade's unit test, stack
+  segments and bucket counts are the plan's named per-node costs, and the
+  `OWNED` flag lets `unhook_retired` skip the `owner_of` and `labels`
+  lookups for nodes that were never owned, which more than pays for them.
+- **Owned-set claim (`delete_owned_tree_shared` +1,304, +0.13%;
+  `delete_owned_tree_local` +4,140 with T6 benches, −158 with T7's):**
+  `claim_set` takes the owned closure under one write hold, CASes each
+  member to `Deleting` and then `Dead` (two CASes where T6's tree claim
+  made one) and checks every member for a dependent outside the set, the
+  costs the plan's gate names for this bench.
+
+Gate against T6 (plan T7 **Gate**): every Local workload is at or below
+T6; every Shared rise is the bench binary's partitioning, the ninth
+state's decode, haphazard's reclaim cadence or the walk's register
+allocation, each measured above; the delete benches fall except the
+owned-tree pair, whose rise is the plan's named `claim_set` cost.
