@@ -13,7 +13,11 @@
 //! through it) and never moves another entry, and only `reserve` rehashes,
 //! so indices stay valid until the next `reserve`.
 
+use std::alloc::{self, Layout};
+use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
+use std::ptr::NonNull;
+use std::slice;
 
 const EMPTY: u8 = 0;
 const TOMBSTONE: u8 = 1;
@@ -35,13 +39,101 @@ struct Entry<T> {
     value: T,
 }
 
+/// `capacity` entries followed by `capacity` control bytes in a single
+/// allocation, since every table needs both. Dropping a table frees the
+/// memory but drops no entry; [`HashedMultiset`] drops the live ones.
+struct Table<T> {
+    entries: NonNull<MaybeUninit<Entry<T>>>,
+    ctrl: NonNull<u8>,
+    capacity: usize,
+    _owns: PhantomData<Entry<T>>,
+}
+
+// SAFETY: a table owns its entries the way a `Box<[Entry<T>]>` would.
+unsafe impl<T: Send> Send for Table<T> {}
+unsafe impl<T: Sync> Sync for Table<T> {}
+
+impl<T> Table<T> {
+    fn empty() -> Self {
+        Self {
+            entries: NonNull::dangling(),
+            ctrl: NonNull::dangling(),
+            capacity: 0,
+            _owns: PhantomData,
+        }
+    }
+
+    /// The allocation's layout and the control bytes' offset in it.
+    fn layout(capacity: usize) -> (Layout, usize) {
+        Layout::array::<Entry<T>>(capacity)
+            .and_then(|entries| entries.extend(Layout::array::<u8>(capacity)?))
+            .expect("incr-core: collection capacity overflow")
+    }
+
+    /// A table of `capacity` EMPTY slots. `capacity` must not be zero.
+    fn new(capacity: usize) -> Self {
+        debug_assert!(capacity != 0);
+        let (layout, ctrl_offset) = Self::layout(capacity);
+        // SAFETY: the size is not zero, because `capacity` is not and an
+        // entry holds a `u64`.
+        let base = unsafe { alloc::alloc(layout) };
+        let Some(base) = NonNull::new(base) else {
+            alloc::handle_alloc_error(layout)
+        };
+        // SAFETY: the `capacity` control bytes at `ctrl_offset` lie inside
+        // the allocation, and the entries at its start are aligned by the
+        // layout. Writing EMPTY initialises every control byte.
+        let ctrl = unsafe {
+            let ctrl = base.add(ctrl_offset);
+            ctrl.write_bytes(EMPTY, capacity);
+            ctrl
+        };
+        Self {
+            entries: base.cast(),
+            ctrl,
+            capacity,
+            _owns: PhantomData,
+        }
+    }
+
+    fn ctrl(&self) -> &[u8] {
+        // SAFETY: `capacity` initialised control bytes start at `ctrl`
+        // (or none, at a dangling pointer).
+        unsafe { slice::from_raw_parts(self.ctrl.as_ptr(), self.capacity) }
+    }
+
+    fn entries(&self) -> &[MaybeUninit<Entry<T>>] {
+        // SAFETY: `capacity` entry slots start at `entries`, and a
+        // `MaybeUninit` slot needs no initialisation.
+        unsafe { slice::from_raw_parts(self.entries.as_ptr(), self.capacity) }
+    }
+
+    fn parts_mut(&mut self) -> (&mut [u8], &mut [MaybeUninit<Entry<T>>]) {
+        // SAFETY: as for `ctrl` and `entries`; the two ranges are disjoint.
+        unsafe {
+            (
+                slice::from_raw_parts_mut(self.ctrl.as_ptr(), self.capacity),
+                slice::from_raw_parts_mut(self.entries.as_ptr(), self.capacity),
+            )
+        }
+    }
+}
+
+impl<T> Drop for Table<T> {
+    fn drop(&mut self) {
+        if self.capacity != 0 {
+            // SAFETY: allocated by `new` with this layout.
+            unsafe { alloc::dealloc(self.entries.as_ptr().cast(), Self::layout(self.capacity).0) }
+        }
+    }
+}
+
 pub(crate) struct HashedMultiset<T> {
     // Invariant: `ctrl[i] & FULL != 0` exactly when `entries[i]` is
-    // initialised. Both slices have the same power-of-two length (or are
-    // empty), and at least one slot is EMPTY whenever they are not empty,
-    // so every probe loop terminates.
-    ctrl: Box<[u8]>,
-    entries: Box<[MaybeUninit<Entry<T>>]>,
+    // initialised. The table's capacity is a power of two (or zero), and
+    // at least one slot is EMPTY whenever it is not zero, so every probe
+    // loop terminates.
+    table: Table<T>,
     len: usize,
     growth_left: usize,
 }
@@ -76,8 +168,7 @@ impl Located {
 impl<T> HashedMultiset<T> {
     pub(crate) fn new() -> Self {
         Self {
-            ctrl: Box::new([]),
-            entries: Box::new([]),
+            table: Table::empty(),
             len: 0,
             growth_left: 0,
         }
@@ -91,9 +182,10 @@ impl<T> HashedMultiset<T> {
 
     /// Distinct elements with their multiplicities, in table order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&T, usize)> {
-        self.ctrl
+        self.table
+            .ctrl()
             .iter()
-            .zip(self.entries.iter())
+            .zip(self.table.entries())
             .filter(|(c, _)| **c & FULL != 0)
             // SAFETY: the slot is full, so its entry is initialised.
             .map(|(_, e)| unsafe { e.assume_init_ref() })
@@ -114,11 +206,11 @@ impl<T> HashedMultiset<T> {
             .len
             .checked_add(additional)
             .expect("incr-core: collection capacity overflow");
-        let limit = load_limit(self.ctrl.len());
+        let limit = load_limit(self.table.capacity);
         // Purging tombstones at the same size is enough when it frees at
         // least half the limit, which keeps rehashes amortised O(1).
         let capacity = if need <= limit / 2 {
-            self.ctrl.len()
+            self.table.capacity
         } else {
             let need = need.max(limit + 1);
             let mut capacity = 8_usize;
@@ -130,16 +222,17 @@ impl<T> HashedMultiset<T> {
             capacity
         };
         let mask = capacity - 1;
-        let mut ctrl = vec![EMPTY; capacity].into_boxed_slice();
-        let mut entries = Box::<[Entry<T>]>::new_uninit_slice(capacity);
-        for i in 0..self.ctrl.len() {
-            if self.ctrl[i] & FULL == 0 {
+        let mut table = Table::new(capacity);
+        let (ctrl, entries) = table.parts_mut();
+        let (old_ctrl, old_entries) = self.table.parts_mut();
+        for (old_c, old_e) in old_ctrl.iter_mut().zip(old_entries.iter()) {
+            if *old_c & FULL == 0 {
                 continue;
             }
             // SAFETY: the slot is full. Marking it empty right away hands
             // ownership to the new table, so the old one never drops it.
-            let entry = unsafe { self.entries[i].assume_init_read() };
-            let c = mem::replace(&mut self.ctrl[i], EMPTY);
+            let entry = unsafe { old_e.assume_init_read() };
+            let c = mem::replace(old_c, EMPTY);
             let mut j = entry.hash as usize & mask;
             while ctrl[j] != EMPTY {
                 j = (j + 1) & mask;
@@ -147,8 +240,7 @@ impl<T> HashedMultiset<T> {
             ctrl[j] = c;
             entries[j].write(entry);
         }
-        self.ctrl = ctrl;
-        self.entries = entries;
+        self.table = table;
         self.growth_left = load_limit(capacity) - self.len;
     }
 
@@ -159,7 +251,7 @@ impl<T> HashedMultiset<T> {
     where
         T: PartialEq,
     {
-        if self.ctrl.is_empty() {
+        if self.table.capacity == 0 {
             return None;
         }
         self.probe(hash, value).ok()
@@ -173,15 +265,16 @@ impl<T> HashedMultiset<T> {
     where
         T: PartialEq,
     {
-        let mask = self.ctrl.len() - 1;
+        let (ctrl, entries) = (self.table.ctrl(), self.table.entries());
+        let mask = ctrl.len() - 1;
         let tag = tag(hash);
         let mut i = hash as usize & mask;
         let mut free = usize::MAX;
         loop {
-            let c = self.ctrl[i];
+            let c = ctrl[i];
             if c == tag {
                 // SAFETY: a tag byte has FULL set, so the entry is initialised.
-                let e = unsafe { self.entries[i].assume_init_ref() };
+                let e = unsafe { entries[i].assume_init_ref() };
                 if e.hash == hash && e.value == *value {
                     return Ok(i);
                 }
@@ -209,12 +302,13 @@ impl<T> HashedMultiset<T> {
     }
 
     fn entry_mut(&mut self, i: usize) -> &mut Entry<T> {
+        let (ctrl, entries) = self.table.parts_mut();
         assert!(
-            self.ctrl[i] & FULL != 0,
+            ctrl[i] & FULL != 0,
             "incr-core: multiset index {i} is not a live entry"
         );
         // SAFETY: checked full just above.
-        unsafe { self.entries[i].assume_init_mut() }
+        unsafe { entries[i].assume_init_mut() }
     }
 
     fn count(&mut self, i: usize) -> usize {
@@ -238,11 +332,12 @@ impl<T> HashedMultiset<T> {
             entry.count -= 1;
             return None;
         }
-        let next = (i + 1) & (self.ctrl.len() - 1);
+        let (ctrl, entries) = self.table.parts_mut();
+        let next = (i + 1) & (ctrl.len() - 1);
         // An entry's probe run covers every slot from its home to its own
         // position, so a run can only pass through `i` if it continues to
         // `i + 1`. With `i + 1` empty, `i` can be emptied too.
-        self.ctrl[i] = if self.ctrl[next] == EMPTY {
+        ctrl[i] = if ctrl[next] == EMPTY {
             self.growth_left += 1;
             EMPTY
         } else {
@@ -251,7 +346,7 @@ impl<T> HashedMultiset<T> {
         self.len -= 1;
         // SAFETY: the slot was full and is now marked free, so this read
         // takes the only ownership of the entry.
-        Some(unsafe { self.entries[i].assume_init_read() }.value)
+        Some(unsafe { entries[i].assume_init_read() }.value)
     }
 
     /// Insert `value`, which no entry equals, with count 1 at `i`, the
@@ -261,19 +356,20 @@ impl<T> HashedMultiset<T> {
             self.growth_left > 0,
             "incr-core: multiset insert without a reserve"
         );
+        let (ctrl, entries) = self.table.parts_mut();
         assert!(
-            self.ctrl[i] & FULL == 0,
+            ctrl[i] & FULL == 0,
             "incr-core: multiset slot {i} is not free"
         );
-        if self.ctrl[i] == EMPTY {
+        if ctrl[i] == EMPTY {
             self.growth_left -= 1;
         }
-        self.entries[i].write(Entry {
+        entries[i].write(Entry {
             hash,
             count: 1,
             value,
         });
-        self.ctrl[i] = tag(hash);
+        ctrl[i] = tag(hash);
         self.len += 1;
     }
 
@@ -367,7 +463,8 @@ impl<T> Drop for HashedMultiset<T> {
         if !mem::needs_drop::<T>() {
             return;
         }
-        for (c, e) in self.ctrl.iter().zip(self.entries.iter_mut()) {
+        let (ctrl, entries) = self.table.parts_mut();
+        for (c, e) in ctrl.iter().zip(entries.iter_mut()) {
             if *c & FULL != 0 {
                 // SAFETY: the slot is full, and the table is never used again.
                 unsafe { e.assume_init_drop() };
@@ -533,12 +630,12 @@ mod tests {
             let found = set.find(hash(hashing, key), &v(key, 0));
             assert_eq!(found.is_some(), model.contains_key(&key), "find({key})");
         }
-        let full = set.ctrl.iter().filter(|c| **c & FULL != 0).count();
-        let tombstones = set.ctrl.iter().filter(|c| **c == TOMBSTONE).count();
+        let full = set.table.ctrl().iter().filter(|c| **c & FULL != 0).count();
+        let tombstones = set.table.ctrl().iter().filter(|c| **c == TOMBSTONE).count();
         assert_eq!(full, set.len);
         assert_eq!(
             full + tombstones + set.growth_left,
-            load_limit(set.ctrl.len())
+            load_limit(set.table.capacity)
         );
     }
 
@@ -560,10 +657,10 @@ mod tests {
                     assert_eq!(got, model_change(&mut model, old, Some((k, id))), "{op:?}");
                 }
                 Op::Reserve(n) => {
-                    let before = set.ctrl.len();
+                    let before = set.table.capacity;
                     set.reserve(n);
                     assert!(set.growth_left >= n);
-                    assert!(set.ctrl.len() >= before, "reserve shrank the table");
+                    assert!(set.table.capacity >= before, "reserve shrank the table");
                 }
             }
             assert_matches(&set, hashing, &model);
@@ -639,12 +736,12 @@ mod tests {
         for (k, id) in [(0, 0), (3, 1)] {
             change(&mut set, hashing, None, Some((k, id)));
         }
-        let home = hash(hashing, 0) as usize & (set.ctrl.len() - 1);
+        let home = hash(hashing, 0) as usize & (set.table.capacity - 1);
         assert_eq!(set.find(hash(hashing, 0), &v(0, 0)), Some(home));
         let (removed, displaced) = change(&mut set, hashing, Some(0), Some((6, 2)));
         assert!(removed);
         assert_eq!(displaced, vec![0]);
-        assert_eq!(set.ctrl[home], TOMBSTONE);
+        assert_eq!(set.table.ctrl()[home], TOMBSTONE);
         assert!(set.find(hash(hashing, 6), &v(6, 0)).is_some());
         assert!(set.find(hash(hashing, 3), &v(3, 0)).is_some());
     }
@@ -658,6 +755,6 @@ mod tests {
             assert_eq!(got, model_change(&mut model, None, Some((k, u32::from(k)))));
         }
         assert_matches(&set, Hashing::Clustered, &model);
-        assert!(set.ctrl.len() >= 32);
+        assert!(set.table.capacity >= 32);
     }
 }
