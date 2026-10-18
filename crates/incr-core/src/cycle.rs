@@ -7,15 +7,41 @@
 //! [`Cycle`]; a `Fixpoint` member iterates from an initial value until
 //! its values converge or an iteration limit is reached. Members with no
 //! strategy land the values computed against the strategy members',
-//! and those that still read each other land [`NodeState::Cyclic`]
-//! (`crate::NodeState::Cyclic`) with no value, which
-//! [`Runtime::try_get`](crate::Runtime::try_get) reports as `Err(Cycle)`.
+//! and those that still read each other land
+//! [`NodeState::Cyclic`](crate::NodeState::Cyclic) with no value, which
+//! [`Runtime::try_get`](crate::Runtime::try_get) reports as `Err(Cycle)`
+//! and [`Runtime::get`](crate::Runtime::get) as a "dependency cycle"
+//! panic.
 //!
 //! The callbacks (`Fallback`'s function, and a `Fixpoint`'s `initial`,
 //! `step`, `converged` and `on_limit`) can run more than once per
 //! landing. They run with no engine lock held and as value code: a read
 //! of a Clean node returns its value and records nothing, and any other
 //! call into the runtime panics.
+//!
+//! # Entry order
+//!
+//! The landed values are the same whichever member is read first, under
+//! `Local` and `Shared`, except in two cases:
+//! - a `get` that enters a cycle at a member with no strategy panics
+//!   while the cycle is being discovered, because that member has no
+//!   value to give the read that closes the cycle; a `try_get` there
+//!   lands the same values as any other entry;
+//! - which nodes are members can differ when a member's reads depend on
+//!   the provisional values the cycle passes around.
+//!
+//! Under `Shared`, two threads can enter one cycle at once and wait on
+//! each other's claims. The wait that closes such a waits-for cycle
+//! makes every thread on it but the oldest release its claims and retry
+//! its outermost engine call, so the oldest resolves the cycle alone.
+//!
+//! # `panic = abort`
+//!
+//! Cycles whose members all have a strategy resolve without unwinding.
+//! These outcomes unwind, and so abort when panics abort (as on wasm by
+//! default): a `get` that closes a cycle with no value, such a read
+//! nested under a `try_get` that would return it as `Err`, and the
+//! retry of a `Shared` thread waiting on a claim cycle.
 
 use std::any::Any;
 use std::cell::Cell;
