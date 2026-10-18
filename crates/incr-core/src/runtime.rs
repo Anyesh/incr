@@ -984,21 +984,13 @@ impl<C: Cells> Runtime<C> {
             .map(|member| self.retire_claimed(member))
             .collect::<Vec<Retired<C>>>()
             .into_iter();
-        let dep_lists = retired
-            .as_slice()
-            .iter()
-            .filter(|r| r.dep_list.is_some())
-            .count();
         let mut inner = self.inner.write();
         let first = retired
             .next()
             .expect("incr-core: a batch release has a member");
-        let had_dep_list = first.dep_list.is_some();
         let (drops, dep_list) = self.unhook_retired(&mut inner, first);
         let mut bag = DeleteBag::new(drops, dep_list);
-        // Counted and reserved under the hold, so the batch's pushes
-        // grow the spill at most once.
-        bag.reserve_batch(retired.len(), dep_lists - usize::from(had_dep_list));
+        bag.reserve_batch(retired.len());
         for member in retired {
             let (drops, dep_list) = self.unhook_retired(&mut inner, member);
             bag.push_node(drops, dep_list);

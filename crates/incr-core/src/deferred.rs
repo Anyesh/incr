@@ -14,10 +14,11 @@
 //! so the hot path boxes and allocates nothing. A compute's `Deferred` is
 //! a dep-list slot and a spill pointer, and draining an empty one is two
 //! null tests. A delete's bag is built around the first released node's
-//! drops, so a single-node delete never tests for an empty node slot.
-//! Batch releases push type-erased items into the spill `Vec` (`None`
-//! until first use, which allocates nothing) and reserve it per batch, so
-//! each batch costs at most one buffer growth.
+//! drops, so a single-node delete never tests for an empty node slot, and
+//! an owned-tree delete's later members go into a typed buffer reserved
+//! per batch, so each batch costs at most one growth and boxes nothing.
+//! A compute's rare extra items go into a type-erased spill `Vec` (`None`
+//! until first use, which allocates nothing).
 //!
 //! The drain has two modes, chosen by the exit and never by
 //! `std::thread::panicking()`. On an exit that returns normally, items
@@ -117,16 +118,6 @@ impl<C: Cells> Deferred<C> {
         }
     }
 
-    /// Reserve room for a batch's `items` erased pushes, so the batch
-    /// costs at most one buffer growth.
-    fn reserve(&mut self, items: usize) {
-        let spill = self.spill_mut();
-        if spill.capacity() - spill.len() < items {
-            spill.reserve(items);
-            count_spill_alloc();
-        }
-    }
-
     pub(crate) fn push_erased(&mut self, item: ErasedDrop) {
         let spill = self.spill_mut();
         if spill.len() == spill.capacity() {
@@ -210,11 +201,14 @@ impl<C: Cells> Deferred<C> {
     }
 }
 
-/// A delete's bag: the first released node's drops inline, everything
-/// after them in `rest`.
+/// A delete's bag: the first released node's drops inline, the first
+/// displaced dep list in its slot, and every later member in `members`.
+/// The drain runs them in that order, which is push order except that
+/// the slot's list goes before every later member.
 pub(crate) struct DeleteBag<C: Cells> {
     node: NodeDrops<C>,
-    rest: Deferred<C>,
+    dep_list: Option<RetiredDeps<C>>,
+    members: Option<Vec<SpilledMember<C>>>,
 }
 
 impl<C: Cells> DeleteBag<C> {
@@ -222,28 +216,37 @@ impl<C: Cells> DeleteBag<C> {
     pub(crate) fn new(node: NodeDrops<C>, dep_list: Option<RetiredDeps<C>>) -> Self {
         Self {
             node,
-            rest: Deferred {
-                dep_list,
-                spill: None,
-            },
+            dep_list,
+            members: None,
         }
     }
 
-    /// Reserve for a batch's further `nodes` node pushes and `dep_lists`
-    /// token pushes, less the dep-list slot if it is still free.
-    pub(crate) fn reserve_batch(&mut self, nodes: usize, dep_lists: usize) {
-        let spilled_lists = dep_lists.saturating_sub(usize::from(self.rest.dep_list.is_none()));
-        let items = nodes + spilled_lists;
-        if items > 0 {
-            self.rest.reserve(items);
+    /// Reserve for a batch's further `nodes` node pushes, so the batch
+    /// grows the member buffer at most once.
+    pub(crate) fn reserve_batch(&mut self, nodes: usize) {
+        let members = self.members.get_or_insert_with(Vec::new);
+        if members.capacity() - members.len() < nodes {
+            members.reserve(nodes);
+            count_spill_alloc();
         }
     }
 
-    pub(crate) fn push_node(&mut self, drops: NodeDrops<C>, dep_list: Option<RetiredDeps<C>>) {
-        self.rest.push_erased(Box::new(SpilledNode(drops)));
-        if let Some(token) = dep_list {
-            self.rest.push_dep_list(token);
+    pub(crate) fn push_node(&mut self, node: NodeDrops<C>, dep_list: Option<RetiredDeps<C>>) {
+        let dep_list = match dep_list {
+            Some(token) if self.dep_list.is_none() => {
+                self.dep_list = Some(token);
+                None
+            }
+            other => other,
+        };
+        let members = self.members.get_or_insert_with(Vec::new);
+        if members.len() == members.capacity() {
+            count_spill_alloc();
         }
+        members.push(SpilledMember {
+            node,
+            _dep_list: RetireOnDrop(dep_list),
+        });
     }
 
     /// Normal mode: see the module docs.
@@ -251,11 +254,11 @@ impl<C: Cells> DeleteBag<C> {
     pub(crate) fn drain(mut self, rt: &Runtime<C>) {
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
             self.node.drop_parts();
-            if !self.rest.is_empty() {
-                self.rest.drop_items();
+            if self.dep_list.is_some() || self.members.is_some() {
+                self.drop_rest();
             }
         })) {
-            self.rest.unwind(rt, payload);
+            self.unwind(rt, payload);
         }
         let DeleteBag {
             node:
@@ -265,30 +268,66 @@ impl<C: Cells> DeleteBag<C> {
                     arena,
                     ..
                 },
-            rest,
+            dep_list,
+            members,
         } = self;
         // `drop_parts` left these empty, so forgetting them leaks nothing
         // and skips their drop glue.
         debug_assert!(compute.is_none() && observers.capacity() == 0);
+        debug_assert!(dep_list.is_none() && members.is_none());
         mem::forget(compute);
         mem::forget(observers);
+        mem::forget(dep_list);
+        mem::forget(members);
         drop(arena);
-        rest.forget_empty();
+    }
+
+    /// Retires the slot's list, then drops every member, each leaving
+    /// the bag only as it drops, and leaves the bag's rest empty. The
+    /// members are reversed so they pop in push order; [`Self::unwind`]
+    /// restores the order of what a panic left.
+    fn drop_rest(&mut self) {
+        if let Some(token) = self.dep_list.take() {
+            retire_dep_list::<C>(token);
+        }
+        if let Some(members) = self.members.as_mut() {
+            members.reverse();
+            while let Some(member) = members.pop() {
+                drop(member);
+            }
+            self.members = None;
+        }
+    }
+
+    /// The normal-mode panic exit: poison the reading frame and resume,
+    /// leaving the items not yet dropped to drop, in order, with the bag.
+    #[cold]
+    fn unwind(&mut self, rt: &Runtime<C>, payload: Box<dyn Any + Send>) -> ! {
+        if let Some(members) = self.members.as_mut() {
+            members.reverse();
+        }
+        rt.dep_stack.poison_current_frame();
+        resume_unwind(payload)
     }
 }
 
-/// A node's drops spilled behind the bag's inline node; its drop runs
-/// the inline node's steps in the same order, the arena release included.
-struct SpilledNode<C: Cells>(NodeDrops<C>);
+/// A member spilled behind the bag's inline node, with the dep list it
+/// displaced unless that took the bag's slot. Its drop runs the inline
+/// node's steps in the same order, the arena release included, and the
+/// list retires after them as a field, even when a step panics.
+struct SpilledMember<C: Cells> {
+    node: NodeDrops<C>,
+    _dep_list: RetireOnDrop<C>,
+}
 
-impl<C: Cells> Drop for SpilledNode<C> {
+impl<C: Cells> Drop for SpilledMember<C> {
     fn drop(&mut self) {
-        self.0.drop_parts();
+        self.node.drop_parts();
     }
 }
 
-/// A second displaced dep list in one bag, spilled as an erased item;
-/// its drop is the retire, like the typed slot's.
+/// A displaced dep list behind a bag's typed slot; its drop is the
+/// retire, like the slot's.
 struct RetireOnDrop<C: Cells>(Option<RetiredDeps<C>>);
 
 impl<C: Cells> Drop for RetireOnDrop<C> {
