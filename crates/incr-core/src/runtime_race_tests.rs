@@ -689,50 +689,51 @@ fn strict_delete_of_an_owner_waits_out_a_claimed_owned_node() {
     rt.assert_invariant_i();
 }
 
-/// Another delete claims a group after the router's strict delete checked
-/// it but before it claimed it. The router delete must not release the
-/// router until that delete has unhooked the group from it.
+/// The router's strict delete finds a group claimed by a parked delete
+/// of that group: `claim_set` rolls every member it took back to its
+/// state, waits the group's delete out, and then deletes the rest.
 #[test]
-fn strict_delete_of_an_owner_survives_an_owned_node_claimed_mid_claim() {
+fn strict_delete_of_an_owner_rolls_back_around_a_claimed_owned_node() {
     let rt = Arc::new(Rt::new());
     let (router, versions) = grouped(&rt);
     let group = versions[0];
-    let owner_claimed = Gate::new();
-    let group_claimed = Gate::new();
+    let claimed = Gate::new();
+    let rolled_back = Gate::new();
     park_at(
         &rt,
         vec![
+            (ParkPoint::DeleteAfterCheck(id(group)), claimed.clone()),
             (
-                ParkPoint::DeleteBeforeOwnedClaims(id(router)),
-                owner_claimed.clone(),
-            ),
-            (
-                ParkPoint::DeleteAfterCheck(id(group)),
-                group_claimed.clone(),
+                ParkPoint::ClaimSetRolledBack(id(router)),
+                rolled_back.clone(),
             ),
         ],
     );
-    let router_delete = {
-        let rt = Arc::clone(&rt);
-        thread::spawn(move || rt.try_delete_node(router))
-    };
-    owner_claimed.wait_parked();
     let group_delete = {
         let rt = Arc::clone(&rt);
         thread::spawn(move || rt.delete_node(group))
     };
-    group_claimed.wait_parked();
-    owner_claimed.release();
+    claimed.wait_parked();
+    let router_delete = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.try_delete_node(router))
+    };
+    rolled_back.wait_parked();
+    assert_eq!(rt.state_of(router), NodeState::Clean);
+    assert_eq!(rt.state_of(versions[1]), NodeState::Clean);
+    assert!(rt.is_alive(router) && rt.is_alive(versions[1]));
+    rolled_back.release();
     thread::sleep(Duration::from_millis(50));
     assert!(
         !router_delete.is_finished(),
-        "the router delete finished before the group's delete released it"
+        "the router delete waits for the group's"
     );
 
-    group_claimed.release();
+    claimed.release();
     group_delete.join().unwrap();
     assert_eq!(router_delete.join().unwrap(), Ok(()));
     assert!(versions.iter().all(|&v| !rt.is_alive(v)));
+    assert_eq!(rt.node_count(), 1, "only the source is left");
     rt.assert_invariant_i();
 }
 

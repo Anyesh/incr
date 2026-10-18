@@ -508,6 +508,7 @@ impl<C: Cells> Runtime<C> {
                 .get_mut(&(self.runtime_id, slot))
                 .expect("incr-core: a member run's node is held");
             e.record_run(deps);
+            e.opened = !ctl.children.get().is_null();
             e.poisoned |= ctl.has(cycle::POISONED);
             // An engine unwind is no fault of the member's.
             if result.is_err()
@@ -544,6 +545,7 @@ impl<C: Cells> Runtime<C> {
         held.buf = ctl.buf.take();
         held.poisoned = ctl.has(cycle::POISONED);
         held.wrote = ctl.wrote.get() != 0;
+        held.opened = !ctl.children.get().is_null();
         held.record_run(deps);
         let displaced = cycle_state::with_held(|h| {
             if lowlink < cidx {
@@ -952,7 +954,7 @@ impl<C: Cells> Runtime<C> {
             }
             let entry = cycle_state::with_held(|h| h.remove(&(rt, m)));
             if let Some(e) = entry {
-                self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev);
+                self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
                 bag.push_erased(Box::new((e.buf, e.s)));
             }
         }
@@ -1001,7 +1003,7 @@ impl<C: Cells> Runtime<C> {
                 };
                 self.land_failed(id, node, flags, attempt, e.wrote, &e.deps, &released, bag);
             } else {
-                self.discard_land(id, e.first, e.wrote, stamp_rev);
+                self.discard_land(id, e.first, e.wrote, stamp_rev, bag);
             }
             bag.push_erased(Box::new((e.buf, e.s)));
         }
@@ -1013,8 +1015,16 @@ impl<C: Cells> Runtime<C> {
     /// wrote its slot is stamped and lands New, so that its retry writes
     /// and stamps unconditionally; any other lands Dirty. Recorded deps
     /// are dropped and installed ones kept. It never lands Failed.
-    pub(super) fn discard_land(&self, id: NodeId, first: bool, wrote: bool, stamp_rev: u64) {
+    pub(super) fn discard_land(
+        &self,
+        id: NodeId,
+        first: bool,
+        wrote: bool,
+        stamp_rev: u64,
+        bag: &mut Deferred<C>,
+    ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
+        self.children_landing(id, flags, ChildLanding::Discard, false, bag);
         let target = if wrote {
             node.max_changed_at(stamp_rev);
             NodeState::New
@@ -1069,6 +1079,7 @@ impl<C: Cells> Runtime<C> {
                 if e.first {
                     node.set_verified_at(0);
                 }
+                self.children_landing(NodeId(m), flags, ChildLanding::Discard, false, bag);
                 self.land_single(NodeId(m), node, flags, NodeState::New, NodeState::New);
                 bag.push_erased(Box::new((e.buf, e.s)));
             }
@@ -1178,6 +1189,16 @@ impl<C: Cells> Runtime<C> {
                 (false, false) => (NodeState::Clean, NodeState::Dirty),
                 (false, true) => (NodeState::Dirty, NodeState::Dirty),
             };
+            // A member of CU lands with no value, so its runs count as
+            // discarded; the others keep the children of their last run,
+            // which is the final pass.
+            let children = match target {
+                NodeState::Clean => ChildLanding::Sweep,
+                NodeState::Dirty => ChildLanding::Keep,
+                _ => ChildLanding::Discard,
+            };
+            let flags = self.nodes.get_with_flags(m).1;
+            self.children_landing(NodeId(m), flags, children, e.opened, bag);
             self.land(node, target, flagged);
             bag.push_erased(Box::new((e.buf, e.s)));
         }
@@ -1212,7 +1233,7 @@ impl<C: Cells> Runtime<C> {
                 let deps = std::mem::take(&mut e.deps);
                 self.land_failed(id, node, flags, attempt, false, &deps, &members, bag);
             } else {
-                self.discard_land(id, e.first, e.wrote, stamp_rev);
+                self.discard_land(id, e.first, e.wrote, stamp_rev, bag);
             }
             bag.push_erased(Box::new((e.buf.take(), e.s.take())));
         }

@@ -149,6 +149,18 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// The node and control block of `rt`'s active frame, if its top
+    /// frame is one of `rt`'s computes. A callback's barrier frame, which
+    /// belongs to no runtime, is never one, under either stack.
+    fn active_compute(&self, rt: RuntimeId) -> Option<(NodeId, *const ComputeCtl)> {
+        self.with(|s| {
+            s.frames
+                .last()
+                .filter(|top| top.rt == rt)
+                .map(|top| (top.node, top.ctl))
+        })
+    }
+
     /// True iff `rt` has an active frame (we're inside one of its
     /// compute closures).
     fn current_frame_active(&self, rt: RuntimeId) -> bool {

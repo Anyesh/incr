@@ -20,6 +20,7 @@
 pub mod arena;
 mod arena_registry;
 pub mod cells;
+mod children;
 pub mod collection;
 pub mod cycle;
 mod cycle_state;

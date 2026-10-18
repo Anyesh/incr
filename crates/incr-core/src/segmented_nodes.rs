@@ -65,6 +65,16 @@ pub(crate) const IN_GROUP: u8 = 2;
 /// (`Inner::cycle_strategies` has an entry for it).
 pub(crate) const HAS_STRATEGY: u8 = 4;
 
+/// `NodeFlags` bit: the node has created owned children through
+/// `child_input` or `child_query` (`Inner::children` has its index).
+/// Unlike [`HAS_CHILDREN`] it stays set when every child is gone, so a
+/// later run reuses the index instead of starting a second one.
+pub(crate) const HAS_INDEX: u8 = 8;
+
+/// `NodeFlags` bit: the node is owned (`Inner::owner_of` has an entry
+/// for it), so a delete looks the entry up only when it is set.
+pub(crate) const OWNED: u8 = 16;
+
 /// A segment of nodes and, beside them, one flags byte per node. The
 /// bytes are zeroed when the segment is allocated and stored only under
 /// the runtime's write lock, so a Relaxed load anywhere reads a value

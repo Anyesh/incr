@@ -36,6 +36,8 @@ pub(crate) struct Held {
     /// landing installs them all.
     pub(crate) installed: Vec<NodeId>,
     pub(crate) wrote: bool,
+    /// The last run reached the node's child index.
+    pub(crate) opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
     pub(crate) poisoned: bool,
@@ -61,6 +63,7 @@ impl Held {
             last: Vec::new(),
             installed: Vec::new(),
             wrote: false,
+            opened: false,
             changed: false,
             poisoned: false,
             failed: false,

@@ -200,7 +200,7 @@ impl Drop for OnDrop {
 
 /// A `Boom(1)` sits retired in the global domain, armed, so the next
 /// forced reclaim runs its panicking `Drop`.
-fn retire_armed_boom<C: Cells>(rt: &Runtime<C>) {
+pub(super) fn retire_armed_boom<C: Cells>(rt: &Runtime<C>) {
     let pending = rt.create_input(Boom(1));
     rt.set(pending, Boom(2));
     arm(1);

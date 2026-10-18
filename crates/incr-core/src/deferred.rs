@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use crate::arena_registry::ErasedArena;
 use crate::cells::Cells;
+use crate::children::ChildIndex;
 use crate::cycle::ErasedStrategy;
 use crate::cycle_state;
 use crate::dep_stack::DepStack;
@@ -59,6 +60,8 @@ pub(crate) type ErasedDrop = Box<dyn Any>;
 /// retiring the value outside the arena lock. The arena is borrowed from
 /// the runtime, which frees arenas only when it drops.
 pub(crate) struct NodeDrops<'rt, C: Cells> {
+    /// A creator's child index, whose keys are user values.
+    pub(crate) children: Option<Box<ChildIndex<C>>>,
     pub(crate) compute: Option<ComputeFn<C>>,
     pub(crate) strategy: Option<Arc<dyn ErasedStrategy>>,
     pub(crate) observers: Vec<ObserverEntry<C>>,
@@ -67,12 +70,13 @@ pub(crate) struct NodeDrops<'rt, C: Cells> {
 }
 
 impl<C: Cells> NodeDrops<'_, C> {
-    /// The closure and cycle strategy, then the observers, then the arena release. Each
+    /// The child index, the closure and cycle strategy, then the observers, then the arena release. Each
     /// part leaves `self` only as it drops, so after a panic the parts
     /// not yet reached drop with `self`, and the release never runs
     /// twice because no drop glue runs it.
     #[inline(always)]
     fn drop_parts(&mut self) {
+        drop(self.children.take());
         drop(self.compute.take());
         drop(self.strategy.take());
         drop(mem::take(&mut self.observers));
@@ -124,6 +128,20 @@ impl<C: Cells> Deferred<C> {
         } else {
             self.push_erased(Box::new(RetireOnDrop::<C>(Some(token))));
         }
+    }
+
+    /// A node a sweep or rollback released while its creator's claim is
+    /// held, dropped at the drain like any spilled item.
+    pub(crate) fn push_node(&mut self, node: NodeDrops<'_, C>, dep_list: Option<RetiredDeps<C>>) {
+        // SAFETY: the only borrow in `NodeDrops` is the arena, which the
+        // runtime frees only when it drops. Every `Deferred` is created,
+        // drained and dropped inside a call that borrows that runtime, so
+        // the arena outlives the item.
+        let node: NodeDrops<'static, C> = unsafe { mem::transmute(node) };
+        self.push_erased(Box::new(ReleasedNode {
+            node,
+            _dep_list: RetireOnDrop(dep_list),
+        }));
     }
 
     pub(crate) fn push_erased(&mut self, item: ErasedDrop) {
@@ -329,6 +347,19 @@ struct SpilledMember<'rt, C: Cells> {
 }
 
 impl<C: Cells> Drop for SpilledMember<'_, C> {
+    fn drop(&mut self) {
+        self.node.drop_parts();
+    }
+}
+
+/// A node released into a compute's bag: its drop runs the same steps
+/// as a delete bag's member.
+struct ReleasedNode<C: Cells> {
+    node: NodeDrops<'static, C>,
+    _dep_list: RetireOnDrop<C>,
+}
+
+impl<C: Cells> Drop for ReleasedNode<C> {
     fn drop(&mut self) {
         self.node.drop_parts();
     }

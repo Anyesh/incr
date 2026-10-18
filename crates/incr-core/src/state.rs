@@ -52,6 +52,12 @@ pub enum NodeState {
     /// and a read gets the cycle. Settled like Clean, so the bit pattern
     /// `(s | 4) == 7` holds for exactly these two.
     Cyclic = 7,
+    /// Claimed by a delete of an owned set (`claim_set`) that may still
+    /// roll the claim back. It exists only inside the claimant's
+    /// `inner.write()` hold, so a path that finds it holds no lock and
+    /// spins until the state moves to `Dead` or back. 8, not 3 or 7, so
+    /// `is_settled` stays false for it.
+    Deleting = 8,
 }
 
 impl NodeState {
@@ -66,6 +72,7 @@ impl NodeState {
             5 => Self::ComputingDirty,
             6 => Self::Dead,
             7 => Self::Cyclic,
+            8 => Self::Deleting,
             other => panic!("invalid NodeState value: {}", other),
         }
     }

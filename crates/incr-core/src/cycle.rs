@@ -335,6 +335,9 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
+    /// The creator's `ChildIndex` while this run may reach it, or null
+    /// until the run creates its first child.
+    pub(crate) children: Cell<*const ()>,
 }
 
 impl ComputeCtl {
@@ -345,6 +348,7 @@ impl ComputeCtl {
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
+            children: Cell::new(std::ptr::null()),
         }
     }
 
