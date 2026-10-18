@@ -1848,9 +1848,12 @@ impl<C: Cells> Runtime<C> {
 
     /// Before a delete claims input `id`: refused here, while nothing is
     /// claimed, because a delete that marked the node first would leave
-    /// it `Dead` under a set claim only this thread could release.
+    /// it `Dead` under a set claim only this thread could release. The
+    /// claim bit is tested first so that the thread-local scan runs only
+    /// when some set holds the input: this thread's own claim is always
+    /// visible to it.
     fn refuse_delete_under_own_set(&self, id: NodeId) {
-        if set_stack::holds(self.runtime_id, id.0) {
+        if self.nodes.get(id.0).set_claimed() && set_stack::holds(self.runtime_id, id.0) {
             reached_under_own_set(id);
         }
     }
