@@ -28,9 +28,16 @@ pub(crate) struct Held {
     pub(crate) s: Option<Erased>,
     /// Every dep any run of this claim recorded, for the stale check.
     pub(crate) deps: Vec<(NodeId, u32)>,
-    /// The deps of the last run, which the landing installs.
+    /// The deps of the last run: its reads of other members are the
+    /// iteration's graph.
     pub(crate) last: Vec<(NodeId, u32)>,
+    /// Every dep the runs since the episode's last restart recorded, in
+    /// first-read order: the landed value depends on all of them, so the
+    /// landing installs them all.
+    pub(crate) installed: Vec<NodeId>,
     pub(crate) wrote: bool,
+    /// The landing changed the slot's value.
+    pub(crate) changed: bool,
     pub(crate) poisoned: bool,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
@@ -52,7 +59,9 @@ impl Held {
             s: None,
             deps: Vec::new(),
             last: Vec::new(),
+            installed: Vec::new(),
             wrote: false,
+            changed: false,
             poisoned: false,
             failed: false,
             episode: None,
@@ -65,6 +74,9 @@ impl Held {
         for &d in &deps {
             if !self.deps.contains(&d) {
                 self.deps.push(d);
+            }
+            if !self.installed.contains(&d.0) {
+                self.installed.push(d.0);
             }
         }
         self.last = deps;
@@ -86,6 +98,7 @@ type HeldMap = HashMap<(RuntimeId, u32), Held>;
 thread_local! {
     static HELD: RefCell<HeldMap> = RefCell::new(HashMap::new());
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+    static FAILURES: Cell<u64> = const { Cell::new(0) };
     static LAST_CYCLE: RefCell<Option<Cycle>> = const { RefCell::new(None) };
     static DISSOLVED: RefCell<HashSet<(RuntimeId, u32)>> = RefCell::new(HashSet::new());
 }
@@ -94,6 +107,7 @@ thread_local! {
 loom::thread_local! {
     static HELD: RefCell<HeldMap> = RefCell::new(HashMap::new());
     static DEPTH: Cell<u32> = Cell::new(0);
+    static FAILURES: Cell<u64> = Cell::new(0);
     static LAST_CYCLE: RefCell<Option<Cycle>> = RefCell::new(None);
     static DISSOLVED: RefCell<HashSet<(RuntimeId, u32)>> = RefCell::new(HashSet::new());
 }
@@ -167,6 +181,19 @@ pub(crate) fn dissolved_before(rt: RuntimeId, root: u32) -> bool {
 
 pub(crate) fn has_dissolved(rt: RuntimeId, root: u32) -> bool {
     DISSOLVED.with(|d| d.borrow().contains(&(rt, root)))
+}
+
+/// How many held claims this thread has marked failed: a member run that
+/// panics marks its node only if no member nested in it was marked, so
+/// the panic is attributed to the member whose own code raised it.
+pub(crate) fn failures() -> u64 {
+    FAILURES.with(Cell::get)
+}
+
+/// Marks `held` failed.
+pub(crate) fn mark_failed(held: &mut Held) {
+    held.failed = true;
+    FAILURES.with(|f| f.set(f.get() + 1));
 }
 
 /// The thread's engine entry depth: 0 outside every engine entry.

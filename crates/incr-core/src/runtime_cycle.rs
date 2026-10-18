@@ -411,6 +411,7 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: this thread holds the node's claim, so its closure is
         // not freed (see `compute_attempts`).
         let compute = unsafe { &*compute };
+        let failures = cycle_state::failures();
         let result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
         let deps = self.dep_stack.pop_frame();
         let word = value_code::thread_word();
@@ -423,7 +424,9 @@ impl<C: Cells> Runtime<C> {
                 .expect("incr-core: a member run's node is held");
             e.record_run(deps);
             e.poisoned |= ctl.has(cycle::POISONED);
-            e.failed |= result.is_err();
+            if result.is_err() && cycle_state::failures() == failures {
+                cycle_state::mark_failed(e);
+            }
             std::mem::replace(&mut e.buf, ctl.buf.take())
         });
         drop(replaced);
@@ -528,7 +531,7 @@ impl<C: Cells> Runtime<C> {
             Err(payload) => {
                 cycle_state::with_held(|h| {
                     if let Some(e) = h.get_mut(&(self.runtime_id, slot)) {
-                        e.failed = true;
+                        cycle_state::mark_failed(e);
                     }
                 });
                 self.abort_episode(cidx, payload, bag)
@@ -611,6 +614,7 @@ impl<C: Cells> Runtime<C> {
                     e.anchor = cidx;
                     e.episode = Some(cycle.clone());
                     e.in_cu = cu.binary_search(m).is_ok();
+                    e.installed.clear();
                 }
             });
             // Every claim precedes this capture, because membership growth
@@ -893,6 +897,7 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         entries.sort_unstable_by_key(|(slot, _)| *slot);
+        let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
         let stamp_rev = self.current_revision();
         let verify_rev = C::walked(&self.walk, &self.revision);
         for (slot, e) in entries {
@@ -905,7 +910,7 @@ impl<C: Cells> Runtime<C> {
                     stamp_rev,
                     verify_rev,
                 };
-                self.land_failed(id, node, flags, attempt, e.wrote, &e.deps, bag);
+                self.land_failed(id, node, flags, attempt, e.wrote, &e.deps, &released, bag);
             } else {
                 self.discard_land(id, e.first, e.wrote, stamp_rev);
             }
@@ -986,14 +991,14 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(*m);
             let mut old: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| old.push(d));
-            let new: Vec<NodeId> = e.last.iter().map(|&(d, _)| d).collect();
+            let new: &[NodeId] = &e.installed;
             superseded |= new.iter().any(|d| {
                 members.binary_search(&d.0).is_err()
                     && !old.contains(d)
                     && !self.observed_clean(*d, verify_rev)
             });
             if old != new {
-                if let Some(displaced) = node.install_deps(&new) {
+                if let Some(displaced) = node.install_deps(new) {
                     bag.push_dep_list(displaced);
                 }
                 for o in &old {
@@ -1001,7 +1006,7 @@ impl<C: Cells> Runtime<C> {
                         inner.dependents[o.0 as usize].remove(id);
                     }
                 }
-                for n in &new {
+                for n in new {
                     if !old.contains(n) {
                         inner.dependents[n.0 as usize].push_unique(id);
                     }
@@ -1030,6 +1035,7 @@ impl<C: Cells> Runtime<C> {
                     entries[i].1.wrote = true;
                 }
                 node.max_changed_at(stamp_rev);
+                entries[i].1.changed = true;
             } else {
                 let e = &mut entries[i].1;
                 let value = if e.seeded { e.s.take() } else { e.buf.take() }
@@ -1044,6 +1050,7 @@ impl<C: Cells> Runtime<C> {
                     Ok((changed, displaced)) => {
                         if changed || first {
                             node.max_changed_at(stamp_rev);
+                            e.changed = true;
                         }
                         if let Some(d) = displaced {
                             bag.push_erased(d);
@@ -1070,6 +1077,12 @@ impl<C: Cells> Runtime<C> {
             });
         for (m, e) in entries {
             let node = self.nodes.get(m);
+            self.record_trace(
+                NodeId(m),
+                crate::trace::TraceAction::Recomputed {
+                    value_changed: e.changed,
+                },
+            );
             let (target, flagged) = match (cu.binary_search(&m).is_ok(), dirty) {
                 (true, false) => (NodeState::Cyclic, NodeState::New),
                 (true, true) => (NodeState::New, NodeState::New),
@@ -1096,6 +1109,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
+        let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {
             let id = NodeId(*m);
             if e.failed && !e.wrote {
@@ -1107,7 +1121,7 @@ impl<C: Cells> Runtime<C> {
                     verify_rev,
                 };
                 let deps = std::mem::take(&mut e.deps);
-                self.land_failed(id, node, flags, attempt, false, &deps, bag);
+                self.land_failed(id, node, flags, attempt, false, &deps, &members, bag);
             } else {
                 self.discard_land(id, e.first, e.wrote, stamp_rev);
             }

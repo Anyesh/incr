@@ -425,6 +425,8 @@ struct Walk {
     /// New nodes with installed deps this walk has expanded, created at
     /// the first one.
     new_expanded: Option<HashSet<NodeId>>,
+    /// The cycle groups this walk has expanded whole.
+    groups: Option<Vec<Arc<GroupInfo>>>,
 }
 
 impl Walk {
@@ -438,6 +440,7 @@ impl Walk {
             first_visits: 0,
             visited: None,
             new_expanded: None,
+            groups: None,
         }
     }
 
@@ -610,6 +613,9 @@ pub struct Runtime<C: Cells> {
     /// Group verifications failed by a member's `verified_at` of 0.
     #[cfg(test)]
     pub(crate) group_zero_fails: std::sync::atomic::AtomicU64,
+    /// Visit entries every `ensure_clean` walk on this runtime popped.
+    #[cfg(test)]
+    pub(crate) walk_pops: std::sync::atomic::AtomicU64,
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -639,6 +645,8 @@ impl<C: Cells> Runtime<C> {
             expansions: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             group_zero_fails: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            walk_pops: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2355,11 +2363,14 @@ impl<C: Cells> Runtime<C> {
                 }
                 continue;
             }
+            #[cfg(test)]
+            self.walk_pops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if walk.is_visited(cur) {
                 continue;
             }
 
-            let node = self.nodes.get(cur.0);
+            let (node, flags) = self.nodes.get_with_flags(cur.0);
             let observed = if taint == VISIT {
                 state::load::<C>(node.state_cell())
             } else {
@@ -2367,6 +2378,12 @@ impl<C: Cells> Runtime<C> {
             };
             match observed {
                 NodeState::Clean | NodeState::Cyclic => continue,
+                NodeState::Dirty
+                    if C::u8_load_relaxed(flags) & IN_GROUP != 0
+                        && self.expand_group(cur, &mut walk) =>
+                {
+                    continue
+                }
                 NodeState::Computing | NodeState::ComputingDirty => {
                     if !is_root {
                         if let Some(depth) = self.own_claim_depth(cur) {
@@ -2413,6 +2430,54 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// The first time a walk reaches a Dirty member of a landed group, it
+    /// expands the whole group: a pending entry for the member, whose
+    /// compute verifies the group, and every member's deps outside the
+    /// group. Edges between members are never pushed, so the group costs
+    /// one expansion per walk. Returns false for a stale `IN_GROUP` bit,
+    /// whose node is expanded as an ordinary Dirty node.
+    #[cold]
+    #[inline(never)]
+    fn expand_group(&self, cur: NodeId, walk: &mut Walk) -> bool {
+        let group = self.inner.read().member_recs.get(&cur.0).cloned();
+        let Some(group) = group else {
+            return false;
+        };
+        let generation = self.nodes.get(cur.0).generation();
+        if !group
+            .members
+            .iter()
+            .any(|&(m, g)| m == cur.0 && g == generation)
+        {
+            return false;
+        }
+        let groups = walk.groups.get_or_insert_with(Vec::new);
+        if groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
+            return true;
+        }
+        groups.push(group.clone());
+        #[cfg(test)]
+        self.expansions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        walk.visit(cur);
+        for &(m, _) in &group.members {
+            self.nodes.get(m).for_each_dep(|dep| {
+                if group
+                    .members
+                    .binary_search_by_key(&dep.0, |&(s, _)| s)
+                    .is_ok()
+                {
+                    return;
+                }
+                let dep_state = state::load::<C>(self.nodes.get(dep.0).state_cell());
+                if !dep_state.is_settled() {
+                    walk.expand(dep, dep_state);
+                }
+            });
+        }
+        true
     }
 
     /// A root the taint memo holds, computed without a walk. Out of line
@@ -2711,7 +2776,7 @@ impl<C: Cells> Runtime<C> {
                 debug_assert_ne!(outcome, Outcome::Buffered);
                 let value_changed = outcome == Outcome::Changed;
 
-                let published = self.publish_deps(id, &deps, false, verify_rev, bag);
+                let published = self.publish_deps(id, &deps, None, verify_rev, bag);
 
                 // The closure has already written its value into the slot, and
                 // the next recompute's early cutoff compares against it, so a
@@ -2801,7 +2866,7 @@ impl<C: Cells> Runtime<C> {
         // would lose recovery paths through deps the failed run had not
         // reached yet. Extra edges only cause spurious re-verification,
         // never staleness.
-        self.land_failed(id, node, flags, attempt, wrote, deps, bag);
+        self.land_failed(id, node, flags, attempt, wrote, deps, &[], bag);
         // An enclosing closure that catches the unwind has still read a
         // dep that did not land Clean.
         self.dep_stack.poison_current_frame(self.runtime_id);
@@ -2811,6 +2876,8 @@ impl<C: Cells> Runtime<C> {
     /// Fix 5's landing of a claim whose closure panicked: the union of
     /// the old and recorded deps is published, and the node lands Failed,
     /// or Dirty or New where publication says the panic may hide a change.
+    /// `co_members`, sorted, are the claims released with it, which count
+    /// as settled.
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -2820,9 +2887,10 @@ impl<C: Cells> Runtime<C> {
         attempt: Attempt,
         wrote: bool,
         deps: &[(NodeId, u32)],
+        co_members: &[u32],
         bag: &mut Deferred<C>,
     ) {
-        let landing = match self.publish_deps(id, deps, true, attempt.verify_rev, bag) {
+        let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
             // A stale dep's slot may already belong to another node, so no
             // union is published. The old deps keep their reverse edges.
             Publish::Stale => NodeState::New,
@@ -2956,11 +3024,12 @@ impl<C: Cells> Runtime<C> {
         &self,
         id: NodeId,
         recorded: &[(NodeId, u32)],
-        panicked: bool,
+        panic: Option<&[u32]>,
         verify_rev: u64,
         bag: &mut Deferred<C>,
     ) -> Publish {
         let node = self.nodes.get(id.0);
+        let panicked = panic.is_some();
 
         // Compared in place so the static-dep fast path, the common case,
         // allocates nothing; under Local an allocation pair per compute
@@ -3010,7 +3079,10 @@ impl<C: Cells> Runtime<C> {
         let settled = |d: &NodeId| {
             old_deps.contains(d)
                 || self.observed_clean(*d, verify_rev)
-                || (panicked && self.nodes.get(d.0).state() == NodeState::Failed)
+                || panic.is_some_and(|members| {
+                    self.nodes.get(d.0).state() == NodeState::Failed
+                        || members.binary_search(&d.0).is_ok()
+                })
         };
         let superseded = !new_deps.iter().all(settled);
 
@@ -3089,6 +3161,44 @@ impl<C: Cells> Runtime<C> {
     #[cfg(not(loom))]
     pub(crate) fn force_state_for_test<T>(&self, h: Incr<T>, to: NodeState) {
         state::store::<C>(self.nodes.get(h.slot()).state_cell(), to);
+    }
+
+    /// Moves a never-run query from New to Dirty, as no engine path does,
+    /// so that a verify meets an empty slot behind `verified_at = 0`.
+    #[cfg(not(loom))]
+    pub(crate) fn force_dirty_for_test<T>(&self, h: Incr<T>) {
+        let node = self.nodes.get(h.slot());
+        assert_eq!(node.dep_count(), 0, "a forced node has no installed deps");
+        assert_eq!(node.verified_at(), 0, "a forced node was never verified");
+        state::try_transition::<C>(node.state_cell(), NodeState::New, NodeState::Dirty)
+            .expect("a forced node is New");
+    }
+
+    /// Records `members` as one landed group, as an episode's step 2 does.
+    #[cfg(not(loom))]
+    pub(crate) fn force_group_for_test(&self, members: &[ErasedIncr]) {
+        let mut inner = self.inner.write();
+        let mut sorted: Vec<(u32, u32)> =
+            members.iter().map(|m| (m.slot(), m.generation())).collect();
+        sorted.sort_unstable();
+        let group = Arc::new(GroupInfo {
+            members: sorted,
+            cycle: Cycle::new(members.to_vec()),
+        });
+        for m in members {
+            inner.member_recs.insert(m.slot(), group.clone());
+            let flags = self.nodes.get_with_flags(m.slot()).1;
+            C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
+        }
+    }
+
+    pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
+        self.nodes.get(h.slot()).verified_at()
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn walk_pops(&self) -> u64 {
+        self.walk_pops.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Invariant (I) of the shared-protocol plan, checked at quiescence:
@@ -3216,6 +3326,10 @@ mod cycle_walk_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_cycle_tests.rs"]
 mod cycle_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_cycle_rule_tests.rs"]
+mod cycle_rule_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]
