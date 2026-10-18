@@ -3,11 +3,13 @@
 //! `loom::model` can explore its interleavings.
 //!
 //! Orderings mirror [`Shared`](crate::cells::Shared) exactly; a model is
-//! only evidence about `Shared` if every ordering here matches it. Value
-//! slots and overflow dep lists are loom `RwLock`s instead of hazard
-//! pointers: `SharedValueSlot` issues a SeqCst fence on every protect,
-//! which would multiply the explored state space, and the models keep
-//! every dep list inline.
+//! only evidence about `Shared` if every ordering here matches it. A
+//! value slot is a loom `AtomicPtr` with `SharedValueSlot`'s orderings but
+//! no hazard pointers, whose SeqCst fence on every protect would multiply
+//! the explored state space; the boxes it displaces stay allocated until
+//! the slot drops, in place of the hazard-deferred retire. Overflow dep
+//! lists are loom `RwLock`s, because the models keep every dep list
+//! inline.
 //!
 //! Every value of a loom type has to be created inside `loom::model`, so
 //! no non-loom test can run in a `--cfg loom` build. The models are
@@ -81,55 +83,91 @@ impl<T: 'static> PtrCell<T> for LoomPtrCell<T> {
     }
 }
 
-pub struct LoomValueSlot<T>(RwLock<Option<T>>);
+/// Null means never written. Reads load with Acquire, the ordering of
+/// the validating load in a hazard protect, and writes swap with Release,
+/// as `haphazard::AtomicPtr::swap` does.
+pub struct LoomValueSlot<T> {
+    ptr: AtomicPtr<T>,
+    /// Displaced boxes, freed with the slot so that a reader still cloning
+    /// one never sees it freed. A std lock, because a loom one would add
+    /// branch points; loom runs one modeled thread at a time and nothing
+    /// under this lock yields to it.
+    parked: std::sync::Mutex<Vec<Box<T>>>,
+}
 
 impl<T: Value> LoomValueSlot<T> {
-    fn read_guard(&self) -> RwLockReadGuard<'_, Option<T>> {
-        self.0
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    fn from_raw(ptr: *mut T) -> Self {
+        Self {
+            ptr: AtomicPtr::new(ptr),
+            parked: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
-    fn write_guard(&self) -> RwLockWriteGuard<'_, Option<T>> {
-        self.0
-            .write()
+    fn current(&self) -> Option<&T> {
+        // SAFETY: every non-null pointer in this slot came from
+        // Box::into_raw, and a displaced one is parked until the slot
+        // drops, so the reference stays valid for the borrow of `self`.
+        unsafe { self.ptr.load(Ordering::Acquire).as_ref() }
+    }
+
+    fn swap(&self, ptr: *mut T) -> Option<()> {
+        let old = self.ptr.swap(ptr, Ordering::Release);
+        if old.is_null() {
+            return None;
+        }
+        // SAFETY: `old` came from Box::into_raw and the swap took it out
+        // of the slot, so this is its only owner.
+        let old = unsafe { Box::from_raw(old) };
+        self.parked
+            .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(old);
+        Some(())
     }
 }
 
 impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
-    type Displaced = T;
+    type Displaced = ();
     fn new_empty() -> Self {
-        Self(RwLock::new(None))
+        Self::from_raw(std::ptr::null_mut())
     }
     fn new_with(v: T) -> Self {
-        Self(RwLock::new(Some(v)))
+        Self::from_raw(Box::into_raw(Box::new(v)))
     }
     fn read(&self) -> T {
-        self.read_guard()
-            .as_ref()
+        self.current()
             .expect("ValueSlot::read on a slot that was never written")
             .clone()
     }
     fn try_read(&self) -> Option<T> {
-        self.read_guard().clone()
+        self.current().cloned()
     }
-    fn write(&self, v: T) -> Option<T> {
-        self.write_guard().replace(v)
+    fn write(&self, v: T) -> Option<()> {
+        self.swap(Box::into_raw(Box::new(v)))
     }
     fn eq_current(&self, v: &T) -> bool {
-        self.read_guard().as_ref() == Some(v)
+        self.current() == Some(v)
     }
-    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, T> {
-        let mut slot = self.write_guard();
-        if value_code::run(|| slot.as_ref() == Some(&v)) {
+    fn write_if_changed(&self, v: T, on_write: impl FnOnce()) -> Compared<T, ()> {
+        if value_code::run(|| self.current() == Some(&v)) {
             return Compared::Equal(v);
         }
         on_write();
-        Compared::Replaced(slot.replace(v))
+        Compared::Replaced(self.write(v))
     }
-    fn clear(&self) -> Option<T> {
-        self.write_guard().take()
+    fn clear(&self) -> Option<()> {
+        self.swap(std::ptr::null_mut())
+    }
+}
+
+impl<T> Drop for LoomValueSlot<T> {
+    fn drop(&mut self) {
+        let ptr = self.ptr.with_mut(|p| *p);
+        if !ptr.is_null() {
+            // SAFETY: the slot owns its current pointer, which came from
+            // Box::into_raw, and nothing can load it past the slot's drop.
+            drop(unsafe { Box::from_raw(ptr) });
+        }
     }
 }
 
