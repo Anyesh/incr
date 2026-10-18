@@ -412,6 +412,11 @@ fn compute_frame_read_over_an_installed_edge(land_first: bool) {
     );
 
     let holding = Gate::new();
+    // Armed before the reader starts, so its `PartialEq` cannot pass the
+    // gate first.
+    if !land_first {
+        holding.arm();
+    }
     let reader = {
         let rt = Arc::clone(&rt);
         let holding = holding.clone();
@@ -430,7 +435,6 @@ fn compute_frame_read_over_an_installed_edge(land_first: bool) {
         assert_eq!(reader.join().unwrap(), 3);
         rt.set(y, 12);
     } else {
-        holding.arm();
         holding.wait_parked();
         rt.set(y, 12);
         holding.release();
