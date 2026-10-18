@@ -540,7 +540,12 @@ fn reached_under_own_set(id: NodeId) -> ! {
 /// retire on any thread. When such a `Drop` panics, the rest of that
 /// reclaim batch is leaked, never dropped and never freed; the runtime
 /// stays usable.
+// `repr(C)` with `dep_stack` first, because every dep read inside a
+// compute passes it to an out-of-line `record_dep`, and at offset 0 that
+// pointer is `self`.
+#[repr(C)]
 pub struct Runtime<C: Cells> {
+    pub(crate) dep_stack: <C as Cells>::DepStack,
     pub(crate) nodes: SegmentedNodes<C>,
     /// Read with no lock; written only under `inner.write()`, through
     /// `Inner::arena_tags`.
@@ -548,7 +553,6 @@ pub struct Runtime<C: Cells> {
     pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
-    pub(crate) dep_stack: <C as Cells>::DepStack,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
     /// `compute_one` via a Relaxed load (~1 ns when disarmed) so the
@@ -1288,14 +1292,19 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether `slot` owns nodes. The caller holds `inner`, under whose
-    /// write hold the flag is kept in step with `Inner::owned`.
-    fn owns_nodes(&self, slot: u32) -> bool {
-        C::u8_load_relaxed(self.nodes.get_with_flags(slot).1) & HAS_CHILDREN != 0
+    /// write hold the flag is kept in step with `Inner::owned`. An empty
+    /// map is tested first because it answers for every node with one
+    /// load, and the flag spares the hash once any node owns something.
+    #[inline]
+    fn owns_nodes(&self, inner: &Inner<C>, slot: u32) -> bool {
+        !inner.owned.is_empty()
+            && C::u8_load_relaxed(self.nodes.get_with_flags(slot).1) & HAS_CHILDREN != 0
     }
 
     /// The nodes `slot` owns, looking the map up only for an owner.
+    #[inline]
     fn owned_by<'a>(&self, inner: &'a Inner<C>, slot: u32) -> Option<&'a Vec<NodeId>> {
-        if self.owns_nodes(slot) {
+        if self.owns_nodes(inner, slot) {
             inner.owned.get(&slot)
         } else {
             None
@@ -1377,7 +1386,9 @@ impl<C: Cells> Runtime<C> {
                         if node.generation() != handle.generation() {
                             return DeleteOutcome::AlreadyGone;
                         }
-                        if !inner.dependents[slot as usize].is_empty() || self.owns_nodes(slot) {
+                        if !inner.dependents[slot as usize].is_empty()
+                            || self.owns_nodes(&inner, slot)
+                        {
                             return DeleteOutcome::HasDependents;
                         }
                         state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok()
@@ -1439,7 +1450,7 @@ impl<C: Cells> Runtime<C> {
     ) -> (NodeDrops<'_, C>, Option<RetiredDeps<C>>) {
         let slot = retired.handle.slot();
         let id = NodeId(slot);
-        let node = self.nodes.get(slot);
+        let (node, flags) = self.nodes.get_with_flags(slot);
         debug_assert!(
             !inner.owned.contains_key(&slot),
             "incr-core: released node {} still owns nodes",
@@ -1461,7 +1472,7 @@ impl<C: Cells> Runtime<C> {
                 C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !HAS_CHILDREN);
             }
         }
-        C::u8_store_relaxed(self.nodes.get_with_flags(slot).1, 0);
+        C::u8_store_relaxed(flags, 0);
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
         let observers: Vec<ObserverEntry<C>> = inner
@@ -1950,10 +1961,10 @@ impl<C: Cells> Runtime<C> {
     /// node as Dirty. Every transition is a CAS so the walk can never
     /// clobber a `Computing` claim it raced with.
     fn mark_dependents_dirty(&self, start: NodeId) {
-        let mut queue: Vec<NodeId> = {
-            let inner = self.inner.read();
-            inner.dependents[start.0 as usize].iter().collect()
-        };
+        // Sized up front so a short walk allocates once and never takes
+        // the grow path.
+        let mut queue: Vec<NodeId> = Vec::with_capacity(8);
+        self.inner.read().dependents[start.0 as usize].extend_into(&mut queue);
 
         while let Some(id) = queue.pop() {
             let node = self.nodes.get(id.0);
@@ -1965,7 +1976,7 @@ impl<C: Cells> Runtime<C> {
                             .is_ok()
                         {
                             let inner = self.inner.read();
-                            queue.extend(inner.dependents[id.0 as usize].iter());
+                            inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
                         // The state moved under us (a claim or another
@@ -1986,7 +1997,7 @@ impl<C: Cells> Runtime<C> {
                         .is_ok()
                         {
                             let inner = self.inner.read();
-                            queue.extend(inner.dependents[id.0 as usize].iter());
+                            inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
                     }
@@ -1998,7 +2009,7 @@ impl<C: Cells> Runtime<C> {
                         // is an RMW for the reason given on the Dirty arm.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
                             let inner = self.inner.read();
-                            queue.extend(inner.dependents[id.0 as usize].iter());
+                            inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
                     }
@@ -2700,7 +2711,7 @@ impl<C: Cells> Runtime<C> {
             ids.dedup();
             assert_eq!(ids.len(), n, "dependents[{slot}] holds a node twice");
             assert_eq!(
-                self.owns_nodes(slot as u32),
+                C::u8_load_relaxed(self.nodes.get_with_flags(slot as u32).1) & HAS_CHILDREN != 0,
                 inner.owned.contains_key(&(slot as u32)),
                 "HAS_CHILDREN of node {slot} disagrees with the owned map"
             );

@@ -65,26 +65,27 @@ impl DependentList {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_inline(&self) -> bool {
         self.head[0] != NONE
     }
 
-    #[inline]
+    #[inline(always)]
     fn block(&self) -> *mut Header {
         debug_assert!(!self.is_inline());
         // SAFETY: outside inline mode the tail holds the block variant.
         unsafe { self.tail.block }
     }
 
+    #[inline(always)]
     fn inline_ids(&self) -> &[u32] {
         // SAFETY: in inline mode `head` and the tail's ids are written and
-        // form one `[u32; INLINE]` (the asserts above); the length counts
-        // the entries before the first `NONE`.
-        unsafe {
-            let all = std::slice::from_raw_parts(ptr::from_ref(self).cast::<u32>(), INLINE);
-            &all[..all.iter().position(|&x| x == NONE).unwrap_or(INLINE)]
-        }
+        // form one `[u32; INLINE]` (the asserts above).
+        let all = unsafe { &*ptr::from_ref(self).cast::<[u32; INLINE]>() };
+        // Entries are packed before the `NONE` padding, so counting them
+        // gives the length without a scan that stops early.
+        let len = all.iter().map(|&x| usize::from(x != NONE)).sum::<usize>();
+        &all[..len]
     }
 
     fn inline_slot(&mut self, i: usize) -> &mut u32 {
@@ -150,6 +151,31 @@ impl DependentList {
         self.as_slice().iter().map(|&x| NodeId(x))
     }
 
+    /// Append the ids to `out`. Inline entries are pushed until the
+    /// first `NONE`, so a one-entry list costs two compares.
+    #[inline(always)]
+    pub(crate) fn extend_into(&self, out: &mut Vec<NodeId>) {
+        if self.is_inline() {
+            // SAFETY: as in `inline_ids`.
+            let all = unsafe { &*ptr::from_ref(self).cast::<[u32; INLINE]>() };
+            out.push(NodeId(all[0]));
+            for &x in &all[1..] {
+                if x == NONE {
+                    return;
+                }
+                out.push(NodeId(x));
+            }
+        } else if !self.block().is_null() {
+            self.extend_from_block(out);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn extend_from_block(&self, out: &mut Vec<NodeId>) {
+        out.extend(Self::block_ids(self.block()).iter().map(|&x| NodeId(x)));
+    }
+
     #[inline]
     pub(crate) fn last(&self) -> Option<NodeId> {
         self.as_slice().last().map(|&x| NodeId(x))
@@ -160,6 +186,7 @@ impl DependentList {
         self.as_slice().contains(&id.0)
     }
 
+    #[inline]
     pub(crate) fn push(&mut self, id: NodeId) {
         debug_assert_ne!(id.0, NONE, "NodeId::SENTINEL is never a dependent");
         if self.is_inline() {
@@ -174,16 +201,21 @@ impl DependentList {
             self.head[0] = id.0;
             self.tail = Tail { ids: [NONE; W] };
         } else {
-            let block = self.block();
-            // SAFETY: a non-null block is live and owned by this list.
-            unsafe {
-                if (*block).len == (*block).cap {
-                    self.tail.block = Self::grow(block);
-                }
-                let block = self.tail.block;
-                Self::ids_of(block).add((*block).len as usize).write(id.0);
-                (*block).len += 1;
+            self.push_to_block(id);
+        }
+    }
+
+    #[inline(never)]
+    fn push_to_block(&mut self, id: NodeId) {
+        let block = self.block();
+        // SAFETY: a non-null block is live and owned by this list.
+        unsafe {
+            if (*block).len == (*block).cap {
+                self.tail.block = Self::grow(block);
             }
+            let block = self.tail.block;
+            Self::ids_of(block).add((*block).len as usize).write(id.0);
+            (*block).len += 1;
         }
     }
 
@@ -225,6 +257,7 @@ impl DependentList {
     }
 
     /// Remove `id`, scanning from the back. Returns whether it was there.
+    #[inline]
     pub(crate) fn remove(&mut self, id: NodeId) -> bool {
         if self.is_inline() {
             let ids = self.inline_ids();
@@ -243,34 +276,47 @@ impl DependentList {
         } else if self.block().is_null() {
             false
         } else {
-            let block = self.block();
-            let ids = Self::block_ids_mut(block);
-            let Some(at) = ids.iter().rposition(|&x| x == id.0) else {
-                return false;
-            };
-            ids.copy_within(at + 1.., at);
-            // SAFETY: a non-null block is live and owned by this list.
-            unsafe {
-                (*block).len -= 1;
-                if (*block).len == 0 {
-                    Self::free(block);
-                    self.tail.block = ptr::null_mut();
-                }
-            }
-            true
+            self.remove_from_block(id)
         }
     }
 
+    #[inline(never)]
+    fn remove_from_block(&mut self, id: NodeId) -> bool {
+        let block = self.block();
+        let ids = Self::block_ids_mut(block);
+        let Some(at) = ids.iter().rposition(|&x| x == id.0) else {
+            return false;
+        };
+        ids.copy_within(at + 1.., at);
+        // SAFETY: a non-null block is live and owned by this list.
+        unsafe {
+            (*block).len -= 1;
+            if (*block).len == 0 {
+                Self::free(block);
+                self.tail.block = ptr::null_mut();
+            }
+        }
+        true
+    }
+
+    #[inline]
     pub(crate) fn clear(&mut self) {
         if !self.is_inline() && !self.block().is_null() {
-            // SAFETY: a non-null block is live and owned by this list.
-            unsafe { Self::free(self.block()) };
+            self.free_block();
         }
         self.set_empty();
     }
 
+    #[cold]
+    #[inline(never)]
+    fn free_block(&mut self) {
+        // SAFETY: a non-null block is live and owned by this list.
+        unsafe { Self::free(self.block()) };
+    }
+
     // Field writes, not `*self = Self::new()`: that assignment would drop
     // the old value, and `Drop` calls `clear`.
+    #[inline(always)]
     fn set_empty(&mut self) {
         self.head = [NONE; W];
         self.tail = Tail {
@@ -353,6 +399,10 @@ mod tests {
                 assert_eq!(list.len(), want.len());
                 assert_eq!(list.is_empty(), want.is_empty());
                 assert_eq!(list.last().map(|n| n.0), want.last().copied());
+                let mut out = vec![NodeId(7)];
+                list.extend_into(&mut out);
+                let out: Vec<u32> = out.iter().map(|n| n.0).collect();
+                assert_eq!(out[1..], want[..]);
                 if want.len() > INLINE {
                     assert!(list.has_block(), "{} ids fit inline", want.len());
                 }
