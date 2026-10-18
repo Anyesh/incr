@@ -393,9 +393,29 @@ impl Walk {
         }
     }
 
+    #[inline(always)]
+    fn push(&mut self, entry: Entry) {
+        if self.work.len() == self.work.capacity() {
+            self.grow();
+        }
+        self.work.push(entry);
+    }
+
+    /// Grows through a fresh allocation, not `realloc`, because glibc's
+    /// `realloc` bypasses its thread cache and costs several times a
+    /// cached `malloc` and `free`. The first growth goes straight to 16
+    /// entries, so a short walk grows once.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let mut grown = Vec::with_capacity((self.work.capacity() * 2).max(16));
+        grown.extend_from_slice(&self.work);
+        self.work = grown;
+    }
+
     #[inline]
     fn visit(&mut self, id: NodeId) {
-        self.work.push(Entry {
+        self.push(Entry {
             id,
             taint: NO_TAINT,
         });
@@ -426,7 +446,7 @@ impl Walk {
 
     #[inline]
     fn expand(&mut self, dep: NodeId) {
-        self.work.push(Entry {
+        self.push(Entry {
             id: dep,
             taint: VISIT,
         });
