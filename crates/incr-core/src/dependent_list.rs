@@ -93,7 +93,13 @@ impl DependentList {
         unsafe { &mut *ptr::from_mut(self).cast::<u32>().add(i) }
     }
 
-    fn block_ids<'a>(block: *mut Header) -> &'a mut [u32] {
+    fn block_ids<'a>(block: *mut Header) -> &'a [u32] {
+        // SAFETY: as in `block_ids_mut`. Shared, so readers on several
+        // threads under the read lock never hold overlapping `&mut`.
+        unsafe { std::slice::from_raw_parts(Self::ids_of(block), (*block).len as usize) }
+    }
+
+    fn block_ids_mut<'a>(block: *mut Header) -> &'a mut [u32] {
         // SAFETY: a block holds `len` initialized ids after its header, and
         // the caller borrows it through the list that owns it.
         unsafe { std::slice::from_raw_parts_mut(Self::ids_of(block), (*block).len as usize) }
@@ -128,6 +134,7 @@ impl DependentList {
         !self.is_inline() && self.block().is_null()
     }
 
+    #[inline]
     fn as_slice(&self) -> &[u32] {
         if self.is_inline() {
             self.inline_ids()
@@ -138,10 +145,12 @@ impl DependentList {
         }
     }
 
+    #[inline]
     pub(crate) fn iter(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.as_slice().iter().map(|&x| NodeId(x))
     }
 
+    #[inline]
     pub(crate) fn last(&self) -> Option<NodeId> {
         self.as_slice().last().map(|&x| NodeId(x))
     }
@@ -235,7 +244,7 @@ impl DependentList {
             false
         } else {
             let block = self.block();
-            let ids = Self::block_ids(block);
+            let ids = Self::block_ids_mut(block);
             let Some(at) = ids.iter().rposition(|&x| x == id.0) else {
                 return false;
             };
