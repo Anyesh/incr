@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use crate::arena_registry::ArenaRegistry;
+use crate::arena_registry::{ArenaRegistry, ArenaTags};
 use crate::cells::Cells;
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
 use crate::dep_stack::DepStack;
@@ -54,7 +54,7 @@ pub(crate) type ComputeFn<C> =
 pub(crate) struct Inner<C: Cells> {
     pub(crate) compute_fns: Vec<Option<ComputeFn<C>>>,
     pub(crate) dependents: Vec<Vec<NodeId>>,
-    pub(crate) arenas: ArenaRegistry<C>,
+    pub(crate) arena_tags: ArenaTags,
     pub(crate) labels: HashMap<u32, String>,
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
     /// Node slots released by delete_node, awaiting recycling.
@@ -89,7 +89,7 @@ impl<C: Cells> Inner<C> {
         Self {
             compute_fns: Vec::new(),
             dependents: Vec::new(),
-            arenas: ArenaRegistry::new(),
+            arena_tags: ArenaTags::default(),
             labels: HashMap::new(),
             trace_log: Vec::new(),
             free_nodes: Vec::new(),
@@ -143,12 +143,27 @@ pub(crate) enum ParkPoint {
     /// In `get`, after the node was found Clean and before its value is
     /// read from the arena.
     GetBeforeRead(NodeId),
+    /// In `get`'s value-code arm, after the fast path missed and before
+    /// the state is loaded again.
+    ValueCodeBeforeReload(NodeId),
     /// In a collection operator's rebuild, just after it read an
     /// upstream's snapshot and released that upstream's guard.
     RebuildAfterSnapshot,
     /// In `compute_one`, after a Stale publish landed `New` and before
     /// the retry, with the attempt's bag carried along.
     StaleRetry(NodeId),
+}
+
+/// The panic of a read that found its node `Dead` under the handle's
+/// generation: a delete has claimed it and not yet unhooked it.
+#[cold]
+#[inline(never)]
+fn deleted_while_reading(id: NodeId) -> ! {
+    panic!(
+        "incr-core: node {} was deleted while a read was reaching it (a \
+         compute raced delete_node on one of its recorded dependencies)",
+        id.0,
+    );
 }
 
 /// What [`Runtime::delete_erased`] did with a node.
@@ -525,6 +540,9 @@ fn reached_under_own_set(id: NodeId) -> ! {
 /// stays usable.
 pub struct Runtime<C: Cells> {
     pub(crate) nodes: SegmentedNodes<C>,
+    /// Read with no lock; written only under `inner.write()`, through
+    /// `Inner::arena_tags`.
+    pub(crate) arenas: ArenaRegistry<C>,
     pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
@@ -554,6 +572,7 @@ impl<C: Cells> Runtime<C> {
     pub fn new() -> Self {
         Self {
             nodes: SegmentedNodes::new(),
+            arenas: ArenaRegistry::new(),
             inner: <<C as Cells>::Lock<Inner<C>> as Lock<Inner<C>>>::new(Inner::new()),
             revision: C::new_u64(1),
             walk: C::new_watermark(1),
@@ -660,7 +679,7 @@ impl<C: Cells> Runtime<C> {
         let revision = self.current_revision();
         let (slot, generation) = {
             let mut inner = self.inner.write();
-            let (type_tag, arena) = inner.arenas.ensure_tagged::<T>();
+            let (type_tag, arena) = self.arenas.ensure_tagged::<T>(&mut inner.arena_tags);
             let arena_slot = arena.reserve_with(value);
             let slot = if let Some(slot) = inner.free_nodes.pop() {
                 self.nodes
@@ -695,7 +714,7 @@ impl<C: Cells> Runtime<C> {
 
         let (slot, generation) = {
             let mut inner = self.inner.write();
-            let (type_tag, arena) = inner.arenas.ensure_tagged::<T>();
+            let (type_tag, arena) = self.arenas.ensure_tagged_shared::<T>(&mut inner.arena_tags);
             let arena_slot = arena.reserve();
             let slot = if let Some(slot) = inner.free_nodes.pop() {
                 self.nodes
@@ -715,7 +734,7 @@ impl<C: Cells> Runtime<C> {
             // means there's no prior value, so we always treat it as
             // changed; `is_recompute=true` compares against the stored
             // value via T's PartialEq.
-            let arena_inner = arena.clone();
+            let arena_inner = arena;
             let compute: ComputeFn<C> = Arc::new(
                 move |rt: &Runtime<C>, slot: u32, is_recompute: bool, wrote: &Cell<u8>| -> bool {
                     let new_value = f(rt);
@@ -1031,7 +1050,7 @@ impl<C: Cells> Runtime<C> {
     /// observer or value `Drop` runs at the bag's drain: a `Drop` that
     /// deletes a member then panics as stale instead of waiting on this
     /// thread's own claim (bug h).
-    fn release_tree(&self, owned: Vec<ErasedIncr>, root: ErasedIncr) -> DeleteBag<C> {
+    fn release_tree(&self, owned: Vec<ErasedIncr>, root: ErasedIncr) -> DeleteBag<'_, C> {
         if owned.is_empty() {
             return self.release_claimed(root);
         }
@@ -1357,7 +1376,7 @@ impl<C: Cells> Runtime<C> {
     /// closure, observers, value and displaced dep list go into the
     /// returned bag, which the delete drains once it holds no lock.
     #[inline(always)]
-    fn release_claimed(&self, handle: ErasedIncr) -> DeleteBag<C> {
+    fn release_claimed(&self, handle: ErasedIncr) -> DeleteBag<'_, C> {
         let retired = self.retire_claimed(handle);
         let (drops, dep_list) = {
             let mut inner = self.inner.write();
@@ -1394,7 +1413,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         inner: &mut Inner<C>,
         retired: Retired<C>,
-    ) -> (NodeDrops<C>, Option<RetiredDeps<C>>) {
+    ) -> (NodeDrops<'_, C>, Option<RetiredDeps<C>>) {
         let slot = retired.handle.slot();
         let id = NodeId(slot);
         let node = self.nodes.get(slot);
@@ -1425,7 +1444,7 @@ impl<C: Cells> Runtime<C> {
             .map(|(_, e)| e)
             .collect();
         inner.labels.remove(&slot);
-        let arena = Arc::clone(inner.arenas.erased(retired.type_tag));
+        let arena = self.arenas.erased(retired.type_tag);
         inner.free_nodes.push(slot);
         let drops = NodeDrops {
             compute,
@@ -1451,21 +1470,7 @@ impl<C: Cells> Runtime<C> {
 
         let observed = state::load::<C>(node.state_cell());
         if observed == NodeState::Clean {
-            // Until the Clean read stops taking locks, value code is
-            // refused here too, where `get_slow` refuses it through
-            // `ensure_clean`.
-            value_code::check();
-            // Seqlock order: the fields first, then the generation under
-            // an Acquire fence, so a generation that still matches the
-            // handle says the fields are this node's, not an occupant's
-            // (the recycle bumps the generation before its Release fence
-            // and the field stores, `reinit_recycled`).
-            let type_tag = node.type_tag();
-            let arena_slot = node.arena_slot();
-            C::fence_acquire();
-            if node.generation() != handle.generation() {
-                self.stale_handle(handle);
-            }
+            let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack.record_dep(NodeId(slot), handle.generation());
             return self.read_slot(handle, node, type_tag, arena_slot);
         }
@@ -1483,27 +1488,69 @@ impl<C: Cells> Runtime<C> {
         }
         self.dep_stack.record_dep(NodeId(slot), handle.generation());
 
+        let word = value_code::thread_word();
+        if word & value_code::COUNTER_MASK != 0 {
+            return self.value_code_read(handle, node);
+        }
         // `get` found the node not Clean, so the walk starts at once.
-        let word = value_code::checked_word();
         if self.clean_walk(NodeId(slot), handle.generation(), word, observed) == Computed::Gone {
             self.stale_handle(handle);
         }
+        let (type_tag, arena_slot) = self.fields_under(handle, node);
+        self.read_slot(handle, node, type_tag, arena_slot)
+    }
 
+    /// [`Self::get_slow`] reached from value code, a trait method of a
+    /// value, key or element type that read a node `get` did not find
+    /// Clean. Value code must not compute or wait, so the read reloads
+    /// the state and succeeds only if the node is Clean by now.
+    #[cold]
+    #[inline(never)]
+    fn value_code_read<T: Value>(&self, handle: Incr<T>, node: &NodeData<C>) -> T {
+        let id = NodeId(handle.slot());
+        self.park(ParkPoint::ValueCodeBeforeReload(id));
+        match state::load::<C>(node.state_cell()) {
+            NodeState::Clean => {
+                let (type_tag, arena_slot) = self.fields_under(handle, node);
+                self.read_slot(handle, node, type_tag, arena_slot)
+            }
+            // A concurrent delete is no contract breach, so the read gets
+            // the panic any reader of a node being deleted gets. Under
+            // Local only this thread can be mid-delete, so the value code
+            // was called from inside the delete.
+            NodeState::Dead if !C::SINGLE_THREADED => {
+                if node.generation() != handle.generation() {
+                    self.stale_handle(handle);
+                }
+                deleted_while_reading(id)
+            }
+            _ => value_code::contract_panic(),
+        }
+    }
+
+    /// A node's arena tag and slot, loaded in seqlock order: the fields
+    /// first, then the generation under an Acquire fence, so a generation
+    /// that still matches the handle says the fields are this node's,
+    /// not an occupant's (the recycle bumps the generation before its
+    /// Release fence and the field stores, `reinit_recycled`).
+    #[inline(always)]
+    fn fields_under<T: Value>(&self, handle: Incr<T>, node: &NodeData<C>) -> (u16, u32) {
         let type_tag = node.type_tag();
         let arena_slot = node.arena_slot();
         C::fence_acquire();
         if node.generation() != handle.generation() {
             self.stale_handle(handle);
         }
-        self.read_slot(handle, node, type_tag, arena_slot)
+        (type_tag, arena_slot)
     }
 
     /// Clone the value behind a node's tag and arena slot, both read
-    /// under a generation that matched the handle. The arena may still
-    /// have released or reassigned the slot since, so the value counts
-    /// only if the generation is unmoved after the read: a recycle
-    /// writes the slot under the arena lock the read takes, after the
-    /// bump, so a reader of the occupant's value sees the bump too.
+    /// under a generation that matched the handle. Takes no lock, so the
+    /// clone, which is value code, runs outside every incr lock. The
+    /// arena may have released or reassigned the slot since, so the value
+    /// counts only if the generation is unmoved after the read: a recycle
+    /// bumps the generation before it writes the slot, and a read that
+    /// loads the occupant's value synchronizes with that write.
     #[inline(always)]
     fn read_slot<T: Value>(
         &self,
@@ -1513,10 +1560,7 @@ impl<C: Cells> Runtime<C> {
         arena_slot: u32,
     ) -> T {
         self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
-        let arena = {
-            let inner = self.inner.read();
-            inner.arenas.tagged_arena::<T>(type_tag)
-        };
+        let arena = self.arenas.tagged_arena::<T>(type_tag);
         let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)));
         C::fence_acquire();
         if node.generation() == handle.generation() {
@@ -1671,7 +1715,7 @@ impl<C: Cells> Runtime<C> {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
-        let displaced = self.write_claimed(claim, &arena, arena_slot, value);
+        let displaced = self.write_claimed(claim, arena, arena_slot, value);
         // The old value's user `Drop`, or the reclaim its retire may run,
         // happens with no claim held and none of the locks this set took.
         drop(displaced);
@@ -1683,7 +1727,7 @@ impl<C: Cells> Runtime<C> {
     fn claim_input<T: Value>(
         &self,
         handle: Incr<T>,
-    ) -> (SetClaim<'_, C>, Arc<GenericArena<T, C>>, u32) {
+    ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
         let slot = handle.slot();
         let id = NodeId(slot);
         let node = self.nodes.get(slot);
@@ -1711,7 +1755,7 @@ impl<C: Cells> Runtime<C> {
                 );
                 // Looked up before the claim so that its panic cannot
                 // leave the claim held with no guard to release it.
-                let arena = inner
+                let arena = self
                     .arenas
                     .tagged_arena::<T>(node.type_tag())
                     .expect("incr-core: arena missing for input handle's type");
@@ -2150,11 +2194,7 @@ impl<C: Cells> Runtime<C> {
                     if g0.is_some_and(|g| g != node.generation()) {
                         return Computed::Gone;
                     }
-                    panic!(
-                        "incr-core: node {} was deleted while a read was reaching it (a \
-                         compute raced delete_node on one of its recorded dependencies)",
-                        id.0,
-                    );
+                    deleted_while_reading(id);
                 }
                 NodeState::New => {
                     // Nothing to verify against, and the walk must not run
@@ -2555,13 +2595,10 @@ impl<C: Cells> Runtime<C> {
         node.state() == NodeState::Clean && node.changed_at() <= rev
     }
 
-    /// Borrow the arena for `T`, panicking if none exists.
-    #[allow(dead_code)]
-    pub(crate) fn arena<T: Value>(&self) -> Arc<GenericArena<T, C>> {
-        let inner = self.inner.read();
-        inner
-            .arenas
-            .try_arena::<T>()
+    #[cfg(test)]
+    pub(crate) fn arena<T: Value>(&self) -> &GenericArena<T, C> {
+        let tag = self.inner.read().arena_tags.tag::<T>();
+        tag.and_then(|tag| self.arenas.tagged_arena::<T>(tag))
             .expect("incr-core: arena lookup failed for T")
     }
 }
@@ -2683,6 +2720,10 @@ pub(crate) mod value_code_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_drop_panic_tests.rs"]
 mod drop_panic_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_value_code_race_tests.rs"]
+mod value_code_race_tests;
 
 #[cfg(test)]
 mod tests {

@@ -50,20 +50,38 @@ def test_raising_element_eq_propagates_out_of_insert(make_rt):
 
 
 @BOTH_RUNTIMES
-def test_element_eq_calling_into_incr_raises_the_contract_error(make_rt):
+def test_element_eq_reading_a_clean_node_is_allowed(make_rt):
     rt = make_rt()
     a = rt.create_input(5)
     col = rt.create_collection()
     count = col.count()
-    col.insert(Element(1, lambda: rt.get(a)))
+    seen = []
+    col.insert(Element(1, lambda: seen.append(rt.get(a))))
     assert_unchanged(rt, col, count, 1)
 
-    probe = Element(1, lambda: rt.get(a))
+    probe = Element(1, lambda: seen.append(rt.get(a)))
+    probe.armed = True
+    col.insert(probe)
+    assert_unchanged(rt, col, count, 2)
+    assert seen and all(v == 5 for v in seen)
+
+
+@BOTH_RUNTIMES
+def test_element_eq_reading_a_node_to_compute_raises_the_contract_error(make_rt):
+    rt = make_rt()
+    a = rt.create_input(5)
+    doubled = rt.create_query(lambda rt: rt.get(a) * 2)
+    col = rt.create_collection()
+    count = col.count()
+    col.insert(Element(1, lambda: rt.get(doubled)))
+    assert_unchanged(rt, col, count, 1)
+
+    probe = Element(1, lambda: rt.get(doubled))
     probe.armed = True
     with pytest.raises(RuntimeError, match="must not call into the runtime"):
         col.insert(probe)
     assert_unchanged(rt, col, count, 1)
-    assert rt.get(a) == 5
+    assert rt.get(doubled) == 10
 
 
 @BOTH_RUNTIMES

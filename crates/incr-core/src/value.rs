@@ -17,17 +17,24 @@
 //! production incr-compute's `T: Any + Clone + PartialEq + 'static` and
 //! tightens it with `Send + Sync`.
 //!
-//! # Value and key methods must not call into the runtime
+//! # Value and key methods may only read Clean nodes
 //!
 //! The runtime calls a value's `Clone` and `PartialEq`, and a collection
 //! element's or key's `Hash`, `Eq` and `Ord`, while it holds locks or a
-//! compute claim. A method that calls back into any runtime from there
-//! (a `get`, a `set`, a collection read or write, creating or deleting a
-//! node) panics with "value and key methods must not call into the
-//! runtime", under `Local` and `Shared` alike, instead of deadlocking or
-//! corrupting the graph. Operator closures (`filter`'s predicate,
-//! `map`'s function, key functions, `aggregate`'s `lift` and `combine`)
-//! are compute code and may read the runtime.
+//! compute claim. Such a method may `get` a Clean node, and an input that
+//! another thread is setting, which reads the old or the new value: that
+//! read takes no lock and never waits. Any other call into a runtime
+//! from there (a `get` of a node that needs a compute or that another
+//! thread is computing, a `set`, a collection read or write, creating or
+//! deleting a node) panics with "value and key methods must not call
+//! into the runtime", under `Local` and `Shared` alike, instead of
+//! deadlocking or corrupting the graph. A `get` of a node another thread
+//! is deleting panics as it does anywhere. Operator closures (`filter`'s
+//! predicate, `map`'s function, key functions, `aggregate`'s `lift` and
+//! `combine`) are compute code and may read the runtime.
+//!
+//! A read from a `PartialEq` that the runtime runs for a recompute, the
+//! early-cutoff compare, counts as a dependency of the query recomputing.
 //!
 //! `Drop` is under the same contract but outside the check: under
 //! `Shared` a displaced value may be reclaimed on any thread, inside any

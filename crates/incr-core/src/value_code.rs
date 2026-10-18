@@ -10,6 +10,11 @@
 //! it cannot release. Operator closures are compute code, not value
 //! code, and run outside the counter; so does user `Drop`, which the
 //! engine cannot wrap because a retire may run it on any thread.
+//!
+//! A Clean `get` takes no lock and never waits, so it serves value code
+//! like any caller. A `get` that misses the Clean fast path tests the
+//! counter in `get_slow`, and from value code it only reloads the state
+//! and reads, or panics.
 
 use std::cell::Cell;
 

@@ -18,7 +18,7 @@
 //! to a plain `mov` on x86 with no `lock` prefixes or fences.
 
 pub mod arena;
-pub mod arena_registry;
+mod arena_registry;
 pub mod cells;
 pub mod collection;
 mod deferred;
@@ -49,7 +49,6 @@ pub mod value_slot;
 pub mod walk_ring;
 
 pub use arena::PrimitiveArena;
-pub use arena_registry::{ArenaRegistry, ErasedArena};
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use collection::{CollectionLog, Delta, GroupedCollection, IncrCollection};
 pub use dep_stack::{DepStack, LocalDepStack, PoppedFrame, SharedDepStack};

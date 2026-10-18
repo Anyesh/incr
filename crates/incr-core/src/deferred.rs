@@ -38,7 +38,6 @@
 use std::any::Any;
 use std::mem;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::sync::Arc;
 
 use crate::arena_registry::ErasedArena;
 use crate::cells::Cells;
@@ -54,15 +53,16 @@ pub(crate) type ErasedDrop = Box<dyn Any>;
 /// containers the delete already built (no new allocation) until the
 /// drain. The arena release itself is deferred: the value stays in its
 /// slot, and `arena.release(slot)` runs as a drain step, dropping or
-/// retiring the value outside the arena lock.
-pub(crate) struct NodeDrops<C: Cells> {
+/// retiring the value outside the arena lock. The arena is borrowed from
+/// the runtime, which frees arenas only when it drops.
+pub(crate) struct NodeDrops<'rt, C: Cells> {
     pub(crate) compute: Option<ComputeFn<C>>,
     pub(crate) observers: Vec<ObserverEntry<C>>,
-    pub(crate) arena: Arc<dyn ErasedArena<C>>,
+    pub(crate) arena: &'rt dyn ErasedArena<C>,
     pub(crate) arena_slot: u32,
 }
 
-impl<C: Cells> NodeDrops<C> {
+impl<C: Cells> NodeDrops<'_, C> {
     /// The closure, then the observers, then the arena release. Each
     /// part leaves `self` only as it drops, so after a panic the parts
     /// not yet reached drop with `self`, and the release never runs
@@ -205,15 +205,15 @@ impl<C: Cells> Deferred<C> {
 /// displaced dep list in its slot, and every later member in `members`.
 /// The drain runs them in that order, which is push order except that
 /// the slot's list goes before every later member.
-pub(crate) struct DeleteBag<C: Cells> {
-    node: NodeDrops<C>,
+pub(crate) struct DeleteBag<'rt, C: Cells> {
+    node: NodeDrops<'rt, C>,
     dep_list: Option<RetiredDeps<C>>,
-    members: Option<Vec<SpilledMember<C>>>,
+    members: Option<Vec<SpilledMember<'rt, C>>>,
 }
 
-impl<C: Cells> DeleteBag<C> {
+impl<'rt, C: Cells> DeleteBag<'rt, C> {
     #[inline(always)]
-    pub(crate) fn new(node: NodeDrops<C>, dep_list: Option<RetiredDeps<C>>) -> Self {
+    pub(crate) fn new(node: NodeDrops<'rt, C>, dep_list: Option<RetiredDeps<C>>) -> Self {
         Self {
             node,
             dep_list,
@@ -231,7 +231,7 @@ impl<C: Cells> DeleteBag<C> {
         }
     }
 
-    pub(crate) fn push_node(&mut self, node: NodeDrops<C>, dep_list: Option<RetiredDeps<C>>) {
+    pub(crate) fn push_node(&mut self, node: NodeDrops<'rt, C>, dep_list: Option<RetiredDeps<C>>) {
         let dep_list = match dep_list {
             Some(token) if self.dep_list.is_none() => {
                 self.dep_list = Some(token);
@@ -261,13 +261,9 @@ impl<C: Cells> DeleteBag<C> {
             self.unwind(rt, payload);
         }
         let DeleteBag {
-            node:
-                NodeDrops {
-                    compute,
-                    observers,
-                    arena,
-                    ..
-                },
+            node: NodeDrops {
+                compute, observers, ..
+            },
             dep_list,
             members,
         } = self;
@@ -279,7 +275,6 @@ impl<C: Cells> DeleteBag<C> {
         mem::forget(observers);
         mem::forget(dep_list);
         mem::forget(members);
-        drop(arena);
     }
 
     /// Retires the slot's list, then drops every member, each leaving
@@ -315,12 +310,12 @@ impl<C: Cells> DeleteBag<C> {
 /// displaced unless that took the bag's slot. Its drop runs the inline
 /// node's steps in the same order, the arena release included, and the
 /// list retires after them as a field, even when a step panics.
-struct SpilledMember<C: Cells> {
-    node: NodeDrops<C>,
+struct SpilledMember<'rt, C: Cells> {
+    node: NodeDrops<'rt, C>,
     _dep_list: RetireOnDrop<C>,
 }
 
-impl<C: Cells> Drop for SpilledMember<C> {
+impl<C: Cells> Drop for SpilledMember<'_, C> {
     fn drop(&mut self) {
         self.node.drop_parts();
     }

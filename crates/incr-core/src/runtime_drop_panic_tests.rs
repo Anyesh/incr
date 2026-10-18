@@ -14,7 +14,6 @@ use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
 use crate::deferred::{ErasedDrop, SPILL_ALLOCS};
 use crate::handle::Incr;
-use crate::locks::Lock;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::state::NodeState;
 
@@ -679,14 +678,7 @@ fn local_owned_tree_delete_releases_every_member_value() {
     }
     assert_eq!(Arc::strong_count(&probe), 5);
     let tag = rt.nodes.get(owner.slot()).type_tag();
-    let arena_len = || {
-        rt.inner
-            .read()
-            .arenas
-            .tagged_arena::<Held>(tag)
-            .unwrap()
-            .len()
-    };
+    let arena_len = || rt.arenas.tagged_arena::<Held>(tag).unwrap().len();
     let slots = arena_len();
     rt.delete_node(owner);
     assert_eq!(

@@ -1,5 +1,6 @@
 //! The value-code contract through the store: a `Serialize`, `Hash` or
-//! `Eq` of a persisted element may not call into the runtime.
+//! `Eq` of a persisted element may read Clean nodes and must not
+//! otherwise call into the runtime.
 
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
@@ -65,16 +66,34 @@ fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// An insert whose element's `op` reads a node panics with the contract
-/// message, leaves the collection unchanged and poisons the store, as any
-/// panic under its lock does.
-fn insert_whose_element_reads_a_node<C: Cells>(op: Op) {
+/// An insert whose element's `op` reads a Clean node succeeds, because
+/// a Clean read takes no lock and never waits.
+fn insert_whose_element_reads_a_clean_node<C: Cells>(op: Op) {
     let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
     let tags = store.collection::<Hooked>("tags").unwrap();
     let probe = store.input("probe", 5u32).unwrap();
     let hooked = Rc::clone(&store);
     arm(op, move || {
-        hooked.runtime().get(probe.handle());
+        assert_eq!(hooked.runtime().get(probe.handle()), 5);
+    });
+    tags.insert(&store, Hooked(1)).unwrap();
+    assert!(HOOK.with(|h| h.borrow().is_none()), "the hook never ran");
+    assert_eq!(tags.handle().values(store.runtime()), vec![Hooked(1)]);
+}
+
+/// An insert whose element's `op` reads a node that needs a compute
+/// panics with the contract message, leaves the collection unchanged and
+/// poisons the store, as any panic under its lock does.
+fn insert_whose_element_reads_a_node_to_compute<C: Cells>(op: Op) {
+    let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let tags = store.collection::<Hooked>("tags").unwrap();
+    let probe = store.input("probe", 5u32).unwrap();
+    let doubled = store
+        .runtime()
+        .create_query(move |rt| rt.get(probe.handle()) * 2);
+    let hooked = Rc::clone(&store);
+    arm(op, move || {
+        hooked.runtime().get(doubled);
     });
     let err = catch_unwind(AssertUnwindSafe(|| tags.insert(&store, Hooked(1))))
         .expect_err("the runtime call was allowed");
@@ -88,6 +107,11 @@ fn insert_whose_element_reads_a_node<C: Cells>(op: Op) {
         tags.insert(&store, Hooked(2)),
         Err(Error::Poisoned)
     ));
+}
+
+fn insert_whose_element_reads_a_node<C: Cells>(op: Op) {
+    insert_whose_element_reads_a_clean_node::<C>(op);
+    insert_whose_element_reads_a_node_to_compute::<C>(op);
 }
 
 #[test]

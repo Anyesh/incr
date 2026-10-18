@@ -1,12 +1,15 @@
 //! The value-code contract: a user `Clone`, `PartialEq`, `Hash` or `Eq`
-//! the engine calls may not call back into the runtime. Each case runs
-//! under `Local` and `Shared`, through a hook that the chosen trait
-//! method of `Hooked` fires on its n-th call.
+//! the engine calls may read Clean nodes and must not otherwise call
+//! back into the runtime. Each case runs under `Local` and `Shared`,
+//! through a hook that the chosen trait method of `Hooked` fires on its
+//! n-th call.
 
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use super::drop_panic_tests::prime_reclaim_timer;
 use super::Runtime;
@@ -210,6 +213,41 @@ fn partial_eq_that_panics_during_set<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_eq!(rt.get(a).0, 3);
 }
 
+/// A `Clone` that panics in a read and a `PartialEq` that panics in a
+/// set and in a recompute each leave the value-code count balanced, so
+/// the same runtime still sets, reads and computes afterwards.
+fn panicking_value_code_leaves_the_runtime_usable<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let q = rt.create_query(move |rt| Hooked(rt.get(a).0 + 10));
+    assert_eq!(rt.get(q).0, 11);
+
+    arm(Op::Clone, || panic!("clone bomb"));
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).expect_err("get returned");
+    assert!(panic_message(err).contains("clone bomb"));
+    disarm();
+    assert_eq!(crate::value_code::thread_word(), 0);
+
+    arm(Op::Eq, || panic!("eq bomb"));
+    let err = catch_unwind(AssertUnwindSafe(|| rt.set(a, Hooked(2)))).expect_err("set returned");
+    assert!(panic_message(err).contains("eq bomb"));
+    disarm();
+    assert_eq!(crate::value_code::thread_word(), 0);
+    assert_eq!(rt.get(a).0, 1);
+
+    rt.set(a, Hooked(2));
+    arm(Op::Eq, || panic!("eq bomb"));
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(q))).expect_err("recompute returned");
+    assert!(panic_message(err).contains("eq bomb"));
+    disarm();
+    assert_eq!(crate::value_code::thread_word(), 0);
+
+    rt.set(a, Hooked(3));
+    assert_eq!(rt.get(a).0, 3);
+    assert_eq!(rt.get(q).0, 13);
+    let b = rt.create_input(Hooked(4));
+    assert_eq!(rt.get(b).0, 4);
+}
+
 /// A `Drop` that deletes its input while unwinding out of that input's
 /// set is refused before the delete claims anything, so a `Drop` that
 /// catches the refusal leaves the input alive, settable and deletable.
@@ -281,15 +319,16 @@ fn drop_that_panics_during_set<C: Cells>(rt: Rc<Runtime<C>>) {
 fn clone_that_reads_a_clean_node<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
     let b = rt.create_input(5u32);
-    assert_eq!(rt.get(b), 5);
+    let q = rt.create_query(move |rt| rt.get(b) * 2);
+    assert_eq!(rt.get(q), 10);
     let hooked = Rc::clone(&rt);
     arm(Op::Clone, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
+        assert_eq!(hooked.get(q), 10);
     });
-    assert_contract_panic("Clean get from Clone", || {
-        rt.get(a);
+    assert_read_allowed("Clean get from Clone", || {
+        assert_eq!(rt.get(a).0, 1);
     });
-    assert_eq!(rt.get(a).0, 1);
     rt.set(a, Hooked(2));
     assert_eq!(rt.get(a).0, 2);
 }
@@ -308,22 +347,45 @@ fn clone_that_creates_a_node<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_eq!(rt.get(a).0, 1);
 }
 
+/// A read from the `PartialEq` of a recompute runs inside the query's
+/// frame, so it records a dependency: the query recomputes when the node
+/// it read changes.
 fn partial_eq_of_a_recompute_that_reads_a_node<C: Cells>(rt: Rc<Runtime<C>>) {
     let x = rt.create_input(1u32);
     let other = rt.create_input(5u32);
-    let q = rt.create_query(move |rt| Hooked(rt.get(x)));
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&runs);
+    let q = rt.create_query(move |rt| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        Hooked(rt.get(x))
+    });
     assert_eq!(rt.get(q).0, 1);
-    assert_eq!(rt.get(other), 5);
     rt.set(x, 2);
     let hooked = Rc::clone(&rt);
     arm(Op::Eq, move || {
-        hooked.get(other);
+        assert_eq!(hooked.get(other), 5);
     });
-    assert_contract_panic("get from write_if_changed", || {
-        rt.get(q);
+    assert_read_allowed("get from write_if_changed", || {
+        assert_eq!(rt.get(q).0, 2);
     });
-    rt.set(x, 3);
-    assert_eq!(rt.get(q).0, 3);
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    rt.set(other, 6);
+    assert_eq!(rt.get(q).0, 2);
+    assert_eq!(
+        runs.load(Ordering::Relaxed),
+        3,
+        "the read in PartialEq recorded no dependency"
+    );
+}
+
+/// Runs `op`, whose hooked calls read Clean nodes, which must succeed,
+/// and leaves the hook disarmed.
+fn assert_read_allowed(what: &str, op: impl FnOnce()) {
+    if let Err(err) = catch_unwind(AssertUnwindSafe(op)) {
+        panic!("{what}: the read was refused: {}", panic_message(err));
+    }
+    assert!(calls() >= 1, "{what}: the hooked call did not run");
+    disarm();
 }
 
 /// The nodes and collections the checked-path table calls into, built
@@ -332,6 +394,7 @@ struct Fixture<C: Cells> {
     clean: crate::Incr<u32>,
     source: crate::Incr<u32>,
     dirty: crate::Incr<u32>,
+    fresh: crate::Incr<u32>,
     victim: crate::Incr<u32>,
     observer: crate::ObserverId,
     c: crate::IncrCollection<u32, C>,
@@ -344,6 +407,7 @@ impl<C: Cells> Fixture<C> {
         let clean = rt.create_input(5u32);
         let source = rt.create_input(1u32);
         let dirty = rt.create_query(move |rt| rt.get(source) + 1);
+        let fresh = rt.create_query(move |rt| rt.get(source) + 2);
         let victim = rt.create_input(0u32);
         let observer = rt.observe(clean, |_| {});
         let c = rt.create_collection::<u32>();
@@ -358,6 +422,7 @@ impl<C: Cells> Fixture<C> {
             clean,
             source,
             dirty,
+            fresh,
             victim,
             observer,
             c,
@@ -371,11 +436,11 @@ type Path<C> = (&'static str, fn(&Runtime<C>, &Fixture<C>));
 
 fn engine_paths<C: Cells>() -> Vec<Path<C>> {
     vec![
-        ("get of a Clean node", |rt, f| {
-            rt.get(f.clean);
-        }),
         ("get of a Dirty node", |rt, f| {
             rt.get(f.dirty);
+        }),
+        ("get of a New node", |rt, f| {
+            rt.get(f.fresh);
         }),
         ("set", |rt, f| rt.set(f.victim, 1)),
         ("delete_node", |rt, f| rt.delete_node(f.victim)),
@@ -492,11 +557,9 @@ fn hash_that_reads_a_node_on_insert<C: Cells>(rt: Rc<Runtime<C>>) {
     let c = rt.create_collection::<Hooked>();
     let hooked = Rc::clone(&rt);
     arm(Op::Hash, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Hash on insert", || c.insert(&rt, Hooked(1)));
-    assert_eq!(c.snapshot_len(), 0);
-    c.insert(&rt, Hooked(1));
+    assert_read_allowed("get from Hash on insert", || c.insert(&rt, Hooked(1)));
     assert_eq!(ids(&rt, &c), vec![1]);
 }
 
@@ -506,11 +569,9 @@ fn eq_that_reads_a_node_on_insert<C: Cells>(rt: Rc<Runtime<C>>) {
     c.insert(&rt, Hooked(1));
     let hooked = Rc::clone(&rt);
     arm(Op::Eq, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Eq on insert", || c.insert(&rt, Hooked(1)));
-    assert_eq!(c.snapshot_len(), 1);
-    c.insert(&rt, Hooked(1));
+    assert_read_allowed("get from Eq on insert", || c.insert(&rt, Hooked(1)));
     assert_eq!(ids(&rt, &c), vec![1, 1]);
 }
 
@@ -520,9 +581,9 @@ fn clone_that_reads_a_node_on_values<C: Cells>(rt: Rc<Runtime<C>>) {
     c.insert(&rt, Hooked(1));
     let hooked = Rc::clone(&rt);
     arm(Op::Clone, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Clone on values", || {
+    assert_read_allowed("get from Clone on values", || {
         c.values(&rt);
     });
     assert_eq!(ids(&rt, &c), vec![1]);
@@ -535,9 +596,9 @@ fn clone_that_reads_a_node_in_a_filter_batch<C: Cells>(rt: Rc<Runtime<C>>) {
     c.insert(&rt, Hooked(2));
     let hooked = Rc::clone(&rt);
     arm(Op::Clone, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Clone in a filter batch", || {
+    assert_read_allowed("get from Clone in a filter batch", || {
         rt.get(evens.version_node());
     });
     c.insert(&rt, Hooked(4));
@@ -551,9 +612,9 @@ fn hash_that_reads_a_node_in_a_group_by_batch<C: Cells>(rt: Rc<Runtime<C>>) {
     c.insert(&rt, Hooked(2));
     let hooked = Rc::clone(&rt);
     arm(Op::Hash, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Hash in the group_by key cache", || {
+    assert_read_allowed("get from Hash in the group_by key cache", || {
         rt.get(grouped.version_node());
     });
     c.insert(&rt, Hooked(3));
@@ -571,22 +632,13 @@ fn hash_that_reads_a_node_in_a_join_batch_and_its_rebuild<C: Cells>(rt: Rc<Runti
     right.insert(&rt, Hooked(1));
     let hooked = Rc::clone(&rt);
     arm(Op::Hash, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Hash in the join key cache", || {
-        rt.get(joined.version_node());
-    });
-    // The panic landed inside the batch, so the next run rebuilds: the
-    // first two hashes file the sides, the third is the output converge.
-    left.insert(&rt, Hooked(2));
-    let hooked = Rc::clone(&rt);
-    arm_nth(Op::Hash, 3, move || {
-        hooked.get(b);
-    });
-    assert_contract_panic("get from Hash in a rebuild's converge", || {
+    assert_read_allowed("get from Hash in the join key cache", || {
         rt.get(joined.version_node());
     });
     right.insert(&rt, Hooked(2));
+    left.insert(&rt, Hooked(2));
     let mut pairs: Vec<(u32, u32)> = joined.values(&rt).iter().map(|(l, r)| (l.0, r.0)).collect();
     pairs.sort_unstable();
     assert_eq!(pairs, vec![(1, 1), (2, 2)]);
@@ -602,18 +654,18 @@ fn clone_that_reads_a_node_in_a_sort_batch<C: Cells>(rt: Rc<Runtime<C>>) {
     // element in the sorted view.
     let hooked = Rc::clone(&rt);
     arm_nth(Op::Clone, 2, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Clone in the sorted view", || {
+    assert_read_allowed("get from Clone in the sorted view", || {
         rt.get(sorted.version_node());
     });
     c.insert(&rt, Hooked(1));
     rt.get(sorted.version_node());
     let hooked = Rc::clone(&rt);
     arm(Op::Clone, move || {
-        hooked.get(b);
+        assert_eq!(hooked.get(b), 5);
     });
-    assert_contract_panic("get from Clone in a pairwise batch", || {
+    assert_read_allowed("get from Clone in a pairwise batch", || {
         rt.get(pairs.version_node());
     });
     c.insert(&rt, Hooked(3));
@@ -647,6 +699,7 @@ both!(
     partial_eq_that_sets_another_input,
     partial_eq_that_inserts_into_a_collection,
     partial_eq_that_panics_during_set,
+    panicking_value_code_leaves_the_runtime_usable,
     drop_that_deletes_the_input_under_its_set,
     clone_that_reads_a_clean_node,
     clone_that_creates_a_node,
