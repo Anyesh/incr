@@ -29,10 +29,10 @@ use incr_core::Local;
 #[doc(hidden)]
 pub use incr_core::with_value_code;
 pub use incr_core::{
-    DeleteError, Delta, ErasedIncr, GroupedCollection as GroupedCollectionInner, Incr,
-    IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace,
-    ObserverId, PropagationTrace, RuntimeId, SortDelta, SortedCollection as SortedCollectionInner,
-    TraceAction, Value,
+    Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint,
+    GroupedCollection as GroupedCollectionInner, Incr, IncrCollection as IncrCollectionInner,
+    NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace, ObserverId, PropagationTrace, QueryOpts,
+    RuntimeId, SortDelta, SortedCollection as SortedCollectionInner, TraceAction, Value,
 };
 
 /// Single-threaded runtime: `Runtime<Local>`. Not `Send`/`Sync`. Use the
@@ -55,14 +55,19 @@ mod reexports {
     #[test]
     fn every_incr_core_item_is_reexported() {
         use crate::{
-            with_value_code, DeleteError, Delta, ErasedIncr, GroupedCollection,
-            GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner, NodeId, NodeInfo,
-            NodeKindInfo, NodeState, NodeTrace, ObserverId, PropagationTrace, Runtime, RuntimeId,
-            SortDelta, SortedCollection, SortedCollectionInner, TraceAction, Value,
+            with_value_code, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint,
+            GroupedCollection, GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner,
+            NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace, ObserverId, PropagationTrace,
+            QueryOpts, Runtime, RuntimeId, SortDelta, SortedCollection, SortedCollectionInner,
+            TraceAction, Value,
         };
 
         fn named<T: ?Sized>() {}
         fn value<T: Value>() {}
+        named::<Cycle>();
+        named::<CycleStrategy<u32>>();
+        named::<Fixpoint<u32>>();
+        named::<QueryOpts<u32>>();
         named::<DeleteError>();
         named::<Delta<u32>>();
         named::<ErasedIncr>();
