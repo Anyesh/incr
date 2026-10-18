@@ -183,6 +183,11 @@ Measured units, Local / Shared, in instructions against T0:
   21, and its call site 5), `mark_deleted`'s `fetch_or` and branch 7 with
   the node index it needs 11, the `DeleteBag` construction 14 and its
   drain 10 outside the drops it runs, the drain's `catch_unwind`.
+  `fd7eb95` tests the input's claim bit first, so the scan runs only
+  while a set holds it: `delete_single` went to 1,335.00 Local and
+  2,140.24 Shared, and `delete_cascade` to 3,477,099.84 Local (-16 per
+  delete) and 4,640,478.62 Shared (-20), means of two runs.
+  `delete_owned_tree` stays inside its seed spread.
 - **strict**, per strict delete of a node that owns nothing: +158 / +166
   engine, against -140 / -147 alloc because T0's `claim_tree` allocated
   its walk stack on every call.
