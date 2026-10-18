@@ -92,14 +92,17 @@ pub(crate) struct Deferred<C: Cells> {
     spill: Option<Vec<ErasedDrop>>,
 }
 
-/// Spill buffer growths since the test started, so a test can show a
-/// batch costs at most one.
 #[cfg(test)]
-pub(crate) static SPILL_ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// Spill buffer growths on this thread since the test reset it, so a
+    /// test can show a batch costs at most one. Per thread because tests
+    /// run in parallel and their deletes would add to a shared count.
+    pub(crate) static SPILL_ALLOCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 fn count_spill_alloc() {
-    SPILL_ALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SPILL_ALLOCS.with(|c| c.set(c.get() + 1));
 }
 
 #[cfg(not(test))]

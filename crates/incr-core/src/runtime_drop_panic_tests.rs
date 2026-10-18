@@ -3,6 +3,7 @@
 //! panicking `Drop` inside a haphazard reclaim leaks the rest of that
 //! batch, and the child keeps the test binary's global domain clean.
 
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
@@ -643,12 +644,12 @@ fn local_delete_spill_grows_at_most_once_per_batch() {
     let _ = rt.get(router);
     let lone = rt.create_input(0_i64);
 
-    SPILL_ALLOCS.store(0, std::sync::atomic::Ordering::Relaxed);
+    SPILL_ALLOCS.with(|c| c.set(0));
     rt.delete_node(lone);
-    assert_eq!(SPILL_ALLOCS.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(SPILL_ALLOCS.with(Cell::get), 0);
 
     rt.delete_node(router);
-    let growths = SPILL_ALLOCS.load(std::sync::atomic::Ordering::Relaxed);
+    let growths = SPILL_ALLOCS.with(Cell::get);
     assert!((1..=2).contains(&growths), "spill grew {growths} times");
     assert!(!rt.is_alive(router));
 }
