@@ -48,6 +48,12 @@ Two strategy impls ship in this crate:
 
 The segmented node store supports up to `MAX_NODES = u32::MAX - 1024` nodes per runtime. Nodes live in segments of 1024 that are allocated lazily, never moved, and live until the runtime drops; the segment directory doubles as the store grows, and the directories it outgrows are kept until the runtime drops (8 bytes per 1024 nodes in total).
 
+## Memory per node
+
+An input with one query reading it costs 250 bytes of requested heap on 64-bit, under `Local` and `Shared` alike: two 64-byte `NodeData`, two 16-byte value slots (under `Shared`, an 8-byte slot and an 8-byte box), two 16-byte dependent lists, two 16-byte closure entries, the query's 24-byte closure capture and a flags byte per node. On wasm32 the same pair costs 218 bytes, because dependent lists and closure entries are 8 bytes there. `tests/memory_ceiling.rs` holds 523,776 such pairs under 252 bytes per pair (220 on wasm32). With glibc's allocator the resident size per pair is about 290 bytes under `Local` and 338 under `Shared`, whose per-value boxes each take a 32-byte malloc chunk.
+
+A dependent list keeps up to four dependents inline (two on wasm32) and moves them to one heap block past that. Each value type in use costs one arena segment of 1024 slots on its first node.
+
 ## Known limitations
 
 - **`get_traced` per-node trace**: records compute, verified-clean, and cutoff events for the current `get` call's compute path. Cross-thread events are not aggregated.
