@@ -94,6 +94,8 @@ pub trait Cells: 'static + Sized {
     fn u64_fetch_add(c: &Self::U64, v: u64) -> u64;
     /// Atomic max; returns the previous value. AcqRel under Shared.
     fn u64_fetch_max(c: &Self::U64, v: u64) -> u64;
+    /// Atomic bitwise or; returns the previous value. AcqRel under Shared.
+    fn u64_fetch_or(c: &Self::U64, v: u64) -> u64;
     /// Atomic compare-exchange; AcqRel/Acquire under Shared. Needed by
     /// the changed_at pending-marker protocol, which must replace the
     /// marker with a concrete revision without regressing a concurrent
@@ -314,6 +316,12 @@ impl Cells for Local {
         prev
     }
     #[inline(always)]
+    fn u64_fetch_or(c: &Self::U64, v: u64) -> u64 {
+        let prev = c.get();
+        c.set(prev | v);
+        prev
+    }
+    #[inline(always)]
     fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64> {
         let prev = c.get();
         if prev == current {
@@ -458,6 +466,10 @@ impl Cells for Shared {
     #[inline(always)]
     fn u64_fetch_max(c: &Self::U64, v: u64) -> u64 {
         c.fetch_max(v, Ordering::AcqRel)
+    }
+    #[inline(always)]
+    fn u64_fetch_or(c: &Self::U64, v: u64) -> u64 {
+        c.fetch_or(v, Ordering::AcqRel)
     }
     #[inline(always)]
     fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64> {

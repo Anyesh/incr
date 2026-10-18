@@ -145,8 +145,8 @@ fn ids<C: Cells>(rt: &Runtime<C>, c: &crate::IncrCollection<Hooked, C>) -> Vec<u
     out
 }
 
-/// `set` compares twice: once before its claim and once under it.
-const SET_COMPARES: std::ops::RangeInclusive<u32> = 1..=2;
+/// `set` compares once, under its claim.
+const SET_COMPARES: std::ops::RangeInclusive<u32> = 1..=1;
 
 fn partial_eq_that_deletes_the_input<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
@@ -210,8 +210,8 @@ fn partial_eq_that_panics_during_set<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_eq!(rt.get(a).0, 3);
 }
 
-/// A `Drop` of the value a `set` displaced runs at step 7, after the
-/// landing, the walk and the set-stack pop: the hook records that the
+/// A `Drop` of the value a `set` displaced runs after the claim's
+/// release, the walk and the set-stack pop: the hook records that the
 /// input is Clean on the new value and no longer held by this thread's
 /// set stack. Its panic leaves `set` with the input Clean on the new
 /// value, and the next set goes through. Under `Shared` the drop runs

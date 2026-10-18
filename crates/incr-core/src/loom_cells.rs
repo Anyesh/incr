@@ -285,6 +285,9 @@ impl Cells for Loom {
     fn u64_fetch_max(c: &Self::U64, v: u64) -> u64 {
         c.fetch_max(v, Ordering::AcqRel)
     }
+    fn u64_fetch_or(c: &Self::U64, v: u64) -> u64 {
+        c.fetch_or(v, Ordering::AcqRel)
+    }
     fn u64_compare_exchange(c: &Self::U64, current: u64, new: u64) -> Result<u64, u64> {
         c.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
     }

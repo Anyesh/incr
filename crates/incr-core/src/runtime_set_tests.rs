@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::race_tests::{grouped, id, panic_message, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
+use crate::node::NodeData;
 use crate::state::NodeState;
 
 type Rt = Runtime<Shared>;
@@ -48,29 +49,23 @@ fn set_vs_delete_recycle() {
     rt.assert_invariant_i();
 }
 
-/// `set(x)`'s claim lands on the Clean query that recycled x's slot. With
-/// a walk flagging the query while the claim is held it lands Dirty,
-/// without one Clean; either way it is not left Computing and the set
-/// panics as stale.
-fn set_claim_lands_on_a_recycled_query(flagged_by_a_walk: bool) {
+/// `set(x)` resumes after a query recycled x's slot. Its generation check
+/// and its claim share one read hold, so it panics as stale without
+/// claiming the query, which a set's claim on its `verified_at` would
+/// corrupt.
+#[test]
+fn set_never_claims_the_query_that_recycled_its_slot() {
     let rt = Arc::new(Rt::new());
     let x = rt.create_input(7_u64);
     let y = rt.create_input(1_u64);
-    let before = Gate::new();
-    let after = Gate::new();
-    park_at(
-        &rt,
-        vec![
-            (ParkPoint::SetBeforeClaim(id(x)), before.clone()),
-            (ParkPoint::SetAfterClaim(id(x)), after.clone()),
-        ],
-    );
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::SetBeforeClaim(id(x)), gate.clone())]);
 
     let setter = {
         let rt = Arc::clone(&rt);
         thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.set(x, 8))))
     };
-    before.wait_parked();
+    gate.wait_parked();
     rt.delete_node(x);
     let q = rt.create_query(move |rt: &Rt| rt.get(y) * 10);
     assert_eq!(
@@ -79,37 +74,16 @@ fn set_claim_lands_on_a_recycled_query(flagged_by_a_walk: bool) {
         "the delete should free x's slot for reuse"
     );
     assert_eq!(rt.get(q), 10);
-    before.release();
-
-    after.wait_parked();
-    assert_eq!(rt.state_of(q), NodeState::Computing);
-    if flagged_by_a_walk {
-        rt.set(y, 2);
-        assert_eq!(rt.state_of(q), NodeState::ComputingDirty);
-    }
-    after.release();
+    gate.release();
 
     let outcome = setter.join().unwrap();
     let msg = panic_message(outcome.expect_err("a set of a deleted input returned"));
     assert!(msg.contains("stale"), "got: {msg}");
-    let (state, value) = if flagged_by_a_walk {
-        (NodeState::Dirty, 20)
-    } else {
-        (NodeState::Clean, 10)
-    };
-    assert_eq!(rt.state_of(q), state);
-    assert_eq!(rt.get(q), value);
+    assert!(!rt.nodes.get(q.slot()).set_claimed());
+    assert_eq!(rt.state_of(q), NodeState::Clean);
+    rt.set(y, 2);
+    assert_eq!(rt.get(q), 20);
     rt.assert_invariant_i();
-}
-
-#[test]
-fn set_claim_on_a_recycled_query_lands_dirty_when_a_walk_flagged_it() {
-    set_claim_lands_on_a_recycled_query(true);
-}
-
-#[test]
-fn set_claim_on_a_recycled_query_lands_clean_when_nothing_flagged_it() {
-    set_claim_lands_on_a_recycled_query(false);
 }
 
 /// Records every park point a runtime reaches.
@@ -123,22 +97,30 @@ fn record_parks<C: Cells>(rt: &Runtime<C>) -> Arc<Mutex<Vec<ParkPoint>>> {
     reached
 }
 
-fn noop_set_takes_no_claim<C: Cells>(rt: &Runtime<C>) {
+/// A no-op set compares under its claim and releases it without a bump
+/// or a walk; a changing set bumps and walks, and both leave the input
+/// unclaimed and Clean.
+fn noop_set_bumps_and_walks_nothing<C: Cells>(rt: &Runtime<C>) {
     let x = rt.create_input(3_u64);
     let d = rt.create_query(move |rt: &Runtime<C>| rt.get(x) + 1);
     assert_eq!(rt.get(d), 4);
     let reached = record_parks(rt);
     let revision = rt.current_revision();
+    let claimed = || rt.nodes.get(x.slot()).set_claimed();
 
     rt.set(x, 3);
 
     assert_eq!(rt.current_revision(), revision);
     assert_eq!(rt.state_of(d), NodeState::Clean);
-    assert!(
-        reached.lock().unwrap().is_empty(),
-        "a no-op set went past its no-op check: {:?}",
-        reached.lock().unwrap()
+    assert!(!claimed());
+    assert_eq!(
+        reached.lock().unwrap().as_slice(),
+        [
+            ParkPoint::SetBeforeClaim(id(x)),
+            ParkPoint::SetAfterClaim(id(x)),
+        ]
     );
+    reached.lock().unwrap().clear();
     rt.set(x, 4);
     assert_eq!(
         reached.lock().unwrap().as_slice(),
@@ -149,17 +131,20 @@ fn noop_set_takes_no_claim<C: Cells>(rt: &Runtime<C>) {
             ParkPoint::SetAfterWalk,
         ]
     );
+    assert!(!claimed());
+    assert_eq!(rt.state_of(x), NodeState::Clean);
+    assert_eq!(rt.nodes.get(x.slot()).verified_at(), rt.current_revision());
     assert_eq!(rt.get(d), 5);
 }
 
 #[test]
-fn local_noop_set_takes_no_claim() {
-    noop_set_takes_no_claim(&Runtime::<Local>::new());
+fn local_noop_set_bumps_and_walks_nothing() {
+    noop_set_bumps_and_walks_nothing(&Runtime::<Local>::new());
 }
 
 #[test]
-fn shared_noop_set_takes_no_claim() {
-    noop_set_takes_no_claim(&Rt::new());
+fn shared_noop_set_bumps_and_walks_nothing() {
+    noop_set_bumps_and_walks_nothing(&Rt::new());
 }
 
 /// A set equal to a value another set has written but not yet walked
@@ -236,12 +221,15 @@ fn equal_set_waits_on_the_claim_of_the_set_that_wrote_it() {
     rt.assert_invariant_i();
 }
 
-/// A reader of an input blocks while a value-changing set holds its
-/// claim and sees the new value once the set lands.
+/// A set's claim is invisible to readers: a read of the input and of a
+/// dependent goes through under it with the old value, and the dependent
+/// sees the new value once the set has walked.
 #[test]
-fn reader_of_an_input_under_a_set_claim_waits_for_the_landing() {
+fn reader_of_an_input_under_a_set_claim_does_not_wait() {
     let rt = Arc::new(Rt::new());
     let x = rt.create_input(1_u64);
+    let d = rt.create_query(move |rt: &Rt| rt.get(x) + 1);
+    assert_eq!(rt.get(d), 2);
     let gate = Gate::new();
     park_at(&rt, vec![(ParkPoint::SetAfterClaim(id(x)), gate.clone())]);
 
@@ -252,23 +240,60 @@ fn reader_of_an_input_under_a_set_claim_waits_for_the_landing() {
     gate.wait_parked();
     let reader = {
         let rt = Arc::clone(&rt);
-        thread::spawn(move || rt.get(x))
+        thread::spawn(move || (rt.get(x), rt.get(d)))
     };
-    thread::sleep(SETTLE);
-    assert!(
-        !reader.is_finished(),
-        "a read went through under the set's claim"
-    );
+    assert_eq!(reader.join().unwrap(), (1, 2));
+    assert_eq!(rt.state_of(x), NodeState::Clean);
 
     gate.release();
     setter.join().unwrap();
-    assert_eq!(reader.join().unwrap(), 5);
+    assert_eq!(rt.get(d), 6);
+    rt.assert_invariant_i();
+}
+
+/// A delete of an input waits for the set that holds it to release its
+/// claim before it retires the node, and a set that comes after the
+/// delete marked it panics as stale instead of claiming it.
+#[test]
+fn delete_of_an_input_waits_for_its_set_and_refuses_later_sets() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::SetAfterClaim(id(x)), gate.clone())]);
+
+    let setter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set(x, 5))
+    };
+    gate.wait_parked();
+    let deleter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.delete_with_dependents(x))
+    };
+    let node = rt.nodes.get(x.slot());
+    while Shared::u64_load_acquire(&node.verified_at) & NodeData::<Shared>::DELETED == 0 {
+        thread::yield_now();
+    }
+    let late = catch_unwind(AssertUnwindSafe(|| rt.set(x, 6)));
+    let msg = panic_message(late.expect_err("a set of a marked input returned"));
+    assert!(msg.contains("stale"), "got: {msg}");
+    thread::sleep(SETTLE);
+    assert!(
+        !deleter.is_finished(),
+        "the delete finished under the set's claim"
+    );
+    assert_eq!(node.generation(), x.generation());
+
+    gate.release();
+    setter.join().unwrap();
+    assert_eq!(deleter.join().unwrap(), 1);
+    assert!(!rt.is_alive(x));
     rt.assert_invariant_i();
 }
 
 /// A strict delete of a router finds one of its group version nodes
-/// under a parked `set`'s claim. It must wait for the set to land instead
-/// of stealing the claim.
+/// under a parked `set`'s claim. It must wait for the set to release its
+/// claim before it retires the node.
 #[test]
 fn delete_of_an_owner_waits_for_a_set_of_an_owned_input() {
     let rt = Arc::new(Rt::new());
@@ -294,7 +319,11 @@ fn delete_of_an_owner_waits_for_a_set_of_an_owned_input() {
         !deleter.is_finished(),
         "the router delete finished under the group's set claim"
     );
-    assert!(rt.is_alive(group), "the group's set claim was stolen");
+    assert_eq!(
+        rt.nodes.get(group.slot()).generation(),
+        group.generation(),
+        "the group was retired under its set's claim"
+    );
 
     gate.release();
     setter.join().unwrap();

@@ -1,8 +1,8 @@
-//! The per-thread stack of inputs whose `Computing` claim a `set` on
-//! this thread holds. `set` pushes an entry once its claim CAS succeeds
-//! and pops it when it releases the claim, so every entry is a held
-//! claim, and a `set` waiting on another thread's claim has no entry of
-//! its own to mistake for one.
+//! The per-thread stack of inputs whose claim (`NodeData::SET_CLAIM`) a
+//! `set` on this thread holds. `set` pushes an entry once its claim
+//! succeeds and pops it when it releases the claim, so every entry is a
+//! held claim, and a `set` waiting on another thread's claim has no
+//! entry of its own to mistake for one.
 
 use std::cell::RefCell;
 

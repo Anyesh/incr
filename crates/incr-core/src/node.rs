@@ -267,9 +267,11 @@ impl<C: Cells> NodeData<C> {
         &self.state
     }
 
+    /// The revision stamp, without an input's [`Self::SET_CLAIM`] and
+    /// [`Self::DELETED`] bits.
     #[inline(always)]
     pub fn verified_at(&self) -> u64 {
-        C::u64_load_acquire(&self.verified_at)
+        C::u64_load_acquire(&self.verified_at) & Self::REVISION_BITS
     }
 
     #[inline(always)]
@@ -294,6 +296,63 @@ impl<C: Cells> NodeData<C> {
     #[inline(always)]
     pub fn max_verified_at(&self, v: u64) {
         C::u64_fetch_max(&self.verified_at, v);
+    }
+
+    /// Set on an input's `verified_at` while a `set` holds the input. The
+    /// claim lives here, not on `state`, because no reader of an input
+    /// loads its `verified_at` (only a query verifying itself reads its
+    /// own), so a set's claim and release are independent of every read.
+    pub const SET_CLAIM: u64 = 1 << 62;
+
+    /// Set on `verified_at` by the delete that claimed the node `Dead`,
+    /// so a later set claim fails. Cleared only by the recycle's store.
+    pub const DELETED: u64 = 1 << 63;
+
+    const REVISION_BITS: u64 = !(Self::SET_CLAIM | Self::DELETED);
+
+    /// Take a `set`'s claim on this input. Returns the stamp it claimed
+    /// over, for [`Self::release_set_claim`], or the word holding
+    /// [`Self::SET_CLAIM`] or [`Self::DELETED`] that refused it.
+    #[inline(always)]
+    pub(crate) fn try_claim_set(&self) -> Result<u64, u64> {
+        let mut cur = C::u64_load_acquire(&self.verified_at);
+        loop {
+            if cur & !Self::REVISION_BITS != 0 {
+                return Err(cur);
+            }
+            match C::u64_compare_exchange(&self.verified_at, cur, cur | Self::SET_CLAIM) {
+                Ok(_) => return Ok(cur),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Release a claim taken over `base`, raising the stamp to `rev` in
+    /// the same RMW. An add rather than a store, so a concurrent delete's
+    /// [`Self::DELETED`] survives: under the claim no other write moves
+    /// the stamp bits (a max loses to the claim bit), so they still read
+    /// `base`, and `rev >= base` keeps the add from carrying into the
+    /// flag bits.
+    #[inline(always)]
+    pub(crate) fn release_set_claim(&self, base: u64, rev: u64) {
+        debug_assert!(base <= rev && rev & !Self::REVISION_BITS == 0);
+        C::u64_fetch_add(
+            &self.verified_at,
+            (rev - base).wrapping_sub(Self::SET_CLAIM),
+        );
+    }
+
+    /// Mark the node deleted, so no `set` claims it from here on. Returns
+    /// true if a set holds it now; the delete must wait that set out
+    /// with [`Self::set_claimed`] before it retires the node.
+    #[inline(always)]
+    pub(crate) fn mark_deleted(&self) -> bool {
+        C::u64_fetch_or(&self.verified_at, Self::DELETED) & Self::SET_CLAIM != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_claimed(&self) -> bool {
+        C::u64_load_acquire(&self.verified_at) & Self::SET_CLAIM != 0
     }
 
     /// Raise `changed_at` to `v` if `v` is larger. See [`Self::max_verified_at`].
@@ -571,6 +630,42 @@ mod tests {
         assert_eq!(n.changed_at(), 11);
         n.max_changed_at(5);
         assert_eq!(n.changed_at(), 11);
+    }
+
+    fn set_claim_and_delete_mark<C: Cells>() {
+        let n: NodeData<C> = NodeData::new_input(0, 0, 10);
+        let base = n.try_claim_set().unwrap();
+        assert_eq!(base, 10);
+        assert!(n.set_claimed());
+        assert_eq!(n.verified_at(), 10, "the claim bit leaks into the stamp");
+        n.max_verified_at(12);
+        assert!(n.try_claim_set().is_err(), "a second claim went through");
+        n.release_set_claim(base, 15);
+        assert!(!n.set_claimed());
+        assert_eq!(n.verified_at(), 15);
+
+        let base = n.try_claim_set().unwrap();
+        assert!(n.mark_deleted(), "the delete missed the held claim");
+        n.release_set_claim(base, base);
+        assert!(!n.set_claimed());
+        assert_eq!(n.verified_at(), 15);
+        let refused = n.try_claim_set().unwrap_err();
+        assert_ne!(refused & NodeData::<C>::DELETED, 0);
+
+        n.reinit_recycled(0, 0, 20, true);
+        assert_eq!(n.try_claim_set(), Ok(20), "the recycle kept a flag bit");
+        n.release_set_claim(20, 20);
+        assert!(!n.mark_deleted());
+    }
+
+    #[test]
+    fn local_set_claim_and_delete_mark() {
+        set_claim_and_delete_mark::<Local>();
+    }
+
+    #[test]
+    fn shared_set_claim_and_delete_mark() {
+        set_claim_and_delete_mark::<Shared>();
     }
 
     #[test]
