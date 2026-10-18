@@ -22,7 +22,9 @@ use loom::thread;
 use crate::generic_arena::GenericArena;
 use crate::handle::Incr;
 use crate::loom_cells::Loom;
+use crate::node::NodeData;
 use crate::runtime::Runtime;
+use crate::segmented_nodes::SegmentedNodes;
 use crate::state::NodeState;
 
 type Rt = Runtime<Loom>;
@@ -563,6 +565,56 @@ fn loom_arena_read_during_growth() {
         reader.join().unwrap();
         for k in 0..9 {
             assert_eq!(arena.read(k), k as u64);
+        }
+    });
+}
+
+/// A reader of a node slot it received through a Release store races the
+/// pushes that allocate the next segments and double the node directory
+/// twice (one-entry directories and four-node segments under loom).
+/// Whichever directory the reader loads holds the slot's segment, even
+/// though it loads the segment pointer Relaxed. Every node read relies on
+/// this once the store outgrows its first directory.
+#[test]
+fn loom_reader_during_directory_growth() {
+    use loom::sync::atomic::{AtomicU32, Ordering};
+    run(|| {
+        let nodes: Arc<SegmentedNodes<Loom>> = Arc::new(SegmentedNodes::new());
+        for k in 0..4 {
+            nodes.push(NodeData::new_input(0, k, 0));
+        }
+        let handoff = Arc::new(AtomicU32::new(u32::MAX));
+
+        let writer = {
+            let nodes = Arc::clone(&nodes);
+            let handoff = Arc::clone(&handoff);
+            thread::spawn(move || {
+                let s = nodes.push(NodeData::new_input(0, 4, 0));
+                handoff.store(s, Ordering::Release);
+                for k in 5..9 {
+                    nodes.push(NodeData::new_input(0, k, 0));
+                }
+            })
+        };
+        let reader = {
+            let nodes = Arc::clone(&nodes);
+            let handoff = Arc::clone(&handoff);
+            thread::spawn(move || {
+                let s = handoff.load(Ordering::Acquire);
+                if s != u32::MAX {
+                    assert_eq!(
+                        nodes.get(s).arena_slot(),
+                        4,
+                        "a handed-off node was missing"
+                    );
+                }
+                assert_eq!(nodes.get(0).arena_slot(), 0);
+            })
+        };
+        writer.join().unwrap();
+        reader.join().unwrap();
+        for k in 0..9 {
+            assert_eq!(nodes.get(k).arena_slot(), k);
         }
     });
 }

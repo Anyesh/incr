@@ -1,64 +1,63 @@
 //! Segmented lock-free-on-read store for [`NodeData<C>`].
 //!
-//! Mirrors the production `SegmentedNodes` from `incr-concurrent`,
-//! parameterized over the strategy:
-//! - Under `Shared`, segment pointers are `AtomicPtr` and the length is
-//!   `AtomicU32`. Readers do an Acquire load on `len`, compute
-//!   `(seg_idx, within)`, do an Acquire load on the segment pointer,
-//!   and return a `&NodeData<Shared>` reference.
-//! - Under `Local`, the same shape uses `Cell<*mut NodesSegment<Local>>`
-//!   and `Cell<u32>` for len. The same indexing math, no actual
-//!   synchronization cost.
+//! Nodes live in never-moving segments of `SEGMENT_SIZE` behind a
+//! [`Directory`] that doubles as the store grows, so a slot index splits
+//! into a segment index and an offset by a shift and a mask. A read loads
+//! the directory with Acquire, bounds-checks the segment index, loads the
+//! segment pointer with Relaxed and tests it for null.
 //!
-//! Layout invariants:
-//! - `MAX_SEGMENTS * SEGMENT_SIZE` slots per store (1024 * 1024 = 1M nodes).
-//! - Segments are heap-allocated and never moved or freed until the
-//!   store drops. A `&NodeData<C>` obtained during the store's lifetime
-//!   stays valid until the store drops.
-//! - Append-only writes are serialized by the runtime's write-side lock
-//!   (RwLock::write under Shared, RefCell::borrow_mut under Local); the
-//!   store itself does not provide writer-vs-writer exclusion.
+//! The Relaxed segment load is enough because a reader only ever holds a
+//! slot it reached through a happens-before chain from that slot's
+//! `push`: a handle passed between threads by a synchronizing channel, a
+//! dep id Release-stored and Acquire-loaded or read from the
+//! hazard-protected overflow list, a dependent or group list read under
+//! the runtime's lock, a table bucket published by its Release. That
+//! `push` stored the segment pointer, so the reader sees it, in the
+//! directory it went into or in a later one copied from it (see the
+//! `directory` module). A null segment means a path without that chain,
+//! which is reported as an internal invariant violation.
+//!
+//! Segments are freed only when the store drops, so a `&NodeData<C>`
+//! stays valid for the store's lifetime. Pushes are serialized by the
+//! runtime's write-side lock; the store does not order writers itself.
 
 use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 
 use crate::cells::{Cells, PtrCell};
-use crate::node::NodeData;
+use crate::directory::Directory;
+use crate::node::{NodeData, NodeId};
 
-// Four-node segments under loom, so a model can allocate a segment on a
-// racing thread without creating a thousand nodes first.
-#[cfg(loom)]
+// Four-node segments under loom and Miri, so a model or a Miri test
+// allocates segments and grows the directory without creating thousands
+// of nodes.
+#[cfg(any(loom, miri))]
 const SEGMENT_SHIFT: u32 = 2;
-#[cfg(not(loom))]
+#[cfg(not(any(loom, miri)))]
 const SEGMENT_SHIFT: u32 = 10;
 const SEGMENT_SIZE: usize = 1 << SEGMENT_SHIFT;
 const SEGMENT_MASK: u32 = (SEGMENT_SIZE as u32) - 1;
-const MAX_SEGMENTS: usize = 1024;
+// One entry under loom, so a model doubles the directory on its second
+// segment.
+#[cfg(loom)]
+const FIRST_DIRECTORY_LEN: usize = 1;
+#[cfg(not(loom))]
+const FIRST_DIRECTORY_LEN: usize = 16;
 
-/// Maximum total nodes per runtime. Matches the production cap so the
-/// consolidation does not silently change capacity limits.
-pub const MAX_NODES: u32 = (MAX_SEGMENTS * SEGMENT_SIZE) as u32;
+/// Maximum total nodes per runtime. Slots run from 0 to
+/// `MAX_NODES - 1 = u32::MAX - 1025`.
+pub const MAX_NODES: u32 = u32::MAX - 1024;
 
-/// One segment of up to `SEGMENT_SIZE` `NodeData<C>` slots. Heap
-/// allocated; pointer remains stable for the store's lifetime.
-pub(crate) struct NodesSegment<C: Cells> {
-    slots: Box<[UnsafeCell<MaybeUninit<NodeData<C>>>]>,
-}
+const _: () = assert!(
+    MAX_NODES - 1 < NodeId::SENTINEL.0,
+    "NodeId::SENTINEL must never be a valid slot"
+);
 
-impl<C: Cells> NodesSegment<C> {
-    fn new() -> Box<Self> {
-        let slots: Vec<UnsafeCell<MaybeUninit<NodeData<C>>>> = (0..SEGMENT_SIZE)
-            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
-            .collect();
-        Box::new(Self {
-            slots: slots.into_boxed_slice(),
-        })
-    }
-}
+type Segment<C> = [UnsafeCell<MaybeUninit<NodeData<C>>>; SEGMENT_SIZE];
 
 /// Strategy-parameterized segmented node store.
 pub struct SegmentedNodes<C: Cells> {
-    segments: Box<[C::Ptr<NodesSegment<C>>]>,
+    segments: Directory<Segment<C>, C>,
     len: C::U32,
 }
 
@@ -66,10 +65,8 @@ impl<C: Cells> SegmentedNodes<C> {
     /// Construct an empty store. No segments are allocated until the
     /// first push.
     pub fn new() -> Self {
-        let segments: Vec<C::Ptr<NodesSegment<C>>> =
-            (0..MAX_SEGMENTS).map(|_| C::Ptr::new_null()).collect();
         Self {
-            segments: segments.into_boxed_slice(),
+            segments: Directory::with_len(FIRST_DIRECTORY_LEN),
             len: C::new_u32(0),
         }
     }
@@ -77,9 +74,6 @@ impl<C: Cells> SegmentedNodes<C> {
     /// Append `node` and return its slot index. Caller must hold the
     /// runtime's write-side lock (or be single-threaded under Local) so
     /// no concurrent writer races on `len` or segment allocation.
-    ///
-    /// Publishes the new slot via a Release store on `len` (a no-op
-    /// under Local) which synchronizes with reader Acquire loads.
     pub fn push(&self, node: NodeData<C>) -> u32 {
         let slot = C::u32_load_relaxed(&self.len);
         assert!(
@@ -87,48 +81,43 @@ impl<C: Cells> SegmentedNodes<C> {
             "SegmentedNodes exhausted at {} slots",
             MAX_NODES
         );
-
         let seg_idx = (slot >> SEGMENT_SHIFT) as usize;
-        let within = (slot & SEGMENT_MASK) as usize;
+        if slot & SEGMENT_MASK == 0 {
+            self.alloc_segment(seg_idx);
+        }
+        let seg_ptr = self
+            .segments
+            .get(seg_idx)
+            .expect("incr-core: a pushed slot's segment has a directory entry")
+            .load_relaxed();
 
-        let seg_ptr = self.segments[seg_idx].load_acquire();
-        let seg_ptr = if seg_ptr.is_null() {
-            let new_seg = Box::into_raw(NodesSegment::<C>::new());
-            self.segments[seg_idx].store_release(new_seg);
-            new_seg
-        } else {
-            seg_ptr
-        };
-
-        // SAFETY: seg_ptr is non-null, points at a NodesSegment owned
-        // by this store. `within` < SEGMENT_SIZE by construction.
-        // Caller holds the write-side lock so no concurrent writer is
-        // initializing this slot. Readers cannot observe this slot
-        // because `len` has not yet been bumped.
+        // SAFETY: the segment was allocated by this push or an earlier
+        // one and is freed only on drop. `slot` is past `len`, so no
+        // reader holds it, and the caller serializes writers.
         unsafe {
-            let cell: &UnsafeCell<MaybeUninit<NodeData<C>>> = &(*seg_ptr).slots[within];
-            (*cell.get()).write(node);
+            (*(*seg_ptr)[(slot & SEGMENT_MASK) as usize].get()).write(node);
         }
 
-        // Release-store the new len so readers' Acquire load sees the
-        // initialized slot.
-        let new_len = slot.checked_add(1).expect("SegmentedNodes len overflow");
-        // We use a relaxed store paired with an explicit release on the
-        // strategy's helper. The strategy's u32_store_release would be
-        // ideal but we only exposed Relaxed for U32. Use Release through
-        // a manual fence-free pattern: on Local this is a plain store,
-        // on Shared we need Release ordering on the store.
-        //
-        // For the spike-tier port we use a small workaround: store the
-        // len via u64 sync helpers which DO have Release; that would
-        // require duplicating fields. Instead we extend the strategy.
-        // For now we rely on the fact that creating a fresh segment
-        // does Release on the segment ptr, and the per-slot data is
-        // synchronized by the runtime's state machine on first read.
-        // See README in this commit for the full ordering argument.
-        C::u32_store_relaxed(&self.len, new_len);
-
+        // Readers never synchronize through `len`: they reach a slot
+        // through a happens-before chain from its push (module doc).
+        C::u32_store_relaxed(&self.len, slot + 1);
         slot
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_segment(&self, seg_idx: usize) {
+        self.segments.grow_to(seg_idx);
+        let segment: Box<[UnsafeCell<MaybeUninit<NodeData<C>>>]> = (0..SEGMENT_SIZE)
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
+            .collect();
+        let segment: Box<Segment<C>> = segment
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("a segment has SEGMENT_SIZE slots"));
+        self.segments
+            .get(seg_idx)
+            .expect("incr-core: grow_to left the segment's entry out")
+            .store_release(Box::into_raw(segment));
     }
 
     /// Read the node at `slot`. The returned reference is valid for the
@@ -146,24 +135,18 @@ impl<C: Cells> SegmentedNodes<C> {
         );
 
         let seg_idx = (slot >> SEGMENT_SHIFT) as usize;
-        let within = (slot & SEGMENT_MASK) as usize;
-
-        // The Acquire load pairs with the Release store in push. A null
-        // pointer means the caller reached `slot` through a path with no
-        // happens-before with its push, so it is reported instead of
-        // dereferenced.
-        let seg_ptr = self.segments[seg_idx].load_acquire();
+        let seg_ptr = match self.segments.get(seg_idx) {
+            Some(entry) => entry.load_relaxed(),
+            None => segment_not_visible(seg_idx),
+        };
         if seg_ptr.is_null() {
             segment_not_visible(seg_idx);
         }
 
-        // SAFETY: `slot < len` (debug-asserted) implies the slot has
-        // been initialized via `push` above; the segment pointer is
-        // non-null and segments are never freed until Drop.
-        unsafe {
-            let cell: &UnsafeCell<MaybeUninit<NodeData<C>>> = &(*seg_ptr).slots[within];
-            (*cell.get()).assume_init_ref()
-        }
+        // SAFETY: the caller reached `slot` through a happens-before
+        // chain from its push (module doc), so the slot is initialized
+        // and the non-null segment is live until drop.
+        unsafe { (*(*seg_ptr)[(slot & SEGMENT_MASK) as usize].get()).assume_init_ref() }
     }
 
     /// Number of initialized slots.
@@ -196,39 +179,40 @@ impl<C: Cells> Drop for SegmentedNodes<C> {
     fn drop(&mut self) {
         let final_len = C::u32_load_relaxed(&self.len);
         for slot in 0..final_len {
-            let seg_idx = (slot >> SEGMENT_SHIFT) as usize;
-            let within = (slot & SEGMENT_MASK) as usize;
-            let seg_ptr = self.segments[seg_idx].load_relaxed();
+            let seg_ptr = self.segments.get((slot >> SEGMENT_SHIFT) as usize);
+            let seg_ptr = seg_ptr.map_or(std::ptr::null_mut(), |e| e.load_relaxed());
             if !seg_ptr.is_null() {
-                // SAFETY: slot < final_len so initialized via push; we
-                // own &mut self so no concurrent access can be in
-                // flight.
-                unsafe {
-                    let cell: &UnsafeCell<MaybeUninit<NodeData<C>>> = &(*seg_ptr).slots[within];
-                    (*cell.get()).assume_init_drop();
-                }
+                // SAFETY: slot < final_len, so push initialized it; `&mut
+                // self` rules out readers.
+                unsafe { (*(*seg_ptr)[(slot & SEGMENT_MASK) as usize].get()).assume_init_drop() };
             }
         }
-        for entry in self.segments.iter() {
-            let ptr = entry.load_relaxed();
-            if !ptr.is_null() {
-                // SAFETY: pointer came from Box::into_raw in push;
-                // uniquely owned because &mut self.
-                unsafe {
-                    drop(Box::from_raw(ptr));
-                }
+        for index in 0..self.segments.len() {
+            let Some(entry) = self.segments.get(index) else {
+                break;
+            };
+            let segment = entry.load_relaxed();
+            if !segment.is_null() {
+                // SAFETY: came from `Box::into_raw` in `alloc_segment`, and
+                // `&mut self` rules out readers.
+                drop(unsafe { Box::from_raw(segment) });
             }
         }
     }
 }
 
 // SAFETY (Shared only): `NodeData<Shared>` is `Send + Sync` because all
-// its fields are atomic. `AtomicPtr<NodesSegment<Shared>>` is `Send + Sync`.
+// its fields are atomic, and the directory's entries are `AtomicPtr`s.
 // Under Local, `LocalPtrCell` is `!Sync` (via `Cell`), so the resulting
 // `SegmentedNodes<Local>` is also `!Sync`, which is the correct property
 // for the single-threaded variant. We rely on auto-derived Send/Sync
 // here rather than manual unsafe impls; the per-strategy auto traits do
 // the right thing without our intervention.
+
+const _: fn() = || {
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<SegmentedNodes<crate::cells::Shared>>();
+};
 
 #[cfg(test)]
 mod tests {

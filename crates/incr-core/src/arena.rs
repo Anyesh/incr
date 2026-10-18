@@ -9,7 +9,7 @@
 //! reference implementation for cross-checking.
 //!
 //! Slot indexing is `u32` because (a) it matches `NodeData::arena_slot`
-//! and (b) the production `MAX_NODES` cap is 1M which fits.
+//! and (b) `MAX_NODES` is below `u32::MAX`, so every node's slot fits.
 
 use crate::cells::Cells;
 

@@ -41,7 +41,9 @@ pub(crate) struct Directory<T: 'static, C: Cells> {
     // Growth is rare (one per doubling), so a lock here costs nothing on
     // any path that does not grow.
     retired: C::Lock<Vec<Retired>>,
-    _entries: PhantomData<T>,
+    // The directory holds pointers to `T` and never drops one, so it is
+    // `Send` and `Sync` whatever `T` is, as `AtomicPtr<T>` is.
+    _entries: PhantomData<fn() -> T>,
 }
 
 impl<T: 'static, C: Cells> Directory<T, C> {

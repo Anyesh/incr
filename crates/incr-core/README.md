@@ -46,7 +46,7 @@ Two strategy impls ship in this crate:
 
 `NodeData<C>` is exactly 64 bytes and 64-byte aligned under both strategies. `const _: () = assert!(...)` blocks enforce this at compile time; layout drift breaks the build immediately.
 
-The segmented node store supports up to 1M nodes per runtime (1024 segments × 1024 slots). Segments are lazily allocated, never moved, and live until the runtime drops.
+The segmented node store supports up to `MAX_NODES = u32::MAX - 1024` nodes per runtime. Nodes live in segments of 1024 that are allocated lazily, never moved, and live until the runtime drops; the segment directory doubles as the store grows, and the directories it outgrows are kept until the runtime drops (8 bytes per 1024 nodes in total).
 
 ## Known limitations
 
