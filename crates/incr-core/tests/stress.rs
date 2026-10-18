@@ -386,3 +386,117 @@ fn shared_table_stress() {
         assert_eq!(rt.get(h), 10 * k as i64);
     }
 }
+
+/// Eight threads change the key sets of a chain of creators (creator
+/// `i` reads creator `i - 1`), read the creators and the children they
+/// return, and attach and delete readers of those children, so sweeps,
+/// retention and deletes of owned sets race each other. Every child a
+/// read returns holds its key's value or is gone, a creator's final run
+/// returns exactly its keys' children, and the cascades from the inputs
+/// leave nothing behind: every child was owned.
+#[test]
+fn shared_children_stress() {
+    const CREATORS: usize = 6;
+    type Kids = Vec<(u32, Incr<u64>)>;
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let mut masks = Vec::new();
+    let mut creators: Vec<Incr<Kids>> = Vec::new();
+    for _ in 0..CREATORS {
+        let mask = rt.create_input(0_u8);
+        let upstream = creators.last().copied();
+        let creator = rt.create_query(move |rt| {
+            if let Some(up) = upstream {
+                let _ = rt.get(up).len();
+            }
+            let m = rt.get(mask);
+            (0..6_u32)
+                .filter(|k| m & (1 << k) != 0)
+                .map(|k| (k, rt.child_input(k, move || u64::from(k) * 100)))
+                .collect()
+        });
+        masks.push(mask);
+        creators.push(creator);
+    }
+    let masks = Arc::new(masks);
+    let creators = Arc::new(creators);
+    let workers: Vec<_> = (0..8_u64)
+        .map(|t| {
+            let (rt, masks, creators) =
+                (Arc::clone(&rt), Arc::clone(&masks), Arc::clone(&creators));
+            std::thread::spawn(move || {
+                let mut seed = 0x2545_f491_4f6c_dd1d_u64 ^ (t + 1);
+                let mut next = move || {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed
+                };
+                let mut readers: Vec<Incr<u64>> = Vec::new();
+                for _ in 0..iters(1500) {
+                    let c = (next() % CREATORS as u64) as usize;
+                    match next() % 4 {
+                        0 => rt.set(masks[c], (next() % 64) as u8),
+                        1 => {
+                            for (k, h) in rt.get(creators[c]) {
+                                if let Ok(v) = catch_quietly(|| rt.get(h)) {
+                                    assert_eq!(v, u64::from(k) * 100);
+                                }
+                            }
+                        }
+                        2 => {
+                            let kids = rt.get(creators[c]);
+                            if let Some(&(k, h)) =
+                                kids.get((next() % 6) as usize % kids.len().max(1))
+                            {
+                                let reader = rt.create_query(move |rt| rt.get(h) + 1);
+                                match catch_quietly(|| rt.get(reader)) {
+                                    Ok(v) => assert_eq!(v, u64::from(k) * 100 + 1),
+                                    Err(_) => rt.delete_node(reader),
+                                }
+                                if rt.is_alive(reader) {
+                                    readers.push(reader);
+                                }
+                            }
+                        }
+                        _ => {
+                            if !readers.is_empty() {
+                                let r =
+                                    readers.swap_remove((next() % readers.len() as u64) as usize);
+                                rt.delete_node(r);
+                            }
+                        }
+                    }
+                }
+                readers
+            })
+        })
+        .collect();
+    let readers: Vec<Incr<u64>> = workers
+        .into_iter()
+        .flat_map(|w| w.join().unwrap())
+        .collect();
+    for r in readers {
+        rt.delete_node(r);
+    }
+    for (i, &creator) in creators.iter().enumerate() {
+        let m = rt.get(masks[i]);
+        let kids = rt.get(creator);
+        let keys: Vec<u32> = kids.iter().map(|&(k, _)| k).collect();
+        let expected: Vec<u32> = (0..6).filter(|k| m & (1 << k) != 0).collect();
+        assert_eq!(keys, expected);
+        for (k, h) in kids {
+            assert_eq!(rt.get(h), u64::from(k) * 100);
+        }
+    }
+    for &mask in masks.iter() {
+        rt.delete_with_dependents(mask);
+    }
+    for &creator in creators.iter() {
+        rt.delete_with_dependents(creator);
+    }
+    assert_eq!(
+        rt.node_count(),
+        0,
+        "every child was owned and went with its creator"
+    );
+}
