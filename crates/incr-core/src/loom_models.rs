@@ -618,3 +618,351 @@ fn loom_reader_during_directory_growth() {
         }
     });
 }
+
+/// A (Fallback) ↔ B, where B also reads x. A reader lands the cycle while
+/// a setter changes x: the group lands with x's old value and is walked
+/// Dirty, or lands with the new one.
+#[test]
+fn loom_cycle_land_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(0_u64);
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*bc.get().unwrap()) + 1,
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(x));
+        bc.set(b).unwrap();
+
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.get(a);
+            })
+        };
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 1))
+        };
+        reader.join().unwrap();
+        setter.join().unwrap();
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(a), 100);
+        assert_eq!(rt.get(b), 101, "(V) violated: B stale against x = 1");
+    });
+}
+
+/// A (Fallback) ↔ B, landed. A reads y through a cutoff, so a `set` of y
+/// leaves the group Dirty with nothing changed, and a reader's group
+/// verify re-lands it while a second setter changes x, which B reads.
+#[test]
+fn loom_group_verify_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(0_u64);
+        let y = rt.create_input(0_u64);
+        let cut = rt.create_query(move |rt: &Rt| rt.get(y) / 4);
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*bc.get().unwrap()) + rt.get(cut),
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(x));
+        bc.set(b).unwrap();
+        assert_eq!(rt.get(a), 100);
+        assert_eq!(rt.get(b), 100);
+        rt.set(y, 1);
+
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.get(b);
+            })
+        };
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 1))
+        };
+        reader.join().unwrap();
+        setter.join().unwrap();
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(b), 101, "(V) violated: B stale against x = 1");
+        assert_eq!(rt.get(a), 100);
+    });
+}
+
+/// A (Fallback) ↔ B, landed and then made Dirty with no change. Two
+/// readers enter the group at different members, so one group verify can
+/// find the other member claimed and fall back to an ordinary compute,
+/// and a wound can release a member with the discard landing, after which
+/// a walk may reach the cycle at either member. The members read each
+/// other with `try_get`, so every entry lands the same values.
+#[test]
+fn loom_group_claim_partial() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let y = rt.create_input(0_u64);
+        let cut = rt.create_query(move |rt: &Rt| rt.get(y) / 4);
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| rt.try_get(*bc.get().unwrap()).unwrap_or(0) + rt.get(cut),
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.try_get(a).map_or(0, |v| v + 1));
+        bc.set(b).unwrap();
+        assert_eq!(rt.get(b), 101);
+        rt.set(y, 1);
+
+        let first = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(a))
+        };
+        let second = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(b))
+        };
+        assert_eq!(first.join().unwrap(), 100);
+        assert_eq!(second.join().unwrap(), 101);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(a), 100);
+        assert_eq!(rt.get(b), 101);
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// A (Fallback) reads B while s is 0, and B reads A. A reader enters the
+/// cycle while a setter breaks it: the final values are the acyclic ones.
+#[test]
+fn loom_cycle_break_race() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let s = rt.create_input(0_u64);
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| {
+                    if rt.get(s) == 0 {
+                        rt.get(*bc.get().unwrap()) + 1
+                    } else {
+                        7
+                    }
+                },
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + 1);
+        bc.set(b).unwrap();
+
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.get(a);
+            })
+        };
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(s, 1))
+        };
+        reader.join().unwrap();
+        setter.join().unwrap();
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(b), 8, "(V) violated: B stale after the break");
+        assert_eq!(rt.get(a), 7);
+        assert!(rt.cycle_of(a).is_none());
+    });
+}
+
+fn fixpoint_pair(rt: &Rt, x: Option<Incr<u64>>) -> (Incr<u64>, Incr<u64>) {
+    let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let opts = || crate::cycle::QueryOpts {
+        cycle: crate::cycle::CycleStrategy::Fixpoint(crate::cycle::Fixpoint::new(|| 0_u64)),
+    };
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt: &Rt| (rt.get(*bc.get().unwrap()) + 1).min(2),
+            opts(),
+        )
+    };
+    let b = rt.create_query_with(
+        move |rt: &Rt| rt.get(a) + x.map_or(0, |x| rt.get(x)),
+        opts(),
+    );
+    bc.set(b).unwrap();
+    (a, b)
+}
+
+/// A ↔ B, both Fixpoint, entered at A and at B on two threads at once.
+/// Their claims wait on each other, and wound-wait leaves one thread to
+/// run the whole episode.
+#[test]
+fn loom_fixpoint_two_entries() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let (a, b) = fixpoint_pair(&rt, None);
+        let first = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(a))
+        };
+        let second = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(b))
+        };
+        assert_eq!(first.join().unwrap(), 2);
+        assert_eq!(second.join().unwrap(), 2);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// A ↔ B, both Fixpoint, with B reading x. A reader iterates the episode
+/// while a setter changes x.
+#[test]
+fn loom_fixpoint_iterate_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(0_u64);
+        let (a, b) = fixpoint_pair(&rt, Some(x));
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.get(a);
+            })
+        };
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 1))
+        };
+        reader.join().unwrap();
+        setter.join().unwrap();
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(a), 2, "(V) violated: A");
+        assert_eq!(rt.get(b), 3, "(V) violated: B stale against x = 1");
+    });
+}
+
+/// A (Fallback) ↔ B, entered at A and at B on two threads: each claims
+/// its entry and waits on the other's, a waits-for cycle that the second
+/// registration closes and wounds.
+#[test]
+fn loom_cross_thread_cycle() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*bc.get().unwrap()) + 1,
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + 1);
+        bc.set(b).unwrap();
+        let first = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(a))
+        };
+        let second = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || may_unwind(|| rt.get(b)))
+        };
+        assert_eq!(first.join().unwrap(), 100);
+        // Entered alone at B, a `get` closes the cycle at an unseeded
+        // member and panics by R3; any other order reads the landing.
+        if let Some(v) = second.join().unwrap() {
+            assert_eq!(v, 101);
+        }
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(b), 101);
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// The cross-thread cycle with A's read of B wrapped in `catch_unwind`,
+/// so a wound raised inside it is swallowed: the pop treats it as an
+/// unwind, and the retry lands the same values.
+#[test]
+fn loom_wound_retry() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| {
+                    let b = *bc.get().unwrap();
+                    may_unwind(|| rt.get(b)).map_or(50, |v| v + 1)
+                },
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.try_get(a).map_or(0, |v| v + 1));
+        bc.set(b).unwrap();
+        let first = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(a))
+        };
+        let second = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(b))
+        };
+        assert_eq!(first.join().unwrap(), 100);
+        assert_eq!(second.join().unwrap(), 101);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// D reads Q, which a second thread is computing: D's thread registers
+/// its wait while holding D's claim, and deregisters once Q lands, with
+/// no cycle and no wound.
+#[test]
+fn loom_wait_deregister() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(1_u64);
+        let q = rt.create_query(move |rt: &Rt| rt.get(x) + 1);
+        let d = rt.create_query(move |rt: &Rt| rt.get(q) * 10);
+        let computer = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(q))
+        };
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(d))
+        };
+        assert_eq!(computer.join().unwrap(), 2);
+        assert_eq!(reader.join().unwrap(), 20);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}

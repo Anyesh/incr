@@ -116,6 +116,15 @@ jobs:
           - { model: "loom_models::loom_set_vs_recycle", bound: 3 }
           - { model: "loom_models::loom_arena_read_during_growth", bound: 3 }
           - { model: "loom_models::loom_reader_during_directory_growth", bound: 3 }
+          - { model: "loom_models::loom_cycle_land_under_set", bound: 2 }
+          - { model: "loom_models::loom_group_verify_under_set", bound: 2 }
+          - { model: "loom_models::loom_group_claim_partial", bound: 2 }
+          - { model: "loom_models::loom_cycle_break_race", bound: 2 }
+          - { model: "loom_models::loom_fixpoint_two_entries", bound: 2 }
+          - { model: "loom_models::loom_fixpoint_iterate_under_set", bound: 2 }
+          - { model: "loom_models::loom_cross_thread_cycle", bound: 2 }
+          - { model: "loom_models::loom_wound_retry", bound: 2 }
+          - { model: "loom_models::loom_wait_deregister", bound: 2 }
     env:
       RUSTFLAGS: --cfg loom -D warnings
       LOOM_MAX_PREEMPTIONS: ${{ matrix.bound }}

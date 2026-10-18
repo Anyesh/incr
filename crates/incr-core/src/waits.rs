@@ -85,7 +85,7 @@ loom::thread_local! {
 pub(crate) static WOUNDS: AtomicU64 = AtomicU64::new(0);
 
 /// Threads registered now, for tests.
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 pub(crate) fn registered() -> usize {
     registry().waiters.len()
 }
