@@ -581,7 +581,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
             return rt.pending_handle();
         }
         self.miss(rt, hash, key, (f, strategy), |rt, (f, strategy)| {
-            rt.create_query_unchecked(f, strategy)
+            rt.create_query_erased::<false, _, _>(f, strategy)
         })
     }
 

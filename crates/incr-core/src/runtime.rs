@@ -750,6 +750,7 @@ impl<C: Cells> Runtime<C> {
     /// The caller is responsible for ensuring the new node is not a dep
     /// of the currently-computing node (i.e., the new node is downstream
     /// of the operator, not upstream).
+    #[inline(always)]
     pub(crate) fn create_input_unchecked<T: Value>(&self, value: T) -> Incr<T> {
         value_code::check();
         let revision = self.current_revision();
@@ -782,7 +783,7 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.create_query_erased(f, None)
+        self.create_query_erased::<true, _, _>(f, None)
     }
 
     /// [`Self::create_query`] with a [`CycleStrategy::Fallback`]: in a
@@ -807,27 +808,14 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.create_query_erased(f, cycle::erase(opts.cycle))
+        self.create_query_erased::<true, _, _>(f, cycle::erase(opts.cycle))
     }
 
     /// Takes the strategy erased so that [`Self::create_query`] builds and
-    /// drops no `CycleStrategy` value.
-    fn create_query_erased<T, F>(&self, f: F, strategy: Option<Arc<dyn ErasedStrategy>>) -> Incr<T>
-    where
-        T: Value,
-        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
-    {
-        assert!(
-            !self.dep_stack.current_frame_active(self.runtime_id),
-            "create_query called during compute; not permitted (a compute creates its \
-             nodes through a NodeTable)",
-        );
-        self.create_query_unchecked(f, strategy)
-    }
-
-    /// A query created without the dep-stack-empty check, for a table
-    /// miss inside a compute.
-    pub(crate) fn create_query_unchecked<T, F>(
+    /// drops no `CycleStrategy` value. `CHECKED` is false for a table miss,
+    /// which may create inside a compute; a const parameter keeps the
+    /// checked instance's code what it was before tables existed.
+    pub(crate) fn create_query_erased<const CHECKED: bool, T, F>(
         &self,
         f: F,
         strategy: Option<Arc<dyn ErasedStrategy>>,
@@ -836,6 +824,13 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
+        if CHECKED {
+            assert!(
+                !self.dep_stack.current_frame_active(self.runtime_id),
+                "create_query called during compute; not permitted (a compute creates its \
+                 nodes through a NodeTable)",
+            );
+        }
         value_code::check();
 
         let (slot, generation) = {
