@@ -444,3 +444,94 @@ except `get_clean_shared` (+1) and `get_contended_shared` (+0.41%), both
 the `record_dep` codegen-unit shift named above, with T3 below T2 on
 both in a single-unit build. The drops come from the directory's
 indexing.
+
+## T4
+
+- Engine: `ca0d327` (branch `spreadsheet-t4`). Machine and toolchain as
+  for T0.
+- T3 is `main` at `e972737` run again in the same session. Both columns
+  are the mean of two runs of `icount.sh` at the default N.
+- Attribution: Intel PT on both drivers, counted per symbol at steady
+  state: each workload runs a warm-up of 10,000 or more iterations, and
+  the per-iteration count is the difference between two traced N. At
+  small N without a warm-up the per-iteration counts differ from the
+  default N, so only steady-state traces are used.
+
+| workload | N | T3 | T4 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,380.00 | 4,326.00 | -54.00 | -1.23 | compute: no closure `Arc` clone, dependent-list walk |
+| `chain_local/propagate/10` | 1,000,000 | 9,504.00 | 9,360.00 | -144.00 | -1.52 | compute: no closure `Arc` clone, dependent-list walk |
+| `chain_local/propagate/100` | 100,000 | 87,123.01 | 85,629.01 | -1,494.01 | -1.71 | compute: no closure `Arc` clone, dependent-list walk |
+| `chain_shared/propagate/4` | 1,000,000 | 9,554.42 | 9,227.19 | -327.23 | -3.42 | compute: no closure `Arc` clone, dependent-list walk |
+| `chain_shared/propagate/10` | 1,000,000 | 20,906.32 | 20,146.80 | -759.52 | -3.63 | compute: no closure `Arc` clone, dependent-list walk |
+| `chain_shared/propagate/100` | 100,000 | 192,192.39 | 184,949.85 | -7,242.54 | -3.77 | compute: no closure `Arc` clone, dependent-list walk |
+| `diamond_local` | 1,000,000 | 3,714.00 | 3,682.00 | -32.00 | -0.86 | compute: no closure `Arc` clone, dependent-list walk |
+| `diamond_shared` | 1,000,000 | 7,965.10 | 7,693.93 | -271.18 | -3.40 | compute: no closure `Arc` clone, dependent-list walk |
+| `early_cutoff_local` | 1,000,000 | 2,139.00 | 2,122.00 | -17.00 | -0.79 | compute: no closure `Arc` clone, dependent-list walk |
+| `early_cutoff_shared` | 1,000,000 | 3,549.99 | 3,426.84 | -123.15 | -3.47 | compute: no closure `Arc` clone, dependent-list walk |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,333.70 | 4,301.85 | -31.85 | -0.74 | compute: no closure `Arc` clone, dependent-list walk |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,234.60 | 7,038.18 | -196.42 | -2.71 | compute: no closure `Arc` clone, dependent-list walk |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.36 | 92,283.50 | +0.14 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,326.05 | 4,294.44 | -31.61 | -0.73 | compute: no closure `Arc` clone, dependent-list walk |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,210.60 | 7,011.88 | -198.72 | -2.76 | compute: no closure `Arc` clone, dependent-list walk |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,886.68 | 158,886.48 | -0.20 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,334.05 | 4,302.80 | -31.25 | -0.72 | compute: no closure `Arc` clone, dependent-list walk |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,216.27 | 7,016.37 | -199.90 | -2.77 | compute: no closure `Arc` clone, dependent-list walk |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,570.40 | 1,490,570.29 | -0.11 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 1,995.85 | 1,986.57 | -9.28 | -0.46 | compute: no closure `Arc` clone, dependent-list walk |
+| `simple_count/shared/1000` | 100,000 | 4,105.03 | 3,981.82 | -123.21 | -3.00 | compute: no closure `Arc` clone, dependent-list walk |
+| `simple_count/local/10000` | 100,000 | 1,992.53 | 1,983.59 | -8.94 | -0.45 | compute: no closure `Arc` clone, dependent-list walk |
+| `simple_count/shared/10000` | 100,000 | 4,086.91 | 3,961.43 | -125.48 | -3.07 | compute: no closure `Arc` clone, dependent-list walk |
+| `get_clean_local` | 10,000,000 | 117.00 | 118.00 | +1.00 | +0.85 | register allocation in `get` (+1) |
+| `get_clean_shared` | 10,000,000 | 246.00 | 220.00 | -26.00 | -10.57 | closure `Arc` gone from the read path; `dep_stack` at offset 0 |
+| `get_contended_shared` | 2,000 | 9,793,057.19 | 8,752,974.64 | -1,040,082.54 | -10.62 | closure `Arc` gone from the read path; `dep_stack` at offset 0 |
+| `fanout_local_4` | 100,000 | 17,367.00 | 17,786.00 | +419.00 | +2.41 | create and delete tables (below) |
+| `fanout_local_5` | 100,000 | 21,490.72 | 22,432.15 | +941.43 | +4.38 | create and delete tables (below) |
+| `fanout_local_1000` | 1,000 | 7,189,574.39 | 3,520,628.27 | -3,668,946.12 | -51.03 | linear fan-in teardown |
+| `fanout_shared_4` | 100,000 | 24,150.10 | 24,377.89 | +227.79 | +0.94 | create and delete tables (below) |
+| `fanout_shared_5` | 100,000 | 29,210.03 | 29,802.78 | +592.75 | +2.03 | create and delete tables (below) |
+| `fanout_shared_1000` | 1,000 | 8,665,752.26 | 4,865,016.29 | -3,800,735.97 | -43.86 | linear fan-in teardown |
+| `delete_single_local` | 200,000 | 1,103.00 | 1,106.00 | +3.00 | +0.27 | create and delete tables (below) |
+| `delete_single_shared` | 200,000 | 1,909.26 | 1,933.24 | +23.98 | +1.26 | create and delete tables (below) |
+| `delete_cascade_local` | 1,000 | 3,100,880.06 | 3,329,606.48 | +228,726.42 | +7.38 | allocator consolidation (below), create and delete tables |
+| `delete_cascade_shared` | 1,000 | 4,237,599.57 | 4,313,815.06 | +76,215.49 | +1.80 | allocator consolidation (below), create and delete tables |
+| `delete_owned_tree_local` | 10,000 | 614,953.89 | 602,068.39 | -12,885.50 | -2.10 | owned-map flag; seeds |
+| `delete_owned_tree_shared` | 10,000 | 1,000,073.06 | 984,464.28 | -15,608.78 | -1.56 | owned-map flag; seeds |
+
+- **compute**, per compute: the closure is borrowed under the claim, so
+  the `Arc` clone and drop go; `Runtime` is `repr(C)` with `dep_stack`
+  first, so `record_dep` takes `self` as its pointer, as it happened to
+  in T3. A dirty walk reads each dependents list inline (a mode test and
+  pushes up to the first `NONE`), and its queue is allocated at 8
+  entries only when the first list is non-empty. Local compute workloads
+  fall 0.6-1.7%, Shared 1.3-3.7%.
+- **`get_clean_local` (+1):** one `mov` more in `get`, a register the
+  handle pointer is kept in; no T4 code runs on that path.
+- **create and delete tables (`fanout_*_4`, `fanout_*_5`,
+  `delete_single_*`):** at steady state on `fanout_local_4` (+427):
+  `delete_erased` +199, which now drops the boxed closure itself
+  (`Arc::drop_slow` -165 is gone); `delete_with_dependents` +157, a
+  `SlotVec` index and a dependent-list `last()` per cascade step;
+  `publish_deps` +121, a `SlotVec` index and an inline push per new
+  edge; allocator +79. A fan-in of five spills its list to a heap block,
+  which is freed when the list empties, where T3 kept every recycled
+  slot's `Vec` capacity; that is `fanout_*_5`'s larger rise.
+- **allocator consolidation (`delete_cascade_*`):** each cascade grows
+  its stack to about 2 KiB, a large-bin request in both builds. With
+  closures in 24-byte boxes instead of 40-byte `Arc`s, glibc finds
+  fastbin chunks to consolidate at that request: of
+  `delete_cascade_local`'s +228,727, `_int_malloc` +92,013,
+  `malloc_consolidate` +63,137 and `unlink_chunk` +23,226 are the
+  allocator, and the rest is the table costs above. Taking the cascade's
+  first dependent instead of its last leaves the count unchanged
+  (3,314,959), so the teardown order is not the cause.
+- **linear fan-in teardown:** each dependent is in a list once, a
+  delete removes it scanning from the back, and the cascade takes the
+  last dependent, so `fanout_*_1000` halves.
+
+Gate against T3 (plan T4 **Gate**): every compute workload is at or
+below T3 except `get_clean_local` (+1, register allocation). The
+`compute_one` flags-byte load the plan allows is not taken: no flag
+`compute_one` decides on exists before T5. The rises on `fanout_*_4`,
+`fanout_*_5`, `delete_single_*` and `delete_cascade_*` are the create
+and delete table costs and the allocator effect named above.
