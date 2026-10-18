@@ -659,6 +659,147 @@ fn thousand_member_ring<C: Cells>() {
     rt.assert_invariant_i();
 }
 
+/// A → B → C → A with a Fallback on A: B and C land over A's fallback.
+fn three_cycle_fallback<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let bc = cell::<i64>();
+    let cc = cell::<i64>();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(move |rt| rt.get(*bc.get().unwrap()) + 1, |_c: &Cycle| 100)
+    };
+    let b = {
+        let cc = cc.clone();
+        rt.create_query(move |rt| rt.get(*cc.get().unwrap()) * 2)
+    };
+    let c = rt.create_query(move |rt| rt.get(a) + 3);
+    bc.set(b).unwrap();
+    cc.set(c).unwrap();
+    assert_eq!(rt.get(a), 100);
+    assert_eq!(rt.get(b), 206);
+    assert_eq!(rt.get(c), 103);
+    assert_eq!(
+        slots(&rt.cycle_of(c).unwrap()),
+        vec![a.slot(), b.slot(), c.slot()]
+    );
+    rt.assert_invariant_i();
+}
+
+/// Three Fixpoint members converge together.
+fn three_cycle_fixpoint<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let bc = cell::<i64>();
+    let cc = cell::<i64>();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt| (rt.get(*bc.get().unwrap()) + 1).min(10),
+            fixpoint(Fixpoint::new(|| 0_i64)),
+        )
+    };
+    let b = {
+        let cc = cc.clone();
+        rt.create_query_with(
+            move |rt| rt.get(*cc.get().unwrap()),
+            fixpoint(Fixpoint::new(|| 0_i64)),
+        )
+    };
+    let c = rt.create_query_with(move |rt| rt.get(a), fixpoint(Fixpoint::new(|| 0_i64)));
+    bc.set(b).unwrap();
+    cc.set(c).unwrap();
+    assert_eq!(rt.get(b), 10);
+    assert_eq!(rt.get(a), 10);
+    assert_eq!(rt.get(c), 10);
+    rt.assert_invariant_i();
+}
+
+/// Three unseeded members reading each other with `try_get` land Cyclic.
+fn three_cycle_unseeded<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let bc = cell::<i64>();
+    let cc = cell::<i64>();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query(move |rt| rt.try_get(*bc.get().unwrap()).map_or(-1, |v| v + 1))
+    };
+    let b = {
+        let cc = cc.clone();
+        rt.create_query(move |rt| rt.try_get(*cc.get().unwrap()).map_or(-2, |v| v + 1))
+    };
+    let c = rt.create_query(move |rt| rt.try_get(a).map_or(-3, |v| v + 1));
+    bc.set(b).unwrap();
+    cc.set(c).unwrap();
+    let cycle = rt.try_get(b).unwrap_err();
+    assert_eq!(slots(&cycle), vec![a.slot(), b.slot(), c.slot()]);
+    for n in [a, b, c] {
+        assert!(rt.try_get(n).is_err());
+        assert_eq!(rt.state_of(n), NodeState::Cyclic);
+    }
+    rt.assert_invariant_i();
+}
+
+/// The group C (Fallback) → X → A → C. With `try_get` reads, entering at
+/// any member lands the same values; with `get`, entering at X panics by
+/// R3 on C's read of X, and a later read at C lands the group.
+fn group_c_x_a<C: Cells>() {
+    let build = |rt: &Runtime<C>, tolerant: bool| {
+        let xc = cell::<i64>();
+        let ac = cell::<i64>();
+        let c = {
+            let xc = xc.clone();
+            rt.create_query_with_fallback(
+                move |rt| {
+                    let x = *xc.get().unwrap();
+                    if tolerant {
+                        rt.try_get(x).map_or(-7, |v| v + 1)
+                    } else {
+                        rt.get(x) + 1
+                    }
+                },
+                |_c: &Cycle| 100,
+            )
+        };
+        let x = {
+            let ac = ac.clone();
+            rt.create_query(move |rt| {
+                let a = *ac.get().unwrap();
+                if tolerant {
+                    rt.try_get(a).map_or(-8, |v| v * 2)
+                } else {
+                    rt.get(a) * 2
+                }
+            })
+        };
+        let a = rt.create_query(move |rt| {
+            if tolerant {
+                rt.try_get(c).map_or(-9, |v| v + 3)
+            } else {
+                rt.get(c) + 3
+            }
+        });
+        xc.set(x).unwrap();
+        ac.set(a).unwrap();
+        [c, x, a]
+    };
+    for entry in 0..3 {
+        let rt = Runtime::<C>::new();
+        let nodes = build(&rt, true);
+        rt.try_get(nodes[entry]).unwrap();
+        let landed: Vec<i64> = nodes.iter().map(|&n| rt.try_get(n).unwrap()).collect();
+        assert_eq!(landed, vec![100, 206, 103], "entered at {entry}");
+        rt.assert_invariant_i();
+    }
+
+    let rt = Runtime::<C>::new();
+    let [c, x, a] = build(&rt, false);
+    let msg = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err());
+    assert!(msg.contains("dependency cycle"), "{msg}");
+    assert_eq!(rt.get(c), 100);
+    assert_eq!(rt.get(x), 206);
+    assert_eq!(rt.get(a), 103);
+    rt.assert_invariant_i();
+}
+
 both!(
     self_cycle_fallback,
     self_cycle_fixpoint,
@@ -666,6 +807,10 @@ both!(
     two_cycle_fallback,
     two_cycle_entered_at_unseeded,
     two_cycle_fixpoint,
+    three_cycle_fallback,
+    three_cycle_fixpoint,
+    three_cycle_unseeded,
+    group_c_x_a,
     oscillation_reaches_the_limit,
     tolerance_convergence,
     fixpoint_step,

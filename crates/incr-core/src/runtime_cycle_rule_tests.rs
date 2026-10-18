@@ -716,7 +716,86 @@ fn swallowed_cycle_is_an_ordinary_result<C: Cells>() {
     assert_eq!(rt.get(r), 2);
 }
 
+/// The plan's G1 = {X, P, U}: X has a Fallback and reads P with
+/// `try_get`; P reads `i`, then U and X when `i` is 0 and R when it is 1;
+/// U and R read P with `try_get`, and so does P read U and R, because
+/// once an episode puts them in CU a `get` between them panics by R0. With `i` = 0, `get(X)` lands X Clean and
+/// P and U Cyclic. After `set(i, 1)` a read of P (or, `at_x`, of X) runs
+/// G1's group verify from X, whose claim fails on New P or U, so X takes
+/// an ordinary compute that lands P and R Cyclic in a new group, and U
+/// and X land Clean through single-node landings that remove their G1
+/// records.
+fn g1_group_verify_falls_back<C: Cells>(at_x: bool) {
+    let rt = Runtime::<C>::new();
+    let i = rt.create_input(0_i64);
+    let pc = cell::<i64>();
+    let rc = cell::<i64>();
+    let x = {
+        let pc = pc.clone();
+        rt.create_query_with_fallback(
+            move |rt| rt.try_get(*pc.get().unwrap()).unwrap_or(-1),
+            |_c: &Cycle| 100,
+        )
+    };
+    let u = {
+        let pc = pc.clone();
+        rt.create_query(move |rt| rt.try_get(*pc.get().unwrap()).unwrap_or(-2))
+    };
+    let r = {
+        let pc = pc.clone();
+        rt.create_query(move |rt| rt.try_get(*pc.get().unwrap()).unwrap_or(-3))
+    };
+    let p = {
+        let rc = rc.clone();
+        rt.create_query(move |rt| {
+            if rt.get(i) == 0 {
+                rt.try_get(u).unwrap_or(-4) + rt.get(x)
+            } else {
+                rt.try_get(*rc.get().unwrap()).unwrap_or(-5)
+            }
+        })
+    };
+    pc.set(p).unwrap();
+    rc.set(r).unwrap();
+
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(rt.state_of(x), NodeState::Clean);
+    assert_eq!(rt.state_of(p), NodeState::Cyclic);
+    assert_eq!(rt.state_of(u), NodeState::Cyclic);
+    rt.assert_invariant_i();
+
+    rt.set(i, 1);
+    assert_eq!(rt.state_of(p), NodeState::New);
+    assert_eq!(rt.state_of(u), NodeState::New);
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    rt.group_verifies.lock().unwrap().clear();
+    if at_x {
+        assert_eq!(rt.get(x), -1);
+    } else {
+        assert!(rt.try_get(p).is_err());
+        assert_eq!(rt.get(x), -1);
+    }
+    assert!(rt.group_verifies.lock().unwrap().contains(&x.slot()));
+    assert!(rt.try_get(p).is_err());
+    assert_eq!(rt.get(u), -2);
+    assert_eq!(rt.state_of(p), NodeState::Cyclic);
+    assert_eq!(rt.state_of(r), NodeState::Cyclic);
+    assert_eq!(rt.state_of(u), NodeState::Clean);
+    assert_eq!(rt.state_of(x), NodeState::Clean);
+    rt.assert_invariant_i();
+}
+
+fn g1_group_verify_falls_back_from_p<C: Cells>() {
+    g1_group_verify_falls_back::<C>(false);
+}
+
+fn g1_group_verify_falls_back_from_x<C: Cells>() {
+    g1_group_verify_falls_back::<C>(true);
+}
+
 both!(
+    g1_group_verify_falls_back_from_p,
+    g1_group_verify_falls_back_from_x,
     rule_a_stores_zero_on_a_new_claim_that_wrote_nothing,
     rule_b_fails_a_verify_at_zero,
     rule_b_fails_a_group_at_zero,
@@ -800,5 +879,140 @@ fn shared_cross_runtime_reentry() {
             assert_eq!(r1.get(a), 9);
             assert_eq!(r1.cycle_of(a), None);
         }
+    }
+}
+
+/// Group verify decides on `IN_GROUP` through a load after its claim:
+/// `n`'s `compute_one` parks between its hold and its claim while another
+/// thread changes `n`'s group membership, each test in one direction.
+mod flags_reload {
+    use std::sync::Arc;
+    use std::thread;
+
+    use super::super::race_tests::{id, park_at, Gate};
+    use super::super::{ParkPoint, Runtime};
+    use super::cell;
+    use crate::cells::Shared;
+    use crate::cycle::Cycle;
+    use crate::state::NodeState;
+
+    /// While the first thread is parked, a second computes `n` as the root
+    /// of a 2-member cycle, and a `set` of the cycle's external dep flags
+    /// the episode, so `n` lands Dirty with a record. The first thread
+    /// claims `n` from Dirty and runs group verify.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_in_group_set_between_hold_and_claim() {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let e = rt.create_input(0_i64);
+        let sw = rt.create_input(0_i64);
+        let mc = cell::<i64>();
+        let m_gate = Gate::new();
+        let n = {
+            let mc = mc.clone();
+            rt.create_query_with_fallback(
+                move |rt| {
+                    if rt.get(sw) == 0 {
+                        rt.get(e)
+                    } else {
+                        rt.get(*mc.get().unwrap()) + rt.get(e)
+                    }
+                },
+                |_c: &Cycle| 100,
+            )
+        };
+        let m = {
+            let m_gate = m_gate.clone();
+            rt.create_query(move |rt| {
+                let v = rt.get(n);
+                m_gate.park();
+                v + 1
+            })
+        };
+        mc.set(m).unwrap();
+        assert_eq!(rt.get(n), 0);
+        rt.set(sw, 1);
+        assert_eq!(rt.state_of(n), NodeState::Dirty);
+
+        let claim = Gate::new();
+        park_at(&rt, vec![(ParkPoint::BeforeClaim(id(n)), claim.clone())]);
+        let first = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(n))
+        };
+        claim.wait_parked();
+        m_gate.arm();
+        let second = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(n))
+        };
+        m_gate.wait_parked();
+        rt.set(e, 5);
+        m_gate.release();
+        assert_eq!(second.join().unwrap(), 100);
+        assert_eq!(rt.state_of(n), NodeState::Dirty);
+        assert_eq!(rt.state_of(m), NodeState::Dirty);
+        rt.group_verifies.lock().unwrap().clear();
+        claim.release();
+        assert_eq!(first.join().unwrap(), 100);
+        assert_eq!(rt.group_verifies.lock().unwrap().first(), Some(&id(n).0));
+        assert_eq!(rt.get(m), 101);
+        rt.assert_invariant_i();
+    }
+
+    /// `n` starts Dirty as a group member, after a `set` that makes its
+    /// closure stop reading the cycle. While the first thread is parked, a
+    /// second claims `n`, group verify finds the change, the episode
+    /// dissolves and `n` lands through the single-node path, which removes
+    /// its record, and a `set` walks it Dirty again. The first thread then
+    /// takes the single-node path; group verify's lookup asserts if a stale
+    /// bit reaches it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_in_group_cleared_between_hold_and_claim() {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let e = rt.create_input(0_i64);
+        let sw = rt.create_input(1_i64);
+        let mc = cell::<i64>();
+        let n = {
+            let mc = mc.clone();
+            rt.create_query_with_fallback(
+                move |rt| {
+                    if rt.get(sw) == 1 {
+                        rt.get(*mc.get().unwrap()) + rt.get(e)
+                    } else {
+                        rt.get(e)
+                    }
+                },
+                |_c: &Cycle| 100,
+            )
+        };
+        let m = rt.create_query(move |rt| rt.get(n) + 1);
+        mc.set(m).unwrap();
+        assert_eq!(rt.get(n), 100);
+        assert_eq!(rt.get(m), 101);
+        rt.set(sw, 0);
+        assert_eq!(rt.state_of(n), NodeState::Dirty);
+
+        let claim = Gate::new();
+        park_at(&rt, vec![(ParkPoint::BeforeClaim(id(n)), claim.clone())]);
+        let first = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(n))
+        };
+        claim.wait_parked();
+        let second = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(n))
+        };
+        assert_eq!(second.join().unwrap(), 0);
+        rt.set(e, 7);
+        assert_eq!(rt.state_of(n), NodeState::Dirty);
+        rt.group_verifies.lock().unwrap().clear();
+        claim.release();
+        assert_eq!(first.join().unwrap(), 7);
+        assert!(rt.group_verifies.lock().unwrap().is_empty());
+        assert_eq!(rt.get(m), 8);
+        rt.assert_invariant_i();
     }
 }

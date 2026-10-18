@@ -618,6 +618,9 @@ pub struct Runtime<C: Cells> {
     /// Visit entries every `ensure_clean` walk on this runtime popped.
     #[cfg(test)]
     pub(crate) walk_pops: std::sync::atomic::AtomicU64,
+    /// The node of every group verification, in order.
+    #[cfg(test)]
+    pub(crate) group_verifies: std::sync::Mutex<Vec<u32>>,
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -649,6 +652,8 @@ impl<C: Cells> Runtime<C> {
             group_zero_fails: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             walk_pops: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            group_verifies: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -3269,6 +3274,16 @@ impl<C: Cells> Runtime<C> {
                 C::u8_load_relaxed(self.nodes.get_with_flags(slot as u32).1) & HAS_CHILDREN != 0,
                 inner.owned.contains_key(&(slot as u32)),
                 "HAS_CHILDREN of node {slot} disagrees with the owned map"
+            );
+        }
+        for slot in 0..self.nodes.len() {
+            if inner.free_nodes.contains(&slot) {
+                continue;
+            }
+            assert_eq!(
+                C::u8_load_relaxed(self.nodes.get_with_flags(slot).1) & IN_GROUP != 0,
+                inner.member_recs.contains_key(&slot),
+                "IN_GROUP of node {slot} disagrees with the member records"
             );
         }
         for &slot in &inner.free_nodes {

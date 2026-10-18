@@ -1210,6 +1210,18 @@ impl<C: Cells> Runtime<C> {
     ) -> GroupEnd {
         let rt = self.runtime_id;
         let group = self.inner.read().member_recs.get(&x.0).cloned();
+        // The flags byte was loaded under the claim, and a record and its
+        // bit change together under the claim, so a missing record is a
+        // stale bit.
+        #[cfg(test)]
+        {
+            assert!(
+                group.is_some(),
+                "incr-core: IN_GROUP set on node {} with no record",
+                x.0
+            );
+            self.group_verifies.lock().unwrap().push(x.0);
+        }
         let Some(group) = group else {
             return GroupEnd::Ordinary;
         };
