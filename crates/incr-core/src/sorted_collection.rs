@@ -53,6 +53,8 @@ const COMPACT_EVERY: usize = 1024;
 pub(crate) struct SortedState<T, K> {
     pub(crate) sorted: Vec<(K, T)>,
     pub(crate) deltas: Vec<SortDelta<T>>,
+    /// An empty buffer the next compaction moves the kept deltas into.
+    pub(crate) spare: Vec<SortDelta<T>>,
     pub(crate) base: u64,
     pub(crate) cursors: Vec<Arc<AtomicU64>>,
     pub(crate) version: u64,
@@ -63,6 +65,7 @@ impl<T: Clone, K> SortedState<T, K> {
         Self {
             sorted: Vec::new(),
             deltas: Vec::new(),
+            spare: Vec::new(),
             base: 0,
             cursors: Vec::new(),
             version: 0,
@@ -111,14 +114,19 @@ impl<T: Clone, K> SortedState<T, K> {
                 .unwrap_or_else(|| self.end());
             if min_cursor > self.base {
                 let cut = (min_cursor - self.base) as usize;
-                let capacity = self.deltas.capacity();
-                let mut compacted =
-                    std::mem::replace(&mut self.deltas, Vec::with_capacity(capacity));
-                self.deltas.extend(compacted.drain(cut..));
+                // The kept deltas move into the spare, not a fresh buffer,
+                // because a large fresh request makes glibc consolidate its
+                // fastbins and slows later small allocations.
+                let mut kept = std::mem::take(&mut self.spare);
+                kept.reserve(self.deltas.capacity());
+                kept.extend(self.deltas.drain(cut..));
+                let mut compacted = std::mem::replace(&mut self.deltas, kept);
                 self.base = min_cursor;
-                // Dropped only now, so that a panicking user `Drop` cannot
-                // leave `base` out of step with the deltas.
-                drop(compacted);
+                // Cleared only now, so that a panicking user `Drop` cannot
+                // leave `base` out of step with the deltas; the buffer is
+                // then lost and the next compaction allocates afresh.
+                compacted.clear();
+                self.spare = compacted;
             }
         }
     }
@@ -721,6 +729,111 @@ mod tests {
             expected_sorted.sort();
             assert_eq!(sorted_elements(&windows), expected_sorted);
         }
+    }
+
+    /// Steps until the sorted log compacts, three times, and checks that
+    /// the buffer its deltas filled comes back as the spare the next
+    /// compaction fills, so a compaction in steady state allocates nothing.
+    #[test]
+    fn sort_compaction_recycles_its_buffer() {
+        let rt: Runtime<Shared> = Runtime::new();
+        let c = rt.create_collection::<i64>();
+        let sorted = c.sort_by_key(&rt, |x| *x);
+        let count = sorted.pairwise(&rt).count(&rt);
+        let mut next = 0;
+        for _ in 0..3 {
+            let base = sorted.state.read().base;
+            let mut filled = sorted.state.read().deltas.as_ptr();
+            while sorted.state.read().base == base {
+                filled = sorted.state.read().deltas.as_ptr();
+                c.insert(&rt, next);
+                next += 1;
+                let _ = rt.get(count);
+            }
+            let st = sorted.state.read();
+            assert!(
+                st.spare.capacity() >= COMPACT_EVERY,
+                "no spare after a compaction"
+            );
+            assert_eq!(
+                st.spare.as_ptr(),
+                filled,
+                "the filled buffer is not the spare"
+            );
+            assert!(st.spare.is_empty());
+        }
+    }
+
+    thread_local! {
+        static FUSE_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Panics on the first drop of a `Fuse(0)` while armed.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct Fuse(i64);
+
+    impl Drop for Fuse {
+        fn drop(&mut self) {
+            if self.0 == 0 && FUSE_ARMED.with(|armed| armed.replace(false)) {
+                panic!("chosen Drop call");
+            }
+        }
+    }
+
+    /// The upstream insert that brings the sorted log to `COMPACT_EVERY`
+    /// deltas has the compaction drop `Fuse(0)`'s delta and panic; the
+    /// view, its log and a positional consumer must still agree after
+    /// recovery.
+    fn sort_compaction_survives_a_panicking_drop<C: Cells>() {
+        let rt: Runtime<C> = Runtime::new();
+        let c = rt.create_collection::<Fuse>();
+        let n = COMPACT_EVERY as i64;
+        for i in 0..n - 1 {
+            c.insert(&rt, Fuse(i));
+        }
+        let sorted = c.sort_by_key(&rt, |f| f.0);
+        let pairs = sorted.pairwise(&rt);
+        let _ = rt.get(pairs.version_node);
+        assert_eq!(sorted.state.read().base, 0);
+
+        c.insert(&rt, Fuse(n - 1));
+        FUSE_ARMED.with(|armed| armed.set(true));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.get(sorted.version_node);
+        }))
+        .is_err();
+        let armed = FUSE_ARMED.with(|armed| armed.replace(false));
+        assert!(panicked && !armed, "the compaction did not drop Fuse(0)");
+
+        c.insert(&rt, Fuse(n));
+        let _ = rt.get(pairs.version_node);
+        let st = sorted.state.read();
+        assert!(st.base > 0, "the sorted log never compacted");
+        assert_eq!(st.base + st.deltas.len() as u64, st.version);
+        drop(st);
+        let order: Vec<i64> = sorted.snapshot().iter().map(|f| f.0).collect();
+        assert_eq!(order, (0..=n).collect::<Vec<_>>());
+        let mut got: Vec<(i64, i64)> = pairs
+            .log
+            .read()
+            .elements_vec()
+            .iter()
+            .map(|(a, b)| (a.0, b.0))
+            .collect();
+        got.sort();
+        assert_eq!(got, (0..n).map(|i| (i, i + 1)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn local_sort_compaction_survives_a_panicking_drop() {
+        sort_compaction_survives_a_panicking_drop::<Local>();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_sort_compaction_survives_a_panicking_drop() {
+        sort_compaction_survives_a_panicking_drop::<Shared>();
     }
 
     trait RetainFirst<T> {
