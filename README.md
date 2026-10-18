@@ -62,6 +62,8 @@ Dependency cycles are values, not crashes. A query created with `create_query_wi
 
 A compute that needs a node per key, such as a spreadsheet cell per address, keeps them in a `NodeTable`: `table.get_or_insert_query(&rt, key, f)` returns the key's node, creating it on the first call from inside or outside a compute, and `rt.get` of the handle records the dependency. Lookups are lock-free, and racing first calls create one node.
 
+A compute can also own the nodes it makes. `rt.child_input(key, init)` and `rt.child_query(key, f)` return the running compute's child for `key`, creating it on the first run that asks and reusing it on every later one. A run that stops asking for a child deletes it when it lands, unless something outside still reads it, a run that fails or is discarded deletes the children it created, and deleting the creator deletes everything it owns.
+
 ## Three crates, one engine
 
 | | `incr-compute` | `incr-concurrent` | `incr-core` |
