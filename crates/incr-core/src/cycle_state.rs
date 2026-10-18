@@ -104,6 +104,10 @@ struct EntryState {
     /// Set by a wound until the outermost entry retries.
     wounded: Cell<bool>,
     failures: Cell<u64>,
+    /// Set when `Outer` may hold something, so that an outermost entry
+    /// with nothing to reset touches only this block, which has no
+    /// destructor and so no liveness check.
+    outer_set: Cell<bool>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -122,6 +126,7 @@ thread_local! {
             ticket: Cell::new(0),
             wounded: Cell::new(false),
             failures: Cell::new(0),
+            outer_set: Cell::new(false),
         }
     };
     static OUTER: RefCell<Outer> = const {
@@ -140,6 +145,7 @@ loom::thread_local! {
         ticket: Cell::new(0),
         wounded: Cell::new(false),
         failures: Cell::new(0),
+        outer_set: Cell::new(false),
     };
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
@@ -225,6 +231,7 @@ pub fn take_last_cycle() -> Option<Cycle> {
 }
 
 pub(crate) fn set_last_cycle(cycle: Cycle) {
+    ENTRY.with(|e| e.outer_set.set(true));
     OUTER.with(|o| o.borrow_mut().last_cycle = Some(cycle));
 }
 
@@ -237,6 +244,7 @@ pub(crate) fn dissolved_before(rt: RuntimeId, root: u32) -> bool {
             return true;
         }
         dissolved.push((rt, root));
+        ENTRY.with(|e| e.outer_set.set(true));
         false
     })
 }
@@ -324,11 +332,11 @@ impl Drop for EntryDepth {
 /// Resets the state an outermost entry starts from.
 #[inline(always)]
 pub(crate) fn reset_outermost() {
-    OUTER.with(|o| {
-        let mut o = o.borrow_mut();
-        if !o.dissolved.is_empty() {
+    if ENTRY.with(|e| e.outer_set.replace(false)) {
+        OUTER.with(|o| {
+            let mut o = o.borrow_mut();
             o.dissolved.clear();
-        }
-        o.last_cycle = None;
-    });
+            o.last_cycle = None;
+        });
+    }
 }
