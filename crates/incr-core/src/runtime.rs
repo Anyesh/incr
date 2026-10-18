@@ -236,52 +236,45 @@ impl<C: Cells> Drop for WalkDone<'_, C> {
 }
 
 /// `set`'s claim on its input, from the claim CAS to the landing, with
-/// the claim's set-stack entry. On an unwind before the write (a
-/// `PartialEq` panic) it lands the input as it found it; after the write
-/// it finishes the bump, the settle, the landing and the walk, none of
-/// which runs user code, so the written value is never left unpublished.
-/// Either way the entry pops with the landing.
+/// the claim's set-stack entry. Dropped while `held` (an unwind before
+/// the write, a `PartialEq` panic, or an exit that writes nothing), it
+/// lands the input as it found it and pops the entry. The write's exit
+/// is [`Self::finish_written`].
 struct SetClaim<'a, C: Cells> {
     rt: &'a Runtime<C>,
     node: &'a NodeData<C>,
     id: NodeId,
-    phase: SetPhase,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum SetPhase {
-    Claimed,
-    Written,
-    Done,
+    held: bool,
 }
 
 impl<C: Cells> SetClaim<'_, C> {
-    fn finish(&mut self) {
-        match std::mem::replace(&mut self.phase, SetPhase::Done) {
-            SetPhase::Done => {}
-            SetPhase::Claimed => {
-                self.rt.land(self.node, NodeState::Clean, NodeState::Dirty);
-                set_stack::pop(self.rt.runtime_id, self.id.0);
-            }
-            SetPhase::Written => {
-                let rev = self.rt.bump_revision();
-                let walk_done = WalkDone { rt: self.rt, rev };
-                self.rt.park(ParkPoint::SetAfterBump);
-                self.node.settle_changed_at(rev);
-                self.node.max_verified_at(rev);
-                self.rt.land(self.node, NodeState::Clean, NodeState::Clean);
-                set_stack::pop(self.rt.runtime_id, self.id.0);
-                self.rt.mark_dependents_dirty(self.id);
-                self.rt.park(ParkPoint::SetAfterWalk);
-                drop(walk_done);
-            }
-        }
+    /// The bump, the settle, the landing and the walk, none of which
+    /// runs user code, so the written value is never left unpublished.
+    /// `held` is cleared first so that an unwind out of this never lands
+    /// the claim a second time.
+    #[inline(always)]
+    fn finish_written(mut self) {
+        self.held = false;
+        let rev = self.rt.bump_revision();
+        let walk_done = WalkDone { rt: self.rt, rev };
+        self.rt.park(ParkPoint::SetAfterBump);
+        self.node.settle_changed_at(rev);
+        self.node.max_verified_at(rev);
+        self.rt.land(self.node, NodeState::Clean, NodeState::Clean);
+        set_stack::pop(self.rt.runtime_id, self.id.0);
+        self.rt.mark_dependents_dirty(self.id);
+        self.rt.park(ParkPoint::SetAfterWalk);
+        drop(walk_done);
+        std::mem::forget(self);
     }
 }
 
 impl<C: Cells> Drop for SetClaim<'_, C> {
     fn drop(&mut self) {
-        self.finish();
+        if self.held {
+            self.rt.land(self.node, NodeState::Clean, NodeState::Dirty);
+            set_stack::pop(self.rt.runtime_id, self.id.0);
+        }
     }
 }
 
@@ -339,22 +332,32 @@ enum Computed {
     Gone,
 }
 
-/// `Entry::taint` of an entry no skipped dep has reached.
-const NO_TAINT: u32 = u32::MAX;
+/// `Entry::taint` of a visit entry.
+const VISIT: u32 = u32::MAX;
 
-/// One entry of `ensure_clean`'s walk. A visit (`pending == false`)
+/// `Entry::taint` of a pending entry no skipped dep has reached.
+const NO_TAINT: u32 = u32::MAX - 1;
+
+/// One entry of `ensure_clean`'s walk. A visit (`taint == VISIT`)
 /// expands `x`'s non-Clean deps; the pending entry is pushed on the first
 /// visit and runs `x`'s compute once they are done.
 #[derive(Copy, Clone)]
 struct Entry {
     id: NodeId,
-    pending: bool,
-    /// Lowest frame depth among the Computing deps this thread holds that
-    /// were skipped under this entry, or `NO_TAINT`. A tainted node is
-    /// reachable only through edges that may be stale, so the walk must
-    /// not run its closure: the parent's closure decides whether it is
-    /// still read.
+    /// `VISIT`, or on a pending entry the lowest frame depth among the
+    /// Computing deps this thread holds that were skipped under it, or
+    /// `NO_TAINT`. A tainted node is reachable only through edges that
+    /// may be stale, so the walk must not run its closure: the parent's
+    /// closure decides whether it is still read. The kind shares the
+    /// field so that an entry stays 8 bytes.
     taint: u32,
+}
+
+impl Entry {
+    #[inline(always)]
+    fn is_pending(self) -> bool {
+        self.taint != VISIT
+    }
 }
 
 /// The stack of `ensure_clean`'s post-order walk.
@@ -369,26 +372,42 @@ struct Walk {
 }
 
 impl Walk {
-    /// `pending` starts the walk at the root's compute, skipping its
-    /// expansion.
     #[inline]
-    fn new(root: NodeId, pending: bool) -> Self {
+    fn new(root: NodeId) -> Self {
         Self {
             work: vec![Entry {
                 id: root,
-                pending,
-                taint: NO_TAINT,
+                taint: VISIT,
             }],
             first_visits: 0,
             visited: None,
         }
     }
 
+    #[inline(always)]
+    fn push(&mut self, entry: Entry) {
+        if self.work.len() == self.work.capacity() {
+            self.grow();
+        }
+        self.work.push(entry);
+    }
+
+    /// Grows through a fresh allocation, not `realloc`, because glibc's
+    /// `realloc` bypasses its thread cache and costs several times a
+    /// cached `malloc` and `free`. The first growth goes straight to 16
+    /// entries, so a short walk grows once.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) {
+        let mut grown = Vec::with_capacity((self.work.capacity() * 2).max(16));
+        grown.extend_from_slice(&self.work);
+        self.work = grown;
+    }
+
     #[inline]
     fn visit(&mut self, id: NodeId) {
-        self.work.push(Entry {
+        self.push(Entry {
             id,
-            pending: true,
             taint: NO_TAINT,
         });
         self.first_visits += 1;
@@ -408,7 +427,7 @@ impl Walk {
                 self.visited = Some(
                     self.work
                         .iter()
-                        .filter(|e| e.pending)
+                        .filter(|e| e.is_pending())
                         .map(|e| e.id)
                         .collect(),
                 );
@@ -418,10 +437,9 @@ impl Walk {
 
     #[inline]
     fn expand(&mut self, dep: NodeId) {
-        self.work.push(Entry {
+        self.push(Entry {
             id: dep,
-            pending: false,
-            taint: NO_TAINT,
+            taint: VISIT,
         });
     }
 
@@ -443,7 +461,7 @@ impl Walk {
     /// pending entry from the top, because everything above it is a
     /// sibling visit or a finished subtree.
     fn taint(&mut self, owner: u32) {
-        if let Some(parent) = self.work.iter_mut().rev().find(|e| e.pending) {
+        if let Some(parent) = self.work.iter_mut().rev().find(|e| e.is_pending()) {
             parent.taint = parent.taint.min(owner);
         }
     }
@@ -984,21 +1002,13 @@ impl<C: Cells> Runtime<C> {
             .map(|member| self.retire_claimed(member))
             .collect::<Vec<Retired<C>>>()
             .into_iter();
-        let dep_lists = retired
-            .as_slice()
-            .iter()
-            .filter(|r| r.dep_list.is_some())
-            .count();
         let mut inner = self.inner.write();
         let first = retired
             .next()
             .expect("incr-core: a batch release has a member");
-        let had_dep_list = first.dep_list.is_some();
         let (drops, dep_list) = self.unhook_retired(&mut inner, first);
         let mut bag = DeleteBag::new(drops, dep_list);
-        // Counted and reserved under the hold, so the batch's pushes
-        // grow the spill at most once.
-        bag.reserve_batch(retired.len(), dep_lists - usize::from(had_dep_list));
+        bag.reserve_batch(retired.len());
         for member in retired {
             let (drops, dep_list) = self.unhook_retired(&mut inner, member);
             bag.push_node(drops, dep_list);
@@ -1708,11 +1718,11 @@ impl<C: Cells> Runtime<C> {
             }
         }
         set_stack::push(self.runtime_id, slot);
-        let mut claim = SetClaim {
+        let claim = SetClaim {
             rt: self,
             node,
             id,
-            phase: SetPhase::Claimed,
+            held: true,
         };
         self.park(ParkPoint::SetAfterClaim(id));
         if node.generation() != handle.generation() {
@@ -1741,8 +1751,7 @@ impl<C: Cells> Runtime<C> {
         //    all of the above to claimants that Acquire the Dirty state.
         node.mark_changed_pending();
         let displaced = arena.write(arena_slot, value);
-        claim.phase = SetPhase::Written;
-        claim.finish();
+        claim.finish_written();
         displaced
     }
 
@@ -1913,29 +1922,20 @@ impl<C: Cells> Runtime<C> {
     /// `word` from `value_code::checked_word` and found `id` not Clean.
     /// A root that went Clean since is left at its first pop.
     fn clean_walk(&self, id: NodeId, gen: u32, word: u64) -> Computed {
-        // A memoized root is computed directly, as the walk's only
-        // entry, so `compute_one` keeps a single call site and inlines.
-        let direct = word != 0 && taint_memo::memoized(word, self.runtime_id, id);
-        let mut walk = Walk::new(id, direct);
+        if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
+            return self.compute_direct(id, gen);
+        }
+        let mut walk = Walk::new(id);
         let mut root = Computed::Done;
 
-        while let Some(Entry {
-            id: cur,
-            pending,
-            taint,
-        }) = walk.work.pop()
-        {
+        while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
-            if pending {
-                let visit = if direct {
-                    Visit::Direct
+            if taint != VISIT {
+                self.park(ParkPoint::BeforeComputeOne(cur));
+                let visit = if is_root || taint == NO_TAINT {
+                    Visit::Full
                 } else {
-                    self.park(ParkPoint::BeforeComputeOne(cur));
-                    if is_root || taint == NO_TAINT {
-                        Visit::Full
-                    } else {
-                        Visit::VerifyOnly(taint)
-                    }
+                    Visit::VerifyOnly(taint)
                 };
                 let computed = self.compute_one(cur, visit, is_root.then_some(gen));
                 if is_root {
@@ -1987,6 +1987,15 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// A root the taint memo holds, computed without a walk. Out of line
+    /// so that the walk's own inlined `compute_one` never tests for
+    /// `Visit::Direct`.
+    #[cold]
+    #[inline(never)]
+    fn compute_direct(&self, id: NodeId, gen: u32) -> Computed {
+        self.compute_one(id, Visit::Direct, Some(gen))
     }
 
     /// Compute (or verify) a single node, assuming all its known deps
