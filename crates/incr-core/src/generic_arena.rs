@@ -87,12 +87,19 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         self.reserve_slot()
     }
 
+    #[inline(always)]
     fn reserve_slot(&self) -> u32 {
         let mut inner = self.inner.write();
-        if let Some(id) = inner.free.pop() {
+        match inner.free.pop() {
             // Released slots were cleared before they were freed.
-            return id;
+            Some(id) => id,
+            None => self.fresh_slot(&mut inner),
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fresh_slot(&self, inner: &mut ArenaInner) -> u32 {
         let id = inner.len;
         if id & SEGMENT_MASK == 0 {
             let index = (id >> SEGMENT_SHIFT) as usize;
