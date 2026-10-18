@@ -2636,9 +2636,8 @@ impl<C: Cells> Runtime<C> {
         // ends with `id` from the first push, so each list holds `id` at
         // most once and a delete's back-to-front remove finds it.
         for new_dep in &new_deps {
-            let list = &mut inner.dependents[new_dep.0 as usize];
-            if !old_deps.contains(new_dep) && list.last() != Some(id) {
-                list.push(id);
+            if !old_deps.contains(new_dep) {
+                inner.dependents[new_dep.0 as usize].push_unique(id);
             }
         }
         if superseded {

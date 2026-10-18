@@ -186,11 +186,17 @@ impl DependentList {
         self.as_slice().contains(&id.0)
     }
 
+    /// Append `id` unless it is already the last entry. The runtime
+    /// pushes each dependent's id once per dep it read, and a dep read
+    /// twice is pushed twice in a row, so this keeps every id unique.
     #[inline]
-    pub(crate) fn push(&mut self, id: NodeId) {
+    pub(crate) fn push_unique(&mut self, id: NodeId) {
         debug_assert_ne!(id.0, NONE, "NodeId::SENTINEL is never a dependent");
         if self.is_inline() {
             let n = self.inline_ids().len();
+            if self.inline_ids()[n - 1] == id.0 {
+                return;
+            }
             if n < INLINE {
                 *self.inline_slot(n) = id.0;
             } else {
@@ -200,7 +206,7 @@ impl DependentList {
             self.head = [NONE; W];
             self.head[0] = id.0;
             self.tail = Tail { ids: [NONE; W] };
-        } else {
+        } else if self.last() != Some(id) {
             self.push_to_block(id);
         }
     }
@@ -375,9 +381,12 @@ mod tests {
         for op in ops {
             match *op {
                 Op::Push(l, x) => {
-                    // The runtime never pushes an id a list already holds.
-                    if !model[l].contains(&x) {
-                        lists[l].push(NodeId(x));
+                    // The runtime pushes an id a list holds only right after
+                    // pushing it, which `push_unique` skips.
+                    if model[l].last() == Some(&x) {
+                        lists[l].push_unique(NodeId(x));
+                    } else if !model[l].contains(&x) {
+                        lists[l].push_unique(NodeId(x));
                         model[l].push(x);
                     }
                 }
@@ -439,10 +448,10 @@ mod tests {
     fn stays_inline_up_to_two_words() {
         let mut list = DependentList::new();
         for x in 0..INLINE as u32 {
-            list.push(NodeId(x));
+            list.push_unique(NodeId(x));
         }
         assert!(!list.has_block());
-        list.push(NodeId(99));
+        list.push_unique(NodeId(99));
         assert!(list.has_block());
     }
 }
