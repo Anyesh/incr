@@ -339,22 +339,32 @@ enum Computed {
     Gone,
 }
 
-/// `Entry::taint` of an entry no skipped dep has reached.
-const NO_TAINT: u32 = u32::MAX;
+/// `Entry::taint` of a visit entry.
+const VISIT: u32 = u32::MAX;
 
-/// One entry of `ensure_clean`'s walk. A visit (`pending == false`)
+/// `Entry::taint` of a pending entry no skipped dep has reached.
+const NO_TAINT: u32 = u32::MAX - 1;
+
+/// One entry of `ensure_clean`'s walk. A visit (`taint == VISIT`)
 /// expands `x`'s non-Clean deps; the pending entry is pushed on the first
 /// visit and runs `x`'s compute once they are done.
 #[derive(Copy, Clone)]
 struct Entry {
     id: NodeId,
-    pending: bool,
-    /// Lowest frame depth among the Computing deps this thread holds that
-    /// were skipped under this entry, or `NO_TAINT`. A tainted node is
-    /// reachable only through edges that may be stale, so the walk must
-    /// not run its closure: the parent's closure decides whether it is
-    /// still read.
+    /// `VISIT`, or on a pending entry the lowest frame depth among the
+    /// Computing deps this thread holds that were skipped under it, or
+    /// `NO_TAINT`. A tainted node is reachable only through edges that
+    /// may be stale, so the walk must not run its closure: the parent's
+    /// closure decides whether it is still read. The kind shares the
+    /// field so that an entry stays 8 bytes.
     taint: u32,
+}
+
+impl Entry {
+    #[inline(always)]
+    fn is_pending(self) -> bool {
+        self.taint != VISIT
+    }
 }
 
 /// The stack of `ensure_clean`'s post-order walk.
@@ -376,8 +386,7 @@ impl Walk {
         Self {
             work: vec![Entry {
                 id: root,
-                pending,
-                taint: NO_TAINT,
+                taint: if pending { NO_TAINT } else { VISIT },
             }],
             first_visits: 0,
             visited: None,
@@ -388,7 +397,6 @@ impl Walk {
     fn visit(&mut self, id: NodeId) {
         self.work.push(Entry {
             id,
-            pending: true,
             taint: NO_TAINT,
         });
         self.first_visits += 1;
@@ -408,7 +416,7 @@ impl Walk {
                 self.visited = Some(
                     self.work
                         .iter()
-                        .filter(|e| e.pending)
+                        .filter(|e| e.is_pending())
                         .map(|e| e.id)
                         .collect(),
                 );
@@ -420,8 +428,7 @@ impl Walk {
     fn expand(&mut self, dep: NodeId) {
         self.work.push(Entry {
             id: dep,
-            pending: false,
-            taint: NO_TAINT,
+            taint: VISIT,
         });
     }
 
@@ -443,7 +450,7 @@ impl Walk {
     /// pending entry from the top, because everything above it is a
     /// sibling visit or a finished subtree.
     fn taint(&mut self, owner: u32) {
-        if let Some(parent) = self.work.iter_mut().rev().find(|e| e.pending) {
+        if let Some(parent) = self.work.iter_mut().rev().find(|e| e.is_pending()) {
             parent.taint = parent.taint.min(owner);
         }
     }
@@ -1911,14 +1918,9 @@ impl<C: Cells> Runtime<C> {
         let mut walk = Walk::new(id, direct);
         let mut root = Computed::Done;
 
-        while let Some(Entry {
-            id: cur,
-            pending,
-            taint,
-        }) = walk.work.pop()
-        {
+        while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
-            if pending {
+            if taint != VISIT {
                 let visit = if direct {
                     Visit::Direct
                 } else {
