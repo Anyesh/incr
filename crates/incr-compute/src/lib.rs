@@ -29,15 +29,19 @@ use incr_core::Local;
 #[doc(hidden)]
 pub use incr_core::{engine_unwind, take_last_cycle, with_value_code};
 pub use incr_core::{
-    Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint,
+    Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
     GroupedCollection as GroupedCollectionInner, Incr, IncrCollection as IncrCollectionInner,
-    NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTrace, ObserverId, PropagationTrace, QueryOpts,
-    RuntimeId, SortDelta, SortedCollection as SortedCollectionInner, TraceAction, Value,
+    NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable as NodeTableInner, NodeTrace, ObserverId,
+    PropagationTrace, QueryOpts, RuntimeId, SortDelta, SortedCollection as SortedCollectionInner,
+    TableKey, TraceAction, Value,
 };
 
 /// Single-threaded runtime: `Runtime<Local>`. Not `Send`/`Sync`. Use the
 /// `incr-concurrent` crate for the multi-threaded equivalent.
 pub type Runtime = incr_core::Runtime<Local>;
+
+/// A map from keys to nodes of one runtime: `NodeTable<K, T, Local, S>`.
+pub type NodeTable<K, T, S = FxBuildHasher> = NodeTableInner<K, T, Local, S>;
 
 /// Single-threaded incremental collection: `IncrCollection<T, Local>`.
 pub type IncrCollection<T> = IncrCollectionInner<T, Local>;
@@ -56,16 +60,23 @@ mod reexports {
     fn every_incr_core_item_is_reexported() {
         use crate::{
             engine_unwind, take_last_cycle, with_value_code, Cycle, CycleStrategy, DeleteError,
-            Delta, ErasedIncr, Fixpoint, GroupedCollection, GroupedCollectionInner, Incr,
-            IncrCollection, IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
-            NodeTrace, ObserverId, PropagationTrace, QueryOpts, Runtime, RuntimeId, SortDelta,
-            SortedCollection, SortedCollectionInner, TraceAction, Value,
+            Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher, GroupedCollection,
+            GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner, NodeId, NodeInfo,
+            NodeKindInfo, NodeState, NodeTable, NodeTableInner, NodeTrace, ObserverId,
+            PropagationTrace, QueryOpts, Runtime, RuntimeId, SortDelta, SortedCollection,
+            SortedCollectionInner, TableKey, TraceAction, Value,
         };
 
         fn named<T: ?Sized>() {}
         fn value<T: Value>() {}
         let _ = (engine_unwind, take_last_cycle);
         named::<Cycle>();
+        named::<FxBuildHasher>();
+        named::<FxHasher>();
+        named::<NodeTable<u32, u32>>();
+        named::<NodeTableInner<u32, u32, incr_core::Local>>();
+        fn key<K: TableKey>() {}
+        key::<u32>();
         named::<CycleStrategy<u32>>();
         named::<Fixpoint<u32>>();
         named::<QueryOpts<u32>>();
