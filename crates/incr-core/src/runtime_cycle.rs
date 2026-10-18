@@ -19,6 +19,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::Held;
+use crate::{set_stack, waits};
 
 /// What a compute attempt carries into its landings.
 #[derive(Copy, Clone)]
@@ -176,6 +177,15 @@ impl<C: Cells> Runtime<C> {
                 Ok(r) => return Ok(r),
                 Err(payload) => payload,
             };
+            // A wound wins over any kind: whatever unwound last, this
+            // thread gave up its claims to an older one, and retries.
+            if outermost && cycle_state::wounded() {
+                cycle_state::take_unwind_kind();
+                cycle_state::set_wounded(false);
+                drop(payload);
+                waits::await_winner(C::backoff);
+                continue;
+            }
             match cycle_state::take_unwind_kind() {
                 Some(UnwindKind::Cycle) => {
                     let cycle = match payload.downcast::<CycleUnwind>() {
@@ -189,10 +199,6 @@ impl<C: Cells> Runtime<C> {
                     }
                     cycle_panic(cycle);
                 }
-                Some(UnwindKind::Wound) if outermost => {
-                    drop(payload);
-                    self.after_wound();
-                }
                 other => {
                     cycle_state::set_unwind_kind(other);
                     resume_unwind(payload);
@@ -202,29 +208,89 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// An engine unwind that a closure caught and returned past: a cycle
-    /// becomes an ordinary result, as under `try_get`; a wound is raised
-    /// again, because the claims it must release are still held.
+    /// becomes an ordinary result, as under `try_get`. A wound stays in
+    /// flight and the pop is told to treat its closure as unwound, since
+    /// the claims the wound must release are still held.
     #[cold]
-    pub(super) fn swallowed(&self, kind: Option<UnwindKind>) {
+    pub(super) fn swallowed(&self, kind: Option<UnwindKind>) -> bool {
         match kind {
-            Some(UnwindKind::Cycle) => cycle_state::set_unwind_kind(None),
-            Some(UnwindKind::Wound) => self.wound_again(),
-            None => {}
+            Some(UnwindKind::Cycle) => {
+                cycle_state::set_unwind_kind(None);
+                false
+            }
+            Some(UnwindKind::Wound) => true,
+            None => false,
         }
     }
 
-    /// Raises this thread's wound again: its closure swallowed the
-    /// wound's unwind while claims it must release are still held.
+    /// Raises a wound: this thread unwinds to its outermost engine entry,
+    /// every claim it holds is released on the way, and the entry
+    /// retries. Also raised again at a pop whose closure swallowed it.
     #[cold]
     #[inline(never)]
-    pub(super) fn wound_again(&self) -> ! {
+    pub(super) fn raise_wound(&self) -> ! {
+        cycle_state::set_wounded(true);
         cycle_state::set_unwind_kind(Some(UnwindKind::Wound));
         resume_unwind(Box::new(WoundUnwind))
     }
 
-    /// The outermost entry caught a wound: every claim this thread held
-    /// has been released on the way out, and the entry retries.
-    pub(super) fn after_wound(&self) {}
+    /// A claim wait on `on` that has spun `REGISTER_AFTER` times: it
+    /// registers with the claims this thread holds and waits until `done`,
+    /// unless a registration that closes a waits-for cycle wounds it.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn wait_registered(&self, on: NodeId, mut done: impl FnMut() -> bool) {
+        let mut holds: Vec<waits::Claim> = self.dep_stack.with(|s| {
+            s.frames
+                .iter()
+                .filter(|f| f.rt != RuntimeId::SENTINEL)
+                .map(|f| (f.rt, f.node.0))
+                .collect()
+        });
+        holds.extend(cycle_state::held_keys());
+        holds.extend(set_stack::claims());
+        // A thread that holds nothing is no one's owner, so no waits-for
+        // cycle can pass through it and it never needs a registration.
+        if holds.is_empty() {
+            let mut spins = waits::REGISTER_AFTER;
+            while !done() {
+                spins += 1;
+                C::backoff(spins);
+            }
+            return;
+        }
+        let reg = waits::Registration::new(
+            |next| cycle_state::ticket(next),
+            (self.runtime_id, on.0),
+            holds,
+        );
+        let mut spins = waits::REGISTER_AFTER;
+        loop {
+            // A wait that is satisfied proceeds even if it was wounded
+            // meanwhile: the oldest thread never needed its claims.
+            if done() {
+                return;
+            }
+            if reg.wounded() {
+                drop(reg);
+                self.raise_wound();
+            }
+            spins += 1;
+            C::backoff(spins);
+        }
+    }
+
+    /// One spin of a claim wait on `on`, which registers once it has
+    /// spun long enough and then waits until `done`.
+    #[inline]
+    pub(super) fn spin_on(&self, on: NodeId, spins: &mut u32, done: impl FnMut() -> bool) {
+        *spins += 1;
+        if !C::SINGLE_THREADED && *spins >= waits::REGISTER_AFTER {
+            self.wait_registered(on, done);
+        } else {
+            C::backoff(*spins);
+        }
+    }
 
     /// Runs a cycle callback with no lock held, as value code, under a
     /// barrier frame that belongs to no runtime: a read of a Clean node
@@ -412,11 +478,13 @@ impl<C: Cells> Runtime<C> {
         // not freed (see `compute_attempts`).
         let compute = unsafe { &*compute };
         let failures = cycle_state::failures();
-        let result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
+        let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
         let deps = self.dep_stack.pop_frame();
         let word = value_code::thread_word();
-        if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0 {
-            self.after_pop(word, result.is_ok());
+        if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
+            && self.after_pop(word, result.is_ok())
+        {
+            result = Err(Box::new(WoundUnwind));
         }
         let replaced = cycle_state::with_held(|h| {
             let e = h

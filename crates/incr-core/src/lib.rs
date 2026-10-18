@@ -50,6 +50,7 @@ pub mod trace;
 pub mod value;
 mod value_code;
 pub mod value_slot;
+mod waits;
 pub mod walk_ring;
 
 pub use arena::PrimitiveArena;

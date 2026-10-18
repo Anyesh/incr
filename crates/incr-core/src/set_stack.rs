@@ -44,6 +44,11 @@ pub(crate) fn pop(rt: RuntimeId, slot: u32) {
 }
 
 /// True iff a `set` on this thread holds the claim on `slot` of `rt`.
+/// Every input this thread's sets hold claimed.
+pub(crate) fn claims() -> Vec<(RuntimeId, u32)> {
+    SET_STACK.with(|s| s.borrow().iter().map(|e| (e.rt, e.slot)).collect())
+}
+
 pub(crate) fn holds(rt: RuntimeId, slot: u32) -> bool {
     SET_STACK.with(|s| s.borrow().iter().any(|e| e.rt == rt && e.slot == slot))
 }

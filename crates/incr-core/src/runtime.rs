@@ -43,6 +43,7 @@ use crate::taint_memo;
 use crate::value::Value;
 use crate::value_code;
 use crate::value_slot::{Compared, Displaced};
+use crate::waits;
 
 /// Compute closure: takes a borrow of the runtime, the node's slot and
 /// the frame's control block, which says whether this is a recompute
@@ -128,7 +129,8 @@ pub struct ObserverId(u64);
 /// inline function, so these compile away.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ParkPoint {
-    /// In `ensure_clean`, just before `compute_one` on a visited node.
+    /// In `ensure_clean`, just before `compute_one` on a visited node, or
+    /// before the walk waits on a node another thread is computing.
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
@@ -1035,7 +1037,7 @@ impl<C: Cells> Runtime<C> {
     pub fn delete_node<T: Value>(&self, handle: Incr<T>) {
         self.check_handle(handle);
         let root = handle.erase();
-        match self.delete_strict(root) {
+        match self.enter(|| self.delete_strict(root)) {
             Ok(()) => {}
             // check_handle passed, so a concurrent delete got there first.
             Err(StrictRefusal::Gone) => {
@@ -1069,10 +1071,11 @@ impl<C: Cells> Runtime<C> {
         if root.runtime_id() != self.runtime_id {
             return Err(DeleteError::NotAlive);
         }
-        self.delete_strict(root).map_err(|refusal| match refusal {
-            StrictRefusal::Gone => DeleteError::NotAlive,
-            StrictRefusal::HasDependents(_) => DeleteError::HasDependents,
-        })
+        self.enter(|| self.delete_strict(root))
+            .map_err(|refusal| match refusal {
+                StrictRefusal::Gone => DeleteError::NotAlive,
+                StrictRefusal::HasDependents(_) => DeleteError::HasDependents,
+            })
     }
 
     fn panic_has_dependents(slot: u32) -> ! {
@@ -1123,8 +1126,9 @@ impl<C: Cells> Runtime<C> {
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
                     self.refuse_wait_on_computing(id);
-                    spins += 1;
-                    C::backoff(spins);
+                    self.spin_on(id, &mut spins, || {
+                        !is_computing(state::load::<C>(node.state_cell()))
+                    });
                     continue;
                 }
                 NodeState::Dead => {
@@ -1250,8 +1254,9 @@ impl<C: Cells> Runtime<C> {
                     handle.slot(),
                 );
             }
-            *spins += 1;
-            C::backoff(*spins);
+            self.spin_on(NodeId(handle.slot()), spins, || {
+                node.generation() != handle.generation()
+            });
         }
     }
 
@@ -1266,8 +1271,7 @@ impl<C: Cells> Runtime<C> {
         }
         loop {
             self.refuse_wait_on_own_set(NodeId(handle.slot()));
-            *spins += 1;
-            C::backoff(*spins);
+            self.spin_on(NodeId(handle.slot()), spins, || !node.set_claimed());
             if !node.set_claimed() {
                 return;
             }
@@ -1340,7 +1344,9 @@ impl<C: Cells> Runtime<C> {
                 stack.push(child);
                 continue;
             }
-            match self.delete_erased(top) {
+            // One delete per entry, so a wound retries only the delete it
+            // interrupted and the count stays exact.
+            match self.enter(|| self.delete_erased(top)) {
                 DeleteOutcome::Deleted => {
                     deleted += 1;
                     stack.pop();
@@ -1461,8 +1467,9 @@ impl<C: Cells> Runtime<C> {
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
                     self.refuse_wait_on_computing(id);
-                    spins += 1;
-                    C::backoff(spins);
+                    self.spin_on(id, &mut spins, || {
+                        !is_computing(state::load::<C>(node.state_cell()))
+                    });
                 }
                 NodeState::Dead => {
                     // Another delete claimed the node and will bump the
@@ -2042,8 +2049,7 @@ impl<C: Cells> Runtime<C> {
             // Another set holds the input. It takes no lock before its
             // release, so this waits with none held.
             self.refuse_wait_on_own_set(id);
-            spins += 1;
-            C::backoff(spins);
+            self.spin_on(id, &mut spins, || !node.set_claimed());
         }
     }
 
@@ -2102,17 +2108,19 @@ impl<C: Cells> Runtime<C> {
     /// owns the compute. Bounded spin first (computes are usually short),
     /// then yield. Local never waits here: single-threaded Computing is a
     /// cycle or a broken invariant.
-    ///
-    /// Known limitation: a cyclic graph whose cycle spans two threads'
-    /// in-flight computes spins forever instead of panicking; cross-thread
-    /// cycle detection needs a waits-for graph and is not implemented.
+    /// Past `REGISTER_AFTER` spins the wait registers for wound-wait.
     #[inline]
     fn wait_on_claim(&self, id: NodeId, spins: u32) {
         if self.holds_claim(id) {
             self.waits_on_own_claim(id);
         }
         self.refuse_wait_on_computing(id);
-        C::backoff(spins);
+        if !C::SINGLE_THREADED && spins >= waits::REGISTER_AFTER {
+            let node = self.nodes.get(id.0);
+            self.wait_registered(id, || !is_computing(state::load::<C>(node.state_cell())));
+        } else {
+            C::backoff(spins);
+        }
     }
 
     /// A wait reached a claim this thread holds, which no wait releases.
@@ -2393,10 +2401,25 @@ impl<C: Cells> Runtime<C> {
                     }
                     // Another thread owns this subtree and is cleaning
                     // its deps itself; expanding them here would tear
-                    // through a dep list mid-rewrite. Just wait for the
-                    // owner, here once and then in compute_one.
-                    self.wait_on_claim(cur, 1);
-                    walk.visit(cur);
+                    // through a dep list mid-rewrite. Wait for the owner,
+                    // then visit the node again: a claim released without
+                    // a Clean landing (a wound's discard, a flagged
+                    // landing) leaves deps the walk has not expanded, and
+                    // one of them may be a claim this thread holds, which
+                    // only the expansion skips.
+                    self.park(ParkPoint::BeforeComputeOne(cur));
+                    let mut spins = 0;
+                    loop {
+                        spins += 1;
+                        self.wait_on_claim(cur, spins);
+                        if !is_computing(state::load::<C>(node.state_cell())) {
+                            break;
+                        }
+                    }
+                    walk.push(Entry {
+                        id: cur,
+                        taint: VISIT,
+                    });
                 }
                 _ => {
                     // New nodes can carry installed edges on each other
@@ -2734,13 +2757,15 @@ impl<C: Cells> Runtime<C> {
                 // succeed while this node is Computing. `SlotVec` never moves
                 // its entries, so the `Box` still points where it was read.
                 let compute = unsafe { &*compute };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     compute(self, id.0, &ctl)
                 }));
                 let deps = self.dep_stack.pop_frame();
                 let word = value_code::thread_word();
-                if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0 {
-                    self.after_pop(word, result.is_ok());
+                if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
+                    && self.after_pop(word, result.is_ok())
+                {
+                    result = Err(Box::new(cycle::WoundUnwind));
                 }
 
                 let outcome = match result {
@@ -2926,16 +2951,17 @@ impl<C: Cells> Runtime<C> {
 
     /// A frame pop found the memo bit or an unwind kind in the thread
     /// word. A kind left set after a closure returned normally is an
-    /// engine unwind the closure caught and swallowed.
+    /// engine unwind the closure caught and swallowed; true if it was a
+    /// wound, which the pop lands as an unwind.
     #[cold]
     #[inline(never)]
-    fn after_pop(&self, word: u64, returned: bool) {
+    fn after_pop(&self, word: u64, returned: bool) -> bool {
         if word & value_code::MEMO_BIT != 0 {
             taint_memo::clear_from(self.dep_stack.depth() as u32);
         }
-        if returned && !std::thread::panicking() {
-            self.swallowed(cycle_state::UnwindKind::of_word(word));
-        }
+        returned
+            && !std::thread::panicking()
+            && self.swallowed(cycle_state::UnwindKind::of_word(word))
     }
 
     /// A single-node landing: a node landing outside an episode leaves
@@ -3192,6 +3218,7 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    #[cfg(not(loom))]
     pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
         self.nodes.get(h.slot()).verified_at()
     }
@@ -3330,6 +3357,10 @@ mod cycle_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_cycle_rule_tests.rs"]
 mod cycle_rule_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_wound_tests.rs"]
+mod wound_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]

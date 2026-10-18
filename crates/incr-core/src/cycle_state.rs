@@ -5,7 +5,7 @@
 //! dissolved during the current outermost entry.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::cycle::{Cycle, Erased};
 use crate::handle::RuntimeId;
@@ -94,27 +94,67 @@ pub(crate) enum UnwindKind {
 
 type HeldMap = HashMap<(RuntimeId, u32), Held>;
 
+/// The engine entry state of a thread, in one block so that an entry
+/// and its exit touch one thread-local.
+struct EntryState {
+    depth: Cell<u32>,
+    /// This thread's wound-wait ticket, 0 until its first registration
+    /// inside the current outermost entry, which keeps it across retries.
+    ticket: Cell<u64>,
+    /// Set by a wound until the outermost entry retries.
+    wounded: Cell<bool>,
+    failures: Cell<u64>,
+}
+
+/// What the outermost entry resets: the roots whose episodes dissolved,
+/// and the cycle the last uncaught cycle panic reported.
+struct Outer {
+    dissolved: Vec<(RuntimeId, u32)>,
+    last_cycle: Option<Cycle>,
+}
+
 #[cfg(not(loom))]
 thread_local! {
     static HELD: RefCell<HeldMap> = RefCell::new(HashMap::new());
-    static DEPTH: Cell<u32> = const { Cell::new(0) };
-    static FAILURES: Cell<u64> = const { Cell::new(0) };
-    static LAST_CYCLE: RefCell<Option<Cycle>> = const { RefCell::new(None) };
-    static DISSOLVED: RefCell<HashSet<(RuntimeId, u32)>> = RefCell::new(HashSet::new());
+    static ENTRY: EntryState = const {
+        EntryState {
+            depth: Cell::new(0),
+            ticket: Cell::new(0),
+            wounded: Cell::new(false),
+            failures: Cell::new(0),
+        }
+    };
+    static OUTER: RefCell<Outer> = const {
+        RefCell::new(Outer {
+            dissolved: Vec::new(),
+            last_cycle: None,
+        })
+    };
 }
 
 #[cfg(loom)]
 loom::thread_local! {
     static HELD: RefCell<HeldMap> = RefCell::new(HashMap::new());
-    static DEPTH: Cell<u32> = Cell::new(0);
-    static FAILURES: Cell<u64> = Cell::new(0);
-    static LAST_CYCLE: RefCell<Option<Cycle>> = RefCell::new(None);
-    static DISSOLVED: RefCell<HashSet<(RuntimeId, u32)>> = RefCell::new(HashSet::new());
+    static ENTRY: EntryState = EntryState {
+        depth: Cell::new(0),
+        ticket: Cell::new(0),
+        wounded: Cell::new(false),
+        failures: Cell::new(0),
+    };
+    static OUTER: RefCell<Outer> = RefCell::new(Outer {
+        dissolved: Vec::new(),
+        last_cycle: None,
+    });
 }
 
 /// Runs `f` on the held map. `f` must not call user code or the engine.
 pub(crate) fn with_held<R>(f: impl FnOnce(&mut HeldMap) -> R) -> R {
     HELD.with(|h| f(&mut h.borrow_mut()))
+}
+
+/// Every claim in the held map, of every runtime.
+pub(crate) fn held_keys() -> Vec<(RuntimeId, u32)> {
+    HELD.with(|h| h.borrow().keys().copied().collect())
 }
 
 pub(crate) fn holds(rt: RuntimeId, slot: u32) -> bool {
@@ -166,43 +206,70 @@ pub(crate) fn take_unwind_kind() -> Option<UnwindKind> {
 
 /// Clears the last reported cycle and returns it.
 pub fn take_last_cycle() -> Option<Cycle> {
-    LAST_CYCLE.with(|c| c.borrow_mut().take())
+    OUTER.with(|o| o.borrow_mut().last_cycle.take())
 }
 
 pub(crate) fn set_last_cycle(cycle: Cycle) {
-    LAST_CYCLE.with(|c| *c.borrow_mut() = Some(cycle));
+    OUTER.with(|o| o.borrow_mut().last_cycle = Some(cycle));
 }
 
 /// Whether `root` already dissolved an episode in this outermost entry,
 /// marking it if not.
 pub(crate) fn dissolved_before(rt: RuntimeId, root: u32) -> bool {
-    DISSOLVED.with(|d| !d.borrow_mut().insert((rt, root)))
+    OUTER.with(|o| {
+        let dissolved = &mut o.borrow_mut().dissolved;
+        if dissolved.contains(&(rt, root)) {
+            return true;
+        }
+        dissolved.push((rt, root));
+        false
+    })
 }
 
 pub(crate) fn has_dissolved(rt: RuntimeId, root: u32) -> bool {
-    DISSOLVED.with(|d| d.borrow().contains(&(rt, root)))
+    OUTER.with(|o| o.borrow().dissolved.contains(&(rt, root)))
 }
 
 /// How many held claims this thread has marked failed: a member run that
 /// panics marks its node only if no member nested in it was marked, so
 /// the panic is attributed to the member whose own code raised it.
 pub(crate) fn failures() -> u64 {
-    FAILURES.with(Cell::get)
+    ENTRY.with(|e| e.failures.get())
 }
 
 /// Marks `held` failed.
 pub(crate) fn mark_failed(held: &mut Held) {
     held.failed = true;
-    FAILURES.with(|f| f.set(f.get() + 1));
+    ENTRY.with(|e| e.failures.set(e.failures.get() + 1));
 }
 
 /// The thread's engine entry depth: 0 outside every engine entry.
 pub(crate) fn depth() -> u32 {
-    DEPTH.with(Cell::get)
+    ENTRY.with(|e| e.depth.get())
+}
+
+/// This thread's wound-wait ticket, taken from `next` at its first
+/// registration inside the outermost entry.
+pub(crate) fn ticket(next: impl FnOnce() -> u64) -> u64 {
+    ENTRY.with(|e| {
+        if e.ticket.get() == 0 {
+            e.ticket.set(next());
+        }
+        e.ticket.get()
+    })
+}
+
+pub(crate) fn set_wounded(wounded: bool) {
+    ENTRY.with(|e| e.wounded.set(wounded));
+}
+
+pub(crate) fn wounded() -> bool {
+    ENTRY.with(|e| e.wounded.get())
 }
 
 /// One count on the thread's engine entry depth; dropping it, by an
-/// unwind included, gives the count back.
+/// unwind included, gives the count back, and the outermost entry's drop
+/// gives up the thread's ticket.
 pub(crate) struct EntryDepth {
     outermost: bool,
 }
@@ -210,9 +277,9 @@ pub(crate) struct EntryDepth {
 impl EntryDepth {
     #[inline(always)]
     pub(crate) fn enter() -> Self {
-        let depth = DEPTH.with(|d| {
-            let depth = d.get();
-            d.set(depth + 1);
+        let depth = ENTRY.with(|e| {
+            let depth = e.depth.get();
+            e.depth.set(depth + 1);
             depth
         });
         Self {
@@ -229,14 +296,24 @@ impl EntryDepth {
 impl Drop for EntryDepth {
     #[inline(always)]
     fn drop(&mut self) {
-        DEPTH.with(|d| d.set(d.get() - 1));
+        ENTRY.with(|e| {
+            let depth = e.depth.get() - 1;
+            e.depth.set(depth);
+            if depth == 0 {
+                e.ticket.set(0);
+            }
+        });
     }
 }
 
 /// Resets the state an outermost entry starts from.
-#[cold]
+#[inline(always)]
 pub(crate) fn reset_outermost() {
-    DISSOLVED.with(|d| d.borrow_mut().clear());
-    LAST_CYCLE.with(|c| c.borrow_mut().take());
-    set_unwind_kind(None);
+    OUTER.with(|o| {
+        let mut o = o.borrow_mut();
+        if !o.dissolved.is_empty() {
+            o.dissolved.clear();
+        }
+        o.last_cycle = None;
+    });
 }
