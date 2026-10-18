@@ -34,7 +34,7 @@ use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
-use crate::segmented_nodes::SegmentedNodes;
+use crate::segmented_nodes::{SegmentedNodes, HAS_CHILDREN};
 use crate::set_stack;
 use crate::slot_vec::SlotVec;
 use crate::state::{self, NodeState};
@@ -1092,7 +1092,7 @@ impl<C: Cells> Runtime<C> {
         let mut owned = Vec::new();
         // The walk's stack starts from the root's children, so a root that
         // owns nothing allocates nothing.
-        if let Some(children) = inner.owned.get(&root.slot()) {
+        if let Some(children) = self.owned_by(&inner, root.slot()) {
             let mut stack: Vec<u32> = children.iter().map(|c| c.0).collect();
             while let Some(slot) = stack.pop() {
                 if !inner.dependents[slot as usize].is_empty() {
@@ -1104,7 +1104,7 @@ impl<C: Cells> Runtime<C> {
                     return Ok(TreeClaim::WaitFor(child));
                 }
                 owned.push(child);
-                if let Some(children) = inner.owned.get(&slot) {
+                if let Some(children) = self.owned_by(&inner, slot) {
                     stack.extend(children.iter().map(|c| c.0));
                 }
             }
@@ -1227,9 +1227,7 @@ impl<C: Cells> Runtime<C> {
                 inner.dependents[slot]
                     .last()
                     .or_else(|| {
-                        inner
-                            .owned
-                            .get(&top.slot())
+                        self.owned_by(&inner, top.slot())
                             .and_then(|o| o.first().copied())
                     })
                     .map(|n| self.erased_at(n.0))
@@ -1285,6 +1283,23 @@ impl<C: Cells> Runtime<C> {
             .entry(owner.slot())
             .or_default()
             .push(NodeId(child.slot()));
+        let flags = self.nodes.get_with_flags(owner.slot()).1;
+        C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | HAS_CHILDREN);
+    }
+
+    /// Whether `slot` owns nodes. The caller holds `inner`, under whose
+    /// write hold the flag is kept in step with `Inner::owned`.
+    fn owns_nodes(&self, slot: u32) -> bool {
+        C::u8_load_relaxed(self.nodes.get_with_flags(slot).1) & HAS_CHILDREN != 0
+    }
+
+    /// The nodes `slot` owns, looking the map up only for an owner.
+    fn owned_by<'a>(&self, inner: &'a Inner<C>, slot: u32) -> Option<&'a Vec<NodeId>> {
+        if self.owns_nodes(slot) {
+            inner.owned.get(&slot)
+        } else {
+            None
+        }
     }
 
     /// True iff `handle` names a node of this runtime that has not been
@@ -1362,9 +1377,7 @@ impl<C: Cells> Runtime<C> {
                         if node.generation() != handle.generation() {
                             return DeleteOutcome::AlreadyGone;
                         }
-                        if !inner.dependents[slot as usize].is_empty()
-                            || inner.owned.contains_key(&slot)
-                        {
+                        if !inner.dependents[slot as usize].is_empty() || self.owns_nodes(slot) {
                             return DeleteOutcome::HasDependents;
                         }
                         state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok()
@@ -1444,8 +1457,11 @@ impl<C: Cells> Runtime<C> {
             siblings.retain(|&c| c != id);
             if siblings.is_empty() {
                 inner.owned.remove(&owner.0);
+                let flags = self.nodes.get_with_flags(owner.0).1;
+                C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !HAS_CHILDREN);
             }
         }
+        C::u8_store_relaxed(self.nodes.get_with_flags(slot).1, 0);
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
         let observers: Vec<ObserverEntry<C>> = inner
@@ -2683,6 +2699,11 @@ impl<C: Cells> Runtime<C> {
             ids.sort_unstable();
             ids.dedup();
             assert_eq!(ids.len(), n, "dependents[{slot}] holds a node twice");
+            assert_eq!(
+                self.owns_nodes(slot as u32),
+                inner.owned.contains_key(&(slot as u32)),
+                "HAS_CHILDREN of node {slot} disagrees with the owned map"
+            );
         }
         for &slot in &inner.free_nodes {
             assert!(

@@ -53,7 +53,18 @@ const _: () = assert!(
     "NodeId::SENTINEL must never be a valid slot"
 );
 
-type Segment<C> = [UnsafeCell<MaybeUninit<NodeData<C>>>; SEGMENT_SIZE];
+/// `NodeFlags` bit: the node owns nodes (`Inner::owned` has an entry
+/// for it), so deletes look the entry up only when it is set.
+pub(crate) const HAS_CHILDREN: u8 = 1;
+
+/// A segment of nodes and, beside them, one flags byte per node. The
+/// bytes are zeroed when the segment is allocated and stored only under
+/// the runtime's write lock, so a Relaxed load anywhere reads a value
+/// some write-lock holder stored.
+struct Segment<C: Cells> {
+    slots: [UnsafeCell<MaybeUninit<NodeData<C>>>; SEGMENT_SIZE],
+    flags: [C::U8; SEGMENT_SIZE],
+}
 
 /// Strategy-parameterized segmented node store.
 pub struct SegmentedNodes<C: Cells> {
@@ -95,7 +106,7 @@ impl<C: Cells> SegmentedNodes<C> {
         // one and is freed only on drop. `slot` is past `len`, so no
         // reader holds it, and the caller serializes writers.
         unsafe {
-            (*(*seg_ptr)[(slot & SEGMENT_MASK) as usize].get()).write(node);
+            (*(*seg_ptr).slots[(slot & SEGMENT_MASK) as usize].get()).write(node);
         }
 
         // Readers never synchronize through `len`: they reach a slot
@@ -108,12 +119,16 @@ impl<C: Cells> SegmentedNodes<C> {
     #[inline(never)]
     fn alloc_segment(&self, seg_idx: usize) {
         self.segments.grow_to(seg_idx);
-        let segment: Box<[UnsafeCell<MaybeUninit<NodeData<C>>>]> = (0..SEGMENT_SIZE)
-            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
-            .collect();
-        let segment: Box<Segment<C>> = segment
-            .try_into()
-            .unwrap_or_else(|_| unreachable!("a segment has SEGMENT_SIZE slots"));
+        let mut segment = Box::<Segment<C>>::new_uninit();
+        let p = segment.as_mut_ptr();
+        // SAFETY: every flags byte is written before `assume_init`; the
+        // slots are `MaybeUninit` and need no initialization.
+        let segment = unsafe {
+            for i in 0..SEGMENT_SIZE {
+                std::ptr::addr_of_mut!((*p).flags[i]).write(C::new_u8(0));
+            }
+            segment.assume_init()
+        };
         self.segments
             .get(seg_idx)
             .expect("incr-core: grow_to left the segment's entry out")
@@ -127,6 +142,12 @@ impl<C: Cells> SegmentedNodes<C> {
     /// Debug builds assert `slot < len`; release builds skip the check
     /// and rely on the caller's invariant.
     pub fn get(&self, slot: u32) -> &NodeData<C> {
+        self.get_with_flags(slot).0
+    }
+
+    /// The node at `slot` and its flags byte, through one directory walk.
+    #[inline(always)]
+    pub(crate) fn get_with_flags(&self, slot: u32) -> (&NodeData<C>, &C::U8) {
         debug_assert!(
             slot < C::u32_load_relaxed(&self.len),
             "SegmentedNodes::get slot {} out of range (len {})",
@@ -146,7 +167,13 @@ impl<C: Cells> SegmentedNodes<C> {
         // SAFETY: the caller reached `slot` through a happens-before
         // chain from its push (module doc), so the slot is initialized
         // and the non-null segment is live until drop.
-        unsafe { (*(*seg_ptr)[(slot & SEGMENT_MASK) as usize].get()).assume_init_ref() }
+        unsafe {
+            let within = (slot & SEGMENT_MASK) as usize;
+            (
+                (*(*seg_ptr).slots[within].get()).assume_init_ref(),
+                &(*seg_ptr).flags[within],
+            )
+        }
     }
 
     /// Number of initialized slots.
@@ -184,7 +211,9 @@ impl<C: Cells> Drop for SegmentedNodes<C> {
             if !seg_ptr.is_null() {
                 // SAFETY: slot < final_len, so push initialized it; `&mut
                 // self` rules out readers.
-                unsafe { (*(*seg_ptr)[(slot & SEGMENT_MASK) as usize].get()).assume_init_drop() };
+                unsafe {
+                    (*(*seg_ptr).slots[(slot & SEGMENT_MASK) as usize].get()).assume_init_drop()
+                };
             }
         }
         for index in 0..self.segments.len() {

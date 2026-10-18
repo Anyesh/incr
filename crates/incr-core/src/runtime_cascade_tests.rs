@@ -194,6 +194,29 @@ local_and_shared!(
     shared_cascade_group_by_pipeline_from_source
 );
 
+fn owner_flag_follows_its_children<C: Cells>(rt: &Runtime<C>) {
+    let owner = rt.create_input(0_u8);
+    let a = rt.create_input(1_u8);
+    let b = rt.create_input(2_u8);
+    rt.adopt(owner.erase(), a.erase());
+    rt.adopt(owner.erase(), b.erase());
+    rt.assert_invariant_i();
+    rt.delete_node(a);
+    rt.assert_invariant_i();
+    rt.delete_node(b);
+    rt.assert_invariant_i();
+    rt.delete_node(owner);
+    assert!(!rt.is_alive(owner));
+    let recycled = rt.create_input(3_u8);
+    assert_eq!(recycled.slot(), owner.slot());
+    rt.assert_invariant_i();
+}
+local_and_shared!(
+    owner_flag_follows_its_children,
+    local_owner_flag_follows_its_children,
+    shared_owner_flag_follows_its_children
+);
+
 fn never_run_query_survives<C: Cells>(rt: &Runtime<C>) {
     let x = rt.create_input(1_i64);
     let q = rt.create_query(move |rt| rt.get(x) + 1);
