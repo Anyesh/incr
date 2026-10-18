@@ -15,6 +15,7 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::cells::{Cells, PtrCell};
@@ -59,7 +60,33 @@ pub(crate) struct ArenaRegistry<C: Cells> {
 /// a `&mut ArenaTags` serializes every registry write.
 #[derive(Default)]
 pub(crate) struct ArenaTags {
-    tags: HashMap<TypeId, u16>,
+    tags: HashMap<TypeId, u16, BuildHasherDefault<TypeIdHasher>>,
+}
+
+/// Uses a `TypeId`'s own bits as its hash. They are already a hash of
+/// the type, and hashing them again with SipHash cost every create
+/// about 40 instructions.
+#[derive(Default)]
+struct TypeIdHasher(u64);
+
+impl Hasher for TypeIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 ^= n;
+    }
+
+    fn write_u128(&mut self, n: u128) {
+        self.0 ^= n as u64 ^ (n >> 64) as u64;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 impl ArenaTags {
