@@ -148,6 +148,139 @@ cycle_100k_tests! {
     shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
 }
 
+/// T1's taint shape: c_0 … c_{n-1}, c_i reading c_{i+1}, and X, which
+/// reads s and, when s = 1, c_0; c_{n-1} reads t and then X when t = 0 or
+/// j when t = 1. `runs[i]` counts c_i's runs and `runs[n]` X's.
+#[cfg(not(debug_assertions))]
+struct Taint {
+    s: Incr<i64>,
+    t: Incr<i64>,
+    x: Incr<i64>,
+    chain: Vec<Incr<i64>>,
+    runs: Arc<Vec<AtomicU32>>,
+}
+
+#[cfg(not(debug_assertions))]
+fn taint_shape<C: Cells>(rt: &Runtime<C>, n: usize) -> Taint {
+    let s = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let j = rt.create_input(20_i64);
+    let runs = counters(n + 1);
+    let top: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let x = {
+        let top = top.clone();
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs[n].fetch_add(1, SeqCst);
+                if rt.get(s) == 1 {
+                    rt.get(*top.get().unwrap())
+                } else {
+                    10
+                }
+            },
+            replayable(),
+        )
+    };
+    let mut chain = vec![x; n];
+    chain[n - 1] = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs[n - 1].fetch_add(1, SeqCst);
+                if rt.get(t) == 0 {
+                    rt.get(x)
+                } else {
+                    rt.get(j)
+                }
+            },
+            replayable(),
+        )
+    };
+    for i in (0..n - 1).rev() {
+        let below = chain[i + 1];
+        let runs = runs.clone();
+        chain[i] = rt.create_query_with(
+            move |rt| {
+                runs[i].fetch_add(1, SeqCst);
+                rt.get(below) + 1
+            },
+            replayable(),
+        );
+    }
+    top.set(chain[0]).unwrap();
+    Taint {
+        s,
+        t,
+        x,
+        chain,
+        runs,
+    }
+}
+
+/// The T1 taint shape at 100k: after the chain's first compute through
+/// replay and sets that leave c_{n-1}'s edge to X stale, `get(X)` returns
+/// the unbounded value with no episode, at most two runs per node and at
+/// most n + B + 1 expansions at budget 256, 2n + 3 at budget 1.
+#[cfg(not(debug_assertions))]
+fn taint_100k<C: Cells>(frames: u32) {
+    let n = 100_000;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(frames);
+    let shape = taint_shape(&rt, n);
+    assert_eq!(rt.get(shape.chain[0]), 10 + n as i64 - 1);
+    rt.set(shape.s, 1);
+    rt.set(shape.t, 1);
+    for r in shape.runs.iter() {
+        r.store(0, SeqCst);
+    }
+    let before = rt.expansions();
+    let episodes_before = episodes(&rt);
+    assert_eq!(rt.get(shape.x), 20 + n as i64 - 1);
+    let expansions = rt.expansions() - before;
+    assert_eq!(episodes(&rt), episodes_before, "the read ran an episode");
+    assert!(
+        max_of(&shape.runs) <= 2,
+        "a node ran {} times",
+        max_of(&shape.runs)
+    );
+    let bound = if frames == 1 {
+        2 * n as u64 + 3
+    } else {
+        (n + frames as usize + 1) as u64
+    };
+    assert!(
+        expansions <= bound,
+        "{expansions} expansions at budget {frames}, over {bound}"
+    );
+    rt.assert_invariant_i();
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_taint_100k_at_budget_256_on_a_1_mib_thread() {
+    on_stack(1 << 20, || taint_100k::<Local>(256));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_taint_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || taint_100k::<Local>(1));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_taint_100k_at_budget_256_on_a_1_mib_thread() {
+    on_stack(1 << 20, || taint_100k::<Shared>(256));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_taint_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || taint_100k::<Shared>(1));
+}
+
 /// What a read of every ring member returns after `try_get` of the
 /// `entry` member, and each member's state, at budget `frames`.
 type RingOutcome = (Vec<Result<i64, Vec<u32>>>, Vec<NodeState>);
