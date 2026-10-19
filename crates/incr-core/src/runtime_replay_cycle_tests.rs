@@ -596,6 +596,116 @@ fn walk_driven_discard_in_an_entry<C: Cells>() {
     );
 }
 
+/// The episodes started so far.
+fn episode_starts<C: Cells>(rt: &Runtime<C>) -> usize {
+    rt.episodes_seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, EpisodeSeen::Start(_)))
+        .count()
+}
+
+/// **A virtual hit above an earlier one** at budget 1: F and X have
+/// Fallbacks, F reads X, X reads Y, and Y, unseeded, reads X and then F.
+/// Y's hit at X's virtual frame claims X, its hit at F's claims F only,
+/// and one episode over {F, X, Y} lands the unbounded run's values.
+fn virtual_hit_above_an_earlier_one<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let y_cell = cell::<u64>();
+        let x = {
+            let y_cell = y_cell.clone();
+            rt.create_query_with(
+                move |rt| rt.get(*y_cell.get().unwrap()) + 1,
+                replayable_fallback(|c| 200 + c.len() as u64),
+            )
+        };
+        let f = rt.create_query_with(
+            move |rt| rt.get(x) + 1,
+            replayable_fallback(|c| 100 + c.len() as u64),
+        );
+        let y = rt.create_query_with(move |rt| rt.get(x) + rt.get(f), replayable());
+        y_cell.set(y).unwrap();
+        let got = get(&rt, f);
+        rt.assert_invariant_i();
+        let states = [f, x, y].map(|n| rt.state_of(n));
+        let dooms: Vec<u32> = rt.dooms.lock().unwrap().iter().map(|d| d.node).collect();
+        assert!(
+            frames.is_none() || dooms == vec![x.slot(), y.slot()],
+            "{dooms:?}"
+        );
+        let values = [x, y].map(|n| try_get(&rt, n));
+        (got, values, states, episode_starts(&rt))
+    };
+    let unbounded = observe(None);
+    assert_eq!(unbounded.0, Outcome::Value(103), "{unbounded:?}");
+    assert_eq!(unbounded.3, 1);
+    assert_eq!(observe(Some(1)), unbounded);
+}
+
+/// **A drop through a frame that can't take a placeholder**: the a = false
+/// IF form with C reading F through Q, a native query whose type has no
+/// placeholder, so C's suspect read drops the chain by unwinding through
+/// Q. The outcome is the unbounded run's, under both strategy placements,
+/// and nothing lands Failed.
+fn drop_through_a_native_frame<C: Cells>() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Bare(u64);
+
+    for (f_fallback, c_fallback) in [(true, false), (false, true)] {
+        for read in [Read::Get, Read::TryGet] {
+            let observe = |frames: Option<u32>| {
+                let rt = runtime::<C>(frames);
+                let a_in = rt.create_input(false);
+                let b_in = rt.create_input(7_u64);
+                let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+                let b = rt.create_query_with(move |rt| rt.get(b_in), replayable());
+                let c_cell = cell::<u64>();
+                let body = {
+                    let c_cell = c_cell.clone();
+                    move |rt: &Runtime<C>| {
+                        if rt.get(a) {
+                            rt.get(b)
+                        } else {
+                            rt.get(*c_cell.get().unwrap())
+                        }
+                    }
+                };
+                let f = if f_fallback {
+                    rt.create_query_with(body, replayable_fallback(|c| 1000 + c.len() as u64))
+                } else {
+                    rt.create_query_with(body, replayable())
+                };
+                let q = rt.create_query(move |rt| Bare(rt.get(f)));
+                let body = move |rt: &Runtime<C>| rt.get(q).0 + 1;
+                let c = if c_fallback {
+                    rt.create_query_with(body, replayable_fallback(|c| 2000 + c.len() as u64))
+                } else {
+                    rt.create_query_with(body, replayable())
+                };
+                c_cell.set(c).unwrap();
+                let got = read.of(&rt, f);
+                let dooms = rt.dooms.lock().unwrap().first().map(|d| d.node);
+                assert!(frames.is_none() || dooms == Some(a.slot()), "{dooms:?}");
+                rt.assert_invariant_i();
+                let states = [f, c].map(|n| rt.state_of(n));
+                let q_state = rt.state_of(q);
+                for s in states.iter().chain([&q_state]) {
+                    assert_ne!(*s, NodeState::Failed);
+                }
+                (got, states, q_state, try_get(&rt, c))
+            };
+            let unbounded = observe(None);
+            assert_eq!(
+                observe(Some(1)),
+                unbounded,
+                "{read:?}, Fallback on F {f_fallback}, on C {c_fallback}"
+            );
+        }
+    }
+}
+
 /// **A suspended episode** at budget 1: in a 3-member Fixpoint cycle M1 ->
 /// M2 -> M3 -> M1, M2 reads a New query N from iteration 2 on, so its member
 /// run dooms there. The episode suspends, N's entry drains, and the pop of
@@ -697,7 +807,101 @@ fn suspended_episode<C: Cells>() {
     );
 }
 
+/// **The marked-parent IF test** at budget 2: P = IF(F, X, Y), Y = P + 1,
+/// F reading A, a New query over a true input with placeholder false. F's
+/// read of A dooms, P is marked and takes F's placeholder, and its read of
+/// Y is suspect, so Y's read of P drops the chain: P returns X's value and
+/// Y stays New, as in the unbounded run.
+#[test]
+fn marked_parent_if_at_budget_2() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<Local>(frames);
+        let a_in = rt.create_input(true);
+        let x_in = rt.create_input(7_u64);
+        let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+        let f = rt.create_query_with(move |rt| rt.get(a), replayable());
+        let x = rt.create_query_with(move |rt| rt.get(x_in), replayable());
+        let y_cell = cell::<u64>();
+        let p = {
+            let y_cell = y_cell.clone();
+            rt.create_query_with(
+                move |rt| {
+                    if rt.get(f) {
+                        rt.get(x)
+                    } else {
+                        rt.get(*y_cell.get().unwrap())
+                    }
+                },
+                replayable(),
+            )
+        };
+        let y = rt.create_query_with(move |rt| rt.get(p) + 1, replayable());
+        y_cell.set(y).unwrap();
+        let got = get(&rt, p);
+        let dooms: Vec<u32> = rt.dooms.lock().unwrap().iter().map(|d| d.node).collect();
+        assert!(frames.is_none() || dooms == vec![a.slot()], "{dooms:?}");
+        rt.assert_invariant_i();
+        (got, rt.state_of(y), get(&rt, y))
+    };
+    let unbounded = observe(None);
+    assert_eq!(
+        unbounded,
+        (Outcome::Value(7), NodeState::New, Outcome::Value(8))
+    );
+    assert_eq!(observe(Some(2)), unbounded);
+}
+
+/// **A speculative root** at budget 1: F = IF(A, S, U) with A's placeholder
+/// true and a = false, S a Fallback member and U unseeded, reading each
+/// other. The speculative entry S never runs an episode; the real run
+/// enters at U, so `get(F)` panics with the cycle message and `try_get(F)`
+/// returns `Err(Cycle)` over {S, U}, with S and U New afterwards.
+#[test]
+fn speculative_root_never_runs_an_episode() {
+    for read in [Read::Get, Read::TryGet] {
+        let observe = |frames: Option<u32>| {
+            let rt = runtime_with::<Local>(frames, true);
+            let a_in = rt.create_input(false);
+            let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+            let u_cell = cell::<u64>();
+            let s = {
+                let u_cell = u_cell.clone();
+                rt.create_query_with(
+                    move |rt| rt.get(*u_cell.get().unwrap()) + 1,
+                    replayable_fallback(|c| 300 + c.len() as u64),
+                )
+            };
+            let u = rt.create_query_with(move |rt| rt.get(s) + 1, replayable());
+            u_cell.set(u).unwrap();
+            let f = rt.create_query_with(
+                move |rt| if rt.get(a) { rt.get(s) } else { rt.get(u) },
+                replayable(),
+            );
+            let got = read.of(&rt, f);
+            rt.assert_invariant_i();
+            (got, rt.state_of(s), rt.state_of(u))
+        };
+        let unbounded = observe(None);
+        match read {
+            Read::Get => assert!(
+                matches!(&unbounded.0, Outcome::Panic(m) if m.contains("dependency cycle")),
+                "{unbounded:?}"
+            ),
+            Read::TryGet => {
+                assert!(
+                    matches!(&unbounded.0, Outcome::Cycle(p) if p.len() == 2),
+                    "{unbounded:?}"
+                )
+            }
+        }
+        assert_eq!((unbounded.1, unbounded.2), (NodeState::New, NodeState::New));
+        assert_eq!(observe(Some(1)), unbounded, "{read:?}");
+    }
+}
+
 local_and_shared!(
+    virtual_hit_above_an_earlier_one,
+    drop_through_a_native_frame,
     suspended_episode,
     walk_driven_discard,
     walk_driven_discard_marks_the_reader,
