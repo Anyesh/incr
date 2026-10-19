@@ -196,6 +196,9 @@ pub(crate) struct Context {
     /// runs, and a retry that resumes their walk or takes a delivery does
     /// not meet them again.
     pub(crate) lows: Vec<(u32, u32, u32, u64, u32)>,
+    /// The level of a landed point a read's judgement met above the
+    /// position it read, until the driver drops the chain above it.
+    pub(crate) drop_at: Option<u32>,
 }
 
 impl Context {
@@ -217,6 +220,7 @@ impl Context {
             resume: None,
             direct: None,
             lows: Vec::new(),
+            drop_at: None,
         }
     }
 

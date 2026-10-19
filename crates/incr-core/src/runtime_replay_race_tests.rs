@@ -285,3 +285,99 @@ fn shared_vframe_node_computing_at_pop() {
     assert_eq!(s.rt.state_of(s.t), NodeState::Clean);
     s.rt.assert_invariant_i();
 }
+
+/// T reads X1, X1 reads X2 (until switched to land 42 alone), X2 reads Y,
+/// and Y reads T with `try_get`, all replayable; T and X1 count runs.
+struct Below {
+    rt: Arc<Rt>,
+    t: Incr<u64>,
+    x1: Incr<u64>,
+    y: Incr<u64>,
+    landed: Arc<AtomicU8>,
+    t_runs: Arc<AtomicU32>,
+}
+
+fn below_shape(rt: Rt) -> Below {
+    let rt = Arc::new(rt);
+    rt.set_placeholder(0_u64);
+    let landed = Arc::new(AtomicU8::new(CHAIN));
+    let t_runs = Arc::new(AtomicU32::new(0));
+    let tc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let y = {
+        let tc = tc.clone();
+        rt.create_query_with(
+            move |rt: &Rt| rt.try_get(*tc.get().unwrap()).map_or(5, |v| v + 100),
+            replayable(),
+        )
+    };
+    let x2 = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let x1 = {
+        let landed = landed.clone();
+        rt.create_query_with(
+            move |rt: &Rt| match landed.load(SeqCst) {
+                CHAIN => rt.get(x2) + 1,
+                _ => 42,
+            },
+            replayable(),
+        )
+    };
+    let t = {
+        let t_runs = t_runs.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                t_runs.fetch_add(1, SeqCst);
+                rt.get(x1) + 1
+            },
+            replayable(),
+        )
+    };
+    tc.set(t).unwrap();
+    Below {
+        rt,
+        t,
+        x1,
+        y,
+        landed,
+        t_runs,
+    }
+}
+
+/// **A landed point below the running entry's maker** (Dropping a
+/// speculative chain), at budget 3: T's run makes virtual frames of T, X1
+/// and X2 and pushes Y, and another thread lands X1 before Y runs. Y's
+/// read of T meets X1 landed above T's frame, a landed point, so the drop
+/// removes only the entries above X1's level and keeps T, the level-0
+/// target, whose retry reads X1 Clean.
+#[test]
+fn shared_landed_point_below_the_running_entrys_maker() {
+    let s = below_shape(Rt::new());
+    s.rt.set_max_frames(3);
+    let entry = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.y)), entry.clone())],
+    );
+    entry.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || rt.get(t))
+    };
+    entry.wait_parked();
+    assert_eq!(s.rt.state_of(s.x1), NodeState::New);
+    s.landed.store(CLEAN, SeqCst);
+    assert_eq!(s.rt.get(s.x1), 42);
+    entry.release();
+
+    let unbounded = below_shape(Rt::new());
+    unbounded.landed.store(CLEAN, SeqCst);
+    assert_eq!(unbounded.rt.get(unbounded.x1), 42);
+    let want = unbounded.rt.get(unbounded.t);
+    assert_eq!(reader.join(), want);
+    assert_eq!(
+        s.t_runs.load(SeqCst),
+        2,
+        "T ran doomed and then as its own retry"
+    );
+    assert_eq!(s.rt.state_of(s.t), NodeState::Clean);
+    s.rt.assert_invariant_i();
+}

@@ -374,6 +374,12 @@ impl<C: Cells> Runtime<C> {
                 );
                 self.drop_unwind();
             }
+            if let Some(q) = self
+                .landed_above(p, top)
+                .filter(|&q| !self.suspect_above(p, q))
+            {
+                self.drop_at_landed(q);
+            }
             if self.suspect_above(p, top) {
                 debug_assert!(
                     replay::speculative(),
@@ -397,6 +403,52 @@ impl<C: Cells> Runtime<C> {
                 },
             }
         }
+    }
+
+    /// The lowest virtual frame above position `p`, up to `top`, whose
+    /// node another thread has landed, deleted or recycled since the
+    /// frame was made: a landed point.
+    fn landed_above(&self, p: u32, top: u32) -> Option<u32> {
+        let rt = self.runtime_id;
+        replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| x.vstack.iter())
+                .filter(|v| v.cidx > p && v.cidx <= top)
+                .filter(|v| {
+                    let node = self.nodes.get(v.node);
+                    node.generation() != v.generation
+                        || matches!(
+                            state::load::<C>(node.state_cell()),
+                            NodeState::Clean
+                                | NodeState::Cyclic
+                                | NodeState::Failed
+                                | NodeState::Dead
+                        )
+                })
+                .map(|v| v.cidx)
+                .min()
+        })
+    }
+
+    /// Drops the chain above landed point `q`: the frames above it stand on
+    /// a run the other thread's landing has made moot. The context that
+    /// holds `q`'s virtual frame records it, and the drop unwind ends the
+    /// running entry's run, after which that context's driver removes the
+    /// entries above `q`'s level and keeps the one whose run made it.
+    fn drop_at_landed(&self, q: u32) -> ! {
+        let rt = self.runtime_id;
+        replay::with(|c| {
+            let x = c
+                .iter_mut()
+                .rev()
+                .find(|x| {
+                    x.rt == rt && x.boundary <= q && x.vstack.len() > (q - x.boundary) as usize
+                })
+                .expect("incr-core: a landed point is a virtual frame");
+            x.drop_at = Some(q - x.boundary);
+        });
+        self.drop_unwind()
     }
 
     /// Whether an edge into a frame above position `p`, up to `top`, is
@@ -1681,6 +1733,30 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Option<Computed> {
         let kind = cycle_state::unwind_kind();
+        if kind == Some(UnwindKind::Discard) {
+            let (own, enclosing) = replay::with(|c| {
+                let at = c
+                    .iter()
+                    .position(|x| x.id == id)
+                    .expect("incr-core: a running context is open");
+                let enclosing = c[..at]
+                    .iter()
+                    .any(|x| x.rt == self.runtime_id && x.drop_at.is_some());
+                (c[at].drop_at.take(), enclosing)
+            });
+            if let Some(q) = own {
+                cycle_state::take_unwind_kind();
+                let mut bag = Deferred::new();
+                bag.push_erased(payload);
+                self.drop_chain(id, q, true, &mut bag);
+                bag.drain(self);
+                return None;
+            }
+            if enclosing {
+                self.close_unwound(id, boundary);
+                resume_unwind(payload);
+            }
+        }
         if kind == Some(UnwindKind::Wound) || (!entry.spec && level == 0) {
             self.close_unwound(id, boundary);
             resume_unwind(payload);
@@ -1747,6 +1823,10 @@ impl<C: Cells> Runtime<C> {
     /// `q` up are truncated with no Tarjan pops, and the claims held at or
     /// above `q` take the discard landing.
     fn drop_chain(&self, id: u64, q: u32, keep: bool, bag: &mut Deferred<C>) {
+        debug_assert!(
+            keep || q > 0,
+            "incr-core: a drop removed the level-0 target"
+        );
         let boundary = replay::with(|c| {
             let x = c
                 .iter_mut()
