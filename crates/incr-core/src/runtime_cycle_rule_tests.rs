@@ -847,6 +847,47 @@ fn dirty_cyclic_landing_reads_as_the_cycle<C: Cells>() {
     rt.assert_invariant_i();
 }
 
+/// S, under R, reads Dirty Q, whose walk computes its dep A first. A reads
+/// R, a Fallback on the stack, and then Q, whose nested walk computes it:
+/// Q reads A, a Fallback on the stack, and defers to it, and A defers to R.
+/// The outer walk finds its root Q held by this thread, so the read is a
+/// read of a held node, not a wait on its own claim.
+fn a_walk_root_deferred_under_its_walk<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let g = rt.create_input(0_i64);
+    let rc = cell::<i64>();
+    let qc = cell::<i64>();
+    let a = {
+        let (rc, qc) = (rc.clone(), qc.clone());
+        rt.create_query_with_fallback(
+            move |rt| {
+                if rt.get(g) == 0 {
+                    1
+                } else {
+                    rt.try_get(*rc.get().unwrap()).unwrap_or(0)
+                        + rt.try_get(*qc.get().unwrap()).unwrap_or(0)
+                }
+            },
+            |_c: &Cycle| 5,
+        )
+    };
+    let q = rt.create_query(move |rt| rt.get(a) + 1);
+    qc.set(q).unwrap();
+    assert_eq!(rt.get(q), 2);
+    rt.set(g, 1);
+    let s = rt.create_query(move |rt| rt.get(q));
+    let r = rt.create_query_with_fallback(move |rt| rt.get(s), |_c: &Cycle| 7);
+    rc.set(r).unwrap();
+    rt.get(r);
+    for n in [a, q, s, r] {
+        assert!(!matches!(
+            rt.state_of(n),
+            NodeState::Computing | NodeState::ComputingDirty
+        ));
+    }
+    rt.assert_invariant_i();
+}
+
 both!(
     member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
@@ -871,6 +912,7 @@ both!(
     recovery_pops_are_bounded,
     swallowed_cycle_is_an_ordinary_result,
     dirty_cyclic_landing_reads_as_the_cycle,
+    a_walk_root_deferred_under_its_walk,
 );
 
 fn on_deep_stack(body: fn()) {

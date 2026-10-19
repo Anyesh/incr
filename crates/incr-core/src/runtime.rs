@@ -2589,6 +2589,12 @@ impl<C: Cells> Runtime<C> {
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
                 NodeState::Computing | NodeState::ComputingDirty => {
+                    // A walk's deps-first computes can defer the walk's own
+                    // root into this thread's held map: its reader reads it
+                    // by the cycle rules, as a deferred compute's.
+                    if spins == 0 && cycle_state::holds(self.runtime_id, id.0) {
+                        return Computed::Deferred;
+                    }
                     spins += 1;
                     self.wait_on_claim(id, spins);
                     continue;
