@@ -578,6 +578,7 @@ fn replay_seeds() {
         0xa649_6004_aa21_dd3b,
         0xa8cc_85b9_bbfd_657d,
         0xe386_b8af_df64_ca89,
+        0xf9e8_e4b4_cddf_4529,
     ] {
         quiet(|| {
             differential::<Local>(seed);

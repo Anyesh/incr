@@ -1478,6 +1478,17 @@ impl<C: Cells> Runtime<C> {
                 x.running_entry = None;
             }
         });
+        // The run that retries the frame takes its lowlink, a suspended
+        // episode's member run as much as a stand-in.
+        let mut low = v.low;
+        let unbuffered = cycle_state::with_held(|h| h.get(&(rt, v.node)).map(|e| e.buf.is_none()));
+        if low < v.cidx && unbuffered != Some(false) {
+            replay::with(|c| {
+                if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                    x.lows.push((v.node, v.generation, v.cidx, v.path, low));
+                }
+            });
+        }
         if let Some(ep) = v.ep {
             let ep = replay::take_episode(id, ep)
                 .expect("incr-core: a member run's virtual frame keeps its episode");
@@ -1504,15 +1515,6 @@ impl<C: Cells> Runtime<C> {
                 Ok(end) => self.episode_task_end(root, end, bag),
                 Err(payload) => self.vframe_unwound(id, v, root.0, false, payload),
             };
-        }
-        let mut low = v.low;
-        let unbuffered = cycle_state::with_held(|h| h.get(&(rt, v.node)).map(|e| e.buf.is_none()));
-        if low < v.cidx && unbuffered != Some(false) {
-            replay::with(|c| {
-                if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                    x.lows.push((v.node, v.generation, v.cidx, v.path, low));
-                }
-            });
         }
         // A virtual hit claimed the node, so no retry recomputes it: its
         // frame's run finishes here, as the unbounded run's frame does
