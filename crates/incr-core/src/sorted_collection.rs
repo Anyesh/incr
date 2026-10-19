@@ -270,7 +270,7 @@ where
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
-        let version_node = rt.create_query(move |rt| -> u64 {
+        let version_node = rt.create_operator_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
 
             if rebuild.is_set() {
@@ -469,7 +469,7 @@ where
 
         let rebuild = NeedsRebuild::new();
         let output_log_for_query = Arc::clone(&output_log);
-        let version_node = rt.create_query(move |rt| -> u64 {
+        let version_node = rt.create_operator_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
             let mut keep = Vec::new();
 

@@ -41,7 +41,7 @@ use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
 use crate::segmented_nodes::{
-    SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, OWNED,
+    SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED,
 };
 use crate::set_stack;
 use crate::slot_vec::SlotVec;
@@ -917,6 +917,24 @@ impl<C: Cells> Runtime<C> {
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
         self.create_query_erased::<true, _, _>(f, cycle::erase_opts(opts))
+    }
+
+    /// Creates a collection operator's query, `NOT_REPLAYABLE` whatever
+    /// `INCR_TEST_ALL_REPLAYABLE` says: its run consumes its upstream's
+    /// log through a cursor, so a doomed run could not be re-run from
+    /// the start.
+    pub(crate) fn create_operator_query<T, F>(&self, f: F) -> Incr<T>
+    where
+        T: Value,
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
+        self.create_query_erased::<true, _, _>(
+            f,
+            ErasedOpts {
+                strategy: None,
+                flags: NOT_REPLAYABLE,
+            },
+        )
     }
 
     /// Takes the strategy erased so that [`Self::create_query`] builds and

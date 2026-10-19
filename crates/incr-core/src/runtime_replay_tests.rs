@@ -217,3 +217,75 @@ fn shared_no_placeholder_recurses_natively() {
         no_placeholder_recurses(&Runtime::<Shared>::new())
     });
 }
+
+/// Every collection operator's query is `NOT_REPLAYABLE`, which wins
+/// over `INCR_TEST_ALL_REPLAYABLE`; a plain query under the same switch
+/// is replayable.
+fn operators_are_not_replayable<C: Cells>(mut rt: Runtime<C>) {
+    rt.all_replayable = true;
+    let c = rt.create_collection::<i64>();
+    let other = rt.create_collection::<i64>();
+    let sorted = c.sort_by_key(&rt, |v| *v);
+    let operators = [
+        (
+            "filter",
+            c.filter(&rt, |v| v % 2 == 0).version_node().slot(),
+        ),
+        ("map", c.map(&rt, |v| v + 1).version_node().slot()),
+        ("count", c.count(&rt).slot()),
+        ("reduce", c.reduce(&rt, |vs| vs.iter().sum::<i64>()).slot()),
+        (
+            "aggregate",
+            c.aggregate(&rt, 0, |v| *v, |a, b| a + b).slot(),
+        ),
+        (
+            "join",
+            c.join(&rt, &other, |v| *v, |v| *v).version_node().slot(),
+        ),
+        ("group_by", c.group_by(&rt, |v| v % 3).version_node().slot()),
+        ("sort_by_key", sorted.version_node().slot()),
+        ("pairwise", sorted.pairwise(&rt).version_node().slot()),
+        ("window", sorted.window(&rt, 2).version_node().slot()),
+    ];
+    for (name, slot) in operators {
+        assert!(!rt.replayable(slot), "{name} is replayable");
+    }
+    let plain = rt.create_query(|_| 0_i64);
+    assert!(rt.replayable(plain.slot()));
+}
+
+#[test]
+fn local_operators_are_not_replayable() {
+    operators_are_not_replayable(Runtime::<Local>::new());
+}
+
+#[test]
+fn shared_operators_are_not_replayable() {
+    operators_are_not_replayable(Runtime::<Shared>::new());
+}
+
+/// No query in the operator sources is created any way but through
+/// `create_operator_query`, so an operator added later can't skip the
+/// `NOT_REPLAYABLE` mark.
+#[test]
+fn operator_sources_create_every_query_not_replayable() {
+    for (file, src) in [
+        ("collection.rs", include_str!("collection.rs")),
+        ("sorted_collection.rs", include_str!("sorted_collection.rs")),
+    ] {
+        let code = src.split("\nmod tests {").next().unwrap();
+        let mut classified = 0;
+        for (i, line) in code.lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            assert!(
+                !line.contains("create_query"),
+                "{file}:{} creates a query outside create_operator_query",
+                i + 1
+            );
+            classified += line.matches("create_operator_query(").count();
+        }
+        assert!(classified > 0, "{file} creates no operator query");
+    }
+}

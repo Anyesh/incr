@@ -854,7 +854,7 @@ where
 
         let rebuild = NeedsRebuild::new();
         let output_log_for_query = Arc::clone(&output_log);
-        let version_node = rt.create_query(move |rt| -> u64 {
+        let version_node = rt.create_operator_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
             let mut keep = Vec::new();
 
@@ -919,7 +919,7 @@ where
         let running = Arc::new(AtomicI64::new(bootstrap.len() as i64));
 
         let running_for_query = Arc::clone(&running);
-        rt.create_query(move |rt| -> u64 {
+        rt.create_operator_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
             let up = upstream_log.read();
             let from = cursor.load(MemOrdering::Acquire);
@@ -953,7 +953,7 @@ where
         let log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
-        rt.create_query(move |rt| -> U {
+        rt.create_operator_query(move |rt| -> U {
             let _uv = rt.get(upstream_version);
             // Snapshot under the read guard, fold outside it: the user
             // fold must not run while the log is locked.
@@ -994,7 +994,7 @@ where
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
-        rt.create_query(move |rt| -> U {
+        rt.create_operator_query(move |rt| -> U {
             let _uv = rt.get(upstream_version);
 
             if rebuild.is_set() {
@@ -1090,7 +1090,7 @@ where
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
         let output_log_for_query = Arc::clone(&output_log);
-        let version_node = rt.create_query(move |rt| -> u64 {
+        let version_node = rt.create_operator_query(move |rt| -> u64 {
             let _lv = rt.get(left_version);
             let _rv = rt.get(right_version);
             let mut keep = Vec::new();
@@ -1223,12 +1223,12 @@ where
         let output_version_counter_for_query = Arc::clone(&output_version_counter);
         // The routing closure adopts the groups it creates, but it has to
         // exist before the router it belongs to. Filled right after
-        // create_query, and a query never runs before its first read.
+        // create_operator_query, and a query never runs before its first read.
         let router: Arc<OnceLock<ErasedIncr>> = Arc::new(OnceLock::new());
         let router_for_query = Arc::clone(&router);
 
         let rebuild = NeedsRebuild::new();
-        let version_node = rt.create_query(move |rt| -> u64 {
+        let version_node = rt.create_operator_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
             let new_group = || {
                 let group = IncrCollection::<T, C>::new_in_compute(rt);
