@@ -447,7 +447,7 @@ impl Entry {
 }
 
 /// The stack of `ensure_clean`'s post-order walk.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct Walk {
     work: Vec<Entry>,
     first_visits: u32,
@@ -2592,22 +2592,10 @@ impl<C: Cells> Runtime<C> {
                 };
                 let mut computed = self.compute_one::<MODE>(cur, visit, is_root.then_some(gen));
                 if computed != Computed::Done {
-                    match computed {
-                        Computed::Doomed => {
-                            self.stash_walk(id, (!is_root).then_some(walk));
-                            return computed;
-                        }
-                        Computed::Discarded => match self.walk_discarded(visit) {
-                            Some(after) => computed = after,
-                            None => {
-                                // The discarded compute is a frame the
-                                // reading frame's retry runs again.
-                                walk.push(Entry { id: cur, taint });
-                                self.stash_walk(id, (!is_root).then_some(walk));
-                                return computed;
-                            }
-                        },
-                        _ => {}
+                    let entry = Entry { id: cur, taint };
+                    match self.walk_stopped(id, entry, visit, is_root, &mut walk, computed) {
+                        Ok(after) => computed = after,
+                        Err(stopped) => return stopped,
                     }
                 }
                 if is_root {

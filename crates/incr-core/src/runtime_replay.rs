@@ -2089,12 +2089,44 @@ impl<C: Cells> Runtime<C> {
         })
     }
 
+    /// A walk of `root` whose compute of `entry` came back other than
+    /// `Done`: `Ok` with the result the walk goes on with, or `Err` with
+    /// the one it stops on, its rest stashed for the reading frame's retry.
+    /// Takes the walk by reference so the hot loop never moves it.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn walk_stopped(
+        &self,
+        root: NodeId,
+        entry: super::Entry,
+        visit: Visit,
+        is_root: bool,
+        walk: &mut Walk,
+        computed: Computed,
+    ) -> Result<Computed, Computed> {
+        match computed {
+            Computed::Doomed => {
+                self.stash_walk(root, (!is_root).then_some(walk));
+                Err(computed)
+            }
+            Computed::Discarded => match self.walk_discarded(visit) {
+                Some(after) => Ok(after),
+                None => {
+                    // The discarded compute is a frame the reading frame's
+                    // retry runs again.
+                    walk.push(entry);
+                    self.stash_walk(root, (!is_root).then_some(walk));
+                    Err(computed)
+                }
+            },
+            _ => Ok(computed),
+        }
+    }
+
     /// A doom stopped the reading frame's walk of `root`: its retry
     /// resumes `walk`, the rest of it, or with none left, takes the root's
     /// landing as the read's outcome.
-    #[cold]
-    #[inline(never)]
-    pub(super) fn stash_walk(&self, root: NodeId, walk: Option<Walk>) {
+    fn stash_walk(&self, root: NodeId, walk: Option<&mut Walk>) {
         // A doomed frame's walk reads past placeholders, and a speculative
         // run's retry takes no delivery.
         if replay::speculative() {
@@ -2115,7 +2147,7 @@ impl<C: Cells> Runtime<C> {
                     .cloned()
                 {
                     match walk {
-                        Some(walk) => x.deliver_walk(&v, walk),
+                        Some(walk) => x.deliver_walk(&v, std::mem::take(walk)),
                         None => {
                             let key = ReadKey::blocked(&v);
                             x.pending.retain(|d| {
