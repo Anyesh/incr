@@ -44,13 +44,13 @@ pub(super) fn on_stack(stack: usize, f: impl FnOnce() + Send + 'static) {
 
 /// A chain of `n` replayable queries over an input: `c[i] = c[i + 1] + 1`
 /// and the last is the input plus one, each counting its runs.
-struct Chain {
-    nodes: Vec<Incr<u64>>,
-    input: Incr<u64>,
-    runs: Arc<Vec<AtomicU32>>,
+pub(super) struct Chain {
+    pub(super) nodes: Vec<Incr<u64>>,
+    pub(super) input: Incr<u64>,
+    pub(super) runs: Arc<Vec<AtomicU32>>,
 }
 
-fn chain<C: Cells>(rt: &Runtime<C>, n: usize) -> Chain {
+pub(super) fn chain<C: Cells>(rt: &Runtime<C>, n: usize) -> Chain {
     let input = rt.create_input(0_u64);
     let runs: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
     let mut nodes = vec![input; n];
@@ -71,11 +71,11 @@ fn chain<C: Cells>(rt: &Runtime<C>, n: usize) -> Chain {
 }
 
 impl Chain {
-    fn max_runs(&self) -> u32 {
+    pub(super) fn max_runs(&self) -> u32 {
         self.runs.iter().map(|r| r.load(SeqCst)).max().unwrap_or(0)
     }
 
-    fn reset_runs(&self) {
+    pub(super) fn reset_runs(&self) {
         for r in self.runs.iter() {
             r.store(0, SeqCst);
         }

@@ -22,6 +22,8 @@ pub(crate) struct DoomSeen {
     /// Frames on the stack at the doom, read by a release-only test.
     #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) depth: usize,
+    /// The id of the context the doom pushed its entry into.
+    pub(crate) context: u64,
 }
 
 /// An unwind a reading frame took from a pending delivery, for tests.
@@ -595,6 +597,7 @@ impl<C: Cells> Runtime<C> {
             state: node.state(),
             verified_at: node.verified_at(),
             depth: self.dep_stack.depth(),
+            context: 0,
         });
         self.mark(
             id,
@@ -781,6 +784,10 @@ impl<C: Cells> Runtime<C> {
                 },
             ),
         };
+        #[cfg(test)]
+        if let Some(d) = self.dooms.lock().unwrap().last_mut() {
+            d.context = id;
+        }
         let vframes: Vec<VFrame> = (0..count)
             .rev()
             .map(|i| {

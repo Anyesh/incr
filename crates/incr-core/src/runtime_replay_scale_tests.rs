@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::replay_tests::{on_stack, replayable};
+use super::replay_tests::{chain, on_stack, replayable};
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::handle::Incr;
@@ -75,4 +75,66 @@ fn local_byte_budget_before_frame_budget() {
 #[cfg_attr(miri, ignore)]
 fn shared_byte_budget_before_frame_budget() {
     on_stack(2 << 20, byte_budget_first::<Shared>);
+}
+
+/// Two observed heads of 100-deep chains, first computed by one
+/// `stabilize` at budget 1: each fires once with the unbounded value and
+/// lands Clean, and the second's loop runs after the first's ends.
+fn doom_under_stabilize<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let first = chain(&rt, 100);
+    let second = chain(&rt, 100);
+    let fired: Arc<Mutex<Vec<(usize, u64)>>> = Arc::default();
+    for (i, c) in [&first, &second].into_iter().enumerate() {
+        let fired = fired.clone();
+        rt.observe(c.nodes[0], move |&v| fired.lock().unwrap().push((i, v)));
+    }
+    rt.stabilize();
+    let mut fired = fired.lock().unwrap().clone();
+    fired.sort_unstable();
+    assert_eq!(fired, vec![(0, 100), (1, 100)]);
+    for c in [&first, &second] {
+        assert_eq!(rt.state_of(c.nodes[0]), NodeState::Clean);
+        assert!(c.max_runs() <= 2, "a node ran {} times", c.max_runs());
+    }
+    let dooms = rt.dooms.lock().unwrap();
+    let of = |c: &super::replay_tests::Chain| {
+        let slots: Vec<u32> = c.nodes.iter().map(|n| n.slot()).collect();
+        dooms
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| slots.contains(&d.node))
+            .map(|(at, d)| (at, d.context))
+            .collect::<Vec<_>>()
+    };
+    let (mut a, mut b) = (of(&first), of(&second));
+    assert!(!a.is_empty() && !b.is_empty());
+    if b[0].0 < a[0].0 {
+        std::mem::swap(&mut a, &mut b);
+    }
+    assert_eq!(a.len() + b.len(), dooms.len());
+    assert!(a.iter().all(|&(_, x)| x == a[0].1));
+    assert!(b.iter().all(|&(_, x)| x == b[0].1));
+    assert!(
+        a.last().unwrap().0 < b[0].0,
+        "the second head's loop began before the first's ended"
+    );
+    drop(dooms);
+    assert!(
+        crate::replay::with(|c| c.is_empty()),
+        "a context is left open"
+    );
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn local_doom_under_stabilize() {
+    doom_under_stabilize::<Local>();
+}
+
+#[test]
+fn shared_doom_under_stabilize() {
+    doom_under_stabilize::<Shared>();
 }
