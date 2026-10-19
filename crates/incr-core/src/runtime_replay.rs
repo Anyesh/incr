@@ -906,7 +906,17 @@ impl<C: Cells> Runtime<C> {
         let wrote = ctl.wrote.get() != 0;
         match rooted {
             Some(path) => self.hold_doomed_root(id, attempt, wrote, path, bag),
-            None => self.discard_land(id, attempt.first, wrote, attempt.stamp_rev, bag),
+            // A replayable closure is pure, so its retry asks for the same
+            // children, which the entries above compute meanwhile; unbinding
+            // them would make the retry create them New and doom again.
+            None => self.discard_land_with(
+                id,
+                attempt.first,
+                wrote,
+                attempt.stamp_rev,
+                ChildLanding::Keep,
+                bag,
+            ),
         }
         replay::unwind_past(self.runtime_id, attempt.cidx + 1);
         Computed::Discarded
@@ -954,7 +964,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         let rt = self.runtime_id;
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        self.children_landing(id, flags, ChildLanding::Discard, false, bag);
+        self.children_landing(id, flags, ChildLanding::Keep, false, bag);
         let seeded = C::u8_load_relaxed(flags) & HAS_STRATEGY != 0;
         let mut held = Held::new(node.generation(), attempt.cidx, seeded, attempt.first);
         held.own(attempt.cidx, id.0, Some(path));

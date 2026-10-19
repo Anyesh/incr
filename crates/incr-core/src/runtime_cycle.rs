@@ -1363,8 +1363,21 @@ impl<C: Cells> Runtime<C> {
         stamp_rev: u64,
         bag: &mut Deferred<C>,
     ) {
+        self.discard_land_with(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
+    }
+
+    /// [`Self::discard_land`] landing the attempt's children as `children`.
+    pub(super) fn discard_land_with(
+        &self,
+        id: NodeId,
+        first: bool,
+        wrote: bool,
+        stamp_rev: u64,
+        children: ChildLanding,
+        bag: &mut Deferred<C>,
+    ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        self.children_landing(id, flags, ChildLanding::Discard, false, bag);
+        self.children_landing(id, flags, children, false, bag);
         let target = if wrote {
             node.max_changed_at(stamp_rev);
             NodeState::New
