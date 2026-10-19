@@ -246,10 +246,12 @@ impl Context {
             self.vstack.len(),
             "incr-core: virtual frames are contiguous"
         );
-        self.vindex
-            .entry(frame.node)
-            .or_default()
-            .push((pos, frame.generation));
+        let stack = self.vindex.entry(frame.node).or_default();
+        #[cfg(all(test, not(loom)))]
+        if !stack.is_empty() {
+            VINDEX_REPUSHES.with(|n| n.set(n.get() + 1));
+        }
+        stack.push((pos, frame.generation));
         self.vstack.push(frame);
     }
 
@@ -352,6 +354,24 @@ loom::thread_local! {
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static VINDEX_REPUSHES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Virtual frames pushed on this thread for a node that already had one
+/// on its context's `vindex`, since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_vindex_repushes() -> u64 {
+    VINDEX_REPUSHES.with(|n| n.replace(0))
+}
+
+/// Whether no context on this thread has a virtual frame indexed.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn vindexes_empty() -> bool {
+    CONTEXTS.with(|c| c.borrow().iter().all(|x| x.vindex.is_empty()))
 }
 
 /// Keeps `read` for its frame's retry. Reads of frames that have popped go:

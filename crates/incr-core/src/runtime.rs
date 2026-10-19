@@ -3797,6 +3797,10 @@ mod children_tests;
 mod replay_tests;
 
 #[cfg(all(test, not(loom)))]
+#[path = "runtime_replay_cycle_tests.rs"]
+mod replay_cycle_tests;
+
+#[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_differential.rs"]
 mod replay_differential;
 
