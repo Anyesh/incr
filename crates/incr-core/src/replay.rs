@@ -190,6 +190,12 @@ pub(crate) struct Context {
     /// `Direct` delivery just taken sends to its compute, until that
     /// read's walk does or the read ends.
     pub(crate) direct: Option<(u32, u32, u32)>,
+    /// The lowlink of each popped virtual frame whose run is not over, as
+    /// `(node, generation, cidx, path, low)`, until the run that finishes
+    /// it starts there: the deferrals that lowered it ran in the doomed
+    /// runs, and a retry that resumes their walk or takes a delivery does
+    /// not meet them again.
+    pub(crate) lows: Vec<(u32, u32, u32, u64, u32)>,
 }
 
 impl Context {
@@ -210,6 +216,7 @@ impl Context {
             memo: Vec::new(),
             resume: None,
             direct: None,
+            lows: Vec::new(),
         }
     }
 

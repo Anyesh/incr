@@ -585,6 +585,11 @@ impl<C: Cells> Runtime<C> {
         ctl.lowlink.set(cidx);
         self.dep_stack
             .push_frame_at(self.runtime_id, id, &ctl, cidx);
+        if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+            if let Some(low) = self.take_low(id, cidx) {
+                ctl.lower(low);
+            }
+        }
         // SAFETY: this thread holds the node's claim, so its closure is
         // not freed (see `compute_attempts`).
         let compute = unsafe { &*compute };

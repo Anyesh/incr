@@ -1028,6 +1028,19 @@ impl<C: Cells> Runtime<C> {
                     break;
                 };
                 self.note_ancestor(&v);
+                // A stand-in run in the pop finishes the frame that was
+                // reading the frame popped just above, so it gets the direct
+                // compute of that read an entry's retry gets below.
+                if let Some((u, false)) = popped_frames.last() {
+                    let read = u64::from(u.node) | (u64::from(u.generation) << 32);
+                    if u.cidx == v.cidx + 1 && v.reading == read {
+                        replay::with(|c| {
+                            if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                                x.deliver_direct(&v, level);
+                            }
+                        });
+                    }
+                }
                 let popped = {
                     let _placed = Placed(
                         &self.dep_stack,
@@ -1262,6 +1275,13 @@ impl<C: Cells> Runtime<C> {
         }
         let mut low = v.low;
         let unbuffered = cycle_state::with_held(|h| h.get(&(rt, v.node)).map(|e| e.buf.is_none()));
+        if low < v.cidx && unbuffered != Some(false) {
+            replay::with(|c| {
+                if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                    x.lows.push((v.node, v.generation, v.cidx, v.path, low));
+                }
+            });
+        }
         // A virtual hit claimed the node, so no retry recomputes it: its
         // frame's run finishes here, as the unbounded run's frame does
         // after its blocked read returns, and buffers its value. The claim
@@ -1285,8 +1305,8 @@ impl<C: Cells> Runtime<C> {
             match ran {
                 Ok(Some(l)) => {
                     self.end_deliveries(id, v.node, v.generation, v.cidx);
-                    // The run read everything again, so its lowlink, not
-                    // the doomed run's, is the frame's.
+                    // The run started from the doomed runs' lowlink
+                    // (`take_low`), so its own is the frame's.
                     low = l;
                 }
                 Ok(None) => return VPop::Restart,
@@ -2017,6 +2037,30 @@ impl<C: Cells> Runtime<C> {
             .read_steps(rt, from, cidx)
             .into_iter()
             .fold(path, replay::extend_path)
+    }
+
+    /// The lowlink a popped virtual frame of `node` at `cidx`, along this
+    /// frame's path, left for the run that finishes it.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn take_low(&self, node: NodeId, cidx: u32) -> Option<u32> {
+        let rt = self.runtime_id;
+        let generation = self.nodes.get(node.0).generation();
+        let key = |l: &(u32, u32, u32, u64, u32)| l.0 == node.0 && l.1 == generation && l.2 == cidx;
+        if !replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .any(|x| x.lows.iter().any(key))
+        }) {
+            return None;
+        }
+        let path = self.path_at(cidx);
+        replay::with(|c| {
+            c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
+                let at = x.lows.iter().position(|l| key(l) && l.3 == path)?;
+                Some(x.lows.remove(at).4)
+            })
+        })
     }
 
     /// The walk this read of `root` resumes: a frame's retry making the

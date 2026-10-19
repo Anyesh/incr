@@ -3061,6 +3061,11 @@ impl<C: Cells> Runtime<C> {
                 let ctl = ComputeCtl::new(if is_recompute { cycle::RECOMPUTE } else { 0 });
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
+                if MODE & VIRT != 0 {
+                    if let Some(low) = self.take_low(id, cidx) {
+                        ctl.lower(low);
+                    }
+                }
                 // SAFETY: the closure was read under the read hold at
                 // generation `g`, and the claim above was rechecked against `g`.
                 // A closure is freed only by `release_claimed`, under a Dead
