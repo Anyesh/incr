@@ -19,6 +19,8 @@ pub(crate) struct DoomSeen {
     /// The node's state after its release.
     pub(crate) state: NodeState,
     pub(crate) verified_at: u64,
+    /// Frames on the stack at the doom.
+    pub(crate) depth: usize,
 }
 
 /// An unwind a reading frame took from a pending delivery, for tests.
@@ -591,6 +593,7 @@ impl<C: Cells> Runtime<C> {
             node: id.0,
             state: node.state(),
             verified_at: node.verified_at(),
+            depth: self.dep_stack.depth(),
         });
         self.mark(
             id,
