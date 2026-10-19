@@ -32,8 +32,8 @@ pub use incr_core::{
     Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
     GroupedCollection as GroupedCollectionInner, Incr, IncrCollection as IncrCollectionInner,
     NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable as NodeTableInner, NodeTrace, ObserverId,
-    PropagationTrace, QueryOpts, RuntimeId, SortDelta, SortedCollection as SortedCollectionInner,
-    TableKey, TraceAction, Value,
+    PropagationTrace, QueryOpts, Replay, RuntimeId, SortDelta,
+    SortedCollection as SortedCollectionInner, TableKey, TraceAction, Value, DEFAULT_MAX_FRAMES,
 };
 
 /// Single-threaded runtime: `Runtime<Local>`. Not `Send`/`Sync`. Use the
@@ -63,8 +63,8 @@ mod reexports {
             Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher, GroupedCollection,
             GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner, NodeId, NodeInfo,
             NodeKindInfo, NodeState, NodeTable, NodeTableInner, NodeTrace, ObserverId,
-            PropagationTrace, QueryOpts, Runtime, RuntimeId, SortDelta, SortedCollection,
-            SortedCollectionInner, TableKey, TraceAction, Value,
+            PropagationTrace, QueryOpts, Replay, Runtime, RuntimeId, SortDelta, SortedCollection,
+            SortedCollectionInner, TableKey, TraceAction, Value, DEFAULT_MAX_FRAMES,
         };
 
         fn named<T: ?Sized>() {}
@@ -80,6 +80,8 @@ mod reexports {
         named::<CycleStrategy<u32>>();
         named::<Fixpoint<u32>>();
         named::<QueryOpts<u32>>();
+        named::<Replay>();
+        let _: u32 = DEFAULT_MAX_FRAMES;
         named::<DeleteError>();
         named::<Delta<u32>>();
         named::<ErasedIncr>();
