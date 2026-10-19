@@ -115,7 +115,7 @@ local_and_shared!(
 
 /// A first compute of a 100k chain at the default budget of 256: native
 /// depth stays within 256 frames, so a 1 MiB thread holds it, and every
-/// node runs at most twice.
+/// node runs at most twice, every doom returning to one context.
 #[cfg(not(debug_assertions))]
 fn chain_100k<C: Cells>(rt: &Runtime<C>) {
     rt.set_placeholder(0_u64);
@@ -123,12 +123,15 @@ fn chain_100k<C: Cells>(rt: &Runtime<C>) {
     let c = chain(rt, 100_000);
     assert_eq!(rt.get(c.nodes[0]), 100_000);
     assert!(c.max_runs() <= 2, "a node ran {} times", c.max_runs());
-    assert!(rt
-        .dooms
-        .lock()
-        .unwrap()
+    let dooms = rt.dooms.lock().unwrap();
+    assert!(!dooms.is_empty());
+    assert!(dooms
         .iter()
         .all(|d| d.depth <= crate::runtime::DEFAULT_MAX_FRAMES as usize));
+    assert!(
+        dooms.iter().all(|d| d.context == dooms[0].context),
+        "the chain's dooms opened more than one context"
+    );
 }
 
 #[cfg(not(debug_assertions))]
