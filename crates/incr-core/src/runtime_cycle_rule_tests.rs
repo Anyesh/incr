@@ -912,6 +912,22 @@ fn a_panic_releases_the_claims_its_frame_deferred<C: Cells>() {
     rt.assert_invariant_i();
 }
 
+/// R catches the cycle S raises, then reads P, which panics on its own:
+/// P lands Failed, its panic no part of the cycle R swallowed.
+fn a_panic_after_a_swallowed_cycle_lands_failed<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sc = cell::<i64>();
+    let s = {
+        let sc = sc.clone();
+        rt.create_query(move |rt| rt.get(*sc.get().unwrap()) + 1)
+    };
+    sc.set(s).unwrap();
+    let p = rt.create_query(|_| -> i64 { panic!("P fails") });
+    let r = rt.create_query(move |rt| quiet(|| rt.get(s)).unwrap_or(0) + rt.get(p));
+    assert!(quiet(|| rt.get(r)).is_err());
+    assert_eq!(rt.state_of(p), NodeState::Failed);
+}
+
 both!(
     member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
@@ -938,6 +954,7 @@ both!(
     dirty_cyclic_landing_reads_as_the_cycle,
     a_walk_root_deferred_under_its_walk,
     a_panic_releases_the_claims_its_frame_deferred,
+    a_panic_after_a_swallowed_cycle_lands_failed,
 );
 
 fn on_deep_stack(body: fn()) {

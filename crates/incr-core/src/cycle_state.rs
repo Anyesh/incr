@@ -228,6 +228,20 @@ pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
     value_code::set_unwind_bits(UnwindKind::bits(kind));
 }
 
+/// Clears the unwind kind of a read made while a cycle's is set: the read
+/// comes from a closure that caught that unwind, so the kind is stale, and
+/// a panic of the node read next would land as a cycle's discard instead
+/// of Failed. Returns the thread word as it is now.
+#[cold]
+#[inline(never)]
+pub(crate) fn clear_stale_cycle(word: u64) -> u64 {
+    if unwind_kind() != Some(UnwindKind::Cycle) {
+        return word;
+    }
+    set_unwind_kind(None);
+    value_code::thread_word()
+}
+
 pub(crate) fn take_unwind_kind() -> Option<UnwindKind> {
     let kind = unwind_kind();
     if kind.is_some() {

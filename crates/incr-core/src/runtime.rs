@@ -1711,9 +1711,12 @@ impl<C: Cells> Runtime<C> {
         self.dep_stack
             .record_dep(self.runtime_id, NodeId(slot), handle.generation());
 
-        let word = value_code::thread_word();
-        if word & value_code::COUNTER_MASK != 0 {
-            return Ok(self.value_code_read(handle, node));
+        let mut word = value_code::thread_word();
+        if word & (value_code::COUNTER_MASK | value_code::UNWIND_MASK) != 0 {
+            if word & value_code::COUNTER_MASK != 0 {
+                return Ok(self.value_code_read(handle, node));
+            }
+            word = cycle_state::clear_stale_cycle(word);
         }
         if observed == NodeState::Cyclic || is_computing(observed) {
             if let Some(read) = self.cycle_read(handle, observed, kind) {
