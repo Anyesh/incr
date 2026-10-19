@@ -58,6 +58,14 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     /// debug assertions only.
     #[doc(hidden)]
     fn has_value(&self, slot: u32) -> bool;
+
+    /// Whether the arena's type has a placeholder.
+    #[doc(hidden)]
+    fn has_placeholder(&self) -> bool;
+
+    /// A clone of the value in `slot`, if it holds one.
+    #[doc(hidden)]
+    fn read_erased(&self, slot: u32) -> Option<Box<dyn Any + Send>>;
 }
 
 impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
@@ -92,6 +100,14 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
 
     fn has_value(&self, slot: u32) -> bool {
         crate::value_code::run(|| self.try_read(slot).is_some())
+    }
+
+    fn has_placeholder(&self) -> bool {
+        self.placeholder().is_some()
+    }
+
+    fn read_erased(&self, slot: u32) -> Option<Box<dyn Any + Send>> {
+        crate::value_code::run(|| self.try_read(slot)).map(|v| Box::new(v) as Box<dyn Any + Send>)
     }
 }
 

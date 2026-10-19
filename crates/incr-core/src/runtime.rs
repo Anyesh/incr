@@ -26,10 +26,12 @@ use std::sync::Arc;
 use crate::arena_registry::{ArenaRegistry, ArenaTags};
 use crate::cells::Cells;
 use crate::children::ChildIndex;
-use crate::cycle::{self, ComputeCtl, Cycle, CycleStrategy, ErasedStrategy, Outcome, QueryOpts};
+use crate::cycle::{
+    self, ComputeCtl, Cycle, CycleStrategy, ErasedOpts, ErasedStrategy, Outcome, QueryOpts,
+};
 use crate::cycle_state::{self, EntryDepth, UnwindKind};
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
-use crate::dep_stack::DepStack;
+use crate::dep_stack::{ActiveRead, DepStack};
 use crate::dependent_list::DependentList;
 use crate::fx::FxBuildHasher;
 use crate::generic_arena::GenericArena;
@@ -37,6 +39,7 @@ use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::locks::Lock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
+use crate::replay;
 use crate::segmented_nodes::{
     SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, OWNED,
 };
@@ -187,6 +190,9 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a Stale publish landed `New` and before
     /// the retry, with the attempt's bag carried along.
     StaleRetry(NodeId),
+    /// At a doom, after the node the read wanted was released and pushed
+    /// and before the reading frame gets its placeholder.
+    AfterDoom(NodeId),
 }
 
 /// The panic of a read that found its node `Dead` under the handle's
@@ -381,12 +387,27 @@ enum Computed {
     /// map, its value is buffered there, and the root of the cycle lands
     /// it.
     Deferred,
+    /// The read that asked for the node was past its budget, so the node
+    /// was released unrun and pushed as a replay entry, and the reading
+    /// frame is doomed.
+    Doomed,
+    /// The node's run was doomed and discarded: it is a virtual frame,
+    /// and a replay driver runs it again.
+    Discarded,
 }
+
+/// `clean_walk` mode bit: a compute about to run a closure dooms the
+/// reading frame instead.
+pub(crate) const ARMED: u8 = 1;
+/// `clean_walk` mode bit: a replay context of this runtime is open, so
+/// the walk skips nodes that have virtual frames.
+pub(crate) const VIRT: u8 = 2;
 
 /// Which read reached a slow path: `get` panics where `try_get` returns
 /// `Err(Cycle)`.
+#[doc(hidden)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ReadKind {
+pub enum ReadKind {
     Get,
     TryGet,
 }
@@ -620,6 +641,14 @@ pub struct Runtime<C: Cells> {
     /// `compute_one` via a Relaxed load (~1 ns when disarmed) so the
     /// non-tracing hot path pays no measurable cost.
     pub(crate) tracing_armed: <C as Cells>::U8,
+    /// The frame budget: a replayable frame's read at this many frames
+    /// or more replays instead of nesting.
+    pub(crate) max_frames: std::sync::atomic::AtomicU32,
+    /// The byte budget, or 0 when it is off.
+    pub(crate) max_stack_bytes: std::sync::atomic::AtomicUsize,
+    /// `INCR_TEST_ALL_REPLAYABLE`: every query not marked
+    /// `NOT_REPLAYABLE` is replayable.
+    pub(crate) all_replayable: bool,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -637,6 +666,32 @@ pub struct Runtime<C: Cells> {
     /// The node of every group verification, in order.
     #[cfg(test)]
     pub(crate) group_verifies: std::sync::Mutex<Vec<u32>>,
+    /// Every doom, in order, as the doom point saw it.
+    #[cfg(test)]
+    pub(crate) dooms: std::sync::Mutex<Vec<replay_impl::DoomSeen>>,
+}
+
+/// The value of [`Runtime::doom_gate`].
+#[cfg(all(test, not(loom)))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DoomGate(pub(crate) bool);
+
+/// The default frame budget.
+pub const DEFAULT_MAX_FRAMES: u32 = 256;
+
+/// The default frame budget and whether every query is replayable, from
+/// `INCR_MAX_DEPTH` and `INCR_TEST_ALL_REPLAYABLE`, read once.
+fn replay_defaults() -> (u32, bool) {
+    static DEFAULTS: std::sync::OnceLock<(u32, bool)> = std::sync::OnceLock::new();
+    *DEFAULTS.get_or_init(|| {
+        let frames = std::env::var("INCR_MAX_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_MAX_FRAMES);
+        let all = std::env::var("INCR_TEST_ALL_REPLAYABLE").is_ok_and(|v| v == "1");
+        (frames, all)
+    })
 }
 
 impl<C: Cells> Default for Runtime<C> {
@@ -656,6 +711,9 @@ impl<C: Cells> Runtime<C> {
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id: RuntimeId::allocate(),
             tracing_armed: C::new_u8(0),
+            max_frames: std::sync::atomic::AtomicU32::new(replay_defaults().0),
+            max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
+            all_replayable: replay_defaults().1,
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -670,6 +728,8 @@ impl<C: Cells> Runtime<C> {
             walk_pops: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             group_verifies: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            dooms: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -791,7 +851,7 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.create_query_erased::<true, _, _>(f, None)
+        self.create_query_erased::<true, _, _>(f, ErasedOpts::NONE)
     }
 
     /// [`Self::create_query`] with a [`CycleStrategy::Fallback`]: in a
@@ -806,6 +866,7 @@ impl<C: Cells> Runtime<C> {
             f,
             QueryOpts {
                 cycle: CycleStrategy::fallback(g),
+                ..Default::default()
             },
         )
     }
@@ -816,7 +877,7 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.create_query_erased::<true, _, _>(f, cycle::erase(opts.cycle))
+        self.create_query_erased::<true, _, _>(f, cycle::erase_opts(opts))
     }
 
     /// Takes the strategy erased so that [`Self::create_query`] builds and
@@ -826,7 +887,7 @@ impl<C: Cells> Runtime<C> {
     pub(crate) fn create_query_erased<const CHECKED: bool, T, F>(
         &self,
         f: F,
-        strategy: Option<Arc<dyn ErasedStrategy>>,
+        opts: ErasedOpts,
     ) -> Incr<T>
     where
         T: Value,
@@ -868,36 +929,41 @@ impl<C: Cells> Runtime<C> {
                 move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
-                    let outcome =
-                        match ctl.flags.get() & (cycle::RECOMPUTE | cycle::BUFFERED | cycle::LOW) {
-                            0 => {
-                                ctl.wrote.set(1);
-                                drop(arena_inner.write(node.arena_slot(), new_value));
+                    let outcome = match ctl.flags.get()
+                        & (cycle::RECOMPUTE | cycle::BUFFERED | cycle::LOW | cycle::DOOMED)
+                    {
+                        0 => {
+                            ctl.wrote.set(1);
+                            drop(arena_inner.write(node.arena_slot(), new_value));
+                            Outcome::Changed
+                        }
+                        cycle::RECOMPUTE => {
+                            if arena_inner.write_if_changed(
+                                node.arena_slot(),
+                                new_value,
+                                &ctl.wrote,
+                            ) {
                                 Outcome::Changed
+                            } else {
+                                Outcome::Unchanged
                             }
-                            cycle::RECOMPUTE => {
-                                if arena_inner.write_if_changed(
-                                    node.arena_slot(),
-                                    new_value,
-                                    &ctl.wrote,
-                                ) {
-                                    Outcome::Changed
-                                } else {
-                                    Outcome::Unchanged
-                                }
-                            }
-                            _ => return ctl.buffer(new_value),
-                        };
+                        }
+                        _ => return ctl.buffer(new_value),
+                    };
                     reclaim_probe::reached(RetireSite::ComputeWrite);
                     outcome
                 },
             );
 
             inner.compute_fns[slot as usize] = Some(compute);
-            if let Some(strategy) = strategy {
+            if let Some(strategy) = opts.strategy {
                 inner.cycle_strategies.insert(slot, strategy);
                 let flags = self.nodes.get_with_flags(slot).1;
                 C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | HAS_STRATEGY);
+            }
+            if opts.flags != 0 {
+                let flags = self.nodes.get_with_flags(slot).1;
+                C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | opts.flags);
             }
             (slot, self.nodes.get(slot).generation())
         };
@@ -985,15 +1051,15 @@ impl<C: Cells> Runtime<C> {
             })
     }
 
-    /// Dooms this runtime's active frame on this thread.
+    /// A node that dooms a replayable frame reading it at budget 1:
+    /// reading it gives `DoomGate(false)`, its placeholder, in the doomed
+    /// run and `DoomGate(true)` in the retry the driver makes once the
+    /// gate has landed. Sets the frame budget to 1.
     #[cfg(all(test, not(loom)))]
-    pub(crate) fn doom_active_frame(&self) {
-        let (ctl, _) = self
-            .dep_stack
-            .active_frame(self.runtime_id)
-            .expect("doom_active_frame outside a compute");
-        // SAFETY: as in `frame_doomed`.
-        unsafe { (*ctl).raise(cycle::DOOMED) };
+    pub(crate) fn doom_gate(&self) -> Incr<DoomGate> {
+        self.set_max_frames(1);
+        self.set_placeholder(DoomGate(false));
+        self.create_query(|_| DoomGate(true))
     }
 
     /// The handle a table miss in a doomed frame returns: no node, only
@@ -1025,6 +1091,29 @@ impl<C: Cells> Runtime<C> {
             "incr-core: placeholder already set for {}",
             std::any::type_name::<T>(),
         );
+    }
+
+    /// Sets the frame budget, 256 unless `INCR_MAX_DEPTH` says otherwise:
+    /// a read made by a replayable query's compute when this runtime's
+    /// frames on the thread number `n` or more (every runtime's, under
+    /// `Shared`) replays instead of nesting, if the read's type has a
+    /// placeholder. Replay changes where computes run, never a result.
+    ///
+    /// Panics if `n` is 0.
+    pub fn set_max_frames(&self, n: u32) {
+        assert!(n > 0, "incr-core: the frame budget is at least 1");
+        self.max_frames
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Sets a byte budget beside the frame budget, off when `n` is 0 (the
+    /// default): a replayable query's read also replays when the stack
+    /// this thread has used since its outermost engine call exceeds `n`
+    /// bytes. Frames differ in size with the closure and the build, so
+    /// the frame count alone does not bound the stack.
+    pub fn set_max_stack_bytes(&self, n: usize) {
+        self.max_stack_bytes
+            .store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// A clone of `T`'s placeholder, if it has one.
@@ -1708,23 +1797,54 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != handle.generation() {
             self.stale_handle(handle);
         }
-        self.dep_stack
-            .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+        let frame = self
+            .dep_stack
+            .record_read(self.runtime_id, NodeId(slot), handle.generation());
 
-        let mut word = value_code::thread_word();
-        if word & (value_code::COUNTER_MASK | value_code::UNWIND_MASK) != 0 {
-            if word & value_code::COUNTER_MASK != 0 {
-                return Ok(self.value_code_read(handle, node));
-            }
-            word = cycle_state::clear_stale_cycle(word);
+        let word = value_code::thread_word();
+        if word & (value_code::COUNTER_MASK | value_code::REPLAY_BIT | value_code::UNWIND_MASK) != 0
+            || frame.is_some_and(|f| self.doomed_or_past_budget(f))
+        {
+            return self.read_cold(handle, observed, kind, frame, word);
         }
+        self.read_walk::<T, 0>(handle, observed, kind, word, frame)
+    }
+
+    /// Whether a read from frame `f` must take the cold path: the frame
+    /// is doomed, or it reads at or past the frame budget, or a byte
+    /// budget is set.
+    #[inline(always)]
+    fn doomed_or_past_budget(&self, f: ActiveRead) -> bool {
+        // SAFETY: the active frame's control block is live while it is on
+        // the stack.
+        unsafe { &*f.ctl }.has(cycle::DOOMED)
+            || f.depth >= self.max_frames.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .max_stack_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0
+    }
+
+    /// The rest of a slow read: a cycle read, or a walk in `MODE` and
+    /// then the slot.
+    #[inline(always)]
+    fn read_walk<T: Value, const MODE: u8>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        kind: ReadKind,
+        word: u64,
+        frame: Option<ActiveRead>,
+    ) -> Result<T, Cycle> {
+        let slot = handle.slot();
+        let node = self.nodes.get(slot);
         if observed == NodeState::Cyclic || is_computing(observed) {
             if let Some(read) = self.cycle_read(handle, observed, kind) {
                 return read;
             }
         }
         // `get` found the node not Clean, so the walk starts at once.
-        let walk = || self.clean_walk(NodeId(slot), handle.generation(), word, observed);
+        let walk = || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
         match self.entered(kind, walk)? {
             Computed::Done => {}
             Computed::Gone => self.stale_handle(handle),
@@ -1732,6 +1852,9 @@ impl<C: Cells> Runtime<C> {
                 return self
                     .cycle_read(handle, NodeState::Computing, kind)
                     .expect("incr-core: a deferred root is held");
+            }
+            Computed::Doomed | Computed::Discarded => {
+                return Ok(self.placeholder_read::<T>(frame));
             }
         }
         let (type_tag, arena_slot) = self.fields_under(handle, node);
@@ -2354,7 +2477,7 @@ impl<C: Cells> Runtime<C> {
         if observed == NodeState::Clean {
             return Computed::Done;
         }
-        self.clean_walk(id, gen, word, observed)
+        self.clean_walk::<0>(id, gen, word, observed)
     }
 
     /// [`Self::ensure_clean`] past its fast path, for a caller that took
@@ -2365,12 +2488,24 @@ impl<C: Cells> Runtime<C> {
     /// A node found Computing is waited on here once before its pending
     /// entry's compute loads it again, so that no Computing state is
     /// loaded twice before the first backoff.
-    fn clean_walk(&self, id: NodeId, gen: u32, word: u64, observed: NodeState) -> Computed {
-        if word != 0 && taint_memo::memoized(word, self.runtime_id, id) {
+    fn clean_walk<const MODE: u8>(
+        &self,
+        id: NodeId,
+        gen: u32,
+        word: u64,
+        observed: NodeState,
+    ) -> Computed {
+        if word != 0 && taint_memo::memoized(word, self.runtime_id, id)
+            || MODE & VIRT != 0 && self.take_direct(id)
+        {
             if is_computing(observed) {
                 self.wait_on_claim(id, 1);
             }
-            return self.compute_direct(id, gen);
+            let computed = self.compute_direct::<MODE>(id, gen);
+            if computed == Computed::Discarded {
+                return self.walk_discarded(Visit::Direct).unwrap_or(computed);
+            }
+            return computed;
         }
         let mut walk = Walk::new(id, observed);
         let mut root = Computed::Done;
@@ -2384,7 +2519,17 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     Visit::VerifyOnly(taint)
                 };
-                let computed = self.compute_one(cur, visit, is_root.then_some(gen));
+                let mut computed = self.compute_one::<MODE>(cur, visit, is_root.then_some(gen));
+                if computed != Computed::Done {
+                    match computed {
+                        Computed::Doomed => return computed,
+                        Computed::Discarded => match self.walk_discarded(visit) {
+                            Some(after) => computed = after,
+                            None => return computed,
+                        },
+                        _ => {}
+                    }
+                }
                 if is_root {
                     root = computed;
                 } else if taint != NO_TAINT {
@@ -2405,6 +2550,27 @@ impl<C: Cells> Runtime<C> {
             } else {
                 NodeState::Computing
             };
+            // A node with a virtual frame stands for a frame on the stack,
+            // so the walk skips it as it skips a real one.
+            if MODE & VIRT != 0
+                && !is_root
+                && matches!(
+                    observed,
+                    NodeState::New
+                        | NodeState::Dirty
+                        | NodeState::Computing
+                        | NodeState::ComputingDirty
+                )
+            {
+                if matches!(observed, NodeState::New | NodeState::Dirty) && self.walk_skips(id, cur)
+                {
+                    continue;
+                }
+                if let Some(owner) = self.virtual_owner(cur) {
+                    walk.taint(owner);
+                    continue;
+                }
+            }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => continue,
                 NodeState::Dirty
@@ -2415,8 +2581,8 @@ impl<C: Cells> Runtime<C> {
                 }
                 NodeState::Computing | NodeState::ComputingDirty => {
                     if !is_root {
-                        if let Some(depth) = self.own_claim_depth(cur) {
-                            walk.taint(depth as u32);
+                        if let Some(owner) = self.own_claim_owner(cur) {
+                            walk.taint(owner);
                             continue;
                         }
                     }
@@ -2536,8 +2702,8 @@ impl<C: Cells> Runtime<C> {
     /// `Visit::Direct`.
     #[cold]
     #[inline(never)]
-    fn compute_direct(&self, id: NodeId, gen: u32) -> Computed {
-        self.compute_one(id, Visit::Direct, Some(gen))
+    fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
+        self.compute_one::<MODE>(id, Visit::Direct, Some(gen))
     }
 
     /// Compute (or verify) a single node, assuming all its known deps
@@ -2568,15 +2734,15 @@ impl<C: Cells> Runtime<C> {
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
     #[inline(always)]
-    fn compute_one(&self, id: NodeId, visit: Visit, gen: Option<u32>) -> Computed {
+    fn compute_one<const MODE: u8>(&self, id: NodeId, visit: Visit, gen: Option<u32>) -> Computed {
         let mut bag = Deferred::new();
-        let computed = self.compute_attempts(id, visit, gen, &mut bag);
+        let computed = self.compute_attempts::<MODE>(id, visit, gen, &mut bag);
         bag.drain(self);
         computed
     }
 
     #[inline(always)]
-    fn compute_attempts(
+    fn compute_attempts<const MODE: u8>(
         &self,
         id: NodeId,
         visit: Visit,
@@ -2723,6 +2889,20 @@ impl<C: Cells> Runtime<C> {
             // episode can land the node into a group or a single-node
             // landing can take it out of one.
             if verifying && C::u8_load_relaxed(flags) & IN_GROUP != 0 {
+                // Group verify claims the other members with no anchor the
+                // doom's discards would release, so a read that dooms skips
+                // it and dooms as if the verify failed. A tainted visit's
+                // group verify runs no member and must not doom, because the
+                // unbounded run's verify leaves the node for its reader.
+                if MODE & ARMED != 0 && !matches!(visit, Visit::VerifyOnly(_)) {
+                    return self.doom(id, node, g, claimed_dirty, matches!(visit, Visit::Direct));
+                }
+                if MODE & VIRT != 0
+                    && !matches!(visit, Visit::VerifyOnly(_))
+                    && replay::speculative()
+                {
+                    self.drop_speculative_verify(node, claimed_dirty);
+                }
                 match self.group_verify(id, g, visit, bag) {
                     GroupEnd::Done(computed) => return computed,
                     GroupEnd::Retry => {
@@ -2774,6 +2954,9 @@ impl<C: Cells> Runtime<C> {
                 // Keep the claim and recompute; the closure's nested reads
                 // clean the changed deps.
             }
+            if MODE & ARMED != 0 {
+                return self.doom(id, node, g, claimed_dirty, matches!(visit, Visit::Direct));
+            }
             let is_recompute = claimed_dirty;
             let first = !claimed_dirty;
 
@@ -2801,14 +2984,38 @@ impl<C: Cells> Runtime<C> {
                 }));
                 let deps = self.dep_stack.pop_frame();
                 let word = value_code::thread_word();
-                if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
-                    && self.after_pop(word, result.is_ok())
+                if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK | value_code::REPLAY_BIT)
+                    != 0
                 {
-                    result = Err(Box::new(cycle::WoundUnwind));
+                    if self.after_pop(word, result.is_ok()) {
+                        result = Err(match UnwindKind::of_word(word) {
+                            Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
+                            _ => Box::new(cycle::WoundUnwind),
+                        });
+                    } else if result.is_ok() && self.speculative_lands_dirty(word, &ctl, &deps) {
+                        cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+                        result = Err(Box::new(cycle::DiscardUnwind));
+                    }
                 }
 
                 let outcome = match result {
                     Ok(outcome) => outcome,
+                    // A doomed run reads placeholders, so a cycle it raises
+                    // is no more the unbounded run's than a panic is: its
+                    // retry raises the cycle again if it is real.
+                    Err(payload)
+                        if ctl.has(cycle::DOOMED)
+                            && !matches!(cycle_state::unwind_kind(), Some(UnwindKind::Wound)) =>
+                    {
+                        cycle_state::take_unwind_kind();
+                        let attempt = Attempt {
+                            first,
+                            cidx,
+                            stamp_rev,
+                            verify_rev,
+                        };
+                        return self.discard_doomed(id, attempt, &ctl, Some(payload), bag);
+                    }
                     Err(payload) => self.compute_panicked(
                         id,
                         node,
@@ -2826,10 +3033,20 @@ impl<C: Cells> Runtime<C> {
                     ),
                 };
 
-                if ctl.has(cycle::LOW) {
+                if ctl.flags.get() & (cycle::LOW | cycle::DOOMED) != 0 {
+                    if ctl.has(cycle::DOOMED) {
+                        let attempt = Attempt {
+                            first,
+                            cidx,
+                            stamp_rev,
+                            verify_rev,
+                        };
+                        return self.discard_doomed(id, attempt, &ctl, None, bag);
+                    }
                     match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
                         PopEnd::Deferred => return Computed::Deferred,
                         PopEnd::Landed => return Computed::Done,
+                        PopEnd::Suspended => return Computed::Discarded,
                         PopEnd::Dissolved => continue 'run,
                         PopEnd::Retry => {
                             self.park_with_bag(ParkPoint::StaleRetry(id), bag);
@@ -2925,7 +3142,18 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.release_held_from(attempt.cidx, kind, bag);
+        replay::unwind_past(self.runtime_id, attempt.cidx);
+        // A speculative entry's run may evaluate nodes the unbounded run
+        // never does, so a panic in it lands nothing Failed, and a cycle
+        // it raises is no read's result: the real run raises either again
+        // if it does reach the node. It goes on as a discard unwind, which
+        // a closure that catches it can't land a value over.
+        let kind = if matches!(kind, None | Some(UnwindKind::Cycle)) && replay::speculative() {
+            Some(UnwindKind::Discard)
+        } else {
+            kind
+        };
+        self.release_unwound_from(attempt.cidx, id.0, kind, kind.is_some(), bag);
         let wrote = ctl.wrote.get() != 0;
         if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
@@ -2942,9 +3170,6 @@ impl<C: Cells> Runtime<C> {
         // reached yet. Extra edges only cause spurious re-verification,
         // never staleness.
         self.land_failed(id, node, flags, attempt, wrote, deps, &[], bag);
-        // An enclosing closure that catches the unwind has still read a
-        // dep that did not land Clean.
-        self.dep_stack.poison_current_frame(self.runtime_id);
         bag.drain_carried(payload);
     }
 
@@ -3010,7 +3235,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn after_pop(&self, word: u64, returned: bool) -> bool {
         if word & value_code::MEMO_BIT != 0 {
-            taint_memo::clear_from(self.dep_stack.depth() as u32);
+            taint_memo::clear_from(self.dep_stack.next_cidx() + 1);
         }
         returned
             && !std::thread::panicking()
@@ -3096,14 +3321,16 @@ impl<C: Cells> Runtime<C> {
         C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !IN_GROUP);
     }
 
-    /// The depth of the frame on this thread (or, under `Local`, this
-    /// runtime) that holds `id`'s `Computing` claim. This is the walk's
-    /// own held set; a set's claim is not on `state`, so it never shows
-    /// up here.
-    fn own_claim_depth(&self, id: NodeId) -> Option<usize> {
+    /// The taint-memo owner for a skip of `id`, if this thread (or, under
+    /// `Local`, this runtime) holds its `Computing` claim: one more than
+    /// the position of the frame computing it, or of the anchor of its
+    /// held claim. This is the walk's own held set; a set's claim is not
+    /// on `state`, so it never shows up here.
+    fn own_claim_owner(&self, id: NodeId) -> Option<u32> {
         self.dep_stack
-            .frame_depth(self.runtime_id, id)
-            .or_else(|| cycle_state::held_anchor(self.runtime_id, id.0).map(|a| a as usize))
+            .frame_cidx(self.runtime_id, id)
+            .or_else(|| cycle_state::held_anchor(self.runtime_id, id.0))
+            .map(|cidx| cidx + 1)
     }
 
     /// Memoize a node verify-only left non-Clean under the frame at depth
@@ -3494,11 +3721,19 @@ mod children_impl;
 #[path = "runtime_claim_set.rs"]
 mod claim_set_impl;
 
+#[path = "runtime_replay.rs"]
+mod replay_impl;
+
 pub(crate) use children_impl::ChildLanding;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_children_tests.rs"]
 mod children_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_replay_tests.rs"]
+mod replay_tests;
+
 use cycle_impl::{Attempt, GroupEnd, PopEnd};
 
 #[cfg(all(test, not(loom)))]

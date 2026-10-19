@@ -36,12 +36,32 @@ pub struct Frame {
     /// owns the control block and pops the frame before it returns.
     pub(crate) ctl: *const ComputeCtl,
     pub(crate) cidx: u32,
+    /// The node the frame's closure is blocked reading, as
+    /// `slot | generation << 32`, stored by every nested non-Clean read
+    /// before it nests: a doom that marks this frame names it.
+    pub(crate) reading: u64,
+}
+
+/// What a nested non-Clean read learns of the frame it is made from.
+#[doc(hidden)]
+#[derive(Copy, Clone)]
+pub struct ActiveRead {
+    pub(crate) node: NodeId,
+    pub(crate) ctl: *const ComputeCtl,
+    pub(crate) cidx: u32,
+    /// Frames on the stack, the reading frame included. Under `Shared`
+    /// the stack is the thread's, so other runtimes' frames count too.
+    pub(crate) depth: u32,
 }
 
 /// A stack of frames, innermost last.
 #[doc(hidden)]
 pub struct Frames {
     pub(crate) frames: Vec<Frame>,
+    /// Added to a frame's index to give its conceptual-stack position: a
+    /// replay driver runs an entry at its level's position, above frames
+    /// whose positions are lower than their indexes would say.
+    pub(crate) bias: u32,
 }
 
 impl Frames {
@@ -53,7 +73,21 @@ impl Frames {
     }
 
     const fn new() -> Self {
-        Self { frames: Vec::new() }
+        Self {
+            frames: Vec::new(),
+            bias: 0,
+        }
+    }
+
+    fn frame(node: NodeId, rt: RuntimeId, ctl: &ComputeCtl, cidx: u32) -> Frame {
+        Frame {
+            node,
+            rt,
+            deps: Vec::with_capacity(4),
+            ctl,
+            cidx,
+            reading: 0,
+        }
     }
 }
 
@@ -76,14 +110,8 @@ pub trait DepStack: 'static {
     #[inline(always)]
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
         self.with(|s| {
-            let cidx = s.frames.len() as u32;
-            s.frames.push(Frame {
-                node,
-                rt,
-                deps: Vec::with_capacity(4),
-                ctl,
-                cidx,
-            });
+            let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
+            s.frames.push(Frames::frame(node, rt, ctl, cidx));
             cidx
         })
     }
@@ -92,15 +120,7 @@ pub trait DepStack: 'static {
     /// member runs all sit at the root's.
     #[doc(hidden)]
     fn push_frame_at(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl, cidx: u32) {
-        self.with(|s| {
-            s.frames.push(Frame {
-                node,
-                rt,
-                deps: Vec::with_capacity(4),
-                ctl,
-                cidx,
-            })
-        })
+        self.with(|s| s.frames.push(Frames::frame(node, rt, ctl, cidx)))
     }
 
     /// Pop the top frame and return the deps it recorded, each with the
@@ -128,6 +148,40 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// [`Self::record_dep`] for a nested non-Clean read, which also stores
+    /// the read in the frame and returns what the read needs to know of
+    /// the frame.
+    #[inline(always)]
+    fn record_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> Option<ActiveRead> {
+        self.with(|s| {
+            let depth = s.frames.len() as u32;
+            let top = s.active(rt, Self::THREAD_WIDE)?;
+            top.deps.push((dep, generation));
+            top.reading = u64::from(dep.0) | (u64::from(generation) << 32);
+            Some(ActiveRead {
+                node: top.node,
+                ctl: top.ctl,
+                cidx: top.cidx,
+                depth,
+            })
+        })
+    }
+
+    /// The position the next frame pushed with [`Self::push_frame`] gets.
+    fn next_cidx(&self) -> u32 {
+        self.with(|s| (s.frames.len() as u32).wrapping_add(s.bias))
+    }
+
+    /// Makes the next frame pushed with [`Self::push_frame`] sit at
+    /// `cidx`, returning the bias to restore once that frame has popped.
+    fn place_next_at(&self, cidx: u32) -> u32 {
+        self.with(|s| std::mem::replace(&mut s.bias, cidx.wrapping_sub(s.frames.len() as u32)))
+    }
+
+    fn restore_bias(&self, bias: u32) {
+        self.with(|s| s.bias = bias);
+    }
+
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
@@ -142,6 +196,38 @@ pub trait DepStack: 'static {
 
     /// The control block and position of `rt`'s active frame.
     #[doc(hidden)]
+    /// How many times `rt`'s active frame has read the node it reads
+    /// now, this read included.
+    fn reads_of_current(&self, rt: RuntimeId) -> u32 {
+        self.with(|s| {
+            s.active(rt, Self::THREAD_WIDE).map_or(0, |top| {
+                let reading = top.reading;
+                top.deps
+                    .iter()
+                    .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == reading)
+                    .count() as u32
+            })
+        })
+    }
+
+    /// For `rt`'s frames at positions `from..to`, bottom first, how many
+    /// times each has read the node it reads now.
+    fn read_ordinals(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<u32> {
+        self.with(|s| {
+            s.frames
+                .iter()
+                .filter(|f| f.rt == rt && (from..to).contains(&f.cidx))
+                .map(|f| {
+                    let reading = f.reading;
+                    f.deps
+                        .iter()
+                        .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == reading)
+                        .count() as u32
+                })
+                .collect()
+        })
+    }
+
     fn active_frame(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32)> {
         self.with(|s| {
             s.active(rt, Self::THREAD_WIDE)
@@ -174,6 +260,18 @@ pub trait DepStack: 'static {
             s.frames
                 .iter()
                 .rposition(|f| f.node == node && (!Self::THREAD_WIDE || f.rt == rt))
+        })
+    }
+
+    /// The position of the innermost frame on this stack computing
+    /// `node` of runtime `rt`, if one is.
+    fn frame_cidx(&self, rt: RuntimeId, node: NodeId) -> Option<u32> {
+        self.with(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .find(|f| f.node == node && (!Self::THREAD_WIDE || f.rt == rt))
+                .map(|f| f.cidx)
         })
     }
 

@@ -795,6 +795,7 @@ fn fixpoint_pair(rt: &Rt, x: Option<Incr<u64>>) -> (Incr<u64>, Incr<u64>) {
     let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
     let opts = || crate::cycle::QueryOpts {
         cycle: crate::cycle::CycleStrategy::Fixpoint(crate::cycle::Fixpoint::new(|| 0_u64)),
+        ..Default::default()
     };
     let a = {
         let bc = bc.clone();

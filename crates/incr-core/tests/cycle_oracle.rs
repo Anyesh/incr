@@ -324,7 +324,13 @@ fn build<C: Cells>(rt: &Runtime<C>, graph: &[Node]) -> Vec<Incr<i64>> {
                     .on_limit(|_c, s| s + ON_LIMIT),
             ),
         };
-        nodes.push(rt.create_query_with(f, QueryOpts { cycle }));
+        nodes.push(rt.create_query_with(
+            f,
+            QueryOpts {
+                cycle,
+                ..Default::default()
+            },
+        ));
     }
     for (cell, &n) in cells.iter().zip(&nodes) {
         cell.set(n).unwrap();

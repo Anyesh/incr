@@ -58,6 +58,7 @@ fn slots(cycle: &Cycle) -> Vec<u32> {
 fn fixpoint<T: crate::Value>(fp: Fixpoint<T>) -> QueryOpts<T> {
     QueryOpts {
         cycle: CycleStrategy::Fixpoint(fp),
+        ..Default::default()
     }
 }
 

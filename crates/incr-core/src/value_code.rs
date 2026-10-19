@@ -28,9 +28,15 @@ pub(crate) const MEMO_BIT: u64 = 1 << 63;
 pub(crate) const UNWIND_SHIFT: u32 = 61;
 pub(crate) const UNWIND_MASK: u64 = 3 << UNWIND_SHIFT;
 
+/// Set while a replay context of some runtime is open on this thread,
+/// so a non-Clean read finds out with the load it already makes for the
+/// counter whether it must look for virtual frames.
+pub(crate) const REPLAY_BIT: u64 = 1 << 60;
+
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
-/// so a live memo or unwind kind never trips the contract panic.
-pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT | UNWIND_MASK);
+/// so a live memo, unwind kind or replay context never trips the
+/// contract panic.
+pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT);
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
@@ -55,6 +61,16 @@ pub(crate) fn set_memo_bit() {
 
 pub(crate) fn clear_memo_bit() {
     THREAD_WORD.with(|w| w.set(w.get() & !MEMO_BIT));
+}
+
+pub(crate) fn set_replay_bit(open: bool) {
+    THREAD_WORD.with(|w| {
+        w.set(if open {
+            w.get() | REPLAY_BIT
+        } else {
+            w.get() & !REPLAY_BIT
+        })
+    });
 }
 
 /// Replaces the unwind kind's bits with `bits`, already shifted.

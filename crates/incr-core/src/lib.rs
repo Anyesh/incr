@@ -39,6 +39,7 @@ pub mod loom_cells;
 mod loom_models;
 pub mod node;
 mod reclaim_probe;
+mod replay;
 pub mod runtime;
 pub mod segmented_nodes;
 mod set_stack;
@@ -59,7 +60,7 @@ pub mod walk_ring;
 pub use arena::PrimitiveArena;
 pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use collection::{CollectionLog, Delta, GroupedCollection, IncrCollection};
-pub use cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
+pub use cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay};
 #[doc(hidden)]
 pub use cycle_state::{engine_unwind, take_last_cycle};
 pub use dep_stack::{DepStack, LocalDepStack, SharedDepStack};

@@ -6,7 +6,9 @@
 //!
 //! Entries are owned by the frame of the node whose skip tainted them
 //! (the lowest such frame when there are several) and cleared when it
-//! pops. A pop finds the memo through the thread word's bit alone, so a
+//! pops. An owner is one more than that frame's conceptual-stack
+//! position, so a replay context can own entries at its boundary, below
+//! every frame its driver runs. A pop finds the memo through the thread word's bit alone, so a
 //! frame that never tainted carries no owner flag; while the memo is
 //! non-empty, every pop compares its depth with the deepest owner, and
 //! only an owner's pop scans the entries. Clearing early is sound: a node with no entry is walked and
@@ -79,6 +81,46 @@ pub(crate) fn clear_from(depth: u32) {
             value_code::clear_memo_bit();
         }
     });
+}
+
+/// Entries taken out of the memo with their owners.
+pub(crate) type Parked = Vec<((RuntimeId, NodeId), u32)>;
+
+/// Takes out every entry owned at `from` or deeper: the frames that own
+/// them are being doomed, and each entry is put back, under the same
+/// owner, for the replay that the frame's virtual frame stands for.
+/// Their discards must not clear them, and the doomed runs' own entries
+/// must not outlive those runs.
+#[cold]
+#[inline(never)]
+pub(crate) fn take_from(from: u32) -> Parked {
+    MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        if m.deepest < from {
+            return Vec::new();
+        }
+        let mut taken = Vec::new();
+        m.owners.retain(|&key, &mut owner| {
+            if owner >= from {
+                taken.push((key, owner));
+            }
+            owner < from
+        });
+        m.deepest = m.owners.values().copied().max().unwrap_or(0);
+        if m.owners.is_empty() {
+            value_code::clear_memo_bit();
+        }
+        taken
+    })
+}
+
+/// Puts back entries [`take_from`] took.
+#[cold]
+#[inline(never)]
+pub(crate) fn restore(parked: Parked) {
+    for ((rt, id), owner) in parked {
+        memoize(rt, id, owner);
+    }
 }
 
 #[cfg(all(test, not(loom)))]

@@ -18,7 +18,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
-use crate::cycle_state::Held;
+use crate::cycle_state::{Episode, Held, Round, Step};
 use crate::{set_stack, waits};
 
 /// What a compute attempt carries into its landings.
@@ -43,6 +43,10 @@ pub(super) enum PopEnd {
     /// A recorded dep went stale: every member landed New, and the root
     /// claims again.
     Retry,
+    /// A doom discarded a member run: the episode waits in a replay
+    /// context, the root's claim with it, and the root's reader is
+    /// answered as a discarded compute's.
+    Suspended,
 }
 
 /// How group verification left the node `compute_one` claimed.
@@ -172,11 +176,13 @@ impl<C: Cells> Runtime<C> {
         loop {
             if outermost {
                 cycle_state::reset_outermost();
+                replay::reset();
             }
             let payload = match catch_unwind(AssertUnwindSafe(&mut *f)) {
                 Ok(r) => return Ok(r),
                 Err(payload) => payload,
             };
+            replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
             // A wound wins over any kind: whatever unwound last, this
             // thread gave up its claims to an older one, and retries.
             if outermost && cycle_state::wounded() {
@@ -208,9 +214,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// An engine unwind that a closure caught and returned past: a cycle
-    /// becomes an ordinary result, as under `try_get`. A wound stays in
-    /// flight and the pop is told to treat its closure as unwound, since
-    /// the claims the wound must release are still held.
+    /// becomes an ordinary result, as under `try_get`. A wound or a
+    /// speculative discard stays in flight and the pop is told to treat
+    /// its closure as unwound, since the claims the wound must release are
+    /// still held and the closure's value rests on the swallowed panic.
     #[cold]
     pub(super) fn swallowed(&self, kind: Option<UnwindKind>) -> bool {
         match kind {
@@ -218,7 +225,7 @@ impl<C: Cells> Runtime<C> {
                 cycle_state::set_unwind_kind(None);
                 false
             }
-            Some(UnwindKind::Wound) => true,
+            Some(UnwindKind::Wound) | Some(UnwindKind::Discard) => true,
             None => false,
         }
     }
@@ -325,6 +332,9 @@ impl<C: Cells> Runtime<C> {
                 .map(|f| f.node.0)
                 .collect()
         });
+        if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+            slots.extend(self.virtual_slots_from(p));
+        }
         cycle_state::with_held(|h| {
             slots.extend(
                 h.iter()
@@ -376,6 +386,13 @@ impl<C: Cells> Runtime<C> {
             h.get(&(rt, slot))
                 .map(|e| (e.anchor, e.in_cu, e.buf.is_some(), e.episode.clone()))
         });
+        // A held node with a virtual frame stands for a frame on the stack.
+        let on_stack = match on_stack {
+            None if held.is_some() && value_code::thread_word() & value_code::REPLAY_BIT != 0 => {
+                self.virtual_position(slot, handle.generation())
+            }
+            on_stack => on_stack,
+        };
         let p = match (on_stack, &held) {
             (Some(cidx), _) => cidx,
             (None, Some((anchor, ..))) => *anchor,
@@ -414,8 +431,8 @@ impl<C: Cells> Runtime<C> {
         let (anchor, _, buffered, _) = held.expect("an unseeded node off the stack is held");
         // R5: run the member for its value, then R4: read its buffer.
         if !buffered {
-            match self.member_run(slot, anchor) {
-                Ok(low) => ctl.lower(low),
+            match self.member_run(slot, anchor, false) {
+                Ok(low) => ctl.lower(low.expect("incr-core: an R5 member run is never doomed")),
                 Err(payload) => {
                     ctl.lower(anchor);
                     return Some(Err(self.member_run_unwound(kind, payload)));
@@ -476,7 +493,12 @@ impl<C: Cells> Runtime<C> {
     /// `cidx`: its value is buffered in the held map, with the deps it
     /// recorded. Returns the run's lowlink, or the panic it ended in, with
     /// the node marked failed.
-    pub(super) fn member_run(&self, slot: u32, cidx: u32) -> Result<u32, Payload> {
+    pub(super) fn member_run(
+        &self,
+        slot: u32,
+        cidx: u32,
+        doomable: bool,
+    ) -> Result<Option<u32>, Payload> {
         let id = NodeId(slot);
         let compute = {
             let inner = self.inner.read();
@@ -487,7 +509,11 @@ impl<C: Cells> Runtime<C> {
                 .map(std::ptr::from_ref)
                 .expect("incr-core: a held node is a query")
         };
-        let ctl = ComputeCtl::new(cycle::BUFFERED);
+        let ctl = ComputeCtl::new(if doomable {
+            cycle::BUFFERED
+        } else {
+            cycle::BUFFERED | cycle::NO_DOOM
+        });
         ctl.lowlink.set(cidx);
         self.dep_stack
             .push_frame_at(self.runtime_id, id, &ctl, cidx);
@@ -495,13 +521,26 @@ impl<C: Cells> Runtime<C> {
         // not freed (see `compute_attempts`).
         let compute = unsafe { &*compute };
         let failures = cycle_state::failures();
+        let first = replay::peek_id();
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
         let deps = self.dep_stack.pop_frame();
         let word = value_code::thread_word();
         if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
             && self.after_pop(word, result.is_ok())
         {
-            result = Err(Box::new(WoundUnwind));
+            result = Err(match UnwindKind::of_word(word) {
+                Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
+                _ => Box::new(WoundUnwind),
+            });
+        }
+        if ctl.has(cycle::DOOMED)
+            && (result.is_ok() || !matches!(cycle_state::unwind_kind(), Some(UnwindKind::Wound)))
+        {
+            self.member_run_doomed(slot, cidx, first, &ctl, result.err());
+            return Ok(None);
+        }
+        if result.is_err() {
+            replay::unwind_past_since(self.runtime_id, cidx, first);
         }
         let replaced = cycle_state::with_held(|h| {
             let e = h
@@ -520,7 +559,44 @@ impl<C: Cells> Runtime<C> {
             std::mem::replace(&mut e.buf, ctl.buf.take())
         });
         drop(replaced);
-        result.map(|_| ctl.lowlink.get())
+        result.map(|_| Some(ctl.lowlink.get()))
+    }
+
+    /// A member run a doom discarded: it stood on placeholders, so nothing
+    /// it computed is kept, but the member keeps its claim, for the run's
+    /// retry at its virtual frame. The claims anchored above it take the
+    /// discard landing.
+    #[cold]
+    #[inline(never)]
+    fn member_run_doomed(
+        &self,
+        slot: u32,
+        cidx: u32,
+        first: u64,
+        ctl: &ComputeCtl,
+        payload: Option<Payload>,
+    ) {
+        cycle_state::take_unwind_kind();
+        let mut bag = Deferred::new();
+        if let Some(payload) = payload {
+            bag.push_erased(payload);
+        }
+        if let Some(value) = ctl.buf.take() {
+            bag.push_erased(value);
+        }
+        // An episode a read in the run suspended waits for its member's
+        // virtual frame, not for this run's retry.
+        let suspended = replay::suspended_members(self.runtime_id);
+        self.release_held_except(cidx + 1, true, &suspended, &mut bag);
+        let old = cycle_state::with_held(|h| {
+            h.get_mut(&(self.runtime_id, slot))
+                .and_then(|e| e.buf.take())
+        });
+        if let Some(old) = old {
+            bag.push_erased(old);
+        }
+        replay::unwind_past_since(self.runtime_id, cidx + 1, first);
+        bag.drain(self);
     }
 
     /// A pop that found its frame `LOW`: defer the node, or run the
@@ -547,12 +623,20 @@ impl<C: Cells> Runtime<C> {
         held.wrote = ctl.wrote.get() != 0;
         held.opened = !ctl.children.get().is_null();
         held.record_run(deps);
-        held.owner = cidx;
+        held.own(cidx, id.0, false);
         let displaced = cycle_state::with_held(|h| h.insert((rt, id.0), held));
         debug_assert!(displaced.is_none(), "incr-core: node {} held twice", id.0);
         if lowlink < cidx {
             self.pass_down(cidx, lowlink);
             return PopEnd::Deferred;
+        }
+        if value_code::thread_word() & value_code::REPLAY_BIT != 0 && replay::speculative() {
+            // A speculative entry never runs an episode: the unbounded run
+            // may enter this cycle at another member, or not at all. The
+            // claims take the discard landing and the chain is dropped.
+            self.release_held_from(cidx, true, bag);
+            cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+            bag.drain_carried(Box::new(cycle::DiscardUnwind));
         }
         self.episode(id, cidx, bag)
     }
@@ -566,7 +650,7 @@ impl<C: Cells> Runtime<C> {
                 .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
                 .map(|((_, slot), e)| {
                     e.anchor = cidx;
-                    e.owner = cidx;
+                    e.own(cidx, u32::MAX, false);
                     *slot
                 })
                 .collect()
@@ -623,7 +707,7 @@ impl<C: Cells> Runtime<C> {
     /// with the discard landing, and the unwind resumes.
     fn abort_episode(&self, cidx: u32, payload: Payload, bag: &mut Deferred<C>) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.release_held_from(cidx, kind, bag);
+        self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), bag);
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
@@ -649,10 +733,27 @@ impl<C: Cells> Runtime<C> {
         })
     }
 
-    /// Runs one member and folds its lowlink into `low`.
-    fn run_member(&self, slot: u32, cidx: u32, low: &mut u32, bag: &mut Deferred<C>) {
-        match self.member_run(slot, cidx) {
-            Ok(l) => *low = (*low).min(l),
+    /// Runs one member of episode `ep`, as its id and root, and folds its
+    /// lowlink into `low`; `false` if a doom discarded the run, which
+    /// suspends the episode.
+    fn run_member(
+        &self,
+        slot: u32,
+        cidx: u32,
+        ep: (u64, u32),
+        low: &mut u32,
+        bag: &mut Deferred<C>,
+    ) -> bool {
+        replay::enter_member_run(cidx, ep);
+        let ran = self.member_run(slot, cidx, true);
+        replay::leave_member_run();
+        replay::run_ended(self.runtime_id, cidx, matches!(ran, Ok(None)));
+        match ran {
+            Ok(Some(l)) => {
+                *low = (*low).min(l);
+                true
+            }
+            Ok(None) => false,
             Err(payload) => self.abort_episode(cidx, payload, bag),
         }
     }
@@ -662,227 +763,324 @@ impl<C: Cells> Runtime<C> {
     /// or dissolve it.
     pub(super) fn episode(&self, root: NodeId, cidx: u32, bag: &mut Deferred<C>) -> PopEnd {
         let rt = self.runtime_id;
-        let mut validated = cycle_state::has_dissolved(rt, root.0);
-        let mut members = self.claim_members(cidx);
-        let mut cu: Vec<u32> = Vec::new();
+        let ep = Box::new(Episode {
+            id: replay::next_id(),
+            root,
+            cidx,
+            validated: cycle_state::has_dissolved(rt, root.0),
+            members: self.claim_members(cidx),
+            cu: Vec::new(),
+            round: None,
+        });
+        self.run_episode(ep, bag)
+    }
 
+    /// Runs episode `ep` on from where it stands. A member run that a doom
+    /// discards suspends it in the context of that run's virtual frame,
+    /// whose pop resumes it with the same member in the same iteration.
+    pub(super) fn run_episode(&self, mut ep: Box<Episode>, bag: &mut Deferred<C>) -> PopEnd {
+        let rt = self.runtime_id;
+        let cidx = ep.cidx;
+        let id = ep.id;
+        let root = ep.root.0;
         'restart: loop {
-            let cycle = Cycle::new(members.iter().map(|&m| self.erased_at_live(m)).collect());
-            let strategies: Vec<(u32, Arc<dyn ErasedStrategy>)> = {
-                let inner = self.inner.read();
-                members
-                    .iter()
-                    .filter_map(|&m| inner.cycle_strategies.get(&m).map(|s| (m, s.clone())))
-                    .collect()
-            };
-            let limit = strategies
-                .iter()
-                .filter_map(|(_, s)| s.max_iterations())
-                .min()
-                .unwrap_or(1);
-            let unseeded: Vec<u32> = members
-                .iter()
-                .copied()
-                .filter(|m| strategies.binary_search_by_key(m, |(s, _)| *s).is_err())
-                .collect();
-            cycle_state::with_held(|h| {
-                for m in &members {
-                    let e = h
-                        .get_mut(&(rt, *m))
-                        .expect("incr-core: an episode member is held");
-                    e.anchor = cidx;
-                    e.owner = cidx;
-                    e.episode = Some(cycle.clone());
-                    e.in_cu = cu.binary_search(m).is_ok();
-                    e.installed.clear();
-                }
-            });
-            // Every claim precedes this capture, because membership growth
-            // restarts the episode.
-            let stamp_rev = self.current_revision();
-            let verify_rev = C::walked(&self.walk, &self.revision);
-            for (m, s) in &strategies {
-                let v0 = self.attributed(*m, cidx, bag, || self.callback(|| s.v0(&cycle)));
-                let old = self.take_held(*m, |e| e.s.replace(v0));
-                self.drop_member_value(*m, cidx, old, bag);
-            }
-
-            // s_{k-1} of each Fixpoint member, for the convergence test and
-            // the landing pass.
-            let mut prev: Vec<Option<Erased>> = (0..strategies.len()).map(|_| None).collect();
-            let mut k: u32 = 1;
-            loop {
-                // 1. Clear the unseeded buffers.
-                for &m in &unseeded {
-                    let old = self.take_held(m, |e| e.buf.take());
-                    self.drop_member_value(m, cidx, old, bag);
-                }
-                // 2. Run each seeded member once, in slot order.
-                let mut low = cidx;
-                for (m, _) in &strategies {
-                    self.run_member(*m, cidx, &mut low, bag);
-                }
-                // 3. Run the unseeded members no read has run.
-                for &m in &unseeded {
-                    if self.take_held(m, |e| e.buf.is_none()) {
-                        self.run_member(m, cidx, &mut low, bag);
-                    }
-                }
-                // 6. A run reached below the root: the group belongs to a
-                // lower root's cycle.
-                if low < cidx {
-                    self.merge_down(cidx, low, bag);
-                    return PopEnd::Deferred;
-                }
-                // 5. A non-member that read the group joined it.
-                if self.join_new(cidx, &mut members) {
-                    continue 'restart;
-                }
-                let graph = self.member_graph(&members);
-                if !validated {
-                    validated = true;
-                    let comp = components(&graph);
-                    let r = members
-                        .binary_search(&root.0)
-                        .expect("the root is a member");
-                    let scc: Vec<u32> = members
+            if ep.round.is_none() {
+                let cycle =
+                    Cycle::new(ep.members.iter().map(|&m| self.erased_at_live(m)).collect());
+                let strategies: Vec<(u32, Arc<dyn ErasedStrategy>)> = {
+                    let inner = self.inner.read();
+                    ep.members
                         .iter()
-                        .enumerate()
-                        .filter(|(i, _)| comp[*i] == comp[r])
-                        .map(|(_, &m)| m)
-                        .collect();
-                    if scc.len() == 1 && !graph[r].contains(&r) {
-                        cycle_state::dissolved_before(rt, root.0);
-                        self.release_members(&members, Some(root.0), bag);
-                        let entry = cycle_state::with_held(|h| h.remove(&(rt, root.0)));
-                        if let Some(e) = entry {
-                            bag.push_erased(Box::new((e.buf, e.s)));
-                        }
-                        return PopEnd::Dissolved;
-                    }
-                    if scc.len() < members.len() {
-                        let gone: Vec<u32> = members
-                            .iter()
-                            .copied()
-                            .filter(|m| scc.binary_search(m).is_err())
-                            .collect();
-                        self.release_members(&gone, None, bag);
-                        members = scc;
-                        continue 'restart;
-                    }
-                }
-                // CU: the unseeded members that still read each other.
-                let un_idx: Vec<usize> = unseeded
+                        .filter_map(|&m| inner.cycle_strategies.get(&m).map(|s| (m, s.clone())))
+                        .collect()
+                };
+                let limit = strategies
                     .iter()
-                    .map(|m| {
-                        members
-                            .binary_search(m)
-                            .expect("an unseeded member is a member")
-                    })
-                    .collect();
-                let sub: Vec<Vec<usize>> = un_idx
-                    .iter()
-                    .map(|&i| {
-                        graph[i]
-                            .iter()
-                            .filter_map(|j| un_idx.binary_search(j).ok())
-                            .collect()
-                    })
-                    .collect();
-                let cyclic = in_cycles(&sub);
-                let mut grew = false;
-                for (i, &m) in unseeded.iter().enumerate() {
-                    if cyclic[i] {
-                        if let Err(at) = cu.binary_search(&m) {
-                            cu.insert(at, m);
-                            grew = true;
-                        }
-                    }
-                }
-                if grew {
-                    continue 'restart;
-                }
-
-                // 4. The strategy members' next values.
-                let mut converged = vec![true; strategies.len()];
-                for (i, (m, s)) in strategies.iter().enumerate() {
-                    let out = self.take_held(*m, |e| e.buf.take());
-                    if s.max_iterations().is_none() {
-                        self.drop_member_value(*m, cidx, out, bag);
-                        continue;
-                    }
-                    let out = out.expect("incr-core: a member run buffers its value");
-                    let s_prev = self
-                        .take_held(*m, |e| e.s.take())
-                        .expect("incr-core: a strategy member has a value");
-                    let next = self
-                        .attributed(*m, cidx, bag, || self.callback(|| s.step(&s_prev, out, k)));
-                    converged[i] = self.attributed(*m, cidx, bag, || {
-                        self.callback(|| s.converged(&s_prev, &next))
-                    });
-                    self.take_held(*m, |e| e.s = Some(next));
-                    let older = prev[i].replace(s_prev);
-                    self.drop_member_value(*m, cidx, older, bag);
-                }
-                if converged.iter().all(|&c| c) || k >= limit {
-                    for (i, (m, s)) in strategies.iter().enumerate() {
-                        if !converged[i] {
-                            let last = self
-                                .take_held(*m, |e| e.s.take())
-                                .expect("incr-core: a strategy member has a value");
-                            let landed = self.attributed(*m, cidx, bag, || {
-                                self.callback(|| s.on_limit(&cycle, last))
-                            });
-                            self.take_held(*m, |e| e.s = Some(landed));
-                        }
-                    }
-                    break;
-                }
-                k += 1;
-            }
-
-            // The landing pass: unseeded members outside CU computed
-            // against s_{K-1} run once more against s*, unless no
-            // Fixpoint member moved.
-            let moved = strategies.iter().enumerate().any(|(i, (m, s))| {
-                prev[i].as_ref().is_some_and(|p| {
-                    let cur = self.take_held(*m, |e| e.s.take());
-                    let same = cur.as_ref().is_some_and(|c| {
-                        self.attributed(*m, cidx, bag, || value_code::run(|| s.same(p, c)))
-                    });
-                    self.take_held(*m, |e| e.s = cur);
-                    !same
-                })
-            });
-            for (i, p) in prev.into_iter().enumerate() {
-                self.drop_member_value(strategies[i].0, cidx, p, bag);
-            }
-            if moved {
-                let outside: Vec<u32> = unseeded
+                    .filter_map(|(_, s)| s.max_iterations())
+                    .min()
+                    .unwrap_or(1);
+                let unseeded: Vec<u32> = ep
+                    .members
                     .iter()
                     .copied()
-                    .filter(|m| cu.binary_search(m).is_err())
+                    .filter(|m| strategies.binary_search_by_key(m, |(s, _)| *s).is_err())
                     .collect();
-                for &m in &outside {
-                    let old = self.take_held(m, |e| e.buf.take());
-                    self.drop_member_value(m, cidx, old, bag);
+                cycle_state::with_held(|h| {
+                    for m in &ep.members {
+                        let e = h
+                            .get_mut(&(rt, *m))
+                            .expect("incr-core: an episode member is held");
+                        e.anchor = cidx;
+                        e.own(cidx, u32::MAX, false);
+                        e.episode = Some(cycle.clone());
+                        e.in_cu = ep.cu.binary_search(m).is_ok();
+                        e.installed.clear();
+                    }
+                });
+                // Every claim precedes this capture, because membership growth
+                // restarts the episode.
+                let stamp_rev = self.current_revision();
+                let verify_rev = C::walked(&self.walk, &self.revision);
+                for (m, s) in &strategies {
+                    let v0 = self.attributed(*m, cidx, bag, || self.callback(|| s.v0(&cycle)));
+                    let old = self.take_held(*m, |e| e.s.replace(v0));
+                    self.drop_member_value(*m, cidx, old, bag);
                 }
-                let mut low = cidx;
-                for &m in &outside {
-                    if self.take_held(m, |e| e.buf.is_none()) {
-                        self.run_member(m, cidx, &mut low, bag);
+                // s_{k-1} of each Fixpoint member, for the convergence test and
+                // the landing pass.
+                let prev = (0..strategies.len()).map(|_| None).collect();
+                ep.round = Some(Round {
+                    cycle,
+                    strategies,
+                    limit,
+                    unseeded,
+                    stamp_rev,
+                    verify_rev,
+                    prev,
+                    k: 1,
+                    low: cidx,
+                    step: Step::Clear,
+                });
+            }
+            let r = ep
+                .round
+                .as_mut()
+                .expect("incr-core: the episode has a round");
+            loop {
+                match &mut r.step {
+                    // 1. Clear the unseeded buffers.
+                    Step::Clear => {
+                        for &m in &r.unseeded {
+                            let old = self.take_held(m, |e| e.buf.take());
+                            self.drop_member_value(m, cidx, old, bag);
+                        }
+                        r.low = cidx;
+                        r.step = Step::Seeded(0);
+                    }
+                    // 2. Run each seeded member once, in slot order.
+                    Step::Seeded(i) => {
+                        let i = *i;
+                        let Some(&(m, _)) = r.strategies.get(i) else {
+                            r.step = Step::Unseeded(0);
+                            continue;
+                        };
+                        if !self.run_member(m, cidx, (id, root), &mut r.low, bag) {
+                            return self.suspend_episode(ep);
+                        }
+                        r.step = Step::Seeded(i + 1);
+                    }
+                    // 3. Run the unseeded members no read has run.
+                    Step::Unseeded(i) => {
+                        let i = *i;
+                        let Some(&m) = r.unseeded.get(i) else {
+                            r.step = Step::Check;
+                            continue;
+                        };
+                        if self.take_held(m, |e| e.buf.is_none())
+                            && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
+                        {
+                            return self.suspend_episode(ep);
+                        }
+                        r.step = Step::Unseeded(i + 1);
+                    }
+                    Step::Check => {
+                        // 6. A run reached below the root: the group belongs to a
+                        // lower root's cycle.
+                        if r.low < cidx {
+                            self.merge_down(cidx, r.low, bag);
+                            return PopEnd::Deferred;
+                        }
+                        // 5. A non-member that read the group joined it.
+                        if self.join_new(cidx, &mut ep.members) {
+                            ep.round = None;
+                            continue 'restart;
+                        }
+                        let graph = self.member_graph(&ep.members);
+                        if !ep.validated {
+                            ep.validated = true;
+                            let comp = components(&graph);
+                            let at = ep
+                                .members
+                                .binary_search(&ep.root.0)
+                                .expect("the root is a member");
+                            let scc: Vec<u32> = ep
+                                .members
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, _)| comp[*i] == comp[at])
+                                .map(|(_, &m)| m)
+                                .collect();
+                            if scc.len() == 1 && !graph[at].contains(&at) {
+                                cycle_state::dissolved_before(rt, ep.root.0);
+                                self.release_members(&ep.members, Some(ep.root.0), bag);
+                                let entry = cycle_state::with_held(|h| h.remove(&(rt, ep.root.0)));
+                                if let Some(e) = entry {
+                                    bag.push_erased(Box::new((e.buf, e.s)));
+                                }
+                                return PopEnd::Dissolved;
+                            }
+                            if scc.len() < ep.members.len() {
+                                let gone: Vec<u32> = ep
+                                    .members
+                                    .iter()
+                                    .copied()
+                                    .filter(|m| scc.binary_search(m).is_err())
+                                    .collect();
+                                self.release_members(&gone, None, bag);
+                                ep.members = scc;
+                                ep.round = None;
+                                continue 'restart;
+                            }
+                        }
+                        // CU: the unseeded members that still read each other.
+                        let un_idx: Vec<usize> = r
+                            .unseeded
+                            .iter()
+                            .map(|m| {
+                                ep.members
+                                    .binary_search(m)
+                                    .expect("an unseeded member is a member")
+                            })
+                            .collect();
+                        let sub: Vec<Vec<usize>> = un_idx
+                            .iter()
+                            .map(|&i| {
+                                graph[i]
+                                    .iter()
+                                    .filter_map(|j| un_idx.binary_search(j).ok())
+                                    .collect()
+                            })
+                            .collect();
+                        let cyclic = in_cycles(&sub);
+                        let mut grew = false;
+                        for (i, &m) in r.unseeded.iter().enumerate() {
+                            if cyclic[i] {
+                                if let Err(at) = ep.cu.binary_search(&m) {
+                                    ep.cu.insert(at, m);
+                                    grew = true;
+                                }
+                            }
+                        }
+                        if grew {
+                            ep.round = None;
+                            continue 'restart;
+                        }
+
+                        // 4. The strategy members' next values.
+                        let mut converged = vec![true; r.strategies.len()];
+                        for (i, (m, s)) in r.strategies.iter().enumerate() {
+                            let out = self.take_held(*m, |e| e.buf.take());
+                            if s.max_iterations().is_none() {
+                                self.drop_member_value(*m, cidx, out, bag);
+                                continue;
+                            }
+                            let out = out.expect("incr-core: a member run buffers its value");
+                            let s_prev = self
+                                .take_held(*m, |e| e.s.take())
+                                .expect("incr-core: a strategy member has a value");
+                            let k = r.k;
+                            let next = self.attributed(*m, cidx, bag, || {
+                                self.callback(|| s.step(&s_prev, out, k))
+                            });
+                            converged[i] = self.attributed(*m, cidx, bag, || {
+                                self.callback(|| s.converged(&s_prev, &next))
+                            });
+                            self.take_held(*m, |e| e.s = Some(next));
+                            let older = r.prev[i].replace(s_prev);
+                            self.drop_member_value(*m, cidx, older, bag);
+                        }
+                        if !(converged.iter().all(|&c| c) || r.k >= r.limit) {
+                            r.k += 1;
+                            r.step = Step::Clear;
+                            continue;
+                        }
+                        for (i, (m, s)) in r.strategies.iter().enumerate() {
+                            if !converged[i] {
+                                let last = self
+                                    .take_held(*m, |e| e.s.take())
+                                    .expect("incr-core: a strategy member has a value");
+                                let landed = self.attributed(*m, cidx, bag, || {
+                                    self.callback(|| s.on_limit(&r.cycle, last))
+                                });
+                                self.take_held(*m, |e| e.s = Some(landed));
+                            }
+                        }
+
+                        // The landing pass: unseeded members outside CU computed
+                        // against s_{K-1} run once more against s*, unless no
+                        // Fixpoint member moved.
+                        let moved = r.strategies.iter().enumerate().any(|(i, (m, s))| {
+                            r.prev[i].as_ref().is_some_and(|p| {
+                                let cur = self.take_held(*m, |e| e.s.take());
+                                let same = cur.as_ref().is_some_and(|c| {
+                                    self.attributed(*m, cidx, bag, || {
+                                        value_code::run(|| s.same(p, c))
+                                    })
+                                });
+                                self.take_held(*m, |e| e.s = cur);
+                                !same
+                            })
+                        });
+                        let prev = std::mem::take(&mut r.prev);
+                        for (i, p) in prev.into_iter().enumerate() {
+                            self.drop_member_value(r.strategies[i].0, cidx, p, bag);
+                        }
+                        if !moved {
+                            break;
+                        }
+                        let outside: Vec<u32> = r
+                            .unseeded
+                            .iter()
+                            .copied()
+                            .filter(|m| ep.cu.binary_search(m).is_err())
+                            .collect();
+                        for &m in &outside {
+                            let old = self.take_held(m, |e| e.buf.take());
+                            self.drop_member_value(m, cidx, old, bag);
+                        }
+                        r.low = cidx;
+                        r.step = Step::Landing { outside, next: 0 };
+                    }
+                    Step::Landing { outside, next } => {
+                        let Some(&m) = outside.get(*next) else {
+                            if r.low < cidx {
+                                self.merge_down(cidx, r.low, bag);
+                                return PopEnd::Deferred;
+                            }
+                            if self.join_new(cidx, &mut ep.members) {
+                                ep.round = None;
+                                continue 'restart;
+                            }
+                            break;
+                        };
+                        *next += 1;
+                        if self.take_held(m, |e| e.buf.is_none())
+                            && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
+                        {
+                            *next -= 1;
+                            return self.suspend_episode(ep);
+                        }
                     }
                 }
-                if low < cidx {
-                    self.merge_down(cidx, low, bag);
-                    return PopEnd::Deferred;
-                }
-                if self.join_new(cidx, &mut members) {
-                    continue 'restart;
-                }
             }
-            return self.land_episode(&members, &cu, cycle, stamp_rev, verify_rev, cidx, bag);
+            let r = ep.round.take().expect("incr-core: the episode has a round");
+            return self.land_episode(
+                &ep.members,
+                &ep.cu,
+                r.cycle,
+                r.stamp_rev,
+                r.verify_rev,
+                cidx,
+                bag,
+            );
         }
+    }
+
+    /// Stores episode `ep`, whose member run a doom discarded, in the
+    /// context that holds that run's virtual frame.
+    fn suspend_episode(&self, ep: Box<Episode>) -> PopEnd {
+        replay::suspend(self.runtime_id, ep);
+        PopEnd::Suspended
     }
 
     /// Adds every claim held at or above `cidx` that is not yet a member.
@@ -895,7 +1093,7 @@ impl<C: Cells> Runtime<C> {
                 })
                 .map(|((_, slot), e)| {
                     e.anchor = cidx;
-                    e.owner = cidx;
+                    e.own(cidx, u32::MAX, false);
                     *slot
                 })
                 .collect()
@@ -933,16 +1131,9 @@ impl<C: Cells> Runtime<C> {
     /// The frame at `cidx` popped deferred with lowlink `low`: the claims
     /// its subtree deferred re-anchor at `low` too, not at a later frame
     /// at their position, and pass to its parent, which inherits `low`.
-    fn pass_down(&self, cidx: u32, low: u32) {
+    pub(super) fn pass_down(&self, cidx: u32, low: u32) {
         let rt = self.runtime_id;
-        let parent = match self.dep_stack.active_frame(rt) {
-            Some((parent, at)) => {
-                // SAFETY: the active frame's control block is live.
-                unsafe { &*parent }.lower(low);
-                at
-            }
-            None => cidx.saturating_sub(1),
-        };
+        let (parent, node, virtual_frame) = self.lower_parent(cidx, low);
         cycle_state::with_held(|h| {
             for ((r, _), e) in h.iter_mut() {
                 if *r == rt {
@@ -950,7 +1141,7 @@ impl<C: Cells> Runtime<C> {
                         e.anchor = low;
                     }
                     if e.owner >= cidx {
-                        e.owner = parent;
+                        e.own(parent, node, virtual_frame);
                     }
                 }
             }
@@ -974,17 +1165,60 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Lands every claim of this runtime held at or above `cidx`, or owned
-    /// there, since a frame that unwinds takes the claims its subtree
-    /// deferred to a root below it: a claim whose own code panicked in user
-    /// code takes fix 5's panic path, and every other claim, and every
-    /// claim under an engine unwind, the discard landing.
-    pub(super) fn release_held_from(
+    /// Lands every claim of this runtime held at or above `cidx`: a claim
+    /// whose own code panicked in user code takes fix 5's panic path, and
+    /// every other claim, and every claim under an engine unwind or a
+    /// discard (`discarding`), the discard landing.
+    pub(super) fn release_held_from(&self, cidx: u32, discarding: bool, bag: &mut Deferred<C>) {
+        self.release_held_where(cidx, discarding, None, &[], bag);
+    }
+
+    /// [`Self::release_held_from`] for a frame at `cidx` that unwound with
+    /// `kind`: the claims its subtree deferred to a root below it go too.
+    /// A doom's discard keeps those, for the frame's retry to read, and so
+    /// does a speculative run's unwind, which the unbounded run may never
+    /// make: another frame at the position may own them.
+    pub(super) fn release_unwound_from(
         &self,
         cidx: u32,
+        node: u32,
         kind: Option<UnwindKind>,
+        discarding: bool,
         bag: &mut Deferred<C>,
     ) {
+        let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
+        self.release_held_where(cidx, discarding, subtree, &[], bag);
+    }
+
+    /// [`Self::release_held_from`], keeping the claims in `keep`.
+    pub(super) fn release_held_except(
+        &self,
+        cidx: u32,
+        discarding: bool,
+        keep: &[u32],
+        bag: &mut Deferred<C>,
+    ) {
+        self.release_held_where(cidx, discarding, None, keep, bag);
+    }
+
+    fn release_held_where(
+        &self,
+        cidx: u32,
+        discarding: bool,
+        subtree: Option<u32>,
+        keep: &[u32],
+        bag: &mut Deferred<C>,
+    ) {
+        // The unwinding frame, of node `subtree`, owns the claims owned at
+        // its position by it, and those owned above.
+        let owned = |e: &Held| {
+            subtree.is_some_and(|node| {
+                e.owner > cidx
+                    || e.owner == cidx
+                        && !e.owner_virtual
+                        && (e.owner_node == node || e.owner_node == u32::MAX)
+            })
+        };
         let rt = self.runtime_id;
         let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             if h.is_empty() {
@@ -992,7 +1226,9 @@ impl<C: Cells> Runtime<C> {
             }
             let keys: Vec<(RuntimeId, u32)> = h
                 .iter()
-                .filter(|((r, _), e)| *r == rt && (e.anchor >= cidx || e.owner >= cidx))
+                .filter(|((r, slot), e)| {
+                    *r == rt && (e.anchor >= cidx || owned(e)) && !keep.contains(slot)
+                })
                 .map(|(k, _)| *k)
                 .collect();
             keys.into_iter()
@@ -1008,7 +1244,7 @@ impl<C: Cells> Runtime<C> {
         let verify_rev = C::walked(&self.walk, &self.revision);
         for (slot, e) in entries {
             let id = NodeId(slot);
-            if e.failed && kind.is_none() {
+            if e.failed && !discarding {
                 let (node, flags) = self.nodes.get_with_flags(slot);
                 let attempt = Attempt {
                     first: e.first,
@@ -1050,6 +1286,80 @@ impl<C: Cells> Runtime<C> {
             NodeState::Dirty
         };
         self.land_single(id, node, flags, target, target);
+    }
+
+    /// Lands held node `slot` from its last run's buffer, as
+    /// `compute_attempts` lands a run that popped neither LOW nor rooting a
+    /// claim: a virtual hit's claim stood for its frame on the stack, and
+    /// that frame turned out to be no cycle's member. `revs` are the stamp
+    /// and verify revisions taken before the run. `Ok(false)` if a dep went
+    /// stale, so that the node landed New for a retry; `Err` if writing the
+    /// value panicked, with the claim still held.
+    pub(super) fn land_alone(
+        &self,
+        slot: u32,
+        (stamp_rev, verify_rev): (u64, u64),
+        bag: &mut Deferred<C>,
+    ) -> Result<bool, Payload> {
+        let rt = self.runtime_id;
+        let id = NodeId(slot);
+        let (node, flags) = self.nodes.get_with_flags(slot);
+        let mut e = cycle_state::with_held(|h| h.remove(&(rt, slot)))
+            .expect("incr-core: a landing claim is held");
+        let value = e.buf.take().expect("incr-core: a finished run has a value");
+        let arena = self.arenas.erased(node.type_tag());
+        let wrote = Cell::new(0_u8);
+        let first = e.first;
+        let written = catch_unwind(AssertUnwindSafe(|| {
+            arena.write_erased(node.arena_slot(), value, first, &wrote)
+        }));
+        e.wrote |= wrote.get() != 0;
+        let changed = match written {
+            Ok((changed, displaced)) => {
+                if let Some(d) = displaced {
+                    bag.push_erased(d);
+                }
+                changed
+            }
+            Err(payload) => {
+                cycle_state::with_held(|h| h.insert((rt, slot), e));
+                return Err(payload);
+            }
+        };
+        if changed || first {
+            node.max_changed_at(stamp_rev);
+        }
+        let published = self.publish_deps(id, &e.last, None, verify_rev, bag);
+        let landed = if published == Publish::Stale {
+            if first && !e.wrote {
+                node.set_verified_at(0);
+            }
+            self.children_landing(id, flags, ChildLanding::Discard, e.opened, bag);
+            self.land_single(id, node, flags, NodeState::New, NodeState::New);
+            false
+        } else {
+            if e.poisoned {
+                node.set_verified_at(0);
+            } else {
+                node.max_verified_at(verify_rev);
+            }
+            let (target, children) = if published == Publish::Superseded || e.poisoned {
+                (NodeState::Dirty, ChildLanding::Keep)
+            } else {
+                (NodeState::Clean, ChildLanding::Sweep)
+            };
+            self.children_landing(id, flags, children, e.opened, bag);
+            self.land_single(id, node, flags, target, NodeState::Dirty);
+            self.record_trace(
+                id,
+                crate::trace::TraceAction::Recomputed {
+                    value_changed: changed,
+                },
+            );
+            true
+        };
+        bag.push_erased(Box::new((e.buf, e.s)));
+        Ok(landed)
     }
 
     /// Lands an episode whose claims are complete (the plan's Landing
@@ -1286,7 +1596,7 @@ impl<C: Cells> Runtime<C> {
             return GroupEnd::Ordinary;
         }
         // The members' runs sit where `x`'s frame would.
-        let cidx = self.dep_stack.depth() as u32;
+        let cidx = self.dep_stack.next_cidx();
         // 1. Claim the other members, Dirty to Computing, in slot order.
         let mut claimed: Vec<u32> = Vec::new();
         for &(m, generation) in &group.members {
@@ -1400,6 +1710,7 @@ impl<C: Cells> Runtime<C> {
             PopEnd::Deferred => GroupEnd::Done(Computed::Deferred),
             PopEnd::Dissolved => GroupEnd::Ordinary,
             PopEnd::Retry => GroupEnd::Retry,
+            PopEnd::Suspended => GroupEnd::Done(Computed::Discarded),
         }
     }
 }

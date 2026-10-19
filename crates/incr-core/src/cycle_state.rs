@@ -7,7 +7,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
-use crate::cycle::{Cycle, Erased};
+use std::sync::Arc;
+
+use crate::cycle::{Cycle, Erased, ErasedStrategy};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::value_code;
@@ -23,6 +25,14 @@ pub(crate) struct Held {
     /// deferral to a root below that frame leaves it anchored lower, so the
     /// anchor alone would let an unwind between them leak the claim.
     pub(crate) owner: u32,
+    /// The node of the frame at `owner`, `u32::MAX` for any: another frame
+    /// at that position later, a sibling's, owns none of it.
+    pub(crate) owner_node: u32,
+    /// The owner is a virtual frame, the run of `owner_node` that a doom
+    /// discarded. A run of that node at that position before its retry is
+    /// another run, as its reader's retry makes when it reads the node more
+    /// than once, and must not release what the doomed run deferred.
+    pub(crate) owner_virtual: bool,
     /// The node has a Fallback or Fixpoint strategy.
     pub(crate) seeded: bool,
     /// The claim was taken from New.
@@ -56,11 +66,21 @@ pub(crate) struct Held {
 }
 
 impl Held {
+    /// Hands the claim to the frame at `owner`, of `node` (`u32::MAX` for
+    /// whichever frame is there), virtual or not.
+    pub(crate) fn own(&mut self, owner: u32, node: u32, virtual_frame: bool) {
+        self.owner = owner;
+        self.owner_node = node;
+        self.owner_virtual = virtual_frame;
+    }
+
     pub(crate) fn new(generation: u32, anchor: u32, seeded: bool, first: bool) -> Self {
         Self {
             generation,
             anchor,
             owner: anchor,
+            owner_node: u32::MAX,
+            owner_virtual: false,
             seeded,
             first,
             buf: None,
@@ -92,6 +112,49 @@ impl Held {
     }
 }
 
+/// An episode between member runs. A doom that discards a member run
+/// suspends it in a replay context until that run's virtual frame pops.
+pub(crate) struct Episode {
+    pub(crate) id: u64,
+    pub(crate) root: NodeId,
+    pub(crate) cidx: u32,
+    pub(crate) validated: bool,
+    pub(crate) members: Vec<u32>,
+    pub(crate) cu: Vec<u32>,
+    /// The iteration state since the last restart, `None` at a restart.
+    pub(crate) round: Option<Round>,
+}
+
+pub(crate) struct Round {
+    pub(crate) cycle: Cycle,
+    pub(crate) strategies: Vec<(u32, Arc<dyn ErasedStrategy>)>,
+    pub(crate) limit: u32,
+    pub(crate) unseeded: Vec<u32>,
+    pub(crate) stamp_rev: u64,
+    pub(crate) verify_rev: u64,
+    /// `s_{k-1}` of each Fixpoint member.
+    pub(crate) prev: Vec<Option<Erased>>,
+    pub(crate) k: u32,
+    pub(crate) low: u32,
+    pub(crate) step: Step,
+}
+
+/// Where iteration `k` of a round stands.
+pub(crate) enum Step {
+    Clear,
+    /// The seeded member at this index runs next.
+    Seeded(usize),
+    /// The unseeded member at this index runs next, if no read has.
+    Unseeded(usize),
+    /// Steps 6, 5, validation, CU growth and 4.
+    Check,
+    /// The landing pass's runs of the unseeded members outside CU.
+    Landing {
+        outside: Vec<u32>,
+        next: usize,
+    },
+}
+
 /// Why an engine unwind is in flight.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum UnwindKind {
@@ -99,6 +162,10 @@ pub(crate) enum UnwindKind {
     Cycle,
     /// The wound-wait scheduler released this thread's claims.
     Wound,
+    /// A user panic in a speculative entry's run. Every frame it reaches,
+    /// a closure that caught it included, takes the discard landing, so
+    /// no value computed over the swallowed panic lands.
+    Discard,
 }
 
 type HeldMap = HashMap<(RuntimeId, u32), Held>;
@@ -120,6 +187,9 @@ struct EntryState {
     /// The held map has entries: a check of a thread that holds nothing
     /// reads this block and not the map, whose access tests liveness.
     held_any: Cell<bool>,
+    /// The address of a local of the outermost entry, from which a read
+    /// measures the stack it has used against a byte budget.
+    stack_base: Cell<usize>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -140,6 +210,7 @@ thread_local! {
             failures: Cell::new(0),
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
+            stack_base: Cell::new(0),
         }
     };
     static OUTER: RefCell<Outer> = const {
@@ -160,6 +231,7 @@ loom::thread_local! {
         failures: Cell::new(0),
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
+        stack_base: Cell::new(0),
     };
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
@@ -207,6 +279,7 @@ impl UnwindKind {
             None => 0,
             Some(UnwindKind::Cycle) => 1,
             Some(UnwindKind::Wound) => 2,
+            Some(UnwindKind::Discard) => 3,
         }) << value_code::UNWIND_SHIFT
     }
 
@@ -215,7 +288,8 @@ impl UnwindKind {
         match (word & value_code::UNWIND_MASK) >> value_code::UNWIND_SHIFT {
             0 => None,
             1 => Some(UnwindKind::Cycle),
-            _ => Some(UnwindKind::Wound),
+            2 => Some(UnwindKind::Wound),
+            _ => Some(UnwindKind::Discard),
         }
     }
 }
@@ -226,20 +300,6 @@ pub(crate) fn unwind_kind() -> Option<UnwindKind> {
 
 pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
     value_code::set_unwind_bits(UnwindKind::bits(kind));
-}
-
-/// Clears the unwind kind of a read made while a cycle's is set: the read
-/// comes from a closure that caught that unwind, so the kind is stale, and
-/// a panic of the node read next would land as a cycle's discard instead
-/// of Failed. Returns the thread word as it is now.
-#[cold]
-#[inline(never)]
-pub(crate) fn clear_stale_cycle(word: u64) -> u64 {
-    if unwind_kind() != Some(UnwindKind::Cycle) {
-        return word;
-    }
-    set_unwind_kind(None);
-    value_code::thread_word()
 }
 
 pub(crate) fn take_unwind_kind() -> Option<UnwindKind> {
@@ -254,14 +314,15 @@ pub(crate) fn take_unwind_kind() -> Option<UnwindKind> {
 /// runs a closure in another language: whether `payload` is an engine
 /// unwind in flight, which the boundary must carry through the other
 /// language and resume unchanged. `Some(Some(cycle))` for a cycle a
-/// `get` raised, `Some(None)` for a wound, `None` for anything else.
+/// `get` raised, `Some(None)` for a wound or a speculative discard,
+/// `None` for anything else.
 #[doc(hidden)]
 pub fn engine_unwind(payload: &(dyn std::any::Any + Send)) -> Option<Option<Cycle>> {
     match unwind_kind()? {
         UnwindKind::Cycle => payload
             .downcast_ref::<crate::cycle::CycleUnwind>()
             .map(|u| Some(u.0.clone())),
-        UnwindKind::Wound => Some(None),
+        UnwindKind::Wound | UnwindKind::Discard => Some(None),
     }
 }
 
@@ -306,6 +367,11 @@ pub(crate) fn mark_failed(held: &mut Held) {
     ENTRY.with(|e| e.failures.set(e.failures.get() + 1));
 }
 
+/// The stack address the outermost engine entry recorded.
+pub(crate) fn stack_base() -> usize {
+    ENTRY.with(|e| e.stack_base.get())
+}
+
 /// The thread's engine entry depth: 0 outside every engine entry.
 pub(crate) fn depth() -> u32 {
     ENTRY.with(|e| e.depth.get())
@@ -340,9 +406,14 @@ pub(crate) struct EntryDepth {
 impl EntryDepth {
     #[inline(always)]
     pub(crate) fn enter() -> Self {
+        let base = 0_u8;
+        let base = std::ptr::from_ref(&base) as usize;
         let depth = ENTRY.with(|e| {
             let depth = e.depth.get();
             e.depth.set(depth + 1);
+            if depth == 0 {
+                e.stack_base.set(base);
+            }
             depth
         });
         Self {

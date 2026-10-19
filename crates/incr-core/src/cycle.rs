@@ -216,14 +216,36 @@ impl<T: Value> Fixpoint<T> {
 /// Options for [`Runtime::create_query_with`](crate::Runtime::create_query_with).
 pub struct QueryOpts<T> {
     pub cycle: CycleStrategy<T>,
+    pub replay: Replay,
 }
 
 impl<T> Default for QueryOpts<T> {
     fn default() -> Self {
         Self {
             cycle: CycleStrategy::None,
+            replay: Replay::Native,
         }
     }
+}
+
+/// Whether a query's compute may be cut short and replayed when a read
+/// in it would nest deeper than the runtime's frame or byte budget
+/// ([`Runtime::set_max_frames`](crate::Runtime::set_max_frames)).
+///
+/// A replayable query's read past the budget returns its type's
+/// placeholder ([`Runtime::set_placeholder`](crate::Runtime::set_placeholder))
+/// instead of nesting; the run is then discarded, and a driver computes
+/// the node that read wanted at a shallow depth before running the query
+/// again. The results are those of the unbounded run. A query's closure
+/// may therefore run more than once for one read; it must be pure, must
+/// terminate on every input, and must not panic or loop on a placeholder.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Replay {
+    /// Reads nest natively at any depth.
+    #[default]
+    Native,
+    /// Reads past the budget unwind and replay.
+    Allowed,
 }
 
 /// A value of the member's type, boxed so an episode can hold every
@@ -310,6 +332,30 @@ pub(crate) fn erase<T: Value>(strategy: CycleStrategy<T>) -> Option<Arc<dyn Eras
     }
 }
 
+/// A query's options with its value type erased: the strategy, and the
+/// node flags the options set.
+pub(crate) struct ErasedOpts {
+    pub(crate) strategy: Option<Arc<dyn ErasedStrategy>>,
+    pub(crate) flags: u8,
+}
+
+impl ErasedOpts {
+    pub(crate) const NONE: Self = Self {
+        strategy: None,
+        flags: 0,
+    };
+}
+
+pub(crate) fn erase_opts<T: Value>(opts: QueryOpts<T>) -> ErasedOpts {
+    ErasedOpts {
+        strategy: erase(opts.cycle),
+        flags: match opts.replay {
+            Replay::Native => 0,
+            Replay::Allowed => crate::segmented_nodes::REPLAYABLE,
+        },
+    }
+}
+
 /// `ComputeCtl::flags`: a recompute, whose write compares first.
 pub(crate) const RECOMPUTE: u8 = 1;
 /// `ComputeCtl::flags`: an episode's member run, whose value is buffered.
@@ -322,6 +368,12 @@ pub(crate) const POISONED: u8 = 8;
 /// `ComputeCtl::flags`: the frame is doomed, so a table miss in it
 /// returns a pending handle and creates nothing.
 pub(crate) const DOOMED: u8 = 16;
+/// `ComputeCtl::flags`: a read in the frame returned a placeholder, so
+/// every node it reads after is reached through a suspect edge.
+pub(crate) const PH_SEEN: u8 = 32;
+/// A member run at its anchor, below the frames that read it: it is never
+/// doomed, and marking stops at it.
+pub(crate) const NO_DOOM: u8 = 128;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -395,3 +447,7 @@ pub(crate) struct CycleUnwind(pub(crate) Cycle);
 /// The payload of a wound: the wound-wait scheduler releasing this
 /// thread's claims so an older thread can finish.
 pub(crate) struct WoundUnwind;
+
+/// The payload a speculative entry's discard unwind carries on from a
+/// closure that swallowed it.
+pub(crate) struct DiscardUnwind;

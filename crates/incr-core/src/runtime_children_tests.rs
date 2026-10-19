@@ -329,6 +329,7 @@ fn cascade_plain_cycle<C: Cells>(rt: &Runtime<C>) {
     let q_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
     let fallback = |opts_value: u64| QueryOpts {
         cycle: CycleStrategy::fallback(move |_| opts_value),
+        ..Default::default()
     };
     let p = {
         let q_cell = q_cell.clone();
@@ -497,6 +498,7 @@ fn rollback_group_abort<C: Cells>(rt: &Runtime<C>) {
             },
             QueryOpts {
                 cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_u64)),
+                ..Default::default()
             },
         )
     };
@@ -529,6 +531,7 @@ fn fixpoint_keeps_the_final_pass<C: Cells>(rt: &Runtime<C>) {
             },
             QueryOpts {
                 cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_u64)),
+                ..Default::default()
             },
         )
     };
@@ -633,23 +636,37 @@ local_and_shared!(
 /// handle, which creates nothing.
 fn doomed_frame<C: Cells>(rt: &Runtime<C>) {
     rt.set_placeholder(0_u64);
+    let gate = rt.doom_gate();
     let x = rt.create_input(0_u64);
-    let creator = rt.create_query(move |rt| {
-        let n = rt.get(x);
-        let a = rt.child_input("a", || 1_u64);
-        if n == 0 {
-            return vec![a];
-        }
-        rt.doom_active_frame();
-        vec![rt.child_input("a", || 2_u64), rt.child_input("b", || 3_u64)]
-    });
+    let seen = Arc::new(Mutex::new(None));
+    let out = seen.clone();
+    let creator = rt.create_query_with(
+        move |rt| {
+            let n = rt.get(x);
+            let a = rt.child_input("a", || 1_u64);
+            if n == 0 {
+                return vec![a];
+            }
+            if rt.get(gate).0 {
+                return vec![a];
+            }
+            let doomed = vec![rt.child_input("a", || 2_u64), rt.child_input("b", || 3_u64)];
+            *out.lock().unwrap() = Some((doomed.clone(), rt.node_count()));
+            doomed
+        },
+        QueryOpts {
+            replay: crate::cycle::Replay::Allowed,
+            ..Default::default()
+        },
+    );
     let first = rt.get(creator)[0];
     let before = rt.node_count();
     rt.set(x, 1);
-    let doomed = rt.get(creator);
+    assert_eq!(rt.get(creator), vec![first]);
+    let (doomed, nodes) = seen.lock().unwrap().take().expect("the run was doomed");
     assert_eq!(doomed[0], first);
     assert_eq!(doomed[1].runtime_id(), RuntimeId::PENDING);
-    assert_eq!(rt.node_count(), before);
+    assert_eq!(nodes, before, "a doomed miss creates nothing");
 }
 local_and_shared!(
     doomed_frame,

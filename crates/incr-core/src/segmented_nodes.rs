@@ -75,6 +75,14 @@ pub(crate) const HAS_INDEX: u8 = 8;
 /// for it), so a delete looks the entry up only when it is set.
 pub(crate) const OWNED: u8 = 16;
 
+/// `NodeFlags` bit: the query was created with `Replay::Allowed`.
+pub(crate) const REPLAYABLE: u8 = 32;
+
+/// `NodeFlags` bit: the query must never be replayed, whatever
+/// `INCR_TEST_ALL_REPLAYABLE` says: a cursor-driven collection operator,
+/// whose run consumes its upstream's log.
+pub(crate) const NOT_REPLAYABLE: u8 = 64;
+
 /// A segment of nodes and, beside them, one flags byte per node. The
 /// bytes are zeroed when the segment is allocated and stored only under
 /// the runtime's write lock, so a Relaxed load anywhere reads a value

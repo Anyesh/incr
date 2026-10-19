@@ -305,6 +305,7 @@ fn fixpoint_value_drop_panics<C: Cells>() {
                         armed: k == 1 && arm.swap(false, Ordering::Relaxed),
                     },
                 )),
+                ..Default::default()
             },
         )
     };
@@ -367,6 +368,112 @@ fn cyclic_landing_is_a_change<C: Cells>() {
     assert_eq!(rt.get(d), 10);
     rt.stabilize();
     assert_eq!(*fired.lock().unwrap(), vec![-100, 10]);
+    rt.assert_invariant_i();
+}
+
+/// P reads S, which panics on its own cycle, through `try_get`, then
+/// itself: P is a lone unseeded member, and S landed New under it, so the
+/// episode lands P New with no value. Its reader still gets the cycle.
+fn dirty_cyclic_landing_reads_as_the_cycle<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sc = cell::<i64>();
+    let s = {
+        let sc = sc.clone();
+        rt.create_query(move |rt| rt.get(*sc.get().unwrap()) + 1)
+    };
+    sc.set(s).unwrap();
+    let pc = cell::<i64>();
+    let p = {
+        let pc = pc.clone();
+        rt.create_query(move |rt| {
+            rt.try_get(s).unwrap_or(0) + rt.try_get(*pc.get().unwrap()).unwrap_or(0)
+        })
+    };
+    pc.set(p).unwrap();
+    let err = rt.try_get(p).unwrap_err();
+    assert_eq!(slots(&err), vec![p.slot()]);
+    assert_eq!(rt.state_of(p), NodeState::New);
+    rt.assert_invariant_i();
+}
+
+/// R catches the cycle S raises, then reads P, which panics on its own:
+/// P lands Failed, its panic no part of the cycle R swallowed.
+fn a_panic_after_a_swallowed_cycle_lands_failed<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sc = cell::<i64>();
+    let s = {
+        let sc = sc.clone();
+        rt.create_query(move |rt| rt.get(*sc.get().unwrap()) + 1)
+    };
+    sc.set(s).unwrap();
+    let p = rt.create_query(|_| -> i64 { panic!("P fails") });
+    let r = rt.create_query(move |rt| quiet(|| rt.get(s)).unwrap_or(0) + rt.get(p));
+    assert!(quiet(|| rt.get(r)).is_err());
+    assert_eq!(rt.state_of(p), NodeState::Failed);
+}
+
+/// R reads A, which catches B's panic. B reads C, which reads R through
+/// `try_get`, so C defers to R and B inherits R's position, then B panics.
+/// The panic takes C's claim with it, though C is anchored below B, and B
+/// lands Dirty, since C landed New under it.
+fn a_panic_releases_the_claims_its_frame_deferred<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let rc = cell::<i64>();
+    let c = {
+        let rc = rc.clone();
+        rt.create_query(move |rt| rt.try_get(*rc.get().unwrap()).unwrap_or(1))
+    };
+    let b = rt.create_query(move |rt| {
+        rt.get(c);
+        panic!("B fails after reading C")
+    });
+    let a = rt.create_query(move |rt| quiet(|| rt.get(b)).unwrap_or(9));
+    let r = rt.create_query(move |rt| rt.get(a));
+    rc.set(r).unwrap();
+    assert_eq!(rt.get(r), 9);
+    assert_eq!(rt.state_of(c), NodeState::New);
+    assert_eq!(rt.state_of(b), NodeState::Dirty);
+    rt.assert_invariant_i();
+}
+
+/// S, under R, reads Dirty Q, whose walk computes its dep A first. A reads
+/// R, a Fallback on the stack, and then Q, whose nested walk computes it:
+/// Q reads A, a Fallback on the stack, and defers to it, and A defers to R.
+/// The outer walk finds its root Q held by this thread, so the read is a
+/// read of a held node, not a wait on its own claim.
+fn a_walk_root_deferred_under_its_walk<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let g = rt.create_input(0_i64);
+    let rc = cell::<i64>();
+    let qc = cell::<i64>();
+    let a = {
+        let (rc, qc) = (rc.clone(), qc.clone());
+        rt.create_query_with_fallback(
+            move |rt| {
+                if rt.get(g) == 0 {
+                    1
+                } else {
+                    rt.try_get(*rc.get().unwrap()).unwrap_or(0)
+                        + rt.try_get(*qc.get().unwrap()).unwrap_or(0)
+                }
+            },
+            |_c: &Cycle| 5,
+        )
+    };
+    let q = rt.create_query(move |rt| rt.get(a) + 1);
+    qc.set(q).unwrap();
+    assert_eq!(rt.get(q), 2);
+    rt.set(g, 1);
+    let s = rt.create_query(move |rt| rt.get(q));
+    let r = rt.create_query_with_fallback(move |rt| rt.get(s), |_c: &Cycle| 7);
+    rc.set(r).unwrap();
+    rt.get(r);
+    for n in [a, q, s, r] {
+        assert!(!matches!(
+            rt.state_of(n),
+            NodeState::Computing | NodeState::ComputingDirty
+        ));
+    }
     rt.assert_invariant_i();
 }
 
@@ -449,6 +556,7 @@ fn input_read_only_in_iteration_one<C: Cells>() {
             },
             QueryOpts {
                 cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
             },
         )
     };
@@ -822,113 +930,8 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
     );
 }
 
-/// P reads S, which panics on its own cycle, through `try_get`, then
-/// itself: P is a lone unseeded member, and S landed New under it, so the
-/// episode lands P New with no value. Its reader still gets the cycle.
-fn dirty_cyclic_landing_reads_as_the_cycle<C: Cells>() {
-    let rt = Runtime::<C>::new();
-    let sc = cell::<i64>();
-    let s = {
-        let sc = sc.clone();
-        rt.create_query(move |rt| rt.get(*sc.get().unwrap()) + 1)
-    };
-    sc.set(s).unwrap();
-    let pc = cell::<i64>();
-    let p = {
-        let pc = pc.clone();
-        rt.create_query(move |rt| {
-            rt.try_get(s).unwrap_or(0) + rt.try_get(*pc.get().unwrap()).unwrap_or(0)
-        })
-    };
-    pc.set(p).unwrap();
-    let err = rt.try_get(p).unwrap_err();
-    assert_eq!(slots(&err), vec![p.slot()]);
-    assert_eq!(rt.state_of(p), NodeState::New);
-    rt.assert_invariant_i();
-}
-
-/// S, under R, reads Dirty Q, whose walk computes its dep A first. A reads
-/// R, a Fallback on the stack, and then Q, whose nested walk computes it:
-/// Q reads A, a Fallback on the stack, and defers to it, and A defers to R.
-/// The outer walk finds its root Q held by this thread, so the read is a
-/// read of a held node, not a wait on its own claim.
-fn a_walk_root_deferred_under_its_walk<C: Cells>() {
-    let rt = Runtime::<C>::new();
-    let g = rt.create_input(0_i64);
-    let rc = cell::<i64>();
-    let qc = cell::<i64>();
-    let a = {
-        let (rc, qc) = (rc.clone(), qc.clone());
-        rt.create_query_with_fallback(
-            move |rt| {
-                if rt.get(g) == 0 {
-                    1
-                } else {
-                    rt.try_get(*rc.get().unwrap()).unwrap_or(0)
-                        + rt.try_get(*qc.get().unwrap()).unwrap_or(0)
-                }
-            },
-            |_c: &Cycle| 5,
-        )
-    };
-    let q = rt.create_query(move |rt| rt.get(a) + 1);
-    qc.set(q).unwrap();
-    assert_eq!(rt.get(q), 2);
-    rt.set(g, 1);
-    let s = rt.create_query(move |rt| rt.get(q));
-    let r = rt.create_query_with_fallback(move |rt| rt.get(s), |_c: &Cycle| 7);
-    rc.set(r).unwrap();
-    rt.get(r);
-    for n in [a, q, s, r] {
-        assert!(!matches!(
-            rt.state_of(n),
-            NodeState::Computing | NodeState::ComputingDirty
-        ));
-    }
-    rt.assert_invariant_i();
-}
-
-/// R reads A, which catches B's panic. B reads C, which reads R through
-/// `try_get`, so C defers to R and B inherits R's position, then B panics.
-/// The panic takes C's claim with it, though C is anchored below B, and B
-/// lands Dirty, since C landed New under it.
-fn a_panic_releases_the_claims_its_frame_deferred<C: Cells>() {
-    let rt = Runtime::<C>::new();
-    let rc = cell::<i64>();
-    let c = {
-        let rc = rc.clone();
-        rt.create_query(move |rt| rt.try_get(*rc.get().unwrap()).unwrap_or(1))
-    };
-    let b = rt.create_query(move |rt| {
-        rt.get(c);
-        panic!("B fails after reading C")
-    });
-    let a = rt.create_query(move |rt| quiet(|| rt.get(b)).unwrap_or(9));
-    let r = rt.create_query(move |rt| rt.get(a));
-    rc.set(r).unwrap();
-    assert_eq!(rt.get(r), 9);
-    assert_eq!(rt.state_of(c), NodeState::New);
-    assert_eq!(rt.state_of(b), NodeState::Dirty);
-    rt.assert_invariant_i();
-}
-
-/// R catches the cycle S raises, then reads P, which panics on its own:
-/// P lands Failed, its panic no part of the cycle R swallowed.
-fn a_panic_after_a_swallowed_cycle_lands_failed<C: Cells>() {
-    let rt = Runtime::<C>::new();
-    let sc = cell::<i64>();
-    let s = {
-        let sc = sc.clone();
-        rt.create_query(move |rt| rt.get(*sc.get().unwrap()) + 1)
-    };
-    sc.set(s).unwrap();
-    let p = rt.create_query(|_| -> i64 { panic!("P fails") });
-    let r = rt.create_query(move |rt| quiet(|| rt.get(s)).unwrap_or(0) + rt.get(p));
-    assert!(quiet(|| rt.get(r)).is_err());
-    assert_eq!(rt.state_of(p), NodeState::Failed);
-}
-
 both!(
+    a_panic_after_a_swallowed_cycle_lands_failed,
     member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
     g1_group_verify_falls_back_from_x,
@@ -941,6 +944,9 @@ both!(
     panic_in_an_iteration,
     fixpoint_value_drop_panics,
     cyclic_landing_is_a_change,
+    dirty_cyclic_landing_reads_as_the_cycle,
+    a_panic_releases_the_claims_its_frame_deferred,
+    a_walk_root_deferred_under_its_walk,
     cyclic_group_grows,
     early_cutoff_through_a_group,
     input_read_only_in_iteration_one,
@@ -951,10 +957,6 @@ both!(
     group_verify_recycled_member,
     recovery_pops_are_bounded,
     swallowed_cycle_is_an_ordinary_result,
-    dirty_cyclic_landing_reads_as_the_cycle,
-    a_walk_root_deferred_under_its_walk,
-    a_panic_releases_the_claims_its_frame_deferred,
-    a_panic_after_a_swallowed_cycle_lands_failed,
 );
 
 fn on_deep_stack(body: fn()) {

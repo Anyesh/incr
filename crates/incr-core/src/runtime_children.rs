@@ -67,7 +67,7 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.child_query_erased(key, f, None, "child_query")
+        self.child_query_erased(key, f, ErasedOpts::NONE, "child_query")
     }
 
     /// [`Self::child_query`] with options: the child's cycle strategy,
@@ -78,16 +78,10 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.child_query_erased(key, f, cycle::erase(opts.cycle), "child_query_with")
+        self.child_query_erased(key, f, cycle::erase_opts(opts), "child_query_with")
     }
 
-    fn child_query_erased<K, T, F>(
-        &self,
-        key: K,
-        f: F,
-        strategy: Option<Arc<dyn ErasedStrategy>>,
-        what: &str,
-    ) -> Incr<T>
+    fn child_query_erased<K, T, F>(&self, key: K, f: F, opts: ErasedOpts, what: &str) -> Incr<T>
     where
         K: Hash + Eq + Send + Sync + 'static,
         T: Value,
@@ -100,7 +94,7 @@ impl<C: Cells> Runtime<C> {
         if self.frame_doomed() {
             return self.pending_handle();
         }
-        let child = self.create_query_erased::<false, _, _>(f, strategy);
+        let child = self.create_query_erased::<false, _, _>(f, opts);
         self.attach_child::<K, T, true>(creator, ctl, key, child.erase());
         child
     }

@@ -6,10 +6,19 @@ use std::sync::{Arc, Mutex};
 use super::NodeTable;
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
+use crate::cycle::{QueryOpts, Replay};
 use crate::handle::Incr;
+use crate::node::NodeId;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::runtime::{DeleteError, Runtime};
 use crate::value_code::CONTRACT_MESSAGE;
+
+fn replayable<T>() -> QueryOpts<T> {
+    QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    }
+}
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     match payload.downcast::<String>() {
@@ -401,45 +410,51 @@ where
     NodeTable<u64, i64, C>: Send + Sync,
 {
     rt.set_placeholder::<i64>(-1);
+    let gate = rt.doom_gate();
     let t = Arc::new(rt.create_table::<u64, i64>());
     let present = t.get_or_insert_input(rt, 1, || 10);
     let seen = Arc::new(Mutex::new(Doomed::default()));
     let (t2, out) = (t.clone(), seen.clone());
-    let q = rt.create_query(move |rt| {
-        rt.doom_active_frame();
-        let mut out = out.lock().unwrap();
-        out.hit = Some(t2.get_or_insert_input(rt, 1, || 0));
-        let p = t2.get_or_insert_input(rt, 2, || 0);
-        out.second = Some(t2.get_or_insert_query(rt, 3, |_| 0));
-        out.pending = Some(p);
-        let mut log = |what: &str, r: std::thread::Result<()>| {
-            out.log.push(match r {
-                Ok(()) => format!("{what}: ok"),
-                Err(e) => format!("{what}: {}", panic_message(e)),
-            })
-        };
-        let quiet = |f: &dyn Fn()| catch_unwind(AssertUnwindSafe(f));
-        assert_eq!(rt.get(p), -1);
-        assert_eq!(rt.try_get(p), Ok(-1));
-        assert_eq!(rt.try_delete_node(p), Err(DeleteError::NotAlive));
-        assert!(!rt.is_alive(p));
-        assert_eq!(rt.cycle_of(p), None);
-        log("set", quiet(&|| rt.set(p, 1)));
-        log("delete_node", quiet(&|| rt.delete_node(p)));
-        log(
-            "observe",
-            quiet(&|| {
-                rt.observe(p, |_| {});
-            }),
-        );
-        log(
-            "delete_with_dependents",
-            quiet(&|| {
-                rt.delete_with_dependents(p);
-            }),
-        );
-        0_i64
-    });
+    let q = rt.create_query_with(
+        move |rt| {
+            if rt.get(gate).0 {
+                return 0;
+            }
+            let mut out = out.lock().unwrap();
+            out.hit = Some(t2.get_or_insert_input(rt, 1, || 0));
+            let p = t2.get_or_insert_input(rt, 2, || 0);
+            out.second = Some(t2.get_or_insert_query(rt, 3, |_| 0));
+            out.pending = Some(p);
+            let mut log = |what: &str, r: std::thread::Result<()>| {
+                out.log.push(match r {
+                    Ok(()) => format!("{what}: ok"),
+                    Err(e) => format!("{what}: {}", panic_message(e)),
+                })
+            };
+            let quiet = |f: &dyn Fn()| catch_unwind(AssertUnwindSafe(f));
+            assert_eq!(rt.get(p), -1);
+            assert_eq!(rt.try_get(p), Ok(-1));
+            assert_eq!(rt.try_delete_node(p), Err(DeleteError::NotAlive));
+            assert!(!rt.is_alive(p));
+            assert_eq!(rt.cycle_of(p), None);
+            log("set", quiet(&|| rt.set(p, 1)));
+            log("delete_node", quiet(&|| rt.delete_node(p)));
+            log(
+                "observe",
+                quiet(&|| {
+                    rt.observe(p, |_| {});
+                }),
+            );
+            log(
+                "delete_with_dependents",
+                quiet(&|| {
+                    rt.delete_with_dependents(p);
+                }),
+            );
+            0_i64
+        },
+        replayable(),
+    );
     let nodes = rt.node_count();
     assert_eq!(rt.get(q), 0);
     let seen = seen.lock().unwrap();
@@ -464,7 +479,7 @@ where
         .expect("q is in the graph");
     assert_eq!(
         info.dependencies,
-        vec![],
+        vec![NodeId(gate.slot())],
         "a placeholder read records no dependency"
     );
 }
@@ -474,14 +489,19 @@ where
     NodeTable<u64, i64, C>: Send + Sync,
 {
     rt.set_placeholder::<i64>(-1);
+    let gate = rt.doom_gate();
     let t = Arc::new(rt.create_table::<u64, i64>());
     let escaped = Arc::new(Mutex::new(None));
     let (t2, out) = (t.clone(), escaped.clone());
-    let q = rt.create_query(move |rt| {
-        rt.doom_active_frame();
-        *out.lock().unwrap() = Some(t2.get_or_insert_input(rt, 2, || 0));
-        0_i64
-    });
+    let q = rt.create_query_with(
+        move |rt| {
+            if !rt.get(gate).0 {
+                *out.lock().unwrap() = Some(t2.get_or_insert_input(rt, 2, || 0));
+            }
+            0_i64
+        },
+        replayable(),
+    );
     rt.get(q);
     let p = escaped.lock().unwrap().expect("minted in the frame");
     const OUTSIDE: &str = "pending handle used outside the replay attempt";
@@ -513,29 +533,62 @@ where
     });
     let other = Runtime::<C>::new();
     other.set_placeholder::<i64>(-2);
-    let q = other.create_query(move |other| {
-        other.doom_active_frame();
-        other.get(p)
-    });
+    let other_gate = other.doom_gate();
+    let in_doomed = Arc::new(Mutex::new(None));
+    let seen = in_doomed.clone();
+    let q = other.create_query_with(
+        move |other| {
+            let doomed = !other.get(other_gate).0;
+            let read = catch_unwind(AssertUnwindSafe(|| other.get(p)));
+            if doomed {
+                *seen.lock().unwrap() = Some(read.err().map(panic_message));
+                return 0;
+            }
+            read.unwrap_or_else(|e| std::panic::resume_unwind(e))
+        },
+        replayable(),
+    );
     panics_with(OUTSIDE, || {
         other.get(q);
     });
+    let doomed = in_doomed
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the doomed run read p");
+    assert!(doomed.is_some_and(|m| m.contains(OUTSIDE)));
 }
 
 fn a_doomed_miss_needs_a_placeholder<C: Cells>(rt: &Runtime<C>)
 where
     NodeTable<u64, String, C>: Send + Sync,
 {
+    let gate = rt.doom_gate();
     let t = Arc::new(rt.create_table::<u64, String>());
-    let t2 = t.clone();
-    let q = rt.create_query(move |rt| {
-        rt.doom_active_frame();
-        t2.get_or_insert_input(rt, 1, String::new);
-        0_i64
-    });
-    panics_with("needs a placeholder for alloc::string::String", || {
-        rt.get(q);
-    });
+    let (t2, seen) = (t.clone(), Arc::new(Mutex::new(None)));
+    let out = seen.clone();
+    let q = rt.create_query_with(
+        move |rt| {
+            if !rt.get(gate).0 {
+                let miss = catch_unwind(AssertUnwindSafe(|| {
+                    t2.get_or_insert_input(rt, 1, String::new);
+                }));
+                *out.lock().unwrap() = miss.err().map(panic_message);
+            }
+            0_i64
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(q), 0);
+    let message = seen
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the doomed miss panicked");
+    assert!(
+        message.contains("needs a placeholder for alloc::string::String"),
+        "{message}"
+    );
     panics_with("placeholder already set", || {
         rt.set_placeholder::<u8>(1);
         rt.set_placeholder::<u8>(2);
