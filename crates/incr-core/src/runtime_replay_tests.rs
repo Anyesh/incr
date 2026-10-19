@@ -296,9 +296,13 @@ fn operator_sources_create_every_query_not_replayable() {
 /// Unbounded, S's read closes the cycle at S, T catches the unwind and is
 /// poisoned, and its `get` panics with T left New. At budget 1 the unwind
 /// is delivered to T's retry, whose read of P dooms it; P's episode then
-/// lands S Clean, so the next retry's read of S takes the Clean fast path
-/// past the pending delivery, T is not poisoned, and it lands Cyclic.
-fn caught_delivery_after_its_node_lands<C: Cells>(frames: u32) -> (bool, [NodeState; 3]) {
+/// lands S Clean, so the next retry reads S with a Clean `get`, which no
+/// delivery can intercept (departure 7). The result is the unbounded
+/// run's when P's episode has landed S before T runs (`warm`).
+fn caught_delivery_after_its_node_lands<C: Cells>(
+    frames: u32,
+    warm: bool,
+) -> (bool, [NodeState; 3]) {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
@@ -325,22 +329,25 @@ fn caught_delivery_after_its_node_lands<C: Cells>(frames: u32) -> (bool, [NodeSt
         replayable(),
     );
     t_cell.set(t).unwrap();
+    if warm {
+        let _ = rt.try_get(p);
+    }
     let ok = catch_unwind(AssertUnwindSafe(|| rt.get(t))).is_ok();
     (ok, [rt.state_of(t), rt.state_of(p), rt.state_of(s)])
 }
 
 #[test]
-fn local_caught_delivery_is_read_again_after_its_node_lands() {
+fn local_caught_delivery_after_its_node_lands_reads_it_clean() {
     assert_eq!(
-        caught_delivery_after_its_node_lands::<Local>(1),
-        caught_delivery_after_its_node_lands::<Local>(u32::MAX)
+        caught_delivery_after_its_node_lands::<Local>(1, false),
+        caught_delivery_after_its_node_lands::<Local>(u32::MAX, true)
     );
 }
 
 #[test]
-fn shared_caught_delivery_is_read_again_after_its_node_lands() {
+fn shared_caught_delivery_after_its_node_lands_reads_it_clean() {
     assert_eq!(
-        caught_delivery_after_its_node_lands::<Shared>(1),
-        caught_delivery_after_its_node_lands::<Shared>(u32::MAX)
+        caught_delivery_after_its_node_lands::<Shared>(1, false),
+        caught_delivery_after_its_node_lands::<Shared>(u32::MAX, true)
     );
 }
