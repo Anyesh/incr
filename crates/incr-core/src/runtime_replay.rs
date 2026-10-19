@@ -1086,9 +1086,7 @@ impl<C: Cells> Runtime<C> {
         payload: Option<Box<dyn std::any::Any + Send>>,
         bag: &mut Deferred<C>,
     ) -> Computed {
-        // An episode a read in the run suspended waits for its member's
-        // virtual frame, not for this frame's retry.
-        let mut keep = replay::suspended_members(self.runtime_id);
+        let mut keep = Vec::new();
         let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
         self.release_held_except(attempt.cidx, true, &keep, bag);
         if let Some(value) = ctl.buf.take() {
@@ -1953,7 +1951,7 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         cycle_state::take_unwind_kind();
-        replay::with(|c| {
+        let abandoned = replay::with(|c| {
             let x = c
                 .iter_mut()
                 .find(|x| x.id == id)
@@ -1968,11 +1966,12 @@ impl<C: Cells> Runtime<C> {
                 },
             );
             x.levels.truncate(level as usize);
-            while x.vstack.len() > level as usize {
-                x.pop_vframe();
-            }
+            x.truncate_vstack(level as usize)
         });
         let mut bag = Deferred::new();
+        for ep in abandoned {
+            bag.push_erased(Box::new(ep));
+        }
         self.release_held_from(boundary + level, true, &mut bag);
         self.release_claim_list(id, level, &mut bag);
         bag.drain(self);
@@ -1989,7 +1988,7 @@ impl<C: Cells> Runtime<C> {
             keep || q > 0,
             "incr-core: a drop removed the level-0 target"
         );
-        let boundary = replay::with(|c| {
+        let (boundary, abandoned) = replay::with(|c| {
             let x = c
                 .iter_mut()
                 .find(|x| x.id == id)
@@ -1998,11 +1997,11 @@ impl<C: Cells> Runtime<C> {
             if !keep {
                 x.levels[q as usize].pop_front();
             }
-            while x.vstack.len() > q as usize {
-                x.pop_vframe();
-            }
-            x.boundary
+            (x.boundary, x.truncate_vstack(q as usize))
         });
+        for ep in abandoned {
+            bag.push_erased(Box::new(ep));
+        }
         self.release_held_from(boundary + q, true, bag);
         self.release_claim_list(id, q, bag);
     }

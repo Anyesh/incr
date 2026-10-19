@@ -335,6 +335,21 @@ impl Context {
         Some(frame)
     }
 
+    /// Truncates `vstack` to `len` with no Tarjan pops, returning the
+    /// episodes suspended at the frames removed: they are abandoned, and
+    /// their members are released with the claims held there.
+    pub(crate) fn truncate_vstack(&mut self, len: usize) -> Vec<Episode> {
+        let mut abandoned = Vec::new();
+        while self.vstack.len() > len {
+            if let Some(ep) = self.pop_vframe().and_then(|v| v.ep) {
+                if let Some(at) = self.episodes.iter().position(|e| e.id == ep) {
+                    abandoned.push(self.episodes.remove(at));
+                }
+            }
+        }
+        abandoned
+    }
+
     /// The highest `vstack` position of `node` at `generation`.
     pub(crate) fn position(&self, node: u32, generation: u32) -> Option<u32> {
         let stack = self.vindex.get(&node)?;

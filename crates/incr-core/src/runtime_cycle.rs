@@ -661,10 +661,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
-        // An episode a read in the run suspended waits for its member's
-        // virtual frame, not for this run's retry.
-        let suspended = replay::suspended_members(self.runtime_id);
-        self.release_held_except(cidx + 1, true, &suspended, &mut bag);
+        self.release_held_from(cidx + 1, true, &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
                 .and_then(|e| e.buf.take())
@@ -1319,6 +1316,10 @@ impl<C: Cells> Runtime<C> {
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
         let owned = |e: &Held| subtree.is_some_and(|node| e.owned_by(cidx, node, path));
         let rt = self.runtime_id;
+        // A suspended episode's members wait for its member run's virtual
+        // frame, whatever frame runs at that position meanwhile: only the
+        // episode's resumption, or its context abandoning it, releases them.
+        let suspended = replay::suspended_members(rt);
         let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             if h.is_empty() {
                 return Vec::new();
@@ -1326,7 +1327,10 @@ impl<C: Cells> Runtime<C> {
             let keys: Vec<(RuntimeId, u32)> = h
                 .iter()
                 .filter(|((r, slot), e)| {
-                    *r == rt && (e.anchor >= cidx || owned(e)) && !keep.contains(slot)
+                    *r == rt
+                        && (e.anchor >= cidx || owned(e))
+                        && !keep.contains(slot)
+                        && !suspended.contains(slot)
                 })
                 .map(|(k, _)| *k)
                 .collect();
