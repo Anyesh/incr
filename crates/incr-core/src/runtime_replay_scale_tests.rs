@@ -3,13 +3,133 @@
 //! entry, the byte budget beating the frame budget, and dooms under
 //! `stabilize`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::replay_tests::{chain, on_stack, replayable};
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
 use crate::handle::Incr;
 use crate::state::NodeState;
+
+fn counters(n: usize) -> Arc<Vec<AtomicU32>> {
+    Arc::new((0..n).map(|_| AtomicU32::new(0)).collect())
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Strategy {
+    None,
+    Fallback,
+    Fixpoint,
+}
+
+/// A ring of `n` replayable members, member k reading member k + 1 (mod
+/// n) through `read`. Under `Fallback` member 0 has the fallback 3; under
+/// `Fixpoint` every member iterates from 0, recording the highest
+/// iteration in `iterations`.
+fn ring<C: Cells>(
+    rt: &Runtime<C>,
+    n: usize,
+    strategy: Strategy,
+    runs: &Arc<Vec<AtomicU32>>,
+    iterations: &Arc<AtomicU32>,
+    read: fn(&Runtime<C>, Incr<i64>, usize) -> i64,
+) -> Vec<Incr<i64>> {
+    let members: Arc<OnceLock<Vec<Incr<i64>>>> = Arc::new(OnceLock::new());
+    let built = (0..n)
+        .map(|k| {
+            let members = members.clone();
+            let runs = runs.clone();
+            let cycle = match strategy {
+                Strategy::Fallback if k == 0 => CycleStrategy::fallback(|_| 3),
+                Strategy::Fixpoint => {
+                    let iterations = iterations.clone();
+                    CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).step(move |_, out, i| {
+                        iterations.fetch_max(i, SeqCst);
+                        out
+                    }))
+                }
+                _ => CycleStrategy::None,
+            };
+            rt.create_query_with(
+                move |rt| {
+                    runs[k].fetch_add(1, SeqCst);
+                    read(rt, members.get().unwrap()[(k + 1) % n], k)
+                },
+                QueryOpts {
+                    cycle,
+                    ..replayable()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    members.set(built.clone()).unwrap();
+    built
+}
+
+/// What a read of every ring member returns after `try_get` of the
+/// `entry` member, and each member's state, at budget `frames`.
+type RingOutcome = (Vec<Result<i64, Vec<u32>>>, Vec<NodeState>);
+
+fn ring_outcome<C: Cells>(
+    len: usize,
+    strategy: Strategy,
+    entry: usize,
+    frames: u32,
+) -> RingOutcome {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(frames);
+    let members = ring(
+        &rt,
+        len,
+        strategy,
+        &counters(len),
+        &Arc::new(AtomicU32::new(0)),
+        |rt, next, k| rt.try_get(next).map_or(-1, |v| (v + 1).min(10 + k as i64)),
+    );
+    let slots = |r: Result<i64, crate::cycle::Cycle>| {
+        r.map_err(|c| c.participants().iter().map(|p| p.slot()).collect())
+    };
+    let mut values = vec![slots(rt.try_get(members[entry]))];
+    values.extend(members.iter().map(|&m| slots(rt.try_get(m))));
+    let states = members.iter().map(|&m| rt.state_of(m)).collect();
+    if frames == 1 {
+        assert!(
+            !rt.dooms.lock().unwrap().is_empty(),
+            "budget 1 never doomed"
+        );
+    }
+    rt.assert_invariant_i();
+    (values, states)
+}
+
+/// Rings of 3 to 10 members at budget 1 land as the unbounded run does,
+/// for every strategy and every entry member.
+fn short_cycles_at_budget_1<C: Cells>() {
+    for len in 3..=10 {
+        for strategy in [Strategy::None, Strategy::Fallback, Strategy::Fixpoint] {
+            for entry in 0..len {
+                assert_eq!(
+                    ring_outcome::<C>(len, strategy, entry, 1),
+                    ring_outcome::<C>(len, strategy, entry, u32::MAX),
+                    "a {len}-ring under {strategy:?} entered at member {entry}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn local_short_cycles_at_budget_1() {
+    short_cycles_at_budget_1::<Local>();
+}
+
+#[test]
+fn shared_short_cycles_at_budget_1() {
+    short_cycles_at_budget_1::<Shared>();
+}
 
 const HEAVY: usize = 16 << 10;
 
