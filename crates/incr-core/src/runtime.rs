@@ -3842,6 +3842,10 @@ mod replay_cycle_tests;
 mod replay_unwind_tests;
 
 #[cfg(all(test, not(loom)))]
+#[path = "runtime_replay_scale_tests.rs"]
+mod replay_scale_tests;
+
+#[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_differential.rs"]
 mod replay_differential;
 

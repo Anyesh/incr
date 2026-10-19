@@ -25,7 +25,7 @@ macro_rules! local_and_shared {
     };
 }
 
-fn replayable<T>() -> QueryOpts<T> {
+pub(super) fn replayable<T>() -> QueryOpts<T> {
     QueryOpts {
         replay: Replay::Allowed,
         ..Default::default()
@@ -33,7 +33,7 @@ fn replayable<T>() -> QueryOpts<T> {
 }
 
 /// Runs `f` on a thread with a `stack`-byte stack.
-fn on_stack(stack: usize, f: impl FnOnce() + Send + 'static) {
+pub(super) fn on_stack(stack: usize, f: impl FnOnce() + Send + 'static) {
     std::thread::Builder::new()
         .stack_size(stack)
         .spawn(f)
