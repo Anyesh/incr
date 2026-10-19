@@ -62,6 +62,17 @@ pub struct Frames {
     /// replay driver runs an entry at its level's position, above frames
     /// whose positions are lower than their indexes would say.
     pub(crate) bias: u32,
+    /// The index the frame a driver placed sits at, while it is placed:
+    /// the frame below it is not its reader.
+    pub(crate) placed: u32,
+}
+
+/// A placement [`DepStack::place_next_at`] replaced, to restore.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct Placement {
+    bias: u32,
+    placed: u32,
 }
 
 impl Frames {
@@ -76,6 +87,7 @@ impl Frames {
         Self {
             frames: Vec::new(),
             bias: 0,
+            placed: u32::MAX,
         }
     }
 
@@ -173,20 +185,36 @@ pub trait DepStack: 'static {
     }
 
     /// Makes the next frame pushed with [`Self::push_frame`] sit at
-    /// `cidx`, returning the bias to restore once that frame has popped.
-    fn place_next_at(&self, cidx: u32) -> u32 {
-        self.with(|s| std::mem::replace(&mut s.bias, cidx.wrapping_sub(s.frames.len() as u32)))
+    /// `cidx`, above a virtual frame if `virtual_below`, returning the
+    /// placement to restore once that frame has popped.
+    fn place_next_at(&self, cidx: u32, virtual_below: bool) -> Placement {
+        self.with(|s| {
+            let len = s.frames.len() as u32;
+            let saved = Placement {
+                bias: s.bias,
+                placed: s.placed,
+            };
+            s.bias = cidx.wrapping_sub(len);
+            s.placed = if virtual_below { len } else { u32::MAX };
+            saved
+        })
     }
 
-    fn restore_bias(&self, bias: u32) {
-        self.with(|s| s.bias = bias);
+    fn restore_placement(&self, saved: Placement) {
+        self.with(|s| {
+            s.bias = saved.bias;
+            s.placed = saved.placed;
+        });
     }
 
     /// Mark `rt`'s active frame, if any, as having read a dep that did
-    /// not land `Clean`, so its compute must not land `Clean` either.
+    /// not land `Clean`, so its compute must not land `Clean` either. The
+    /// frame below one a replay driver placed above a virtual frame is not
+    /// its reader.
     fn poison_current_frame(&self, rt: RuntimeId) {
         self.with(|s| {
-            if let Some(top) = s.active(rt, Self::THREAD_WIDE) {
+            let placed = s.frames.len() as u32 == s.placed;
+            if let Some(top) = s.active(rt, Self::THREAD_WIDE).filter(|_| !placed) {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
                 unsafe { (*top.ctl).raise(POISONED) };
@@ -210,19 +238,21 @@ pub trait DepStack: 'static {
         })
     }
 
-    /// For `rt`'s frames at positions `from..to`, bottom first, how many
-    /// times each has read the node it reads now.
-    fn read_ordinals(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<u32> {
+    /// For `rt`'s frames at positions `from..to`, bottom first, the node
+    /// each reads now and how many times it has read it.
+    fn read_steps(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<(u64, u32)> {
         self.with(|s| {
             s.frames
                 .iter()
                 .filter(|f| f.rt == rt && (from..to).contains(&f.cidx))
                 .map(|f| {
                     let reading = f.reading;
-                    f.deps
+                    let ordinal = f
+                        .deps
                         .iter()
                         .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == reading)
-                        .count() as u32
+                        .count() as u32;
+                    (reading, ordinal)
                 })
                 .collect()
         })
@@ -402,6 +432,20 @@ mod tests {
         assert!(b.has(POISONED));
         assert!(!a.has(POISONED));
         s.poison_current_frame(rt(1));
+    }
+
+    #[test]
+    fn local_poison_skips_a_frame_below_a_placed_position() {
+        let s = LocalDepStack::new();
+        let a = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &a);
+        let placement = s.place_next_at(3, true);
+        s.poison_current_frame(rt(1));
+        assert!(!a.has(POISONED));
+        s.restore_placement(placement);
+        s.poison_current_frame(rt(1));
+        assert!(a.has(POISONED));
+        s.pop_frame();
     }
 
     #[test]

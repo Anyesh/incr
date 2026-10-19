@@ -623,7 +623,7 @@ impl<C: Cells> Runtime<C> {
         held.wrote = ctl.wrote.get() != 0;
         held.opened = !ctl.children.get().is_null();
         held.record_run(deps);
-        held.own(cidx, id.0, false);
+        held.own(cidx, id.0, None);
         let displaced = cycle_state::with_held(|h| h.insert((rt, id.0), held));
         debug_assert!(displaced.is_none(), "incr-core: node {} held twice", id.0);
         if lowlink < cidx {
@@ -650,7 +650,7 @@ impl<C: Cells> Runtime<C> {
                 .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
                 .map(|((_, slot), e)| {
                     e.anchor = cidx;
-                    e.own(cidx, u32::MAX, false);
+                    e.own(cidx, u32::MAX, None);
                     *slot
                 })
                 .collect()
@@ -811,7 +811,7 @@ impl<C: Cells> Runtime<C> {
                             .get_mut(&(rt, *m))
                             .expect("incr-core: an episode member is held");
                         e.anchor = cidx;
-                        e.own(cidx, u32::MAX, false);
+                        e.own(cidx, u32::MAX, None);
                         e.episode = Some(cycle.clone());
                         e.in_cu = ep.cu.binary_search(m).is_ok();
                         e.installed.clear();
@@ -1093,7 +1093,7 @@ impl<C: Cells> Runtime<C> {
                 })
                 .map(|((_, slot), e)| {
                     e.anchor = cidx;
-                    e.own(cidx, u32::MAX, false);
+                    e.own(cidx, u32::MAX, None);
                     *slot
                 })
                 .collect()
@@ -1134,13 +1134,14 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn pass_down(&self, cidx: u32, low: u32) {
         let rt = self.runtime_id;
         let (parent, node, virtual_frame) = self.lower_parent(cidx, low);
+        let path = self.virtual_path_at(cidx);
         cycle_state::with_held(|h| {
             for ((r, _), e) in h.iter_mut() {
                 if *r == rt {
                     if e.anchor >= cidx {
                         e.anchor = low;
                     }
-                    if e.owner >= cidx {
+                    if e.owned_by(cidx, u32::MAX, path) {
                         e.own(parent, node, virtual_frame);
                     }
                 }
@@ -1211,14 +1212,8 @@ impl<C: Cells> Runtime<C> {
     ) {
         // The unwinding frame, of node `subtree`, owns the claims owned at
         // its position by it, and those owned above.
-        let owned = |e: &Held| {
-            subtree.is_some_and(|node| {
-                e.owner > cidx
-                    || e.owner == cidx
-                        && !e.owner_virtual
-                        && (e.owner_node == node || e.owner_node == u32::MAX)
-            })
-        };
+        let path = subtree.and_then(|_| self.virtual_path_at(cidx));
+        let owned = |e: &Held| subtree.is_some_and(|node| e.owned_by(cidx, node, path));
         let rt = self.runtime_id;
         let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             if h.is_empty() {

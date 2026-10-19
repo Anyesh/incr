@@ -29,10 +29,15 @@ pub(crate) struct Held {
     /// at that position later, a sibling's, owns none of it.
     pub(crate) owner_node: u32,
     /// The owner is a virtual frame, the run of `owner_node` that a doom
-    /// discarded. A run of that node at that position before its retry is
-    /// another run, as its reader's retry makes when it reads the node more
-    /// than once, and must not release what the doomed run deferred.
-    pub(crate) owner_virtual: bool,
+    /// discarded, with that frame's path. Another run of the node at the
+    /// position, as its reader's retry makes when it reads the node more
+    /// than once, has another path and must not take or release what the
+    /// doomed run deferred.
+    pub(crate) owner_virtual: Option<u64>,
+    /// For a virtual owner, the position and path of each virtual frame
+    /// below it that has popped since: a run at such a position along
+    /// another path is not the owner's ancestor.
+    pub(crate) ancestry: Vec<(u32, u64)>,
     /// The node has a Fallback or Fixpoint strategy.
     pub(crate) seeded: bool,
     /// The claim was taken from New.
@@ -67,11 +72,31 @@ pub(crate) struct Held {
 
 impl Held {
     /// Hands the claim to the frame at `owner`, of `node` (`u32::MAX` for
-    /// whichever frame is there), virtual or not.
-    pub(crate) fn own(&mut self, owner: u32, node: u32, virtual_frame: bool) {
+    /// whichever frame is there), virtual at a path or not.
+    pub(crate) fn own(&mut self, owner: u32, node: u32, virtual_frame: Option<u64>) {
         self.owner = owner;
         self.owner_node = node;
         self.owner_virtual = virtual_frame;
+        self.ancestry.clear();
+    }
+
+    /// The run at `cidx`, of `node` (`u32::MAX` for any), at `path` (the
+    /// path when a virtual frame at or above `cidx` owns claims), owns the
+    /// claim: one owned at its position by it, or owned above it in its
+    /// subtree.
+    pub(crate) fn owned_by(&self, cidx: u32, node: u32, path: Option<u64>) -> bool {
+        let at = |p: u64| Some(p) == path;
+        let of_node = node == u32::MAX || self.owner_node == node || self.owner_node == u32::MAX;
+        match self.owner_virtual {
+            _ if self.owner < cidx => false,
+            None => self.owner > cidx || of_node,
+            Some(p) if self.owner == cidx => at(p) && of_node,
+            Some(_) => self
+                .ancestry
+                .iter()
+                .find(|a| a.0 == cidx)
+                .is_none_or(|a| at(a.1)),
+        }
     }
 
     pub(crate) fn new(generation: u32, anchor: u32, seeded: bool, first: bool) -> Self {
@@ -80,7 +105,8 @@ impl Held {
             anchor,
             owner: anchor,
             owner_node: u32::MAX,
-            owner_virtual: false,
+            owner_virtual: None,
+            ancestry: Vec::new(),
             seeded,
             first,
             buf: None,

@@ -76,10 +76,9 @@ pub(crate) struct VFrame {
     pub(crate) deferred: Vec<(u32, u32)>,
 }
 
-/// What an entry's run left for the frame below the entry's level, whose
-/// retry gets it at its read of the entry's node, as the unbounded run's
-/// frame gets it at that read.
-pub(crate) struct Delivery {
+/// The read a delivery is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadKey {
     pub(crate) node: u32,
     pub(crate) generation: u32,
     /// The frame's position: a run of the node elsewhere on the stack is
@@ -91,6 +90,31 @@ pub(crate) struct Delivery {
     pub(crate) ordinal: u32,
     /// The frame's [`VFrame::path`].
     pub(crate) path: u64,
+    /// For an episode's member run, the episode: the frame's own run, and
+    /// the episode's other member runs of the node there, are other runs.
+    pub(crate) episode: Option<u64>,
+}
+
+impl ReadKey {
+    /// The read virtual frame `v` was blocked in.
+    pub(crate) fn blocked(v: &VFrame) -> Self {
+        Self {
+            node: v.node,
+            generation: v.generation,
+            cidx: v.cidx,
+            reading: v.reading,
+            ordinal: v.ordinal,
+            path: v.path,
+            episode: v.ep,
+        }
+    }
+}
+
+/// What an entry's run left for the frame below the entry's level, whose
+/// retry gets it at its read of the entry's node, as the unbounded run's
+/// frame gets it at that read.
+pub(crate) struct Delivery {
+    pub(crate) key: ReadKey,
     /// The level of the entry whose retry recomputes the frame; the
     /// delivery is dropped when that run ends without reaching the read.
     pub(crate) maker: u32,
@@ -105,9 +129,12 @@ pub(crate) struct Delivery {
 
 pub(crate) enum Delivered {
     /// An unwind out of a non-speculative entry: a cycle unwind, whose
-    /// payload is the `CycleUnwind`, or a user panic.
+    /// payload is the `CycleUnwind`, or a user panic. It poisons the
+    /// reader unless it is the cycle of a node that landed `Cyclic`, which
+    /// a read of the node raises with the node landed.
     Unwind {
         cycle: bool,
+        poison: bool,
         payload: Box<dyn Any + Send>,
     },
     /// The entry landed without a Clean value. The unbounded run's read
@@ -116,11 +143,10 @@ pub(crate) enum Delivered {
     /// the delivery is made, because a later run in the context may
     /// compute the node again before the retry reads it.
     Landed(Box<dyn Any + Send>),
-    /// The entry, at this node and generation, landed other than Clean in
-    /// the walk of the frame's blocked read, which visited it once: the
-    /// retry's walk of that read skips it, where a later read would run
-    /// it again.
-    Walked(u32, u32),
+    /// The rest of the walk of the frame's blocked read, from the compute
+    /// a doom stopped it at: the retry's walk of that read resumes it, as
+    /// the unbounded run's walk goes on after that compute.
+    Walk(Box<crate::runtime::Walk>),
     /// The read ran its node's compute, a virtual frame above the frame's,
     /// which the retry runs again as that compute: a walk would first
     /// visit deps the replay of that frame's run has left Failed or Dirty.
@@ -156,12 +182,14 @@ pub(crate) struct Context {
     /// before the next entry runs, as a frame's entries outlive the runs
     /// nested in it.
     pub(crate) memo: taint_memo::Parked,
-    /// The `Walked` deliveries taken, as the read they were for, the
-    /// node and its generation, until the walk of that read skips them.
-    pub(crate) walk_skip: Vec<(u64, u32, u32)>,
-    /// The node and generation a `Direct` delivery just taken sends to
-    /// its compute, until the read's walk does.
-    pub(crate) direct: Option<(u32, u32)>,
+    /// The walk a `Walk` delivery just taken resumes, with the read it is
+    /// for and the reading frame's position, until that read's walk takes
+    /// it or the read ends.
+    pub(crate) resume: Option<(u64, u32, crate::runtime::Walk)>,
+    /// The node, generation and reading frame's position of the read a
+    /// `Direct` delivery just taken sends to its compute, until that
+    /// read's walk does or the read ends.
+    pub(crate) direct: Option<(u32, u32, u32)>,
 }
 
 impl Context {
@@ -180,7 +208,7 @@ impl Context {
             claims: Vec::new(),
             episodes: Vec::new(),
             memo: Vec::new(),
-            walk_skip: Vec::new(),
+            resume: None,
             direct: None,
         }
     }
@@ -228,22 +256,10 @@ impl Context {
     /// Pops the top virtual frame.
     /// Delivers `what` to the read virtual frame `below` was blocked in.
     pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) {
-        self.pending.retain(|d| {
-            !(d.blocked
-                && d.node == below.node
-                && d.generation == below.generation
-                && d.cidx == below.cidx
-                && d.reading == below.reading
-                && d.ordinal == below.ordinal
-                && d.path == below.path)
-        });
+        let key = ReadKey::blocked(below);
+        self.pending.retain(|d| !(d.blocked && d.key == key));
         self.pending.push(Delivery {
-            node: below.node,
-            generation: below.generation,
-            cidx: below.cidx,
-            reading: below.reading,
-            ordinal: below.ordinal,
-            path: below.path,
+            key,
             maker: below.maker,
             taken: false,
             blocked: true,
@@ -251,26 +267,32 @@ impl Context {
         });
     }
 
+    /// Keeps the walk of the read virtual frame `below` was blocked in, from
+    /// where a doom stopped it, for the frame's retry.
+    pub(crate) fn deliver_walk(&mut self, below: &VFrame, walk: crate::runtime::Walk) {
+        let key = ReadKey::blocked(below);
+        self.pending
+            .retain(|d| !(matches!(d.what, Delivered::Walk(_)) && d.key == key));
+        self.pending.push(Delivery {
+            key,
+            maker: below.maker,
+            taken: false,
+            blocked: false,
+            what: Delivered::Walk(Box::new(walk)),
+        });
+    }
+
     /// Sends the read virtual frame `below` was blocked in to its compute
     /// in the retry of the entry at `level`.
     pub(crate) fn deliver_direct(&mut self, below: &VFrame, level: u32) {
-        let same = |d: &Delivery| {
-            matches!(d.what, Delivered::Direct)
-                && d.node == below.node
-                && d.generation == below.generation
-                && d.cidx == below.cidx
-                && d.reading == below.reading
-                && d.ordinal == below.ordinal
-                && d.path == below.path
-        };
-        if !self.pending.iter().any(same) {
+        let key = ReadKey::blocked(below);
+        if !self
+            .pending
+            .iter()
+            .any(|d| matches!(d.what, Delivered::Direct) && d.key == key)
+        {
             self.pending.push(Delivery {
-                node: below.node,
-                generation: below.generation,
-                cidx: below.cidx,
-                reading: below.reading,
-                ordinal: below.ordinal,
-                path: below.path,
+                key,
                 maker: level,
                 taken: false,
                 blocked: false,
@@ -303,8 +325,20 @@ impl Context {
     }
 }
 
+/// A read of a frame that may be retried that returned the value a
+/// landing had left Dirty.
+pub(crate) struct DirtyRead {
+    pub(crate) rt: RuntimeId,
+    pub(crate) cidx: u32,
+    pub(crate) ctl: *const crate::cycle::ComputeCtl,
+    pub(crate) reading: u64,
+    pub(crate) ordinal: u32,
+    pub(crate) value: crate::cycle::Erased,
+}
+
 #[cfg(not(loom))]
 thread_local! {
+    static DIRTY_READS: RefCell<Vec<DirtyRead>> = const { RefCell::new(Vec::new()) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
@@ -313,10 +347,39 @@ thread_local! {
 
 #[cfg(loom)]
 loom::thread_local! {
+    static DIRTY_READS: RefCell<Vec<DirtyRead>> = RefCell::new(Vec::new());
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
+}
+
+/// Keeps `read` for its frame's retry. Reads of frames that have popped go:
+/// every frame at or above the reading one's position, but the reading
+/// one, which is a run of its own if this is its first such read.
+pub(crate) fn note_dirty_read(read: DirtyRead, fresh: bool) {
+    DIRTY_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        d.retain(|e| {
+            e.rt != read.rt
+                || e.cidx < read.cidx
+                || e.cidx == read.cidx && e.ctl == read.ctl && !fresh
+        });
+        d.push(read);
+    });
+}
+
+/// The reads kept for the run of control block `ctl` at `cidx`.
+pub(crate) fn take_dirty_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<DirtyRead> {
+    DIRTY_READS.with(|d| {
+        d.borrow_mut()
+            .extract_if(.., |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl)
+            .collect()
+    })
 }
 
 /// The id the next context or episode gets.
@@ -326,9 +389,30 @@ pub(crate) fn peek_id() -> u64 {
 
 /// The path of a frame above one at `path` that is in its `ordinal`-th
 /// read of a node.
-pub(crate) fn extend_path(path: u64, ordinal: u32) -> u64 {
+pub(crate) fn extend_path(path: u64, (reading, ordinal): (u64, u32)) -> u64 {
     path.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(reading)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(u64::from(ordinal) + 1)
+}
+
+/// A read that may take deliveries: when it ends, the walk directions it
+/// took, used or not, go with it, so that no later read of the node finds
+/// them.
+pub(crate) struct ReadScope {
+    pub(crate) rt: RuntimeId,
+    pub(crate) reading: u64,
+}
+
+impl Drop for ReadScope {
+    fn drop(&mut self) {
+        with(|c| {
+            for x in c.iter_mut().filter(|x| x.rt == self.rt) {
+                x.direct = None;
+                x.resume.take_if(|r| r.0 == self.reading);
+            }
+        });
+    }
 }
 
 /// A fresh id for a context or an episode.

@@ -447,7 +447,8 @@ impl Entry {
 }
 
 /// The stack of `ensure_clean`'s post-order walk.
-struct Walk {
+#[derive(Clone)]
+pub(crate) struct Walk {
     work: Vec<Entry>,
     first_visits: u32,
     /// Exact mode: every node with a `(x, true)` entry on `work`, kept
@@ -460,7 +461,7 @@ struct Walk {
     expanded: Option<Box<Expanded>>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Expanded {
     /// New nodes with installed deps the walk has expanded.
     new: HashSet<NodeId>,
@@ -469,6 +470,17 @@ struct Expanded {
 }
 
 impl Walk {
+    /// Drops the pending entry of `id` the walk was to run next, whose
+    /// compute ran elsewhere.
+    pub(crate) fn ran(&mut self, id: u32) {
+        if self
+            .work
+            .last()
+            .is_some_and(|e| e.is_pending() && e.id.0 == id)
+        {
+            self.work.pop();
+        }
+    }
     #[inline]
     fn new(root: NodeId, root_state: NodeState) -> Self {
         Self {
@@ -669,6 +681,9 @@ pub struct Runtime<C: Cells> {
     /// Every doom, in order, as the doom point saw it.
     #[cfg(test)]
     pub(crate) dooms: std::sync::Mutex<Vec<replay_impl::DoomSeen>>,
+    /// The nodes whose Dirty value a read in a frame returned.
+    #[cfg(test)]
+    pub(crate) dirty_reads: std::sync::Mutex<Vec<u32>>,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -730,6 +745,8 @@ impl<C: Cells> Runtime<C> {
             group_verifies: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             dooms: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            dirty_reads: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1859,7 +1876,16 @@ impl<C: Cells> Runtime<C> {
         }
         let (type_tag, arena_slot) = self.fields_under(handle, node);
         match self.try_read_slot(handle, node, type_tag, arena_slot) {
-            Some(value) => Ok(value),
+            Some(value) => {
+                if let Some(f) = frame {
+                    if state::load::<C>(node.state_cell()) == NodeState::Dirty {
+                        #[cfg(test)]
+                        self.dirty_reads.lock().unwrap().push(handle.slot());
+                        self.note_dirty_read(f, handle, &value);
+                    }
+                }
+                Ok(value)
+            }
             None => Err(self.read_missing(handle, node)),
         }
     }
@@ -2507,7 +2533,12 @@ impl<C: Cells> Runtime<C> {
             }
             return computed;
         }
-        let mut walk = Walk::new(id, observed);
+        let mut walk = if MODE & VIRT == 0 {
+            Walk::new(id, observed)
+        } else {
+            self.take_resume(id)
+                .unwrap_or_else(|| Walk::new(id, observed))
+        };
         let mut root = Computed::Done;
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
@@ -2522,10 +2553,19 @@ impl<C: Cells> Runtime<C> {
                 let mut computed = self.compute_one::<MODE>(cur, visit, is_root.then_some(gen));
                 if computed != Computed::Done {
                     match computed {
-                        Computed::Doomed => return computed,
+                        Computed::Doomed => {
+                            self.stash_walk(id, (!is_root).then_some(walk));
+                            return computed;
+                        }
                         Computed::Discarded => match self.walk_discarded(visit) {
                             Some(after) => computed = after,
-                            None => return computed,
+                            None => {
+                                // The discarded compute is a frame the
+                                // reading frame's retry runs again.
+                                walk.push(Entry { id: cur, taint });
+                                self.stash_walk(id, (!is_root).then_some(walk));
+                                return computed;
+                            }
                         },
                         _ => {}
                     }
@@ -2562,10 +2602,6 @@ impl<C: Cells> Runtime<C> {
                         | NodeState::ComputingDirty
                 )
             {
-                if matches!(observed, NodeState::New | NodeState::Dirty) && self.walk_skips(id, cur)
-                {
-                    continue;
-                }
                 if let Some(owner) = self.virtual_owner(cur) {
                     walk.taint(owner);
                     continue;
@@ -3757,6 +3793,10 @@ mod children_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_tests.rs"]
 mod replay_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_replay_differential.rs"]
+mod replay_differential;
 
 use cycle_impl::{Attempt, GroupEnd, PopEnd};
 
