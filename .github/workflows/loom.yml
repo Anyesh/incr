@@ -18,6 +18,9 @@ jobs:
       matrix:
         model:
           - "loom_models::loom_chain_cutoff"
+          - "loom_models::replay_release_vs_reader"
+          - "loom_models::virtual_hit_claim_race"
+          - "loom_models::discard_under_set"
     env:
       RUSTFLAGS: --cfg loom -D warnings
       LOOM_MAX_PREEMPTIONS: 3

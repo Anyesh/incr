@@ -1181,3 +1181,108 @@ fn child_create_and_reuse() {
         rt.assert_invariant_i();
     });
 }
+
+fn replayable<T>() -> crate::cycle::QueryOpts<T> {
+    crate::cycle::QueryOpts {
+        replay: crate::cycle::Replay::Allowed,
+        ..Default::default()
+    }
+}
+
+/// T reads X at budget 1, so T's read dooms and releases X's claim before
+/// T gets the placeholder, and the driver runs X as an entry while
+/// another thread reads X. X lands once with its value, and T's retry
+/// reads it.
+#[test]
+fn replay_release_vs_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let x = rt.create_query_with(|_: &Rt| 7_u64, replayable());
+        let t = rt.create_query_with(move |rt: &Rt| rt.get(x) + 1, replayable());
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(x))
+        };
+        assert_eq!(rt.get(t), 8);
+        assert_eq!(reader.join().unwrap(), 7);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.state_of(x), NodeState::Clean);
+        assert_eq!(rt.state_of(t), NodeState::Clean);
+    });
+}
+
+/// A Fallback cycle F <-> X at budget 1, entered at F on two threads. On
+/// each, F's read of X dooms, and X's entry reads F: a virtual hit whose
+/// claim of F can find the other thread's claim, roll back and wait,
+/// while that thread's F waits on X. Both reads return the landing.
+#[test]
+fn virtual_hit_claim_race() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let fc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let x = {
+            let fc = fc.clone();
+            rt.create_query_with(move |rt: &Rt| rt.get(*fc.get().unwrap()) + 1, replayable())
+        };
+        let f = rt.create_query_with(
+            move |rt: &Rt| rt.get(x) + 1,
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::Fallback(Box::new(|_| 100)),
+                replay: crate::cycle::Replay::Allowed,
+            },
+        );
+        fc.set(f).unwrap();
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(f))
+        };
+        assert_eq!(rt.get(f), 100);
+        assert_eq!(other.join().unwrap(), 100);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(x), 101);
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// F, Clean at s = 0, reads a New query N once s is set, so at budget 1
+/// its run claimed from Dirty dooms on N and is discarded, while another
+/// thread sets s again. The discard landing keeps that set's dirtying:
+/// the read returns either revision's value and the next read the last.
+#[test]
+fn discard_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let s = rt.create_input(0_u64);
+        let n = rt.create_query_with(|_: &Rt| 1_u64, replayable());
+        let f = rt.create_query_with(
+            move |rt: &Rt| match rt.get(s) {
+                0 => 0,
+                v => v * 10 + rt.get(n),
+            },
+            replayable(),
+        );
+        assert_eq!(rt.get(f), 0);
+        rt.set(s, 1);
+        rt.set_max_frames(1);
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(s, 2))
+        };
+        let read = rt.get(f);
+        setter.join().unwrap();
+        assert!(read == 11 || read == 21, "{read}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(f), 21, "(V) violated: F stale against s = 2");
+    });
+}

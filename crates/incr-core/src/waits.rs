@@ -91,7 +91,7 @@ pub(crate) fn registered() -> usize {
 }
 
 /// Whether a registered thread is waiting on `claim`, for tests.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 pub(crate) fn waited_on(claim: Claim) -> bool {
     registry().waiters.iter().any(|w| w.waiting_on == claim)
 }

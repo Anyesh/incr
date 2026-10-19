@@ -14,6 +14,8 @@ use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
 /// What the doom point saw, for tests.
 #[cfg(test)]
 #[derive(Clone, Debug)]
+// Read only by the replay tests, which loom does not build.
+#[cfg_attr(loom, allow(dead_code))]
 pub(crate) struct DoomSeen {
     pub(crate) node: u32,
     /// The node's state after its release.

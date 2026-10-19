@@ -140,6 +140,9 @@ jobs:
           - { model: "loom_models::tree_claim_rollback_under_set", bound: 2 }
           - { model: "loom_models::child_sweep_vs_reader", bound: 2 }
           - { model: "loom_models::child_create_and_reuse", bound: 2 }
+          - { model: "loom_models::replay_release_vs_reader", bound: 2 }
+          - { model: "loom_models::virtual_hit_claim_race", bound: 2 }
+          - { model: "loom_models::discard_under_set", bound: 2 }
     env:
       RUSTFLAGS: --cfg loom -D warnings
       LOOM_MAX_PREEMPTIONS: ${{ matrix.bound }}
