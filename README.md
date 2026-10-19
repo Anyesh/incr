@@ -64,6 +64,8 @@ A compute that needs a node per key, such as a spreadsheet cell per address, kee
 
 A compute can also own the nodes it makes. `rt.child_input(key, init)` and `rt.child_query(key, f)` return the running compute's child for `key`, creating it on the first run that asks and reusing it on every later one. A run that stops asking for a child deletes it when it lands, unless something outside still reads it, a run that fails or is discarded deletes the children it created, and deleting the creator deletes everything it owns.
 
+Long chains don't overflow the stack. A query created with `QueryOpts { replay: Replay::Allowed, .. }` whose type has a placeholder (`rt.set_placeholder`) reads past a frame budget (`rt.set_max_frames`, 256 by default) by discarding its frame and the replayable frames below it and computing what it wanted at a shallow depth, then running them again; the results are those of the unbounded run, so a first compute of a 100k-deep chain fits on a 1 MiB thread. Such a closure may run more than once for one read, so it must be pure.
+
 ## Three crates, one engine
 
 | | `incr-compute` | `incr-concurrent` | `incr-core` |
