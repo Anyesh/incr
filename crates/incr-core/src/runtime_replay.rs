@@ -1041,6 +1041,7 @@ impl<C: Cells> Runtime<C> {
                 x.running_entry = None;
                 (level, entry, parked)
             });
+            self.park(ParkPoint::BeforeEntry(NodeId(entry.node)));
             if !parked.is_empty() {
                 taint_memo::restore(parked);
             }

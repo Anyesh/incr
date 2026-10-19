@@ -193,6 +193,12 @@ pub(crate) enum ParkPoint {
     /// At a doom, after the node the read wanted was released and pushed
     /// and before the reading frame gets its placeholder.
     AfterDoom(NodeId),
+    /// In a replay driver's loop, after it took its next entry and before
+    /// the virtual frames at and above that entry's level pop.
+    BeforeEntry(NodeId),
+    /// In `compute_one`, on finding the node claimed by another thread,
+    /// before its first wait on that claim.
+    ComputeWaits(NodeId),
 }
 
 /// The panic of a read that found its node `Dead` under the handle's
@@ -2838,6 +2844,9 @@ impl<C: Cells> Runtime<C> {
                     if spins == 0 && cycle_state::holds(self.runtime_id, id.0) {
                         return Computed::Deferred;
                     }
+                    if spins == 0 {
+                        self.park(ParkPoint::ComputeWaits(id));
+                    }
                     spins += 1;
                     self.wait_on_claim(id, spins);
                     continue;
@@ -3849,6 +3858,10 @@ mod replay_unwind_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_scale_tests.rs"]
 mod replay_scale_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_replay_race_tests.rs"]
+mod replay_race_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_differential.rs"]
