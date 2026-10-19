@@ -1,12 +1,13 @@
 //! Deep chains by unwind and replay: dooms, discards, the driver loop and
 //! the bounds on runs and walks the plan's T8 tests set.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{QueryOpts, Replay};
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
 use crate::state::NodeState;
 
@@ -288,4 +289,58 @@ fn operator_sources_create_every_query_not_replayable() {
         }
         assert!(classified > 0, "{file} creates no operator query");
     }
+}
+
+/// T reads S with `get` inside `catch_unwind`, then P, then itself with
+/// `try_get`, then S again; P (Fixpoint) and S (unseeded) read each other.
+/// Unbounded, S's read closes the cycle at S, T catches the unwind and is
+/// poisoned, and its `get` panics with T left New. At budget 1 the unwind
+/// is delivered to T's retry, whose read of P dooms it; P's episode then
+/// lands S Clean, so the next retry's read of S takes the Clean fast path
+/// past the pending delivery, T is not poisoned, and it lands Cyclic.
+fn caught_delivery_after_its_node_lands<C: Cells>(frames: u32) -> (bool, [NodeState; 3]) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let s_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let t_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let s_for_p = s_cell.clone();
+    let p = rt.create_query_with(
+        move |rt| rt.get(*s_for_p.get().unwrap()),
+        QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 3).max_iterations(1)),
+            replay: Replay::Allowed,
+        },
+    );
+    let s = rt.create_query_with(move |rt| rt.get(p), replayable());
+    s_cell.set(s).unwrap();
+    let t_for_t = t_cell.clone();
+    let t = rt.create_query_with(
+        move |rt| {
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(s)));
+            let _ = rt.get(p);
+            let _ = rt.try_get(*t_for_t.get().unwrap());
+            rt.try_get(s).unwrap_or(7777)
+        },
+        replayable(),
+    );
+    t_cell.set(t).unwrap();
+    let ok = catch_unwind(AssertUnwindSafe(|| rt.get(t))).is_ok();
+    (ok, [rt.state_of(t), rt.state_of(p), rt.state_of(s)])
+}
+
+#[test]
+fn local_caught_delivery_is_read_again_after_its_node_lands() {
+    assert_eq!(
+        caught_delivery_after_its_node_lands::<Local>(1),
+        caught_delivery_after_its_node_lands::<Local>(u32::MAX)
+    );
+}
+
+#[test]
+fn shared_caught_delivery_is_read_again_after_its_node_lands() {
+    assert_eq!(
+        caught_delivery_after_its_node_lands::<Shared>(1),
+        caught_delivery_after_its_node_lands::<Shared>(u32::MAX)
+    );
 }
