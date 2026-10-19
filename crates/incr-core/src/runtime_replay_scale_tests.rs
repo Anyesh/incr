@@ -17,6 +17,10 @@ fn counters(n: usize) -> Arc<Vec<AtomicU32>> {
     Arc::new((0..n).map(|_| AtomicU32::new(0)).collect())
 }
 
+fn episodes<C: Cells>(rt: &Runtime<C>) -> u64 {
+    rt.episodes.load(SeqCst)
+}
+
 #[derive(Copy, Clone, Debug)]
 enum Strategy {
     None,
@@ -129,6 +133,60 @@ fn local_short_cycles_at_budget_1() {
 #[test]
 fn shared_short_cycles_at_budget_1() {
     short_cycles_at_budget_1::<Shared>();
+}
+
+/// F = IF(A, B, C) with C = F + 1 and A's placeholder false: at budget 1
+/// the doomed F reads false from A, yet `get(F)` runs no episode and C at
+/// most once.
+fn if_abc_at_budget_1<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_placeholder(false);
+    rt.set_max_frames(1);
+    let a_in = rt.create_input(true);
+    let b_in = rt.create_input(7_i64);
+    let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+    let b = rt.create_query_with(move |rt| rt.get(b_in), replayable());
+    let f_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let c_runs = Arc::new(AtomicU32::new(0));
+    let c = {
+        let f_cell = f_cell.clone();
+        let c_runs = c_runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                c_runs.fetch_add(1, SeqCst);
+                rt.get(*f_cell.get().unwrap()) + 1
+            },
+            replayable(),
+        )
+    };
+    let f = rt.create_query_with(
+        move |rt| if rt.get(a) { rt.get(b) } else { rt.get(c) },
+        replayable(),
+    );
+    f_cell.set(f).unwrap();
+    assert_eq!(rt.get(f), 7);
+    assert!(
+        !rt.dooms.lock().unwrap().is_empty(),
+        "the read never doomed"
+    );
+    assert_eq!(episodes(&rt), 0, "the read ran an episode");
+    assert!(
+        c_runs.load(SeqCst) <= 1,
+        "C ran {} times",
+        c_runs.load(SeqCst)
+    );
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn local_if_abc_at_budget_1() {
+    if_abc_at_budget_1::<Local>();
+}
+
+#[test]
+fn shared_if_abc_at_budget_1() {
+    if_abc_at_budget_1::<Shared>();
 }
 
 const HEAVY: usize = 16 << 10;

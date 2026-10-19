@@ -698,6 +698,9 @@ pub struct Runtime<C: Cells> {
     /// Every entry a driver ran, as it found its context.
     #[cfg(test)]
     pub(crate) entries: std::sync::Mutex<Vec<replay_impl::EntrySeen>>,
+    /// Episodes started on this runtime.
+    #[cfg(test)]
+    pub(crate) episodes: std::sync::atomic::AtomicU64,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -769,6 +772,8 @@ impl<C: Cells> Runtime<C> {
             deliveries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             entries: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            episodes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

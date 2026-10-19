@@ -846,6 +846,9 @@ impl<C: Cells> Runtime<C> {
     /// iterate the members to a landing, defer the group to a lower root,
     /// or dissolve it.
     pub(super) fn episode(&self, root: NodeId, cidx: u32, bag: &mut Deferred<C>) -> PopEnd {
+        #[cfg(test)]
+        self.episodes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rt = self.runtime_id;
         let ep = Box::new(Episode {
             id: replay::next_id(),
