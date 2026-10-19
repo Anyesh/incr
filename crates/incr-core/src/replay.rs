@@ -594,10 +594,16 @@ fn remove_where(mut gone: impl FnMut(&Context) -> bool) {
 
 /// Removes every context on the thread: an outermost engine entry
 /// starts with none.
+#[inline(always)]
 pub(crate) fn reset() {
-    if value_code::thread_word() & value_code::REPLAY_BIT == 0 {
-        return;
+    if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+        clear();
     }
+}
+
+#[cold]
+#[inline(never)]
+fn clear() {
     let removed = with(std::mem::take);
     drop(removed);
 }

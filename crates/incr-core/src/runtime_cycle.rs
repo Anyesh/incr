@@ -167,6 +167,7 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    #[inline(always)]
     fn entered_catching<R>(
         &self,
         outermost: bool,
@@ -178,37 +179,53 @@ impl<C: Cells> Runtime<C> {
                 cycle_state::reset_outermost();
                 replay::reset();
             }
-            let payload = match catch_unwind(AssertUnwindSafe(&mut *f)) {
+            match catch_unwind(AssertUnwindSafe(&mut *f)) {
                 Ok(r) => return Ok(r),
-                Err(payload) => payload,
-            };
-            replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
-            // A wound wins over any kind: whatever unwound last, this
-            // thread gave up its claims to an older one, and retries.
-            if outermost && cycle_state::wounded() {
-                cycle_state::take_unwind_kind();
-                cycle_state::set_wounded(false);
-                drop(payload);
-                waits::await_winner(C::backoff);
-                continue;
-            }
-            match cycle_state::take_unwind_kind() {
-                Some(UnwindKind::Cycle) => {
-                    let cycle = match payload.downcast::<CycleUnwind>() {
-                        Ok(unwind) => unwind.0,
-                        // A closure swallowed the cycle and then panicked
-                        // on its own: that panic is the one to deliver.
-                        Err(payload) => resume_unwind(payload),
-                    };
-                    if kind == ReadKind::TryGet {
+                Err(payload) => {
+                    if let Some(cycle) = self.caught(outermost, kind, payload) {
                         return Err(cycle);
                     }
-                    cycle_panic(cycle);
                 }
-                other => {
-                    cycle_state::set_unwind_kind(other);
-                    resume_unwind(payload);
+            }
+        }
+    }
+
+    /// An unwind out of an entry: `None` to retry after a wound, or the
+    /// cycle a `try_get` returns; anything else unwinds on.
+    #[cold]
+    #[inline(never)]
+    fn caught(
+        &self,
+        outermost: bool,
+        kind: ReadKind,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> Option<Cycle> {
+        replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
+        // A wound wins over any kind: whatever unwound last, this
+        // thread gave up its claims to an older one, and retries.
+        if outermost && cycle_state::wounded() {
+            cycle_state::take_unwind_kind();
+            cycle_state::set_wounded(false);
+            drop(payload);
+            waits::await_winner(C::backoff);
+            return None;
+        }
+        match cycle_state::take_unwind_kind() {
+            Some(UnwindKind::Cycle) => {
+                let cycle = match payload.downcast::<CycleUnwind>() {
+                    Ok(unwind) => unwind.0,
+                    // A closure swallowed the cycle and then panicked
+                    // on its own: that panic is the one to deliver.
+                    Err(payload) => resume_unwind(payload),
+                };
+                if kind == ReadKind::TryGet {
+                    return Some(cycle);
                 }
+                cycle_panic(cycle);
+            }
+            other => {
+                cycle_state::set_unwind_kind(other);
+                resume_unwind(payload);
             }
         }
     }

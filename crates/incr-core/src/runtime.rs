@@ -3408,6 +3408,7 @@ impl<C: Cells> Runtime<C> {
     /// writes happen-before the next claim. Loom and Miri both treat a
     /// failed CAS as reading the newest value, so neither would catch a
     /// regression here.
+    #[inline(always)]
     fn land(&self, node: &NodeData<C>, target: NodeState, flagged: NodeState) -> NodeState {
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             return target;

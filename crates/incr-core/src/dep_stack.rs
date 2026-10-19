@@ -91,6 +91,7 @@ impl Frames {
         }
     }
 
+    #[inline(always)]
     fn frame(node: NodeId, rt: RuntimeId, ctl: &ComputeCtl, cidx: u32) -> Frame {
         Frame {
             node,
