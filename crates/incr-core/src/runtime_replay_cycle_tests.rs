@@ -7,6 +7,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
+use super::cycle_impl::EpisodeSeen;
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
@@ -51,10 +52,15 @@ fn replayable_fallback<T>(g: impl Fn(&Cycle) -> T + Send + Sync + 'static) -> Qu
 /// A runtime at frame budget `frames`, `None` for the unbounded run, with
 /// placeholders for every value type the tests read.
 fn runtime<C: Cells>(frames: Option<u32>) -> Runtime<C> {
+    runtime_with::<C>(frames, false)
+}
+
+/// [`runtime`] with `bool`'s placeholder `ph`.
+fn runtime_with<C: Cells>(frames: Option<u32>, ph: bool) -> Runtime<C> {
     let rt = Runtime::<C>::new();
     rt.set_max_frames(frames.unwrap_or(u32::MAX));
     rt.set_placeholder(0_u64);
-    rt.set_placeholder(false);
+    rt.set_placeholder(ph);
     rt
 }
 
@@ -590,7 +596,109 @@ fn walk_driven_discard_in_an_entry<C: Cells>() {
     );
 }
 
+/// **A suspended episode** at budget 1: in a 3-member Fixpoint cycle M1 ->
+/// M2 -> M3 -> M1, M2 reads a New query N from iteration 2 on, so its member
+/// run dooms there. The episode suspends, N's entry drains, and the pop of
+/// M2's virtual frame resumes the same episode in iteration 2 with the
+/// same revisions and re-runs M2; no second episode starts, and the values
+/// and iteration count are the unbounded run's.
+fn suspended_episode<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let k_max = Arc::new(AtomicU32::new(0));
+        let fixpoint = |k_max: &Arc<AtomicU32>| {
+            let k_max = k_max.clone();
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(crate::cycle::Fixpoint::new(|| 0_u64).step(
+                    move |_, out, k| {
+                        k_max.fetch_max(k, SeqCst);
+                        out
+                    },
+                )),
+                replay: Replay::Allowed,
+            }
+        };
+        let one = rt.create_input(1_u64);
+        let n = rt.create_query_with(move |rt| rt.get(one), replayable());
+        let m1_cell = cell::<u64>();
+        let m3 = {
+            let m1_cell = m1_cell.clone();
+            rt.create_query_with(
+                move |rt| (rt.get(*m1_cell.get().unwrap()) + 1).min(3),
+                fixpoint(&k_max),
+            )
+        };
+        let m2 = rt.create_query_with(
+            move |rt| {
+                let v = rt.get(m3);
+                if v >= 1 {
+                    (v + rt.get(n)).min(3)
+                } else {
+                    v + 1
+                }
+            },
+            fixpoint(&k_max),
+        );
+        let m1 = rt.create_query_with(move |rt| (rt.get(m2) + 1).min(3), fixpoint(&k_max));
+        m1_cell.set(m1).unwrap();
+        let got = get(&rt, m1);
+        rt.assert_invariant_i();
+        let values = [m2, m3].map(|m| try_get(&rt, m));
+        let seen = rt.episodes_seen.lock().unwrap().clone();
+        ((got, values, k_max.load(SeqCst)), seen, m2.slot())
+    };
+    let (unbounded, seen, _) = observe(None);
+    assert_eq!(
+        seen.iter()
+            .filter(|e| matches!(e, EpisodeSeen::Start(_)))
+            .count(),
+        1
+    );
+    let (bounded, seen, m2) = observe(Some(1));
+    assert_eq!(bounded, unbounded);
+    let starts: Vec<u64> = seen
+        .iter()
+        .filter_map(|e| match e {
+            EpisodeSeen::Start(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(starts.len(), 1, "{seen:?}");
+    let id = starts[0];
+    let suspend = seen
+        .iter()
+        .position(|e| matches!(e, EpisodeSeen::Suspend { .. }))
+        .unwrap_or_else(|| panic!("no member run was suspended: {seen:?}"));
+    let EpisodeSeen::Suspend { id: s_id, k, revs } = seen[suspend].clone() else {
+        unreachable!()
+    };
+    assert_eq!((s_id, k), (id, 2), "{seen:?}");
+    assert!(
+        matches!(seen[suspend - 1], EpisodeSeen::Member { id: Some(e), slot } if e == id && slot == m2),
+        "the suspended run is M2's: {seen:?}"
+    );
+    assert_eq!(
+        seen[suspend + 1],
+        EpisodeSeen::Resume {
+            id,
+            k: 2,
+            revs,
+            queued_above: 0
+        },
+        "{seen:?}"
+    );
+    assert_eq!(
+        seen[suspend + 2],
+        EpisodeSeen::Member {
+            id: Some(id),
+            slot: m2
+        },
+        "{seen:?}"
+    );
+}
+
 local_and_shared!(
+    suspended_episode,
     walk_driven_discard,
     walk_driven_discard_marks_the_reader,
     walk_driven_discard_in_an_entry,

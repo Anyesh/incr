@@ -1206,6 +1206,22 @@ impl<C: Cells> Runtime<C> {
         if let Some(ep) = v.ep {
             let ep = replay::take_episode(id, ep)
                 .expect("incr-core: a member run's virtual frame keeps its episode");
+            #[cfg(test)]
+            {
+                let queued_above = replay::with(|c| {
+                    c.iter().find(|x| x.id == id).map_or(0, |x| {
+                        x.levels
+                            .iter()
+                            .skip((v.cidx - x.boundary) as usize + 1)
+                            .map(|q| q.len())
+                            .sum()
+                    })
+                });
+                self.episodes_seen
+                    .lock()
+                    .unwrap()
+                    .push(cycle_impl::EpisodeSeen::of(&ep, Some(queued_above)));
+            }
             let root = ep.root;
             let mut bag = Deferred::new();
             let end = catch_unwind(AssertUnwindSafe(|| self.run_episode(ep, &mut bag)));

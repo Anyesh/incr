@@ -689,6 +689,9 @@ pub struct Runtime<C: Cells> {
     /// frame's position, whose taint-memo entries the context owns.
     #[cfg(test)]
     pub(crate) virtual_anchor_skips: std::sync::atomic::AtomicU64,
+    /// Every episode start, suspension, resumption and member run, in order.
+    #[cfg(test)]
+    pub(crate) episodes_seen: std::sync::Mutex<Vec<cycle_impl::EpisodeSeen>>,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -754,6 +757,8 @@ impl<C: Cells> Runtime<C> {
             dirty_reads: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            episodes_seen: std::sync::Mutex::new(Vec::new()),
         }
     }
 

@@ -49,6 +49,57 @@ pub(super) enum PopEnd {
     Suspended,
 }
 
+/// What an episode did, for tests.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EpisodeSeen {
+    Start(u64),
+    /// A doomed member run suspended the episode in iteration `k`, with
+    /// its captured `(stamp_rev, verify_rev)`.
+    Suspend {
+        id: u64,
+        k: u32,
+        revs: (u64, u64),
+    },
+    /// A member run's virtual frame popped and resumed its episode, with
+    /// `queued_above` entries still queued above that frame's level.
+    Resume {
+        id: u64,
+        k: u32,
+        revs: (u64, u64),
+        queued_above: usize,
+    },
+    /// A run of member `slot` started under the episode's `MEMBER` mark.
+    Member {
+        id: Option<u64>,
+        slot: u32,
+    },
+}
+
+#[cfg(test)]
+impl EpisodeSeen {
+    pub(crate) fn of(ep: &Episode, queued_above: Option<usize>) -> Self {
+        let r = ep
+            .round
+            .as_ref()
+            .expect("incr-core: a suspended episode has a round");
+        let revs = (r.stamp_rev, r.verify_rev);
+        match queued_above {
+            Some(queued_above) => Self::Resume {
+                id: ep.id,
+                k: r.k,
+                revs,
+                queued_above,
+            },
+            None => Self::Suspend {
+                id: ep.id,
+                k: r.k,
+                revs,
+            },
+        }
+    }
+}
+
 /// How group verification left the node `compute_one` claimed.
 pub(super) enum GroupEnd {
     Done(Computed),
@@ -765,6 +816,14 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> bool {
         replay::enter_member_run(cidx, ep);
+        #[cfg(test)]
+        self.episodes_seen
+            .lock()
+            .unwrap()
+            .push(EpisodeSeen::Member {
+                id: replay::member_run_episode(cidx),
+                slot,
+            });
         let ran = self.member_run(slot, cidx, true);
         replay::leave_member_run();
         replay::run_ended(self.runtime_id, cidx, matches!(ran, Ok(None)));
@@ -792,6 +851,11 @@ impl<C: Cells> Runtime<C> {
             cu: Vec::new(),
             round: None,
         });
+        #[cfg(test)]
+        self.episodes_seen
+            .lock()
+            .unwrap()
+            .push(EpisodeSeen::Start(ep.id));
         self.run_episode(ep, bag)
     }
 
@@ -1099,6 +1163,11 @@ impl<C: Cells> Runtime<C> {
     /// Stores episode `ep`, whose member run a doom discarded, in the
     /// context that holds that run's virtual frame.
     fn suspend_episode(&self, ep: Box<Episode>) -> PopEnd {
+        #[cfg(test)]
+        self.episodes_seen
+            .lock()
+            .unwrap()
+            .push(EpisodeSeen::of(&ep, None));
         replay::suspend(self.runtime_id, ep);
         PopEnd::Suspended
     }
