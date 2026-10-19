@@ -381,3 +381,153 @@ fn shared_landed_point_below_the_running_entrys_maker() {
     assert_eq!(s.rt.state_of(s.t), NodeState::Clean);
     s.rt.assert_invariant_i();
 }
+
+/// The landed-VFrame shape with X deleted by another thread between
+/// rounds: X's entry is dropped as `Gone`, and T's retry reads X by
+/// handle and panics as stale, as the unbounded run does when the delete
+/// comes first.
+#[test]
+fn shared_delete_of_a_vframes_node_between_rounds() {
+    let s = landed_shape(Rt::new(), false);
+    s.rt.set_max_frames(1);
+    let entry = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.y)), entry.clone())],
+    );
+    entry.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    entry.wait_parked();
+    s.rt.delete_node(s.x);
+    entry.release();
+    let got = reader.join();
+
+    let unbounded = landed_shape(Rt::new(), false);
+    unbounded.rt.delete_node(unbounded.x);
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("stale")),
+        "{want:?}"
+    );
+    assert_eq!(got, want);
+    assert_eq!(s.x_runs.load(SeqCst), 1, "only X's doomed run ran");
+    s.rt.assert_invariant_i();
+}
+
+/// Where the recycling delete lands relative to Y's read of T.
+#[derive(Clone, Copy)]
+enum Recycle {
+    BeforeScan,
+    BeforeClaim,
+}
+
+/// **A delete during replay, with recycling** (judgement steps 2 and 4,
+/// Loop step 2), at budget 1 on the shape where Y reads T: T, X1 and X2
+/// are virtual frames when Y reads T, and another thread deletes X1 and
+/// recycles its slot into a New query Z before the read's scan, or
+/// between the scan and the claim. The read drops the chain at X1's
+/// level, Z's closure never runs, and `get(T)` panics as stale, as the
+/// unbounded run does with the delete first.
+fn delete_and_recycle_during_replay(when: Recycle) {
+    let s = below_shape(Rt::new());
+    s.rt.set_max_frames(1);
+    let gate = Gate::new();
+    let point = match when {
+        Recycle::BeforeScan => ParkPoint::BeforeEntry(id(s.y)),
+        Recycle::BeforeClaim => ParkPoint::BeforeVirtualClaim(id(s.t)),
+    };
+    hook(&s.rt, vec![(point, gate.clone())]);
+    gate.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    gate.wait_parked();
+    s.rt.delete_node(s.x1);
+    let z_runs = Arc::new(AtomicU32::new(0));
+    let z = {
+        let z_runs = z_runs.clone();
+        s.rt.create_query_with(
+            move |_: &Rt| {
+                z_runs.fetch_add(1, SeqCst);
+                9_u64
+            },
+            replayable(),
+        )
+    };
+    assert_eq!(z.slot(), s.x1.slot(), "Z reuses X1's slot");
+    gate.release();
+    let got = reader.join();
+
+    let unbounded = below_shape(Rt::new());
+    unbounded.rt.delete_node(unbounded.x1);
+    unbounded
+        .rt
+        .create_query_with(|_: &Rt| 9_u64, replayable::<u64>());
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("stale")),
+        "{want:?}"
+    );
+    assert_eq!(got, want);
+    assert_eq!(z_runs.load(SeqCst), 0, "Z ran on the reader's behalf");
+    assert_eq!(s.rt.state_of(z), NodeState::New);
+    s.rt.assert_invariant_i();
+}
+
+#[test]
+fn shared_delete_and_recycle_before_the_scan() {
+    delete_and_recycle_during_replay(Recycle::BeforeScan);
+}
+
+#[test]
+fn shared_delete_and_recycle_between_scan_and_claim() {
+    delete_and_recycle_during_replay(Recycle::BeforeClaim);
+}
+
+/// The Local form of a delete during replay: Y's closure deletes X, whose
+/// virtual frame stands for a frame on the stack below Y, and panics as
+/// a delete from inside the node's own compute, as the unbounded run's
+/// delete of a node it is computing does.
+#[test]
+fn local_delete_of_a_vframes_node_from_its_own_thread() {
+    fn run(budget: Option<u32>) -> Result<u64, String> {
+        let rt = Runtime::<crate::cells::Local>::new();
+        rt.set_placeholder(0_u64);
+        if let Some(n) = budget {
+            rt.set_max_frames(n);
+        }
+        let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let y = {
+            let xc = xc.clone();
+            rt.create_query_with(
+                move |rt: &Runtime<crate::cells::Local>| {
+                    rt.delete_node(*xc.get().unwrap());
+                    7_u64
+                },
+                replayable(),
+            )
+        };
+        let x = rt.create_query_with(
+            move |rt: &Runtime<crate::cells::Local>| rt.get(y) + 1,
+            replayable(),
+        );
+        xc.set(x).unwrap();
+        let t = rt.create_query_with(
+            move |rt: &Runtime<crate::cells::Local>| rt.get(x) + 1,
+            replayable(),
+        );
+        let got = outcome(|| rt.get(t));
+        rt.assert_invariant_i();
+        got
+    }
+    let want = run(None);
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("own compute")),
+        "{want:?}"
+    );
+    assert_eq!(run(Some(1)), want);
+}

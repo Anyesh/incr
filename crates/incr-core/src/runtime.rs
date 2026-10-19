@@ -199,6 +199,9 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, on finding the node claimed by another thread,
     /// before its first wait on that claim.
     ComputeWaits(NodeId),
+    /// In a read's judgement of a node with a virtual frame, after the scan
+    /// of the virtual frames above it and before their claims.
+    BeforeVirtualClaim(NodeId),
 }
 
 /// The panic of a read that found its node `Dead` under the handle's
@@ -1395,9 +1398,11 @@ impl<C: Cells> Runtime<C> {
         )
     }
 
-    fn assert_not_own_compute(&self, id: NodeId) {
+    /// A node with a virtual frame on this thread stands for a frame of
+    /// its own below the caller, though nothing holds its claim.
+    fn assert_not_own_compute(&self, id: NodeId, generation: u32) {
         assert!(
-            !self.holds_claim(id),
+            !self.holds_claim(id) && self.virtual_position(id.0, generation).is_none(),
             "incr-core: delete_node called from inside node {}'s own compute",
             id.0,
         );
@@ -1418,7 +1423,7 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != root.generation() {
             return Err(StrictRefusal::Gone);
         }
-        self.assert_not_own_compute(id);
+        self.assert_not_own_compute(id, root.generation());
         self.refuse_delete_under_own_set(id);
         self.park(ParkPoint::DeleteAfterHandleCheck(id));
 
@@ -1648,7 +1653,7 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != handle.generation() {
             return DeleteOutcome::AlreadyGone;
         }
-        self.assert_not_own_compute(id);
+        self.assert_not_own_compute(id, handle.generation());
         self.refuse_delete_under_own_set(id);
 
         let mut spins: u32 = 0;

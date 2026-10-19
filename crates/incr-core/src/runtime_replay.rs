@@ -387,6 +387,7 @@ impl<C: Cells> Runtime<C> {
                 );
                 self.drop_unwind();
             }
+            self.park(ParkPoint::BeforeVirtualClaim(NodeId(slot)));
             match self.claim_virtual(p, top) {
                 Ok(()) => {
                     return Some(
