@@ -29,6 +29,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p "$CRATE" --release $FEATURES
+      - run: cargo test -p "$CRATE" --release $FEATURES
+        env:
+          INCR_MAX_DEPTH: "1"
+          INCR_TEST_ALL_REPLAYABLE: "1"
 
   # The release job above never runs the debug-only lock-order check, so
   # this covers every crate's tests in debug. The Python crates are
@@ -42,6 +46,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-wasm-tests --features incr-persist/sqlite
+      - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-wasm-tests --features incr-persist/sqlite
+        env:
+          INCR_MAX_DEPTH: "1"
+          INCR_TEST_ALL_REPLAYABLE: "1"
 
   wasm:
     name: wasm32 (Node)
