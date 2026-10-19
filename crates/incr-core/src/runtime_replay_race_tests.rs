@@ -382,6 +382,126 @@ fn shared_landed_point_below_the_running_entrys_maker() {
     s.rt.assert_invariant_i();
 }
 
+/// The T1 taint shape at n = 2 over inputs s, t and j: P reads s and, when
+/// s = 1, a New query A and then c0; c0 reads c1; c1 reads t and then P
+/// when t = 0 or j when t = 1. Computed at s = t = 0, so c1 holds an
+/// installed edge to P, then set to s = t = 1, j = 5, which leaves that
+/// edge stale. At budget 1, P dooms on A and its doomed read of c0 pushes
+/// c0 as a walk. P parks on `gate` once it is armed.
+struct Taint {
+    rt: Arc<Rt>,
+    p: Incr<u64>,
+    c0: Incr<u64>,
+    gate: Gate,
+    p_runs: Arc<AtomicU32>,
+}
+
+fn taint_shape() -> Taint {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let (s, t, j) = (
+        rt.create_input(0_u64),
+        rt.create_input(0_u64),
+        rt.create_input(0_u64),
+    );
+    let gate = Gate::new();
+    let p_runs = Arc::new(AtomicU32::new(0));
+    let pc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let c1 = {
+        let pc = pc.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if rt.get(t) == 0 {
+                    rt.get(*pc.get().unwrap()) + 1
+                } else {
+                    rt.get(j) + 1
+                }
+            },
+            replayable(),
+        )
+    };
+    let c0 = rt.create_query_with(move |rt: &Rt| rt.get(c1) + 1, replayable());
+    let a = rt.create_query_with(|_: &Rt| 1_u64, replayable());
+    let p = {
+        let (gate, p_runs) = (gate.clone(), p_runs.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                p_runs.fetch_add(1, SeqCst);
+                gate.park();
+                if rt.get(s) == 1 {
+                    rt.get(a) + 1000 + rt.get(c0)
+                } else {
+                    0
+                }
+            },
+            replayable(),
+        )
+    };
+    pc.set(p).unwrap();
+    assert_eq!(rt.get(c0), 2);
+    rt.set(s, 1);
+    rt.set(t, 1);
+    rt.set(j, 5);
+    p_runs.store(0, SeqCst);
+    Taint {
+        rt,
+        p,
+        c0,
+        gate,
+        p_runs,
+    }
+}
+
+/// **The walk's Computing arm at a VFrame** (T1 The Computing arm too),
+/// at budget 1: thread 1's `get(P)` dooms P on its read of c0, so P is a
+/// virtual frame when the driver takes c0. Thread 2 then claims P and
+/// parks inside P's closure, and c0's entry walk reaches P Computing
+/// through c1's stale edge: it skips P and taints the path instead of
+/// waiting, so thread 1 reaches its level-0 target while thread 2 still
+/// holds P. Both threads read the value of the unbounded run in which
+/// thread 2's claim came first, and P runs only doomed and on thread 2.
+#[test]
+fn shared_walk_skips_a_vframe_computing_on_another_thread() {
+    let s = taint_shape();
+    s.rt.set_max_frames(1);
+    let (entry, target) = (Gate::new(), Gate::new());
+    hook(
+        &s.rt,
+        vec![
+            (ParkPoint::BeforeEntry(id(s.c0)), entry.clone()),
+            (ParkPoint::BeforeEntry(id(s.p)), target.clone()),
+        ],
+    );
+    entry.arm();
+    let reader = {
+        let (rt, p) = (s.rt.clone(), s.p);
+        spawn(move || rt.get(p))
+    };
+    entry.wait_parked();
+    assert_eq!(s.p_runs.load(SeqCst), 1);
+    s.gate.arm();
+    let claimer = {
+        let (rt, p) = (s.rt.clone(), s.p);
+        spawn(move || rt.get(p))
+    };
+    s.gate.wait_parked();
+    target.arm();
+    entry.release();
+    target.wait_parked();
+    assert_eq!(s.rt.state_of(s.p), NodeState::Computing);
+    assert_eq!(s.rt.state_of(s.c0), NodeState::Clean);
+    s.gate.release();
+    let unbounded = {
+        let u = taint_shape();
+        u.rt.get(u.p)
+    };
+    assert_eq!(claimer.join(), unbounded);
+    target.release();
+    assert_eq!(reader.join(), unbounded);
+    assert_eq!(s.p_runs.load(SeqCst), 2, "thread 1's walk never ran P");
+    s.rt.assert_invariant_i();
+}
+
 /// The landed-VFrame shape with X deleted by another thread between
 /// rounds: X's entry is dropped as `Gone`, and T's retry reads X by
 /// handle and panics as stale, as the unbounded run does when the delete
