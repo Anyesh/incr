@@ -2587,8 +2587,16 @@ impl<C: Cells> Runtime<C> {
         word: u64,
         observed: NodeState,
     ) -> Computed {
-        if word != 0 && taint_memo::memoized(word, self.runtime_id, id)
-            || MODE & VIRT != 0 && self.take_direct(id)
+        // A read whose walk a doom stopped goes on with it even if its root
+        // has been memoized since, as the unbounded run's walk goes on.
+        let resume = if MODE & VIRT != 0 {
+            self.take_resume(id)
+        } else {
+            None
+        };
+        if resume.is_none()
+            && (word != 0 && taint_memo::memoized(word, self.runtime_id, id)
+                || MODE & VIRT != 0 && self.take_direct(id))
         {
             if is_computing(observed) {
                 self.wait_on_claim(id, 1);
@@ -2599,12 +2607,7 @@ impl<C: Cells> Runtime<C> {
             }
             return computed;
         }
-        let mut walk = if MODE & VIRT == 0 {
-            Walk::new(id, observed)
-        } else {
-            self.take_resume(id)
-                .unwrap_or_else(|| Walk::new(id, observed))
-        };
+        let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
         let mut root = Computed::Done;
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
