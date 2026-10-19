@@ -378,8 +378,101 @@ fn if_recompute<C: Cells>() {
     observe(Some(1));
 }
 
+/// T reads F; F and X, both with Fallbacks, read each other once s = 1,
+/// and X then reads the head of a chain D whose last node has an installed
+/// edge into F from a run with t = 0.
+struct TaintGraph {
+    t: Incr<u64>,
+    d: Vec<Incr<u64>>,
+    s_in: Incr<u64>,
+    t_in: Incr<u64>,
+}
+
+fn taint_graph<C: Cells>(rt: &Runtime<C>, n: usize) -> TaintGraph {
+    let s_in = rt.create_input(0_u64);
+    let t_in = rt.create_input(0_u64);
+    let f_cell = cell::<u64>();
+    let d_cell = cell::<u64>();
+    let mut d = Vec::with_capacity(n);
+    let mut below = {
+        let f_cell = f_cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                if rt.get(t_in) == 0 {
+                    rt.get(*f_cell.get().unwrap()) + 1
+                } else {
+                    1
+                }
+            },
+            replayable(),
+        )
+    };
+    d.push(below);
+    for _ in 1..n {
+        let next = below;
+        below = rt.create_query_with(move |rt| rt.get(next) + 1, replayable());
+        d.push(below);
+    }
+    d.reverse();
+    let x = {
+        let (f_cell, d_cell) = (f_cell.clone(), d_cell.clone());
+        rt.create_query_with(
+            move |rt| {
+                if rt.get(s_in) == 0 {
+                    return 5;
+                }
+                rt.get(*f_cell.get().unwrap()) + rt.get(*d_cell.get().unwrap())
+            },
+            replayable_fallback(|c| 200 + c.len() as u64),
+        )
+    };
+    let f = rt.create_query_with(
+        move |rt| rt.get(x) + 1,
+        replayable_fallback(|c| 100 + c.len() as u64),
+    );
+    f_cell.set(f).unwrap();
+    d_cell.set(d[0]).unwrap();
+    let t = rt.create_query_with(move |rt| rt.get(f) * 2, replayable());
+    TaintGraph { t, d, s_in, t_in }
+}
+
+/// **Taint-memo entries owned by a virtual position** at budget 1: X's
+/// read of F's virtual frame claims F, and the driver entry that computes
+/// the Dirty chain D walks its stale edge into F, skips the claim anchored
+/// at the virtual frame and memoizes the chain. The memo is empty with its
+/// bit clear once `get` returns, and the values are the unbounded run's.
+fn taint_memo_owned_by_a_virtual_position<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let g = taint_graph(&rt, 5);
+        assert_eq!(rt.get(g.d[0]), 11);
+        rt.set(g.s_in, 1);
+        rt.set(g.t_in, 1);
+        let t = get(&rt, g.t);
+        assert!(crate::taint_memo::is_empty());
+        assert_eq!(crate::value_code::thread_word(), 0);
+        rt.assert_invariant_i();
+        let skips = rt.virtual_anchor_skips.load(SeqCst);
+        let d = g.d.iter().map(|&n| get(&rt, n)).collect::<Vec<_>>();
+        rt.set(g.s_in, 0);
+        let again = get(&rt, g.t);
+        rt.assert_invariant_i();
+        (t, d, again, skips)
+    };
+    let (t, d, again, skips) = observe(None);
+    assert_eq!(skips, 0);
+    let (bt, bd, bagain, bskips) = observe(Some(1));
+    assert!(
+        bskips > 0,
+        "no walk skipped a claim anchored at a virtual frame"
+    );
+    assert_eq!(t, Outcome::Value(204));
+    assert_eq!((bt, bd, bagain), (t, d, again));
+}
+
 local_and_shared!(
     read_of_a_vframes_own_node,
+    taint_memo_owned_by_a_virtual_position,
     if_false_fallback_on_f,
     if_false_fallback_on_c,
     if_b_reads_f,

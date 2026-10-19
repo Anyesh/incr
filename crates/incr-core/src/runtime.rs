@@ -685,6 +685,10 @@ pub struct Runtime<C: Cells> {
     /// a read in a frame returned.
     #[cfg(test)]
     pub(crate) dirty_reads: std::sync::Mutex<Vec<u32>>,
+    /// Walk skips of a claim this thread holds anchored at a virtual
+    /// frame's position, whose taint-memo entries the context owns.
+    #[cfg(test)]
+    pub(crate) virtual_anchor_skips: std::sync::atomic::AtomicU64,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -748,6 +752,8 @@ impl<C: Cells> Runtime<C> {
             dooms: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             dirty_reads: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2619,6 +2625,11 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Computing | NodeState::ComputingDirty => {
                     if !is_root {
                         if let Some(owner) = self.own_claim_owner(cur) {
+                            #[cfg(all(test, not(loom)))]
+                            if self.is_virtual_cidx(owner - 1) {
+                                self.virtual_anchor_skips
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             walk.taint(owner);
                             continue;
                         }

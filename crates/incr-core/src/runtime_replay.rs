@@ -2032,6 +2032,17 @@ impl<C: Cells> Runtime<C> {
         self.virtual_position(id.0, self.nodes.get(id.0).generation())
             .map(|p| p + 1)
     }
+
+    /// Whether position `cidx` holds one of this runtime's virtual frames.
+    #[cfg(all(test, not(loom)))]
+    pub(super) fn is_virtual_cidx(&self, cidx: u32) -> bool {
+        let rt = self.runtime_id;
+        replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .any(|x| x.vstack.iter().any(|v| v.cidx == cidx))
+        })
+    }
 }
 
 /// A copy of a panic payload of a type the engine knows: a cycle unwind's

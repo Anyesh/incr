@@ -83,6 +83,12 @@ pub(crate) fn clear_from(depth: u32) {
     });
 }
 
+/// Whether this thread's memo has no entries.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn is_empty() -> bool {
+    MEMO.with(|m| m.borrow().owners.is_empty())
+}
+
 /// Entries taken out of the memo with their owners.
 pub(crate) type Parked = Vec<((RuntimeId, NodeId), u32)>;
 
