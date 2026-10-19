@@ -18,6 +18,11 @@ pub(crate) struct Held {
     pub(crate) generation: u32,
     /// The conceptual-stack position of the root that resolves it.
     pub(crate) anchor: u32,
+    /// The position of the frame whose unwind releases it: the frame it
+    /// stands for, or the frame below that its deferral passed to. A
+    /// deferral to a root below that frame leaves it anchored lower, so the
+    /// anchor alone would let an unwind between them leak the claim.
+    pub(crate) owner: u32,
     /// The node has a Fallback or Fixpoint strategy.
     pub(crate) seeded: bool,
     /// The claim was taken from New.
@@ -55,6 +60,7 @@ impl Held {
         Self {
             generation,
             anchor,
+            owner: anchor,
             seeded,
             first,
             buf: None,

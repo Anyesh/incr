@@ -888,6 +888,30 @@ fn a_walk_root_deferred_under_its_walk<C: Cells>() {
     rt.assert_invariant_i();
 }
 
+/// R reads A, which catches B's panic. B reads C, which reads R through
+/// `try_get`, so C defers to R and B inherits R's position, then B panics.
+/// The panic takes C's claim with it, though C is anchored below B, and B
+/// lands Dirty, since C landed New under it.
+fn a_panic_releases_the_claims_its_frame_deferred<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let rc = cell::<i64>();
+    let c = {
+        let rc = rc.clone();
+        rt.create_query(move |rt| rt.try_get(*rc.get().unwrap()).unwrap_or(1))
+    };
+    let b = rt.create_query(move |rt| {
+        rt.get(c);
+        panic!("B fails after reading C")
+    });
+    let a = rt.create_query(move |rt| quiet(|| rt.get(b)).unwrap_or(9));
+    let r = rt.create_query(move |rt| rt.get(a));
+    rc.set(r).unwrap();
+    assert_eq!(rt.get(r), 9);
+    assert_eq!(rt.state_of(c), NodeState::New);
+    assert_eq!(rt.state_of(b), NodeState::Dirty);
+    rt.assert_invariant_i();
+}
+
 both!(
     member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
@@ -913,6 +937,7 @@ both!(
     swallowed_cycle_is_an_ordinary_result,
     dirty_cyclic_landing_reads_as_the_cycle,
     a_walk_root_deferred_under_its_walk,
+    a_panic_releases_the_claims_its_frame_deferred,
 );
 
 fn on_deep_stack(body: fn()) {

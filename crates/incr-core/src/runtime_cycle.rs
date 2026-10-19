@@ -547,24 +547,11 @@ impl<C: Cells> Runtime<C> {
         held.wrote = ctl.wrote.get() != 0;
         held.opened = !ctl.children.get().is_null();
         held.record_run(deps);
-        let displaced = cycle_state::with_held(|h| {
-            if lowlink < cidx {
-                // The claims this frame's subtree deferred belong to the
-                // lower root too, not to a later frame at their position.
-                for ((r, _), e) in h.iter_mut() {
-                    if *r == rt && e.anchor >= cidx {
-                        e.anchor = lowlink;
-                    }
-                }
-            }
-            h.insert((rt, id.0), held)
-        });
+        held.owner = cidx;
+        let displaced = cycle_state::with_held(|h| h.insert((rt, id.0), held));
         debug_assert!(displaced.is_none(), "incr-core: node {} held twice", id.0);
         if lowlink < cidx {
-            if let Some((parent, _)) = self.dep_stack.active_frame(rt) {
-                // SAFETY: the active frame's control block is live.
-                unsafe { &*parent }.lower(lowlink);
-            }
+            self.pass_down(cidx, lowlink);
             return PopEnd::Deferred;
         }
         self.episode(id, cidx, bag)
@@ -579,6 +566,7 @@ impl<C: Cells> Runtime<C> {
                 .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
                 .map(|((_, slot), e)| {
                     e.anchor = cidx;
+                    e.owner = cidx;
                     *slot
                 })
                 .collect()
@@ -703,6 +691,7 @@ impl<C: Cells> Runtime<C> {
                         .get_mut(&(rt, *m))
                         .expect("incr-core: an episode member is held");
                     e.anchor = cidx;
+                    e.owner = cidx;
                     e.episode = Some(cycle.clone());
                     e.in_cu = cu.binary_search(m).is_ok();
                     e.installed.clear();
@@ -906,6 +895,7 @@ impl<C: Cells> Runtime<C> {
                 })
                 .map(|((_, slot), e)| {
                     e.anchor = cidx;
+                    e.owner = cidx;
                     *slot
                 })
                 .collect()
@@ -937,10 +927,34 @@ impl<C: Cells> Runtime<C> {
         for v in values {
             bag.push_erased(v);
         }
-        if let Some((parent, _)) = self.dep_stack.active_frame(rt) {
-            // SAFETY: the active frame's control block is live.
-            unsafe { &*parent }.lower(low);
-        }
+        self.pass_down(cidx, low);
+    }
+
+    /// The frame at `cidx` popped deferred with lowlink `low`: the claims
+    /// its subtree deferred re-anchor at `low` too, not at a later frame
+    /// at their position, and pass to its parent, which inherits `low`.
+    fn pass_down(&self, cidx: u32, low: u32) {
+        let rt = self.runtime_id;
+        let parent = match self.dep_stack.active_frame(rt) {
+            Some((parent, at)) => {
+                // SAFETY: the active frame's control block is live.
+                unsafe { &*parent }.lower(low);
+                at
+            }
+            None => cidx.saturating_sub(1),
+        };
+        cycle_state::with_held(|h| {
+            for ((r, _), e) in h.iter_mut() {
+                if *r == rt {
+                    if e.anchor >= cidx {
+                        e.anchor = low;
+                    }
+                    if e.owner >= cidx {
+                        e.owner = parent;
+                    }
+                }
+            }
+        });
     }
 
     /// Releases `slots` from the held map with the discard landing,
@@ -960,10 +974,11 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Lands every claim of this runtime held at or above `cidx`: a claim
-    /// whose own code panicked in user code takes fix 5's panic path, and
-    /// every other claim, and every claim under an engine unwind, the
-    /// discard landing.
+    /// Lands every claim of this runtime held at or above `cidx`, or owned
+    /// there, since a frame that unwinds takes the claims its subtree
+    /// deferred to a root below it: a claim whose own code panicked in user
+    /// code takes fix 5's panic path, and every other claim, and every
+    /// claim under an engine unwind, the discard landing.
     pub(super) fn release_held_from(
         &self,
         cidx: u32,
@@ -977,7 +992,7 @@ impl<C: Cells> Runtime<C> {
             }
             let keys: Vec<(RuntimeId, u32)> = h
                 .iter()
-                .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
+                .filter(|((r, _), e)| *r == rt && (e.anchor >= cidx || e.owner >= cidx))
                 .map(|(k, _)| *k)
                 .collect();
             keys.into_iter()
