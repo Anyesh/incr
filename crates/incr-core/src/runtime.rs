@@ -2774,6 +2774,9 @@ impl<C: Cells> Runtime<C> {
                     continue;
                 }
                 NodeState::Failed => {
+                    // A closure that catches this panic has still read a
+                    // node with no value, so it must not land Clean over it.
+                    self.dep_stack.poison_current_frame(self.runtime_id);
                     panic!(
                         "incr-core: node {} read but its last compute panicked; it stays \
                          Failed until a dependency changes (set an upstream input to retry)",
@@ -2904,6 +2907,11 @@ impl<C: Cells> Runtime<C> {
                     self.drop_speculative_verify(node, claimed_dirty);
                 }
                 match self.group_verify(id, g, visit, bag) {
+                    // A tainted verify leaves the node Dirty for the root's
+                    // compute to read again, which poisons where needed.
+                    GroupEnd::Done(Computed::Done) if !matches!(visit, Visit::VerifyOnly(_)) => {
+                        return self.episode_landed(node)
+                    }
                     GroupEnd::Done(computed) => return computed,
                     GroupEnd::Retry => {
                         self.park_with_bag(ParkPoint::StaleRetry(id), bag);
@@ -3045,7 +3053,7 @@ impl<C: Cells> Runtime<C> {
                     }
                     match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
                         PopEnd::Deferred => return Computed::Deferred,
-                        PopEnd::Landed => return Computed::Done,
+                        PopEnd::Landed => return self.episode_landed(node),
                         PopEnd::Suspended => return Computed::Discarded,
                         PopEnd::Dissolved => continue 'run,
                         PopEnd::Retry => {
@@ -3124,6 +3132,16 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// A root whose episode landed it: a reader that reads it Dirty, or
+    /// New with no value, must not land Clean over it, as after a
+    /// single-node landing.
+    fn episode_landed(&self, node: &NodeData<C>) -> Computed {
+        if matches!(node.state(), NodeState::Dirty | NodeState::New) {
+            self.dep_stack.poison_current_frame(self.runtime_id);
+        }
+        Computed::Done
+    }
+
     /// The `Err` arm of a compute: the closure panicked, or an engine
     /// unwind passed through it. Lands the node and every claim this
     /// thread held above its frame, then resumes the unwind.
@@ -3159,6 +3177,9 @@ impl<C: Cells> Runtime<C> {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
             self.discard_land(id, attempt.first, wrote, attempt.stamp_rev, bag);
+            // A closure that catches the unwind has read a dep that did not
+            // land, which its publish counts as settled if it read it before.
+            self.dep_stack.poison_current_frame(self.runtime_id);
             cycle_state::set_unwind_kind(kind);
             bag.drain_carried(payload);
         }
@@ -3170,6 +3191,9 @@ impl<C: Cells> Runtime<C> {
         // reached yet. Extra edges only cause spurious re-verification,
         // never staleness.
         self.land_failed(id, node, flags, attempt, wrote, deps, &[], bag);
+        // An enclosing closure that catches the unwind has still read a
+        // dep that did not land Clean.
+        self.dep_stack.poison_current_frame(self.runtime_id);
         bag.drain_carried(payload);
     }
 
