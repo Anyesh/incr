@@ -651,3 +651,232 @@ fn local_delete_of_a_vframes_node_from_its_own_thread() {
     );
     assert_eq!(run(Some(1)), want);
 }
+
+/// Blocks until a thread has registered a wait on `h`'s claim.
+fn await_registered_wait(rt: &Rt, h: Incr<u64>) {
+    let start = std::time::Instant::now();
+    while !crate::waits::waited_on((rt.runtime_id, h.slot())) {
+        assert!(
+            start.elapsed() < JOIN_TIMEOUT,
+            "no thread waited on node {}",
+            h.slot()
+        );
+        thread::yield_now();
+    }
+}
+
+/// **Readers of released claims**, at budget 1 on the landed-VFrame
+/// shape in its chain form: a doom releases the claim of the node its
+/// read wanted before the reading frame gets its placeholder, and
+/// another thread parked there computes that node; another thread also
+/// computes a discarded frame's node between rounds. Each is computed
+/// once, by the other thread, as a node no one claims, and T's value is
+/// the unbounded run's.
+fn released_claim_read(point: fn(&Landed) -> ParkPoint) {
+    let s = landed_shape(Rt::new(), false);
+    s.rt.set_max_frames(1);
+    let gate = Gate::new();
+    hook(&s.rt, vec![(point(&s), gate.clone())]);
+    gate.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || rt.get(t))
+    };
+    gate.wait_parked();
+    assert_eq!(s.rt.state_of(s.x), NodeState::New, "X's claim is released");
+    let alone = landed_shape(Rt::new(), false);
+    alone.rt.set_max_frames(1);
+    assert_eq!(s.rt.get(s.x), alone.rt.get(alone.x));
+    let runs_before = s.x_runs.load(SeqCst);
+    gate.release();
+    let unbounded = landed_shape(Rt::new(), false);
+    assert_eq!(reader.join(), unbounded.rt.get(unbounded.t));
+    assert_eq!(
+        s.x_runs.load(SeqCst),
+        runs_before,
+        "the reader never ran X once it had landed"
+    );
+    assert_eq!(s.rt.state_of(s.t), NodeState::Clean);
+    s.rt.assert_invariant_i();
+}
+
+#[test]
+fn shared_reader_of_a_doomed_reads_released_claim() {
+    released_claim_read(|s| ParkPoint::AfterDoom(id(s.x)));
+}
+
+#[test]
+fn shared_reader_of_a_discarded_frames_released_claim() {
+    released_claim_read(|s| ParkPoint::BeforeEntry(id(s.y)));
+}
+
+/// **A `set` during a discard**, at budget 1: F, Clean at s = 0, is
+/// claimed from Dirty after `set(s, 1)` and dooms on its read of a New
+/// query N; parked at the doom, another thread sets s = 2 under F's
+/// claim. F's discard landing keeps the set's dirtying, so the value the
+/// read returns is one of the two revisions', and the next read, after
+/// both sets, is the unbounded run's at s = 2.
+#[test]
+fn shared_set_during_a_discard() {
+    fn shape(rt: &Arc<Rt>) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
+        rt.set_placeholder(0_u64);
+        let s = rt.create_input(0_u64);
+        let n = rt.create_query_with(|_: &Rt| 1_u64, replayable());
+        let f = rt.create_query_with(
+            move |rt: &Rt| match rt.get(s) {
+                0 => 0,
+                v => v * 10 + rt.get(n),
+            },
+            replayable(),
+        );
+        assert_eq!(rt.get(f), 0);
+        (s, n, f)
+    }
+    let rt = Arc::new(Rt::new());
+    let (s, n, f) = shape(&rt);
+    rt.set(s, 1);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    hook(&rt, vec![(ParkPoint::AfterDoom(id(n)), gate.clone())]);
+    gate.arm();
+    let reader = {
+        let rt = rt.clone();
+        spawn(move || rt.get(f))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(f), NodeState::Computing);
+    rt.set(s, 2);
+    gate.release();
+    let got = reader.join();
+    assert!(got == 11 || got == 21, "{got}");
+    rt.assert_invariant_i();
+
+    let unbounded = Arc::new(Rt::new());
+    let (us, _, uf) = shape(&unbounded);
+    unbounded.set(us, 2);
+    assert_eq!(rt.get(f), unbounded.get(uf));
+    assert_eq!(rt.state_of(f), NodeState::Clean);
+    rt.assert_invariant_i();
+}
+
+/// A Fallback cycle F -> X -> Y -> F, all replayable: F's fallback is
+/// 100, X reads Y while input b is 0 and is 50 otherwise, and Y,
+/// unseeded, reads F. X parks on `gate` once it is armed.
+struct Hit {
+    rt: Arc<Rt>,
+    f: Incr<u64>,
+    x: Incr<u64>,
+    y: Incr<u64>,
+    b: Incr<u64>,
+    gate: Gate,
+}
+
+fn hit_shape() -> Hit {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let b = rt.create_input(0_u64);
+    let gate = Gate::new();
+    let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let y = {
+        let fc = fc.clone();
+        rt.create_query_with(move |rt: &Rt| rt.get(*fc.get().unwrap()) + 1, replayable())
+    };
+    let x = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                gate.park();
+                if rt.get(b) == 0 {
+                    rt.get(y) + 1
+                } else {
+                    50
+                }
+            },
+            replayable(),
+        )
+    };
+    let f = rt.create_query_with(
+        move |rt: &Rt| rt.get(x) + 1,
+        QueryOpts {
+            cycle: crate::cycle::CycleStrategy::Fallback(Box::new(|_| 100)),
+            replay: Replay::Allowed,
+        },
+    );
+    fc.set(f).unwrap();
+    Hit {
+        rt,
+        f,
+        x,
+        y,
+        b,
+        gate,
+    }
+}
+
+/// The values of F, X and Y in a single-threaded unbounded run entered
+/// at F, with b set first.
+fn hit_unbounded(b: u64) -> (u64, u64, Option<u64>) {
+    let u = hit_shape();
+    u.rt.set(u.b, b);
+    let f = u.rt.get(u.f);
+    let x = u.rt.get(u.x);
+    let y = (b == 0).then(|| u.rt.get(u.y));
+    (f, x, y)
+}
+
+/// **A virtual-hit claim racing another thread** (Virtual cycles step 4),
+/// at budget 1: F and X are virtual frames when the driver takes Y, and
+/// another thread claims X and parks inside X's closure. Y's read of F is
+/// a virtual hit whose claim of X fails, so the claims taken roll back
+/// and the read waits on X, registered. With `b` still 0, X's closure on
+/// the other thread reads Y, which the first thread computes: the
+/// registry closes the waits-for cycle, and the results are the single
+/// run's. With `b` set to 1 first, X lands Clean without reading Y, the
+/// second judgement finds a landed frame above F's and drops the chain,
+/// and F's retry reads X Clean.
+fn virtual_hit_claim_race(b: u64) {
+    let s = hit_shape();
+    s.rt.set_max_frames(1);
+    let entry = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.y)), entry.clone())],
+    );
+    entry.arm();
+    let first = {
+        let (rt, f) = (s.rt.clone(), s.f);
+        spawn(move || rt.get(f))
+    };
+    entry.wait_parked();
+    s.rt.set(s.b, b);
+    s.gate.arm();
+    let second = {
+        let (rt, x) = (s.rt.clone(), s.x);
+        spawn(move || rt.get(x))
+    };
+    s.gate.wait_parked();
+    entry.release();
+    await_registered_wait(&s.rt, s.x);
+    s.gate.release();
+    let (f, x) = (first.join(), second.join());
+
+    let (want_f, want_x, want_y) = hit_unbounded(b);
+    assert_eq!((f, x), (want_f, want_x));
+    if let Some(y) = want_y {
+        assert_eq!(s.rt.get(s.y), y);
+    }
+    s.rt.assert_invariant_i();
+    for h in [s.f, s.x, s.y] {
+        assert!(!crate::waits::waited_on((s.rt.runtime_id, h.slot())));
+    }
+}
+
+#[test]
+fn shared_virtual_hit_claim_race_closes_a_waits_for_cycle() {
+    virtual_hit_claim_race(0);
+}
+
+#[test]
+fn shared_virtual_hit_claim_race_then_a_landed_frame() {
+    virtual_hit_claim_race(1);
+}

@@ -90,6 +90,12 @@ pub(crate) fn registered() -> usize {
     registry().waiters.len()
 }
 
+/// Whether a registered thread is waiting on `claim`, for tests.
+#[cfg(test)]
+pub(crate) fn waited_on(claim: Claim) -> bool {
+    registry().waiters.iter().any(|w| w.waiting_on == claim)
+}
+
 fn registry() -> impl std::ops::DerefMut<Target = Registry> {
     #[cfg(not(loom))]
     {
