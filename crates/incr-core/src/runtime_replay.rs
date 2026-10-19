@@ -311,6 +311,9 @@ impl<C: Cells> Runtime<C> {
     ) -> Option<Result<T, Cycle>> {
         let rt = self.runtime_id;
         let slot = handle.slot();
+        // A member run sits at its episode's anchor but reads from the top
+        // of the stack, above every frame between.
+        let top = f.cidx.max(self.dep_stack.next_cidx().wrapping_sub(1));
         let mut spins = 0;
         loop {
             match state::load::<C>(self.nodes.get(slot).state_cell()) {
@@ -346,14 +349,14 @@ impl<C: Cells> Runtime<C> {
                 );
                 self.drop_unwind();
             }
-            if self.suspect_above(p, f.cidx) {
+            if self.suspect_above(p, top) {
                 debug_assert!(
                     replay::speculative(),
                     "incr-core: a suspect edge lies under a speculative entry"
                 );
                 self.drop_unwind();
             }
-            match self.claim_virtual(p, f.cidx) {
+            match self.claim_virtual(p, top) {
                 Ok(()) => {
                     return Some(
                         self.cycle_read(handle, NodeState::Computing, kind)
