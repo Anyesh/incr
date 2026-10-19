@@ -857,7 +857,7 @@ impl<C: Cells> Runtime<C> {
 
     /// The pop of a doomed frame: its run, its panic included, lands
     /// nothing, and every claim held at or above it takes the discard
-    /// landing.
+    /// landing, except those virtual frames own, whose root stays held.
     #[cold]
     #[inline(never)]
     pub(super) fn discard_doomed(
@@ -870,8 +870,9 @@ impl<C: Cells> Runtime<C> {
     ) -> Computed {
         // An episode a read in the run suspended waits for its member's
         // virtual frame, not for this frame's retry.
-        let suspended = replay::suspended_members(self.runtime_id);
-        self.release_held_except(attempt.cidx, true, &suspended, bag);
+        let mut keep = replay::suspended_members(self.runtime_id);
+        let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
+        self.release_held_except(attempt.cidx, true, &keep, bag);
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
@@ -879,9 +880,62 @@ impl<C: Cells> Runtime<C> {
             bag.push_erased(payload);
         }
         let wrote = ctl.wrote.get() != 0;
-        self.discard_land(id, attempt.first, wrote, attempt.stamp_rev, bag);
+        match rooted {
+            Some(path) => self.hold_doomed_root(id, attempt, wrote, path, bag),
+            None => self.discard_land(id, attempt.first, wrote, attempt.stamp_rev, bag),
+        }
         replay::unwind_past(self.runtime_id, attempt.cidx + 1);
         Computed::Discarded
+    }
+
+    /// The claims that virtual frames at or above `cidx` own since the
+    /// mark, added to `keep`: the unbounded run's frames are still on the
+    /// stack with them held while the blocked read runs, so the entries
+    /// above read them held, not New. When some are anchored at `cidx`, the
+    /// doomed run of `id` there roots them, and the path of its virtual
+    /// frame is returned.
+    fn keep_virtual(&self, id: NodeId, cidx: u32, keep: &mut Vec<u32>) -> Option<u64> {
+        let rt = self.runtime_id;
+        let mut rooted = false;
+        cycle_state::with_held(|h| {
+            for (&(r, slot), e) in h.iter() {
+                if r == rt && e.owner_virtual.is_some() && e.anchor >= cidx && e.owner >= cidx {
+                    keep.push(slot);
+                    rooted |= e.anchor == cidx;
+                }
+            }
+        });
+        if !rooted || cycle_state::holds(rt, id.0) {
+            return None;
+        }
+        replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| x.vstack.iter())
+                .find(|v| v.cidx == cidx && v.node == id.0)
+                .map(|v| v.path)
+        })
+    }
+
+    /// The doomed root of kept claims stays claimed, as a virtual hit's
+    /// claim of its frame, unbuffered: its virtual frame's pop finishes its
+    /// run and roots the episode, as the unbounded run's frame does.
+    fn hold_doomed_root(
+        &self,
+        id: NodeId,
+        attempt: Attempt,
+        wrote: bool,
+        path: u64,
+        bag: &mut Deferred<C>,
+    ) {
+        let rt = self.runtime_id;
+        let (node, flags) = self.nodes.get_with_flags(id.0);
+        self.children_landing(id, flags, ChildLanding::Discard, false, bag);
+        let seeded = C::u8_load_relaxed(flags) & HAS_STRATEGY != 0;
+        let mut held = Held::new(node.generation(), attempt.cidx, seeded, attempt.first);
+        held.own(attempt.cidx, id.0, Some(path));
+        held.wrote = wrote;
+        cycle_state::with_held(|h| h.insert((rt, id.0), held));
     }
 
     /// A walk's compute came back discarded. If the doom opened a context

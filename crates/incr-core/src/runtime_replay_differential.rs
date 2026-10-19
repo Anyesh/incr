@@ -495,10 +495,10 @@ fn regressions() {
     // and landed Clean over that dep through the same-deps publish. 0x74f
     // and 0x597: a read whose compute ran an episode that landed the node
     // Dirty or New returned as if it landed Clean.
-    // 0x4d1b and 0xe8d4_a530_7b: a cycle episode that aborted left its
+    // 0x4d1b and 0x00e8_d4a5_307b: a cycle episode that aborted left its
     // root's reader unpoisoned, so a `try_get` that caught the unwind
     // landed Clean over a dep the abort left Dirty.
-    for seed in [0xbc2, 0x74f, 0x597, 0x4d1b, 0xe8d4_a530_7b] {
+    for seed in [0xbc2, 0x74f, 0x597, 0x4d1b, 0x00e8_d4a5_307b] {
         let case = gen_case(seed);
         quiet(|| {
             run::<Local>(&case, None, 0);
@@ -569,6 +569,8 @@ fn replay_seeds() {
         0x2cce,
         0x2d76,
         0x4654,
+        0x00e8_d4a5_2919,
+        0x00e8_d4a5_2db3,
         0x551d_e2c5_404a_84b1,
         0xa649_6004_aa21_dd3b,
         0xa8cc_85b9_bbfd_657d,
