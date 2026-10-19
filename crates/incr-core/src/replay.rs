@@ -541,6 +541,18 @@ pub(crate) fn suspended_members(rt: RuntimeId) -> Vec<u32> {
     })
 }
 
+/// Whether an episode of runtime `rt` that waits in a context has a member
+/// run that read the frame at `cidx`, below its root: resumed, it defers
+/// its members to that frame.
+pub(crate) fn suspended_low_at(rt: RuntimeId, cidx: u32) -> bool {
+    with(|c| {
+        c.iter()
+            .filter(|x| x.rt == rt)
+            .flat_map(|x| x.episodes.iter())
+            .any(|e| e.cidx > cidx && e.round.as_ref().is_some_and(|r| r.low == cidx))
+    })
+}
+
 /// Takes episode `ep` out of context `id`.
 pub(crate) fn take_episode(id: u64, ep: u64) -> Option<Box<Episode>> {
     with(|c| {

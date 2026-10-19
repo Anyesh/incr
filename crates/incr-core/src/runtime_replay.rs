@@ -1129,9 +1129,10 @@ impl<C: Cells> Runtime<C> {
     /// The claims that virtual frames at or above `cidx` own since the
     /// mark, added to `keep`: the unbounded run's frames are still on the
     /// stack with them held while the blocked read runs, so the entries
-    /// above read them held, not New. When some are anchored at `cidx`, the
-    /// doomed run of `id` there roots them, and the path of its virtual
-    /// frame is returned.
+    /// above read them held, not New. When some are anchored at `cidx`, or
+    /// a waiting episode's member run read the frame there, the doomed run
+    /// of `id` there roots them, and the path of its virtual frame is
+    /// returned.
     fn keep_virtual(&self, id: NodeId, cidx: u32, keep: &mut Vec<u32>) -> Option<u64> {
         let rt = self.runtime_id;
         let mut rooted = false;
@@ -1143,6 +1144,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         });
+        rooted |= replay::suspended_low_at(rt, cidx);
         if !rooted || cycle_state::holds(rt, id.0) {
             return None;
         }
