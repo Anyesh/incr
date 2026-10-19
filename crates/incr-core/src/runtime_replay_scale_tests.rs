@@ -17,6 +17,10 @@ fn counters(n: usize) -> Arc<Vec<AtomicU32>> {
     Arc::new((0..n).map(|_| AtomicU32::new(0)).collect())
 }
 
+fn max_of(runs: &[AtomicU32]) -> u32 {
+    runs.iter().map(|r| r.load(SeqCst)).max().unwrap_or(0)
+}
+
 fn episodes<C: Cells>(rt: &Runtime<C>) -> u64 {
     rt.episodes.load(SeqCst)
 }
@@ -70,6 +74,78 @@ fn ring<C: Cells>(
         .collect::<Vec<_>>();
     members.set(built.clone()).unwrap();
     built
+}
+
+/// A 100k-member ring at budget `frames`: Fallback lands member 0's
+/// fallback and every other member over it, Fixpoint converges every
+/// member to 5. Every member runs at most twice per pass, the discovery
+/// pass counted with the iterations.
+fn cycle_100k<C: Cells>(strategy: Strategy, frames: u32) {
+    let n = 100_000;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(frames);
+    let runs = counters(n);
+    let iterations = Arc::new(AtomicU32::new(0));
+    let members = ring(&rt, n, strategy, &runs, &iterations, |rt, next, _| {
+        (rt.get(next) + 1).min(5)
+    });
+    let head = rt.get(members[0]);
+    let passes = match strategy {
+        Strategy::Fallback => {
+            assert_eq!(head, 3);
+            for (k, &m) in members.iter().enumerate().skip(1) {
+                assert_eq!(rt.get(m), if k == n - 1 { 4 } else { 5 }, "member {k}");
+            }
+            2
+        }
+        Strategy::Fixpoint => {
+            assert_eq!(head, 5);
+            for &m in &members {
+                assert_eq!(rt.get(m), 5);
+            }
+            iterations.load(SeqCst) + 1
+        }
+        Strategy::None => unreachable!(),
+    };
+    for &m in &members {
+        assert_eq!(rt.state_of(m), NodeState::Clean);
+    }
+    assert!(rt
+        .dooms
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|d| d.depth <= frames as usize));
+    assert!(
+        max_of(&runs) <= 2 * passes,
+        "a member ran {} times over {passes} passes",
+        max_of(&runs)
+    );
+    rt.assert_invariant_i();
+}
+
+macro_rules! cycle_100k_tests {
+    ($($name:ident: $cells:ident, $strategy:ident, $frames:expr;)*) => {
+        $(
+            #[test]
+            #[cfg_attr(miri, ignore)]
+            fn $name() {
+                on_stack(8 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
+            }
+        )*
+    };
+}
+
+cycle_100k_tests! {
+    local_fallback_cycle_100k_at_budget_256: Local, Fallback, 256;
+    local_fallback_cycle_100k_at_budget_1: Local, Fallback, 1;
+    local_fixpoint_cycle_100k_at_budget_256: Local, Fixpoint, 256;
+    local_fixpoint_cycle_100k_at_budget_1: Local, Fixpoint, 1;
+    shared_fallback_cycle_100k_at_budget_256: Shared, Fallback, 256;
+    shared_fallback_cycle_100k_at_budget_1: Shared, Fallback, 1;
+    shared_fixpoint_cycle_100k_at_budget_256: Shared, Fixpoint, 256;
+    shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
 }
 
 /// What a read of every ring member returns after `try_get` of the
