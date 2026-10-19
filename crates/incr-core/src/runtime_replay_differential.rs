@@ -495,7 +495,10 @@ fn regressions() {
     // and landed Clean over that dep through the same-deps publish. 0x74f
     // and 0x597: a read whose compute ran an episode that landed the node
     // Dirty or New returned as if it landed Clean.
-    for seed in [0xbc2, 0x74f, 0x597] {
+    // 0x4d1b and 0xe8d4_a530_7b: a cycle episode that aborted left its
+    // root's reader unpoisoned, so a `try_get` that caught the unwind
+    // landed Clean over a dep the abort left Dirty.
+    for seed in [0xbc2, 0x74f, 0x597, 0x4d1b, 0xe8d4_a530_7b] {
         let case = gen_case(seed);
         quiet(|| {
             run::<Local>(&case, None, 0);

@@ -708,6 +708,9 @@ impl<C: Cells> Runtime<C> {
     fn abort_episode(&self, cidx: u32, payload: Payload, bag: &mut Deferred<C>) -> ! {
         let kind = cycle_state::take_unwind_kind();
         self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), bag);
+        // The root's reader that catches the unwind has read a node that
+        // did not land, as after a single node's unwind.
+        self.dep_stack.poison_current_frame(self.runtime_id);
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
@@ -1557,6 +1560,7 @@ impl<C: Cells> Runtime<C> {
             }
             bag.push_erased(Box::new((e.buf.take(), e.s.take())));
         }
+        self.dep_stack.poison_current_frame(self.runtime_id);
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
