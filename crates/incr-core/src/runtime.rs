@@ -692,6 +692,12 @@ pub struct Runtime<C: Cells> {
     /// Every episode start, suspension, resumption and member run, in order.
     #[cfg(test)]
     pub(crate) episodes_seen: std::sync::Mutex<Vec<cycle_impl::EpisodeSeen>>,
+    /// Every unwind a reading frame took from a pending delivery, in order.
+    #[cfg(test)]
+    pub(crate) deliveries: std::sync::Mutex<Vec<replay_impl::DeliverySeen>>,
+    /// Every entry a driver ran, as it found its context.
+    #[cfg(test)]
+    pub(crate) entries: std::sync::Mutex<Vec<replay_impl::EntrySeen>>,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -759,6 +765,10 @@ impl<C: Cells> Runtime<C> {
             virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             episodes_seen: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            deliveries: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            entries: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -3815,6 +3825,10 @@ mod replay_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_cycle_tests.rs"]
 mod replay_cycle_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_replay_unwind_tests.rs"]
+mod replay_unwind_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_differential.rs"]

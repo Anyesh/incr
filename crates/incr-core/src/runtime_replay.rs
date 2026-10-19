@@ -21,6 +21,26 @@ pub(crate) struct DoomSeen {
     pub(crate) verified_at: u64,
 }
 
+/// An unwind a reading frame took from a pending delivery, for tests.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeliverySeen {
+    pub(crate) frame: u32,
+    pub(crate) read: u32,
+    pub(crate) cycle: bool,
+    pub(crate) kind: ReadKind,
+}
+
+/// The context a driver found when it picked an entry, for tests.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct EntrySeen {
+    pub(crate) context: u64,
+    pub(crate) level: u32,
+    /// The front entry of each level, the target at level 0.
+    pub(crate) fronts: Vec<Option<u32>>,
+}
+
 /// How a virtual frame's pop left its context's driver.
 enum VPop {
     Next,
@@ -971,6 +991,12 @@ impl<C: Cells> Runtime<C> {
                 let (level, entry) = x
                     .next_entry()
                     .expect("incr-core: a context keeps its target until it lands");
+                #[cfg(test)]
+                self.entries.lock().unwrap().push(EntrySeen {
+                    context: x.id,
+                    level,
+                    fronts: x.levels.iter().map(|q| q.front().map(|e| e.node)).collect(),
+                });
                 // Running, with no entry yet while its virtual frames pop.
                 x.running = Some(level);
                 x.running_entry = None;
@@ -1791,6 +1817,13 @@ impl<C: Cells> Runtime<C> {
                     .expect("incr-core: a landed value has its node's type")));
             }
         };
+        #[cfg(test)]
+        self.deliveries.lock().unwrap().push(DeliverySeen {
+            frame: f.node.0,
+            read: handle.slot(),
+            cycle,
+            kind,
+        });
         // As at the panicking compute's landing: a closure that catches the
         // unwind, or a `try_get` that returns it, has still read a dep that
         // did not land. The native walk computes a Dirty reader's deps

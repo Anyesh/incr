@@ -393,6 +393,18 @@ pub(crate) fn mark_failed(held: &mut Held) {
     ENTRY.with(|e| e.failures.set(e.failures.get() + 1));
 }
 
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static OUTERMOST_ENTRIES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The thread's 0 to 1 transitions of the entry depth, each of which
+/// stored the stack base.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn outermost_entries() -> u64 {
+    OUTERMOST_ENTRIES.with(Cell::get)
+}
+
 /// The stack address the outermost engine entry recorded.
 pub(crate) fn stack_base() -> usize {
     ENTRY.with(|e| e.stack_base.get())
@@ -439,6 +451,8 @@ impl EntryDepth {
             e.depth.set(depth + 1);
             if depth == 0 {
                 e.stack_base.set(base);
+                #[cfg(all(test, not(loom)))]
+                OUTERMOST_ENTRIES.with(|n| n.set(n.get() + 1));
             }
             depth
         });
