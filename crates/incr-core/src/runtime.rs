@@ -681,7 +681,8 @@ pub struct Runtime<C: Cells> {
     /// Every doom, in order, as the doom point saw it.
     #[cfg(test)]
     pub(crate) dooms: std::sync::Mutex<Vec<replay_impl::DoomSeen>>,
-    /// The nodes whose Dirty value a read in a frame returned.
+    /// The nodes whose Dirty value, or whose unwind delivered to a retry,
+    /// a read in a frame returned.
     #[cfg(test)]
     pub(crate) dirty_reads: std::sync::Mutex<Vec<u32>>,
 }

@@ -1759,7 +1759,11 @@ impl<C: Cells> Runtime<C> {
                 cycle,
                 poison,
                 payload,
-            } => (cycle, poison, payload),
+            } => {
+                #[cfg(test)]
+                self.dirty_reads.lock().unwrap().push(handle.slot());
+                (cycle, poison, payload)
+            }
             Delivered::Walk(_) | Delivered::Direct => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }

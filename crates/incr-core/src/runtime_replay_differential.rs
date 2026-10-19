@@ -456,9 +456,10 @@ fn differential<C: Cells>(seed: u64) {
                         continue;
                     }
                 }
-                // So may a frame that read a node's Dirty value which a later
-                // landing made Clean, which its retry reads with a `get`.
-                if want.3 {
+                // So may a frame that read a node's Dirty value, or took its
+                // unwind, which a later landing made Clean: its next retry
+                // reads it with a Clean `get`.
+                if want.3 || got.3 {
                     agree = false;
                     continue;
                 }
