@@ -1304,6 +1304,13 @@ impl<C: Cells> Runtime<C> {
                     let cidx = boundary + level;
                     self.retry_deliveries(id, entry.node, entry.generation, cidx);
                     let ran = {
+                        // Its frames sit above `cidx`, as an entry's run's do:
+                        // at a lower position a panic among them releases
+                        // this member's own claim.
+                        let _placed = Placed(
+                            &self.dep_stack,
+                            self.dep_stack.place_next_at(cidx, level > 0),
+                        );
                         let _speculating = entry.spec.then(replay::Speculating::enter);
                         self.member_run(entry.node, cidx, true)
                     };
