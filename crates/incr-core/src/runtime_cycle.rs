@@ -47,6 +47,10 @@ pub(super) enum PopEnd {
     /// context, the root's claim with it, and the root's reader is
     /// answered as a discarded compute's.
     Suspended,
+    /// A speculative run's pop would have run an episode and dropped its
+    /// chain cooperatively instead, its claims discarded: the reader is
+    /// answered as a discarded compute's.
+    Dropped,
 }
 
 /// What an episode did, for tests.
@@ -708,7 +712,10 @@ impl<C: Cells> Runtime<C> {
             // may enter this cycle at another member, or not at all. The
             // claims take the discard landing and the chain is dropped.
             self.release_held_from(cidx, true, bag);
-            cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+            if self.drop_cooperatively(None) {
+                return PopEnd::Dropped;
+            }
+            self.set_drop_kind();
             bag.drain_carried(Box::new(cycle::DiscardUnwind));
         }
         self.episode(id, cidx, bag)
@@ -1816,7 +1823,7 @@ impl<C: Cells> Runtime<C> {
             PopEnd::Deferred => GroupEnd::Done(Computed::Deferred),
             PopEnd::Dissolved => GroupEnd::Ordinary,
             PopEnd::Retry => GroupEnd::Retry,
-            PopEnd::Suspended => GroupEnd::Done(Computed::Discarded),
+            PopEnd::Suspended | PopEnd::Dropped => GroupEnd::Done(Computed::Discarded),
         }
     }
 }

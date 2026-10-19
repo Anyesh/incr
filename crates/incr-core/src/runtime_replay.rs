@@ -114,8 +114,8 @@ impl<C: Cells> Runtime<C> {
     /// A speculative entry's run lands only Clean values: a node it would
     /// land Dirty, poisoned or over a dep that is not Clean, has a history
     /// the unbounded run may never give it, and a later walk of its deps
-    /// would differ from a first run of its closure. Such a pop goes on as
-    /// a discard unwind.
+    /// would differ from a first run of its closure. Such a pop drops the
+    /// chain. A doomed frame's pop lands nothing anyway.
     #[cold]
     #[inline(never)]
     pub(super) fn speculative_lands_dirty(
@@ -126,6 +126,7 @@ impl<C: Cells> Runtime<C> {
     ) -> bool {
         word & value_code::REPLAY_BIT != 0
             && replay::speculative()
+            && !ctl.has(cycle::DOOMED)
             && (ctl.has(cycle::POISONED)
                 || deps.iter().any(|&(d, _)| {
                     !matches!(
@@ -196,6 +197,9 @@ impl<C: Cells> Runtime<C> {
                         .virtual_position(handle.slot(), handle.generation())
                         .is_some()
                 {
+                    if self.placeholder::<T>().is_some() && self.drop_cooperatively(Some(f.cidx)) {
+                        return Ok(self.placeholder_read::<T>(frame));
+                    }
                     self.drop_unwind();
                 }
                 // A doomed frame has read a placeholder, so the unbounded
@@ -374,7 +378,7 @@ impl<C: Cells> Runtime<C> {
                     replay::speculative(),
                     "incr-core: only a speculative run reads before a loop runs"
                 );
-                self.drop_unwind();
+                return Some(Ok(self.drop_at_read::<T>(f)));
             }
             if let Some(q) = self
                 .landed_above(p, top)
@@ -387,7 +391,7 @@ impl<C: Cells> Runtime<C> {
                     replay::speculative(),
                     "incr-core: a suspect edge lies under a speculative entry"
                 );
-                self.drop_unwind();
+                return Some(Ok(self.drop_at_read::<T>(f)));
             }
             self.park(ParkPoint::BeforeVirtualClaim(NodeId(slot)));
             match self.claim_virtual(p, top) {
@@ -477,7 +481,11 @@ impl<C: Cells> Runtime<C> {
     /// that the retry verifies the group.
     #[cold]
     #[inline(never)]
-    pub(super) fn drop_speculative_verify(&self, node: &NodeData<C>, claimed_dirty: bool) -> ! {
+    pub(super) fn drop_speculative_verify(
+        &self,
+        node: &NodeData<C>,
+        claimed_dirty: bool,
+    ) -> Computed {
         let target = if claimed_dirty {
             NodeState::Dirty
         } else {
@@ -485,6 +493,9 @@ impl<C: Cells> Runtime<C> {
             NodeState::New
         };
         self.land(node, target, target);
+        if self.drop_cooperatively(None) {
+            return Computed::Discarded;
+        }
         self.drop_unwind()
     }
 
@@ -492,8 +503,107 @@ impl<C: Cells> Runtime<C> {
     /// it passes takes the discard landing, and the driver's catch of the
     /// speculative entry drops the chain.
     pub(super) fn drop_unwind(&self) -> ! {
-        cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+        self.set_drop_kind();
         resume_unwind(Box::new(cycle::DiscardUnwind))
+    }
+
+    /// Frame `f`'s read drops the speculative chain it stands on: the
+    /// placeholder, if the drop is cooperative, else a drop unwind.
+    fn drop_at_read<T: Value>(&self, f: ActiveRead) -> T {
+        if self.placeholder::<T>().is_some() && self.drop_cooperatively(Some(f.cidx)) {
+            return self.placeholder_read::<T>(Some(f));
+        }
+        self.drop_unwind()
+    }
+
+    /// Drops the running speculative entry's chain without an unwind, when
+    /// every frame of the entry's run can take a placeholder for the read
+    /// it is blocked in, as **Marking** tests, and the drop point lies in
+    /// the entry's context. Those frames are doomed, so the read in progress
+    /// in the top one, at `reader` when given, returns a placeholder, each
+    /// frame pops discarded and the run comes back `Discarded` to the
+    /// driver, which drops the chain from the point recorded here. `false`
+    /// leaves the drop to an unwind.
+    pub(super) fn drop_cooperatively(&self, reader: Option<u32>) -> bool {
+        let rt = self.runtime_id;
+        // The chain starts at the lowest level whose virtual frames below
+        // are all real ones', as for a drop unwind's catch.
+        let found = replay::with(|c| {
+            let x = &c[replay::innermost(c, rt)?];
+            let level = x
+                .running
+                .filter(|_| x.running_entry.is_some_and(|e| e.spec))?;
+            let mut q = level;
+            while q > 0 && x.vstack.get(q as usize - 1).is_some_and(|v| v.spec) {
+                q -= 1;
+            }
+            (q > 0).then_some((x.id, x.boundary + level, q))
+        });
+        let Some((id, floor, q)) = found else {
+            return false;
+        };
+        let frames: Vec<(bool, u32, u32, *const ComputeCtl, u64)> = self.dep_stack.with(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .take_while(|f| f.cidx >= floor)
+                .map(|f| (f.rt == rt, f.node.0, f.cidx, f.ctl, f.reading))
+                .collect()
+        });
+        if reader.is_some_and(|r| frames.first().is_none_or(|f| f.2 != r)) {
+            return false;
+        }
+        let doomable = frames.iter().all(|&(ours, node, _, ctl, reading)| {
+            // SAFETY: a frame's control block is live while it is on the
+            // stack.
+            ours && unsafe { &*ctl }.flags.get() & (cycle::NO_DOOM | cycle::BUFFERED) == 0
+                && self.replayable(node)
+                && self.reading_has_placeholder(reading)
+        });
+        if !doomable {
+            return false;
+        }
+        for &(_, _, _, ctl, _) in &frames {
+            // SAFETY: as above.
+            unsafe { &*ctl }.raise(cycle::DOOMED);
+        }
+        replay::with(|c| {
+            if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                x.drop_point = Some(q);
+            }
+        });
+        true
+    }
+
+    /// A speculative run's frame of `id` at `attempt` popped where it would
+    /// land other than Clean, or root an episode, and dropped its chain
+    /// cooperatively: it lands as a drop unwind would land it, and its
+    /// reader gets a placeholder.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn discard_dropped(
+        &self,
+        id: NodeId,
+        attempt: Attempt,
+        ctl: &ComputeCtl,
+        bag: &mut Deferred<C>,
+    ) -> Computed {
+        replay::unwind_past(self.runtime_id, attempt.cidx);
+        self.release_unwound_from(attempt.cidx, id.0, Some(UnwindKind::Discard), true, bag);
+        if let Some(value) = ctl.buf.take() {
+            bag.push_erased(value);
+        }
+        let wrote = ctl.wrote.get() != 0;
+        self.discard_land(id, attempt.first, wrote, attempt.stamp_rev, bag);
+        Computed::Discarded
+    }
+
+    /// Sets the unwind kind of a drop unwind about to be raised.
+    pub(super) fn set_drop_kind(&self) {
+        #[cfg(test)]
+        self.drop_unwinds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
     }
 
     /// A virtual hit's claims: the node of every virtual frame from
@@ -591,6 +701,10 @@ impl<C: Cells> Runtime<C> {
             let at = replay::covering(c, rt, f.cidx)
                 .expect("incr-core: a doomed frame lies in a replay context");
             let x = &mut c[at];
+            // A dropped chain's entries would be removed with it.
+            if x.drop_point.is_some() {
+                return;
+            }
             let spec = x.vstack[(f.cidx - x.boundary) as usize].spec;
             x.push_entry(
                 f.cidx + 1 - x.boundary,
@@ -988,18 +1102,30 @@ impl<C: Cells> Runtime<C> {
             Some(path) => self.hold_doomed_root(id, attempt, wrote, path, bag),
             // A replayable closure is pure, so its retry asks for the same
             // children, which the entries above compute meanwhile; unbinding
-            // them would make the retry create them New and doom again.
+            // them would make the retry create them New and doom again. A
+            // frame of a dropped chain has no retry.
             None => self.discard_land_with(
                 id,
                 attempt.first,
                 wrote,
                 attempt.stamp_rev,
-                ChildLanding::Keep,
+                if self.dropping(attempt.cidx) {
+                    ChildLanding::Discard
+                } else {
+                    ChildLanding::Keep
+                },
                 bag,
             ),
         }
         replay::unwind_past(self.runtime_id, attempt.cidx + 1);
         Computed::Discarded
+    }
+
+    /// Whether the frame at `cidx` belongs to a chain its context drops.
+    fn dropping(&self, cidx: u32) -> bool {
+        replay::with(|c| {
+            replay::covering(c, self.runtime_id, cidx).is_some_and(|at| c[at].drop_point.is_some())
+        })
     }
 
     /// The claims that virtual frames at or above `cidx` own since the
@@ -1094,6 +1220,7 @@ impl<C: Cells> Runtime<C> {
                 // Running, with no entry yet while its virtual frames pop.
                 x.running = Some(level);
                 x.running_entry = None;
+                x.drop_point = None;
                 (level, entry, parked)
             });
             self.park(ParkPoint::BeforeEntry(NodeId(entry.node)));
@@ -1261,12 +1388,17 @@ impl<C: Cells> Runtime<C> {
                 }))
             };
             self.dep_stack.restore_placement(placement);
+            let dropped = replay::with(|c| {
+                c.iter_mut()
+                    .find(|x| x.id == id)
+                    .and_then(|x| x.drop_point.take())
+            });
             // A delivery its frame's retry never read is dropped once the
             // run ends, as the unbounded run drops it when a set changed
             // that frame's earlier reads. A run doomed again has not
             // ended: the frame comes back as an entry of its own, and its
             // next retry reads the delivery again.
-            if matches!(ran, Ok(Computed::Discarded)) {
+            if matches!(ran, Ok(Computed::Discarded)) && dropped.is_none() {
                 replay::with(|c| {
                     if let Some(x) = c.iter_mut().find(|x| x.id == id) {
                         for d in x.pending.iter_mut().filter(|d| d.maker == level) {
@@ -1291,8 +1423,17 @@ impl<C: Cells> Runtime<C> {
                 },
             };
             if computed == Computed::Discarded {
+                if let Some(q) = dropped {
+                    #[cfg(test)]
+                    self.cooperative_drops
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut bag = Deferred::new();
+                    self.drop_chain(id, q, false, &mut bag);
+                    bag.drain(self);
+                }
                 continue;
             }
+            debug_assert!(dropped.is_none(), "incr-core: a dropped run landed");
             debug_assert_ne!(computed, Computed::Doomed);
             if computed == Computed::Done && level > 0 {
                 self.hold_landing(id, level, entry.node, entry.generation);

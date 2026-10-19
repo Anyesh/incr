@@ -704,6 +704,12 @@ pub struct Runtime<C: Cells> {
     /// Every unwind a reading frame took from a pending delivery, in order.
     #[cfg(test)]
     pub(crate) deliveries: std::sync::Mutex<Vec<replay_impl::DeliverySeen>>,
+    /// Drop unwinds raised.
+    #[cfg(test)]
+    pub(crate) drop_unwinds: std::sync::atomic::AtomicU32,
+    /// Speculative chains a driver dropped with no unwind.
+    #[cfg(test)]
+    pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
     /// Every entry a driver ran, as it found its context.
     #[cfg(test)]
     pub(crate) entries: std::sync::Mutex<Vec<replay_impl::EntrySeen>>,
@@ -779,6 +785,10 @@ impl<C: Cells> Runtime<C> {
             episodes_seen: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             deliveries: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            drop_unwinds: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -2992,7 +3002,7 @@ impl<C: Cells> Runtime<C> {
                     && !matches!(visit, Visit::VerifyOnly(_))
                     && replay::speculative()
                 {
-                    self.drop_speculative_verify(node, claimed_dirty);
+                    return self.drop_speculative_verify(node, claimed_dirty);
                 }
                 match self.group_verify(id, g, visit, bag) {
                     // A tainted verify leaves the node Dirty for the root's
@@ -3094,7 +3104,16 @@ impl<C: Cells> Runtime<C> {
                             _ => Box::new(cycle::WoundUnwind),
                         });
                     } else if result.is_ok() && self.speculative_lands_dirty(word, &ctl, &deps) {
-                        cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+                        if self.drop_cooperatively(None) {
+                            let attempt = Attempt {
+                                first,
+                                cidx,
+                                stamp_rev,
+                                verify_rev,
+                            };
+                            return self.discard_dropped(id, attempt, &ctl, bag);
+                        }
+                        self.set_drop_kind();
                         result = Err(Box::new(cycle::DiscardUnwind));
                     }
                 }
@@ -3147,7 +3166,7 @@ impl<C: Cells> Runtime<C> {
                     match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
                         PopEnd::Deferred => return Computed::Deferred,
                         PopEnd::Landed => return self.episode_landed(node),
-                        PopEnd::Suspended => return Computed::Discarded,
+                        PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
                         PopEnd::Dissolved => continue 'run,
                         PopEnd::Retry => {
                             self.park_with_bag(ParkPoint::StaleRetry(id), bag);

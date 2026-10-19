@@ -899,7 +899,48 @@ fn speculative_root_never_runs_an_episode() {
     }
 }
 
+/// **A cooperative drop** at budget 1: F = IF(A, S, U) with A's
+/// placeholder true and a = false, S and U Fallback members reading each
+/// other, every query replayable and every read type with a placeholder.
+/// The speculative chain from S drops with no engine unwind, which
+/// `panic = abort` would turn into an abort, and F, S and U read as in the
+/// unbounded run.
+fn speculative_chain_drops_without_unwinding<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime_with::<C>(frames, true);
+        let a_in = rt.create_input(false);
+        let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+        let u_cell = cell::<u64>();
+        let s = {
+            let u_cell = u_cell.clone();
+            rt.create_query_with(
+                move |rt| rt.get(*u_cell.get().unwrap()) + 1,
+                replayable_fallback(|_| 100),
+            )
+        };
+        let u = rt.create_query_with(move |rt| rt.get(s) + 10, replayable_fallback(|_| 200));
+        u_cell.set(u).unwrap();
+        let f = rt.create_query_with(
+            move |rt| if rt.get(a) { rt.get(s) } else { rt.get(u) },
+            replayable(),
+        );
+        let got = (rt.get(f), rt.get(s), rt.get(u));
+        rt.assert_invariant_i();
+        (
+            got,
+            rt.drop_unwinds.load(SeqCst),
+            rt.cooperative_drops.load(SeqCst),
+        )
+    };
+    let (unbounded, _, _) = observe(None);
+    let (got, unwinds, drops) = observe(Some(1));
+    assert_eq!(got, unbounded);
+    assert_eq!(unwinds, 0, "a drop unwind was raised");
+    assert!(drops > 0, "no chain was dropped");
+}
+
 local_and_shared!(
+    speculative_chain_drops_without_unwinding,
     virtual_hit_above_an_earlier_one,
     drop_through_a_native_frame,
     suspended_episode,

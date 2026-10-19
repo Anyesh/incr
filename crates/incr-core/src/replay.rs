@@ -199,6 +199,10 @@ pub(crate) struct Context {
     /// The level of a landed point a read's judgement met above the
     /// position it read, until the driver drops the chain above it.
     pub(crate) drop_at: Option<u32>,
+    /// The level a read in the running entry's run dropped the chain from
+    /// cooperatively, by dooming every frame of the run: the driver drops
+    /// it once the run comes back discarded.
+    pub(crate) drop_point: Option<u32>,
 }
 
 impl Context {
@@ -221,6 +225,7 @@ impl Context {
             direct: None,
             lows: Vec::new(),
             drop_at: None,
+            drop_point: None,
         }
     }
 
