@@ -559,7 +559,7 @@ local_and_shared!(
 /// placeholder there and creates nothing. P's retry creates the real
 /// nodes and lands the unbounded value, and an escaped pending handle
 /// panics outside its frame. P reads its input child but not its query
-/// child.
+/// child, whose read is `doomed_child_query_read_terminates`'s.
 fn doomed_miss_returns_a_pending_handle<C: Cells>()
 where
     NodeTable<u64, u64, C>: Send + Sync,
@@ -612,4 +612,30 @@ local_and_shared!(
     doomed_miss_returns_a_pending_handle,
     local_doomed_miss_returns_a_pending_handle,
     shared_doomed_miss_returns_a_pending_handle
+);
+
+/// P creates a query child and reads it, at budget 1: the read of the New
+/// child dooms P, and P's retry must find the child and land, as the
+/// unbounded run does after one run. The runs are capped so that a retry
+/// that never lands fails instead of hanging.
+fn doomed_child_query_read_terminates<C: Cells>() {
+    let rt = runtime::<C>(Some(1));
+    let runs = Arc::new(AtomicU32::new(0));
+    let r = runs.clone();
+    let p = rt.create_query_with(
+        move |rt| {
+            let run = r.fetch_add(1, SeqCst) + 1;
+            assert!(run <= 8, "P ran {run} times");
+            let query = rt.child_query("two", |_| 3_u64);
+            rt.get(query) + 1
+        },
+        replayable(),
+    );
+    assert_eq!(get(&rt, p), Out::Value(4));
+    assert!(runs.load(SeqCst) <= 2, "P ran {} times", runs.load(SeqCst));
+}
+local_and_shared!(
+    doomed_child_query_read_terminates,
+    local_doomed_child_query_read_terminates,
+    shared_doomed_child_query_read_terminates
 );
