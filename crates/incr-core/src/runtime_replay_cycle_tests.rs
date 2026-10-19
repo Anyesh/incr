@@ -470,7 +470,130 @@ fn taint_memo_owned_by_a_virtual_position<C: Cells>() {
     assert_eq!((bt, bd, bagain), (t, d, again));
 }
 
+/// B reads s and, when s = 1, also N, a New query over k; C reads B; G
+/// reads C; H reads M, a New query, and then C.
+struct WalkGraph {
+    s_in: Incr<u64>,
+    n: Incr<u64>,
+    m: Incr<u64>,
+    c: Incr<u64>,
+    g: Incr<u64>,
+    h: Incr<u64>,
+}
+
+fn walk_graph<C: Cells>(rt: &Runtime<C>) -> WalkGraph {
+    let s_in = rt.create_input(0_u64);
+    let k_in = rt.create_input(3_u64);
+    let m_in = rt.create_input(40_u64);
+    let n = rt.create_query_with(move |rt| rt.get(k_in), replayable());
+    let b = rt.create_query_with(
+        move |rt| {
+            if rt.get(s_in) == 1 {
+                10 + rt.get(n)
+            } else {
+                1
+            }
+        },
+        replayable(),
+    );
+    let c = rt.create_query_with(move |rt| rt.get(b) * 2, replayable());
+    let g = rt.create_query_with(move |rt| rt.get(c) + 100, replayable());
+    let m = rt.create_query_with(move |rt| rt.get(m_in), replayable());
+    let h = rt.create_query_with(move |rt| rt.get(m) + rt.get(c), replayable());
+    WalkGraph {
+        s_in,
+        n,
+        m,
+        c,
+        g,
+        h,
+    }
+}
+
+/// **A walk-driven discard** at budget 1: `get(C)`'s walk computes B, which
+/// dooms on its read of N, so the walk runs the top-level context's loop
+/// with B as its target and then computes C from its preserved `work`, with
+/// the unbounded run's 3 expansions: a restarted walk would add C again.
+impl WalkGraph {
+    /// The nodes released by every doom so far, by name.
+    fn dooms<C: Cells>(&self, rt: &Runtime<C>) -> String {
+        let dooms = rt.dooms.lock().unwrap();
+        dooms
+            .iter()
+            .map(|d| match d.node {
+                s if s == self.n.slot() => 'N',
+                s if s == self.m.slot() => 'M',
+                _ => '?',
+            })
+            .collect()
+    }
+}
+
+fn walk_driven_discard<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let w = walk_graph(&rt);
+        assert_eq!(rt.get(w.c), 2);
+        rt.set(w.s_in, 1);
+        rt.dooms.lock().unwrap().clear();
+        let before = rt.expansions();
+        let c = get(&rt, w.c);
+        rt.assert_invariant_i();
+        (c, rt.expansions() - before, w.dooms(&rt))
+    };
+    let unbounded = observe(None);
+    assert_eq!(unbounded, (Outcome::Value(26), 3, String::new()));
+    // The plan counts 4, with B expanded again as the loop's target; the
+    // driver instead runs that target as the walk's own compute of B, whose
+    // deps the walk already cleaned, as the unbounded run does.
+    assert_eq!(observe(Some(1)), (unbounded.0, unbounded.1, "N".into()));
+}
+
+/// G, New, reads C at budget 2, so B's doom marks G, whose read of C returns the
+/// placeholder and abandons the walk; G's retry lands the unbounded value.
+fn walk_driven_discard_marks_the_reader<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let w = walk_graph(&rt);
+        assert_eq!(rt.get(w.c), 2);
+        rt.set(w.s_in, 1);
+        rt.dooms.lock().unwrap().clear();
+        let g = get(&rt, w.g);
+        rt.assert_invariant_i();
+        (g, w.dooms(&rt))
+    };
+    assert_eq!(observe(None), (Outcome::Value(126), String::new()));
+    assert_eq!(observe(Some(2)), (Outcome::Value(126), "N".into()));
+}
+
+/// H's doomed run pushes C as a driver entry, whose own walk meets B's
+/// discard: the entry is kept, and its retry lands C.
+fn walk_driven_discard_in_an_entry<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let w = walk_graph(&rt);
+        assert_eq!(rt.get(w.c), 2);
+        rt.set(w.s_in, 1);
+        rt.dooms.lock().unwrap().clear();
+        let h = get(&rt, w.h);
+        rt.assert_invariant_i();
+        (h, rt.state_of(w.c), w.dooms(&rt))
+    };
+    let (h, c, dooms) = observe(None);
+    assert_eq!(
+        (h, c, dooms),
+        (Outcome::Value(66), NodeState::Clean, String::new())
+    );
+    assert_eq!(
+        observe(Some(1)),
+        (Outcome::Value(66), NodeState::Clean, "MN".into())
+    );
+}
+
 local_and_shared!(
+    walk_driven_discard,
+    walk_driven_discard_marks_the_reader,
+    walk_driven_discard_in_an_entry,
     read_of_a_vframes_own_node,
     taint_memo_owned_by_a_virtual_position,
     if_false_fallback_on_f,
