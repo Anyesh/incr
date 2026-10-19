@@ -574,6 +574,7 @@ fn replay_seeds() {
         0x00e8_d4a5_2db3,
         0x00e8_d4a5_33fa,
         0x551d_e2c5_404a_84b1,
+        0x84a1_d45b_e6f9_b165,
         0xa649_6004_aa21_dd3b,
         0xa8cc_85b9_bbfd_657d,
         0xe386_b8af_df64_ca89,

@@ -827,6 +827,24 @@ impl<C: Cells> Runtime<C> {
                 .find(|x| x.id == id)
                 .expect("incr-core: the doom's context is open");
             let maker = bottom.cidx - x.boundary;
+            // The running entry's run got past its verify into the closure
+            // that this doom discards: its next retry goes straight to the
+            // closure, as the unbounded run verifies once, before deps that
+            // the entries above land can change the verify's answer.
+            // SAFETY: as above.
+            if joined.is_some()
+                && !unsafe { &*bottom.ctl }.has(cycle::BUFFERED)
+                && running_entry.is_some_and(|e| e.node == bottom.node)
+            {
+                if let Some(e) = x
+                    .levels
+                    .get_mut(maker as usize)
+                    .and_then(|q| q.front_mut())
+                    .filter(|e| e.node == bottom.node)
+                {
+                    e.retry = Retry::Direct;
+                }
+            }
             for mut v in vframes {
                 v.maker = maker;
                 x.push_vframe(v);
