@@ -1738,11 +1738,12 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// A read after a walk found no value: the node landed `Cyclic`.
+    /// A read after a walk found no value: the node landed `Cyclic`, or
+    /// New as a member without a value of an episode that landed Dirty.
     #[cold]
     #[inline(never)]
     fn read_missing<T: Value>(&self, handle: Incr<T>, node: &NodeData<C>) -> Cycle {
-        if node.state() == NodeState::Cyclic {
+        if matches!(node.state(), NodeState::Cyclic | NodeState::New) {
             if let Some(cycle) = self.cycle_of(handle) {
                 return cycle;
             }

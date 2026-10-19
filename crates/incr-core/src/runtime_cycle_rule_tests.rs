@@ -822,6 +822,31 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
     );
 }
 
+/// P reads S, which panics on its own cycle, through `try_get`, then
+/// itself: P is a lone unseeded member, and S landed New under it, so the
+/// episode lands P New with no value. Its reader still gets the cycle.
+fn dirty_cyclic_landing_reads_as_the_cycle<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sc = cell::<i64>();
+    let s = {
+        let sc = sc.clone();
+        rt.create_query(move |rt| rt.get(*sc.get().unwrap()) + 1)
+    };
+    sc.set(s).unwrap();
+    let pc = cell::<i64>();
+    let p = {
+        let pc = pc.clone();
+        rt.create_query(move |rt| {
+            rt.try_get(s).unwrap_or(0) + rt.try_get(*pc.get().unwrap()).unwrap_or(0)
+        })
+    };
+    pc.set(p).unwrap();
+    let err = rt.try_get(p).unwrap_err();
+    assert_eq!(slots(&err), vec![p.slot()]);
+    assert_eq!(rt.state_of(p), NodeState::New);
+    rt.assert_invariant_i();
+}
+
 both!(
     member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
@@ -845,6 +870,7 @@ both!(
     group_verify_recycled_member,
     recovery_pops_are_bounded,
     swallowed_cycle_is_an_ordinary_result,
+    dirty_cyclic_landing_reads_as_the_cycle,
 );
 
 fn on_deep_stack(body: fn()) {
