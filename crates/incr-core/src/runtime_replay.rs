@@ -1607,6 +1607,10 @@ impl<C: Cells> Runtime<C> {
                 }
                 q
             });
+            if q == 0 {
+                self.close_dropped(id);
+                self.drop_unwind();
+            }
             self.drop_chain(id, q, false, &mut bag);
             bag.drain(self);
             return VPop::Restart;
@@ -1713,6 +1717,11 @@ impl<C: Cells> Runtime<C> {
                 }
                 q
             });
+            if q == 0 {
+                bag.drain(self);
+                self.close_dropped(id);
+                resume_unwind(payload);
+            }
             cycle_state::take_unwind_kind();
             bag.push_erased(payload);
             self.drop_chain(id, q, false, &mut bag);
@@ -1987,6 +1996,23 @@ impl<C: Cells> Runtime<C> {
         });
         self.release_held_from(boundary + q, true, bag);
         self.release_claim_list(id, q, bag);
+    }
+
+    /// Closes context `id`, whose speculative chain reaches its level-0
+    /// target, before the unwind that ends the speculative run which
+    /// opened it: the claims held from its boundary up take the discard
+    /// landing.
+    fn close_dropped(&self, id: u64) {
+        let mut bag = Deferred::new();
+        self.drop_chain(id, 0, true, &mut bag);
+        bag.drain(self);
+        let boundary = replay::with(|c| {
+            c.iter()
+                .find(|x| x.id == id)
+                .expect("incr-core: a running context is open")
+                .boundary
+        });
+        self.close_context(id, boundary);
     }
 
     /// The unwind held for frame `f`'s read of `handle`, if this is the
