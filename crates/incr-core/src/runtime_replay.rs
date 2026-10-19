@@ -19,7 +19,8 @@ pub(crate) struct DoomSeen {
     /// The node's state after its release.
     pub(crate) state: NodeState,
     pub(crate) verified_at: u64,
-    /// Frames on the stack at the doom.
+    /// Frames on the stack at the doom, read by a release-only test.
+    #[cfg_attr(debug_assertions, allow(dead_code))]
     pub(crate) depth: usize,
 }
 
