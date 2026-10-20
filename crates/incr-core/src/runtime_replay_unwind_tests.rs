@@ -946,6 +946,105 @@ local_and_shared!(
     shared_entry_guard_spans_the_loop
 );
 
+/// What one read of the chain over C's cycle saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Revalidated {
+    value: u64,
+    /// Two: the episode that dissolves, then the re-entry.
+    episodes: u64,
+    validations: u64,
+    outermost: u64,
+    /// C's dissolve is recorded when the call returns.
+    dissolved_after: bool,
+    /// The previous call's C is no longer recorded: the next outermost
+    /// entry reset the set.
+    earlier_reset: Option<bool>,
+}
+
+/// The bottom of a 50-deep chain reads C, the root of a Fallback cycle
+/// with A, A reading C on its first and third runs. The episode's member
+/// run of A, its second, doesn't read C, so validation dissolves it; C's
+/// compute then reads A, whose third run re-enters C's cycle, which
+/// skips validation. At budget 1 that re-entry is a later entry of the
+/// same driver loop, and validation runs as often as in the unbounded
+/// run, inside the one outermost entry and context the read opened.
+fn validation_skipped_on_reentry_within_one_loop<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let mut seen = Vec::new();
+        let mut earlier: Option<u32> = None;
+        for try_ in [false, true] {
+            let c_later = Later::default();
+            let a_runs = Arc::new(AtomicU32::new(0));
+            let (cl, ar) = (c_later.clone(), a_runs.clone());
+            let a = rt.create_query_with(
+                move |rt| {
+                    if matches!(ar.fetch_add(1, SeqCst), 0 | 2) {
+                        rt.get(later(&cl))
+                    } else {
+                        5
+                    }
+                },
+                fallback(200),
+            );
+            let c = rt.create_query_with(move |rt| rt.get(a) + 1, fallback(100));
+            c_later.set(c).unwrap();
+            let mut head = c;
+            for _ in 0..50 {
+                let below = head;
+                head = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+            }
+            rt.entries.lock().unwrap().clear();
+            let before = cycle_state::outermost_entries();
+            let validations = rt.validations.load(SeqCst);
+            let episodes = rt.episodes.load(SeqCst);
+            let value = if try_ {
+                rt.try_get(head).expect("no cycle")
+            } else {
+                rt.get(head)
+            };
+            let entries = std::mem::take(&mut *rt.entries.lock().unwrap());
+            if let Some(first) = entries.first() {
+                assert!(
+                    entries.iter().all(|e| e.context == first.context),
+                    "one context for the whole loop, try: {try_}"
+                );
+            }
+            seen.push(Revalidated {
+                value,
+                episodes: rt.episodes.load(SeqCst) - episodes,
+                validations: rt.validations.load(SeqCst) - validations,
+                outermost: cycle_state::outermost_entries() - before,
+                dissolved_after: cycle_state::has_dissolved(rt.runtime_id, c.slot()),
+                earlier_reset: earlier.map(|e| !cycle_state::has_dissolved(rt.runtime_id, e)),
+            });
+            earlier = Some(c.slot());
+            rt.assert_invariant_i();
+        }
+        seen
+    };
+    let unbounded = observe(None);
+    let once = Revalidated {
+        value: 150,
+        episodes: 2,
+        validations: 1,
+        outermost: 1,
+        dissolved_after: true,
+        earlier_reset: None,
+    };
+    let again = Revalidated {
+        earlier_reset: Some(true),
+        ..once
+    };
+    assert_eq!(unbounded, [once, again]);
+    assert_eq!(observe(Some(1)), unbounded);
+}
+local_and_shared!(
+    validation_skipped_on_reentry_within_one_loop,
+    local_validation_skipped_on_reentry_within_one_loop,
+    shared_validation_skipped_on_reentry_within_one_loop
+);
+
 /// P's run dooms on its read of a New N, then misses a table and its own
 /// children: each miss returns the pending handle, which reads the
 /// placeholder there and creates nothing. P's retry creates the real

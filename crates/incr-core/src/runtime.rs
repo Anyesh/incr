@@ -800,6 +800,9 @@ pub struct Runtime<C: Cells> {
     /// Episodes started on this runtime.
     #[cfg(test)]
     pub(crate) episodes: std::sync::atomic::AtomicU64,
+    /// Episode validations run on this runtime.
+    #[cfg(test)]
+    pub(crate) validations: std::sync::atomic::AtomicU64,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -878,6 +881,8 @@ impl<C: Cells> Runtime<C> {
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             episodes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            validations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
