@@ -309,13 +309,17 @@ impl<C: Cells> Runtime<C> {
 
     /// The claims of this runtime the frame at `cidx`, of `node`, at
     /// `path`, owns, as `(slot, anchor)`, which the virtual frame it
-    /// becomes owns from now.
+    /// becomes owns from now. A suspended episode's members belong to its
+    /// member run's virtual frame, not to a frame that runs at its position
+    /// meanwhile.
     fn owned_claims(&self, cidx: u32, node: u32, path: u64) -> Vec<(u32, u32)> {
         let rt = self.runtime_id;
+        let suspended = replay::suspended_members(rt);
         cycle_state::with_held(|h| {
             h.iter_mut()
-                .filter(|((r, _), e)| {
+                .filter(|((r, slot), e)| {
                     *r == rt
+                        && !suspended.contains(slot)
                         && e.owner == cidx
                         && (e.owner_node == node || e.owner_node == u32::MAX)
                         && e.owner_virtual.is_none_or(|p| p == path)
