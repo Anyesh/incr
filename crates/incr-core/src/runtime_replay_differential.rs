@@ -1207,6 +1207,28 @@ fn two_thread_repush_seeds() {
     }
 }
 
+/// Two-thread seeds whose fault needs a particular schedule, each run many
+/// times at the budget it failed at. A case with panics or cycles may end
+/// otherwise than the single-thread run under any schedule, so these
+/// assert only what `run_two` checks: no engine panic, no virtual frame
+/// left indexed after an operation, and the invariants after each phase.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_seeds() {
+    // 0x1e89: a wound in a doomed episode member run that a virtual
+    // frame's pop ran was delivered to the frame below, which left the
+    // doom's virtual frame naming the aborted episode.
+    for (seed, frames, bytes) in [(0x1e89, 1, 16 * 1024)] {
+        let case = gen_case(seed, false, true);
+        let phases = phases(&case, seed);
+        for _ in 0..300 {
+            quiet(|| {
+                run_two(&case, &phases, Some(frames), bytes);
+            });
+        }
+    }
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
