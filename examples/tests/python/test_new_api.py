@@ -278,3 +278,20 @@ def test_python_exception_is_raised_as_itself_with_no_panic_message(make_rt, cap
     with pytest.raises(ZeroDivisionError):
         rt.get(outer)
     assert capfd.readouterr().err == ""
+
+
+@BOTH_RUNTIMES
+def test_runtime_ref_kept_by_a_raising_query_is_invalidated(make_rt):
+    rt = make_rt()
+    a = rt.create_input(1)
+    kept = []
+
+    def body(r):
+        kept.append(r)
+        raise ValueError("boom")
+
+    q = rt.create_query(body)
+    with pytest.raises(ValueError):
+        rt.get(q)
+    with pytest.raises(RuntimeError, match="no longer valid"):
+        kept[0].get(a)
