@@ -902,10 +902,10 @@ fn nested_superseded_dep_poisons_fast_path_publisher() {
 }
 
 /// A reader loads Q `Dirty` and stops before its claim. Meanwhile another
-/// reader cleans Q by cutoff and verifies D at revision 2, and a second
+/// reader cleans Q by cutoff and verifies D at revision 4, and a second
 /// set dirties both again. The stopped reader's claim then succeeds on
 /// the newer `Dirty`, so revisions captured before the claim predate the
-/// second set: Q's change would be stamped 2 and D, verified at 2, would
+/// second set: Q's change would be stamped 4 and D, verified at 4, would
 /// stay Clean over it.
 #[test]
 fn claim_on_a_later_dirty_stamps_that_dirty_revision() {

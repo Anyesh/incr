@@ -163,13 +163,22 @@ pub struct NodeData<C: Cells> {
 }
 
 impl<C: Cells> NodeData<C> {
+    /// The `changed_at` of an input created, recycled or set at revision
+    /// `revision`: revisions are even, inputs carry the odd stamp below
+    /// and computes the even revision they ran at, so a stamp just below
+    /// every later claim's revision is free for a seed.
+    #[inline(always)]
+    pub(crate) fn input_stamp(revision: u64) -> u64 {
+        revision - 1
+    }
+
     /// Construct a new input node. Input nodes start `Clean` because their
-    /// value is provided at creation. `revision` seeds both `verified_at`
-    /// and `changed_at`.
+    /// value is provided at creation. `revision` seeds `verified_at`, and
+    /// `changed_at` gets its [`Self::input_stamp`].
     pub fn new_input(type_tag: u16, arena_slot: u32, revision: u64) -> Self {
         Self {
             verified_at: C::new_u64(revision),
-            changed_at: C::new_u64(revision),
+            changed_at: C::new_u64(Self::input_stamp(revision)),
             overflow_deps: C::DepListCell::new_null(),
             inline_deps: Self::empty_inline_deps(),
             arena_slot: C::new_u32(arena_slot),
@@ -235,7 +244,14 @@ impl<C: Cells> NodeData<C> {
     ) {
         C::fence_release();
         C::u64_store_relaxed(&self.verified_at, if is_input { revision } else { 0 });
-        C::u64_store_relaxed(&self.changed_at, if is_input { revision } else { 0 });
+        C::u64_store_relaxed(
+            &self.changed_at,
+            if is_input {
+                Self::input_stamp(revision)
+            } else {
+                0
+            },
+        );
         C::u32_store_relaxed(&self.arena_slot, arena_slot);
         C::u16_store_relaxed(&self.type_tag, type_tag);
         C::u8_store_relaxed(&self.dep_count, 0);
@@ -585,9 +601,9 @@ mod tests {
 
     #[test]
     fn local_input_roundtrip() {
-        let n: NodeData<Local> = NodeData::new_input(0, 42, 7);
+        let n: NodeData<Local> = NodeData::new_input(0, 42, 8);
         assert_eq!(n.arena_slot(), 42);
-        assert_eq!(n.verified_at(), 7);
+        assert_eq!(n.verified_at(), 8);
         assert_eq!(n.changed_at(), 7);
         assert_eq!(n.state(), NodeState::Clean);
         n.set_verified_at(11);
@@ -596,9 +612,9 @@ mod tests {
 
     #[test]
     fn shared_input_roundtrip() {
-        let n: NodeData<Shared> = NodeData::new_input(0, 42, 7);
+        let n: NodeData<Shared> = NodeData::new_input(0, 42, 8);
         assert_eq!(n.arena_slot(), 42);
-        assert_eq!(n.verified_at(), 7);
+        assert_eq!(n.verified_at(), 8);
         assert_eq!(n.changed_at(), 7);
         assert_eq!(n.state(), NodeState::Clean);
         n.set_verified_at(11);
