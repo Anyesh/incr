@@ -1,9 +1,12 @@
 use std::any::Any;
 
+use incr_core::persist_hooks::set_returning_displaced;
+use incr_core::value_slot::Compared;
 use incr_core::{with_value_code, Cells, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use super::dep_index::{fp_of, DepFp, DepIndex, PanicGuard};
 use super::logged::{Elements, LoggedKey};
 use crate::{Error, Kind, Record, Result};
 
@@ -28,10 +31,21 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// through the runtime and can no longer be read, changes nothing.
     fn unbind(&self, rt: &Runtime<C>) -> Result<Option<Elements>>;
 
+    /// The key's fingerprint now, for registering it in a [`DepIndex`].
+    /// Computed with no incr lock held and before the index is held.
+    fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp>;
+
     /// Applies `record`, one of this key's records in position order, to the
-    /// node. `before` is the key's logged state without the record.
-    fn apply(&mut self, rt: &Runtime<C>, record: &Record, before: Option<&LoggedKey>)
-        -> Result<()>;
+    /// node. `before` is the key's logged state without the record. With
+    /// `deps`, the runtime write and the fingerprint update run inside one
+    /// hold of it, and what the write displaced is dropped after the hold.
+    fn apply(
+        &mut self,
+        rt: &Runtime<C>,
+        record: &Record,
+        before: Option<&LoggedKey>,
+        deps: Option<&DepIndex>,
+    ) -> Result<()>;
 
     /// Sets the node to exactly what `logged` holds, or to the binding's
     /// default when the log no longer knows the key. A collection binding
@@ -40,11 +54,13 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// `changes` is given, a collection binding pushes a `Remove` or
     /// `Insert` onto it per element occurrence it changed; an input's change
     /// is visible in the logged state alone, so input bindings push nothing.
+    /// `deps` is held as for [`Binding::apply`].
     fn replace(
         &mut self,
         rt: &Runtime<C>,
         logged: Option<&mut LoggedKey>,
         changes: Option<&mut Vec<Record>>,
+        deps: Option<&DepIndex>,
     ) -> Result<()>;
 
     /// Fails with [`Error::Bypassed`] when the node holds something other
@@ -67,14 +83,38 @@ pub(crate) struct InputBinding<T: 'static> {
     /// compaction has since forgotten the key, which is what the key holds
     /// then.
     pub default: T,
+    /// The fingerprint of the bytes `default` was decoded from.
+    pub default_fp: u128,
+    /// The fingerprint of the bytes the runtime value was decoded from. A
+    /// write the runtime treats as a no-op leaves it, because the runtime
+    /// keeps the earlier value, which may differ in its bytes (-0.0 after
+    /// 0.0).
+    pub fp: u128,
 }
 
 impl<T: Value + DeserializeOwned> InputBinding<T> {
-    fn value_of(&self, logged: Option<&LoggedKey>) -> Result<T> {
+    /// The value `logged` gives the key, with the fingerprint of its bytes.
+    fn value_of(&self, logged: Option<&LoggedKey>) -> Result<(T, u128)> {
         match logged.and_then(LoggedKey::current) {
-            Some(bytes) => decode(&self.key, bytes),
-            None => Ok(with_value_code(|| self.default.clone())),
+            Some(bytes) => Ok((decode(&self.key, bytes)?, fp_of(bytes))),
+            None => Ok((with_value_code(|| self.default.clone()), self.default_fp)),
         }
+    }
+
+    /// Sets the node to `value`, decoded from bytes fingerprinting as `fp`.
+    fn write<C: Cells>(&mut self, rt: &Runtime<C>, value: T, fp: u128, deps: Option<&DepIndex>) {
+        let mut hold = deps.map(DepIndex::write);
+        let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
+        let compared = set_returning_displaced(rt, self.handle, value);
+        if matches!(compared, Compared::Replaced(_)) {
+            self.fp = fp;
+            if let Some(map) = guard.deps() {
+                map.set_fp(&self.key, fp);
+            }
+        }
+        guard.disarm();
+        drop(hold);
+        drop(compared);
     }
 }
 
@@ -99,18 +139,23 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         Ok(None)
     }
 
+    fn dep_fp(&self, _rt: &Runtime<C>) -> Result<DepFp> {
+        Ok(DepFp::Known(self.fp))
+    }
+
     fn apply(
         &mut self,
         rt: &Runtime<C>,
         record: &Record,
         before: Option<&LoggedKey>,
+        deps: Option<&DepIndex>,
     ) -> Result<()> {
-        let value = match record {
-            Record::Set { value, .. } => decode(&self.key, value)?,
+        let (value, fp) = match record {
+            Record::Set { value, .. } => (decode(&self.key, value)?, fp_of(value)),
             // A forgotten key holds the default it last had, as after a
             // compaction forgot it.
             Record::Delete { .. } | Record::Forget { .. } => {
-                with_value_code(|| self.default.clone())
+                (with_value_code(|| self.default.clone()), self.default_fp)
             }
             // Only the first Declare since the key was last forgotten is
             // live, as in the folded log.
@@ -118,14 +163,15 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
                 if before.is_none_or(|logged| logged.declared.is_none()) =>
             {
                 self.default = decode(&self.key, default)?;
+                self.default_fp = fp_of(default);
                 if before.and_then(LoggedKey::current).is_some() {
                     return Ok(());
                 }
-                with_value_code(|| self.default.clone())
+                (with_value_code(|| self.default.clone()), self.default_fp)
             }
             _ => return Ok(()),
         };
-        rt.set(self.handle, value);
+        self.write(rt, value, fp, deps);
         Ok(())
     }
 
@@ -134,24 +180,29 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         rt: &Runtime<C>,
         logged: Option<&mut LoggedKey>,
         _changes: Option<&mut Vec<Record>>,
+        deps: Option<&DepIndex>,
     ) -> Result<()> {
         let logged = logged.as_deref();
         let declared = logged.and_then(|logged| logged.declared.as_ref());
         let default = declared
-            .map(|declared| decode(&self.key, &declared.default))
+            .map(|declared| {
+                decode::<T>(&self.key, &declared.default)
+                    .map(|default| (default, fp_of(&declared.default)))
+            })
             .transpose()?;
-        let value = self.value_of(logged)?;
-        if let Some(default) = default {
+        let (value, fp) = self.value_of(logged)?;
+        if let Some((default, default_fp)) = default {
             self.default = default;
+            self.default_fp = default_fp;
         }
-        rt.set(self.handle, value);
+        self.write(rt, value, fp, deps);
         Ok(())
     }
 
     #[cfg(debug_assertions)]
     fn check_bypass(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<()> {
         let held = rt.get(self.handle);
-        let applied = self.value_of(logged)?;
+        let (applied, _) = self.value_of(logged)?;
         // Equal bytes cover values unequal to themselves, such as NaN.
         if with_value_code(|| held == applied) || encode(&held)? == encode(&applied)? {
             Ok(())

@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use incr_core::{check_value_code, with_value_code, Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
@@ -10,12 +10,17 @@ use serde::Serialize;
 use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use binding::{decode, encode, Binding, InputBinding};
+use dep_index::{fp_of, DepFp, DepIndex};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
 pub use collection::PersistedCollection;
 
 mod binding;
 mod collection;
+pub(crate) mod dep_index;
+#[cfg(test)]
+#[path = "dep_index_tests.rs"]
+mod dep_index_tests;
 mod logged;
 
 /// The bound on values a [`Store`] persists: a runtime [`Value`] that serde
@@ -159,6 +164,8 @@ struct State<C: Cells> {
     next_id: u32,
     subscribers: Vec<(SubscriptionId, Subscriber)>,
     next_subscription: u64,
+    /// Kept current by every mapped write once a memo has opened it.
+    deps: Option<Arc<DepIndex>>,
 }
 
 impl<T: 'static> Input<T> {
@@ -337,6 +344,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 next_id: 0,
                 subscribers: Vec::new(),
                 next_subscription: 0,
+                deps: None,
             }),
         };
         {
@@ -344,6 +352,37 @@ impl<C: Cells, B: Backend> Store<C, B> {
             store.catch_up(&mut state, None)?;
         }
         Ok(store)
+    }
+
+    /// The store's [`DepIndex`], created on the first call with every key
+    /// this store has declared. From then on every mapped write keeps it
+    /// current.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn open_dep_index(&self) -> Result<Arc<DepIndex>> {
+        let mut guard = self.state()?;
+        let state = &mut *guard;
+        if let Some(deps) = &state.deps {
+            return Ok(Arc::clone(deps));
+        }
+        let mut entries = Vec::with_capacity(state.bound.len());
+        for (key, id) in &state.bound {
+            let binding = &state.bindings[id];
+            entries.push((
+                key,
+                binding.node(),
+                binding.kind(),
+                binding.dep_fp(&self.runtime)?,
+            ));
+        }
+        let deps = Arc::new(DepIndex::default());
+        {
+            let mut map = deps.write();
+            for (key, handle, kind, fp) in entries {
+                map.register(key, handle, kind, fp);
+            }
+        }
+        state.deps = Some(Arc::clone(&deps));
+        Ok(deps)
     }
 
     /// The runtime the store keeps in sync with the log. Create queries and
@@ -387,17 +426,25 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         let declared = self.declare(state, key, Kind::Input, || encode(&default))?;
         let logged_default: T = decode(key, &declared.default)?;
-        let value = match &state.logged[key].value {
-            Some(bytes) => decode(key, bytes)?,
-            None => with_value_code(|| logged_default.clone()),
+        let default_fp = fp_of(&declared.default);
+        let (value, fp) = match &state.logged[key].value {
+            Some(bytes) => (decode(key, bytes)?, fp_of(bytes)),
+            None => (with_value_code(|| logged_default.clone()), default_fp),
         };
+        let mut hold = state.deps.as_deref().map(DepIndex::write);
         let handle = self.runtime.create_input(value);
+        if let Some(map) = hold.as_deref_mut() {
+            map.register(key, handle.erase(), Kind::Input, DepFp::Known(fp));
+        }
+        drop(hold);
         let id = state.bind(
             key,
             Box::new(InputBinding {
                 key: key.to_owned(),
                 handle,
                 default: logged_default,
+                default_fp,
+                fp,
             }),
         );
         Ok(Input { id, handle })
@@ -472,9 +519,19 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let binding = &state.bindings[&id];
         let key = binding.key().to_owned();
         let held = binding.unbind(&self.runtime)?;
+        let unregistered = state
+            .deps
+            .as_deref()
+            .and_then(|deps| deps.write().unregister(&key));
         match self.runtime.try_delete_node(binding.node()) {
             Ok(()) | Err(DeleteError::NotAlive) => {}
-            Err(DeleteError::HasDependents) => return Err(Error::HasDependents { key }),
+            Err(DeleteError::HasDependents) => {
+                if let (Some(deps), Some(entry)) = (state.deps.as_deref(), unregistered) {
+                    deps.write()
+                        .register(&key, entry.handle, entry.kind, entry.fp);
+                }
+                return Err(Error::HasDependents { key });
+            }
         }
         state.bindings.remove(&id);
         state.bound.remove(&key);
@@ -983,7 +1040,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
         if let Some(&id) = state.bound.get(record.key()) {
             let binding = bound_binding(&mut state.bindings, id);
-            binding.apply(&self.runtime, &record, state.logged.get(record.key()))?;
+            let deps = state.deps.as_deref();
+            binding.apply(&self.runtime, &record, state.logged.get(record.key()), deps)?;
             // A bound collection holds its elements by decoded value; folding
             // them by bytes as well would let the two disagree.
             if binding.kind() == Kind::Collection && is_element_change(&record) {
@@ -1078,7 +1136,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         if let Some(id) = id {
             let changes = if rebuilt { None } else { changes };
-            bound_binding(&mut state.bindings, id).replace(&self.runtime, new, changes)?;
+            let deps = state.deps.as_deref();
+            bound_binding(&mut state.bindings, id).replace(&self.runtime, new, changes, deps)?;
         }
         Ok(())
     }
