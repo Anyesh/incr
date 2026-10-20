@@ -3,6 +3,7 @@
 //! operator built after the episode would have, and a `group_by` router
 //! refuses a provisional value with the cycle and routes nothing.
 
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
@@ -15,8 +16,8 @@ use crate::state::NodeState;
 /// API's `Fn(&T)` signatures otherwise can't reach.
 struct RtRef<C: Cells>(*const Runtime<C>);
 
-// SAFETY: each test keeps its runtime boxed and alive past every operator
-// run, and a `Local` runtime's operators only run on the test's thread.
+// SAFETY: each test keeps its `OwnedRt` alive past every operator run, and
+// a `Local` runtime's operators only run on the test's thread.
 unsafe impl<C: Cells> Send for RtRef<C> {}
 // SAFETY: as above.
 unsafe impl<C: Cells> Sync for RtRef<C> {}
@@ -25,6 +26,39 @@ impl<C: Cells> RtRef<C> {
     fn rt(&self) -> &Runtime<C> {
         // SAFETY: as above.
         unsafe { &*self.0 }
+    }
+}
+
+/// A runtime owned through a raw pointer. Moving a `Box` retags its
+/// allocation as unique, which under Stacked Borrows invalidates every
+/// `RtRef` taken before the move; moving a raw pointer retags nothing.
+struct OwnedRt<C: Cells>(NonNull<Runtime<C>>);
+
+impl<C: Cells> OwnedRt<C> {
+    fn new() -> Self {
+        Self(NonNull::new(Box::into_raw(Box::new(Runtime::new()))).unwrap())
+    }
+
+    fn r(&self) -> RtRef<C> {
+        RtRef(self.0.as_ptr())
+    }
+}
+
+impl<C: Cells> std::ops::Deref for OwnedRt<C> {
+    type Target = Runtime<C>;
+
+    fn deref(&self) -> &Runtime<C> {
+        // SAFETY: the pointer came from `Box::into_raw` and is freed only by
+        // `drop`, so it is valid for as long as `self` is.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<C: Cells> Drop for OwnedRt<C> {
+    fn drop(&mut self) {
+        // SAFETY: as in `deref`; nothing reads through an `RtRef` after the
+        // test drops its `OwnedRt`.
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
     }
 }
 
@@ -43,10 +77,10 @@ fn sorted(mut v: Vec<u64>) -> Vec<u64> {
 /// M = min(count(F) + 1, 5) and F = S.filter(x <= M), over S = 0..10, so
 /// M climbs 0, 2, 4, 5 and F lands {0..=5}.
 fn filter_member<C: Cells>() {
-    let rt = Box::new(Runtime::<C>::new());
+    let rt = OwnedRt::<C>::new();
     let s = rt.create_collection::<u64>();
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
-    let (r, m) = (RtRef(&*rt), m_cell.clone());
+    let (r, m) = (rt.r(), m_cell.clone());
     let f = s.filter(&rt, move |&x| x <= r.rt().get(*m.get().unwrap()));
     let count = f.count(&rt);
     let m = rt.create_query_with(move |rt| (rt.get(count) + 1).min(5), fixpoint(20));
@@ -66,10 +100,10 @@ fn filter_member<C: Cells>() {
 /// As [`filter_member`], with an aggregate counting the members at or
 /// below M in place of the filter and its count.
 fn aggregate_member<C: Cells>() {
-    let rt = Box::new(Runtime::<C>::new());
+    let rt = OwnedRt::<C>::new();
     let s = rt.create_collection::<u64>();
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
-    let (r, m) = (RtRef(&*rt), m_cell.clone());
+    let (r, m) = (rt.r(), m_cell.clone());
     let below = s.aggregate(
         &rt,
         0_u64,
@@ -94,10 +128,10 @@ fn aggregate_member<C: Cells>() {
 /// `min(a + b, M + 1)` is associative for nonnegative values, so the
 /// aggregate counts `min(|S|, M + 1)`.
 fn aggregate_combine_member<C: Cells>() {
-    let rt = Box::new(Runtime::<C>::new());
+    let rt = OwnedRt::<C>::new();
     let s = rt.create_collection::<u64>();
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
-    let (r, m) = (RtRef(&*rt), m_cell.clone());
+    let (r, m) = (rt.r(), m_cell.clone());
     let below = s.aggregate(
         &rt,
         0_u64,
@@ -124,12 +158,12 @@ fn aggregate_combine_member<C: Cells>() {
 /// `set` unlinks M from `key_fn`, it routes normally. Element 0 is routed
 /// at construction, so the state the refusals leave alone is not empty.
 fn group_by_refuses<C: Cells>() {
-    let rt = Box::new(Runtime::<C>::new());
+    let rt = OwnedRt::<C>::new();
     let s = rt.create_collection::<u64>();
     s.insert(&rt, 0);
     let link = rt.create_input(1_u64);
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
-    let (r, m) = (RtRef(&*rt), m_cell.clone());
+    let (r, m) = (rt.r(), m_cell.clone());
     let grouped = s.group_by(&rt, move |&x| {
         let rt = r.rt();
         if x == 0 {
@@ -195,13 +229,13 @@ fn group_by_refuses<C: Cells>() {
 /// member: Q reads M on the stack, defers, and hands its frame `LOW`.
 /// Element 0 is routed at construction, as in [`group_by_refuses`].
 fn group_by_refuses_through_a_deferral<C: Cells>() {
-    let rt = Box::new(Runtime::<C>::new());
+    let rt = OwnedRt::<C>::new();
     let s = rt.create_collection::<u64>();
     s.insert(&rt, 0);
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
     let m = m_cell.clone();
     let q = rt.create_query(move |rt| rt.get(*m.get().unwrap()) % 2);
-    let r = RtRef(&*rt);
+    let r = rt.r();
     let grouped = s.group_by(
         &rt,
         move |&x| {
@@ -229,10 +263,10 @@ fn group_by_refuses_through_a_deferral<C: Cells>() {
 /// is entered at M, so the filter is a member off the stack when the
 /// router reads its version.
 fn group_by_refuses_a_member_upstream<C: Cells>() {
-    let rt = Box::new(Runtime::<C>::new());
+    let rt = OwnedRt::<C>::new();
     let s = rt.create_collection::<u64>();
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
-    let (r, m) = (RtRef(&*rt), m_cell.clone());
+    let (r, m) = (rt.r(), m_cell.clone());
     let f = s.filter(&rt, move |&x| x <= r.rt().get(*m.get().unwrap()));
     let grouped = f.group_by(&rt, |&x| x % 2);
     let router = grouped.version_node();
@@ -286,7 +320,7 @@ impl Shape {
 }
 
 struct Episode<C: Cells> {
-    rt: Box<Runtime<C>>,
+    rt: OwnedRt<C>,
     s: IncrCollection<u64, C>,
     f: IncrCollection<u64, C>,
     count: Incr<u64>,
@@ -298,13 +332,13 @@ struct Episode<C: Cells> {
 
 impl<C: Cells> Episode<C> {
     fn new(shape: Shape) -> Self {
-        let rt = Box::new(Runtime::<C>::new());
+        let rt = OwnedRt::<C>::new();
         let s = rt.create_collection::<u64>();
         let link = rt.create_input(shape.link);
         let runs = Arc::new(AtomicUsize::new(0));
         let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
         let pred_calls = AtomicUsize::new(0);
-        let (r, m, pred_runs) = (RtRef(&*rt), m_cell.clone(), runs.clone());
+        let (r, m, pred_runs) = (rt.r(), m_cell.clone(), runs.clone());
         let f = s.filter(&rt, move |&x| {
             pred_runs.fetch_add(1, SeqCst);
             let rt = r.rt();
