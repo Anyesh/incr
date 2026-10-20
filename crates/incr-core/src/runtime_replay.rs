@@ -224,6 +224,11 @@ impl<C: Cells> Runtime<C> {
                     mode |= ARMED;
                 }
             }
+        } else if self.dep_stack.other_top_doomed(self.runtime_id) {
+            // Another runtime's doomed frame reads this one: its
+            // placeholder may have led it to a read the unbounded run never
+            // makes, as a doomed frame's own native read is.
+            _speculating = Some(replay::Speculating::enter());
         }
         if word & value_code::REPLAY_BIT != 0
             && replay::with(|c| replay::innermost(c, self.runtime_id).is_some())

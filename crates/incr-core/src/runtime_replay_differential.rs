@@ -1123,14 +1123,25 @@ fn two_threads_hang() {
 
 /// Cases with a second runtime that once failed: 0x135's second runtime
 /// read the template's A directly, whose first run is a doomed one at
-/// budget 1.
+/// budget 1; in 0xfe, 0x308, 0x38b and 0x3d0 a doomed frame's read of
+/// the other runtime computed a node that panics and landed it Failed, so
+/// the real read panicked "last compute panicked" (Shared only: a Local
+/// stack can't see another runtime's frames).
 #[test]
 #[cfg_attr(miri, ignore)]
 fn cross_seeds() {
-    for seed in [0x135] {
+    for (seed, local) in [
+        (0x135, true),
+        (0xfe, false),
+        (0x308, false),
+        (0x38b, false),
+        (0x3d0, false),
+    ] {
         let case = gen_case(seed, true, false);
         quiet(|| {
-            differential::<Local>(&case, seed);
+            if local {
+                differential::<Local>(&case, seed);
+            }
             differential::<Shared>(&case, seed);
         });
     }
