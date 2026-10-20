@@ -1031,6 +1031,9 @@ impl<C: Cells> Runtime<C> {
                         let graph = self.member_graph(&ep.members);
                         if !ep.validated {
                             ep.validated = true;
+                            #[cfg(test)]
+                            self.validations
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let comp = components(&graph);
                             let at = ep
                                 .members
