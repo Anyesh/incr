@@ -1147,26 +1147,26 @@ fn two_threads_hang() {
 /// read the template's A directly, whose first run is a doomed one at
 /// budget 1; in 0xfe, 0x308, 0x38b and 0x3d0 a doomed frame's read of
 /// the other runtime computed a node that panics and landed it Failed, so
-/// the real read panicked "last compute panicked" (Shared only: a Local
-/// stack can't see another runtime's frames); in 0xa02 a speculative
+/// the real read panicked "last compute panicked"; in 0xa02 a speculative
 /// landing read the second runtime's input before a set of it, and a
-/// later walk verified that reader Clean on the old value.
+/// later walk verified that reader Clean on the old value. The rest failed
+/// under Local only, while each Local runtime had its own frame stack: a
+/// read from another runtime's closure nested in R's compute recorded into
+/// R's frame and missed its doom, so in 0xb (rt2 5 -> rt1 4 -> rt2 2 at
+/// budget 1) rt1 4 landed Clean with the placeholder. 0x2, 0x27c, 0x35c,
+/// 0x1b5, 0x1e4 and 0x2e1 failed under a per-thread marker of the
+/// innermost Local frame, which kept the stacks apart.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn cross_seeds() {
-    for (seed, local) in [
-        (0x135, true),
-        (0xfe, false),
-        (0x308, false),
-        (0x38b, false),
-        (0x3d0, false),
-        (0xa02, false),
+    for seed in [
+        0x2, 0xb, 0xfa, 0xfb, 0xfe, 0x109, 0x135, 0x14a, 0x14d, 0x19a, 0x19e, 0x1b5, 0x1b6, 0x1e4,
+        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x401, 0x441, 0x4f9,
+        0x50d, 0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0xa02,
     ] {
         let case = gen_case(seed, true, false);
         quiet(|| {
-            if local {
-                differential::<Local>(&case, seed);
-            }
+            differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);
         });
     }
