@@ -2324,6 +2324,13 @@ impl<C: Cells> Runtime<C> {
         reclaim_probe::reached(RetireSite::SetRetire);
     }
 
+    /// `handle`'s `changed_at`, loaded with Acquire. `u64::MAX` while a
+    /// `set` of it is between its compare and its settle.
+    pub(crate) fn changed_at<T: Value>(&self, handle: Incr<T>) -> u64 {
+        self.check_handle(handle);
+        self.nodes.get(handle.slot()).changed_at()
+    }
+
     /// [`Self::set`] that hands back what it would drop: the displaced
     /// value if it wrote, or the rejected equal value if it did not.
     pub(crate) fn set_returning_displaced<T: Value>(

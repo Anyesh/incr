@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use proptest::prelude::*;
 
 use super::{
-    collection_delete, collection_insert, collection_replace, set_returning_displaced, Displaced,
-    RepSide, RepSink,
+    changed_at, collection_delete, collection_insert, collection_replace, set_returning_displaced,
+    Displaced, RepSide, RepSink,
 };
 use crate::cells::{Cells, Local, Shared};
 use crate::runtime::Runtime;
@@ -425,4 +425,54 @@ fn sink_runs_as_value_code_before_any_change_local() {
 #[test]
 fn sink_runs_as_value_code_before_any_change_shared() {
     sink_runs_as_value_code_before_any_change::<Shared>();
+}
+
+fn changed_at_tracks_writes_that_wrote<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    let c0 = changed_at(&rt, x);
+    rt.set(x, 2);
+    let c1 = changed_at(&rt, x);
+    assert!(c1 > c0, "a write that wrote moves the stamp");
+    rt.set(x, 2);
+    assert_eq!(changed_at(&rt, x), c1, "a no-op leaves it");
+    assert!(matches!(
+        set_returning_displaced(&rt, x, 3),
+        Compared::Replaced(_)
+    ));
+    let c2 = changed_at(&rt, x);
+    assert!(c2 > c1);
+    assert!(matches!(
+        set_returning_displaced(&rt, x, 3),
+        Compared::Equal(_)
+    ));
+    assert_eq!(changed_at(&rt, x), c2);
+}
+
+#[test]
+fn changed_at_tracks_writes_that_wrote_local() {
+    changed_at_tracks_writes_that_wrote::<Local>();
+}
+
+#[test]
+fn changed_at_tracks_writes_that_wrote_shared() {
+    changed_at_tracks_writes_that_wrote::<Shared>();
+}
+
+#[test]
+fn changed_at_refuses_a_stale_or_foreign_handle() {
+    let rt = Runtime::<Shared>::new();
+    let x = rt.create_input(1_u64);
+    let other = Runtime::<Shared>::new();
+    let err = catch_unwind(AssertUnwindSafe(|| changed_at(&other, x)))
+        .expect_err("a foreign handle panics");
+    drop(err);
+    rt.delete_node(x);
+    let err =
+        catch_unwind(AssertUnwindSafe(|| changed_at(&rt, x))).expect_err("a stale handle panics");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(msg.contains("stale"), "unexpected panic: {msg}");
 }
