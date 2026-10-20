@@ -2533,12 +2533,18 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Closes context `id` on an unwind out of its loop, which also ends
-    /// the runs whose virtual hits took the claims it lists.
+    /// the runs whose virtual hits took the claims it lists. A wound out of
+    /// an entry above level 0 pops no frame at the positions below it, so
+    /// the claims anchored at the context's virtual frames, and those its
+    /// closed episodes waited for, are released here.
     fn close_unwound(&self, id: u64, boundary: u32) {
         let mut bag = Deferred::new();
         self.release_claim_list(id, 0, &mut bag);
         bag.drain(self);
         self.close_context(id, boundary);
+        let mut bag = Deferred::new();
+        self.release_held_from(boundary, true, &mut bag);
+        bag.drain(self);
     }
 
     fn close_context(&self, id: u64, boundary: u32) {

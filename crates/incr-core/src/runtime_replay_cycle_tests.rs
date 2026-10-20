@@ -646,6 +646,62 @@ fn virtual_hit_above_an_earlier_one<C: Cells>() {
     assert_eq!(observe(Some(1)), unbounded);
 }
 
+/// **A wound out of an entry above virtual frames that own claims** at
+/// budget 1: F and X have Fallbacks, F reads X, X reads Y and then W, and
+/// Y reads X and then F. Y's entry defers Y to F's virtual frame, and X's
+/// retry dooms on W, so W's entry runs at position 2 above the virtual
+/// frames of F and X. W's first run raises a wound, as a claim wait does:
+/// no frame at a position below W's pops, so closing the context releases
+/// every claim the thread holds, and the retry returns the unbounded run's
+/// values.
+#[test]
+fn shared_wound_above_virtual_frames_releases_their_claims() {
+    let observe = |frames: Option<u32>, wound: bool| {
+        let rt = runtime::<Shared>(frames);
+        let i = rt.create_input(5_u64);
+        let y_cell = cell::<u64>();
+        let w_runs = Arc::new(AtomicU32::new(0));
+        let w = {
+            let (y_cell, w_runs) = (y_cell.clone(), w_runs.clone());
+            rt.create_query_with(
+                move |rt: &Runtime<Shared>| {
+                    if wound && w_runs.fetch_add(1, SeqCst) == 0 {
+                        let y = y_cell.get().unwrap().slot();
+                        assert!(crate::cycle_state::holds(rt.runtime_id, y));
+                        rt.raise_wound();
+                    }
+                    rt.get(i)
+                },
+                replayable(),
+            )
+        };
+        let x = {
+            let y_cell = y_cell.clone();
+            rt.create_query_with(
+                move |rt: &Runtime<Shared>| rt.get(*y_cell.get().unwrap()) + rt.get(w) + 1,
+                replayable_fallback(|c| 200 + c.len() as u64),
+            )
+        };
+        let f = rt.create_query_with(
+            move |rt| rt.get(x) + 1,
+            replayable_fallback(|c| 100 + c.len() as u64),
+        );
+        let y = rt.create_query_with(move |rt| rt.get(x) + rt.get(f), replayable());
+        y_cell.set(y).unwrap();
+        let got = get(&rt, f);
+        assert!(crate::cycle_state::held_keys().is_empty());
+        rt.assert_invariant_i();
+        assert!(
+            !wound || w_runs.load(SeqCst) > 1,
+            "W's wounded run ran again"
+        );
+        (got, [x, y, w].map(|n| try_get(&rt, n)))
+    };
+    let unbounded = observe(None, false);
+    assert_eq!(unbounded.0, Outcome::Value(103), "{unbounded:?}");
+    assert_eq!(observe(Some(1), true), unbounded);
+}
+
 /// **A drop through a frame that can't take a placeholder**: the a = false
 /// IF form with C reading F through Q, a native query whose type has no
 /// placeholder, so C's suspect read drops the chain by unwinding through
