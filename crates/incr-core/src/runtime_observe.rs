@@ -59,39 +59,36 @@ impl Drop for Observing {
 impl<C: Cells> Runtime<C> {
     /// Bring the node up to date and read it with its change stamp, as
     /// `try_get` does, except that a node deleted or recycled under the
-    /// handle reads `Gone` instead of panicking. The stamp is loaded
-    /// before the value, so a change landing between them fires again
-    /// rather than not at all.
+    /// handle reads `Gone` instead of panicking. Each stamp is loaded
+    /// before the state or value it goes with, so a change landing
+    /// between them fires again rather than not at all.
     ///
-    /// Inside a compute the value is read by `try_get`, so that the read
-    /// records its dependency and follows the frame's doom rules.
+    /// Inside a compute the read records its dependency, and a read the
+    /// frame's rules settle (a node held by this thread, or a doomed or
+    /// discarded run) does not fire.
     pub(super) fn observer_read<T: Value>(&self, handle: Incr<T>) -> Result<(T, u64), ObsErr> {
         let id = NodeId(handle.slot());
         let gen = handle.generation();
         let node = self.nodes.get(id.0);
-        let observed = {
+        let (observed, entry_stamp) = {
             let _inner = self.inner.read();
             if node.generation() != gen {
                 return Err(ObsErr::Gone);
             }
-            state::load::<C>(node.state_cell())
+            let stamp = self.observed_stamp(node);
+            C::fence_acquire();
+            (state::load::<C>(node.state_cell()), stamp)
         };
+        self.dep_stack.record_dep(self.runtime_id, id, gen);
         self.park(ParkPoint::ObserverAfterEntryCheck(id));
-        let in_compute = self.dep_stack.current_frame_active(self.runtime_id);
         if observed != NodeState::Clean {
-            self.observer_walk(handle, observed, in_compute)?;
+            self.observer_walk(handle, observed, entry_stamp)?;
         }
         self.park(ParkPoint::ObserverAfterEnsureClean(id));
         if node.generation() != gen {
             return Err(ObsErr::Gone);
         }
         let stamp = self.observed_stamp(node);
-        if in_compute {
-            return self
-                .try_get(handle)
-                .map(|value| (value, stamp))
-                .map_err(|_| ObsErr::Cycle(stamp));
-        }
         self.park(ParkPoint::ObserverBeforePreCheck(id));
         let type_tag = node.type_tag();
         let arena_slot = node.arena_slot();
@@ -107,33 +104,30 @@ impl<C: Cells> Runtime<C> {
         }
         match value {
             Some(value) => Ok((value, stamp)),
-            None => {
-                self.read_missing(handle, node);
-                Err(ObsErr::Cycle(stamp))
-            }
+            None => self.observer_read_missing(handle, node, stamp),
         }
     }
 
     /// `observer_read`'s walk of a node it found not Clean, under the
     /// record that lets the Dead arm return `Gone` for this node.
+    /// `stamp` was loaded before `observed`.
     #[cold]
     #[inline(never)]
     fn observer_walk<T: Value>(
         &self,
         handle: Incr<T>,
         observed: NodeState,
-        in_compute: bool,
+        stamp: u64,
     ) -> Result<(), ObsErr> {
         let id = NodeId(handle.slot());
-        let node = self.nodes.get(id.0);
         if observed == NodeState::Cyclic || is_computing(observed) {
-            match self.cycle_read(handle, observed, ReadKind::TryGet, None) {
-                Some(Err(_)) => return Err(ObsErr::Cycle(self.observed_stamp(node))),
-                // A node on this thread's stack: `try_get` reads it by the
-                // same rule.
-                Some(Ok(_)) if in_compute => return Ok(()),
-                Some(Ok(_)) => unreachable!("incr-core: a held node outside a compute"),
-                None => {}
+            // `Ok` is a node on this thread's stack or held map, in a
+            // compute: its value is not settled, so nothing fires.
+            if self
+                .cycle_read(handle, observed, ReadKind::TryGet, None)
+                .is_some()
+            {
+                return Err(ObsErr::Cycle(stamp));
             }
         }
         let _observing = Observing::record(self.runtime_id, id.0);
@@ -141,15 +135,36 @@ impl<C: Cells> Runtime<C> {
             .entered(ReadKind::TryGet, || {
                 self.ensure_clean(id, handle.generation())
             })
-            .map_err(|_| ObsErr::Cycle(self.observed_stamp(node)))?;
+            .map_err(|_| ObsErr::Cycle(stamp))?;
         match computed {
             Computed::Done | Computed::Unsettled => Ok(()),
             Computed::Gone => Err(ObsErr::Gone),
-            // The frame's read rules handle these under `try_get`.
-            Computed::Deferred | Computed::Doomed | Computed::Discarded if in_compute => Ok(()),
-            _ => unreachable!(
-                "incr-core: an observer's walk outside a compute returned {computed:?}"
-            ),
+            Computed::Deferred => Err(ObsErr::Cycle(stamp)),
+            // The reading run is thrown away and its retry reads again.
+            Computed::Doomed | Computed::Discarded => Err(ObsErr::Gone),
+            Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
+        }
+    }
+
+    /// `observer_read` found no value under an unmoved generation: the
+    /// node is without one because of a cycle, or a delete has claimed
+    /// it since the walk.
+    #[cold]
+    #[inline(never)]
+    fn observer_read_missing<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        stamp: u64,
+    ) -> Result<(T, u64), ObsErr> {
+        let state = node.state();
+        if node.generation() != handle.generation() {
+            return Err(ObsErr::Gone);
+        }
+        match state {
+            NodeState::Cyclic | NodeState::New => Err(ObsErr::Cycle(stamp)),
+            NodeState::Dead | NodeState::Deleting => Err(ObsErr::Gone),
+            _ => self.read_failed(handle),
         }
     }
 

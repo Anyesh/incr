@@ -20,12 +20,13 @@ fn id<T>(h: Incr<T>) -> NodeId {
     NodeId(h.slot())
 }
 
-/// x -> q = x + 1, read Clean, observed, then x set so q is Dirty and the
+/// x -> q = x + 1, read Clean, watched and observed, then x set so q is Dirty and the
 /// observer's read has to compute it.
 fn observed_leaf(rt: &Rt) -> (Incr<u64>, Incr<u64>, Arc<AtomicBool>) {
     let x = rt.create_input(1_u64);
     let q = rt.create_query(move |rt: &Rt| rt.get(x) + 1);
     assert_eq!(rt.get(q), 2);
+    rt.watch(q);
     let fired = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&fired);
     rt.observe(q, move |_| seen.store(true, Ordering::SeqCst));
@@ -172,6 +173,7 @@ fn a_panicking_observed_compute_leaves_the_observed_slot_clear<C: Cells>() {
         v
     });
     rt.get(q);
+    rt.watch(q);
     rt.observe(q, |_| {});
     rt.set(x, 1);
     assert!(catch_unwind(AssertUnwindSafe(|| rt.stabilize())).is_err());
@@ -183,21 +185,23 @@ both!(
     shared_a_panicking_observed_compute_leaves_the_observed_slot_clear
 );
 
-/// x -> a -> b -> a while x is odd: a and b land Cyclic. b reads x / 2,
-/// which cuts off, once the cycle is broken.
+/// a -> b -> a while x is odd, so a and b land Cyclic; a also reads
+/// c = x / 10, which cuts off when the `set` that breaks the cycle runs.
 fn an_observer_of_a_cyclic_node_fires_once_the_cycle_breaks<C: Cells>() {
     let rt = Runtime::<C>::new();
     let x = rt.create_input(1_u64);
+    let c = rt.create_query(move |rt: &Runtime<C>| rt.get(x) / 10);
     let b_slot: Arc<Mutex<Option<Incr<u64>>>> = Arc::new(Mutex::new(None));
     let to_b = Arc::clone(&b_slot);
     let a = rt.create_query_with(
         move |rt: &Runtime<C>| {
             let v = rt.get(x);
+            let tens = rt.get(c);
             if v % 2 == 1 {
                 let b = to_b.lock().unwrap().expect("b is created");
-                rt.get(b) + v
+                rt.get(b) + tens
             } else {
-                v
+                v + tens
             }
         },
         QueryOpts {
@@ -208,6 +212,7 @@ fn an_observer_of_a_cyclic_node_fires_once_the_cycle_breaks<C: Cells>() {
     let b = rt.create_query(move |rt: &Runtime<C>| rt.get(a) / 2);
     *b_slot.lock().unwrap() = Some(b);
     assert!(rt.try_get(a).is_err());
+    rt.watch(a);
     let fired: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&fired);
     rt.observe(a, move |v| seen.lock().unwrap().push(*v));
