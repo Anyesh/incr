@@ -26,17 +26,17 @@ impl EncodedEntry {
 /// A store holds a sequence of immutable generations and names one of them
 /// current. Several handles, in this process or others, may share a store;
 /// every method takes `&self` and implementations serialize internally.
-/// A checkpoint
-/// calls, in order: [`lock_checkpoint`](Self::lock_checkpoint), [`load`](Self::load),
-/// [`read_entry`](Self::read_entry) on the loaded generation,
-/// [`write_generation`](Self::write_generation) from it, and drops the
-/// guard. The caller swaps its in-memory index to the new generation and
+/// [`write_checkpoint`](super::write_checkpoint) calls, in order:
+/// [`lock_checkpoint`](Self::lock_checkpoint), [`load`](Self::load),
+/// [`read_entry`](Self::read_entry) on the loaded generation, and
+/// [`write_generation`](Self::write_generation) from it, then drops the
+/// guard. Its caller swaps its in-memory index to the new generation and
 /// only then calls [`remove_generation`](Self::remove_generation) on the
 /// old one. Restores call `read_entry` on whichever generation their index
 /// names, which may by then have been removed by another handle.
 ///
-/// The [`memo_backend_conformance!`](crate::memo_backend_conformance)
-/// suite checks this contract.
+/// The `memo_backend_conformance!` suite, behind the `backend-tests`
+/// feature, checks this contract.
 pub trait MemoBackend: Send + Sync {
     /// Held for the length of one checkpoint; dropping it releases the
     /// lock.
