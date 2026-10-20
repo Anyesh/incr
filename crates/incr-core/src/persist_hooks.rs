@@ -1,13 +1,17 @@
-//! Hooks for incr-persist's mapped writes. Unstable: incr-persist pins
-//! this crate's exact version, and nothing else should call them.
+//! Hooks for incr-persist's mapped writes, restores and checkpoints.
+//! Unstable: incr-persist pins this crate's exact version, and nothing
+//! else should call them.
 
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 
 use crate::cells::Cells;
 pub use crate::collection::Displaced;
 use crate::collection::IncrCollection;
-use crate::handle::Incr;
+use crate::cycle::QueryOpts;
+pub use crate::deferred::Deferred;
+use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::runtime::Runtime;
+use crate::table::{NodeTable, TableKey};
 use crate::value::Value;
 use crate::value_slot::{self, Compared};
 
@@ -92,6 +96,111 @@ pub fn collection_replace<T: Value + Hash + Eq, C: Cells, R: RepSink<T>>(
     keep: &mut Vec<Displaced<T>>,
 ) -> bool {
     collection.replace_with(rt, old, new, on_rep, |d| d.keep_into(keep))
+}
+
+/// The stamp a restore seeds every entry with, `walked - 1`: odd, so at
+/// or above every input whose set has walked and below the revision of
+/// every later claim, which is at least `walked`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeedBase {
+    pub w0: u64,
+    pub rid: RuntimeId,
+}
+
+/// One dep of a seeded query. `trusted_stamp` is a query dep's seed
+/// stamp, which it must still carry for the seed to be `IfUnchanged`;
+/// `None` is a dep the caller has checked itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SeedDep {
+    pub dep: ErasedIncr,
+    pub trusted_stamp: Option<u64>,
+}
+
+/// How a seeded query is first read: `IfUnchanged` verifies Clean without
+/// running when no dep changed since the base; `RecomputeFirst` runs the
+/// closure, and an equal value is a cutoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reuse {
+    IfUnchanged,
+    RecomputeFirst,
+}
+
+/// Why [`seed_query`] did not seed; the query is left New.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedError {
+    /// The query is not a New node with no deps and no dependents.
+    NotFresh,
+    /// A dep was deleted, or belongs to another runtime.
+    DepNotAlive,
+    /// `RecomputeFirst` with no deps, which no change could ever rerun.
+    NoDeps,
+    /// The base or the query belongs to another runtime.
+    ForeignBase,
+}
+
+/// A Clean query's value and the deps of the run that produced it.
+#[derive(Clone, Debug)]
+pub struct Inspected<T> {
+    pub value: T,
+    pub deps: Vec<ErasedIncr>,
+    pub in_group: bool,
+}
+
+pub fn seed_base<C: Cells>(rt: &Runtime<C>) -> SeedBase {
+    rt.seed_base()
+}
+
+/// Lands New query `q` Dirty with `value` and `deps` at `base.w0`, as of
+/// a run that read those deps; `IfUnchanged` falls back to
+/// `RecomputeFirst` when a trusted dep no longer holds its stamp. On
+/// failure `value` comes back for the caller to drop where its protocol
+/// allows. Panics in a doomed frame.
+pub fn seed_query<T: Value, C: Cells>(
+    rt: &Runtime<C>,
+    base: &SeedBase,
+    q: Incr<T>,
+    value: T,
+    deps: &[SeedDep],
+    reuse: Reuse,
+) -> Result<Reuse, (SeedError, T)> {
+    rt.seed_query(base, q, value, deps, reuse)
+}
+
+/// `None` unless `q` is Clean through both reads, with its stamp and
+/// deps unmoved between them. Panics inside a compute of `rt`.
+pub fn inspect<T: Value, C: Cells>(rt: &Runtime<C>, q: Incr<T>) -> Option<Inspected<T>> {
+    rt.inspect(q)
+}
+
+/// [`NodeTable::get_or_insert_query_with`] that hands a node the miss
+/// creates to `seed` before publishing it; a value `seed` returns, a
+/// failed seed's, drops after the miss mutex. A hit never calls `seed`.
+pub fn get_or_insert_query_seeded<K, T, C, S, F>(
+    table: &NodeTable<K, T, C, S>,
+    rt: &Runtime<C>,
+    key: K,
+    f: F,
+    opts: QueryOpts<T>,
+    seed: impl FnOnce(&Runtime<C>, Incr<T>) -> Option<T>,
+) -> Incr<T>
+where
+    K: TableKey,
+    T: Value,
+    C: Cells,
+    S: BuildHasher,
+    F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+{
+    table.get_or_insert_query_seeded(rt, key, f, opts, seed)
+}
+
+/// The live node for `key`, if any, without `NodeTable::get`'s refusal
+/// inside a compute: a restore records no dependency on the lookup.
+pub fn probe_unchecked<K: TableKey, T: Value, C: Cells, S: BuildHasher>(
+    table: &NodeTable<K, T, C, S>,
+    rt: &Runtime<C>,
+    key: &K,
+) -> Option<Incr<T>> {
+    table.probe_unchecked(rt, key)
 }
 
 #[cfg(all(test, not(loom)))]

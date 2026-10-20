@@ -1,0 +1,490 @@
+//! The restore and checkpoint hooks (T10): `seed_base`, `seed_query`,
+//! `NodeTable::get_or_insert_query_seeded` and `inspect`.
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use super::race_tests::{id, park_at, Gate};
+use super::{ParkPoint, Runtime};
+use crate::cells::{Cells, Local, Shared};
+use crate::handle::{ErasedIncr, Incr};
+use crate::persist_hooks::{
+    get_or_insert_query_seeded, inspect, probe_unchecked, seed_base, seed_query, Reuse, SeedDep,
+    SeedError,
+};
+use crate::state::NodeState;
+use crate::table::NodeTable;
+
+type Rt = Runtime<Shared>;
+
+macro_rules! both {
+    ($($name:ident),* $(,)?) => {
+        mod local {
+            $(
+                #[test]
+                fn $name() {
+                    super::$name::<super::Local>();
+                }
+            )*
+        }
+        mod shared {
+            $(
+                #[test]
+                fn $name() {
+                    super::$name::<super::Shared>();
+                }
+            )*
+        }
+    };
+}
+
+both!(
+    if_unchanged_over_unchanged_deps_never_runs,
+    recompute_first_runs_once_and_cuts_off,
+    a_moved_trusted_dep_downgrades_to_recompute_first,
+    failures_return_the_value_and_land_new,
+    two_restores_in_one_compute_run_once,
+    recomputed_seeded_dep_invalidates_trusting_entry,
+    inspect_reads_a_clean_node_with_its_deps,
+    table_seeds_only_a_node_it_creates,
+);
+
+fn dep<T>(h: Incr<T>) -> SeedDep {
+    SeedDep {
+        dep: h.erase(),
+        trusted_stamp: None,
+    }
+}
+
+fn trusted<T>(h: Incr<T>, stamp: u64) -> SeedDep {
+    SeedDep {
+        dep: h.erase(),
+        trusted_stamp: Some(stamp),
+    }
+}
+
+/// A query over `x` that counts its runs and returns `x * 10`.
+fn counted<C: Cells>(rt: &Runtime<C>, x: Incr<u64>) -> (Incr<u64>, Arc<AtomicU32>) {
+    let runs = Arc::new(AtomicU32::new(0));
+    let counter = Arc::clone(&runs);
+    let q = rt.create_query(move |rt: &Runtime<C>| {
+        counter.fetch_add(1, SeqCst);
+        rt.get(x) * 10
+    });
+    (q, runs)
+}
+
+/// Seeded `IfUnchanged` over an input that has not changed since the
+/// base: the node lands Dirty at W0 and verifies Clean without running,
+/// and a later change runs it.
+fn if_unchanged_over_unchanged_deps_never_runs<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(3_u64);
+    let (q, runs) = counted(&rt, x);
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, q, 30, &[dep(x)], Reuse::IfUnchanged),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.state_of(q), NodeState::Dirty);
+    let node = rt.nodes.get(q.slot());
+    assert_eq!((node.changed_at(), node.verified_at()), (base.w0, base.w0));
+    assert_eq!(base.w0 % 2, 1, "W0 is an odd stamp");
+    assert_eq!(rt.get(q), 30);
+    assert_eq!(runs.load(SeqCst), 0);
+    assert_eq!(rt.state_of(q), NodeState::Clean);
+
+    rt.set(x, 4);
+    assert_eq!(rt.get(q), 40);
+    assert_eq!(runs.load(SeqCst), 1);
+    rt.assert_invariant_i();
+}
+
+/// `RecomputeFirst` runs the closure on the first read; a run that
+/// returns the seeded value is a cutoff, so a dependent seeded over it
+/// stays verified.
+fn recompute_first_runs_once_and_cuts_off<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(3_u64);
+    let (q, runs) = counted(&rt, x);
+    let (r, r_runs) = {
+        let r_runs = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&r_runs);
+        let r = rt.create_query(move |rt: &Runtime<C>| {
+            counter.fetch_add(1, SeqCst);
+            rt.get(q) + 1
+        });
+        (r, r_runs)
+    };
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, q, 30, &[dep(x)], Reuse::RecomputeFirst),
+        Ok(Reuse::RecomputeFirst)
+    );
+    assert_eq!(rt.nodes.get(q.slot()).verified_at(), 0);
+    assert_eq!(
+        seed_query(
+            &rt,
+            &base,
+            r,
+            31,
+            &[trusted(q, base.w0)],
+            Reuse::IfUnchanged
+        ),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.get(r), 31);
+    assert_eq!(runs.load(SeqCst), 1);
+    assert_eq!(r_runs.load(SeqCst), 0, "a cutoff recompute of q ran r");
+    assert_eq!(rt.nodes.get(q.slot()).changed_at(), base.w0);
+    rt.assert_invariant_i();
+}
+
+/// A trusted dep whose stamp is not the one recorded, or that is not
+/// Clean or Dirty, makes the seed `RecomputeFirst`.
+fn a_moved_trusted_dep_downgrades_to_recompute_first<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(3_u64);
+    let (q, _) = counted(&rt, x);
+    assert_eq!(rt.get(q), 30);
+    let (r, _) = counted(&rt, x);
+    let base = seed_base(&rt);
+    let stamp = rt.nodes.get(q.slot()).changed_at();
+    assert_eq!(
+        seed_query(
+            &rt,
+            &base,
+            r,
+            0,
+            &[trusted(q, stamp + 2), dep(x)],
+            Reuse::IfUnchanged
+        ),
+        Ok(Reuse::RecomputeFirst)
+    );
+    assert_eq!(rt.nodes.get(r.slot()).verified_at(), 0);
+    assert_eq!(rt.get(r), 30);
+
+    let failed = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("boom") });
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(failed))).is_err());
+    assert_eq!(rt.state_of(failed), NodeState::Failed);
+    let (s, _) = counted(&rt, x);
+    let stamp = rt.nodes.get(failed.slot()).changed_at();
+    assert_eq!(
+        seed_query(
+            &rt,
+            &seed_base(&rt),
+            s,
+            0,
+            &[trusted(failed, stamp)],
+            Reuse::IfUnchanged
+        ),
+        Ok(Reuse::RecomputeFirst)
+    );
+}
+
+/// Each failure hands the value back, lands the node New and installs
+/// nothing, so a read computes it cold.
+fn failures_return_the_value_and_land_new<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let other = Runtime::<C>::new();
+    let x = rt.create_input(3_u64);
+    let gone = rt.create_input(0_u64);
+    rt.delete_node(gone);
+    let (q, runs) = counted(&rt, x);
+    let base = seed_base(&rt);
+    let foreign = seed_base(&other);
+    let cases: [(
+        &crate::persist_hooks::SeedBase,
+        Vec<SeedDep>,
+        Reuse,
+        SeedError,
+    ); 3] = [
+        (
+            &foreign,
+            vec![dep(x)],
+            Reuse::IfUnchanged,
+            SeedError::ForeignBase,
+        ),
+        (
+            &base,
+            vec![dep(gone)],
+            Reuse::IfUnchanged,
+            SeedError::DepNotAlive,
+        ),
+        (&base, vec![], Reuse::RecomputeFirst, SeedError::NoDeps),
+    ];
+    for (b, deps, reuse, err) in cases {
+        assert_eq!(seed_query(&rt, b, q, 7, &deps, reuse), Err((err, 7)));
+        assert_eq!(rt.state_of(q), NodeState::New);
+        assert_eq!(rt.nodes.get(q.slot()).dep_count(), 0);
+    }
+    assert_eq!(rt.get(q), 30);
+    assert_eq!(runs.load(SeqCst), 1);
+    assert_eq!(
+        seed_query(&rt, &base, q, 7, &[dep(x)], Reuse::IfUnchanged),
+        Err((SeedError::NotFresh, 7))
+    );
+    assert_eq!(rt.state_of(q), NodeState::Clean);
+    rt.assert_invariant_i();
+}
+
+/// P restores A over x and B over A from a table inside its compute and
+/// reads both: A and B never run and P runs once.
+fn two_restores_in_one_compute_run_once<C: Cells>()
+where
+    NodeTable<u8, u64, C>: Send + Sync,
+{
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(2_u64);
+    let table: Arc<NodeTable<u8, u64, C>> = Arc::new(rt.create_table());
+    let leaf_runs = Arc::new(AtomicU32::new(0));
+    let p_runs = Arc::new(AtomicU32::new(0));
+    let p = {
+        let (table, leaf_runs, p_runs) = (table.clone(), leaf_runs.clone(), p_runs.clone());
+        rt.create_query(move |rt: &Runtime<C>| {
+            p_runs.fetch_add(1, SeqCst);
+            let base = seed_base(rt);
+            let runs = leaf_runs.clone();
+            let a = get_or_insert_query_seeded(
+                &table,
+                rt,
+                0,
+                move |rt: &Runtime<C>| {
+                    runs.fetch_add(1, SeqCst);
+                    rt.get(x) * 10
+                },
+                Default::default(),
+                |rt, a| {
+                    seed_query(rt, &base, a, 20, &[dep(x)], Reuse::IfUnchanged)
+                        .err()
+                        .map(|e| e.1)
+                },
+            );
+            let runs = leaf_runs.clone();
+            let b = get_or_insert_query_seeded(
+                &table,
+                rt,
+                1,
+                move |rt: &Runtime<C>| {
+                    runs.fetch_add(1, SeqCst);
+                    rt.get(a) + 1
+                },
+                Default::default(),
+                |rt, b| {
+                    seed_query(rt, &base, b, 21, &[trusted(a, base.w0)], Reuse::IfUnchanged)
+                        .err()
+                        .map(|e| e.1)
+                },
+            );
+            rt.get(a) + rt.get(b)
+        })
+    };
+    assert_eq!(rt.get(p), 41);
+    assert_eq!(p_runs.load(SeqCst), 1);
+    assert_eq!(leaf_runs.load(SeqCst), 0);
+    rt.assert_invariant_i();
+}
+
+/// R trusts A at its seed stamp; A recomputes to a new value, which
+/// stamps above W0, so R runs.
+fn recomputed_seeded_dep_invalidates_trusting_entry<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(5_u64);
+    let (a, _) = counted(&rt, x);
+    let (r, r_runs) = {
+        let r_runs = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&r_runs);
+        let r = rt.create_query(move |rt: &Runtime<C>| {
+            counter.fetch_add(1, SeqCst);
+            rt.get(a) + 1
+        });
+        (r, r_runs)
+    };
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, a, 999, &[dep(x)], Reuse::RecomputeFirst),
+        Ok(Reuse::RecomputeFirst)
+    );
+    assert_eq!(
+        seed_query(
+            &rt,
+            &base,
+            r,
+            1000,
+            &[trusted(a, base.w0)],
+            Reuse::IfUnchanged
+        ),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.get(r), 51);
+    assert_eq!(r_runs.load(SeqCst), 1);
+    assert!(rt.nodes.get(a.slot()).changed_at() > base.w0);
+    rt.assert_invariant_i();
+}
+
+/// `inspect` returns a Clean node's value and deps, and `None` for one
+/// that is not Clean.
+fn inspect_reads_a_clean_node_with_its_deps<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    let y = rt.create_input(2_u64);
+    let q = rt.create_query(move |rt: &Runtime<C>| rt.get(x) + rt.get(y));
+    assert!(inspect(&rt, q).is_none());
+    assert_eq!(rt.get(q), 3);
+    let seen = inspect(&rt, q).expect("a Clean node is inspected");
+    assert_eq!(seen.value, 3);
+    assert_eq!(seen.deps, vec![x.erase(), y.erase()]);
+    assert!(!seen.in_group);
+    rt.set(x, 5);
+    assert!(inspect(&rt, q).is_none());
+}
+
+/// The seed hook runs only for a node the miss creates; a hit, or the
+/// probe, returns the live node and leaves the hook uncalled.
+fn table_seeds_only_a_node_it_creates<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(4_u64);
+    let table: NodeTable<u8, u64, C> = rt.create_table();
+    assert_eq!(probe_unchecked(&table, &rt, &0), None);
+    let calls = AtomicU32::new(0);
+    let hook = |rt: &Runtime<C>, q: Incr<u64>| {
+        calls.fetch_add(1, SeqCst);
+        let base = seed_base(rt);
+        seed_query(rt, &base, q, 40, &[dep(x)], Reuse::IfUnchanged)
+            .err()
+            .map(|e| e.1)
+    };
+    let f = move |rt: &Runtime<C>| rt.get(x) * 10;
+    let q = get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), hook);
+    assert_eq!(rt.state_of(q), NodeState::Dirty);
+    let again = get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), |_, _| {
+        panic!("the hook ran on a hit")
+    });
+    assert_eq!(again, q);
+    assert_eq!(calls.load(SeqCst), 1);
+    assert_eq!(probe_unchecked(&table, &rt, &0), Some(q));
+    assert_eq!(rt.get(q), 40);
+}
+
+/// A dep seeded at W0 and trusted by R, claimed by a reader inside the
+/// seed of R's `inner` hold, before its trust check (`before`) or after.
+/// The reader loaded the closure before the hold and parks just before
+/// its claim CAS, which takes no lock. Before, the check finds the dep
+/// claimed or moved and R falls back to `RecomputeFirst`; after, the claim
+/// reads from the check, so the reader's landing stamps above W0 and R
+/// runs. Either way R reads the dep's new value.
+fn trust_check_against_a_claim(before: bool) {
+    let rt = Arc::new(Rt::new());
+    let y = rt.create_input(1_u64);
+    let d = rt.create_query(move |rt: &Rt| rt.get(y) + 100);
+    let (r, r_runs) = counted(&rt, d);
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, d, 7, &[dep(y)], Reuse::RecomputeFirst),
+        Ok(Reuse::RecomputeFirst)
+    );
+    let (claim, trust) = (Gate::new(), Gate::new());
+    let point = if before {
+        ParkPoint::SeedBeforeTrust(id(d))
+    } else {
+        ParkPoint::SeedAfterTrust(id(d))
+    };
+    park_at(
+        &rt,
+        vec![
+            (ParkPoint::BeforeClaim(id(d)), claim.clone()),
+            (point, trust.clone()),
+        ],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    claim.wait_parked();
+    let seeder = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            seed_query(
+                &rt,
+                &base,
+                r,
+                70,
+                &[trusted(d, base.w0)],
+                Reuse::IfUnchanged,
+            )
+        })
+    };
+    trust.wait_parked();
+    claim.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.state_of(d) == NodeState::Dirty {
+        assert!(Instant::now() < deadline, "the reader never claimed d");
+        thread::yield_now();
+    }
+    trust.release();
+    let seeded = seeder.join().unwrap();
+    assert_eq!(reader.join().unwrap(), 101);
+    assert_eq!(
+        seeded,
+        Ok(if before {
+            Reuse::RecomputeFirst
+        } else {
+            Reuse::IfUnchanged
+        })
+    );
+    assert_eq!(rt.get(r), 1010);
+    assert_eq!(r_runs.load(SeqCst), 1);
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn a_claim_before_the_trust_check_downgrades_the_seed() {
+    trust_check_against_a_claim(true);
+}
+
+#[test]
+fn a_claim_after_the_trust_check_stamps_above_w0() {
+    trust_check_against_a_claim(false);
+}
+
+/// Q reads x and then a or b by `pick`, with a == b. A cutoff recompute
+/// between `inspect`'s two holds moves Q from {x, a} to {x, b} without
+/// moving its stamp, and `inspect` returns `None`.
+#[test]
+fn inspect_refuses_a_dep_change_between_its_holds() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let pick = rt.create_input(false);
+    let a = rt.create_input(5_u64);
+    let b = rt.create_input(5_u64);
+    let q = rt.create_query(move |rt: &Rt| {
+        let v = rt.get(x);
+        let side = if rt.get(pick) { b } else { a };
+        v + rt.get(side)
+    });
+    assert_eq!(rt.get(q), 6);
+    let stamp = rt.nodes.get(q.slot()).changed_at();
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::InspectBetweenHolds(id(q)), gate.clone())],
+    );
+    let inspector = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || inspect(&rt, q).map(|s| (s.value, s.deps)))
+    };
+    gate.wait_parked();
+    rt.set(pick, true);
+    assert_eq!(rt.get(q), 6);
+    assert_eq!(rt.nodes.get(q.slot()).changed_at(), stamp, "not a cutoff");
+    gate.release();
+    assert_eq!(inspector.join().unwrap(), None);
+    let seen = inspect(&rt, q).expect("Clean");
+    assert_eq!(
+        seen.deps,
+        vec![x.erase(), pick.erase(), b.erase()] as Vec<ErasedIncr>
+    );
+}

@@ -190,6 +190,14 @@ pub(crate) enum ParkPoint {
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
+    /// In `seed_query`'s `inner.write()`, before the trust check of the
+    /// trusted dep `NodeId`.
+    SeedBeforeTrust(NodeId),
+    /// In `seed_query`'s `inner.write()`, after the trust check of the
+    /// trusted dep `NodeId`.
+    SeedAfterTrust(NodeId),
+    /// In `inspect`, after its first read hold and before the clone.
+    InspectBetweenHolds(NodeId),
     /// In `stabilize`, after it took its observers and before the first
     /// one runs.
     StabilizeAfterDrain,
@@ -4041,6 +4049,13 @@ mod watch_impl;
 
 #[path = "runtime_observe.rs"]
 mod observe_impl;
+
+#[path = "runtime_seed.rs"]
+mod seed_impl;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_seed_tests.rs"]
+mod seed_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_watch_tests.rs"]
