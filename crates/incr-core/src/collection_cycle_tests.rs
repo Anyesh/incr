@@ -128,6 +128,13 @@ fn group_by_refuses<C: Cells>() {
     assert!(refused.load(SeqCst), "the router read a provisional M");
     assert_eq!(grouped.group_count(), 0, "a refused run routes nothing");
 
+    // The refusal left the router marked for a rebuild, whose key_fn pass
+    // over the snapshot meets M again. The read's walk runs the router as
+    // M's dep, before M's closure, so the cycle reaches this `try_get`.
+    s.insert(&rt, 4);
+    assert!(rt.try_get(m).is_err(), "the rebuild read a provisional M");
+    assert_eq!(grouped.group_count(), 0);
+
     rt.set(link, 0);
     let _ = rt.get(m);
     let mut keys = grouped.keys();
@@ -138,6 +145,68 @@ fn group_by_refuses<C: Cells>() {
         vec![1, 3]
     );
     rt.assert_invariant_i();
+}
+
+/// The provisional value reaches the router through Q, a query that is no
+/// member: Q reads M on the stack, defers, and hands its frame `LOW`.
+fn group_by_refuses_through_a_deferral<C: Cells>() {
+    let rt = Box::new(Runtime::<C>::new());
+    let s = rt.create_collection::<u64>();
+    let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let m = m_cell.clone();
+    let q = rt.create_query(move |rt| rt.get(*m.get().unwrap()) % 2);
+    let r = RtRef(&*rt);
+    let grouped = s.group_by(&rt, move |&x| (x + r.rt().get(q)) % 2);
+    let router = grouped.version_node();
+    let m = rt.create_query_with(move |rt| rt.try_get(router).map_or(7, |v| v), fixpoint(20));
+    m_cell.set(m).unwrap();
+    for x in 1..=3 {
+        s.insert(&rt, x);
+    }
+    assert_eq!(rt.get(m), 7, "the router refused");
+    assert_eq!(grouped.group_count(), 0);
+    rt.assert_invariant_i();
+}
+
+/// The router's upstream is a filter whose `pred` reads M, and the episode
+/// is entered at M, so the filter is a member off the stack when the
+/// router reads its version.
+fn group_by_refuses_a_member_upstream<C: Cells>() {
+    let rt = Box::new(Runtime::<C>::new());
+    let s = rt.create_collection::<u64>();
+    let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let (r, m) = (RtRef(&*rt), m_cell.clone());
+    let f = s.filter(&rt, move |&x| x <= r.rt().get(*m.get().unwrap()));
+    let grouped = f.group_by(&rt, |&x| x % 2);
+    let router = grouped.version_node();
+    let m = rt.create_query_with(move |rt| rt.try_get(router).map_or(7, |v| v), fixpoint(20));
+    m_cell.set(m).unwrap();
+    for x in 1..=3 {
+        s.insert(&rt, x);
+    }
+    assert_eq!(rt.get(m), 7, "the router refused");
+    assert_eq!(grouped.group_count(), 0);
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn local_group_by_refuses_through_a_deferral() {
+    group_by_refuses_through_a_deferral::<Local>();
+}
+
+#[test]
+fn shared_group_by_refuses_through_a_deferral() {
+    group_by_refuses_through_a_deferral::<Shared>();
+}
+
+#[test]
+fn local_group_by_refuses_a_member_upstream() {
+    group_by_refuses_a_member_upstream::<Local>();
+}
+
+#[test]
+fn shared_group_by_refuses_a_member_upstream() {
+    group_by_refuses_a_member_upstream::<Shared>();
 }
 
 #[test]
