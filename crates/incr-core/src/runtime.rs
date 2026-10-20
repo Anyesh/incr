@@ -691,6 +691,21 @@ fn reached_under_own_set(id: NodeId) -> ! {
 
 /// The runtime.
 ///
+/// # Closures may run more than once
+///
+/// A query's closure can run several times for one change: a retry after
+/// a dep was released under it, a retry after another thread wounded its
+/// claim, a discarded run, a replayed run ([`Replay`](crate::Replay)) and each iteration
+/// of a cycle's episode. So a closure must be pure, must terminate on
+/// every input, and must not panic or loop on a placeholder
+/// ([`Runtime::set_placeholder`]).
+///
+/// A replayed run can be speculative: after a read returned a
+/// placeholder, the run may evaluate queries the run without a budget
+/// would never evaluate. A panic there is swallowed and lands nothing
+/// `Failed`, so a query that the real run does evaluate raises its own
+/// panic then.
+///
 /// # Panics in user code
 ///
 /// A panic in a user `Hash`, `Eq`, `PartialEq`, `Clone`, `Serialize` or

@@ -237,8 +237,8 @@ impl<T> Default for QueryOpts<T> {
 /// instead of nesting; the run is then discarded, and a driver computes
 /// the node that read wanted at a shallow depth before running the query
 /// again. The results are those of the unbounded run. A query's closure
-/// may therefore run more than once for one read; it must be pure, must
-/// terminate on every input, and must not panic or loop on a placeholder.
+/// may therefore run more than once for one read, under the contract in
+/// [`Runtime`](crate::Runtime)'s docs.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Replay {
     /// Reads nest natively at any depth.
