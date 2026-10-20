@@ -1685,6 +1685,22 @@ impl<C: Cells> Runtime<C> {
         state != NodeState::Dead && node.generation() == handle.generation()
     }
 
+    /// The typed handle behind `handle`: `Some` only if it names a live
+    /// node of this runtime, at its slot's current generation, whose value
+    /// type is `T`.
+    pub fn typed_handle<T: Value>(&self, handle: ErasedIncr) -> Option<Incr<T>> {
+        if !self.is_alive(handle) {
+            return None;
+        }
+        let tag = self.nodes.get(handle.slot()).type_tag();
+        self.arenas.tagged_arena::<T>(tag)?;
+        Some(Incr::new(
+            handle.slot(),
+            handle.generation(),
+            self.runtime_id,
+        ))
+    }
+
     /// The deletion path behind every public delete. Never panics on a
     /// dependent or on a node that is already gone; it reports them. An
     /// owned node counts as a dependent: callers delete owned nodes first.
@@ -4750,6 +4766,38 @@ mod tests {
         let a = rt1.create_input(1_i64);
         let _same_slot = rt2.create_input(2_i64);
         assert!(!rt2.is_alive(a));
+    }
+
+    fn typed_handle_checks_runtime_generation_and_type<C: Cells>() {
+        let rt = Runtime::<C>::new();
+        let other = Runtime::<C>::new();
+        let a = rt.create_input(1_i64);
+        let q = rt.create_query(move |rt: &Runtime<C>| rt.get(a) + 1);
+        let _same_slot = other.create_input(2_i64);
+        assert_eq!(rt.typed_handle::<i64>(a.erase()), Some(a));
+        assert_eq!(rt.typed_handle::<i64>(q.erase()), Some(q));
+        assert_eq!(
+            other.typed_handle::<i64>(a.erase()),
+            None,
+            "another runtime's"
+        );
+        assert_eq!(rt.typed_handle::<u64>(a.erase()), None, "another type");
+
+        rt.delete_node(q);
+        let recycled = rt.create_input(3_i64);
+        assert_eq!(recycled.slot(), q.slot());
+        assert_eq!(rt.typed_handle::<i64>(q.erase()), None, "a recycled slot");
+        assert_eq!(rt.typed_handle::<i64>(recycled.erase()), Some(recycled));
+    }
+
+    #[test]
+    fn typed_handle_checks_runtime_generation_and_type_local() {
+        typed_handle_checks_runtime_generation_and_type::<Local>();
+    }
+
+    #[test]
+    fn typed_handle_checks_runtime_generation_and_type_shared() {
+        typed_handle_checks_runtime_generation_and_type::<Shared>();
     }
 
     #[test]
