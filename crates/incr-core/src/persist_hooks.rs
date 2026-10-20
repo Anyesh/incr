@@ -51,6 +51,14 @@ pub fn set_returning_displaced<T: Value, C: Cells>(
     rt.set_returning_displaced(handle, value)
 }
 
+/// An input's `changed_at`, for the stamp a mapped write records and the
+/// bypass check that compares it. Settled once that input's `set` has
+/// returned; `u64::MAX`, which matches no recorded stamp, while another
+/// thread's `set` of it is in flight. Panics on a stale or foreign handle.
+pub fn changed_at<T: Value, C: Cells>(rt: &Runtime<C>, handle: Incr<T>) -> u64 {
+    rt.changed_at(handle)
+}
+
 /// [`IncrCollection::insert`] reporting to `on_rep` and keeping what it
 /// displaced in `keep`.
 pub fn collection_insert<T: Value + Hash + Eq, C: Cells, R: RepSink<T>>(
