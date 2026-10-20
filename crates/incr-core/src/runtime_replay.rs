@@ -1268,7 +1268,7 @@ impl<C: Cells> Runtime<C> {
                                     })
                                     .cloned()
                                 {
-                                    x.deliver_direct(&w, w.maker);
+                                    x.deliver_direct(&w);
                                 }
                             }
                         });
@@ -1288,15 +1288,16 @@ impl<C: Cells> Runtime<C> {
                         NodeState::New | NodeState::Dirty
                     );
                 self.note_ancestor(&v);
-                // A stand-in run in the pop finishes the frame that was
-                // reading the frame popped just above, so it gets the direct
-                // compute of that read an entry's retry gets below.
+                // The frame that was reading the frame popped just above gets
+                // the direct compute of that read, whether a stand-in run in
+                // the pop finishes it or its maker's retry, in a later pass,
+                // runs it again.
                 if let Some((u, false)) = popped_frames.last() {
                     let read = u64::from(u.node) | (u64::from(u.generation) << 32);
                     if u.cidx == v.cidx + 1 && v.reading == read {
                         replay::with(|c| {
                             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                                x.deliver_direct(&v, level);
+                                x.deliver_direct(&v);
                             }
                         });
                     }
@@ -1413,7 +1414,7 @@ impl<C: Cells> Runtime<C> {
                 {
                     replay::with(|c| {
                         if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                            x.deliver_direct(w, level);
+                            x.deliver_direct(w);
                         }
                     });
                 }

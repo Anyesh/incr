@@ -301,8 +301,10 @@ impl Context {
     }
 
     /// Sends the read virtual frame `below` was blocked in to its compute
-    /// in the retry of the entry at `level`.
-    pub(crate) fn deliver_direct(&mut self, below: &VFrame, level: u32) {
+    /// in the retry of the entry that made the frame. A pass at a higher
+    /// level can pop the frame above it, and that pass's end must not drop
+    /// the delivery before the frame's retry reads it.
+    pub(crate) fn deliver_direct(&mut self, below: &VFrame) {
         let key = ReadKey::blocked(below);
         if !self
             .pending
@@ -311,7 +313,7 @@ impl Context {
         {
             self.pending.push(Delivery {
                 key,
-                maker: level,
+                maker: below.maker,
                 taken: false,
                 blocked: false,
                 what: Delivered::Direct,
