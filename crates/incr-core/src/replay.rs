@@ -375,6 +375,15 @@ impl Context {
         abandoned
     }
 
+    /// The virtual frames that stand for frames on the unbounded run's
+    /// stack: those below the running entry's level. Before the loop
+    /// starts, and from that level up, they stand for doomed frames that
+    /// have popped, though a read may still meet their positions.
+    pub(crate) fn stacked(&self) -> &[VFrame] {
+        let level = self.running.map_or(0, |l| l as usize);
+        &self.vstack[..level.min(self.vstack.len())]
+    }
+
     /// The highest `vstack` position of `node` at `generation`.
     pub(crate) fn position(&self, node: u32, generation: u32) -> Option<u32> {
         let stack = self.vindex.get(&node)?;
