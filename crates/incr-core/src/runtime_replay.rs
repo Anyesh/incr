@@ -2082,7 +2082,12 @@ impl<C: Cells> Runtime<C> {
                         && !matches!(d.what, Delivered::Walk(_) | Delivered::Direct)
                         && d.key == key
                 })?;
-                x.pending[at].taken = true;
+                // The read has its outcome, which ended the walk it was
+                // blocked in, so a later read under the same key in this
+                // run must not resume that walk or recompute its node.
+                for d in x.pending.iter_mut().filter(|d| d.key == key) {
+                    d.taken = true;
+                }
                 Some(match &x.pending[at].what {
                     Delivered::Landed(value) => {
                         Delivered::Landed(Box::new(value_code::run(|| {
