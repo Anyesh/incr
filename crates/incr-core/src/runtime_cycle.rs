@@ -645,8 +645,13 @@ impl<C: Cells> Runtime<C> {
     /// the read closes, or the fixpoint's initial value.
     fn discovery_value<T: Value>(&self, slot: u32, p: u32) -> T {
         let strategy = self.strategy_of(slot);
-        let cycle = self.cycle_at(p);
-        let v = self.callback(|| strategy.v0(&cycle));
+        // A Fixpoint's initial value ignores the cycle, which costs a
+        // scan of every member to build.
+        let cycle = strategy
+            .max_iterations()
+            .is_none()
+            .then(|| self.cycle_at(p));
+        let v = self.callback(|| strategy.v0(cycle.as_ref()));
         *v.downcast::<T>()
             .expect("incr-core: a cycle value has its member's type")
     }
@@ -1017,7 +1022,8 @@ impl<C: Cells> Runtime<C> {
                 let stamp_rev = self.current_revision();
                 let verify_rev = C::walked(&self.walk, &self.revision);
                 for (m, s) in &strategies {
-                    let v0 = self.attributed(*m, cidx, bag, || self.callback(|| s.v0(&cycle)));
+                    let v0 =
+                        self.attributed(*m, cidx, bag, || self.callback(|| s.v0(Some(&cycle))));
                     let old = self.take_held(*m, |e| e.s.replace(v0));
                     self.drop_member_value(*m, cidx, old, bag);
                 }
