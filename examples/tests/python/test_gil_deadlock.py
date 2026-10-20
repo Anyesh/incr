@@ -6,11 +6,9 @@ import pytest
 
 # Each reproduction runs in a child killed after 10 s, because a thread
 # that holds the GIL inside native code cannot be stopped from inside the
-# process. The main thread holds the GIL in a binding method that does not
-# detach and waits on an engine lock, while the other thread would hold
-# that lock across a PyValue method that waits for the GIL. A Clean get
-# holds no lock, so the arena form cannot deadlock; the collection form
-# still can.
+# process. The other thread holds engine locks across PyValue methods that
+# wait for the GIL, so a binding method on the main thread that waited on
+# those locks without releasing the GIL would deadlock.
 
 ARENA_CHILD = textwrap.dedent(
     """
@@ -88,7 +86,11 @@ def run_child(source):
     """
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", source], capture_output=True, text=True, timeout=10
+            [sys.executable, "-c", source],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return None
@@ -101,13 +103,6 @@ def test_get_racing_create_input_does_not_deadlock_on_the_gil():
     assert run_child(ARENA_CHILD) is not None, "child deadlocked, killed after 10 s"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="bug (f), collection form: insert and operator reads hold collection "
-    "locks across PyValue clone and eq, which wait for the GIL held by "
-    "snapshot_len, get_group or filter waiting on those locks",
-)
 def test_collection_reads_racing_inserts_do_not_deadlock_on_the_gil():
     assert run_child(COLLECTION_CHILD) is not None, (
         "child deadlocked, killed after 10 s"

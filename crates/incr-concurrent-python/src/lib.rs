@@ -27,6 +27,7 @@
 //! different thread trips over the resulting Failed node it gets a
 //! `RuntimeError` carrying the engine's message instead.
 
+use pyo3::marker::Ungil;
 use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use std::cell::RefCell;
@@ -138,6 +139,13 @@ fn pyerr_boundary<R>(f: impl FnOnce() -> R) -> PyResult<R> {
     }
 }
 
+/// Runs a `#[pymethods]` engine call with the GIL released, because the
+/// engine may wait on a claim whose holder needs the GIL to finish: the
+/// GIL is lock level -1, never held while waiting on an incr lock.
+fn engine_call<R: Ungil>(py: Python<'_>, f: impl FnOnce() -> R + Ungil) -> PyResult<R> {
+    pyerr_boundary(|| py.detach(f))
+}
+
 /// Newtype around `Py<PyAny>` that satisfies the `Value` bound
 /// (`Py<PyAny>` is `Send + Sync`; dereferencing requires the GIL). All
 /// trait methods reacquire the GIL, the conventional PyO3 pattern.
@@ -241,21 +249,35 @@ impl VersionBridges {
     /// and again only if the user deleted the previous one, whose handle
     /// then stays stale like any deleted node's.
     fn get(&self, rt: &Runtime, version: Incr<u64>) -> PyNodeId {
-        // Held across create_query so two threads cannot both create a
-        // bridge for one collection. Poison is ignored because the map
-        // is only ever inserted into whole.
-        let mut bridges = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&bridge) = bridges.get(&version) {
-            if rt.is_alive(bridge) {
-                return PyNodeId { inner: bridge };
-            }
+        if let Some(bridge) = self.alive(rt, version) {
+            return PyNodeId { inner: bridge };
         }
+        // Created without the mutex, which is never held across an engine
+        // call that may wait: a racing thread may create one too.
         let bridge = rt.create_query(move |rt| -> PyValue {
             let n: u64 = rt.get(version);
             Python::attach(|py| PyValue(n.into_pyobject(py).unwrap().into_any().unbind()))
         });
+        let mut bridges = self.lock();
+        if let Some(&existing) = bridges.get(&version) {
+            if rt.is_alive(existing) {
+                drop(bridges);
+                rt.delete_node(bridge);
+                return PyNodeId { inner: existing };
+            }
+        }
         bridges.insert(version, bridge);
         PyNodeId { inner: bridge }
+    }
+
+    fn alive(&self, rt: &Runtime, version: Incr<u64>) -> Option<Incr<PyValue>> {
+        let bridge = self.lock().get(&version).copied()?;
+        rt.is_alive(bridge).then_some(bridge)
+    }
+
+    /// Poison is ignored because the map is only ever inserted into whole.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Incr<u64>, Incr<PyValue>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -291,7 +313,7 @@ impl PyRuntimeRef {
         // thread is computing, and that thread needs the GIL to finish.
         // A boundary here too, so an engine unwind crosses the calling
         // Python frames as an exception instead of a foreign panic.
-        let val: PyValue = pyerr_boundary(|| py.detach(|| rt.get(node.inner)))?;
+        let val: PyValue = engine_call(py, || rt.get(node.inner))?;
         Ok(val.0)
     }
 }
@@ -307,24 +329,26 @@ struct PyCollection {
 impl PyCollection {
     fn insert(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
         let v = PyValue(value);
-        pyerr_boundary(|| py.detach(|| self.inner.insert(&self.rt, v)))
+        engine_call(py, || self.inner.insert(&self.rt, v))
     }
 
     fn delete(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<bool> {
         let v = PyValue(value);
-        pyerr_boundary(|| py.detach(|| self.inner.delete(&self.rt, &v)))
+        engine_call(py, || self.inner.delete(&self.rt, &v))
     }
 
-    fn snapshot_len(&self) -> usize {
-        self.inner.snapshot_len()
+    fn snapshot_len(&self, py: Python<'_>) -> PyResult<usize> {
+        engine_call(py, || self.inner.snapshot_len())
     }
 
-    fn filter(&self, predicate: Py<PyAny>) -> PyResult<PyCollection> {
-        let filtered = self.inner.filter(&self.rt, move |val: &PyValue| -> bool {
-            Python::attach(|py| {
-                or_stash(call_stashing(py, &predicate, (val.0.clone_ref(py),)).is_truthy(py))
+    fn filter(&self, py: Python<'_>, predicate: Py<PyAny>) -> PyResult<PyCollection> {
+        let filtered = engine_call(py, || {
+            self.inner.filter(&self.rt, move |val: &PyValue| -> bool {
+                Python::attach(|py| {
+                    or_stash(call_stashing(py, &predicate, (val.0.clone_ref(py),)).is_truthy(py))
+                })
             })
-        });
+        })?;
         Ok(PyCollection {
             inner: filtered,
             rt: Arc::clone(&self.rt),
@@ -332,10 +356,12 @@ impl PyCollection {
         })
     }
 
-    fn map(&self, func: Py<PyAny>) -> PyResult<PyCollection> {
-        let mapped = self.inner.map(&self.rt, move |val: &PyValue| -> PyValue {
-            Python::attach(|py| PyValue(call_stashing(py, &func, (val.0.clone_ref(py),))))
-        });
+    fn map(&self, py: Python<'_>, func: Py<PyAny>) -> PyResult<PyCollection> {
+        let mapped = engine_call(py, || {
+            self.inner.map(&self.rt, move |val: &PyValue| -> PyValue {
+                Python::attach(|py| PyValue(call_stashing(py, &func, (val.0.clone_ref(py),))))
+            })
+        })?;
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
@@ -343,25 +369,29 @@ impl PyCollection {
         })
     }
 
-    fn count(&self) -> PyResult<PyNodeId> {
-        let count_node: Incr<u64> = self.inner.count(&self.rt);
-        let node = self.rt.create_query(move |rt| -> PyValue {
-            let c: u64 = rt.get(count_node);
-            Python::attach(|py| PyValue(c.into_pyobject(py).unwrap().into_any().unbind()))
-        });
+    fn count(&self, py: Python<'_>) -> PyResult<PyNodeId> {
+        let node = engine_call(py, || {
+            let count_node: Incr<u64> = self.inner.count(&self.rt);
+            self.rt.create_query(move |rt| -> PyValue {
+                let c: u64 = rt.get(count_node);
+                Python::attach(|py| PyValue(c.into_pyobject(py).unwrap().into_any().unbind()))
+            })
+        })?;
         Ok(PyNodeId { inner: node })
     }
 
-    fn reduce(&self, fold_fn: Py<PyAny>) -> PyResult<PyNodeId> {
-        let node = self.inner.reduce(&self.rt, move |elements| -> PyValue {
-            Python::attach(|py| {
-                let py_list = pyo3::types::PyList::empty(py);
-                for elem in elements.iter() {
-                    py_list.append(elem.0.clone_ref(py)).unwrap();
-                }
-                PyValue(call_stashing(py, &fold_fn, (py_list,)))
+    fn reduce(&self, py: Python<'_>, fold_fn: Py<PyAny>) -> PyResult<PyNodeId> {
+        let node = engine_call(py, || {
+            self.inner.reduce(&self.rt, move |elements| -> PyValue {
+                Python::attach(|py| {
+                    let py_list = pyo3::types::PyList::empty(py);
+                    for elem in elements.iter() {
+                        py_list.append(elem.0.clone_ref(py)).unwrap();
+                    }
+                    PyValue(call_stashing(py, &fold_fn, (py_list,)))
+                })
             })
-        });
+        })?;
         Ok(PyNodeId { inner: node })
     }
 
@@ -369,35 +399,39 @@ impl PyCollection {
     /// the Rust docs for the associativity contract.
     fn aggregate(
         &self,
+        py: Python<'_>,
         identity: Py<PyAny>,
         lift: Py<PyAny>,
         combine: Py<PyAny>,
     ) -> PyResult<PyNodeId> {
-        let node = self.inner.aggregate(
-            &self.rt,
-            PyValue(identity),
-            move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &lift, (val.0.clone_ref(py),))))
-            },
-            move |a: &PyValue, b: &PyValue| -> PyValue {
-                Python::attach(|py| {
-                    PyValue(call_stashing(
-                        py,
-                        &combine,
-                        (a.0.clone_ref(py), b.0.clone_ref(py)),
-                    ))
-                })
-            },
-        );
+        let node = engine_call(py, || {
+            self.inner.aggregate(
+                &self.rt,
+                PyValue(identity),
+                move |val: &PyValue| -> PyValue {
+                    Python::attach(|py| PyValue(call_stashing(py, &lift, (val.0.clone_ref(py),))))
+                },
+                move |a: &PyValue, b: &PyValue| -> PyValue {
+                    Python::attach(|py| {
+                        PyValue(call_stashing(
+                            py,
+                            &combine,
+                            (a.0.clone_ref(py), b.0.clone_ref(py)),
+                        ))
+                    })
+                },
+            )
+        })?;
         Ok(PyNodeId { inner: node })
     }
 
-    fn sort_by_key(&self, key_fn: Py<PyAny>) -> PyResult<PySortedCollection> {
-        let sorted = self
-            .inner
-            .sort_by_key(&self.rt, move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
-            });
+    fn sort_by_key(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PySortedCollection> {
+        let sorted = engine_call(py, || {
+            self.inner
+                .sort_by_key(&self.rt, move |val: &PyValue| -> PyValue {
+                    Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
+                })
+        })?;
         Ok(PySortedCollection {
             inner: sorted,
             rt: Arc::clone(&self.rt),
@@ -405,12 +439,13 @@ impl PyCollection {
         })
     }
 
-    fn group_by(&self, key_fn: Py<PyAny>) -> PyResult<PyGroupedCollection> {
-        let grouped = self
-            .inner
-            .group_by(&self.rt, move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
-            });
+    fn group_by(&self, py: Python<'_>, key_fn: Py<PyAny>) -> PyResult<PyGroupedCollection> {
+        let grouped = engine_call(py, || {
+            self.inner
+                .group_by(&self.rt, move |val: &PyValue| -> PyValue {
+                    Python::attach(|py| PyValue(call_stashing(py, &key_fn, (val.0.clone_ref(py),))))
+                })
+        })?;
         Ok(PyGroupedCollection {
             inner: grouped,
             rt: Arc::clone(&self.rt),
@@ -420,30 +455,37 @@ impl PyCollection {
 
     fn join(
         &self,
+        py: Python<'_>,
         right: &PyCollection,
         left_key: Py<PyAny>,
         right_key: Py<PyAny>,
     ) -> PyResult<PyCollection> {
-        let joined = self.inner.join(
-            &self.rt,
-            &right.inner,
-            move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &left_key, (val.0.clone_ref(py),))))
-            },
-            move |val: &PyValue| -> PyValue {
-                Python::attach(|py| PyValue(call_stashing(py, &right_key, (val.0.clone_ref(py),))))
-            },
-        );
-        let mapped = joined.map(&self.rt, |pair: &(PyValue, PyValue)| -> PyValue {
-            Python::attach(|py| {
-                let tuple = pyo3::types::PyTuple::new(
-                    py,
-                    &[pair.0 .0.clone_ref(py), pair.1 .0.clone_ref(py)],
-                )
-                .unwrap();
-                PyValue(tuple.into_any().unbind())
+        let mapped = engine_call(py, || {
+            let joined = self.inner.join(
+                &self.rt,
+                &right.inner,
+                move |val: &PyValue| -> PyValue {
+                    Python::attach(|py| {
+                        PyValue(call_stashing(py, &left_key, (val.0.clone_ref(py),)))
+                    })
+                },
+                move |val: &PyValue| -> PyValue {
+                    Python::attach(|py| {
+                        PyValue(call_stashing(py, &right_key, (val.0.clone_ref(py),)))
+                    })
+                },
+            );
+            joined.map(&self.rt, |pair: &(PyValue, PyValue)| -> PyValue {
+                Python::attach(|py| {
+                    let tuple = pyo3::types::PyTuple::new(
+                        py,
+                        &[pair.0 .0.clone_ref(py), pair.1 .0.clone_ref(py)],
+                    )
+                    .unwrap();
+                    PyValue(tuple.into_any().unbind())
+                })
             })
-        });
+        })?;
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
@@ -452,8 +494,8 @@ impl PyCollection {
     }
 
     #[getter]
-    fn version_node(&self) -> PyResult<PyNodeId> {
-        Ok(self.bridges.get(&self.rt, self.inner.version_node()))
+    fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
+        engine_call(py, || self.bridges.get(&self.rt, self.inner.version_node()))
     }
 }
 
@@ -466,18 +508,20 @@ struct PySortedCollection {
 
 #[pymethods]
 impl PySortedCollection {
-    fn pairwise(&self) -> PyResult<PyCollection> {
-        let pair_collection = self.inner.pairwise(&self.rt);
-        let mapped = pair_collection.map(&self.rt, |pair: &(PyValue, PyValue)| -> PyValue {
-            Python::attach(|py| {
-                let tuple = pyo3::types::PyTuple::new(
-                    py,
-                    &[pair.0 .0.clone_ref(py), pair.1 .0.clone_ref(py)],
-                )
-                .unwrap();
-                PyValue(tuple.into_any().unbind())
+    fn pairwise(&self, py: Python<'_>) -> PyResult<PyCollection> {
+        let mapped = engine_call(py, || {
+            let pair_collection = self.inner.pairwise(&self.rt);
+            pair_collection.map(&self.rt, |pair: &(PyValue, PyValue)| -> PyValue {
+                Python::attach(|py| {
+                    let tuple = pyo3::types::PyTuple::new(
+                        py,
+                        &[pair.0 .0.clone_ref(py), pair.1 .0.clone_ref(py)],
+                    )
+                    .unwrap();
+                    PyValue(tuple.into_any().unbind())
+                })
             })
-        });
+        })?;
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
@@ -485,17 +529,19 @@ impl PySortedCollection {
         })
     }
 
-    fn window(&self, size: usize) -> PyResult<PyCollection> {
-        let win_collection = self.inner.window(&self.rt, size);
-        let mapped = win_collection.map(&self.rt, |window: &Vec<PyValue>| -> PyValue {
-            Python::attach(|py| {
-                let py_list = pyo3::types::PyList::empty(py);
-                for elem in window.iter() {
-                    py_list.append(elem.0.clone_ref(py)).unwrap();
-                }
-                PyValue(py_list.into_any().unbind())
+    fn window(&self, py: Python<'_>, size: usize) -> PyResult<PyCollection> {
+        let mapped = engine_call(py, || {
+            let win_collection = self.inner.window(&self.rt, size);
+            win_collection.map(&self.rt, |window: &Vec<PyValue>| -> PyValue {
+                Python::attach(|py| {
+                    let py_list = pyo3::types::PyList::empty(py);
+                    for elem in window.iter() {
+                        py_list.append(elem.0.clone_ref(py)).unwrap();
+                    }
+                    PyValue(py_list.into_any().unbind())
+                })
             })
-        });
+        })?;
         Ok(PyCollection {
             inner: mapped,
             rt: Arc::clone(&self.rt),
@@ -503,24 +549,22 @@ impl PySortedCollection {
         })
     }
 
-    fn snapshot(&self) -> PyResult<Py<PyAny>> {
-        let entries = self.inner.snapshot();
-        Python::attach(|py| {
-            let list = pyo3::types::PyList::empty(py);
-            for entry in entries {
-                list.append(entry.0.clone_ref(py))?;
-            }
-            Ok(list.into_any().unbind())
-        })
+    fn snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let entries = engine_call(py, || self.inner.snapshot())?;
+        let list = pyo3::types::PyList::empty(py);
+        for entry in entries {
+            list.append(entry.0.clone_ref(py))?;
+        }
+        Ok(list.into_any().unbind())
     }
 
-    fn snapshot_len(&self) -> usize {
-        self.inner.snapshot_len()
+    fn snapshot_len(&self, py: Python<'_>) -> PyResult<usize> {
+        engine_call(py, || self.inner.snapshot_len())
     }
 
     #[getter]
-    fn version_node(&self) -> PyResult<PyNodeId> {
-        Ok(self.bridges.get(&self.rt, self.inner.version_node()))
+    fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
+        engine_call(py, || self.bridges.get(&self.rt, self.inner.version_node()))
     }
 }
 
@@ -533,20 +577,18 @@ struct PyGroupedCollection {
 
 #[pymethods]
 impl PyGroupedCollection {
-    fn keys(&self) -> PyResult<Py<PyAny>> {
-        let keys = self.inner.keys();
-        Python::attach(|py| {
-            let list = pyo3::types::PyList::empty(py);
-            for key in keys {
-                list.append(key.0.clone_ref(py))?;
-            }
-            Ok(list.into_any().unbind())
-        })
+    fn keys(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let keys = engine_call(py, || self.inner.keys())?;
+        let list = pyo3::types::PyList::empty(py);
+        for key in keys {
+            list.append(key.0.clone_ref(py))?;
+        }
+        Ok(list.into_any().unbind())
     }
 
-    fn get_group(&self, key: Py<PyAny>) -> PyResult<Option<PyCollection>> {
+    fn get_group(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<PyCollection>> {
         let py_key = PyValue(key);
-        let group = pyerr_boundary(|| self.inner.get_group(&py_key))?;
+        let group = engine_call(py, || self.inner.get_group(&py_key))?;
         Ok(group.map(|collection| PyCollection {
             inner: collection,
             rt: Arc::clone(&self.rt),
@@ -554,13 +596,13 @@ impl PyGroupedCollection {
         }))
     }
 
-    fn group_count(&self) -> usize {
-        self.inner.group_count()
+    fn group_count(&self, py: Python<'_>) -> PyResult<usize> {
+        engine_call(py, || self.inner.group_count())
     }
 
     #[getter]
-    fn version_node(&self) -> PyResult<PyNodeId> {
-        Ok(self.bridges.get(&self.rt, self.inner.version_node()))
+    fn version_node(&self, py: Python<'_>) -> PyResult<PyNodeId> {
+        engine_call(py, || self.bridges.get(&self.rt, self.inner.version_node()))
     }
 }
 
@@ -580,27 +622,26 @@ impl PyRuntime {
         }
     }
 
-    fn create_input(&self, value: Py<PyAny>) -> PyNodeId {
-        let node = self.inner.create_input(PyValue(value));
-        PyNodeId { inner: node }
+    fn create_input(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<PyNodeId> {
+        let v = PyValue(value);
+        let node = engine_call(py, || self.inner.create_input(v))?;
+        Ok(PyNodeId { inner: node })
     }
 
     fn get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
-        pyerr_boundary(|| {
-            let val: PyValue = py.detach(|| self.inner.get(node.inner));
-            val.0
-        })
+        let val: PyValue = engine_call(py, || self.inner.get(node.inner))?;
+        Ok(val.0)
     }
 
     fn set(&self, py: Python<'_>, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
         let v = PyValue(value);
-        pyerr_boundary(|| py.detach(|| self.inner.set(node.inner, v)))
+        engine_call(py, || self.inner.set(node.inner, v))
     }
 
     /// Delete a node and recycle its slot. Every surviving handle to it
     /// raises on use. The node must have no dependents.
     fn delete_node(&self, py: Python<'_>, node: PyNodeId) -> PyResult<()> {
-        pyerr_boundary(|| py.detach(|| self.inner.delete_node(node.inner)))
+        engine_call(py, || self.inner.delete_node(node.inner))
     }
 
     /// Delete the node, every node that depends on it (transitively)
@@ -608,75 +649,84 @@ impl PyRuntime {
     /// nodes were deleted; 0 if the node was already gone. A query that
     /// has never run is not reached, and raises as stale on first use.
     fn delete_with_dependents(&self, py: Python<'_>, node: PyNodeId) -> PyResult<usize> {
-        pyerr_boundary(|| py.detach(|| self.inner.delete_with_dependents(node.inner)))
+        engine_call(py, || self.inner.delete_with_dependents(node.inner))
     }
 
     /// True while the node exists in this runtime. False after it is
     /// deleted, and for a node from another runtime.
-    fn is_alive(&self, node: PyNodeId) -> bool {
-        self.inner.is_alive(node.inner)
+    fn is_alive(&self, py: Python<'_>, node: PyNodeId) -> PyResult<bool> {
+        engine_call(py, || self.inner.is_alive(node.inner))
     }
 
     /// Register `callback` to fire on `stabilize()` whenever the node's
     /// value changed since the last firing.
-    fn observe(&self, node: PyNodeId, callback: Py<PyAny>) -> PyResult<PyObserverId> {
-        let id = self.inner.observe(node.inner, move |v: &PyValue| {
-            Python::attach(|py| {
-                call_stashing(py, &callback, (v.0.clone_ref(py),));
-            });
-        });
+    fn observe(
+        &self,
+        py: Python<'_>,
+        node: PyNodeId,
+        callback: Py<PyAny>,
+    ) -> PyResult<PyObserverId> {
+        let id = engine_call(py, || {
+            self.inner.observe(node.inner, move |v: &PyValue| {
+                Python::attach(|py| {
+                    call_stashing(py, &callback, (v.0.clone_ref(py),));
+                });
+            })
+        })?;
         Ok(PyObserverId { inner: id })
     }
 
-    fn unobserve(&self, id: PyObserverId) {
-        self.inner.unobserve(id.inner);
+    fn unobserve(&self, py: Python<'_>, id: PyObserverId) -> PyResult<()> {
+        engine_call(py, || self.inner.unobserve(id.inner))
     }
 
     /// Bring observed nodes up to date and fire callbacks for changed
     /// values. Releases the GIL; callbacks reacquire it individually.
     fn stabilize(&self, py: Python<'_>) -> PyResult<()> {
-        pyerr_boundary(|| py.detach(|| self.inner.stabilize()))
+        engine_call(py, || self.inner.stabilize())
     }
 
-    fn create_query(&self, py_func: Py<PyAny>) -> PyNodeId {
-        let node = self.inner.create_query(move |rt: &Runtime| -> PyValue {
-            Python::attach(|py| {
-                let rt_ref = Py::new(
-                    py,
-                    PyRuntimeRef {
-                        ptr: rt as *const _,
-                    },
-                )
-                .unwrap();
-                let result = call_stashing(py, &py_func, (rt_ref.clone_ref(py),));
-                // Invalidate the ref so it can't be used after callback returns.
-                rt_ref.bind(py).borrow_mut().ptr = std::ptr::null();
-                PyValue(result)
+    fn create_query(&self, py: Python<'_>, py_func: Py<PyAny>) -> PyResult<PyNodeId> {
+        let node = engine_call(py, || {
+            self.inner.create_query(move |rt: &Runtime| -> PyValue {
+                Python::attach(|py| {
+                    let rt_ref = Py::new(
+                        py,
+                        PyRuntimeRef {
+                            ptr: rt as *const _,
+                        },
+                    )
+                    .unwrap();
+                    let result = call_stashing(py, &py_func, (rt_ref.clone_ref(py),));
+                    // Invalidate the ref so it can't be used after callback returns.
+                    rt_ref.bind(py).borrow_mut().ptr = std::ptr::null();
+                    PyValue(result)
+                })
             })
-        });
-        PyNodeId { inner: node }
+        })?;
+        Ok(PyNodeId { inner: node })
     }
 
-    fn create_collection(&self) -> PyCollection {
-        let col = self.inner.create_collection::<PyValue>();
-        PyCollection {
+    fn create_collection(&self, py: Python<'_>) -> PyResult<PyCollection> {
+        let col = engine_call(py, || self.inner.create_collection::<PyValue>())?;
+        Ok(PyCollection {
             inner: col,
             rt: Arc::clone(&self.inner),
             bridges: Arc::clone(&self.bridges),
-        }
+        })
     }
 
-    fn set_label(&self, node: PyNodeId, label: String) {
-        self.inner.set_label(node.inner.slot(), label);
+    fn set_label(&self, py: Python<'_>, node: PyNodeId, label: String) -> PyResult<()> {
+        engine_call(py, || self.inner.set_label(node.inner.slot(), label))
     }
 
-    fn set_label_by_id(&self, id: u32, label: String) {
-        self.inner.set_label(id, label);
+    fn set_label_by_id(&self, py: Python<'_>, id: u32, label: String) -> PyResult<()> {
+        engine_call(py, || self.inner.set_label(id, label))
     }
 
     fn get_traced(&self, py: Python<'_>, node: PyNodeId) -> PyResult<(Py<PyAny>, Py<PyAny>)> {
         let (val, trace): (PyValue, PropagationTrace) =
-            pyerr_boundary(|| py.detach(|| self.inner.get_traced(node.inner)))?;
+            engine_call(py, || self.inner.get_traced(node.inner))?;
         Python::attach(|py| {
             let trace_dict = pyo3::types::PyDict::new(py);
             trace_dict.set_item("target", trace.target.0)?;
@@ -709,9 +759,9 @@ impl PyRuntime {
         })
     }
 
-    fn graph_snapshot(&self) -> PyResult<Py<PyAny>> {
-        let infos = self.inner.graph_snapshot();
-        Python::attach(|py| {
+    fn graph_snapshot(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let infos = engine_call(py, || self.inner.graph_snapshot())?;
+        {
             let result = pyo3::types::PyList::empty(py);
             for info in &infos {
                 let d = pyo3::types::PyDict::new(py);
@@ -731,11 +781,11 @@ impl PyRuntime {
                 result.append(d)?;
             }
             Ok(result.into_any().unbind())
-        })
+        }
     }
 
-    fn node_count(&self) -> usize {
-        self.inner.node_count()
+    fn node_count(&self, py: Python<'_>) -> PyResult<usize> {
+        engine_call(py, || self.inner.node_count())
     }
 }
 

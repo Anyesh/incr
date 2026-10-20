@@ -66,3 +66,25 @@ def test_exception_propagates_in_concurrent_module():
     q = rt.create_query(lambda r: 10 // r.get(a))
     with pytest.raises(ZeroDivisionError):
         rt.get(q)
+
+
+def test_racing_version_node_reads_share_one_node():
+    rt = Runtime()
+    col = rt.create_collection()
+    col.insert(1)
+    nodes = rt.node_count()
+    barrier = threading.Barrier(8)
+    seen = []
+
+    def read():
+        barrier.wait()
+        seen.append(col.version_node)
+
+    threads = [threading.Thread(target=read) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(set(seen)) == 1
+    assert rt.node_count() == nodes + 1
+    assert rt.get(seen[0]) == rt.get(col.version_node)
