@@ -553,6 +553,7 @@ impl Walk {
                 visited.insert(id);
             }
             None => {
+                self.drop_repeats();
                 self.visited = Some(
                     self.work
                         .iter()
@@ -562,6 +563,36 @@ impl Walk {
                 );
             }
         }
+    }
+
+    /// At the switch, drops what the walk pushed since it first expanded a
+    /// node that already had a pending entry, except the entry just pushed:
+    /// exact mode would have skipped that expansion, and each repeated
+    /// pending entry of a node that does not land Clean would run its
+    /// compute, nested walks included, once more. The dropped entries'
+    /// taint goes to the pending entry below them, which their pops would
+    /// have reached.
+    fn drop_repeats(&mut self) {
+        let Some(top) = self.work.len().checked_sub(1) else {
+            return;
+        };
+        let mut pending = HashSet::new();
+        let Some(cut) = self.work[..top]
+            .iter()
+            .position(|e| e.is_pending() && !pending.insert(e.id))
+        else {
+            return;
+        };
+        let taint = self.work[cut..top]
+            .iter()
+            .filter(|e| e.is_pending())
+            .map(|e| e.taint)
+            .min()
+            .unwrap_or(NO_TAINT);
+        if let Some(parent) = self.work[..cut].iter_mut().rev().find(|e| e.is_pending()) {
+            parent.taint = parent.taint.min(taint);
+        }
+        self.work.drain(cut..top);
     }
 
     #[inline]

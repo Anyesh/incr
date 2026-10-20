@@ -2,6 +2,7 @@
 //! cycle panic, each case run under `Local` and `Shared`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use std::time::Duration;
 use super::race_tests::{id, park_at, Gate};
 use super::{ParkPoint, Runtime, EXACT_MODE_AT};
 use crate::cells::{Cells, Local, Shared};
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
 use crate::test_size::test_size;
 
@@ -184,6 +186,77 @@ fn local_single_point_break_recovery_is_bounded() {
 #[cfg_attr(miri, ignore)]
 fn shared_single_point_break_recovery_is_bounded() {
     on_deep_stack(single_point_break_recovery_is_bounded::<Shared>);
+}
+
+/// A ring a -> b -> c -> d -> e -> a that the first read lands with its
+/// edges recorded, where `e` also reads `t1` above `a`. After `x` changes,
+/// the walk of `t0` re-expands the Dirty ring until the switch to exact
+/// mode, so it holds about `EXACT_MODE_AT / 5` pending entries for each
+/// member. The members' computes don't land Clean, and each of those
+/// entries would run them, and `e`'s closure, again.
+fn dirty_ring_computes_each_member_once_per_walk<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(3_u64);
+    let e_runs = Arc::new(AtomicU64::new(0));
+    let a_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let t1_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let e = {
+        let (a_cell, t1_cell, e_runs) = (a_cell.clone(), t1_cell.clone(), e_runs.clone());
+        rt.create_query_with_fallback(
+            move |rt| {
+                e_runs.fetch_add(1, Ordering::Relaxed);
+                let a = catch_unwind(AssertUnwindSafe(|| rt.get(*a_cell.get().unwrap())))
+                    .unwrap_or(9999);
+                if a % 2 == 0 {
+                    0
+                } else {
+                    catch_unwind(AssertUnwindSafe(|| rt.get(*t1_cell.get().unwrap())))
+                        .unwrap_or(9999)
+                }
+            },
+            |_| 3,
+        )
+    };
+    let d = rt.create_query(move |rt| rt.get(e));
+    let c = rt.create_query(move |rt| rt.get(d));
+    let b = rt.create_query_with(
+        move |rt| rt.get(c),
+        QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 4).max_iterations(3)),
+            replay: Replay::Native,
+        },
+    );
+    let xq = rt.create_query(move |rt| rt.get(x));
+    let a = rt.create_query(move |rt| {
+        if rt.get(xq).wrapping_add(rt.get(b)) % 2 == 0 {
+            0
+        } else {
+            rt.get(b)
+        }
+    });
+    a_cell.set(a).unwrap();
+    let t0 = rt.create_query(move |rt| rt.get(a));
+    let t1 = rt.create_query(move |rt| rt.get(t0));
+    t1_cell.set(t1).unwrap();
+    assert_eq!(rt.get(t1), 0);
+
+    rt.set(x, 2);
+    e_runs.store(0, Ordering::Relaxed);
+    assert_eq!(rt.get(t0), 3);
+    let runs = e_runs.load(Ordering::Relaxed);
+    assert!(runs <= 32, "e's closure ran {runs} times in one read");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_dirty_ring_computes_each_member_once_per_walk() {
+    dirty_ring_computes_each_member_once_per_walk::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_dirty_ring_computes_each_member_once_per_walk() {
+    dirty_ring_computes_each_member_once_per_walk::<Shared>();
 }
 
 /// A recomputing `a` reads `c`, whose recorded edge to `a` is stale: `c`
