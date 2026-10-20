@@ -11,3 +11,5 @@ screenshots
 docs/
 devlogs/
 *.db
+# wasm-bindgen-test-runner writes its bench baseline under the package
+crates/incr-wasm-tests/target/
