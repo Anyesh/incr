@@ -7,8 +7,8 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
-use std::thread;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 use super::race_tests::{id, Gate};
@@ -387,12 +387,15 @@ fn shared_landed_point_below_the_running_entrys_maker() {
 /// when t = 0 or j when t = 1. Computed at s = t = 0, so c1 holds an
 /// installed edge to P, then set to s = t = 1, j = 5, which leaves that
 /// edge stale. At budget 1, P dooms on A and its doomed read of c0 pushes
-/// c0 as a walk. P parks on `gate` once it is armed.
+/// c0 as a walk. P parks on `gate` once it is armed, and on `late` after
+/// its read of A.
 struct Taint {
     rt: Arc<Rt>,
     p: Incr<u64>,
+    a: Incr<u64>,
     c0: Incr<u64>,
     gate: Gate,
+    late: Gate,
     p_runs: Arc<AtomicU32>,
 }
 
@@ -404,7 +407,7 @@ fn taint_shape() -> Taint {
         rt.create_input(0_u64),
         rt.create_input(0_u64),
     );
-    let gate = Gate::new();
+    let (gate, late) = (Gate::new(), Gate::new());
     let p_runs = Arc::new(AtomicU32::new(0));
     let pc: Arc<OnceLock<Incr<u64>>> = Arc::default();
     let c1 = {
@@ -423,13 +426,15 @@ fn taint_shape() -> Taint {
     let c0 = rt.create_query_with(move |rt: &Rt| rt.get(c1) + 1, replayable());
     let a = rt.create_query_with(|_: &Rt| 1_u64, replayable());
     let p = {
-        let (gate, p_runs) = (gate.clone(), p_runs.clone());
+        let (gate, late, p_runs) = (gate.clone(), late.clone(), p_runs.clone());
         rt.create_query_with(
             move |rt: &Rt| {
                 p_runs.fetch_add(1, SeqCst);
                 gate.park();
                 if rt.get(s) == 1 {
-                    rt.get(a) + 1000 + rt.get(c0)
+                    let a = rt.get(a);
+                    late.park();
+                    a + 1000 + rt.get(c0)
                 } else {
                     0
                 }
@@ -446,8 +451,10 @@ fn taint_shape() -> Taint {
     Taint {
         rt,
         p,
+        a,
         c0,
         gate,
+        late,
         p_runs,
     }
 }
@@ -499,6 +506,109 @@ fn shared_walk_skips_a_vframe_computing_on_another_thread() {
     target.release();
     assert_eq!(reader.join(), unbounded);
     assert_eq!(s.p_runs.load(SeqCst), 2, "thread 1's walk never ran P");
+    s.rt.assert_invariant_i();
+}
+
+/// **The walk's Computing arm at a VFrame, the discard-landing form** (T1
+/// The Computing arm too, row 22), at budget 1. The plan's form parks
+/// thread 1's walk inside its wait on P and has thread 2 discard-land P,
+/// so that the wait ends with P Dirty and a virtual frame of it on the
+/// first thread. That precondition is unreachable: the walk looks P's
+/// virtual frame up before its Computing arm waits, and only thread 1
+/// makes its own virtual frames, which it cannot do while it waits, so a
+/// wait on P begins only when P has none and ends the same way.
+/// `post_wait_owner` asserts it on every post-wait claim. This test runs
+/// the reachable order instead: thread 1's `get(P)` dooms P, then thread 2
+/// claims P and dooms on A, which thread 1's driver has not run yet, and
+/// parks inside P's doomed run. c0's entry walk reaches P Computing and
+/// skips it without waiting; thread 2 then discard-lands P and parks
+/// before its retry, and thread 1's target entry claims P from that
+/// landing.
+#[test]
+fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
+    let s = taint_shape();
+    s.rt.set_max_frames(1);
+    let (first, target, held) = (Gate::new(), Gate::new(), Gate::new());
+    let p = id(s.p);
+    let seen: Arc<Mutex<Vec<(ThreadId, ParkPoint)>>> = Arc::default();
+    let installed = s.rt.park_hook.set(Box::new({
+        let gates = vec![
+            (ParkPoint::BeforeEntry(id(s.a)), first.clone()),
+            (ParkPoint::BeforeEntry(p), target.clone()),
+            (ParkPoint::BeforeEntry(p), held.clone()),
+        ];
+        let seen = seen.clone();
+        move |point| {
+            if matches!(point, ParkPoint::BeforeComputeOne(n) | ParkPoint::ComputeWaits(n) if n == p)
+            {
+                seen.lock().unwrap().push((thread::current().id(), point));
+            }
+            for (at, gate) in &gates {
+                if *at == point {
+                    gate.park();
+                }
+            }
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
+    first.arm();
+    let reader_id: Arc<OnceLock<ThreadId>> = Arc::default();
+    let reader = {
+        let (rt, p, reader_id) = (s.rt.clone(), s.p, reader_id.clone());
+        spawn(move || {
+            reader_id.set(thread::current().id()).unwrap();
+            rt.get(p)
+        })
+    };
+    first.wait_parked();
+    assert_eq!(s.rt.state_of(s.a), NodeState::New);
+    s.late.arm();
+    let claimer = {
+        let (rt, p) = (s.rt.clone(), s.p);
+        spawn(move || rt.get(p))
+    };
+    s.late.wait_parked();
+    assert_eq!(s.p_runs.load(SeqCst), 2);
+    target.arm();
+    first.release();
+    target.wait_parked();
+    assert_eq!(s.rt.state_of(s.p), NodeState::Computing);
+    assert_eq!(s.rt.state_of(s.c0), NodeState::Clean);
+    held.arm();
+    s.late.release();
+    held.wait_parked();
+    assert_eq!(
+        s.rt.state_of(s.p),
+        NodeState::Dirty,
+        "thread 2 discard-landed P"
+    );
+    assert_eq!(s.p_runs.load(SeqCst), 2);
+    let unbounded = {
+        let u = taint_shape();
+        u.rt.get(u.p)
+    };
+    target.release();
+    assert_eq!(reader.join(), unbounded);
+    held.release();
+    assert_eq!(claimer.join(), unbounded);
+    assert_eq!(
+        s.p_runs.load(SeqCst),
+        3,
+        "P ran doomed on each thread and once more in thread 1's target entry"
+    );
+    let reader_id = *reader_id.get().unwrap();
+    let waits: Vec<ParkPoint> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(t, _)| *t == reader_id)
+        .map(|&(_, point)| point)
+        .collect();
+    assert_eq!(
+        waits,
+        vec![ParkPoint::BeforeComputeOne(p)],
+        "thread 1's only walk compute of P is its root's, and it never waited on P"
+    );
     s.rt.assert_invariant_i();
 }
 

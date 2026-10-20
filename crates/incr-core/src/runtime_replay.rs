@@ -2539,6 +2539,10 @@ impl<C: Cells> Runtime<C> {
                     return Err(computed);
                 }
             },
+            Computed::Skipped(owner) => {
+                walk.taint(owner);
+                return Ok(Computed::Done);
+            }
             _ => computed,
         };
         if computed == Computed::Unsettled {
@@ -2597,6 +2601,25 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn virtual_owner(&self, id: NodeId) -> Option<u32> {
         self.virtual_position(id.0, self.nodes.get(id.0).generation())
             .map(|p| p + 1)
+    }
+
+    /// The taint-memo owner for a walk's compute of `id` whose claim wait
+    /// ended with `id` New or Dirty, if `id` has a virtual frame. Never
+    /// one: the visit that pushed the compute checked the same frames,
+    /// only this thread makes them, and every one it makes while cleaning
+    /// the node's deps sits above the walk's frame and pops before the
+    /// walk goes on.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn post_wait_owner(&self, id: NodeId) -> Option<u32> {
+        let owner = self.virtual_owner(id);
+        #[cfg(test)]
+        assert!(
+            owner.is_none(),
+            "incr-core: post-wait claim of a node with a virtual frame: node {}",
+            id.0
+        );
+        owner
     }
 
     /// Whether position `cidx` holds one of this runtime's virtual frames.
