@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use super::replay_impl::DeliverySeen;
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{CycleStrategy, QueryOpts, Replay};
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::cycle_state;
 use crate::handle::{Incr, RuntimeId};
 use crate::runtime::ReadKind;
@@ -418,6 +418,194 @@ local_and_shared!(
     virtual_hit_then_panic_in_a_speculative_entry,
     local_virtual_hit_then_panic_in_a_speculative_entry,
     shared_virtual_hit_then_panic_in_a_speculative_entry
+);
+
+/// A cycle value whose drop panics "drop boom" when `marked`; a clone is
+/// unmarked, so only the iterate a step marked panics.
+struct Marked {
+    v: u64,
+    marked: bool,
+}
+
+impl Clone for Marked {
+    fn clone(&self) -> Self {
+        Marked {
+            v: self.v,
+            marked: false,
+        }
+    }
+}
+
+impl PartialEq for Marked {
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v
+    }
+}
+
+impl Drop for Marked {
+    fn drop(&mut self) {
+        if self.marked && !std::thread::panicking() {
+            std::panic::panic_any(String::from("drop boom"));
+        }
+    }
+}
+
+fn marked(v: u64) -> Marked {
+    Marked { v, marked: false }
+}
+
+/// The episode callback that panics.
+#[derive(Copy, Clone, Debug)]
+enum Callback {
+    /// A Fallback's `g`, "g boom".
+    G,
+    /// A Fixpoint's `step`, "step boom".
+    Step,
+    /// The drop of a Fixpoint's s_1 when s_2 replaces it, "drop boom".
+    Drop,
+}
+
+/// What the IF form over a panicking episode saw.
+#[derive(Debug, PartialEq, Eq)]
+struct EpisodePanic {
+    out: Out,
+    /// S and T after the `get`.
+    states: Vec<NodeState>,
+}
+
+/// F = IF(A, S, R) as in [`speculative`], where S, suspect, and T read
+/// each other, both seeded with `callback`'s strategy. With `real_reads`
+/// F's real run reads S. Returns the outcome and, if the callback
+/// panicked inside a speculative entry's run, S's and T's states at the
+/// first entry the driver took after it.
+fn speculative_episode<C: Cells>(
+    frames: Option<u32>,
+    callback: Callback,
+    real_reads: bool,
+) -> (EpisodePanic, Option<Vec<NodeState>>) {
+    let rt = runtime::<C>(frames);
+    rt.set_placeholder(marked(0));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let strategy = |mark: bool| -> QueryOpts<Marked> {
+        let p = panicked.clone();
+        let cycle = match callback {
+            Callback::G => CycleStrategy::fallback(move |_| -> Marked {
+                p.store(p.load(SeqCst) || crate::replay::speculative(), SeqCst);
+                std::panic::panic_any(String::from("g boom"))
+            }),
+            Callback::Step => CycleStrategy::Fixpoint(Fixpoint::new(|| marked(0)).step(
+                move |_, _, _| -> Marked {
+                    p.store(p.load(SeqCst) || crate::replay::speculative(), SeqCst);
+                    std::panic::panic_any(String::from("step boom"))
+                },
+            )),
+            Callback::Drop => CycleStrategy::Fixpoint(Fixpoint::new(|| marked(0)).step(
+                move |_, out: Marked, k| {
+                    let mark = mark && k == 1;
+                    if mark {
+                        p.store(p.load(SeqCst) || crate::replay::speculative(), SeqCst);
+                    }
+                    Marked {
+                        v: out.v,
+                        marked: mark,
+                    }
+                },
+            )),
+        };
+        QueryOpts {
+            cycle,
+            replay: Replay::Allowed,
+        }
+    };
+    let a_in = rt.create_input(false);
+    let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+    let s_later: Arc<OnceLock<Incr<Marked>>> = Arc::default();
+    let sl = s_later.clone();
+    let t = rt.create_query_with(
+        move |rt| marked((rt.get(*sl.get().unwrap()).v + 1).min(3)),
+        strategy(false),
+    );
+    let s = rt.create_query_with(move |rt| marked((rt.get(t).v + 1).min(3)), strategy(true));
+    s_later.set(s).unwrap();
+    let r = rt.create_query_with(|_| 7_u64, replayable());
+    let f = rt.create_query_with(
+        move |rt| {
+            if rt.get(a) || real_reads {
+                rt.get(s).v
+            } else {
+                rt.get(r)
+            }
+        },
+        replayable(),
+    );
+    let after_panic = Arc::new(Mutex::new(None));
+    let (seen, p, at) = (after_panic.clone(), panicked.clone(), RtRef(&rt));
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if matches!(point, ParkPoint::BeforeEntry(_)) && p.load(SeqCst) {
+            let mut seen = seen.lock().unwrap();
+            if seen.is_none() {
+                let rt = at.rt();
+                *seen = Some(vec![rt.state_of(s), rt.state_of(t)]);
+            }
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
+    let out = get(&rt, f);
+    rt.assert_invariant_i();
+    let seen = EpisodePanic {
+        out,
+        states: vec![rt.state_of(s), rt.state_of(t)],
+    };
+    let after_panic = after_panic.lock().unwrap().take();
+    assert_eq!(after_panic.is_some(), panicked.load(SeqCst));
+    (seen, after_panic)
+}
+
+/// F5 (b): a speculative entry's run reaches a cycle whose callback
+/// panics. Every member is New or Dirty after the speculative run; F
+/// lands 7 when the real run never reads S, and panics with the
+/// callback's own payload, as the unbounded run does, when it does. Only
+/// `g` runs speculatively, as T's virtual hit seeds S: a speculative
+/// entry never runs an episode, so `step` and the drop of s_1 are
+/// reached by the real run alone.
+fn panicking_episode_in_a_speculative_entry<C: Cells>() {
+    for (callback, payload, speculative) in [
+        (Callback::G, "g boom", true),
+        (Callback::Step, "step boom", false),
+        (Callback::Drop, "drop boom", false),
+    ] {
+        let new_or_dirty = |states: &[NodeState]| {
+            states
+                .iter()
+                .all(|s| matches!(s, NodeState::New | NodeState::Dirty))
+        };
+        let (quiet, after) = speculative_episode::<C>(Some(1), callback, false);
+        assert_eq!(quiet.out, Out::Value(7), "{callback:?}");
+        assert!(new_or_dirty(&quiet.states), "{callback:?}: {quiet:?}");
+        assert_eq!(after.is_some(), speculative, "{callback:?}");
+        if let Some(after) = after {
+            assert!(new_or_dirty(&after), "{callback:?}: {after:?}");
+        }
+        assert_eq!(
+            speculative_episode::<C>(None, callback, false).0,
+            quiet,
+            "{callback:?}"
+        );
+
+        let (unbounded, _) = speculative_episode::<C>(None, callback, true);
+        assert_eq!(unbounded.out, Out::Panic(payload.into()), "{callback:?}");
+        let (bounded, after) = speculative_episode::<C>(Some(1), callback, true);
+        assert_eq!(bounded, unbounded, "{callback:?}");
+        assert_eq!(after.is_some(), speculative, "{callback:?}");
+        if let Some(after) = after {
+            assert!(new_or_dirty(&after), "{callback:?}: {after:?}");
+        }
+    }
+}
+local_and_shared!(
+    panicking_episode_in_a_speculative_entry,
+    local_panicking_episode_in_a_speculative_entry,
+    shared_panicking_episode_in_a_speculative_entry
 );
 
 /// How T reads F in the T/F/U shape.
