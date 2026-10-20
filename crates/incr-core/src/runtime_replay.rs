@@ -1494,7 +1494,7 @@ impl<C: Cells> Runtime<C> {
             }
             debug_assert!(dropped.is_none(), "incr-core: a dropped run landed");
             debug_assert_ne!(computed, Computed::Doomed);
-            if computed == Computed::Done && level > 0 {
+            if matches!(computed, Computed::Done | Computed::Unsettled) && level > 0 {
                 self.hold_landing(id, level, entry.node, entry.generation);
             }
             replay::with(|c| {
@@ -2462,23 +2462,30 @@ impl<C: Cells> Runtime<C> {
         walk: &mut Walk,
         computed: Computed,
     ) -> Result<Computed, Computed> {
-        match computed {
+        let computed = match computed {
             Computed::Doomed => {
                 self.stash_walk(root, (!is_root).then_some(walk));
-                Err(computed)
+                return Err(computed);
             }
             Computed::Discarded => match self.walk_discarded(visit) {
-                Some(after) => Ok(after),
+                Some(after) => after,
                 None => {
                     // The discarded compute is a frame the reading frame's
                     // retry runs again.
                     walk.push(entry);
                     self.stash_walk(root, (!is_root).then_some(walk));
-                    Err(computed)
+                    return Err(computed);
                 }
             },
-            _ => Ok(computed),
+            _ => computed,
+        };
+        if computed == Computed::Unsettled {
+            if !is_root {
+                walk.unsettled(entry.id);
+            }
+            return Ok(Computed::Done);
         }
+        Ok(computed)
     }
 
     /// A doom stopped the reading frame's walk of `root`: its retry

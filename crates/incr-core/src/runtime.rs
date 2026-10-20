@@ -387,6 +387,9 @@ enum Visit {
 enum Computed {
     /// The node is as settled as the visit allows.
     Done,
+    /// As `Done`, but a closure run left the node not Clean, so a walk
+    /// that computes it again runs the closure again.
+    Unsettled,
     /// The slot's generation moved during the call: the node was deleted
     /// and its slot recycled, so the closure read under the hold belongs
     /// to a node that no longer exists. Any claim taken was released
@@ -460,10 +463,11 @@ impl Entry {
 pub(crate) struct Walk {
     work: Vec<Entry>,
     first_visits: u32,
-    /// Exact mode: every node with a `(x, true)` entry on `work`, kept
-    /// from the switch on so a popped `(x, false)` of one of them is
-    /// skipped instead of expanded again. `None` below the switch, which
-    /// keeps the walk free of set operations for small graphs.
+    /// Exact mode: every node with a `(x, true)` entry on `work`, and every
+    /// node a compute left not Clean, kept from the switch on so a popped
+    /// `(x, false)` of one of them is skipped instead of expanded again.
+    /// `None` below the switch, which keeps the walk free of set
+    /// operations for small graphs.
     visited: Option<HashSet<NodeId>>,
     /// Created at the walk's first New expansion or group expansion, in
     /// one box so that a walk with neither tests one pointer at its drop.
@@ -553,7 +557,7 @@ impl Walk {
                 visited.insert(id);
             }
             None => {
-                self.drop_repeats();
+                self.drop_repeats(self.work.len() - 1);
                 self.visited = Some(
                     self.work
                         .iter()
@@ -565,17 +569,13 @@ impl Walk {
         }
     }
 
-    /// At the switch, drops what the walk pushed since it first expanded a
-    /// node that already had a pending entry, except the entry just pushed:
-    /// exact mode would have skipped that expansion, and each repeated
-    /// pending entry of a node that does not land Clean would run its
-    /// compute, nested walks included, once more. The dropped entries'
-    /// taint goes to the pending entry below them, which their pops would
-    /// have reached.
-    fn drop_repeats(&mut self) {
-        let Some(top) = self.work.len().checked_sub(1) else {
-            return;
-        };
+    /// At the switch, drops what the walk pushed below `top` since it first
+    /// expanded a node that already had a pending entry: exact mode would
+    /// have skipped that expansion, and each repeated pending entry of a
+    /// node that does not land Clean would run its compute, nested walks
+    /// included, once more. The dropped entries' taint goes to the pending
+    /// entry below them, which their pops would have reached.
+    fn drop_repeats(&mut self, top: usize) {
         let mut pending = HashSet::new();
         let Some(cut) = self.work[..top]
             .iter()
@@ -593,6 +593,38 @@ impl Walk {
             parent.taint = parent.taint.min(taint);
         }
         self.work.drain(cut..top);
+    }
+
+    /// A compute of `id` the walk ran left it not Clean, so every other
+    /// pending entry or visit of it would run its closure, nested walks
+    /// included, once more: switches to exact mode now, with `id` visited
+    /// and its pending entries dropped, their taint passed down as
+    /// `drop_repeats` passes it. The root's entry stays for its caller.
+    #[cold]
+    #[inline(never)]
+    fn unsettled(&mut self, id: NodeId) {
+        // From the switch on, a node is expanded at most once per walk.
+        if self.visited.is_some() {
+            return;
+        }
+        self.drop_repeats(self.work.len());
+        for at in (1..self.work.len()).rev() {
+            let entry = self.work[at];
+            if entry.is_pending() && entry.id == id {
+                self.work.remove(at);
+                if let Some(parent) = self.work[..at].iter_mut().rev().find(|e| e.is_pending()) {
+                    parent.taint = parent.taint.min(entry.taint);
+                }
+            }
+        }
+        let mut visited: HashSet<NodeId> = self
+            .work
+            .iter()
+            .filter(|e| e.is_pending())
+            .map(|e| e.id)
+            .collect();
+        visited.insert(id);
+        self.visited = Some(visited);
     }
 
     #[inline]
@@ -1960,7 +1992,7 @@ impl<C: Cells> Runtime<C> {
         // `get` found the node not Clean, so the walk starts at once.
         let walk = || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
         match self.entered(kind, walk)? {
-            Computed::Done => {}
+            Computed::Done | Computed::Unsettled => {}
             Computed::Gone => self.stale_handle(handle),
             Computed::Deferred => {
                 return self
@@ -2632,11 +2664,7 @@ impl<C: Cells> Runtime<C> {
             if is_computing(observed) {
                 self.wait_on_claim(id, 1);
             }
-            let computed = self.compute_direct::<MODE>(id, gen);
-            if computed == Computed::Discarded {
-                return self.walk_discarded(Visit::Direct).unwrap_or(computed);
-            }
-            return computed;
+            return self.compute_direct::<MODE>(id, gen);
         }
         let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
         let mut root = Computed::Done;
@@ -2832,7 +2860,14 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
-        self.compute_one::<MODE>(id, Visit::Direct, Some(gen))
+        let mut computed = self.compute_one::<MODE>(id, Visit::Direct, Some(gen));
+        if computed == Computed::Discarded {
+            computed = self.walk_discarded(Visit::Direct).unwrap_or(computed);
+        }
+        if computed == Computed::Unsettled {
+            return Computed::Done;
+        }
+        computed
     }
 
     /// Compute (or verify) a single node, assuming all its known deps
@@ -3281,6 +3316,8 @@ impl<C: Cells> Runtime<C> {
                     // landing. Its own publish may take the fast path, where
                     // nothing else would catch that.
                     self.dep_stack.poison_current_frame(self.runtime_id);
+                    self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
+                    return Computed::Unsettled;
                 }
                 self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                 return Computed::Done;

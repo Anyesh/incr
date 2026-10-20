@@ -259,6 +259,72 @@ fn shared_dirty_ring_computes_each_member_once_per_walk() {
     dirty_ring_computes_each_member_once_per_walk::<Shared>();
 }
 
+/// `l` reads itself and then `n`, `n` reads `s` (twice when it is odd),
+/// and `s` reads `l` once `x` is odd. After `x` changes, the walk of `l`
+/// re-expands `l`'s self edge until the switch to exact mode, and each
+/// lap reaches `n` and `s` with nothing to wait on. Their computes land
+/// Dirty, so each lap would run their closures, and the nested walks
+/// those start, again.
+fn non_clean_landing_computes_once_per_walk<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let runs = Arc::new(AtomicU64::new(0));
+    let l_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let x = rt.create_input(2_u64);
+    let s = {
+        let (runs, l_cell) = (runs.clone(), l_cell.clone());
+        rt.create_query(move |rt| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            if rt.get(x) % 2 == 0 {
+                3
+            } else {
+                rt.get(*l_cell.get().unwrap())
+            }
+        })
+    };
+    let n = {
+        let runs = runs.clone();
+        rt.create_query(move |rt| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            if rt.get(s) % 2 == 0 {
+                0
+            } else {
+                rt.get(s)
+            }
+        })
+    };
+    let l = {
+        let (runs, l_cell) = (runs.clone(), l_cell.clone());
+        rt.create_query_with_fallback(
+            move |rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                rt.get(*l_cell.get().unwrap())
+                    .wrapping_add(rt.try_get(n).unwrap_or(7777))
+            },
+            |_| 1,
+        )
+    };
+    l_cell.set(l).unwrap();
+    assert_eq!(rt.get(l), 1);
+
+    rt.set(x, 3);
+    runs.store(0, Ordering::Relaxed);
+    assert_eq!(rt.get(l), 1);
+    let runs = runs.load(Ordering::Relaxed);
+    assert!(runs <= 32, "closures ran {runs} times in one read");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_non_clean_landing_computes_once_per_walk() {
+    non_clean_landing_computes_once_per_walk::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_non_clean_landing_computes_once_per_walk() {
+    non_clean_landing_computes_once_per_walk::<Shared>();
+}
+
 /// A recomputing `a` reads `c`, whose recorded edge to `a` is stale: `c`
 /// stopped reading `a` when `s` changed, but has not recomputed yet. The
 /// walk for `c` finds `a` Computing on this thread's own frame through
