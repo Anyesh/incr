@@ -27,7 +27,7 @@
 use incr_core::Shared;
 
 #[doc(hidden)]
-pub use incr_core::{engine_unwind, take_last_cycle, with_value_code};
+pub use incr_core::{check_value_code, engine_unwind, take_last_cycle, with_value_code};
 pub use incr_core::{
     Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
     GroupedCollection as GroupedCollectionInner, Incr, IncrCollection as IncrCollectionInner,
@@ -59,12 +59,13 @@ mod reexports {
     #[test]
     fn every_incr_core_item_is_reexported() {
         use crate::{
-            engine_unwind, take_last_cycle, with_value_code, Cycle, CycleStrategy, DeleteError,
-            Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher, GroupedCollection,
-            GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner, NodeId, NodeInfo,
-            NodeKindInfo, NodeState, NodeTable, NodeTableInner, NodeTrace, ObserverId,
-            PropagationTrace, QueryOpts, Replay, Runtime, RuntimeId, SortDelta, SortedCollection,
-            SortedCollectionInner, TableKey, TraceAction, Value, DEFAULT_MAX_FRAMES,
+            check_value_code, engine_unwind, take_last_cycle, with_value_code, Cycle,
+            CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
+            GroupedCollection, GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner,
+            NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable, NodeTableInner, NodeTrace,
+            ObserverId, PropagationTrace, QueryOpts, Replay, Runtime, RuntimeId, SortDelta,
+            SortedCollection, SortedCollectionInner, TableKey, TraceAction, Value,
+            DEFAULT_MAX_FRAMES,
         };
 
         fn named<T: ?Sized>() {}
@@ -105,5 +106,6 @@ mod reexports {
         named::<TraceAction>();
         value::<u32>();
         with_value_code(|| ());
+        check_value_code();
     }
 }

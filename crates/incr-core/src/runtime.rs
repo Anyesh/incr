@@ -1206,6 +1206,14 @@ impl<C: Cells> Runtime<C> {
         panic!("incr-core: pending handle used outside the replay attempt that produced it");
     }
 
+    /// Whether this thread is inside a compute of this runtime, or under
+    /// `Shared` of any `Shared` runtime, since that frame stack is per
+    /// thread.
+    #[doc(hidden)]
+    pub fn frame_active(&self) -> bool {
+        self.dep_stack.current_frame_active(self.runtime_id)
+    }
+
     /// Whether this runtime's active frame on this thread is doomed.
     pub(crate) fn frame_doomed(&self) -> bool {
         self.dep_stack
@@ -4954,6 +4962,24 @@ mod tests {
 
         rt.set(input, 5);
         assert_eq!(rt.get(parent), 12);
+    }
+
+    fn frame_active_inside_a_compute_only<C: Cells>() {
+        let rt: Runtime<C> = Runtime::new();
+        assert!(!rt.frame_active());
+        let q = rt.create_query(|rt| rt.frame_active());
+        assert!(rt.get(q));
+        assert!(!rt.frame_active());
+    }
+
+    #[test]
+    fn local_frame_active_inside_a_compute_only() {
+        frame_active_inside_a_compute_only::<Local>();
+    }
+
+    #[test]
+    fn shared_frame_active_inside_a_compute_only() {
+        frame_active_inside_a_compute_only::<Shared>();
     }
 
     /// A query may read more than 255 inputs; the u8 dep-count cell uses

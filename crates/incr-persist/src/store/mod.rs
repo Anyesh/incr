@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
 use std::sync::{Mutex, MutexGuard};
 
-use incr_core::{with_value_code, Cells, DeleteError, Incr, Runtime, Value};
+use incr_core::{check_value_code, with_value_code, Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -124,7 +124,10 @@ pub struct Batch<'s, C: Cells, B: Backend> {
 /// and is lost on restart.
 ///
 /// Store methods must not be called from inside a query's compute, because
-/// they create and set runtime inputs.
+/// they create and set runtime inputs, nor from a value, key or element
+/// type's trait method that the engine or the store is running, because
+/// that call may run under the store's own lock. Either call panics, in
+/// release builds too, before the store's lock is requested.
 ///
 /// A `Store<Local, _>` is confined to its thread like its runtime:
 ///
@@ -756,7 +759,16 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.write(&mut state, vec![record])
     }
 
+    /// The only place the store mutex is locked. Both checks run in
+    /// release builds and before the lock: the holder may be waiting on a
+    /// claim the calling compute or value code's caller holds, and value
+    /// code may be running on the thread that holds the mutex.
     fn state(&self) -> Result<MutexGuard<'_, State<C>>> {
+        assert!(
+            !self.runtime.frame_active(),
+            "incr-persist: Store methods must not be called from inside a query's compute",
+        );
+        check_value_code();
         // A panic while the mutex was held may have left the runtime and
         // the folded log out of step, which is the poisoned condition too.
         let state = self.state.lock().map_err(|_| Error::Poisoned)?;
