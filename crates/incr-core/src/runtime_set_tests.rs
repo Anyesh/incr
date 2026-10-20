@@ -147,6 +147,43 @@ fn shared_noop_set_bumps_and_walks_nothing() {
     noop_set_bumps_and_walks_nothing(&Rt::new());
 }
 
+/// Revisions step by 2 from 2. An input carries the odd stamp below the
+/// revision it was created, recycled or set at, and a compute carries the
+/// even revision it ran at.
+fn inputs_carry_odd_stamps<C: Cells>(rt: &Runtime<C>) {
+    let changed = |slot: u32| rt.nodes.get(slot).changed_at();
+    let walked = || C::walked(&rt.walk, &rt.revision);
+    assert_eq!((rt.current_revision(), walked()), (2, 2));
+    let x = rt.create_input(1_u64);
+    assert_eq!(changed(x.slot()), 1);
+    assert_eq!(rt.nodes.get(x.slot()).verified_at(), 2);
+    let d = rt.create_query(move |rt: &Runtime<C>| rt.get(x) + 1);
+    assert_eq!(rt.get(d), 2);
+    assert_eq!(changed(d.slot()), 2);
+
+    rt.set(x, 2);
+    assert_eq!((rt.current_revision(), walked()), (4, 4));
+    assert_eq!(changed(x.slot()), 3);
+    assert_eq!(rt.nodes.get(x.slot()).verified_at(), 4);
+    assert_eq!(rt.get(d), 3);
+    assert_eq!(changed(d.slot()), 4);
+
+    rt.delete_node(d);
+    let y = rt.create_input(5_u64);
+    assert_eq!(y.slot(), d.slot());
+    assert_eq!(changed(y.slot()), 3);
+}
+
+#[test]
+fn local_inputs_carry_odd_stamps() {
+    inputs_carry_odd_stamps(&Runtime::<Local>::new());
+}
+
+#[test]
+fn shared_inputs_carry_odd_stamps() {
+    inputs_carry_odd_stamps(&Rt::new());
+}
+
 /// A set equal to a value another set has written but not yet walked
 /// returns only once that walk is recorded, so its caller can rely on
 /// dependents having been dirtied.

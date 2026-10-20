@@ -581,7 +581,7 @@ fn loom_reader_during_directory_growth() {
     run(|| {
         let nodes: Arc<SegmentedNodes<Loom>> = Arc::new(SegmentedNodes::new());
         for k in 0..4 {
-            nodes.push(NodeData::new_input(0, k, 0));
+            nodes.push(NodeData::new_input(0, k, 2));
         }
         let handoff = Arc::new(AtomicU32::new(u32::MAX));
 
@@ -589,10 +589,10 @@ fn loom_reader_during_directory_growth() {
             let nodes = Arc::clone(&nodes);
             let handoff = Arc::clone(&handoff);
             thread::spawn(move || {
-                let s = nodes.push(NodeData::new_input(0, 4, 0));
+                let s = nodes.push(NodeData::new_input(0, 4, 2));
                 handoff.store(s, Ordering::Release);
                 for k in 5..9 {
-                    nodes.push(NodeData::new_input(0, k, 0));
+                    nodes.push(NodeData::new_input(0, k, 2));
                 }
             })
         };

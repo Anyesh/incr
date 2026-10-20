@@ -322,7 +322,7 @@ impl<C: Cells> SetClaim<'_, C> {
         let rev = self.rt.bump_revision();
         let walk_done = WalkDone { rt: self.rt, rev };
         self.rt.park(ParkPoint::SetAfterBump);
-        self.node.settle_changed_at(rev);
+        self.node.settle_changed_at(NodeData::<C>::input_stamp(rev));
         self.node.release_set_claim(self.base, rev);
         set_stack::pop(self.rt.runtime_id, self.id.0);
         self.rt.mark_dependents_dirty(self.id, self.flags);
@@ -848,8 +848,8 @@ impl<C: Cells> Runtime<C> {
             arenas: ArenaRegistry::new(),
             inner: <<C as Cells>::Lock<Inner<C>> as Lock<Inner<C>>>::new(Inner::new()),
             watch_queue: Lock::new(watch_impl::WatchQueue::new()),
-            revision: C::new_u64(1),
-            walk: C::new_watermark(1),
+            revision: C::new_u64(2),
+            walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id: RuntimeId::allocate(),
             tracing_armed: C::new_u8(0),
@@ -960,7 +960,7 @@ impl<C: Cells> Runtime<C> {
         // fetch_add, not load+store: two concurrent set() calls must not
         // collapse into one revision or the cutoff protocol conflates
         // their changes.
-        C::u64_fetch_add(&self.revision, 1) + 1
+        C::u64_fetch_add(&self.revision, 2) + 2
     }
 
     /// Create an input node with an initial value.
@@ -2426,7 +2426,7 @@ impl<C: Cells> Runtime<C> {
         //    revision also observes the new value (swap is sequenced
         //    before the AcqRel fetch_add);
         // 3. revision bump;
-        // 4. settle changed_at to the concrete revision;
+        // 4. settle changed_at to the revision's input stamp;
         // 5. claim release, then the dirty walk, whose Release stores
         //    publish all of the above to claimants that Acquire the
         //    Dirty state.
@@ -2437,6 +2437,8 @@ impl<C: Cells> Runtime<C> {
                 // change is visible to its caller's dependents.
                 let changed_at = node.changed_at();
                 drop(claim);
+                // The stamp is the odd one below its set's revision, and
+                // `walked` is even, so reaching the stamp reaches the set.
                 self.wait_walked(changed_at);
                 rejected(equal);
                 None
