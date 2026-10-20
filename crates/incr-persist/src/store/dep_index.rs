@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::ErasedIncr;
 
 use crate::Kind;
@@ -46,12 +47,16 @@ impl DepIndex {
     // Poisoning is ignored: a mapped write that panics marks the one key it
     // was writing untrusted before the hold is released.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn read(&self) -> RwLockReadGuard<'_, DepMap> {
-        self.map.read().unwrap_or_else(PoisonError::into_inner)
+    pub(crate) fn read(&self) -> Ordered<RwLockReadGuard<'_, DepMap>> {
+        Ordered::take(LockKind::DepIndex, || {
+            self.map.read().unwrap_or_else(PoisonError::into_inner)
+        })
     }
 
-    pub(crate) fn write(&self) -> RwLockWriteGuard<'_, DepMap> {
-        self.map.write().unwrap_or_else(PoisonError::into_inner)
+    pub(crate) fn write(&self) -> Ordered<RwLockWriteGuard<'_, DepMap>> {
+        Ordered::take(LockKind::DepIndex, || {
+            self.map.write().unwrap_or_else(PoisonError::into_inner)
+        })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
