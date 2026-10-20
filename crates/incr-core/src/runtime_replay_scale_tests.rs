@@ -586,18 +586,23 @@ fn scratch_ring_timing() {
         rt.set_max_frames(std::env::var("RING_F").map_or(1, |v| v.parse().unwrap()));
         let runs = counters(n);
         let iterations = Arc::new(AtomicU32::new(0));
-        let members = ring(
-            &rt,
-            n,
-            Strategy::Fallback,
-            &runs,
-            &iterations,
-            |rt, next, _| (rt.get(next) + 1).min(5),
-        );
+        let fixpoint = std::env::var("RING_S").is_ok_and(|s| s == "fixpoint");
+        let strategy = if fixpoint {
+            Strategy::Fixpoint
+        } else {
+            Strategy::Fallback
+        };
+        let members = ring(&rt, n, strategy, &runs, &iterations, |rt, next, _| {
+            (rt.get(next) + 1).min(5)
+        });
         let t = std::time::Instant::now();
-        assert_eq!(rt.get(members[0]), 3);
+        assert_eq!(rt.get(members[0]), if fixpoint { 5 } else { 3 });
+        let first = t.elapsed();
+        for &m in &members {
+            rt.get(m);
+        }
         eprintln!(
-            "n {n} {:?} maxruns {} dooms {} entries {}",
+            "n {n} {first:?} then all {:?} maxruns {} dooms {} entries {}",
             t.elapsed(),
             max_of(&runs),
             rt.dooms.lock().unwrap().len(),
