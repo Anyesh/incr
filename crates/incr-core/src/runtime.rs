@@ -71,8 +71,7 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
     /// Node slots released by delete_node, awaiting recycling.
     pub(crate) free_nodes: Vec<u32>,
-    pub(crate) observers: HashMap<u64, ObserverEntry<C>>,
-    pub(crate) next_observer_id: u64,
+    pub(crate) observers: Observers<C>,
     /// Nodes an operator created for its own output and adopted: it sets
     /// them but never reads them, so no reverse edge records them.
     /// Sparse, because only operators like `group_by` own nodes. Kept in
@@ -100,19 +99,6 @@ pub(crate) struct GroupInfo {
     pub(crate) cycle: Cycle,
 }
 
-/// Type-erased observer runner: takes the runtime and the observer's
-/// last-seen stamp, returns the new stamp if the callback fired.
-type ObserverRunFn<C> = Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>;
-
-/// One registered observer: which slot it watches, the changed_at stamp
-/// it last fired for, and a type-erased runner that ensures the node is
-/// clean and invokes the user callback if the value changed.
-pub(crate) struct ObserverEntry<C: Cells> {
-    pub(crate) slot: u32,
-    pub(crate) last_seen: u64,
-    pub(crate) run: ObserverRunFn<C>,
-}
-
 impl<C: Cells> Inner<C> {
     fn new() -> Self {
         Self {
@@ -122,8 +108,7 @@ impl<C: Cells> Inner<C> {
             labels: HashMap::new(),
             trace_log: Vec::new(),
             free_nodes: Vec::new(),
-            observers: HashMap::new(),
-            next_observer_id: 1,
+            observers: Observers::new(),
             owned: HashMap::new(),
             owner_of: HashMap::new(),
             children: HashMap::default(),
@@ -1371,96 +1356,6 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
-    /// Register a callback fired by [`Self::stabilize`] whenever the
-    /// node's value has changed since the last firing. Observation does
-    /// not change the engine's pull model: nothing runs until someone
-    /// calls `stabilize` (or `get`); the observer registry is a batch
-    /// poll with last-seen bookkeeping, the same shape as Jane Street
-    /// Incremental's observers.
-    ///
-    /// A node that has never computed fires on the first stabilize. A
-    /// stabilize racing a concurrent `set` may fire twice for one
-    /// change; it can never miss one.
-    pub fn observe<T: Value, F>(&self, handle: Incr<T>, callback: F) -> ObserverId
-    where
-        F: Fn(&T) + Send + Sync + 'static,
-    {
-        value_code::check();
-        self.check_handle(handle);
-        let slot = handle.slot();
-        let node = self.nodes.get(slot);
-        // Fire-baseline: if the node already has a clean value, only
-        // future changes fire; a never-computed node starts at 0 so the
-        // first stabilize computes and fires.
-        let last_seen = match state::load::<C>(node.state_cell()) {
-            NodeState::New => 0,
-            _ => node.changed_at().min(self.current_revision()),
-        };
-
-        let run = Arc::new(
-            move |rt: &Runtime<C>, last_seen: u64| match rt.observer_read(handle) {
-                Ok((value, stamp)) if stamp > last_seen => {
-                    callback(&value);
-                    Some(stamp)
-                }
-                Err(ObsErr::Cycle(stamp)) if stamp > last_seen => Some(stamp),
-                Ok(_) | Err(ObsErr::Cycle(_) | ObsErr::Gone) => None,
-            },
-        );
-
-        let mut inner = self.inner.write();
-        let id = inner.next_observer_id;
-        inner.next_observer_id += 1;
-        inner.observers.insert(
-            id,
-            ObserverEntry {
-                slot,
-                last_seen,
-                run,
-            },
-        );
-        ObserverId(id)
-    }
-
-    /// Remove an observer. Safe to call with an already-removed id.
-    pub fn unobserve(&self, id: ObserverId) {
-        value_code::check();
-        // Bound to a local so the entry, whose callback is user code,
-        // drops after the write guard does.
-        let removed = self.inner.write().observers.remove(&id.0);
-        drop(removed);
-    }
-
-    /// Bring every observed node up to date and fire callbacks for the
-    /// ones whose values changed since they last fired. Callbacks run
-    /// with no engine lock held; they may read from the runtime but must
-    /// not call `stabilize` reentrantly from another thread if duplicate
-    /// notifications matter.
-    pub fn stabilize(&self) {
-        value_code::check();
-        self.enter(|| self.stabilize_entered());
-    }
-
-    fn stabilize_entered(&self) {
-        let entries: Vec<(u64, u64, ObserverRunFn<C>)> = {
-            let inner = self.inner.read();
-            inner
-                .observers
-                .iter()
-                .map(|(&id, e)| (id, e.last_seen, Arc::clone(&e.run)))
-                .collect()
-        };
-        self.park(ParkPoint::StabilizeAfterDrain);
-        for (id, last_seen, run) in entries {
-            if let Some(new_stamp) = run(self, last_seen) {
-                let mut inner = self.inner.write();
-                if let Some(e) = inner.observers.get_mut(&id) {
-                    e.last_seen = e.last_seen.max(new_stamp);
-                }
-            }
-        }
-    }
-
     /// Delete a node and recycle its slot. The node must have no
     /// dependents (delete downstream nodes first) and must not be
     /// deleted from inside its own compute. Any in-flight compute on the
@@ -1880,11 +1775,7 @@ impl<C: Cells> Runtime<C> {
         C::u8_store_relaxed(flags, 0);
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
-        let observers: Vec<ObserverEntry<C>> = inner
-            .observers
-            .extract_if(|_, e| e.slot == slot)
-            .map(|(_, e)| e)
-            .collect();
+        let observers = inner.observers.take_slot(slot);
         if !inner.labels.is_empty() {
             inner.labels.remove(&slot);
         }
@@ -4057,8 +3948,13 @@ mod watch_tests;
 #[path = "runtime_observer_read_tests.rs"]
 mod observer_read_tests;
 
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_stabilize_tests.rs"]
+mod stabilize_tests;
+
 pub(crate) use children_impl::ChildLanding;
-use observe_impl::ObsErr;
+pub(crate) use observe_impl::ObserverEntry;
+use observe_impl::Observers;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_children_tests.rs"]
