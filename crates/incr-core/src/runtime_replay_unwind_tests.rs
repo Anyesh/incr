@@ -946,6 +946,31 @@ local_and_shared!(
     shared_entry_guard_spans_the_loop
 );
 
+/// Above budget 1 an entry is pushed several levels above the one
+/// running, leaving empty levels between; the running entry is still the
+/// top level, so finding it never walks the empty ones.
+fn running_entry_is_the_top_level_above_budget_1<C: Cells>() {
+    let rt = runtime::<C>(Some(8));
+    let input = rt.create_input(0_u64);
+    let mut head = input;
+    for _ in 0..200 {
+        let below = head;
+        head = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+    }
+    rt.entries.lock().unwrap().clear();
+    assert_eq!(rt.get(head), 200);
+    let entries = std::mem::take(&mut *rt.entries.lock().unwrap());
+    assert!(entries.len() > 1, "{} entries", entries.len());
+    for e in &entries {
+        assert_eq!(e.levels, e.level as usize + 1, "{e:?}");
+    }
+}
+local_and_shared!(
+    running_entry_is_the_top_level_above_budget_1,
+    local_running_entry_is_the_top_level_above_budget_1,
+    shared_running_entry_is_the_top_level_above_budget_1
+);
+
 /// What one read of the chain over C's cycle saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Revalidated {

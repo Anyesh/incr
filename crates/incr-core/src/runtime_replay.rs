@@ -2205,6 +2205,7 @@ impl<C: Cells> Runtime<C> {
                 },
             );
             x.levels.truncate(level as usize);
+            x.trim_levels();
             x.truncate_vstack(level as usize)
         });
         let mut bag = Deferred::new();
@@ -2236,6 +2237,7 @@ impl<C: Cells> Runtime<C> {
             if !keep {
                 x.levels[q as usize].pop_front();
             }
+            x.trim_levels();
             (x.boundary, x.truncate_vstack(q as usize))
         });
         for ep in abandoned {
