@@ -1237,14 +1237,32 @@ impl<C: Cells> Runtime<C> {
                         .find(|x| x.id == id)
                         .expect("incr-core: a running context is open");
                     if x.vstack.len() > level as usize {
-                        x.pop_vframe().map(|v| (v, !x.vstack.is_empty()))
+                        let kept = match x.vstack.last() {
+                            Some(v) if value_code::thread_word() & value_code::MEMO_BIT != 0 => {
+                                taint_memo::take_from(v.cidx + 1)
+                            }
+                            _ => Vec::new(),
+                        };
+                        x.pop_vframe().map(|v| (v, !x.vstack.is_empty(), kept))
                     } else {
                         None
                     }
                 });
-                let Some((v, virtual_below)) = popped else {
+                let Some((v, virtual_below, kept)) = popped else {
                     break;
                 };
+                // A frame still New or Dirty that its pop does not finish is
+                // retried as the frame the unbounded run never popped, so it
+                // keeps its memo entries: a read of the retry that takes a
+                // delivery skips the walk that made them. Nothing the pop
+                // runs sees them.
+                let node = self.nodes.get(v.node);
+                let retried = v.ep.is_none()
+                    && node.generation() == v.generation
+                    && matches!(
+                        state::load::<C>(node.state_cell()),
+                        NodeState::New | NodeState::Dirty
+                    );
                 self.note_ancestor(&v);
                 // A stand-in run in the pop finishes the frame that was
                 // reading the frame popped just above, so it gets the direct
@@ -1267,7 +1285,12 @@ impl<C: Cells> Runtime<C> {
                     self.tarjan_pop(id, &v)
                 };
                 match popped {
-                    VPop::Next => popped_frames.push((v.clone(), false)),
+                    VPop::Next => {
+                        if retried && !kept.is_empty() {
+                            taint_memo::restore(kept);
+                        }
+                        popped_frames.push((v.clone(), false));
+                    }
                     VPop::Restart => continue 'entries,
                     VPop::Finished(node, landed) => {
                         popped_frames.push((v.clone(), landed));
