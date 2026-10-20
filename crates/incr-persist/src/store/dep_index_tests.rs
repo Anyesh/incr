@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
+use incr_core::persist_hooks::changed_at;
 use serde::{Deserialize, Serialize};
 
 use super::binding::encode;
@@ -218,6 +219,7 @@ fn a_panic_in_a_mapped_input_write_leaves_the_key_untrusted() {
     let outcome = catch_unwind(AssertUnwindSafe(|| store.set(x, Bomb(13))));
     assert!(outcome.is_err());
     assert_eq!(deps.fp("x"), Some(DepFp::Untrusted));
+    assert_eq!(deps.stamp("x"), None, "an untrusted key keeps no stamp");
 }
 
 /// Panics when hashed with 13.
@@ -311,4 +313,92 @@ fn a_collection_whose_node_was_deleted_registers_untrusted() {
         .unwrap();
     let deps = store.open_dep_index().unwrap();
     assert_eq!(deps.fp("c"), Some(DepFp::Untrusted));
+}
+
+fn stamp(deps: &DepIndex, key: &str) -> u64 {
+    deps.stamp(key)
+        .unwrap_or_else(|| panic!("{key}: expected a mapped stamp"))
+}
+
+#[test]
+fn an_input_records_its_stamp_at_creation() {
+    let store = open::<Local>();
+    let x = store.input("x", 5u32).unwrap();
+    let deps = store.open_dep_index().unwrap();
+    assert_eq!(stamp(&deps, "x"), changed_at(store.runtime(), x.handle()));
+}
+
+#[test]
+fn an_input_created_while_the_index_is_open_registers_its_stamp() {
+    let store = open::<Local>();
+    let deps = store.open_dep_index().unwrap();
+    let x = store.input("x", 5u32).unwrap();
+    assert_eq!(stamp(&deps, "x"), changed_at(store.runtime(), x.handle()));
+}
+
+fn writes_that_wrote_move_the_stamp<C: Cells>() {
+    let store = open::<C>();
+    let x = store.input("x", 1u32).unwrap();
+    store.set(x, 2).unwrap();
+    let deps = store.open_dep_index().unwrap();
+    let before = stamp(&deps, "x");
+    assert_eq!(
+        before,
+        changed_at(store.runtime(), x.handle()),
+        "kept without a memo"
+    );
+    store.set(x, 3).unwrap();
+    let after = stamp(&deps, "x");
+    assert!(after > before);
+    assert_eq!(after, changed_at(store.runtime(), x.handle()));
+    store.set(x, 3).unwrap();
+    assert_eq!(stamp(&deps, "x"), after, "a no-op leaves it");
+}
+
+#[test]
+fn writes_that_wrote_move_the_stamp_local() {
+    writes_that_wrote_move_the_stamp::<Local>();
+}
+
+#[test]
+fn writes_that_wrote_move_the_stamp_shared() {
+    writes_that_wrote_move_the_stamp::<Shared>();
+}
+
+#[test]
+fn a_no_op_mapped_write_cannot_launder_a_bypass() {
+    let backend = MemoryBackend::new();
+    let a = Store::<Local, _>::open(backend.clone(), Options::default()).unwrap();
+    let b = Store::<Local, _>::open(backend, Options::default()).unwrap();
+    let xa = a.input("x", 1u32).unwrap();
+    let xb = b.input("x", 1u32).unwrap();
+    let deps = a.open_dep_index().unwrap();
+    let mapped = stamp(&deps, "x");
+    a.runtime().set(xa.handle(), 9);
+    b.set(xb, 9).unwrap();
+    // Equal to the bypassed value, so the runtime treats it as a no-op.
+    a.refresh().unwrap();
+    assert_eq!(stamp(&deps, "x"), mapped);
+    assert_ne!(changed_at(a.runtime(), xa.handle()), mapped);
+}
+
+#[test]
+fn a_collection_has_no_stamp() {
+    let store = open::<Local>();
+    store.collection::<u32>("c").unwrap();
+    let deps = store.open_dep_index().unwrap();
+    assert_eq!(deps.stamp("c"), None);
+}
+
+#[test]
+fn an_undeclare_that_fails_keeps_the_stamp() {
+    let store = open::<Local>();
+    let x = store.input("x", 1u32).unwrap();
+    let deps = store.open_dep_index().unwrap();
+    let before = stamp(&deps, "x");
+    let h = x.handle();
+    let q = store.runtime().create_query(move |rt| rt.get(h) + 1);
+    store.runtime().get(q);
+    assert!(store.undeclare(x).is_err());
+    assert_eq!(stamp(&deps, "x"), before);
 }

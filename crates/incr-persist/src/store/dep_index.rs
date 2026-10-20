@@ -24,6 +24,9 @@ pub(crate) struct DepEntry {
     pub(crate) handle: ErasedIncr,
     pub(crate) kind: Kind,
     pub(crate) fp: DepFp,
+    /// An input's mapped stamp: its `changed_at` after the last mapped write
+    /// that wrote. `None` for a collection and for an untrusted key.
+    pub(crate) stamp: Option<u64>,
 }
 
 /// Every declared key of a store, with its node and fingerprint, while a
@@ -57,6 +60,11 @@ impl DepIndex {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn stamp(&self, key: &str) -> Option<u64> {
+        self.read().entry(key).and_then(|entry| entry.stamp)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn key_of(&self, handle: ErasedIncr) -> Option<String> {
         self.read().by_handle.get(&handle).cloned()
     }
@@ -72,11 +80,22 @@ impl DepMap {
         self.by_key.get(key)
     }
 
-    pub(crate) fn register(&mut self, key: &str, handle: ErasedIncr, kind: Kind, fp: DepFp) {
-        if let Some(old) = self
-            .by_key
-            .insert(key.to_owned(), DepEntry { handle, kind, fp })
-        {
+    pub(crate) fn register(
+        &mut self,
+        key: &str,
+        handle: ErasedIncr,
+        kind: Kind,
+        fp: DepFp,
+        stamp: Option<u64>,
+    ) {
+        let stamp = stamp.filter(|_| fp != DepFp::Untrusted);
+        let entry = DepEntry {
+            handle,
+            kind,
+            fp,
+            stamp,
+        };
+        if let Some(old) = self.by_key.insert(key.to_owned(), entry) {
             self.by_handle.remove(&old.handle);
         }
         self.by_handle.insert(handle, key.to_owned());
@@ -97,6 +116,17 @@ impl DepMap {
         }
     }
 
+    /// Sets a registered input's fingerprint and mapped stamp after a write
+    /// that wrote; an untrusted one stays so.
+    pub(crate) fn set_written(&mut self, key: &str, fp: u128, stamp: u64) {
+        if let Some(entry) = self.by_key.get_mut(key) {
+            if entry.fp != DepFp::Untrusted {
+                entry.fp = DepFp::Known(fp);
+                entry.stamp = Some(stamp);
+            }
+        }
+    }
+
     pub(crate) fn store_fp(&mut self, key: &str, fp: DepFp) {
         match fp {
             DepFp::Known(fp) => self.set_fp(key, fp),
@@ -107,6 +137,7 @@ impl DepMap {
     pub(crate) fn untrust(&mut self, key: &str) {
         if let Some(entry) = self.by_key.get_mut(key) {
             entry.fp = DepFp::Untrusted;
+            entry.stamp = None;
         }
     }
 }
