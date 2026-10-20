@@ -1418,6 +1418,8 @@ impl<C: Cells> Runtime<C> {
         // A suspended episode's members wait for its member run's virtual
         // frame, whatever frame runs at that position meanwhile: only the
         // episode's resumption, or its context abandoning it, releases them.
+        // So do the claims its member runs deferred to its root, which the
+        // resumption joins.
         let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             if h.is_empty() {
                 return Vec::new();
@@ -1434,8 +1436,10 @@ impl<C: Cells> Runtime<C> {
             }
             slots.retain(|m| {
                 !keep.contains(m)
-                    && h.get(&(rt, *m))
-                        .is_some_and(|e| !replay::is_suspended(e.ep))
+                    && h.get(&(rt, *m)).is_some_and(|e| {
+                        !replay::is_suspended(e.ep)
+                            && !replay::waits_for_suspended(rt, e.anchor(), cidx)
+                    })
             });
             slots
                 .into_iter()

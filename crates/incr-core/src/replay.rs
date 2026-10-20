@@ -590,6 +590,19 @@ pub(crate) fn suspended_reachable(ep: u64) -> Option<bool> {
     })
 }
 
+/// Whether a claim of runtime `rt` anchored at `anchor`, released from
+/// position `cidx`, waits for an episode that waits in a context with its
+/// root between them: the unbounded run's root still holds the claim, which
+/// the episode joins when it resumes.
+pub(crate) fn waits_for_suspended(rt: RuntimeId, anchor: u32, cidx: u32) -> bool {
+    with(|c| {
+        c.iter()
+            .filter(|x| x.rt == rt)
+            .flat_map(|x| x.episodes.iter())
+            .any(|e| cidx <= e.cidx && e.cidx <= anchor)
+    })
+}
+
 /// Whether an episode of runtime `rt` that waits in a context has a member
 /// run that read the frame at `cidx`, below its root: resumed, it defers
 /// its members to that frame.
