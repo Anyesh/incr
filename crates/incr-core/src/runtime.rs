@@ -1217,6 +1217,15 @@ impl<C: Cells> Runtime<C> {
             })
     }
 
+    /// For a binding that runs user code in another language: whether
+    /// this runtime's active frame on this thread is doomed, so an error
+    /// its code raises belongs to a run the engine discards. Unlike
+    /// [`crate::active_frame_doomed`], it sees `Local` frames too.
+    #[doc(hidden)]
+    pub fn active_frame_doomed(&self) -> bool {
+        self.frame_doomed()
+    }
+
     /// A node that dooms a replayable frame reading it at budget 1:
     /// reading it gives `DoomGate(false)`, its placeholder, in the doomed
     /// run and `DoomGate(true)` in the retry the driver makes once the

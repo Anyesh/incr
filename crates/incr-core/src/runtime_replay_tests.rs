@@ -377,3 +377,33 @@ fn local_explicit_budgets_win_over_incr_max_depth() {
 fn shared_explicit_budgets_win_over_incr_max_depth() {
     explicit_budgets_win::<Shared>();
 }
+
+/// The binding accessor sees the doomed frame of either strategy, where
+/// the thread-local `active_frame_doomed` sees only `Shared` frames.
+fn active_frame_doomed_sees_this_runtimes_frame<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let gate = rt.doom_gate();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let q = rt.create_query_with(
+        move |rt| {
+            let open = rt.get(gate).0;
+            log.lock().unwrap().push((open, rt.active_frame_doomed()));
+            0_u8
+        },
+        replayable(),
+    );
+    assert!(!rt.active_frame_doomed());
+    rt.get(q);
+    assert_eq!(*seen.lock().unwrap(), [(false, true), (true, false)]);
+}
+
+#[test]
+fn local_active_frame_doomed_sees_this_runtimes_frame() {
+    active_frame_doomed_sees_this_runtimes_frame::<Local>();
+}
+
+#[test]
+fn shared_active_frame_doomed_sees_this_runtimes_frame() {
+    active_frame_doomed_sees_this_runtimes_frame::<Shared>();
+}
