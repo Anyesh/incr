@@ -1587,19 +1587,25 @@ fn size(e: &Expr) -> usize {
 #[ignore = "a diagnostic that scans seeds"]
 fn replay_scan() {
     let n: u64 = std::env::var("REPLAY_SCAN").map_or(2000, |v| v.parse().expect("a count"));
-    let mut best: Option<(usize, u64)> = None;
-    let mut failing: Vec<u64> = Vec::new();
     if let Ok(seed) = std::env::var("REPLAY_CHECK") {
         let seed = u64::from_str_radix(&seed, 16).expect("a hex seed");
         check(seed);
         return;
     }
+    let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
+    let seeds = (from..n).filter(|seed| !two_threads() || seed.is_multiple_of(6) || all_seeds());
+    scan(seeds, std::env::var_os("REPLAY_ALL").is_some(), check);
+}
+
+/// Runs `check` on each seed and panics at the end if any failed, naming
+/// the smallest failing case. With `all` every seed runs and each failure
+/// is printed; without it, a seed no smaller than the smallest failure so
+/// far is skipped.
+fn scan(seeds: impl Iterator<Item = u64>, all: bool, check: impl Fn(u64)) {
+    let mut best: Option<(usize, u64)> = None;
+    let mut failing: Vec<u64> = Vec::new();
     quiet(|| {
-        let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
-        for seed in from..n {
-            if two_threads() && !seed.is_multiple_of(6) && !all_seeds() {
-                continue;
-            }
+        for seed in seeds {
             let case = case_of(seed);
             let weight: usize = case
                 .specs
@@ -1611,7 +1617,6 @@ fn replay_scan() {
                 })
                 .sum::<usize>()
                 + case.ops.len();
-            let all = std::env::var_os("REPLAY_ALL").is_some();
             if !all && best.is_some_and(|(w, _)| w <= weight) {
                 continue;
             }
@@ -1624,8 +1629,8 @@ fn replay_scan() {
                     let message = class(payload);
                     let first = message.lines().next().unwrap_or_default();
                     eprintln!("FAIL {seed:x}: {first}");
-                    failing.push(seed);
                 }
+                failing.push(seed);
                 if best.is_none_or(|(w, _)| weight < w) {
                     best = Some((weight, seed));
                 }
@@ -1633,9 +1638,36 @@ fn replay_scan() {
         }
     });
     eprintln!("smallest failing: {best:?}");
-    if !failing.is_empty() {
-        eprintln!("failing: {} {failing:x?}", failing.len());
+    if let Some((_, smallest)) = best {
+        let skipped = if all {
+            ""
+        } else {
+            " (heavier seeds were skipped; set REPLAY_ALL to run them)"
+        };
+        panic!(
+            "{} seeds failed{skipped}, the first {:x?}; smallest failing: {smallest:#x}",
+            failing.len(),
+            &failing[..failing.len().min(8)],
+        );
     }
+}
+
+#[test]
+fn scan_passes_when_every_seed_passes() {
+    scan(0..4, true, |_| {});
+    scan(0..4, false, |_| {});
+}
+
+#[test]
+#[should_panic(expected = "2 seeds failed, the first [1, 3]")]
+fn scan_panics_when_a_seed_fails() {
+    scan(0..5, true, |seed| assert!(seed % 2 == 0, "seed {seed}"));
+}
+
+#[test]
+#[should_panic(expected = "seeds failed (heavier seeds were skipped")]
+fn scan_without_all_panics_when_a_seed_fails() {
+    scan(0..5, false, |seed| assert!(seed % 2 == 0, "seed {seed}"));
 }
 
 fn reads_any(e: &Expr, hit: &impl Fn(usize) -> bool) -> bool {
