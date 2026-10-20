@@ -406,6 +406,10 @@ enum Computed {
     /// The node's run was doomed and discarded: it is a virtual frame,
     /// and a replay driver runs it again.
     Discarded,
+    /// A claim wait ended with the node New or Dirty and a virtual frame
+    /// of it on this thread, which stands for a frame on the stack: the
+    /// walk skips it and taints the path under this memo owner.
+    Skipped(u32),
 }
 
 /// `clean_walk` mode bit: a compute about to run a closure dooms the
@@ -2037,6 +2041,7 @@ impl<C: Cells> Runtime<C> {
             Computed::Doomed | Computed::Discarded => {
                 return Ok(self.placeholder_read::<T>(frame));
             }
+            Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
         }
         let (type_tag, arena_slot) = self.fields_under(handle, node);
         match self.try_read_slot(handle, node, type_tag, arena_slot) {
@@ -3002,6 +3007,11 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 NodeState::Dirty => {}
+            }
+            if MODE & VIRT != 0 && spins != 0 && gen.is_none() {
+                if let Some(owner) = self.post_wait_owner(id) {
+                    return Computed::Skipped(owner);
+                }
             }
 
             // Distinguish input vs query: inputs don't compute, they
