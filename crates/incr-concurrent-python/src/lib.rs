@@ -37,8 +37,8 @@ use std::sync::{Arc, Mutex};
 
 use ::incr_concurrent as engine;
 use engine::{
-    Cycle, CycleStrategy, Fixpoint, Incr, IncrCollection, NodeId, NodeKindInfo, PropagationTrace,
-    QueryOpts, Replay, Runtime, SortedCollection, TraceAction,
+    Cycle, CycleStrategy, DeleteError, Fixpoint, Incr, IncrCollection, NodeId, NodeKindInfo,
+    NodeTable, PropagationTrace, QueryOpts, Replay, Runtime, SortedCollection, TraceAction,
 };
 
 pyo3::create_exception!(
@@ -267,6 +267,11 @@ fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 
     }
 }
 
+/// An input's initial value from a Python callable, called only on a miss.
+fn init_fn(init: Py<PyAny>) -> impl FnOnce() -> PyValue {
+    move || Python::attach(|py| PyValue(call_stashing(py, &init, ())))
+}
+
 /// The options of a query created with `fallback`, `fixpoint` and
 /// `replay` keyword arguments.
 fn query_opts(
@@ -489,6 +494,110 @@ impl PyRuntimeRef {
     fn try_get(&self, py: Python<'_>, node: PyNodeId) -> PyResult<Py<PyAny>> {
         let rt = self.rt()?;
         try_read(engine_call(py, || rt.try_get(node.inner))?)
+    }
+
+    /// The input child named `key` of this query, created with `init()`
+    /// the first time this query asks for it. Children this query stops
+    /// asking for are deleted when it next lands.
+    fn child_input(&self, py: Python<'_>, key: Py<PyAny>, init: Py<PyAny>) -> PyResult<PyNodeId> {
+        let rt = self.rt()?;
+        let (key, init) = (PyValue(key), init_fn(init));
+        let node = engine_call(py, || rt.child_input(key, init))?;
+        Ok(PyNodeId { inner: node })
+    }
+
+    /// The query child named `key`, created with `f` the first time, like
+    /// `child_input`; the options apply only when the call creates it.
+    #[pyo3(signature = (key, f, *, fallback=None, fixpoint=None, replay=false))]
+    fn child_query(
+        &self,
+        py: Python<'_>,
+        key: Py<PyAny>,
+        f: Py<PyAny>,
+        fallback: Option<Py<PyAny>>,
+        fixpoint: Option<PyRef<'_, PyFixpoint>>,
+        replay: bool,
+    ) -> PyResult<PyNodeId> {
+        let rt = self.rt()?;
+        let opts = query_opts(py, fallback, fixpoint, replay)?;
+        let (key, f) = (PyValue(key), query_fn(f));
+        let node = engine_call(py, || rt.child_query_with(key, f, opts))?;
+        Ok(PyNodeId { inner: node })
+    }
+}
+
+/// A map from keys to nodes of one runtime. Key `__eq__` and `__hash__`
+/// run as value code: one that calls into incr raises the contract error.
+#[pyclass(name = "NodeTable")]
+struct PyNodeTable {
+    inner: NodeTable<PyValue, PyValue>,
+    rt: Arc<Runtime>,
+}
+
+#[pymethods]
+impl PyNodeTable {
+    /// The input node for `key`, created with `init()`'s value on a miss.
+    fn get_or_insert_input(
+        &self,
+        py: Python<'_>,
+        key: Py<PyAny>,
+        init: Py<PyAny>,
+    ) -> PyResult<PyNodeId> {
+        let (key, init) = (PyValue(key), init_fn(init));
+        let node = engine_call(py, || self.inner.get_or_insert_input(&self.rt, key, init))?;
+        Ok(PyNodeId { inner: node })
+    }
+
+    /// The query node for `key`, created with `f` and the options on a miss.
+    #[pyo3(signature = (key, f, *, fallback=None, fixpoint=None, replay=false))]
+    fn get_or_insert_query(
+        &self,
+        py: Python<'_>,
+        key: Py<PyAny>,
+        f: Py<PyAny>,
+        fallback: Option<Py<PyAny>>,
+        fixpoint: Option<PyRef<'_, PyFixpoint>>,
+        replay: bool,
+    ) -> PyResult<PyNodeId> {
+        let opts = query_opts(py, fallback, fixpoint, replay)?;
+        let (key, f) = (PyValue(key), query_fn(f));
+        let node = engine_call(py, || {
+            self.inner.get_or_insert_query_with(&self.rt, key, f, opts)
+        })?;
+        Ok(PyNodeId { inner: node })
+    }
+
+    /// The live node for `key`, or `None`. Not allowed inside a query.
+    fn get(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<Option<PyNodeId>> {
+        let key = PyValue(key);
+        let node = engine_call(py, || self.inner.get(&self.rt, &key))?;
+        Ok(node.map(|inner| PyNodeId { inner }))
+    }
+
+    /// Deletes `key`'s node and removes the entry. Raises `KeyError` if
+    /// the table holds no live node for it.
+    fn remove(&self, py: Python<'_>, key: Py<PyAny>) -> PyResult<()> {
+        let k = PyValue(key.clone_ref(py));
+        match engine_call(py, || self.inner.remove(&self.rt, &k))? {
+            Ok(()) => Ok(()),
+            Err(DeleteError::NotAlive) => Err(pyo3::exceptions::PyKeyError::new_err(key)),
+            Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+        }
+    }
+
+    /// The `(key, node)` pairs whose node is alive. Not allowed inside a
+    /// query.
+    fn items(&self, py: Python<'_>) -> PyResult<Vec<(Py<PyAny>, PyNodeId)>> {
+        let entries = engine_call(py, || {
+            let mut entries = Vec::new();
+            self.inner
+                .for_each(&self.rt, |key, node| entries.push((key.clone(), node)));
+            entries
+        })?;
+        Ok(entries
+            .into_iter()
+            .map(|(key, inner)| (key.0, PyNodeId { inner }))
+            .collect())
     }
 }
 
@@ -884,6 +993,14 @@ impl PyRuntime {
         Ok(PyNodeId { inner: node })
     }
 
+    fn create_table(&self, py: Python<'_>) -> PyResult<PyNodeTable> {
+        let table = engine_call(py, || self.inner.create_table::<PyValue, PyValue>())?;
+        Ok(PyNodeTable {
+            inner: table,
+            rt: Arc::clone(&self.inner),
+        })
+    }
+
     /// The value a replayed read returns in place of the node it wanted.
     /// Set once per runtime.
     fn set_placeholder(&self, py: Python<'_>, value: Py<PyAny>) -> PyResult<()> {
@@ -991,6 +1108,7 @@ fn incr_concurrent(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyObserverId>()?;
     m.add_class::<PyRuntimeRef>()?;
     m.add_class::<PyFixpoint>()?;
+    m.add_class::<PyNodeTable>()?;
     m.add_class::<PyCollection>()?;
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
