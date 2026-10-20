@@ -835,7 +835,11 @@ impl<C: Cells> Runtime<C> {
             });
         let ran = self.member_run(slot, cidx, true);
         replay::leave_member_run();
-        replay::run_ended(self.runtime_id, cidx, matches!(ran, Ok(None)));
+        self.drop_deliveries(replay::run_ended(
+            self.runtime_id,
+            cidx,
+            matches!(ran, Ok(None)),
+        ));
         match ran {
             Ok(Some(l)) => {
                 *low = (*low).min(l);

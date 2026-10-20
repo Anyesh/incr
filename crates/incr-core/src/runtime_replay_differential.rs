@@ -398,7 +398,7 @@ fn deps<C: Cells>(rt: &Runtime<C>) -> Vec<Vec<u32>> {
 
 /// A run's outcomes, every query's state and every node's dependencies,
 /// operation by operation, and whether a read returned a node's Dirty
-/// value that a later landing made Clean.
+/// value, or had a delivery, that a later landing made Clean.
 type Trace = Vec<(Out, Vec<NodeState>, Vec<Vec<u32>>, bool)>;
 
 fn run<C: Cells>(case: &Case, frames: Option<u32>, bytes: usize) -> Trace {
@@ -457,8 +457,8 @@ fn differential<C: Cells>(seed: u64) {
                     }
                 }
                 // So may a frame that read a node's Dirty value, or took its
-                // unwind, which a later landing made Clean: its next retry
-                // reads it with a Clean `get`.
+                // unwind or a delivery for its read, which a later landing
+                // made Clean: its next retry reads it with a Clean `get`.
                 if want.3 || got.3 {
                     agree = false;
                     continue;
@@ -577,6 +577,7 @@ fn replay_seeds() {
         0x8b41,
         0x9e14,
         0xa7c1,
+        0xbc86,
         0xc118,
         0x00e8_d4a5_2919,
         0x00e8_d4a5_2db3,

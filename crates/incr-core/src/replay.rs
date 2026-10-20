@@ -602,10 +602,12 @@ pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry) -> u64 {
     id
 }
 
-/// Removes context `id`, if it is still open.
-pub(crate) fn close(id: u64) {
+/// Removes context `id`, if it is still open, returning the deliveries
+/// it still holds.
+#[must_use]
+pub(crate) fn close(id: u64) -> Vec<Delivery> {
     let removed = with(|c| c.iter().position(|x| x.id == id).map(|at| c.remove(at)));
-    drop(removed);
+    removed.map(|x| x.pending).unwrap_or_default()
 }
 
 /// Removes every context of `rt` whose boundary is at or above `cidx`:
@@ -679,10 +681,11 @@ pub(crate) fn covering(c: &[Context], rt: RuntimeId, cidx: u32) -> Option<usize>
 
 /// A run at position `cidx` that is not a driver entry's, a member run,
 /// ended. The deliveries for the frames its run made are read again by its
-/// retry if a doom discarded it, and dropped otherwise, as the driver does
-/// for an entry's run.
-pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) {
-    let ended: Vec<Delivery> = with(|c| {
+/// retry if a doom discarded it, and returned to be dropped otherwise, as
+/// the driver does for an entry's run.
+#[must_use]
+pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery> {
+    with(|c| {
         let Some(at) = covering(c, rt, cidx) else {
             return Vec::new();
         };
@@ -695,8 +698,7 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) {
             return Vec::new();
         }
         x.pending.extract_if(.., |d| d.maker == level).collect()
-    });
-    drop(ended);
+    })
 }
 
 /// The innermost context of `rt`, as an index into the stack.

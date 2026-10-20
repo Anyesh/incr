@@ -1337,7 +1337,11 @@ impl<C: Cells> Runtime<C> {
                         let _speculating = entry.spec.then(replay::Speculating::enter);
                         self.member_run(entry.node, cidx, true)
                     };
-                    replay::run_ended(self.runtime_id, cidx, matches!(ran, Ok(None)));
+                    self.drop_deliveries(replay::run_ended(
+                        self.runtime_id,
+                        cidx,
+                        matches!(ran, Ok(None)),
+                    ));
                     if !matches!(ran, Ok(None)) {
                         self.end_deliveries(id, entry.node, entry.generation, cidx);
                     }
@@ -1443,7 +1447,7 @@ impl<C: Cells> Runtime<C> {
                         .map(|x| x.pending.extract_if(.., |d| d.maker == level).collect())
                         .unwrap_or_default()
                 });
-                drop(unread);
+                self.drop_deliveries(unread);
             }
             let computed = match ran {
                 Ok(computed) => computed,
@@ -1565,7 +1569,7 @@ impl<C: Cells> Runtime<C> {
                 let _speculating = v.spec.then(replay::Speculating::enter);
                 self.member_run(v.node, v.cidx, true)
             };
-            replay::run_ended(rt, v.cidx, matches!(ran, Ok(None)));
+            self.drop_deliveries(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
             match ran {
                 Ok(Some(l)) => {
                     self.end_deliveries(id, v.node, v.generation, v.cidx);
@@ -1875,7 +1879,7 @@ impl<C: Cells> Runtime<C> {
                 })
                 .unwrap_or_default()
         });
-        drop(ended);
+        self.drop_deliveries(ended);
     }
 
     /// Releases, with the discard landing, the claims virtual hits took
@@ -2046,6 +2050,21 @@ impl<C: Cells> Runtime<C> {
                 .boundary
         });
         self.close_context(id, boundary);
+    }
+
+    /// Drops the deliveries of a run that ended.
+    pub(super) fn drop_deliveries(&self, ended: Vec<Delivery>) {
+        // A retry reads a node that landed Clean with a Clean `get`, which
+        // no delivery can intercept, so the read's outcome may not be the
+        // unbounded run's.
+        #[cfg(test)]
+        for d in ended.iter().filter(|d| !d.taken) {
+            let slot = d.key.reading as u32;
+            if state::load::<C>(self.nodes.get(slot).state_cell()) == NodeState::Clean {
+                self.dirty_reads.lock().unwrap().push(slot);
+            }
+        }
+        drop(ended);
     }
 
     /// The unwind held for frame `f`'s read of `handle`, if this is the
@@ -2299,7 +2318,7 @@ impl<C: Cells> Runtime<C> {
         if value_code::thread_word() & value_code::MEMO_BIT != 0 {
             taint_memo::clear_from(boundary);
         }
-        replay::close(id);
+        self.drop_deliveries(replay::close(id));
     }
 
     /// [`Self::ensure_clean`] for a driver entry, whose walk skips nodes
