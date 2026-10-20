@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::replay_impl::DeliverySeen;
-use super::Runtime;
+use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, QueryOpts, Replay};
 use crate::cycle_state;
-use crate::handle::Incr;
+use crate::handle::{Incr, RuntimeId};
 use crate::runtime::ReadKind;
 use crate::state::NodeState;
 use crate::table::NodeTable;
@@ -59,6 +59,24 @@ type Later = Arc<OnceLock<Incr<u64>>>;
 
 fn later(l: &Later) -> Incr<u64> {
     *l.get().expect("created before the first read")
+}
+
+/// A runtime a park hook captures, which its `'static` bound otherwise
+/// keeps out of reach.
+struct RtRef<C: Cells>(*const Runtime<C>);
+
+// SAFETY: each test installs the hook on the runtime it points to, so the
+// runtime outlives every call, and a `Local` runtime only parks on the
+// test's thread.
+unsafe impl<C: Cells> Send for RtRef<C> {}
+// SAFETY: as above.
+unsafe impl<C: Cells> Sync for RtRef<C> {}
+
+impl<C: Cells> RtRef<C> {
+    fn rt(&self) -> &Runtime<C> {
+        // SAFETY: as above.
+        unsafe { &*self.0 }
+    }
 }
 
 fn message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -247,32 +265,66 @@ local_and_shared!(
 /// is false, so F's doomed run reads S after its placeholder read and S's
 /// entry is suspect. `nested` puts the panicking closure in S2, which S
 /// reads, so its entry is a non-suspect one a suspect entry's run pushed.
-/// With `real_reads` F's real run reads the panicking node too.
+/// With `real_reads` F's real run reads the panicking node too. With
+/// `back_edge`, S has a Fallback and S2 reads S before it panics.
 struct Speculative {
     out: Out,
     /// F, S and S2.
     states: Vec<NodeState>,
     panicking_runs: u32,
+    /// What S2's read of S returned, by the run that went on to panic.
+    back_read: Option<u64>,
+    /// The held map and S's state at the first entry the driver took
+    /// after the panicking run.
+    after_panic: Option<(Vec<(RuntimeId, u32)>, NodeState)>,
 }
 
-fn speculative<C: Cells>(frames: Option<u32>, nested: bool, real_reads: bool) -> Speculative {
+fn speculative<C: Cells>(
+    frames: Option<u32>,
+    nested: bool,
+    real_reads: bool,
+    back_edge: bool,
+) -> Speculative {
     let rt = runtime::<C>(frames);
     let a_in = rt.create_input(false);
     let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
     let runs = Arc::new(AtomicU32::new(0));
-    let r = runs.clone();
+    let back_read = Arc::new(Mutex::new(None));
+    let s_later = Later::default();
+    let (r, b, sl) = (runs.clone(), back_read.clone(), s_later.clone());
     let s2 = rt.create_query_with(
-        move |_| -> u64 {
+        move |rt| -> u64 {
+            if back_edge {
+                let v = rt.get(later(&sl));
+                *b.lock().unwrap() = Some(v);
+            }
             r.fetch_add(1, SeqCst);
             std::panic::panic_any(String::from("spec boom"))
         },
         replayable(),
     );
     let s = if nested {
-        rt.create_query_with(move |rt| rt.get(s2) + 1, replayable())
+        let opts = if back_edge {
+            fallback(50)
+        } else {
+            replayable()
+        };
+        rt.create_query_with(move |rt| rt.get(s2) + 1, opts)
     } else {
         s2
     };
+    s_later.set(s).unwrap();
+    let after_panic = Arc::new(Mutex::new(None));
+    let (seen, r, at) = (after_panic.clone(), runs.clone(), RtRef(&rt));
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        if matches!(p, ParkPoint::BeforeEntry(_)) && r.load(SeqCst) > 0 {
+            let mut seen = seen.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some((cycle_state::held_keys(), at.rt().state_of(s)));
+            }
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
     let r = rt.create_query_with(|_| 7_u64, replayable());
     let f = rt.create_query_with(
         move |rt| {
@@ -288,16 +340,20 @@ fn speculative<C: Cells>(frames: Option<u32>, nested: bool, real_reads: bool) ->
     );
     let out = get(&rt, f);
     rt.assert_invariant_i();
+    let back_read = *back_read.lock().unwrap();
+    let after_panic = after_panic.lock().unwrap().take();
     Speculative {
         out,
         states: [f, s, s2].iter().map(|&h| rt.state_of(h)).collect(),
         panicking_runs: runs.load(SeqCst),
+        back_read,
+        after_panic,
     }
 }
 
 fn panic_in_a_speculative_entry<C: Cells>() {
     for nested in [false, true] {
-        let quiet = speculative::<C>(Some(1), nested, false);
+        let quiet = speculative::<C>(Some(1), nested, false, false);
         assert_eq!(quiet.out, Out::Value(7), "nested: {nested}");
         assert_eq!(
             quiet.panicking_runs, 1,
@@ -310,14 +366,14 @@ fn panic_in_a_speculative_entry<C: Cells>() {
             );
         }
         assert_eq!(
-            speculative::<C>(None, nested, false).out,
+            speculative::<C>(None, nested, false, false).out,
             Out::Value(7),
             "nested: {nested}"
         );
 
-        let unbounded = speculative::<C>(None, nested, true);
+        let unbounded = speculative::<C>(None, nested, true, false);
         assert_eq!(unbounded.out, Out::Panic("spec boom".into()));
-        let bounded = speculative::<C>(Some(1), nested, true);
+        let bounded = speculative::<C>(Some(1), nested, true, false);
         assert_eq!(bounded.out, unbounded.out, "nested: {nested}");
         assert_eq!(bounded.states[0], unbounded.states[0], "nested: {nested}");
         assert_eq!(bounded.states[2], unbounded.states[2], "nested: {nested}");
@@ -327,6 +383,41 @@ local_and_shared!(
     panic_in_a_speculative_entry,
     local_panic_in_a_speculative_entry,
     shared_panic_in_a_speculative_entry
+);
+
+/// F5 (a): in the nested form S has a Fallback and S2, the non-suspect
+/// entry S's run pushes, reads S, a virtual hit that claims S and returns
+/// its seed, then panics. The swallow leaves the held map empty and S
+/// unclaimed for the driver's next entry, and F lands the unbounded value
+/// with nothing Failed.
+fn virtual_hit_then_panic_in_a_speculative_entry<C: Cells>() {
+    let unbounded = speculative::<C>(None, true, false, true);
+    assert_eq!(unbounded.out, Out::Value(7));
+    let bounded = speculative::<C>(Some(1), true, false, true);
+    assert_eq!(bounded.out, unbounded.out);
+    assert_eq!(bounded.panicking_runs, 1, "S2's run reached its panic");
+    assert_eq!(
+        bounded.back_read,
+        Some(50),
+        "S2's read of S was a seeded hit"
+    );
+    let (held, s_state) = bounded.after_panic.expect("an entry followed the panic");
+    assert!(held.is_empty(), "held after the swallow: {held:?}");
+    assert!(
+        matches!(s_state, NodeState::New | NodeState::Dirty),
+        "S is {s_state:?} after the swallow"
+    );
+    for state in &bounded.states[1..] {
+        assert!(
+            matches!(state, NodeState::New | NodeState::Dirty),
+            "a speculative node is {state:?}"
+        );
+    }
+}
+local_and_shared!(
+    virtual_hit_then_panic_in_a_speculative_entry,
+    local_virtual_hit_then_panic_in_a_speculative_entry,
+    shared_virtual_hit_then_panic_in_a_speculative_entry
 );
 
 /// How T reads F in the T/F/U shape.
