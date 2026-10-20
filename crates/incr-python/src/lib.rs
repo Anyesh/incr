@@ -34,8 +34,8 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use incr_compute::{
-    Incr, IncrCollection, NodeId, NodeKindInfo, PropagationTrace, Runtime, SortedCollection,
-    TraceAction,
+    Cycle, CycleStrategy, Fixpoint, Incr, IncrCollection, NodeId, NodeKindInfo, PropagationTrace,
+    QueryOpts, Replay, Runtime, SortedCollection, TraceAction,
 };
 
 pyo3::create_exception!(
@@ -149,11 +149,7 @@ fn pyerr_boundary<R>(f: impl FnOnce() -> R) -> PyResult<R> {
         });
     }
     if let Some(cycle) = cycle {
-        let ids: Vec<u32> = cycle.participants().iter().map(|p| p.slot()).collect();
-        return Err(CycleError::new_err((
-            format!("dependency cycle: {cycle}"),
-            ids,
-        )));
+        return Err(cycle_error(&cycle));
     }
     let msg = if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
@@ -163,6 +159,20 @@ fn pyerr_boundary<R>(f: impl FnOnce() -> R) -> PyResult<R> {
         std::panic::resume_unwind(payload);
     };
     Err(pyo3::exceptions::PyRuntimeError::new_err(msg))
+}
+
+fn cycle_ids(cycle: &Cycle) -> Vec<u32> {
+    cycle.participants().iter().map(|p| p.slot()).collect()
+}
+
+fn cycle_error(cycle: &Cycle) -> PyErr {
+    CycleError::new_err((format!("dependency cycle: {cycle}"), cycle_ids(cycle)))
+}
+
+/// A `try_get` result as Python sees it: the value, or `CycleError`
+/// raised as an ordinary exception, never an engine unwind.
+fn try_read(read: Result<PyValue, Cycle>) -> PyResult<Py<PyAny>> {
+    read.map(|v| v.0).map_err(|cycle| cycle_error(&cycle))
 }
 
 /// Runs a `#[pymethods]` engine call. A Local runtime is touched by one
@@ -235,6 +245,128 @@ impl Ord for PyValue {
     }
 }
 
+/// The closure the engine runs for a Python query: `py_func` called with
+/// a `RuntimeRef` that is invalidated when it returns.
+fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 'static {
+    move |rt: &Runtime| -> PyValue {
+        Python::attach(|py| {
+            let rt_ref = Py::new(
+                py,
+                PyRuntimeRef {
+                    ptr: rt as *const _,
+                },
+            )
+            .unwrap();
+            let result = call_stashing(py, &py_func, (rt_ref.clone_ref(py),));
+            // Invalidate the ref so it can't be used after callback returns.
+            rt_ref.bind(py).borrow_mut().ptr = std::ptr::null();
+            PyValue(result)
+        })
+    }
+}
+
+/// The options of a query created with `fallback`, `fixpoint` and
+/// `replay` keyword arguments.
+fn query_opts(
+    py: Python<'_>,
+    fallback: Option<Py<PyAny>>,
+    fixpoint: Option<PyRef<'_, PyFixpoint>>,
+    replay: bool,
+) -> PyResult<QueryOpts<PyValue>> {
+    let cycle = match (fallback, fixpoint) {
+        (Some(_), Some(_)) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "a query takes a fallback or a fixpoint, not both",
+            ))
+        }
+        (Some(g), None) => CycleStrategy::fallback(move |cycle: &Cycle| {
+            Python::attach(|py| PyValue(call_stashing(py, &g, (cycle_ids(cycle),))))
+        }),
+        (None, Some(fixpoint)) => CycleStrategy::Fixpoint(fixpoint.strategy(py)),
+        (None, None) => CycleStrategy::None,
+    };
+    let replay = if replay {
+        Replay::Allowed
+    } else {
+        Replay::Native
+    };
+    Ok(QueryOpts { cycle, replay })
+}
+
+/// A fixed-point cycle strategy: every member starts at `initial()`, and
+/// iteration `k` gives it `step(previous, output, k)` (the output by
+/// default) until every member has `converged(previous, current)` (equal
+/// by default), or after `max_iterations`, where each member that has
+/// not converged lands `on_limit(ids, current)` (the current value by
+/// default).
+#[pyclass(name = "Fixpoint", frozen)]
+struct PyFixpoint {
+    initial: Py<PyAny>,
+    converged: Option<Py<PyAny>>,
+    step: Option<Py<PyAny>>,
+    max_iterations: u32,
+    on_limit: Option<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyFixpoint {
+    #[new]
+    #[pyo3(signature = (initial, *, converged=None, step=None, max_iterations=100, on_limit=None))]
+    fn new(
+        initial: Py<PyAny>,
+        converged: Option<Py<PyAny>>,
+        step: Option<Py<PyAny>>,
+        max_iterations: u32,
+        on_limit: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        if max_iterations == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "a fixpoint needs at least one iteration",
+            ));
+        }
+        Ok(Self {
+            initial,
+            converged,
+            step,
+            max_iterations,
+            on_limit,
+        })
+    }
+}
+
+impl PyFixpoint {
+    fn strategy(&self, py: Python<'_>) -> Fixpoint<PyValue> {
+        let initial = self.initial.clone_ref(py);
+        let mut fixpoint =
+            Fixpoint::new(move || Python::attach(|py| PyValue(call_stashing(py, &initial, ()))))
+                .max_iterations(self.max_iterations);
+        if let Some(f) = &self.converged {
+            let f = f.clone_ref(py);
+            fixpoint = fixpoint.converged(move |prev: &PyValue, cur: &PyValue| {
+                Python::attach(|py| {
+                    let args = (prev.0.clone_ref(py), cur.0.clone_ref(py));
+                    or_stash(call_stashing(py, &f, args).is_truthy(py))
+                })
+            });
+        }
+        if let Some(f) = &self.step {
+            let f = f.clone_ref(py);
+            fixpoint = fixpoint.step(move |prev: &PyValue, out: PyValue, k: u32| {
+                Python::attach(|py| {
+                    PyValue(call_stashing(py, &f, (prev.0.clone_ref(py), out.0, k)))
+                })
+            });
+        }
+        if let Some(f) = &self.on_limit {
+            let f = f.clone_ref(py);
+            fixpoint = fixpoint.on_limit(move |cycle: &Cycle, cur: PyValue| {
+                Python::attach(|py| PyValue(call_stashing(py, &f, (cycle_ids(cycle), cur.0))))
+            });
+        }
+        fixpoint
+    }
+}
+
 /// Typed node handle exposed to Python. Wraps `Incr<PyValue>`.
 #[pyclass(name = "NodeId", unsendable)]
 #[derive(Clone)]
@@ -279,9 +411,8 @@ struct PyRuntimeRef {
     ptr: *const Runtime,
 }
 
-#[pymethods]
 impl PyRuntimeRef {
-    fn get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
+    fn rt(&self) -> PyResult<&Runtime> {
         if self.ptr.is_null() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "RuntimeRef is no longer valid (used outside query callback)",
@@ -290,11 +421,25 @@ impl PyRuntimeRef {
         // SAFETY: ptr is non-null only inside an active query callback;
         // the Runtime is borrowed by the runtime's own closure dispatch,
         // so the lifetime is guaranteed to outlive the callback.
-        let rt = unsafe { &*self.ptr };
-        // A boundary here too, so an engine unwind crosses the calling
-        // Python frames as an exception instead of a foreign panic.
+        Ok(unsafe { &*self.ptr })
+    }
+}
+
+// Each method is a boundary, so an engine unwind crosses the calling
+// Python frames as an exception instead of a foreign panic.
+#[pymethods]
+impl PyRuntimeRef {
+    fn get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        let rt = self.rt()?;
         let val: PyValue = engine_call(|| rt.get(node.inner))?;
         Ok(val.0)
+    }
+
+    /// Like `get`, but a cycle that leaves the node without a value
+    /// raises `CycleError` as an ordinary exception the query may catch.
+    fn try_get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        let rt = self.rt()?;
+        try_read(engine_call(|| rt.try_get(node.inner))?)
     }
 }
 
@@ -658,6 +803,12 @@ impl PyRuntime {
         Ok(val.0)
     }
 
+    /// Like `get`, but a cycle that leaves the node without a value raises
+    /// `CycleError` as an ordinary exception.
+    fn try_get(&self, node: PyNodeId) -> PyResult<Py<PyAny>> {
+        try_read(engine_call(|| self.inner.try_get(node.inner))?)
+    }
+
     fn set(&self, node: PyNodeId, value: Py<PyAny>) -> PyResult<()> {
         engine_call(|| self.inner.set(node.inner, PyValue(value)))
     }
@@ -705,25 +856,38 @@ impl PyRuntime {
         engine_call(|| self.inner.stabilize())
     }
 
-    fn create_query(&self, py_func: Py<PyAny>) -> PyResult<PyNodeId> {
-        let node = engine_call(|| {
-            self.inner.create_query(move |rt: &Runtime| -> PyValue {
-                Python::attach(|py| {
-                    let rt_ref = Py::new(
-                        py,
-                        PyRuntimeRef {
-                            ptr: rt as *const _,
-                        },
-                    )
-                    .unwrap();
-                    let result = call_stashing(py, &py_func, (rt_ref.clone_ref(py),));
-                    // Invalidate the ref so it can't be used after callback returns.
-                    rt_ref.bind(py).borrow_mut().ptr = std::ptr::null();
-                    PyValue(result)
-                })
-            })
-        })?;
+    /// A query computing `py_func(runtime_ref)`. `fallback(ids)` or a
+    /// `Fixpoint` resolves a cycle through it; `replay=True` lets a read
+    /// past the frame budget replay instead of nesting.
+    #[pyo3(signature = (py_func, *, fallback=None, fixpoint=None, replay=false))]
+    fn create_query(
+        &self,
+        py: Python<'_>,
+        py_func: Py<PyAny>,
+        fallback: Option<Py<PyAny>>,
+        fixpoint: Option<PyRef<'_, PyFixpoint>>,
+        replay: bool,
+    ) -> PyResult<PyNodeId> {
+        let opts = query_opts(py, fallback, fixpoint, replay)?;
+        let f = query_fn(py_func);
+        let node = engine_call(|| self.inner.create_query_with(f, opts))?;
         Ok(PyNodeId { inner: node })
+    }
+
+    /// The value a replayed read returns in place of the node it wanted.
+    /// Set once per runtime.
+    fn set_placeholder(&self, value: Py<PyAny>) -> PyResult<()> {
+        engine_call(|| self.inner.set_placeholder(PyValue(value)))
+    }
+
+    /// The frame budget past which a replayable query's read replays.
+    fn set_max_frames(&self, n: u32) -> PyResult<()> {
+        engine_call(|| self.inner.set_max_frames(n))
+    }
+
+    /// A stack budget in bytes beside the frame budget; 0 turns it off.
+    fn set_max_stack_bytes(&self, n: usize) -> PyResult<()> {
+        engine_call(|| self.inner.set_max_stack_bytes(n))
     }
 
     fn create_collection(slf: PyRef<'_, Self>) -> PyResult<PyCollection> {
@@ -812,6 +976,7 @@ fn incr(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNodeId>()?;
     m.add_class::<PyObserverId>()?;
     m.add_class::<PyRuntimeRef>()?;
+    m.add_class::<PyFixpoint>()?;
     m.add_class::<PyCollection>()?;
     m.add_class::<PySortedCollection>()?;
     m.add_class::<PyGroupedCollection>()?;
