@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts};
+use crate::cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
 use crate::state::NodeState;
 
@@ -980,20 +980,75 @@ fn shared_ring_recovery_pops() {
     on_deep_stack(ring_recovery_pops::<Shared>);
 }
 
+macro_rules! pairs {
+    ($($name:ident),* $(,)?) => {
+        $(
+            mod $name {
+                use super::{Local, Shared};
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn local_local() {
+                    super::$name::<Local, Local>();
+                }
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn local_shared() {
+                    super::$name::<Local, Shared>();
+                }
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn shared_local() {
+                    super::$name::<Shared, Local>();
+                }
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn shared_shared() {
+                    super::$name::<Shared, Shared>();
+                }
+            }
+        )*
+    };
+}
+
+pairs!(
+    cross_runtime_reentry,
+    cross_runtime_read_records_nothing,
+    foreign_reader_is_never_doomed,
+    foreign_ring_read_is_not_rerun,
+);
+
+/// A runtime that another runtime's closures read. Test-only: it outlives
+/// every call into those closures, and a Local one never leaves its thread.
+struct OtherRt<C: Cells>(*const Runtime<C>);
+
+// SAFETY: see `OtherRt`.
+unsafe impl<C: Cells> Send for OtherRt<C> {}
+unsafe impl<C: Cells> Sync for OtherRt<C> {}
+
+impl<C: Cells> std::ops::Deref for OtherRt<C> {
+    type Target = Runtime<C>;
+
+    fn deref(&self) -> &Runtime<C> {
+        // SAFETY: see `OtherRt`.
+        unsafe { &*self.0 }
+    }
+}
+
 /// A read of a node of runtime R from another runtime's closure, while
-/// that node is on this thread's R stack, is a cycle no group resolves:
+/// that node is on this thread's stack, is a cycle no group resolves:
 /// `try_get` returns `Err` and `get` panics.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn shared_cross_runtime_reentry() {
+fn cross_runtime_reentry<A: Cells, B: Cells>() {
     for use_get in [false, true] {
-        let r1 = Arc::new(Runtime::<Shared>::new());
-        let r2 = Arc::new(Runtime::<Shared>::new());
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
         let ac = cell::<i64>();
         let b = {
-            let (r1, ac) = (Arc::downgrade(&r1), ac.clone());
+            let (r1, ac) = (OtherRt(&*r1), ac.clone());
             r2.create_query(move |_| {
-                let r1 = r1.upgrade().unwrap();
                 let a = *ac.get().unwrap();
                 if use_get {
                     r1.get(a)
@@ -1004,11 +1059,8 @@ fn shared_cross_runtime_reentry() {
         };
         let i = r1.create_input(10_i64);
         let a = {
-            let r2 = Arc::downgrade(&r2);
-            r1.create_query_with_fallback(
-                move |rt| rt.get(i) + r2.upgrade().unwrap().get(b),
-                |_c: &Cycle| 77,
-            )
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with_fallback(move |rt| rt.get(i) + r2.get(b), |_c: &Cycle| 77)
         };
         ac.set(a).unwrap();
         if use_get {
@@ -1022,6 +1074,35 @@ fn shared_cross_runtime_reentry() {
             assert_eq!(r1.cycle_of(a), None);
         }
     }
+}
+
+/// A read of R's node from another runtime's closure nested in R's compute
+/// records no edge for R's computing node, and R's own reads after that
+/// closure returns still record.
+fn cross_runtime_read_records_nothing<A: Cells, B: Cells>() {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    let x = r1.create_input(1_i64);
+    let y = r1.create_input(100_i64);
+    let b = {
+        let r1 = OtherRt(&*r1);
+        r2.create_query(move |_| r1.get(x))
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let a = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query(move |rt| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            r2.get(b) + rt.get(y)
+        })
+    };
+    assert_eq!(r1.get(a), 101);
+    r1.set(x, 2);
+    assert_eq!(r1.get(a), 101);
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    r1.set(y, 200);
+    assert_eq!(r1.get(a), 201);
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
 }
 
 /// Group verify decides on `IN_GROUP` through a load after its claim:
@@ -1156,5 +1237,81 @@ mod flags_reload {
         assert!(rt.group_verifies.lock().unwrap().is_empty());
         assert_eq!(rt.get(m), 8);
         rt.assert_invariant_i();
+    }
+}
+
+/// A replayable frame at budget 1 that reads 64 leaves runs twice, once
+/// doomed; after a read of another runtime's node it is never doomed, so
+/// its leaves nest natively and it runs once.
+fn foreign_reader_is_never_doomed<A: Cells, B: Cells>() {
+    for foreign in [false, true] {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_u64);
+        r1.set_max_frames(1);
+        let x = r2.create_input(1000_u64);
+        let leaves: Vec<Incr<u64>> = (0..64_u64).map(|i| r1.create_query(move |_| i)).collect();
+        let runs = Arc::new(AtomicU32::new(0));
+        let wide = {
+            let (r2, runs) = (OtherRt(&*r2), runs.clone());
+            r1.create_query_with(
+                move |rt| {
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    let base = if foreign { r2.get(x) } else { 1000 };
+                    base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(r1.get(wide), 1000 + (0..64).sum::<u64>());
+        assert_eq!(runs.load(Ordering::Relaxed), if foreign { 1 } else { 2 });
+        assert_eq!(r1.dooms.lock().unwrap().is_empty(), foreign);
+    }
+}
+
+/// Seed 0x3f39 shrunk: rt1's ring 7 -> 8 -> 9 -> 11 -> 7 of replayable
+/// queries with no strategy, 11 reading 7 by `try_get`, and rt2's X =
+/// rt1 8 + Y. Read once, rt1 8 is 7777, but read again after the first
+/// read left the ring Dirty, the walk enters at 7 and closes a cycle. X,
+/// doomed by its read of Y past the budget, would read 8 again on its
+/// retry; having read rt1 it is never doomed, so every budget agrees
+/// with the unbounded run.
+fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
+    let run = |frames: u32| {
+        let rt1 = Box::new(Runtime::<A>::new());
+        let rt2 = Box::new(Runtime::<B>::new());
+        rt1.set_max_frames(frames);
+        rt1.set_placeholder(0_u64);
+        rt2.set_max_frames(frames);
+        rt2.set_placeholder(0_u64);
+        let c7 = cell::<u64>();
+        let replayable = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let n11 = {
+            let c7 = c7.clone();
+            rt1.create_query_with(
+                move |rt| rt.try_get(*c7.get().unwrap()).unwrap_or(7777),
+                replayable(),
+            )
+        };
+        let n9 = rt1.create_query_with(move |rt| rt.get(n11), replayable());
+        let n8 = rt1.create_query_with(move |rt| rt.get(n9), replayable());
+        let n7 = rt1.create_query_with(move |rt| rt.get(n8), replayable());
+        c7.set(n7).unwrap();
+        let y = rt2.create_query_with(|_| 0_u64, replayable());
+        let x = {
+            let r1 = OtherRt(&*rt1);
+            rt2.create_query_with(move |rt| r1.get(n8) + rt.get(y), replayable())
+        };
+        rt2.try_get(x).map_err(|c| c.participants().len())
+    };
+    assert_eq!(run(u32::MAX), Ok(7777));
+    for frames in [1, 2] {
+        assert_eq!(run(frames), Ok(7777), "budget {frames}");
     }
 }

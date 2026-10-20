@@ -239,6 +239,11 @@ impl<T> Default for QueryOpts<T> {
 /// again. The results are those of the unbounded run. A query's closure
 /// may therefore run more than once for one read, under the contract in
 /// [`Runtime`](crate::Runtime)'s docs.
+///
+/// A run that has read another runtime's node is not cut short after
+/// that read, since its rerun would read the other runtime again; its
+/// reads nest natively instead. A deep chain that alternates between two
+/// runtimes therefore recurses past the budget.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Replay {
     /// Reads nest natively at any depth.
@@ -379,8 +384,9 @@ pub(crate) const PH_SEEN: u8 = 32;
 /// had left Dirty, or took an unwind, which `replay::keep_read` keeps for
 /// a retry.
 pub(crate) const KEPT_READ: u8 = 64;
-/// A member run at its anchor, below the frames that read it: it is never
-/// doomed, and marking stops at it.
+/// A member run at its anchor, below the frames that read it, or a frame
+/// that has read another runtime's node in this run: it is never doomed,
+/// and marking stops at it.
 pub(crate) const NO_DOOM: u8 = 128;
 
 /// What one compute frame tells its wrapper and its landing. It lives on

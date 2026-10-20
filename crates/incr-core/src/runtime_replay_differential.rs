@@ -280,6 +280,21 @@ fn shift(e: Expr, by: usize) -> Expr {
     }
 }
 
+/// `e` with its reads of the first `skip` of `nodes` nodes moved to the
+/// nodes after them.
+fn past_template(e: Expr, skip: usize, nodes: usize) -> Expr {
+    let p = |e: Box<Expr>| Box::new(past_template(*e, skip, nodes));
+    match e {
+        Expr::Read(t, try_) if t < skip => Expr::Read(skip + t % (nodes - skip), try_),
+        Expr::Add(a, b) => Expr::Add(p(a), p(b)),
+        Expr::If(c, a, b) => Expr::If(p(c), p(a), p(b)),
+        Expr::PanicIf(a, when) => Expr::PanicIf(p(a), when),
+        Expr::Catch(a) => Expr::Catch(p(a)),
+        Expr::FirstRun(a, b) => Expr::FirstRun(p(a), p(b)),
+        leaf => leaf,
+    }
+}
+
 fn replayable(expr: Expr, strategy: Strat) -> Spec {
     Spec::Query {
         expr,
@@ -352,7 +367,14 @@ fn add_second_runtime(case: &mut Case, rng: &mut Rng, skip: usize) {
         let read = move |rng: &mut Rng| {
             let try_ = rng.chance(25);
             if at >= lower && rng.chance(50) {
-                Expr::ReadOther(rng.below(nodes1 as u64) as usize, try_)
+                // The template is entered at R or C only: A's first run,
+                // a doomed one included, reads C, so a read of A's own
+                // differs by budget.
+                let target = match rng.below(nodes1 as u64) as usize {
+                    2 if skip > 0 => 1,
+                    target => target,
+                };
+                Expr::ReadOther(target, try_)
             } else if at + 1 < lower && rng.chance(50) {
                 Expr::Read(at + 1 + rng.below((lower - at - 1) as u64) as usize, try_)
             } else if at >= lower && rng.chance(50) {
@@ -403,9 +425,11 @@ fn add_second_runtime(case: &mut Case, rng: &mut Rng, skip: usize) {
 
 /// Deletes of the first runtime's nodes, most followed by a recreate into
 /// the freed slot, reads of the deleted nodes, and reads of replaced
-/// handles. The first `skip` nodes are a template and are never deleted:
-/// its first-run counter counts doomed runs, so a recreated member would
-/// first run the template's cycle at a point that differs by budget.
+/// handles. The first `skip` nodes are a template, never deleted and never
+/// read by a recreated node: its first-run counter counts doomed runs, so
+/// a recreated member, or a recreated reader of a member that has not run
+/// yet, would first run the template's cycle at a point that differs by
+/// budget.
 fn add_deletes(case: &mut Case, rng: &mut Rng, skip: usize, paired: bool) {
     let nodes = case.specs.len();
     for _ in 0..1 + rng.below(3) {
@@ -428,7 +452,8 @@ fn add_deletes(case: &mut Case, rng: &mut Rng, skip: usize, paired: bool) {
         }
         if paired || rng.chance(70) {
             let spec = if q < case.queries {
-                let mut expr = gen_expr(rng, 3, &reads(q, case.queries, nodes, case.cycles));
+                let expr = gen_expr(rng, 3, &reads(q, case.queries, nodes, case.cycles));
+                let mut expr = past_template(expr, skip, nodes);
                 if !case.panics {
                     expr = without_panics(expr);
                 }
@@ -973,6 +998,13 @@ fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, lab
         if !agree && (panics || case.cycles) {
             break;
         }
+        // A read of the other runtime records no edge (T5 Scoping), so a
+        // set of the second runtime leaves the first's readers of it on
+        // what they read when they last ran. Once the states differ, the
+        // runs ran those readers at different times.
+        if !agree && matches!(case.ops[i], Op::Set2(..)) {
+            break;
+        }
         // A read that lands its target Dirty returns a value computed
         // against a read that a later landing in the same revision
         // changed. A replayed frame reads after that landing when the read
@@ -1023,12 +1055,26 @@ fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, lab
     }
 }
 
+/// Runs `f`, prefixing the message of any panic out of it with `label`.
+fn labelled<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let message = p
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| p.downcast_ref::<&str>().copied())
+            .unwrap_or("a non-string panic");
+        panic!("{label}: {message}")
+    })
+}
+
 fn differential<C: Cells>(case: &Case, seed: u64) {
-    let unbounded = run::<C>(case, None, 0);
+    let unbounded = labelled(&format!("seed {seed:#x}, unbounded"), || {
+        run::<C>(case, None, 0)
+    });
     for frames in [1, 2, 3] {
         for bytes in [0, 16 * 1024] {
-            let bounded = run::<C>(case, Some(frames), bytes);
             let label = format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes");
+            let bounded = labelled(&label, || run::<C>(case, Some(frames), bytes));
             compare(case, &unbounded, &bounded, None, &label);
         }
     }
@@ -1041,10 +1087,10 @@ fn differential_two(case: &Case, seed: u64) {
     let unbounded = run::<Shared>(case, None, 0);
     for frames in [None, Some(1), Some(2), Some(3)] {
         for bytes in [0, 16 * 1024] {
-            let (got, settles) = run_two(case, &phases, frames, bytes);
             let label = format!(
                 "seed {seed:#x}, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
             );
+            let (got, settles) = labelled(&label, || run_two(case, &phases, frames, bytes));
             compare(case, &unbounded, &got, Some(&settles), &label);
         }
     }
@@ -1095,6 +1141,148 @@ fn delete_seeds() {
 fn two_threads_hang() {
     let case = gen_case(0x159, false, false);
     quiet(|| differential_two(&case, 0x159));
+}
+
+/// Cases with a second runtime that once failed: 0x135's second runtime
+/// read the template's A directly, whose first run is a doomed one at
+/// budget 1; in 0xfe, 0x308, 0x38b and 0x3d0 a doomed frame's read of
+/// the other runtime computed a node that panics and landed it Failed, so
+/// the real read panicked "last compute panicked"; in 0xa02 a speculative
+/// landing read the second runtime's input before a set of it, and a
+/// later walk verified that reader Clean on the old value. The rest failed
+/// under Local only, while each Local runtime had its own frame stack: a
+/// read from another runtime's closure nested in R's compute recorded into
+/// R's frame and missed its doom, so in 0xb (rt2 5 -> rt1 4 -> rt2 2 at
+/// budget 1) rt1 4 landed Clean with the placeholder. 0x2, 0x27c, 0x35c,
+/// 0x1b5, 0x1e4 and 0x2e1 failed under a per-thread marker of the
+/// innermost Local frame, which kept the stacks apart. In 0x432a a
+/// frame's read of the other runtime returned a value its landing left
+/// Dirty, and the frame's retry read that node again and walked into a
+/// Failed dep; in 0x3f39 the retry's second read of a strategy-less ring
+/// entered it elsewhere and closed a cycle the first read had not.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_seeds() {
+    for seed in [
+        0x2, 0xb, 0xfa, 0xfb, 0xfe, 0x109, 0x135, 0x14a, 0x14d, 0x19a, 0x19e, 0x1b5, 0x1b6, 0x1e4,
+        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x401, 0x441, 0x4f9,
+        0x50d, 0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0xa02,
+        0x3f39, 0x432a,
+    ] {
+        let case = gen_case(seed, true, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
+/// Two-thread seeds, with a second runtime when `.1`, whose reads pushed a
+/// virtual frame onto a node that already had one, a group verify having
+/// claimed a member with a virtual frame on its thread. The threads'
+/// overlapping reads enter shared cycles, so only each run's own checks
+/// apply, over several schedules.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_repush_seeds() {
+    let cross = gen_case(0xe43, true, false);
+    quiet(|| {
+        differential::<Local>(&cross, 0xe43);
+        differential::<Shared>(&cross, 0xe43);
+    });
+    for (seed, cross) in [
+        (0x527, false),
+        (0x107d, false),
+        (0x3f88, false),
+        (0x4371, false),
+        (0x59d, true),
+        (0xe43, true),
+    ] {
+        run_two_repeatedly(seed, cross, &[Some(1), Some(2), Some(3)]);
+    }
+}
+
+/// Two-thread cases with panics and cycles in which a read's walk landed
+/// its node New as a cycle member and the other thread claimed the node
+/// before the read loaded its state. Which thread computes a node first
+/// decides these cases' results, so the runs check only that no engine
+/// panic escapes and the invariants hold after each phase, a few times
+/// over because the race is schedule-dependent.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn arena_missing_two_thread_seeds() {
+    for (seed, cross) in [(0x33e9, false), (0xa55, false), (0x19f0, true)] {
+        run_two_repeatedly(seed, cross, &[None, Some(1), Some(2), Some(3)]);
+    }
+}
+
+/// The two-thread case of `seed`, with a second runtime if `cross`, run
+/// four times at each of `budgets` with and without a byte budget, each
+/// run held only to its own checks.
+fn run_two_repeatedly(seed: u64, cross: bool, budgets: &[Option<u32>]) {
+    let case = gen_case(seed, cross, true);
+    let phases = phases(&case, seed);
+    quiet(|| {
+        for _ in 0..4 {
+            for &frames in budgets {
+                for bytes in [0, 16 * 1024] {
+                    run_two(&case, &phases, frames, bytes);
+                }
+            }
+        }
+    });
+}
+
+/// Two-thread seeds whose fault needs a particular schedule, each run many
+/// times at the budget it failed at. A case with panics or cycles may end
+/// otherwise than the single-thread run under any schedule, so these
+/// assert only what `run_two` checks: no engine panic, no virtual frame
+/// left indexed after an operation, and the invariants after each phase.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_schedule_seeds() {
+    // 0x1e89: a wound in a doomed episode member run that a virtual
+    // frame's pop ran was delivered to the frame below, which left the
+    // doom's virtual frame naming the aborted episode.
+    for (seed, frames, bytes) in [(0x1e89, 1, 16 * 1024)] {
+        let case = gen_case(seed, false, true);
+        let phases = phases(&case, seed);
+        for _ in 0..300 {
+            quiet(|| {
+                run_two(&case, &phases, Some(frames), bytes);
+            });
+        }
+    }
+}
+
+/// Two-thread seeds with a second runtime, each over several schedules.
+/// 0x43c2 and 0x4c08, with no cycles, compare with the unbounded run: a
+/// concurrent `Get2` panicked "dependency cycle" before a doomed frame's
+/// read of the other runtime became speculative (ee874c3). In 0x4b15, at
+/// budget 2, a read made a virtual hit while a context whose loop had not
+/// started kept a virtual frame at the read's position, whose node the
+/// other thread had landed, so the hit's claim of it failed on every
+/// retry and the read spun.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_two_thread_seeds() {
+    for seed in [0x43c2, 0x4c08] {
+        let case = gen_case(seed, true, true);
+        quiet(|| {
+            for _ in 0..4 {
+                differential_two(&case, seed);
+            }
+        });
+    }
+    let case = gen_case(0x4b15, true, true);
+    let phases = phases(&case, 0x4b15);
+    quiet(|| {
+        for _ in 0..16 {
+            for bytes in [0, 16 * 1024] {
+                run_two(&case, &phases, Some(2), bytes);
+            }
+        }
+    });
 }
 
 /// Seeds the scans found failing at a frame budget, each a replay fault
@@ -1399,19 +1587,25 @@ fn size(e: &Expr) -> usize {
 #[ignore = "a diagnostic that scans seeds"]
 fn replay_scan() {
     let n: u64 = std::env::var("REPLAY_SCAN").map_or(2000, |v| v.parse().expect("a count"));
-    let mut best: Option<(usize, u64)> = None;
-    let mut failing: Vec<u64> = Vec::new();
     if let Ok(seed) = std::env::var("REPLAY_CHECK") {
         let seed = u64::from_str_radix(&seed, 16).expect("a hex seed");
         check(seed);
         return;
     }
+    let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
+    let seeds = (from..n).filter(|seed| !two_threads() || seed.is_multiple_of(6) || all_seeds());
+    scan(seeds, std::env::var_os("REPLAY_ALL").is_some(), check);
+}
+
+/// Runs `check` on each seed and panics at the end if any failed, naming
+/// the smallest failing case. With `all` every seed runs and each failure
+/// is printed; without it, a seed no smaller than the smallest failure so
+/// far is skipped.
+fn scan(seeds: impl Iterator<Item = u64>, all: bool, check: impl Fn(u64)) {
+    let mut best: Option<(usize, u64)> = None;
+    let mut failing: Vec<u64> = Vec::new();
     quiet(|| {
-        let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
-        for seed in from..n {
-            if two_threads() && !seed.is_multiple_of(6) && !all_seeds() {
-                continue;
-            }
+        for seed in seeds {
             let case = case_of(seed);
             let weight: usize = case
                 .specs
@@ -1423,7 +1617,6 @@ fn replay_scan() {
                 })
                 .sum::<usize>()
                 + case.ops.len();
-            let all = std::env::var_os("REPLAY_ALL").is_some();
             if !all && best.is_some_and(|(w, _)| w <= weight) {
                 continue;
             }
@@ -1436,8 +1629,8 @@ fn replay_scan() {
                     let message = class(payload);
                     let first = message.lines().next().unwrap_or_default();
                     eprintln!("FAIL {seed:x}: {first}");
-                    failing.push(seed);
                 }
+                failing.push(seed);
                 if best.is_none_or(|(w, _)| weight < w) {
                     best = Some((weight, seed));
                 }
@@ -1445,7 +1638,72 @@ fn replay_scan() {
         }
     });
     eprintln!("smallest failing: {best:?}");
-    if !failing.is_empty() {
-        eprintln!("failing: {} {failing:x?}", failing.len());
+    if let Some((_, smallest)) = best {
+        let skipped = if all {
+            ""
+        } else {
+            " (heavier seeds were skipped; set REPLAY_ALL to run them)"
+        };
+        panic!(
+            "{} seeds failed{skipped}, the first {:x?}; smallest failing: {smallest:#x}",
+            failing.len(),
+            &failing[..failing.len().min(8)],
+        );
+    }
+}
+
+#[test]
+fn scan_passes_when_every_seed_passes() {
+    scan(0..4, true, |_| {});
+    scan(0..4, false, |_| {});
+}
+
+#[test]
+#[should_panic(expected = "2 seeds failed, the first [1, 3]")]
+fn scan_panics_when_a_seed_fails() {
+    scan(0..5, true, |seed| assert!(seed % 2 == 0, "seed {seed}"));
+}
+
+#[test]
+#[should_panic(expected = "seeds failed (heavier seeds were skipped")]
+fn scan_without_all_panics_when_a_seed_fails() {
+    scan(0..5, false, |seed| assert!(seed % 2 == 0, "seed {seed}"));
+}
+
+fn reads_any(e: &Expr, hit: &impl Fn(usize) -> bool) -> bool {
+    match e {
+        Expr::Const(_) | Expr::ReadOther(..) => false,
+        Expr::Read(target, _) => hit(*target),
+        Expr::Add(a, b) | Expr::FirstRun(a, b) => reads_any(a, hit) || reads_any(b, hit),
+        Expr::If(c, a, b) => reads_any(c, hit) || reads_any(a, hit) || reads_any(b, hit),
+        Expr::PanicIf(inner, _) | Expr::Catch(inner) => reads_any(inner, hit),
+    }
+}
+
+/// A recreated node that read the dissolving root's template could run the
+/// template's first-run-only read for the first time, at a point that
+/// differs by budget (seed 0x16eb).
+#[test]
+fn no_recreated_node_reads_the_template() {
+    for seed in (0..4000).chain([0x16eb]) {
+        let case = case_of(seed);
+        let template = matches!(
+            case.specs.get(2),
+            Some(Spec::Query {
+                expr: Expr::FirstRun(..),
+                ..
+            })
+        );
+        if !template {
+            continue;
+        }
+        for op in &case.ops {
+            if let Op::Recreate(_, Spec::Query { expr, .. }) = op {
+                assert!(
+                    !reads_any(expr, &|target| target < 4),
+                    "seed {seed:#x}: {expr:?}"
+                );
+            }
+        }
     }
 }

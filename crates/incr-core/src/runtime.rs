@@ -1338,6 +1338,30 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
+    /// A read that loaded the node Clean found its slot empty: under
+    /// `Shared` another thread's set and episode can land it as a cycle
+    /// member, which clears the slot, between the load and the read. A
+    /// Clean reload is read again, so only a Clean node with an empty slot
+    /// is the invariant panic; `Err` hands back any other state, which the
+    /// read goes on from as if it had loaded it first.
+    #[cold]
+    #[inline(never)]
+    fn reload_after_empty_slot<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+    ) -> Result<T, NodeState> {
+        if C::SINGLE_THREADED {
+            self.read_failed(handle);
+        }
+        match state::load::<C>(node.state_cell()) {
+            NodeState::Clean => Ok(self.read_slot(handle, node, type_tag, arena_slot)),
+            now => Err(now),
+        }
+    }
+
     /// The read of a Clean node found no value behind its tag and arena
     /// slot, or found one under a moved generation. A moved generation
     /// is a stale handle; an unmoved one means the fields and the arena
@@ -1812,7 +1836,13 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
-            return self.read_slot(handle, node, type_tag, arena_slot);
+            return match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => value,
+                None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                    Ok(value) => value,
+                    Err(now) => self.get_slow(handle, now),
+                },
+            };
         }
         self.get_slow(handle, observed)
     }
@@ -1843,7 +1873,13 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
-            return Ok(self.read_slot(handle, node, type_tag, arena_slot));
+            return match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => Ok(value),
+                None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                    Ok(value) => Ok(value),
+                    Err(now) => self.try_get_slow(handle, now),
+                },
+            };
         }
         self.try_get_slow(handle, observed)
     }
@@ -1921,66 +1957,86 @@ impl<C: Cells> Runtime<C> {
     fn read_walk<T: Value, const MODE: u8>(
         &self,
         handle: Incr<T>,
-        observed: NodeState,
+        mut observed: NodeState,
         kind: ReadKind,
         word: u64,
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
-        if observed == NodeState::Cyclic || is_computing(observed) {
-            let armed = frame.filter(|_| MODE & ARMED != 0);
-            if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
-                return read;
-            }
-        }
-        // `get` found the node not Clean, so the walk starts at once.
-        let walk = || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
-        match self.entered(kind, walk)? {
-            Computed::Done | Computed::Unsettled => {}
-            Computed::Gone => self.stale_handle(handle),
-            Computed::Deferred => {
-                return self
-                    .cycle_read(
-                        handle,
-                        NodeState::Computing,
-                        kind,
-                        frame.filter(|_| MODE & ARMED != 0),
-                    )
-                    .expect("incr-core: a deferred root is held");
-            }
-            Computed::Doomed | Computed::Discarded => {
-                return Ok(self.placeholder_read::<T>(frame));
-            }
-            Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
-        }
-        let (type_tag, arena_slot) = self.fields_under(handle, node);
-        match self.try_read_slot(handle, node, type_tag, arena_slot) {
-            Some(value) => {
-                if let Some(f) = frame {
-                    if state::load::<C>(node.state_cell()) == NodeState::Dirty {
-                        #[cfg(test)]
-                        self.dirty_reads.lock().unwrap().push(handle.slot());
-                        self.note_dirty_read(f, handle, &value);
-                    }
+        loop {
+            if observed == NodeState::Cyclic || is_computing(observed) {
+                let armed = frame.filter(|_| MODE & ARMED != 0);
+                if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
+                    return read;
                 }
-                Ok(value)
             }
-            None => Err(self.read_missing(handle, node)),
+            // `get` found the node not Clean, so the walk starts at once.
+            let walk =
+                || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
+            match self.entered(kind, walk)? {
+                Computed::Done | Computed::Unsettled => {}
+                Computed::Gone => self.stale_handle(handle),
+                Computed::Deferred => {
+                    return self
+                        .cycle_read(
+                            handle,
+                            NodeState::Computing,
+                            kind,
+                            frame.filter(|_| MODE & ARMED != 0),
+                        )
+                        .expect("incr-core: a deferred root is held");
+                }
+                Computed::Doomed | Computed::Discarded => {
+                    return Ok(self.placeholder_read::<T>(frame));
+                }
+                Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
+            }
+            let (type_tag, arena_slot) = self.fields_under(handle, node);
+            match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => {
+                    if let Some(f) = frame {
+                        if state::load::<C>(node.state_cell()) == NodeState::Dirty {
+                            #[cfg(test)]
+                            self.dirty_reads.lock().unwrap().push(handle.slot());
+                            self.note_dirty_read(f, handle, &value);
+                        }
+                    }
+                    return Ok(value);
+                }
+                None => match self.read_missing(handle, node) {
+                    Ok(cycle) => return Err(cycle),
+                    Err(NodeState::Clean) => {
+                        return Ok(self.read_slot(handle, node, type_tag, arena_slot));
+                    }
+                    Err(now) => observed = now,
+                },
+            }
         }
     }
 
     /// A read after a walk found no value: the node landed `Cyclic`, or
     /// New as a member without a value of an episode that landed Dirty.
+    /// Under `Shared` another thread can claim or land the node between
+    /// the walk and these loads, so `Err` hands back the state the read
+    /// goes on from: a Clean one is read, any other walked again.
     #[cold]
     #[inline(never)]
-    fn read_missing<T: Value>(&self, handle: Incr<T>, node: &NodeData<C>) -> Cycle {
-        if matches!(node.state(), NodeState::Cyclic | NodeState::New) {
+    fn read_missing<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+    ) -> Result<Cycle, NodeState> {
+        let state = state::load::<C>(node.state_cell());
+        if matches!(state, NodeState::Cyclic | NodeState::New) {
             if let Some(cycle) = self.cycle_of(handle) {
-                return cycle;
+                return Ok(cycle);
             }
         }
-        self.read_failed(handle)
+        if C::SINGLE_THREADED {
+            self.read_failed(handle);
+        }
+        Err(state)
     }
 
     /// [`Self::get_slow`] reached from value code, a trait method of a
@@ -1994,18 +2050,27 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::ValueCodeBeforeReload(id));
         let mut spins = 0;
         let mut state = state::load::<C>(node.state_cell());
-        // A `claim_set` that rolls back leaves the node as it found it,
-        // so the read waits for the outcome instead of failing on it.
-        while state == NodeState::Deleting {
-            spins += 1;
-            self.wait_out_deleting(id, spins);
-            state = state::load::<C>(node.state_cell());
+        loop {
+            // A `claim_set` that rolls back leaves the node as it found it,
+            // so the read waits for the outcome instead of failing on it.
+            while state == NodeState::Deleting {
+                spins += 1;
+                self.wait_out_deleting(id, spins);
+                state = state::load::<C>(node.state_cell());
+            }
+            if state != NodeState::Clean {
+                break;
+            }
+            let (type_tag, arena_slot) = self.fields_under(handle, node);
+            match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => return value,
+                None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                    Ok(value) => return value,
+                    Err(now) => state = now,
+                },
+            }
         }
         match state {
-            NodeState::Clean => {
-                let (type_tag, arena_slot) = self.fields_under(handle, node);
-                self.read_slot(handle, node, type_tag, arena_slot)
-            }
             // A concurrent delete is no contract breach, so the read gets
             // the panic any reader of a node being deleted gets. Under
             // Local only this thread can be mid-delete, so the value code

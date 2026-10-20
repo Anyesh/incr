@@ -1384,3 +1384,143 @@ fn get_before_read_vs_delete_recycle() {
     assert!(msg.contains("stale"), "got: {msg}");
     assert_eq!(rt.get(new), 99);
 }
+
+/// A read whose walk lands its node New as a member of a cycle finds the
+/// slot empty, and another thread claims the node before the read loads
+/// its state and group: the read waits for that claim and returns the
+/// cycle, where it used to panic that a Clean node had no value (replay
+/// seeds 0x33e9, 0xa55 and 0x19f0 on two threads).
+#[test]
+fn read_of_cycle_member_vs_claim_after_landing() {
+    let rt = Arc::new(Rt::new());
+    let inp = rt.create_input(0_u64);
+    let failed = rt.create_query(move |rt: &Rt| match rt.get(inp) {
+        0 => panic!("boom"),
+        v => v,
+    });
+    let in_a = Gate::new();
+    let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
+    let a = {
+        let (in_a, b_cell) = (in_a.clone(), Arc::clone(&b_cell));
+        rt.create_query(move |rt: &Rt| {
+            in_a.park();
+            let b = *b_cell.get().unwrap();
+            catch_unwind(AssertUnwindSafe(|| rt.try_get(b).unwrap_or(7777))).unwrap_or(9999)
+        })
+    };
+    // b catches the panic of a read, so the episode lands Dirty and its
+    // members New, with their group.
+    let b = rt.create_query(move |rt: &Rt| {
+        let v = catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1);
+        catch_unwind(AssertUnwindSafe(|| rt.get(a) + v)).unwrap_or(9999)
+    });
+    b_cell.set(b).unwrap();
+    let x = rt.create_query(move |rt: &Rt| rt.try_get(a).map_or(1000, |v| v + 1));
+
+    let before_read = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::GetBeforeRead(id(a)), before_read.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).map_err(panic_message))
+    };
+    before_read.wait_parked();
+    assert_eq!(rt.state_of(a), NodeState::New);
+    assert!(rt.cycle_of(a).is_some());
+    // So that the claimer's walk recomputes the failed dep instead of
+    // panicking on it before it claims a.
+    rt.set(inp, 1);
+
+    in_a.arm();
+    let claimer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.try_get(a))).map_err(panic_message)
+        })
+    };
+    in_a.wait_parked();
+    assert_eq!(rt.state_of(a), NodeState::Computing);
+    before_read.release();
+    // Time for the reader to load a's state while the claim is held.
+    thread::sleep(Duration::from_millis(50));
+    in_a.release();
+
+    assert_eq!(reader.join().unwrap(), Ok(1000));
+    let cycle = claimer
+        .join()
+        .unwrap()
+        .unwrap()
+        .expect_err("a is in a cycle");
+    assert_eq!(cycle.participants().len(), 2);
+    rt.assert_invariant_i();
+}
+
+/// `a` and `b` read each other while `g` is 0, and `a` reads only `g`
+/// otherwise. Returns them with `a` Clean at 7.
+pub(super) fn clean_node_that_can_turn_cyclic(rt: &Rt) -> (Incr<u64>, Incr<i64>, Incr<i64>) {
+    let g = rt.create_input(1_u64);
+    let b_cell: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::default();
+    let a = {
+        let b_cell = Arc::clone(&b_cell);
+        rt.create_query(move |rt: &Rt| {
+            if rt.get(g) == 0 {
+                rt.try_get(*b_cell.get().unwrap()).map_or(-1, |v| v + 1)
+            } else {
+                7
+            }
+        })
+    };
+    let b = rt.create_query(move |rt: &Rt| rt.try_get(a).map_or(-1, |v| v * 2));
+    b_cell.set(b).unwrap();
+    assert_eq!(rt.get(a), 7);
+    assert_eq!(rt.state_of(a), NodeState::Clean);
+    (g, a, b)
+}
+
+/// A read that loaded `a` Clean parks before its slot read; another
+/// thread's set and episode land `a` Cyclic and clear its slot. The read
+/// goes on from the state it reloads and returns the cycle, where it
+/// used to panic that a Clean node had no value.
+fn clean_read_vs_cyclic_landing<R: Send + 'static>(
+    read: fn(&Rt, Incr<i64>) -> R,
+) -> Result<R, String> {
+    let rt = Arc::new(Rt::new());
+    let (g, a, b) = clean_node_that_can_turn_cyclic(&rt);
+    let before_read = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::GetBeforeRead(id(a)), before_read.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| read(&rt, a))).map_err(panic_message)
+        })
+    };
+    before_read.wait_parked();
+
+    rt.set(g, 0);
+    let cycle = rt.try_get(b).expect_err("b is in a cycle");
+    assert_eq!(cycle.participants().len(), 2);
+    assert_eq!(rt.state_of(a), NodeState::Cyclic);
+    before_read.release();
+
+    let read = reader.join().unwrap();
+    rt.assert_invariant_i();
+    read
+}
+
+#[test]
+fn clean_try_get_vs_cyclic_landing() {
+    let read =
+        clean_read_vs_cyclic_landing(|rt, a| rt.try_get(a).map_err(|c| c.participants().len()));
+    assert_eq!(read, Ok(Err(2)));
+}
+
+#[test]
+fn clean_get_vs_cyclic_landing() {
+    let msg = clean_read_vs_cyclic_landing(|rt, a| rt.get(a)).expect_err("a has no value");
+    assert!(msg.contains("dependency cycle"), "got: {msg}");
+}

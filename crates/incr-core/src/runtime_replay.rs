@@ -224,6 +224,11 @@ impl<C: Cells> Runtime<C> {
                     mode |= ARMED;
                 }
             }
+        } else if self.dep_stack.other_top_doomed(self.runtime_id) {
+            // Another runtime's doomed frame reads this one: its
+            // placeholder may have led it to a read the unbounded run never
+            // makes, as a doomed frame's own native read is.
+            _speculating = Some(replay::Speculating::enter());
         }
         if word & value_code::REPLAY_BIT != 0
             && replay::with(|c| replay::innermost(c, self.runtime_id).is_some())
@@ -446,7 +451,7 @@ impl<C: Cells> Runtime<C> {
         replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
+                .flat_map(|x| x.stacked())
                 .filter(|v| v.cidx > p && v.cidx <= top)
                 .filter(|v| {
                     let node = self.nodes.get(v.node);
@@ -476,7 +481,7 @@ impl<C: Cells> Runtime<C> {
                 .iter_mut()
                 .rev()
                 .find(|x| {
-                    x.rt == rt && x.boundary <= q && x.vstack.len() > (q - x.boundary) as usize
+                    x.rt == rt && x.boundary <= q && x.stacked().len() > (q - x.boundary) as usize
                 })
                 .expect("incr-core: a landed point is a virtual frame");
             x.drop_at = Some(q - x.boundary);
@@ -490,7 +495,7 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         replay::with(|c| {
             c.iter().filter(|x| x.rt == rt).any(|x| {
-                x.vstack
+                x.stacked()
                     .iter()
                     .any(|v| v.cidx > p && v.cidx <= top && v.suspect)
                     || x.running.is_some_and(|level| {
@@ -647,7 +652,7 @@ impl<C: Cells> Runtime<C> {
         let mut frames: Vec<(u32, u32, u32)> = replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
+                .flat_map(|x| x.stacked())
                 .filter(|v| v.cidx >= p && v.cidx <= top)
                 .map(|v| (v.cidx, v.node, v.generation))
                 .collect()
@@ -1915,6 +1920,9 @@ impl<C: Cells> Runtime<C> {
     /// the node lands as that frame's compute would) or out of the episode
     /// it rooted, which released its claims. The unwind goes on to the
     /// frame below, a virtual frame's retry or the read that ran the loop.
+    /// A wound closes the context and unwinds on, as out of an entry: the
+    /// virtual frames a doom in the ended run pushed may name an episode
+    /// the wound aborted.
     fn vframe_unwound(
         &self,
         id: u64,
@@ -1929,17 +1937,23 @@ impl<C: Cells> Runtime<C> {
         if continuation {
             self.continuation_unwound(v.node, v.cidx, &mut bag);
         }
-        let (pos, below) = replay::with(|c| {
+        let (boundary, pos, below) = replay::with(|c| {
             let x = c
                 .iter()
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
             let pos = v.cidx - x.boundary;
             (
+                x.boundary,
                 pos,
                 pos.checked_sub(1).map(|b| x.vstack[b as usize].clone()),
             )
         });
+        if kind == Some(UnwindKind::Wound) {
+            bag.drain(self);
+            self.close_unwound(id, boundary);
+            resume_unwind(payload);
+        }
         if v.spec || kind == Some(UnwindKind::Discard) {
             let q = replay::with(|c| {
                 let x = c
@@ -1964,8 +1978,6 @@ impl<C: Cells> Runtime<C> {
             return VPop::Restart;
         }
         let Some(below) = below else {
-            let boundary =
-                replay::with(|c| c.iter().find(|x| x.id == id).map_or(v.cidx, |x| x.boundary));
             // The read that ran the loop reads the target as a compute's
             // unwind leaves its reader.
             self.dep_stack.poison_current_frame(self.runtime_id);
