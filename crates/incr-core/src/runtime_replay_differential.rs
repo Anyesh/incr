@@ -280,6 +280,21 @@ fn shift(e: Expr, by: usize) -> Expr {
     }
 }
 
+/// `e` with its reads of the first `skip` of `nodes` nodes moved to the
+/// nodes after them.
+fn past_template(e: Expr, skip: usize, nodes: usize) -> Expr {
+    let p = |e: Box<Expr>| Box::new(past_template(*e, skip, nodes));
+    match e {
+        Expr::Read(t, try_) if t < skip => Expr::Read(skip + t % (nodes - skip), try_),
+        Expr::Add(a, b) => Expr::Add(p(a), p(b)),
+        Expr::If(c, a, b) => Expr::If(p(c), p(a), p(b)),
+        Expr::PanicIf(a, when) => Expr::PanicIf(p(a), when),
+        Expr::Catch(a) => Expr::Catch(p(a)),
+        Expr::FirstRun(a, b) => Expr::FirstRun(p(a), p(b)),
+        leaf => leaf,
+    }
+}
+
 fn replayable(expr: Expr, strategy: Strat) -> Spec {
     Spec::Query {
         expr,
@@ -410,9 +425,11 @@ fn add_second_runtime(case: &mut Case, rng: &mut Rng, skip: usize) {
 
 /// Deletes of the first runtime's nodes, most followed by a recreate into
 /// the freed slot, reads of the deleted nodes, and reads of replaced
-/// handles. The first `skip` nodes are a template and are never deleted:
-/// its first-run counter counts doomed runs, so a recreated member would
-/// first run the template's cycle at a point that differs by budget.
+/// handles. The first `skip` nodes are a template, never deleted and never
+/// read by a recreated node: its first-run counter counts doomed runs, so
+/// a recreated member, or a recreated reader of a member that has not run
+/// yet, would first run the template's cycle at a point that differs by
+/// budget.
 fn add_deletes(case: &mut Case, rng: &mut Rng, skip: usize, paired: bool) {
     let nodes = case.specs.len();
     for _ in 0..1 + rng.below(3) {
@@ -435,7 +452,8 @@ fn add_deletes(case: &mut Case, rng: &mut Rng, skip: usize, paired: bool) {
         }
         if paired || rng.chance(70) {
             let spec = if q < case.queries {
-                let mut expr = gen_expr(rng, 3, &reads(q, case.queries, nodes, case.cycles));
+                let expr = gen_expr(rng, 3, &reads(q, case.queries, nodes, case.cycles));
+                let mut expr = past_template(expr, skip, nodes);
                 if !case.panics {
                     expr = without_panics(expr);
                 }
@@ -1504,5 +1522,43 @@ fn replay_scan() {
     eprintln!("smallest failing: {best:?}");
     if !failing.is_empty() {
         eprintln!("failing: {} {failing:x?}", failing.len());
+    }
+}
+
+fn reads_any(e: &Expr, hit: &impl Fn(usize) -> bool) -> bool {
+    match e {
+        Expr::Const(_) | Expr::ReadOther(..) => false,
+        Expr::Read(target, _) => hit(*target),
+        Expr::Add(a, b) | Expr::FirstRun(a, b) => reads_any(a, hit) || reads_any(b, hit),
+        Expr::If(c, a, b) => reads_any(c, hit) || reads_any(a, hit) || reads_any(b, hit),
+        Expr::PanicIf(inner, _) | Expr::Catch(inner) => reads_any(inner, hit),
+    }
+}
+
+/// A recreated node that read the dissolving root's template could run the
+/// template's first-run-only read for the first time, at a point that
+/// differs by budget (seed 0x16eb).
+#[test]
+fn no_recreated_node_reads_the_template() {
+    for seed in (0..4000).chain([0x16eb]) {
+        let case = case_of(seed);
+        let template = matches!(
+            case.specs.get(2),
+            Some(Spec::Query {
+                expr: Expr::FirstRun(..),
+                ..
+            })
+        );
+        if !template {
+            continue;
+        }
+        for op in &case.ops {
+            if let Op::Recreate(_, Spec::Query { expr, .. }) = op {
+                assert!(
+                    !reads_any(expr, &|target| target < 4),
+                    "seed {seed:#x}: {expr:?}"
+                );
+            }
+        }
     }
 }
