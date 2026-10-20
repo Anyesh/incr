@@ -1207,6 +1207,23 @@ fn two_thread_repush_seeds() {
     }
 }
 
+/// Two-thread seeds with a second runtime, each over several schedules.
+/// 0x43c2 and 0x4c08, with no cycles, compare with the unbounded run: a
+/// concurrent `Get2` panicked "dependency cycle" before a doomed frame's
+/// read of the other runtime became speculative (ee874c3).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_two_thread_seeds() {
+    for seed in [0x43c2, 0x4c08] {
+        let case = gen_case(seed, true, true);
+        quiet(|| {
+            for _ in 0..4 {
+                differential_two(&case, seed);
+            }
+        });
+    }
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
