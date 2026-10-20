@@ -58,6 +58,7 @@ A dependent list keeps up to four dependents inline (two on wasm32) and moves th
 
 - **`get_traced` per-node trace**: records compute, verified-clean, and cutoff events for the current `get` call's compute path. Cross-thread events are not aggregated.
 - **Cross-thread dependency cycles livelock**: a cycle confined to one thread's compute stack panics with a diagnostic, but a cycle spanning two threads' in-flight computes spins in the wait loop; detecting that needs a waits-for graph, which is not implemented.
+- **A `group_by` key function can't take part in a cycle**: a group is an input, which never holds a cycle's provisional value, so a router whose `key_fn` (or anything it read) saw one refuses the run: `try_get` of the router returns `Err(Cycle)` and `get` panics with the cycle, and no group changes. Other collection operators may sit on a cycle; they rebuild from their upstream after it lands.
 - **`Hash`/`Eq`/`Ord` panics during operator apply phases** are outside the exactly-once replay guarantee that covers user closures (predicates, mappers, key extractors, folds).
 
 ## Memory reclamation
