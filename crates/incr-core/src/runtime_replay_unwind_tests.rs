@@ -543,8 +543,8 @@ fn entry_guard_spans_the_loop<C: Cells>() {
         let context = entries[0].context;
         for e in &entries {
             assert_eq!(e.context, context, "one context for the whole loop");
-            assert_eq!(e.fronts[0], Some(head.slot()), "the target stays");
-            assert_eq!(e.fronts.len(), e.level as usize + 1);
+            assert_eq!(e.target, Some(head.slot()), "the target stays");
+            assert_eq!(e.levels, e.level as usize + 1);
         }
     }
 }

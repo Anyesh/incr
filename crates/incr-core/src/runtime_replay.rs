@@ -45,8 +45,11 @@ pub(crate) struct DeliverySeen {
 pub(crate) struct EntrySeen {
     pub(crate) context: u64,
     pub(crate) level: u32,
-    /// The front entry of each level, the target at level 0.
-    pub(crate) fronts: Vec<Option<u32>>,
+    /// The front entry of level 0, the target.
+    pub(crate) target: Option<u32>,
+    /// The number of levels; a copy of every level's front would make
+    /// the log quadratic in a ring's length at budget 1.
+    pub(crate) levels: usize,
 }
 
 /// How a virtual frame's pop left its context's driver.
@@ -1274,7 +1277,8 @@ impl<C: Cells> Runtime<C> {
                 self.entries.lock().unwrap().push(EntrySeen {
                     context: x.id,
                     level,
-                    fronts: x.levels.iter().map(|q| q.front().map(|e| e.node)).collect(),
+                    target: x.levels.first().and_then(|q| q.front()).map(|e| e.node),
+                    levels: x.levels.len(),
                 });
                 // Running, with no entry yet while its virtual frames pop.
                 x.running = Some(level);
