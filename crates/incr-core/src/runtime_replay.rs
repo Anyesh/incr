@@ -451,7 +451,7 @@ impl<C: Cells> Runtime<C> {
         replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
+                .flat_map(|x| x.stacked())
                 .filter(|v| v.cidx > p && v.cidx <= top)
                 .filter(|v| {
                     let node = self.nodes.get(v.node);
@@ -481,7 +481,7 @@ impl<C: Cells> Runtime<C> {
                 .iter_mut()
                 .rev()
                 .find(|x| {
-                    x.rt == rt && x.boundary <= q && x.vstack.len() > (q - x.boundary) as usize
+                    x.rt == rt && x.boundary <= q && x.stacked().len() > (q - x.boundary) as usize
                 })
                 .expect("incr-core: a landed point is a virtual frame");
             x.drop_at = Some(q - x.boundary);
@@ -495,7 +495,7 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         replay::with(|c| {
             c.iter().filter(|x| x.rt == rt).any(|x| {
-                x.vstack
+                x.stacked()
                     .iter()
                     .any(|v| v.cidx > p && v.cidx <= top && v.suspect)
                     || x.running.is_some_and(|level| {
@@ -651,7 +651,7 @@ impl<C: Cells> Runtime<C> {
         let mut frames: Vec<(u32, u32, u32)> = replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
+                .flat_map(|x| x.stacked())
                 .filter(|v| v.cidx >= p && v.cidx <= top)
                 .map(|v| (v.cidx, v.node, v.generation))
                 .collect()

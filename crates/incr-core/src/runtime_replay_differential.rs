@@ -1250,6 +1250,36 @@ fn two_thread_schedule_seeds() {
     }
 }
 
+/// Two-thread seeds with a second runtime, each over several schedules.
+/// 0x43c2 and 0x4c08, with no cycles, compare with the unbounded run: a
+/// concurrent `Get2` panicked "dependency cycle" before a doomed frame's
+/// read of the other runtime became speculative (ee874c3). In 0x4b15, at
+/// budget 2, a read made a virtual hit while a context whose loop had not
+/// started kept a virtual frame at the read's position, whose node the
+/// other thread had landed, so the hit's claim of it failed on every
+/// retry and the read spun.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_two_thread_seeds() {
+    for seed in [0x43c2, 0x4c08] {
+        let case = gen_case(seed, true, true);
+        quiet(|| {
+            for _ in 0..4 {
+                differential_two(&case, seed);
+            }
+        });
+    }
+    let case = gen_case(0x4b15, true, true);
+    let phases = phases(&case, 0x4b15);
+    quiet(|| {
+        for _ in 0..16 {
+            for bytes in [0, 16 * 1024] {
+                run_two(&case, &phases, Some(2), bytes);
+            }
+        }
+    });
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
