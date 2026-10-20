@@ -1239,7 +1239,7 @@ fn run_two_repeatedly(seed: u64, cross: bool, budgets: &[Option<u32>]) {
 /// left indexed after an operation, and the invariants after each phase.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn two_thread_seeds() {
+fn two_thread_schedule_seeds() {
     // 0x1e89: a wound in a doomed episode member run that a virtual
     // frame's pop ran was delivered to the frame below, which left the
     // doom's virtual frame naming the aborted episode.
