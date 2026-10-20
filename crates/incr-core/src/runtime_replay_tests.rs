@@ -2,10 +2,10 @@
 //! the bounds on runs and walks the plan's T8 tests set.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
-use super::Runtime;
+use super::{Runtime, DEFAULT_MAX_FRAMES};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
@@ -353,4 +353,27 @@ fn shared_caught_delivery_after_its_node_lands_reads_it_clean() {
         caught_delivery_after_its_node_lands::<Shared>(1, false),
         caught_delivery_after_its_node_lands::<Shared>(u32::MAX, true)
     );
+}
+
+/// `INCR_MAX_DEPTH` changes only the default frame budget: a byte budget
+/// set explicitly runs at the default 256 frames, and an explicit frame
+/// budget stays.
+fn explicit_budgets_win<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_max_stack_bytes(1 << 20);
+    assert_eq!(rt.max_frames.load(Relaxed), DEFAULT_MAX_FRAMES);
+    let rt = Runtime::<C>::new();
+    rt.set_max_frames(3);
+    rt.set_max_stack_bytes(1 << 20);
+    assert_eq!(rt.max_frames.load(Relaxed), 3);
+}
+
+#[test]
+fn local_explicit_budgets_win_over_incr_max_depth() {
+    explicit_budgets_win::<Local>();
+}
+
+#[test]
+fn shared_explicit_budgets_win_over_incr_max_depth() {
+    explicit_budgets_win::<Shared>();
 }

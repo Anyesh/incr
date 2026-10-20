@@ -733,6 +733,9 @@ pub struct Runtime<C: Cells> {
     pub(crate) max_frames: std::sync::atomic::AtomicU32,
     /// The byte budget, or 0 when it is off.
     pub(crate) max_stack_bytes: std::sync::atomic::AtomicUsize,
+    /// `set_max_frames` has been called, so a byte budget set later keeps
+    /// its frame budget instead of taking the default's place.
+    frames_set: std::sync::atomic::AtomicBool,
     /// `INCR_TEST_ALL_REPLAYABLE`: every query not marked
     /// `NOT_REPLAYABLE` is replayable.
     pub(crate) all_replayable: bool,
@@ -826,6 +829,7 @@ impl<C: Cells> Runtime<C> {
             tracing_armed: C::new_u8(0),
             max_frames: std::sync::atomic::AtomicU32::new(replay_defaults().0),
             max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
+            frames_set: std::sync::atomic::AtomicBool::new(false),
             all_replayable: replay_defaults().1,
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
@@ -1249,6 +1253,8 @@ impl<C: Cells> Runtime<C> {
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
         assert!(n > 0, "incr-core: the frame budget is at least 1");
+        self.frames_set
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.max_frames
             .store(n, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1257,8 +1263,14 @@ impl<C: Cells> Runtime<C> {
     /// default): a replayable query's read also replays when the stack
     /// this thread has used since its outermost engine call exceeds `n`
     /// bytes. Frames differ in size with the closure and the build, so
-    /// the frame count alone does not bound the stack.
+    /// the frame count alone does not bound the stack. Like
+    /// [`Self::set_max_frames`], it wins over `INCR_MAX_DEPTH`: a runtime
+    /// that has not set its frame budget gets the default of 256.
     pub fn set_max_stack_bytes(&self, n: usize) {
+        if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
+            self.max_frames
+                .store(DEFAULT_MAX_FRAMES, std::sync::atomic::Ordering::Relaxed);
+        }
         self.max_stack_bytes
             .store(n, std::sync::atomic::Ordering::Relaxed);
     }
