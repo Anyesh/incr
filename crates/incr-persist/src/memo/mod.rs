@@ -6,7 +6,8 @@
 //! [`MemoBackend`] is what a store implements; [`write_checkpoint`] merges
 //! a checkpoint's live entries with the current generation, evicts down to
 //! a byte budget and writes the next generation through it. [`MemoryMemo`]
-//! is an in-process store for tests.
+//! is an in-process store for tests; `SqliteMemo`, behind the `sqlite`
+//! feature, keeps generations in an SQLite database.
 
 mod backend;
 mod checkpoint;
@@ -15,6 +16,8 @@ mod codec;
 pub mod conformance;
 mod generation;
 mod memory;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 pub use backend::{EncodedEntry, MemoBackend};
 pub use checkpoint::{
@@ -23,3 +26,5 @@ pub use checkpoint::{
 pub use codec::*;
 pub use generation::{GenId, Generation};
 pub use memory::MemoryMemo;
+#[cfg(feature = "sqlite")]
+pub use sqlite::{SqliteMemo, SqliteMemoGuard, SqliteMemoOptions};

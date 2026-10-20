@@ -459,7 +459,7 @@ impl Turns {
     }
 }
 
-fn is_busy(error: &rusqlite::Error) -> bool {
+pub(crate) fn is_busy(error: &rusqlite::Error) -> bool {
     error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
 }
 
@@ -470,7 +470,7 @@ fn data_version(conn: &Connection) -> Result<i64> {
         .map_err(sql)
 }
 
-fn enable_wal(conn: &Connection, busy_timeout: Duration) -> Result<()> {
+pub(crate) fn enable_wal(conn: &Connection, busy_timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + busy_timeout;
     let mode: String = loop {
         match conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)) {
@@ -614,7 +614,7 @@ fn sql_position(at: Position) -> i64 {
     i64::try_from(at.0).unwrap_or(i64::MAX)
 }
 
-fn sql(error: rusqlite::Error) -> Error {
+pub(crate) fn sql(error: rusqlite::Error) -> Error {
     Error::Backend(Box::new(error))
 }
 
