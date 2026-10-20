@@ -318,18 +318,37 @@ impl<C: Cells> Runtime<C> {
     fn owned_claims(&self, cidx: u32, node: u32, path: u64) -> Vec<(u32, u32)> {
         let rt = self.runtime_id;
         cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, _), e)| {
-                    *r == rt
-                        && !replay::is_suspended(e.ep)
-                        && e.owner == cidx
-                        && (e.owner_node == node || e.owner_node == u32::MAX)
-                        && e.owner_virtual.is_none_or(|p| p == path)
-                })
-                .map(|(&(_, slot), e)| {
-                    e.own(cidx, node, Some(path));
-                    (slot, e.anchor)
-                })
+            // Groups whose every member is taken move whole; a group with a
+            // suspended member moves the others one by one.
+            let (mut whole, mut singles) = (Vec::new(), Vec::new());
+            for g in h.owners(rt, cidx, cidx) {
+                let owner = h.owner(g);
+                if !(owner.node() == node || owner.node() == u32::MAX)
+                    || owner.virtual_frame().is_some_and(|p| p != path)
+                {
+                    continue;
+                }
+                let members = h.members(g);
+                let start = singles.len();
+                singles.extend(
+                    members
+                        .iter()
+                        .copied()
+                        .filter(|&m| !replay::is_suspended(h[&(rt, m)].ep)),
+                );
+                if singles.len() - start == members.len() {
+                    singles.truncate(start);
+                    whole.push(g);
+                }
+            }
+            let mut owned = singles.clone();
+            for &g in &whole {
+                owned.extend_from_slice(h.members(g));
+            }
+            h.hand_over(rt, &whole, &singles, cidx, node, Some(path));
+            owned
+                .into_iter()
+                .map(|m| (m, h[&(rt, m)].anchor()))
                 .collect()
         })
     }
@@ -1235,10 +1254,13 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let mut rooted = false;
         cycle_state::with_held(|h| {
-            for (&(r, slot), e) in h.iter() {
-                if r == rt && e.owner_virtual.is_some() && e.anchor >= cidx && e.owner >= cidx {
-                    keep.push(slot);
-                    rooted |= e.anchor == cidx;
+            for g in h.virtual_owners(rt, cidx, u32::MAX) {
+                for &slot in h.members(g) {
+                    let anchor = h[&(rt, slot)].anchor();
+                    if anchor >= cidx {
+                        keep.push(slot);
+                        rooted |= anchor == cidx;
+                    }
                 }
             }
         });
@@ -1753,11 +1775,12 @@ impl<C: Cells> Runtime<C> {
                 // The run finished the frame, which defers as `cycle_pop`
                 // defers a real one.
                 cycle_state::with_held(|h| {
-                    let e = h
-                        .get_mut(&(rt, v.node))
-                        .expect("incr-core: a stand-in is held");
-                    e.anchor = v.cidx;
-                    e.own(v.cidx, v.node, None);
+                    assert!(
+                        h.contains_key(&(rt, v.node)),
+                        "incr-core: a stand-in is held"
+                    );
+                    h.set_anchor((rt, v.node), v.cidx);
+                    h.own((rt, v.node), v.cidx, v.node, None);
                 });
                 self.pass_down(v.cidx, low);
             } else if unbuffered.is_some() {
@@ -1769,9 +1792,14 @@ impl<C: Cells> Runtime<C> {
             return VPop::Next;
         }
         let rooted = cycle_state::with_held(|h| {
-            h.iter().any(|(&(r, slot), e)| {
-                r == rt && e.anchor >= v.cidx && (stand_in.is_none() || slot != v.node)
-            }) || stand_in.is_some() && h[&(rt, v.node)].last.iter().any(|&(d, _)| d.0 == v.node)
+            h.anchored(rt, v.cidx)
+                .any(|slot| stand_in.is_none() || slot != v.node)
+                || stand_in.is_some()
+                    && h.get(&(rt, v.node))
+                        .expect("incr-core: a stand-in is held")
+                        .last
+                        .iter()
+                        .any(|&(d, _)| d.0 == v.node)
         });
         if let (Some(revs), false) = (stand_in, rooted) {
             if !(v.spec && self.alone_lands_dirty(v.node)) {
@@ -1824,8 +1852,8 @@ impl<C: Cells> Runtime<C> {
         }
         if stand_in.is_some() {
             cycle_state::with_held(|h| {
-                if let Some(e) = h.get_mut(&(rt, v.node)) {
-                    e.anchor = v.cidx;
+                if h.contains_key(&(rt, v.node)) {
+                    h.set_anchor((rt, v.node), v.cidx);
                 }
             });
         }
@@ -2004,27 +2032,18 @@ impl<C: Cells> Runtime<C> {
     /// Virtual frame `v` pops: the claims frames above it own keep its
     /// path, so that only its retry takes them over.
     fn note_ancestor(&self, v: &VFrame) {
-        cycle_state::with_held(|h| {
-            for ((r, _), e) in h.iter_mut() {
-                if *r == self.runtime_id && e.owner > v.cidx && e.owner_virtual.is_some() {
-                    e.ancestry.push((v.cidx, v.path));
-                }
-            }
-        });
+        cycle_state::with_held(|h| h.note_ancestor(self.runtime_id, v.cidx, v.path));
     }
 
     /// The claims a doomed run of `node` at `cidx` deferred become those of
     /// the run that retries or finishes it there, which releases them if
     /// it unwinds.
     fn own_deferred(&self, cidx: u32, node: u32) {
+        let rt = self.runtime_id;
         cycle_state::with_held(|h| {
-            for ((r, _), e) in h.iter_mut() {
-                if *r == self.runtime_id
-                    && e.owner_virtual.is_some()
-                    && e.owner == cidx
-                    && e.owner_node == node
-                {
-                    e.owner_virtual = None;
+            for g in h.virtual_owners(rt, cidx, cidx) {
+                if h.owner(g).node() == node {
+                    h.own_retry(g);
                 }
             }
         });
@@ -2557,11 +2576,7 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let rt = self.runtime_id;
-        cycle_state::with_held(|h| {
-            h.iter()
-                .any(|((r, _), e)| *r == rt && e.owner >= cidx && e.owner_virtual.is_some())
-        })
-        .then(|| self.path_at(cidx))
+        cycle_state::with_held(|h| h.any_virtually_owned_from(rt, cidx)).then(|| self.path_at(cidx))
     }
 
     /// The path of a frame at position `cidx`: the highest virtual frame
@@ -2571,8 +2586,7 @@ impl<C: Cells> Runtime<C> {
         let base = replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
-                .filter(|v| v.cidx < cidx)
+                .filter_map(|x| x.vframe_below(cidx))
                 .max_by_key(|v| v.cidx)
                 .map(|v| (v.cidx, replay::extend_path(v.path, (v.reading, v.ordinal))))
         });

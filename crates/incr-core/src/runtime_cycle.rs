@@ -439,13 +439,7 @@ impl<C: Cells> Runtime<C> {
         if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
             slots.extend(self.virtual_slots_from(p));
         }
-        cycle_state::with_held(|h| {
-            slots.extend(
-                h.iter()
-                    .filter(|((r, _), e)| *r == rt && e.anchor >= p)
-                    .map(|((_, slot), _)| *slot),
-            )
-        });
+        cycle_state::with_held(|h| slots.extend(h.anchored_from(rt, p)));
         Cycle::new(slots.into_iter().map(|s| self.erased_at_live(s)).collect())
     }
 
@@ -489,8 +483,15 @@ impl<C: Cells> Runtime<C> {
                 .map(|f| f.cidx)
         });
         let held = cycle_state::with_held(|h| {
-            h.get(&(rt, slot))
-                .map(|e| (e.anchor, e.in_cu, e.buf.is_some(), e.episode.clone(), e.ep))
+            h.get(&(rt, slot)).map(|e| {
+                (
+                    e.anchor(),
+                    e.in_cu,
+                    e.buf.is_some(),
+                    e.episode.clone(),
+                    e.ep,
+                )
+            })
         });
         // A held node with a virtual frame stands for a frame on the stack.
         let on_stack = match on_stack {
@@ -821,14 +822,9 @@ impl<C: Cells> Runtime<C> {
     fn claim_members(&self, cidx: u32) -> Vec<u32> {
         let rt = self.runtime_id;
         let mut members: Vec<u32> = cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
-                .map(|((_, slot), e)| {
-                    e.anchor = cidx;
-                    e.own(cidx, u32::MAX, None);
-                    *slot
-                })
-                .collect()
+            let members = h.anchored_from(rt, cidx);
+            h.root_at(rt, &members, cidx);
+            members
         });
         members.sort_unstable();
         members
@@ -1005,12 +1001,11 @@ impl<C: Cells> Runtime<C> {
                     .filter(|m| strategies.binary_search_by_key(m, |(s, _)| *s).is_err())
                     .collect();
                 cycle_state::with_held(|h| {
+                    h.root_at(rt, &ep.members, cidx);
                     for m in &ep.members {
                         let e = h
                             .get_mut(&(rt, *m))
                             .expect("incr-core: an episode member is held");
-                        e.anchor = cidx;
-                        e.own(cidx, u32::MAX, None);
                         e.episode = Some(cycle.clone());
                         e.ep = id;
                         e.in_cu = ep.cu.binary_search(m).is_ok();
@@ -1295,16 +1290,10 @@ impl<C: Cells> Runtime<C> {
     fn join_new(&self, cidx: u32, members: &mut Vec<u32>) -> bool {
         let rt = self.runtime_id;
         let joined: Vec<u32> = cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, slot), e)| {
-                    *r == rt && e.anchor >= cidx && members.binary_search(slot).is_err()
-                })
-                .map(|((_, slot), e)| {
-                    e.anchor = cidx;
-                    e.own(cidx, u32::MAX, None);
-                    *slot
-                })
-                .collect()
+            let mut joined = h.anchored_from(rt, cidx);
+            joined.retain(|slot| members.binary_search(slot).is_err());
+            h.root_at(rt, &joined, cidx);
+            joined
         });
         if joined.is_empty() {
             return false;
@@ -1320,10 +1309,11 @@ impl<C: Cells> Runtime<C> {
     fn merge_down(&self, cidx: u32, low: u32, bag: &mut Deferred<C>) {
         let rt = self.runtime_id;
         let values: Vec<Erased> = cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
-                .filter_map(|(_, e)| {
-                    e.anchor = low;
+            h.anchored_from(rt, cidx)
+                .into_iter()
+                .filter_map(|m| {
+                    h.set_anchor((rt, m), low);
+                    let e = h.get_mut(&(rt, m)).expect("the slot was just listed");
                     e.episode = None;
                     e.ep = 0;
                     e.in_cu = false;
@@ -1345,16 +1335,12 @@ impl<C: Cells> Runtime<C> {
         let (parent, node, virtual_frame) = self.lower_parent(cidx, low);
         let path = self.virtual_path_at(cidx);
         cycle_state::with_held(|h| {
-            for ((r, _), e) in h.iter_mut() {
-                if *r == rt {
-                    if e.anchor >= cidx {
-                        e.anchor = low;
-                    }
-                    if e.owned_by(cidx, u32::MAX, path) {
-                        e.own(parent, node, virtual_frame);
-                    }
-                }
+            for m in h.anchored_from(rt, cidx) {
+                h.set_anchor((rt, m), low);
             }
+            let mut owned = h.owners(rt, cidx, u32::MAX);
+            owned.retain(|&g| h.owner(g).owned_by(cidx, u32::MAX, path));
+            h.hand_over(rt, &owned, &[], parent, node, virtual_frame);
         });
     }
 
@@ -1422,7 +1408,6 @@ impl<C: Cells> Runtime<C> {
         // The unwinding frame, of node `subtree`, owns the claims owned at
         // its position by it, and those owned above.
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
-        let owned = |e: &Held| subtree.is_some_and(|node| e.owned_by(cidx, node, path));
         let rt = self.runtime_id;
         // A suspended episode's members wait for its member run's virtual
         // frame, whatever frame runs at that position meanwhile: only the
@@ -1431,18 +1416,24 @@ impl<C: Cells> Runtime<C> {
             if h.is_empty() {
                 return Vec::new();
             }
-            let keys: Vec<(RuntimeId, u32)> = h
-                .iter()
-                .filter(|((r, slot), e)| {
-                    *r == rt
-                        && (e.anchor >= cidx || owned(e))
-                        && !keep.contains(slot)
-                        && !replay::is_suspended(e.ep)
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            keys.into_iter()
-                .map(|k| (k.1, h.remove(&k).expect("the key was just listed")))
+            let mut slots = h.anchored_from(rt, cidx);
+            if let Some(node) = subtree {
+                for g in h.owners(rt, cidx, u32::MAX) {
+                    if h.owner(g).owned_by(cidx, node, path) {
+                        slots.extend_from_slice(h.members(g));
+                    }
+                }
+                slots.sort_unstable();
+                slots.dedup();
+            }
+            slots.retain(|m| {
+                !keep.contains(m)
+                    && h.get(&(rt, *m))
+                        .is_some_and(|e| !replay::is_suspended(e.ep))
+            });
+            slots
+                .into_iter()
+                .map(|m| (m, h.remove(&(rt, m)).expect("the slot was just listed")))
                 .collect()
         });
         if entries.is_empty() {

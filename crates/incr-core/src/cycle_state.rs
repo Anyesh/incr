@@ -5,7 +5,7 @@
 //! dissolved during the current outermost entry.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use std::sync::Arc;
 
@@ -14,30 +14,80 @@ use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::value_code;
 
+/// The frame whose unwind releases a claim: the frame it stands for, or
+/// the frame below that its deferral passed to. A deferral to a root below
+/// that frame leaves the claim anchored lower, so the anchor alone would
+/// let an unwind between them leak it.
+#[derive(Clone, Default)]
+pub(crate) struct Owner {
+    /// The frame's position.
+    pos: u32,
+    /// The frame's node, `u32::MAX` for any: another frame at that
+    /// position later, a sibling's, owns none of it.
+    node: u32,
+    /// The owner is a virtual frame, the run of `node` that a doom
+    /// discarded, with that frame's path. Another run of the node at the
+    /// position, as its reader's retry makes when it reads the node more
+    /// than once, has another path and must not take or release what the
+    /// doomed run deferred.
+    virtual_frame: Option<u64>,
+    /// For a virtual owner, the position and path of each virtual frame
+    /// below it that has popped since: a run at such a position along
+    /// another path is not the owner's ancestor.
+    ancestry: Vec<(u32, u64)>,
+}
+
+impl Owner {
+    fn new(pos: u32, node: u32, virtual_frame: Option<u64>) -> Self {
+        Self {
+            pos,
+            node,
+            virtual_frame,
+            ancestry: Vec::new(),
+        }
+    }
+
+    pub(crate) fn node(&self) -> u32 {
+        self.node
+    }
+
+    pub(crate) fn virtual_frame(&self) -> Option<u64> {
+        self.virtual_frame
+    }
+
+    /// The run at `cidx`, of `node` (`u32::MAX` for any), at `path` (the
+    /// path when a virtual frame at or above `cidx` owns claims), owns the
+    /// claims of this owner: those owned at its position by it, or owned
+    /// above it in its subtree.
+    pub(crate) fn owned_by(&self, cidx: u32, node: u32, path: Option<u64>) -> bool {
+        let at = |p: u64| Some(p) == path;
+        let of_node = node == u32::MAX || self.node == node || self.node == u32::MAX;
+        match self.virtual_frame {
+            _ if self.pos < cidx => false,
+            None => self.pos > cidx || of_node,
+            Some(p) if self.pos == cidx => at(p) && of_node,
+            Some(_) => self
+                .ancestry
+                .iter()
+                .find(|a| a.0 == cidx)
+                .is_none_or(|a| at(a.1)),
+        }
+    }
+}
+
 /// A claim this thread holds outside its frame stack: a node deferred
 /// during discovery, or a member of a running episode.
 pub(crate) struct Held {
     pub(crate) generation: u32,
     /// The conceptual-stack position of the root that resolves it.
-    pub(crate) anchor: u32,
-    /// The position of the frame whose unwind releases it: the frame it
-    /// stands for, or the frame below that its deferral passed to. A
-    /// deferral to a root below that frame leaves it anchored lower, so the
-    /// anchor alone would let an unwind between them leak the claim.
-    pub(crate) owner: u32,
-    /// The node of the frame at `owner`, `u32::MAX` for any: another frame
-    /// at that position later, a sibling's, owns none of it.
-    pub(crate) owner_node: u32,
-    /// The owner is a virtual frame, the run of `owner_node` that a doom
-    /// discarded, with that frame's path. Another run of the node at the
-    /// position, as its reader's retry makes when it reads the node more
-    /// than once, has another path and must not take or release what the
-    /// doomed run deferred.
-    pub(crate) owner_virtual: Option<u64>,
-    /// For a virtual owner, the position and path of each virtual frame
-    /// below it that has popped since: a run at such a position along
-    /// another path is not the owner's ancestor.
-    pub(crate) ancestry: Vec<(u32, u64)>,
+    anchor: u32,
+    /// The claim's owner while it is out of the held map; inside it, the
+    /// claim's owner group holds it.
+    owner: Owner,
+    /// The owner group inside the held map, 0 outside it.
+    group: u64,
+    /// The claim's index in its group's members.
+    group_ix: usize,
     /// The node has a Fallback or Fixpoint strategy.
     pub(crate) seeded: bool,
     /// The claim was taken from New.
@@ -73,42 +123,25 @@ pub(crate) struct Held {
 }
 
 impl Held {
-    /// Hands the claim to the frame at `owner`, of `node` (`u32::MAX` for
-    /// whichever frame is there), virtual at a path or not.
+    /// Hands the claim, before it enters the held map, to the frame at
+    /// `owner`, of `node` (`u32::MAX` for whichever frame is there),
+    /// virtual at a path or not. Inside the map, [`HeldMap::own`] does.
     pub(crate) fn own(&mut self, owner: u32, node: u32, virtual_frame: Option<u64>) {
-        self.owner = owner;
-        self.owner_node = node;
-        self.owner_virtual = virtual_frame;
-        self.ancestry.clear();
+        debug_assert_eq!(self.group, 0, "incr-core: the claim is out of the held map");
+        self.owner = Owner::new(owner, node, virtual_frame);
     }
 
-    /// The run at `cidx`, of `node` (`u32::MAX` for any), at `path` (the
-    /// path when a virtual frame at or above `cidx` owns claims), owns the
-    /// claim: one owned at its position by it, or owned above it in its
-    /// subtree.
-    pub(crate) fn owned_by(&self, cidx: u32, node: u32, path: Option<u64>) -> bool {
-        let at = |p: u64| Some(p) == path;
-        let of_node = node == u32::MAX || self.owner_node == node || self.owner_node == u32::MAX;
-        match self.owner_virtual {
-            _ if self.owner < cidx => false,
-            None => self.owner > cidx || of_node,
-            Some(p) if self.owner == cidx => at(p) && of_node,
-            Some(_) => self
-                .ancestry
-                .iter()
-                .find(|a| a.0 == cidx)
-                .is_none_or(|a| at(a.1)),
-        }
+    pub(crate) fn anchor(&self) -> u32 {
+        self.anchor
     }
 
     pub(crate) fn new(generation: u32, anchor: u32, seeded: bool, first: bool) -> Self {
         Self {
             generation,
             anchor,
-            owner: anchor,
-            owner_node: u32::MAX,
-            owner_virtual: None,
-            ancestry: Vec::new(),
+            owner: Owner::new(anchor, u32::MAX, None),
+            group: 0,
+            group_ix: 0,
             seeded,
             first,
             buf: None,
@@ -197,7 +230,329 @@ pub(crate) enum UnwindKind {
     Discard,
 }
 
-type HeldMap = HashMap<(RuntimeId, u32), Held>;
+/// The held map, indexed by anchor and by owner position: the queries
+/// every driver step makes ask for the claims at or above a position, and
+/// a scan of the whole map per step makes a long cycle quadratic. Claims
+/// that share an owner share an owner group, so that a pop handing every
+/// claim its subtree deferred to its parent merges groups instead of
+/// moving each claim.
+pub(crate) struct HeldMap {
+    claims: HashMap<(RuntimeId, u32), Held>,
+    by_anchor: BTreeSet<(RuntimeId, u32, u32)>,
+    groups: HashMap<u64, Group>,
+    /// `(rt, owner position, group)` of every group.
+    by_owner: BTreeSet<(RuntimeId, u32, u64)>,
+    /// The groups a virtual frame owns.
+    by_virtual_owner: BTreeSet<(RuntimeId, u32, u64)>,
+    next_group: u64,
+}
+
+struct Group {
+    rt: RuntimeId,
+    owner: Owner,
+    members: Vec<u32>,
+}
+
+impl std::ops::Index<&(RuntimeId, u32)> for HeldMap {
+    type Output = Held;
+
+    fn index(&self, key: &(RuntimeId, u32)) -> &Held {
+        &self.claims[key]
+    }
+}
+
+impl HeldMap {
+    fn new() -> Self {
+        Self {
+            claims: HashMap::new(),
+            by_anchor: BTreeSet::new(),
+            groups: HashMap::new(),
+            by_owner: BTreeSet::new(),
+            by_virtual_owner: BTreeSet::new(),
+            next_group: 1,
+        }
+    }
+
+    fn span<T: Ord + Copy>(
+        rt: RuntimeId,
+        from: u32,
+        to: u32,
+        min: T,
+        max: T,
+    ) -> std::ops::RangeInclusive<(RuntimeId, u32, T)> {
+        (rt, from, min)..=(rt, to, max)
+    }
+
+    fn index_group(&mut self, g: u64) {
+        let group = &self.groups[&g];
+        let key = (group.rt, group.owner.pos, g);
+        self.by_owner.insert(key);
+        if group.owner.virtual_frame.is_some() {
+            self.by_virtual_owner.insert(key);
+        }
+    }
+
+    fn unindex_group(&mut self, g: u64) {
+        let group = &self.groups[&g];
+        let key = (group.rt, group.owner.pos, g);
+        self.by_owner.remove(&key);
+        self.by_virtual_owner.remove(&key);
+    }
+
+    fn new_group(&mut self, rt: RuntimeId, owner: Owner) -> u64 {
+        let g = self.next_group;
+        self.next_group += 1;
+        self.groups.insert(
+            g,
+            Group {
+                rt,
+                owner,
+                members: Vec::new(),
+            },
+        );
+        self.index_group(g);
+        g
+    }
+
+    /// Adds `key`'s claim, out of every group, to group `g`.
+    fn join(&mut self, (rt, slot): (RuntimeId, u32), g: u64) {
+        let members = &mut self
+            .groups
+            .get_mut(&g)
+            .expect("incr-core: the group exists")
+            .members;
+        let e = self
+            .claims
+            .get_mut(&(rt, slot))
+            .expect("incr-core: the claim is held");
+        e.group = g;
+        e.group_ix = members.len();
+        members.push(slot);
+    }
+
+    /// Takes `key`'s claim out of its group, returning the group's owner if
+    /// the claim was its last member.
+    fn leave(&mut self, (rt, slot): (RuntimeId, u32)) -> Option<Owner> {
+        let e = self
+            .claims
+            .get_mut(&(rt, slot))
+            .expect("incr-core: the claim is held");
+        let (g, ix) = (e.group, e.group_ix);
+        e.group = 0;
+        let group = self
+            .groups
+            .get_mut(&g)
+            .expect("incr-core: the group exists");
+        group.members.swap_remove(ix);
+        if let Some(&moved) = group.members.get(ix) {
+            self.claims
+                .get_mut(&(rt, moved))
+                .expect("incr-core: a member is held")
+                .group_ix = ix;
+            return None;
+        }
+        if !group.members.is_empty() {
+            return None;
+        }
+        self.unindex_group(g);
+        self.groups.remove(&g).map(|group| group.owner)
+    }
+
+    pub(crate) fn insert(&mut self, key: (RuntimeId, u32), mut held: Held) -> Option<Held> {
+        let displaced = self.remove(&key);
+        self.by_anchor.insert((key.0, held.anchor, key.1));
+        let g = self.new_group(key.0, std::mem::take(&mut held.owner));
+        self.claims.insert(key, held);
+        self.join(key, g);
+        displaced
+    }
+
+    pub(crate) fn remove(&mut self, key: &(RuntimeId, u32)) -> Option<Held> {
+        let g = self.claims.get(key)?.group;
+        let owner = match self.leave(*key) {
+            Some(owner) => owner,
+            None => self.groups[&g].owner.clone(),
+        };
+        let mut e = self
+            .claims
+            .remove(key)
+            .expect("incr-core: the claim is held");
+        self.by_anchor.remove(&(key.0, e.anchor, key.1));
+        e.owner = owner;
+        Some(e)
+    }
+
+    pub(crate) fn get(&self, key: &(RuntimeId, u32)) -> Option<&Held> {
+        self.claims.get(key)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &(RuntimeId, u32)) -> Option<&mut Held> {
+        self.claims.get_mut(key)
+    }
+
+    pub(crate) fn contains_key(&self, key: &(RuntimeId, u32)) -> bool {
+        self.claims.contains_key(key)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.claims.is_empty()
+    }
+
+    /// Moves `key`'s claim to anchor `anchor`.
+    pub(crate) fn set_anchor(&mut self, key: (RuntimeId, u32), anchor: u32) {
+        let e = self
+            .claims
+            .get_mut(&key)
+            .expect("incr-core: the claim is held");
+        if e.anchor != anchor {
+            self.by_anchor.remove(&(key.0, e.anchor, key.1));
+            self.by_anchor.insert((key.0, anchor, key.1));
+            e.anchor = anchor;
+        }
+    }
+
+    /// The episode root at `cidx` holds `rt`'s claims `slots`: anchored
+    /// and owned there, by whichever frame runs at that position.
+    pub(crate) fn root_at(&mut self, rt: RuntimeId, slots: &[u32], cidx: u32) {
+        for &m in slots {
+            self.set_anchor((rt, m), cidx);
+        }
+        self.hand_over(rt, &[], slots, cidx, u32::MAX, None);
+    }
+
+    /// [`Held::own`] for a claim in the map.
+    pub(crate) fn own(
+        &mut self,
+        key: (RuntimeId, u32),
+        owner: u32,
+        node: u32,
+        virtual_frame: Option<u64>,
+    ) {
+        self.hand_over(key.0, &[], &[key.1], owner, node, virtual_frame);
+    }
+
+    /// Hands every claim of `rt`'s owner groups `groups`, and `rt`'s claims
+    /// `slots`, to the frame at `owner`, of `node`, virtual at a path or
+    /// not, as [`Held::own`] would each. The largest of `groups` takes the
+    /// rest, so that a claim moves a logarithmic number of times however
+    /// often its owner is handed down.
+    pub(crate) fn hand_over(
+        &mut self,
+        rt: RuntimeId,
+        groups: &[u64],
+        slots: &[u32],
+        owner: u32,
+        node: u32,
+        virtual_frame: Option<u64>,
+    ) {
+        if groups.is_empty() && slots.is_empty() {
+            return;
+        }
+        let owner = Owner::new(owner, node, virtual_frame);
+        let target = groups
+            .iter()
+            .copied()
+            .max_by_key(|g| self.groups[g].members.len());
+        let target = match target {
+            Some(g) => {
+                self.unindex_group(g);
+                self.groups
+                    .get_mut(&g)
+                    .expect("incr-core: the group exists")
+                    .owner = owner;
+                self.index_group(g);
+                g
+            }
+            None => self.new_group(rt, owner),
+        };
+        for &g in groups.iter().filter(|&&g| g != target) {
+            self.unindex_group(g);
+            let group = self.groups.remove(&g).expect("incr-core: the group exists");
+            for m in group.members {
+                self.join((rt, m), target);
+            }
+        }
+        for &m in slots {
+            if self.claims[&(rt, m)].group != target {
+                self.leave((rt, m));
+                self.join((rt, m), target);
+            }
+        }
+    }
+
+    /// The frame that retries virtual owner group `g`'s frame owns its
+    /// claims from now, at the same position, of the same node.
+    pub(crate) fn own_retry(&mut self, g: u64) {
+        self.unindex_group(g);
+        self.groups
+            .get_mut(&g)
+            .expect("incr-core: the group exists")
+            .owner
+            .virtual_frame = None;
+        self.index_group(g);
+    }
+
+    /// Records that the virtual frame at `cidx`, at `path`, popped, in each
+    /// owner group a virtual frame above it is.
+    pub(crate) fn note_ancestor(&mut self, rt: RuntimeId, cidx: u32, path: u64) {
+        let Some(from) = cidx.checked_add(1) else {
+            return;
+        };
+        for &(_, _, g) in self
+            .by_virtual_owner
+            .range(Self::span(rt, from, u32::MAX, 0, u64::MAX))
+        {
+            if let Some(group) = self.groups.get_mut(&g) {
+                group.owner.ancestry.push((cidx, path));
+            }
+        }
+    }
+
+    /// The slots of `rt`'s claims anchored at or above `from`, lowest
+    /// anchor first.
+    pub(crate) fn anchored(&self, rt: RuntimeId, from: u32) -> impl Iterator<Item = u32> + '_ {
+        self.by_anchor
+            .range(Self::span(rt, from, u32::MAX, 0, u32::MAX))
+            .map(|&(_, _, slot)| slot)
+    }
+
+    /// [`Self::anchored`], collected, for a caller that changes the map.
+    pub(crate) fn anchored_from(&self, rt: RuntimeId, from: u32) -> Vec<u32> {
+        self.anchored(rt, from).collect()
+    }
+
+    /// `rt`'s owner groups at positions `from..=to`.
+    pub(crate) fn owners(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<u64> {
+        self.by_owner
+            .range(Self::span(rt, from, to, 0, u64::MAX))
+            .map(|&(_, _, g)| g)
+            .collect()
+    }
+
+    /// `rt`'s virtual owner groups at positions `from..=to`.
+    pub(crate) fn virtual_owners(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<u64> {
+        self.by_virtual_owner
+            .range(Self::span(rt, from, to, 0, u64::MAX))
+            .map(|&(_, _, g)| g)
+            .collect()
+    }
+
+    /// Whether a virtual frame at or above `from` owns a claim of `rt`.
+    pub(crate) fn any_virtually_owned_from(&self, rt: RuntimeId, from: u32) -> bool {
+        self.by_virtual_owner
+            .range(Self::span(rt, from, u32::MAX, 0, u64::MAX))
+            .next()
+            .is_some()
+    }
+
+    pub(crate) fn owner(&self, g: u64) -> &Owner {
+        &self.groups[&g].owner
+    }
+
+    pub(crate) fn members(&self, g: u64) -> &[u32] {
+        &self.groups[&g].members
+    }
+}
 
 /// The engine entry state of a thread, in one block so that an entry
 /// and its exit touch one thread-local.
@@ -230,7 +585,7 @@ struct Outer {
 
 #[cfg(not(loom))]
 thread_local! {
-    static HELD: RefCell<HeldMap> = RefCell::new(HashMap::new());
+    static HELD: RefCell<HeldMap> = RefCell::new(HeldMap::new());
     static ENTRY: EntryState = const {
         EntryState {
             depth: Cell::new(0),
@@ -252,7 +607,7 @@ thread_local! {
 
 #[cfg(loom)]
 loom::thread_local! {
-    static HELD: RefCell<HeldMap> = RefCell::new(HashMap::new());
+    static HELD: RefCell<HeldMap> = RefCell::new(HeldMap::new());
     static ENTRY: EntryState = EntryState {
         depth: Cell::new(0),
         ticket: Cell::new(0),
@@ -287,7 +642,7 @@ fn held_any() -> bool {
 
 /// Every claim in the held map, of every runtime.
 pub(crate) fn held_keys() -> Vec<(RuntimeId, u32)> {
-    HELD.with(|h| h.borrow().keys().copied().collect())
+    HELD.with(|h| h.borrow().claims.keys().copied().collect())
 }
 
 pub(crate) fn holds(rt: RuntimeId, slot: u32) -> bool {

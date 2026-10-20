@@ -278,6 +278,12 @@ impl Context {
         self.vstack.push(frame);
     }
 
+    /// The highest virtual frame below position `cidx`.
+    pub(crate) fn vframe_below(&self, cidx: u32) -> Option<&VFrame> {
+        let above = cidx.saturating_sub(self.boundary) as usize;
+        self.vstack[..above.min(self.vstack.len())].last()
+    }
+
     /// Pops the top virtual frame.
     /// Delivers `what` to the read virtual frame `below` was blocked in.
     pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) {
