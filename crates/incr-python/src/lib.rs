@@ -59,6 +59,9 @@ thread_local! {
     /// held panic to a read made after nested boundaries have returned.
     static PENDING_PYERR: RefCell<Vec<(u64, PyErr)>> = const { RefCell::new(Vec::new()) };
     static BOUNDARY_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// The runtime whose Python query callback is innermost on this
+    /// thread, or null outside every callback.
+    static QUERY_RT: Cell<*const Runtime> = const { Cell::new(std::ptr::null()) };
     static LAST_TOKEN: Cell<u64> = const { Cell::new(0) };
     /// An engine unwind a nested boundary caught, carried through the
     /// Python frames between it and the engine as `_IncrEngineUnwind`
@@ -101,7 +104,7 @@ fn raise_into_engine(e: PyErr) -> ! {
         let payload = ENGINE_UNWIND.with(|u| u.borrow_mut().take());
         std::panic::resume_unwind(payload.unwrap_or_else(|| Box::new("incr: engine unwind")));
     }
-    if incr_compute::active_frame_doomed() {
+    if query_frame_doomed() {
         drop(e);
         std::panic::resume_unwind(Box::new("incr: python code raised in a doomed frame"));
     }
@@ -114,6 +117,32 @@ fn raise_into_engine(e: PyErr) -> ! {
     // Not `panic!`: the exception is re-raised as itself, so the panic
     // hook's message would only be noise on stderr.
     std::panic::resume_unwind(Box::new(PyStashPanic { token, msg }))
+}
+
+/// Whether the innermost Python query on this thread runs in a doomed
+/// frame. A Local runtime keeps its frames to itself, so this asks the
+/// runtime `query_fn` recorded.
+fn query_frame_doomed() -> bool {
+    let rt = QUERY_RT.with(Cell::get);
+    // SAFETY: non-null only while that runtime runs a query callback on
+    // this thread (see `InQuery`), which borrows it for the whole call.
+    !rt.is_null() && unsafe { &*rt }.active_frame_doomed()
+}
+
+/// Records `rt` as the runtime of the innermost query callback, restoring
+/// the enclosing one when the callback returns or unwinds.
+struct InQuery(*const Runtime);
+
+impl InQuery {
+    fn enter(rt: &Runtime) -> Self {
+        InQuery(QUERY_RT.with(|q| q.replace(rt as *const _)))
+    }
+}
+
+impl Drop for InQuery {
+    fn drop(&mut self) {
+        QUERY_RT.with(|q| q.set(self.0));
+    }
 }
 
 fn take_stash(token: u64) -> Option<PyErr> {
@@ -287,6 +316,7 @@ fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 
             // Invalidates the ref when the callback returns or unwinds, so
             // one the callback kept never reaches a dropped runtime.
             let _guard = InvalidateRef(rt_ref.bind(py).clone());
+            let _query = InQuery::enter(rt);
             PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
         })
     }

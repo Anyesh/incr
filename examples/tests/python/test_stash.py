@@ -1,4 +1,5 @@
 import threading
+import weakref
 
 import incr
 import incr_concurrent
@@ -52,6 +53,33 @@ def test_an_exception_in_a_doomed_frame_is_dropped(module):
     a = rt.create_query(lambda r: 2, replay=True)
     t = rt.create_query(lambda r: 10 // r.get(a), replay=True)
     assert rt.get(t) == 5
+
+
+class Payload:
+    pass
+
+
+@BOTH
+def test_a_doomed_frames_exception_is_dropped_before_the_retry(module):
+    rt = doom_ready(module)
+    a = rt.create_query(lambda r: 2, replay=True)
+    refs, alive = [], []
+
+    def payload():
+        p = Payload()
+        refs.append(weakref.ref(p))
+        return p
+
+    def top(r):
+        x = r.get(a)
+        if x == PLACEHOLDER:
+            raise ZeroDivisionError(payload())
+        alive.append(refs[0]() is not None)
+        return x
+
+    t = rt.create_query(top, replay=True)
+    assert rt.get(t) == 2
+    assert alive == [False], "the doomed run's exception was kept"
 
 
 @BOTH
