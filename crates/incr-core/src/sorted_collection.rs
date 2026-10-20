@@ -273,7 +273,8 @@ where
         let version_node = rt.create_operator_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
 
-            if rebuild.is_set() {
+            let _provisional = rebuild.provisional(rt);
+            if rebuild.due(rt) {
                 let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
                 let target = paired_with(&key_fn, snapshot);
                 let mut st = state_for_query.write();
@@ -473,7 +474,8 @@ where
             let _uv = rt.get(upstream_version);
             let mut keep = Vec::new();
 
-            if rebuild.is_set() {
+            let _provisional = rebuild.provisional(rt);
+            if rebuild.due(rt) {
                 let (snapshot, end) = rebuild_snapshot(rt, &state, SortedState::snapshot);
                 let target = value_code::run(|| outputs(&snapshot));
                 let mut mirror = mirror.write();

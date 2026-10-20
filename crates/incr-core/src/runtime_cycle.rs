@@ -186,6 +186,38 @@ fn in_cycles(adj: &[Vec<usize>]) -> Vec<bool> {
 }
 
 impl<C: Cells> Runtime<C> {
+    fn active_ctl_has(&self, flag: u8) -> bool {
+        self.dep_stack
+            .active_frame(self.runtime_id)
+            // SAFETY: the active frame's control block is live.
+            .is_some_and(|(ctl, _)| unsafe { &*ctl }.has(flag))
+    }
+
+    /// Whether the compute running on this thread is a member run of a
+    /// known episode member.
+    pub(crate) fn running_as_member(&self) -> bool {
+        self.active_ctl_has(cycle::BUFFERED)
+    }
+
+    /// Whether the compute running on this thread has read a provisional
+    /// value (R2 to R5 set `LOW`).
+    pub(crate) fn read_provisional(&self) -> bool {
+        self.active_ctl_has(cycle::LOW)
+    }
+
+    /// Raises R3's outcome if the running compute has read a provisional
+    /// value: the cycle from its lowlink up.
+    pub(crate) fn refuse_provisional(&self) {
+        let Some((ctl, _)) = self.dep_stack.active_frame(self.runtime_id) else {
+            return;
+        };
+        // SAFETY: the active frame's control block is live.
+        let ctl = unsafe { &*ctl };
+        if ctl.has(cycle::LOW) {
+            self.raise_cycle(self.cycle_at(ctl.lowlink.get()));
+        }
+    }
+
     /// Raises the cycle a `get` read found: an engine unwind inside an
     /// engine entry, which the outermost entry turns into a panic, or that
     /// panic itself at depth 0.

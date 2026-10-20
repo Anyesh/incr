@@ -564,6 +564,23 @@ impl NeedsRebuild {
         self.0.store(false, MemOrdering::Relaxed);
     }
 
+    /// Whether this run rebuilds: the flag is set, or the run is a known
+    /// episode member's, which rebuilds against the current provisional
+    /// values whatever the flag says (bug k's rebuild is idempotent).
+    #[inline]
+    pub(crate) fn due<C: Cells>(&self, rt: &Runtime<C>) -> bool {
+        self.is_set() || rt.running_as_member()
+    }
+
+    /// Sets the flag when the run ends, on every exit, if the run read a
+    /// provisional value or ran as an episode member: its state then rests
+    /// on values the episode may still change or discard, so only an
+    /// ordinary run outside any episode leaves the flag clear.
+    #[inline]
+    pub(crate) fn provisional<'a, C: Cells>(&'a self, rt: &'a Runtime<C>) -> Provisional<'a, C> {
+        Provisional { flag: self, rt }
+    }
+
     /// Runs the part of a batch that changes state, setting the flag if a
     /// user panic unwinds out of it. The panic keeps unwinding.
     #[inline(always)]
@@ -572,6 +589,19 @@ impl NeedsRebuild {
         let r = batch();
         std::mem::forget(armed);
         r
+    }
+}
+
+pub(crate) struct Provisional<'a, C: Cells> {
+    flag: &'a NeedsRebuild,
+    rt: &'a Runtime<C>,
+}
+
+impl<C: Cells> Drop for Provisional<'_, C> {
+    fn drop(&mut self) {
+        if self.rt.running_as_member() || self.rt.read_provisional() {
+            self.flag.0.store(true, MemOrdering::Relaxed);
+        }
     }
 }
 
@@ -858,7 +888,8 @@ where
             let _uv = rt.get(upstream_version);
             let mut keep = Vec::new();
 
-            if rebuild.is_set() {
+            let _provisional = rebuild.provisional(rt);
+            if rebuild.due(rt) {
                 let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
                 let target: Vec<U> = snapshot.into_iter().filter_map(&image).collect();
                 let mut out = output_log_for_query.write();
@@ -997,7 +1028,8 @@ where
         rt.create_operator_query(move |rt| -> U {
             let _uv = rt.get(upstream_version);
 
-            if rebuild.is_set() {
+            let _provisional = rebuild.provisional(rt);
+            if rebuild.due(rt) {
                 let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
                 let fresh =
                     AggState::build(cloned(&identity), paired_with(&lift, snapshot), &combine);
@@ -1095,7 +1127,8 @@ where
             let _rv = rt.get(right_version);
             let mut keep = Vec::new();
 
-            if rebuild.is_set() {
+            let _provisional = rebuild.provisional(rt);
+            if rebuild.due(rt) {
                 let (l_snapshot, l_end) = rebuild_snapshot(rt, &left_log, CollectionLog::snapshot);
                 let (r_snapshot, r_end) = rebuild_snapshot(rt, &right_log, CollectionLog::snapshot);
                 let (fresh, pairs) = JoinState::build(
@@ -1230,6 +1263,9 @@ where
         let rebuild = NeedsRebuild::new();
         let version_node = rt.create_operator_query(move |rt| -> u64 {
             let _uv = rt.get(upstream_version);
+            // A router's groups are inputs, which never hold a provisional
+            // value, so it refuses one with the cycle before routing.
+            rt.refuse_provisional();
             let new_group = || {
                 let group = IncrCollection::<T, C>::new_in_compute(rt);
                 let router = *router_for_query
@@ -1240,7 +1276,8 @@ where
             };
             let mut keep = Vec::new();
 
-            if rebuild.is_set() {
+            let _provisional = rebuild.provisional(rt);
+            if rebuild.due(rt) {
                 let (snapshot, end) = rebuild_snapshot(rt, &upstream_log, CollectionLog::snapshot);
                 let mut fresh = KeyCache::new();
                 let mut targets: HashMap<K, Vec<T>> = HashMap::new();
@@ -1248,6 +1285,7 @@ where
                     let k = fresh.insert(cloned(&v), k);
                     value_code::run(|| targets.entry(k).or_default()).push(v);
                 }
+                rt.refuse_provisional();
 
                 let mut grps = groups_for_query.write();
                 let mut kc = key_cache_for_query.write();
@@ -1288,6 +1326,7 @@ where
             // Stage: key extraction outside the locks. Deletes look up
             // the cached key during apply instead.
             let keyed = keyed_inserts(&key_fn, pending);
+            rt.refuse_provisional();
 
             let mut grps = groups_for_query.write();
             let mut kc = key_cache_for_query.write();
@@ -1693,6 +1732,10 @@ where
 #[cfg(test)]
 #[path = "collection_rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[cfg(test)]
+#[path = "collection_cycle_tests.rs"]
+mod cycle_tests;
 
 #[cfg(test)]
 mod tests {
