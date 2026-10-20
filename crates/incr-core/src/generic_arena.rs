@@ -20,7 +20,8 @@ use std::cell::Cell;
 
 use crate::cells::{Cells, PtrCell};
 use crate::directory::Directory;
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 use crate::value::Value;
 use crate::value_slot::{Compared, Displaced, ValueSlot};
 
@@ -49,7 +50,7 @@ struct ArenaInner {
 
 pub struct GenericArena<T: Value, C: Cells> {
     segments: Directory<Segment<T, C>, C>,
-    inner: C::Lock<ArenaInner>,
+    inner: OrderedLock<ArenaInner, C>,
     /// What a pending handle of this type reads; set at most once.
     placeholder: std::sync::OnceLock<T>,
 }
@@ -64,10 +65,13 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
     pub fn new() -> Self {
         Self {
             segments: Directory::with_len(FIRST_DIRECTORY_LEN),
-            inner: <C::Lock<ArenaInner> as Lock<_>>::new(ArenaInner {
-                len: 0,
-                free: Vec::new(),
-            }),
+            inner: OrderedLock::new(
+                LockKind::Arena,
+                ArenaInner {
+                    len: 0,
+                    free: Vec::new(),
+                },
+            ),
             placeholder: std::sync::OnceLock::new(),
         }
     }

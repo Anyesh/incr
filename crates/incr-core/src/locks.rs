@@ -17,6 +17,8 @@
 //! closure into a permanently bricked runtime, which the compute panic
 //! boundary exists to prevent.
 
+use crate::cells::Cells;
+use crate::lock_order::{LockKind, Ordered};
 use std::cell::{Ref, RefCell, RefMut};
 use std::ops::{Deref, DerefMut};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -92,6 +94,43 @@ impl<T: 'static> Lock<T> for RwLock<T> {
     #[inline(always)]
     fn write(&self) -> Self::WriteGuard<'_> {
         RwLock::write(self).unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A strategy's lock with its place in the lock order (`lock_order`): each
+/// acquisition is checked against the thread's other locks in debug builds.
+pub(crate) struct OrderedLock<T: 'static, C: Cells> {
+    lock: C::Lock<T>,
+    #[cfg(debug_assertions)]
+    kind: LockKind,
+}
+
+impl<T: 'static, C: Cells> OrderedLock<T, C> {
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
+    pub(crate) fn new(kind: LockKind, val: T) -> Self {
+        Self {
+            lock: <C::Lock<T> as Lock<T>>::new(val),
+            #[cfg(debug_assertions)]
+            kind,
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn read(&self) -> Ordered<<C::Lock<T> as Lock<T>>::ReadGuard<'_>> {
+        Ordered::take(self.order(), || self.lock.read())
+    }
+
+    #[inline(always)]
+    pub(crate) fn write(&self) -> Ordered<<C::Lock<T> as Lock<T>>::WriteGuard<'_>> {
+        Ordered::take(self.order(), || self.lock.write())
+    }
+
+    #[inline(always)]
+    fn order(&self) -> LockKind {
+        #[cfg(debug_assertions)]
+        return self.kind;
+        #[cfg(not(debug_assertions))]
+        LockKind::Inner
     }
 }
 

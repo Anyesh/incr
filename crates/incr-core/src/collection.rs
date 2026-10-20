@@ -52,7 +52,8 @@ use std::sync::{Arc, OnceLock};
 use crate::cells::Cells;
 use crate::handle::{ErasedIncr, Incr};
 use crate::hashed_multiset::HashedMultiset;
-use crate::locks::Lock;
+use crate::lock_order::{self, LockKind, Ordered};
+use crate::locks::{Lock, OrderedLock};
 use crate::persist_hooks::{RepSide, RepSink};
 use crate::runtime::{ParkPoint, Runtime};
 use crate::value::Value;
@@ -73,18 +74,18 @@ pub(crate) fn park<C: Cells>(_rt: &Runtime<C>, _point: ParkPoint) {}
 /// a `RefCell` (no atomics, which is the point: collection ops on the
 /// single-threaded runtime pay no synchronization); under `Shared` it is
 /// the poison-ignoring `RwLock`.
-pub(crate) struct OpLock<T: 'static, C: Cells>(C::Lock<T>);
+pub(crate) struct OpLock<T: 'static, C: Cells>(OrderedLock<T, C>);
 
 impl<T: 'static, C: Cells> OpLock<T, C> {
-    pub(crate) fn new(v: T) -> Self {
-        Self(<C::Lock<T> as Lock<T>>::new(v))
+    pub(crate) fn new(kind: LockKind, v: T) -> Self {
+        Self(OrderedLock::new(kind, v))
     }
 
-    pub(crate) fn read(&self) -> <C::Lock<T> as Lock<T>>::ReadGuard<'_> {
+    pub(crate) fn read(&self) -> Ordered<<C::Lock<T> as Lock<T>>::ReadGuard<'_>> {
         self.0.read()
     }
 
-    pub(crate) fn write(&self) -> <C::Lock<T> as Lock<T>>::WriteGuard<'_> {
+    pub(crate) fn write(&self) -> Ordered<<C::Lock<T> as Lock<T>>::WriteGuard<'_>> {
         self.0.write()
     }
 }
@@ -723,7 +724,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         let log = CollectionLog::new();
         Self {
             hasher: log.hasher.clone(),
-            log: Arc::new(OpLock::new(log)),
+            log: Arc::new(OpLock::new(LockKind::CollectionLog, log)),
             version_node: rt.create_input(0_u64),
             derived: false,
             _confine: std::marker::PhantomData,
@@ -751,7 +752,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         let log = CollectionLog::new();
         Self {
             hasher: log.hasher.clone(),
-            log: Arc::new(OpLock::new(log)),
+            log: Arc::new(OpLock::new(LockKind::CollectionLog, log)),
             version_node: rt.create_input_unchecked(0_u64),
             derived: true,
             _confine: std::marker::PhantomData,
@@ -932,6 +933,7 @@ where
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
+        let pred = lock_order::unlocked("pred", pred);
         self.per_element(rt, move |v| pred(&v).then_some(v))
     }
 
@@ -942,6 +944,7 @@ where
         U: Value + Hash + Eq,
         F: Fn(&T) -> U + Send + Sync + 'static,
     {
+        let f = lock_order::unlocked("f", f);
         self.per_element(rt, move |v| Some(f(&v)))
     }
 
@@ -960,7 +963,8 @@ where
 
         let output = CollectionLog::new();
         let out_hasher = output.hasher.clone();
-        let output_log: Arc<OpLock<CollectionLog<U>, C>> = Arc::new(OpLock::new(output));
+        let output_log: Arc<OpLock<CollectionLog<U>, C>> =
+            Arc::new(OpLock::new(LockKind::CollectionLog, output));
 
         // Bootstrap: seed the output from the live snapshot; the cursor
         // starts past everything the snapshot covered.
@@ -1107,12 +1111,14 @@ where
         Cmb: Fn(&U, &U) -> U + Send + Sync + 'static,
     {
         value_code::check();
+        let lift = lock_order::unlocked("lift", lift);
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         let state = AggState::build(cloned(&identity), paired_with(&lift, bootstrap), &combine);
-        let state: Arc<OpLock<AggState<T, U>, C>> = Arc::new(OpLock::new(state));
+        let state: Arc<OpLock<AggState<T, U>, C>> =
+            Arc::new(OpLock::new(LockKind::AggregateState, state));
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
@@ -1187,6 +1193,8 @@ where
         FR: Fn(&U) -> K + Send + Sync + 'static,
     {
         value_code::check();
+        let left_key = lock_order::unlocked("left_key", left_key);
+        let right_key = lock_order::unlocked("right_key", right_key);
         let left_log = Arc::clone(&self.log);
         let right_log = Arc::clone(&right.log);
         let left_version = self.version_node;
@@ -1201,14 +1209,15 @@ where
             paired_with(&right_key, right_boot),
         );
         let output_log: Arc<OpLock<CollectionLog<(T, U)>, C>> =
-            Arc::new(OpLock::new(CollectionLog::new()));
+            Arc::new(OpLock::new(LockKind::CollectionLog, CollectionLog::new()));
         {
             let mut out = output_log.write();
             for pair in pairs {
                 out.insert(pair);
             }
         }
-        let state: Arc<OpLock<JoinState<T, U, K>, C>> = Arc::new(OpLock::new(st));
+        let state: Arc<OpLock<JoinState<T, U, K>, C>> =
+            Arc::new(OpLock::new(LockKind::OperatorState, st));
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
@@ -1318,13 +1327,16 @@ where
         F: Fn(&T) -> K + Send + Sync + 'static,
     {
         value_code::check();
+        let key_fn = lock_order::unlocked("key_fn", key_fn);
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
 
-        let groups: GroupMap<K, T, C> = Arc::new(OpLock::new(HashMap::new()));
-        let key_cache: Arc<OpLock<KeyCache<T, K>, C>> = Arc::new(OpLock::new(KeyCache::new()));
+        let groups: GroupMap<K, T, C> =
+            Arc::new(OpLock::new(LockKind::OperatorState, HashMap::new()));
+        let key_cache: Arc<OpLock<KeyCache<T, K>, C>> =
+            Arc::new(OpLock::new(LockKind::KeyCache, KeyCache::new()));
         let output_version_counter = Arc::new(AtomicU64::new(0));
 
         {

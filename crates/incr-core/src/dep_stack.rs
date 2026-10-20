@@ -157,6 +157,7 @@ pub trait DepStack: 'static {
     #[doc(hidden)]
     #[inline(always)]
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
+        crate::lock_order::enter_frame();
         self.with(|s| {
             let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
             s.frames.push(Frames::frame(node, rt, ctl, cidx));
@@ -168,6 +169,7 @@ pub trait DepStack: 'static {
     /// member runs all sit at the root's.
     #[doc(hidden)]
     fn push_frame_at(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl, cidx: u32) {
+        crate::lock_order::enter_frame();
         self.with(|s| s.frames.push(Frames::frame(node, rt, ctl, cidx)))
     }
 
@@ -175,12 +177,14 @@ pub trait DepStack: 'static {
     /// generation it was read at.
     #[inline(always)]
     fn pop_frame(&self) -> Vec<(NodeId, u32)> {
-        self.with(|s| {
+        let deps = self.with(|s| {
             s.frames
                 .pop()
                 .expect("incr-core: pop_frame on an empty stack")
                 .deps
-        })
+        });
+        crate::lock_order::leave_frame();
+        deps
     }
 
     /// Record `dep`, read at `generation`, as a dependency of runtime

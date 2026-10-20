@@ -32,6 +32,7 @@ pub mod fx;
 pub mod generic_arena;
 pub mod handle;
 mod hashed_multiset;
+pub mod lock_order;
 pub mod locks;
 #[cfg(loom)]
 pub mod loom_cells;

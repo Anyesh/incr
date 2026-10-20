@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use incr_core::lock_order::{LockKind, Ordered};
 use incr_core::persist_hooks::changed_at;
 use incr_core::{check_value_code, with_value_code, Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
@@ -830,7 +831,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
     /// release builds and before the lock: the holder may be waiting on a
     /// claim the calling compute or value code's caller holds, and value
     /// code may be running on the thread that holds the mutex.
-    fn state(&self) -> Result<MutexGuard<'_, State<C>>> {
+    fn state(&self) -> Result<Ordered<MutexGuard<'_, State<C>>>> {
         assert!(
             !self.runtime.frame_active(),
             "incr-persist: Store methods must not be called from inside a query's compute",
@@ -838,7 +839,9 @@ impl<C: Cells, B: Backend> Store<C, B> {
         check_value_code();
         // A panic while the mutex was held may have left the runtime and
         // the folded log out of step, which is the poisoned condition too.
-        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let state = Ordered::try_take(LockKind::Store, || {
+            self.state.lock().map_err(|_| Error::Poisoned)
+        })?;
         if state.poisoned {
             return Err(Error::Poisoned);
         }

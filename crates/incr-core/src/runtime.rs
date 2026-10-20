@@ -36,7 +36,8 @@ use crate::dependent_list::DependentList;
 use crate::fx::FxBuildHasher;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
@@ -740,9 +741,9 @@ pub struct Runtime<C: Cells> {
     /// Read with no lock; written only under `inner.write()`, through
     /// `Inner::arena_tags`.
     pub(crate) arenas: ArenaRegistry<C>,
-    pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
+    pub(crate) inner: OrderedLock<Inner<C>, C>,
     /// Taken only inside an `inner` section or with no lock held.
-    pub(crate) watch_queue: <C as Cells>::Lock<watch_impl::WatchQueue>,
+    pub(crate) watch_queue: OrderedLock<watch_impl::WatchQueue, C>,
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
@@ -846,8 +847,8 @@ impl<C: Cells> Runtime<C> {
         Self {
             nodes: SegmentedNodes::new(),
             arenas: ArenaRegistry::new(),
-            inner: <<C as Cells>::Lock<Inner<C>> as Lock<Inner<C>>>::new(Inner::new()),
-            watch_queue: Lock::new(watch_impl::WatchQueue::new()),
+            inner: OrderedLock::new(LockKind::Inner, Inner::new()),
+            watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),

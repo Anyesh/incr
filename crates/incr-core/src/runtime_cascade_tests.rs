@@ -8,7 +8,6 @@ use std::sync::Arc;
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::handle::Incr;
-use crate::locks::Lock;
 
 fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
     match err.downcast::<String>() {
