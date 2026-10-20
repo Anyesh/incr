@@ -34,6 +34,8 @@ def test_a_replayable_chain_deeper_than_python_recursion_computes(module):
 def test_a_byte_budget_also_replays(module):
     rt = module.Runtime()
     rt.set_placeholder(0)
+    # Past the chain's depth, so only the byte budget stops the nesting.
+    rt.set_max_frames(1_000_000)
     rt.set_max_stack_bytes(256 * 1024)
     nodes = chain(rt, replay=True)
     assert rt.get(nodes[-1]) == DEPTH

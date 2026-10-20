@@ -1,3 +1,6 @@
+import threading
+import time
+
 import incr
 import incr_concurrent
 import pytest
@@ -68,7 +71,7 @@ def test_get_is_refused_inside_a_query(module):
     table = rt.create_table()
     table.get_or_insert_input("x", lambda: 1)
     q = rt.create_query(lambda r: table.get("x"))
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="called during compute"):
         rt.get(q)
 
 
@@ -102,3 +105,36 @@ def test_key_eq_that_calls_into_incr_raises_the_contract_error(module):
         table.get_or_insert_input(Key("second", state), lambda: 2)
     assert state["calls"] == state["arm_at"]
     assert [k.name for k, _ in table.items()] == ["first"]
+
+
+class SlowKey:
+    """One hash for every key, and an `__eq__` that sleeps, so a second
+    thread's miss waits on the miss mutex while the first compares."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __hash__(self):
+        return 0
+
+    def __eq__(self, other):
+        time.sleep(0.05)
+        return isinstance(other, SlowKey) and self.name == other.name
+
+
+def test_a_table_miss_waits_without_the_gil():
+    rt = incr_concurrent.Runtime()
+    table = rt.create_table()
+    table.get_or_insert_input(SlowKey("a"), lambda: 0)
+    threads = [
+        threading.Thread(
+            target=table.get_or_insert_input, args=(SlowKey(name), lambda: 1), daemon=True
+        )
+        for name in "bcd"
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a miss waited holding the GIL"
+    assert sorted(k.name for k, _ in table.items()) == ["a", "b", "c", "d"]
