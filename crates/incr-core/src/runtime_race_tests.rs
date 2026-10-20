@@ -28,9 +28,9 @@ const PARK_TIMEOUT: Duration = Duration::from_secs(10);
 /// gate only parks once it is armed, so a closure can carry one through
 /// setup computes without stopping.
 #[derive(Clone)]
-pub(super) struct Gate(Arc<GateInner>);
+pub(crate) struct Gate(Arc<GateInner>);
 
-pub(super) struct GateInner {
+pub(crate) struct GateInner {
     armed: AtomicBool,
     reached_tx: Mutex<Sender<()>>,
     reached_rx: Mutex<Receiver<()>>,
@@ -39,7 +39,7 @@ pub(super) struct GateInner {
 }
 
 impl Gate {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let (reached_tx, reached_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         Self(Arc::new(GateInner {
@@ -51,11 +51,11 @@ impl Gate {
         }))
     }
 
-    pub(super) fn arm(&self) {
+    pub(crate) fn arm(&self) {
         self.0.armed.store(true, Ordering::SeqCst);
     }
 
-    pub(super) fn park(&self) {
+    pub(crate) fn park(&self) {
         if !self.0.armed.swap(false, Ordering::SeqCst) {
             return;
         }
@@ -68,7 +68,7 @@ impl Gate {
             .expect("parked thread was never released");
     }
 
-    pub(super) fn wait_parked(&self) {
+    pub(crate) fn wait_parked(&self) {
         self.0
             .reached_rx
             .lock()
@@ -77,7 +77,7 @@ impl Gate {
             .expect("thread never reached its park point");
     }
 
-    pub(super) fn release(&self) {
+    pub(crate) fn release(&self) {
         self.0.release_tx.lock().unwrap().send(()).unwrap();
     }
 }

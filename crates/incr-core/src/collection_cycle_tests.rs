@@ -3,12 +3,13 @@
 //! operator built after the episode would have, and a `group_by` router
 //! refuses a provisional value with the cycle and routes nothing.
 
-use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
 use super::*;
 use crate::cells::{Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
+use crate::state::NodeState;
 
 /// A runtime a user function captures to read nodes, which the operator
 /// API's `Fn(&T)` signatures otherwise can't reach.
@@ -245,6 +246,302 @@ fn group_by_refuses_a_member_upstream<C: Cells>() {
     assert_eq!(grouped.routed_state(&rt), routed);
     assert_eq!(grouped.group_count(), 0);
     rt.assert_invariant_i();
+}
+
+/// Called with the number of the run it is called from.
+type Hook = Arc<dyn Fn(usize) + Send + Sync>;
+
+/// [`filter_member`]'s shape, M = min(count(F) + 1, 5) + (W on one run)
+/// and F = S.filter(pred) over S = 0..10, where M reads `count` with
+/// `try_get`, so that an entry below M meets R3 as an `Err`, with ways to change F's reads
+/// part-way through the episode. `pred` is `x <= M` for its first
+/// `m_reads` calls while input `link` is 1, and `x <= 3` after that.
+#[derive(Clone, Default)]
+struct Shape {
+    m_reads: usize,
+    link: u64,
+    /// M's run that sets `link` to 0.
+    unlink_on: Option<usize>,
+    /// M's run that reads W, which reads `count` and lands 0.
+    w_on: Option<usize>,
+    m_hook: Option<Hook>,
+    w_hook: Option<Hook>,
+}
+
+impl Shape {
+    fn plain() -> Self {
+        Self {
+            m_reads: usize::MAX,
+            link: 1,
+            ..Self::default()
+        }
+    }
+
+    fn unlinked() -> Self {
+        Self {
+            link: 0,
+            ..Self::plain()
+        }
+    }
+}
+
+struct Episode<C: Cells> {
+    rt: Box<Runtime<C>>,
+    s: IncrCollection<u64, C>,
+    f: IncrCollection<u64, C>,
+    count: Incr<u64>,
+    m: Incr<u64>,
+    w: Incr<u64>,
+    /// Runs of `pred`, M and W.
+    runs: Arc<AtomicUsize>,
+}
+
+impl<C: Cells> Episode<C> {
+    fn new(shape: Shape) -> Self {
+        let rt = Box::new(Runtime::<C>::new());
+        let s = rt.create_collection::<u64>();
+        let link = rt.create_input(shape.link);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+        let pred_calls = AtomicUsize::new(0);
+        let (r, m, pred_runs) = (RtRef(&*rt), m_cell.clone(), runs.clone());
+        let f = s.filter(&rt, move |&x| {
+            pred_runs.fetch_add(1, SeqCst);
+            let rt = r.rt();
+            if pred_calls.fetch_add(1, SeqCst) < shape.m_reads && rt.get(link) == 1 {
+                x <= rt.get(*m.get().unwrap())
+            } else {
+                x <= 3
+            }
+        });
+        let count = f.count(&rt);
+        let (w_runs, w_hook) = (runs.clone(), shape.w_hook.clone());
+        let w = rt.create_query(move |rt| {
+            w_runs.fetch_add(1, SeqCst);
+            if let Some(hook) = &w_hook {
+                hook(1);
+            }
+            rt.get(count);
+            0
+        });
+        let (m_runs, m_hook) = (runs.clone(), shape.m_hook.clone());
+        let own_runs = AtomicUsize::new(0);
+        let m = rt.create_query_with(
+            move |rt| {
+                m_runs.fetch_add(1, SeqCst);
+                let run = own_runs.fetch_add(1, SeqCst) + 1;
+                if let Some(hook) = &m_hook {
+                    hook(run);
+                }
+                let w = if shape.w_on == Some(run) {
+                    rt.get(w)
+                } else {
+                    0
+                };
+                if shape.unlink_on == Some(run) {
+                    rt.set(link, 0);
+                }
+                (rt.try_get(count).unwrap_or(0) + 1).min(5) + w
+            },
+            fixpoint(20),
+        );
+        m_cell.set(m).unwrap();
+        for x in 0..10 {
+            s.insert(&rt, x);
+        }
+        Self {
+            rt,
+            s,
+            f,
+            count,
+            m,
+            w,
+            runs,
+        }
+    }
+
+    /// The episode's landing against a fresh runtime of shape `fresh` and
+    /// a fresh filter `x <= bound`: equal values, every member `Clean`,
+    /// and a further get of each node runs no closure. A run that spans a
+    /// `set` may land `Dirty` and run again, as in
+    /// `set_during_replay_dissolves`, so with `spans_set` that holds only
+    /// from the get after it.
+    fn assert_landed(&self, fresh: Shape, bound: u64, spans_set: bool) {
+        let rt = &*self.rt;
+        let version = self.f.version_node();
+        let assert_clean = || {
+            for (name, state) in [
+                ("M", rt.state_of(self.m)),
+                ("count", rt.state_of(self.count)),
+                ("F", rt.state_of(version)),
+            ] {
+                assert_eq!(state, NodeState::Clean, "{name} landed Clean");
+            }
+        };
+        if spans_set {
+            let _ = (rt.get(self.m), rt.get(self.count), rt.get(version));
+        }
+        assert_clean();
+        let runs = self.runs.load(SeqCst);
+        let landed = (rt.get(self.m), rt.get(self.count), rt.get(version));
+        assert_eq!(self.runs.load(SeqCst), runs, "a further get ran a closure");
+        assert_clean();
+        let landed = (landed.0, landed.1);
+
+        let other = Episode::<C>::new(fresh);
+        assert_eq!(landed, (other.rt.get(other.m), other.rt.get(other.count)));
+        let fresh_op = self.s.filter(rt, move |&x| x <= bound);
+        assert_eq!(sorted(self.f.values(rt)), sorted(fresh_op.values(rt)));
+        assert_eq!(rt.cycle_of(self.w), None);
+        rt.assert_invariant_i();
+    }
+}
+
+/// `pred` reads M only in the discovery run, so the episode's validation
+/// releases F and the cycle dissolves: F lands `x <= 3` as a fresh filter
+/// does, over a rebuild rather than its provisional output.
+fn dissolve_after_discovery<C: Cells>() {
+    let ep = Episode::<C>::new(Shape {
+        m_reads: 10,
+        ..Shape::plain()
+    });
+    assert_eq!(ep.rt.get(ep.m), 5);
+    assert_eq!(ep.rt.cycle_of(ep.m), None);
+    ep.assert_landed(Shape::unlinked(), 3, false);
+}
+
+/// M's iteration-1 run sets `link`, which takes M out of `pred`'s reads,
+/// as `set_during_replay_dissolves`' Z does.
+fn dissolve_after_iteration_1<C: Cells>() {
+    let ep = Episode::<C>::new(Shape {
+        unlink_on: Some(2),
+        ..Shape::plain()
+    });
+    assert_eq!(ep.rt.get(ep.m), 5);
+    assert_eq!(ep.rt.cycle_of(ep.m), None);
+    ep.assert_landed(Shape::unlinked(), 3, true);
+}
+
+/// M reads W, which reads `count`, only on one run. M's last run doesn't
+/// read W, so W is on no cycle once the episode lands. Read on M's run 1 or
+/// 2 it lands outside the group, but read first in iteration 2 (run 3) or
+/// later it lands as a member, and `cycle_of` names it.
+fn member_read_once_leaves_the_group<C: Cells>() {
+    for on in 1..=4 {
+        let ep = Episode::<C>::new(Shape {
+            w_on: Some(on),
+            ..Shape::plain()
+        });
+        assert_eq!(ep.rt.get(ep.m), 5);
+        assert_eq!(ep.rt.cycle_of(ep.w), None, "W read on M's run {on}");
+        ep.assert_landed(Shape::plain(), 5, false);
+    }
+}
+
+#[test]
+#[ignore = "a node first read in iteration 2 or later stays in the landed group"]
+fn local_member_read_once_leaves_the_group() {
+    member_read_once_leaves_the_group::<Local>();
+}
+
+#[test]
+#[ignore = "a node first read in iteration 2 or later stays in the landed group"]
+fn shared_member_read_once_leaves_the_group() {
+    member_read_once_leaves_the_group::<Shared>();
+}
+
+#[test]
+fn local_filter_dissolves_after_the_discovery_run() {
+    dissolve_after_discovery::<Local>();
+}
+
+#[test]
+fn shared_filter_dissolves_after_the_discovery_run() {
+    dissolve_after_discovery::<Shared>();
+}
+
+#[test]
+fn local_filter_dissolves_after_iteration_1() {
+    dissolve_after_iteration_1::<Local>();
+}
+
+#[test]
+fn shared_filter_dissolves_after_iteration_1() {
+    dissolve_after_iteration_1::<Shared>();
+}
+
+/// Thread 1 runs the episode at M. On M's run `on`, M parks before it
+/// reads W, which thread 2 has claimed and parks in before W reads
+/// `count`, a member thread 1 holds. Each then waits on the other, the
+/// episode's thread first unless `episode_older` is false, and the
+/// registry wounds the younger.
+#[cfg(not(loom))]
+mod wounds {
+    use std::thread;
+
+    use super::*;
+    use crate::runtime::race_tests::Gate;
+    use crate::runtime::wound_tests::{assert_wounded, wait_registered};
+
+    fn wound_at(on: usize, episode_older: bool) {
+        let (m_gate, w_gate) = (Gate::new(), Gate::new());
+        let (mg, wg) = (m_gate.clone(), w_gate.clone());
+        let ep = Episode::<Shared>::new(Shape {
+            w_on: Some(on),
+            m_hook: Some(Arc::new(move |run| {
+                if run == on {
+                    mg.park();
+                }
+            })),
+            w_hook: Some(Arc::new(move |_| wg.park())),
+            ..Shape::plain()
+        });
+        let rt = &*ep.rt;
+        let (m, w) = (ep.m, ep.w);
+        thread::scope(|scope| {
+            m_gate.arm();
+            let episode = scope.spawn(move || rt.get(m));
+            m_gate.wait_parked();
+            w_gate.arm();
+            let reader = scope.spawn(move || rt.get(w));
+            w_gate.wait_parked();
+            let (first, second) = if episode_older {
+                (&m_gate, &w_gate)
+            } else {
+                (&w_gate, &m_gate)
+            };
+            first.release();
+            wait_registered(1);
+            second.release();
+            assert_eq!(episode.join().unwrap(), 5);
+            assert_eq!(reader.join().unwrap(), 0);
+        });
+        assert_wounded();
+        ep.assert_landed(Shape::plain(), 5, false);
+    }
+
+    macro_rules! wound_tests {
+        ($($(#[$attr:meta])* $name:ident: $on:expr, $older:expr;)*) => {$(
+            #[test]
+            #[cfg_attr(miri, ignore)]
+            $(#[$attr])*
+            fn $name() {
+                crate::child_test::run_in_child(
+                    concat!("collection::cycle_tests::wounds::", stringify!($name)),
+                    || wound_at($on, $older),
+                )
+                .assert_clean();
+            }
+        )*};
+    }
+
+    wound_tests! {
+        shared_wound_after_the_discovery_run_episode_older: 2, true;
+        shared_wound_after_the_discovery_run_reader_older: 2, false;
+        #[ignore = "W, read by M only in iteration 2, stays in the landed group"]
+        shared_wound_after_iteration_1_episode_older: 3, true;
+        shared_wound_after_iteration_1_reader_older: 3, false;
+    }
 }
 
 #[test]
