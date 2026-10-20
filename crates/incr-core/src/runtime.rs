@@ -205,6 +205,18 @@ pub(crate) enum ParkPoint {
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
+    /// In `stabilize`, after it took its observers and before the first
+    /// one runs.
+    StabilizeAfterDrain,
+    /// In `observer_read`, after the entry generation compare and before
+    /// `ensure_clean`.
+    ObserverAfterEntryCheck(NodeId),
+    /// In `observer_read`, after `ensure_clean` returned and before the
+    /// generation compare that follows it.
+    ObserverAfterEnsureClean(NodeId),
+    /// In `observer_read`, after the compare that follows `ensure_clean`
+    /// and before the seqlock pre-check.
+    ObserverBeforePreCheck(NodeId),
 }
 
 /// The panic of a read that found its node `Dead` under the handle's
@@ -1385,23 +1397,16 @@ impl<C: Cells> Runtime<C> {
             _ => node.changed_at().min(self.current_revision()),
         };
 
-        let run = Arc::new(move |rt: &Runtime<C>, last_seen: u64| -> Option<u64> {
-            if rt.ensure_clean(NodeId(handle.slot()), handle.generation()) == Computed::Gone {
-                rt.stale_handle(handle);
-            }
-            let node = rt.nodes.get(handle.slot());
-            // A pending set() marker reads as u64::MAX; clamp to the
-            // current revision so last_seen stays passable and the
-            // settled stamp can still exceed it (duplicate, not lost).
-            let stamp = node.changed_at().min(rt.current_revision());
-            if stamp > last_seen {
-                let value = rt.get(handle);
-                callback(&value);
-                Some(stamp)
-            } else {
-                None
-            }
-        });
+        let run = Arc::new(
+            move |rt: &Runtime<C>, last_seen: u64| match rt.observer_read(handle) {
+                Ok((value, stamp)) if stamp > last_seen => {
+                    callback(&value);
+                    Some(stamp)
+                }
+                Err(ObsErr::Cycle(stamp)) if stamp > last_seen => Some(stamp),
+                Ok(_) | Err(ObsErr::Cycle(_) | ObsErr::Gone) => None,
+            },
+        );
 
         let mut inner = self.inner.write();
         let id = inner.next_observer_id;
@@ -1445,6 +1450,7 @@ impl<C: Cells> Runtime<C> {
                 .map(|(&id, e)| (id, e.last_seen, Arc::clone(&e.run)))
                 .collect()
         };
+        self.park(ParkPoint::StabilizeAfterDrain);
         for (id, last_seen, run) in entries {
             if let Some(new_stamp) = run(self, last_seen) {
                 let mut inner = self.inner.write();
@@ -3024,6 +3030,11 @@ impl<C: Cells> Runtime<C> {
                     if g0.is_some_and(|g| g != node.generation()) {
                         return Computed::Gone;
                     }
+                    // An observer's read of a node whose delete has not
+                    // bumped its generation yet: the observer goes with it.
+                    if observe_impl::is_observed(self.runtime_id, id.0) {
+                        return Computed::Gone;
+                    }
                     deleted_while_reading(id);
                 }
                 NodeState::New => {
@@ -4035,11 +4046,19 @@ mod replay_impl;
 #[path = "runtime_watch.rs"]
 mod watch_impl;
 
+#[path = "runtime_observe.rs"]
+mod observe_impl;
+
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_watch_tests.rs"]
 mod watch_tests;
 
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_observer_read_tests.rs"]
+mod observer_read_tests;
+
 pub(crate) use children_impl::ChildLanding;
+use observe_impl::ObsErr;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_children_tests.rs"]
