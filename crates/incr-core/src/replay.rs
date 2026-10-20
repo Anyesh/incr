@@ -70,6 +70,9 @@ pub(crate) struct VFrame {
     /// For an episode's member run, the episode, which waits in the
     /// context until this frame pops.
     pub(crate) ep: Option<u64>,
+    /// For a member run, the episode its member is in, R5's nested runs
+    /// included: the frame's [`ReadKey::episode`].
+    pub(crate) member_of: Option<u64>,
     /// The compute the frame below was blocked reading, `slot |
     /// generation << 32`: the frame's own node, or for an episode's member
     /// run the episode's root, whose compute ran the episode.
@@ -94,8 +97,9 @@ pub(crate) struct ReadKey {
     pub(crate) ordinal: u32,
     /// The frame's [`VFrame::path`].
     pub(crate) path: u64,
-    /// For an episode's member run, the episode: the frame's own run, and
-    /// the episode's other member runs of the node there, are other runs.
+    /// For a member run, the episode its member is in: a discovery run of
+    /// the node at the position, and the runs of another episode, are other
+    /// runs.
     pub(crate) episode: Option<u64>,
 }
 
@@ -109,7 +113,7 @@ impl ReadKey {
             reading: v.reading,
             ordinal: v.ordinal,
             path: v.path,
-            episode: v.ep,
+            episode: v.member_of,
         }
     }
 }

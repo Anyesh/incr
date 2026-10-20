@@ -1094,6 +1094,11 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         None
                     },
+                    member_of: if ctl.has(cycle::BUFFERED) {
+                        cycle_state::held_episode(rt, f.node)
+                    } else {
+                        None
+                    },
                     computes: {
                         let n = if ctl.has(cycle::BUFFERED) {
                             replay::member_run_root(f.cidx).unwrap_or(f.node)
@@ -2297,7 +2302,9 @@ impl<C: Cells> Runtime<C> {
             reading,
             ordinal: self.dep_stack.reads_of_current(rt),
             path: self.path_at(f.cidx),
-            episode: member.then(|| replay::member_run_episode(f.cidx)).flatten(),
+            episode: member
+                .then(|| cycle_state::held_episode(rt, f.node.0))
+                .flatten(),
         };
         let what = replay::with(|c| {
             c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {

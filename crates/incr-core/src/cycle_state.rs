@@ -649,6 +649,15 @@ pub(crate) fn holds(rt: RuntimeId, slot: u32) -> bool {
     held_any() && HELD.with(|h| h.borrow().contains_key(&(rt, slot)))
 }
 
+/// The episode `slot`'s held claim is a member of, if it is held in one.
+pub(crate) fn held_episode(rt: RuntimeId, slot: u32) -> Option<u64> {
+    if !held_any() {
+        return None;
+    }
+    HELD.with(|h| h.borrow().get(&(rt, slot)).map(|e| e.ep))
+        .filter(|&ep| ep != 0)
+}
+
 /// The anchor of `slot`'s held claim, if this thread holds one.
 pub(crate) fn held_anchor(rt: RuntimeId, slot: u32) -> Option<u32> {
     if !held_any() {
