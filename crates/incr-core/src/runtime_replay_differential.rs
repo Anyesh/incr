@@ -1193,18 +1193,39 @@ fn two_thread_repush_seeds() {
         (0x59d, true),
         (0xe43, true),
     ] {
-        let case = gen_case(seed, cross, true);
-        let phases = phases(&case, seed);
-        quiet(|| {
-            for _ in 0..4 {
-                for frames in 1..=3 {
-                    for bytes in [0, 16 * 1024] {
-                        run_two(&case, &phases, Some(frames), bytes);
-                    }
+        run_two_repeatedly(seed, cross, &[Some(1), Some(2), Some(3)]);
+    }
+}
+
+/// Two-thread cases with panics and cycles in which a read's walk landed
+/// its node New as a cycle member and the other thread claimed the node
+/// before the read loaded its state. Which thread computes a node first
+/// decides these cases' results, so the runs check only that no engine
+/// panic escapes and the invariants hold after each phase, a few times
+/// over because the race is schedule-dependent.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_seeds() {
+    for (seed, cross) in [(0x33e9, false), (0xa55, false), (0x19f0, true)] {
+        run_two_repeatedly(seed, cross, &[None, Some(1), Some(2), Some(3)]);
+    }
+}
+
+/// The two-thread case of `seed`, with a second runtime if `cross`, run
+/// four times at each of `budgets` with and without a byte budget, each
+/// run held only to its own checks.
+fn run_two_repeatedly(seed: u64, cross: bool, budgets: &[Option<u32>]) {
+    let case = gen_case(seed, cross, true);
+    let phases = phases(&case, seed);
+    quiet(|| {
+        for _ in 0..4 {
+            for &frames in budgets {
+                for bytes in [0, 16 * 1024] {
+                    run_two(&case, &phases, frames, bytes);
                 }
             }
-        });
-    }
+        }
+    });
 }
 
 /// Two-thread seeds whose fault needs a particular schedule, each run many
