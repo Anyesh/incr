@@ -40,6 +40,7 @@ pub(crate) struct DeliverySeen {
 
 /// The context a driver found when it picked an entry, for tests.
 #[cfg(test)]
+#[cfg_attr(loom, allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct EntrySeen {
     pub(crate) context: u64,
