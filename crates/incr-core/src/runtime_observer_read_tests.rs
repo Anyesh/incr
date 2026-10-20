@@ -13,6 +13,7 @@ use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, QueryOpts};
 use crate::handle::Incr;
 use crate::node::NodeId;
+use crate::state::NodeState;
 
 type Rt = Runtime<Shared>;
 
@@ -176,7 +177,8 @@ fn a_panicking_observed_compute_leaves_the_observed_slot_clear<C: Cells>() {
     rt.watch(q);
     rt.observe(q, |_| {});
     rt.set(x, 1);
-    assert!(catch_unwind(AssertUnwindSafe(|| rt.stabilize())).is_err());
+    rt.stabilize();
+    assert_eq!(rt.state_of(q), NodeState::Failed);
     assert!(observed_is_clear());
 }
 both!(

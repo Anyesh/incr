@@ -39,7 +39,8 @@ macro_rules! both {
 
 both!(
     only_drained_nodes_run_their_observers,
-    a_panicking_observed_compute_leaves_stabilize,
+    a_panicking_observed_compute_stays_in_stabilize,
+    a_failed_observed_node_does_not_block_later_observers,
     observing_a_drained_watched_node_queues_it,
 );
 
@@ -127,10 +128,11 @@ fn an_unwind_puts_the_rest_back_at_the_front() {
     assert!(observed_is_clear());
 }
 
-/// A watched node whose observed compute panics: the panic leaves
-/// `stabilize`, the observer's thread-local is clear, and once the input
-/// is fixed the observer fires.
-fn a_panicking_observed_compute_leaves_stabilize<C: Cells>() {
+/// A watched node whose observed compute panics lands Failed: its
+/// observer does not fire and `stabilize` returns. The Failed landing
+/// reports the node once more, the next `stabilize` fires nothing for it,
+/// and once the input is fixed the observer fires.
+fn a_panicking_observed_compute_stays_in_stabilize<C: Cells>() {
     let rt = Runtime::<C>::new();
     let x = rt.create_input(0_u64);
     let q = rt.create_query(move |rt: &Runtime<C>| {
@@ -143,12 +145,59 @@ fn a_panicking_observed_compute_leaves_stabilize<C: Cells>() {
     rt.stabilize();
     assert_eq!(take(&fired), vec![(0, 0)]);
     rt.set(x, 1);
-    assert!(catch_unwind(AssertUnwindSafe(|| rt.stabilize())).is_err());
+    rt.stabilize();
+    assert_eq!(rt.state_of(q), NodeState::Failed);
     assert!(observed_is_clear());
     assert!(take(&fired).is_empty());
+    assert_eq!(rt.queued_slots(), vec![q.slot()]);
+    rt.stabilize();
+    assert!(take(&fired).is_empty());
+    assert!(rt.queued_slots().is_empty());
     rt.set(x, 2);
     rt.stabilize();
     assert_eq!(take(&fired), vec![(0, 2)]);
+}
+
+/// A Failed observed node queued ahead of a healthy one, whether its
+/// compute panics in this `stabilize` or it was Failed before: the healthy
+/// observer fires in the same `stabilize`.
+fn a_failed_observed_node_does_not_block_later_observers<C: Cells>() {
+    for failed_before in [false, true] {
+        let rt = Runtime::<C>::new();
+        let x = rt.create_input(0_u64);
+        let y = rt.create_input(10_u64);
+        let q = rt.create_query(move |rt: &Runtime<C>| {
+            let v = rt.get(x);
+            assert!(v != 1, "boom");
+            v
+        });
+        let p = rt.create_query(move |rt: &Runtime<C>| rt.get(y) + 1);
+        let fired: Fired = Arc::default();
+        observe_into(&rt, q, 0, &fired);
+        observe_into(&rt, p, 1, &fired);
+        rt.stabilize();
+        assert_eq!(take(&fired), vec![(0, 0), (1, 11)]);
+        rt.set(x, 1);
+        if failed_before {
+            assert!(catch_unwind(AssertUnwindSafe(|| rt.get(q))).is_err());
+            assert_eq!(rt.state_of(q), NodeState::Failed);
+        }
+        rt.set(y, 20);
+        rt.stabilize();
+        assert_eq!(
+            take(&fired),
+            vec![(1, 21)],
+            "failed before: {failed_before}"
+        );
+        // Only a landing in this `stabilize` reports the node again.
+        let requeued = if failed_before {
+            vec![]
+        } else {
+            vec![q.slot()]
+        };
+        assert_eq!(rt.queued_slots(), requeued);
+        assert!(observed_is_clear());
+    }
 }
 
 /// A watched, observed node lands Superseded after a drain took it: the
