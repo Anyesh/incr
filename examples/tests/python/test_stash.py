@@ -143,3 +143,48 @@ def test_a_wound_inside_a_python_closure_retries():
     assert not any(t.is_alive() for t in threads), "the wound did not resolve"
     assert results == {"a": -1, "b": -1}
     assert "_IncrEngineUnwind" in seen
+
+
+@BOTH
+def test_a_swallowed_exception_is_dropped_when_the_call_returns(module):
+    rt = doom_ready(module)
+    refs = []
+
+    def raises(r):
+        p = Payload()
+        refs.append(weakref.ref(p))
+        raise ZeroDivisionError(p)
+
+    a = rt.create_query(lambda r: 1, replay=True)
+    s = rt.create_query(raises)
+    t = rt.create_query(lambda r: r.get(s) if r.get(a) == PLACEHOLDER else 0, replay=True)
+    assert rt.get(t) == 0
+    assert refs and all(ref() is None for ref in refs)
+
+
+@BOTH
+def test_another_runtimes_callback_inside_a_doomed_query_raises_as_itself(module):
+    other = module.Runtime()
+    col = other.create_collection()
+
+    def bad(x):
+        raise ValueError("from the other runtime")
+
+    # Built empty, so `bad` first runs inside the doomed query's read.
+    count = col.map(bad).count()
+    col.insert(1)
+    rt = doom_ready(module)
+    a = rt.create_query(lambda r: 2, replay=True)
+    seen = []
+
+    def top(r):
+        if r.get(a) == PLACEHOLDER:
+            try:
+                other.get(count)
+            except Exception as e:
+                seen.append(type(e).__name__)
+        return 0
+
+    t = rt.create_query(top, replay=True)
+    assert rt.get(t) == 0
+    assert seen == ["ValueError"]
