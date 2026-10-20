@@ -1249,6 +1249,29 @@ impl<C: Cells> Runtime<C> {
                     }
                 });
                 let Some((v, virtual_below, kept)) = popped else {
+                    // The frame left on top was blocked reading the compute
+                    // popped last, which the same doomed run made, so no
+                    // entry stands for it: the run of a later entry that
+                    // retries the frame gets the direct compute below.
+                    if let Some((u, false)) = popped_frames.last() {
+                        let read = u64::from(u.node) | (u64::from(u.generation) << 32);
+                        replay::with(|c| {
+                            if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                                if let Some(w) = x
+                                    .vstack
+                                    .last()
+                                    .filter(|w| {
+                                        w.cidx + 1 == u.cidx
+                                            && w.reading == read
+                                            && w.maker == u.maker
+                                    })
+                                    .cloned()
+                                {
+                                    x.deliver_direct(&w, w.maker);
+                                }
+                            }
+                        });
+                    }
                     break;
                 };
                 // A frame still New or Dirty that its pop does not finish is
