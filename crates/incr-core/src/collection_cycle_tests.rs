@@ -424,8 +424,8 @@ fn dissolve_after_iteration_1<C: Cells>() {
 
 /// M reads W, which reads `count`, only on one run. M's last run doesn't
 /// read W, so W is on no cycle once the episode lands. Read on M's run 1 or
-/// 2 it lands outside the group, but read first in iteration 2 (run 3) or
-/// later it lands as a member, and `cycle_of` names it.
+/// 2, validation releases it; read first in iteration 2 (run 3) or later,
+/// it joins after validation and the landing's cut releases it.
 fn member_read_once_leaves_the_group<C: Cells>() {
     for on in 1..=4 {
         let ep = Episode::<C>::new(Shape {
@@ -439,13 +439,11 @@ fn member_read_once_leaves_the_group<C: Cells>() {
 }
 
 #[test]
-#[ignore = "a node first read in iteration 2 or later stays in the landed group"]
 fn local_member_read_once_leaves_the_group() {
     member_read_once_leaves_the_group::<Local>();
 }
 
 #[test]
-#[ignore = "a node first read in iteration 2 or later stays in the landed group"]
 fn shared_member_read_once_leaves_the_group() {
     member_read_once_leaves_the_group::<Shared>();
 }
@@ -538,7 +536,6 @@ mod wounds {
     wound_tests! {
         shared_wound_after_the_discovery_run_episode_older: 2, true;
         shared_wound_after_the_discovery_run_reader_older: 2, false;
-        #[ignore = "W, read by M only in iteration 2, stays in the landed group"]
         shared_wound_after_iteration_1_episode_older: 3, true;
         shared_wound_after_iteration_1_reader_older: 3, false;
     }

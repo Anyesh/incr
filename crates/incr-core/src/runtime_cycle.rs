@@ -31,6 +31,13 @@ pub(super) struct Attempt {
     pub(super) verify_rev: u64,
 }
 
+/// What cutting an episode to its root's SCC did.
+enum Shrink {
+    Kept,
+    Shrunk,
+    Dissolved,
+}
+
 /// How a `LOW` pop, or an episode, left the root.
 pub(super) enum PopEnd {
     /// The node is held, for a lower root to land.
@@ -973,6 +980,7 @@ impl<C: Cells> Runtime<C> {
             root,
             cidx,
             validated: cycle_state::has_dissolved(rt, root.0),
+            pruned: cycle_state::has_dissolved(rt, root.0),
             members: self.claim_members(cidx),
             cu: Vec::new(),
             round: None,
@@ -1112,38 +1120,19 @@ impl<C: Cells> Runtime<C> {
                             #[cfg(test)]
                             self.validations
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let comp = components(&graph);
-                            let at = ep
-                                .members
-                                .binary_search(&ep.root.0)
-                                .expect("the root is a member");
-                            let scc: Vec<u32> = ep
-                                .members
-                                .iter()
-                                .enumerate()
-                                .filter(|(i, _)| comp[*i] == comp[at])
-                                .map(|(_, &m)| m)
-                                .collect();
-                            if scc.len() == 1 && !graph[at].contains(&at) {
-                                cycle_state::dissolved_before(rt, ep.root.0);
-                                self.release_members(&ep.members, Some(ep.root.0), bag);
-                                let entry = cycle_state::with_held(|h| h.remove(&(rt, ep.root.0)));
-                                if let Some(e) = entry {
-                                    bag.push_erased(Box::new((e.buf, e.s)));
+                            match self.shrink_to_root_scc(
+                                ep.root,
+                                &mut ep.members,
+                                &mut ep.cu,
+                                &graph,
+                                bag,
+                            ) {
+                                Shrink::Kept => {}
+                                Shrink::Shrunk => {
+                                    ep.round = None;
+                                    continue 'restart;
                                 }
-                                return PopEnd::Dissolved;
-                            }
-                            if scc.len() < ep.members.len() {
-                                let gone: Vec<u32> = ep
-                                    .members
-                                    .iter()
-                                    .copied()
-                                    .filter(|m| scc.binary_search(m).is_err())
-                                    .collect();
-                                self.release_members(&gone, None, bag);
-                                ep.members = scc;
-                                ep.round = None;
-                                continue 'restart;
+                                Shrink::Dissolved => return PopEnd::Dissolved,
                             }
                         }
                         // CU: the unseeded members that still read each other.
@@ -1277,6 +1266,22 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
+            // Validation cuts to the SCC of iteration 1's reads only, so a
+            // member that joined later, or whose reads moved, may be on no
+            // cycle in the final reads. One more cut per episode keeps
+            // growth the only change after it, so episodes still terminate.
+            if !ep.pruned {
+                ep.pruned = true;
+                let graph = self.member_graph(&ep.members);
+                match self.shrink_to_root_scc(ep.root, &mut ep.members, &mut ep.cu, &graph, bag) {
+                    Shrink::Kept => {}
+                    Shrink::Shrunk => {
+                        ep.round = None;
+                        continue 'restart;
+                    }
+                    Shrink::Dissolved => return PopEnd::Dissolved,
+                }
+            }
             let r = ep.round.take().expect("incr-core: the episode has a round");
             return self.land_episode(
                 &ep.members,
@@ -1288,6 +1293,51 @@ impl<C: Cells> Runtime<C> {
                 bag,
             );
         }
+    }
+
+    /// Cuts `ep` to the root's SCC in `graph`, the member graph of the
+    /// last runs, releasing the rest with the discard landing. A root
+    /// alone with no self-edge dissolves.
+    fn shrink_to_root_scc(
+        &self,
+        root: NodeId,
+        members: &mut Vec<u32>,
+        cu: &mut Vec<u32>,
+        graph: &[Vec<usize>],
+        bag: &mut Deferred<C>,
+    ) -> Shrink {
+        let rt = self.runtime_id;
+        let comp = components(graph);
+        let at = members
+            .binary_search(&root.0)
+            .expect("the root is a member");
+        let scc: Vec<u32> = members
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| comp[*i] == comp[at])
+            .map(|(_, &m)| m)
+            .collect();
+        if scc.len() == 1 && !graph[at].contains(&at) {
+            cycle_state::dissolved_before(rt, root.0);
+            self.release_members(members, Some(root.0), bag);
+            let entry = cycle_state::with_held(|h| h.remove(&(rt, root.0)));
+            if let Some(e) = entry {
+                bag.push_erased(Box::new((e.buf, e.s)));
+            }
+            return Shrink::Dissolved;
+        }
+        if scc.len() == members.len() {
+            return Shrink::Kept;
+        }
+        let gone: Vec<u32> = members
+            .iter()
+            .copied()
+            .filter(|m| scc.binary_search(m).is_err())
+            .collect();
+        self.release_members(&gone, None, bag);
+        cu.retain(|m| scc.binary_search(m).is_ok());
+        *members = scc;
+        Shrink::Shrunk
     }
 
     /// Stores episode `ep`, whose member run a doom discarded, in the
