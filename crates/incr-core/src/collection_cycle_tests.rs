@@ -89,6 +89,34 @@ fn aggregate_member<C: Cells>() {
     rt.assert_invariant_i();
 }
 
+/// As [`aggregate_member`], with `combine` reading M in place of `lift`:
+/// `min(a + b, M + 1)` is associative for nonnegative values, so the
+/// aggregate counts `min(|S|, M + 1)`.
+fn aggregate_combine_member<C: Cells>() {
+    let rt = Box::new(Runtime::<C>::new());
+    let s = rt.create_collection::<u64>();
+    let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let (r, m) = (RtRef(&*rt), m_cell.clone());
+    let below = s.aggregate(
+        &rt,
+        0_u64,
+        |_| 1,
+        move |a, b| (a + b).min(r.rt().get(*m.get().unwrap()) + 1),
+    );
+    let m = rt.create_query_with(move |rt| (rt.get(below) + 1).min(5), fixpoint(20));
+    m_cell.set(m).unwrap();
+    for x in 0..10 {
+        s.insert(&rt, x);
+    }
+
+    assert_eq!(rt.get(m), 5);
+    let landed = rt.get(m);
+    let fresh = s.aggregate(&rt, 0_u64, |_| 1, move |a, b| (a + b).min(landed + 1));
+    assert_eq!(rt.get(below), rt.get(fresh));
+    assert_eq!(rt.get(below), 6);
+    rt.assert_invariant_i();
+}
+
 /// A router whose `key_fn` reads Fixpoint member M while M reads the
 /// router: the router's run gets `Err(Cycle)` at M's `try_get` and creates
 /// no group. Once a `set` unlinks M from `key_fn`, it routes normally.
@@ -227,6 +255,16 @@ fn local_aggregate_member_lands_a_fresh_aggregates_output() {
 #[test]
 fn shared_aggregate_member_lands_a_fresh_aggregates_output() {
     aggregate_member::<Shared>();
+}
+
+#[test]
+fn local_aggregate_combine_member_lands_a_fresh_aggregates_output() {
+    aggregate_combine_member::<Local>();
+}
+
+#[test]
+fn shared_aggregate_combine_member_lands_a_fresh_aggregates_output() {
+    aggregate_combine_member::<Shared>();
 }
 
 #[test]
