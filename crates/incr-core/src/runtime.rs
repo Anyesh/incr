@@ -1538,7 +1538,9 @@ impl<C: Cells> Runtime<C> {
     /// its own below the caller, though nothing holds its claim.
     fn assert_not_own_compute(&self, id: NodeId, generation: u32) {
         assert!(
-            !self.holds_claim(id) && self.virtual_position(id.0, generation).is_none(),
+            !self.holds_claim(id)
+                && (value_code::thread_word() & value_code::REPLAY_BIT == 0
+                    || self.virtual_position(id.0, generation).is_none()),
             "incr-core: delete_node called from inside node {}'s own compute",
             id.0,
         );
