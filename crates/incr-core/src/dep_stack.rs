@@ -20,7 +20,7 @@
 
 use std::cell::RefCell;
 
-use crate::cycle::{ComputeCtl, POISONED};
+use crate::cycle::{ComputeCtl, DOOMED, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 
@@ -290,6 +290,21 @@ pub trait DepStack: 'static {
                 .filter(|top| top.rt == rt)
                 .map(|top| (top.node, top.ctl))
         })
+    }
+
+    /// Whether the thread's top frame is another runtime's than `rt` and
+    /// doomed, so a read `rt` serves now comes from a closure that has
+    /// read a placeholder. Only a thread-wide stack sees other runtimes'
+    /// frames, so under Local this is always false.
+    fn other_top_doomed(&self, rt: RuntimeId) -> bool {
+        Self::THREAD_WIDE
+            && self.with(|s| {
+                s.frames.last().is_some_and(|top| {
+                    // SAFETY: the frame is on the stack, so its control
+                    // block is live (see `Frame::ctl`).
+                    top.rt != rt && unsafe { &*top.ctl }.has(DOOMED)
+                })
+            })
     }
 
     /// True iff `rt` has an active frame (we're inside one of its
