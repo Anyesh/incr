@@ -20,7 +20,7 @@ use crate::waits;
 /// `await_winner`'s head start makes rare but cannot rule out under load,
 /// is wounded again over the same cycle, which costs a retry and never
 /// changes a value.
-fn assert_wounded() {
+pub(super) fn assert_wounded() {
     assert!(waits::WOUNDS.load(Ordering::Relaxed) >= 1);
 }
 

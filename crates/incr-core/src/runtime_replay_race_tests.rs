@@ -612,6 +612,153 @@ fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
     s.rt.assert_invariant_i();
 }
 
+/// Thread 1's replayable chain: H, New, reads X; X reads input i while
+/// t = 0, and otherwise parks on `x_gate` and reads Z. Thread 2's side is
+/// not replayable: Z, New, parks on `z_gate` and reads W + 1, and W reads
+/// X while s = 0 and k otherwise. W is computed at s = t = 0, so it holds
+/// an edge to X, and then s = t = 1 leaves that edge stale. Z is New so
+/// that its closure runs before any walk reaches X.
+struct WoundEntry {
+    rt: Arc<Rt>,
+    h: Incr<u64>,
+    x: Incr<u64>,
+    z: Incr<u64>,
+    x_gate: Gate,
+    z_gate: Gate,
+}
+
+fn wound_entry_shape() -> WoundEntry {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let (s, t, i, k) = (
+        rt.create_input(0_u64),
+        rt.create_input(0_u64),
+        rt.create_input(1_u64),
+        rt.create_input(7_u64),
+    );
+    let (x_gate, z_gate) = (Gate::new(), Gate::new());
+    let zc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let x = {
+        let (zc, x_gate) = (zc.clone(), x_gate.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if rt.get(t) == 0 {
+                    rt.get(i)
+                } else {
+                    x_gate.park();
+                    rt.get(*zc.get().unwrap())
+                }
+            },
+            replayable(),
+        )
+    };
+    let w = rt.create_query(move |rt: &Rt| if rt.get(s) == 0 { rt.get(x) } else { rt.get(k) });
+    let z = {
+        let z_gate = z_gate.clone();
+        rt.create_query(move |rt: &Rt| {
+            z_gate.park();
+            rt.get(w) + 1
+        })
+    };
+    zc.set(z).unwrap();
+    assert_eq!(rt.get(w), 1);
+    rt.set(s, 1);
+    rt.set(t, 1);
+    let h = rt.create_query_with(move |rt: &Rt| rt.get(x) + 1, replayable());
+    WoundEntry {
+        rt,
+        h,
+        x,
+        z,
+        x_gate,
+        z_gate,
+    }
+}
+
+/// **The entry guard spans the loop, the wound form** (T5 Entry depth,
+/// Contexts), at `set_max_frames(1)`: thread 1's `get(H)` dooms H on its
+/// read of X and parks at X's entry. Thread 2 claims Z, X's entry claims
+/// X and parks in its closure, and Z's read of W waits on X through W's
+/// stale edge, registered first; X's read of Z then closes the waits-for
+/// cycle and the registry wounds thread 1, the younger, inside the entry.
+/// Thread 1's retry runs `get(H)`'s `ensure_clean` and its loop again in
+/// a new context and returns the value of the unbounded run in which
+/// thread 2's `get(Z)` came first, and thread 2's result is that run's.
+fn wound_inside_a_driver_entry() {
+    let s = wound_entry_shape();
+    s.rt.set_max_frames(1);
+    let entry = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.x)), entry.clone())],
+    );
+    entry.arm();
+    let reader = {
+        let (rt, h) = (s.rt.clone(), s.h);
+        spawn(move || {
+            let got = rt.get(h);
+            (got, crate::replay::with(|c| c.is_empty()))
+        })
+    };
+    entry.wait_parked();
+    let before: Vec<u64> =
+        s.rt.entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| e.context)
+            .collect();
+    assert_eq!(before.len(), 1, "X's entry is the loop's first");
+    s.z_gate.arm();
+    let claimer = {
+        let (rt, z) = (s.rt.clone(), s.z);
+        spawn(move || outcome(|| rt.get(z)))
+    };
+    s.z_gate.wait_parked();
+    s.x_gate.arm();
+    entry.release();
+    s.x_gate.wait_parked();
+    assert_eq!(s.rt.state_of(s.x), NodeState::Computing);
+    s.z_gate.release();
+    await_registered_wait(&s.rt, s.x);
+    s.x_gate.release();
+    let (got, empty) = reader.join();
+    let claimed = claimer.join();
+
+    let u = wound_entry_shape();
+    let want_z = outcome(|| u.rt.get(u.z));
+    let want_h = u.rt.get(u.h);
+    assert_eq!(claimed, want_z);
+    assert_eq!(got, want_h);
+    assert!(empty, "the read returns with no context open");
+    let entries = s.rt.entries.lock().unwrap();
+    let after = &entries[before.len()..];
+    assert!(
+        after
+            .iter()
+            .any(|e| e.target == Some(id(s.h).0) && !before.contains(&e.context)),
+        "the retry ran H's loop in a new context"
+    );
+    assert!(
+        after.iter().all(|e| !before.contains(&e.context)),
+        "no entry ran in the wounded context after the wound"
+    );
+    drop(entries);
+    super::wound_tests::assert_wounded();
+    assert_eq!(crate::waits::registered(), 0);
+    s.rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wound_inside_a_driver_entry_retries_from_an_empty_context() {
+    crate::child_test::run_in_child(
+        "runtime::replay_race_tests::shared_wound_inside_a_driver_entry_retries_from_an_empty_context",
+        wound_inside_a_driver_entry,
+    )
+    .assert_clean();
+}
+
 /// The landed-VFrame shape with X deleted by another thread between
 /// rounds: X's entry is dropped as `Gone`, and T's retry reads X by
 /// handle and panics as stale, as the unbounded run does when the delete
