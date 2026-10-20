@@ -352,7 +352,14 @@ fn add_second_runtime(case: &mut Case, rng: &mut Rng, skip: usize) {
         let read = move |rng: &mut Rng| {
             let try_ = rng.chance(25);
             if at >= lower && rng.chance(50) {
-                Expr::ReadOther(rng.below(nodes1 as u64) as usize, try_)
+                // The template is entered at R or C only: A's first run,
+                // a doomed one included, reads C, so a read of A's own
+                // differs by budget.
+                let target = match rng.below(nodes1 as u64) as usize {
+                    2 if skip > 0 => 1,
+                    target => target,
+                };
+                Expr::ReadOther(target, try_)
             } else if at + 1 < lower && rng.chance(50) {
                 Expr::Read(at + 1 + rng.below((lower - at - 1) as u64) as usize, try_)
             } else if at >= lower && rng.chance(50) {
@@ -1112,6 +1119,21 @@ fn vindex_repush() {
 fn two_threads_hang() {
     let case = gen_case(0x159, false, false);
     quiet(|| differential_two(&case, 0x159));
+}
+
+/// Cases with a second runtime that once failed: 0x135's second runtime
+/// read the template's A directly, whose first run is a doomed one at
+/// budget 1.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn cross_seeds() {
+    for seed in [0x135] {
+        let case = gen_case(seed, true, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
 }
 
 /// Seeds the scans found failing at a frame budget, each a replay fault
