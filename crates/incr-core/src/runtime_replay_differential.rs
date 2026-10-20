@@ -1097,6 +1097,7 @@ fn differential_two(case: &Case, seed: u64) {
 }
 /// Seeds that once failed, each with what it caught.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn regressions() {
     // A closure caught the panic of its read of a Failed member in a walk
     // the Failed node's read ran, and landed Clean over it.
