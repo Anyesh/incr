@@ -118,17 +118,22 @@ fn aggregate_combine_member<C: Cells>() {
 }
 
 /// A router whose `key_fn` reads Fixpoint member M while M reads the
-/// router: the router's run gets `Err(Cycle)` at M's `try_get` and creates
-/// no group. Once a `set` unlinks M from `key_fn`, it routes normally.
+/// router: the router's run gets `Err(Cycle)` at M's `try_get` and leaves
+/// its groups, their version nodes and its key cache as they were. Once a
+/// `set` unlinks M from `key_fn`, it routes normally. Element 0 is routed
+/// at construction, so the state the refusals leave alone is not empty.
 fn group_by_refuses<C: Cells>() {
     let rt = Box::new(Runtime::<C>::new());
     let s = rt.create_collection::<u64>();
+    s.insert(&rt, 0);
     let link = rt.create_input(1_u64);
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
     let (r, m) = (RtRef(&*rt), m_cell.clone());
     let grouped = s.group_by(&rt, move |&x| {
         let rt = r.rt();
-        if rt.get(link) == 1 {
+        if x == 0 {
+            0
+        } else if rt.get(link) == 1 {
             (x + rt.get(*m.get().unwrap())) % 2
         } else {
             x % 2
@@ -152,16 +157,26 @@ fn group_by_refuses<C: Cells>() {
         s.insert(&rt, x);
     }
 
+    let routed = grouped.routed_state(&rt);
+    assert_eq!(grouped.group_count(), 1);
     let _ = rt.get(m);
     assert!(refused.load(SeqCst), "the router read a provisional M");
-    assert_eq!(grouped.group_count(), 0, "a refused run routes nothing");
+    assert_eq!(
+        grouped.routed_state(&rt),
+        routed,
+        "a refused run routes nothing"
+    );
 
     // The refusal left the router marked for a rebuild, whose key_fn pass
     // over the snapshot meets M again. The read's walk runs the router as
     // M's dep, before M's closure, so the cycle reaches this `try_get`.
     s.insert(&rt, 4);
     assert!(rt.try_get(m).is_err(), "the rebuild read a provisional M");
-    assert_eq!(grouped.group_count(), 0);
+    assert_eq!(
+        grouped.routed_state(&rt),
+        routed,
+        "a refused rebuild routes nothing"
+    );
 
     rt.set(link, 0);
     let _ = rt.get(m);
@@ -177,22 +192,35 @@ fn group_by_refuses<C: Cells>() {
 
 /// The provisional value reaches the router through Q, a query that is no
 /// member: Q reads M on the stack, defers, and hands its frame `LOW`.
+/// Element 0 is routed at construction, as in [`group_by_refuses`].
 fn group_by_refuses_through_a_deferral<C: Cells>() {
     let rt = Box::new(Runtime::<C>::new());
     let s = rt.create_collection::<u64>();
+    s.insert(&rt, 0);
     let m_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
     let m = m_cell.clone();
     let q = rt.create_query(move |rt| rt.get(*m.get().unwrap()) % 2);
     let r = RtRef(&*rt);
-    let grouped = s.group_by(&rt, move |&x| (x + r.rt().get(q)) % 2);
+    let grouped = s.group_by(
+        &rt,
+        move |&x| {
+            if x == 0 {
+                0
+            } else {
+                (x + r.rt().get(q)) % 2
+            }
+        },
+    );
     let router = grouped.version_node();
     let m = rt.create_query_with(move |rt| rt.try_get(router).map_or(7, |v| v), fixpoint(20));
     m_cell.set(m).unwrap();
     for x in 1..=3 {
         s.insert(&rt, x);
     }
+    let routed = grouped.routed_state(&rt);
+    assert_eq!(grouped.group_count(), 1);
     assert_eq!(rt.get(m), 7, "the router refused");
-    assert_eq!(grouped.group_count(), 0);
+    assert_eq!(grouped.routed_state(&rt), routed);
     rt.assert_invariant_i();
 }
 
@@ -212,7 +240,9 @@ fn group_by_refuses_a_member_upstream<C: Cells>() {
     for x in 1..=3 {
         s.insert(&rt, x);
     }
+    let routed = grouped.routed_state(&rt);
     assert_eq!(rt.get(m), 7, "the router refused");
+    assert_eq!(grouped.routed_state(&rt), routed);
     assert_eq!(grouped.group_count(), 0);
     rt.assert_invariant_i();
 }
