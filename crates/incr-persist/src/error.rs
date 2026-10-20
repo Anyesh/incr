@@ -87,6 +87,12 @@ pub enum Error {
     #[error("input {key:?} was written through the runtime, bypassing the store's log")]
     Bypassed { key: String },
 
+    /// Another handle holds the memo checkpoint lock, or wrote a newer
+    /// memo generation since this one loaded its base. The checkpoint wrote
+    /// nothing; a later one can try again.
+    #[error("another memo checkpoint holds the lock or has replaced the generation")]
+    Busy,
+
     /// A handle passed to a store was not issued by that store.
     #[error("handle was not issued by this store")]
     UnknownHandle,
