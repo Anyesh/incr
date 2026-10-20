@@ -299,3 +299,16 @@ fn a_catch_up_across_a_compaction_keeps_the_fingerprints() {
     assert_eq!(known(&deps, "x"), h(&5u32));
     assert_eq!(known(&deps, "c"), h(&3u32).wrapping_add(h(&4u32)));
 }
+
+#[test]
+fn a_collection_whose_node_was_deleted_registers_untrusted() {
+    let store = open::<Local>();
+    let c = store.collection::<u32>("c").unwrap();
+    c.insert(&store, 1).unwrap();
+    store
+        .runtime()
+        .try_delete_node(c.handle().version_node())
+        .unwrap();
+    let deps = store.open_dep_index().unwrap();
+    assert_eq!(deps.fp("c"), Some(DepFp::Untrusted));
+}

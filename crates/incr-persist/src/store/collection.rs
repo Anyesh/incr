@@ -488,6 +488,10 @@ where
     }
 
     fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp> {
+        // Deleted through the runtime: nothing can say what it holds.
+        if !rt.is_alive(self.node()) {
+            return Ok(DepFp::Untrusted);
+        }
         Ok(DepFp::Known(fp_of_elements(&self.collection.values(rt))?))
     }
 
