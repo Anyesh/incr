@@ -183,7 +183,8 @@ impl<C: Cells> Runtime<C> {
     ///
     /// A node that has never computed fires on the first stabilize. A
     /// stabilize racing a concurrent `set` may fire twice for one
-    /// change; it can never miss one.
+    /// change; it misses one only when a [`Self::drain_dirtied_watched`]
+    /// took the report first.
     pub fn observe<T: Value, F>(&self, handle: Incr<T>, callback: F) -> ObserverId
     where
         F: Fn(&T) + Send + Sync + 'static,
@@ -208,10 +209,15 @@ impl<C: Cells> Runtime<C> {
             self.stale_handle(handle);
         }
         self.watch_held(slot, handle.generation());
-        // The baseline is loaded after the watch, so a landing it misses
-        // was off Clean at the watch and queued there. A node with a
-        // clean value fires only on later changes; a never-computed one
-        // starts at 0 so the first stabilize computes and fires.
+        // Queued even if it was watched already: a drain may have taken
+        // its entry, and the walk stops at a node that is not Clean.
+        if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
+            self.watch_queue.write().push(slot, handle.generation());
+        }
+        // The baseline is loaded after that, so a landing it misses was
+        // off Clean then and is queued. A node with a clean value fires
+        // only on later changes; a never-computed one starts at 0 so the
+        // first stabilize computes and fires.
         let last_seen = match state::load::<C>(node.state_cell()) {
             NodeState::New => 0,
             _ => self.observed_stamp(node),

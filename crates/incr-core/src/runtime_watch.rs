@@ -34,7 +34,7 @@ impl WatchQueue {
             .is_some_and(|w| w & (1 << (slot % 64)) != 0)
     }
 
-    fn push(&mut self, slot: u32, generation: u32) {
+    pub(super) fn push(&mut self, slot: u32, generation: u32) {
         if self.mark(slot) {
             self.entries.push_back((slot, generation));
         }

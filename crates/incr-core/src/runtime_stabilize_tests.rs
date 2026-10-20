@@ -40,6 +40,7 @@ macro_rules! both {
 both!(
     only_drained_nodes_run_their_observers,
     a_panicking_observed_compute_leaves_stabilize,
+    observing_a_drained_watched_node_queues_it,
 );
 
 fn observe_into<C: Cells>(rt: &Runtime<C>, h: Incr<u64>, tag: usize, fired: &Fired) {
@@ -246,4 +247,23 @@ fn observe_during_a_first_compute_fires_once() {
 #[test]
 fn observe_during_a_changing_recompute_fires_once() {
     observe_in_flight(false);
+}
+
+/// A node watched and drained before it is observed, Dirty or never
+/// computed: the observe queues it, so the next `stabilize` fires it.
+fn observing_a_drained_watched_node_queues_it<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    let dirty = rt.create_query(move |rt: &Runtime<C>| rt.get(x) + 1);
+    let new = rt.create_query(move |rt: &Runtime<C>| rt.get(x) + 2);
+    assert_eq!(rt.get(dirty), 2);
+    rt.watch(dirty);
+    rt.watch(new);
+    rt.set(x, 5);
+    assert_eq!(rt.drain_dirtied_watched().len(), 2);
+    let fired: Fired = Arc::default();
+    observe_into(&rt, dirty, 0, &fired);
+    observe_into(&rt, new, 1, &fired);
+    rt.stabilize();
+    assert_eq!(take(&fired), vec![(0, 6), (1, 7)]);
 }
