@@ -255,14 +255,14 @@ fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 
             let rt_ref = Py::new(
                 py,
                 PyRuntimeRef {
-                    ptr: rt as *const _,
+                    ptr: Cell::new(rt as *const _),
                 },
             )
             .unwrap();
-            let result = call_stashing(py, &py_func, (rt_ref.clone_ref(py),));
-            // Invalidate the ref so it can't be used after callback returns.
-            rt_ref.bind(py).borrow_mut().ptr = std::ptr::null();
-            PyValue(result)
+            // Invalidates the ref when the callback returns or unwinds, so
+            // one the callback kept never reaches a dropped runtime.
+            let _guard = InvalidateRef(rt_ref.bind(py).clone());
+            PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
         })
     }
 }
@@ -460,12 +460,22 @@ struct PyObserverId {
 /// it wraps belongs to the invoking thread's compute frame.
 #[pyclass(name = "RuntimeRef", unsendable)]
 struct PyRuntimeRef {
-    ptr: *const Runtime,
+    ptr: Cell<*const Runtime>,
+}
+
+struct InvalidateRef<'py>(Bound<'py, PyRuntimeRef>);
+
+impl Drop for InvalidateRef<'_> {
+    fn drop(&mut self) {
+        // No method borrows the ref mutably, so this borrow cannot fail.
+        self.0.borrow().ptr.set(std::ptr::null());
+    }
 }
 
 impl PyRuntimeRef {
     fn rt(&self) -> PyResult<&Runtime> {
-        if self.ptr.is_null() {
+        let ptr = self.ptr.get();
+        if ptr.is_null() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(
                 "RuntimeRef is no longer valid (used outside query callback)",
             ));
@@ -473,7 +483,7 @@ impl PyRuntimeRef {
         // SAFETY: ptr is non-null only inside an active query callback;
         // the Runtime is borrowed by the runtime's own closure dispatch,
         // so the lifetime is guaranteed to outlive the callback.
-        Ok(unsafe { &*self.ptr })
+        Ok(unsafe { &*ptr })
     }
 }
 
