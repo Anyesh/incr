@@ -113,37 +113,54 @@ local_and_shared!(
     shared_chain_at_budget_1
 );
 
-/// A first compute of a 100k chain at the default budget of 256: native
-/// depth stays within 256 frames, so a 1 MiB thread holds it, and every
+/// A first compute of a 100k chain at budget `frames`, or at the default
+/// budget (256 unless `INCR_MAX_DEPTH` says otherwise) when `None`: native
+/// depth stays within the budget, so a 1 MiB thread holds it, and every
 /// node runs at most twice, every doom returning to one context.
 #[cfg(not(debug_assertions))]
-fn chain_100k<C: Cells>(rt: &Runtime<C>) {
+fn chain_100k<C: Cells>(rt: &Runtime<C>, frames: Option<u32>) {
     rt.set_placeholder(0_u64);
-    rt.set_max_frames(crate::runtime::DEFAULT_MAX_FRAMES);
+    if let Some(frames) = frames {
+        rt.set_max_frames(frames);
+    }
+    let budget = rt.max_frames.load(Relaxed) as usize;
     let c = chain(rt, 100_000);
     assert_eq!(rt.get(c.nodes[0]), 100_000);
     assert!(c.max_runs() <= 2, "a node ran {} times", c.max_runs());
     let dooms = rt.dooms.lock().unwrap();
     assert!(!dooms.is_empty());
-    assert!(dooms
-        .iter()
-        .all(|d| d.depth <= crate::runtime::DEFAULT_MAX_FRAMES as usize));
+    assert!(dooms.iter().all(|d| d.depth <= budget));
     assert!(
         dooms.iter().all(|d| d.context == dooms[0].context),
         "the chain's dooms opened more than one context"
     );
+    for &n in &c.nodes {
+        assert_eq!(rt.state_of(n), NodeState::Clean);
+    }
 }
 
 #[cfg(not(debug_assertions))]
 #[test]
 fn local_chain_100k_on_a_1_mib_thread() {
-    on_stack(1 << 20, || chain_100k(&Runtime::<Local>::new()));
+    on_stack(1 << 20, || chain_100k(&Runtime::<Local>::new(), None));
 }
 
 #[cfg(not(debug_assertions))]
 #[test]
 fn shared_chain_100k_on_a_1_mib_thread() {
-    on_stack(1 << 20, || chain_100k(&Runtime::<Shared>::new()));
+    on_stack(1 << 20, || chain_100k(&Runtime::<Shared>::new(), None));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_chain_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || chain_100k(&Runtime::<Local>::new(), Some(1)));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_chain_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || chain_100k(&Runtime::<Shared>::new(), Some(1)));
 }
 
 /// A doomed first compute lands New, and the driver computes it again.
