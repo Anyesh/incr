@@ -1456,3 +1456,71 @@ fn read_of_cycle_member_vs_claim_after_landing() {
     assert_eq!(cycle.participants().len(), 2);
     rt.assert_invariant_i();
 }
+
+/// `a` and `b` read each other while `g` is 0, and `a` reads only `g`
+/// otherwise. Returns them with `a` Clean at 7.
+pub(super) fn clean_node_that_can_turn_cyclic(rt: &Rt) -> (Incr<u64>, Incr<i64>, Incr<i64>) {
+    let g = rt.create_input(1_u64);
+    let b_cell: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::default();
+    let a = {
+        let b_cell = Arc::clone(&b_cell);
+        rt.create_query(move |rt: &Rt| {
+            if rt.get(g) == 0 {
+                rt.try_get(*b_cell.get().unwrap()).map_or(-1, |v| v + 1)
+            } else {
+                7
+            }
+        })
+    };
+    let b = rt.create_query(move |rt: &Rt| rt.try_get(a).map_or(-1, |v| v * 2));
+    b_cell.set(b).unwrap();
+    assert_eq!(rt.get(a), 7);
+    assert_eq!(rt.state_of(a), NodeState::Clean);
+    (g, a, b)
+}
+
+/// A read that loaded `a` Clean parks before its slot read; another
+/// thread's set and episode land `a` Cyclic and clear its slot. The read
+/// goes on from the state it reloads and returns the cycle, where it
+/// used to panic that a Clean node had no value.
+fn clean_read_vs_cyclic_landing<R: Send + 'static>(
+    read: fn(&Rt, Incr<i64>) -> R,
+) -> Result<R, String> {
+    let rt = Arc::new(Rt::new());
+    let (g, a, b) = clean_node_that_can_turn_cyclic(&rt);
+    let before_read = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::GetBeforeRead(id(a)), before_read.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| read(&rt, a))).map_err(panic_message)
+        })
+    };
+    before_read.wait_parked();
+
+    rt.set(g, 0);
+    let cycle = rt.try_get(b).expect_err("b is in a cycle");
+    assert_eq!(cycle.participants().len(), 2);
+    assert_eq!(rt.state_of(a), NodeState::Cyclic);
+    before_read.release();
+
+    let read = reader.join().unwrap();
+    rt.assert_invariant_i();
+    read
+}
+
+#[test]
+fn clean_try_get_vs_cyclic_landing() {
+    let read =
+        clean_read_vs_cyclic_landing(|rt, a| rt.try_get(a).map_err(|c| c.participants().len()));
+    assert_eq!(read, Ok(Err(2)));
+}
+
+#[test]
+fn clean_get_vs_cyclic_landing() {
+    let msg = clean_read_vs_cyclic_landing(|rt, a| rt.get(a)).expect_err("a has no value");
+    assert!(msg.contains("dependency cycle"), "got: {msg}");
+}
