@@ -722,6 +722,12 @@ impl<C: Cells> Runtime<C> {
         }
         if result.is_err() {
             replay::unwind_past_since(self.runtime_id, cidx, first);
+            // A discard unwinds a run the unbounded run never makes: the
+            // member keeps what its last run recorded, or its episode's
+            // landing installs deps that the discard leaves New.
+            if cycle_state::unwind_kind() == Some(UnwindKind::Discard) {
+                return result.map(|_| None);
+            }
         }
         let replaced = cycle_state::with_held(|h| {
             let e = h
