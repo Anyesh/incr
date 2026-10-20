@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::replay_impl::DeliverySeen;
-use super::{ParkPoint, Runtime};
+use super::{NodeId, ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::cycle_state;
@@ -792,6 +792,119 @@ local_and_shared!(
     doomed_reads_node,
     local_doomed_reads_node,
     shared_doomed_reads_node
+);
+
+/// What a doomed read of a group member saw.
+#[derive(Debug, PartialEq, Eq)]
+struct GroupDoom {
+    p: Out,
+    /// N and N2 after the `get`.
+    states: [NodeState; 2],
+    member_runs: u32,
+}
+
+/// The doomed read's N as a Dirty `IN_GROUP` member: N (Fallback) and N2
+/// form a landed group over M = x % 2, and a cutoff-only `set` of x leaves
+/// both Dirty. P, New, reads N at budget 1, so the read dooms P. The doom
+/// point finds N and N2 Dirty, neither claimed, and the held map empty;
+/// the driver's run of level 1 verifies the group with neither closure
+/// running, and P lands the unbounded value.
+fn doomed_read_of_a_group_member<C: Cells>() {
+    let run = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let x = rt.create_input(1_u64);
+        let m = rt.create_query_with(move |rt| rt.get(x) % 2, replayable());
+        let runs = Arc::new(AtomicU32::new(0));
+        let n_later = Later::default();
+        let (r, nl) = (runs.clone(), n_later.clone());
+        let n2 = rt.create_query_with(
+            move |rt| {
+                r.fetch_add(1, SeqCst);
+                rt.get(later(&nl)) + rt.get(m)
+            },
+            replayable(),
+        );
+        let r = runs.clone();
+        let n = rt.create_query_with(
+            move |rt| {
+                r.fetch_add(1, SeqCst);
+                rt.get(n2)
+            },
+            fallback(100),
+        );
+        n_later.set(n).unwrap();
+        assert_eq!(rt.get(n), 100);
+        assert_eq!(rt.get(n2), 101);
+        rt.set(x, 3);
+        assert_eq!([rt.state_of(n), rt.state_of(n2)], [NodeState::Dirty; 2]);
+
+        let doom_seen = Arc::new(Mutex::new(Vec::new()));
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let (d, e, at) = (doom_seen.clone(), entries.clone(), RtRef(&rt));
+        let installed = rt.park_hook.set(Box::new(move |p| {
+            let rt = at.rt();
+            match p {
+                ParkPoint::AfterDoom(node) if node == NodeId(n.slot()) => {
+                    d.lock().unwrap().push((
+                        rt.state_of(n),
+                        rt.state_of(n2),
+                        cycle_state::held_keys(),
+                    ));
+                }
+                ParkPoint::BeforeEntry(node) => {
+                    let verified = rt.group_verifies.lock().unwrap().len();
+                    e.lock().unwrap().push((node, verified));
+                }
+                _ => {}
+            }
+        }));
+        assert!(installed.is_ok(), "park hook installed twice");
+        runs.store(0, SeqCst);
+        rt.group_verifies.lock().unwrap().clear();
+        let p = rt.create_query_with(move |rt| rt.get(n) + 1, replayable());
+        let got = get(&rt, p);
+        rt.assert_invariant_i();
+        let seen = GroupDoom {
+            p: got,
+            states: [rt.state_of(n), rt.state_of(n2)],
+            member_runs: runs.load(SeqCst),
+        };
+        let doom_seen = std::mem::take(&mut *doom_seen.lock().unwrap());
+        let entries = std::mem::take(&mut *entries.lock().unwrap());
+        let verifies = std::mem::take(&mut *rt.group_verifies.lock().unwrap());
+        (seen, doom_seen, entries, verifies, [n.slot(), n2.slot()])
+    };
+    let (unbounded, ..) = run(None);
+    assert_eq!(
+        unbounded,
+        GroupDoom {
+            p: Out::Value(101),
+            states: [NodeState::Clean; 2],
+            member_runs: 0,
+        }
+    );
+    let (bounded, doom_seen, entries, verifies, members) = run(Some(1));
+    assert_eq!(bounded, unbounded);
+    assert_eq!(
+        doom_seen,
+        [(NodeState::Dirty, NodeState::Dirty, Vec::new())],
+        "the doom point found N and N2 Dirty, unclaimed, with nothing held"
+    );
+    let at = entries
+        .iter()
+        .position(|&(node, _)| node == NodeId(members[0]))
+        .expect("N's entry ran");
+    let from = entries[at].1;
+    let to = entries.get(at + 1).map_or(verifies.len(), |&(_, v)| v);
+    assert!(
+        verifies[from..to].iter().any(|v| members.contains(v)),
+        "N's entry verified the group: {verifies:?}, entries {entries:?}"
+    );
+}
+local_and_shared!(
+    doomed_read_of_a_group_member,
+    local_doomed_read_of_a_group_member,
+    shared_doomed_read_of_a_group_member
 );
 
 /// A `get` and a `try_get` of the head of a 50-deep chain at budget 1 each
