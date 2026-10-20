@@ -980,6 +980,13 @@ fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, lab
         if !agree && (panics || case.cycles) {
             break;
         }
+        // A read of the other runtime records no edge (T5 Scoping), so a
+        // set of the second runtime leaves the first's readers of it on
+        // what they read when they last ran. Once the states differ, the
+        // runs ran those readers at different times.
+        if !agree && matches!(case.ops[i], Op::Set2(..)) {
+            break;
+        }
         // A read that lands its target Dirty returns a value computed
         // against a read that a later landing in the same revision
         // changed. A replayed frame reads after that landing when the read
@@ -1126,7 +1133,9 @@ fn two_threads_hang() {
 /// budget 1; in 0xfe, 0x308, 0x38b and 0x3d0 a doomed frame's read of
 /// the other runtime computed a node that panics and landed it Failed, so
 /// the real read panicked "last compute panicked" (Shared only: a Local
-/// stack can't see another runtime's frames).
+/// stack can't see another runtime's frames); in 0xa02 a speculative
+/// landing read the second runtime's input before a set of it, and a
+/// later walk verified that reader Clean on the old value.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn cross_seeds() {
@@ -1136,6 +1145,7 @@ fn cross_seeds() {
         (0x308, false),
         (0x38b, false),
         (0x3d0, false),
+        (0xa02, false),
     ] {
         let case = gen_case(seed, true, false);
         quiet(|| {
