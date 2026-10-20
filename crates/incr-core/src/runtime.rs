@@ -484,12 +484,15 @@ struct Expanded {
 
 impl Walk {
     /// Drops the pending entry of `id` the walk was to run next, whose
-    /// compute ran elsewhere.
+    /// compute ran elsewhere. The root's entry stays: a walk stopped at a
+    /// non-root entry of the root's own node (a self-edge's repeat) still
+    /// owes its caller the root's compute.
     pub(crate) fn ran(&mut self, id: u32) {
-        if self
-            .work
-            .last()
-            .is_some_and(|e| e.is_pending() && e.id.0 == id)
+        if self.work.len() > 1
+            && self
+                .work
+                .last()
+                .is_some_and(|e| e.is_pending() && e.id.0 == id)
         {
             self.work.pop();
         }
