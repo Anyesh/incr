@@ -228,7 +228,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         };
         let fp = binding.run_converge(&self.runtime, &plan, hold.as_deref_mut(), &mut spent);
         if let (Some(map), Some(fp)) = (hold.as_deref_mut(), fp) {
-            map.register(key, binding.node(), Kind::Collection, fp);
+            map.register(key, binding.node(), Kind::Collection, fp, None);
         }
         drop(hold);
         drop(spent);
@@ -485,6 +485,10 @@ where
             .map(encode)
             .collect::<Result<Vec<_>>>()?;
         Ok(Some(Elements::from_encoded(encoded)))
+    }
+
+    fn mapped_stamp(&self) -> Option<u64> {
+        None
     }
 
     fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp> {

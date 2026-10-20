@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use incr_core::persist_hooks::set_returning_displaced;
+use incr_core::persist_hooks::{changed_at, set_returning_displaced};
 use incr_core::value_slot::Compared;
 use incr_core::{with_value_code, Cells, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
@@ -34,6 +34,10 @@ pub(crate) trait Binding<C: Cells>: Send + Sync {
     /// The key's fingerprint now, for registering it in a [`DepIndex`].
     /// Computed with no incr lock held and before the index is held.
     fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp>;
+
+    /// An input's mapped stamp, which registering it in a [`DepIndex`]
+    /// copies; `None` for a collection.
+    fn mapped_stamp(&self) -> Option<u64>;
 
     /// Applies `record`, one of this key's records in position order, to the
     /// node. `before` is the key's logged state without the record. With
@@ -90,6 +94,10 @@ pub(crate) struct InputBinding<T: 'static> {
     /// keeps the earlier value, which may differ in its bytes (-0.0 after
     /// 0.0).
     pub fp: u128,
+    /// The input's `changed_at` when it was created or last written by a
+    /// mapped write that wrote. A no-op write leaves it, so a bypass write
+    /// through the runtime keeps `changed_at` away from it.
+    pub stamp: u64,
 }
 
 impl<T: Value + DeserializeOwned> InputBinding<T> {
@@ -108,8 +116,9 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
         let compared = set_returning_displaced(rt, self.handle, value);
         if matches!(compared, Compared::Replaced(_)) {
             self.fp = fp;
+            self.stamp = changed_at(rt, self.handle);
             if let Some(map) = guard.deps() {
-                map.set_fp(&self.key, fp);
+                map.set_written(&self.key, fp, self.stamp);
             }
         }
         guard.disarm();
@@ -141,6 +150,10 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
 
     fn dep_fp(&self, _rt: &Runtime<C>) -> Result<DepFp> {
         Ok(DepFp::Known(self.fp))
+    }
+
+    fn mapped_stamp(&self) -> Option<u64> {
+        Some(self.stamp)
     }
 
     fn apply(

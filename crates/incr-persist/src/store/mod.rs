@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use incr_core::persist_hooks::changed_at;
 use incr_core::{check_value_code, with_value_code, Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -372,13 +373,14 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 binding.node(),
                 binding.kind(),
                 binding.dep_fp(&self.runtime)?,
+                binding.mapped_stamp(),
             ));
         }
         let deps = Arc::new(DepIndex::default());
         {
             let mut map = deps.write();
-            for (key, handle, kind, fp) in entries {
-                map.register(key, handle, kind, fp);
+            for (key, handle, kind, fp, stamp) in entries {
+                map.register(key, handle, kind, fp, stamp);
             }
         }
         state.deps = Some(Arc::clone(&deps));
@@ -433,8 +435,15 @@ impl<C: Cells, B: Backend> Store<C, B> {
         };
         let mut hold = state.deps.as_deref().map(DepIndex::write);
         let handle = self.runtime.create_input(value);
+        let stamp = changed_at(&self.runtime, handle);
         if let Some(map) = hold.as_deref_mut() {
-            map.register(key, handle.erase(), Kind::Input, DepFp::Known(fp));
+            map.register(
+                key,
+                handle.erase(),
+                Kind::Input,
+                DepFp::Known(fp),
+                Some(stamp),
+            );
         }
         drop(hold);
         let id = state.bind(
@@ -445,6 +454,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 default: logged_default,
                 default_fp,
                 fp,
+                stamp,
             }),
         );
         Ok(Input { id, handle })
@@ -528,7 +538,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
             Err(DeleteError::HasDependents) => {
                 if let (Some(deps), Some(entry)) = (state.deps.as_deref(), unregistered) {
                     deps.write()
-                        .register(&key, entry.handle, entry.kind, entry.fp);
+                        .register(&key, entry.handle, entry.kind, entry.fp, entry.stamp);
                 }
                 return Err(Error::HasDependents { key });
             }
