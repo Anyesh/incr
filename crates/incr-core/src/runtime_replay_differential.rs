@@ -1088,6 +1088,29 @@ fn delete_seeds() {
     }
 }
 
+/// At budget 1, and at 2 and 3 under the 16 KiB byte budget, `try_get(0)`
+/// pushes ten virtual frames onto nodes that already had one.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "a virtual frame is pushed for a node already on its context's vindex"]
+fn vindex_repush() {
+    let case = gen_base(0xd4f2);
+    quiet(|| {
+        differential::<Local>(&case, 0xd4f2);
+        differential::<Shared>(&case, 0xd4f2);
+    });
+}
+
+/// A case with cycles on two threads, about one run in three of which
+/// never finishes.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "two threads reading a case with cycles hang about one run in three"]
+fn two_threads_hang() {
+    let case = gen_case(0x159, false, false);
+    quiet(|| differential_two(&case, 0x159));
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
