@@ -491,6 +491,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn drop_speculative_verify(
         &self,
+        id: NodeId,
         node: &NodeData<C>,
         claimed_dirty: bool,
     ) -> Computed {
@@ -500,7 +501,7 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
             NodeState::New
         };
-        self.land(node, target, target);
+        self.land(id, node, target, target);
         if self.drop_cooperatively(None) {
             return Computed::Discarded;
         }
@@ -646,7 +647,7 @@ impl<C: Cells> Runtime<C> {
             let first = match claimed {
                 Ok(src) if node.generation() == generation => src == NodeState::New,
                 Ok(src) => {
-                    self.land(node, src, src);
+                    self.land(NodeId(slot), node, src, src);
                     self.roll_back_hit(&taken);
                     return Err(NodeId(slot));
                 }
@@ -771,7 +772,7 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
             NodeState::New
         };
-        self.land(node, target, target);
+        self.land(id, node, target, target);
         #[cfg(test)]
         self.dooms.lock().unwrap().push(DoomSeen {
             node: id.0,

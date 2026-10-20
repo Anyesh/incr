@@ -1677,7 +1677,7 @@ impl<C: Cells> Runtime<C> {
             };
             let flags = self.nodes.get_with_flags(m).1;
             self.children_landing(NodeId(m), flags, children, e.opened, bag);
-            self.land(node, target, flagged);
+            self.land(NodeId(m), node, target, flagged);
             bag.push_erased(Box::new((e.buf, e.s)));
         }
         PopEnd::Landed
@@ -1766,7 +1766,7 @@ impl<C: Cells> Runtime<C> {
             )
             .is_ok();
             if ok && node.generation() != generation {
-                self.land(node, NodeState::Dirty, NodeState::Dirty);
+                self.land(NodeId(m), node, NodeState::Dirty, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
@@ -1828,7 +1828,9 @@ impl<C: Cells> Runtime<C> {
                     "incr-core: group verify re-lands member {m} over an empty slot"
                 );
                 node.max_verified_at(verify_rev);
-                if self.land(node, NodeState::Clean, NodeState::Dirty) == NodeState::Clean {
+                if self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty)
+                    == NodeState::Clean
+                {
                     self.record_trace(NodeId(m), crate::trace::TraceAction::VerifiedClean);
                 }
             }

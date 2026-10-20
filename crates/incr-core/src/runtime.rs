@@ -41,7 +41,7 @@ use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
 use crate::segmented_nodes::{
-    SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED,
+    SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED, WATCHED,
 };
 use crate::set_stack;
 use crate::slot_vec::SlotVec;
@@ -175,6 +175,9 @@ pub(crate) enum ParkPoint {
     /// rolled back around a busy member and released its hold, before
     /// the wait on that member.
     ClaimSetRolledBack(NodeId),
+    /// In `unwatch`, under its write hold, after `WATCHED` is cleared and
+    /// before the node's entry is dequeued.
+    UnwatchBeforeDequeue(NodeId),
     /// In `get`, after the handle's runtime check and before its
     /// generation is compared.
     GetAfterHandleCheck(NodeId),
@@ -303,6 +306,7 @@ impl<C: Cells> Drop for WalkDone<'_, C> {
 struct SetClaim<'a, C: Cells> {
     rt: &'a Runtime<C>,
     node: &'a NodeData<C>,
+    flags: &'a C::U8,
     id: NodeId,
     /// The input's `verified_at` the claim was taken over.
     base: u64,
@@ -324,7 +328,7 @@ impl<C: Cells> SetClaim<'_, C> {
         self.node.settle_changed_at(rev);
         self.node.release_set_claim(self.base, rev);
         set_stack::pop(self.rt.runtime_id, self.id.0);
-        self.rt.mark_dependents_dirty(self.id);
+        self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         std::mem::forget(self);
@@ -736,6 +740,8 @@ pub struct Runtime<C: Cells> {
     /// `Inner::arena_tags`.
     pub(crate) arenas: ArenaRegistry<C>,
     pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
+    /// Taken only inside an `inner` section or with no lock held.
+    pub(crate) watch_queue: <C as Cells>::Lock<watch_impl::WatchQueue>,
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
@@ -837,6 +843,7 @@ impl<C: Cells> Runtime<C> {
             nodes: SegmentedNodes::new(),
             arenas: ArenaRegistry::new(),
             inner: <<C as Cells>::Lock<Inner<C>> as Lock<Inner<C>>>::new(Inner::new()),
+            watch_queue: Lock::new(watch_impl::WatchQueue::new()),
             revision: C::new_u64(1),
             walk: C::new_watermark(1),
             dep_stack: <C::DepStack as DepStack>::new(),
@@ -1854,6 +1861,7 @@ impl<C: Cells> Runtime<C> {
         } else {
             None
         };
+        self.unwatch_deleted(slot, bits);
         C::u8_store_relaxed(flags, 0);
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
@@ -2324,7 +2332,7 @@ impl<C: Cells> Runtime<C> {
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
         let slot = handle.slot();
         let id = NodeId(slot);
-        let node = self.nodes.get(slot);
+        let (node, flags) = self.nodes.get_with_flags(slot);
         self.park(ParkPoint::SetBeforeClaim(id));
         let mut spins: u32 = 0;
         loop {
@@ -2361,6 +2369,7 @@ impl<C: Cells> Runtime<C> {
                         let claim = SetClaim {
                             rt: self,
                             node,
+                            flags,
                             id,
                             base,
                             held: true,
@@ -2515,11 +2524,15 @@ impl<C: Cells> Runtime<C> {
 
     /// BFS forward walk from `start`'s dependents, marking each Clean
     /// node as Dirty. Every transition is a CAS so the walk can never
-    /// clobber a `Computing` claim it raced with.
-    fn mark_dependents_dirty(&self, start: NodeId) {
+    /// clobber a `Computing` claim it raced with. `start_flags` is the
+    /// set input's flags byte, so that a watched input is queued too.
+    fn mark_dependents_dirty(&self, start: NodeId, start_flags: &C::U8) {
         let mut queue: Vec<NodeId> = Vec::new();
         {
             let inner = self.inner.read();
+            if C::u8_load_relaxed(start_flags) & WATCHED != 0 {
+                self.enqueue_watched(start, self.nodes.get(start.0));
+            }
             let first = &inner.dependents[start.0 as usize];
             // Sized up front so a short walk allocates once and never
             // takes the grow path; a node nothing reads allocates nothing.
@@ -2531,7 +2544,7 @@ impl<C: Cells> Runtime<C> {
 
         let mut expanded_new: Option<HashSet<NodeId>> = None;
         while let Some(id) = queue.pop() {
-            let node = self.nodes.get(id.0);
+            let (node, flags) = self.nodes.get_with_flags(id.0);
             loop {
                 let cur = state::load::<C>(node.state_cell());
                 match cur {
@@ -2540,6 +2553,9 @@ impl<C: Cells> Runtime<C> {
                             .is_ok()
                         {
                             let inner = self.inner.read();
+                            if C::u8_load_relaxed(flags) & WATCHED != 0 {
+                                self.enqueue_watched(id, node);
+                            }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
@@ -2561,6 +2577,9 @@ impl<C: Cells> Runtime<C> {
                         .is_ok()
                         {
                             let inner = self.inner.read();
+                            if C::u8_load_relaxed(flags) & WATCHED != 0 {
+                                self.enqueue_watched(id, node);
+                            }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
@@ -2591,6 +2610,9 @@ impl<C: Cells> Runtime<C> {
                             .is_ok()
                         {
                             let inner = self.inner.read();
+                            if C::u8_load_relaxed(flags) & WATCHED != 0 {
+                                self.enqueue_watched(id, node);
+                            }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
@@ -3061,7 +3083,7 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     NodeState::New
                 };
-                self.land(node, discard, discard);
+                self.land(id, node, discard, discard);
                 return Computed::Gone;
             }
 
@@ -3101,14 +3123,14 @@ impl<C: Cells> Runtime<C> {
                     && !matches!(visit, Visit::VerifyOnly(_))
                     && replay::speculative()
                 {
-                    return self.drop_speculative_verify(node, claimed_dirty);
+                    return self.drop_speculative_verify(id, node, claimed_dirty);
                 }
                 // A speculative tainted verify leaves the node Dirty for its
                 // reader as a failed one would, but keeps the group, whose
                 // release or re-landing would outlive the run's discard.
                 if let Visit::VerifyOnly(owner) = visit {
                     if MODE & VIRT != 0 && replay::speculative() {
-                        self.land(node, NodeState::Dirty, NodeState::Dirty);
+                        self.land(id, node, NodeState::Dirty, NodeState::Dirty);
                         self.memoize(id, owner);
                         return Computed::Done;
                     }
@@ -3506,7 +3528,7 @@ impl<C: Cells> Runtime<C> {
         if C::u8_load_relaxed(flags) & IN_GROUP != 0 {
             self.leave_group(id, flags);
         }
-        self.land(node, target, flagged)
+        self.land(id, node, target, flagged)
     }
 
     /// The landing of a run of `id` in `compute_one`: a creator's
@@ -3529,7 +3551,7 @@ impl<C: Cells> Runtime<C> {
         if C::u8_load_relaxed(flags) & (IN_GROUP | HAS_INDEX) != 0 {
             self.settle_before_landing(id, flags, target, run, discard, bag);
         }
-        self.land(node, target, flagged)
+        self.land(id, node, target, flagged)
     }
 
     #[cold]
@@ -3596,9 +3618,22 @@ impl<C: Cells> Runtime<C> {
     /// writes happen-before the next claim. Loom and Miri both treat a
     /// failed CAS as reading the newest value, so neither would catch a
     /// regression here.
+    ///
+    /// A landing off the Clean path, neither Clean nor Cyclic, then
+    /// reports a watched node: the walk stops at a node already Dirty,
+    /// so nothing else would.
     #[inline(always)]
-    fn land(&self, node: &NodeData<C>, target: NodeState, flagged: NodeState) -> NodeState {
+    fn land(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+    ) -> NodeState {
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
+            if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
+                self.report_landing(id);
+            }
             return target;
         }
         let owned =
@@ -3607,6 +3642,9 @@ impl<C: Cells> Runtime<C> {
             owned.is_ok(),
             "only the claim's owner leaves ComputingDirty"
         );
+        if !matches!(flagged, NodeState::Clean | NodeState::Cyclic) {
+            self.report_landing(id);
+        }
         flagged
     }
 
@@ -3972,6 +4010,13 @@ mod claim_set_impl;
 
 #[path = "runtime_replay.rs"]
 mod replay_impl;
+
+#[path = "runtime_watch.rs"]
+mod watch_impl;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_watch_tests.rs"]
+mod watch_tests;
 
 pub(crate) use children_impl::ChildLanding;
 
