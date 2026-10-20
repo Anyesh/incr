@@ -1919,6 +1919,9 @@ impl<C: Cells> Runtime<C> {
     /// the node lands as that frame's compute would) or out of the episode
     /// it rooted, which released its claims. The unwind goes on to the
     /// frame below, a virtual frame's retry or the read that ran the loop.
+    /// A wound closes the context and unwinds on, as out of an entry: the
+    /// virtual frames a doom in the ended run pushed may name an episode
+    /// the wound aborted.
     fn vframe_unwound(
         &self,
         id: u64,
@@ -1933,17 +1936,23 @@ impl<C: Cells> Runtime<C> {
         if continuation {
             self.continuation_unwound(v.node, v.cidx, &mut bag);
         }
-        let (pos, below) = replay::with(|c| {
+        let (boundary, pos, below) = replay::with(|c| {
             let x = c
                 .iter()
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
             let pos = v.cidx - x.boundary;
             (
+                x.boundary,
                 pos,
                 pos.checked_sub(1).map(|b| x.vstack[b as usize].clone()),
             )
         });
+        if kind == Some(UnwindKind::Wound) {
+            bag.drain(self);
+            self.close_unwound(id, boundary);
+            resume_unwind(payload);
+        }
         if v.spec || kind == Some(UnwindKind::Discard) {
             let q = replay::with(|c| {
                 let x = c
@@ -1968,8 +1977,6 @@ impl<C: Cells> Runtime<C> {
             return VPop::Restart;
         }
         let Some(below) = below else {
-            let boundary =
-                replay::with(|c| c.iter().find(|x| x.id == id).map_or(v.cidx, |x| x.boundary));
             // The read that ran the loop reads the target as a compute's
             // unwind leaves its reader.
             self.dep_stack.poison_current_frame(self.runtime_id);
