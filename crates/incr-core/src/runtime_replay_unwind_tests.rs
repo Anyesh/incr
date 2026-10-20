@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::replay_impl::DeliverySeen;
-use super::Runtime;
+use super::{NodeId, ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{CycleStrategy, QueryOpts, Replay};
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::cycle_state;
-use crate::handle::Incr;
+use crate::handle::{Incr, RuntimeId};
 use crate::runtime::ReadKind;
 use crate::state::NodeState;
 use crate::table::NodeTable;
@@ -59,6 +59,24 @@ type Later = Arc<OnceLock<Incr<u64>>>;
 
 fn later(l: &Later) -> Incr<u64> {
     *l.get().expect("created before the first read")
+}
+
+/// A runtime a park hook captures, which its `'static` bound otherwise
+/// keeps out of reach.
+struct RtRef<C: Cells>(*const Runtime<C>);
+
+// SAFETY: each test installs the hook on the runtime it points to, so the
+// runtime outlives every call, and a `Local` runtime only parks on the
+// test's thread.
+unsafe impl<C: Cells> Send for RtRef<C> {}
+// SAFETY: as above.
+unsafe impl<C: Cells> Sync for RtRef<C> {}
+
+impl<C: Cells> RtRef<C> {
+    fn rt(&self) -> &Runtime<C> {
+        // SAFETY: as above.
+        unsafe { &*self.0 }
+    }
 }
 
 fn message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -247,32 +265,66 @@ local_and_shared!(
 /// is false, so F's doomed run reads S after its placeholder read and S's
 /// entry is suspect. `nested` puts the panicking closure in S2, which S
 /// reads, so its entry is a non-suspect one a suspect entry's run pushed.
-/// With `real_reads` F's real run reads the panicking node too.
+/// With `real_reads` F's real run reads the panicking node too. With
+/// `back_edge`, S has a Fallback and S2 reads S before it panics.
 struct Speculative {
     out: Out,
     /// F, S and S2.
     states: Vec<NodeState>,
     panicking_runs: u32,
+    /// What S2's read of S returned, by the run that went on to panic.
+    back_read: Option<u64>,
+    /// The held map and S's state at the first entry the driver took
+    /// after the panicking run.
+    after_panic: Option<(Vec<(RuntimeId, u32)>, NodeState)>,
 }
 
-fn speculative<C: Cells>(frames: Option<u32>, nested: bool, real_reads: bool) -> Speculative {
+fn speculative<C: Cells>(
+    frames: Option<u32>,
+    nested: bool,
+    real_reads: bool,
+    back_edge: bool,
+) -> Speculative {
     let rt = runtime::<C>(frames);
     let a_in = rt.create_input(false);
     let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
     let runs = Arc::new(AtomicU32::new(0));
-    let r = runs.clone();
+    let back_read = Arc::new(Mutex::new(None));
+    let s_later = Later::default();
+    let (r, b, sl) = (runs.clone(), back_read.clone(), s_later.clone());
     let s2 = rt.create_query_with(
-        move |_| -> u64 {
+        move |rt| -> u64 {
+            if back_edge {
+                let v = rt.get(later(&sl));
+                *b.lock().unwrap() = Some(v);
+            }
             r.fetch_add(1, SeqCst);
             std::panic::panic_any(String::from("spec boom"))
         },
         replayable(),
     );
     let s = if nested {
-        rt.create_query_with(move |rt| rt.get(s2) + 1, replayable())
+        let opts = if back_edge {
+            fallback(50)
+        } else {
+            replayable()
+        };
+        rt.create_query_with(move |rt| rt.get(s2) + 1, opts)
     } else {
         s2
     };
+    s_later.set(s).unwrap();
+    let after_panic = Arc::new(Mutex::new(None));
+    let (seen, r, at) = (after_panic.clone(), runs.clone(), RtRef(&rt));
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        if matches!(p, ParkPoint::BeforeEntry(_)) && r.load(SeqCst) > 0 {
+            let mut seen = seen.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some((cycle_state::held_keys(), at.rt().state_of(s)));
+            }
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
     let r = rt.create_query_with(|_| 7_u64, replayable());
     let f = rt.create_query_with(
         move |rt| {
@@ -288,16 +340,20 @@ fn speculative<C: Cells>(frames: Option<u32>, nested: bool, real_reads: bool) ->
     );
     let out = get(&rt, f);
     rt.assert_invariant_i();
+    let back_read = *back_read.lock().unwrap();
+    let after_panic = after_panic.lock().unwrap().take();
     Speculative {
         out,
         states: [f, s, s2].iter().map(|&h| rt.state_of(h)).collect(),
         panicking_runs: runs.load(SeqCst),
+        back_read,
+        after_panic,
     }
 }
 
 fn panic_in_a_speculative_entry<C: Cells>() {
     for nested in [false, true] {
-        let quiet = speculative::<C>(Some(1), nested, false);
+        let quiet = speculative::<C>(Some(1), nested, false, false);
         assert_eq!(quiet.out, Out::Value(7), "nested: {nested}");
         assert_eq!(
             quiet.panicking_runs, 1,
@@ -310,14 +366,14 @@ fn panic_in_a_speculative_entry<C: Cells>() {
             );
         }
         assert_eq!(
-            speculative::<C>(None, nested, false).out,
+            speculative::<C>(None, nested, false, false).out,
             Out::Value(7),
             "nested: {nested}"
         );
 
-        let unbounded = speculative::<C>(None, nested, true);
+        let unbounded = speculative::<C>(None, nested, true, false);
         assert_eq!(unbounded.out, Out::Panic("spec boom".into()));
-        let bounded = speculative::<C>(Some(1), nested, true);
+        let bounded = speculative::<C>(Some(1), nested, true, false);
         assert_eq!(bounded.out, unbounded.out, "nested: {nested}");
         assert_eq!(bounded.states[0], unbounded.states[0], "nested: {nested}");
         assert_eq!(bounded.states[2], unbounded.states[2], "nested: {nested}");
@@ -327,6 +383,229 @@ local_and_shared!(
     panic_in_a_speculative_entry,
     local_panic_in_a_speculative_entry,
     shared_panic_in_a_speculative_entry
+);
+
+/// F5 (a): in the nested form S has a Fallback and S2, the non-suspect
+/// entry S's run pushes, reads S, a virtual hit that claims S and returns
+/// its seed, then panics. The swallow leaves the held map empty and S
+/// unclaimed for the driver's next entry, and F lands the unbounded value
+/// with nothing Failed.
+fn virtual_hit_then_panic_in_a_speculative_entry<C: Cells>() {
+    let unbounded = speculative::<C>(None, true, false, true);
+    assert_eq!(unbounded.out, Out::Value(7));
+    let bounded = speculative::<C>(Some(1), true, false, true);
+    assert_eq!(bounded.out, unbounded.out);
+    assert_eq!(bounded.panicking_runs, 1, "S2's run reached its panic");
+    assert_eq!(
+        bounded.back_read,
+        Some(50),
+        "S2's read of S was a seeded hit"
+    );
+    let (held, s_state) = bounded.after_panic.expect("an entry followed the panic");
+    assert!(held.is_empty(), "held after the swallow: {held:?}");
+    assert!(
+        matches!(s_state, NodeState::New | NodeState::Dirty),
+        "S is {s_state:?} after the swallow"
+    );
+    for state in &bounded.states[1..] {
+        assert!(
+            matches!(state, NodeState::New | NodeState::Dirty),
+            "a speculative node is {state:?}"
+        );
+    }
+}
+local_and_shared!(
+    virtual_hit_then_panic_in_a_speculative_entry,
+    local_virtual_hit_then_panic_in_a_speculative_entry,
+    shared_virtual_hit_then_panic_in_a_speculative_entry
+);
+
+/// A cycle value whose drop panics "drop boom" when `marked`; a clone is
+/// unmarked, so only the iterate a step marked panics.
+struct Marked {
+    v: u64,
+    marked: bool,
+}
+
+impl Clone for Marked {
+    fn clone(&self) -> Self {
+        Marked {
+            v: self.v,
+            marked: false,
+        }
+    }
+}
+
+impl PartialEq for Marked {
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v
+    }
+}
+
+impl Drop for Marked {
+    fn drop(&mut self) {
+        if self.marked && !std::thread::panicking() {
+            std::panic::panic_any(String::from("drop boom"));
+        }
+    }
+}
+
+fn marked(v: u64) -> Marked {
+    Marked { v, marked: false }
+}
+
+/// The episode callback that panics.
+#[derive(Copy, Clone, Debug)]
+enum Callback {
+    /// A Fallback's `g`, "g boom".
+    G,
+    /// A Fixpoint's `step`, "step boom".
+    Step,
+    /// The drop of a Fixpoint's s_1 when s_2 replaces it, "drop boom".
+    Drop,
+}
+
+/// What the IF form over a panicking episode saw.
+#[derive(Debug, PartialEq, Eq)]
+struct EpisodePanic {
+    out: Out,
+    /// S and T after the `get`.
+    states: Vec<NodeState>,
+}
+
+/// F = IF(A, S, R) as in [`speculative`], where S, suspect, and T read
+/// each other, both seeded with `callback`'s strategy. With `real_reads`
+/// F's real run reads S. Returns the outcome and, if the callback
+/// panicked inside a speculative entry's run, S's and T's states at the
+/// first entry the driver took after it.
+fn speculative_episode<C: Cells>(
+    frames: Option<u32>,
+    callback: Callback,
+    real_reads: bool,
+) -> (EpisodePanic, Option<Vec<NodeState>>) {
+    let rt = runtime::<C>(frames);
+    rt.set_placeholder(marked(0));
+    let panicked = Arc::new(AtomicBool::new(false));
+    let strategy = |mark: bool| -> QueryOpts<Marked> {
+        let p = panicked.clone();
+        let cycle = match callback {
+            Callback::G => CycleStrategy::fallback(move |_| -> Marked {
+                p.store(p.load(SeqCst) || crate::replay::speculative(), SeqCst);
+                std::panic::panic_any(String::from("g boom"))
+            }),
+            Callback::Step => CycleStrategy::Fixpoint(Fixpoint::new(|| marked(0)).step(
+                move |_, _, _| -> Marked {
+                    p.store(p.load(SeqCst) || crate::replay::speculative(), SeqCst);
+                    std::panic::panic_any(String::from("step boom"))
+                },
+            )),
+            Callback::Drop => CycleStrategy::Fixpoint(Fixpoint::new(|| marked(0)).step(
+                move |_, out: Marked, k| {
+                    let mark = mark && k == 1;
+                    if mark {
+                        p.store(p.load(SeqCst) || crate::replay::speculative(), SeqCst);
+                    }
+                    Marked {
+                        v: out.v,
+                        marked: mark,
+                    }
+                },
+            )),
+        };
+        QueryOpts {
+            cycle,
+            replay: Replay::Allowed,
+        }
+    };
+    let a_in = rt.create_input(false);
+    let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+    let s_later: Arc<OnceLock<Incr<Marked>>> = Arc::default();
+    let sl = s_later.clone();
+    let t = rt.create_query_with(
+        move |rt| marked((rt.get(*sl.get().unwrap()).v + 1).min(3)),
+        strategy(false),
+    );
+    let s = rt.create_query_with(move |rt| marked((rt.get(t).v + 1).min(3)), strategy(true));
+    s_later.set(s).unwrap();
+    let r = rt.create_query_with(|_| 7_u64, replayable());
+    let f = rt.create_query_with(
+        move |rt| {
+            if rt.get(a) || real_reads {
+                rt.get(s).v
+            } else {
+                rt.get(r)
+            }
+        },
+        replayable(),
+    );
+    let after_panic = Arc::new(Mutex::new(None));
+    let (seen, p, at) = (after_panic.clone(), panicked.clone(), RtRef(&rt));
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if matches!(point, ParkPoint::BeforeEntry(_)) && p.load(SeqCst) {
+            let mut seen = seen.lock().unwrap();
+            if seen.is_none() {
+                let rt = at.rt();
+                *seen = Some(vec![rt.state_of(s), rt.state_of(t)]);
+            }
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
+    let out = get(&rt, f);
+    rt.assert_invariant_i();
+    let seen = EpisodePanic {
+        out,
+        states: vec![rt.state_of(s), rt.state_of(t)],
+    };
+    let after_panic = after_panic.lock().unwrap().take();
+    assert_eq!(after_panic.is_some(), panicked.load(SeqCst));
+    (seen, after_panic)
+}
+
+/// F5 (b): a speculative entry's run reaches a cycle whose callback
+/// panics. Every member is New or Dirty after the speculative run; F
+/// lands 7 when the real run never reads S, and panics with the
+/// callback's own payload, as the unbounded run does, when it does. Only
+/// `g` runs speculatively, as T's virtual hit seeds S: a speculative
+/// entry never runs an episode, so `step` and the drop of s_1 are
+/// reached by the real run alone.
+fn panicking_episode_in_a_speculative_entry<C: Cells>() {
+    for (callback, payload, speculative) in [
+        (Callback::G, "g boom", true),
+        (Callback::Step, "step boom", false),
+        (Callback::Drop, "drop boom", false),
+    ] {
+        let new_or_dirty = |states: &[NodeState]| {
+            states
+                .iter()
+                .all(|s| matches!(s, NodeState::New | NodeState::Dirty))
+        };
+        let (quiet, after) = speculative_episode::<C>(Some(1), callback, false);
+        assert_eq!(quiet.out, Out::Value(7), "{callback:?}");
+        assert!(new_or_dirty(&quiet.states), "{callback:?}: {quiet:?}");
+        assert_eq!(after.is_some(), speculative, "{callback:?}");
+        if let Some(after) = after {
+            assert!(new_or_dirty(&after), "{callback:?}: {after:?}");
+        }
+        assert_eq!(
+            speculative_episode::<C>(None, callback, false).0,
+            quiet,
+            "{callback:?}"
+        );
+
+        let (unbounded, _) = speculative_episode::<C>(None, callback, true);
+        assert_eq!(unbounded.out, Out::Panic(payload.into()), "{callback:?}");
+        let (bounded, after) = speculative_episode::<C>(Some(1), callback, true);
+        assert_eq!(bounded, unbounded, "{callback:?}");
+        assert_eq!(after.is_some(), speculative, "{callback:?}");
+        if let Some(after) = after {
+            assert!(new_or_dirty(&after), "{callback:?}: {after:?}");
+        }
+    }
+}
+local_and_shared!(
+    panicking_episode_in_a_speculative_entry,
+    local_panicking_episode_in_a_speculative_entry,
+    shared_panicking_episode_in_a_speculative_entry
 );
 
 /// How T reads F in the T/F/U shape.
@@ -515,6 +794,119 @@ local_and_shared!(
     shared_doomed_reads_node
 );
 
+/// What a doomed read of a group member saw.
+#[derive(Debug, PartialEq, Eq)]
+struct GroupDoom {
+    p: Out,
+    /// N and N2 after the `get`.
+    states: [NodeState; 2],
+    member_runs: u32,
+}
+
+/// The doomed read's N as a Dirty `IN_GROUP` member: N (Fallback) and N2
+/// form a landed group over M = x % 2, and a cutoff-only `set` of x leaves
+/// both Dirty. P, New, reads N at budget 1, so the read dooms P. The doom
+/// point finds N and N2 Dirty, neither claimed, and the held map empty;
+/// the driver's run of level 1 verifies the group with neither closure
+/// running, and P lands the unbounded value.
+fn doomed_read_of_a_group_member<C: Cells>() {
+    let run = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let x = rt.create_input(1_u64);
+        let m = rt.create_query_with(move |rt| rt.get(x) % 2, replayable());
+        let runs = Arc::new(AtomicU32::new(0));
+        let n_later = Later::default();
+        let (r, nl) = (runs.clone(), n_later.clone());
+        let n2 = rt.create_query_with(
+            move |rt| {
+                r.fetch_add(1, SeqCst);
+                rt.get(later(&nl)) + rt.get(m)
+            },
+            replayable(),
+        );
+        let r = runs.clone();
+        let n = rt.create_query_with(
+            move |rt| {
+                r.fetch_add(1, SeqCst);
+                rt.get(n2)
+            },
+            fallback(100),
+        );
+        n_later.set(n).unwrap();
+        assert_eq!(rt.get(n), 100);
+        assert_eq!(rt.get(n2), 101);
+        rt.set(x, 3);
+        assert_eq!([rt.state_of(n), rt.state_of(n2)], [NodeState::Dirty; 2]);
+
+        let doom_seen = Arc::new(Mutex::new(Vec::new()));
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let (d, e, at) = (doom_seen.clone(), entries.clone(), RtRef(&rt));
+        let installed = rt.park_hook.set(Box::new(move |p| {
+            let rt = at.rt();
+            match p {
+                ParkPoint::AfterDoom(node) if node == NodeId(n.slot()) => {
+                    d.lock().unwrap().push((
+                        rt.state_of(n),
+                        rt.state_of(n2),
+                        cycle_state::held_keys(),
+                    ));
+                }
+                ParkPoint::BeforeEntry(node) => {
+                    let verified = rt.group_verifies.lock().unwrap().len();
+                    e.lock().unwrap().push((node, verified));
+                }
+                _ => {}
+            }
+        }));
+        assert!(installed.is_ok(), "park hook installed twice");
+        runs.store(0, SeqCst);
+        rt.group_verifies.lock().unwrap().clear();
+        let p = rt.create_query_with(move |rt| rt.get(n) + 1, replayable());
+        let got = get(&rt, p);
+        rt.assert_invariant_i();
+        let seen = GroupDoom {
+            p: got,
+            states: [rt.state_of(n), rt.state_of(n2)],
+            member_runs: runs.load(SeqCst),
+        };
+        let doom_seen = std::mem::take(&mut *doom_seen.lock().unwrap());
+        let entries = std::mem::take(&mut *entries.lock().unwrap());
+        let verifies = std::mem::take(&mut *rt.group_verifies.lock().unwrap());
+        (seen, doom_seen, entries, verifies, [n.slot(), n2.slot()])
+    };
+    let (unbounded, ..) = run(None);
+    assert_eq!(
+        unbounded,
+        GroupDoom {
+            p: Out::Value(101),
+            states: [NodeState::Clean; 2],
+            member_runs: 0,
+        }
+    );
+    let (bounded, doom_seen, entries, verifies, members) = run(Some(1));
+    assert_eq!(bounded, unbounded);
+    assert_eq!(
+        doom_seen,
+        [(NodeState::Dirty, NodeState::Dirty, Vec::new())],
+        "the doom point found N and N2 Dirty, unclaimed, with nothing held"
+    );
+    let at = entries
+        .iter()
+        .position(|&(node, _)| node == NodeId(members[0]))
+        .expect("N's entry ran");
+    let from = entries[at].1;
+    let to = entries.get(at + 1).map_or(verifies.len(), |&(_, v)| v);
+    assert!(
+        verifies[from..to].iter().any(|v| members.contains(v)),
+        "N's entry verified the group: {verifies:?}, entries {entries:?}"
+    );
+}
+local_and_shared!(
+    doomed_read_of_a_group_member,
+    local_doomed_read_of_a_group_member,
+    shared_doomed_read_of_a_group_member
+);
+
 /// A `get` and a `try_get` of the head of a 50-deep chain at budget 1 each
 /// run their whole driver loop, about 100 entries, inside the one
 /// outermost entry the read opened: one 0 to 1 transition of the entry
@@ -552,6 +944,130 @@ local_and_shared!(
     entry_guard_spans_the_loop,
     local_entry_guard_spans_the_loop,
     shared_entry_guard_spans_the_loop
+);
+
+/// Above budget 1 an entry is pushed several levels above the one
+/// running, leaving empty levels between; the running entry is still the
+/// top level, so finding it never walks the empty ones.
+fn running_entry_is_the_top_level_above_budget_1<C: Cells>() {
+    let rt = runtime::<C>(Some(8));
+    let input = rt.create_input(0_u64);
+    let mut head = input;
+    for _ in 0..200 {
+        let below = head;
+        head = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+    }
+    rt.entries.lock().unwrap().clear();
+    assert_eq!(rt.get(head), 200);
+    let entries = std::mem::take(&mut *rt.entries.lock().unwrap());
+    assert!(entries.len() > 1, "{} entries", entries.len());
+    for e in &entries {
+        assert_eq!(e.levels, e.level as usize + 1, "{e:?}");
+    }
+}
+local_and_shared!(
+    running_entry_is_the_top_level_above_budget_1,
+    local_running_entry_is_the_top_level_above_budget_1,
+    shared_running_entry_is_the_top_level_above_budget_1
+);
+
+/// What one read of the chain over C's cycle saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Revalidated {
+    value: u64,
+    /// Two: the episode that dissolves, then the re-entry.
+    episodes: u64,
+    validations: u64,
+    outermost: u64,
+    /// C's dissolve is recorded when the call returns.
+    dissolved_after: bool,
+    /// The previous call's C is no longer recorded: the next outermost
+    /// entry reset the set.
+    earlier_reset: Option<bool>,
+}
+
+/// The bottom of a 50-deep chain reads C, the root of a Fallback cycle
+/// with A, A reading C on its first and third runs. The episode's member
+/// run of A, its second, doesn't read C, so validation dissolves it; C's
+/// compute then reads A, whose third run re-enters C's cycle, which
+/// skips validation. At budget 1 that re-entry is a later entry of the
+/// same driver loop, and validation runs as often as in the unbounded
+/// run, inside the one outermost entry and context the read opened.
+fn validation_skipped_on_reentry_within_one_loop<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let mut seen = Vec::new();
+        let mut earlier: Option<u32> = None;
+        for try_ in [false, true] {
+            let c_later = Later::default();
+            let a_runs = Arc::new(AtomicU32::new(0));
+            let (cl, ar) = (c_later.clone(), a_runs.clone());
+            let a = rt.create_query_with(
+                move |rt| {
+                    if matches!(ar.fetch_add(1, SeqCst), 0 | 2) {
+                        rt.get(later(&cl))
+                    } else {
+                        5
+                    }
+                },
+                fallback(200),
+            );
+            let c = rt.create_query_with(move |rt| rt.get(a) + 1, fallback(100));
+            c_later.set(c).unwrap();
+            let mut head = c;
+            for _ in 0..50 {
+                let below = head;
+                head = rt.create_query_with(move |rt| rt.get(below) + 1, replayable());
+            }
+            rt.entries.lock().unwrap().clear();
+            let before = cycle_state::outermost_entries();
+            let validations = rt.validations.load(SeqCst);
+            let episodes = rt.episodes.load(SeqCst);
+            let value = if try_ {
+                rt.try_get(head).expect("no cycle")
+            } else {
+                rt.get(head)
+            };
+            let entries = std::mem::take(&mut *rt.entries.lock().unwrap());
+            if let Some(first) = entries.first() {
+                assert!(
+                    entries.iter().all(|e| e.context == first.context),
+                    "one context for the whole loop, try: {try_}"
+                );
+            }
+            seen.push(Revalidated {
+                value,
+                episodes: rt.episodes.load(SeqCst) - episodes,
+                validations: rt.validations.load(SeqCst) - validations,
+                outermost: cycle_state::outermost_entries() - before,
+                dissolved_after: cycle_state::has_dissolved(rt.runtime_id, c.slot()),
+                earlier_reset: earlier.map(|e| !cycle_state::has_dissolved(rt.runtime_id, e)),
+            });
+            earlier = Some(c.slot());
+            rt.assert_invariant_i();
+        }
+        seen
+    };
+    let unbounded = observe(None);
+    let once = Revalidated {
+        value: 150,
+        episodes: 2,
+        validations: 1,
+        outermost: 1,
+        dissolved_after: true,
+        earlier_reset: None,
+    };
+    let again = Revalidated {
+        earlier_reset: Some(true),
+        ..once
+    };
+    assert_eq!(unbounded, [once, again]);
+    assert_eq!(observe(Some(1)), unbounded);
+}
+local_and_shared!(
+    validation_skipped_on_reentry_within_one_loop,
+    local_validation_skipped_on_reentry_within_one_loop,
+    shared_validation_skipped_on_reentry_within_one_loop
 );
 
 /// P's run dooms on its read of a New N, then misses a table and its own

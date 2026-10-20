@@ -317,20 +317,38 @@ impl<C: Cells> Runtime<C> {
     /// meanwhile.
     fn owned_claims(&self, cidx: u32, node: u32, path: u64) -> Vec<(u32, u32)> {
         let rt = self.runtime_id;
-        let suspended = replay::suspended_members(rt);
         cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, slot), e)| {
-                    *r == rt
-                        && !suspended.contains(slot)
-                        && e.owner == cidx
-                        && (e.owner_node == node || e.owner_node == u32::MAX)
-                        && e.owner_virtual.is_none_or(|p| p == path)
-                })
-                .map(|(&(_, slot), e)| {
-                    e.own(cidx, node, Some(path));
-                    (slot, e.anchor)
-                })
+            // Groups whose every member is taken move whole; a group with a
+            // suspended member moves the others one by one.
+            let (mut whole, mut singles) = (Vec::new(), Vec::new());
+            for g in h.owners(rt, cidx, cidx) {
+                let owner = h.owner(g);
+                if !(owner.node() == node || owner.node() == u32::MAX)
+                    || owner.virtual_frame().is_some_and(|p| p != path)
+                {
+                    continue;
+                }
+                let members = h.members(g);
+                let start = singles.len();
+                singles.extend(
+                    members
+                        .iter()
+                        .copied()
+                        .filter(|&m| !replay::is_suspended(h[&(rt, m)].ep)),
+                );
+                if singles.len() - start == members.len() {
+                    singles.truncate(start);
+                    whole.push(g);
+                }
+            }
+            let mut owned = singles.clone();
+            for &g in &whole {
+                owned.extend_from_slice(h.members(g));
+            }
+            h.hand_over(rt, &whole, &singles, cidx, node, Some(path));
+            owned
+                .into_iter()
+                .map(|m| (m, h[&(rt, m)].anchor()))
                 .collect()
         })
     }
@@ -405,7 +423,7 @@ impl<C: Cells> Runtime<C> {
             match self.claim_virtual(p, top) {
                 Ok(()) => {
                     return Some(
-                        self.cycle_read(handle, NodeState::Computing, kind)
+                        self.cycle_read(handle, NodeState::Computing, kind, None)
                             .expect("incr-core: a virtual hit holds the node it read"),
                     );
                 }
@@ -794,6 +812,28 @@ impl<C: Cells> Runtime<C> {
         Computed::Doomed
     }
 
+    /// The doom of an R5 read of `handle`, a member this thread holds
+    /// without a buffer, from frame `f` past the budget: the member keeps
+    /// its claim, the frames below that can take a placeholder are marked,
+    /// and the member becomes an entry, which the driver runs as a member
+    /// run (**Loop** step 4).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn doom_held<T: Value>(&self, handle: Incr<T>, f: ActiveRead) -> T {
+        let id = NodeId(handle.slot());
+        #[cfg(test)]
+        self.dooms.lock().unwrap().push(DoomSeen {
+            node: id.0,
+            state: self.nodes.get(id.0).state(),
+            verified_at: self.nodes.get(id.0).verified_at(),
+            depth: self.dep_stack.depth(),
+            context: 0,
+        });
+        self.mark(id, handle.generation(), Retry::Compute);
+        self.park(ParkPoint::AfterDoom(id));
+        self.placeholder_read::<T>(Some(f))
+    }
+
     /// A clone of node `slot`'s value, if its slot holds one.
     fn slot_value(&self, slot: u32) -> Option<cycle::Erased> {
         let node = self.nodes.get(slot);
@@ -881,6 +921,7 @@ impl<C: Cells> Runtime<C> {
         let what = Delivered::Unwind {
             cycle: kind == Some(UnwindKind::Cycle),
             poison: true,
+            attributed: false,
             payload,
         };
         self.keep_read(ctl, cidx, reading, ordinal, what);
@@ -923,6 +964,12 @@ impl<C: Cells> Runtime<C> {
     /// doomed, makes them virtual frames, and pushes `n` one level above F.
     fn mark(&self, n: NodeId, generation: u32, retry: Retry) {
         let rt = self.runtime_id;
+        #[cfg(test)]
+        assert!(
+            self.virtual_position(n.0, generation).is_none(),
+            "incr-core: a doom pushed node {} that has a virtual frame",
+            n.0
+        );
         let mut frames: Vec<Below> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
@@ -1047,6 +1094,19 @@ impl<C: Cells> Runtime<C> {
                         replay::member_run_episode(f.cidx)
                     } else {
                         None
+                    },
+                    member_of: if ctl.has(cycle::BUFFERED) {
+                        cycle_state::held_episode(rt, f.node)
+                    } else {
+                        None
+                    },
+                    computes: {
+                        let n = if ctl.has(cycle::BUFFERED) {
+                            replay::member_run_root(f.cidx).unwrap_or(f.node)
+                        } else {
+                            f.node
+                        };
+                        u64::from(n) | (u64::from(self.nodes.get(n).generation()) << 32)
                     },
                     deferred: if ctl.has(cycle::BUFFERED) {
                         Vec::new()
@@ -1200,10 +1260,13 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let mut rooted = false;
         cycle_state::with_held(|h| {
-            for (&(r, slot), e) in h.iter() {
-                if r == rt && e.owner_virtual.is_some() && e.anchor >= cidx && e.owner >= cidx {
-                    keep.push(slot);
-                    rooted |= e.anchor == cidx;
+            for g in h.virtual_owners(rt, cidx, u32::MAX) {
+                for &slot in h.members(g) {
+                    let anchor = h[&(rt, slot)].anchor();
+                    if anchor >= cidx {
+                        keep.push(slot);
+                        rooted |= anchor == cidx;
+                    }
                 }
             }
         });
@@ -1259,6 +1322,29 @@ impl<C: Cells> Runtime<C> {
         Some(self.run_loop(id, visit))
     }
 
+    /// An R5 member run at `cidx` that a doom discarded: if the doom
+    /// opened a context at its position, which it does when the member run
+    /// is the doom's bottom frame, that context runs until the member it
+    /// targets is buffered, or until its member run unwinds, which the
+    /// result carries as the nested run's unwind. `None` if the doom marked
+    /// the reader instead.
+    pub(super) fn member_run_discarded(
+        &self,
+        cidx: u32,
+    ) -> Option<Result<(), Box<dyn std::any::Any + Send>>> {
+        let rt = self.runtime_id;
+        let id = replay::with(|c| {
+            let at = replay::innermost(c, rt)?;
+            let x = &c[at];
+            (x.running.is_none() && x.boundary == cidx).then_some(x.id)
+        })?;
+        Some(
+            catch_unwind(AssertUnwindSafe(|| self.run_loop(id, Visit::Full))).map(|computed| {
+                debug_assert_eq!(computed, Computed::Deferred);
+            }),
+        )
+    }
+
     /// The driver of context `id`: runs its entries, highest level first
     /// and oldest first within a level, each at its level's position,
     /// until the level-0 target lands, and returns how the target's last
@@ -1288,6 +1374,7 @@ impl<C: Cells> Runtime<C> {
                 (level, entry, parked)
             });
             self.park(ParkPoint::BeforeEntry(NodeId(entry.node)));
+            let failures = cycle_state::failures();
             if !parked.is_empty() {
                 taint_memo::restore(parked);
             }
@@ -1318,7 +1405,7 @@ impl<C: Cells> Runtime<C> {
                     // entry stands for it: the run of a later entry that
                     // retries the frame gets the direct compute below.
                     if let Some((u, false)) = popped_frames.last() {
-                        let read = u64::from(u.node) | (u64::from(u.generation) << 32);
+                        let read = u.computes;
                         replay::with(|c| {
                             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
                                 if let Some(w) = x
@@ -1356,7 +1443,7 @@ impl<C: Cells> Runtime<C> {
                 // the pop finishes it or its maker's retry, in a later pass,
                 // runs it again.
                 if let Some((u, false)) = popped_frames.last() {
-                    let read = u64::from(u.node) | (u64::from(u.generation) << 32);
+                    let read = u.computes;
                     if u.cidx == v.cidx + 1 && v.reading == read {
                         replay::with(|c| {
                             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
@@ -1443,7 +1530,8 @@ impl<C: Cells> Runtime<C> {
                             let mut bag = Deferred::new();
                             self.continuation_unwound(entry.node, cidx, &mut bag);
                             bag.drain(self);
-                            match self.entry_unwound(id, level, entry, boundary, payload) {
+                            match self.entry_unwound(id, level, entry, boundary, payload, failures)
+                            {
                                 Some(computed) => return computed,
                                 None => continue,
                             }
@@ -1470,7 +1558,7 @@ impl<C: Cells> Runtime<C> {
                 .iter()
                 .filter(|&(v, landed)| !landed && v.cidx > at)
             {
-                let read = u64::from(v.node) | (u64::from(v.generation) << 32);
+                let read = v.computes;
                 if let Some((w, _)) = popped_frames
                     .iter()
                     .find(|(w, _)| w.cidx + 1 == v.cidx && w.reading == read)
@@ -1539,10 +1627,12 @@ impl<C: Cells> Runtime<C> {
             }
             let computed = match ran {
                 Ok(computed) => computed,
-                Err(payload) => match self.entry_unwound(id, level, entry, boundary, payload) {
-                    Some(computed) => computed,
-                    None => continue,
-                },
+                Err(payload) => {
+                    match self.entry_unwound(id, level, entry, boundary, payload, failures) {
+                        Some(computed) => computed,
+                        None => continue,
+                    }
+                }
             };
             if computed == Computed::Discarded {
                 if let Some(q) = dropped {
@@ -1583,6 +1673,7 @@ impl<C: Cells> Runtime<C> {
     /// the driver picks its next entry again (`true`).
     fn tarjan_pop(&self, id: u64, v: &VFrame) -> VPop {
         let rt = self.runtime_id;
+        let failures = cycle_state::failures();
         let node = self.nodes.get(v.node);
         if node.generation() != v.generation {
             return VPop::Next;
@@ -1635,7 +1726,7 @@ impl<C: Cells> Runtime<C> {
             let end = catch_unwind(AssertUnwindSafe(|| self.run_episode(ep, &mut bag)));
             return match end {
                 Ok(end) => self.episode_task_end(root, end, bag),
-                Err(payload) => self.vframe_unwound(id, v, root.0, false, payload),
+                Err(payload) => self.vframe_unwound(id, v, root.0, false, payload, failures),
             };
         }
         // A virtual hit claimed the node, so no retry recomputes it: its
@@ -1668,20 +1759,34 @@ impl<C: Cells> Runtime<C> {
                 Ok(None) => return VPop::Restart,
                 Err(payload) => {
                     self.end_deliveries(id, v.node, v.generation, v.cidx);
-                    return self.vframe_unwound(id, v, v.node, true, payload);
+                    return self.vframe_unwound(id, v, v.node, true, payload, failures);
                 }
             }
+        }
+        // An R5 member run's frame: the member stays held for its episode,
+        // so the pop only finishes the run, as the run nested in its reader
+        // does, and passes the run's lowlink down.
+        if self.episode_member(v.node) {
+            if low < v.cidx {
+                if stand_in.is_some() {
+                    self.pass_down(v.cidx, low);
+                } else {
+                    self.lower_parent(v.cidx, low);
+                }
+            }
+            return VPop::Next;
         }
         if low < v.cidx {
             if stand_in.is_some() {
                 // The run finished the frame, which defers as `cycle_pop`
                 // defers a real one.
                 cycle_state::with_held(|h| {
-                    let e = h
-                        .get_mut(&(rt, v.node))
-                        .expect("incr-core: a stand-in is held");
-                    e.anchor = v.cidx;
-                    e.own(v.cidx, v.node, None);
+                    assert!(
+                        h.contains_key(&(rt, v.node)),
+                        "incr-core: a stand-in is held"
+                    );
+                    h.set_anchor((rt, v.node), v.cidx);
+                    h.own((rt, v.node), v.cidx, v.node, None);
                 });
                 self.pass_down(v.cidx, low);
             } else if unbuffered.is_some() {
@@ -1693,9 +1798,14 @@ impl<C: Cells> Runtime<C> {
             return VPop::Next;
         }
         let rooted = cycle_state::with_held(|h| {
-            h.iter().any(|(&(r, slot), e)| {
-                r == rt && e.anchor >= v.cidx && (stand_in.is_none() || slot != v.node)
-            }) || stand_in.is_some() && h[&(rt, v.node)].last.iter().any(|&(d, _)| d.0 == v.node)
+            h.anchored(rt, v.cidx)
+                .any(|slot| stand_in.is_none() || slot != v.node)
+                || stand_in.is_some()
+                    && h.get(&(rt, v.node))
+                        .expect("incr-core: a stand-in is held")
+                        .last
+                        .iter()
+                        .any(|&(d, _)| d.0 == v.node)
         });
         if let (Some(revs), false) = (stand_in, rooted) {
             if !(v.spec && self.alone_lands_dirty(v.node)) {
@@ -1711,7 +1821,7 @@ impl<C: Cells> Runtime<C> {
                     }
                     Err(payload) => {
                         bag.drain(self);
-                        self.vframe_unwound(id, v, v.node, true, payload)
+                        self.vframe_unwound(id, v, v.node, true, payload, failures)
                     }
                 };
             }
@@ -1748,8 +1858,8 @@ impl<C: Cells> Runtime<C> {
         }
         if stand_in.is_some() {
             cycle_state::with_held(|h| {
-                if let Some(e) = h.get_mut(&(rt, v.node)) {
-                    e.anchor = v.cidx;
+                if h.contains_key(&(rt, v.node)) {
+                    h.set_anchor((rt, v.node), v.cidx);
                 }
             });
         }
@@ -1758,7 +1868,7 @@ impl<C: Cells> Runtime<C> {
         }));
         match end {
             Ok(end) => self.episode_task_end(NodeId(v.node), end, bag),
-            Err(payload) => self.vframe_unwound(id, v, v.node, false, payload),
+            Err(payload) => self.vframe_unwound(id, v, v.node, false, payload, failures),
         }
     }
 
@@ -1812,6 +1922,7 @@ impl<C: Cells> Runtime<C> {
         node: u32,
         continuation: bool,
         payload: Box<dyn std::any::Any + Send>,
+        failures: u64,
     ) -> VPop {
         let kind = cycle_state::unwind_kind();
         let mut bag = Deferred::new();
@@ -1863,13 +1974,15 @@ impl<C: Cells> Runtime<C> {
             resume_unwind(payload);
         };
         cycle_state::take_unwind_kind();
+        let poison = !(continuation && self.episode_member(node));
         replay::with(|c| {
             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
                 x.deliver_blocked(
                     &below,
                     Delivered::Unwind {
                         cycle: kind == Some(UnwindKind::Cycle),
-                        poison: true,
+                        poison,
+                        attributed: cycle_state::failures() != failures,
                         payload,
                     },
                 );
@@ -1887,6 +2000,12 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let kind = cycle_state::unwind_kind();
         let discarding = kind.is_some() || replay::speculative();
+        // An episode's member stays held for its episode, as when the run
+        // nests in its reader: only what the run left above it goes.
+        if self.episode_member(slot) {
+            self.release_unwound_from(cidx, slot, kind, discarding, bag);
+            return;
+        }
         let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) else {
             return;
         };
@@ -1908,30 +2027,29 @@ impl<C: Cells> Runtime<C> {
         bag.push_erased(Box::new((e.buf, e.s)));
     }
 
+    /// Whether held node `slot` is a member of a running episode.
+    fn episode_member(&self, slot: u32) -> bool {
+        cycle_state::with_held(|h| {
+            h.get(&(self.runtime_id, slot))
+                .is_some_and(|e| e.episode.is_some())
+        })
+    }
+
     /// Virtual frame `v` pops: the claims frames above it own keep its
     /// path, so that only its retry takes them over.
     fn note_ancestor(&self, v: &VFrame) {
-        cycle_state::with_held(|h| {
-            for ((r, _), e) in h.iter_mut() {
-                if *r == self.runtime_id && e.owner > v.cidx && e.owner_virtual.is_some() {
-                    e.ancestry.push((v.cidx, v.path));
-                }
-            }
-        });
+        cycle_state::with_held(|h| h.note_ancestor(self.runtime_id, v.cidx, v.path));
     }
 
     /// The claims a doomed run of `node` at `cidx` deferred become those of
     /// the run that retries or finishes it there, which releases them if
     /// it unwinds.
     fn own_deferred(&self, cidx: u32, node: u32) {
+        let rt = self.runtime_id;
         cycle_state::with_held(|h| {
-            for ((r, _), e) in h.iter_mut() {
-                if *r == self.runtime_id
-                    && e.owner_virtual.is_some()
-                    && e.owner == cidx
-                    && e.owner_node == node
-                {
-                    e.owner_virtual = None;
+            for g in h.virtual_owners(rt, cidx, cidx) {
+                if h.owner(g).node() == node {
+                    h.own_retry(g);
                 }
             }
         });
@@ -2008,6 +2126,7 @@ impl<C: Cells> Runtime<C> {
         entry: Entry,
         boundary: u32,
         payload: Box<dyn std::any::Any + Send>,
+        failures: u64,
     ) -> Option<Computed> {
         let kind = cycle_state::unwind_kind();
         if kind == Some(UnwindKind::Discard) {
@@ -2068,6 +2187,9 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         cycle_state::take_unwind_kind();
+        // An R5 member run's unwind leaves its reader unpoisoned, as the
+        // member stays held for its episode.
+        let poison = !self.episode_member(entry.node);
         let abandoned = replay::with(|c| {
             let x = c
                 .iter_mut()
@@ -2078,11 +2200,13 @@ impl<C: Cells> Runtime<C> {
                 &below,
                 Delivered::Unwind {
                     cycle: kind == Some(UnwindKind::Cycle),
-                    poison: true,
+                    poison,
+                    attributed: cycle_state::failures() != failures,
                     payload,
                 },
             );
             x.levels.truncate(level as usize);
+            x.trim_levels();
             x.truncate_vstack(level as usize)
         });
         let mut bag = Deferred::new();
@@ -2114,6 +2238,7 @@ impl<C: Cells> Runtime<C> {
             if !keep {
                 x.levels[q as usize].pop_front();
             }
+            x.trim_levels();
             (x.boundary, x.truncate_vstack(q as usize))
         });
         for ep in abandoned {
@@ -2180,7 +2305,9 @@ impl<C: Cells> Runtime<C> {
             reading,
             ordinal: self.dep_stack.reads_of_current(rt),
             path: self.path_at(f.cidx),
-            episode: member.then(|| replay::member_run_episode(f.cidx)).flatten(),
+            episode: member
+                .then(|| cycle_state::held_episode(rt, f.node.0))
+                .flatten(),
         };
         let what = replay::with(|c| {
             c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
@@ -2210,11 +2337,13 @@ impl<C: Cells> Runtime<C> {
                     Delivered::Unwind {
                         cycle,
                         poison,
+                        attributed,
                         payload,
                     } => match copy_payload(&**payload) {
                         Some(copy) => Delivered::Unwind {
                             cycle: *cycle,
                             poison: *poison,
+                            attributed: *attributed,
                             payload: copy,
                         },
                         None => x.pending.remove(at).what,
@@ -2251,15 +2380,22 @@ impl<C: Cells> Runtime<C> {
             });
             return None;
         };
-        let (cycle, poison, payload) = match what {
+        // A read of a held node lowers its reader to the node's anchor,
+        // whatever the read returns, as the read rules do.
+        if let Some(anchor) = cycle_state::held_anchor(rt, handle.slot()) {
+            // SAFETY: the active frame's control block is live.
+            unsafe { &*f.ctl }.lower(anchor);
+        }
+        let (cycle, poison, attributed, payload) = match what {
             Delivered::Unwind {
                 cycle,
                 poison,
+                attributed,
                 payload,
             } => {
                 #[cfg(test)]
                 self.dirty_reads.lock().unwrap().push(handle.slot());
-                (cycle, poison, payload)
+                (cycle, poison, attributed, payload)
             }
             Delivered::Walk(_) | Delivered::Direct => {
                 unreachable!("incr-core: a walk's direction is not a value")
@@ -2288,6 +2424,11 @@ impl<C: Cells> Runtime<C> {
             unsafe { &*f.ctl }.raise(cycle::POISONED);
         }
         if !cycle {
+            // The member marked for the panic was marked in the run it came
+            // out of, so the reader's member run is not, as when it nests.
+            if attributed {
+                cycle_state::count_failure();
+            }
             resume_unwind(payload);
         }
         // A closure that swallowed the cycle and then panicked on its own
@@ -2365,6 +2506,7 @@ impl<C: Cells> Runtime<C> {
                     .get(&node)
                     .map(|g| Delivered::Unwind {
                         cycle: true,
+                        attributed: false,
                         // As `episode_landed` poisons a reader of a node
                         // left New, and not of one left Cyclic.
                         poison: state == NodeState::New,
@@ -2394,12 +2536,18 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Closes context `id` on an unwind out of its loop, which also ends
-    /// the runs whose virtual hits took the claims it lists.
+    /// the runs whose virtual hits took the claims it lists. A wound out of
+    /// an entry above level 0 pops no frame at the positions below it, so
+    /// the claims anchored at the context's virtual frames, and those its
+    /// closed episodes waited for, are released here.
     fn close_unwound(&self, id: u64, boundary: u32) {
         let mut bag = Deferred::new();
         self.release_claim_list(id, 0, &mut bag);
         bag.drain(self);
         self.close_context(id, boundary);
+        let mut bag = Deferred::new();
+        self.release_held_from(boundary, true, &mut bag);
+        bag.drain(self);
     }
 
     fn close_context(&self, id: u64, boundary: u32) {
@@ -2444,11 +2592,7 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let rt = self.runtime_id;
-        cycle_state::with_held(|h| {
-            h.iter()
-                .any(|((r, _), e)| *r == rt && e.owner >= cidx && e.owner_virtual.is_some())
-        })
-        .then(|| self.path_at(cidx))
+        cycle_state::with_held(|h| h.any_virtually_owned_from(rt, cidx)).then(|| self.path_at(cidx))
     }
 
     /// The path of a frame at position `cidx`: the highest virtual frame
@@ -2458,8 +2602,7 @@ impl<C: Cells> Runtime<C> {
         let base = replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
-                .filter(|v| v.cidx < cidx)
+                .filter_map(|x| x.vframe_below(cidx))
                 .max_by_key(|v| v.cidx)
                 .map(|v| (v.cidx, replay::extend_path(v.path, (v.reading, v.ordinal))))
         });
@@ -2540,6 +2683,10 @@ impl<C: Cells> Runtime<C> {
                     return Err(computed);
                 }
             },
+            Computed::Skipped(owner) => {
+                walk.taint(owner);
+                return Ok(Computed::Done);
+            }
             _ => computed,
         };
         if computed == Computed::Unsettled {
@@ -2598,6 +2745,25 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn virtual_owner(&self, id: NodeId) -> Option<u32> {
         self.virtual_position(id.0, self.nodes.get(id.0).generation())
             .map(|p| p + 1)
+    }
+
+    /// The taint-memo owner for a walk's compute of `id` whose claim wait
+    /// ended with `id` New or Dirty, if `id` has a virtual frame. Never
+    /// one: the visit that pushed the compute checked the same frames,
+    /// only this thread makes them, and every one it makes while cleaning
+    /// the node's deps sits above the walk's frame and pops before the
+    /// walk goes on.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn post_wait_owner(&self, id: NodeId) -> Option<u32> {
+        let owner = self.virtual_owner(id);
+        #[cfg(test)]
+        assert!(
+            owner.is_none(),
+            "incr-core: post-wait claim of a node with a virtual frame: node {}",
+            id.0
+        );
+        owner
     }
 
     /// Whether position `cidx` holds one of this runtime's virtual frames.

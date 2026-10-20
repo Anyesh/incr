@@ -70,6 +70,13 @@ pub(crate) struct VFrame {
     /// For an episode's member run, the episode, which waits in the
     /// context until this frame pops.
     pub(crate) ep: Option<u64>,
+    /// For a member run, the episode its member is in, R5's nested runs
+    /// included: the frame's [`ReadKey::episode`].
+    pub(crate) member_of: Option<u64>,
+    /// The compute the frame below was blocked reading, `slot |
+    /// generation << 32`: the frame's own node, or for an episode's member
+    /// run the episode's root, whose compute ran the episode.
+    pub(crate) computes: u64,
     /// The claims its run deferred before the doom, as `(slot, anchor)`.
     /// The discard released them, but in the unbounded run they are still
     /// held, so a cycle closed above counts them among its participants.
@@ -90,8 +97,9 @@ pub(crate) struct ReadKey {
     pub(crate) ordinal: u32,
     /// The frame's [`VFrame::path`].
     pub(crate) path: u64,
-    /// For an episode's member run, the episode: the frame's own run, and
-    /// the episode's other member runs of the node there, are other runs.
+    /// For a member run, the episode its member is in: a discovery run of
+    /// the node at the position, and the runs of another episode, are other
+    /// runs.
     pub(crate) episode: Option<u64>,
 }
 
@@ -105,7 +113,7 @@ impl ReadKey {
             reading: v.reading,
             ordinal: v.ordinal,
             path: v.path,
-            episode: v.ep,
+            episode: v.member_of,
         }
     }
 }
@@ -135,6 +143,9 @@ pub(crate) enum Delivered {
     Unwind {
         cycle: bool,
         poison: bool,
+        /// A member was marked failed in the run the panic came out of,
+        /// so a member run that takes it again is not.
+        attributed: bool,
         payload: Box<dyn Any + Send>,
     },
     /// The entry landed without a Clean value. The unbounded run's read
@@ -248,9 +259,15 @@ impl Context {
 
     /// Removes the oldest entry at `level`, the one the driver ran.
     pub(crate) fn pop_entry(&mut self, level: u32) {
-        let q = &mut self.levels[level as usize];
-        q.pop_front();
-        if q.is_empty() && level as usize + 1 == self.levels.len() && level > 0 {
+        self.levels[level as usize].pop_front();
+        self.trim_levels();
+    }
+
+    /// Drops the empty levels on top, so `next_entry` finds the highest
+    /// entry without walking the empty levels a push above budget 1
+    /// leaves below it.
+    pub(crate) fn trim_levels(&mut self) {
+        while self.levels.len() > 1 && self.levels.last().is_some_and(VecDeque::is_empty) {
             self.levels.pop();
         }
     }
@@ -269,6 +286,12 @@ impl Context {
         }
         stack.push((pos, frame.generation));
         self.vstack.push(frame);
+    }
+
+    /// The highest virtual frame below position `cidx`.
+    pub(crate) fn vframe_below(&self, cidx: u32) -> Option<&VFrame> {
+        let above = cidx.saturating_sub(self.boundary) as usize;
+        self.vstack[..above.min(self.vstack.len())].last()
     }
 
     /// Pops the top virtual frame.
@@ -379,6 +402,7 @@ thread_local! {
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
+    static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(loom)]
@@ -388,6 +412,7 @@ loom::thread_local! {
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
+    static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(all(test, not(loom)))]
@@ -514,12 +539,13 @@ pub(crate) fn member_run_root(cidx: u32) -> Option<u32> {
 /// virtual frame.
 pub(crate) fn suspend(rt: RuntimeId, ep: Box<Episode>) {
     let unplaced = with(|c| {
-        match c
-            .iter_mut()
-            .rev()
-            .find(|x| x.rt == rt && x.vstack.iter().any(|v| v.ep == Some(ep.id)))
-        {
-            Some(x) => {
+        let found = c.iter_mut().rev().find_map(|x| {
+            let level = x.vstack.iter().rposition(|v| v.ep == Some(ep.id))?;
+            (x.rt == rt).then_some((x, level as u32))
+        });
+        match found {
+            Some((x, level)) => {
+                SUSPENDED.with(|s| s.borrow_mut().insert(ep.id, (x.id, level)));
                 x.episodes.push(*ep);
                 None
             }
@@ -533,14 +559,53 @@ pub(crate) fn suspend(rt: RuntimeId, ep: Box<Episode>) {
     drop(unplaced);
 }
 
-/// The claims of the episodes of runtime `rt` that wait in a context.
-pub(crate) fn suspended_members(rt: RuntimeId) -> Vec<u32> {
+/// The context and level of the member run's virtual frame of episode
+/// `ep`, if it waits in a context.
+fn suspension(c: &[Context], ep: u64) -> Option<(usize, u32)> {
+    if ep == 0 {
+        return None;
+    }
+    let (id, level) = SUSPENDED.with(|s| s.borrow().get(&ep).copied())?;
+    let at = c.iter().position(|x| x.id == id)?;
+    c[at]
+        .episodes
+        .iter()
+        .any(|e| e.id == ep)
+        .then_some((at, level))
+}
+
+/// Whether episode `ep` waits in a context: its members wait for its
+/// member run's virtual frame, whatever runs at that position meanwhile.
+pub(crate) fn is_suspended(ep: u64) -> bool {
+    ep != 0 && with(|c| suspension(c, ep).is_some())
+}
+
+/// For a read of a member of episode `ep`: `None` if the episode is not
+/// suspended, else whether the read is made by an entry its context runs
+/// above the member run's virtual frame, the only runs the unbounded run
+/// has while the member run is blocked. Any other read comes from a
+/// doomed frame's run below, which the unbounded run makes only after the
+/// episode lands.
+pub(crate) fn suspended_reachable(ep: u64) -> Option<bool> {
+    if ep == 0 {
+        return None;
+    }
+    with(|c| {
+        let (at, level) = suspension(c, ep)?;
+        Some(c[at].running.is_some_and(|l| level < l))
+    })
+}
+
+/// Whether a claim of runtime `rt` anchored at `anchor`, released from
+/// position `cidx`, waits for an episode that waits in a context with its
+/// root between them: the unbounded run's root still holds the claim, which
+/// the episode joins when it resumes.
+pub(crate) fn waits_for_suspended(rt: RuntimeId, anchor: u32, cidx: u32) -> bool {
     with(|c| {
         c.iter()
             .filter(|x| x.rt == rt)
             .flat_map(|x| x.episodes.iter())
-            .flat_map(|e| e.members.iter().copied().chain([e.root.0]))
-            .collect()
+            .any(|e| cidx <= e.cidx && e.cidx <= anchor)
     })
 }
 
@@ -558,6 +623,7 @@ pub(crate) fn suspended_low_at(rt: RuntimeId, cidx: u32) -> bool {
 
 /// Takes episode `ep` out of context `id`.
 pub(crate) fn take_episode(id: u64, ep: u64) -> Option<Box<Episode>> {
+    SUSPENDED.with(|s| s.borrow_mut().remove(&ep));
     with(|c| {
         let x = c.iter_mut().find(|x| x.id == id)?;
         let at = x.episodes.iter().position(|e| e.id == ep)?;
@@ -672,6 +738,7 @@ pub(crate) fn reset() {
 #[cold]
 #[inline(never)]
 fn clear() {
+    SUSPENDED.with(|s| s.borrow_mut().clear());
     let removed = with(std::mem::take);
     drop(removed);
 }

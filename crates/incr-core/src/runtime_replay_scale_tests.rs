@@ -10,6 +10,7 @@ use super::replay_tests::{chain, on_stack, replayable};
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
+use crate::dep_stack::DepStack;
 use crate::handle::Incr;
 use crate::state::NodeState;
 
@@ -146,6 +147,55 @@ cycle_100k_tests! {
     shared_fallback_cycle_100k_at_budget_1: Shared, Fallback, 1;
     shared_fixpoint_cycle_100k_at_budget_256: Shared, Fixpoint, 256;
     shared_fixpoint_cycle_100k_at_budget_1: Shared, Fixpoint, 1;
+}
+
+thread_local! {
+    static DEEPEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A ring's member runs (T5's R5) stay within the frame budget: an
+/// over-budget read of an unbuffered member dooms its reader and pushes
+/// the member as a held entry instead of running it nested.
+fn ring_member_runs_within_budget<C: Cells>(strategy: Strategy) {
+    let n = 2000;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(1);
+    let runs = counters(n);
+    let iterations = Arc::new(AtomicU32::new(0));
+    DEEPEST.with(|d| d.set(0));
+    let members = ring(&rt, n, strategy, &runs, &iterations, |rt, next, _| {
+        DEEPEST.with(|d| d.set(d.get().max(rt.dep_stack.depth())));
+        (rt.get(next) + 1).min(5)
+    });
+    let head = rt.get(members[0]);
+    assert_eq!(
+        head,
+        if matches!(strategy, Strategy::Fallback) {
+            3
+        } else {
+            5
+        }
+    );
+    let deepest = DEEPEST.with(std::cell::Cell::get);
+    assert!(
+        deepest <= 4,
+        "a member ran {deepest} frames deep at budget 1"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ring_member_runs_within_budget() {
+    ring_member_runs_within_budget::<Local>(Strategy::Fallback);
+    ring_member_runs_within_budget::<Local>(Strategy::Fixpoint);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ring_member_runs_within_budget() {
+    ring_member_runs_within_budget::<Shared>(Strategy::Fallback);
+    ring_member_runs_within_budget::<Shared>(Strategy::Fixpoint);
 }
 
 /// T1's taint shape: c_0 … c_{n-1}, c_i reading c_{i+1}, and X, which
@@ -524,4 +574,39 @@ fn local_doom_under_stabilize() {
 #[test]
 fn shared_doom_under_stabilize() {
     doom_under_stabilize::<Shared>();
+}
+
+#[test]
+#[ignore = "scratch timing"]
+fn scratch_ring_timing() {
+    let n: usize = std::env::var("RING_N").unwrap().parse().unwrap();
+    on_stack(8 << 20, move || {
+        let rt = Runtime::<Local>::new();
+        rt.set_placeholder(0_i64);
+        rt.set_max_frames(std::env::var("RING_F").map_or(1, |v| v.parse().unwrap()));
+        let runs = counters(n);
+        let iterations = Arc::new(AtomicU32::new(0));
+        let fixpoint = std::env::var("RING_S").is_ok_and(|s| s == "fixpoint");
+        let strategy = if fixpoint {
+            Strategy::Fixpoint
+        } else {
+            Strategy::Fallback
+        };
+        let members = ring(&rt, n, strategy, &runs, &iterations, |rt, next, _| {
+            (rt.get(next) + 1).min(5)
+        });
+        let t = std::time::Instant::now();
+        assert_eq!(rt.get(members[0]), if fixpoint { 5 } else { 3 });
+        let first = t.elapsed();
+        for &m in &members {
+            rt.get(m);
+        }
+        eprintln!(
+            "n {n} {first:?} then all {:?} maxruns {} dooms {} entries {}",
+            t.elapsed(),
+            max_of(&runs),
+            rt.dooms.lock().unwrap().len(),
+            rt.entries.lock().unwrap().len()
+        );
+    });
 }

@@ -410,6 +410,10 @@ enum Computed {
     /// The node's run was doomed and discarded: it is a virtual frame,
     /// and a replay driver runs it again.
     Discarded,
+    /// A claim wait ended with the node New or Dirty and a virtual frame
+    /// of it on this thread, which stands for a frame on the stack: the
+    /// walk skips it and taints the path under this memo owner.
+    Skipped(u32),
 }
 
 /// `clean_walk` mode bit: a compute about to run a closure dooms the
@@ -806,6 +810,9 @@ pub struct Runtime<C: Cells> {
     /// Episodes started on this runtime.
     #[cfg(test)]
     pub(crate) episodes: std::sync::atomic::AtomicU64,
+    /// Episode validations run on this runtime.
+    #[cfg(test)]
+    pub(crate) validations: std::sync::atomic::AtomicU64,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -885,6 +892,8 @@ impl<C: Cells> Runtime<C> {
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             episodes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            validations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -2023,7 +2032,8 @@ impl<C: Cells> Runtime<C> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         if observed == NodeState::Cyclic || is_computing(observed) {
-            if let Some(read) = self.cycle_read(handle, observed, kind) {
+            let armed = frame.filter(|_| MODE & ARMED != 0);
+            if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
                 return read;
             }
         }
@@ -2034,12 +2044,18 @@ impl<C: Cells> Runtime<C> {
             Computed::Gone => self.stale_handle(handle),
             Computed::Deferred => {
                 return self
-                    .cycle_read(handle, NodeState::Computing, kind)
+                    .cycle_read(
+                        handle,
+                        NodeState::Computing,
+                        kind,
+                        frame.filter(|_| MODE & ARMED != 0),
+                    )
                     .expect("incr-core: a deferred root is held");
             }
             Computed::Doomed | Computed::Discarded => {
                 return Ok(self.placeholder_read::<T>(frame));
             }
+            Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
         }
         let (type_tag, arena_slot) = self.fields_under(handle, node);
         match self.try_read_slot(handle, node, type_tag, arena_slot) {
@@ -3019,6 +3035,11 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 NodeState::Dirty => {}
+            }
+            if MODE & VIRT != 0 && spins != 0 && gen.is_none() {
+                if let Some(owner) = self.post_wait_owner(id) {
+                    return Computed::Skipped(owner);
+                }
             }
 
             // Distinguish input vs query: inputs don't compute, they
@@ -4052,7 +4073,7 @@ use cycle_impl::{Attempt, GroupEnd, PopEnd};
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_race_tests.rs"]
-mod race_tests;
+pub(crate) mod race_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_set_tests.rs"]
@@ -4080,7 +4101,7 @@ mod cycle_rule_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_wound_tests.rs"]
-mod wound_tests;
+pub(crate) mod wound_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]

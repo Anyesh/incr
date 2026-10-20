@@ -257,7 +257,9 @@ pub(crate) type Erased = Box<dyn Any + Send>;
 pub(crate) trait ErasedStrategy: Send + Sync {
     /// The iteration limit, or `None` for a Fallback.
     fn max_iterations(&self) -> Option<u32>;
-    fn v0(&self, cycle: &Cycle) -> Erased;
+    /// The initial value: a Fallback's `g` of `cycle`, which only a
+    /// Fallback is handed, or a Fixpoint's initial value.
+    fn v0(&self, cycle: Option<&Cycle>) -> Erased;
     fn step(&self, prev: &Erased, out: Erased, k: u32) -> Erased;
     fn converged(&self, prev: &Erased, cur: &Erased) -> bool;
     fn on_limit(&self, cycle: &Cycle, s: Erased) -> Erased;
@@ -284,9 +286,11 @@ impl<T: Value> ErasedStrategy for Typed<T> {
         }
     }
 
-    fn v0(&self, cycle: &Cycle) -> Erased {
+    fn v0(&self, cycle: Option<&Cycle>) -> Erased {
         match &self.0 {
-            CycleStrategy::Fallback(g) => Box::new(g(cycle)),
+            CycleStrategy::Fallback(g) => {
+                Box::new(g(cycle.expect("incr-core: a Fallback is handed its cycle")))
+            }
             CycleStrategy::Fixpoint(fp) => Box::new((fp.initial)()),
             CycleStrategy::None => unreachable!("a strategy entry is never None"),
         }
