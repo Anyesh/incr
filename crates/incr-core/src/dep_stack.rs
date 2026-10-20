@@ -42,6 +42,17 @@ pub struct Frame {
     pub(crate) reading: u64,
 }
 
+impl Frame {
+    /// How many times the frame has read the node it reads now, this read
+    /// included.
+    fn reads_of_reading(&self) -> u32 {
+        self.deps
+            .iter()
+            .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == self.reading)
+            .count() as u32
+    }
+}
+
 /// What a nested non-Clean read learns of the frame it is made from.
 #[doc(hidden)]
 #[derive(Copy, Clone)]
@@ -81,6 +92,17 @@ impl Frames {
         self.frames
             .last_mut()
             .filter(|top| !thread_wide || top.rt == rt)
+    }
+
+    /// The active frame as the reader of what the compute that popped
+    /// above it left: none while a replay driver's placed frame is on top,
+    /// since the frame below that one is not its reader.
+    #[inline(always)]
+    fn reader(&mut self, rt: RuntimeId, thread_wide: bool) -> Option<&mut Frame> {
+        if self.frames.len() as u32 == self.placed {
+            return None;
+        }
+        self.active(rt, thread_wide)
     }
 
     const fn new() -> Self {
@@ -209,13 +231,10 @@ pub trait DepStack: 'static {
     }
 
     /// Mark `rt`'s active frame, if any, as having read a dep that did
-    /// not land `Clean`, so its compute must not land `Clean` either. The
-    /// frame below one a replay driver placed above a virtual frame is not
-    /// its reader.
+    /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
         self.with(|s| {
-            let placed = s.frames.len() as u32 == s.placed;
-            if let Some(top) = s.active(rt, Self::THREAD_WIDE).filter(|_| !placed) {
+            if let Some(top) = s.reader(rt, Self::THREAD_WIDE) {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
                 unsafe { (*top.ctl).raise(POISONED) };
@@ -223,19 +242,22 @@ pub trait DepStack: 'static {
         })
     }
 
-    /// The control block and position of `rt`'s active frame.
-    #[doc(hidden)]
+    /// `rt`'s active frame as the reader of an unwind out of the compute
+    /// that popped above it, with the node it reads and how many times it
+    /// has read it.
+    fn unwound_reader(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32, u64, u32)> {
+        self.with(|s| {
+            let top = s.reader(rt, Self::THREAD_WIDE)?;
+            Some((top.ctl, top.cidx, top.reading, top.reads_of_reading()))
+        })
+    }
+
     /// How many times `rt`'s active frame has read the node it reads
     /// now, this read included.
     fn reads_of_current(&self, rt: RuntimeId) -> u32 {
         self.with(|s| {
-            s.active(rt, Self::THREAD_WIDE).map_or(0, |top| {
-                let reading = top.reading;
-                top.deps
-                    .iter()
-                    .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == reading)
-                    .count() as u32
-            })
+            s.active(rt, Self::THREAD_WIDE)
+                .map_or(0, |top| top.reads_of_reading())
         })
     }
 
@@ -246,15 +268,7 @@ pub trait DepStack: 'static {
             s.frames
                 .iter()
                 .filter(|f| f.rt == rt && (from..to).contains(&f.cidx))
-                .map(|f| {
-                    let reading = f.reading;
-                    let ordinal = f
-                        .deps
-                        .iter()
-                        .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == reading)
-                        .count() as u32;
-                    (reading, ordinal)
-                })
+                .map(|f| (f.reading, f.reads_of_reading()))
                 .collect()
         })
     }

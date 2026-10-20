@@ -360,20 +360,21 @@ impl Context {
     }
 }
 
-/// A read of a frame that may be retried that returned the value a
-/// landing had left Dirty.
-pub(crate) struct DirtyRead {
+/// A read of a frame that may be retried whose outcome the retry's read
+/// takes again: the value a landing had left Dirty, or the unwind out of
+/// the compute the read ran.
+pub(crate) struct KeptRead {
     pub(crate) rt: RuntimeId,
     pub(crate) cidx: u32,
     pub(crate) ctl: *const crate::cycle::ComputeCtl,
     pub(crate) reading: u64,
     pub(crate) ordinal: u32,
-    pub(crate) value: crate::cycle::Erased,
+    pub(crate) what: Delivered,
 }
 
 #[cfg(not(loom))]
 thread_local! {
-    static DIRTY_READS: RefCell<Vec<DirtyRead>> = const { RefCell::new(Vec::new()) };
+    static KEPT_READS: RefCell<Vec<KeptRead>> = const { RefCell::new(Vec::new()) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
@@ -382,7 +383,7 @@ thread_local! {
 
 #[cfg(loom)]
 loom::thread_local! {
-    static DIRTY_READS: RefCell<Vec<DirtyRead>> = RefCell::new(Vec::new());
+    static KEPT_READS: RefCell<Vec<KeptRead>> = RefCell::new(Vec::new());
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
@@ -410,8 +411,8 @@ pub(crate) fn vindexes_empty() -> bool {
 /// Keeps `read` for its frame's retry. Reads of frames that have popped go:
 /// every frame at or above the reading one's position, but the reading
 /// one, which is a run of its own if this is its first such read.
-pub(crate) fn note_dirty_read(read: DirtyRead, fresh: bool) {
-    DIRTY_READS.with(|d| {
+pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
+    KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
         d.retain(|e| {
             e.rt != read.rt
@@ -423,12 +424,12 @@ pub(crate) fn note_dirty_read(read: DirtyRead, fresh: bool) {
 }
 
 /// The reads kept for the run of control block `ctl` at `cidx`.
-pub(crate) fn take_dirty_reads(
+pub(crate) fn take_kept_reads(
     rt: RuntimeId,
     cidx: u32,
     ctl: *const crate::cycle::ComputeCtl,
-) -> Vec<DirtyRead> {
-    DIRTY_READS.with(|d| {
+) -> Vec<KeptRead> {
+    KEPT_READS.with(|d| {
         d.borrow_mut()
             .extract_if(.., |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl)
             .collect()

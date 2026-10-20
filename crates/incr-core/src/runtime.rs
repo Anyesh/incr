@@ -3364,6 +3364,7 @@ impl<C: Cells> Runtime<C> {
         } else {
             kind
         };
+        self.note_unwound_read(&*payload, kind);
         self.release_unwound_from(attempt.cidx, id.0, kind, kind.is_some(), bag);
         let wrote = ctl.wrote.get() != 0;
         if kind.is_some() {

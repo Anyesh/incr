@@ -784,6 +784,7 @@ impl<C: Cells> Runtime<C> {
     /// with the discard landing, and the unwind resumes.
     fn abort_episode(&self, cidx: u32, payload: Payload, bag: &mut Deferred<C>) -> ! {
         let kind = cycle_state::take_unwind_kind();
+        self.note_unwound_read(&*payload, kind);
         self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), bag);
         // The root's reader that catches the unwind has read a node that
         // did not land, as after a single node's unwind.
@@ -1664,6 +1665,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
+        self.note_unwound_read(&*payload, kind);
         let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {
             let id = NodeId(*m);

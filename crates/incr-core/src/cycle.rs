@@ -372,8 +372,9 @@ pub(crate) const DOOMED: u8 = 16;
 /// every node it reads after is reached through a suspect edge.
 pub(crate) const PH_SEEN: u8 = 32;
 /// `ComputeCtl::flags`: a read in the frame returned a value a landing
-/// had left Dirty, which `replay::note_dirty_read` keeps for a retry.
-pub(crate) const DIRTY_READ: u8 = 64;
+/// had left Dirty, or took an unwind, which `replay::keep_read` keeps for
+/// a retry.
+pub(crate) const KEPT_READ: u8 = 64;
 /// A member run at its anchor, below the frames that read it: it is never
 /// doomed, and marking stops at it.
 pub(crate) const NO_DOOM: u8 = 128;

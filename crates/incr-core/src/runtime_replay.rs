@@ -799,22 +799,23 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The earlier reads of the frames being marked that returned a value
-    /// a landing had left Dirty. A retry's read gets that value again, as
-    /// the frame's first run did, where a fresh read would walk the Dirty
-    /// node, or read what a later landing replaced it with.
-    fn landed_reads(&self, marked: &[Below], vframes: &[VFrame]) -> Vec<(ReadKey, cycle::Erased)> {
+    /// a landing had left Dirty, or took an unwind. A retry's read gets
+    /// that outcome again, as the frame's first run did, where a fresh read
+    /// would walk the node and run it again, or read what a later landing
+    /// replaced it with.
+    fn kept_reads(&self, marked: &[Below], vframes: &[VFrame]) -> Vec<(ReadKey, Delivered)> {
         let rt = self.runtime_id;
         let mut out = Vec::new();
         for f in marked {
             // SAFETY: a frame's control block is live while it is on the
             // stack, and these frames are being marked.
-            if !unsafe { &*f.ctl }.has(cycle::DIRTY_READ) {
+            if !unsafe { &*f.ctl }.has(cycle::KEPT_READ) {
                 continue;
             }
             let Some(v) = vframes.iter().find(|v| v.cidx == f.cidx) else {
                 continue;
             };
-            for read in replay::take_dirty_reads(rt, f.cidx, f.ctl) {
+            for read in replay::take_kept_reads(rt, f.cidx, f.ctl) {
                 if vframes
                     .iter()
                     .any(|w| u64::from(w.node) == read.reading & 0xffff_ffff)
@@ -826,7 +827,7 @@ impl<C: Cells> Runtime<C> {
                     ordinal: read.ordinal,
                     ..ReadKey::blocked(v)
                 };
-                out.push((key, read.value));
+                out.push((key, read.what));
             }
         }
         out
@@ -838,28 +839,77 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn note_dirty_read<T: Value>(&self, f: ActiveRead, handle: Incr<T>, value: &T) {
-        if self.max_frames.load(std::sync::atomic::Ordering::Relaxed) == u32::MAX
-            && self
-                .max_stack_bytes
-                .load(std::sync::atomic::Ordering::Relaxed)
-                == 0
+        if !self.budgeted() {
+            return;
+        }
+        let value: cycle::Erased = Box::new(value_code::run(|| value.clone()));
+        let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
+        let ordinal = self.dep_stack.reads_of_current(self.runtime_id);
+        self.keep_read(f.ctl, f.cidx, reading, ordinal, Delivered::Landed(value));
+    }
+
+    /// The active frame's read took `payload`, a user panic or a cycle
+    /// unwinding out of the compute it ran. If a budget is set, the frame
+    /// may be doomed and retried, and the retry's read must take the
+    /// unwind again: the unbounded run's frame read the node once, and a
+    /// fresh read would run what the unwind left New, Dirty or Failed
+    /// again, or panic as Failed with another payload.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_unwound_read(
+        &self,
+        payload: &(dyn std::any::Any + Send),
+        kind: Option<UnwindKind>,
+    ) {
+        if !matches!(kind, None | Some(UnwindKind::Cycle))
+            || replay::speculative()
+            || !self.budgeted()
         {
             return;
         }
-        // SAFETY: the active frame's control block is live.
-        let ctl = unsafe { &*f.ctl };
-        let fresh = !ctl.has(cycle::DIRTY_READ);
-        ctl.raise(cycle::DIRTY_READ);
-        let rt = self.runtime_id;
-        let value: cycle::Erased = Box::new(value_code::run(|| value.clone()));
-        replay::note_dirty_read(
-            replay::DirtyRead {
-                rt,
-                cidx: f.cidx,
-                ctl: f.ctl,
-                reading: u64::from(handle.slot()) | (u64::from(handle.generation()) << 32),
-                ordinal: self.dep_stack.reads_of_current(rt),
-                value,
+        let Some((ctl, cidx, reading, ordinal)) = self.dep_stack.unwound_reader(self.runtime_id)
+        else {
+            return;
+        };
+        let Some(payload) = copy_payload(payload) else {
+            return;
+        };
+        let what = Delivered::Unwind {
+            cycle: kind == Some(UnwindKind::Cycle),
+            poison: true,
+            payload,
+        };
+        self.keep_read(ctl, cidx, reading, ordinal, what);
+    }
+
+    fn budgeted(&self) -> bool {
+        self.max_frames.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX
+            || self
+                .max_stack_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != 0
+    }
+
+    fn keep_read(
+        &self,
+        ctl: *const cycle::ComputeCtl,
+        cidx: u32,
+        reading: u64,
+        ordinal: u32,
+        what: Delivered,
+    ) {
+        // SAFETY: the frame is on the stack, so its control block is live.
+        let flags = unsafe { &*ctl };
+        let fresh = !flags.has(cycle::KEPT_READ);
+        flags.raise(cycle::KEPT_READ);
+        replay::keep_read(
+            replay::KeptRead {
+                rt: self.runtime_id,
+                cidx,
+                ctl,
+                reading,
+                ordinal,
+                what,
             },
             fresh,
         );
@@ -1002,7 +1052,7 @@ impl<C: Cells> Runtime<C> {
                 }
             })
             .collect();
-        let landed = self.landed_reads(marked, &vframes);
+        let kept = self.kept_reads(marked, &vframes);
         // SAFETY: as above.
         let top_ctl = unsafe { &*top.ctl };
         let suspect = top_ctl.has(cycle::PH_SEEN);
@@ -1034,7 +1084,7 @@ impl<C: Cells> Runtime<C> {
                 v.maker = maker;
                 x.push_vframe(v);
             }
-            for (key, value) in landed {
+            for (key, what) in kept {
                 // A frame marked again keeps the delivery its first mark, or
                 // the entry it was blocked on, made for the read.
                 if !x.pending.iter().any(|d| {
@@ -1046,7 +1096,7 @@ impl<C: Cells> Runtime<C> {
                         maker,
                         taken: false,
                         blocked: false,
-                        what: Delivered::Landed(value),
+                        what,
                     });
                 }
             }
