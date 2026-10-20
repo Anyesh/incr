@@ -1172,6 +1172,41 @@ fn cross_seeds() {
     }
 }
 
+/// Two-thread seeds, with a second runtime when `.1`, whose reads pushed a
+/// virtual frame onto a node that already had one, a group verify having
+/// claimed a member with a virtual frame on its thread. The threads'
+/// overlapping reads enter shared cycles, so only each run's own checks
+/// apply, over several schedules.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_repush_seeds() {
+    let cross = gen_case(0xe43, true, false);
+    quiet(|| {
+        differential::<Local>(&cross, 0xe43);
+        differential::<Shared>(&cross, 0xe43);
+    });
+    for (seed, cross) in [
+        (0x527, false),
+        (0x107d, false),
+        (0x3f88, false),
+        (0x4371, false),
+        (0x59d, true),
+        (0xe43, true),
+    ] {
+        let case = gen_case(seed, cross, true);
+        let phases = phases(&case, seed);
+        quiet(|| {
+            for _ in 0..4 {
+                for frames in 1..=3 {
+                    for bytes in [0, 16 * 1024] {
+                        run_two(&case, &phases, Some(frames), bytes);
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
