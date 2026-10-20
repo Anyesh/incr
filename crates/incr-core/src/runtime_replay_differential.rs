@@ -1205,7 +1205,7 @@ fn two_thread_repush_seeds() {
 /// over because the race is schedule-dependent.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn two_thread_seeds() {
+fn arena_missing_two_thread_seeds() {
     for (seed, cross) in [(0x33e9, false), (0xa55, false), (0x19f0, true)] {
         run_two_repeatedly(seed, cross, &[None, Some(1), Some(2), Some(3)]);
     }
