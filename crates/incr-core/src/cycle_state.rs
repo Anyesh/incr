@@ -181,6 +181,8 @@ pub(crate) struct Episode {
     pub(crate) root: NodeId,
     pub(crate) cidx: u32,
     pub(crate) validated: bool,
+    /// The landing's one cut to the root's SCC in the final reads has run.
+    pub(crate) pruned: bool,
     pub(crate) members: Vec<u32>,
     pub(crate) cu: Vec<u32>,
     /// The iteration state since the last restart, `None` at a restart.
