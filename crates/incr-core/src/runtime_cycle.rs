@@ -463,7 +463,8 @@ impl<C: Cells> Runtime<C> {
 
     /// The read rules, for a read of `handle` that found it `Cyclic` or
     /// Computing. `None` when the node is not this thread's: the read
-    /// waits like any other.
+    /// waits like any other. `armed` is the reading frame when the read is
+    /// past the frame budget and may doom it.
     #[cold]
     #[inline(never)]
     pub(super) fn cycle_read<T: Value>(
@@ -471,6 +472,7 @@ impl<C: Cells> Runtime<C> {
         handle: Incr<T>,
         observed: NodeState,
         kind: ReadKind,
+        armed: Option<ActiveRead>,
     ) -> Option<Result<T, Cycle>> {
         let rt = self.runtime_id;
         let slot = handle.slot();
@@ -488,7 +490,7 @@ impl<C: Cells> Runtime<C> {
         });
         let held = cycle_state::with_held(|h| {
             h.get(&(rt, slot))
-                .map(|e| (e.anchor, e.in_cu, e.buf.is_some(), e.episode.clone()))
+                .map(|e| (e.anchor, e.in_cu, e.buf.is_some(), e.episode.clone(), e.ep))
         });
         // A held node with a virtual frame stands for a frame on the stack.
         let on_stack = match on_stack {
@@ -506,22 +508,43 @@ impl<C: Cells> Runtime<C> {
             .dep_stack
             .active_frame(rt)
             .filter(|_| !self.foreign_frame_above(p));
-        let Some((ctl, _)) = active else {
+        let Some((ctl, at)) = active else {
             return Some(Err(self.cycle_at(p)));
         };
         // SAFETY: the active frame is on the stack, so its control block
         // is live.
         let ctl = unsafe { &*ctl };
 
+        // A member of a suspended episode, read from below its member run's
+        // virtual frame: only a doomed frame's speculative run reads there.
+        if let Some((.., ep)) = held {
+            if value_code::thread_word() & value_code::REPLAY_BIT != 0
+                && replay::suspended_reachable(ep) == Some(false)
+            {
+                debug_assert!(
+                    replay::speculative(),
+                    "incr-core: only a speculative run reads a suspended member from below"
+                );
+                if let Some(v) = self
+                    .placeholder::<T>()
+                    .filter(|_| self.drop_cooperatively(Some(at)))
+                {
+                    ctl.raise(cycle::PH_SEEN);
+                    return Some(Ok(v));
+                }
+                self.drop_unwind();
+            }
+        }
+
         // R0: an unseeded member that still reads another such member.
-        if let Some((anchor, true, _, Some(cycle))) = &held {
+        if let Some((anchor, true, _, Some(cycle), _)) = &held {
             ctl.lower(*anchor);
             return Some(Err(cycle.clone()));
         }
         // R2: a strategy member reads as its current value.
         if C::u8_load_relaxed(self.nodes.get_with_flags(slot).1) & HAS_STRATEGY != 0 {
             let value = match &held {
-                Some((.., Some(_))) => self.held_value::<T>(slot, true),
+                Some((_, _, _, Some(_), _)) => self.held_value::<T>(slot, true),
                 _ => self.discovery_value::<T>(slot, p),
             };
             ctl.lower(p);
@@ -532,13 +555,56 @@ impl<C: Cells> Runtime<C> {
             ctl.lower(p);
             return Some(Err(self.cycle_at(p)));
         }
-        let (anchor, _, buffered, _) = held.expect("an unseeded node off the stack is held");
-        // R5: run the member for its value, then R4: read its buffer.
+        let (anchor, _, buffered, ..) = held.expect("an unseeded node off the stack is held");
+        // R5: run the member for its value, then R4: read its buffer. Past
+        // the budget the reader is doomed instead, and the member becomes
+        // a held entry the driver runs as a member run.
         if !buffered {
-            match self.member_run(slot, anchor, false) {
-                Ok(low) => ctl.lower(low.expect("incr-core: an R5 member run is never doomed")),
+            if let Some(f) = armed {
+                ctl.lower(anchor);
+                return Some(Ok(self.doom_held(handle, f)));
+            }
+            // One position above its reader, as the driver runs a held
+            // entry: nested member runs at one anchor would share it, and a
+            // doom marks frames by position.
+            let mut r5 = self.member_run(slot, at + 1, true);
+            // A read past the budget in the member run doomed it. If the
+            // member run was the doom's bottom frame, its context runs here
+            // until the member is buffered, and the loop's member run passes
+            // its lowlink down; otherwise the doom marked the reader, which
+            // takes the placeholder.
+            if let Ok(None) = r5 {
+                match self.member_run_discarded(at + 1) {
+                    Some(ran) => r5 = ran.map(|()| None),
+                    None => {
+                        ctl.lower(anchor);
+                        ctl.raise(cycle::PH_SEEN);
+                        return Some(Ok(self
+                            .placeholder::<T>()
+                            .expect("incr-core: a doomed read's type has a placeholder")));
+                    }
+                }
+            }
+            match r5 {
+                Ok(Some(low)) => {
+                    if low <= at {
+                        self.pass_down(at + 1, low);
+                    }
+                    ctl.lower(low);
+                }
+                Ok(None) => {}
                 Err(payload) => {
                     ctl.lower(anchor);
+                    let kind_now = cycle_state::unwind_kind();
+                    let mut bag = Deferred::new();
+                    self.release_unwound_from(
+                        at + 1,
+                        slot,
+                        kind_now,
+                        kind_now.is_some() || replay::speculative(),
+                        &mut bag,
+                    );
+                    bag.drain(self);
                     return Some(Err(self.member_run_unwound(kind, payload)));
                 }
             }
@@ -946,6 +1012,7 @@ impl<C: Cells> Runtime<C> {
                         e.anchor = cidx;
                         e.own(cidx, u32::MAX, None);
                         e.episode = Some(cycle.clone());
+                        e.ep = id;
                         e.in_cu = ep.cu.binary_search(m).is_ok();
                         e.installed.clear();
                     }
@@ -1258,6 +1325,7 @@ impl<C: Cells> Runtime<C> {
                 .filter_map(|(_, e)| {
                     e.anchor = low;
                     e.episode = None;
+                    e.ep = 0;
                     e.in_cu = false;
                     e.s.take()
                 })
@@ -1359,7 +1427,6 @@ impl<C: Cells> Runtime<C> {
         // A suspended episode's members wait for its member run's virtual
         // frame, whatever frame runs at that position meanwhile: only the
         // episode's resumption, or its context abandoning it, releases them.
-        let suspended = replay::suspended_members(rt);
         let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             if h.is_empty() {
                 return Vec::new();
@@ -1370,7 +1437,7 @@ impl<C: Cells> Runtime<C> {
                     *r == rt
                         && (e.anchor >= cidx || owned(e))
                         && !keep.contains(slot)
-                        && !suspended.contains(slot)
+                        && !replay::is_suspended(e.ep)
                 })
                 .map(|(k, _)| *k)
                 .collect();

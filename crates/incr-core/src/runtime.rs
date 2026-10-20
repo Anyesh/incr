@@ -2024,7 +2024,8 @@ impl<C: Cells> Runtime<C> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         if observed == NodeState::Cyclic || is_computing(observed) {
-            if let Some(read) = self.cycle_read(handle, observed, kind) {
+            let armed = frame.filter(|_| MODE & ARMED != 0);
+            if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
                 return read;
             }
         }
@@ -2035,7 +2036,12 @@ impl<C: Cells> Runtime<C> {
             Computed::Gone => self.stale_handle(handle),
             Computed::Deferred => {
                 return self
-                    .cycle_read(handle, NodeState::Computing, kind)
+                    .cycle_read(
+                        handle,
+                        NodeState::Computing,
+                        kind,
+                        frame.filter(|_| MODE & ARMED != 0),
+                    )
                     .expect("incr-core: a deferred root is held");
             }
             Computed::Doomed | Computed::Discarded => {

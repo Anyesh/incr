@@ -65,6 +65,8 @@ pub(crate) struct Held {
     pub(crate) failed: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
     pub(crate) episode: Option<Cycle>,
+    /// That episode's id, 0 when there is none.
+    pub(crate) ep: u64,
     /// The member is in the episode's set of unseeded members that read
     /// each other.
     pub(crate) in_cu: bool,
@@ -120,6 +122,7 @@ impl Held {
             poisoned: false,
             failed: false,
             episode: None,
+            ep: 0,
             in_cu: false,
         }
     }
@@ -390,6 +393,12 @@ pub(crate) fn failures() -> u64 {
 /// Marks `held` failed.
 pub(crate) fn mark_failed(held: &mut Held) {
     held.failed = true;
+    count_failure();
+}
+
+/// Counts a failure already marked, as a panic of a marked member that
+/// reaches its reader again.
+pub(crate) fn count_failure() {
     ENTRY.with(|e| e.failures.set(e.failures.get() + 1));
 }
 
