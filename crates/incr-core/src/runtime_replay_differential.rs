@@ -1023,12 +1023,26 @@ fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, lab
     }
 }
 
+/// Runs `f`, prefixing the message of any panic out of it with `label`.
+fn labelled<T>(label: &str, f: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|p| {
+        let message = p
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| p.downcast_ref::<&str>().copied())
+            .unwrap_or("a non-string panic");
+        panic!("{label}: {message}")
+    })
+}
+
 fn differential<C: Cells>(case: &Case, seed: u64) {
-    let unbounded = run::<C>(case, None, 0);
+    let unbounded = labelled(&format!("seed {seed:#x}, unbounded"), || {
+        run::<C>(case, None, 0)
+    });
     for frames in [1, 2, 3] {
         for bytes in [0, 16 * 1024] {
-            let bounded = run::<C>(case, Some(frames), bytes);
             let label = format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes");
+            let bounded = labelled(&label, || run::<C>(case, Some(frames), bytes));
             compare(case, &unbounded, &bounded, None, &label);
         }
     }
@@ -1041,10 +1055,10 @@ fn differential_two(case: &Case, seed: u64) {
     let unbounded = run::<Shared>(case, None, 0);
     for frames in [None, Some(1), Some(2), Some(3)] {
         for bytes in [0, 16 * 1024] {
-            let (got, settles) = run_two(case, &phases, frames, bytes);
             let label = format!(
                 "seed {seed:#x}, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
             );
+            let (got, settles) = labelled(&label, || run_two(case, &phases, frames, bytes));
             compare(case, &unbounded, &got, Some(&settles), &label);
         }
     }
