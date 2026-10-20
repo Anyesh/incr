@@ -3007,6 +3007,16 @@ impl<C: Cells> Runtime<C> {
                 {
                     return self.drop_speculative_verify(node, claimed_dirty);
                 }
+                // A speculative tainted verify leaves the node Dirty for its
+                // reader as a failed one would, but keeps the group, whose
+                // release or re-landing would outlive the run's discard.
+                if let Visit::VerifyOnly(owner) = visit {
+                    if MODE & VIRT != 0 && replay::speculative() {
+                        self.land(node, NodeState::Dirty, NodeState::Dirty);
+                        self.memoize(id, owner);
+                        return Computed::Done;
+                    }
+                }
                 match self.group_verify(id, g, visit, bag) {
                     // A tainted verify leaves the node Dirty for the root's
                     // compute to read again, which poisons where needed.
