@@ -575,38 +575,3 @@ fn local_doom_under_stabilize() {
 fn shared_doom_under_stabilize() {
     doom_under_stabilize::<Shared>();
 }
-
-#[test]
-#[ignore = "scratch timing"]
-fn scratch_ring_timing() {
-    let n: usize = std::env::var("RING_N").unwrap().parse().unwrap();
-    on_stack(8 << 20, move || {
-        let rt = Runtime::<Local>::new();
-        rt.set_placeholder(0_i64);
-        rt.set_max_frames(std::env::var("RING_F").map_or(1, |v| v.parse().unwrap()));
-        let runs = counters(n);
-        let iterations = Arc::new(AtomicU32::new(0));
-        let fixpoint = std::env::var("RING_S").is_ok_and(|s| s == "fixpoint");
-        let strategy = if fixpoint {
-            Strategy::Fixpoint
-        } else {
-            Strategy::Fallback
-        };
-        let members = ring(&rt, n, strategy, &runs, &iterations, |rt, next, _| {
-            (rt.get(next) + 1).min(5)
-        });
-        let t = std::time::Instant::now();
-        assert_eq!(rt.get(members[0]), if fixpoint { 5 } else { 3 });
-        let first = t.elapsed();
-        for &m in &members {
-            rt.get(m);
-        }
-        eprintln!(
-            "n {n} {first:?} then all {:?} maxruns {} dooms {} entries {}",
-            t.elapsed(),
-            max_of(&runs),
-            rt.dooms.lock().unwrap().len(),
-            rt.entries.lock().unwrap().len()
-        );
-    });
-}
