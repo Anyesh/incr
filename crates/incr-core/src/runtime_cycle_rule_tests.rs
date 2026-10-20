@@ -980,20 +980,70 @@ fn shared_ring_recovery_pops() {
     on_deep_stack(ring_recovery_pops::<Shared>);
 }
 
+macro_rules! pairs {
+    ($($name:ident),* $(,)?) => {
+        $(
+            mod $name {
+                use super::{Local, Shared};
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn local_local() {
+                    super::$name::<Local, Local>();
+                }
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn local_shared() {
+                    super::$name::<Local, Shared>();
+                }
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn shared_local() {
+                    super::$name::<Shared, Local>();
+                }
+
+                #[test]
+                #[cfg_attr(miri, ignore)]
+                fn shared_shared() {
+                    super::$name::<Shared, Shared>();
+                }
+            }
+        )*
+    };
+}
+
+pairs!(cross_runtime_reentry, cross_runtime_read_records_nothing);
+
+/// A runtime that another runtime's closures read. Test-only: it outlives
+/// every call into those closures, and a Local one never leaves its thread.
+struct OtherRt<C: Cells>(*const Runtime<C>);
+
+// SAFETY: see `OtherRt`.
+unsafe impl<C: Cells> Send for OtherRt<C> {}
+unsafe impl<C: Cells> Sync for OtherRt<C> {}
+
+impl<C: Cells> std::ops::Deref for OtherRt<C> {
+    type Target = Runtime<C>;
+
+    fn deref(&self) -> &Runtime<C> {
+        // SAFETY: see `OtherRt`.
+        unsafe { &*self.0 }
+    }
+}
+
 /// A read of a node of runtime R from another runtime's closure, while
-/// that node is on this thread's R stack, is a cycle no group resolves:
+/// that node is on this thread's stack, is a cycle no group resolves:
 /// `try_get` returns `Err` and `get` panics.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn shared_cross_runtime_reentry() {
+fn cross_runtime_reentry<A: Cells, B: Cells>() {
     for use_get in [false, true] {
-        let r1 = Arc::new(Runtime::<Shared>::new());
-        let r2 = Arc::new(Runtime::<Shared>::new());
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
         let ac = cell::<i64>();
         let b = {
-            let (r1, ac) = (Arc::downgrade(&r1), ac.clone());
+            let (r1, ac) = (OtherRt(&*r1), ac.clone());
             r2.create_query(move |_| {
-                let r1 = r1.upgrade().unwrap();
                 let a = *ac.get().unwrap();
                 if use_get {
                     r1.get(a)
@@ -1004,11 +1054,8 @@ fn shared_cross_runtime_reentry() {
         };
         let i = r1.create_input(10_i64);
         let a = {
-            let r2 = Arc::downgrade(&r2);
-            r1.create_query_with_fallback(
-                move |rt| rt.get(i) + r2.upgrade().unwrap().get(b),
-                |_c: &Cycle| 77,
-            )
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with_fallback(move |rt| rt.get(i) + r2.get(b), |_c: &Cycle| 77)
         };
         ac.set(a).unwrap();
         if use_get {
@@ -1022,6 +1069,35 @@ fn shared_cross_runtime_reentry() {
             assert_eq!(r1.cycle_of(a), None);
         }
     }
+}
+
+/// A read of R's node from another runtime's closure nested in R's compute
+/// records no edge for R's computing node, and R's own reads after that
+/// closure returns still record.
+fn cross_runtime_read_records_nothing<A: Cells, B: Cells>() {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    let x = r1.create_input(1_i64);
+    let y = r1.create_input(100_i64);
+    let b = {
+        let r1 = OtherRt(&*r1);
+        r2.create_query(move |_| r1.get(x))
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let a = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query(move |rt| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            r2.get(b) + rt.get(y)
+        })
+    };
+    assert_eq!(r1.get(a), 101);
+    r1.set(x, 2);
+    assert_eq!(r1.get(a), 101);
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    r1.set(y, 200);
+    assert_eq!(r1.get(a), 201);
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
 }
 
 /// Group verify decides on `IN_GROUP` through a load after its claim:
