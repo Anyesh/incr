@@ -259,9 +259,15 @@ impl Context {
 
     /// Removes the oldest entry at `level`, the one the driver ran.
     pub(crate) fn pop_entry(&mut self, level: u32) {
-        let q = &mut self.levels[level as usize];
-        q.pop_front();
-        if q.is_empty() && level as usize + 1 == self.levels.len() && level > 0 {
+        self.levels[level as usize].pop_front();
+        self.trim_levels();
+    }
+
+    /// Drops the empty levels on top, so `next_entry` finds the highest
+    /// entry without walking the empty levels a push above budget 1
+    /// leaves below it.
+    pub(crate) fn trim_levels(&mut self) {
+        while self.levels.len() > 1 && self.levels.last().is_some_and(VecDeque::is_empty) {
             self.levels.pop();
         }
     }
