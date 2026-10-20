@@ -1,11 +1,123 @@
-//! `observer_read`, the read an observer's run makes: the read path of
-//! `try_get` with every stale-handle panic turned into `ObsErr::Gone`,
-//! because a Shared delete can land between `stabilize` taking its
-//! observers and an observer's run.
+//! Observers: the registry, `stabilize` over the watch queue, and
+//! `observer_read`, the read an observer's run makes. That read is the
+//! read path of `try_get` with every stale-handle panic turned into
+//! `ObsErr::Gone`, because a Shared delete can land between `stabilize`
+//! taking a node's observers and their run.
 
 use std::cell::Cell;
 
 use super::*;
+
+/// Type-erased observer runner: takes the runtime and the observer's
+/// last-seen stamp, returns the new stamp if it advanced.
+type ObserverRunFn<C> = Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>;
+
+/// One registered observer: its slot, the change stamp it last fired
+/// (or skipped a cycle) for, and its runner.
+pub(crate) struct ObserverEntry<C: Cells> {
+    slot: u32,
+    last_seen: u64,
+    run: ObserverRunFn<C>,
+}
+
+/// An observer taken for a run: its id, last-seen stamp and runner.
+type ObserverRun<C> = (u64, u64, ObserverRunFn<C>);
+
+/// The observer registry: entries by id, and each observed slot's ids in
+/// registration order.
+pub(crate) struct Observers<C: Cells> {
+    by_id: HashMap<u64, ObserverEntry<C>>,
+    by_slot: HashMap<u32, Vec<u64>>,
+    next_id: u64,
+}
+
+impl<C: Cells> Observers<C> {
+    pub(crate) fn new() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            by_slot: HashMap::new(),
+            next_id: 1,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    fn insert(&mut self, slot: u32, last_seen: u64, run: ObserverRunFn<C>) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.by_id.insert(
+            id,
+            ObserverEntry {
+                slot,
+                last_seen,
+                run,
+            },
+        );
+        self.by_slot.entry(slot).or_default().push(id);
+        id
+    }
+
+    fn remove(&mut self, id: u64) -> Option<ObserverEntry<C>> {
+        let entry = self.by_id.remove(&id)?;
+        if let Some(ids) = self.by_slot.get_mut(&entry.slot) {
+            ids.retain(|&other| other != id);
+            if ids.is_empty() {
+                self.by_slot.remove(&entry.slot);
+            }
+        }
+        Some(entry)
+    }
+
+    /// A deleted node's observers.
+    pub(super) fn take_slot(&mut self, slot: u32) -> Vec<ObserverEntry<C>> {
+        if self.by_id.is_empty() {
+            return Vec::new();
+        }
+        let ids = self.by_slot.remove(&slot).unwrap_or_default();
+        ids.iter().filter_map(|id| self.by_id.remove(id)).collect()
+    }
+
+    fn runs_of(&self, slot: u32) -> Vec<ObserverRun<C>> {
+        self.by_slot.get(&slot).map_or_else(Vec::new, |ids| {
+            ids.iter()
+                .map(|id| {
+                    let e = &self.by_id[id];
+                    (*id, e.last_seen, Arc::clone(&e.run))
+                })
+                .collect()
+        })
+    }
+
+    fn advance(&mut self, id: u64, stamp: u64) {
+        if let Some(e) = self.by_id.get_mut(&id) {
+            e.last_seen = e.last_seen.max(stamp);
+        }
+    }
+}
+
+/// The entries one `stabilize` drained, each with its node's observers,
+/// and how many it has finished. Dropped before the end, by a wound or a
+/// panic, it puts the rest back, the one in progress included.
+struct Pending<'a, C: Cells> {
+    rt: &'a Runtime<C>,
+    entries: Vec<(u32, u32, Vec<ObserverRun<C>>)>,
+    next: usize,
+}
+
+impl<C: Cells> Drop for Pending<'_, C> {
+    fn drop(&mut self) {
+        if self.next < self.entries.len() {
+            self.rt.requeue_front(
+                self.entries[self.next..]
+                    .iter()
+                    .map(|&(slot, generation, _)| (slot, generation)),
+            );
+        }
+    }
+}
 
 /// Why an observer's read has no value to fire with.
 #[derive(Debug)]
@@ -57,6 +169,114 @@ impl Drop for Observing {
 }
 
 impl<C: Cells> Runtime<C> {
+    /// Register a callback fired by [`Self::stabilize`] whenever the
+    /// node's value has changed since the last firing. Observation does
+    /// not change the engine's pull model: nothing runs until someone
+    /// calls `stabilize` (or `get`); the observer registry is a batch
+    /// poll with last-seen bookkeeping, the same shape as Jane Street
+    /// Incremental's observers.
+    ///
+    /// Observing a node watches it ([`Self::watch`]): `stabilize` runs
+    /// the observers of the nodes a change moved off Clean, and after an
+    /// [`Self::unwatch`] the node's observers stay quiet until it is
+    /// watched again.
+    ///
+    /// A node that has never computed fires on the first stabilize. A
+    /// stabilize racing a concurrent `set` may fire twice for one
+    /// change; it can never miss one.
+    pub fn observe<T: Value, F>(&self, handle: Incr<T>, callback: F) -> ObserverId
+    where
+        F: Fn(&T) + Send + Sync + 'static,
+    {
+        value_code::check();
+        self.check_handle(handle);
+        let run = Arc::new(
+            move |rt: &Runtime<C>, last_seen: u64| match rt.observer_read(handle) {
+                Ok((value, stamp)) if stamp > last_seen => {
+                    callback(&value);
+                    Some(stamp)
+                }
+                Err(ObsErr::Cycle(stamp)) if stamp > last_seen => Some(stamp),
+                Ok(_) | Err(ObsErr::Cycle(_) | ObsErr::Gone) => None,
+            },
+        );
+        let slot = handle.slot();
+        let node = self.nodes.get(slot);
+        let mut inner = self.inner.write();
+        if node.generation() != handle.generation() {
+            drop(inner);
+            self.stale_handle(handle);
+        }
+        self.watch_held(slot, handle.generation());
+        // The baseline is loaded after the watch, so a landing it misses
+        // was off Clean at the watch and queued there. A node with a
+        // clean value fires only on later changes; a never-computed one
+        // starts at 0 so the first stabilize computes and fires.
+        let last_seen = match state::load::<C>(node.state_cell()) {
+            NodeState::New => 0,
+            _ => self.observed_stamp(node),
+        };
+        let id = inner.observers.insert(slot, last_seen, run);
+        drop(inner);
+        ObserverId(id)
+    }
+
+    /// Remove an observer. Safe to call with an already-removed id.
+    pub fn unobserve(&self, id: ObserverId) {
+        value_code::check();
+        // Bound to a local so the entry, whose callback is user code,
+        // drops after the write guard does.
+        let removed = self.inner.write().observers.remove(id.0);
+        drop(removed);
+    }
+
+    /// Run the observers of the watched nodes reported since the last
+    /// drain, in the order they were reported: each node is brought up
+    /// to date and its callbacks fire if its value changed since they
+    /// last fired. The reports are the queue [`Self::drain_dirtied_watched`]
+    /// takes, so a drain between two stabilizes takes them from the
+    /// second. If a compute or callback panics, the nodes not finished,
+    /// the one in progress included, are reported again.
+    ///
+    /// Callbacks run with no engine lock held; they may read from the
+    /// runtime but must not call `stabilize` reentrantly from another
+    /// thread if duplicate notifications matter.
+    pub fn stabilize(&self) {
+        value_code::check();
+        self.enter(|| self.stabilize_entered());
+    }
+
+    fn stabilize_entered(&self) {
+        let mut pending = Pending {
+            rt: self,
+            entries: self.drain_observed(),
+            next: 0,
+        };
+        self.park(ParkPoint::StabilizeAfterDrain);
+        while pending.next < pending.entries.len() {
+            let runs = std::mem::take(&mut pending.entries[pending.next].2);
+            for (id, last_seen, run) in runs {
+                if let Some(stamp) = run(self, last_seen) {
+                    self.inner.write().observers.advance(id, stamp);
+                }
+            }
+            pending.next += 1;
+        }
+    }
+
+    /// The queue's entries, each with its node's observers, taken in one
+    /// `inner` section, in which every queued node is live and watched.
+    fn drain_observed(&self) -> Vec<(u32, u32, Vec<ObserverRun<C>>)> {
+        let inner = self.inner.read();
+        let taken = self.watch_queue.write().take();
+        let entries = taken
+            .into_iter()
+            .map(|(slot, generation)| (slot, generation, inner.observers.runs_of(slot)))
+            .collect();
+        drop(inner);
+        entries
+    }
+
     /// Bring the node up to date and read it with its change stamp, as
     /// `try_get` does, except that a node deleted or recycled under the
     /// handle reads `Gone` instead of panicking. Each stamp is loaded
