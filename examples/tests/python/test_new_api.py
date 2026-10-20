@@ -243,3 +243,38 @@ def test_cycle_error_caught_in_a_query_is_an_ordinary_result(make_rt):
     bad = rt.create_query(lambda r: 10 // r.get(a))
     with pytest.raises(ZeroDivisionError):
         rt.get(bad)
+
+
+@BOTH_RUNTIMES
+def test_engine_unwind_crosses_a_closure_as_a_base_exception(make_rt):
+    rt = make_rt()
+    module = incr if make_rt is incr.Runtime else incr_concurrent
+    holder = {}
+    seen = []
+
+    def reads_itself(r):
+        try:
+            return r.get(holder["q"]) + 1
+        except Exception as e:
+            seen.append(("exception", type(e).__name__))
+            raise
+        except BaseException as e:
+            seen.append(("base", type(e).__name__))
+            raise
+
+    q = rt.create_query(reads_itself)
+    holder["q"] = q
+    with pytest.raises(module.CycleError):
+        rt.get(q)
+    assert seen == [("base", "_IncrEngineUnwind")]
+
+
+@BOTH_RUNTIMES
+def test_python_exception_is_raised_as_itself_with_no_panic_message(make_rt, capfd):
+    rt = make_rt()
+    a = rt.create_input(0)
+    bad = rt.create_query(lambda r: 10 // r.get(a))
+    outer = rt.create_query(lambda r: r.get(bad) + 1)
+    with pytest.raises(ZeroDivisionError):
+        rt.get(outer)
+    assert capfd.readouterr().err == ""
