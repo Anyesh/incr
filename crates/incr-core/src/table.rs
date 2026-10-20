@@ -34,7 +34,8 @@ use crate::deferred::Deferred;
 use crate::dep_stack::DepStack;
 use crate::fx::FxBuildHasher;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::runtime::{DeleteError, Runtime};
 use crate::value::Value;
@@ -455,7 +456,7 @@ struct Counts {
 pub struct NodeTable<K: TableKey, T: Value, C: Cells, S = FxBuildHasher> {
     runtime_id: RuntimeId,
     array: C::TableArray<K>,
-    counts: C::Lock<Counts>,
+    counts: OrderedLock<Counts, C>,
     hasher: S,
     _value: PhantomData<fn() -> T>,
 }
@@ -508,10 +509,13 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         Self {
             runtime_id,
             array: <C::TableArray<K> as ArrayCell<_>>::new(Array::with_capacity(MIN_CAPACITY)),
-            counts: <C::Lock<Counts> as Lock<_>>::new(Counts {
-                live: 0,
-                tombstones: 0,
-            }),
+            counts: OrderedLock::new(
+                LockKind::TableMiss,
+                Counts {
+                    live: 0,
+                    tombstones: 0,
+                },
+            ),
             hasher,
             _value: PhantomData,
         }

@@ -121,6 +121,7 @@ impl Registration {
         waiting_on: Claim,
         holds: Vec<Claim>,
     ) -> Self {
+        crate::lock_order::assert_may_wait_on_claim();
         let state = Arc::new(AtomicU8::new(WAITING));
         let mut reg = registry();
         let reg = &mut *reg;
