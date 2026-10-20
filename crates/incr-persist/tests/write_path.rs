@@ -59,10 +59,12 @@ impl Hooked {
     }
 }
 
+/// Runs the hook on a thread of its own: the other writer it plays is
+/// another process, which never runs under this store's mutex.
 fn run(hook: &Mutex<Option<Hook>>) {
     let hook = hook.lock().unwrap().take();
     if let Some(hook) = hook {
-        hook();
+        std::thread::spawn(hook).join().unwrap();
     }
 }
 
