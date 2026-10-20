@@ -1890,12 +1890,17 @@ impl<C: Cells> Runtime<C> {
                 continue;
             }
             let node = self.nodes.get(m);
-            let mut ok = state::try_transition::<C>(
-                node.state_cell(),
-                NodeState::Dirty,
-                NodeState::Computing,
-            )
-            .is_ok();
+            // A member with a virtual frame stands for a frame computing on
+            // this thread's stack, whose claim the unbounded run fails.
+            let virtual_member = value_code::thread_word() & value_code::REPLAY_BIT != 0
+                && self.virtual_position(m, generation).is_some();
+            let mut ok = !virtual_member
+                && state::try_transition::<C>(
+                    node.state_cell(),
+                    NodeState::Dirty,
+                    NodeState::Computing,
+                )
+                .is_ok();
             if ok && node.generation() != generation {
                 self.land(node, NodeState::Dirty, NodeState::Dirty);
                 ok = false;

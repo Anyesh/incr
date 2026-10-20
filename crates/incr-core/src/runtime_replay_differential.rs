@@ -1088,23 +1088,6 @@ fn delete_seeds() {
     }
 }
 
-/// Seeds whose reads push a virtual frame onto a node that already has one:
-/// 0xd4f2's `try_get(0)` at budget 1, and at 2 and 3 under the 16 KiB byte
-/// budget; 0x4654's `try_get(7)` at budget 2, where a retry computes 18 as a
-/// plain frame whose read of the Dirty `IN_GROUP` 17 group-verifies at 17.
-#[test]
-#[cfg_attr(miri, ignore)]
-#[ignore = "a virtual frame is pushed for a node already on its context's vindex"]
-fn vindex_repush() {
-    for seed in [0xd4f2, 0x4654] {
-        let case = gen_base(seed);
-        quiet(|| {
-            differential::<Local>(&case, seed);
-            differential::<Shared>(&case, seed);
-        });
-    }
-}
-
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
@@ -1175,6 +1158,7 @@ fn replay_seeds() {
         0x2bd9,
         0x2cce,
         0x2d76,
+        0x4654,
         0x518e,
         0x69d7,
         0x7043,
@@ -1186,6 +1170,7 @@ fn replay_seeds() {
         0xbc86,
         0xbef0,
         0xc118,
+        0xd4f2,
         0x0001_2b74,
         0x0001_2d3c,
         0x0001_2fa6,
