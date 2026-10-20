@@ -38,6 +38,8 @@ pub mod loom_cells;
 #[cfg(all(test, loom))]
 mod loom_models;
 pub mod node;
+#[doc(hidden)]
+pub mod persist_hooks;
 mod reclaim_probe;
 mod replay;
 pub mod runtime;

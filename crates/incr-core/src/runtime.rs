@@ -2317,11 +2317,29 @@ impl<C: Cells> Runtime<C> {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
-        let displaced = self.write_claimed(claim, arena, arena_slot, value);
+        let displaced = self.write_claimed(claim, arena, arena_slot, value, drop);
         // The old value's user `Drop`, or the reclaim its retire may run,
         // happens with no claim held and none of the locks this set took.
         drop(displaced);
         reclaim_probe::reached(RetireSite::SetRetire);
+    }
+
+    /// [`Self::set`] that hands back what it would drop: the displaced
+    /// value if it wrote, or the rejected equal value if it did not.
+    pub(crate) fn set_returning_displaced<T: Value>(
+        &self,
+        handle: Incr<T>,
+        value: T,
+    ) -> Compared<T, Displaced<T, C>> {
+        value_code::check();
+        self.check_runtime(handle);
+        let (claim, arena, arena_slot) = self.claim_input(handle);
+        let mut rejected = None;
+        let displaced = self.write_claimed(claim, arena, arena_slot, value, |r| rejected = Some(r));
+        match rejected {
+            Some(rejected) => Compared::Equal(rejected),
+            None => Compared::Replaced(displaced),
+        }
     }
 
     /// Take `set`'s claim on `handle`'s input, with the arena and slot
@@ -2394,13 +2412,15 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// `set` from its claim to its walk. Returns what the write
-    /// displaced, if it wrote.
+    /// displaced, if it wrote; an equal value is handed to `rejected`
+    /// once its earlier change has walked.
     fn write_claimed<T: Value>(
         &self,
         claim: SetClaim<'_, C>,
         arena: &GenericArena<T, C>,
         arena_slot: u32,
         value: T,
+        rejected: impl FnOnce(T),
     ) -> Option<Displaced<T, C>> {
         let node = claim.node;
         // Publication order is the protocol's backbone:
@@ -2417,14 +2437,14 @@ impl<C: Cells> Runtime<C> {
         //    publish all of the above to claimants that Acquire the
         //    Dirty state.
         match arena.compare_and_write(arena_slot, value, || node.mark_changed_pending()) {
-            Compared::Equal(rejected) => {
+            Compared::Equal(equal) => {
                 // The set that wrote this value released its claim before
                 // its walk, and this call must not return before that
                 // change is visible to its caller's dependents.
                 let changed_at = node.changed_at();
                 drop(claim);
                 self.wait_walked(changed_at);
-                drop(rejected);
+                rejected(equal);
                 None
             }
             Compared::Replaced(displaced) => {
