@@ -20,7 +20,7 @@
 
 use std::cell::RefCell;
 
-use crate::cycle::{ComputeCtl, DOOMED, POISONED};
+use crate::cycle::{ComputeCtl, DOOMED, NO_DOOM, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 
@@ -90,6 +90,25 @@ impl Frames {
     #[inline(always)]
     fn active(&mut self, rt: RuntimeId) -> Option<&mut Frame> {
         self.frames.last_mut().filter(|top| top.rt == rt)
+    }
+
+    /// A read `rt` serves to the top frame, which is not one of `rt`'s:
+    /// that frame can no longer be doomed, because its retry would read
+    /// the other runtime again and no kept read carries what the first
+    /// read returned. A frame doomed already keeps its doom.
+    #[cold]
+    #[inline(never)]
+    fn note_foreign_read(&mut self) {
+        let top = self
+            .frames
+            .last()
+            .expect("incr-core: a foreign read has a reading frame");
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        let ctl = unsafe { &*top.ctl };
+        if !ctl.has(DOOMED) {
+            ctl.raise(NO_DOOM);
+        }
     }
 
     /// The active frame as the reader of what the compute that popped
@@ -170,10 +189,10 @@ pub trait DepStack: 'static {
     /// read.
     #[inline(always)]
     fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) {
-        self.with(|s| {
-            if let Some(top) = s.active(rt) {
-                top.deps.push((dep, generation));
-            }
+        self.with(|s| match s.frames.last_mut() {
+            Some(top) if top.rt == rt => top.deps.push((dep, generation)),
+            Some(_) => s.note_foreign_read(),
+            None => {}
         })
     }
 
@@ -184,7 +203,14 @@ pub trait DepStack: 'static {
     fn record_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> Option<ActiveRead> {
         self.with(|s| {
             let depth = s.frames.len() as u32;
-            let top = s.active(rt)?;
+            let top = match s.frames.last_mut() {
+                Some(top) if top.rt == rt => top,
+                Some(_) => {
+                    s.note_foreign_read();
+                    return None;
+                }
+                None => return None,
+            };
             top.deps.push((dep, generation));
             top.reading = u64::from(dep.0) | (u64::from(generation) << 32);
             Some(ActiveRead {

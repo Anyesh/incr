@@ -1155,7 +1155,11 @@ fn two_threads_hang() {
 /// R's frame and missed its doom, so in 0xb (rt2 5 -> rt1 4 -> rt2 2 at
 /// budget 1) rt1 4 landed Clean with the placeholder. 0x2, 0x27c, 0x35c,
 /// 0x1b5, 0x1e4 and 0x2e1 failed under a per-thread marker of the
-/// innermost Local frame, which kept the stacks apart.
+/// innermost Local frame, which kept the stacks apart. In 0x432a a
+/// frame's read of the other runtime returned a value its landing left
+/// Dirty, and the frame's retry read that node again and walked into a
+/// Failed dep; in 0x3f39 the retry's second read of a strategy-less ring
+/// entered it elsewhere and closed a cycle the first read had not.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn cross_seeds() {
@@ -1163,6 +1167,7 @@ fn cross_seeds() {
         0x2, 0xb, 0xfa, 0xfb, 0xfe, 0x109, 0x135, 0x14a, 0x14d, 0x19a, 0x19e, 0x1b5, 0x1b6, 0x1e4,
         0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x401, 0x441, 0x4f9,
         0x50d, 0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0xa02,
+        0x3f39, 0x432a,
     ] {
         let case = gen_case(seed, true, false);
         quiet(|| {
