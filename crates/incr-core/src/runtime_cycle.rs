@@ -294,6 +294,10 @@ impl<C: Cells> Runtime<C> {
             cycle_state::take_unwind_kind();
             cycle_state::set_wounded(false);
             drop(payload);
+            debug_assert!(
+                cycle_state::held_keys().is_empty(),
+                "incr-core: a wounded thread waits for its winner holding claims"
+            );
             waits::await_winner(C::backoff);
             return None;
         }

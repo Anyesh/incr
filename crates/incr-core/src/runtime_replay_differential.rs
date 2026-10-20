@@ -1105,11 +1105,10 @@ fn vindex_repush() {
     }
 }
 
-/// A case with cycles on two threads, about one run in three of which
-/// never finishes.
+/// A case with cycles on two threads in which a thread is wounded out of
+/// an entry above virtual frames that own deferred claims.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "two threads reading a case with cycles hang about one run in three"]
 fn two_threads_hang() {
     let case = gen_case(0x159, false, false);
     quiet(|| differential_two(&case, 0x159));
