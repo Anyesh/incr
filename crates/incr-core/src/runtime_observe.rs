@@ -2,9 +2,12 @@
 //! `observer_read`, the read an observer's run makes. That read is the
 //! read path of `try_get` with every stale-handle panic turned into
 //! `ObsErr::Gone`, because a Shared delete can land between `stabilize`
-//! taking a node's observers and their run.
+//! taking a node's observers and their run, and a Failed observed node's
+//! panic into `ObsErr::Failed`, so it does not stop `stabilize`.
 
+use std::any::Any;
 use std::cell::Cell;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 
@@ -128,6 +131,8 @@ pub(crate) enum ObsErr {
     /// The node has no value because of a cycle; the stamp of its last
     /// landing.
     Cycle(u64),
+    /// The node's last compute panicked; the stamp of its last landing.
+    Failed(u64),
 }
 
 #[cfg(not(loom))]
@@ -181,7 +186,8 @@ impl<C: Cells> Runtime<C> {
     /// [`Self::unwatch`] the node's observers stay quiet until it is
     /// watched again.
     ///
-    /// A node that has never computed fires on the first stabilize. A
+    /// A node that has never computed fires on the first stabilize, and a
+    /// node that is Failed or Cyclic does not fire until it has a value. A
     /// stabilize racing a concurrent `set` may fire twice for one
     /// change; it misses one only when a [`Self::drain_dirtied_watched`]
     /// took the report first.
@@ -197,8 +203,10 @@ impl<C: Cells> Runtime<C> {
                     callback(&value);
                     Some(stamp)
                 }
-                Err(ObsErr::Cycle(stamp)) if stamp > last_seen => Some(stamp),
-                Ok(_) | Err(ObsErr::Cycle(_) | ObsErr::Gone) => None,
+                Err(ObsErr::Cycle(stamp) | ObsErr::Failed(stamp)) if stamp > last_seen => {
+                    Some(stamp)
+                }
+                Ok(_) | Err(ObsErr::Cycle(_) | ObsErr::Failed(_) | ObsErr::Gone) => None,
             },
         );
         let slot = handle.slot();
@@ -241,8 +249,12 @@ impl<C: Cells> Runtime<C> {
     /// to date and its callbacks fire if its value changed since they
     /// last fired. The reports are the queue [`Self::drain_dirtied_watched`]
     /// takes, so a drain between two stabilizes takes them from the
-    /// second. If a compute or callback panics, the nodes not finished,
-    /// the one in progress included, are reported again.
+    /// second. A node whose compute panics, leaving it Failed, fires none
+    /// of its callbacks and does not stop the run. If a callback panics,
+    /// the panic leaves `stabilize` and the nodes not finished, the one in
+    /// progress included, are reported again at the front of the queue, so
+    /// a callback that panics every time blocks the observers queued after
+    /// it.
     ///
     /// Callbacks run with no engine lock held; they may read from the
     /// runtime but must not call `stabilize` reentrantly from another
@@ -285,7 +297,8 @@ impl<C: Cells> Runtime<C> {
 
     /// Bring the node up to date and read it with its change stamp, as
     /// `try_get` does, except that a node deleted or recycled under the
-    /// handle reads `Gone` instead of panicking. Each stamp is loaded
+    /// handle reads `Gone`, and a Failed node `Failed`, instead of
+    /// panicking. Each stamp is loaded
     /// before the state or value it goes with, so a change landing
     /// between them fires again rather than not at all.
     ///
@@ -357,11 +370,15 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let _observing = Observing::record(self.runtime_id, id.0);
-        let computed = self
-            .entered(ReadKind::TryGet, || {
+        let walked = catch_unwind(AssertUnwindSafe(|| {
+            self.entered(ReadKind::TryGet, || {
                 self.ensure_clean(id, handle.generation())
             })
-            .map_err(|_| ObsErr::Cycle(stamp))?;
+        }));
+        let computed = match walked {
+            Ok(computed) => computed.map_err(|_| ObsErr::Cycle(stamp))?,
+            Err(payload) => return Err(self.observed_failed(handle, payload)),
+        };
         match computed {
             Computed::Done | Computed::Unsettled => Ok(()),
             Computed::Gone => Err(ObsErr::Gone),
@@ -370,6 +387,26 @@ impl<C: Cells> Runtime<C> {
             Computed::Doomed | Computed::Discarded => Err(ObsErr::Gone),
             Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
         }
+    }
+
+    /// An unwind out of `observer_walk`: a user panic that left the
+    /// observed node Failed is that node's error, so `stabilize` goes on to
+    /// the next observer; a wound, an engine unwind or any other panic
+    /// unwinds on.
+    #[cold]
+    #[inline(never)]
+    fn observed_failed<T: Value>(&self, handle: Incr<T>, payload: Box<dyn Any + Send>) -> ObsErr {
+        let node = self.nodes.get(handle.slot());
+        let stamp = self.observed_stamp(node);
+        C::fence_acquire();
+        let failed = !cycle_state::wounded()
+            && cycle_state::unwind_kind().is_none()
+            && node.generation() == handle.generation()
+            && node.state() == NodeState::Failed;
+        if !failed {
+            resume_unwind(payload);
+        }
+        ObsErr::Failed(stamp)
     }
 
     /// `observer_read` found no value under an unmoved generation: the
@@ -390,6 +427,7 @@ impl<C: Cells> Runtime<C> {
         match state {
             NodeState::Cyclic | NodeState::New => Err(ObsErr::Cycle(stamp)),
             NodeState::Dead | NodeState::Deleting => Err(ObsErr::Gone),
+            NodeState::Failed => Err(ObsErr::Failed(stamp)),
             _ => self.read_failed(handle),
         }
     }
