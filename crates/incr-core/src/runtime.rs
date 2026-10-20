@@ -4012,7 +4012,7 @@ use cycle_impl::{Attempt, GroupEnd, PopEnd};
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_race_tests.rs"]
-mod race_tests;
+pub(crate) mod race_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_set_tests.rs"]
@@ -4040,7 +4040,7 @@ mod cycle_rule_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_wound_tests.rs"]
-mod wound_tests;
+pub(crate) mod wound_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]

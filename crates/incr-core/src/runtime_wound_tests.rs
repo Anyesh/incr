@@ -20,11 +20,11 @@ use crate::waits;
 /// `await_winner`'s head start makes rare but cannot rule out under load,
 /// is wounded again over the same cycle, which costs a retry and never
 /// changes a value.
-fn assert_wounded() {
+pub(crate) fn assert_wounded() {
     assert!(waits::WOUNDS.load(Ordering::Relaxed) >= 1);
 }
 
-fn wait_registered(n: usize) {
+pub(crate) fn wait_registered(n: usize) {
     while waits::registered() < n {
         thread::sleep(Duration::from_millis(1));
     }
