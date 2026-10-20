@@ -631,8 +631,10 @@ fn virtual_hit_above_an_earlier_one<C: Cells>() {
         rt.assert_invariant_i();
         let states = [f, x, y].map(|n| rt.state_of(n));
         let dooms: Vec<u32> = rt.dooms.lock().unwrap().iter().map(|d| d.node).collect();
+        // Discovery dooms F's read of X and X's of Y; iteration 1's
+        // member run of X dooms on its R5 read of the unseeded Y.
         assert!(
-            frames.is_none() || dooms == vec![x.slot(), y.slot()],
+            frames.is_none() || dooms == vec![x.slot(), y.slot(), y.slot()],
             "{dooms:?}"
         );
         let values = [x, y].map(|n| try_get(&rt, n));
