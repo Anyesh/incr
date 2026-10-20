@@ -406,6 +406,9 @@ impl<C: Cells> Runtime<C> {
     /// spun long enough and then waits until `done`.
     #[inline]
     pub(super) fn spin_on(&self, on: NodeId, spins: &mut u32, done: impl FnMut() -> bool) {
+        if *spins == 0 {
+            crate::lock_order::assert_may_wait_on_claim();
+        }
         *spins += 1;
         if !C::SINGLE_THREADED && *spins >= waits::REGISTER_AFTER {
             self.wait_registered(on, done);

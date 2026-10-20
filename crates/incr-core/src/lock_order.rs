@@ -224,31 +224,27 @@ pub(crate) fn leave_frame() {
 /// An operator closure (`pred`, `f`, `key_fn`, `lift`, a sort key) is about
 /// to run: it is compute code, so the current frame holds no incr lock but
 /// the Store mutex, which a closure that computes can never request.
-#[inline]
+#[cfg(all(debug_assertions, not(loom)))]
 pub(crate) fn assert_unlocked(closure: &str) {
-    #[cfg(all(debug_assertions, not(loom)))]
-    {
-        let frame = stack::FRAME.with(std::cell::Cell::get);
-        stack::HELD.with(|held| {
-            let held = held.borrow();
-            let locked: Vec<LockKind> = held
-                .iter()
-                .filter(|e| e.frame == frame && e.kind != LockKind::Store)
-                .map(|e| e.kind)
-                .collect();
-            drop(held);
-            assert!(
-                locked.is_empty(),
-                "incr-core: lock order: {closure} runs while holding {locked:?}"
-            );
-        });
-    }
-    #[cfg(not(all(debug_assertions, not(loom))))]
-    let _ = closure;
+    let frame = stack::FRAME.with(std::cell::Cell::get);
+    stack::HELD.with(|held| {
+        let held = held.borrow();
+        let locked: Vec<LockKind> = held
+            .iter()
+            .filter(|e| e.frame == frame && e.kind != LockKind::Store)
+            .map(|e| e.kind)
+            .collect();
+        drop(held);
+        assert!(
+            locked.is_empty(),
+            "incr-core: lock order: {closure} runs while holding {locked:?}"
+        );
+    });
 }
 
 /// `f`, checking at each call that it runs with no incr lock held (see
 /// [`assert_unlocked`]).
+#[cfg(all(debug_assertions, not(loom)))]
 pub(crate) fn unlocked<A: ?Sized, R>(
     closure: &'static str,
     f: impl Fn(&A) -> R + Send + Sync + 'static,
@@ -257,6 +253,12 @@ pub(crate) fn unlocked<A: ?Sized, R>(
         assert_unlocked(closure);
         f(a)
     }
+}
+
+#[cfg(not(all(debug_assertions, not(loom))))]
+#[inline(always)]
+pub(crate) fn unlocked<F>(_closure: &'static str, f: F) -> F {
+    f
 }
 
 /// A thread is about to wait on a claim. It may hold only the Store mutex,

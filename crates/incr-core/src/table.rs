@@ -497,11 +497,11 @@ unsafe impl<K: TableKey, T: Value, S: Send + Sync> Sync
 fn _fields_are_thread_safe<K: TableKey>() {
     fn thread_safe<X: Send + Sync>() {}
     thread_safe::<<Shared as Cells>::TableArray<K>>();
-    thread_safe::<<Shared as Cells>::Lock<Counts>>();
+    thread_safe::<OrderedLock<Counts, Shared>>();
     #[cfg(loom)]
     thread_safe::<<crate::loom_cells::Loom as Cells>::TableArray<K>>();
     #[cfg(loom)]
-    thread_safe::<<crate::loom_cells::Loom as Cells>::Lock<Counts>>();
+    thread_safe::<OrderedLock<Counts, crate::loom_cells::Loom>>();
 }
 
 impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
