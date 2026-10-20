@@ -31,6 +31,13 @@ pub(super) struct Attempt {
     pub(super) verify_rev: u64,
 }
 
+/// What cutting an episode to its root's SCC did.
+enum Shrink {
+    Kept,
+    Shrunk,
+    Dissolved,
+}
+
 /// How a `LOW` pop, or an episode, left the root.
 pub(super) enum PopEnd {
     /// The node is held, for a lower root to land.
@@ -294,6 +301,10 @@ impl<C: Cells> Runtime<C> {
             cycle_state::take_unwind_kind();
             cycle_state::set_wounded(false);
             drop(payload);
+            debug_assert!(
+                cycle_state::held_keys().is_empty(),
+                "incr-core: a wounded thread waits for its winner holding claims"
+            );
             waits::await_winner(C::backoff);
             return None;
         }
@@ -439,13 +450,7 @@ impl<C: Cells> Runtime<C> {
         if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
             slots.extend(self.virtual_slots_from(p));
         }
-        cycle_state::with_held(|h| {
-            slots.extend(
-                h.iter()
-                    .filter(|((r, _), e)| *r == rt && e.anchor >= p)
-                    .map(|((_, slot), _)| *slot),
-            )
-        });
+        cycle_state::with_held(|h| slots.extend(h.anchored_from(rt, p)));
         Cycle::new(slots.into_iter().map(|s| self.erased_at_live(s)).collect())
     }
 
@@ -463,7 +468,8 @@ impl<C: Cells> Runtime<C> {
 
     /// The read rules, for a read of `handle` that found it `Cyclic` or
     /// Computing. `None` when the node is not this thread's: the read
-    /// waits like any other.
+    /// waits like any other. `armed` is the reading frame when the read is
+    /// past the frame budget and may doom it.
     #[cold]
     #[inline(never)]
     pub(super) fn cycle_read<T: Value>(
@@ -471,6 +477,7 @@ impl<C: Cells> Runtime<C> {
         handle: Incr<T>,
         observed: NodeState,
         kind: ReadKind,
+        armed: Option<ActiveRead>,
     ) -> Option<Result<T, Cycle>> {
         let rt = self.runtime_id;
         let slot = handle.slot();
@@ -487,8 +494,15 @@ impl<C: Cells> Runtime<C> {
                 .map(|f| f.cidx)
         });
         let held = cycle_state::with_held(|h| {
-            h.get(&(rt, slot))
-                .map(|e| (e.anchor, e.in_cu, e.buf.is_some(), e.episode.clone()))
+            h.get(&(rt, slot)).map(|e| {
+                (
+                    e.anchor(),
+                    e.in_cu,
+                    e.buf.is_some(),
+                    e.episode.clone(),
+                    e.ep,
+                )
+            })
         });
         // A held node with a virtual frame stands for a frame on the stack.
         let on_stack = match on_stack {
@@ -506,22 +520,43 @@ impl<C: Cells> Runtime<C> {
             .dep_stack
             .active_frame(rt)
             .filter(|_| !self.foreign_frame_above(p));
-        let Some((ctl, _)) = active else {
+        let Some((ctl, at)) = active else {
             return Some(Err(self.cycle_at(p)));
         };
         // SAFETY: the active frame is on the stack, so its control block
         // is live.
         let ctl = unsafe { &*ctl };
 
+        // A member of a suspended episode, read from below its member run's
+        // virtual frame: only a doomed frame's speculative run reads there.
+        if let Some((.., ep)) = held {
+            if value_code::thread_word() & value_code::REPLAY_BIT != 0
+                && replay::suspended_reachable(ep) == Some(false)
+            {
+                debug_assert!(
+                    replay::speculative(),
+                    "incr-core: only a speculative run reads a suspended member from below"
+                );
+                if let Some(v) = self
+                    .placeholder::<T>()
+                    .filter(|_| self.drop_cooperatively(Some(at)))
+                {
+                    ctl.raise(cycle::PH_SEEN);
+                    return Some(Ok(v));
+                }
+                self.drop_unwind();
+            }
+        }
+
         // R0: an unseeded member that still reads another such member.
-        if let Some((anchor, true, _, Some(cycle))) = &held {
+        if let Some((anchor, true, _, Some(cycle), _)) = &held {
             ctl.lower(*anchor);
             return Some(Err(cycle.clone()));
         }
         // R2: a strategy member reads as its current value.
         if C::u8_load_relaxed(self.nodes.get_with_flags(slot).1) & HAS_STRATEGY != 0 {
             let value = match &held {
-                Some((.., Some(_))) => self.held_value::<T>(slot, true),
+                Some((_, _, _, Some(_), _)) => self.held_value::<T>(slot, true),
                 _ => self.discovery_value::<T>(slot, p),
             };
             ctl.lower(p);
@@ -532,13 +567,56 @@ impl<C: Cells> Runtime<C> {
             ctl.lower(p);
             return Some(Err(self.cycle_at(p)));
         }
-        let (anchor, _, buffered, _) = held.expect("an unseeded node off the stack is held");
-        // R5: run the member for its value, then R4: read its buffer.
+        let (anchor, _, buffered, ..) = held.expect("an unseeded node off the stack is held");
+        // R5: run the member for its value, then R4: read its buffer. Past
+        // the budget the reader is doomed instead, and the member becomes
+        // a held entry the driver runs as a member run.
         if !buffered {
-            match self.member_run(slot, anchor, false) {
-                Ok(low) => ctl.lower(low.expect("incr-core: an R5 member run is never doomed")),
+            if let Some(f) = armed {
+                ctl.lower(anchor);
+                return Some(Ok(self.doom_held(handle, f)));
+            }
+            // One position above its reader, as the driver runs a held
+            // entry: nested member runs at one anchor would share it, and a
+            // doom marks frames by position.
+            let mut r5 = self.member_run(slot, at + 1, true);
+            // A read past the budget in the member run doomed it. If the
+            // member run was the doom's bottom frame, its context runs here
+            // until the member is buffered, and the loop's member run passes
+            // its lowlink down; otherwise the doom marked the reader, which
+            // takes the placeholder.
+            if let Ok(None) = r5 {
+                match self.member_run_discarded(at + 1) {
+                    Some(ran) => r5 = ran.map(|()| None),
+                    None => {
+                        ctl.lower(anchor);
+                        ctl.raise(cycle::PH_SEEN);
+                        return Some(Ok(self
+                            .placeholder::<T>()
+                            .expect("incr-core: a doomed read's type has a placeholder")));
+                    }
+                }
+            }
+            match r5 {
+                Ok(Some(low)) => {
+                    if low <= at {
+                        self.pass_down(at + 1, low);
+                    }
+                    ctl.lower(low);
+                }
+                Ok(None) => {}
                 Err(payload) => {
                     ctl.lower(anchor);
+                    let kind_now = cycle_state::unwind_kind();
+                    let mut bag = Deferred::new();
+                    self.release_unwound_from(
+                        at + 1,
+                        slot,
+                        kind_now,
+                        kind_now.is_some() || replay::speculative(),
+                        &mut bag,
+                    );
+                    bag.drain(self);
                     return Some(Err(self.member_run_unwound(kind, payload)));
                 }
             }
@@ -578,8 +656,13 @@ impl<C: Cells> Runtime<C> {
     /// the read closes, or the fixpoint's initial value.
     fn discovery_value<T: Value>(&self, slot: u32, p: u32) -> T {
         let strategy = self.strategy_of(slot);
-        let cycle = self.cycle_at(p);
-        let v = self.callback(|| strategy.v0(&cycle));
+        // A Fixpoint's initial value ignores the cycle, which costs a
+        // scan of every member to build.
+        let cycle = strategy
+            .max_iterations()
+            .is_none()
+            .then(|| self.cycle_at(p));
+        let v = self.callback(|| strategy.v0(cycle.as_ref()));
         *v.downcast::<T>()
             .expect("incr-core: a cycle value has its member's type")
     }
@@ -650,6 +733,12 @@ impl<C: Cells> Runtime<C> {
         }
         if result.is_err() {
             replay::unwind_past_since(self.runtime_id, cidx, first);
+            // A discard unwinds a run the unbounded run never makes: the
+            // member keeps what its last run recorded, or its episode's
+            // landing installs deps that the discard leaves New.
+            if cycle_state::unwind_kind() == Some(UnwindKind::Discard) {
+                return result.map(|_| None);
+            }
         }
         let replaced = cycle_state::with_held(|h| {
             let e = h
@@ -755,14 +844,9 @@ impl<C: Cells> Runtime<C> {
     fn claim_members(&self, cidx: u32) -> Vec<u32> {
         let rt = self.runtime_id;
         let mut members: Vec<u32> = cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
-                .map(|((_, slot), e)| {
-                    e.anchor = cidx;
-                    e.own(cidx, u32::MAX, None);
-                    *slot
-                })
-                .collect()
+            let members = h.anchored_from(rt, cidx);
+            h.root_at(rt, &members, cidx);
+            members
         });
         members.sort_unstable();
         members
@@ -896,6 +980,7 @@ impl<C: Cells> Runtime<C> {
             root,
             cidx,
             validated: cycle_state::has_dissolved(rt, root.0),
+            pruned: cycle_state::has_dissolved(rt, root.0),
             members: self.claim_members(cidx),
             cu: Vec::new(),
             round: None,
@@ -939,13 +1024,13 @@ impl<C: Cells> Runtime<C> {
                     .filter(|m| strategies.binary_search_by_key(m, |(s, _)| *s).is_err())
                     .collect();
                 cycle_state::with_held(|h| {
+                    h.root_at(rt, &ep.members, cidx);
                     for m in &ep.members {
                         let e = h
                             .get_mut(&(rt, *m))
                             .expect("incr-core: an episode member is held");
-                        e.anchor = cidx;
-                        e.own(cidx, u32::MAX, None);
                         e.episode = Some(cycle.clone());
+                        e.ep = id;
                         e.in_cu = ep.cu.binary_search(m).is_ok();
                         e.installed.clear();
                     }
@@ -955,7 +1040,8 @@ impl<C: Cells> Runtime<C> {
                 let stamp_rev = self.current_revision();
                 let verify_rev = C::walked(&self.walk, &self.revision);
                 for (m, s) in &strategies {
-                    let v0 = self.attributed(*m, cidx, bag, || self.callback(|| s.v0(&cycle)));
+                    let v0 =
+                        self.attributed(*m, cidx, bag, || self.callback(|| s.v0(Some(&cycle))));
                     let old = self.take_held(*m, |e| e.s.replace(v0));
                     self.drop_member_value(*m, cidx, old, bag);
                 }
@@ -1031,38 +1117,22 @@ impl<C: Cells> Runtime<C> {
                         let graph = self.member_graph(&ep.members);
                         if !ep.validated {
                             ep.validated = true;
-                            let comp = components(&graph);
-                            let at = ep
-                                .members
-                                .binary_search(&ep.root.0)
-                                .expect("the root is a member");
-                            let scc: Vec<u32> = ep
-                                .members
-                                .iter()
-                                .enumerate()
-                                .filter(|(i, _)| comp[*i] == comp[at])
-                                .map(|(_, &m)| m)
-                                .collect();
-                            if scc.len() == 1 && !graph[at].contains(&at) {
-                                cycle_state::dissolved_before(rt, ep.root.0);
-                                self.release_members(&ep.members, Some(ep.root.0), bag);
-                                let entry = cycle_state::with_held(|h| h.remove(&(rt, ep.root.0)));
-                                if let Some(e) = entry {
-                                    bag.push_erased(Box::new((e.buf, e.s)));
+                            #[cfg(test)]
+                            self.validations
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            match self.shrink_to_root_scc(
+                                ep.root,
+                                &mut ep.members,
+                                &mut ep.cu,
+                                &graph,
+                                bag,
+                            ) {
+                                Shrink::Kept => {}
+                                Shrink::Shrunk => {
+                                    ep.round = None;
+                                    continue 'restart;
                                 }
-                                return PopEnd::Dissolved;
-                            }
-                            if scc.len() < ep.members.len() {
-                                let gone: Vec<u32> = ep
-                                    .members
-                                    .iter()
-                                    .copied()
-                                    .filter(|m| scc.binary_search(m).is_err())
-                                    .collect();
-                                self.release_members(&gone, None, bag);
-                                ep.members = scc;
-                                ep.round = None;
-                                continue 'restart;
+                                Shrink::Dissolved => return PopEnd::Dissolved,
                             }
                         }
                         // CU: the unseeded members that still read each other.
@@ -1196,6 +1266,22 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
+            // Validation cuts to the SCC of iteration 1's reads only, so a
+            // member that joined later, or whose reads moved, may be on no
+            // cycle in the final reads. One more cut per episode keeps
+            // growth the only change after it, so episodes still terminate.
+            if !ep.pruned {
+                ep.pruned = true;
+                let graph = self.member_graph(&ep.members);
+                match self.shrink_to_root_scc(ep.root, &mut ep.members, &mut ep.cu, &graph, bag) {
+                    Shrink::Kept => {}
+                    Shrink::Shrunk => {
+                        ep.round = None;
+                        continue 'restart;
+                    }
+                    Shrink::Dissolved => return PopEnd::Dissolved,
+                }
+            }
             let r = ep.round.take().expect("incr-core: the episode has a round");
             return self.land_episode(
                 &ep.members,
@@ -1207,6 +1293,51 @@ impl<C: Cells> Runtime<C> {
                 bag,
             );
         }
+    }
+
+    /// Cuts `ep` to the root's SCC in `graph`, the member graph of the
+    /// last runs, releasing the rest with the discard landing. A root
+    /// alone with no self-edge dissolves.
+    fn shrink_to_root_scc(
+        &self,
+        root: NodeId,
+        members: &mut Vec<u32>,
+        cu: &mut Vec<u32>,
+        graph: &[Vec<usize>],
+        bag: &mut Deferred<C>,
+    ) -> Shrink {
+        let rt = self.runtime_id;
+        let comp = components(graph);
+        let at = members
+            .binary_search(&root.0)
+            .expect("the root is a member");
+        let scc: Vec<u32> = members
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| comp[*i] == comp[at])
+            .map(|(_, &m)| m)
+            .collect();
+        if scc.len() == 1 && !graph[at].contains(&at) {
+            cycle_state::dissolved_before(rt, root.0);
+            self.release_members(members, Some(root.0), bag);
+            let entry = cycle_state::with_held(|h| h.remove(&(rt, root.0)));
+            if let Some(e) = entry {
+                bag.push_erased(Box::new((e.buf, e.s)));
+            }
+            return Shrink::Dissolved;
+        }
+        if scc.len() == members.len() {
+            return Shrink::Kept;
+        }
+        let gone: Vec<u32> = members
+            .iter()
+            .copied()
+            .filter(|m| scc.binary_search(m).is_err())
+            .collect();
+        self.release_members(&gone, None, bag);
+        cu.retain(|m| scc.binary_search(m).is_ok());
+        *members = scc;
+        Shrink::Shrunk
     }
 
     /// Stores episode `ep`, whose member run a doom discarded, in the
@@ -1225,16 +1356,10 @@ impl<C: Cells> Runtime<C> {
     fn join_new(&self, cidx: u32, members: &mut Vec<u32>) -> bool {
         let rt = self.runtime_id;
         let joined: Vec<u32> = cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, slot), e)| {
-                    *r == rt && e.anchor >= cidx && members.binary_search(slot).is_err()
-                })
-                .map(|((_, slot), e)| {
-                    e.anchor = cidx;
-                    e.own(cidx, u32::MAX, None);
-                    *slot
-                })
-                .collect()
+            let mut joined = h.anchored_from(rt, cidx);
+            joined.retain(|slot| members.binary_search(slot).is_err());
+            h.root_at(rt, &joined, cidx);
+            joined
         });
         if joined.is_empty() {
             return false;
@@ -1250,11 +1375,13 @@ impl<C: Cells> Runtime<C> {
     fn merge_down(&self, cidx: u32, low: u32, bag: &mut Deferred<C>) {
         let rt = self.runtime_id;
         let values: Vec<Erased> = cycle_state::with_held(|h| {
-            h.iter_mut()
-                .filter(|((r, _), e)| *r == rt && e.anchor >= cidx)
-                .filter_map(|(_, e)| {
-                    e.anchor = low;
+            h.anchored_from(rt, cidx)
+                .into_iter()
+                .filter_map(|m| {
+                    h.set_anchor((rt, m), low);
+                    let e = h.get_mut(&(rt, m)).expect("the slot was just listed");
                     e.episode = None;
+                    e.ep = 0;
                     e.in_cu = false;
                     e.s.take()
                 })
@@ -1274,16 +1401,12 @@ impl<C: Cells> Runtime<C> {
         let (parent, node, virtual_frame) = self.lower_parent(cidx, low);
         let path = self.virtual_path_at(cidx);
         cycle_state::with_held(|h| {
-            for ((r, _), e) in h.iter_mut() {
-                if *r == rt {
-                    if e.anchor >= cidx {
-                        e.anchor = low;
-                    }
-                    if e.owned_by(cidx, u32::MAX, path) {
-                        e.own(parent, node, virtual_frame);
-                    }
-                }
+            for m in h.anchored_from(rt, cidx) {
+                h.set_anchor((rt, m), low);
             }
+            let mut owned = h.owners(rt, cidx, u32::MAX);
+            owned.retain(|&g| h.owner(g).owned_by(cidx, u32::MAX, path));
+            h.hand_over(rt, &owned, &[], parent, node, virtual_frame);
         });
     }
 
@@ -1351,28 +1474,36 @@ impl<C: Cells> Runtime<C> {
         // The unwinding frame, of node `subtree`, owns the claims owned at
         // its position by it, and those owned above.
         let path = subtree.and_then(|_| self.virtual_path_at(cidx));
-        let owned = |e: &Held| subtree.is_some_and(|node| e.owned_by(cidx, node, path));
         let rt = self.runtime_id;
         // A suspended episode's members wait for its member run's virtual
         // frame, whatever frame runs at that position meanwhile: only the
         // episode's resumption, or its context abandoning it, releases them.
-        let suspended = replay::suspended_members(rt);
+        // So do the claims its member runs deferred to its root, which the
+        // resumption joins.
         let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             if h.is_empty() {
                 return Vec::new();
             }
-            let keys: Vec<(RuntimeId, u32)> = h
-                .iter()
-                .filter(|((r, slot), e)| {
-                    *r == rt
-                        && (e.anchor >= cidx || owned(e))
-                        && !keep.contains(slot)
-                        && !suspended.contains(slot)
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            keys.into_iter()
-                .map(|k| (k.1, h.remove(&k).expect("the key was just listed")))
+            let mut slots = h.anchored_from(rt, cidx);
+            if let Some(node) = subtree {
+                for g in h.owners(rt, cidx, u32::MAX) {
+                    if h.owner(g).owned_by(cidx, node, path) {
+                        slots.extend_from_slice(h.members(g));
+                    }
+                }
+                slots.sort_unstable();
+                slots.dedup();
+            }
+            slots.retain(|m| {
+                !keep.contains(m)
+                    && h.get(&(rt, *m)).is_some_and(|e| {
+                        !replay::is_suspended(e.ep)
+                            && !replay::waits_for_suspended(rt, e.anchor(), cidx)
+                    })
+            });
+            slots
+                .into_iter()
+                .map(|m| (m, h.remove(&(rt, m)).expect("the slot was just listed")))
                 .collect()
         });
         if entries.is_empty() {
@@ -1677,7 +1808,7 @@ impl<C: Cells> Runtime<C> {
             };
             let flags = self.nodes.get_with_flags(m).1;
             self.children_landing(NodeId(m), flags, children, e.opened, bag);
-            self.land(node, target, flagged);
+            self.land(NodeId(m), node, target, flagged);
             bag.push_erased(Box::new((e.buf, e.s)));
         }
         PopEnd::Landed
@@ -1759,14 +1890,19 @@ impl<C: Cells> Runtime<C> {
                 continue;
             }
             let node = self.nodes.get(m);
-            let mut ok = state::try_transition::<C>(
-                node.state_cell(),
-                NodeState::Dirty,
-                NodeState::Computing,
-            )
-            .is_ok();
+            // A member with a virtual frame stands for a frame computing on
+            // this thread's stack, whose claim the unbounded run fails.
+            let virtual_member = value_code::thread_word() & value_code::REPLAY_BIT != 0
+                && self.virtual_position(m, generation).is_some();
+            let mut ok = !virtual_member
+                && state::try_transition::<C>(
+                    node.state_cell(),
+                    NodeState::Dirty,
+                    NodeState::Computing,
+                )
+                .is_ok();
             if ok && node.generation() != generation {
-                self.land(node, NodeState::Dirty, NodeState::Dirty);
+                self.land(NodeId(m), node, NodeState::Dirty, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
@@ -1828,7 +1964,9 @@ impl<C: Cells> Runtime<C> {
                     "incr-core: group verify re-lands member {m} over an empty slot"
                 );
                 node.max_verified_at(verify_rev);
-                if self.land(node, NodeState::Clean, NodeState::Dirty) == NodeState::Clean {
+                if self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty)
+                    == NodeState::Clean
+                {
                     self.record_trace(NodeId(m), crate::trace::TraceAction::VerifiedClean);
                 }
             }

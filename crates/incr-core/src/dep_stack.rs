@@ -2,8 +2,8 @@
 //!
 //! When a compute closure runs, every `rt.get(other)` call records `other`
 //! as a dependency of the currently-computing node. The recording happens
-//! through a per-thread (Shared) or per-runtime (Local) stack of frames:
-//! each frame holds the dep set for one nested compute.
+//! through a per-thread stack of frames: each frame holds the dep set for
+//! one nested compute.
 //!
 //! Shared MUST use thread-local frames. Multiple reader threads can each
 //! drive a compute on different nodes simultaneously; if frames lived in
@@ -14,13 +14,13 @@
 //! frame of runtime R is the top frame only if it belongs to R: a read
 //! of an R node from another runtime's closure records nothing.
 //!
-//! Local uses a RefCell-backed stack per runtime because there's only
-//! one thread. RefCell's borrow counter is cheaper than a thread_local
-//! key lookup.
+//! Local runtimes share it too: they also nest each other's computes on
+//! one thread, and the doom and replay rules read every runtime's frames
+//! and their positions on the thread.
 
 use std::cell::RefCell;
 
-use crate::cycle::{ComputeCtl, DOOMED, POISONED};
+use crate::cycle::{ComputeCtl, DOOMED, NO_DOOM, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 
@@ -60,8 +60,8 @@ pub struct ActiveRead {
     pub(crate) node: NodeId,
     pub(crate) ctl: *const ComputeCtl,
     pub(crate) cidx: u32,
-    /// Frames on the stack, the reading frame included. Under `Shared`
-    /// the stack is the thread's, so other runtimes' frames count too.
+    /// Frames on the thread's stack, the reading frame included, other
+    /// runtimes' frames too.
     pub(crate) depth: u32,
 }
 
@@ -88,21 +88,38 @@ pub struct Placement {
 
 impl Frames {
     #[inline(always)]
-    fn active(&mut self, rt: RuntimeId, thread_wide: bool) -> Option<&mut Frame> {
-        self.frames
-            .last_mut()
-            .filter(|top| !thread_wide || top.rt == rt)
+    fn active(&mut self, rt: RuntimeId) -> Option<&mut Frame> {
+        self.frames.last_mut().filter(|top| top.rt == rt)
+    }
+
+    /// A read `rt` serves to the top frame, which is not one of `rt`'s:
+    /// that frame can no longer be doomed, because its retry would read
+    /// the other runtime again and no kept read carries what the first
+    /// read returned. A frame doomed already keeps its doom.
+    #[cold]
+    #[inline(never)]
+    fn note_foreign_read(&mut self) {
+        let top = self
+            .frames
+            .last()
+            .expect("incr-core: a foreign read has a reading frame");
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        let ctl = unsafe { &*top.ctl };
+        if !ctl.has(DOOMED) {
+            ctl.raise(NO_DOOM);
+        }
     }
 
     /// The active frame as the reader of what the compute that popped
     /// above it left: none while a replay driver's placed frame is on top,
     /// since the frame below that one is not its reader.
     #[inline(always)]
-    fn reader(&mut self, rt: RuntimeId, thread_wide: bool) -> Option<&mut Frame> {
+    fn reader(&mut self, rt: RuntimeId) -> Option<&mut Frame> {
         if self.frames.len() as u32 == self.placed {
             return None;
         }
-        self.active(rt, thread_wide)
+        self.active(rt)
     }
 
     const fn new() -> Self {
@@ -128,10 +145,6 @@ impl Frames {
 
 /// Strategy-parameterized dep tracker used by the runtime during compute.
 pub trait DepStack: 'static {
-    /// Every runtime on the thread shares the stack, so the active frame
-    /// of a runtime is the top frame only if it belongs to it.
-    const THREAD_WIDE: bool;
-
     fn new() -> Self;
 
     /// Runs `f` on the stack. `f` must not reach user code or the stack.
@@ -176,10 +189,10 @@ pub trait DepStack: 'static {
     /// read.
     #[inline(always)]
     fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) {
-        self.with(|s| {
-            if let Some(top) = s.active(rt, Self::THREAD_WIDE) {
-                top.deps.push((dep, generation));
-            }
+        self.with(|s| match s.frames.last_mut() {
+            Some(top) if top.rt == rt => top.deps.push((dep, generation)),
+            Some(_) => s.note_foreign_read(),
+            None => {}
         })
     }
 
@@ -190,7 +203,14 @@ pub trait DepStack: 'static {
     fn record_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> Option<ActiveRead> {
         self.with(|s| {
             let depth = s.frames.len() as u32;
-            let top = s.active(rt, Self::THREAD_WIDE)?;
+            let top = match s.frames.last_mut() {
+                Some(top) if top.rt == rt => top,
+                Some(_) => {
+                    s.note_foreign_read();
+                    return None;
+                }
+                None => return None,
+            };
             top.deps.push((dep, generation));
             top.reading = u64::from(dep.0) | (u64::from(generation) << 32);
             Some(ActiveRead {
@@ -234,7 +254,7 @@ pub trait DepStack: 'static {
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
         self.with(|s| {
-            if let Some(top) = s.reader(rt, Self::THREAD_WIDE) {
+            if let Some(top) = s.reader(rt) {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
                 unsafe { (*top.ctl).raise(POISONED) };
@@ -247,7 +267,7 @@ pub trait DepStack: 'static {
     /// has read it.
     fn unwound_reader(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32, u64, u32)> {
         self.with(|s| {
-            let top = s.reader(rt, Self::THREAD_WIDE)?;
+            let top = s.reader(rt)?;
             Some((top.ctl, top.cidx, top.reading, top.reads_of_reading()))
         })
     }
@@ -255,10 +275,7 @@ pub trait DepStack: 'static {
     /// How many times `rt`'s active frame has read the node it reads
     /// now, this read included.
     fn reads_of_current(&self, rt: RuntimeId) -> u32 {
-        self.with(|s| {
-            s.active(rt, Self::THREAD_WIDE)
-                .map_or(0, |top| top.reads_of_reading())
-        })
+        self.with(|s| s.active(rt).map_or(0, |top| top.reads_of_reading()))
     }
 
     /// For `rt`'s frames at positions `from..to`, bottom first, the node
@@ -274,10 +291,7 @@ pub trait DepStack: 'static {
     }
 
     fn active_frame(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32)> {
-        self.with(|s| {
-            s.active(rt, Self::THREAD_WIDE)
-                .map(|top| (top.ctl, top.cidx))
-        })
+        self.with(|s| s.active(rt).map(|top| (top.ctl, top.cidx)))
     }
 
     /// The node and control block of `rt`'s active frame, if its top
@@ -292,20 +306,29 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// Whether the thread's top frame is another runtime's than `rt` and
+    /// doomed, so a read `rt` serves now comes from a closure that has
+    /// read a placeholder.
+    fn other_top_doomed(&self, rt: RuntimeId) -> bool {
+        self.with(|s| {
+            s.frames.last().is_some_and(|top| {
+                // SAFETY: the frame is on the stack, so its control block
+                // is live (see `Frame::ctl`).
+                top.rt != rt && unsafe { &*top.ctl }.has(DOOMED)
+            })
+        })
+    }
+
     /// True iff `rt` has an active frame (we're inside one of its
     /// compute closures).
     fn current_frame_active(&self, rt: RuntimeId) -> bool {
-        self.with(|s| s.active(rt, Self::THREAD_WIDE).is_some())
+        self.with(|s| s.active(rt).is_some())
     }
 
     /// The depth of the innermost frame on this stack computing `node`
     /// of runtime `rt`, if one is. Depth 0 is the outermost frame.
     fn frame_depth(&self, rt: RuntimeId, node: NodeId) -> Option<usize> {
-        self.with(|s| {
-            s.frames
-                .iter()
-                .rposition(|f| f.node == node && (!Self::THREAD_WIDE || f.rt == rt))
-        })
+        self.with(|s| s.frames.iter().rposition(|f| f.node == node && f.rt == rt))
     }
 
     /// The position of the innermost frame on this stack computing
@@ -315,7 +338,7 @@ pub trait DepStack: 'static {
             s.frames
                 .iter()
                 .rev()
-                .find(|f| f.node == node && (!Self::THREAD_WIDE || f.rt == rt))
+                .find(|f| f.node == node && f.rt == rt)
                 .map(|f| f.cidx)
         })
     }
@@ -333,31 +356,13 @@ pub trait DepStack: 'static {
     }
 }
 
-pub struct LocalDepStack {
-    stack: RefCell<Frames>,
-}
-
-impl DepStack for LocalDepStack {
-    const THREAD_WIDE: bool = false;
-
-    fn new() -> Self {
-        Self {
-            stack: RefCell::new(Frames::new()),
-        }
-    }
-
-    #[inline(always)]
-    fn with<R>(&self, f: impl FnOnce(&mut Frames) -> R) -> R {
-        f(&mut self.stack.borrow_mut())
-    }
-}
+pub type LocalDepStack = SharedDepStack;
 
 pub struct SharedDepStack;
 
 /// For a binding that runs user code in another language: whether this
-/// thread's innermost compute frame of a `Shared` runtime is doomed, so the
-/// run it belongs to is discarded. A `Local` runtime keeps its frames in the
-/// runtime, out of reach of this check.
+/// thread's innermost compute frame, of any runtime, is doomed, so the run
+/// it belongs to is discarded.
 #[doc(hidden)]
 pub fn active_frame_doomed() -> bool {
     SharedDepStack.with(|s| {
@@ -374,8 +379,6 @@ thread_local! {
 }
 
 impl DepStack for SharedDepStack {
-    const THREAD_WIDE: bool = true;
-
     fn new() -> Self {
         Self
     }
@@ -403,8 +406,6 @@ loom::thread_local! {
 
 #[cfg(loom)]
 impl DepStack for LoomDepStack {
-    const THREAD_WIDE: bool = true;
-
     fn new() -> Self {
         Self
     }
@@ -423,8 +424,8 @@ mod tests {
     }
 
     #[test]
-    fn local_push_pop_records() {
-        let s = LocalDepStack::new();
+    fn push_pop_records() {
+        let s = SharedDepStack::new();
         let ctl = ComputeCtl::new(0);
         assert!(!s.current_frame_active(rt(1)));
         assert_eq!(s.push_frame(rt(1), NodeId(100), &ctl), 0);
@@ -438,8 +439,8 @@ mod tests {
     }
 
     #[test]
-    fn local_nested_frames_are_independent() {
-        let s = LocalDepStack::new();
+    fn nested_frames_are_independent() {
+        let s = SharedDepStack::new();
         let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
         s.push_frame(rt(1), NodeId(100), &a);
         s.record_dep(rt(1), NodeId(1), 0);
@@ -451,8 +452,8 @@ mod tests {
     }
 
     #[test]
-    fn local_poison_marks_only_the_top_frame() {
-        let s = LocalDepStack::new();
+    fn poison_marks_only_the_top_frame() {
+        let s = SharedDepStack::new();
         let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
         s.push_frame(rt(1), NodeId(100), &a);
         s.push_frame(rt(1), NodeId(101), &b);
@@ -465,8 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn local_poison_skips_a_frame_below_a_placed_position() {
-        let s = LocalDepStack::new();
+    fn poison_skips_a_frame_below_a_placed_position() {
+        let s = SharedDepStack::new();
         let a = ComputeCtl::new(0);
         s.push_frame(rt(1), NodeId(100), &a);
         let placement = s.place_next_at(3, true);
@@ -479,15 +480,15 @@ mod tests {
     }
 
     #[test]
-    fn local_record_outside_frame_is_noop() {
-        let s = LocalDepStack::new();
+    fn record_outside_frame_is_noop() {
+        let s = SharedDepStack::new();
         s.record_dep(rt(1), NodeId(42), 0);
         assert!(!s.current_frame_active(rt(1)));
     }
 
     #[test]
-    fn local_is_computing_tracks_open_frames() {
-        let s = LocalDepStack::new();
+    fn is_computing_tracks_open_frames() {
+        let s = SharedDepStack::new();
         let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
         assert!(!s.is_computing(rt(1), NodeId(7)));
         s.push_frame(rt(1), NodeId(7), &a);
@@ -503,17 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_push_pop_records() {
-        let s = SharedDepStack::new();
-        let ctl = ComputeCtl::new(0);
-        s.push_frame(rt(1), NodeId(100), &ctl);
-        s.record_dep(rt(1), NodeId(7), 0);
-        s.record_dep(rt(1), NodeId(11), 0);
-        assert_eq!(s.pop_frame(), vec![(NodeId(7), 0), (NodeId(11), 0)]);
-    }
-
-    #[test]
-    fn shared_frames_are_scoped_to_their_runtime() {
+    fn frames_are_scoped_to_their_runtime() {
         let s = SharedDepStack::new();
         let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
         s.push_frame(rt(1), NodeId(5), &a);
@@ -546,7 +537,27 @@ mod tests {
     }
 
     #[test]
-    fn shared_is_computing_is_thread_local() {
+    fn local_runtimes_share_the_threads_frames() {
+        let (s1, s2) = (LocalDepStack::new(), LocalDepStack::new());
+        let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
+        s1.push_frame(rt(1), NodeId(5), &a);
+        assert_eq!(s2.push_frame(rt(2), NodeId(6), &b), 1);
+        assert!(!s1.current_frame_active(rt(1)));
+        s1.record_dep(rt(1), NodeId(9), 0);
+        s1.poison_current_frame(rt(1));
+        assert!(!a.has(POISONED));
+        assert!(!s1.other_top_doomed(rt(1)));
+        b.raise(DOOMED);
+        assert!(s1.other_top_doomed(rt(1)));
+        assert!(!s2.other_top_doomed(rt(2)));
+        assert!(s2.pop_frame().is_empty());
+        assert!(s1.current_frame_active(rt(1)));
+        s1.record_dep(rt(1), NodeId(10), 0);
+        assert_eq!(s1.pop_frame(), vec![(NodeId(10), 0)]);
+    }
+
+    #[test]
+    fn is_computing_is_thread_local() {
         let s = SharedDepStack::new();
         let ctl = ComputeCtl::new(0);
         s.push_frame(rt(1), NodeId(5), &ctl);

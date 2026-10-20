@@ -41,7 +41,7 @@ use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
 use crate::segmented_nodes::{
-    SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED,
+    SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED, WATCHED,
 };
 use crate::set_stack;
 use crate::slot_vec::SlotVec;
@@ -71,8 +71,7 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) trace_log: Vec<crate::trace::NodeTrace>,
     /// Node slots released by delete_node, awaiting recycling.
     pub(crate) free_nodes: Vec<u32>,
-    pub(crate) observers: HashMap<u64, ObserverEntry<C>>,
-    pub(crate) next_observer_id: u64,
+    pub(crate) observers: Observers<C>,
     /// Nodes an operator created for its own output and adopted: it sets
     /// them but never reads them, so no reverse edge records them.
     /// Sparse, because only operators like `group_by` own nodes. Kept in
@@ -100,19 +99,6 @@ pub(crate) struct GroupInfo {
     pub(crate) cycle: Cycle,
 }
 
-/// Type-erased observer runner: takes the runtime and the observer's
-/// last-seen stamp, returns the new stamp if the callback fired.
-type ObserverRunFn<C> = Arc<dyn Fn(&Runtime<C>, u64) -> Option<u64> + Send + Sync>;
-
-/// One registered observer: which slot it watches, the changed_at stamp
-/// it last fired for, and a type-erased runner that ensures the node is
-/// clean and invokes the user callback if the value changed.
-pub(crate) struct ObserverEntry<C: Cells> {
-    pub(crate) slot: u32,
-    pub(crate) last_seen: u64,
-    pub(crate) run: ObserverRunFn<C>,
-}
-
 impl<C: Cells> Inner<C> {
     fn new() -> Self {
         Self {
@@ -122,8 +108,7 @@ impl<C: Cells> Inner<C> {
             labels: HashMap::new(),
             trace_log: Vec::new(),
             free_nodes: Vec::new(),
-            observers: HashMap::new(),
-            next_observer_id: 1,
+            observers: Observers::new(),
             owned: HashMap::new(),
             owner_of: HashMap::new(),
             children: HashMap::default(),
@@ -175,6 +160,9 @@ pub(crate) enum ParkPoint {
     /// rolled back around a busy member and released its hold, before
     /// the wait on that member.
     ClaimSetRolledBack(NodeId),
+    /// In `unwatch`, under its write hold, after `WATCHED` is cleared and
+    /// before the node's entry is dequeued.
+    UnwatchBeforeDequeue(NodeId),
     /// In `get`, after the handle's runtime check and before its
     /// generation is compared.
     GetAfterHandleCheck(NodeId),
@@ -202,6 +190,18 @@ pub(crate) enum ParkPoint {
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
+    /// In `stabilize`, after it took its observers and before the first
+    /// one runs.
+    StabilizeAfterDrain,
+    /// In `observer_read`, after the entry generation compare and before
+    /// `ensure_clean`.
+    ObserverAfterEntryCheck(NodeId),
+    /// In `observer_read`, after `ensure_clean` returned and before the
+    /// generation compare that follows it.
+    ObserverAfterEnsureClean(NodeId),
+    /// In `observer_read`, after the compare that follows `ensure_clean`
+    /// and before the seqlock pre-check.
+    ObserverBeforePreCheck(NodeId),
 }
 
 /// The panic of a read that found its node `Dead` under the handle's
@@ -303,6 +303,7 @@ impl<C: Cells> Drop for WalkDone<'_, C> {
 struct SetClaim<'a, C: Cells> {
     rt: &'a Runtime<C>,
     node: &'a NodeData<C>,
+    flags: &'a C::U8,
     id: NodeId,
     /// The input's `verified_at` the claim was taken over.
     base: u64,
@@ -324,7 +325,7 @@ impl<C: Cells> SetClaim<'_, C> {
         self.node.settle_changed_at(rev);
         self.node.release_set_claim(self.base, rev);
         set_stack::pop(self.rt.runtime_id, self.id.0);
-        self.rt.mark_dependents_dirty(self.id);
+        self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         std::mem::forget(self);
@@ -406,6 +407,10 @@ enum Computed {
     /// The node's run was doomed and discarded: it is a virtual frame,
     /// and a replay driver runs it again.
     Discarded,
+    /// A claim wait ended with the node New or Dirty and a virtual frame
+    /// of it on this thread, which stands for a frame on the stack: the
+    /// walk skips it and taints the path under this memo owner.
+    Skipped(u32),
 }
 
 /// `clean_walk` mode bit: a compute about to run a closure dooms the
@@ -736,6 +741,8 @@ pub struct Runtime<C: Cells> {
     /// `Inner::arena_tags`.
     pub(crate) arenas: ArenaRegistry<C>,
     pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
+    /// Taken only inside an `inner` section or with no lock held.
+    pub(crate) watch_queue: <C as Cells>::Lock<watch_impl::WatchQueue>,
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
@@ -800,6 +807,9 @@ pub struct Runtime<C: Cells> {
     /// Episodes started on this runtime.
     #[cfg(test)]
     pub(crate) episodes: std::sync::atomic::AtomicU64,
+    /// Episode validations run on this runtime.
+    #[cfg(test)]
+    pub(crate) validations: std::sync::atomic::AtomicU64,
 }
 
 /// The value of [`Runtime::doom_gate`].
@@ -837,6 +847,7 @@ impl<C: Cells> Runtime<C> {
             nodes: SegmentedNodes::new(),
             arenas: ArenaRegistry::new(),
             inner: <<C as Cells>::Lock<Inner<C>> as Lock<Inner<C>>>::new(Inner::new()),
+            watch_queue: Lock::new(watch_impl::WatchQueue::new()),
             revision: C::new_u64(1),
             walk: C::new_watermark(1),
             dep_stack: <C::DepStack as DepStack>::new(),
@@ -878,6 +889,8 @@ impl<C: Cells> Runtime<C> {
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             episodes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            validations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1334,6 +1347,30 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
+    /// A read that loaded the node Clean found its slot empty: under
+    /// `Shared` another thread's set and episode can land it as a cycle
+    /// member, which clears the slot, between the load and the read. A
+    /// Clean reload is read again, so only a Clean node with an empty slot
+    /// is the invariant panic; `Err` hands back any other state, which the
+    /// read goes on from as if it had loaded it first.
+    #[cold]
+    #[inline(never)]
+    fn reload_after_empty_slot<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+    ) -> Result<T, NodeState> {
+        if C::SINGLE_THREADED {
+            self.read_failed(handle);
+        }
+        match state::load::<C>(node.state_cell()) {
+            NodeState::Clean => Ok(self.read_slot(handle, node, type_tag, arena_slot)),
+            now => Err(now),
+        }
+    }
+
     /// The read of a Clean node found no value behind its tag and arena
     /// slot, or found one under a moved generation. A moved generation
     /// is a stale handle; an unmoved one means the fields and the arena
@@ -1350,102 +1387,6 @@ impl<C: Cells> Runtime<C> {
             handle.slot(),
             std::any::type_name::<T>(),
         );
-    }
-
-    /// Register a callback fired by [`Self::stabilize`] whenever the
-    /// node's value has changed since the last firing. Observation does
-    /// not change the engine's pull model: nothing runs until someone
-    /// calls `stabilize` (or `get`); the observer registry is a batch
-    /// poll with last-seen bookkeeping, the same shape as Jane Street
-    /// Incremental's observers.
-    ///
-    /// A node that has never computed fires on the first stabilize. A
-    /// stabilize racing a concurrent `set` may fire twice for one
-    /// change; it can never miss one.
-    pub fn observe<T: Value, F>(&self, handle: Incr<T>, callback: F) -> ObserverId
-    where
-        F: Fn(&T) + Send + Sync + 'static,
-    {
-        value_code::check();
-        self.check_handle(handle);
-        let slot = handle.slot();
-        let node = self.nodes.get(slot);
-        // Fire-baseline: if the node already has a clean value, only
-        // future changes fire; a never-computed node starts at 0 so the
-        // first stabilize computes and fires.
-        let last_seen = match state::load::<C>(node.state_cell()) {
-            NodeState::New => 0,
-            _ => node.changed_at().min(self.current_revision()),
-        };
-
-        let run = Arc::new(move |rt: &Runtime<C>, last_seen: u64| -> Option<u64> {
-            if rt.ensure_clean(NodeId(handle.slot()), handle.generation()) == Computed::Gone {
-                rt.stale_handle(handle);
-            }
-            let node = rt.nodes.get(handle.slot());
-            // A pending set() marker reads as u64::MAX; clamp to the
-            // current revision so last_seen stays passable and the
-            // settled stamp can still exceed it (duplicate, not lost).
-            let stamp = node.changed_at().min(rt.current_revision());
-            if stamp > last_seen {
-                let value = rt.get(handle);
-                callback(&value);
-                Some(stamp)
-            } else {
-                None
-            }
-        });
-
-        let mut inner = self.inner.write();
-        let id = inner.next_observer_id;
-        inner.next_observer_id += 1;
-        inner.observers.insert(
-            id,
-            ObserverEntry {
-                slot,
-                last_seen,
-                run,
-            },
-        );
-        ObserverId(id)
-    }
-
-    /// Remove an observer. Safe to call with an already-removed id.
-    pub fn unobserve(&self, id: ObserverId) {
-        value_code::check();
-        // Bound to a local so the entry, whose callback is user code,
-        // drops after the write guard does.
-        let removed = self.inner.write().observers.remove(&id.0);
-        drop(removed);
-    }
-
-    /// Bring every observed node up to date and fire callbacks for the
-    /// ones whose values changed since they last fired. Callbacks run
-    /// with no engine lock held; they may read from the runtime but must
-    /// not call `stabilize` reentrantly from another thread if duplicate
-    /// notifications matter.
-    pub fn stabilize(&self) {
-        value_code::check();
-        self.enter(|| self.stabilize_entered());
-    }
-
-    fn stabilize_entered(&self) {
-        let entries: Vec<(u64, u64, ObserverRunFn<C>)> = {
-            let inner = self.inner.read();
-            inner
-                .observers
-                .iter()
-                .map(|(&id, e)| (id, e.last_seen, Arc::clone(&e.run)))
-                .collect()
-        };
-        for (id, last_seen, run) in entries {
-            if let Some(new_stamp) = run(self, last_seen) {
-                let mut inner = self.inner.write();
-                if let Some(e) = inner.observers.get_mut(&id) {
-                    e.last_seen = e.last_seen.max(new_stamp);
-                }
-            }
-        }
     }
 
     /// Delete a node and recycle its slot. The node must have no
@@ -1863,14 +1804,11 @@ impl<C: Cells> Runtime<C> {
         } else {
             None
         };
+        self.unwatch_deleted(slot, bits);
         C::u8_store_relaxed(flags, 0);
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
-        let observers: Vec<ObserverEntry<C>> = inner
-            .observers
-            .extract_if(|_, e| e.slot == slot)
-            .map(|(_, e)| e)
-            .collect();
+        let observers = inner.observers.take_slot(slot);
         if !inner.labels.is_empty() {
             inner.labels.remove(&slot);
         }
@@ -1907,7 +1845,13 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
-            return self.read_slot(handle, node, type_tag, arena_slot);
+            return match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => value,
+                None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                    Ok(value) => value,
+                    Err(now) => self.get_slow(handle, now),
+                },
+            };
         }
         self.get_slow(handle, observed)
     }
@@ -1938,7 +1882,13 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
-            return Ok(self.read_slot(handle, node, type_tag, arena_slot));
+            return match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => Ok(value),
+                None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                    Ok(value) => Ok(value),
+                    Err(now) => self.try_get_slow(handle, now),
+                },
+            };
         }
         self.try_get_slow(handle, observed)
     }
@@ -2016,59 +1966,86 @@ impl<C: Cells> Runtime<C> {
     fn read_walk<T: Value, const MODE: u8>(
         &self,
         handle: Incr<T>,
-        observed: NodeState,
+        mut observed: NodeState,
         kind: ReadKind,
         word: u64,
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
-        if observed == NodeState::Cyclic || is_computing(observed) {
-            if let Some(read) = self.cycle_read(handle, observed, kind) {
-                return read;
-            }
-        }
-        // `get` found the node not Clean, so the walk starts at once.
-        let walk = || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
-        match self.entered(kind, walk)? {
-            Computed::Done | Computed::Unsettled => {}
-            Computed::Gone => self.stale_handle(handle),
-            Computed::Deferred => {
-                return self
-                    .cycle_read(handle, NodeState::Computing, kind)
-                    .expect("incr-core: a deferred root is held");
-            }
-            Computed::Doomed | Computed::Discarded => {
-                return Ok(self.placeholder_read::<T>(frame));
-            }
-        }
-        let (type_tag, arena_slot) = self.fields_under(handle, node);
-        match self.try_read_slot(handle, node, type_tag, arena_slot) {
-            Some(value) => {
-                if let Some(f) = frame {
-                    if state::load::<C>(node.state_cell()) == NodeState::Dirty {
-                        #[cfg(test)]
-                        self.dirty_reads.lock().unwrap().push(handle.slot());
-                        self.note_dirty_read(f, handle, &value);
-                    }
+        loop {
+            if observed == NodeState::Cyclic || is_computing(observed) {
+                let armed = frame.filter(|_| MODE & ARMED != 0);
+                if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
+                    return read;
                 }
-                Ok(value)
             }
-            None => Err(self.read_missing(handle, node)),
+            // `get` found the node not Clean, so the walk starts at once.
+            let walk =
+                || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
+            match self.entered(kind, walk)? {
+                Computed::Done | Computed::Unsettled => {}
+                Computed::Gone => self.stale_handle(handle),
+                Computed::Deferred => {
+                    return self
+                        .cycle_read(
+                            handle,
+                            NodeState::Computing,
+                            kind,
+                            frame.filter(|_| MODE & ARMED != 0),
+                        )
+                        .expect("incr-core: a deferred root is held");
+                }
+                Computed::Doomed | Computed::Discarded => {
+                    return Ok(self.placeholder_read::<T>(frame));
+                }
+                Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
+            }
+            let (type_tag, arena_slot) = self.fields_under(handle, node);
+            match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => {
+                    if let Some(f) = frame {
+                        if state::load::<C>(node.state_cell()) == NodeState::Dirty {
+                            #[cfg(test)]
+                            self.dirty_reads.lock().unwrap().push(handle.slot());
+                            self.note_dirty_read(f, handle, &value);
+                        }
+                    }
+                    return Ok(value);
+                }
+                None => match self.read_missing(handle, node) {
+                    Ok(cycle) => return Err(cycle),
+                    Err(NodeState::Clean) => {
+                        return Ok(self.read_slot(handle, node, type_tag, arena_slot));
+                    }
+                    Err(now) => observed = now,
+                },
+            }
         }
     }
 
     /// A read after a walk found no value: the node landed `Cyclic`, or
     /// New as a member without a value of an episode that landed Dirty.
+    /// Under `Shared` another thread can claim or land the node between
+    /// the walk and these loads, so `Err` hands back the state the read
+    /// goes on from: a Clean one is read, any other walked again.
     #[cold]
     #[inline(never)]
-    fn read_missing<T: Value>(&self, handle: Incr<T>, node: &NodeData<C>) -> Cycle {
-        if matches!(node.state(), NodeState::Cyclic | NodeState::New) {
+    fn read_missing<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+    ) -> Result<Cycle, NodeState> {
+        let state = state::load::<C>(node.state_cell());
+        if matches!(state, NodeState::Cyclic | NodeState::New) {
             if let Some(cycle) = self.cycle_of(handle) {
-                return cycle;
+                return Ok(cycle);
             }
         }
-        self.read_failed(handle)
+        if C::SINGLE_THREADED {
+            self.read_failed(handle);
+        }
+        Err(state)
     }
 
     /// [`Self::get_slow`] reached from value code, a trait method of a
@@ -2082,18 +2059,27 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::ValueCodeBeforeReload(id));
         let mut spins = 0;
         let mut state = state::load::<C>(node.state_cell());
-        // A `claim_set` that rolls back leaves the node as it found it,
-        // so the read waits for the outcome instead of failing on it.
-        while state == NodeState::Deleting {
-            spins += 1;
-            self.wait_out_deleting(id, spins);
-            state = state::load::<C>(node.state_cell());
+        loop {
+            // A `claim_set` that rolls back leaves the node as it found it,
+            // so the read waits for the outcome instead of failing on it.
+            while state == NodeState::Deleting {
+                spins += 1;
+                self.wait_out_deleting(id, spins);
+                state = state::load::<C>(node.state_cell());
+            }
+            if state != NodeState::Clean {
+                break;
+            }
+            let (type_tag, arena_slot) = self.fields_under(handle, node);
+            match self.try_read_slot(handle, node, type_tag, arena_slot) {
+                Some(value) => return value,
+                None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                    Ok(value) => return value,
+                    Err(now) => state = now,
+                },
+            }
         }
         match state {
-            NodeState::Clean => {
-                let (type_tag, arena_slot) = self.fields_under(handle, node);
-                self.read_slot(handle, node, type_tag, arena_slot)
-            }
             // A concurrent delete is no contract breach, so the read gets
             // the panic any reader of a node being deleted gets. Under
             // Local only this thread can be mid-delete, so the value code
@@ -2333,7 +2319,7 @@ impl<C: Cells> Runtime<C> {
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
         let slot = handle.slot();
         let id = NodeId(slot);
-        let node = self.nodes.get(slot);
+        let (node, flags) = self.nodes.get_with_flags(slot);
         self.park(ParkPoint::SetBeforeClaim(id));
         let mut spins: u32 = 0;
         loop {
@@ -2370,6 +2356,7 @@ impl<C: Cells> Runtime<C> {
                         let claim = SetClaim {
                             rt: self,
                             node,
+                            flags,
                             id,
                             base,
                             held: true,
@@ -2524,11 +2511,15 @@ impl<C: Cells> Runtime<C> {
 
     /// BFS forward walk from `start`'s dependents, marking each Clean
     /// node as Dirty. Every transition is a CAS so the walk can never
-    /// clobber a `Computing` claim it raced with.
-    fn mark_dependents_dirty(&self, start: NodeId) {
+    /// clobber a `Computing` claim it raced with. `start_flags` is the
+    /// set input's flags byte, so that a watched input is queued too.
+    fn mark_dependents_dirty(&self, start: NodeId, start_flags: &C::U8) {
         let mut queue: Vec<NodeId> = Vec::new();
         {
             let inner = self.inner.read();
+            if C::u8_load_relaxed(start_flags) & WATCHED != 0 {
+                self.enqueue_watched(start, self.nodes.get(start.0));
+            }
             let first = &inner.dependents[start.0 as usize];
             // Sized up front so a short walk allocates once and never
             // takes the grow path; a node nothing reads allocates nothing.
@@ -2540,7 +2531,7 @@ impl<C: Cells> Runtime<C> {
 
         let mut expanded_new: Option<HashSet<NodeId>> = None;
         while let Some(id) = queue.pop() {
-            let node = self.nodes.get(id.0);
+            let (node, flags) = self.nodes.get_with_flags(id.0);
             loop {
                 let cur = state::load::<C>(node.state_cell());
                 match cur {
@@ -2549,6 +2540,9 @@ impl<C: Cells> Runtime<C> {
                             .is_ok()
                         {
                             let inner = self.inner.read();
+                            if C::u8_load_relaxed(flags) & WATCHED != 0 {
+                                self.enqueue_watched(id, node);
+                            }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
@@ -2570,6 +2564,9 @@ impl<C: Cells> Runtime<C> {
                         .is_ok()
                         {
                             let inner = self.inner.read();
+                            if C::u8_load_relaxed(flags) & WATCHED != 0 {
+                                self.enqueue_watched(id, node);
+                            }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
@@ -2600,6 +2597,9 @@ impl<C: Cells> Runtime<C> {
                             .is_ok()
                         {
                             let inner = self.inner.read();
+                            if C::u8_load_relaxed(flags) & WATCHED != 0 {
+                                self.enqueue_watched(id, node);
+                            }
                             inner.dependents[id.0 as usize].extend_into(&mut queue);
                             break;
                         }
@@ -2995,6 +2995,11 @@ impl<C: Cells> Runtime<C> {
                     if g0.is_some_and(|g| g != node.generation()) {
                         return Computed::Gone;
                     }
+                    // An observer's read of a node whose delete has not
+                    // bumped its generation yet: the observer goes with it.
+                    if observe_impl::is_observed(self.runtime_id, id.0) {
+                        return Computed::Gone;
+                    }
                     deleted_while_reading(id);
                 }
                 NodeState::New => {
@@ -3006,6 +3011,11 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 NodeState::Dirty => {}
+            }
+            if MODE & VIRT != 0 && spins != 0 && gen.is_none() {
+                if let Some(owner) = self.post_wait_owner(id) {
+                    return Computed::Skipped(owner);
+                }
             }
 
             // Distinguish input vs query: inputs don't compute, they
@@ -3070,7 +3080,7 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     NodeState::New
                 };
-                self.land(node, discard, discard);
+                self.land(id, node, discard, discard);
                 return Computed::Gone;
             }
 
@@ -3110,14 +3120,14 @@ impl<C: Cells> Runtime<C> {
                     && !matches!(visit, Visit::VerifyOnly(_))
                     && replay::speculative()
                 {
-                    return self.drop_speculative_verify(node, claimed_dirty);
+                    return self.drop_speculative_verify(id, node, claimed_dirty);
                 }
                 // A speculative tainted verify leaves the node Dirty for its
                 // reader as a failed one would, but keeps the group, whose
                 // release or re-landing would outlive the run's discard.
                 if let Visit::VerifyOnly(owner) = visit {
                     if MODE & VIRT != 0 && replay::speculative() {
-                        self.land(node, NodeState::Dirty, NodeState::Dirty);
+                        self.land(id, node, NodeState::Dirty, NodeState::Dirty);
                         self.memoize(id, owner);
                         return Computed::Done;
                     }
@@ -3515,7 +3525,7 @@ impl<C: Cells> Runtime<C> {
         if C::u8_load_relaxed(flags) & IN_GROUP != 0 {
             self.leave_group(id, flags);
         }
-        self.land(node, target, flagged)
+        self.land(id, node, target, flagged)
     }
 
     /// The landing of a run of `id` in `compute_one`: a creator's
@@ -3538,7 +3548,7 @@ impl<C: Cells> Runtime<C> {
         if C::u8_load_relaxed(flags) & (IN_GROUP | HAS_INDEX) != 0 {
             self.settle_before_landing(id, flags, target, run, discard, bag);
         }
-        self.land(node, target, flagged)
+        self.land(id, node, target, flagged)
     }
 
     #[cold]
@@ -3605,9 +3615,22 @@ impl<C: Cells> Runtime<C> {
     /// writes happen-before the next claim. Loom and Miri both treat a
     /// failed CAS as reading the newest value, so neither would catch a
     /// regression here.
+    ///
+    /// A landing off the Clean path, neither Clean nor Cyclic, then
+    /// reports a watched node: the walk stops at a node already Dirty,
+    /// so nothing else would.
     #[inline(always)]
-    fn land(&self, node: &NodeData<C>, target: NodeState, flagged: NodeState) -> NodeState {
+    fn land(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+    ) -> NodeState {
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
+            if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
+                self.report_landing(id);
+            }
             return target;
         }
         let owned =
@@ -3616,6 +3639,9 @@ impl<C: Cells> Runtime<C> {
             owned.is_ok(),
             "only the claim's owner leaves ComputingDirty"
         );
+        if !matches!(flagged, NodeState::Clean | NodeState::Cyclic) {
+            self.report_landing(id);
+        }
         flagged
     }
 
@@ -3982,7 +4008,27 @@ mod claim_set_impl;
 #[path = "runtime_replay.rs"]
 mod replay_impl;
 
+#[path = "runtime_watch.rs"]
+mod watch_impl;
+
+#[path = "runtime_observe.rs"]
+mod observe_impl;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_watch_tests.rs"]
+mod watch_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_observer_read_tests.rs"]
+mod observer_read_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_stabilize_tests.rs"]
+mod stabilize_tests;
+
 pub(crate) use children_impl::ChildLanding;
+pub(crate) use observe_impl::ObserverEntry;
+use observe_impl::Observers;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_children_tests.rs"]
@@ -4016,7 +4062,7 @@ use cycle_impl::{Attempt, GroupEnd, PopEnd};
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_race_tests.rs"]
-mod race_tests;
+pub(crate) mod race_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_set_tests.rs"]
@@ -4044,7 +4090,7 @@ mod cycle_rule_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_wound_tests.rs"]
-mod wound_tests;
+pub(crate) mod wound_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_tests.rs"]
