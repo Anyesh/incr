@@ -1480,6 +1480,8 @@ where
         GroupedCollection {
             groups,
             version_node,
+            #[cfg(test)]
+            key_cache,
             _confine: std::marker::PhantomData,
         }
     }
@@ -1770,6 +1772,8 @@ where
 {
     pub(crate) groups: GroupMap<K, T, C>,
     pub(crate) version_node: Incr<u64>,
+    #[cfg(test)]
+    key_cache: Arc<OpLock<KeyCache<T, K>, C>>,
     pub(crate) _confine: std::marker::PhantomData<C::Ptr<()>>,
 }
 
@@ -1787,6 +1791,8 @@ where
         Self {
             groups: Arc::clone(&self.groups),
             version_node: self.version_node,
+            #[cfg(test)]
+            key_cache: Arc::clone(&self.key_cache),
             _confine: std::marker::PhantomData,
         }
     }
@@ -1818,6 +1824,35 @@ where
         value_code::check();
         self.groups.read().len()
     }
+
+    /// Everything a routing run can change: each group's elements, log
+    /// end, log version and version node value, and the key cache.
+    #[cfg(test)]
+    pub(crate) fn routed_state(&self, rt: &Runtime<C>) -> RoutedState<K, T> {
+        let groups = self.groups.read();
+        let groups = groups
+            .iter()
+            .map(|(k, g)| {
+                let log = g.log.read();
+                let (elements, end, version) = (log.elements_vec(), log.end(), log.version);
+                drop(log);
+                (k.clone(), (elements, end, version, rt.get(g.version_node)))
+            })
+            .collect();
+        let key_cache = self.key_cache.read().0.clone();
+        RoutedState { groups, key_cache }
+    }
+}
+
+/// A group's elements, log end, log version and version node value.
+#[cfg(test)]
+type GroupState<T> = (Vec<T>, u64, u64, u64);
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct RoutedState<K: Hash + Eq, T: Hash + Eq> {
+    groups: HashMap<K, GroupState<T>>,
+    key_cache: HashMap<T, (K, usize)>,
 }
 
 #[cfg(test)]

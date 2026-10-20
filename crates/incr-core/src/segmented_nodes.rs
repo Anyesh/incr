@@ -83,6 +83,11 @@ pub(crate) const REPLAYABLE: u8 = 32;
 /// whose run consumes its upstream's log.
 pub(crate) const NOT_REPLAYABLE: u8 = 64;
 
+/// `NodeFlags` bit: the node is watched. Unlike the other bits it can
+/// change at any time, so it is decided on only inside an `inner`
+/// section (`runtime_watch.rs`).
+pub(crate) const WATCHED: u8 = 128;
+
 /// A segment of nodes and, beside them, one flags byte per node. The
 /// bytes are zeroed when the segment is allocated and stored only under
 /// the runtime's write lock, so a Relaxed load anywhere reads a value

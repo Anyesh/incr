@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use super::race_tests::{id, panic_message, park_at, Gate};
+use super::race_tests::{clean_node_that_can_turn_cyclic, id, panic_message, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::handle::Incr;
@@ -509,4 +509,49 @@ fn clone_waiting_on_a_lock_a_creator_holds_does_not_deadlock() {
     assert_eq!(reader.join().unwrap(), 1);
     let b = creator.join().unwrap();
     assert_eq!(rt.get(b).0, 2);
+}
+
+/// The value-code arm reloads `a` Clean and parks before its slot read;
+/// another thread's set and episode land `a` Cyclic and clear its slot.
+/// The arm goes on from the state it reloads, which is not Clean, so the
+/// read is the contract panic, where it used to panic that a Clean node
+/// had no value.
+#[test]
+fn value_code_read_of_a_node_now_clean_vs_cyclic_landing() {
+    let rt = Arc::new(Rt::new());
+    let (g, a, b) = clean_node_that_can_turn_cyclic(&rt);
+    rt.set(g, 2);
+    let x = rt.create_input(Probe(0));
+    let reload = Gate::new();
+    let before_read = Gate::new();
+    park_at(
+        &rt,
+        vec![
+            (ParkPoint::ValueCodeBeforeReload(id(a)), reload.clone()),
+            (ParkPoint::GetBeforeRead(id(a)), before_read.clone()),
+        ],
+    );
+    let reader = set_reading(&rt, x, a);
+    reload.wait_parked();
+
+    let computer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(a))
+    };
+    before_read.wait_parked();
+    before_read.release();
+    assert_eq!(computer.join().unwrap(), 7);
+    before_read.arm();
+    reload.release();
+    before_read.wait_parked();
+
+    rt.set(g, 0);
+    assert!(rt.try_get(b).is_err());
+    assert_eq!(rt.state_of(a), crate::state::NodeState::Cyclic);
+    before_read.release();
+
+    let msg = reader.join().unwrap().expect_err("a has no value");
+    assert!(msg.contains(CONTRACT_MESSAGE), "got: {msg}");
+    assert_eq!(rt.get(x).0, 0);
+    rt.assert_invariant_i();
 }

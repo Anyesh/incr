@@ -1286,3 +1286,45 @@ fn discard_under_set() {
         assert_eq!(rt.get(f), 21, "(V) violated: F stale against s = 2");
     });
 }
+
+/// x -> Q, both Clean, with x watched. One thread sets x while another
+/// watches Q and drains. The walk's flip and `watch`'s state load are
+/// ordered only through `inner`, with no SeqCst: whichever section comes
+/// second sees the other's store, so Q is reported, and x once.
+#[test]
+fn drain_vs_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(1_u64);
+        let q = rt.create_query(move |rt: &Rt| rt.get(x) + 1);
+        assert_eq!(rt.get(q), 2);
+        rt.watch(x);
+
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 2))
+        };
+        let drained = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.watch(q);
+                rt.drain_dirtied_watched()
+            })
+        };
+        setter.join().unwrap();
+        let mut seen = drained.join().unwrap();
+        let rest = rt.drain_dirtied_watched();
+        for e in &rest {
+            assert!(!seen.contains(e) || *e == q.erase(), "{e:?} drained twice");
+        }
+        seen.extend(rest);
+
+        assert_eq!(seen.iter().filter(|&&e| e == x.erase()).count(), 1);
+        let reports = seen.iter().filter(|&&e| e == q.erase()).count();
+        assert!(reports >= 1, "Q's dirtying was never reported");
+        assert!(reports <= 2, "Q was reported {reports} times");
+        assert!(rt.drain_dirtied_watched().is_empty());
+        assert_eq!(rt.get(q), 3);
+        rt.assert_invariant_i();
+    });
+}

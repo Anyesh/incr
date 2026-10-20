@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
+use super::observe_impl::observed_is_clear;
 use super::race_tests::{id, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::Shared;
@@ -20,11 +21,11 @@ use crate::waits;
 /// `await_winner`'s head start makes rare but cannot rule out under load,
 /// is wounded again over the same cycle, which costs a retry and never
 /// changes a value.
-fn assert_wounded() {
+pub(crate) fn assert_wounded() {
     assert!(waits::WOUNDS.load(Ordering::Relaxed) >= 1);
 }
 
-fn wait_registered(n: usize) {
+pub(crate) fn wait_registered(n: usize) {
     while waits::registered() < n {
         thread::sleep(Duration::from_millis(1));
     }
@@ -223,6 +224,41 @@ fn shared_wound_under_stabilize_is_retried() {
             assert_eq!(thread_a.join().unwrap(), 4);
             thread_b.join().unwrap().unwrap();
             assert_eq!(*fired.lock().unwrap(), vec![4]);
+            assert_wounded();
+        },
+    )
+    .assert_clean();
+}
+
+/// Three queued observed nodes, B wounded while `stabilize` processes
+/// the second, `q`: the retry takes `q` and the third back from the
+/// queue (`q`'s wound release may queue it first), every observer fires
+/// once, and the observer's thread-local is
+/// clear afterwards.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wound_on_the_second_of_three_observers() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_wound_on_the_second_of_three_observers",
+        || {
+            let g = StaleEdge::new(QReads::Plain, false);
+            let w = g.rt.create_input(7_i64);
+            let first = g.rt.create_query(move |rt| rt.get(w) + 1);
+            let third = g.rt.create_query(move |rt| rt.get(w) + 2);
+            let fired = Arc::new(Mutex::new(Vec::new()));
+            for (tag, h) in [(0, first), (1, g.q), (2, third)] {
+                let fired = fired.clone();
+                g.rt.observe(h, move |v| fired.lock().unwrap().push((tag, *v)));
+            }
+            let (thread_a, thread_b) = g.run(true, |rt| {
+                rt.stabilize();
+                observed_is_clear()
+            });
+            assert_eq!(thread_a.join().unwrap(), 4);
+            assert!(thread_b.join().unwrap().unwrap());
+            let mut fired = fired.lock().unwrap().clone();
+            fired.sort_unstable();
+            assert_eq!(fired, vec![(0, 8), (1, 4), (2, 9)]);
             assert_wounded();
         },
     )
