@@ -1,7 +1,8 @@
 //! O(n) memory for a first compute of a 100k-member Fixpoint ring by
 //! replay, at budgets 256 and 1: the peak of live heap bytes during the
 //! `get`, counted by a global allocator, grows linearly in the ring's size.
-#![cfg(not(miri))]
+// Release only: the same check takes over two minutes in a debug build.
+#![cfg(not(any(miri, debug_assertions)))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -114,7 +115,6 @@ fn linear<C: Cells>(frames: u32) {
 
 /// One test, because the counters are process-global.
 #[test]
-#[ignore = "a ring's first compute by replay takes time superlinear in n (R2's discovery_value builds the whole Cycle per read), so 100k runs for hours"]
 fn fixpoint_ring_replay_memory_is_linear() {
     for frames in [256, 1] {
         linear::<Local>(frames);
