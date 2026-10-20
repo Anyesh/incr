@@ -59,7 +59,7 @@ fn silence_expected_panics() {
     });
 }
 
-fn run(f: impl Fn() + Sync + Send + 'static) {
+pub(crate) fn run(f: impl Fn() + Sync + Send + 'static) {
     silence_expected_panics();
     loom::model(f);
 }

@@ -37,6 +37,8 @@ pub mod locks;
 pub mod loom_cells;
 #[cfg(all(test, loom))]
 mod loom_models;
+#[cfg(all(test, loom))]
+mod loom_seed_models;
 pub mod node;
 #[doc(hidden)]
 pub mod persist_hooks;
