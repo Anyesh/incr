@@ -538,16 +538,20 @@ impl<C: Cells> Runtime<C> {
             while q > 0 && x.vstack.get(q as usize - 1).is_some_and(|v| v.spec) {
                 q -= 1;
             }
-            (q > 0).then_some((x.id, x.boundary + level, q))
+            (q > 0).then_some((x.id, q))
         });
-        let Some((id, floor, q)) = found else {
+        let Some((id, q)) = found else {
             return false;
         };
+        // The run's frames are those from where the driver placed the entry
+        // up, not those at or above its position: a member run in the run
+        // sits at its anchor, which can lie below that position.
         let frames: Vec<(bool, u32, u32, *const ComputeCtl, u64)> = self.dep_stack.with(|s| {
             s.frames
+                .get(s.placed as usize..)
+                .expect("incr-core: an entry above level 0 runs placed")
                 .iter()
                 .rev()
-                .take_while(|f| f.cidx >= floor)
                 .map(|f| (f.rt == rt, f.node.0, f.cidx, f.ctl, f.reading))
                 .collect()
         });
