@@ -7,9 +7,10 @@ use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use format::{
     decode_frames, header, journal_path, parse_header, push_frames, read_current, read_header,
-    remove_stale, scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current,
-    write_synced, HEADER_LEN, JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
+    remove_stale, scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current, HEADER_LEN,
+    JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
 };
+pub(crate) use format::{sync_dir, write_synced};
 
 mod format;
 #[cfg(test)]

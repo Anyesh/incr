@@ -186,7 +186,7 @@ pub(super) fn write_current(dir: &Path, generation: u64) -> Result<()> {
 
 /// Creates (or truncates) `path`, writes `bytes` and fsyncs, returning the
 /// open file for further reads and writes.
-pub(super) fn write_synced(path: &Path, bytes: &[u8]) -> Result<File> {
+pub(crate) fn write_synced(path: &Path, bytes: &[u8]) -> Result<File> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -199,7 +199,7 @@ pub(super) fn write_synced(path: &Path, bytes: &[u8]) -> Result<File> {
 }
 
 #[cfg(unix)]
-pub(super) fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     File::open(dir)?.sync_all()?;
     Ok(())
 }
@@ -207,7 +207,7 @@ pub(super) fn sync_dir(dir: &Path) -> Result<()> {
 // Windows cannot open a directory as a file to fsync it, and NTFS journals
 // the rename metadata itself.
 #[cfg(not(unix))]
-pub(super) fn sync_dir(_dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> Result<()> {
     Ok(())
 }
 
