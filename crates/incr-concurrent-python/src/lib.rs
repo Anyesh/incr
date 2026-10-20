@@ -984,6 +984,32 @@ impl PyRuntime {
         engine_call(py, || self.inner.is_alive(node.inner))
     }
 
+    /// Report the node through `drain_dirtied_watched()` whenever a change
+    /// moves it off Clean. A node that has no current value when watched
+    /// is reported at once.
+    fn watch(&self, py: Python<'_>, node: PyNodeId) -> PyResult<()> {
+        engine_call(py, || self.inner.watch(node.inner))
+    }
+
+    /// Stop reporting the node, and drop its pending report.
+    fn unwatch(&self, py: Python<'_>, node: PyNodeId) -> PyResult<()> {
+        engine_call(py, || self.inner.unwatch(node.inner))
+    }
+
+    /// The watched nodes a change moved off Clean since the last drain,
+    /// each once, in the order the changes reached them. A node deleted
+    /// since is left out.
+    fn drain_dirtied_watched(&self, py: Python<'_>) -> PyResult<Vec<PyNodeId>> {
+        engine_call(py, || {
+            self.inner
+                .drain_dirtied_watched()
+                .into_iter()
+                .filter_map(|h| self.inner.typed_handle::<PyValue>(h))
+                .map(|inner| PyNodeId { inner })
+                .collect()
+        })
+    }
+
     /// Register `callback` to fire on `stabilize()` whenever the node's
     /// value changed since the last firing.
     fn observe(
