@@ -352,6 +352,15 @@ pub fn engine_unwind(payload: &(dyn std::any::Any + Send)) -> Option<Option<Cycl
     }
 }
 
+/// For a binding that runs user code in another language: whether an
+/// engine unwind is in flight on this thread, or a wound has marked it for
+/// a retry. An error that code raises now belongs to a run the engine
+/// discards, so the binding must not keep it to report later.
+#[doc(hidden)]
+pub fn engine_unwind_in_progress() -> bool {
+    unwind_kind().is_some() || wounded()
+}
+
 /// Clears the last reported cycle and returns it.
 pub fn take_last_cycle() -> Option<Cycle> {
     OUTER.with(|o| o.borrow_mut().last_cycle.take())
@@ -489,5 +498,24 @@ pub(crate) fn reset_outermost() {
             o.dissolved.clear();
             o.last_cycle = None;
         });
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod binding_tests {
+    use super::*;
+
+    #[test]
+    fn engine_unwind_in_progress_covers_every_kind_and_a_wound() {
+        assert!(!engine_unwind_in_progress());
+        for kind in [UnwindKind::Cycle, UnwindKind::Wound, UnwindKind::Discard] {
+            set_unwind_kind(Some(kind));
+            assert!(engine_unwind_in_progress());
+            set_unwind_kind(None);
+        }
+        set_wounded(true);
+        assert!(engine_unwind_in_progress());
+        set_wounded(false);
+        assert!(!engine_unwind_in_progress());
     }
 }

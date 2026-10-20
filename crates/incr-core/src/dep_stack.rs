@@ -20,7 +20,7 @@
 
 use std::cell::RefCell;
 
-use crate::cycle::{ComputeCtl, POISONED};
+use crate::cycle::{ComputeCtl, DOOMED, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 
@@ -354,6 +354,21 @@ impl DepStack for LocalDepStack {
 
 pub struct SharedDepStack;
 
+/// For a binding that runs user code in another language: whether this
+/// thread's innermost compute frame of a `Shared` runtime is doomed, so the
+/// run it belongs to is discarded. A `Local` runtime keeps its frames in the
+/// runtime, out of reach of this check.
+#[doc(hidden)]
+pub fn active_frame_doomed() -> bool {
+    SharedDepStack.with(|s| {
+        s.frames.last().is_some_and(|top| {
+            // SAFETY: a frame's control block is live while the frame is on
+            // the stack (see `Frame::ctl`).
+            unsafe { &*top.ctl }.has(DOOMED)
+        })
+    })
+}
+
 thread_local! {
     static SHARED_FRAMES: RefCell<Frames> = const { RefCell::new(Frames::new()) };
 }
@@ -512,6 +527,22 @@ mod tests {
         assert!(s.pop_frame().is_empty());
         assert!(s.current_frame_active(rt(1)));
         s.pop_frame();
+    }
+
+    #[test]
+    fn active_frame_doomed_reads_the_innermost_shared_frame() {
+        let s = SharedDepStack::new();
+        assert!(!active_frame_doomed());
+        let doomed = ComputeCtl::new(0);
+        doomed.raise(DOOMED);
+        s.push_frame(rt(1), NodeId(5), &doomed);
+        assert!(active_frame_doomed());
+        let live = ComputeCtl::new(0);
+        s.push_frame(rt(2), NodeId(6), &live);
+        assert!(!active_frame_doomed());
+        s.pop_frame();
+        s.pop_frame();
+        assert!(!active_frame_doomed());
     }
 
     #[test]
