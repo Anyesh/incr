@@ -2499,6 +2499,9 @@ impl<C: Cells> Runtime<C> {
             self.waits_on_own_claim(id);
         }
         self.refuse_wait_on_computing(id);
+        if spins == 1 {
+            crate::lock_order::assert_may_wait_on_claim();
+        }
         if !C::SINGLE_THREADED && spins >= waits::REGISTER_AFTER {
             let node = self.nodes.get(id.0);
             self.wait_registered(id, || !is_computing(state::load::<C>(node.state_cell())));
