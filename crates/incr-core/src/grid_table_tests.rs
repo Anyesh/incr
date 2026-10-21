@@ -476,3 +476,34 @@ where
     );
     assert!(t.get(rt, key(0, 1, 0)).is_some());
 }
+
+#[cfg(all(debug_assertions, not(loom)))]
+mod lock_order {
+    use super::*;
+    use crate::persist_hooks::{get_or_insert_query_seeded, Deferred};
+
+    both!(grid_a_miss_under_a_table_miss_breaks_the_lock_order);
+
+    /// A seed hook runs under its `NodeTable`'s miss mutex, so a grid
+    /// miss there would hold two table misses at once.
+    fn grid_a_miss_under_a_table_miss_breaks_the_lock_order<C: Cells>(rt: &Runtime<C>) {
+        let grid = rt.create_grid_table::<i64>();
+        let table = rt.create_table::<u8, i64>();
+        let mut bag = Deferred::new();
+        panics_with("taking TableMiss while holding TableMiss", || {
+            get_or_insert_query_seeded(
+                &table,
+                rt,
+                0,
+                |_: &Runtime<C>| 1,
+                Default::default(),
+                |rt, _| {
+                    grid.get_or_insert_input(rt, key(0, 0, 0), || 2);
+                    None
+                },
+                &mut bag,
+            );
+        });
+        bag.drain(rt);
+    }
+}

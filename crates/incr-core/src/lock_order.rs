@@ -18,7 +18,8 @@ pub enum LockKind {
     Memo,
     /// The memo index lock, held only to clone or swap its `Arc`.
     MemoIndex,
-    /// A `NodeTable`'s miss mutex; a thread holds at most one.
+    /// A `NodeTable`'s or `GridTable`'s miss mutex; a thread holds at
+    /// most one.
     TableMiss,
     /// incr-persist's `DepIndex`.
     DepIndex,
