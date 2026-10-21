@@ -101,20 +101,30 @@ pub(crate) struct InputBinding<T: 'static> {
 }
 
 impl<T: Value + DeserializeOwned> InputBinding<T> {
-    /// The value `logged` gives the key, with the fingerprint of its bytes.
-    fn value_of(&self, logged: Option<&LoggedKey>) -> Result<(T, u128)> {
+    /// The value `logged` gives the key, with the bytes it was decoded
+    /// from, or `None` when it is the binding's default.
+    fn value_of<'a>(&self, logged: Option<&'a LoggedKey>) -> Result<(T, Option<&'a [u8]>)> {
         match logged.and_then(LoggedKey::current) {
-            Some(bytes) => Ok((decode(&self.key, bytes)?, fp_of(bytes))),
-            None => Ok((with_value_code(|| self.default.clone()), self.default_fp)),
+            Some(bytes) => Ok((decode(&self.key, bytes)?, Some(bytes))),
+            None => Ok((with_value_code(|| self.default.clone()), None)),
         }
     }
 
-    /// Sets the node to `value`, decoded from bytes fingerprinting as `fp`.
-    fn write<C: Cells>(&mut self, rt: &Runtime<C>, value: T, fp: u128, deps: Option<&DepIndex>) {
+    /// Sets the node to `value`, decoded from `bytes`, or to the binding's
+    /// default when `bytes` is `None`. The bytes are hashed only when the
+    /// set writes, since a no-op keeps the fingerprint it had.
+    fn write<C: Cells>(
+        &mut self,
+        rt: &Runtime<C>,
+        value: T,
+        bytes: Option<&[u8]>,
+        deps: Option<&DepIndex>,
+    ) {
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
         let (compared, stamp) = set_returning_displaced(rt, self.handle, value);
         if matches!(compared, Compared::Replaced(_)) {
+            let fp = bytes.map_or(self.default_fp, fp_of);
             self.fp = fp;
             self.stamp = stamp;
             if let Some(map) = guard.deps() {
@@ -163,12 +173,12 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
         before: Option<&LoggedKey>,
         deps: Option<&DepIndex>,
     ) -> Result<()> {
-        let (value, fp) = match record {
-            Record::Set { value, .. } => (decode(&self.key, value)?, fp_of(value)),
+        let (value, bytes) = match record {
+            Record::Set { value, .. } => (decode(&self.key, value)?, Some(value.as_slice())),
             // A forgotten key holds the default it last had, as after a
             // compaction forgot it.
             Record::Delete { .. } | Record::Forget { .. } => {
-                (with_value_code(|| self.default.clone()), self.default_fp)
+                (with_value_code(|| self.default.clone()), None)
             }
             // Only the first Declare since the key was last forgotten is
             // live, as in the folded log.
@@ -180,11 +190,11 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
                 if before.and_then(LoggedKey::current).is_some() {
                     return Ok(());
                 }
-                (with_value_code(|| self.default.clone()), self.default_fp)
+                (with_value_code(|| self.default.clone()), None)
             }
             _ => return Ok(()),
         };
-        self.write(rt, value, fp, deps);
+        self.write(rt, value, bytes, deps);
         Ok(())
     }
 
@@ -203,12 +213,12 @@ impl<C: Cells, T: Value + Serialize + DeserializeOwned> Binding<C> for InputBind
                     .map(|default| (default, fp_of(&declared.default)))
             })
             .transpose()?;
-        let (value, fp) = self.value_of(logged)?;
+        let (value, bytes) = self.value_of(logged)?;
         if let Some((default, default_fp)) = default {
             self.default = default;
             self.default_fp = default_fp;
         }
-        self.write(rt, value, fp, deps);
+        self.write(rt, value, bytes, deps);
         Ok(())
     }
 
