@@ -1723,3 +1723,94 @@ workloads, which neither walk nor compute, are unchanged. Every workload
 that computes falls: −95 to −115 Local and −85 Shared per compute, −50
 and −45 per walk, and a grow's malloc and copy wherever the base grew
 its walk.
+
+## T12 support: Clean read
+
+- Engine: branch `w/T12-perf-a1-floor-cleanread` against its base
+  `spreadsheet-t11` at `abe8ac3` (alloc pools included), each built in a
+  worktree at a path of the same length; one run of `icount.sh` at the
+  default N for each column. No workloads added.
+- Change: the registry entry keeps its arena's typed pointer, so a
+  typed read skips the `Arc<dyn _>` vtable load; a Clean `get` tests
+  the raw state byte; under `Local` a Clean `get` or `try_get` clones
+  straight into the return place, and every slot read skips the
+  generation recheck after the clone (each caller checks the generation
+  just before it, and the clone is value code, which cannot delete,
+  recycle or overwrite the node); a liveness test (`is_alive`, a `GridTable` hit)
+  compares the raw state byte; a `GridKey`'s range is checked on a miss
+  only; `cycle_of` skips its lock-held map lookup while no group has
+  landed.
+
+| workload | N | spreadsheet-t11 | Clean read | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 3,936.00 | 3,890.00 | -46.00 | -1.17 | Clean read |
+| `chain_local/propagate/10` | 1,000,000 | 8,664.00 | 8,564.00 | -100.00 | -1.15 | Clean read |
+| `chain_local/propagate/100` | 100,000 | 79,584.01 | 78,674.00 | -910.01 | -1.14 | Clean read |
+| `chain_shared/propagate/4` | 1,000,000 | 8,724.26 | 8,703.25 | -21.01 | -0.24 | Clean read |
+| `chain_shared/propagate/10` | 1,000,000 | 19,164.79 | 19,119.79 | -45.00 | -0.23 | Clean read |
+| `chain_shared/propagate/100` | 100,000 | 175,899.62 | 175,494.69 | -404.93 | -0.23 | Clean read |
+| `diamond_local` | 1,000,000 | 3,334.00 | 3,288.00 | -46.00 | -1.38 | Clean read |
+| `diamond_shared` | 1,000,000 | 7,267.48 | 7,246.48 | -21.00 | -0.29 | Clean read |
+| `early_cutoff_local` | 1,000,000 | 1,916.00 | 1,897.00 | -19.00 | -0.99 | Clean read |
+| `early_cutoff_shared` | 1,000,000 | 3,223.77 | 3,214.78 | -8.99 | -0.28 | Clean read |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,243.34 | 4,214.78 | -28.56 | -0.67 | Clean read |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 6,928.49 | 6,914.82 | -13.67 | -0.20 | Clean read |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,284.20 | 92,283.63 | -0.57 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,236.72 | 4,208.32 | -28.40 | -0.67 | Clean read |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 6,902.64 | 6,889.31 | -13.33 | -0.19 | Clean read |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,886.79 | 158,885.92 | -0.87 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,245.49 | 4,216.33 | -29.16 | -0.69 | Clean read |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 6,907.27 | 6,894.76 | -12.51 | -0.18 | Clean read |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,573.53 | 1,490,564.84 | -8.69 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 1,979.87 | 1,961.00 | -18.87 | -0.95 | Clean read |
+| `simple_count/shared/1000` | 100,000 | 3,950.89 | 3,941.66 | -9.23 | -0.23 | Clean read |
+| `simple_count/local/10000` | 100,000 | 1,976.37 | 1,957.12 | -19.25 | -0.97 | Clean read |
+| `simple_count/shared/10000` | 100,000 | 3,930.68 | 3,921.98 | -8.70 | -0.22 | Clean read |
+| `get_clean_local` | 10,000,000 | 102.00 | 94.00 | -8.00 | -7.84 | Clean read |
+| `get_clean_shared` | 10,000,000 | 196.00 | 192.00 | -4.00 | -2.04 | Clean read |
+| `get_contended_shared` | 2,000 | 7,791,774.81 | 7,631,651.77 | -160,123.04 | -2.06 | Clean read (below) |
+| `fanout_local_4` | 100,000 | 16,276.01 | 16,209.00 | -67.01 | -0.41 | Clean read |
+| `fanout_local_5` | 100,000 | 20,068.01 | 19,987.01 | -81.00 | -0.40 | Clean read |
+| `fanout_local_1000` | 1,000 | 3,328,414.00 | 3,314,402.56 | -14,011.44 | -0.42 | Clean read |
+| `fanout_shared_4` | 100,000 | 22,753.72 | 22,745.71 | -8.01 | -0.04 | Clean read |
+| `fanout_shared_5` | 100,000 | 27,631.50 | 27,623.50 | -8.00 | -0.03 | Clean read |
+| `fanout_shared_1000` | 1,000 | 4,622,581.17 | 4,622,555.18 | -25.99 | -0.00 | Clean read |
+| `delete_single_local` | 200,000 | 706.00 | 700.00 | -6.00 | -0.85 | Clean read |
+| `delete_single_shared` | 200,000 | 1,530.25 | 1,524.24 | -6.01 | -0.39 | Clean read |
+| `delete_cascade_local` | 1,000 | 3,082,661.66 | 3,068,656.23 | -14,005.43 | -0.45 | Clean read |
+| `delete_cascade_shared` | 1,000 | 4,348,197.08 | 4,342,189.46 | -6,007.62 | -0.14 | Clean read |
+| `delete_owned_tree_local` | 10,000 | 601,503.32 | 597,114.82 | -4,388.50 | -0.73 | run spread (below) |
+| `delete_owned_tree_shared` | 10,000 | 979,012.84 | 977,371.38 | -1,641.46 | -0.17 | Clean read |
+| `table_hit_local` | 10,000,000 | 155.14 | 150.14 | -5.00 | -3.22 | table hit liveness; Clean read |
+| `table_hit_shared` | 10,000,000 | 218.14 | 216.14 | -2.00 | -0.92 | table hit liveness; Clean read |
+| `table_hit_sip_local` | 10,000,000 | 300.52 | 295.29 | -5.23 | -1.74 | table hit liveness; Clean read |
+| `table_miss_local` | 100,000 | 871.18 | 861.74 | -9.44 | -1.08 | table hit liveness; Clean read |
+| `table_miss_shared` | 100,000 | 2,170.22 | 2,161.93 | -8.29 | -0.38 | table hit liveness; Clean read |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,841.01 | 214,821.85 | -3,019.16 | -1.39 | Clean read |
+| `children_rerun_1k_shared` | 10,000 | 224,806.02 | 222,797.06 | -2,008.96 | -0.89 | Clean read |
+| `children_churn_local` | 100,000 | 16,363.47 | 16,293.47 | -70.00 | -0.43 | Clean read |
+| `children_churn_shared` | 100,000 | 19,270.97 | 19,228.24 | -42.73 | -0.22 | Clean read |
+
+- **Clean read:** `get_clean_local` falls 8 per get and
+  `get_clean_shared` 4; every workload that reads Clean nodes falls
+  with its reads, Local by about twice Shared, as the Local-only
+  recheck and return-place changes predict. The workloads that compute
+  fall about 9 to 12 per node Local and 4 to 5 Shared.
+  `get_contended_shared` (−160,123, −2.06%) is outside the T12
+  pools section's spread for it (7,791,676 to 7,791,893): its
+  iterations are Shared Clean gets.
+- **Table hit liveness:** `table_hit_*` and `table_miss_*` fall 2 to
+  9 through `is_alive`'s raw byte compare and the Clean read of the
+  hit. The `GridTable` changes are on no workload.
+- **Run spread:** `delete_owned_tree_local` falls 4,389 (601,504 to
+  597,115): the base sits inside the pools section's range for it
+  (600,363 to 604,337) and the tip below it, so the drop is about the
+  size of that spread and is not attributed. The
+  `collection_insert_then_read/batch/*` rows move by under 10.
+- Not traced: no workload rises, so the drops are attributed by
+  mechanism, not by `pt-lines.sh`.
+
+Gate: no workload rises; `get_clean_local` 102 to 94 and
+`get_clean_shared` 196 to 192.
