@@ -730,6 +730,42 @@ pub fn engine_unwind_in_progress() -> bool {
     unwind_kind().is_some() || wounded()
 }
 
+/// A cycle unwind a binding carries through user code in another
+/// language, set aside while that code makes an engine call, such as a
+/// read in a Python `finally` the unwind runs.
+#[doc(hidden)]
+#[must_use]
+pub struct CycleUnwindAside(());
+
+/// For a binding whose user code runs while it carries a cycle unwind:
+/// clears the unwind kind so an engine call that code makes computes,
+/// fails and finds its own cycles as if no unwind were in flight. Without
+/// this, an engine catch inside the call takes the carried cycle as the
+/// call's own. `None` unless a cycle unwind is in flight; a wound or a
+/// discard is never set aside, since the run it belongs to is given up.
+#[doc(hidden)]
+pub fn set_aside_cycle_unwind() -> Option<CycleUnwindAside> {
+    if wounded() || unwind_kind() != Some(UnwindKind::Cycle) {
+        return None;
+    }
+    set_unwind_kind(None);
+    Some(CycleUnwindAside(()))
+}
+
+impl CycleUnwindAside {
+    /// Ends the engine call: `true` if the carried cycle unwind is in
+    /// flight again, `false` if the call ended in an engine unwind of its
+    /// own, which replaces it as the exception it raises replaces the
+    /// carried one.
+    pub fn put_back(self) -> bool {
+        if engine_unwind_in_progress() {
+            return false;
+        }
+        set_unwind_kind(Some(UnwindKind::Cycle));
+        true
+    }
+}
+
 /// Clears the last reported cycle and returns it.
 pub fn take_last_cycle() -> Option<Cycle> {
     OUTER.with(|o| o.borrow_mut().last_cycle.take())
@@ -892,5 +928,31 @@ mod binding_tests {
         assert!(engine_unwind_in_progress());
         set_wounded(false);
         assert!(!engine_unwind_in_progress());
+    }
+
+    #[test]
+    fn only_a_cycle_unwind_is_set_aside() {
+        assert!(set_aside_cycle_unwind().is_none());
+        for kind in [UnwindKind::Wound, UnwindKind::Discard] {
+            set_unwind_kind(Some(kind));
+            assert!(set_aside_cycle_unwind().is_none());
+            assert_eq!(unwind_kind(), Some(kind));
+            set_unwind_kind(None);
+        }
+        set_unwind_kind(Some(UnwindKind::Cycle));
+        set_wounded(true);
+        assert!(set_aside_cycle_unwind().is_none());
+        set_wounded(false);
+
+        let aside = set_aside_cycle_unwind().expect("a cycle unwind is set aside");
+        assert!(!engine_unwind_in_progress());
+        assert!(aside.put_back());
+        assert_eq!(unwind_kind(), Some(UnwindKind::Cycle));
+
+        let aside = set_aside_cycle_unwind().expect("a cycle unwind is set aside");
+        set_unwind_kind(Some(UnwindKind::Discard));
+        assert!(!aside.put_back());
+        assert_eq!(unwind_kind(), Some(UnwindKind::Discard));
+        set_unwind_kind(None);
     }
 }

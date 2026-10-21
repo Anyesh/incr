@@ -294,6 +294,62 @@ def test_clean_read_in_finally_keeps_the_cycle_error(make_rt, cleanup_read, top_
 
 
 @BOTH_RUNTIMES
+@pytest.mark.parametrize("raises", [False, True], ids=["returns", "raises"])
+@pytest.mark.parametrize("cleanup_read", ["get", "try_get"])
+@pytest.mark.parametrize("top_read", ["get", "try_get"])
+def test_compute_in_finally_keeps_its_outcome_and_the_cycle(
+    make_rt, raises, cleanup_read, top_read
+):
+    rt = make_rt()
+    module = incr if make_rt is incr.Runtime else incr_concurrent
+    holder = {}
+    runs = []
+    seen = []
+
+    def body(r):
+        runs.append("b")
+        if raises:
+            raise ValueError("b failed")
+        return 7
+
+    b = rt.create_query(body)
+
+    def reads_itself(r):
+        try:
+            return r.get(holder["q"]) + 1
+        finally:
+            try:
+                seen.append(getattr(r, cleanup_read)(b))
+            except BaseException as e:
+                seen.append(e)
+                raise
+
+    q = rt.create_query(reads_itself)
+    holder["q"] = q
+    with pytest.raises(module.CycleError) as raised:
+        getattr(rt, top_read)(q)
+    assert raised.value.args[1] == [q.id]
+    assert runs == ["b"]
+    if raises:
+        assert len(seen) == 1
+        assert type(seen[0]) is ValueError
+        assert str(seen[0]) == "b failed"
+        # `b` landed Failed on its own error, outside the cycle.
+        for read in (rt.get, rt.try_get):
+            with pytest.raises(RuntimeError, match="last compute panicked") as failed:
+                read(b)
+            assert not isinstance(failed.value, module.CycleError)
+    else:
+        assert seen == [7]
+        assert rt.get(b) == 7
+        assert rt.try_get(b) == 7
+    assert runs == ["b"]
+    with pytest.raises(module.CycleError) as again:
+        rt.get(q)
+    assert again.value.args[1] == [q.id]
+
+
+@BOTH_RUNTIMES
 def test_python_exception_is_raised_as_itself_with_no_panic_message(make_rt, capfd):
     rt = make_rt()
     a = rt.create_input(0)

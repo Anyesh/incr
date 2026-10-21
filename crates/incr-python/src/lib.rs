@@ -188,6 +188,21 @@ impl Drop for Boundary {
 /// become RuntimeError with the engine's message. Inside a query, an
 /// engine unwind in flight on return becomes `_IncrEngineUnwind`.
 fn pyerr_boundary<R>(f: impl FnOnce() -> R) -> PyResult<R> {
+    // A call from Python code a carried cycle unwind runs, such as a
+    // `finally`: it computes and raises as itself, and the carried unwind
+    // goes on unless the call ended in an engine unwind of its own.
+    let Some(aside) = incr_compute::set_aside_cycle_unwind() else {
+        return catch_into_python(f);
+    };
+    let carried = ENGINE_UNWIND.with(|u| u.borrow_mut().take());
+    let result = catch_into_python(f);
+    if aside.put_back() {
+        ENGINE_UNWIND.with(|u| *u.borrow_mut() = carried);
+    }
+    result
+}
+
+fn catch_into_python<R>(f: impl FnOnce() -> R) -> PyResult<R> {
     incr_compute::take_last_cycle();
     let _boundary = Boundary::enter();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
