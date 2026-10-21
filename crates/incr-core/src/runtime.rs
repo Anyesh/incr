@@ -326,18 +326,20 @@ impl<C: Cells> SetClaim<'_, C> {
     /// releases the claim a second time. The release precedes the walk
     /// so that a delete or set waiting on the claim is not held up by it.
     #[inline(always)]
-    fn finish_written(mut self) {
+    fn finish_written(mut self) -> u64 {
         self.held = false;
         let rev = self.rt.bump_revision();
         let walk_done = WalkDone { rt: self.rt, rev };
         self.rt.park(ParkPoint::SetAfterBump);
-        self.node.settle_changed_at(NodeData::<C>::input_stamp(rev));
+        let stamp = NodeData::<C>::input_stamp(rev);
+        self.node.settle_changed_at(stamp);
         self.node.release_set_claim(self.base, rev);
         set_stack::pop(self.rt.runtime_id, self.id.0);
         self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         std::mem::forget(self);
+        stamp
     }
 }
 
@@ -1228,12 +1230,13 @@ impl<C: Cells> Runtime<C> {
         panic!("incr-core: pending handle used outside the replay attempt that produced it");
     }
 
-    /// Whether this thread is inside a compute of this runtime, or under
-    /// `Shared` of any `Shared` runtime, since that frame stack is per
-    /// thread.
+    /// Whether this thread is inside a compute of any runtime. Every
+    /// runtime on a thread shares its frame stack, and a compute of
+    /// another runtime holds that runtime's claim as surely as one of this
+    /// runtime's does.
     #[doc(hidden)]
     pub fn frame_active(&self) -> bool {
-        self.dep_stack.current_frame_active(self.runtime_id)
+        self.dep_stack.any_compute_frame()
     }
 
     /// Whether this runtime's active frame on this thread is doomed.
@@ -2323,7 +2326,7 @@ impl<C: Cells> Runtime<C> {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
-        let displaced = self.write_claimed(claim, arena, arena_slot, value, drop);
+        let (displaced, _) = self.write_claimed(claim, arena, arena_slot, value, drop);
         // The old value's user `Drop`, or the reclaim its retire may run,
         // happens with no claim held and none of the locks this set took.
         drop(displaced);
@@ -2351,21 +2354,24 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// [`Self::set`] that hands back what it would drop: the displaced
-    /// value if it wrote, or the rejected equal value if it did not.
+    /// value if it wrote, or the rejected equal value if it did not, with
+    /// the input's `changed_at` as this call left it.
     pub(crate) fn set_returning_displaced<T: Value>(
         &self,
         handle: Incr<T>,
         value: T,
-    ) -> Compared<T, Displaced<T, C>> {
+    ) -> (Compared<T, Displaced<T, C>>, u64) {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
         let mut rejected = None;
-        let displaced = self.write_claimed(claim, arena, arena_slot, value, |r| rejected = Some(r));
-        match rejected {
+        let (displaced, stamp) =
+            self.write_claimed(claim, arena, arena_slot, value, |r| rejected = Some(r));
+        let compared = match rejected {
             Some(rejected) => Compared::Equal(rejected),
             None => Compared::Replaced(displaced),
-        }
+        };
+        (compared, stamp)
     }
 
     /// Take `set`'s claim on `handle`'s input, with the arena and slot
@@ -2439,8 +2445,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// `set` from its claim to its walk. Returns what the write
-    /// displaced, if it wrote; an equal value is handed to `rejected`
-    /// once its earlier change has walked.
+    /// displaced, if it wrote, and the input's `changed_at` read under the
+    /// claim: the stamp this write settled, or the one an equal value
+    /// already carried. An equal value is handed to `rejected` once its
+    /// earlier change has walked.
     fn write_claimed<T: Value>(
         &self,
         claim: SetClaim<'_, C>,
@@ -2448,7 +2456,7 @@ impl<C: Cells> Runtime<C> {
         arena_slot: u32,
         value: T,
         rejected: impl FnOnce(T),
-    ) -> Option<Displaced<T, C>> {
+    ) -> (Option<Displaced<T, C>>, u64) {
         let node = claim.node;
         // Publication order is the protocol's backbone:
         // 1. pending marker, so no verifier can stamp past this change
@@ -2474,11 +2482,11 @@ impl<C: Cells> Runtime<C> {
                 // `walked` is even, so reaching the stamp reaches the set.
                 self.wait_walked(changed_at);
                 rejected(equal);
-                None
+                (None, changed_at)
             }
             Compared::Replaced(displaced) => {
-                claim.finish_written();
-                displaced
+                let stamp = claim.finish_written();
+                (displaced, stamp)
             }
         }
     }
@@ -2504,6 +2512,9 @@ impl<C: Cells> Runtime<C> {
             self.waits_on_own_claim(id);
         }
         self.refuse_wait_on_computing(id);
+        if spins == 1 {
+            crate::lock_order::assert_may_wait_on_claim();
+        }
         if !C::SINGLE_THREADED && spins >= waits::REGISTER_AFTER {
             let node = self.nodes.get(id.0);
             self.wait_registered(id, || !is_computing(state::load::<C>(node.state_cell())));

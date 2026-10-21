@@ -369,3 +369,39 @@ fn delete_of_an_owner_waits_for_a_set_of_an_owned_input() {
     assert!(versions.iter().all(|&v| !rt.is_alive(v)));
     rt.assert_invariant_i();
 }
+
+/// A mapped write records the stamp its own write settled (T10 mapped
+/// stamp). A second `set` of the input can claim and settle as soon as the
+/// first releases its claim, before the first returns, so a stamp loaded
+/// after the return would be the second write's.
+#[test]
+fn set_returning_displaced_returns_the_stamp_it_settled() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(0_u64);
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::SetAfterWalk, gate.clone())]);
+    let mapped = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set_returning_displaced(x, 1).1)
+    };
+    gate.wait_parked();
+    let settled = rt.changed_at(x);
+    rt.set(x, 2);
+    let bypass = rt.changed_at(x);
+    assert_ne!(bypass, settled);
+    gate.release();
+    let stamp = mapped.join().unwrap();
+    assert_eq!(stamp, settled, "the stamp is the mapped write's own");
+    assert_ne!(stamp, rt.changed_at(x), "a later set changes changed_at");
+}
+
+#[test]
+fn set_returning_displaced_returns_the_current_stamp_on_an_equal_value() {
+    let rt = Rt::new();
+    let x = rt.create_input(4_u64);
+    rt.set(x, 5);
+    let before = rt.changed_at(x);
+    let (compared, stamp) = rt.set_returning_displaced(x, 5);
+    assert!(matches!(compared, crate::value_slot::Compared::Equal(5)));
+    assert_eq!(stamp, before);
+}
