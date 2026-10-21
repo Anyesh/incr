@@ -27,6 +27,8 @@
 use incr_core::Shared;
 
 #[doc(hidden)]
+pub use incr_core::persist_hooks;
+#[doc(hidden)]
 pub use incr_core::{check_value_code, engine_unwind, take_last_cycle, with_value_code};
 pub use incr_core::{
     Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
@@ -69,6 +71,7 @@ mod reexports {
         };
 
         fn named<T: ?Sized>() {}
+        named::<crate::persist_hooks::SeedBase>();
         fn value<T: Value>() {}
         let _ = (engine_unwind, take_last_cycle);
         named::<Cycle>();

@@ -86,8 +86,10 @@ impl<C: Cells> NodeDrops<'_, C> {
 }
 
 /// What a compute defers: the displaced dep list's retire token, and
-/// spilled items.
-pub(crate) struct Deferred<C: Cells> {
+/// spilled items. incr-persist's restore keeps one for the values its
+/// failed seeds hand back.
+#[doc(hidden)]
+pub struct Deferred<C: Cells> {
     /// The retire token of a displaced overflow dep list. Lock-free
     /// walkers may still be reading the list under a hazard pointer, so
     /// draining retires it; a plain drop of the list would free memory a
@@ -115,11 +117,17 @@ fn count_spill_alloc() {}
 
 impl<C: Cells> Deferred<C> {
     #[inline(always)]
-    pub(crate) fn new() -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         Self {
             dep_list: None,
             spill: None,
         }
+    }
+
+    /// Keeps `value` to drop at the drain.
+    pub fn push<T: 'static>(&mut self, value: T) {
+        self.push_erased(Box::new(value));
     }
 
     pub(crate) fn push_dep_list(&mut self, token: RetiredDeps<C>) {
@@ -163,7 +171,7 @@ impl<C: Cells> Deferred<C> {
 
     /// Normal mode: see the module docs.
     #[inline(always)]
-    pub(crate) fn drain(self, rt: &Runtime<C>) {
+    pub fn drain(self, rt: &Runtime<C>) {
         if self.is_empty() {
             mem::forget(self);
         } else {

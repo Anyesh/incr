@@ -583,6 +583,49 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         })
     }
 
+    /// [`Self::get_or_insert_query_with`] that hands a node the miss
+    /// creates to `seed` under the miss mutex, before the node is in the
+    /// table, so no reader has claimed it. A value `seed` returns drops
+    /// after the mutex.
+    pub(crate) fn get_or_insert_query_seeded<F>(
+        &self,
+        rt: &Runtime<C>,
+        key: K,
+        f: F,
+        opts: QueryOpts<T>,
+        seed: impl FnOnce(&Runtime<C>, Incr<T>) -> Option<T>,
+    ) -> Incr<T>
+    where
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
+        self.check_runtime(rt);
+        let hash = self.hash(&key);
+        if let Some(handle) = self.find(rt, hash, &key) {
+            return handle;
+        }
+        if rt.frame_doomed() {
+            return rt.pending_handle();
+        }
+        let opts = cycle::erase_opts(opts);
+        let mut unseeded = None;
+        let handle = self.miss(rt, hash, key, (f, opts), |rt, (f, opts)| {
+            let q = rt.create_query_erased::<false, _, _>(f, opts);
+            unseeded = seed(rt, q);
+            q
+        });
+        let mut bag = Deferred::<C>::new();
+        if let Some(value) = unseeded {
+            bag.push(value);
+        }
+        bag.drain(rt);
+        handle
+    }
+
+    pub(crate) fn probe_unchecked(&self, rt: &Runtime<C>, key: &K) -> Option<Incr<T>> {
+        self.check_runtime(rt);
+        self.find(rt, self.hash(key), key)
+    }
+
     /// The node for `key`, if the table holds a live one. Not a
     /// dependency, and so not allowed inside a compute of this runtime.
     pub fn get(&self, rt: &Runtime<C>, key: &K) -> Option<Incr<T>> {
