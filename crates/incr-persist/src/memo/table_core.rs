@@ -25,6 +25,9 @@ pub(crate) enum Seeded {
     Live,
     /// The value failed to decode, so the node was created cold.
     Corrupt,
+    /// `seed_query` refused the node (a dep deleted since the restore
+    /// mapped it), so the node was created cold.
+    Failed,
 }
 
 /// One live entry a checkpoint's snapshot found, typed values hidden.
@@ -195,7 +198,10 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
                         seeded = Seeded::As(reuse);
                         None
                     }
-                    Err((_, failed)) => Some(failed),
+                    Err((_, failed)) => {
+                        seeded = Seeded::Failed;
+                        Some(failed)
+                    }
                 }
             },
             bag,
