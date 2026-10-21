@@ -77,7 +77,7 @@ impl Default for SqliteMemoOptions {
 /// database, named after it with `-checkpoint` appended; the OS releases it
 /// when its holder's process dies. Like the `-wal` and `-shm` files, it
 /// belongs to the database and is never removed. Taking it also removes
-/// the generations above the current one.
+/// every generation but the current one.
 #[derive(Debug)]
 pub struct SqliteMemo {
     reader: Mutex<Connection>,
@@ -301,10 +301,11 @@ impl MemoBackend for SqliteMemo {
 }
 
 impl SqliteMemo {
-    /// Removes the generations above the current one, which only a
-    /// `memo_current` pointed back at an older generation leaves, since a
-    /// write commits its rows and the pointer together. They would make
-    /// every later write's id not newer than the newest row.
+    /// Removes every generation but the current one. Those below it are
+    /// left by a removal that failed or never ran. Those above it only by a
+    /// `memo_current` pointed back at an older generation, since a write
+    /// commits its rows and the pointer together, and they would make every
+    /// later write's id not newer than the newest row.
     fn remove_leftovers(&self) -> Result<()> {
         let mut conn = lock(&self.writer);
         if leftovers(&conn)?.is_empty() {
@@ -332,7 +333,7 @@ fn leftovers(conn: &Connection) -> Result<Vec<GenId>> {
     let mut ids = Vec::new();
     while let Some(row) = rows.next().map_err(sql)? {
         let id = GenId(from_sql(row.get(0).map_err(sql)?));
-        if id > current {
+        if id != current {
             ids.push(id);
         }
     }

@@ -48,6 +48,10 @@ pub trait MemoBackend: Send + Sync {
     /// [`write_generation`](Self::write_generation) is atomic against
     /// concurrent writers on its own may return a guard that excludes
     /// nothing; its base check then makes the losing writer `Busy`.
+    ///
+    /// Once taken, it removes every generation but the current one: what
+    /// an interrupted write left, and old generations whose removal failed
+    /// or never ran. Handles whose index names one of them then miss.
     fn lock_checkpoint(&self) -> Result<Self::Guard>;
 
     /// Loads the current generation's header and index, without entry
