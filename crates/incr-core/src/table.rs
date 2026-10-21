@@ -23,7 +23,7 @@ use std::cell::{RefCell, UnsafeCell};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use haphazard::{AtomicPtr as HzAtomicPtr, Global, Replaced};
@@ -587,7 +587,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     /// creates to `seed` under the miss mutex, before the node is in the
     /// table, so no reader has claimed it. A value `seed` returns drops
     /// after the mutex. If `seed` panics, the node is deleted after the
-    /// mutex and the panic resumes.
+    /// mutex and the panic resumes; a panic after the insert leaves it.
     pub(crate) fn get_or_insert_query_seeded<F>(
         &self,
         rt: &Runtime<C>,
@@ -609,34 +609,40 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         }
         let opts = cycle::erase_opts(opts);
         let mut created = None;
+        // Once `seed` returns nothing before the insert can unwind, so an
+        // unwind after that (a displaced key's drop at the miss's drain)
+        // must leave the published node alone.
+        let mut seeded = false;
         let mut unseeded = None;
         let missed = catch_unwind(AssertUnwindSafe(|| {
             self.miss(rt, hash, key, (f, opts), |rt, (f, opts)| {
                 let q = rt.create_query_erased::<false, _, _>(f, opts);
                 created = Some(q);
                 unseeded = seed(rt, q);
+                seeded = true;
                 q
             })
         }));
-        let handle = match missed {
-            Ok(handle) => handle,
+        let mut bag = Deferred::<C>::new();
+        if let Some(value) = unseeded {
+            bag.push(value);
+        }
+        match missed {
+            Ok(handle) => {
+                bag.drain(rt);
+                handle
+            }
             Err(unwind) => {
-                if let Some(q) = created {
+                if let (Some(q), false) = (created, seeded) {
                     isolate(|| match rt.try_delete_node(q) {
                         // q never reached the table, so only the hook could
                         // have deleted it or computed a node against it.
                         Ok(()) | Err(DeleteError::NotAlive | DeleteError::HasDependents) => {}
                     });
                 }
-                resume_unwind(unwind)
+                bag.drain_carried(unwind)
             }
-        };
-        let mut bag = Deferred::<C>::new();
-        if let Some(value) = unseeded {
-            bag.push(value);
         }
-        bag.drain(rt);
-        handle
     }
 
     pub(crate) fn probe_unchecked(&self, rt: &Runtime<C>, key: &K) -> Option<Incr<T>> {
