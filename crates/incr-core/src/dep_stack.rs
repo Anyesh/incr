@@ -19,6 +19,7 @@
 //! and their positions on the thread.
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 
 use crate::cycle::{ComputeCtl, DOOMED, NO_DOOM, POISONED};
 use crate::handle::RuntimeId;
@@ -131,6 +132,14 @@ impl Frames {
     }
 
     #[inline(always)]
+    fn push(&mut self, frame: Frame) {
+        if self.frames.capacity() == 0 {
+            first_push();
+        }
+        self.frames.push(frame);
+    }
+
+    #[inline(always)]
     fn frame(node: NodeId, rt: RuntimeId, ctl: &ComputeCtl, cidx: u32) -> Frame {
         Frame {
             node,
@@ -159,7 +168,7 @@ pub trait DepStack: 'static {
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
         self.with(|s| {
             let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
-            s.frames.push(Frames::frame(node, rt, ctl, cidx));
+            s.push(Frames::frame(node, rt, ctl, cidx));
             cidx
         })
     }
@@ -168,7 +177,7 @@ pub trait DepStack: 'static {
     /// member runs all sit at the root's.
     #[doc(hidden)]
     fn push_frame_at(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl, cidx: u32) {
-        self.with(|s| s.frames.push(Frames::frame(node, rt, ctl, cidx)))
+        self.with(|s| s.push(Frames::frame(node, rt, ctl, cidx)))
     }
 
     /// Pop the top frame and return the deps it recorded, each with the
@@ -356,7 +365,34 @@ pub trait DepStack: 'static {
     }
 }
 
-pub type LocalDepStack = SharedDepStack;
+/// A Local runtime's view of its thread's stack, whose address it takes
+/// once, at creation. The pointer keeps it `!Send`, as `Runtime<Local>`
+/// is:
+///
+/// ```compile_fail,E0277
+/// fn send<T: Send>() {}
+/// send::<incr_core::runtime::Runtime<incr_core::cells::Local>>();
+/// ```
+pub struct LocalDepStack {
+    frames: *const RefCell<Frames>,
+}
+
+impl DepStack for LocalDepStack {
+    fn new() -> Self {
+        Self {
+            frames: SHARED_FRAMES.with(|f| std::ptr::from_ref(&**f)),
+        }
+    }
+
+    #[inline(always)]
+    fn with<R>(&self, f: impl FnOnce(&mut Frames) -> R) -> R {
+        // SAFETY: the pointer was taken on this thread, the only one a
+        // Local runtime runs on, and `SHARED_FRAMES` has no destructor,
+        // so its storage lasts as long as the thread. The reference does
+        // not outlive this call.
+        f(&mut unsafe { &*self.frames }.borrow_mut())
+    }
+}
 
 pub struct SharedDepStack;
 
@@ -375,7 +411,34 @@ pub fn active_frame_doomed() -> bool {
 }
 
 thread_local! {
-    static SHARED_FRAMES: RefCell<Frames> = const { RefCell::new(Frames::new()) };
+    /// Without a destructor, so an access needs no check of the
+    /// thread-local's state; `FRAMES_GUARD` frees the buffer instead.
+    static SHARED_FRAMES: ManuallyDrop<RefCell<Frames>> =
+        const { ManuallyDrop::new(RefCell::new(Frames::new())) };
+    static FRAMES_GUARD: FramesGuard = const { FramesGuard };
+}
+
+/// Frees this thread's frame buffer as the thread exits, and leaves an
+/// empty stack in `SHARED_FRAMES` for any later access.
+struct FramesGuard;
+
+impl Drop for FramesGuard {
+    fn drop(&mut self) {
+        SHARED_FRAMES.with(|f| {
+            if let Ok(mut frames) = f.try_borrow_mut() {
+                drop(std::mem::replace(&mut *frames, Frames::new()));
+            }
+        });
+    }
+}
+
+/// Registers `FRAMES_GUARD`'s destructor, on the push that allocates the
+/// thread's buffer. During thread-local destruction the registration is
+/// refused, and that late buffer is leaked.
+#[cold]
+#[inline(never)]
+fn first_push() {
+    let _ = FRAMES_GUARD.try_with(|_| {});
 }
 
 impl DepStack for SharedDepStack {
@@ -388,7 +451,7 @@ impl DepStack for SharedDepStack {
         // Only the address is taken inside `LocalKey::with`, so that call
         // stays small enough to inline at every site; with `f` inside it,
         // the compiler leaves it out of line on the `get` path.
-        let frames: *const RefCell<Frames> = SHARED_FRAMES.with(std::ptr::from_ref);
+        let frames: *const RefCell<Frames> = SHARED_FRAMES.with(|f| std::ptr::from_ref(&**f));
         // SAFETY: a thread's locals are destroyed only as the thread
         // exits, never during a call on that thread, and the reference
         // does not outlive this call.
