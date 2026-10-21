@@ -6,10 +6,13 @@
 //! Children talk to the parent through lines on stdout prefixed with
 //! [`PREFIX`], and `b` hands back a [`Report`] file.
 
+#![cfg(unix)]
+
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
@@ -36,6 +39,7 @@ const ROLE: &str = "INCR_MEMO_RESTART_ROLE";
 const DIR: &str = "INCR_MEMO_RESTART_DIR";
 const PREFIX: &str = "incr-memo-restart: ";
 const READY: &str = "ready";
+const SIGKILL: i32 = 9;
 
 /// Not a hang bound: a child that outlives it has hung or crawled, and the
 /// test fails instead of blocking the suite.
@@ -564,6 +568,14 @@ fn play_child<C: Flavor>() -> bool {
     );
     match role.as_str() {
         "a" => {
+            // Killed with SIGKILL, so the parent learns of a panic only
+            // through this message and the abort's signal.
+            let default = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                default(info);
+                say(&format!("panicked: {info}"));
+                std::process::abort();
+            }));
             let reads: Vec<u64> = spec
                 .a
                 .iter()
@@ -650,7 +662,18 @@ impl Peer {
         }
         thread::sleep(delay);
         self.child.kill().unwrap();
-        self.child.wait().unwrap();
+        let status = self.child.wait().unwrap();
+        if status.signal() != Some(SIGKILL) {
+            self.fail(&format!("was not killed but exited with {status}"));
+        }
+        loop {
+            match self.messages.recv_timeout(CHILD_TIMEOUT) {
+                Ok(message) if message == READY => {}
+                Ok(other) => self.fail(&format!("sent {other:?}")),
+                Err(RecvTimeoutError::Timeout) => self.fail("held stdout open after it was killed"),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
     }
 
     fn finish(mut self) {

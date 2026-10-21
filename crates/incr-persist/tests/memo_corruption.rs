@@ -538,7 +538,7 @@ fn a_key_that_decodes_to_another_runs_cold<C: MemoCells>() {
 /// form cycles: a self-loop at `chain(1)`, `chain(2)` and `chain(3)` reading
 /// each other, and `chain(4)` over `chain(5)` and `chain(6)`, which read
 /// each other. Every stored value is a bogus 999 whose fingerprint the
-/// deps record. Each root restores in a fresh process; the walk must end,
+/// deps record. Each root restores in a fresh runtime; the walk must end,
 /// and the values must be the closure's.
 fn crafted_cyclic_entries_restore_cold<C: MemoCells>() {
     let log = MemoryBackend::new();

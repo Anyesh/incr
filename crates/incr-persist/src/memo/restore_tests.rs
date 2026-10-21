@@ -300,8 +300,9 @@ fn stored(memo: &MemoryMemo) -> Vec<Entry> {
 
 // A mapped write would wait on the snapshot's `DepIndex` hold, so the dep
 // change mid-`inspect` comes from a write around the store. That write also
-// unmaps x, so {x, a} is stored only if both `inspect`'s second read and
-// the stamp check in `mapping.rs` fail.
+// unmaps x, which the stamp check in `mapping.rs` catches whatever `inspect`
+// returns, so this guards what a checkpoint writes; `inspect`'s own recheck
+// is covered by incr-core's seed tests.
 #[test]
 fn a_checkpoint_never_stores_deps_a_cutoff_moved_mid_inspect() {
     let backends = Backends::new();
