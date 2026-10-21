@@ -285,3 +285,67 @@ fn eviction_through_the_driver_keeps_the_newest_within_budget() {
     assert_eq!(done.stats.evicted, 1);
     assert_eq!(ids(&stored(&memo)), [(0, 2, 20, 2)]);
 }
+
+#[test]
+fn an_entry_too_large_for_a_frame_is_dropped_with_its_dependents() {
+    let memo = MemoryMemo::new();
+    let tables = vec![desc("a", 1)];
+    let base = vec![entry(0, 2, 2, vec![]), entry(0, 4, 40, vec![on(0, 2)])];
+    write_checkpoint(&memo, input(tables.clone(), base)).unwrap();
+    let fresh = vec![
+        entry(0, 1, 10, vec![]),
+        entry(0, 2, 20, vec![]),
+        entry(0, 3, 30, vec![on(0, 2)]),
+    ];
+    let too_large = |e: &Entry| {
+        if e.key == [2] {
+            Err(Error::FrameTooLarge {
+                len: u64::from(u32::MAX) + 1,
+            })
+        } else {
+            EncodedEntry::new(e)
+        }
+    };
+    let done = write_with(&memo, input(tables, fresh), too_large).unwrap();
+    assert_eq!(done.stats.merged, 1);
+    assert_eq!(done.stats.oversized, 3);
+    assert_eq!(done.stats.evicted, 0);
+    assert_eq!(done.stats.written, 1);
+    assert_eq!(ids(&stored(&memo)), [(0, 1, 10, 2)]);
+}
+
+#[test]
+fn a_base_whose_seq_cannot_advance_is_replaced_without_merging() {
+    let memo = MemoryMemo::new();
+    let tables = vec![desc("a", 1)];
+    let header = GenHeader {
+        build: BUILD,
+        seq: u64::MAX,
+        tables: tables.clone(),
+    };
+    let old = EncodedEntry::new(&entry(0, 1, 10, vec![])).unwrap();
+    memo.write_generation(None, GenId(1), &header, &[old])
+        .unwrap();
+    let done = write_checkpoint(&memo, input(tables, vec![entry(0, 2, 20, vec![])])).unwrap();
+    assert_eq!(done.generation.id(), GenId(2));
+    assert_eq!(done.generation.header().seq, 1);
+    assert_eq!(done.stats.merged, 0);
+    assert_eq!(ids(&stored(&memo)), [(0, 2, 20, 1)]);
+}
+
+#[test]
+fn a_base_with_the_largest_id_fails_the_checkpoint_and_writes_nothing() {
+    let memo = MemoryMemo::new();
+    let tables = vec![desc("a", 1)];
+    let header = GenHeader {
+        build: BUILD,
+        seq: 1,
+        tables: tables.clone(),
+    };
+    memo.write_generation(None, GenId(u64::MAX), &header, &[])
+        .unwrap();
+    let result = write_checkpoint(&memo, input(tables, vec![entry(0, 1, 10, vec![])]));
+    assert!(matches!(result, Err(Error::Corrupt(_))));
+    let current = memo.load().unwrap().unwrap();
+    assert_eq!((current.id(), current.items().len()), (GenId(u64::MAX), 0));
+}

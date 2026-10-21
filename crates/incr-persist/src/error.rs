@@ -110,4 +110,10 @@ pub enum Error {
     /// which has no thread to run it on.
     #[error("automatic memo checkpoints need a Shared runtime")]
     AutoCheckpointNeedsShared,
+
+    /// A memo entry, header or index encodes to a frame whose length does
+    /// not fit the `u32` a frame records. A checkpoint drops such an entry,
+    /// with every entry that reads it, instead of failing.
+    #[error("a memo frame of {len} bytes exceeds the 4 GiB frame limit")]
+    FrameTooLarge { len: u64 },
 }
