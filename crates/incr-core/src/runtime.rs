@@ -1317,7 +1317,8 @@ impl<C: Cells> Runtime<C> {
     /// For a binding that runs user code in another language: whether
     /// this runtime's active frame on this thread is doomed, so an error
     /// its code raises belongs to a run the engine discards. Unlike
-    /// [`crate::active_frame_doomed`], it sees `Local` frames too.
+    /// [`crate::active_frame_doomed`], which asks the thread's innermost
+    /// frame of any runtime, it asks only this runtime's active frame.
     #[doc(hidden)]
     pub fn active_frame_doomed(&self) -> bool {
         self.frame_doomed()
