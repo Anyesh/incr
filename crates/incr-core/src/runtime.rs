@@ -36,6 +36,7 @@ use crate::dep_stack::{ActiveRead, DepStack};
 use crate::dependent_list::DependentList;
 use crate::fx::FxBuildHasher;
 use crate::generic_arena::GenericArena;
+use crate::grid_table::GridTable;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
 use crate::lock_order::LockKind;
 use crate::locks::OrderedLock;
@@ -62,6 +63,92 @@ use crate::waits;
 /// with the value: `Unchanged` is the early cutoff.
 pub(crate) type ComputeFn<C> =
     Box<dyn Fn(&Runtime<C>, u32, &ComputeCtl) -> Outcome + Send + Sync + 'static>;
+
+/// Pushes an input node holding `$value` into its slot under the caller's
+/// `$inner` write hold, and evaluates to its `(slot, generation)`. A macro,
+/// not a function, so that `create_input` compiles to what it did before
+/// batches shared this code.
+macro_rules! push_input {
+    ($rt:ident, $inner:ident, $type_tag:ident, $arena:ident, $value:ident, $revision:ident) => {{
+        let arena_slot = $arena.reserve_with($value);
+        let slot = if let Some(slot) = $inner.free_nodes.pop() {
+            $rt.nodes
+                .get(slot)
+                .reinit_recycled($type_tag, arena_slot, $revision, true);
+            slot
+        } else {
+            let node = NodeData::<C>::new_input($type_tag, arena_slot, $revision);
+            let slot = $rt.nodes.push(node);
+            $inner.compute_fns.push(None);
+            $inner.dependents.push(DependentList::new());
+            slot
+        };
+        (slot, $rt.nodes.get(slot).generation())
+    }};
+}
+
+/// [`push_input!`] for a query computed by `$f` with `$opts`.
+macro_rules! push_query {
+    ($rt:ident, $inner:ident, $type_tag:ident, $arena:ident, $f:ident, $opts:ident) => {{
+        let arena_slot = $arena.reserve();
+        let slot = if let Some(slot) = $inner.free_nodes.pop() {
+            $rt.nodes
+                .get(slot)
+                .reinit_recycled($type_tag, arena_slot, 0, false);
+            slot
+        } else {
+            let node = NodeData::<C>::new_query($type_tag, arena_slot);
+            let slot = $rt.nodes.push(node);
+            $inner.compute_fns.push(None);
+            $inner.dependents.push(DependentList::new());
+            slot
+        };
+
+        // A first compute writes unconditionally; a recompute
+        // compares and publishes in one slot session, and an equal
+        // value is the early cutoff. A frame that read an open cycle,
+        // or an episode's member run, keeps the value in its control
+        // block instead.
+        let arena_inner = $arena;
+        let compute: ComputeFn<C> = Box::new(
+            move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
+                let new_value = $f(rt);
+                let node = rt.nodes.get(slot);
+                let outcome = match ctl.flags.get()
+                    & (cycle::RECOMPUTE | cycle::BUFFERED | cycle::LOW | cycle::DOOMED)
+                {
+                    0 => {
+                        ctl.wrote.set(1);
+                        drop(arena_inner.write(node.arena_slot(), new_value));
+                        Outcome::Changed
+                    }
+                    cycle::RECOMPUTE => {
+                        if arena_inner.write_if_changed(node.arena_slot(), new_value, &ctl.wrote) {
+                            Outcome::Changed
+                        } else {
+                            Outcome::Unchanged
+                        }
+                    }
+                    _ => return ctl.buffer(new_value),
+                };
+                reclaim_probe::reached(RetireSite::ComputeWrite);
+                outcome
+            },
+        );
+
+        $inner.compute_fns[slot as usize] = Some(compute);
+        if let Some(strategy) = $opts.strategy {
+            $inner.cycle_strategies.insert(slot, strategy);
+            let flags = $rt.nodes.get_with_flags(slot).1;
+            C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | HAS_STRATEGY);
+        }
+        if $opts.flags != 0 {
+            let flags = $rt.nodes.get_with_flags(slot).1;
+            C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | $opts.flags);
+        }
+        (slot, $rt.nodes.get(slot).generation())
+    }};
+}
 
 /// Per-runtime mutable state guarded by the inner lock. Holds everything
 /// that's not on the per-node `NodeData` and not in an arena.
@@ -1002,22 +1089,24 @@ impl<C: Cells> Runtime<C> {
         let (slot, generation) = {
             let mut inner = self.inner.write();
             let (type_tag, arena) = self.arenas.ensure_tagged::<T>(&mut inner.arena_tags);
-            let arena_slot = arena.reserve_with(value);
-            let slot = if let Some(slot) = inner.free_nodes.pop() {
-                self.nodes
-                    .get(slot)
-                    .reinit_recycled(type_tag, arena_slot, revision, true);
-                slot
-            } else {
-                let node = NodeData::<C>::new_input(type_tag, arena_slot, revision);
-                let slot = self.nodes.push(node);
-                inner.compute_fns.push(None);
-                inner.dependents.push(DependentList::new());
-                slot
-            };
-            (slot, self.nodes.get(slot).generation())
+            push_input!(self, inner, type_tag, arena, value, revision)
         };
         Incr::new(slot, generation, self.runtime_id)
+    }
+
+    /// An input node for each of `values`, in order, under one hold of
+    /// the inner lock. The caller checks that no compute is running.
+    pub(crate) fn create_inputs<T: Value>(&self, values: Vec<T>) -> Vec<Incr<T>> {
+        value_code::check();
+        let revision = self.current_revision();
+        let mut handles = Vec::with_capacity(values.len());
+        let mut inner = self.inner.write();
+        let (type_tag, arena) = self.arenas.ensure_tagged::<T>(&mut inner.arena_tags);
+        for value in values {
+            let (slot, generation) = push_input!(self, inner, type_tag, arena, value, revision);
+            handles.push(Incr::new(slot, generation, self.runtime_id));
+        }
+        handles
     }
 
     /// Create a compute (query) node. Dependencies are tracked
@@ -1109,69 +1198,30 @@ impl<C: Cells> Runtime<C> {
         let (slot, generation) = {
             let mut inner = self.inner.write();
             let (type_tag, arena) = self.arenas.ensure_tagged_shared::<T>(&mut inner.arena_tags);
-            let arena_slot = arena.reserve();
-            let slot = if let Some(slot) = inner.free_nodes.pop() {
-                self.nodes
-                    .get(slot)
-                    .reinit_recycled(type_tag, arena_slot, 0, false);
-                slot
-            } else {
-                let node = NodeData::<C>::new_query(type_tag, arena_slot);
-                let slot = self.nodes.push(node);
-                inner.compute_fns.push(None);
-                inner.dependents.push(DependentList::new());
-                slot
-            };
-
-            // A first compute writes unconditionally; a recompute
-            // compares and publishes in one slot session, and an equal
-            // value is the early cutoff. A frame that read an open cycle,
-            // or an episode's member run, keeps the value in its control
-            // block instead.
-            let arena_inner = arena;
-            let compute: ComputeFn<C> = Box::new(
-                move |rt: &Runtime<C>, slot: u32, ctl: &ComputeCtl| -> Outcome {
-                    let new_value = f(rt);
-                    let node = rt.nodes.get(slot);
-                    let outcome = match ctl.flags.get()
-                        & (cycle::RECOMPUTE | cycle::BUFFERED | cycle::LOW | cycle::DOOMED)
-                    {
-                        0 => {
-                            ctl.wrote.set(1);
-                            drop(arena_inner.write(node.arena_slot(), new_value));
-                            Outcome::Changed
-                        }
-                        cycle::RECOMPUTE => {
-                            if arena_inner.write_if_changed(
-                                node.arena_slot(),
-                                new_value,
-                                &ctl.wrote,
-                            ) {
-                                Outcome::Changed
-                            } else {
-                                Outcome::Unchanged
-                            }
-                        }
-                        _ => return ctl.buffer(new_value),
-                    };
-                    reclaim_probe::reached(RetireSite::ComputeWrite);
-                    outcome
-                },
-            );
-
-            inner.compute_fns[slot as usize] = Some(compute);
-            if let Some(strategy) = opts.strategy {
-                inner.cycle_strategies.insert(slot, strategy);
-                let flags = self.nodes.get_with_flags(slot).1;
-                C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | HAS_STRATEGY);
-            }
-            if opts.flags != 0 {
-                let flags = self.nodes.get_with_flags(slot).1;
-                C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | opts.flags);
-            }
-            (slot, self.nodes.get(slot).generation())
+            push_query!(self, inner, type_tag, arena, f, opts)
         };
         Incr::new(slot, generation, self.runtime_id)
+    }
+
+    /// A query node for each of `queries`, in order, each watched as
+    /// [`Self::watch`] does, under one hold of the inner lock. The caller
+    /// checks that no compute is running.
+    pub(crate) fn create_queries_watched<T, F>(&self, queries: Vec<(F, ErasedOpts)>) -> Vec<Incr<T>>
+    where
+        T: Value,
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
+        value_code::check();
+        let mut handles = Vec::with_capacity(queries.len());
+        let mut inner = self.inner.write();
+        let (type_tag, shared_arena) = self.arenas.ensure_tagged_shared::<T>(&mut inner.arena_tags);
+        for (f, opts) in queries {
+            let arena = Arc::clone(&shared_arena);
+            let (slot, generation) = push_query!(self, inner, type_tag, arena, f, opts);
+            self.watch_held(slot, generation);
+            handles.push(Incr::new(slot, generation, self.runtime_id));
+        }
+        handles
     }
 
     /// Reject handles minted by a different runtime and handles whose
@@ -1413,6 +1463,11 @@ impl<C: Cells> Runtime<C> {
     /// [`FxBuildHasher`].
     pub fn create_table<K: TableKey, T: Value>(&self) -> NodeTable<K, T, C> {
         NodeTable::new(self.runtime_id, FxBuildHasher)
+    }
+
+    /// A [`GridTable`] bound to this runtime.
+    pub fn create_grid_table<T: Value>(&self) -> GridTable<T, C> {
+        GridTable::new(self.runtime_id)
     }
 
     /// [`Self::create_table`] with another hasher, such as one resistant

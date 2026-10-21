@@ -31,6 +31,7 @@ mod dependent_list;
 mod directory;
 pub mod fx;
 pub mod generic_arena;
+pub mod grid_table;
 pub mod handle;
 mod hashed_multiset;
 pub mod lock_order;
@@ -72,6 +73,7 @@ pub use cycle_state::{engine_unwind, engine_unwind_in_progress, take_last_cycle}
 pub use dep_stack::{active_frame_doomed, DepStack, LocalDepStack, SharedDepStack};
 pub use fx::{FxBuildHasher, FxHasher};
 pub use generic_arena::GenericArena;
+pub use grid_table::{GridKey, GridTable};
 pub use handle::{ErasedIncr, Incr, RuntimeId};
 pub use locks::{LocalLock, Lock};
 pub use node::{NodeData, NodeId};
