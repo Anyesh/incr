@@ -631,7 +631,8 @@ impl<C: Cells> Runtime<C> {
             bag.push_erased(value);
         }
         let wrote = ctl.wrote.get() != 0;
-        self.discard_land(id, attempt.first, wrote, attempt.stamp_rev, bag);
+        let kind = Some(UnwindKind::Discard);
+        self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
         Computed::Discarded
     }
 
@@ -707,7 +708,8 @@ impl<C: Cells> Runtime<C> {
         let mut bag = Deferred::new();
         for &(slot, first) in taken {
             cycle_state::with_held(|h| h.remove(&(rt, slot)));
-            self.discard_land(NodeId(slot), first, false, stamp_rev, &mut bag);
+            let kind = Some(UnwindKind::Discard);
+            self.unwound_land(NodeId(slot), first, false, stamp_rev, kind, &mut bag);
         }
         bag.drain(self);
     }
@@ -1217,7 +1219,7 @@ impl<C: Cells> Runtime<C> {
     ) -> Computed {
         let mut keep = Vec::new();
         let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
-        self.release_held_except(attempt.cidx, true, &keep, bag);
+        self.release_held_except(attempt.cidx, &keep, bag);
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
@@ -1231,7 +1233,7 @@ impl<C: Cells> Runtime<C> {
             // children, which the entries above compute meanwhile; unbinding
             // them would make the retry create them New and doom again. A
             // frame of a dropped chain has no retry.
-            None => self.discard_land_with(
+            None => self.discard_land_in_group(
                 id,
                 attempt.first,
                 wrote,
@@ -2263,8 +2265,9 @@ impl<C: Cells> Runtime<C> {
         for ep in abandoned {
             bag.push_erased(Box::new(ep));
         }
-        self.release_held_from(boundary + q, true, None, bag);
-        self.release_claim_list(id, q, None, bag);
+        let kind = Some(UnwindKind::Discard);
+        self.release_held_from(boundary + q, true, kind, bag);
+        self.release_claim_list(id, q, kind, bag);
     }
 
     /// Closes context `id`, whose speculative chain reaches its level-0
