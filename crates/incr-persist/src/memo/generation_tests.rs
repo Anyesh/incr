@@ -1,3 +1,5 @@
+use proptest::prelude::*;
+
 use super::*;
 use crate::memo::{encode_entry, key_hash, EncodedEntry, Entry, GenHeader, IndexItem};
 
@@ -39,6 +41,37 @@ fn find_returns_every_item_with_the_table_and_hash() {
     assert!(generation.find(3, 9).is_empty());
     assert_eq!(generation.items().len(), 5);
     assert_eq!(generation.entry_bytes(), 50 + 10);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    // Hashes drawn from a few values that share their low and high bits
+    // pile items into the same runs and the same probe chains.
+    #[test]
+    fn find_matches_a_scan_of_every_item(
+        raw in prop::collection::vec((0_u32..3, 0_u64..6, any::<u64>()), 0..64),
+    ) {
+        let spread = |h: u64| h | (h << 32) | (h << 60);
+        let items: Vec<_> = raw
+            .iter()
+            .map(|&(table, hash, loc)| item(table, spread(hash), loc % 1000))
+            .collect();
+        let generation = Generation::new(GenId(1), header(), items.clone());
+        for table in 0..4 {
+            for hash in 0..7 {
+                let mut found = generation.find(table, spread(hash)).to_vec();
+                let mut want: Vec<_> = items
+                    .iter()
+                    .filter(|i| (i.table, i.key_hash) == (table, spread(hash)))
+                    .copied()
+                    .collect();
+                found.sort_by_key(|i| i.loc);
+                want.sort_by_key(|i| i.loc);
+                prop_assert_eq!(found, want);
+            }
+        }
+    }
 }
 
 #[test]
