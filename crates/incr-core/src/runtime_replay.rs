@@ -235,11 +235,12 @@ impl<C: Cells> Runtime<C> {
         {
             mode |= VIRT;
         }
+        let node = self.nodes.get(handle.slot());
         match mode {
-            0 => self.read_walk::<T, 0>(handle, observed, kind, word, frame),
-            ARMED => self.read_walk::<T, ARMED>(handle, observed, kind, word, frame),
-            VIRT => self.read_walk::<T, VIRT>(handle, observed, kind, word, frame),
-            _ => self.read_walk::<T, { ARMED | VIRT }>(handle, observed, kind, word, frame),
+            0 => self.read_walk::<T, 0>(handle, node, observed, kind, word, frame),
+            ARMED => self.read_walk::<T, ARMED>(handle, node, observed, kind, word, frame),
+            VIRT => self.read_walk::<T, VIRT>(handle, node, observed, kind, word, frame),
+            _ => self.read_walk::<T, { ARMED | VIRT }>(handle, node, observed, kind, word, frame),
         }
     }
 
