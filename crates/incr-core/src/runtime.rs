@@ -3865,70 +3865,8 @@ impl<C: Cells> Runtime<C> {
 // !Send + !Sync by auto-derive. We rely on auto traits here; no manual
 // impls needed.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl<C: Cells> Runtime<C> {
-    #[cfg(not(loom))]
-    /// Give `member` installed edges to `extra` on top of its own, with
-    /// the reverse edges, as an episode leaves a cycle's members.
-    pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
-        let mut inner = self.inner.write();
-        let id = NodeId(member.slot());
-        let node = self.nodes.get(id.0);
-        let mut deps = Vec::new();
-        node.for_each_dep(|d| deps.push(d));
-        for e in extra {
-            deps.push(NodeId(e.slot()));
-            inner.dependents[e.slot() as usize].push_unique(id);
-        }
-        if let Some(displaced) = node.install_deps(&deps) {
-            drop(displaced);
-        }
-    }
-
-    #[cfg(not(loom))]
-    pub(crate) fn force_state_for_test<T>(&self, h: Incr<T>, to: NodeState) {
-        state::store::<C>(self.nodes.get(h.slot()).state_cell(), to);
-    }
-
-    /// Moves a never-run query from New to Dirty, as no engine path does,
-    /// so that a verify meets an empty slot behind `verified_at = 0`.
-    #[cfg(not(loom))]
-    pub(crate) fn force_dirty_for_test<T>(&self, h: Incr<T>) {
-        let node = self.nodes.get(h.slot());
-        assert_eq!(node.dep_count(), 0, "a forced node has no installed deps");
-        assert_eq!(node.verified_at(), 0, "a forced node was never verified");
-        state::try_transition::<C>(node.state_cell(), NodeState::New, NodeState::Dirty)
-            .expect("a forced node is New");
-    }
-
-    /// Records `members` as one landed group, as an episode's step 2 does.
-    #[cfg(not(loom))]
-    pub(crate) fn force_group_for_test(&self, members: &[ErasedIncr]) {
-        let mut inner = self.inner.write();
-        let mut sorted: Vec<(u32, u32)> =
-            members.iter().map(|m| (m.slot(), m.generation())).collect();
-        sorted.sort_unstable();
-        let group = Arc::new(GroupInfo {
-            members: sorted,
-            cycle: Cycle::new(members.to_vec()),
-        });
-        for m in members {
-            inner.member_recs.insert(m.slot(), group.clone());
-            let flags = self.nodes.get_with_flags(m.slot()).1;
-            C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
-        }
-    }
-
-    #[cfg(not(loom))]
-    pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
-        self.nodes.get(h.slot()).verified_at()
-    }
-
-    #[cfg(not(loom))]
-    pub(crate) fn walk_pops(&self) -> u64 {
-        self.walk_pops.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Invariant (I) of the shared-protocol plan, checked at quiescence:
     /// every installed dep S of a `Clean` node X is alive, has X in
     /// `dependents[S]`, and is itself `Clean`. Also checks that no freed
@@ -4035,14 +3973,6 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    pub(crate) fn has_reverse_edge<T, U>(&self, dep: Incr<T>, dependent: Incr<U>) -> bool {
-        self.inner.read().dependents[dep.slot() as usize].contains(NodeId(dependent.slot()))
-    }
-
-    pub(crate) fn state_of<T>(&self, handle: Incr<T>) -> NodeState {
-        self.nodes.get(handle.slot()).state()
-    }
-
     /// Every installed dep of a node that is not `Dead` is alive and has
     /// the node in its dependents. Covers `Dirty`, `Failed` and recovered
     /// `New` nodes, where a missing edge would otherwise surface only
@@ -4070,6 +4000,79 @@ impl<C: Cells> Runtime<C> {
                 );
             });
         }
+    }
+}
+
+#[cfg(test)]
+impl<C: Cells> Runtime<C> {
+    #[cfg(not(loom))]
+    /// Give `member` installed edges to `extra` on top of its own, with
+    /// the reverse edges, as an episode leaves a cycle's members.
+    pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
+        let mut inner = self.inner.write();
+        let id = NodeId(member.slot());
+        let node = self.nodes.get(id.0);
+        let mut deps = Vec::new();
+        node.for_each_dep(|d| deps.push(d));
+        for e in extra {
+            deps.push(NodeId(e.slot()));
+            inner.dependents[e.slot() as usize].push_unique(id);
+        }
+        if let Some(displaced) = node.install_deps(&deps) {
+            drop(displaced);
+        }
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn force_state_for_test<T>(&self, h: Incr<T>, to: NodeState) {
+        state::store::<C>(self.nodes.get(h.slot()).state_cell(), to);
+    }
+
+    /// Moves a never-run query from New to Dirty, as no engine path does,
+    /// so that a verify meets an empty slot behind `verified_at = 0`.
+    #[cfg(not(loom))]
+    pub(crate) fn force_dirty_for_test<T>(&self, h: Incr<T>) {
+        let node = self.nodes.get(h.slot());
+        assert_eq!(node.dep_count(), 0, "a forced node has no installed deps");
+        assert_eq!(node.verified_at(), 0, "a forced node was never verified");
+        state::try_transition::<C>(node.state_cell(), NodeState::New, NodeState::Dirty)
+            .expect("a forced node is New");
+    }
+
+    /// Records `members` as one landed group, as an episode's step 2 does.
+    #[cfg(not(loom))]
+    pub(crate) fn force_group_for_test(&self, members: &[ErasedIncr]) {
+        let mut inner = self.inner.write();
+        let mut sorted: Vec<(u32, u32)> =
+            members.iter().map(|m| (m.slot(), m.generation())).collect();
+        sorted.sort_unstable();
+        let group = Arc::new(GroupInfo {
+            members: sorted,
+            cycle: Cycle::new(members.to_vec()),
+        });
+        for m in members {
+            inner.member_recs.insert(m.slot(), group.clone());
+            let flags = self.nodes.get_with_flags(m.slot()).1;
+            C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
+        }
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
+        self.nodes.get(h.slot()).verified_at()
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn walk_pops(&self) -> u64 {
+        self.walk_pops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn has_reverse_edge<T, U>(&self, dep: Incr<T>, dependent: Incr<U>) -> bool {
+        self.inner.read().dependents[dep.slot() as usize].contains(NodeId(dependent.slot()))
+    }
+
+    pub(crate) fn state_of<T>(&self, handle: Incr<T>) -> NodeState {
+        self.nodes.get(handle.slot()).state()
     }
 
     pub(crate) fn assert_walks_complete(&self) {

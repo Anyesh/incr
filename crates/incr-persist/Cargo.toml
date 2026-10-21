@@ -26,6 +26,7 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 # Self dependency so that plain `cargo test -p incr-persist` runs the
 # conformance suite against MemoryBackend without passing --features.
 incr-persist = { path = ".", features = ["backend-tests"] }
+incr-core = { workspace = true, features = ["test-hooks"] }
 proptest = "1.11"
 tempfile = "3.27"
 criterion = { version = "0.5", features = ["html_reports"] }

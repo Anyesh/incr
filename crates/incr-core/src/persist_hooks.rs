@@ -69,6 +69,14 @@ pub fn changed_at_erased<C: Cells>(rt: &Runtime<C>, handle: ErasedIncr) -> Optio
     rt.changed_at_erased(handle)
 }
 
+/// Panics unless `rt`, at quiescence, holds invariant (I) and every
+/// installed dep has its reverse edge. For incr-persist's restart tests.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn assert_invariants<C: Cells>(rt: &Runtime<C>) {
+    rt.assert_invariant_i();
+    rt.assert_edges_complete();
+}
+
 /// Whether `rt`'s active frame on this thread is doomed, so a table miss
 /// there returns [`pending_handle`] instead of creating a node.
 pub fn frame_doomed<C: Cells>(rt: &Runtime<C>) -> bool {

@@ -18,6 +18,10 @@ loom = "0.7"
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 
+[features]
+# Quiescent invariant checks for other crates' tests; never for releases.
+test-hooks = []
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
