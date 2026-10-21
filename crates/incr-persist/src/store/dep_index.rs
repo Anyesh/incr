@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use incr_core::lock_order::{LockKind, Ordered};
-use incr_core::ErasedIncr;
+use incr_core::{ErasedIncr, Incr};
 
 use crate::Kind;
 
@@ -41,6 +41,9 @@ pub(crate) struct DepIndex {
 pub(crate) struct DepMap {
     by_key: HashMap<String, DepEntry>,
     by_handle: HashMap<ErasedIncr, String>,
+    /// A memo's externals: an input per name whose value is its fp.
+    externals: HashMap<String, (Incr<u128>, u128)>,
+    external_names: HashMap<ErasedIncr, String>,
 }
 
 impl DepIndex {
@@ -137,6 +140,24 @@ impl DepMap {
             DepFp::Known(fp) => self.set_fp(key, fp),
             DepFp::Untrusted => self.untrust(key),
         }
+    }
+
+    pub(crate) fn key_of(&self, handle: ErasedIncr) -> Option<&str> {
+        self.by_handle.get(&handle).map(String::as_str)
+    }
+
+    pub(crate) fn external(&self, name: &str) -> Option<(Incr<u128>, u128)> {
+        self.externals.get(name).copied()
+    }
+
+    pub(crate) fn external_name(&self, handle: ErasedIncr) -> Option<&str> {
+        self.external_names.get(&handle).map(String::as_str)
+    }
+
+    /// Records `name`'s input and the fp it was just set to.
+    pub(crate) fn set_external(&mut self, name: &str, handle: Incr<u128>, fp: u128) {
+        self.externals.insert(name.to_owned(), (handle, fp));
+        self.external_names.insert(handle.erase(), name.to_owned());
     }
 
     pub(crate) fn untrust(&mut self, key: &str) {
