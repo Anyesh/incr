@@ -1229,3 +1229,107 @@ the codegen pass above recovered under 10 of it.
 - **Clean get, table and value-slot reads:** unchanged. Observers and
   `stabilize` run only in workloads that use them, which none of these
   do.
+
+## Dependent-list index
+
+- Engine: branch `w/T-core-dependents-linear` against its base
+  `spreadsheet-t10` at `be61773`, built in a detached worktree; one run
+  of `icount.sh` at the default N for each column. No workloads added.
+- Change: a block-mode `DependentList` whose remove scans past 64 ids
+  from the back builds an id-to-position index, and later removes take
+  a hash lookup and leave a `NONE` hole (compacting once holes outnumber
+  ids), so rewiring a dependent off a shared input no longer scans and
+  shifts the whole list. The block header grows from 8 to 24 bytes on
+  64-bit for the hole count and the index pointer. Inline lists (up to 4
+  ids on 64-bit) are unchanged.
+- Attribution: Intel PT (`intel_pt/tsc=0,mtc=0,noretcomp=0/u`) on
+  line-table builds of both drivers, per symbol, N minus 0:
+  `fanout_*_5` at N = 20 with 20 warm-up and `fanout_local_1000` at N = 1
+  with none, where the traced totals match `perf stat` to within 100 per
+  iteration. The cascade traces lose data at every N, so the allocator's
+  share comes from a third driver: the base with only its block header
+  padded to the new 24 bytes ("padded base" below), counted with
+  `perf stat`.
+
+| workload | N | base | index | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,639.00 | 4,639.00 | +0.00 | +0.00 | none |
+| `chain_local/propagate/10` | 1,000,000 | 10,027.00 | 10,027.00 | +0.00 | +0.00 | none |
+| `chain_local/propagate/100` | 100,000 | 91,606.12 | 91,606.03 | -0.09 | -0.00 | none (run spread) |
+| `chain_shared/propagate/4` | 1,000,000 | 9,356.41 | 9,356.45 | +0.04 | +0.00 | none (run spread) |
+| `chain_shared/propagate/10` | 1,000,000 | 20,354.26 | 20,354.30 | +0.04 | +0.00 | none (run spread) |
+| `chain_shared/propagate/100` | 100,000 | 186,339.97 | 186,340.25 | +0.28 | +0.00 | none (run spread) |
+| `diamond_local` | 1,000,000 | 3,927.00 | 3,927.00 | +0.00 | +0.00 | none |
+| `diamond_shared` | 1,000,000 | 7,796.09 | 7,796.09 | +0.00 | +0.00 | none |
+| `early_cutoff_local` | 1,000,000 | 2,299.00 | 2,299.00 | +0.00 | +0.00 | none |
+| `early_cutoff_shared` | 1,000,000 | 3,582.89 | 3,582.89 | +0.00 | +0.00 | none |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,739.08 | 4,738.65 | -0.43 | -0.01 | none (run spread) |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,365.62 | 7,365.69 | +0.07 | +0.00 | none (run spread) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,282.72 | 92,283.51 | +0.79 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,730.71 | 4,731.70 | +0.99 | +0.02 | none (run spread) |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,339.54 | 7,339.99 | +0.45 | +0.01 | none (run spread) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,886.10 | 158,886.20 | +0.10 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,739.46 | 4,739.92 | +0.46 | +0.01 | none (run spread) |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,346.23 | 7,344.35 | -1.88 | -0.03 | none (run spread) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,571.62 | 1,490,567.99 | -3.63 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,129.84 | 2,129.44 | -0.40 | -0.02 | none (run spread) |
+| `simple_count/shared/1000` | 100,000 | 4,076.30 | 4,076.68 | +0.38 | +0.01 | none (run spread) |
+| `simple_count/local/10000` | 100,000 | 2,126.80 | 2,126.20 | -0.60 | -0.03 | none (run spread) |
+| `simple_count/shared/10000` | 100,000 | 4,056.15 | 4,056.54 | +0.39 | +0.01 | none (run spread) |
+| `get_clean_local` | 10,000,000 | 102.00 | 102.00 | +0.00 | +0.00 | none |
+| `get_clean_shared` | 10,000,000 | 196.00 | 196.00 | +0.00 | +0.00 | none |
+| `get_contended_shared` | 2,000 | 7,791,704.26 | 7,792,709.64 | +1,005.38 | +0.01 | run spread |
+| `fanout_local_4` | 100,000 | 17,111.01 | 17,111.02 | +0.01 | +0.00 | none (run spread) |
+| `fanout_local_5` | 100,000 | 21,674.00 | 21,719.02 | +45.02 | +0.21 | per-remove and spill (below) |
+| `fanout_local_1000` | 1,000 | 3,442,229.18 | 3,449,740.20 | +7,511.02 | +0.22 | per-remove and per-push; block size (below) |
+| `fanout_shared_4` | 100,000 | 23,467.47 | 23,467.32 | -0.15 | -0.00 | none (run spread) |
+| `fanout_shared_5` | 100,000 | 28,806.12 | 28,809.43 | +3.31 | +0.01 | per-remove and spill; block size (below) |
+| `fanout_shared_1000` | 1,000 | 4,735,368.88 | 4,751,561.99 | +16,193.11 | +0.34 | per-remove and per-push; block size (below) |
+| `delete_single_local` | 200,000 | 706.00 | 706.00 | +0.00 | +0.00 | none |
+| `delete_single_shared` | 200,000 | 1,530.24 | 1,530.24 | +0.00 | +0.00 | none |
+| `delete_cascade_local` | 1,000 | 3,229,254.71 | 3,228,572.90 | -681.81 | -0.02 | block size (below) |
+| `delete_cascade_shared` | 1,000 | 4,523,990.43 | 4,533,605.93 | +9,615.50 | +0.21 | block size (below) |
+| `delete_owned_tree_local` | 10,000 | 601,878.67 | 601,269.84 | -608.83 | -0.10 | run spread |
+| `delete_owned_tree_shared` | 10,000 | 984,913.95 | 977,903.88 | -7,010.07 | -0.71 | run spread |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 218.14 | 218.14 | +0.00 | +0.00 | none |
+| `table_hit_sip_local` | 10,000,000 | 301.06 | 301.52 | +0.46 | +0.15 | none (run spread) |
+| `table_miss_local` | 100,000 | 871.18 | 871.18 | +0.00 | +0.00 | none |
+| `table_miss_shared` | 100,000 | 2,170.29 | 2,170.27 | -0.02 | -0.00 | none (run spread) |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,992.01 | 217,992.97 | +0.96 | +0.00 | none (run spread) |
+| `children_rerun_1k_shared` | 10,000 | 224,936.74 | 224,936.34 | -0.40 | -0.00 | none (run spread) |
+| `children_churn_local` | 100,000 | 16,525.48 | 16,513.72 | -11.76 | -0.07 | outside the list (below) |
+| `children_churn_shared` | 100,000 | 19,413.17 | 19,401.97 | -11.20 | -0.06 | outside the list (below) |
+
+- **Per-remove and spill (`fanout_*_5`):** the teardown removes 5 leaves
+  from the input's block list, each +9 in `remove_from_block` (the index
+  test, and the scan-length test that decides whether to build one), and
+  the spill writes the header's two new fields (+2): +47 per iteration
+  in both traces. Shared nets +3 because glibc runs fewer instructions
+  for the larger block: the padded base reads −36 against the base.
+- **Per-remove and per-push (`fanout_*_1000`):** +9,000 in
+  `remove_from_block` (1,000 removes at +9) and +2,985 in `push_to_block`
+  (995 pushes at +3, the index test), plus about +1,100 in glibc's
+  malloc: +13,056 traced against +12,964 by `perf stat` at N = 1. The
+  teardown removes back to front, so no remove scans past 64 and no
+  index is built. At the recorded N the padded base reads −5,206 Local
+  and +407 Shared against the base, which with the engine's +12,000
+  accounts for both rises; the same Shared binaries read up to 3,000
+  apart between passes.
+- **Block size (`delete_cascade_*`):** the padded base alone reads
+  +10,678 Shared and −501 Local against the base, matching the index
+  build's +10,759 and −414 in the same `perf stat` pass, so both are
+  glibc's response to the larger header; the engine part traces at
+  +105 (10 removes, 5 pushes).
+- **Outside the list (`children_churn_*`, −12 and −11):** the padded
+  base reads within 2 of the base, and the N = 1 trace has no
+  `DependentList` symbol; the fall is in `HashMap::insert` and
+  `Vec::retain`.
+
+Gate (board item: the small case must not grow): every inline-list
+workload (`chain_*`, `diamond_*`, `early_cutoff_*`, `fanout_*_4`,
+`delete_single_*`, the Clean get, table hit and value slot) is unchanged.
+The engine's only rise is +9 per remove and +3 per push on a list that
+has spilled to a block, plus 16 bytes per block.

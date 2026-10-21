@@ -405,3 +405,56 @@ fn set_returning_displaced_returns_the_current_stamp_on_an_equal_value() {
     assert!(matches!(compared, crate::value_slot::Compared::Equal(5)));
     assert_eq!(stamp, before);
 }
+
+/// One input read by 50k queries, half of which then drop it, and a
+/// quarter of the rest are deleted. Each unhook from the input's
+/// dependent list must not scan or shift the whole list.
+fn wide_input_rewires_in_sublinear_time<C: Cells>(rt: &Runtime<C>) {
+    const N: usize = 50_000;
+    let x = rt.create_input(1_i64);
+    let drop_x = rt.create_input(false);
+    let queries: Vec<_> = (0..N)
+        .map(|i| {
+            rt.create_query(move |rt| {
+                if i % 2 == 0 && rt.get(drop_x) {
+                    0
+                } else {
+                    rt.get(x)
+                }
+            })
+        })
+        .collect();
+    for &q in &queries {
+        assert_eq!(rt.get(q), 1);
+    }
+    let start = std::time::Instant::now();
+    rt.set(drop_x, true);
+    for &q in queries.iter().step_by(2) {
+        assert_eq!(rt.get(q), 0);
+    }
+    for &q in queries.iter().skip(1).step_by(4) {
+        rt.delete_node(q);
+    }
+    let took = start.elapsed();
+    assert_eq!(
+        rt.inner.read().dependents[x.slot() as usize].iter().count(),
+        N / 4
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "unhooking {} dependents took {took:?}",
+        N / 2 + N / 8
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn local_wide_input_rewires_in_sublinear_time() {
+    wide_input_rewires_in_sublinear_time(&Runtime::<Local>::new());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn shared_wide_input_rewires_in_sublinear_time() {
+    wide_input_rewires_in_sublinear_time(&Runtime::<Shared>::new());
+}
