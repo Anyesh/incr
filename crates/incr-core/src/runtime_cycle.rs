@@ -1958,8 +1958,18 @@ impl<C: Cells> Runtime<C> {
         payload: Payload,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
+        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)));
+        cycle_state::set_unwind_kind(kind);
+        bag.drain_carried(payload)
+    }
+
+    /// Lands group verify's claims `claimed`, taken from Dirty, back to
+    /// Dirty and in their group, as if never claimed: no member ran, so
+    /// another thread's read of one must make the decision a read before
+    /// the claims would have made.
+    fn release_group_claims<'a>(&self, claimed: impl IntoIterator<Item = &'a u32>) {
         let rt = self.runtime_id;
-        for &c in claimed.iter().chain(std::iter::once(&x.0)) {
+        for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
             self.land(
                 NodeId(c),
@@ -1968,8 +1978,6 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty,
             );
         }
-        cycle_state::set_unwind_kind(kind);
-        bag.drain_carried(payload)
     }
 
     /// Group verification of the Dirty group member `x`, whose claim
@@ -2020,11 +2028,7 @@ impl<C: Cells> Runtime<C> {
                 ok = false;
             }
             if !ok {
-                for c in claimed {
-                    cycle_state::with_held(|h| h.remove(&(rt, c)));
-                    let (node, flags) = self.nodes.get_with_flags(c);
-                    self.land_single(NodeId(c), node, flags, NodeState::Dirty, NodeState::Dirty);
-                }
+                self.release_group_claims(&claimed);
                 return GroupEnd::Ordinary;
             }
             cycle_state::with_held(|h| {
@@ -2089,14 +2093,9 @@ impl<C: Cells> Runtime<C> {
 
         if let Visit::VerifyOnly(owner) = visit {
             // A tainted node never runs: release the group, and leave `x`
-            // Dirty for the closure that still reads it.
-            for c in claimed {
-                cycle_state::with_held(|h| h.remove(&(rt, c)));
-                let (node, flags) = self.nodes.get_with_flags(c);
-                self.land_single(NodeId(c), node, flags, NodeState::Dirty, NodeState::Dirty);
-            }
-            let (node, flags) = self.nodes.get_with_flags(x.0);
-            self.land_single(x, node, flags, NodeState::Dirty, NodeState::Dirty);
+            // Dirty for the closure that still reads it, whose read the
+            // taint memo makes compute `x` alone.
+            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)));
             self.memoize(x, owner);
             return GroupEnd::Done(Computed::Done);
         }
