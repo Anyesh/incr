@@ -35,6 +35,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "throughput"
 harness = false
 
+[[bench]]
+name = "memo"
+harness = false
+
 [[example]]
 name = "sqlite_writers"
 required-features = ["sqlite"]

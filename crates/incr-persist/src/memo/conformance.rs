@@ -48,6 +48,7 @@ macro_rules! memo_backend_conformance {
             one_of_two_racing_writers_publishes,
             older_generation_stays_readable_until_removed,
             checkpoint_lock_excludes_other_handles,
+            checkpoint_lock_removes_generations_below_current,
         );
     };
     (@cases $harness:expr; $($case:ident),+ $(,)?) => {
@@ -261,4 +262,27 @@ pub fn checkpoint_lock_excludes_other_handles<H: MemoHarness>(mut h: H) {
     let guard = b.lock_checkpoint().expect("lock after release failed");
     assert!(matches!(a.lock_checkpoint(), Err(Error::Busy)));
     drop(guard);
+}
+
+/// Taking the checkpoint lock removes every generation below the current
+/// one, such as one whose writer died before removing it.
+pub fn checkpoint_lock_removes_generations_below_current<H: MemoHarness>(mut h: H) {
+    let store = h.new_store();
+    let backend = h.open(&store);
+    let old = write(&backend, None, 1, &entries(3));
+    let written = entries(4);
+    write(&backend, Some(GenId(1)), 2, &written);
+    drop(backend.lock_checkpoint().expect("lock failed"));
+
+    let other = h.open(&store);
+    for item in old.items() {
+        assert_eq!(
+            other.read_entry(old.id(), item).expect("read_entry failed"),
+            None,
+            "generation 1 outlived the checkpoint lock"
+        );
+    }
+    let loaded = other.load().unwrap().unwrap();
+    assert_eq!(loaded.id(), GenId(2));
+    assert_holds(&other, &loaded, &written);
 }

@@ -218,6 +218,28 @@ fn current_pointed_back_at_an_older_generation_loads_that_one_whole() {
     }
 }
 
+#[test]
+fn a_checkpoint_after_current_pointed_back_replaces_the_newer_generation() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    memo.write_generation(Some(GenId(1)), GenId(2), &header(2), &encoded(3))
+        .unwrap();
+    raw(&db)
+        .execute("UPDATE memo_current SET generation = 1", [])
+        .unwrap();
+
+    let first = checkpoint(&memo, vec![entry(9)]);
+    assert_eq!(first.replaced, Some(GenId(1)));
+    assert_eq!(memo.load().unwrap().unwrap().id(), first.generation.id());
+    memo.remove_generation(GenId(1)).unwrap();
+    let second = checkpoint(&memo, vec![entry(8)]);
+    let loaded = memo.load().unwrap().unwrap();
+    assert_eq!(loaded.id(), second.generation.id());
+    assert_eq!(loaded.items().len(), 4);
+}
+
 /// A buffered commit that never reached the disk is a write-ahead log tail
 /// that is gone after a crash. The copy below keeps the main file only,
 /// which is what survives when the log after the last checkpoint is lost.
@@ -364,6 +386,44 @@ fn a_database_of_another_kind_is_rejected() {
         .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
         .unwrap();
     assert!(matches!(SqliteMemo::open(&other), Err(Error::Backend(_))));
+}
+
+#[test]
+fn another_applications_database_is_rejected_and_left_unchanged() {
+    let db = db();
+    raw(&db)
+        .execute_batch("CREATE TABLE users (id INTEGER)")
+        .unwrap();
+    assert!(matches!(SqliteMemo::open(&db.path), Err(Error::Backend(_))));
+
+    let conn = raw(&db);
+    let mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(tables, ["users"]);
+    let application_id: i32 = conn
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .unwrap();
+    assert_eq!(application_id, 0);
+}
+
+#[test]
+fn a_rejected_database_stays_in_its_journal_mode() {
+    let db = db();
+    raw(&db).pragma_update(None, "user_version", 7).unwrap();
+    assert!(matches!(SqliteMemo::open(&db.path), Err(Error::Backend(_))));
+    let mode: String = raw(&db)
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
 }
 
 #[test]

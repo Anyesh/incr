@@ -71,6 +71,8 @@ impl MemoBackend for MemoryMemo {
             return Err(Error::Busy);
         }
         state.locked = true;
+        let current = state.current;
+        state.generations.retain(|&id, _| Some(id) == current);
         Ok(MemoryMemoGuard {
             state: Arc::clone(&self.state),
         })

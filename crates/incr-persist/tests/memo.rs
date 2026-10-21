@@ -1,14 +1,19 @@
 //! `MemoBuilder`, `Memo` and `MemoTable` over a store, with "restarts"
 //! that reopen a fresh store and memo on the same backends.
 
+use std::cell::Cell;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use incr_core::lock_order::{acquire, LockKind};
 
 use incr_persist::memo::{
     BuildId, Memo, MemoBackend, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo,
 };
 use incr_persist::{Error, Local, MemoryBackend, Options, Shared, Store};
+use serde::{Deserialize, Serialize};
 
 macro_rules! both {
     ($($name:ident),* $(,)?) => {
@@ -48,6 +53,8 @@ both!(
     another_value_type_drops_the_table,
     a_checkpoint_removes_the_generation_it_replaces,
     an_undefined_table_fails_open,
+    a_restore_drops_no_key_under_the_memo_lock,
+    a_checkpoint_drops_no_key_under_the_memo_lock,
 );
 
 const BUILD: u128 = 0xb1d;
@@ -557,4 +564,90 @@ fn automatic_checkpoints_write_and_stop_on_drop() {
     let w = scaled::<Shared>(&backends, options(), 1, &runs);
     assert_eq!(read(&w, 3), 3);
     assert_eq!(runs.load(SeqCst), 1);
+}
+
+thread_local! {
+    static WATCHING: Cell<bool> = const { Cell::new(false) };
+    static DROPS: Cell<usize> = const { Cell::new(0) };
+    static UNDER_M: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A key whose drop, while watched, counts itself and whether the memo
+/// lock M is held, which the debug lock-order checker shows by refusing
+/// to take M again.
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+struct Watched(u32);
+
+impl Drop for Watched {
+    fn drop(&mut self) {
+        if !WATCHING.with(Cell::get) {
+            return;
+        }
+        DROPS.with(|n| n.set(n.get() + 1));
+        if catch_unwind(AssertUnwindSafe(|| drop(acquire(LockKind::Memo)))).is_err() {
+            UNDER_M.with(|n| n.set(n.get() + 1));
+        }
+    }
+}
+
+/// `f`'s watched key drops on this thread, and how many of them ran under M.
+fn watch(f: impl FnOnce()) -> (usize, usize) {
+    DROPS.with(|n| n.set(0));
+    UNDER_M.with(|n| n.set(0));
+    WATCHING.with(|w| w.set(true));
+    f();
+    WATCHING.with(|w| w.set(false));
+    (DROPS.with(Cell::get), UNDER_M.with(Cell::get))
+}
+
+/// Enough entries that the restore's table grows while M is held, each
+/// dep decoded by the walk.
+fn a_restore_drops_no_key_under_the_memo_lock<C: MemoCells>() {
+    const N: u32 = 40;
+    let backends = Backends::new();
+    let open = || {
+        let store = backends.store::<C>();
+        let mut builder = MemoBuilder::new(options());
+        let chain = builder.table::<Watched, u64>("chain", 1);
+        builder.define(chain, move |ctx, k| match k.0 {
+            0 => 0,
+            n => ctx.get(chain, Watched(n - 1)) + 1,
+        });
+        let memo = builder.open(&store, backends.memo.clone()).unwrap();
+        (store, memo, chain)
+    };
+    {
+        let (_store, memo, chain) = open();
+        let q = memo.get_or_insert(chain, Watched(N));
+        assert_eq!(memo.runtime().get(q), u64::from(N));
+        memo.checkpoint().unwrap();
+    }
+    let (_store, memo, chain) = open();
+    let (drops, under_m) = watch(|| {
+        let q = memo.get_or_insert(chain, Watched(N));
+        assert_eq!(memo.runtime().get(q), u64::from(N));
+    });
+    assert_eq!(memo.stats().reused, u64::from(N) + 1);
+    assert!(drops > 0);
+    assert_eq!(under_m, 0);
+}
+
+/// A Dirty entry is skipped by the snapshot, which holds M.
+fn a_checkpoint_drops_no_key_under_the_memo_lock<C: MemoCells>() {
+    let backends = Backends::new();
+    let store = backends.store::<C>();
+    let x = store.input("x", 1_u64).unwrap();
+    let xh = x.handle();
+    let mut builder = MemoBuilder::new(options());
+    let t = builder.table::<Watched, u64>("t", 1);
+    builder.define(t, move |ctx, k| ctx.rt().get(xh) + u64::from(k.0));
+    let memo = builder.open(&store, backends.memo.clone()).unwrap();
+    let q = memo.get_or_insert(t, Watched(1));
+    assert_eq!(memo.runtime().get(q), 2);
+    store.set(x, 2).unwrap();
+    let (drops, under_m) = watch(|| {
+        assert_eq!(memo.checkpoint().unwrap().written, 0);
+    });
+    assert!(drops > 0);
+    assert_eq!(under_m, 0);
 }

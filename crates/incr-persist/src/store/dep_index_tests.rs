@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
@@ -7,7 +7,7 @@ use incr_core::persist_hooks::changed_at;
 use serde::{Deserialize, Serialize};
 
 use super::binding::encode;
-use super::dep_index::{fp_of, DepFp, DepIndex};
+use super::dep_index::{fp_of, DepFp, DepIndex, FP_BYTES};
 use super::{Options, Store};
 use crate::{Cells, Local, MemoryBackend, Shared};
 
@@ -85,6 +85,78 @@ fn an_equal_write_leaves_the_fingerprint_of_the_value_the_runtime_holds() {
     store.set(x, -0.0).unwrap();
     assert_eq!(known(&deps, "x"), h(&0.0f64));
     assert_ne!(h(&0.0f64), h(&-0.0f64));
+}
+
+/// The bytes `f` hashes on this thread.
+fn hashes(f: impl FnOnce()) -> usize {
+    let before = FP_BYTES.with(Cell::get);
+    f();
+    FP_BYTES.with(Cell::get) - before
+}
+
+fn a_no_op_mapped_set_does_not_hash<C: Cells>() {
+    let store = open::<C>();
+    let x = store.input("x", vec![7u8; 1024]).unwrap();
+    store.set(x, vec![1u8; 1024]).unwrap();
+    let no_op = hashes(|| {
+        store.set(x, vec![1u8; 1024]).unwrap();
+    });
+    assert_eq!(no_op, 0, "a no-op mapped set hashed its bytes");
+    let wrote = hashes(|| {
+        store.set(x, vec![2u8; 1024]).unwrap();
+    });
+    assert!(
+        wrote >= 1024,
+        "a mapped set that wrote did not hash its bytes"
+    );
+}
+
+#[test]
+fn a_no_op_mapped_set_does_not_hash_local() {
+    a_no_op_mapped_set_does_not_hash::<Local>();
+}
+
+#[test]
+fn a_no_op_mapped_set_does_not_hash_shared() {
+    a_no_op_mapped_set_does_not_hash::<Shared>();
+}
+
+#[test]
+fn a_caught_up_no_op_set_does_not_hash() {
+    let backend = MemoryBackend::new();
+    let a = Store::<Local, _>::open(backend.clone(), Options::default()).unwrap();
+    let b = Store::<Local, _>::open(backend, Options::default()).unwrap();
+    let xa = a.input("x", Vec::<u8>::new()).unwrap();
+    let xb = b.input("x", Vec::<u8>::new()).unwrap();
+    a.set(xa, vec![5u8; 1024]).unwrap();
+    b.set(xb, vec![5u8; 1024]).unwrap();
+    let caught_up = hashes(|| {
+        a.refresh().unwrap();
+    });
+    assert_eq!(caught_up, 0, "catching up an equal set hashed its bytes");
+}
+
+#[test]
+fn a_no_op_replace_from_a_snapshot_does_not_hash() {
+    let backend = MemoryBackend::new();
+    let a = Store::<Local, _>::open(backend.clone(), Options::default()).unwrap();
+    let b = Store::<Local, _>::open(backend, Options::default()).unwrap();
+    let xa = a.input("x", Vec::<u8>::new()).unwrap();
+    let xb = b.input("x", Vec::<u8>::new()).unwrap();
+    b.set(xb, vec![5u8; 1024]).unwrap();
+    a.refresh().unwrap();
+    b.set(xb, vec![5u8; 1024]).unwrap();
+    b.checkpoint().unwrap();
+    b.set(xb, vec![5u8; 1024]).unwrap();
+    b.checkpoint().unwrap();
+    let replaced = hashes(|| {
+        a.refresh().unwrap();
+    });
+    assert_eq!(a.runtime().get(xa.handle()), vec![5u8; 1024]);
+    assert!(
+        replaced < 1024,
+        "replacing a key with its equal snapshot value hashed the value"
+    );
 }
 
 #[test]

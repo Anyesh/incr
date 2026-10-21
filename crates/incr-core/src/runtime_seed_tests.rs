@@ -3,7 +3,7 @@
 
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 use super::race_tests::{id, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
+use crate::child_test::run_in_child;
 use crate::handle::{ErasedIncr, Incr};
 use crate::persist_hooks::{
     changed_at, changed_at_erased, frame_doomed, get_or_insert_query_seeded, inspect,
-    pending_handle, probe_unchecked, seed_base, seed_query, Reuse, SeedDep, SeedError,
+    pending_handle, probe_unchecked, seed_base, seed_query, Deferred, Reuse, SeedDep, SeedError,
 };
+use crate::reclaim_probe::{self, RetireSite};
 use crate::state::NodeState;
 use crate::table::NodeTable;
 
@@ -55,6 +57,7 @@ both!(
     a_panicking_seed_hook_leaves_no_node,
     changed_at_erased_refuses_dead_and_foreign_handles,
     a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle,
+    a_seeded_hit_leaves_its_key_and_closure_in_the_bag,
 );
 
 fn dep<T>(h: Incr<T>) -> SeedDep {
@@ -284,6 +287,7 @@ where
         rt.create_query(move |rt: &Runtime<C>| {
             p_runs.fetch_add(1, SeqCst);
             let base = seed_base(rt);
+            let mut bag = Deferred::new();
             let runs = leaf_runs.clone();
             let a = get_or_insert_query_seeded(
                 &table,
@@ -299,6 +303,7 @@ where
                         .err()
                         .map(|e| e.1)
                 },
+                &mut bag,
             );
             let runs = leaf_runs.clone();
             let b = get_or_insert_query_seeded(
@@ -315,7 +320,9 @@ where
                         .err()
                         .map(|e| e.1)
                 },
+                &mut bag,
             );
+            bag.drain(rt);
             rt.get(a) + rt.get(b)
         })
     };
@@ -395,11 +402,19 @@ fn table_seeds_only_a_node_it_creates<C: Cells>() {
             .map(|e| e.1)
     };
     let f = move |rt: &Runtime<C>| rt.get(x) * 10;
-    let q = get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), hook);
+    let mut bag = Deferred::new();
+    let q = get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), hook, &mut bag);
     assert_eq!(rt.state_of(q), NodeState::Dirty);
-    let again = get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), |_, _| {
-        panic!("the hook ran on a hit")
-    });
+    let again = get_or_insert_query_seeded(
+        &table,
+        &rt,
+        0,
+        f,
+        Default::default(),
+        |_, _| panic!("the hook ran on a hit"),
+        &mut bag,
+    );
+    bag.drain(&rt);
     assert_eq!(again, q);
     assert_eq!(calls.load(SeqCst), 1);
     assert_eq!(probe_unchecked(&table, &rt, &0), Some(q));
@@ -425,9 +440,11 @@ fn a_panicking_seed_hook_leaves_no_node<C: Cells>() {
             panic!("seed hook");
         };
         let f = move |rt: &Runtime<C>| rt.get(x) * 10;
+        let mut bag = Deferred::new();
         let caught = catch_unwind(AssertUnwindSafe(|| {
-            get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), hook)
+            get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), hook, &mut bag)
         }));
+        bag.drain(&rt);
         assert!(caught.is_err());
         let q = created.get().expect("the miss created a node");
         assert!(!rt.is_alive(q));
@@ -438,6 +455,146 @@ fn a_panicking_seed_hook_leaves_no_node<C: Cells>() {
         let again = table.get_or_insert_query(&rt, 0, f);
         assert_eq!(rt.get(again), 40);
     }
+}
+
+/// A key whose `Drop` panics once for the id `KEY_DROP_ARMED` holds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DropKey(u64);
+
+static KEY_DROP_ARMED: AtomicU64 = AtomicU64::new(u64::MAX);
+
+impl Drop for DropKey {
+    fn drop(&mut self) {
+        if KEY_DROP_ARMED
+            .compare_exchange(self.0, u64::MAX, SeqCst, SeqCst)
+            .is_ok()
+        {
+            panic!("drop of DropKey({}) panicked on purpose", self.0);
+        }
+    }
+}
+
+/// A seeded miss that rehashes leaves the old array's keys to the
+/// caller's bag: a key's `Drop` panic surfaces at its drain, and the
+/// node, already in the table, stays alive with its seed.
+fn key_drop_panic_after_a_seeded_insert<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(4_u64);
+    let table: NodeTable<DropKey, u64, C> = rt.create_table();
+    let f = move |rt: &Runtime<C>| rt.get(x) * 10;
+    for i in 0..14 {
+        table.get_or_insert_query(&rt, DropKey(i), f);
+    }
+    assert_eq!(table.shape().0, 16);
+    KEY_DROP_ARMED.store(3, SeqCst);
+    let created = Cell::new(None);
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        let mut bag = Deferred::new();
+        get_or_insert_query_seeded(
+            &table,
+            &rt,
+            DropKey(99),
+            f,
+            Default::default(),
+            |rt, q| {
+                created.set(Some(q));
+                let base = seed_base(rt);
+                seed_query(rt, &base, q, 41, &[dep(x)], Reuse::IfUnchanged)
+                    .err()
+                    .map(|e| e.1)
+            },
+            &mut bag,
+        );
+        assert!(created.get().is_some_and(|q| rt.is_alive(q)));
+        bag.drain(&rt);
+    }));
+    let unwind = caught.expect_err("the key's drop panic surfaces");
+    let message = unwind.downcast_ref::<String>().expect("a formatted panic");
+    assert!(message.contains("DropKey(3)"), "{message}");
+    assert_eq!(table.shape().0, 32);
+    let q = created.get().expect("the miss created a node");
+    assert!(rt.is_alive(q));
+    assert_eq!(probe_unchecked(&table, &rt, &DropKey(99)), Some(q));
+    assert_eq!(rt.state_of(q), NodeState::Dirty);
+    assert_eq!(rt.get(q), 41);
+    rt.assert_invariant_i();
+    rt.assert_edges_complete();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_key_drop_panic_after_a_seeded_insert_keeps_the_node() {
+    run_in_child(
+        "runtime::seed_tests::local_key_drop_panic_after_a_seeded_insert_keeps_the_node",
+        key_drop_panic_after_a_seeded_insert::<Local>,
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_key_drop_panic_after_a_seeded_insert_keeps_the_node() {
+    run_in_child(
+        "runtime::seed_tests::shared_key_drop_panic_after_a_seeded_insert_keeps_the_node",
+        || {
+            reclaim_probe::force(RetireSite::TableRetire);
+            key_drop_panic_after_a_seeded_insert::<Shared>();
+        },
+    )
+    .assert_clean();
+}
+
+/// A key that counts its drops; equal by its id alone.
+#[derive(Clone)]
+struct Noted(u8, Arc<AtomicU32>);
+
+impl PartialEq for Noted {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Noted {}
+
+impl std::hash::Hash for Noted {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl Drop for Noted {
+    fn drop(&mut self) {
+        self.1.fetch_add(1, SeqCst);
+    }
+}
+
+/// A hit keeps neither its key nor its closure, and both wait in the
+/// caller's bag until the drain.
+fn a_seeded_hit_leaves_its_key_and_closure_in_the_bag<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let drops = Arc::new(AtomicU32::new(0));
+    let key = || Noted(0, drops.clone());
+    let table: NodeTable<Noted, u64, C> = rt.create_table();
+    let q = table.get_or_insert_query(&rt, key(), |_: &Runtime<C>| 1);
+    let held = key();
+    let f = move |_: &Runtime<C>| {
+        let held = &held;
+        u64::from(held.0)
+    };
+    let mut bag = Deferred::new();
+    let again = get_or_insert_query_seeded(
+        &table,
+        &rt,
+        key(),
+        f,
+        Default::default(),
+        |_, _| panic!("the hook ran on a hit"),
+        &mut bag,
+    );
+    assert_eq!(again, q);
+    assert_eq!(drops.load(SeqCst), 0);
+    bag.drain(&rt);
+    assert_eq!(drops.load(SeqCst), 2);
 }
 
 fn changed_at_erased_refuses_dead_and_foreign_handles<C: Cells>() {

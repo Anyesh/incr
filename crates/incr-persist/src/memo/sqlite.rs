@@ -76,7 +76,8 @@ impl Default for SqliteMemoOptions {
 /// The checkpoint lock is an exclusive `flock` on a file next to the
 /// database, named after it with `-checkpoint` appended; the OS releases it
 /// when its holder's process dies. Like the `-wal` and `-shm` files, it
-/// belongs to the database and is never removed.
+/// belongs to the database and is never removed. Taking it also removes
+/// every generation but the current one.
 #[derive(Debug)]
 pub struct SqliteMemo {
     reader: Mutex<Connection>,
@@ -114,6 +115,9 @@ impl SqliteMemo {
         )
         .map_err(sql)?;
         writer.busy_timeout(options.busy_timeout).map_err(sql)?;
+        // After the schema check, because the journal mode is stored in the
+        // file and a refused file must be left as it was.
+        create_schema(&mut writer)?;
         enable_wal(&writer, options.busy_timeout)?;
         let synchronous = match options.durability {
             SqliteDurability::Full => "FULL",
@@ -122,7 +126,6 @@ impl SqliteMemo {
         writer
             .pragma_update(None, "synchronous", synchronous)
             .map_err(sql)?;
-        create_schema(&mut writer)?;
 
         let reader = Connection::open_with_flags(
             path,
@@ -159,10 +162,12 @@ impl MemoBackend for SqliteMemo {
             .truncate(false)
             .open(&self.lock_path)?;
         match file.try_lock() {
-            Ok(()) => Ok(SqliteMemoGuard { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(Error::Busy),
-            Err(TryLockError::Error(e)) => Err(e.into()),
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(Error::Busy),
+            Err(TryLockError::Error(e)) => return Err(e.into()),
         }
+        self.remove_leftovers()?;
+        Ok(SqliteMemoGuard { _file: file })
     }
 
     fn load(&self) -> Result<Option<Generation>> {
@@ -292,18 +297,63 @@ impl MemoBackend for SqliteMemo {
                 .into(),
             ));
         }
-        tx.execute(
-            "DELETE FROM memo_entry WHERE generation = ?1",
-            [to_sql(generation.0)],
-        )
-        .map_err(sql)?;
-        tx.execute(
-            "DELETE FROM memo_generation WHERE id = ?1",
-            [to_sql(generation.0)],
-        )
-        .map_err(sql)?;
+        delete_generation(&tx, generation)?;
         tx.commit().map_err(sql)
     }
+}
+
+impl SqliteMemo {
+    /// Removes every generation but the current one. Those below it are
+    /// left by a removal that failed or never ran. Those above it only by a
+    /// `memo_current` pointed back at an older generation, since a write
+    /// commits its rows and the pointer together, and they would make every
+    /// later write's id not newer than the newest row.
+    fn remove_leftovers(&self) -> Result<()> {
+        let mut conn = lock(&self.writer);
+        if leftovers(&conn)?.is_empty() {
+            return Ok(());
+        }
+        let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
+            Err(e) if is_busy(&e) => return Err(Error::Busy),
+            begun => begun.map_err(sql)?,
+        };
+        for generation in leftovers(&tx)? {
+            delete_generation(&tx, generation)?;
+        }
+        tx.commit().map_err(sql)
+    }
+}
+
+fn leftovers(conn: &Connection) -> Result<Vec<GenId>> {
+    let Some(current) = current(conn)? else {
+        return Ok(Vec::new());
+    };
+    let mut select = conn
+        .prepare_cached("SELECT id FROM memo_generation")
+        .map_err(sql)?;
+    let mut rows = select.query([]).map_err(sql)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().map_err(sql)? {
+        let id = GenId(from_sql(row.get(0).map_err(sql)?));
+        if id != current {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn delete_generation(conn: &Connection, generation: GenId) -> Result<()> {
+    conn.execute(
+        "DELETE FROM memo_entry WHERE generation = ?1",
+        [to_sql(generation.0)],
+    )
+    .map_err(sql)?;
+    conn.execute(
+        "DELETE FROM memo_generation WHERE id = ?1",
+        [to_sql(generation.0)],
+    )
+    .map_err(sql)?;
+    Ok(())
 }
 
 fn create_schema(conn: &mut Connection) -> Result<()> {
@@ -318,8 +368,11 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     let version: i64 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(sql)?;
+    let objects: i64 = tx
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .map_err(sql)?;
     match (application_id, version) {
-        (0, 0) => {
+        (0, 0) if objects == 0 => {
             tx.execute_batch(SCHEMA).map_err(sql)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)
                 .map_err(sql)?;
@@ -327,6 +380,11 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
                 .map_err(sql)?;
         }
         (APPLICATION_ID, SCHEMA_VERSION) => {}
+        (0, 0) => {
+            return Err(Error::Backend(
+                "not an incr-persist memo store: the database holds another schema".into(),
+            ))
+        }
         _ => {
             return Err(Error::Backend(
                 format!(

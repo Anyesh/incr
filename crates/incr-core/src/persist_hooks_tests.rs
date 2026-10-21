@@ -116,7 +116,7 @@ fn set_hands_back_what_it_displaced<C: Cells>() {
     assert_eq!(rt.get(q), 1);
 
     let before = drops.of(10);
-    let out = set_returning_displaced(&rt, x, drops.value(2, 20));
+    let out = set_returning_displaced(&rt, x, drops.value(2, 20)).0;
     assert!(matches!(out, Compared::Replaced(_)), "a change writes");
     assert_eq!(drops.of(10), before, "the displaced value is not dropped");
     drop(out);
@@ -126,7 +126,7 @@ fn set_hands_back_what_it_displaced<C: Cells>() {
     assert_eq!(rt.get(q), 2, "the walk ran");
     assert_eq!(runs.load(Ordering::Relaxed), 2);
 
-    let out = set_returning_displaced(&rt, x, drops.value(2, 21));
+    let out = set_returning_displaced(&rt, x, drops.value(2, 21)).0;
     match &out {
         Compared::Equal(rejected) => assert_eq!(rejected.tag, 21),
         Compared::Replaced(_) => panic!("an equal value must not write"),
@@ -155,7 +155,7 @@ fn set_returning_displaced_hands_back_the_old_value_under_local() {
     let drops = Drops::new();
     let x = rt.create_input(drops.value(1, 10));
     let before = drops.of(10);
-    match set_returning_displaced(&rt, x, drops.value(2, 20)) {
+    match set_returning_displaced(&rt, x, drops.value(2, 20)).0 {
         Compared::Replaced(Some(old)) => assert_eq!(old.tag, 10),
         _ => panic!("a change hands back the old value"),
     }
@@ -437,13 +437,13 @@ fn changed_at_tracks_writes_that_wrote<C: Cells>() {
     rt.set(x, 2);
     assert_eq!(changed_at(&rt, x), c1, "a no-op leaves it");
     assert!(matches!(
-        set_returning_displaced(&rt, x, 3),
+        set_returning_displaced(&rt, x, 3).0,
         Compared::Replaced(_)
     ));
     let c2 = changed_at(&rt, x);
     assert!(c2 > c1);
     assert!(matches!(
-        set_returning_displaced(&rt, x, 3),
+        set_returning_displaced(&rt, x, 3).0,
         Compared::Equal(_)
     ));
     assert_eq!(changed_at(&rt, x), c2);

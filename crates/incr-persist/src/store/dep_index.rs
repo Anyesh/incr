@@ -8,7 +8,14 @@ use crate::Kind;
 
 /// The xxh3-128 of `bytes`: every fingerprint the memo compares.
 pub(crate) fn fp_of(bytes: &[u8]) -> u128 {
+    #[cfg(test)]
+    FP_BYTES.with(|hashed| hashed.set(hashed.get() + bytes.len()));
     xxhash_rust::xxh3::xxh3_128(bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FP_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// What a key's runtime node holds, as far as a memo can tell.

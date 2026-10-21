@@ -114,9 +114,7 @@ pub fn frame_len(buf: &[u8]) -> Option<usize> {
 }
 
 pub fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
-    Ok(frame_bytes(
-        &postcard::to_stdvec(entry).map_err(Error::Encode)?,
-    ))
+    frame_bytes(&postcard::to_stdvec(entry).map_err(Error::Encode)?)
 }
 
 /// Decodes one entry from exactly one frame. A crc mismatch, a length that
@@ -129,7 +127,7 @@ pub fn encode_header(header: &GenHeader) -> Result<Vec<u8>> {
     let mut body = MAGIC.to_vec();
     body.push(FORMAT);
     body.extend(postcard::to_stdvec(header).map_err(Error::Encode)?);
-    Ok(frame_bytes(&body))
+    frame_bytes(&body)
 }
 
 /// Decodes a header from exactly one frame, failing with
@@ -150,22 +148,32 @@ pub fn decode_header(frame: &[u8]) -> Result<GenHeader> {
 }
 
 pub fn encode_index(items: &[IndexItem]) -> Result<Vec<u8>> {
-    Ok(frame_bytes(
-        &postcard::to_stdvec(items).map_err(Error::Encode)?,
-    ))
+    frame_bytes(&postcard::to_stdvec(items).map_err(Error::Encode)?)
 }
 
 pub fn decode_index(frame: &[u8]) -> Result<Vec<IndexItem>> {
     decode_body(body(frame)?)
 }
 
-pub(super) fn frame_bytes(body: &[u8]) -> Vec<u8> {
-    let word = u32::try_from(body.len()).expect("a memo frame body exceeds 4 GiB");
+/// The length word of a frame whose body is `body_len` bytes. The whole
+/// frame's length must fit a `u32`, since [`IndexItem::len`] records it.
+pub(super) fn frame_word(body_len: usize) -> Result<u32> {
+    FRAME_HEADER_LEN
+        .checked_add(body_len)
+        .and_then(|len| u32::try_from(len).ok())
+        .map(|_| body_len as u32)
+        .ok_or(Error::FrameTooLarge {
+            len: (body_len as u64).saturating_add(FRAME_HEADER_LEN as u64),
+        })
+}
+
+pub(super) fn frame_bytes(body: &[u8]) -> Result<Vec<u8>> {
+    let word = frame_word(body.len())?;
     let mut out = Vec::with_capacity(FRAME_HEADER_LEN + body.len());
     out.extend_from_slice(&word.to_le_bytes());
     out.extend_from_slice(&crc(word, body).to_le_bytes());
     out.extend_from_slice(body);
-    out
+    Ok(out)
 }
 
 fn crc(word: u32, body: &[u8]) -> u32 {

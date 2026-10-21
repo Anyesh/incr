@@ -1,7 +1,20 @@
+use std::cell::RefCell;
+
 use super::*;
 use crate::memo::{
     decode_entry, write_checkpoint, CheckpointInput, Entry, StoredDep, TableDesc, DEFAULT_MAX_BYTES,
 };
+
+thread_local! {
+    static AFTER_LOAD_READS_CURRENT: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
+}
+
+pub(super) fn after_load_reads_current() {
+    if let Some(hook) = AFTER_LOAD_READS_CURRENT.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
 
 fn header(seq: u64) -> GenHeader {
     GenHeader {
@@ -322,4 +335,24 @@ fn a_log_in_the_same_directory_leaves_the_memo_alone() {
     crate::Backend::compact(&log, at, Vec::new()).unwrap();
     drop(log);
     assert_whole(&reload(dir.path()).unwrap(), &first);
+}
+
+#[test]
+fn a_load_racing_a_publish_and_remove_loads_the_new_generation() {
+    let (dir, memo) = store();
+    memo.write_generation(None, GenId(1), &header(1), &entries(0..2))
+        .unwrap();
+    let other = FileMemo::open(dir.path()).unwrap();
+    AFTER_LOAD_READS_CURRENT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            other
+                .write_generation(Some(GenId(1)), GenId(2), &header(2), &entries(0..3))
+                .unwrap();
+            other.remove_generation(GenId(1)).unwrap();
+        }))
+    });
+
+    let loaded = FileMemo::open(dir.path()).unwrap().load().unwrap().unwrap();
+    assert_eq!(loaded.id(), GenId(2));
+    assert_whole(&loaded, &reload(dir.path()).unwrap());
 }

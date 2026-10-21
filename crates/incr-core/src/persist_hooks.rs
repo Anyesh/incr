@@ -46,12 +46,16 @@ impl<T> RepSink<T> for () {
 
 /// [`Runtime::set`] that hands back what it would drop, for the caller to
 /// drop after releasing its own locks: `Replaced` with the displaced value
-/// if it wrote, `Equal` with the rejected value if it did not.
+/// if it wrote, `Equal` with the rejected value if it did not. The `u64`
+/// is the input's `changed_at` as read under this call's claim: after a
+/// write, the stamp that write settled, which a mapped write records as
+/// its stamp. Loading [`changed_at`] after the return instead can see a
+/// later `set` of the same input.
 pub fn set_returning_displaced<T: Value, C: Cells>(
     rt: &Runtime<C>,
     handle: Incr<T>,
     value: T,
-) -> Compared<T, value_slot::Displaced<T, C>> {
+) -> (Compared<T, value_slot::Displaced<T, C>>, u64) {
     rt.set_returning_displaced(handle, value)
 }
 
@@ -201,8 +205,9 @@ pub fn inspect<T: Value, C: Cells>(rt: &Runtime<C>, q: Incr<T>) -> Option<Inspec
 }
 
 /// [`NodeTable::get_or_insert_query_with`] that hands a node the miss
-/// creates to `seed` before publishing it; a value `seed` returns, a
-/// failed seed's, drops after the miss mutex. A hit never calls `seed`.
+/// creates to `seed` before publishing it. A hit never calls `seed`.
+/// Everything the call does not keep, a failed seed's value among it,
+/// goes to `bag`, so none of it drops under the caller's own locks.
 pub fn get_or_insert_query_seeded<K, T, C, S, F>(
     table: &NodeTable<K, T, C, S>,
     rt: &Runtime<C>,
@@ -210,6 +215,7 @@ pub fn get_or_insert_query_seeded<K, T, C, S, F>(
     f: F,
     opts: QueryOpts<T>,
     seed: impl FnOnce(&Runtime<C>, Incr<T>) -> Option<T>,
+    bag: &mut Deferred<C>,
 ) -> Incr<T>
 where
     K: TableKey,
@@ -218,7 +224,7 @@ where
     S: BuildHasher,
     F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
 {
-    table.get_or_insert_query_seeded(rt, key, f, opts, seed)
+    table.get_or_insert_query_seeded(rt, key, f, opts, seed, bag)
 }
 
 /// The live node for `key`, if any, without `NodeTable::get`'s refusal

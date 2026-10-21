@@ -338,6 +338,13 @@ pub trait DepStack: 'static {
         self.with(|s| s.active(rt).is_some())
     }
 
+    /// True iff any runtime's compute frame is on this thread's stack,
+    /// at any depth. A callback's barrier frame belongs to no runtime and
+    /// does not count.
+    fn any_compute_frame(&self) -> bool {
+        self.with(|s| s.frames.iter().any(|f| f.rt != RuntimeId::SENTINEL))
+    }
+
     /// The depth of the innermost frame on this stack computing `node`
     /// of runtime `rt`, if one is. Depth 0 is the outermost frame.
     fn frame_depth(&self, rt: RuntimeId, node: NodeId) -> Option<usize> {
@@ -571,6 +578,23 @@ mod tests {
         assert!(s.pop_frame().is_empty());
         assert!(s.current_frame_active(rt(1)));
         s.pop_frame();
+    }
+
+    #[test]
+    fn any_compute_frame_sees_every_runtime_but_not_a_barrier() {
+        let s = SharedDepStack::new();
+        let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
+        assert!(!s.any_compute_frame());
+        s.push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &a, u32::MAX);
+        assert!(!s.any_compute_frame());
+        s.pop_frame();
+        s.push_frame(rt(2), NodeId(5), &a);
+        s.push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &b, u32::MAX);
+        assert!(!s.current_frame_active(rt(1)));
+        assert!(s.any_compute_frame(), "a frame below the barrier counts");
+        s.pop_frame();
+        s.pop_frame();
+        assert!(!s.any_compute_frame());
     }
 
     #[test]

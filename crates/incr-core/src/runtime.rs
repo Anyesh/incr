@@ -31,6 +31,7 @@ use crate::cycle::{
 };
 use crate::cycle_state::{self, EntryDepth, UnwindKind};
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
+use crate::dep_set::{self, DepDiff, DepHashSet, DepLookup};
 use crate::dep_stack::{ActiveRead, DepStack};
 use crate::dependent_list::DependentList;
 use crate::fx::FxBuildHasher;
@@ -326,18 +327,20 @@ impl<C: Cells> SetClaim<'_, C> {
     /// releases the claim a second time. The release precedes the walk
     /// so that a delete or set waiting on the claim is not held up by it.
     #[inline(always)]
-    fn finish_written(mut self) {
+    fn finish_written(mut self) -> u64 {
         self.held = false;
         let rev = self.rt.bump_revision();
         let walk_done = WalkDone { rt: self.rt, rev };
         self.rt.park(ParkPoint::SetAfterBump);
-        self.node.settle_changed_at(NodeData::<C>::input_stamp(rev));
+        let stamp = NodeData::<C>::input_stamp(rev);
+        self.node.settle_changed_at(stamp);
         self.node.release_set_claim(self.base, rev);
         set_stack::pop(self.rt.runtime_id, self.id.0);
         self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         std::mem::forget(self);
+        stamp
     }
 }
 
@@ -1228,12 +1231,13 @@ impl<C: Cells> Runtime<C> {
         panic!("incr-core: pending handle used outside the replay attempt that produced it");
     }
 
-    /// Whether this thread is inside a compute of this runtime, or under
-    /// `Shared` of any `Shared` runtime, since that frame stack is per
-    /// thread.
+    /// Whether this thread is inside a compute of any runtime. Every
+    /// runtime on a thread shares its frame stack, and a compute of
+    /// another runtime holds that runtime's claim as surely as one of this
+    /// runtime's does.
     #[doc(hidden)]
     pub fn frame_active(&self) -> bool {
-        self.dep_stack.current_frame_active(self.runtime_id)
+        self.dep_stack.any_compute_frame()
     }
 
     /// Whether this runtime's active frame on this thread is doomed.
@@ -2323,7 +2327,7 @@ impl<C: Cells> Runtime<C> {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
-        let displaced = self.write_claimed(claim, arena, arena_slot, value, drop);
+        let (displaced, _) = self.write_claimed(claim, arena, arena_slot, value, drop);
         // The old value's user `Drop`, or the reclaim its retire may run,
         // happens with no claim held and none of the locks this set took.
         drop(displaced);
@@ -2351,21 +2355,24 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// [`Self::set`] that hands back what it would drop: the displaced
-    /// value if it wrote, or the rejected equal value if it did not.
+    /// value if it wrote, or the rejected equal value if it did not, with
+    /// the input's `changed_at` as this call left it.
     pub(crate) fn set_returning_displaced<T: Value>(
         &self,
         handle: Incr<T>,
         value: T,
-    ) -> Compared<T, Displaced<T, C>> {
+    ) -> (Compared<T, Displaced<T, C>>, u64) {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
         let mut rejected = None;
-        let displaced = self.write_claimed(claim, arena, arena_slot, value, |r| rejected = Some(r));
-        match rejected {
+        let (displaced, stamp) =
+            self.write_claimed(claim, arena, arena_slot, value, |r| rejected = Some(r));
+        let compared = match rejected {
             Some(rejected) => Compared::Equal(rejected),
             None => Compared::Replaced(displaced),
-        }
+        };
+        (compared, stamp)
     }
 
     /// Take `set`'s claim on `handle`'s input, with the arena and slot
@@ -2439,8 +2446,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// `set` from its claim to its walk. Returns what the write
-    /// displaced, if it wrote; an equal value is handed to `rejected`
-    /// once its earlier change has walked.
+    /// displaced, if it wrote, and the input's `changed_at` read under the
+    /// claim: the stamp this write settled, or the one an equal value
+    /// already carried. An equal value is handed to `rejected` once its
+    /// earlier change has walked.
     fn write_claimed<T: Value>(
         &self,
         claim: SetClaim<'_, C>,
@@ -2448,7 +2457,7 @@ impl<C: Cells> Runtime<C> {
         arena_slot: u32,
         value: T,
         rejected: impl FnOnce(T),
-    ) -> Option<Displaced<T, C>> {
+    ) -> (Option<Displaced<T, C>>, u64) {
         let node = claim.node;
         // Publication order is the protocol's backbone:
         // 1. pending marker, so no verifier can stamp past this change
@@ -2474,11 +2483,11 @@ impl<C: Cells> Runtime<C> {
                 // `walked` is even, so reaching the stamp reaches the set.
                 self.wait_walked(changed_at);
                 rejected(equal);
-                None
+                (None, changed_at)
             }
             Compared::Replaced(displaced) => {
-                claim.finish_written();
-                displaced
+                let stamp = claim.finish_written();
+                (displaced, stamp)
             }
         }
     }
@@ -2504,6 +2513,9 @@ impl<C: Cells> Runtime<C> {
             self.waits_on_own_claim(id);
         }
         self.refuse_wait_on_computing(id);
+        if spins == 1 {
+            crate::lock_order::assert_may_wait_on_claim();
+        }
         if !C::SINGLE_THREADED && spins >= waits::REGISTER_AFTER {
             let node = self.nodes.get(id.0);
             self.wait_registered(id, || !is_computing(state::load::<C>(node.state_cell())));
@@ -3776,13 +3788,7 @@ impl<C: Cells> Runtime<C> {
         let mut old_deps: Vec<NodeId> = Vec::with_capacity(8);
         node.for_each_dep(|d| old_deps.push(d));
         let new_deps: Vec<NodeId> = if panicked {
-            let mut union = old_deps.clone();
-            for &(d, _) in recorded {
-                if !union.contains(&d) {
-                    union.push(d);
-                }
-            }
-            union
+            dep_set::union(&old_deps, recorded)
         } else {
             recorded.iter().map(|&(d, _)| d).collect()
         };
@@ -3790,7 +3796,61 @@ impl<C: Cells> Runtime<C> {
         if old_deps == new_deps {
             return Publish::Published;
         }
+        if dep_set::needs_hashing(old_deps.len(), new_deps.len()) {
+            return self.publish_large_diff(
+                id, node, recorded, panic, verify_rev, bag, &old_deps, &new_deps,
+            );
+        }
+        let diff = DepDiff {
+            old: &old_deps,
+            new: &new_deps,
+            old_set: &old_deps[..],
+            new_set: &new_deps[..],
+        };
+        self.publish_diff(id, node, recorded, panic, verify_rev, bag, diff)
+    }
 
+    /// `publish_deps` for lists long enough that scanning one per entry
+    /// of the other would be quadratic. Out of line so the short-list
+    /// path compiles to plain scans.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_large_diff(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        recorded: &[(NodeId, u32)],
+        panic: Option<&[u32]>,
+        verify_rev: u64,
+        bag: &mut Deferred<C>,
+        old_deps: &[NodeId],
+        new_deps: &[NodeId],
+    ) -> Publish {
+        // Built before the write hold, which every reader of the graph waits on.
+        let old_set = DepHashSet::new(old_deps);
+        let new_set = DepHashSet::new(new_deps);
+        let diff = DepDiff {
+            old: old_deps,
+            new: new_deps,
+            old_set: &old_set,
+            new_set: &new_set,
+        };
+        self.publish_diff(id, node, recorded, panic, verify_rev, bag, diff)
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_diff<S: DepLookup + ?Sized>(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        recorded: &[(NodeId, u32)],
+        panic: Option<&[u32]>,
+        verify_rev: u64,
+        bag: &mut Deferred<C>,
+        diff: DepDiff<'_, S>,
+    ) -> Publish {
         let mut inner = self.inner.write();
         let stale = recorded.iter().any(|&(d, generation)| {
             let dep = self.nodes.get(d.0);
@@ -3804,34 +3864,32 @@ impl<C: Cells> Runtime<C> {
         // through an edge it lacks, and a dep recomputed for that set
         // lands Clean with a changed_at up to the stamp revision.
         let settled = |d: &NodeId| {
-            old_deps.contains(d)
+            diff.old_set.has(*d)
                 || self.observed_clean(*d, verify_rev)
                 || panic.is_some_and(|members| {
                     self.nodes.get(d.0).state() == NodeState::Failed
                         || members.binary_search(&d.0).is_ok()
                 })
         };
-        let superseded = !new_deps.iter().all(settled);
+        let superseded = !diff.new.iter().all(settled);
 
         // The displaced list is retired at the attempt's drain, after its
         // landing: a retire can reclaim pending values and run their
         // `Drop` under this hold otherwise.
-        if let Some(displaced) = node.install_deps(&new_deps) {
+        if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
         }
 
-        // Linear scans for small dep sets are faster than HashSet
-        // construction below ~16 items.
-        for old_dep in &old_deps {
-            if !new_deps.contains(old_dep) {
+        for old_dep in diff.old {
+            if !diff.new_set.has(*old_dep) {
                 inner.dependents[old_dep.0 as usize].remove(id);
             }
         }
         // A dep read twice is in `new_deps` twice, and its list already
         // ends with `id` from the first push, so each list holds `id` at
         // most once and a delete's back-to-front remove finds it.
-        for new_dep in &new_deps {
-            if !old_deps.contains(new_dep) {
+        for new_dep in diff.new {
+            if !diff.old_set.has(*new_dep) {
                 inner.dependents[new_dep.0 as usize].push_unique(id);
             }
         }
@@ -5169,5 +5227,95 @@ mod tests {
             let _ = rt.get(dynamic);
         }
         drop(rt);
+    }
+
+    const BIG: usize = 50_000;
+    const SHIFT: usize = 10_000;
+
+    /// `BIG + SHIFT` inputs and a query that reads the first `BIG` in
+    /// order while `flip` is false, and the last `BIG` in reverse after.
+    fn big_reordered_query(
+        rt: &Runtime<Local>,
+        panic_after: bool,
+    ) -> (Incr<bool>, Vec<Incr<i64>>, Incr<i64>) {
+        let flip = rt.create_input(false);
+        let inputs: Vec<_> = (0..(BIG + SHIFT) as i64)
+            .map(|v| rt.create_input(v))
+            .collect();
+        let captured = inputs.clone();
+        let sum = rt.create_query(move |rt| {
+            if !rt.get(flip) {
+                return captured[..BIG].iter().map(|&i| rt.get(i)).sum::<i64>();
+            }
+            let total = captured[SHIFT..].iter().rev().map(|&i| rt.get(i)).sum();
+            assert!(!panic_after, "panic after the reordered reads");
+            total
+        });
+        (flip, inputs, sum)
+    }
+
+    fn installed_deps(rt: &Runtime<Local>, h: Incr<i64>) -> Vec<NodeId> {
+        let mut deps = Vec::new();
+        rt.nodes.get(h.slot()).for_each_dep(|d| deps.push(d));
+        deps
+    }
+
+    /// A recompute whose 50k-entry dep list is shifted and reversed
+    /// publishes in time linear in the list, installing exactly the new
+    /// list and moving the reverse edges with it.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a timing test; dep_set::tests cover the hashed diff under Miri"
+    )]
+    fn local_large_reordered_dep_list_publishes_new_edges() {
+        let rt: Runtime<Local> = Runtime::new();
+        let (flip, inputs, sum) = big_reordered_query(&rt, false);
+        assert_eq!(rt.get(sum), (0..BIG as i64).sum());
+
+        rt.set(flip, true);
+        let start = std::time::Instant::now();
+        assert_eq!(rt.get(sum), (SHIFT as i64..(BIG + SHIFT) as i64).sum());
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+
+        let expected: Vec<NodeId> = std::iter::once(NodeId(flip.slot()))
+            .chain(inputs[SHIFT..].iter().rev().map(|i| NodeId(i.slot())))
+            .collect();
+        assert_eq!(installed_deps(&rt, sum), expected);
+        for (i, &input) in inputs.iter().enumerate() {
+            assert_eq!(rt.has_reverse_edge(input, sum), i >= SHIFT, "input {i}");
+        }
+        rt.assert_invariant_i();
+    }
+
+    /// A panicking recompute over the same lists publishes the union of
+    /// the old and recorded deps, each once, in linear time.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a timing test; dep_set::tests cover the hashed diff under Miri"
+    )]
+    fn local_large_panicked_dep_list_publishes_the_union() {
+        let rt: Runtime<Local> = Runtime::new();
+        let (flip, inputs, sum) = big_reordered_query(&rt, true);
+        assert_eq!(rt.get(sum), (0..BIG as i64).sum());
+
+        rt.set(flip, true);
+        let start = std::time::Instant::now();
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(sum)));
+        let took = start.elapsed();
+        assert!(read.is_err());
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+
+        let expected: Vec<NodeId> = std::iter::once(NodeId(flip.slot()))
+            .chain(inputs[..BIG].iter().map(|i| NodeId(i.slot())))
+            .chain(inputs[BIG..].iter().rev().map(|i| NodeId(i.slot())))
+            .collect();
+        assert_eq!(installed_deps(&rt, sum), expected);
+        for &input in &inputs {
+            assert!(rt.has_reverse_edge(input, sum));
+        }
+        rt.assert_edges_complete();
     }
 }

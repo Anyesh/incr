@@ -44,7 +44,8 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// base, renames the file into place, fsyncs the directory, replaces
 /// `MEMO_CURRENT` the same way and fsyncs the directory again.
 /// [`lock_checkpoint`](MemoBackend::lock_checkpoint) takes `MEMO_LOCK`
-/// without waiting and removes what an interrupted write left behind. Locks
+/// without waiting and removes temp files and every generation file but
+/// the current one. Locks
 /// are taken on a fresh open of the lock file, so they exclude other
 /// handles and other threads in this process as well as other processes.
 /// That cleanup assumes every writer holds the checkpoint lock: a
@@ -119,19 +120,21 @@ impl FileMemo {
         Ok(file)
     }
 
-    /// Removes temp files and generation files above the current one, which
-    /// only an interrupted write leaves. Runs under `MEMO_LOCK` and
-    /// `MEMO_PUBLISH`, so no checkpoint of any handle is writing.
+    /// Removes temp files and every generation file but the current one.
+    /// Runs under `MEMO_LOCK` and `MEMO_PUBLISH`, so no checkpoint of any
+    /// handle is writing.
     fn remove_leftovers(&self) -> Result<()> {
         let _publish = self.lock_publish()?;
-        let current = self.current()?.map_or(0, |id| id.0);
+        let current = self.current()?;
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            let is_tmp = name.to_str().is_some_and(|n| n.starts_with(TMP_PREFIX));
-            let is_orphan = generation_of(&name).is_some_and(|id| id > current);
-            if is_tmp || is_orphan {
+            if name.to_str().is_some_and(|n| n.starts_with(TMP_PREFIX)) {
                 remove_if_present(&entry.path())?;
+            } else if let Some(id) = generation_of(&name).map(GenId) {
+                if Some(id) != current {
+                    self.remove_generation(id)?;
+                }
             }
         }
         Ok(())
@@ -188,11 +191,21 @@ impl MemoBackend for FileMemo {
     }
 
     fn load(&self) -> Result<Option<Generation>> {
-        let Some(id) = self.current()? else {
+        let Some(mut id) = self.current()? else {
             return Ok(None);
         };
-        let Some(file) = self.generation_file(id)? else {
-            return Ok(Some(Generation::empty(id)));
+        #[cfg(test)]
+        tests::after_load_reads_current();
+        // Another handle may publish the next generation and remove this
+        // one between reading `MEMO_CURRENT` and opening the file.
+        let file = loop {
+            if let Some(file) = self.generation_file(id)? {
+                break file;
+            }
+            match self.current()? {
+                Some(now) if now != id => id = now,
+                _ => return Ok(Some(Generation::empty(id))),
+            }
         };
         Ok(Some(
             read_generation(&file, id)?.unwrap_or_else(|| Generation::empty(id)),
