@@ -3393,6 +3393,8 @@ impl<C: Cells> Runtime<C> {
                     if first && ctl.wrote.get() == 0 {
                         node.set_verified_at(0);
                     }
+                    // Leaving the group is safe: a New node's record is inert,
+                    // and the retry computes the node alone.
                     self.land_run(
                         id,
                         node,
@@ -3429,6 +3431,8 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     NodeState::Clean
                 };
+                // The run computed the node alone, as the unbounded run's
+                // does, so the node leaves its group.
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
@@ -3562,6 +3566,8 @@ impl<C: Cells> Runtime<C> {
         // After the publish, so that a child the attempt read keeps the
         // union's edge and is retained rather than deleted under it.
         self.children_landing(id, flags, ChildLanding::Discard, false, bag);
+        // The panic fails this attempt in the unbounded run too, so the node
+        // leaves its group.
         self.land_single(id, node, flags, landing, flagged);
     }
 

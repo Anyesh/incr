@@ -44,8 +44,8 @@ pub(super) enum PopEnd {
     Deferred,
     /// The episode landed every member.
     Landed,
-    /// Validation found the root alone: it computes as an ordinary node,
-    /// under the claim it holds.
+    /// Validation found the root alone: its caller ends the root's held
+    /// entry, and it computes as an ordinary node, under the claim it holds.
     Dissolved,
     /// A recorded dep went stale: every member landed New, and the root
     /// claims again.
@@ -1440,7 +1440,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Releases `slots` from the held map with the discard landing,
-    /// except `keep`.
+    /// except `keep`. They leave their group, as the unbounded run's
+    /// episode cuts them at the same point.
     fn release_members(&self, slots: &[u32], keep: Option<u32>, bag: &mut Deferred<C>) {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
@@ -1567,7 +1568,9 @@ impl<C: Cells> Runtime<C> {
     /// stores `verified_at = 0` if it wrote nothing (rule (a)); one that
     /// wrote its slot is stamped and lands New, so that its retry writes
     /// and stamps unconditionally; any other lands Dirty. Recorded deps
-    /// are dropped and installed ones kept. It never lands Failed.
+    /// are dropped and installed ones kept. It never lands Failed. The node
+    /// leaves its group, so callers use it only for an attempt the unbounded
+    /// run releases the same way.
     pub(super) fn discard_land(
         &self,
         id: NodeId,
@@ -1585,7 +1588,9 @@ impl<C: Cells> Runtime<C> {
     /// A wound's and a T8 discard's keep the node in its group, as
     /// `unclaim_group` does: neither attempt is in the unbounded run or in
     /// any single-thread order, and a member it took out would make another
-    /// thread compute alone what that order verifies as a group.
+    /// thread compute alone what that order verifies as a group. A user
+    /// panic or a cycle error outside a speculative run unwinds the
+    /// unbounded run too, so its claims leave their group.
     pub(super) fn unwound_land(
         &self,
         id: NodeId,
@@ -1688,6 +1693,7 @@ impl<C: Cells> Runtime<C> {
                 node.set_verified_at(0);
             }
             self.children_landing(id, flags, ChildLanding::Discard, e.opened, bag);
+            // Leaving the group is safe: a New node's record is inert.
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
             false
         } else {
@@ -1702,6 +1708,8 @@ impl<C: Cells> Runtime<C> {
                 (NodeState::Clean, ChildLanding::Sweep)
             };
             self.children_landing(id, flags, children, e.opened, bag);
+            // The run computed the node alone, as the frame's run in the
+            // unbounded run does, so the node leaves its group.
             self.land_single(id, node, flags, target, NodeState::Dirty);
             self.record_trace(
                 id,
@@ -1758,6 +1766,8 @@ impl<C: Cells> Runtime<C> {
                     node.set_verified_at(0);
                 }
                 self.children_landing(NodeId(m), flags, ChildLanding::Discard, false, bag);
+                // Leaving the group is safe: a New member's record is inert,
+                // and the root's retry records the group again.
                 self.land_single(NodeId(m), node, flags, NodeState::New, NodeState::New);
                 bag.push_erased(Box::new((e.buf, e.s)));
             }
@@ -1886,7 +1896,7 @@ impl<C: Cells> Runtime<C> {
     /// Step 3 ended in a panic (a `PartialEq` of a member's value): every
     /// member whose slot was written is stamped and lands New, the member
     /// whose compare panicked lands through fix 5's panic path, and the
-    /// others take the discard landing. Each leaves its group.
+    /// others take the unwind's landing ([`Self::unwound_land`]).
     fn abort_landing(
         &self,
         entries: &mut [(u32, Held)],
