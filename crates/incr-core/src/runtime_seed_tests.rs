@@ -8,10 +8,11 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::race_tests::{id, park_at, Gate};
+use super::race_tests::{id, panic_message, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
+use crate::cycle::{CycleStrategy, QueryOpts};
 use crate::handle::{ErasedIncr, Incr};
 use crate::persist_hooks::{
     changed_at, changed_at_erased, frame_doomed, get_or_insert_query_seeded, inspect,
@@ -58,6 +59,7 @@ both!(
     changed_at_erased_refuses_dead_and_foreign_handles,
     a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle,
     a_seeded_hit_leaves_its_key_and_closure_in_the_bag,
+    a_seeded_type_fallback_miss_needs_the_types_fallback,
 );
 
 fn dep<T>(h: Incr<T>) -> SeedDep {
@@ -455,6 +457,36 @@ fn a_panicking_seed_hook_leaves_no_node<C: Cells>() {
         let again = table.get_or_insert_query(&rt, 0, f);
         assert_eq!(rt.get(again), 40);
     }
+}
+
+/// A seeded miss asking for `TypeFallback` on a type with no fallback
+/// panics at creation, as `get_or_insert_query_with` does, before the
+/// hook runs or a node exists.
+fn a_seeded_type_fallback_miss_needs_the_types_fallback<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let table: NodeTable<u8, u64, C> = rt.create_table();
+    let nodes = rt.node_count();
+    let opts = QueryOpts {
+        cycle: CycleStrategy::TypeFallback,
+        ..Default::default()
+    };
+    let mut bag = Deferred::new();
+    let caught = catch_unwind(AssertUnwindSafe(|| {
+        get_or_insert_query_seeded(
+            &table,
+            &rt,
+            0,
+            |_: &Runtime<C>| 1_u64,
+            opts,
+            |_, _| panic!("the hook ran"),
+            &mut bag,
+        )
+    }));
+    bag.drain(&rt);
+    let msg = panic_message(caught.expect_err("the miss created the query"));
+    assert!(msg.contains("needs its type's fallback"), "{msg}");
+    assert_eq!(rt.node_count(), nodes);
+    assert_eq!(probe_unchecked(&table, &rt, &0), None);
 }
 
 /// A key whose `Drop` panics once for the id `KEY_DROP_ARMED` holds.

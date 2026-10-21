@@ -29,7 +29,7 @@ use std::rc::Rc;
 use haphazard::{AtomicPtr as HzAtomicPtr, Global, Replaced};
 
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{self, ErasedOpts, QueryOpts};
+use crate::cycle::{ErasedOpts, QueryOpts};
 use crate::deferred::{isolate, Deferred};
 use crate::dep_stack::DepStack;
 use crate::fx::FxBuildHasher;
@@ -628,7 +628,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        let opts = cycle::erase_opts(opts);
+        let opts = rt.erase_query_opts(opts);
         let mut created = None;
         // Once `seed` returns the node may be in the table, so an unwind
         // after that must leave the published node alone.
