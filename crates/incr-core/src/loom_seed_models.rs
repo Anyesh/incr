@@ -117,40 +117,43 @@ fn seed_vs_reader() {
     });
 }
 
-/// Q = x + (a or b by pick), with a != b. A recompute moves Q from
-/// {pick, x, a} to {pick, x, b} while `inspect` reads it: what `inspect`
-/// returns is one run's value with that run's deps.
+/// Q = x + (a or b by pick), with b != a and, for the value-preserving
+/// dep change, b == a. A recompute moves Q from {pick, x, a} to
+/// {pick, x, b} while `inspect` reads it: what `inspect` returns is one
+/// run's value with that run's deps.
 #[test]
 fn inspect_vs_recompute() {
-    run(|| {
-        let rt = Arc::new(Rt::new());
-        let x = rt.create_input(1_u64);
-        let pick = rt.create_input(false);
-        let a = rt.create_input(5_u64);
-        let b = rt.create_input(7_u64);
-        let q = rt.create_query(move |rt: &Rt| {
-            let side = if rt.get(pick) { b } else { a };
-            rt.get(x) + rt.get(side)
+    for b_value in [7_u64, 5] {
+        run(move || {
+            let rt = Arc::new(Rt::new());
+            let x = rt.create_input(1_u64);
+            let pick = rt.create_input(false);
+            let a = rt.create_input(5_u64);
+            let b = rt.create_input(b_value);
+            let q = rt.create_query(move |rt: &Rt| {
+                let side = if rt.get(pick) { b } else { a };
+                rt.get(x) + rt.get(side)
+            });
+            assert_eq!(rt.get(q), 6);
+            let other = {
+                let rt = Arc::clone(&rt);
+                thread::spawn(move || {
+                    rt.set(pick, true);
+                    rt.get(q)
+                })
+            };
+            let seen = inspect(&rt, q);
+            assert_eq!(other.join().unwrap(), 1 + b_value);
+            if let Some(seen) = seen {
+                let before = (6, vec![pick.erase(), x.erase(), a.erase()]);
+                let after = (1 + b_value, vec![pick.erase(), x.erase(), b.erase()]);
+                let pair = (seen.value, seen.deps);
+                assert!(
+                    pair == before || pair == after,
+                    "inspect mixed two runs: {pair:?}"
+                );
+            }
+            rt.assert_invariant_i();
         });
-        assert_eq!(rt.get(q), 6);
-        let other = {
-            let rt = Arc::clone(&rt);
-            thread::spawn(move || {
-                rt.set(pick, true);
-                rt.get(q)
-            })
-        };
-        let seen = inspect(&rt, q);
-        assert_eq!(other.join().unwrap(), 8);
-        if let Some(seen) = seen {
-            let before = (6, vec![pick.erase(), x.erase(), a.erase()]);
-            let after = (8, vec![pick.erase(), x.erase(), b.erase()]);
-            let pair = (seen.value, seen.deps);
-            assert!(
-                pair == before || pair == after,
-                "inspect mixed two runs: {pair:?}"
-            );
-        }
-        rt.assert_invariant_i();
-    });
+    }
 }
