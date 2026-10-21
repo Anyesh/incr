@@ -1,8 +1,7 @@
 //! Restoring memo entries after a restart against running them cold.
 //!
-//! Every case is a fresh `Store<Local, _>` and memo over a `FileMemo` in a
-//! directory under the workspace's `target/`, as a restarted process would
-//! open them; restores read a generation an earlier checkpoint wrote, with
+//! Every case is a fresh `Store` and memo over a `FileMemo` in a directory
+//! under the workspace's `target/`, as a restarted process would open them; restores read a generation an earlier checkpoint wrote, with
 //! the page cache warm. Opening the memo is untimed except in `open`.
 //!
 //! - `chain`: 100k entries, each reading the one below it and entry 0 an
@@ -16,6 +15,9 @@
 //! - `index`: a 100k-item `Generation` alone: `build` indexes it as a
 //!   load does, and `find` looks up every item once in key order, which
 //!   is hash order scattered over the index.
+//!
+//! `chain`, `wide` and `sweep` run on Local and, in groups named with a
+//! `_shared` suffix, on Shared; `index` uses no runtime.
 
 mod common;
 
@@ -23,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::bench_dir;
+use common::{bench_dir, BenchCells};
 use criterion::measurement::WallTime;
 use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkGroup, Criterion, Throughput,
@@ -33,29 +35,29 @@ use incr_persist::memo::{
     key_hash, BuildId, FileMemo, GenHeader, GenId, Generation, IndexItem, Memo, MemoBuilder,
     MemoOptions, MemoTable,
 };
-use incr_persist::{Local, MemoryBackend, Options, Store};
+use incr_persist::{Local, MemoryBackend, Options, Shared, Store};
 use tempfile::TempDir;
 
 const BIG: u32 = 100_000;
 const SWEEP: u32 = 1_000;
 const BUILD: u128 = 0xbe9c4;
 
-type Define = dyn Fn(&mut MemoBuilder<Local>, Incr<u64>) -> MemoTable<u32, u64>;
+type Define<C> = dyn Fn(&mut MemoBuilder<C>, Incr<u64>) -> MemoTable<u32, u64>;
 
 /// One shape: how its table is defined and which keys a cold run and a
 /// restore read.
-struct Shape {
-    define: Box<Define>,
+struct Shape<C: BenchCells> {
+    define: Box<Define<C>>,
     keys: u32,
     restore_reads_top_only: bool,
 }
 
-struct Opened {
-    memo: Memo<Local, MemoryBackend>,
+struct Opened<C: BenchCells> {
+    memo: Memo<C, MemoryBackend>,
     table: MemoTable<u32, u64>,
 }
 
-impl Opened {
+impl<C: BenchCells> Opened<C> {
     fn read(&self, key: u32) -> u64 {
         let q = self.memo.get_or_insert(self.table, key);
         self.memo.runtime().get(q)
@@ -68,8 +70,8 @@ impl Opened {
     }
 }
 
-impl Shape {
-    fn chain() -> Shape {
+impl<C: BenchCells> Shape<C> {
+    fn chain() -> Self {
         Shape {
             define: Box::new(|builder, x| {
                 let chain = builder.table::<u32, u64>("chain", 1);
@@ -87,7 +89,7 @@ impl Shape {
         }
     }
 
-    fn wide(keys: u32, cost: Duration) -> Shape {
+    fn wide(keys: u32, cost: Duration) -> Self {
         Shape {
             define: Box::new(move |builder, x| {
                 let wide = builder.table::<u32, u64>("wide", 1);
@@ -108,8 +110,8 @@ impl Shape {
     /// replays the same input.
     // `MemoBuilder::open` takes the store as an `Arc` whatever its cells.
     #[allow(clippy::arc_with_non_send_sync)]
-    fn open(&self, log: &MemoryBackend, dir: &Path) -> Opened {
-        let store = Arc::new(Store::<Local, _>::open(log.clone(), Options::default()).unwrap());
+    fn open(&self, log: &MemoryBackend, dir: &Path) -> Opened<C> {
+        let store = Arc::new(Store::<C, _>::open(log.clone(), Options::default()).unwrap());
         let x = store.input("x", 3_u64).unwrap().handle();
         let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(BUILD)));
         let table = (self.define)(&mut builder, x);
@@ -117,11 +119,11 @@ impl Shape {
         Opened { memo, table }
     }
 
-    fn cold(&self, opened: &Opened) {
+    fn cold(&self, opened: &Opened<C>) {
         opened.read_ascending(self.keys);
     }
 
-    fn restore(&self, opened: &Opened) {
+    fn restore(&self, opened: &Opened<C>) {
         if self.restore_reads_top_only {
             black_box(opened.read(self.keys - 1));
         } else {
@@ -154,10 +156,10 @@ fn spin(d: Duration) {
     }
 }
 
-fn bench_cold(
+fn bench_cold<C: BenchCells>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     id: &str,
-    shape: &Shape,
+    shape: &Shape<C>,
     log: &MemoryBackend,
 ) {
     let empty = bench_dir();
@@ -173,10 +175,10 @@ fn bench_cold(
     });
 }
 
-fn bench_restore(
+fn bench_restore<C: BenchCells>(
     group: &mut BenchmarkGroup<'_, WallTime>,
     id: &str,
-    shape: &Shape,
+    shape: &Shape<C>,
     log: &MemoryBackend,
     dir: &Path,
 ) {
@@ -193,10 +195,10 @@ fn bench_restore(
 }
 
 /// Cold, restore, open and checkpoint for one 100k-entry shape.
-fn big(c: &mut Criterion, name: &str, shape: Shape) {
+fn big<C: BenchCells>(c: &mut Criterion, name: &str, shape: Shape<C>) {
     let log = MemoryBackend::new();
     let stored = shape.checkpointed(&log);
-    let mut group = c.benchmark_group(name);
+    let mut group = c.benchmark_group(format!("{name}{}", C::SUFFIX));
     group.sample_size(10);
     group.throughput(Throughput::Elements(u64::from(shape.keys)));
     bench_cold(&mut group, "cold", &shape, &log);
@@ -226,12 +228,12 @@ fn big(c: &mut Criterion, name: &str, shape: Shape) {
     group.finish();
 }
 
-fn chain(c: &mut Criterion) {
-    big(c, "memo_chain_100k", Shape::chain());
+fn chain<C: BenchCells>(c: &mut Criterion) {
+    big(c, "memo_chain_100k", Shape::<C>::chain());
 }
 
-fn wide(c: &mut Criterion) {
-    big(c, "memo_wide_100k", Shape::wide(BIG, Duration::ZERO));
+fn wide<C: BenchCells>(c: &mut Criterion) {
+    big(c, "memo_wide_100k", Shape::<C>::wide(BIG, Duration::ZERO));
 }
 
 const COSTS: [(&str, Duration); 9] = [
@@ -246,13 +248,13 @@ const COSTS: [(&str, Duration); 9] = [
     ("1ms", Duration::from_millis(1)),
 ];
 
-fn sweep(c: &mut Criterion) {
-    let mut group = c.benchmark_group("memo_sweep");
+fn sweep<C: BenchCells>(c: &mut Criterion) {
+    let mut group = c.benchmark_group(format!("memo_sweep{}", C::SUFFIX));
     group.sample_size(10);
     for (label, cost) in COSTS {
         group.throughput(Throughput::Elements(1));
         group.bench_function(format!("spin/{label}"), |b| b.iter(|| spin(cost)));
-        let shape = Shape::wide(SWEEP, cost);
+        let shape = Shape::<C>::wide(SWEEP, cost);
         let log = MemoryBackend::new();
         let stored = shape.checkpointed(&log);
         group.throughput(Throughput::Elements(u64::from(SWEEP)));
@@ -302,5 +304,14 @@ fn index(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, chain, wide, sweep, index);
+criterion_group!(
+    benches,
+    chain::<Local>,
+    wide::<Local>,
+    sweep::<Local>,
+    index,
+    chain::<Shared>,
+    wide::<Shared>,
+    sweep::<Shared>
+);
 criterion_main!(benches);
