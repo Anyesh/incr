@@ -3295,23 +3295,16 @@ impl<C: Cells> Runtime<C> {
                 if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK | value_code::REPLAY_BIT)
                     != 0
                 {
-                    if self.after_pop(word, result.is_ok()) {
-                        result = Err(match UnwindKind::of_word(word) {
-                            Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
-                            _ => Box::new(cycle::WoundUnwind),
-                        });
-                    } else if result.is_ok() && self.speculative_lands_dirty(word, &ctl, &deps) {
-                        if self.drop_cooperatively(None) {
-                            let attempt = Attempt {
-                                first,
-                                cidx,
-                                stamp_rev,
-                                verify_rev,
-                            };
-                            return self.discard_dropped(id, attempt, &ctl, bag);
-                        }
-                        self.set_drop_kind();
-                        result = Err(Box::new(cycle::DiscardUnwind));
+                    let attempt = Attempt {
+                        first,
+                        cidx,
+                        stamp_rev,
+                        verify_rev,
+                    };
+                    if let Some(dropped) =
+                        self.after_pop_word(id, word, &mut result, attempt, &ctl, &deps, bag)
+                    {
+                        return dropped;
                     }
                 }
 
@@ -3561,6 +3554,37 @@ impl<C: Cells> Runtime<C> {
         // union's edge and is retained rather than deleted under it.
         self.children_landing(id, flags, ChildLanding::Discard, false, bag);
         self.land_single(id, node, flags, landing, flagged);
+    }
+
+    /// A frame pop found the memo, unwind or replay bit in the thread word.
+    /// A wound or discard rewrites `result` into its unwind; `Some` is a
+    /// speculative run dropped in place.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn after_pop_word(
+        &self,
+        id: NodeId,
+        word: u64,
+        result: &mut std::thread::Result<Outcome>,
+        attempt: Attempt,
+        ctl: &ComputeCtl,
+        deps: &[(NodeId, u32)],
+        bag: &mut Deferred<C>,
+    ) -> Option<Computed> {
+        if self.after_pop(word, result.is_ok()) {
+            *result = Err(match UnwindKind::of_word(word) {
+                Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
+                _ => Box::new(cycle::WoundUnwind),
+            });
+        } else if result.is_ok() && self.speculative_lands_dirty(word, ctl, deps) {
+            if self.drop_cooperatively(None) {
+                return Some(self.discard_dropped(id, attempt, ctl, bag));
+            }
+            self.set_drop_kind();
+            *result = Err(Box::new(cycle::DiscardUnwind));
+        }
+        None
     }
 
     /// A frame pop found the memo bit or an unwind kind in the thread
