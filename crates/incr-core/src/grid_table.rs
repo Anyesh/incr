@@ -412,7 +412,9 @@ impl<T: Value, C: Cells> GridTable<T, C> {
 
     /// Probes again under the miss mutex and creates the node with
     /// `create` if the entry still has no live one. A live hit there
-    /// drops `payload` after unlocking and returns the winner.
+    /// drops `payload` after unlocking and returns the winner. A frame
+    /// doomed while `payload` was built drops it and gets a pending
+    /// handle, since the build may hold pending handles of its own.
     fn miss<P>(
         &self,
         rt: &Runtime<C>,
@@ -420,6 +422,10 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         payload: P,
         create: impl FnOnce(&Runtime<C>, P) -> Incr<T>,
     ) -> Incr<T> {
+        if rt.frame_doomed() {
+            drop(payload);
+            return rt.pending_handle();
+        }
         // Checked before the mutex, so a value method that misses panics
         // with the contract message instead of re-entering it.
         value_code::check();
