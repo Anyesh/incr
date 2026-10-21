@@ -1334,6 +1334,242 @@ workload (`chain_*`, `diamond_*`, `early_cutoff_*`, `fanout_*_4`,
 The engine's only rise is +9 per remove and +3 per push on a list that
 has spilled to a block, plus 16 bytes per block.
 
+## T10
+
+- Engine: `c84147f` (branch `spreadsheet-t10`). T9 is `main` at
+  `b9f0d0b`. Every driver here was built in a worktree at a path of the
+  same length; one run of `icount.sh` at the default N for each column,
+  and a second run of both ends to bound the spread. T10 changes no
+  bench source and adds no workloads.
+- The split by merge comes from runs at `e51579d`, the first
+  `spreadsheet-t10` commit that contains T9 (so everything T10 merged
+  before it lands in one step: revision encoding, the lock-order
+  checker, the seed, inspect and mapped-write hooks, the memo API's core
+  hooks and the core review), `dee3270` (key drop under M), `1b58522`
+  (dependent-list index), `ccbdd6a` (T10.6 suites), `e24badd`
+  (wound-cycle timing, `569af22`) and `c84147f` (discard-land-group,
+  `136bf75`).
+- Attribution: Intel PT (`intel_pt/tsc=0,mtc=0,noretcomp=0/u`) on
+  line-table builds, N minus 0, each line mapped across the source diff,
+  through `pt-lines.sh` in the incr runbooks; traced totals match
+  `perf stat` on the same driver to within 1 per iteration. The
+  collection workloads hash with per-process random seeds, so two runs
+  of one binary differ by up to 200 per iteration at a traceable N; they
+  were traced with `getrandom` pinned by an `LD_PRELOAD` shim, which
+  makes their counts repeat exactly and reproduces the full-N deltas.
+
+| workload | N | T9 | T10 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,638.00 | 4,639.00 | +1.00 | +0.02 | revision encoding (below) |
+| `chain_local/propagate/10` | 1,000,000 | 10,026.00 | 10,027.00 | +1.00 | +0.01 | revision encoding (below) |
+| `chain_local/propagate/100` | 100,000 | 91,605.02 | 91,606.01 | +0.99 | +0.00 | revision encoding (below) |
+| `chain_shared/propagate/4` | 1,000,000 | 9,375.23 | 9,356.20 | -19.03 | -0.20 | revision encoding; walk codegen (below) |
+| `chain_shared/propagate/10` | 1,000,000 | 20,408.86 | 20,353.82 | -55.04 | -0.27 | revision encoding; walk codegen (below) |
+| `chain_shared/propagate/100` | 100,000 | 186,931.83 | 186,336.36 | -595.47 | -0.32 | revision encoding; walk codegen (below) |
+| `diamond_local` | 1,000,000 | 3,926.00 | 3,927.00 | +1.00 | +0.03 | revision encoding |
+| `diamond_shared` | 1,000,000 | 7,810.95 | 7,795.93 | -15.02 | -0.19 | revision encoding; walk codegen |
+| `early_cutoff_local` | 1,000,000 | 2,298.00 | 2,299.00 | +1.00 | +0.04 | revision encoding |
+| `early_cutoff_shared` | 1,000,000 | 3,576.85 | 3,582.84 | +5.99 | +0.17 | revision encoding; walk codegen; placement (below) |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,732.69 | 4,738.64 | +5.95 | +0.13 | collection hooks; revision encoding (below) |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,371.74 | 7,365.31 | -6.43 | -0.09 | collection hooks; revision encoding; walk codegen (below) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,273.79 | 92,283.20 | +9.41 | +0.01 | placement (below) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,726.11 | 4,731.13 | +5.02 | +0.11 | collection hooks; revision encoding (below) |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,346.37 | 7,340.04 | -6.33 | -0.09 | collection hooks; revision encoding; walk codegen (below) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,875.97 | 158,886.16 | +10.19 | +0.01 | placement (below) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,733.60 | 4,739.35 | +5.75 | +0.12 | collection hooks; revision encoding (below) |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,349.95 | 7,344.95 | -5.00 | -0.07 | collection hooks; revision encoding; walk codegen (below) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,562.86 | 1,490,571.13 | +8.27 | +0.00 | placement (below) |
+| `simple_count/local/1000` | 100,000 | 2,123.93 | 2,129.59 | +5.66 | +0.27 | collection hooks; revision encoding |
+| `simple_count/shared/1000` | 100,000 | 4,073.69 | 4,076.22 | +2.53 | +0.06 | collection hooks; revision encoding; walk codegen |
+| `simple_count/local/10000` | 100,000 | 2,120.75 | 2,126.87 | +6.12 | +0.29 | collection hooks; revision encoding |
+| `simple_count/shared/10000` | 100,000 | 4,053.52 | 4,056.74 | +3.22 | +0.08 | collection hooks; revision encoding; walk codegen |
+| `get_clean_local` | 10,000,000 | 102.00 | 102.00 | +0.00 | +0.00 | none |
+| `get_clean_shared` | 10,000,000 | 196.00 | 196.00 | +0.00 | +0.00 | none |
+| `get_contended_shared` | 2,000 | 7,791,675.07 | 7,791,652.17 | -22.90 | -0.00 | run spread |
+| `fanout_local_4` | 100,000 | 17,111.99 | 17,111.00 | -0.99 | -0.01 | `create_input` (below) |
+| `fanout_local_5` | 100,000 | 21,675.01 | 21,719.00 | +43.99 | +0.20 | dependent-list index |
+| `fanout_local_1000` | 1,000 | 3,443,455.96 | 3,449,234.28 | +5,778.32 | +0.17 | dependent-list index |
+| `fanout_shared_4` | 100,000 | 23,467.18 | 23,467.09 | -0.09 | -0.00 | none (run spread) |
+| `fanout_shared_5` | 100,000 | 28,805.81 | 28,809.16 | +3.35 | +0.01 | dependent-list index |
+| `fanout_shared_1000` | 1,000 | 4,738,116.85 | 4,748,487.99 | +10,371.14 | +0.22 | dependent-list index; first computes; reclamation (below) |
+| `delete_single_local` | 200,000 | 707.00 | 706.00 | -1.00 | -0.14 | `create_input` (below) |
+| `delete_single_shared` | 200,000 | 1,527.24 | 1,530.35 | +3.11 | +0.20 | lock-order guards; revision encoding (below) |
+| `delete_cascade_local` | 1,000 | 3,228,973.34 | 3,228,608.35 | -364.99 | -0.01 | dependent-list index; placement (below) |
+| `delete_cascade_shared` | 1,000 | 4,525,271.89 | 4,534,072.24 | +8,800.35 | +0.19 | dependent-list index; first computes; reclamation (below) |
+| `delete_owned_tree_local` | 10,000 | 602,503.91 | 603,510.73 | +1,006.82 | +0.17 | run spread |
+| `delete_owned_tree_shared` | 10,000 | 983,524.75 | 978,511.63 | -5,013.12 | -0.51 | run spread |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 218.14 | 218.14 | +0.00 | +0.00 | none |
+| `table_hit_sip_local` | 10,000,000 | 299.83 | 301.24 | +1.41 | +0.47 | none (run spread) |
+| `table_miss_local` | 100,000 | 871.18 | 871.17 | -0.01 | -0.00 | revision encoding; key drop under M (below) |
+| `table_miss_shared` | 100,000 | 2,164.23 | 2,170.23 | +6.00 | +0.28 | lock-order guards; revision encoding; key drop under M (below) |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,990.98 | 217,992.00 | +1.02 | +0.00 | revision encoding |
+| `children_rerun_1k_shared` | 10,000 | 224,937.44 | 224,936.25 | -1.19 | -0.00 | revision encoding; walk codegen |
+| `children_churn_local` | 100,000 | 16,524.46 | 16,514.47 | -9.99 | -0.06 | dependent-list index (outside the list) |
+| `children_churn_shared` | 100,000 | 19,409.13 | 19,400.35 | -8.78 | -0.05 | dependent-list index (outside the list) |
+
+- **Revision encoding (`b65dfba`; every workload that sets):** a `set`
+  and its walk cost +5 Shared and +1 Local, from the slope of
+  `chain_*/propagate/100` against `/10`. Under Shared the walk ring
+  indexes by `(rev / 2) % N` (9 against `rev % N`'s 6) and bounds its
+  catch-up by `2 * N`, +3 in `WalkRing::complete`; the odd input stamp
+  `revision - 1` (`node.rs:172`) +1; and `mark_dependents_dirty`'s lock
+  release +1. Local runs no ring, so its +1 is the stamp. Creating an
+  input stamps it the same way (`input_stamp`, +1).
+- **Walk codegen (every Shared walk-driven compute):** −6 per compute,
+  (−595.47 + 55.04) / 90 from the same slope. No source line of
+  `mark_dependents_dirty` or `clean_walk` changed: the compiled walk no
+  longer reloads a node's segment, its null check, a state and three
+  atomics per flipped node (−3 in each function), against +1 at the
+  `wait_out_deleting` join and +1 comparing `Computed`. A first compute
+  saves 3 in `clean_walk`. `diamond_shared` −15 is one `set` and three
+  computes; `early_cutoff_shared` is below.
+- **Collection hooks (T10.1b; `collection_insert_then_read/*_incremental`,
+  `simple_count/*`):** an insert costs +5 Local and +4 Shared. `insert`
+  now hands the representative sink (`()` here) and the displaced-value
+  list into `publish`'s closure (+6 at `collection.rs:799`) and moves
+  the staged insert (+5), and the insert, now inlined into its caller,
+  sheds 6 in its prologue and log write. With the `set`'s +1 Local that
+  is +5 to +6 per iteration; Shared adds the `set`'s +5 and the walk
+  codegen of the read (−16 for `shared_incremental`, which nets −6, and
+  the count's for `simple_count/shared`, which nets +3; fixed-seed
+  traces, exact).
+- **Lock-order guards (T10.2; Shared table misses and deletes):** in
+  release the checker's `Held` is zero-sized and checks nothing, but the
+  compiler stores each `Ordered` guard's lock pointer and poison flag to
+  the stack (`locks.rs:125`): +2 per table miss and +4 per Shared
+  delete, net of the old lock lines. `delete_single_shared` +3 is those
+  +4, the recycled node's input stamp +1 and −2 around the node slot.
+- **Key drop under M (`dee3270`; table misses):** a miss goes through
+  `miss_dropping`, which builds a `Deferred` bag and returns through a
+  `Result`: +3 Shared and −1 Local in `get_or_insert_input`. With the
+  guards and the stamp, `table_miss_shared` +6 and `table_miss_local` 0.
+- **`create_input` (`fanout_local_4`, `delete_single_local`, −1
+  Local):** the odd stamp +1 and two fewer instructions at the node's
+  slot.
+- **Placement:** bench functions inline differently. `early_cutoff_shared`
+  calls its `run` instead of inlining it into `main` (+12), with the
+  ring +3, the `set` +1 and the walk codegen −10; the batch workloads'
+  `BatchRebuild::run` is no longer inlined into `drive` (+9 at its
+  prologue, epilogue and call, per batch, not per element); and
+  `delete_cascade_local`'s setup moved out of `drive` (+18,090 against
+  −18,046) with node segments −11, +34 traced and +47 counted at
+  `e51579d`.
+- **Dependent-list index (`1b58522`):** its own section above. At that
+  merge here: `fanout_local_5` +45, `fanout_shared_5` +4,
+  `fanout_local_1000` +5,787, `fanout_shared_1000` +11,386,
+  `delete_cascade_local` −412, `delete_cascade_shared` +10,745, and
+  `children_churn_*` −10.
+- **First computes and reclamation (`fanout_shared_1000`,
+  `delete_cascade_shared`):** −985 and −1,913 at `e51579d`. Per query
+  created, `clean_walk` −3, the cascade's `delete_with_dependents` −1,
+  and `create_query_erased` and the arena release trade 2 (N = 1 with
+  pinned seeds: −2,961 and −3,916); the rest is haphazard's hazard
+  pointer reclamation, a `BTreeMap` keyed by retired addresses, which
+  moves by up to 2,000 between traces. The wound-cycle merge's −44 and
+  −53 are all inside that reclamation (−78 traced in haphazard's
+  `Domain`, no incr-core line).
+- **Discard-land-group (`136bf75`):** nothing moves; pinned-seed counts
+  of `delete_cascade_shared`, `children_churn_shared` and
+  `collection_insert_then_read/batch/100000` agree to 3 per iteration.
+- **Run spread:** `get_contended_shared`, `delete_owned_tree_*`,
+  `table_hit_sip_local` (SipHash with random keys) and `fanout_shared_4`,
+  within the spread of the second runs.
+
+Gate: the Clean get, table hit and value-slot reads are unchanged. The
+rises are the revision encoding's +5 Shared and +1 Local per `set`, the
+collection hooks' +5 Local and +4 Shared per insert, the lock-order
+guards' spills (+2 per Shared table miss, +4 per Shared delete) and the
+key drop's +3 per Shared table miss; Shared walk-driven computes are 6
+cheaper each.
+
+## T11
+
+- Engine: `539e904` (branch `spreadsheet-t11`), before the alloc pools,
+  whose section below starts from the same commit. T10 is the `c84147f`
+  column above, with a second run of each, built at paths of the same
+  length. T11 adds no workloads and changes no bench source.
+- T11's incr-core additions are functions only the bindings call
+  (`engine_unwind_in_progress`, `active_frame_doomed`, `typed_handle`),
+  the per-type cycle fallbacks (`8f83f8f`), whose only hot-path change
+  is in query creation, and `GridTable` (`f2a9b14`); no workload runs
+  them, and the 1,000 query creations per `fanout_*_1000` and
+  `delete_cascade_*` iteration are unchanged.
+
+| workload | N | T10 | T11 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,639.00 | 4,639.00 | +0.00 | +0.00 | none |
+| `chain_local/propagate/10` | 1,000,000 | 10,027.00 | 10,027.00 | +0.00 | +0.00 | none |
+| `chain_local/propagate/100` | 100,000 | 91,606.01 | 91,606.01 | +0.00 | +0.00 | none |
+| `chain_shared/propagate/4` | 1,000,000 | 9,356.20 | 9,356.20 | +0.00 | +0.00 | none |
+| `chain_shared/propagate/10` | 1,000,000 | 20,353.82 | 20,353.88 | +0.06 | +0.00 | none (run spread) |
+| `chain_shared/propagate/100` | 100,000 | 186,336.36 | 186,336.28 | -0.08 | -0.00 | none (run spread) |
+| `diamond_local` | 1,000,000 | 3,927.00 | 3,927.00 | +0.00 | +0.00 | none |
+| `diamond_shared` | 1,000,000 | 7,795.93 | 7,795.94 | +0.01 | +0.00 | none |
+| `early_cutoff_local` | 1,000,000 | 2,299.00 | 2,299.00 | +0.00 | +0.00 | none |
+| `early_cutoff_shared` | 1,000,000 | 3,582.84 | 3,582.85 | +0.01 | +0.00 | none |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,738.64 | 4,738.42 | -0.22 | -0.00 | none (run spread) |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,365.31 | 7,367.50 | +2.19 | +0.03 | guard spill (below) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.20 | 92,282.55 | -0.65 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,731.13 | 4,731.56 | +0.43 | +0.01 | none (run spread) |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,340.04 | 7,342.41 | +2.37 | +0.03 | guard spill (below) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,886.16 | 158,885.46 | -0.70 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,739.35 | 4,740.02 | +0.67 | +0.01 | none (run spread) |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,344.95 | 7,346.92 | +1.97 | +0.03 | guard spill (below) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,571.13 | 1,490,568.52 | -2.61 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,129.59 | 2,129.62 | +0.03 | +0.00 | none |
+| `simple_count/shared/1000` | 100,000 | 4,076.22 | 4,078.55 | +2.33 | +0.06 | guard spill (below) |
+| `simple_count/local/10000` | 100,000 | 2,126.87 | 2,126.54 | -0.33 | -0.02 | none (run spread) |
+| `simple_count/shared/10000` | 100,000 | 4,056.74 | 4,058.75 | +2.01 | +0.05 | guard spill (below) |
+| `get_clean_local` | 10,000,000 | 102.00 | 102.00 | +0.00 | +0.00 | none |
+| `get_clean_shared` | 10,000,000 | 196.00 | 196.00 | +0.00 | +0.00 | none |
+| `get_contended_shared` | 2,000 | 7,791,652.17 | 7,791,827.18 | +175.01 | +0.00 | run spread |
+| `fanout_local_4` | 100,000 | 17,111.00 | 17,111.00 | +0.00 | +0.00 | none |
+| `fanout_local_5` | 100,000 | 21,719.00 | 21,719.00 | +0.00 | +0.00 | none |
+| `fanout_local_1000` | 1,000 | 3,449,234.28 | 3,449,234.42 | +0.14 | +0.00 | none (run spread) |
+| `fanout_shared_4` | 100,000 | 23,467.09 | 23,467.07 | -0.02 | -0.00 | none |
+| `fanout_shared_5` | 100,000 | 28,809.16 | 28,809.07 | -0.09 | -0.00 | none (run spread) |
+| `fanout_shared_1000` | 1,000 | 4,748,487.99 | 4,748,492.47 | +4.48 | +0.00 | none (run spread) |
+| `delete_single_local` | 200,000 | 706.00 | 706.00 | +0.00 | +0.00 | none |
+| `delete_single_shared` | 200,000 | 1,530.35 | 1,530.25 | -0.10 | -0.01 | none (run spread) |
+| `delete_cascade_local` | 1,000 | 3,228,608.35 | 3,228,607.38 | -0.97 | -0.00 | none (run spread) |
+| `delete_cascade_shared` | 1,000 | 4,534,072.24 | 4,534,070.53 | -1.71 | -0.00 | none (run spread) |
+| `delete_owned_tree_local` | 10,000 | 603,510.73 | 603,783.42 | +272.69 | +0.05 | run spread |
+| `delete_owned_tree_shared` | 10,000 | 978,511.63 | 979,540.18 | +1,028.55 | +0.11 | run spread |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 218.14 | 218.14 | +0.00 | +0.00 | none |
+| `table_hit_sip_local` | 10,000,000 | 301.24 | 301.76 | +0.52 | +0.17 | none (run spread) |
+| `table_miss_local` | 100,000 | 871.17 | 871.17 | +0.00 | +0.00 | none |
+| `table_miss_shared` | 100,000 | 2,170.23 | 2,170.22 | -0.01 | -0.00 | none |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,992.00 | 217,992.06 | +0.06 | +0.00 | none (run spread) |
+| `children_rerun_1k_shared` | 10,000 | 224,936.25 | 224,936.42 | +0.17 | +0.00 | none (run spread) |
+| `children_churn_local` | 100,000 | 16,514.47 | 16,515.99 | +1.52 | +0.01 | none (run spread) |
+| `children_churn_shared` | 100,000 | 19,400.35 | 19,403.38 | +3.03 | +0.02 | none (run spread) |
+
+- **Guard spill (`simple_count/shared/*`,
+  `collection_insert_then_read/shared_incremental/*`, +2):** pinned-seed
+  traces of both `/1000` workloads put all of it at the insert's
+  `Ordered::take` (`locks.rs:125`): two more stores of a lock guard's
+  pointer and poison flag to the stack in the compiled Shared insert.
+  No T11 source line runs there. Bisecting by merge, the type-cycle
+  strategy (`2c4c7dc` against `d5065a2`) moves these workloads by under
+  1.5, so it is not that merge's work either; the instructions are
+  codegen of unchanged source.
+- **Run spread:** `collection_insert_then_read/batch/100000`,
+  `delete_cascade_shared`, `fanout_shared_1000`, `children_churn_*`,
+  `get_contended_shared` and `delete_owned_tree_*`: pinned-seed counts
+  of `batch/100000`, `delete_cascade_shared` and `children_churn_shared`
+  agree to 2 per iteration between T10 and T11, and the rest move
+  inside the spread of their second runs.
+
+Gate: T11 equals T10 except +2 per Shared collection insert, which is
+codegen. It holds as well for `67f6ea6`, the T11 tip before
+discard-land-group and `GridTable` landed, against `e24badd`.
+
 ## T12 support: alloc pools
 
 - Engine: branch `w/T12-perf-core-alloc-pools` at `c37bef1` against its
