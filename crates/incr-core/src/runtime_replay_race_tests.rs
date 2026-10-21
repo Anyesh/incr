@@ -13,9 +13,10 @@ use std::time::Duration;
 
 use super::race_tests::{id, Gate};
 use super::{ParkPoint, Runtime};
-use crate::cells::Shared;
-use crate::cycle::{QueryOpts, Replay};
+use crate::cells::{Cells, Shared};
+use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
 use crate::handle::Incr;
+use crate::segmented_nodes::IN_GROUP;
 use crate::state::NodeState;
 
 type Rt = Runtime<Shared>;
@@ -1139,4 +1140,168 @@ fn shared_virtual_hit_claim_race_closes_a_waits_for_cycle() {
 #[test]
 fn shared_virtual_hit_claim_race_then_a_landed_frame() {
     virtual_hit_claim_race(1);
+}
+
+/// X (no strategy) keeps a record of the group {X, M} and M (Fallback
+/// 100) has left it, as a single-node landing of M leaves it. Once k is
+/// 1, X reads D and then M, M reads X and then W (Fallback 500), and W
+/// reads X. T reads M. All are replayable over a `u64` placeholder.
+struct Member<C: Cells> {
+    rt: Arc<Runtime<C>>,
+    t: Incr<u64>,
+    x: Incr<u64>,
+    m: Incr<u64>,
+    w: Incr<u64>,
+    d: Incr<u64>,
+}
+
+fn member_shape<C: Cells>(frames: u32) -> Member<C> {
+    let rt = Arc::new(Runtime::<C>::new());
+    rt.set_max_frames(frames);
+    rt.set_placeholder(0_u64);
+    let k = rt.create_input(0_u64);
+    let mc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let wc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let d = rt.create_query_with(move |rt: &Runtime<C>| rt.get(k) * 3, replayable());
+    let x = {
+        let mc = mc.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| match rt.get(k) {
+                0 => 1,
+                _ => rt.get(d) + rt.get(*mc.get().unwrap()) + 1,
+            },
+            replayable(),
+        )
+    };
+    let fallback = |v: u64| QueryOpts {
+        cycle: CycleStrategy::Fallback(Box::new(move |_: &Cycle| v)),
+        replay: Replay::Allowed,
+    };
+    let w = rt.create_query_with(
+        move |rt: &Runtime<C>| match rt.get(k) {
+            0 => 0,
+            _ => rt.get(x) + 1000,
+        },
+        fallback(500),
+    );
+    let m = {
+        let wc = wc.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| match rt.get(k) {
+                0 => 0,
+                _ => rt.get(x) + rt.get(*wc.get().unwrap()),
+            },
+            fallback(100),
+        )
+    };
+    mc.set(m).unwrap();
+    wc.set(w).unwrap();
+    let t = rt.create_query_with(move |rt: &Runtime<C>| rt.get(m) + 7, replayable());
+    assert_eq!((rt.get(t), rt.get(x), rt.get(w)), (7, 1, 0));
+    rt.force_group_for_test(&[x.erase(), m.erase()]);
+    rt.leave_group(id(m), rt.nodes.get_with_flags(m.slot()).1);
+    rt.set(k, 1);
+    Member { rt, t, x, m, w, d }
+}
+
+impl<C: Cells> Member<C> {
+    fn in_group(&self, h: Incr<u64>) -> bool {
+        C::u8_load_relaxed(self.rt.nodes.get_with_flags(h.slot()).1) & IN_GROUP != 0
+    }
+
+    fn reads(&self, order: &[Incr<u64>]) -> Vec<Result<u64, String>> {
+        order.iter().map(|&h| outcome(|| self.rt.get(h))).collect()
+    }
+}
+
+/// The nodes a run reads first, in order.
+type Order<C> = fn(&Member<C>) -> Vec<Incr<u64>>;
+
+/// The outcomes of `get` of each node in `order` and then of every node,
+/// at budget `frames`, with whether some run doomed on D.
+fn member_reads<C: Cells>(frames: u32, order: Order<C>) -> (Vec<Result<u64, String>>, bool) {
+    let s = member_shape::<C>(frames);
+    let got = [s.reads(&order(&s)), s.reads(&[s.t, s.w, s.m, s.x, s.d])].concat();
+    s.rt.assert_invariant_i();
+    let doomed_d =
+        s.rt.dooms
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|d| d.node == s.d.slot());
+    (got, doomed_d)
+}
+
+/// At budget 2, T's run dooms on X's read of D, and X, which computes
+/// alone after its group verify failed on M, is discarded with M and T.
+/// Every order of reads gives the unbounded run's outcomes at every
+/// budget.
+fn member_discard_matches_unbounded<C: Cells>() {
+    let orders: [Order<C>; 3] = [|s| vec![s.t, s.w], |s| vec![s.w, s.t], |s| vec![s.x, s.t]];
+    for order in orders {
+        let (want, _) = member_reads::<C>(u32::MAX, order);
+        for frames in 1..=3 {
+            let (got, _) = member_reads::<C>(frames, order);
+            assert_eq!(got, want, "budget {frames}");
+        }
+    }
+    assert!(
+        member_reads::<C>(2, orders[0]).1,
+        "T's run never doomed on D"
+    );
+}
+
+#[test]
+fn local_discarded_member_matches_unbounded() {
+    member_discard_matches_unbounded::<crate::cells::Local>();
+}
+
+#[test]
+fn shared_discarded_member_matches_unbounded() {
+    member_discard_matches_unbounded::<Shared>();
+}
+
+/// The member shape at budget 2: T's reader parks before D's entry, with
+/// X discarded. Another thread then reads W, which reads X, and must
+/// verify X's group, as a run that reads W first does: computed alone, X
+/// reads M, which reads X on the stack, a cycle error that neither order
+/// of the two reads raises.
+#[test]
+fn shared_reader_of_a_discarded_member_verifies_its_group() {
+    let s = member_shape::<Shared>(2);
+    let entry = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.d)), entry.clone())],
+    );
+    entry.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    entry.wait_parked();
+    assert_eq!(s.rt.state_of(s.x), NodeState::Dirty, "X is discarded");
+    let kept = s.in_group(s.x);
+    let w = {
+        let (rt, w) = (s.rt.clone(), s.w);
+        spawn(move || outcome(|| rt.get(w)))
+    }
+    .join();
+    entry.release();
+    let t = reader.join();
+    let got = [vec![t, w], s.reads(&[s.t, s.w, s.m, s.x, s.d])].concat();
+    s.rt.assert_invariant_i();
+
+    let (t_first, _) = member_reads::<Shared>(u32::MAX, |s| vec![s.t, s.w]);
+    let (w_first, _) = member_reads::<Shared>(u32::MAX, |s| vec![s.w, s.t]);
+    let w_first = [
+        vec![w_first[1].clone(), w_first[0].clone()],
+        w_first[2..].to_vec(),
+    ]
+    .concat();
+    assert!(
+        got == t_first || got == w_first,
+        "X in its group at the discard: {kept}\n got {got:?}\n T first {t_first:?}\n W first {w_first:?}"
+    );
+    assert!(kept, "the discard took X out of its group");
 }
