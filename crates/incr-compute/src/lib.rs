@@ -34,10 +34,11 @@ pub use incr_core::{
 };
 pub use incr_core::{
     Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
-    GroupedCollection as GroupedCollectionInner, Incr, IncrCollection as IncrCollectionInner,
-    NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable as NodeTableInner, NodeTrace, ObserverId,
-    PropagationTrace, QueryOpts, Replay, RuntimeId, SortDelta,
-    SortedCollection as SortedCollectionInner, TableKey, TraceAction, Value, DEFAULT_MAX_FRAMES,
+    GridKey, GridTable as GridTableInner, GroupedCollection as GroupedCollectionInner, Incr,
+    IncrCollection as IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
+    NodeTable as NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay,
+    RuntimeId, SortDelta, SortedCollection as SortedCollectionInner, TableKey, TraceAction, Value,
+    DEFAULT_MAX_FRAMES,
 };
 
 /// Single-threaded runtime: `Runtime<Local>`. Not `Send`/`Sync`. Use the
@@ -46,6 +47,10 @@ pub type Runtime = incr_core::Runtime<Local>;
 
 /// A map from keys to nodes of one runtime: `NodeTable<K, T, Local, S>`.
 pub type NodeTable<K, T, S = FxBuildHasher> = NodeTableInner<K, T, Local, S>;
+
+/// A map from `(sheet, row, column)` to nodes of one runtime:
+/// `GridTable<T, Local>`.
+pub type GridTable<T> = GridTableInner<T, Local>;
 
 /// Single-threaded incremental collection: `IncrCollection<T, Local>`.
 pub type IncrCollection<T> = IncrCollectionInner<T, Local>;
@@ -65,11 +70,11 @@ mod reexports {
         use crate::{
             active_frame_doomed, engine_unwind, engine_unwind_in_progress, take_last_cycle,
             with_value_code, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint,
-            FxBuildHasher, FxHasher, GroupedCollection, GroupedCollectionInner, Incr,
-            IncrCollection, IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
-            NodeTable, NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay,
-            Runtime, RuntimeId, SortDelta, SortedCollection, SortedCollectionInner, TableKey,
-            TraceAction, Value, DEFAULT_MAX_FRAMES,
+            FxBuildHasher, FxHasher, GridKey, GridTable, GridTableInner, GroupedCollection,
+            GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner, NodeId, NodeInfo,
+            NodeKindInfo, NodeState, NodeTable, NodeTableInner, NodeTrace, ObserverId,
+            PropagationTrace, QueryOpts, Replay, Runtime, RuntimeId, SortDelta, SortedCollection,
+            SortedCollectionInner, TableKey, TraceAction, Value, DEFAULT_MAX_FRAMES,
         };
 
         fn named<T: ?Sized>() {}
@@ -85,6 +90,9 @@ mod reexports {
         named::<FxBuildHasher>();
         named::<FxHasher>();
         named::<NodeTable<u32, u32>>();
+        named::<GridTable<u32>>();
+        named::<GridTableInner<u32, incr_core::Local>>();
+        named::<GridKey>();
         named::<NodeTableInner<u32, u32, incr_core::Local>>();
         fn key<K: TableKey>() {}
         key::<u32>();
