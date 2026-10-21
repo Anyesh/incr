@@ -226,6 +226,7 @@ fn no_placeholder_recurses<C: Cells>(rt: &Runtime<C>) {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn local_no_placeholder_recurses_natively() {
     on_stack(256 << 20, || {
         no_placeholder_recurses(&Runtime::<Local>::new())
@@ -233,6 +234,7 @@ fn local_no_placeholder_recurses_natively() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn shared_no_placeholder_recurses_natively() {
     on_stack(256 << 20, || {
         no_placeholder_recurses(&Runtime::<Shared>::new())

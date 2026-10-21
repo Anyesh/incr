@@ -368,10 +368,11 @@ fn ring_outcome<C: Cells>(
     (values, states)
 }
 
-/// Rings of 3 to 10 members at budget 1 land as the unbounded run does,
-/// for every strategy and every entry member.
+/// Rings of 3 to 10 members (3 and 4 under Miri) at budget 1 land as the
+/// unbounded run does, for every strategy and every entry member.
 fn short_cycles_at_budget_1<C: Cells>() {
-    for len in 3..=10 {
+    let longest = if cfg!(miri) { 4 } else { 10 };
+    for len in 3..=longest {
         for strategy in [Strategy::None, Strategy::Fallback, Strategy::Fixpoint] {
             for entry in 0..len {
                 assert_eq!(
