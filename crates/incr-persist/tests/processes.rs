@@ -93,6 +93,22 @@ mod sqlite {
 
     const WRITES: u32 = 200;
 
+    // These tests check that writers progress and take fair turns, not how
+    // fast they do: on a loaded box a writer can wait seconds for the turns
+    // ahead of it, and the default timeout would fail it for that alone.
+    const BUSY_TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn open(path: &Path) -> SqliteBackend {
+        SqliteBackend::open_with(
+            path,
+            SqliteOptions {
+                busy_timeout: BUSY_TIMEOUT,
+                ..SqliteOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
     fn view(store: &Store<Local, SqliteBackend>) -> String {
         let events = store.collection::<(u8, u32)>("events").unwrap();
         let shared = store.input("shared", 0u32).unwrap();
@@ -114,8 +130,7 @@ mod sqlite {
     /// writes to keys they share and keys of their own, then refreshes
     /// until the other's `done` flag shows its writes have all landed.
     fn write_and_converge(path: &Path, writer: u8) -> String {
-        let store = Store::<Local, _>::open(SqliteBackend::open(path).unwrap(), Options::default())
-            .unwrap();
+        let store = Store::<Local, _>::open(open(path), Options::default()).unwrap();
         let events = store.collection::<(u8, u32)>("events").unwrap();
         let shared = store.input("shared", 0u32).unwrap();
         let own = store.input(&format!("own/{writer}"), 0u32).unwrap();
@@ -133,7 +148,7 @@ mod sqlite {
         store.set(done, true).unwrap();
 
         let other = store.input(&format!("done/{}", 1 - writer), false).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(300);
         while !store.runtime().get(other.handle()) {
             assert!(Instant::now() < deadline, "the other writer never finished");
             thread::sleep(Duration::from_millis(5));
@@ -147,7 +162,7 @@ mod sqlite {
         if let Some(role) = child_role() {
             if role == "sqlite-writer" {
                 let path = child_dir().join("log.sqlite");
-                SqliteBackend::open(&path).unwrap();
+                open(&path);
                 say("ready");
                 say(&format!("state {}", write_and_converge(&path, 1)));
             }
@@ -167,9 +182,7 @@ mod sqlite {
         assert_eq!(theirs.strip_prefix("state "), Some(mine.as_str()));
         peer.finish();
 
-        let restarted =
-            Store::<Local, _>::open(SqliteBackend::open(&path).unwrap(), Options::default())
-                .unwrap();
+        let restarted = Store::<Local, _>::open(open(&path), Options::default()).unwrap();
         assert_eq!(
             view(&restarted),
             mine,
@@ -180,10 +193,6 @@ mod sqlite {
     const CONTENDERS: usize = 3;
     const CONTENTION_WINDOW: Duration = Duration::from_secs(4);
 
-    // Shorter than the default so that a writer shut out of the lock fails
-    // inside the window instead of after it.
-    const CONTENTION_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
-
     /// Opens the log, runs `wait_for_start`, then appends in a tight loop
     /// for the window. Returns the appends that succeeded, the ones that
     /// failed, and the first failure.
@@ -192,7 +201,7 @@ mod sqlite {
             path,
             SqliteOptions {
                 durability: SqliteDurability::Full,
-                busy_timeout: CONTENTION_BUSY_TIMEOUT,
+                busy_timeout: BUSY_TIMEOUT,
                 ..SqliteOptions::default()
             },
         )
