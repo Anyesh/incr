@@ -1961,7 +1961,7 @@ impl<C: Cells> Runtime<C> {
         {
             return self.read_cold(handle, observed, kind, frame, word);
         }
-        self.read_walk::<T, 0>(handle, observed, kind, word, frame)
+        self.read_walk::<T, 0>(handle, node, observed, kind, word, frame)
     }
 
     /// Whether a read from frame `f` must take the cold path: the frame
@@ -1985,13 +1985,13 @@ impl<C: Cells> Runtime<C> {
     fn read_walk<T: Value, const MODE: u8>(
         &self,
         handle: Incr<T>,
+        node: &NodeData<C>,
         mut observed: NodeState,
         kind: ReadKind,
         word: u64,
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
-        let node = self.nodes.get(slot);
         loop {
             if observed == NodeState::Cyclic || is_computing(observed) {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
