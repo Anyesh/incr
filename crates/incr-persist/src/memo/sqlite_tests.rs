@@ -218,6 +218,28 @@ fn current_pointed_back_at_an_older_generation_loads_that_one_whole() {
     }
 }
 
+#[test]
+fn a_checkpoint_after_current_pointed_back_replaces_the_newer_generation() {
+    let db = db();
+    let memo = SqliteMemo::open(&db.path).unwrap();
+    memo.write_generation(None, GenId(1), &header(1), &encoded(2))
+        .unwrap();
+    memo.write_generation(Some(GenId(1)), GenId(2), &header(2), &encoded(3))
+        .unwrap();
+    raw(&db)
+        .execute("UPDATE memo_current SET generation = 1", [])
+        .unwrap();
+
+    let first = checkpoint(&memo, vec![entry(9)]);
+    assert_eq!(first.replaced, Some(GenId(1)));
+    assert_eq!(memo.load().unwrap().unwrap().id(), first.generation.id());
+    memo.remove_generation(GenId(1)).unwrap();
+    let second = checkpoint(&memo, vec![entry(8)]);
+    let loaded = memo.load().unwrap().unwrap();
+    assert_eq!(loaded.id(), second.generation.id());
+    assert_eq!(loaded.items().len(), 4);
+}
+
 /// A buffered commit that never reached the disk is a write-ahead log tail
 /// that is gone after a crash. The copy below keeps the main file only,
 /// which is what survives when the log after the last checkpoint is lost.
