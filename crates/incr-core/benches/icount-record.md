@@ -933,10 +933,11 @@ owned-tree pair, whose rise is the plan's named `claim_set` cost.
     body. `clean_walk` inlines `compute_attempts`, and with T8's replay
     arms in it the walk executes per compute +16 stack loads, +6 stack
     stores, +14 compares and +11 branches on lines whose source did not
-    change. Of that, +4 Local and +8 Shared is the `Skipped(u32)` result
-    (579f0a4, merged in bb737b6): its payload makes `Computed` two words,
-    so the walk keeps a second register live through the compute and
-    reloads it on the loop's back edge.
+    change. Of that, +4 Local and +8 Shared came with the `Skipped` result
+    (579f0a4, merged in bb737b6), whose arms run only under a replay
+    context; a `Skipped` without its payload measures −1 per 10 computes,
+    so the rise is the variant's effect on the walk's register
+    allocation, not executed work.
 
   By commit (first-parent sweep of `spreadsheet-t8` built with T7's
   bench sources, `chain_local/propagate/10` and `chain_shared/propagate/10`,
