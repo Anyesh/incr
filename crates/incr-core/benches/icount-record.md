@@ -1333,3 +1333,157 @@ workload (`chain_*`, `diamond_*`, `early_cutoff_*`, `fanout_*_4`,
 `delete_single_*`, the Clean get, table hit and value slot) is unchanged.
 The engine's only rise is +9 per remove and +3 per push on a list that
 has spilled to a block, plus 16 bytes per block.
+
+## T12 support: alloc pools
+
+- Engine: branch `w/T12-perf-core-alloc-pools` at `c37bef1` against its
+  base `spreadsheet-t11` at `539e904`, each built in a worktree at a path
+  of the same length; one run of `icount.sh` at the default N for each
+  column. No workloads added.
+- Change: popped dep frames hand their emptied deps buffer to a spare
+  list in the thread's `Frames` (at most 32 buffers, each of capacity 64
+  or less), and a dropped `Walk` hands its emptied work vector to a
+  thread-local spare list (at most 32, capacity 256 or less), so a
+  compute and a walk take a buffer from the list instead of `malloc`. A
+  pooled work vector starts at 16 entries, where the base's `vec![root]`
+  starts at 1 and grows to 16 on the walk's second entry.
+- Attribution: Intel PT (`intel_pt/tsc=0,mtc=0,noretcomp=0/u`) on
+  line-table builds of both drivers, N minus 0, every driver instruction
+  given to the innermost incr-core source line of its inline chain (so
+  inlined `Vec` and `RefCell` code counts in the engine line that called
+  it), lines matched across the diff by source text. Columns of the
+  split below: "alloc" is glibc plus the Rust allocator shims and
+  `RawVec`; "dep pool" is every line of `dep_stack.rs`; "walk" is the
+  `Walk` type's lines (the pool, `new`, `push` and `grow`); "std" is
+  out-of-line std code; "compute path" is the rest of the engine. Walks,
+  computes and grows per iteration are the execution counts of
+  `Walk::new`, `Frames::frame` and `Walk::grow`. Traces that reported
+  lost AUX data were rerun; the base `delete_cascade_shared` trace lost
+  data in all 16 runs, so that workload is not split.
+
+| workload | N | spreadsheet-t11 | pools | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,639.00 | 3,936.00 | -703.00 | -15.15 | per compute; per walk and its grow (below) |
+| `chain_local/propagate/10` | 1,000,000 | 10,027.00 | 8,664.00 | -1,363.00 | -13.59 | per compute; per walk and its grow (below) |
+| `chain_local/propagate/100` | 100,000 | 91,606.03 | 79,584.01 | -12,022.02 | -13.12 | per compute; per walk and its grow (below) |
+| `chain_shared/propagate/4` | 1,000,000 | 9,356.22 | 8,724.24 | -631.98 | -6.75 | per compute; per walk and its grow (below) |
+| `chain_shared/propagate/10` | 1,000,000 | 20,353.82 | 19,164.81 | -1,189.01 | -5.84 | per compute; per walk and its grow (below) |
+| `chain_shared/propagate/100` | 100,000 | 186,336.15 | 175,899.71 | -10,436.44 | -5.60 | per compute; per walk and its grow (below) |
+| `diamond_local` | 1,000,000 | 3,927.00 | 3,334.00 | -593.00 | -15.10 | per compute; per walk and its grow (below) |
+| `diamond_shared` | 1,000,000 | 7,795.93 | 7,267.51 | -528.42 | -6.78 | per compute; per walk and its grow (below) |
+| `early_cutoff_local` | 1,000,000 | 2,299.00 | 1,916.00 | -383.00 | -16.66 | per compute; per walk and its grow (below) |
+| `early_cutoff_shared` | 1,000,000 | 3,582.85 | 3,223.78 | -359.07 | -10.02 | per compute; per walk and its grow (below) |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,738.32 | 4,243.30 | -495.02 | -10.45 | per compute; per walk and its grow (below) |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,368.10 | 6,927.77 | -440.33 | -5.98 | per compute; per walk and its grow (below) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.80 | 92,282.92 | -0.88 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,731.01 | 4,235.97 | -495.04 | -10.46 | per compute; per walk and its grow (below) |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,342.18 | 6,902.87 | -439.31 | -5.98 | per compute; per walk and its grow (below) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,881.67 | 158,886.93 | +5.26 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,739.18 | 4,244.83 | -494.35 | -10.43 | per compute; per walk and its grow (below) |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,346.85 | 6,907.09 | -439.76 | -5.99 | per compute; per walk and its grow (below) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,573.72 | 1,490,569.78 | -3.94 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,129.50 | 1,980.03 | -149.47 | -7.02 | per compute; per walk (below) |
+| `simple_count/shared/1000` | 100,000 | 4,078.58 | 3,950.51 | -128.07 | -3.14 | per compute; per walk (below) |
+| `simple_count/local/10000` | 100,000 | 2,127.03 | 1,976.19 | -150.84 | -7.09 | per compute; per walk (below) |
+| `simple_count/shared/10000` | 100,000 | 4,057.92 | 3,930.81 | -127.11 | -3.13 | per compute; per walk (below) |
+| `get_clean_local` | 10,000,000 | 102.00 | 102.00 | +0.00 | +0.00 | none |
+| `get_clean_shared` | 10,000,000 | 196.00 | 196.00 | +0.00 | +0.00 | none |
+| `get_contended_shared` | 2,000 | 7,791,675.57 | 7,791,763.68 | +88.11 | +0.00 | run spread (below) |
+| `fanout_local_4` | 100,000 | 17,111.00 | 16,276.01 | -834.99 | -4.88 | per compute; per walk (below) |
+| `fanout_local_5` | 100,000 | 21,719.00 | 20,068.00 | -1,651.00 | -7.60 | per compute; per walk (below) |
+| `fanout_local_1000` | 1,000 | 3,449,233.63 | 3,328,414.50 | -120,819.13 | -3.50 | per compute; per walk; glibc at N (below) |
+| `fanout_shared_4` | 100,000 | 23,467.17 | 22,753.72 | -713.45 | -3.04 | per compute; per walk (below) |
+| `fanout_shared_5` | 100,000 | 28,809.07 | 27,631.51 | -1,177.56 | -4.09 | per compute; per walk (below) |
+| `fanout_shared_1000` | 1,000 | 4,748,489.91 | 4,622,574.39 | -125,915.52 | -2.65 | per compute; per walk; glibc at N (below) |
+| `delete_single_local` | 200,000 | 706.00 | 706.00 | +0.00 | +0.00 | none |
+| `delete_single_shared` | 200,000 | 1,530.32 | 1,530.37 | +0.05 | +0.00 | none (run spread) |
+| `delete_cascade_local` | 1,000 | 3,228,608.57 | 3,082,662.62 | -145,945.95 | -4.52 | per compute; per walk; glibc at N (below) |
+| `delete_cascade_shared` | 1,000 | 4,534,070.84 | 4,348,200.66 | -185,870.18 | -4.10 | per compute; per walk; glibc at N (below) |
+| `delete_owned_tree_local` | 10,000 | 604,336.81 | 604,587.23 | +250.42 | +0.04 | run spread (below) |
+| `delete_owned_tree_shared` | 10,000 | 978,677.60 | 979,104.37 | +426.77 | +0.04 | run spread (below) |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 218.14 | 218.14 | +0.00 | +0.00 | none |
+| `table_hit_sip_local` | 10,000,000 | 300.52 | 301.20 | +0.68 | +0.23 | run spread (below) |
+| `table_miss_local` | 100,000 | 871.18 | 871.17 | -0.01 | -0.00 | none (run spread) |
+| `table_miss_shared` | 100,000 | 2,170.76 | 2,170.22 | -0.54 | -0.02 | none (run spread) |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,992.09 | 217,840.99 | -151.10 | -0.07 | per compute; per walk (below) |
+| `children_rerun_1k_shared` | 10,000 | 224,936.25 | 224,805.87 | -130.38 | -0.06 | per compute; per walk (below) |
+| `children_churn_local` | 100,000 | 16,515.93 | 16,362.70 | -153.23 | -0.93 | per compute; per walk (below) |
+| `children_churn_shared` | 100,000 | 19,400.33 | 19,270.99 | -129.34 | -0.67 | per compute; per walk (below) |
+
+Traced split, per iteration (Local unless named):
+
+| workload | traced N | walks / computes / grows | alloc | dep pool | walk | std | compute path | traced | `perf stat` |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `early_cutoff_local` | 2,000 | 1 / 1 / 1 | -442.0 | +60.0 | +14.0 | +15.0 | -30.0 | -383.0 | -383.00 |
+| `early_cutoff_shared` | 2,000 | 1 / 1 / 1 | -445.9 | +63.0 | +7.0 | +21.0 | -1.0 | -355.9 | -359.07 |
+| `diamond_local` | 2,000 | 1 / 3 / 1 | -728.0 | +180.0 | +13.0 | +15.0 | -73.0 | -593.0 | -593.00 |
+| `chain_local/propagate/10` | 1,000 | 1 / 10 / 1 | -1,729.0 | +600.0 | +6.0 | +15.0 | -255.0 | -1,363.0 | -1,363.00 |
+| `chain_shared/propagate/10` | 500 | 1 / 10 / 1 | -1,775.6 | +630.0 | +7.0 | +21.0 | -66.0 | -1,183.6 | -1,189.01 |
+| `chain_local/propagate/100` | 100 | 1 / 100 / 4 | -15,157.0 | +6,000.0 | -285.0 | +15.0 | -2,595.0 | -12,022.0 | -12,022.02 |
+| `chain_shared/propagate/100` | 50 | 1 / 100 / 4 | -15,802.0 | +6,300.0 | -194.0 | +14.9 | -699.0 | -10,380.2 | -10,436.44 |
+| `collection_insert_then_read/local_incremental/1000` | 1,000 | 1 / 2 / 1 | -585.6 | +120.0 | +13.0 | +15.0 | -62.5 | -500.0 | -495.02 |
+| `simple_count/local/1000` | 2,000 | 1 / 1 / 0 | -286.0 | +60.0 | +82.0 | +15.0 | -10.0 | -139.0 | -149.47 |
+| `simple_count/shared/1000` | 2,000 | 1 / 1 / 0 | -286.2 | +63.0 | +74.0 | +23.0 | -2.3 | -128.5 | -128.07 |
+| `children_churn_local` | 300 | 1 / 1 / 0 | -286.0 | +60.0 | +82.0 | +16.1 | -22.3 | -150.2 | -153.23 |
+| `children_churn_shared` | 300 | 1 / 1 / 0 | -286.0 | +63.0 | +74.0 | +25.4 | -3.2 | -126.8 | -129.34 |
+| `fanout_local_5` | 300 | 6 / 6 / 0 | -2,464.0 | +358.0 | +492.0 | +71.0 | -108.0 | -1,651.0 | -1,651.00 |
+| `fanout_shared_5` | 300 | 6 / 6 / 0 | -2,100.8 | +376.0 | +444.0 | +119.0 | -18.0 | -1,179.8 | -1,177.56 |
+| `fanout_local_1000` | 2 | 1,001 / 1,001 / 0 | -286,152.5 | +60,069.0 | +82,079.0 | +15,069.5 | -18,018.0 | -146,953.0 | -120,819.13 |
+| `delete_cascade_local` | 2 | 1,000 / 1,000 / 0 | -287,863.0 | +60,017.0 | +82,000.5 | +15,052.5 | -18,000.0 | -148,793.0 | -145,945.95 |
+
+- **Per compute (every workload that computes):** the base allocates
+  each frame's deps buffer (`Vec::with_capacity(4)`) and frees it after
+  `publish_deps`, one `malloc` and `free` at about −144 in "alloc". The
+  pool costs +60 Local and +63 Shared in `dep_stack.rs`: the spare
+  `pop` in `Frames::frame` (+14), `push_frame`'s closure now building the
+  frame through `&mut self` (+22), `recycle`'s count and capacity test
+  (+5 Local, +8 Shared) and its `push` (+12), and the second `RefCell`
+  borrow through `DepStack::with` that `recycle_deps` takes (+11 Local,
+  +12 Shared), less the removed `with_capacity` (−7). Without the
+  buffer's free, `compute_one` runs −10 to −30 Local and −1 to −7
+  Shared, on lines with no line information in `runtime.rs` and
+  `cells.rs` and in register moves across its lines. Net per compute:
+  −95 to −115 Local and about −85 Shared.
+- **Per walk:** the base's `vec![root]` is one more `malloc` and `free`
+  (about −144). The pool costs +82 Local and +74 Shared in the `Walk`
+  lines: `Walk::new` +48 (its `SPARE_WORK.try_with`, `try_borrow_mut`
+  and `pop` +19, the `ok` and `unwrap_or_else` +10, the root push and
+  the prologue +19), `Drop for Walk` about +45 (the capacity test,
+  `mem::take`, `try_with`, the count test and `push`), less the base's
+  `vec!` and struct literal (−15). Out of line it costs +15 Local and
+  +23 Shared: `drop_in_place` for `Walk`, which now calls `Drop` (+8),
+  and `Vec` code with no line information (+8 Local, +14 Shared). Net
+  per walk: about −50 Local and −45 Shared.
+- **Per grow (a walk that queues a second entry):** the base grows its
+  capacity-1 vector to 16 in `Walk::grow`, a fresh allocation, a copy
+  and a free: about −144 in "alloc" and −70 in `grow`'s lines. A pooled
+  vector holds 16 from the start and keeps any capacity up to 256, so
+  no traced walk grows. The chains' walks hold every node of the chain,
+  so `/100` grows four times in the base (16, 32, 64, 128), which is the
+  extra fall per compute of `/100` over `/10`.
+- **glibc at N (`fanout_*_1000`, `delete_cascade_*`):** 1,001 and 1,000
+  walks and computes per iteration, whose engine share at the traced
+  N = 2 is +139,199 and +139,070 Local. At the recorded N glibc saves
+  less per pair in the larger heap, so `fanout_local_1000` reads
+  −120,819 against −146,953 traced. `delete_cascade_shared` (−185,870)
+  is not split: its base trace loses AUX data in every run, and its
+  branch trace has the same 1,000 walks and computes.
+- **Run spread (`delete_owned_tree_*`, `get_contended_shared`,
+  `table_hit_sip_local`):** two more runs of each column put the
+  pools inside the base's range: `delete_owned_tree_local` base 600,363
+  to 604,337 and pools 600,143 to 604,587, `_shared` base 978,471 to
+  979,171 and pools 978,295 to 979,289, `get_contended_shared` base
+  7,791,676 to 7,791,856 and pools 7,791,764 to 7,791,893,
+  `table_hit_sip_local` base 299.97 to 301.59 and pools 300.60 to
+  301.39.
+
+Gate (board item: every rise or fall attributed; the Clean get must not
+rise): `get_clean_local` and `get_clean_shared` read 102 and 196 in both
+columns, and the table hit, table miss, value slot and `delete_single_*`
+workloads, which neither walk nor compute, are unchanged. Every workload
+that computes falls: −95 to −115 Local and −85 Shared per compute, −50
+and −45 per walk, and a grow's malloc and copy wherever the base grew
+its walk.
