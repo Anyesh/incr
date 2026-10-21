@@ -3637,7 +3637,7 @@ impl<C: Cells> Runtime<C> {
         if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
-            self.discard_land(id, attempt.first, wrote, attempt.stamp_rev, bag);
+            self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
             // A closure that catches the unwind has read a dep that did not
             // land, which its publish counts as settled if it read it before.
             self.dep_stack.poison_current_frame(self.runtime_id);
@@ -4250,7 +4250,6 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Records `members` as one landed group, as an episode's step 2 does.
-    #[cfg(not(loom))]
     pub(crate) fn force_group_for_test(&self, members: &[ErasedIncr]) {
         let mut inner = self.inner.write();
         let mut sorted: Vec<(u32, u32)> =

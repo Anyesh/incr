@@ -1952,7 +1952,7 @@ impl<C: Cells> Runtime<C> {
         });
         if kind == Some(UnwindKind::Wound) {
             bag.drain(self);
-            self.close_unwound(id, boundary);
+            self.close_unwound(id, boundary, kind);
             resume_unwind(payload);
         }
         if v.spec || kind == Some(UnwindKind::Discard) {
@@ -1983,7 +1983,7 @@ impl<C: Cells> Runtime<C> {
             // unwind leaves its reader.
             self.dep_stack.poison_current_frame(self.runtime_id);
             bag.drain(self);
-            self.close_unwound(id, boundary);
+            self.close_unwound(id, boundary, kind);
             resume_unwind(payload);
         };
         cycle_state::take_unwind_kind();
@@ -2026,7 +2026,7 @@ impl<C: Cells> Runtime<C> {
         let id = NodeId(slot);
         let stamp_rev = self.current_revision();
         if discarding {
-            self.discard_land(id, e.first, e.wrote, stamp_rev, bag);
+            self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
         } else {
             let (node, flags) = self.nodes.get_with_flags(slot);
             let attempt = Attempt {
@@ -2104,7 +2104,13 @@ impl<C: Cells> Runtime<C> {
     /// Releases, with the discard landing, the claims virtual hits took
     /// for the entries of context `id` at or above `level` that are still
     /// held.
-    fn release_claim_list(&self, id: u64, level: u32, bag: &mut Deferred<C>) {
+    fn release_claim_list(
+        &self,
+        id: u64,
+        level: u32,
+        kind: Option<UnwindKind>,
+        bag: &mut Deferred<C>,
+    ) {
         let rt = self.runtime_id;
         let slots: Vec<u32> = replay::with(|c| {
             c.iter_mut()
@@ -2120,7 +2126,7 @@ impl<C: Cells> Runtime<C> {
         let stamp_rev = self.current_revision();
         for slot in slots {
             if let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) {
-                self.discard_land(NodeId(slot), e.first, e.wrote, stamp_rev, bag);
+                self.unwound_land(NodeId(slot), e.first, e.wrote, stamp_rev, kind, bag);
                 bag.push_erased(Box::new((e.buf, e.s)));
             }
         }
@@ -2162,12 +2168,12 @@ impl<C: Cells> Runtime<C> {
                 return None;
             }
             if enclosing {
-                self.close_unwound(id, boundary);
+                self.close_unwound(id, boundary, kind);
                 resume_unwind(payload);
             }
         }
         if kind == Some(UnwindKind::Wound) || (!entry.spec && level == 0) {
-            self.close_unwound(id, boundary);
+            self.close_unwound(id, boundary, kind);
             resume_unwind(payload);
         }
         if entry.spec {
@@ -2189,7 +2195,7 @@ impl<C: Cells> Runtime<C> {
                 q
             });
             if q == 0 {
-                self.close_unwound(id, boundary);
+                self.close_unwound(id, boundary, kind);
                 resume_unwind(payload);
             }
             cycle_state::take_unwind_kind();
@@ -2226,8 +2232,8 @@ impl<C: Cells> Runtime<C> {
         for ep in abandoned {
             bag.push_erased(Box::new(ep));
         }
-        self.release_held_from(boundary + level, true, &mut bag);
-        self.release_claim_list(id, level, &mut bag);
+        self.release_held_from(boundary + level, true, kind, &mut bag);
+        self.release_claim_list(id, level, kind, &mut bag);
         bag.drain(self);
         None
     }
@@ -2257,8 +2263,8 @@ impl<C: Cells> Runtime<C> {
         for ep in abandoned {
             bag.push_erased(Box::new(ep));
         }
-        self.release_held_from(boundary + q, true, bag);
-        self.release_claim_list(id, q, bag);
+        self.release_held_from(boundary + q, true, None, bag);
+        self.release_claim_list(id, q, None, bag);
     }
 
     /// Closes context `id`, whose speculative chain reaches its level-0
@@ -2553,13 +2559,13 @@ impl<C: Cells> Runtime<C> {
     /// an entry above level 0 pops no frame at the positions below it, so
     /// the claims anchored at the context's virtual frames, and those its
     /// closed episodes waited for, are released here.
-    fn close_unwound(&self, id: u64, boundary: u32) {
+    fn close_unwound(&self, id: u64, boundary: u32, kind: Option<UnwindKind>) {
         let mut bag = Deferred::new();
-        self.release_claim_list(id, 0, &mut bag);
+        self.release_claim_list(id, 0, kind, &mut bag);
         bag.drain(self);
         self.close_context(id, boundary);
         let mut bag = Deferred::new();
-        self.release_held_from(boundary, true, &mut bag);
+        self.release_held_from(boundary, true, kind, &mut bag);
         bag.drain(self);
     }
 

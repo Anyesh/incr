@@ -786,6 +786,72 @@ fn loom_group_claim_contended() {
     });
 }
 
+/// X, which has no strategy, keeps a record of the group {X, M}, and M
+/// (Fallback) has left it, as a single-node landing of M leaves it; once
+/// k is 1, X reads M, and M reads X and then W (Fallback), which reads X.
+/// The reader of M computes it alone, and its group verify of X finds M
+/// on its stack and computes X alone. A wound of that reader must leave X
+/// in its group: out of it, the reader of W computes X alone, a cycle
+/// error that neither single-thread order raises.
+#[test]
+fn loom_wound_keeps_a_member_computed_alone_in_its_group() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let k = rt.create_input(0_u64);
+        let mc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let wc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let x = {
+            let mc = mc.clone();
+            rt.create_query(move |rt: &Rt| match rt.get(k) {
+                0 => 1,
+                _ => rt.get(*mc.get().unwrap()) + 1,
+            })
+        };
+        let w = rt.create_query_with_fallback(
+            move |rt: &Rt| match rt.get(k) {
+                0 => 0,
+                _ => rt.get(x) + 1000,
+            },
+            |_c: &crate::cycle::Cycle| 500,
+        );
+        let m = {
+            let wc = wc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| match rt.get(k) {
+                    0 => 0,
+                    _ => rt.get(x) + rt.get(*wc.get().unwrap()),
+                },
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        mc.set(m).unwrap();
+        wc.set(w).unwrap();
+        assert_eq!((rt.get(m), rt.get(x), rt.get(w)), (0, 1, 0));
+        rt.force_group_for_test(&[x.erase(), m.erase()]);
+        rt.leave_group(
+            crate::node::NodeId(m.slot()),
+            rt.nodes.get_with_flags(m.slot()).1,
+        );
+        rt.set(k, 1);
+
+        let reads_w = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(w))
+        };
+        let reads_m = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(m))
+        };
+        assert_eq!(reads_w.join().unwrap(), 500);
+        assert_eq!(reads_m.join().unwrap(), 100);
+        assert_eq!(rt.get(x), 101);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
 /// A (Fallback) reads B while s is 0, and B reads A. A reader enters the
 /// cycle while a setter breaks it: the final values are the acyclic ones.
 #[test]
