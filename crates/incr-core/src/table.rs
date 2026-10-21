@@ -609,7 +609,11 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
             unseeded = seed(rt, q);
             q
         });
-        drop(unseeded);
+        let mut bag = Deferred::<C>::new();
+        if let Some(value) = unseeded {
+            bag.push(value);
+        }
+        bag.drain(rt);
         handle
     }
 

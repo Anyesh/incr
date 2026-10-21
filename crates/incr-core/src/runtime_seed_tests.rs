@@ -190,6 +190,7 @@ fn a_moved_trusted_dep_downgrades_to_recompute_first<C: Cells>() {
 fn failures_return_the_value_and_land_new<C: Cells>() {
     let rt = Runtime::<C>::new();
     let other = Runtime::<C>::new();
+    let far = (0..64_u64).map(|i| other.create_input(i)).last().unwrap();
     let x = rt.create_input(3_u64);
     let gone = rt.create_input(0_u64);
     rt.delete_node(gone);
@@ -201,7 +202,7 @@ fn failures_return_the_value_and_land_new<C: Cells>() {
         Vec<SeedDep>,
         Reuse,
         SeedError,
-    ); 3] = [
+    ); 4] = [
         (
             &foreign,
             vec![dep(x)],
@@ -211,6 +212,12 @@ fn failures_return_the_value_and_land_new<C: Cells>() {
         (
             &base,
             vec![dep(gone)],
+            Reuse::IfUnchanged,
+            SeedError::DepNotAlive,
+        ),
+        (
+            &base,
+            vec![dep(far)],
             Reuse::IfUnchanged,
             SeedError::DepNotAlive,
         ),

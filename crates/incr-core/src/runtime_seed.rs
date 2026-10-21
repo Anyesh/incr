@@ -79,11 +79,13 @@ impl<C: Cells> Runtime<C> {
         {
             return Err(SeedError::NotFresh);
         }
+        // The runtime first: a foreign dep's slot may lie past this
+        // runtime's nodes.
         let alive = deps.iter().all(|d| {
-            let dep = self.nodes.get(d.dep.slot());
-            d.dep.runtime_id() == self.runtime_id
-                && dep.generation() == d.dep.generation()
-                && dep.state() != NodeState::Dead
+            d.dep.runtime_id() == self.runtime_id && {
+                let dep = self.nodes.get(d.dep.slot());
+                dep.generation() == d.dep.generation() && dep.state() != NodeState::Dead
+            }
         });
         if !alive {
             return Err(SeedError::DepNotAlive);

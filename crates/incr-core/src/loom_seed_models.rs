@@ -117,9 +117,9 @@ fn seed_vs_reader() {
     });
 }
 
-/// Q = x + (a or b by pick), with a == b. A cutoff recompute moves Q from
-/// {pick, x, a} to {pick, x, b} without moving its stamp while `inspect`
-/// reads it: what `inspect` returns is the value with one run's deps.
+/// Q = x + (a or b by pick), with a != b. A recompute moves Q from
+/// {pick, x, a} to {pick, x, b} while `inspect` reads it: what `inspect`
+/// returns is one run's value with that run's deps.
 #[test]
 fn inspect_vs_recompute() {
     run(|| {
@@ -127,7 +127,7 @@ fn inspect_vs_recompute() {
         let x = rt.create_input(1_u64);
         let pick = rt.create_input(false);
         let a = rt.create_input(5_u64);
-        let b = rt.create_input(5_u64);
+        let b = rt.create_input(7_u64);
         let q = rt.create_query(move |rt: &Rt| {
             let side = if rt.get(pick) { b } else { a };
             rt.get(x) + rt.get(side)
@@ -141,15 +141,14 @@ fn inspect_vs_recompute() {
             })
         };
         let seen = inspect(&rt, q);
-        assert_eq!(other.join().unwrap(), 6);
+        assert_eq!(other.join().unwrap(), 8);
         if let Some(seen) = seen {
-            assert_eq!(seen.value, 6);
-            let before = vec![pick.erase(), x.erase(), a.erase()];
-            let after = vec![pick.erase(), x.erase(), b.erase()];
+            let before = (6, vec![pick.erase(), x.erase(), a.erase()]);
+            let after = (8, vec![pick.erase(), x.erase(), b.erase()]);
+            let pair = (seen.value, seen.deps);
             assert!(
-                seen.deps == before || seen.deps == after,
-                "inspect mixed two runs' deps: {:?}",
-                seen.deps
+                pair == before || pair == after,
+                "inspect mixed two runs: {pair:?}"
             );
         }
         rt.assert_invariant_i();
