@@ -68,6 +68,7 @@ both!(
     pending_handles_in_their_doomed_frame,
     pending_handles_out_of_their_frame,
     a_doomed_miss_needs_a_placeholder,
+    an_init_that_dooms_its_frame_creates_nothing,
 );
 
 fn a_hit_returns_the_first_node<C: Cells>(rt: &Runtime<C>) {
@@ -394,6 +395,43 @@ fn a_clone_that_misses_hits_the_contract<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(rt.node_count(), nodes);
     assert_eq!(t.shape(), (16, 14, 0));
     assert_eq!(rt.get(t.get_or_insert_input(rt, HookKey(99), || 99)), 99);
+}
+
+fn an_init_that_dooms_its_frame_creates_nothing<C: Cells>(rt: &Runtime<C>)
+where
+    NodeTable<u64, i64, C>: Send + Sync,
+{
+    rt.set_placeholder::<i64>(-1);
+    let gate = rt.doom_gate();
+    let t = Arc::new(rt.create_table::<u64, i64>());
+    let doomed = Arc::new(Mutex::new(Vec::new()));
+    let (t2, d2) = (t.clone(), doomed.clone());
+    let q = rt.create_query_with(
+        move |rt| {
+            let i = t2.get_or_insert_input(rt, 7, || {
+                let _ = rt.get(gate);
+                7
+            });
+            if !rt.get(gate).0 {
+                d2.lock().unwrap().push(rt.is_alive(i));
+                return 0;
+            }
+            rt.get(i)
+        },
+        replayable(),
+    );
+    let nodes = rt.node_count();
+    assert_eq!(rt.get(q), 7);
+    assert_eq!(
+        *doomed.lock().unwrap(),
+        [false],
+        "the doomed init's value is dropped"
+    );
+    assert_eq!(
+        rt.node_count(),
+        nodes + 1,
+        "only the retry creates the input"
+    );
 }
 
 /// What a doomed frame saw, recorded for the test to check after it.
