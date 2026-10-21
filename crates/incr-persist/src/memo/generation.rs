@@ -12,6 +12,8 @@ pub struct GenId(pub u64);
 pub struct Generation {
     id: GenId,
     header: GenHeader,
+    /// `header.frame_tag()`.
+    frame_tag: u64,
     /// Sorted by `(table, key_hash, loc)`, so equal keys form one run.
     items: Vec<IndexItem>,
     /// Open addressing over the runs of `items`: a slot is 0 or one plus
@@ -54,6 +56,7 @@ impl Generation {
         }
         Generation {
             id,
+            frame_tag: header.frame_tag(),
             header,
             items,
             slots,
@@ -80,6 +83,11 @@ impl Generation {
 
     pub fn header(&self) -> &GenHeader {
         &self.header
+    }
+
+    /// The [`GenHeader::frame_tag`] its entry frames are decoded with.
+    pub fn frame_tag(&self) -> u64 {
+        self.frame_tag
     }
 
     /// Every item, sorted by `(table, key_hash, loc)`.

@@ -10,6 +10,8 @@ fn table(name: &str) -> TableDesc {
     }
 }
 
+const TAG: u64 = 0x7a6;
+
 fn entry() -> Entry {
     Entry {
         table: 1,
@@ -40,43 +42,83 @@ fn entry() -> Entry {
 
 #[test]
 fn entry_roundtrips_through_its_frame() {
-    let frame = encode_entry(&entry()).unwrap();
+    let frame = encode_entry(&entry(), TAG).unwrap();
     assert_eq!(frame_len(&frame), Some(frame.len()));
-    assert_eq!(decode_entry(&frame).unwrap(), entry());
+    assert_eq!(decode_entry(&frame, TAG).unwrap(), entry());
+}
+
+#[test]
+fn an_entry_frame_of_another_generation_is_rejected() {
+    let frame = encode_entry(&entry(), TAG).unwrap();
+    assert!(matches!(
+        decode_entry(&frame, TAG + 1),
+        Err(Error::Corrupt(_))
+    ));
+}
+
+#[test]
+fn the_frame_tag_tells_headers_apart() {
+    let header = GenHeader {
+        build: 1,
+        seq: 2,
+        tables: vec![table("a"), table("b")],
+    };
+    assert_eq!(header.frame_tag(), header.clone().frame_tag());
+    let reordered = GenHeader {
+        tables: vec![table("b"), table("a")],
+        ..header.clone()
+    };
+    let next = GenHeader {
+        seq: 3,
+        ..header.clone()
+    };
+    let rebuilt = GenHeader {
+        build: 2,
+        ..header.clone()
+    };
+    for other in [reordered, next, rebuilt] {
+        assert_ne!(header.frame_tag(), other.frame_tag(), "{other:?}");
+    }
 }
 
 #[test]
 fn every_single_byte_flip_in_an_entry_frame_is_rejected() {
-    let frame = encode_entry(&entry()).unwrap();
+    let frame = encode_entry(&entry(), TAG).unwrap();
     for at in 0..frame.len() {
         let mut bad = frame.clone();
         bad[at] ^= 0x10;
-        assert!(decode_entry(&bad).is_err(), "flip at byte {at} decoded");
+        assert!(
+            decode_entry(&bad, TAG).is_err(),
+            "flip at byte {at} decoded"
+        );
     }
 }
 
 #[test]
 fn truncated_and_extended_entry_frames_are_rejected() {
-    let frame = encode_entry(&entry()).unwrap();
+    let frame = encode_entry(&entry(), TAG).unwrap();
     for len in 0..frame.len() {
         assert!(matches!(
-            decode_entry(&frame[..len]),
+            decode_entry(&frame[..len], TAG),
             Err(Error::Corrupt(_))
         ));
         assert_eq!(frame_len(&frame[..len]), None);
     }
     let mut longer = frame.clone();
     longer.push(0);
-    assert!(matches!(decode_entry(&longer), Err(Error::Corrupt(_))));
+    assert!(matches!(decode_entry(&longer, TAG), Err(Error::Corrupt(_))));
 }
 
 #[test]
 fn frames_split_a_concatenation() {
-    let a = encode_entry(&entry()).unwrap();
-    let b = encode_entry(&Entry {
-        last_used: 1,
-        ..entry()
-    })
+    let a = encode_entry(&entry(), TAG).unwrap();
+    let b = encode_entry(
+        &Entry {
+            last_used: 1,
+            ..entry()
+        },
+        TAG,
+    )
     .unwrap();
     let joined = [a.clone(), b.clone()].concat();
     let first = frame_len(&joined).unwrap();
@@ -99,17 +141,20 @@ fn header_roundtrips_and_checks_magic_and_format() {
     assert!(decode_header(&bad).is_err());
 
     assert!(matches!(
-        decode_header(&encode_entry(&entry()).unwrap()),
+        decode_header(&encode_entry(&entry(), TAG).unwrap()),
         Err(Error::Corrupt(_))
     ));
 
-    let mut body = MAGIC.to_vec();
-    body.push(FORMAT + 1);
-    body.extend(postcard::to_stdvec(&header).unwrap());
-    assert!(matches!(
-        decode_header(&frame_bytes(&body).unwrap()),
-        Err(Error::UnsupportedFormat { found, supported }) if found == FORMAT + 1 && supported == FORMAT
-    ));
+    // Format 1 entry frames carry no frame tag.
+    for other in [1, FORMAT + 1] {
+        let mut body = MAGIC.to_vec();
+        body.push(other);
+        body.extend(postcard::to_stdvec(&header).unwrap());
+        assert!(matches!(
+            decode_header(&frame_bytes(&body).unwrap()),
+            Err(Error::UnsupportedFormat { found, supported }) if found == other && supported == FORMAT
+        ));
+    }
 }
 
 #[test]

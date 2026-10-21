@@ -293,7 +293,8 @@ fn stored(memo: &MemoryMemo) -> Vec<Entry> {
         .items()
         .iter()
         .map(|item| {
-            decode_entry(&memo.read_entry(generation.id(), item).unwrap().unwrap()).unwrap()
+            let frame = memo.read_entry(generation.id(), item).unwrap().unwrap();
+            decode_entry(&frame, generation.frame_tag()).unwrap()
         })
         .collect()
 }

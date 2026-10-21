@@ -12,11 +12,13 @@ pub struct EncodedEntry {
 }
 
 impl EncodedEntry {
-    pub fn new(entry: &Entry) -> Result<Self> {
+    /// Encodes `entry` for the generation whose header has
+    /// [`frame_tag`](super::GenHeader::frame_tag) `tag`.
+    pub fn new(entry: &Entry, tag: u64) -> Result<Self> {
         Ok(EncodedEntry {
             table: entry.table,
             key_hash: key_hash(&entry.key),
-            frame: encode_entry(entry)?,
+            frame: encode_entry(entry, tag)?,
         })
     }
 }
@@ -66,9 +68,10 @@ pub trait MemoBackend: Send + Sync {
     /// Returns the frame `item` locates in `generation`, exactly as it was
     /// written, or `None` when the generation has been removed.
     ///
-    /// The bytes are not checked here: a damaged or short frame is returned
-    /// as found, and the caller's [`decode_entry`](super::decode_entry)
-    /// rejects it. Errors are I/O failures other than the generation being
+    /// The bytes are not checked here: a damaged or short frame, or one of
+    /// another generation, is returned as found, and the caller's
+    /// [`decode_entry`](super::decode_entry) with the generation's frame
+    /// tag rejects it. Errors are I/O failures other than the generation being
     /// gone.
     fn read_entry(&self, generation: GenId, item: &IndexItem) -> Result<Option<Vec<u8>>>;
 

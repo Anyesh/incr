@@ -39,9 +39,11 @@ fn entry(key: u8) -> Entry {
     }
 }
 
+/// Frames tagged for `header(1)`, which the tests that decode them write.
 fn encoded(count: u8) -> Vec<EncodedEntry> {
+    let tag = header(1).frame_tag();
     (0..count)
-        .map(|key| EncodedEntry::new(&entry(key)).unwrap())
+        .map(|key| EncodedEntry::new(&entry(key), tag).unwrap())
         .collect()
 }
 
@@ -106,7 +108,8 @@ fn flipped_frame_bytes_read_back_as_stored_and_fail_to_decode() {
         set_frame(&conn, item.loc, &bad);
         let read = memo.read_entry(generation.id(), &item).unwrap().unwrap();
         assert_eq!(read, bad);
-        assert!(decode_entry(&read).is_err(), "flip at {at} decoded");
+        let tag = generation.frame_tag();
+        assert!(decode_entry(&read, tag).is_err(), "flip at {at} decoded");
     }
 }
 

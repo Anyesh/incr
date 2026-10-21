@@ -80,7 +80,7 @@ pub fn write_checkpoint<B: MemoBackend + ?Sized>(
 fn write_with<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
-    encode: impl Fn(&Entry) -> Result<EncodedEntry>,
+    encode: impl Fn(&Entry, u64) -> Result<EncodedEntry>,
 ) -> Result<Checkpointed> {
     let _guard = backend.lock_checkpoint()?;
     let base = backend.load()?;
@@ -113,7 +113,14 @@ fn write_with<B: MemoBackend + ?Sized>(
     if let Some(base) = base.as_ref().filter(mergeable) {
         merge(backend, base, &mut tables, &mut entries, &mut stats)?;
     }
+    let header = GenHeader {
+        build: input.build,
+        seq,
+        tables,
+    };
 
+    let tag = header.frame_tag();
+    let encode = |entry: &Entry| encode(entry, tag);
     let (entries, encoded) = encode_fitting(entries, encode, &mut stats.oversized)?;
     let sizes: Vec<u64> = encoded.iter().map(|e| e.frame.len() as u64).collect();
     let evicted = evict(&entries, &sizes, input.max_bytes);
@@ -124,12 +131,6 @@ fn write_with<B: MemoBackend + ?Sized>(
         .collect();
     stats.evicted = entries.len() - encoded.len();
     stats.written = encoded.len();
-
-    let header = GenHeader {
-        build: input.build,
-        seq,
-        tables,
-    };
     let base_id = base.as_ref().map(Generation::id);
     let generation = backend.write_generation(base_id, id, &header, &encoded)?;
     Ok(Checkpointed {
@@ -235,7 +236,7 @@ fn merge<B: MemoBackend + ?Sized>(
             // Another handle removed the base; nothing more can be merged.
             break;
         };
-        let Ok(mut entry) = decode_entry(&frame) else {
+        let Ok(mut entry) = decode_entry(&frame, base.frame_tag()) else {
             stats.corrupt += 1;
             continue;
         };

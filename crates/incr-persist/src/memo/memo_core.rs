@@ -116,7 +116,7 @@ impl IndexGen {
         let mut corrupt = false;
         for item in self.generation.find(gen, key_hash(key)) {
             match backend.read_entry(self.generation.id(), item) {
-                Ok(Some(frame)) => match decode_entry(&frame) {
+                Ok(Some(frame)) => match decode_entry(&frame, self.generation.frame_tag()) {
                     Ok(entry) if entry.table == gen && entry.key == key => return Ok(Some(entry)),
                     Ok(_) => {}
                     Err(_) => corrupt = true,
