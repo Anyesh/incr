@@ -1094,3 +1094,138 @@ the codegen pass above recovered under 10 of it.
   from the dep-count cell before the lists are built (+55 Local).
 - **Run spread (`delete_owned_tree_local` +752):** inside T8's
   recorded spread of about 2,700 between runs of one binary.
+
+## T9
+
+- Engine: `9fc5a3f` (branch `spreadsheet-t9`). Machine and toolchain as
+  for T0.
+- T8 is `main` at `3127150`, built in a worktree at a path of the same
+  length as T9's. T9 changes no bench source (only this file under
+  `benches/`), so the "T9, T8 benches" column is the same binary as
+  "T9" and the two differ only by run; one run of `icount.sh` at the
+  default N for each column. T9 adds no workloads.
+- The split by merge comes from two more runs at the same path length:
+  `c63f074`, which is T8 (all but a test-only commit) plus T9's watch
+  queue, `observer_read`, `stabilize` and the failed-observer fix, and
+  `2e10c62`, which adds the `get_slow` node pass-through. The rest,
+  up to `9fc5a3f`, is `publish_deps` (its own section above); the other
+  merges in between change no incr-core source but tests.
+
+| workload | N | T8 | T9, T8 benches | T9 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,612.00 | 4,638.00 | 4,638.00 | +26.00 | +0.56 | watch sources; `get_slow` node pass-through (below) |
+| `chain_local/propagate/10` | 1,000,000 | 9,976.01 | 10,026.02 | 10,026.00 | +49.99 | +0.50 | watch sources; `get_slow` node pass-through (below) |
+| `chain_local/propagate/100` | 100,000 | 91,195.13 | 91,605.11 | 91,605.10 | +409.97 | +0.45 | watch sources; `get_slow` node pass-through (below) |
+| `chain_shared/propagate/4` | 1,000,000 | 9,349.26 | 9,375.24 | 9,375.28 | +26.02 | +0.28 | watch sources; `get_slow` node pass-through (below) |
+| `chain_shared/propagate/10` | 1,000,000 | 20,352.89 | 20,408.97 | 20,408.95 | +56.06 | +0.28 | watch sources; `get_slow` node pass-through (below) |
+| `chain_shared/propagate/100` | 100,000 | 186,426.01 | 186,931.85 | 186,932.63 | +506.62 | +0.27 | watch sources; `get_slow` node pass-through (below) |
+| `diamond_local` | 1,000,000 | 3,903.01 | 3,926.02 | 3,926.00 | +22.99 | +0.59 | watch sources; `get_slow` node pass-through (below) |
+| `diamond_shared` | 1,000,000 | 7,787.97 | 7,810.97 | 7,810.98 | +23.01 | +0.30 | watch sources; `get_slow` node pass-through (below) |
+| `early_cutoff_local` | 1,000,000 | 2,280.00 | 2,298.01 | 2,298.00 | +18.00 | +0.79 | watch sources; `get_slow` node pass-through (below) |
+| `early_cutoff_shared` | 1,000,000 | 3,559.85 | 3,576.85 | 3,576.86 | +17.01 | +0.48 | watch sources; `get_slow` node pass-through (below) |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,711.21 | 4,732.34 | 4,732.70 | +21.49 | +0.46 | watch sources; `get_slow` node pass-through (below) |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,349.83 | 7,371.86 | 7,372.40 | +22.57 | +0.31 | watch sources; `get_slow` node pass-through (below) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,274.01 | 92,273.56 | 92,273.82 | -0.19 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,703.99 | 4,726.00 | 4,726.00 | +22.01 | +0.47 | watch sources; `get_slow` node pass-through (below) |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,324.14 | 7,346.28 | 7,345.86 | +21.72 | +0.30 | watch sources; `get_slow` node pass-through (below) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,876.64 | 158,875.23 | 158,875.61 | -1.03 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,712.72 | 4,733.94 | 4,731.98 | +19.26 | +0.41 | watch sources; `get_slow` node pass-through (below) |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,329.27 | 7,351.01 | 7,352.31 | +23.04 | +0.31 | watch sources; `get_slow` node pass-through (below) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,566.08 | 1,490,567.19 | 1,490,559.01 | -7.07 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,109.99 | 2,123.80 | 2,124.31 | +14.32 | +0.68 | watch sources; `get_slow` node pass-through (below) |
+| `simple_count/shared/1000` | 100,000 | 4,062.83 | 4,073.62 | 4,073.28 | +10.45 | +0.26 | watch sources; `get_slow` node pass-through (below) |
+| `simple_count/local/10000` | 100,000 | 2,105.87 | 2,120.22 | 2,120.30 | +14.43 | +0.69 | watch sources; `get_slow` node pass-through (below) |
+| `simple_count/shared/10000` | 100,000 | 4,042.49 | 4,053.84 | 4,053.79 | +11.30 | +0.28 | watch sources; `get_slow` node pass-through (below) |
+| `get_clean_local` | 10,000,000 | 102.00 | 102.00 | 102.00 | +0.00 | +0.00 | none |
+| `get_clean_shared` | 10,000,000 | 196.00 | 196.00 | 196.00 | +0.00 | +0.00 | none |
+| `get_contended_shared` | 2,000 | 7,791,623.01 | 7,791,671.33 | 7,791,677.22 | +54.21 | +0.00 | none (run spread) |
+| `fanout_local_4` | 100,000 | 17,205.06 | 17,112.06 | 17,112.06 | -93.00 | -0.54 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `fanout_local_5` | 100,000 | 21,781.00 | 21,675.01 | 21,675.00 | -106.00 | -0.49 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `fanout_local_1000` | 1,000 | 3,456,502.41 | 3,443,455.17 | 3,443,461.98 | -13,040.43 | -0.38 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `fanout_shared_4` | 100,000 | 23,633.11 | 23,467.12 | 23,467.11 | -166.00 | -0.70 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `fanout_shared_5` | 100,000 | 29,002.87 | 28,805.91 | 28,806.04 | -196.83 | -0.68 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `fanout_shared_1000` | 1,000 | 4,769,160.10 | 4,738,126.07 | 4,738,137.44 | -31,022.66 | -0.65 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `delete_single_local` | 200,000 | 730.01 | 707.00 | 707.00 | -23.01 | -3.15 | delete path (below) |
+| `delete_single_shared` | 200,000 | 1,546.27 | 1,527.24 | 1,527.24 | -19.03 | -1.23 | delete path (below) |
+| `delete_cascade_local` | 1,000 | 3,246,002.48 | 3,228,976.97 | 3,228,976.45 | -17,026.03 | -0.52 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `delete_cascade_shared` | 1,000 | 4,550,304.43 | 4,525,268.31 | 4,525,277.50 | -25,026.93 | -0.55 | delete path; `get_slow` node pass-through; changed-dep publish (below) |
+| `delete_owned_tree_local` | 10,000 | 607,278.40 | 603,752.12 | 603,848.16 | -3,430.24 | -0.56 | run spread (below) |
+| `delete_owned_tree_shared` | 10,000 | 979,617.18 | 984,745.36 | 985,570.65 | +5,953.47 | +0.61 | run spread (below) |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 218.14 | 218.14 | 218.14 | +0.00 | +0.00 | none |
+| `table_hit_sip_local` | 10,000,000 | 301.68 | 301.24 | 300.64 | -1.04 | -0.34 | none |
+| `table_miss_local` | 100,000 | 871.17 | 871.18 | 871.18 | +0.01 | +0.00 | none |
+| `table_miss_shared` | 100,000 | 2,164.22 | 2,164.22 | 2,164.23 | +0.01 | +0.00 | none |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,976.94 | 217,991.05 | 217,991.11 | +14.17 | +0.01 | watch sources; `get_slow` node pass-through (below) |
+| `children_rerun_1k_shared` | 10,000 | 224,925.35 | 224,938.15 | 224,937.25 | +11.90 | +0.01 | watch sources; `get_slow` node pass-through (below) |
+| `children_churn_local` | 100,000 | 16,530.70 | 16,523.74 | 16,523.71 | -6.99 | -0.04 | `get_slow` node pass-through; layout (below) |
+| `children_churn_shared` | 100,000 | 19,417.93 | 19,410.01 | 19,408.46 | -9.47 | -0.05 | `get_slow` node pass-through; layout (below) |
+
+- **Watch sources (every workload that sets or computes; `c63f074`).**
+  A walk-driven compute costs +4 Local and +5 Shared, from the slope of
+  `chain_*/propagate/100` against `/10` ((417.96 − 58.00) / 90 and
+  (512.67 − 63.04) / 90), and each `set` with its walk +18 Local and +13
+  Shared. Intel PT per source line, with line-table builds of T8 and
+  `c63f074` and each line mapped across the diff
+  (`chain_local/propagate/10` and `/100`, `chain_shared/propagate/10`;
+  the Shared `/100` trace loses AUX data), splits them:
+  - per node the dirty walk flips, the `WATCHED` byte load and branch
+    the plan names (Local +2, Shared +3) and the flags pointer that
+    `get_with_flags` derives for it (Local +1, Shared +2);
+  - per landing, the test that the target is neither Clean nor Cyclic
+    before `report_landing` (+2); every icount landing is Clean or
+    Cyclic, so `report_landing`'s `inner.read()` never runs;
+  - per compute, register reallocation in the compute path: `land_run`'s
+    call line −2, the `verifying` test +1 Local, the `compute` call +1
+    Shared; under Local the walk's `inner.read()` reloads its borrow
+    flag once more per flipped node (`cell.rs:955`, +1), offset by one
+    fewer instruction with no line information in `runtime.rs` (−1);
+  - per `set`, the own-input `WATCHED` test the plan names (+2), passing
+    the input's flags through `claim_input`, `SetClaim` and
+    `finish_written` into the walk (+4), the walk queue's
+    `Vec::with_capacity` and its inlined std lines, whose source did not
+    change (+8 Local), and +2 in `arena_registry.rs` with no line
+    information. Under Shared the `/10` trace adds +9 indexing the
+    dependents' `SlotVec` and −14 of moves across `cycle.rs`,
+    `directory.rs` and lines with no line information, with the
+    workload's total exact (+63).
+
+  The workloads compose from these: `early_cutoff_local` +26 is one
+  `set` and two computes, and `simple_count/*` and
+  `children_rerun_1k_*` (+22 and +22 Local, +18 and +20 Shared) one
+  `set` and one compute. A first compute,
+  which no walk flips, nets 0 Local and −3 Shared (`fanout_*_1000`'s
+  1,001 computes after its deletes are taken out).
+- **`get_slow` node pass-through (every non-Clean `get`; `2e10c62`):**
+  −8 Local and −7 Shared per top-level non-Clean `get`, as recorded for
+  T8's follow-up; a nested one (`fanout_*_1000`, 1,000 per iteration)
+  saves about 5 Local and 9 Shared.
+- **Delete path (`delete_single_*`, and the teardown of `fanout_*` and
+  `delete_cascade_*`):** −23 Local and −19 Shared per deleted node. The
+  plan's `WATCHED`/`QUEUED` clear and conditional dequeue
+  (`unwatch_deleted`) costs +2 Local and +1 Shared, but T8 collected a
+  deleted node's observers with `extract_if` over the observer
+  `HashMap` into a `Vec` on every delete (46 Local, the empty map scan
+  and the `collect`), where T9's `Observers::take_slot` and its `Vec`
+  take 25; `unhook_retired` and `delete_strict` move by +4 and −8 Local
+  (Intel PT per function, `delete_single_*`). Six
+  deletes per `fanout_local_4` iteration give its −138, and 1,001 per
+  `delete_cascade_local` iteration its −23,029.
+- **Changed-dep publish (`fanout_*`, `delete_cascade_*`):** the
+  `publish_deps` length test, +14 Local and +4 Shared per first
+  compute, as its section above records (`fanout_local_1000` +15,009,
+  `delete_cascade_local` +14,004 here).
+- **Layout (`children_churn_*` −3 Local, −2 Shared after the
+  `publish_deps` merge):** the T9 runs agree to 0.03, but the
+  `publish_deps` section measured this workload unchanged across the
+  same commit at another path length, so it is placement, not executed
+  work.
+- **Run spread (`delete_owned_tree_*`):** −3,430 Local and +5,953
+  Shared over three merges whose steps change sign (Local −6,748,
+  +7,698, −4,380), inside the recorded spread between runs of one
+  binary.
+- **Clean get, table and value-slot reads:** unchanged. Observers and
+  `stabilize` run only in workloads that use them, which none of these
+  do.
