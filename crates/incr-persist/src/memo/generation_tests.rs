@@ -91,8 +91,14 @@ fn encoded_entry_carries_the_frame_and_the_key_hash() {
         deps: Vec::new(),
         last_used: 1,
     };
-    let encoded = EncodedEntry::new(&entry).unwrap();
+    let encoded = EncodedEntry::new(&entry, 5).unwrap();
     assert_eq!(encoded.table, 2);
     assert_eq!(encoded.key_hash, key_hash(&entry.key));
-    assert_eq!(encoded.frame, encode_entry(&entry).unwrap());
+    assert_eq!(encoded.frame, encode_entry(&entry, 5).unwrap());
+}
+
+#[test]
+fn a_generation_decodes_with_its_headers_frame_tag() {
+    let generation = Generation::new(GenId(1), header(), Vec::new());
+    assert_eq!(generation.frame_tag(), header().frame_tag());
 }

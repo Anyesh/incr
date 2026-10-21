@@ -3,7 +3,9 @@
 //!
 //! Every frame is `u32 len | u32 crc32 | body`, all little-endian, and the
 //! crc covers the length word and the body, so a flipped or truncated frame
-//! is rejected before its body is decoded. Bodies are postcard.
+//! is rejected before its body is decoded. Bodies are postcard, except that
+//! an entry's body starts with its generation's
+//! [`frame_tag`](GenHeader::frame_tag) as 8 little-endian bytes.
 
 use serde::{Deserialize, Serialize};
 
@@ -12,7 +14,7 @@ use crate::{Error, Result};
 /// The leading bytes of a header frame's body.
 pub const MAGIC: [u8; 8] = *b"incrmemo";
 /// The format version this build writes and reads, stored after [`MAGIC`].
-pub const FORMAT: u8 = 1;
+pub const FORMAT: u8 = 2;
 /// The bytes before a frame's body.
 pub const FRAME_HEADER_LEN: usize = 8;
 
@@ -42,6 +44,15 @@ pub struct GenHeader {
 }
 
 impl GenHeader {
+    /// The xxh3-64 of this header's postcard bytes, which every entry frame
+    /// of its generation carries. Entries name tables by catalog index, so
+    /// a frame decoded under another header, as from a generation file
+    /// rewritten in place under an open handle, must fail.
+    pub fn frame_tag(&self) -> u64 {
+        let bytes = postcard::to_stdvec(self).expect("a GenHeader always encodes");
+        xxhash_rust::xxh3::xxh3_64(&bytes)
+    }
+
     /// The catalog index of the table that matches `desc` in every field.
     pub fn table_index(&self, desc: &TableDesc) -> Option<u32> {
         self.tables
@@ -113,14 +124,25 @@ pub fn frame_len(buf: &[u8]) -> Option<usize> {
     (buf.len() >= len).then_some(len)
 }
 
-pub fn encode_entry(entry: &Entry) -> Result<Vec<u8>> {
-    frame_bytes(&postcard::to_stdvec(entry).map_err(Error::Encode)?)
+/// Encodes `entry` as a frame of the generation whose header has
+/// [`frame_tag`](GenHeader::frame_tag) `tag`.
+pub fn encode_entry(entry: &Entry, tag: u64) -> Result<Vec<u8>> {
+    let body = postcard::to_extend(entry, tag.to_le_bytes().to_vec()).map_err(Error::Encode)?;
+    frame_bytes(&body)
 }
 
-/// Decodes one entry from exactly one frame. A crc mismatch, a length that
-/// differs from `frame.len()` or an undecodable body is an error.
-pub fn decode_entry(frame: &[u8]) -> Result<Entry> {
-    decode_body(body(frame)?)
+/// Decodes one entry from exactly one frame of the generation whose header
+/// has [`frame_tag`](GenHeader::frame_tag) `tag`. A crc mismatch, a length
+/// that differs from `frame.len()`, another tag or an undecodable body is
+/// an error.
+pub fn decode_entry(frame: &[u8], tag: u64) -> Result<Entry> {
+    let body = body(frame)?;
+    match body.split_first_chunk() {
+        Some((found, entry)) if u64::from_le_bytes(*found) == tag => decode_body(entry),
+        _ => Err(Error::Corrupt(
+            "memo entry frame belongs to another generation",
+        )),
+    }
 }
 
 pub fn encode_header(header: &GenHeader) -> Result<Vec<u8>> {

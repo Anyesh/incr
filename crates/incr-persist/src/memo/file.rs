@@ -56,7 +56,9 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// A handle keeps the last generation file it read from open. On Unix it
 /// therefore keeps reading a generation another process removed after this
 /// handle opened it, which returns the frames that generation was written
-/// with.
+/// with. If the file is rewritten in place instead, its frames carry
+/// another generation's [`frame_tag`](super::GenHeader::frame_tag) and fail
+/// to decode.
 #[derive(Debug)]
 pub struct FileMemo {
     dir: PathBuf,
