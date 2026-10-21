@@ -88,6 +88,9 @@ pub(crate) struct Inner<C: Cells> {
     /// The cycle strategies of the queries that have one, flagged by
     /// `HAS_STRATEGY`.
     pub(crate) cycle_strategies: HashMap<u32, Arc<dyn ErasedStrategy>>,
+    /// Each type's fallback, by type tag: the strategy of a query flagged
+    /// `HAS_STRATEGY` with none in `cycle_strategies`.
+    pub(crate) type_fallbacks: Vec<Option<Arc<dyn ErasedStrategy>>>,
     /// The group each landed cycle member belongs to, flagged by
     /// `IN_GROUP`.
     pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
@@ -114,6 +117,7 @@ impl<C: Cells> Inner<C> {
             owner_of: HashMap::new(),
             children: HashMap::default(),
             cycle_strategies: HashMap::new(),
+            type_fallbacks: Vec::new(),
             member_recs: HashMap::new(),
         }
     }
@@ -1039,7 +1043,16 @@ impl<C: Cells> Runtime<C> {
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.create_query_erased::<true, _, _>(f, cycle::erase_opts(opts))
+        self.create_query_erased::<true, _, _>(f, self.erase_query_opts(opts))
+    }
+
+    /// `opts` erased, after checking that a
+    /// [`CycleStrategy::TypeFallback`] query's type has a fallback.
+    pub(crate) fn erase_query_opts<T: Value>(&self, opts: QueryOpts<T>) -> ErasedOpts {
+        if let CycleStrategy::TypeFallback = opts.cycle {
+            self.expect_type_fallback::<T>();
+        }
+        cycle::erase_opts(opts)
     }
 
     /// Creates a collection operator's query, `NOT_REPLAYABLE` whatever
@@ -1311,6 +1324,62 @@ impl<C: Cells> Runtime<C> {
         }
         self.max_stack_bytes
             .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Sets the fallback of every query of `T` created with
+    /// [`CycleStrategy::TypeFallback`]: in a dependency cycle such a query
+    /// `q` lands `g(cycle, q)`, as if it had been created with its own
+    /// `Fallback`. `g` runs as a `Fallback`'s function does. Panics if `T`
+    /// already has one, so readers never race a replacement.
+    pub fn set_cycle_fallback<T: Value>(
+        &self,
+        g: impl Fn(&Cycle, Incr<T>) -> T + Send + Sync + 'static,
+    ) {
+        value_code::check();
+        let g = cycle::erase_type_fallback(g);
+        // A refused `g` drops after the lock is released, since dropping it
+        // runs user code.
+        let refused = {
+            let mut inner = self.inner.write();
+            let inner = &mut *inner;
+            let (tag, _) = self.arenas.ensure_tagged::<T>(&mut inner.arena_tags);
+            let tag = usize::from(tag);
+            if inner.type_fallbacks.len() <= tag {
+                inner.type_fallbacks.resize_with(tag + 1, || None);
+            }
+            let slot = &mut inner.type_fallbacks[tag];
+            if slot.is_some() {
+                Some(g)
+            } else {
+                *slot = Some(g);
+                None
+            }
+        };
+        assert!(
+            refused.is_none(),
+            "incr-core: cycle fallback already set for {}",
+            std::any::type_name::<T>(),
+        );
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn expect_type_fallback<T: Value>(&self) {
+        let has = {
+            let inner = self.inner.read();
+            inner.arena_tags.tag::<T>().is_some_and(|tag| {
+                inner
+                    .type_fallbacks
+                    .get(usize::from(tag))
+                    .is_some_and(Option::is_some)
+            })
+        };
+        assert!(
+            has,
+            "incr-core: a TypeFallback query of {} needs its type's fallback; \
+             register one with set_cycle_fallback",
+            std::any::type_name::<T>(),
+        );
     }
 
     /// A clone of `T`'s placeholder, if it has one.
@@ -4185,6 +4254,10 @@ mod cycle_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_cycle_rule_tests.rs"]
 mod cycle_rule_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_type_fallback_tests.rs"]
+mod type_fallback_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_wound_tests.rs"]

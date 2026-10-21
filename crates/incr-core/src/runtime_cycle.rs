@@ -662,18 +662,28 @@ impl<C: Cells> Runtime<C> {
             .max_iterations()
             .is_none()
             .then(|| self.cycle_at(p));
-        let v = self.callback(|| strategy.v0(cycle.as_ref()));
+        let node = self.erased_at_live(slot);
+        let v = self.callback(|| strategy.v0(cycle.as_ref(), node));
         *v.downcast::<T>()
             .expect("incr-core: a cycle value has its member's type")
     }
 
     fn strategy_of(&self, slot: u32) -> Arc<dyn ErasedStrategy> {
-        self.inner
-            .read()
-            .cycle_strategies
-            .get(&slot)
-            .cloned()
-            .expect("incr-core: HAS_STRATEGY names a node with a strategy")
+        self.strategy_in(&self.inner.read(), slot)
+    }
+
+    /// The strategy of a node flagged `HAS_STRATEGY`: its own, or else
+    /// its type's fallback.
+    fn strategy_in(&self, inner: &Inner<C>, slot: u32) -> Arc<dyn ErasedStrategy> {
+        match inner.cycle_strategies.get(&slot) {
+            Some(own) => own.clone(),
+            None => inner
+                .type_fallbacks
+                .get(usize::from(self.nodes.get(slot).type_tag()))
+                .cloned()
+                .flatten()
+                .expect("incr-core: HAS_STRATEGY names a node with a strategy"),
+        }
     }
 
     /// Runs held node `slot`'s closure as a member run at position
@@ -1009,7 +1019,10 @@ impl<C: Cells> Runtime<C> {
                     let inner = self.inner.read();
                     ep.members
                         .iter()
-                        .filter_map(|&m| inner.cycle_strategies.get(&m).map(|s| (m, s.clone())))
+                        .filter(|&&m| {
+                            C::u8_load_relaxed(self.nodes.get_with_flags(m).1) & HAS_STRATEGY != 0
+                        })
+                        .map(|&m| (m, self.strategy_in(&inner, m)))
                         .collect()
                 };
                 let limit = strategies
@@ -1040,8 +1053,9 @@ impl<C: Cells> Runtime<C> {
                 let stamp_rev = self.current_revision();
                 let verify_rev = C::walked(&self.walk, &self.revision);
                 for (m, s) in &strategies {
-                    let v0 =
-                        self.attributed(*m, cidx, bag, || self.callback(|| s.v0(Some(&cycle))));
+                    let node = self.erased_at_live(*m);
+                    let v0 = self
+                        .attributed(*m, cidx, bag, || self.callback(|| s.v0(Some(&cycle), node)));
                     let old = self.take_held(*m, |e| e.s.replace(v0));
                     self.drop_member_value(*m, cidx, old, bag);
                 }

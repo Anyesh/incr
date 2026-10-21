@@ -61,8 +61,9 @@ pub(crate) const HAS_CHILDREN: u8 = 1;
 /// (`Inner::member_recs` has an entry for it).
 pub(crate) const IN_GROUP: u8 = 2;
 
-/// `NodeFlags` bit: the node has a cycle strategy
-/// (`Inner::cycle_strategies` has an entry for it).
+/// `NodeFlags` bit: the node has a cycle strategy (`Inner::cycle_strategies`
+/// has an entry for it, or else `Inner::type_fallbacks` has one for its
+/// type).
 pub(crate) const HAS_STRATEGY: u8 = 4;
 
 /// `NodeFlags` bit: the node has created owned children through
