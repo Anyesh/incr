@@ -127,6 +127,7 @@ jobs:
           - { model: "loom_models::loom_cycle_land_under_set", bound: 2 }
           - { model: "loom_models::loom_group_verify_under_set", bound: 2 }
           - { model: "loom_models::loom_group_claim_partial", bound: 2 }
+          - { model: "loom_models::loom_group_claim_contended", bound: 2 }
           - { model: "loom_models::loom_wound_keeps_a_member_computed_alone_in_its_group", bound: 2 }
           - { model: "loom_models::loom_cycle_break_race", bound: 2 }
           - { model: "loom_models::loom_fixpoint_two_entries", bound: 2 }
