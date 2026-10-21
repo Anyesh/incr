@@ -2,9 +2,12 @@
 //! keys, `(sheet, row, column)`, that finds a node by indexing instead of
 //! hashing.
 //!
-//! Each sheet has a directory of columns and each column a directory of
-//! pages of [`PAGE_ROWS`] consecutive rows, so a walk down a column reads
-//! adjacent memory and an entry costs 8 bytes in a page that is in use.
+//! Each sheet has a directory of columns, and each column a three-level
+//! tree of directories over pages of [`PAGE_ROWS`] consecutive rows, each
+//! level indexed by six more bits of the row, so a column costs memory by
+//! the pages in use rather than by its largest row. A walk down a column
+//! reads adjacent memory and an entry costs 8 bytes in a page that is in
+//! use.
 //! An entry is one word, the node's slot and generation, written under
 //! the table's miss mutex with a Release store and read with an Acquire
 //! load. Directories, pages and the column and sheet levels are never
@@ -31,11 +34,16 @@ use crate::value_code;
 /// Rows per page.
 pub const PAGE_ROWS: u32 = 64;
 const PAGE_SHIFT: u32 = PAGE_ROWS.trailing_zeros();
+/// Row bits each directory level of a column indexes.
+const LEVEL_SHIFT: u32 = 6;
+const LEVEL_MASK: u32 = (1 << LEVEL_SHIFT) - 1;
+const CHUNK_SHIFT: u32 = PAGE_SHIFT + LEVEL_SHIFT;
+const MID_SHIFT: u32 = CHUNK_SHIFT + LEVEL_SHIFT;
 
 /// The key of a [`GridTable`] entry. Each coordinate has a bound, so a
 /// stray key cannot make the table allocate gigabytes of directory: a
-/// column's directory grows with its largest row, a sheet's with its
-/// largest column.
+/// sheet's directory grows with its largest column, and a column's top
+/// level, at most 64 entries under `ROWS`, with its largest row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GridKey {
     pub sheet: u32,
@@ -132,7 +140,9 @@ impl<T: 'static, C: Cells> Drop for Owning<T, C> {
 
 struct Page<C: Cells>([C::U64; PAGE_ROWS as usize]);
 
-type Column<C> = Owning<Page<C>, C>;
+type Chunk<C> = Owning<Page<C>, C>;
+type Mid<C> = Owning<Chunk<C>, C>;
+type Column<C> = Owning<Mid<C>, C>;
 type Sheet<C> = Owning<Column<C>, C>;
 
 /// A map from `(sheet, row, column)` to nodes of the runtime that created
@@ -391,7 +401,9 @@ impl<T: Value, C: Cells> GridTable<T, C> {
             .sheets
             .get(key.sheet)?
             .get(key.column)?
-            .get(key.row >> PAGE_SHIFT)?;
+            .get(key.row >> MID_SHIFT)?
+            .get((key.row >> CHUNK_SHIFT) & LEVEL_MASK)?
+            .get((key.row >> PAGE_SHIFT) & LEVEL_MASK)?;
         Some(&page.0[(key.row & (PAGE_ROWS - 1)) as usize])
     }
 
@@ -402,7 +414,9 @@ impl<T: Value, C: Cells> GridTable<T, C> {
             .sheets
             .get_or_create(key.sheet, || Owning::new(1))
             .get_or_create(key.column, || Owning::new(1))
-            .get_or_create(key.row >> PAGE_SHIFT, || {
+            .get_or_create(key.row >> MID_SHIFT, || Owning::new(1))
+            .get_or_create((key.row >> CHUNK_SHIFT) & LEVEL_MASK, || Owning::new(1))
+            .get_or_create((key.row >> PAGE_SHIFT) & LEVEL_MASK, || {
                 Page(std::array::from_fn(|_| C::new_u64(0)))
             });
         &page.0[(key.row & (PAGE_ROWS - 1)) as usize]
