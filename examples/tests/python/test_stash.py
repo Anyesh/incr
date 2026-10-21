@@ -145,6 +145,138 @@ def test_a_wound_inside_a_python_closure_retries():
     assert "_IncrEngineUnwind" in seen
 
 
+def cleanup_query(rt, name, raises, runs):
+    def body(r):
+        runs.append(name)
+        if raises:
+            raise ValueError(f"{name} failed")
+        return 7
+
+    return rt.create_query(body)
+
+
+def assert_discarded_then_lands_its_own_outcome(rt, node, name, raises, runs):
+    """`node` ran once in an engine unwind's finally and was discarded with
+    that run, so the next read runs it again and gets its own outcome."""
+    assert runs == [name]
+    if raises:
+        with pytest.raises(ValueError, match=f"{name} failed"):
+            rt.get(node)
+    else:
+        assert rt.get(node) == 7
+    assert runs == [name, name]
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["returns", "raises"])
+@pytest.mark.parametrize("cleanup_read", ["get", "try_get"])
+def test_a_read_in_finally_during_a_wound_is_given_up_with_the_run(
+    raises, cleanup_read, capfd
+):
+    rt = incr_concurrent.Runtime()
+    nodes = {}
+    both_claimed = threading.Barrier(2, timeout=10)
+    first = {"a": True, "b": True}
+    runs = {"a": [], "b": []}
+    seen = {"a": [], "b": []}
+    cleanup = {me: cleanup_query(rt, me, raises, runs[me]) for me in "ab"}
+
+    # Each first run claims its node, then reads the other's: the waits-for
+    # cycle wounds the younger thread, whose finally reads its cleanup node
+    # while the wound is carried. A later run reads nothing.
+    def member(me, other):
+        def body(r):
+            if not first[me]:
+                return 1
+            first[me] = False
+            both_claimed.wait()
+            unwound = False
+            try:
+                return r.get(nodes[other]) + 1
+            except BaseException:
+                unwound = True
+                raise
+            finally:
+                if unwound:
+                    try:
+                        seen[me].append(getattr(r, cleanup_read)(cleanup[me]))
+                    except BaseException as e:
+                        seen[me].append(type(e).__name__)
+                        raise
+
+        return body
+
+    nodes["a"] = rt.create_query(member("a", "b"))
+    nodes["b"] = rt.create_query(member("b", "a"))
+    results = {}
+
+    def read(name):
+        results[name] = rt.get(nodes[name])
+
+    threads = [threading.Thread(target=read, args=(n,), daemon=True) for n in "ab"]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "the wound did not resolve"
+
+    wounded = [me for me in "ab" if seen[me]]
+    assert len(wounded) == 1, seen
+    w = wounded[0]
+    o = "b" if w == "a" else "a"
+    # The older thread ran the wounded node's retry, which reads nothing.
+    assert results == {w: 1, o: 2}
+    assert seen[w] == ["_IncrEngineUnwind"]
+    assert runs[o] == []
+    assert_discarded_then_lands_its_own_outcome(rt, cleanup[w], w, raises, runs[w])
+    assert capfd.readouterr().err == ""
+
+
+@BOTH
+@pytest.mark.parametrize("raises", [False, True], ids=["returns", "raises"])
+@pytest.mark.parametrize("cleanup_read", ["get", "try_get"])
+@pytest.mark.parametrize("top_read", ["get", "try_get"])
+def test_a_read_in_finally_during_a_discard_is_given_up_with_the_run(
+    module, raises, cleanup_read, top_read, capfd
+):
+    rt = doom_ready(module)
+    runs = []
+    seen = []
+    inner_runs = []
+    c = cleanup_query(rt, "c", raises, runs)
+
+    def fails(r):
+        inner_runs.append("i")
+        raise ZeroDivisionError("speculative")
+
+    inner = rt.create_query(fails)
+
+    # `spec` runs as a speculative entry, so `inner`'s exception goes on as
+    # a discard unwind that the finally's read of `c` runs under.
+    def spec(r):
+        try:
+            return r.get(inner)
+        finally:
+            try:
+                seen.append(getattr(r, cleanup_read)(c))
+            except BaseException as e:
+                seen.append(type(e).__name__)
+                raise
+
+    s = rt.create_query(spec)
+    a = rt.create_query(lambda r: 1, replay=True)
+    t = rt.create_query(
+        lambda r: r.get(s) if r.get(a) == PLACEHOLDER else 5, replay=True
+    )
+    assert getattr(rt, top_read)(t) == 5
+    assert inner_runs == ["i"], "the speculative entry never ran"
+    assert seen == ["_IncrEngineUnwind"]
+    assert_discarded_then_lands_its_own_outcome(rt, c, "c", raises, runs)
+    # Discarded too, never Failed: the real read raises its own exception.
+    with pytest.raises(ZeroDivisionError, match="speculative"):
+        rt.get(inner)
+    assert capfd.readouterr().err == ""
+
+
 @BOTH
 def test_a_swallowed_exception_is_dropped_when_the_call_returns(module):
     rt = doom_ready(module)
@@ -157,7 +289,9 @@ def test_a_swallowed_exception_is_dropped_when_the_call_returns(module):
 
     a = rt.create_query(lambda r: 1, replay=True)
     s = rt.create_query(raises)
-    t = rt.create_query(lambda r: r.get(s) if r.get(a) == PLACEHOLDER else 0, replay=True)
+    t = rt.create_query(
+        lambda r: r.get(s) if r.get(a) == PLACEHOLDER else 0, replay=True
+    )
     assert rt.get(t) == 0
     assert refs and all(ref() is None for ref in refs)
 
