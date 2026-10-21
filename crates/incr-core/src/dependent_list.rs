@@ -207,7 +207,7 @@ impl DependentList {
         self.as_slice().last().map(|&x| NodeId(x))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn contains(&self, id: NodeId) -> bool {
         debug_assert_ne!(id.0, NONE);
         self.as_slice().contains(&id.0)

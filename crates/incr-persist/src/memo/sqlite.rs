@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -10,6 +10,7 @@ use super::{
     decode_header, encode_header, EncodedEntry, GenHeader, GenId, Generation, IndexItem,
     MemoBackend,
 };
+use crate::flock::Flock;
 use crate::sqlite::{enable_wal, is_busy, sql};
 use crate::{Error, Result, SqliteDurability};
 
@@ -88,7 +89,7 @@ pub struct SqliteMemo {
 /// The checkpoint lock of a [`SqliteMemo`], released on drop.
 #[derive(Debug)]
 pub struct SqliteMemoGuard {
-    _file: File,
+    _file: Flock,
 }
 
 impl SqliteMemo {
@@ -167,7 +168,7 @@ impl MemoBackend for SqliteMemo {
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
         self.remove_leftovers()?;
-        Ok(SqliteMemoGuard { _file: file })
+        Ok(SqliteMemoGuard { _file: Flock(file) })
     }
 
     fn load(&self) -> Result<Option<Generation>> {

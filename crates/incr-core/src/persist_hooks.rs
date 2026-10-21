@@ -73,6 +73,15 @@ pub fn changed_at_erased<C: Cells>(rt: &Runtime<C>, handle: ErasedIncr) -> Optio
     rt.changed_at_erased(handle)
 }
 
+/// Panics unless `rt`, at quiescence, holds invariant (I) and every
+/// installed dep has its reverse edge. For incr-persist's restart tests.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub fn assert_invariants<C: Cells>(rt: &Runtime<C>) {
+    rt.assert_invariant_i();
+    rt.assert_edges_complete();
+}
+
 /// Whether `rt`'s active frame on this thread is doomed, so a table miss
 /// there returns [`pending_handle`] instead of creating a node.
 pub fn frame_doomed<C: Cells>(rt: &Runtime<C>) -> bool {
@@ -154,7 +163,8 @@ pub enum SeedError {
     NotFresh,
     /// A dep was deleted, or belongs to another runtime.
     DepNotAlive,
-    /// `RecomputeFirst` with no deps, which no change could ever rerun.
+    /// `RecomputeFirst` with no deps: no dep can have moved, so a query
+    /// that read nothing seeds `IfUnchanged`.
     NoDeps,
     /// The base or the query belongs to another runtime.
     ForeignBase,
@@ -174,11 +184,12 @@ pub fn seed_base<C: Cells>(rt: &Runtime<C>) -> SeedBase {
     rt.seed_base()
 }
 
-/// Lands New query `q` Dirty with `value` and `deps` at `base.w0`, as of
-/// a run that read those deps; `IfUnchanged` falls back to
-/// `RecomputeFirst` when a trusted dep no longer holds its stamp. On
-/// failure `value` comes back for the caller to drop where its protocol
-/// allows. Panics in a doomed frame.
+/// Lands New query `q` Dirty with `value` at `base.w0`, as of a run that
+/// read `deps`; `IfUnchanged` falls back to `RecomputeFirst` when a trusted
+/// dep no longer holds its stamp. Only `IfUnchanged` installs `deps`: a
+/// `RecomputeFirst` query reruns on its first walk and records what that
+/// run reads, as a cold one does. On failure `value` comes back for the
+/// caller to drop where its protocol allows. Panics in a doomed frame.
 pub fn seed_query<T: Value, C: Cells>(
     rt: &Runtime<C>,
     base: &SeedBase,

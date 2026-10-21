@@ -16,6 +16,7 @@ mod backend;
 pub mod conformance;
 mod error;
 mod file;
+mod flock;
 pub mod memo;
 mod memory;
 mod record;

@@ -1,6 +1,8 @@
 //! `MemoTable::get_or_insert`: a miss restores the stored entry and every
 //! stored query dep under it, seeding each one only after its deps.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 use incr_core::persist_hooks::{
@@ -59,6 +61,8 @@ impl<C: MemoCells> CoreRef<C> {
         }
         let index = self.index();
         let base = seed_base(rt);
+        #[cfg(test)]
+        park(Park::AfterBase);
         let mut walk = Walk {
             core: self,
             rt,
@@ -85,10 +89,40 @@ impl<C: MemoCells> CoreRef<C> {
             state.stats.cold += 1;
             return t.cold_into(self, rt, key, bag);
         };
+        #[cfg(test)]
+        park(Park::BeforeSeed);
         let (handle, seeded) = t.seed(self, rt, key, &entry.value, &deps, reuse, &base, bag);
         record(state, handle.erase(), entry, &base, seeded);
         handle
     }
+}
+
+/// Where a restore calls this thread's [`PARK`] hook.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Park {
+    /// The base is taken and no fingerprint is read yet.
+    AfterBase,
+    /// One entry's fingerprints are read and their `DepIndex` hold is
+    /// released; the entry isn't seeded yet.
+    BeforeSeed,
+}
+
+#[cfg(test)]
+type ParkHook = Box<dyn Fn(Park)>;
+
+#[cfg(test)]
+thread_local! {
+    static PARK: RefCell<Option<ParkHook>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn park(point: Park) {
+    PARK.with(|hook| {
+        if let Some(hook) = &*hook.borrow() {
+            hook(point);
+        }
+    });
 }
 
 fn corrupt(state: &mut MemoState) {
@@ -284,6 +318,8 @@ impl<C: MemoCells> Walk<'_, C> {
             }
             return;
         };
+        #[cfg(test)]
+        park(Park::BeforeSeed);
         let visit = &self.visits[id];
         let entry = visit.entry.as_ref().expect("an opened visit has its entry");
         let table = &self.core.tables[visit.table as usize];
@@ -355,3 +391,7 @@ impl<C: MemoCells> Walk<'_, C> {
         Some((deps, reuse))
     }
 }
+
+#[cfg(test)]
+#[path = "restore_tests.rs"]
+mod tests;
