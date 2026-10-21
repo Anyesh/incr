@@ -1869,12 +1869,18 @@ impl<C: Cells> Runtime<C> {
         if handle.runtime_id() != self.runtime_id {
             return false;
         }
-        let node = self.nodes.get(handle.slot());
+        self.is_alive_at(handle.slot(), handle.generation())
+    }
+
+    /// [`Self::is_alive`] for a slot and generation of this runtime.
+    #[inline(always)]
+    pub(crate) fn is_alive_at(&self, slot: u32, generation: u32) -> bool {
+        let node = self.nodes.get(slot);
         // State before generation: a recycle bumps the generation before
         // it Release-stores the new occupant's state, so if the Acquire
         // load below sees that occupant, the generation load sees the bump.
-        let state = node.state();
-        state != NodeState::Dead && node.generation() == handle.generation()
+        let state = C::state_load_acquire(node.state_cell());
+        state != NodeState::Dead.as_u8() && node.generation() == generation
     }
 
     /// The typed handle behind `handle`: `Some` only if it names a live
@@ -2048,11 +2054,15 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(slot);
         self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
 
-        let observed = state::load::<C>(node.state_cell());
-        if observed == NodeState::Clean {
+        // The raw byte, so the Clean test skips `from_u8`'s range check.
+        let observed = C::state_load_acquire(node.state_cell());
+        if observed == NodeState::Clean.as_u8() {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+            if C::SINGLE_THREADED {
+                return self.read_clean_local(handle, type_tag, arena_slot);
+            }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => value,
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
@@ -2061,7 +2071,7 @@ impl<C: Cells> Runtime<C> {
                 },
             };
         }
-        self.get_slow(handle, observed)
+        self.get_slow(handle, NodeState::from_u8(observed))
     }
 
     /// The non-Clean arm of [`Self::get`]: walk, then read. `observed`
@@ -2090,6 +2100,9 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+            if C::SINGLE_THREADED {
+                return Ok(self.read_clean_local(handle, type_tag, arena_slot));
+            }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => Ok(value),
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
@@ -2117,7 +2130,9 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let inner = self.inner.read();
-        if self.nodes.get(handle.slot()).generation() != handle.generation() {
+        if inner.member_recs.is_empty()
+            || self.nodes.get(handle.slot()).generation() != handle.generation()
+        {
             return None;
         }
         inner
@@ -2339,6 +2354,20 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// [`Self::try_read_slot`] for a Clean `get` or `try_get` under
+    /// `Local`, where an empty slot is [`Self::read_failed`]
+    /// (`reload_after_empty_slot`), and the value is cloned straight into
+    /// the return place.
+    #[inline(always)]
+    fn read_clean_local<T: Value>(&self, handle: Incr<T>, type_tag: u16, arena_slot: u32) -> T {
+        debug_assert!(C::SINGLE_THREADED);
+        self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
+        let Some(arena) = self.arenas.tagged_arena::<T>(type_tag) else {
+            self.read_failed(handle)
+        };
+        value_code::run(|| arena.read_or(arena_slot, || self.read_failed(handle)))
+    }
+
     /// [`Self::read_slot`], with `None` for an empty slot.
     #[inline(always)]
     fn try_read_slot<T: Value>(
@@ -2351,9 +2380,14 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
         let arena = self.arenas.tagged_arena::<T>(type_tag);
         let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)));
-        C::fence_acquire();
-        if node.generation() != handle.generation() {
-            self.stale_handle(handle);
+        // Under `Local` the generation the caller checked cannot move
+        // during the clone: no other thread exists, and the clone runs as
+        // value code, where every delete and recycle panics.
+        if !C::SINGLE_THREADED {
+            C::fence_acquire();
+            if node.generation() != handle.generation() {
+                self.stale_handle(handle);
+            }
         }
         value
     }

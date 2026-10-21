@@ -55,7 +55,9 @@ both!(
     grid_computes_create_their_nodes_through_the_table,
     grid_lookups_and_inserts_refuse_a_compute,
     grid_another_runtime_is_refused,
+    grid_a_dead_or_recycled_entry_is_a_miss,
     grid_a_key_out_of_range_is_refused,
+    grid_a_doomed_frame_refuses_a_key_out_of_range,
     grid_a_doomed_miss_returns_a_pending_handle_and_creates_nothing,
     grid_a_make_that_dooms_its_frame_creates_nothing,
     grid_an_init_that_dooms_its_frame_creates_nothing,
@@ -206,24 +208,139 @@ fn grid_another_runtime_is_refused<C: Cells>(rt: &Runtime<C>) {
     });
 }
 
-fn grid_a_key_out_of_range_is_refused<C: Cells>(rt: &Runtime<C>) {
+/// A hit takes the entry's node only while that node is alive under the
+/// entry's generation: a deleted node is a miss, and so is a slot another
+/// node recycled, which is alive under a newer generation.
+fn grid_a_dead_or_recycled_entry_is_a_miss<C: Cells>(rt: &Runtime<C>) {
     let t = rt.create_grid_table::<i64>();
-    for k in [
+    let (dead, recycled) = (key(0, 1, 1), key(0, 2, 1));
+    let d = t.get_or_insert_input(rt, dead, || 10);
+    let r = t.get_or_insert_query(rt, recycled, |_| 11);
+    assert_eq!(rt.get(r), 11);
+    rt.delete_node(r);
+    let occupant = rt.create_input(99_i64);
+    assert_eq!(occupant.slot(), r.slot(), "the occupant reuses the slot");
+    rt.delete_node(d);
+    assert_eq!(t.get(rt, dead), None);
+    assert_eq!(t.get(rt, recycled), None);
+
+    let ran = Cell::new(0);
+    let d2 = t.get_or_insert_input(rt, dead, || {
+        ran.set(ran.get() + 1);
+        20
+    });
+    let r2 = t.get_or_insert_query(rt, recycled, |_| 21);
+    assert_eq!(ran.get(), 1, "a dead entry is a miss");
+    assert!(r2 != occupant && r2 != r, "a recycled entry is a miss");
+    assert_eq!((rt.get(d2), rt.get(r2), rt.get(occupant)), (20, 21, 99));
+    assert_eq!(t.get(rt, dead), Some(d2));
+    assert_eq!(t.get(rt, recycled), Some(r2));
+}
+
+fn out_of_range_keys() -> [GridKey; 4] {
+    [
         key(GridKey::SHEETS, 0, 0),
         key(0, GridKey::ROWS, 0),
+        key(0, GridKey::ROWS + PAGE_ROWS - 1, 0),
         key(0, 0, GridKey::COLUMNS),
-    ] {
-        panics_with("out of range", || {
-            t.get_or_insert_input(rt, k, || 1);
-        });
-        panics_with("out of range", || {
-            t.get(rt, k);
-        });
-        panics_with("out of range", || {
-            t.insert_inputs(rt, vec![(k, 1)]);
-        });
+    ]
+}
+
+/// Whether `f` panicked with the out-of-range message.
+fn refused_out_of_range<R>(f: impl FnOnce() -> R) -> bool {
+    catch_unwind(AssertUnwindSafe(f)).is_err_and(|payload| {
+        payload
+            .downcast_ref::<String>()
+            .is_some_and(|m| m.contains("out of range"))
+    })
+}
+
+/// A lookup checks the key's range only on a miss, which an out-of-range
+/// key always is, so it is refused whether or not the table has entries
+/// at the edge of every bound.
+fn grid_a_key_out_of_range_is_refused<C: Cells>(rt: &Runtime<C>) {
+    let t = rt.create_grid_table::<i64>();
+    let mut edges = vec![key(1, PAGE_ROWS, 1)];
+    // Directories that large are too slow to initialize under Miri.
+    if !cfg!(miri) {
+        edges.extend([
+            key(GridKey::SHEETS - 1, 0, 0),
+            key(0, GridKey::ROWS - 1, 0),
+            key(0, 0, GridKey::COLUMNS - 1),
+        ]);
     }
-    assert_eq!(rt.node_count(), 0);
+    for populated in [false, true] {
+        if populated {
+            for &k in &edges {
+                t.get_or_insert_input(rt, k, || 1);
+            }
+        }
+        let nodes = rt.node_count();
+        for k in out_of_range_keys() {
+            let calls: [(&str, &dyn Fn()); 5] = [
+                ("get_or_insert_input", &|| {
+                    t.get_or_insert_input(rt, k, || 1);
+                }),
+                ("get_or_insert_query", &|| {
+                    t.get_or_insert_query(rt, k, |_| 1);
+                }),
+                ("get_or_insert_query_lazy", &|| {
+                    t.get_or_insert_query_lazy(rt, k, || -> Built<C> {
+                        (|_| 1, QueryOpts::default())
+                    });
+                }),
+                ("get", &|| {
+                    t.get(rt, k);
+                }),
+                ("insert_inputs", &|| {
+                    t.insert_inputs(rt, vec![(k, 1)]);
+                }),
+            ];
+            for (call, f) in calls {
+                assert!(
+                    refused_out_of_range(f),
+                    "{call} {k:?}, populated {populated}"
+                );
+            }
+        }
+        assert_eq!(rt.node_count(), nodes);
+    }
+}
+
+/// The range check comes before the doomed frame's pending handle, so a
+/// doomed compute's out-of-range key panics as it would undoomed.
+fn grid_a_doomed_frame_refuses_a_key_out_of_range<C: Cells>(rt: &Runtime<C>)
+where
+    GridTable<i64, C>: Send + Sync,
+{
+    rt.set_placeholder::<i64>(-1);
+    let gate = rt.doom_gate();
+    let t = Arc::new(rt.create_grid_table::<i64>());
+    t.get_or_insert_input(rt, key(0, 0, 0), || 1);
+    let refused = Arc::new(AtomicU32::new(0));
+    let doomed = Arc::new(AtomicU32::new(0));
+    let (t2, count, pending) = (t.clone(), refused.clone(), doomed.clone());
+    let q = rt.create_query_with(
+        move |rt| {
+            if rt.get(gate).0 {
+                return 0;
+            }
+            let p = t2.get_or_insert_input(rt, key(0, 5, 0), || 0);
+            pending.fetch_add(u32::from(!rt.is_alive(p)), Ordering::Relaxed);
+            for k in out_of_range_keys() {
+                let input = refused_out_of_range(|| t2.get_or_insert_input(rt, k, || 0));
+                let query = refused_out_of_range(|| t2.get_or_insert_query(rt, k, |_| 0));
+                count.fetch_add(u32::from(input) + u32::from(query), Ordering::Relaxed);
+            }
+            0_i64
+        },
+        replayable(),
+    );
+    let nodes = rt.node_count();
+    assert_eq!(rt.get(q), 0);
+    assert_eq!(doomed.load(Ordering::Relaxed), 1, "one doomed run");
+    assert_eq!(refused.load(Ordering::Relaxed), 8);
+    assert_eq!(rt.node_count(), nodes);
 }
 
 #[derive(Default)]

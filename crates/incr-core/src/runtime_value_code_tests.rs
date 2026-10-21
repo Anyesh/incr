@@ -333,6 +333,40 @@ fn clone_that_reads_a_clean_node<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_eq!(rt.get(a).0, 2);
 }
 
+/// A Clean read under `Local` skips the generation recheck after its
+/// clone because the clone cannot delete, recycle or overwrite the node
+/// it is cloning; each attempt panics and leaves the node as it was.
+fn clone_that_deletes_or_sets_the_node_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
+    type Change<C> = (&'static str, fn(&Runtime<C>, crate::Incr<Hooked>));
+    let changes: [Change<C>; 4] = [
+        ("delete_node", |rt, a| rt.delete_node(a)),
+        ("try_delete_node", |rt, a| {
+            let _ = rt.try_delete_node(a);
+        }),
+        ("delete_with_dependents", |rt, a| {
+            rt.delete_with_dependents(a);
+        }),
+        ("set", |rt, a| rt.set(a, Hooked(2))),
+    ];
+    let a = rt.create_input(Hooked(1));
+    for (name, change) in changes {
+        for try_get in [false, true] {
+            let hooked = Rc::clone(&rt);
+            arm(Op::Clone, move || change(&hooked, a));
+            assert_contract_panic(name, || {
+                if try_get {
+                    let _ = rt.try_get(a);
+                } else {
+                    rt.get(a);
+                }
+            });
+            assert!(rt.is_alive(a), "{name}");
+            assert_eq!(rt.state_of(a), NodeState::Clean, "{name}");
+            assert_eq!(rt.get(a).0, 1, "{name}");
+        }
+    }
+}
+
 fn clone_that_creates_a_node<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
     let hooked = Rc::clone(&rt);
@@ -702,6 +736,7 @@ both!(
     panicking_value_code_leaves_the_runtime_usable,
     drop_that_deletes_the_input_under_its_set,
     clone_that_reads_a_clean_node,
+    clone_that_deletes_or_sets_the_node_it_reads,
     clone_that_creates_a_node,
     partial_eq_of_a_recompute_that_reads_a_node,
     hash_that_reads_a_node_on_insert,

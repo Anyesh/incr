@@ -138,6 +138,7 @@ jobs:
           - { model: "loom_models::table_miss_race_under_set", bound: 2 }
           - { model: "loom_models::table_hit_vs_publish", bound: 2 }
           - { model: "loom_models::table_hit_vs_remove_rehash", bound: 2 }
+          - { model: "loom_models::grid_hit_vs_recycle", bound: 3 }
           - { model: "loom_models::tree_claim_vs_compute", bound: 2 }
           - { model: "loom_models::tree_claim_rollback_under_set", bound: 2 }
           - { model: "loom_models::child_sweep_vs_reader", bound: 2 }
