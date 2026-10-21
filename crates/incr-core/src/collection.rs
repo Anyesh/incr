@@ -116,7 +116,9 @@ pub enum Delta<T> {
 /// Compaction batch: how many deltas accumulate before a compaction
 /// sweep looks at consumer cursors. Sweeps are O(consumers) plus the
 /// drain memmove, so they are amortized across the batch.
-const COMPACT_EVERY: usize = 1024;
+/// Smaller under Miri so the compaction tests reach their sweeps in
+/// minutes instead of hours.
+const COMPACT_EVERY: usize = if cfg!(miri) { 128 } else { 1024 };
 
 /// Delta log + multiset bookkeeping for a single collection.
 ///

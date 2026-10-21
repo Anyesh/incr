@@ -336,7 +336,7 @@ fn sink_tracks_the_stored_representatives<C: Cells>(ops: &[Op]) {
 
 proptest! {
     #![proptest_config(ProptestConfig {
-        cases: 256,
+        cases: if cfg!(miri) { 8 } else { 256 },
         failure_persistence: None,
         ..ProptestConfig::default()
     })]
