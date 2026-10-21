@@ -40,7 +40,7 @@ use engine::{
     SortedCollection, TraceAction,
 };
 use incr_python_protocol::{
-    call_stashing, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions, InRuntime,
+    call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions,
     PyFixpoint, PyValue,
 };
 
@@ -81,10 +81,7 @@ fn engine_call<R: Ungil>(
     rt: &Runtime,
     f: impl FnOnce() -> R + Ungil,
 ) -> PyResult<R> {
-    pyerr_boundary::<Exc, _>(|| {
-        let _active = InRuntime::enter(rt);
-        py.detach(f)
-    })
+    pyerr_boundary::<Exc, _>(|| in_runtime(rt, || py.detach(f)))
 }
 
 /// The closure the engine runs for a Python query: `py_func` called with
@@ -102,8 +99,9 @@ fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 
             // Invalidates the ref when the callback returns or unwinds, so
             // one the callback kept never reaches a dropped runtime.
             let _guard = InvalidateRef(rt_ref.bind(py).clone());
-            let _active = InRuntime::enter(rt);
-            PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
+            in_runtime(rt, || {
+                PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
+            })
         })
     }
 }

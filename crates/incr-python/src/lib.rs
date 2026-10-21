@@ -37,7 +37,7 @@ use incr_compute::{
     SortedCollection, TraceAction,
 };
 use incr_python_protocol::{
-    call_stashing, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions, InRuntime,
+    call_stashing, in_runtime, init_fn, or_stash, pyerr_boundary, query_opts, try_read, Exceptions,
     PyFixpoint, PyValue,
 };
 
@@ -73,10 +73,7 @@ impl Exceptions for Exc {
 /// by one thread, so its waits never block on another thread and the GIL
 /// stays held.
 fn engine_call<R>(rt: &Runtime, f: impl FnOnce() -> R) -> PyResult<R> {
-    pyerr_boundary::<Exc, _>(|| {
-        let _active = InRuntime::enter(rt);
-        f()
-    })
+    pyerr_boundary::<Exc, _>(|| in_runtime(rt, f))
 }
 
 /// A binding object that reaches its runtime through the `Runtime` object
@@ -106,8 +103,9 @@ fn query_fn(py_func: Py<PyAny>) -> impl Fn(&Runtime) -> PyValue + Send + Sync + 
             // Invalidates the ref when the callback returns or unwinds, so
             // one the callback kept never reaches a dropped runtime.
             let _guard = InvalidateRef(rt_ref.bind(py).clone());
-            let _active = InRuntime::enter(rt);
-            PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
+            in_runtime(rt, || {
+                PyValue(call_stashing(py, &py_func, (rt_ref.clone_ref(py),)))
+            })
         })
     }
 }
