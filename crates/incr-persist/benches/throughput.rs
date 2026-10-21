@@ -4,16 +4,22 @@
 //! directory under the workspace's `target/` (or `INCR_PERSIST_BENCH_DIR`),
 //! never under a tmpfs `/tmp`, where fsync would cost nothing. The
 //! two-writer SQLite case needs two processes and lives in
-//! `examples/sqlite_writers.rs`.
+//! `examples/sqlite_writers.rs`. Every case runs on Local in the `set`
+//! group and on Shared in `set_shared`.
 
 mod common;
 
 use std::time::Duration;
 
-use common::bench_dir;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use common::{bench_dir, BenchCells};
+use criterion::measurement::WallTime;
+use criterion::{
+    black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion, Throughput,
+};
 use incr_core::Runtime;
-use incr_persist::{Backend, Durability, FileBackend, Local, MemoryBackend, Options, Store};
+use incr_persist::{
+    Backend, Durability, FileBackend, Local, MemoryBackend, Options, Shared, Store,
+};
 #[cfg(feature = "sqlite")]
 use incr_persist::{SqliteBackend, SqliteDurability, SqliteOptions};
 #[cfg(feature = "sqlite")]
@@ -28,10 +34,18 @@ fn options(durability: Durability) -> Options {
     }
 }
 
-fn bench_store<B: Backend>(c: &mut Criterion, name: &str, open: impl FnOnce() -> Store<Local, B>) {
+fn set_group<C: BenchCells>(c: &mut Criterion) -> BenchmarkGroup<'_, WallTime> {
+    c.benchmark_group(format!("set{}", C::SUFFIX))
+}
+
+fn bench_store<C: BenchCells, B: Backend>(
+    c: &mut Criterion,
+    name: &str,
+    open: impl FnOnce() -> Store<C, B>,
+) {
     let store = open();
     let input = store.input("x", 0u64).unwrap();
-    let mut group = c.benchmark_group("set");
+    let mut group = set_group::<C>(c);
     group.throughput(Throughput::Elements(1));
     let mut value = 0u64;
     group.bench_function(name, |b| {
@@ -43,10 +57,10 @@ fn bench_store<B: Backend>(c: &mut Criterion, name: &str, open: impl FnOnce() ->
     group.finish();
 }
 
-fn plain(c: &mut Criterion) {
-    let rt: Runtime<Local> = Runtime::new();
+fn plain<C: BenchCells>(c: &mut Criterion) {
+    let rt: Runtime<C> = Runtime::new();
     let input = rt.create_input(0u64);
-    let mut group = c.benchmark_group("set");
+    let mut group = set_group::<C>(c);
     group.throughput(Throughput::Elements(1));
     let mut value = 0u64;
     group.bench_function("runtime", |b| {
@@ -58,15 +72,15 @@ fn plain(c: &mut Criterion) {
     group.finish();
 }
 
-fn memory(c: &mut Criterion) {
-    bench_store(c, "memory", || {
+fn memory<C: BenchCells>(c: &mut Criterion) {
+    bench_store::<C, _>(c, "memory", || {
         Store::open(MemoryBackend::new(), options(Durability::Sync)).unwrap()
     });
 }
 
-fn file_buffered(c: &mut Criterion) {
+fn file_buffered<C: BenchCells>(c: &mut Criterion) {
     let dir = bench_dir();
-    bench_store(c, "file_buffered", || {
+    bench_store::<C, _>(c, "file_buffered", || {
         Store::open(
             FileBackend::open(dir.path()).unwrap(),
             options(Durability::Buffered),
@@ -75,9 +89,9 @@ fn file_buffered(c: &mut Criterion) {
     });
 }
 
-fn file_sync(c: &mut Criterion) {
+fn file_sync<C: BenchCells>(c: &mut Criterion) {
     let dir = bench_dir();
-    bench_store(c, "file_sync", || {
+    bench_store::<C, _>(c, "file_sync", || {
         Store::open(
             FileBackend::open(dir.path()).unwrap(),
             options(Durability::Sync),
@@ -86,15 +100,15 @@ fn file_sync(c: &mut Criterion) {
     });
 }
 
-fn file_sync_batched(c: &mut Criterion) {
+fn file_sync_batched<C: BenchCells>(c: &mut Criterion) {
     let dir = bench_dir();
-    let store = Store::<Local, _>::open(
+    let store = Store::<C, _>::open(
         FileBackend::open(dir.path()).unwrap(),
         options(Durability::Sync),
     )
     .unwrap();
     let input = store.input("x", 0u64).unwrap();
-    let mut group = c.benchmark_group("set");
+    let mut group = set_group::<C>(c);
     group.throughput(Throughput::Elements(BATCH));
     let mut value = 0u64;
     group.bench_function("file_sync_batch100", |b| {
@@ -117,7 +131,10 @@ fn file_sync_batched(c: &mut Criterion) {
 // nothing for it; what an append survives is SQLite's `synchronous`
 // setting, which each case pairs with the matching store option.
 #[cfg(feature = "sqlite")]
-fn sqlite_store(durability: SqliteDurability, dir: &TempDir) -> Store<Local, SqliteBackend> {
+fn sqlite_store<C: BenchCells>(
+    durability: SqliteDurability,
+    dir: &TempDir,
+) -> Store<C, SqliteBackend> {
     let backend = SqliteBackend::open_with(
         dir.path().join("log.db"),
         SqliteOptions {
@@ -134,26 +151,26 @@ fn sqlite_store(durability: SqliteDurability, dir: &TempDir) -> Store<Local, Sql
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_full(c: &mut Criterion) {
+fn sqlite_full<C: BenchCells>(c: &mut Criterion) {
     let dir = bench_dir();
-    bench_store(c, "sqlite_full", || {
+    bench_store::<C, _>(c, "sqlite_full", || {
         sqlite_store(SqliteDurability::Full, &dir)
     });
 }
 
 #[cfg(feature = "sqlite")]
-fn sqlite_buffered(c: &mut Criterion) {
+fn sqlite_buffered<C: BenchCells>(c: &mut Criterion) {
     let dir = bench_dir();
-    bench_store(c, "sqlite_buffered", || {
+    bench_store::<C, _>(c, "sqlite_buffered", || {
         sqlite_store(SqliteDurability::Buffered, &dir)
     });
 }
 
 #[cfg(not(feature = "sqlite"))]
-fn sqlite_full(_: &mut Criterion) {}
+fn sqlite_full<C: BenchCells>(_: &mut Criterion) {}
 
 #[cfg(not(feature = "sqlite"))]
-fn sqlite_buffered(_: &mut Criterion) {}
+fn sqlite_buffered<C: BenchCells>(_: &mut Criterion) {}
 
 fn cpu_bound() -> Criterion {
     Criterion::default().measurement_time(Duration::from_secs(5))
@@ -171,13 +188,15 @@ fn fsync_bound() -> Criterion {
 criterion_group! {
     name = cpu;
     config = cpu_bound();
-    targets = plain, memory, file_buffered, sqlite_buffered
+    targets = plain::<Local>, memory::<Local>, file_buffered::<Local>, sqlite_buffered::<Local>,
+        plain::<Shared>, memory::<Shared>, file_buffered::<Shared>, sqlite_buffered::<Shared>
 }
 
 criterion_group! {
     name = fsync;
     config = fsync_bound();
-    targets = file_sync, file_sync_batched, sqlite_full
+    targets = file_sync::<Local>, file_sync_batched::<Local>, sqlite_full::<Local>,
+        file_sync::<Shared>, file_sync_batched::<Shared>, sqlite_full::<Shared>
 }
 
 criterion_main!(cpu, fsync);
