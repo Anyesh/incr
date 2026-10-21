@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use incr_core::persist_hooks::changed_at_erased;
+use incr_core::persist_hooks::{changed_at_erased, Deferred};
 use incr_core::{check_value_code, ErasedIncr, Runtime};
 
 use super::mapping::LiveDep;
@@ -21,6 +21,7 @@ impl<C: MemoCells> CoreRef<C> {
         );
         check_value_code();
         let _checkpoint = self.lock_checkpoint();
+        let mut bag = Deferred::new();
         let (snaps, moved) = {
             let mut state = self.lock_memo();
             state.seed_info.retain(|&handle, _| rt.is_alive(handle));
@@ -30,7 +31,7 @@ impl<C: MemoCells> CoreRef<C> {
             let map = self.deps.read();
             let mut snaps = Vec::new();
             for table in &self.tables {
-                table.snapshot(rt, &map, self.id, &mut snaps);
+                table.snapshot(rt, &map, self.id, &mut snaps, &mut bag);
             }
             // A node that landed again since its `inspect`, which only a
             // write around the store allows, may have dependents inspected
@@ -40,6 +41,7 @@ impl<C: MemoCells> CoreRef<C> {
             })
         };
         drop(moved);
+        bag.drain(rt);
         let done = self.backend.checkpoint(CheckpointInput {
             build: self.build,
             tables: self.catalog.clone(),
