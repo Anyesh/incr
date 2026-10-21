@@ -25,6 +25,14 @@ pub(crate) mod dep_index;
 mod dep_index_tests;
 mod logged;
 
+#[cfg(test)]
+thread_local! {
+    /// Called by [`Store::undeclare`] on its thread, store mutex held, just
+    /// before it deletes the key's node.
+    pub(crate) static UNDECLARE_PARK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The bound on values a [`Store`] persists: a runtime [`Value`] that serde
 /// can write to and read from the log.
 pub trait PersistValue: Value + Serialize + DeserializeOwned {}
@@ -530,19 +538,21 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let binding = &state.bindings[&id];
         let key = binding.key().to_owned();
         let held = binding.unbind(&self.runtime)?;
-        let unregistered = state
-            .deps
-            .as_deref()
-            .and_then(|deps| deps.write().unregister(&key));
+        #[cfg(test)]
+        UNDECLARE_PARK.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                hook();
+            }
+        });
         match self.runtime.try_delete_node(binding.node()) {
             Ok(()) | Err(DeleteError::NotAlive) => {}
-            Err(DeleteError::HasDependents) => {
-                if let (Some(deps), Some(entry)) = (state.deps.as_deref(), unregistered) {
-                    deps.write()
-                        .register(&key, entry.handle, entry.kind, entry.fp, entry.stamp);
-                }
-                return Err(Error::HasDependents { key });
-            }
+            Err(DeleteError::HasDependents) => return Err(Error::HasDependents { key }),
+        }
+        // Unregistered only now, so readers of the index never see the key
+        // unmapped while the delete can still be refused. A deleted handle
+        // left mapped meanwhile matches no live node.
+        if let Some(deps) = state.deps.as_deref() {
+            deps.write().unregister(&key);
         }
         state.bindings.remove(&id);
         state.bound.remove(&key);

@@ -22,7 +22,8 @@ use crate::cycle::{ErasedOpts, QueryOpts};
 use crate::dep_stack::DepStack;
 use crate::directory::Directory;
 use crate::handle::{Incr, RuntimeId};
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 use crate::runtime::Runtime;
 use crate::value::Value;
 use crate::value_code;
@@ -141,7 +142,7 @@ type Sheet<C> = Owning<Column<C>, C>;
 pub struct GridTable<T: Value, C: Cells> {
     runtime_id: RuntimeId,
     sheets: Owning<Sheet<C>, C>,
-    miss: C::Lock<()>,
+    miss: OrderedLock<(), C>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -174,7 +175,7 @@ fn _fields_are_thread_safe() {
     fn thread_safe<X: Send + Sync>() {}
     thread_safe::<Directory<Sheet<Shared>, Shared>>();
     thread_safe::<<Shared as Cells>::U64>();
-    thread_safe::<<Shared as Cells>::Lock<()>>();
+    thread_safe::<OrderedLock<(), Shared>>();
 }
 
 impl<T: Value, C: Cells> GridTable<T, C> {
@@ -182,7 +183,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         Self {
             runtime_id,
             sheets: Owning::new(1),
-            miss: <C::Lock<()> as Lock<_>>::new(()),
+            miss: OrderedLock::new(LockKind::TableMiss, ()),
             _value: PhantomData,
         }
     }
@@ -212,7 +213,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.query(rt, key, f, || ErasedOpts::NONE)
+        self.query(rt, key, || (f, ErasedOpts::NONE))
     }
 
     /// [`Self::get_or_insert_query`] with options for the query a miss
@@ -227,17 +228,34 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.query(rt, key, f, || rt.erase_query_opts(opts))
+        self.query(rt, key, || (f, rt.erase_query_opts(opts)))
     }
 
-    /// `opts` is erased only on a miss that creates the query.
+    /// [`Self::get_or_insert_query_with`] with the compute and options
+    /// built by `make` only on a miss that creates the query, so a hit
+    /// pays nothing for options that allocate. `make` runs with no lock
+    /// held.
+    pub fn get_or_insert_query_lazy<F>(
+        &self,
+        rt: &Runtime<C>,
+        key: GridKey,
+        make: impl FnOnce() -> (F, QueryOpts<T>),
+    ) -> Incr<T>
+    where
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
+        self.query(rt, key, || {
+            let (f, opts) = make();
+            (f, rt.erase_query_opts(opts))
+        })
+    }
+
     #[inline]
     fn query<F>(
         &self,
         rt: &Runtime<C>,
         key: GridKey,
-        f: F,
-        opts: impl FnOnce() -> ErasedOpts,
+        make: impl FnOnce() -> (F, ErasedOpts),
     ) -> Incr<T>
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
@@ -250,7 +268,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         if rt.frame_doomed() {
             return rt.pending_handle();
         }
-        let opts = opts();
+        let (f, opts) = make();
         self.miss(rt, key, (f, opts), |rt, (f, opts)| {
             rt.create_query_erased::<false, _, _>(f, opts)
         })
