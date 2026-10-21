@@ -31,7 +31,7 @@ pub use incr_core::persist_hooks;
 #[doc(hidden)]
 pub use incr_core::{
     active_frame_doomed, check_value_code, engine_unwind, engine_unwind_in_progress,
-    take_last_cycle, with_value_code,
+    set_aside_cycle_unwind, take_last_cycle, with_value_code, CycleUnwindAside,
 };
 pub use incr_core::{
     Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
@@ -70,13 +70,13 @@ mod reexports {
     fn every_incr_core_item_is_reexported() {
         use crate::{
             active_frame_doomed, check_value_code, engine_unwind, engine_unwind_in_progress,
-            take_last_cycle, with_value_code, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr,
-            Fixpoint, FxBuildHasher, FxHasher, GridKey, GridTable, GridTableInner,
-            GroupedCollection, GroupedCollectionInner, Incr, IncrCollection, IncrCollectionInner,
-            NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable, NodeTableInner, NodeTrace,
-            ObserverId, PropagationTrace, QueryOpts, Replay, Runtime, RuntimeId, SortDelta,
-            SortedCollection, SortedCollectionInner, TableKey, TraceAction, Value,
-            DEFAULT_MAX_FRAMES,
+            set_aside_cycle_unwind, take_last_cycle, with_value_code, Cycle, CycleStrategy,
+            DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher, GridKey, GridTable,
+            GridTableInner, GroupedCollection, GroupedCollectionInner, Incr, IncrCollection,
+            IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState, NodeTable,
+            NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay, Runtime,
+            RuntimeId, SortDelta, SortedCollection, SortedCollectionInner, TableKey, TraceAction,
+            Value, DEFAULT_MAX_FRAMES,
         };
 
         fn named<T: ?Sized>() {}
@@ -86,8 +86,10 @@ mod reexports {
             active_frame_doomed,
             engine_unwind,
             engine_unwind_in_progress,
+            set_aside_cycle_unwind,
             take_last_cycle,
         );
+        named::<crate::CycleUnwindAside>();
         named::<Cycle>();
         named::<FxBuildHasher>();
         named::<FxHasher>();

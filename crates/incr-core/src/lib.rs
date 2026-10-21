@@ -69,7 +69,10 @@ pub use cells::{Cells, Local, LocalPtrCell, PtrCell, Shared};
 pub use collection::{CollectionLog, Delta, GroupedCollection, IncrCollection};
 pub use cycle::{Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay};
 #[doc(hidden)]
-pub use cycle_state::{engine_unwind, engine_unwind_in_progress, take_last_cycle};
+pub use cycle_state::{
+    engine_unwind, engine_unwind_in_progress, set_aside_cycle_unwind, take_last_cycle,
+    CycleUnwindAside,
+};
 pub use dep_stack::{active_frame_doomed, DepStack, LocalDepStack, SharedDepStack};
 pub use fx::{FxBuildHasher, FxHasher};
 pub use generic_arena::GenericArena;
