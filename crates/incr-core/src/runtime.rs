@@ -1536,14 +1536,23 @@ impl<C: Cells> Runtime<C> {
 
     /// A node with a virtual frame on this thread stands for a frame of
     /// its own below the caller, though nothing holds its claim.
+    #[inline]
     fn assert_not_own_compute(&self, id: NodeId, generation: u32) {
         assert!(
             !self.holds_claim(id)
                 && (value_code::thread_word() & value_code::REPLAY_BIT == 0
-                    || self.virtual_position(id.0, generation).is_none()),
+                    || self.no_virtual_frame(id.0, generation)),
             "incr-core: delete_node called from inside node {}'s own compute",
             id.0,
         );
+    }
+
+    /// Out of line so the scan does not stop every delete inlining the
+    /// assert above.
+    #[cold]
+    #[inline(never)]
+    fn no_virtual_frame(&self, slot: u32, generation: u32) -> bool {
+        self.virtual_position(slot, generation).is_none()
     }
 
     /// The strict delete behind `delete_node` and `try_delete_node`:
