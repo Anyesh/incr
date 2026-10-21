@@ -11,7 +11,9 @@
 //! [`NodeState::Cyclic`](crate::NodeState::Cyclic) with no value, which
 //! [`Runtime::try_get`](crate::Runtime::try_get) reports as `Err(Cycle)`
 //! and [`Runtime::get`](crate::Runtime::get) as a "dependency cycle"
-//! panic.
+//! panic. A `TypeFallback` member is a `Fallback` member whose function is
+//! its type's ([`Runtime::set_cycle_fallback`](crate::Runtime::set_cycle_fallback)),
+//! which is handed the member too, so the query stores no strategy.
 //!
 //! The callbacks (`Fallback`'s function, and a `Fixpoint`'s `initial`,
 //! `step`, `converged` and `on_limit`) can run more than once per
@@ -48,7 +50,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::handle::ErasedIncr;
+use crate::handle::{ErasedIncr, Incr};
 use crate::value::Value;
 
 /// The members of a dependency cycle, sorted by slot. The head is the
@@ -133,6 +135,12 @@ pub enum CycleStrategy<T> {
     Fallback(FallbackFn<T>),
     /// The member iterates from an initial value to a fixed point.
     Fixpoint(Fixpoint<T>),
+    /// A `Fallback` shared by every query of `T` that names it: the
+    /// function registered with
+    /// [`Runtime::set_cycle_fallback`](crate::Runtime::set_cycle_fallback),
+    /// handed the cycle and the member. The query stores no strategy of
+    /// its own. Creating such a query panics if `T` has no fallback.
+    TypeFallback,
 }
 
 impl<T> fmt::Debug for CycleStrategy<T> {
@@ -141,6 +149,7 @@ impl<T> fmt::Debug for CycleStrategy<T> {
             CycleStrategy::None => "None",
             CycleStrategy::Fallback(_) => "Fallback",
             CycleStrategy::Fixpoint(_) => "Fixpoint",
+            CycleStrategy::TypeFallback => "TypeFallback",
         })
     }
 }
@@ -262,9 +271,9 @@ pub(crate) type Erased = Box<dyn Any + Send>;
 pub(crate) trait ErasedStrategy: Send + Sync {
     /// The iteration limit, or `None` for a Fallback.
     fn max_iterations(&self) -> Option<u32>;
-    /// The initial value: a Fallback's `g` of `cycle`, which only a
-    /// Fallback is handed, or a Fixpoint's initial value.
-    fn v0(&self, cycle: Option<&Cycle>) -> Erased;
+    /// The initial value of member `node`: a Fallback's `g` of `cycle`,
+    /// which only a Fallback is handed, or a Fixpoint's initial value.
+    fn v0(&self, cycle: Option<&Cycle>, node: ErasedIncr) -> Erased;
     fn step(&self, prev: &Erased, out: Erased, k: u32) -> Erased;
     fn converged(&self, prev: &Erased, cur: &Erased) -> bool;
     fn on_limit(&self, cycle: &Cycle, s: Erased) -> Erased;
@@ -291,13 +300,15 @@ impl<T: Value> ErasedStrategy for Typed<T> {
         }
     }
 
-    fn v0(&self, cycle: Option<&Cycle>) -> Erased {
+    fn v0(&self, cycle: Option<&Cycle>, _node: ErasedIncr) -> Erased {
         match &self.0 {
             CycleStrategy::Fallback(g) => {
                 Box::new(g(cycle.expect("incr-core: a Fallback is handed its cycle")))
             }
             CycleStrategy::Fixpoint(fp) => Box::new((fp.initial)()),
-            CycleStrategy::None => unreachable!("a strategy entry is never None"),
+            CycleStrategy::None | CycleStrategy::TypeFallback => {
+                unreachable!("a node's own strategy is a Fallback or a Fixpoint")
+            }
         }
     }
 
@@ -333,10 +344,50 @@ impl<T: Value> ErasedStrategy for Typed<T> {
     }
 }
 
-/// The erased form of `strategy`, or `None` for [`CycleStrategy::None`].
+type TypeFallbackFn<T> = Box<dyn Fn(&Cycle, Incr<T>) -> T + Send + Sync>;
+
+/// A type's fallback, kept in its arena.
+struct TypeFallback<T: 'static>(TypeFallbackFn<T>);
+
+impl<T: Value> ErasedStrategy for TypeFallback<T> {
+    fn max_iterations(&self) -> Option<u32> {
+        None
+    }
+
+    fn v0(&self, cycle: Option<&Cycle>, node: ErasedIncr) -> Erased {
+        let cycle = cycle.expect("incr-core: a Fallback is handed its cycle");
+        let node = Incr::new(node.slot(), node.generation(), node.runtime_id());
+        Box::new((self.0)(cycle, node))
+    }
+
+    fn step(&self, _prev: &Erased, out: Erased, _k: u32) -> Erased {
+        out
+    }
+
+    fn converged(&self, prev: &Erased, cur: &Erased) -> bool {
+        self.same(prev, cur)
+    }
+
+    fn on_limit(&self, _cycle: &Cycle, s: Erased) -> Erased {
+        s
+    }
+
+    fn same(&self, a: &Erased, b: &Erased) -> bool {
+        downcast::<T>(a) == downcast::<T>(b)
+    }
+}
+
+pub(crate) fn erase_type_fallback<T: Value>(
+    g: impl Fn(&Cycle, Incr<T>) -> T + Send + Sync + 'static,
+) -> Arc<dyn ErasedStrategy> {
+    Arc::new(TypeFallback(Box::new(g)))
+}
+
+/// The erased form of a node's own `strategy`: `None` for
+/// [`CycleStrategy::None`] and [`CycleStrategy::TypeFallback`].
 pub(crate) fn erase<T: Value>(strategy: CycleStrategy<T>) -> Option<Arc<dyn ErasedStrategy>> {
     match strategy {
-        CycleStrategy::None => None,
+        CycleStrategy::None | CycleStrategy::TypeFallback => None,
         s => Some(Arc::new(Typed(s))),
     }
 }
@@ -355,13 +406,21 @@ impl ErasedOpts {
     };
 }
 
+/// Sets `HAS_STRATEGY` with no strategy for a
+/// [`CycleStrategy::TypeFallback`] query, which finds its strategy
+/// through its type.
 pub(crate) fn erase_opts<T: Value>(opts: QueryOpts<T>) -> ErasedOpts {
+    let by_type = match opts.cycle {
+        CycleStrategy::TypeFallback => crate::segmented_nodes::HAS_STRATEGY,
+        _ => 0,
+    };
     ErasedOpts {
         strategy: erase(opts.cycle),
-        flags: match opts.replay {
-            Replay::Native => 0,
-            Replay::Allowed => crate::segmented_nodes::REPLAYABLE,
-        },
+        flags: by_type
+            | match opts.replay {
+                Replay::Native => 0,
+                Replay::Allowed => crate::segmented_nodes::REPLAYABLE,
+            },
     }
 }
 

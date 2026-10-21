@@ -29,7 +29,7 @@ use std::rc::Rc;
 use haphazard::{AtomicPtr as HzAtomicPtr, Global, Replaced};
 
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{self, ErasedOpts, QueryOpts};
+use crate::cycle::{ErasedOpts, QueryOpts};
 use crate::deferred::Deferred;
 use crate::dep_stack::DepStack;
 use crate::fx::FxBuildHasher;
@@ -544,7 +544,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.query(rt, key, f, ErasedOpts::NONE)
+        self.query(rt, key, f, || ErasedOpts::NONE)
     }
 
     /// [`Self::get_or_insert_query`] with options for the query a miss
@@ -559,10 +559,11 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.query(rt, key, f, cycle::erase_opts(opts))
+        self.query(rt, key, f, || rt.erase_query_opts(opts))
     }
 
-    fn query<F>(&self, rt: &Runtime<C>, key: K, f: F, opts: ErasedOpts) -> Incr<T>
+    /// `opts` is erased only on a miss that creates the query.
+    fn query<F>(&self, rt: &Runtime<C>, key: K, f: F, opts: impl FnOnce() -> ErasedOpts) -> Incr<T>
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
@@ -574,6 +575,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         if rt.frame_doomed() {
             return rt.pending_handle();
         }
+        let opts = opts();
         self.miss(rt, hash, key, (f, opts), |rt, (f, opts)| {
             rt.create_query_erased::<false, _, _>(f, opts)
         })
