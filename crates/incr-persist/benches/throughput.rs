@@ -6,27 +6,20 @@
 //! two-writer SQLite case needs two processes and lives in
 //! `examples/sqlite_writers.rs`.
 
-use std::path::PathBuf;
+mod common;
+
 use std::time::Duration;
 
+use common::bench_dir;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use incr_core::Runtime;
 use incr_persist::{Backend, Durability, FileBackend, Local, MemoryBackend, Options, Store};
 #[cfg(feature = "sqlite")]
 use incr_persist::{SqliteBackend, SqliteDurability, SqliteOptions};
+#[cfg(feature = "sqlite")]
 use tempfile::TempDir;
 
 const BATCH: u64 = 100;
-
-fn bench_dir() -> TempDir {
-    let base = std::env::var_os("INCR_PERSIST_BENCH_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/incr-persist-bench")
-        });
-    std::fs::create_dir_all(&base).unwrap();
-    tempfile::tempdir_in(base).unwrap()
-}
 
 fn options(durability: Durability) -> Options {
     Options {
