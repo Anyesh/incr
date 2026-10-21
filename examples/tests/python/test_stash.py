@@ -163,6 +163,34 @@ def test_a_swallowed_exception_is_dropped_when_the_call_returns(module):
 
 
 @BOTH
+def test_another_runtimes_callback_inside_a_doomed_query_raises_as_itself(module):
+    other = module.Runtime()
+    col = other.create_collection()
+    col.insert(1)
+
+    def bad(x):
+        raise ValueError("from the other runtime")
+
+    rt = doom_ready(module)
+    a = rt.create_query(lambda r: 2, replay=True)
+    seen = []
+
+    # `map` runs `bad` on the existing element in the other runtime's own
+    # call, which pushes no frame over the doomed one.
+    def top(r):
+        if r.get(a) == PLACEHOLDER:
+            try:
+                col.map(bad)
+            except Exception as e:
+                seen.append(type(e).__name__)
+        return 0
+
+    t = rt.create_query(top, replay=True)
+    assert rt.get(t) == 0
+    assert seen == ["ValueError"]
+
+
+@BOTH
 def test_a_doomed_querys_read_of_another_runtime_discards_its_error(module):
     other = module.Runtime()
     col = other.create_collection()
