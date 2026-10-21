@@ -2,12 +2,12 @@
 //! keys, `(sheet, row, column)`, that finds a node by indexing instead of
 //! hashing.
 //!
-//! Each sheet has a directory of columns, and each column a three-level
-//! tree of directories over pages of [`PAGE_ROWS`] consecutive rows, each
-//! level indexed by six more bits of the row, so a column costs memory by
-//! the pages in use rather than by its largest row. A walk down a column
-//! reads adjacent memory and an entry costs 8 bytes in a page that is in
-//! use.
+//! Each sheet has a directory of columns. A column reaches its pages of
+//! [`PAGE_ROWS`] consecutive rows through a directory and two fixed
+//! levels of 64 entries, each indexed by six more bits of the row, so it
+//! costs memory by the pages in use rather than by its largest row. A
+//! walk down a column reads adjacent memory and an entry costs 8 bytes in
+//! a page that is in use.
 //! An entry is one word, the node's slot and generation, written under
 //! the table's miss mutex with a Release store and read with an Acquire
 //! load. Directories, pages and the column and sheet levels are never
@@ -138,10 +138,51 @@ impl<T: 'static, C: Cells> Drop for Owning<T, C> {
     }
 }
 
+/// A level of `1 << LEVEL_SHIFT` entries that owns them as [`Owning`]
+/// does. Fixed in size, so an index is one load with no length to check.
+struct Fixed<T: 'static, C: Cells>([C::Ptr<T>; 1 << LEVEL_SHIFT]);
+
+impl<T: 'static, C: Cells> Fixed<T, C> {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| C::Ptr::new_null()))
+    }
+
+    #[inline(always)]
+    fn get(&self, index: u32) -> Option<&T> {
+        let p = self.0[(index & LEVEL_MASK) as usize].load_acquire();
+        // SAFETY: as in `Owning::get`.
+        (!p.is_null()).then(|| unsafe { &*p })
+    }
+
+    /// As [`Owning::get_or_create`], under the table's miss mutex.
+    fn get_or_create(&self, index: u32, new: impl FnOnce() -> T) -> &T {
+        let cell = &self.0[(index & LEVEL_MASK) as usize];
+        let mut p = cell.load_relaxed();
+        if p.is_null() {
+            p = Box::into_raw(Box::new(new()));
+            cell.store_release(p);
+        }
+        // SAFETY: as in `Owning::get`.
+        unsafe { &*p }
+    }
+}
+
+impl<T: 'static, C: Cells> Drop for Fixed<T, C> {
+    fn drop(&mut self) {
+        for cell in &self.0 {
+            let p = cell.load_relaxed();
+            if !p.is_null() {
+                // SAFETY: see `Owning::get`; `&mut self` rules out readers.
+                drop(unsafe { Box::from_raw(p) });
+            }
+        }
+    }
+}
+
 struct Page<C: Cells>([C::U64; PAGE_ROWS as usize]);
 
-type Chunk<C> = Owning<Page<C>, C>;
-type Mid<C> = Owning<Chunk<C>, C>;
+type Chunk<C> = Fixed<Page<C>, C>;
+type Mid<C> = Fixed<Chunk<C>, C>;
 type Column<C> = Owning<Mid<C>, C>;
 type Sheet<C> = Owning<Column<C>, C>;
 
@@ -408,8 +449,8 @@ impl<T: Value, C: Cells> GridTable<T, C> {
             .get(key.sheet)?
             .get(key.column)?
             .get(key.row >> MID_SHIFT)?
-            .get((key.row >> CHUNK_SHIFT) & LEVEL_MASK)?
-            .get((key.row >> PAGE_SHIFT) & LEVEL_MASK)?;
+            .get(key.row >> CHUNK_SHIFT)?
+            .get(key.row >> PAGE_SHIFT)?;
         Some(&page.0[(key.row & (PAGE_ROWS - 1)) as usize])
     }
 
@@ -420,9 +461,9 @@ impl<T: Value, C: Cells> GridTable<T, C> {
             .sheets
             .get_or_create(key.sheet, || Owning::new(1))
             .get_or_create(key.column, || Owning::new(1))
-            .get_or_create(key.row >> MID_SHIFT, || Owning::new(1))
-            .get_or_create((key.row >> CHUNK_SHIFT) & LEVEL_MASK, || Owning::new(1))
-            .get_or_create((key.row >> PAGE_SHIFT) & LEVEL_MASK, || {
+            .get_or_create(key.row >> MID_SHIFT, Fixed::new)
+            .get_or_create(key.row >> CHUNK_SHIFT, Fixed::new)
+            .get_or_create(key.row >> PAGE_SHIFT, || {
                 Page(std::array::from_fn(|_| C::new_u64(0)))
             });
         &page.0[(key.row & (PAGE_ROWS - 1)) as usize]
