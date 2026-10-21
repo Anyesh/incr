@@ -13,6 +13,9 @@
 //! - `sweep`: 1000 independent entries whose closure spins for 100 ns to
 //!   1 ms; where `restore` stops being faster than `cold` per entry is the
 //!   break-even closure cost. `spin` times the closure's spin alone.
+//! - `index`: a 100k-item `Generation` alone: `build` indexes it as a
+//!   load does, and `find` looks up every item once in key order, which
+//!   is hash order scattered over the index.
 
 mod common;
 
@@ -26,7 +29,10 @@ use criterion::{
     black_box, criterion_group, criterion_main, BatchSize, BenchmarkGroup, Criterion, Throughput,
 };
 use incr_core::Incr;
-use incr_persist::memo::{BuildId, FileMemo, Memo, MemoBuilder, MemoOptions, MemoTable};
+use incr_persist::memo::{
+    key_hash, BuildId, FileMemo, GenHeader, GenId, Generation, IndexItem, Memo, MemoBuilder,
+    MemoOptions, MemoTable,
+};
 use incr_persist::{Local, MemoryBackend, Options, Store};
 use tempfile::TempDir;
 
@@ -262,5 +268,39 @@ fn sweep(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, chain, wide, sweep);
+fn index(c: &mut Criterion) {
+    let items: Vec<IndexItem> = (0..BIG)
+        .map(|k| IndexItem {
+            table: 0,
+            key_hash: key_hash(&k.to_le_bytes()),
+            loc: u64::from(k) * 64,
+            len: 64,
+        })
+        .collect();
+    let header = GenHeader {
+        build: BUILD,
+        seq: 1,
+        tables: Vec::new(),
+    };
+    let mut group = c.benchmark_group("memo_index_100k");
+    group.throughput(Throughput::Elements(u64::from(BIG)));
+    group.bench_function("build", |b| {
+        b.iter_batched(
+            || items.clone(),
+            |items| Generation::new(GenId(1), header.clone(), items),
+            BatchSize::LargeInput,
+        )
+    });
+    let generation = Generation::new(GenId(1), header.clone(), items.clone());
+    group.bench_function("find", |b| {
+        b.iter(|| {
+            for item in &items {
+                black_box(generation.find(item.table, item.key_hash));
+            }
+        })
+    });
+    group.finish();
+}
+
+criterion_group!(benches, chain, wide, sweep, index);
 criterion_main!(benches);

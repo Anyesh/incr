@@ -75,3 +75,42 @@ search is about 17 dependent cache misses, part of why the 100k wide
 table restores more slowly than the 1000-entry sweep. `malloc`
 and `free` take about 8% (per-entry key and frame buffers and the walk's
 `HashMap`) and the kernel about 10% (per-entry frame reads).
+
+## T10 restore index
+
+- Change: `Generation::find` probes an open-addressed table over the
+  index's `(table, key_hash)` runs instead of binary-searching it. A
+  slot's home is the top bits of `key_hash`, so within a table homes rise
+  in sorted order and `Generation::new` fills the table in one sweep.
+  Restore still calls `find` twice per root entry (`holds`, then `read`),
+  but the second probe hits the two lines the first just loaded, so
+  carrying the slot across the M lock was not worth it.
+- Code: before is spreadsheet-t10 at `dee3270`, after is this branch,
+  both with the `memo_index_100k` group added. Same machine as T10.7.
+- Command: each side built with `cargo bench -p incr-persist --bench memo
+  --no-run` and its binary copied aside, then the two binaries run
+  alternately, four pairs, each through `buildlock.sh` as
+  `memo --bench --output-format bencher
+  'memo_(chain|wide)_100k/(restore|open)|memo_index_100k'`. The load
+  average sat between 12 and 17 on 12 threads.
+
+Medians of the four runs, minimum in brackets; restore and `find` per
+entry, `open` and `build` per 100k table.
+
+| | before | after | median after/before of each pair |
+|---|---|---|---|
+| chain restore | 5.64 µs (4.34) | 4.51 µs (4.17) | 0.84 |
+| wide restore | 5.28 µs (4.67) | 4.75 µs (3.03) | 0.82 |
+| chain open | 13.1 ms (11.2) | 13.2 ms (11.1) | 1.01 |
+| wide open | 12.6 ms (11.3) | 12.7 ms (10.6) | 0.94 |
+| index build | 7.3 ms (6.2) | 7.3 ms (6.4) | 0.95 |
+| index find | 290 ns (240) | 30 ns (30) | 0.11 |
+
+A lookup is about ten times faster, and restore gains roughly the 0.4 to
+0.6 µs per entry the two binary searches cost. An earlier draft that
+hashed `(table, key_hash)` with a multiply wrote its slots at random and
+added about 1 ms to every 100k open (nine pairs, `open` after/before
+1.12 and 1.17); filling in sorted order removed that, and the slot table
+adds 8 to 16 bytes per item. Nine pairs of that draft, whose lookup is
+the same, put restore after/before at 0.90 for the chain and 0.87 for
+the wide table.
