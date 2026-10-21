@@ -97,11 +97,16 @@ impl<C: Cells> Runtime<C> {
             Reuse::IfUnchanged if !deps.iter().all(|d| self.trusts(d)) => Reuse::RecomputeFirst,
             reuse => reuse,
         };
-        let ids: Vec<NodeId> = deps.iter().map(|d| NodeId(d.dep.slot())).collect();
-        let displaced = node.install_deps(&ids);
-        debug_assert!(displaced.is_none(), "a fresh query has no dep list");
-        for d in &ids {
-            inner.dependents[d.0 as usize].push_unique(id);
+        // `RecomputeFirst` lands with `verified_at` 0, which always runs, so
+        // its recorded deps would only make a walk compute ones the rerun
+        // no longer reads, which a cold run never does.
+        if reuse == Reuse::IfUnchanged {
+            let ids: Vec<NodeId> = deps.iter().map(|d| NodeId(d.dep.slot())).collect();
+            let displaced = node.install_deps(&ids);
+            debug_assert!(displaced.is_none(), "a fresh query has no dep list");
+            for d in &ids {
+                inner.dependents[d.0 as usize].push_unique(id);
+            }
         }
         Ok(reuse)
     }

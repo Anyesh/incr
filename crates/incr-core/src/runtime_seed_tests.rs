@@ -45,6 +45,7 @@ macro_rules! both {
 both!(
     if_unchanged_over_unchanged_deps_never_runs,
     recompute_first_runs_once_and_cuts_off,
+    a_recompute_first_seed_runs_no_dep_its_rerun_drops,
     a_moved_trusted_dep_downgrades_to_recompute_first,
     failures_return_the_value_and_land_new,
     two_restores_in_one_compute_run_once,
@@ -145,6 +146,31 @@ fn recompute_first_runs_once_and_cuts_off<C: Cells>() {
     assert_eq!(r_runs.load(SeqCst), 0, "a cutoff recompute of q ran r");
     assert_eq!(rt.nodes.get(q.slot()).changed_at(), base.w0);
     rt.assert_invariant_i();
+}
+
+/// Seeded `RecomputeFirst` over a stale run that read Dirty `a`: the rerun
+/// reads only `p`, so `a` never runs, as in a cold run.
+fn a_recompute_first_seed_runs_no_dep_its_rerun_drops<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    let (a, a_runs) = counted(&rt, x);
+    assert_eq!(rt.get(a), 10);
+    rt.set(x, 2);
+    let p = rt.create_input(5_u64);
+    let q = rt.create_query(move |rt: &Runtime<C>| rt.get(p));
+    let base = seed_base(&rt);
+    assert_eq!(
+        seed_query(&rt, &base, q, 10, &[dep(p), dep(a)], Reuse::RecomputeFirst),
+        Ok(Reuse::RecomputeFirst)
+    );
+    assert_eq!(rt.get(q), 5);
+    assert_eq!(
+        a_runs.load(SeqCst),
+        1,
+        "the walk ran a dep q no longer reads"
+    );
+    rt.assert_invariant_i();
+    rt.assert_edges_complete();
 }
 
 /// A trusted dep whose stamp is not the one recorded, or that is not
