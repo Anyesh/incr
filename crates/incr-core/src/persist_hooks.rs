@@ -46,12 +46,16 @@ impl<T> RepSink<T> for () {
 
 /// [`Runtime::set`] that hands back what it would drop, for the caller to
 /// drop after releasing its own locks: `Replaced` with the displaced value
-/// if it wrote, `Equal` with the rejected value if it did not.
+/// if it wrote, `Equal` with the rejected value if it did not. The `u64`
+/// is the input's `changed_at` as read under this call's claim: after a
+/// write, the stamp that write settled, which a mapped write records as
+/// its stamp. Loading [`changed_at`] after the return instead can see a
+/// later `set` of the same input.
 pub fn set_returning_displaced<T: Value, C: Cells>(
     rt: &Runtime<C>,
     handle: Incr<T>,
     value: T,
-) -> Compared<T, value_slot::Displaced<T, C>> {
+) -> (Compared<T, value_slot::Displaced<T, C>>, u64) {
     rt.set_returning_displaced(handle, value)
 }
 

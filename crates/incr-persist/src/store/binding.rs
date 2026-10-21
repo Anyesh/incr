@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use incr_core::persist_hooks::{changed_at, set_returning_displaced};
+use incr_core::persist_hooks::set_returning_displaced;
 use incr_core::value_slot::Compared;
 use incr_core::{with_value_code, Cells, ErasedIncr, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
@@ -113,10 +113,10 @@ impl<T: Value + DeserializeOwned> InputBinding<T> {
     fn write<C: Cells>(&mut self, rt: &Runtime<C>, value: T, fp: u128, deps: Option<&DepIndex>) {
         let mut hold = deps.map(DepIndex::write);
         let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
-        let compared = set_returning_displaced(rt, self.handle, value);
+        let (compared, stamp) = set_returning_displaced(rt, self.handle, value);
         if matches!(compared, Compared::Replaced(_)) {
             self.fp = fp;
-            self.stamp = changed_at(rt, self.handle);
+            self.stamp = stamp;
             if let Some(map) = guard.deps() {
                 map.set_written(&self.key, fp, self.stamp);
             }
