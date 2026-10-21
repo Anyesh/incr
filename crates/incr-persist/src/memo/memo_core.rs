@@ -24,7 +24,8 @@ pub struct MemoStats {
     /// Entries seeded to run once and cut off if their value is unchanged.
     pub revalidated: u64,
     /// Stored entries created cold instead: an unknown or untrusted dep, a
-    /// query dep that could not be restored, or a corrupt frame.
+    /// query dep that could not be restored, a dep deleted before the seed,
+    /// or a corrupt frame.
     pub cold: u64,
     /// Frames, keys or values that failed to decode, a subset of `cold`.
     pub corrupt: u64,

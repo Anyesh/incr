@@ -149,6 +149,7 @@ fn record(
         }
         Seeded::Live => {}
         Seeded::Corrupt => corrupt(state),
+        Seeded::Failed => state.stats.cold += 1,
     }
 }
 

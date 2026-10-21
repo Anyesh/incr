@@ -1,8 +1,9 @@
-//! Park-point tests for restore and checkpoint under `Shared`: one thread
-//! parks at a named point, or inside a value's `Clone`, while another
+//! Park-point tests for restore and checkpoint, mostly under `Shared`: one
+//! thread parks at a named point, or inside a value's `Clone`, while another
 //! writes, and the restored or stored result must not reflect the stale
 //! value.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
@@ -14,10 +15,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{Park, PARK};
 use crate::memo::{
-    decode_entry, BuildId, Entry, Memo, MemoBackend, MemoBuilder, MemoOptions, MemoTable,
-    MemoryMemo, StoredDep,
+    decode_entry, BuildId, Entry, Memo, MemoBackend, MemoBuilder, MemoCells, MemoOptions,
+    MemoStats, MemoTable, MemoryMemo, StoredDep,
 };
-use crate::{Input, MemoryBackend, Options, Shared, Store};
+use crate::{Input, Local, MemoryBackend, Options, Shared, Store};
 
 const BUILD: u128 = 0x9a7c;
 
@@ -269,6 +270,80 @@ kinds!(
     a_set_between_the_base_and_the_fp_read_reruns_the_entry,
     a_set_between_the_fp_read_and_the_seed_reruns_the_entry,
     a_set_between_a_deps_fp_read_and_its_seed_reruns_both,
+);
+
+/// Checkpoints `plus(2) = x * 2 + 1` (and `scaled(2)` under it), reopens
+/// under `C`, deletes x's node at the first `BeforeSeed` a restore of
+/// `table`'s key 2 reaches, and returns the restore's stats.
+fn a_dep_deleted_before_the_seed<C: MemoCells>(root: &str) -> MemoStats {
+    let backends = Backends::new();
+    let open = || {
+        let store =
+            Arc::new(Store::<C, _>::open(backends.log.clone(), Options::default()).unwrap());
+        let x = store.input("x", 1_u64).unwrap().handle();
+        let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(BUILD)));
+        let scaled = builder.table::<u32, u64>("scaled", 1);
+        let plus = builder.table::<u32, u64>("plus", 1);
+        builder.define(scaled, move |ctx, k| ctx.rt().get(x) * u64::from(*k));
+        builder.define(plus, move |ctx, k| ctx.get(scaled, *k) + 1);
+        let memo = builder.open(&store, backends.memo.clone()).unwrap();
+        let table = if root == "plus" { plus } else { scaled };
+        (store, memo, x, table)
+    };
+    {
+        let (_store, memo, _, table) = open();
+        let q = memo.get_or_insert(table, 2);
+        memo.runtime().get(q);
+        assert!(memo.checkpoint().unwrap().written > 0);
+    }
+    let (store, memo, x, table) = open();
+    let armed = Cell::new(true);
+    PARK.set(Some(Box::new(move |point| {
+        if point == Park::BeforeSeed && armed.replace(false) {
+            store.runtime().delete_node(x);
+        }
+    })));
+    memo.get_or_insert(table, 2);
+    PARK.set(None);
+    memo.stats()
+}
+
+fn a_root_whose_dep_is_deleted_before_its_seed_counts_cold<C: MemoCells>() {
+    let stats = a_dep_deleted_before_the_seed::<C>("scaled");
+    assert_eq!((stats.cold, stats.reused, stats.revalidated), (1, 0, 0));
+}
+
+// `scaled` falls back cold inside the walk, so `plus` can't trust it and
+// seeds to run first.
+fn a_walked_dep_whose_dep_is_deleted_before_its_seed_counts_cold<C: MemoCells>() {
+    let stats = a_dep_deleted_before_the_seed::<C>("plus");
+    assert_eq!((stats.cold, stats.reused, stats.revalidated), (1, 0, 1));
+}
+
+macro_rules! cells {
+    ($($name:ident),* $(,)?) => {
+        mod local {
+            $(
+                #[test]
+                fn $name() {
+                    super::$name::<super::Local>();
+                }
+            )*
+        }
+        mod shared {
+            $(
+                #[test]
+                fn $name() {
+                    super::$name::<super::Shared>();
+                }
+            )*
+        }
+    };
+}
+
+cells!(
+    a_root_whose_dep_is_deleted_before_its_seed_counts_cold,
+    a_walked_dep_whose_dep_is_deleted_before_its_seed_counts_cold,
 );
 
 /// Armed by the one test that stores `Parked`; `inspect` clones the value
