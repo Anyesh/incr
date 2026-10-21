@@ -23,14 +23,14 @@ use std::cell::{RefCell, UnsafeCell};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use haphazard::{AtomicPtr as HzAtomicPtr, Global, Replaced};
 
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{self, ErasedOpts, QueryOpts};
-use crate::deferred::Deferred;
+use crate::deferred::{isolate, Deferred};
 use crate::dep_stack::DepStack;
 use crate::fx::FxBuildHasher;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
@@ -586,7 +586,8 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     /// [`Self::get_or_insert_query_with`] that hands a node the miss
     /// creates to `seed` under the miss mutex, before the node is in the
     /// table, so no reader has claimed it. A value `seed` returns drops
-    /// after the mutex.
+    /// after the mutex. If `seed` panics, the node is deleted after the
+    /// mutex and the panic resumes.
     pub(crate) fn get_or_insert_query_seeded<F>(
         &self,
         rt: &Runtime<C>,
@@ -607,12 +608,29 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
             return rt.pending_handle();
         }
         let opts = cycle::erase_opts(opts);
+        let mut created = None;
         let mut unseeded = None;
-        let handle = self.miss(rt, hash, key, (f, opts), |rt, (f, opts)| {
-            let q = rt.create_query_erased::<false, _, _>(f, opts);
-            unseeded = seed(rt, q);
-            q
-        });
+        let missed = catch_unwind(AssertUnwindSafe(|| {
+            self.miss(rt, hash, key, (f, opts), |rt, (f, opts)| {
+                let q = rt.create_query_erased::<false, _, _>(f, opts);
+                created = Some(q);
+                unseeded = seed(rt, q);
+                q
+            })
+        }));
+        let handle = match missed {
+            Ok(handle) => handle,
+            Err(unwind) => {
+                if let Some(q) = created {
+                    isolate(|| match rt.try_delete_node(q) {
+                        // q never reached the table, so only the hook could
+                        // have deleted it or computed a node against it.
+                        Ok(()) | Err(DeleteError::NotAlive | DeleteError::HasDependents) => {}
+                    });
+                }
+                resume_unwind(unwind)
+            }
+        };
         let mut bag = Deferred::<C>::new();
         if let Some(value) = unseeded {
             bag.push(value);

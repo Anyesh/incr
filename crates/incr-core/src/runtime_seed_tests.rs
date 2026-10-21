@@ -1,6 +1,7 @@
 //! The restore and checkpoint hooks (T10): `seed_base`, `seed_query`,
 //! `NodeTable::get_or_insert_query_seeded` and `inspect`.
 
+use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::Arc;
@@ -50,6 +51,7 @@ both!(
     recomputed_seeded_dep_invalidates_trusting_entry,
     inspect_reads_a_clean_node_with_its_deps,
     table_seeds_only_a_node_it_creates,
+    a_panicking_seed_hook_leaves_no_node,
 );
 
 fn dep<T>(h: Incr<T>) -> SeedDep {
@@ -374,6 +376,40 @@ fn table_seeds_only_a_node_it_creates<C: Cells>() {
     assert_eq!(calls.load(SeqCst), 1);
     assert_eq!(probe_unchecked(&table, &rt, &0), Some(q));
     assert_eq!(rt.get(q), 40);
+}
+
+/// A seed hook that panics, before seeding or after seeding with a dep,
+/// leaves neither its node nor a table entry, and the next miss creates
+/// the key's node.
+fn a_panicking_seed_hook_leaves_no_node<C: Cells>() {
+    for seed_first in [false, true] {
+        let rt = Runtime::<C>::new();
+        let x = rt.create_input(4_u64);
+        let table: NodeTable<u8, u64, C> = rt.create_table();
+        let nodes = rt.node_count();
+        let created = Cell::new(None);
+        let hook = |rt: &Runtime<C>, q: Incr<u64>| -> Option<u64> {
+            created.set(Some(q));
+            if seed_first {
+                let base = seed_base(rt);
+                seed_query(rt, &base, q, 40, &[dep(x)], Reuse::IfUnchanged).unwrap();
+            }
+            panic!("seed hook");
+        };
+        let f = move |rt: &Runtime<C>| rt.get(x) * 10;
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            get_or_insert_query_seeded(&table, &rt, 0, f, Default::default(), hook)
+        }));
+        assert!(caught.is_err());
+        let q = created.get().expect("the miss created a node");
+        assert!(!rt.is_alive(q));
+        assert_eq!(rt.node_count(), nodes);
+        assert_eq!(probe_unchecked(&table, &rt, &0), None);
+        rt.assert_invariant_i();
+        rt.assert_edges_complete();
+        let again = table.get_or_insert_query(&rt, 0, f);
+        assert_eq!(rt.get(again), 40);
+    }
 }
 
 /// A dep seeded at W0 and trusted by R, claimed by a reader inside the
