@@ -270,6 +270,30 @@ def test_engine_unwind_crosses_a_closure_as_a_base_exception(make_rt):
 
 
 @BOTH_RUNTIMES
+@pytest.mark.parametrize("cleanup_read", ["get", "try_get"])
+@pytest.mark.parametrize("top_read", ["get", "try_get"])
+def test_clean_read_in_finally_keeps_the_cycle_error(make_rt, cleanup_read, top_read):
+    rt = make_rt()
+    module = incr if make_rt is incr.Runtime else incr_concurrent
+    a = rt.create_input(1)
+    assert rt.get(a) == 1
+    holder = {}
+
+    def reads_itself(r):
+        try:
+            return r.get(holder["q"]) + 1
+        finally:
+            getattr(r, cleanup_read)(a)
+
+    q = rt.create_query(reads_itself)
+    holder["q"] = q
+    with pytest.raises(module.CycleError) as raised:
+        getattr(rt, top_read)(q)
+    _, ids = raised.value.args
+    assert ids == [q.id]
+
+
+@BOTH_RUNTIMES
 def test_python_exception_is_raised_as_itself_with_no_panic_message(make_rt, capfd):
     rt = make_rt()
     a = rt.create_input(0)

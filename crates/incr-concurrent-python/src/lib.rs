@@ -159,7 +159,7 @@ fn take_stash(token: u64) -> Option<PyErr> {
 
 /// Marks a `pyerr_boundary` in progress; the outermost one drops every
 /// exception still stashed when it exits, such as one an engine catch
-/// swallowed.
+/// swallowed, and the payload of an `_IncrEngineUnwind` Python swallowed.
 struct Boundary;
 
 impl Boundary {
@@ -180,6 +180,8 @@ impl Drop for Boundary {
             // into a callback that stashes again.
             let stale = PENDING_PYERR.with(|c| std::mem::take(&mut *c.borrow_mut()));
             drop(stale);
+            let stale_unwind = ENGINE_UNWIND.with(|u| u.borrow_mut().take());
+            drop(stale_unwind);
         }
     }
 }
@@ -193,8 +195,11 @@ fn pyerr_boundary<R>(f: impl FnOnce() -> R) -> PyResult<R> {
     let _boundary = Boundary::enter();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     if engine::engine_unwind_in_progress() {
-        // Replaces any payload a swallowed `_IncrEngineUnwind` left.
-        ENGINE_UNWIND.with(|u| *u.borrow_mut() = result.err());
+        // A call that returned, such as a Clean read in a `finally` the
+        // unwind runs, keeps the payload of the unwind already carried.
+        if let Err(payload) = result {
+            ENGINE_UNWIND.with(|u| *u.borrow_mut() = Some(payload));
+        }
         return Err(_IncrEngineUnwind::new_err(()));
     }
     let payload = match result {
