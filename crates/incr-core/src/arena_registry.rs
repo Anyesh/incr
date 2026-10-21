@@ -115,6 +115,12 @@ struct ArenaEntry<C: Cells> {
     type_id: TypeId,
     // An `Arc` because a query's compute closure keeps its typed arena.
     arena: Arc<dyn ErasedArena<C>>,
+    /// `arena`'s data pointer, so a typed read skips the vtable load that
+    /// finding the data part of an `Arc<dyn _>` takes. `Arc::as_ptr` of
+    /// the typed `Arc` before its unsizing, which moves the same raw
+    /// pointer, so it has the allocation's provenance; `arena` keeps the
+    /// allocation alive for as long as the entry exists.
+    typed: *const (),
 }
 
 #[cfg(loom)]
@@ -200,8 +206,8 @@ impl<C: Cells> ArenaRegistry<C> {
         }
         // SAFETY: the entry was built from a `GenericArena<T, C>` for
         // the `T` its `type_id` names, which the compare just matched,
-        // so the erased pointer's data part points at one.
-        Some(unsafe { &*(Arc::as_ptr(&entry.arena) as *const GenericArena<T, C>) })
+        // and `typed` is that arena's address, live while `entry.arena` is.
+        Some(unsafe { &*entry.typed.cast::<GenericArena<T, C>>() })
     }
 
     /// The arena behind `tag`. Panics on a tag this registry never
@@ -260,9 +266,12 @@ impl<C: Cells> ArenaRegistry<C> {
         let tag = u16::try_from(tags.tags.len())
             .expect("incr-core: more than 65536 distinct value types in one runtime");
         self.entries.grow_to(tag as usize);
+        let arena = Arc::new(GenericArena::<T, C>::new());
+        let typed = Arc::as_ptr(&arena).cast::<()>();
         let entry = Box::new(ArenaEntry {
             type_id,
-            arena: Arc::new(GenericArena::<T, C>::new()) as Arc<dyn ErasedArena<C>>,
+            arena: arena as Arc<dyn ErasedArena<C>>,
+            typed,
         });
         self.entries
             .get(tag as usize)
