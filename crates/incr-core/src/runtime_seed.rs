@@ -167,6 +167,7 @@ impl<C: Cells> Runtime<C> {
         let (deps, in_group) = checked?;
         Some(Inspected {
             value,
+            changed_at: stamp,
             deps,
             in_group,
         })

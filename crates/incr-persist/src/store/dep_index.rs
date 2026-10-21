@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use incr_core::lock_order::{LockKind, Ordered};
-use incr_core::ErasedIncr;
+use incr_core::{ErasedIncr, Incr};
 
 use crate::Kind;
 
@@ -30,6 +30,14 @@ pub(crate) struct DepEntry {
     pub(crate) stamp: Option<u64>,
 }
 
+/// A memo external's input, its fp and the stamp the fp vouches for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct External {
+    pub(crate) handle: Incr<u128>,
+    pub(crate) fp: u128,
+    pub(crate) stamp: u64,
+}
+
 /// Every declared key of a store, with its node and fingerprint, while a
 /// memo is open over the store.
 #[derive(Default)]
@@ -41,6 +49,11 @@ pub(crate) struct DepIndex {
 pub(crate) struct DepMap {
     by_key: HashMap<String, DepEntry>,
     by_handle: HashMap<ErasedIncr, String>,
+    /// Each memo's externals by (memo id, name): an input whose value is
+    /// its fp. Keyed by memo too, because every memo on a store shares
+    /// this map but owns its own external nodes.
+    externals: HashMap<(u64, String), External>,
+    external_names: HashMap<ErasedIncr, (u64, String)>,
 }
 
 impl DepIndex {
@@ -137,6 +150,29 @@ impl DepMap {
             DepFp::Known(fp) => self.set_fp(key, fp),
             DepFp::Untrusted => self.untrust(key),
         }
+    }
+
+    pub(crate) fn key_of(&self, handle: ErasedIncr) -> Option<&str> {
+        self.by_handle.get(&handle).map(String::as_str)
+    }
+
+    pub(crate) fn external(&self, memo: u64, name: &str) -> Option<External> {
+        self.externals.get(&(memo, name.to_owned())).copied()
+    }
+
+    /// The memo and name of the external whose input is `handle`.
+    pub(crate) fn external_of(&self, handle: ErasedIncr) -> Option<(u64, &str)> {
+        self.external_names
+            .get(&handle)
+            .map(|(memo, name)| (*memo, name.as_str()))
+    }
+
+    /// Records the input of `memo`'s external `name`, the fp it was just
+    /// set to and its `changed_at` after that set.
+    pub(crate) fn set_external(&mut self, memo: u64, name: &str, external: External) {
+        self.externals.insert((memo, name.to_owned()), external);
+        self.external_names
+            .insert(external.handle.erase(), (memo, name.to_owned()));
     }
 
     pub(crate) fn untrust(&mut self, key: &str) {

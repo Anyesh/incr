@@ -17,9 +17,17 @@ mod codec;
 pub mod conformance;
 mod file;
 mod generation;
+mod handle;
+mod mapping;
+mod memo_core;
 mod memory;
+mod open;
+mod options;
+mod restore;
+mod snapshot;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+mod table_core;
 
 pub use backend::{EncodedEntry, MemoBackend};
 pub use checkpoint::{
@@ -28,6 +36,10 @@ pub use checkpoint::{
 pub use codec::*;
 pub use file::{FileMemo, FileMemoGuard};
 pub use generation::{GenId, Generation};
+pub use handle::{MemoCtx, MemoKey, MemoTable, MemoValue};
+pub use memo_core::{MemoCells, MemoStats};
 pub use memory::MemoryMemo;
+pub use open::{Memo, MemoBuilder};
+pub use options::{BuildId, MemoOptions};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteMemo, SqliteMemoGuard, SqliteMemoOptions};

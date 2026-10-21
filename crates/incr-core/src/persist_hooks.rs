@@ -63,6 +63,24 @@ pub fn changed_at<T: Value, C: Cells>(rt: &Runtime<C>, handle: Incr<T>) -> u64 {
     rt.changed_at(handle)
 }
 
+/// [`changed_at`] of a handle that may be dead, recycled or foreign:
+/// `None` for those.
+pub fn changed_at_erased<C: Cells>(rt: &Runtime<C>, handle: ErasedIncr) -> Option<u64> {
+    rt.changed_at_erased(handle)
+}
+
+/// Whether `rt`'s active frame on this thread is doomed, so a table miss
+/// there returns [`pending_handle`] instead of creating a node.
+pub fn frame_doomed<C: Cells>(rt: &Runtime<C>) -> bool {
+    rt.frame_doomed()
+}
+
+/// The handle a table miss returns in a doomed frame: it reads `T`'s
+/// placeholder there. Panics if `T` has no placeholder.
+pub fn pending_handle<T: Value, C: Cells>(rt: &Runtime<C>) -> Incr<T> {
+    rt.pending_handle()
+}
+
 /// [`IncrCollection::insert`] reporting to `on_rep` and keeping what it
 /// displaced in `keep`.
 pub fn collection_insert<T: Value + Hash + Eq, C: Cells, R: RepSink<T>>(
@@ -138,10 +156,12 @@ pub enum SeedError {
     ForeignBase,
 }
 
-/// A Clean query's value and the deps of the run that produced it.
+/// A Clean query's value, its `changed_at` and the deps of the run that
+/// produced it.
 #[derive(Clone, Debug)]
 pub struct Inspected<T> {
     pub value: T,
+    pub changed_at: u64,
     pub deps: Vec<ErasedIncr>,
     pub in_group: bool,
 }

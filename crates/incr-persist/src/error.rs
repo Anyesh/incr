@@ -96,4 +96,18 @@ pub enum Error {
     /// A handle passed to a store was not issued by that store.
     #[error("handle was not issued by this store")]
     UnknownHandle,
+
+    /// `BuildId::CurrentExe` could not read the running executable.
+    #[error("cannot fingerprint the running executable for the memo build id")]
+    BuildIdUnavailable(#[source] std::io::Error),
+
+    /// A memo table was declared with `MemoBuilder::table` but never given
+    /// a closure with `MemoBuilder::define`.
+    #[error("memo table {0:?} is declared but not defined")]
+    UndefinedTable(String),
+
+    /// `MemoOptions::auto_checkpoint_secs` was set on a `Local` runtime,
+    /// which has no thread to run it on.
+    #[error("automatic memo checkpoints need a Shared runtime")]
+    AutoCheckpointNeedsShared,
 }
