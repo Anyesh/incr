@@ -5,16 +5,17 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::observe_impl::observed_is_clear;
 use super::race_tests::{id, park_at, Gate};
-use super::{ParkPoint, Runtime};
+use super::{NodeId, ParkPoint, Runtime};
 use crate::cells::Shared;
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
 use crate::handle::Incr;
+use crate::state::NodeState;
 use crate::waits;
 
 /// Asserts the cycle was resolved by wounds. Usually one: a retry that
@@ -632,6 +633,219 @@ fn shared_wound_of_a_member_computed_alone_keeps_its_group() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_wound_of_a_member_computed_alone_keeps_its_group",
         || wounded_member_keeps_its_group(GroupShape::MemberAlone),
+    )
+    .assert_clean();
+}
+
+/// Which release of group verify's claims [`Released`] exercises.
+#[derive(Copy, Clone, Debug)]
+enum Release {
+    /// `r` and `x` keep a record of the group {r, m, x}, which `m` has
+    /// left, as a single-node landing of `m` leaves it. B's group verify
+    /// of `x`, in `m`'s run, claims `r` and fails on `m`, B's own claim,
+    /// so step 1 releases `r`.
+    Step1,
+    /// `r` and `x` keep a record of the group {r, x}, and `n` reads `x`,
+    /// which read `m` before `k` was set. B's walk for `n`, in `m`'s run,
+    /// reaches `m`, B's own claim, through `x`, so it verifies `x` only:
+    /// its group verify claims `r`, finds `k` changed and releases both.
+    Tainted,
+}
+
+/// Once `k` is 1, `r` reads `m` (Fallback 100), `m` reads `n` (Tainted)
+/// or `x`, `n` reads `x`, and `x` reads `r`; `r` and `x` are unseeded.
+/// B's read of `m` computes `m` alone, its group verify of `x` releases
+/// `r` as `release` says, and `x` computes alone and parks before
+/// reading `r`. A reads `r` and waits on `m`, and B's read of `r` closes
+/// the waits-for cycle, so B is wounded. If the release took `r` out of
+/// its group, A computes `r` alone, and the cycle enters at the unseeded
+/// `x`: a cycle error that no single-thread order raises.
+struct Released {
+    rt: Arc<Runtime<Shared>>,
+    r: Incr<i64>,
+    m: Incr<i64>,
+    n: Incr<i64>,
+    x: Incr<i64>,
+    gate: Gate,
+    /// A's thread, and the nodes A's reads visit or wait on.
+    a_thread: Arc<OnceLock<thread::ThreadId>>,
+    visits: Mutex<mpsc::Receiver<NodeId>>,
+}
+
+impl Released {
+    fn new(release: Release) -> Self {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let k = rt.create_input(0_i64);
+        let m_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let x_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let r = {
+            let m_cell = m_cell.clone();
+            rt.create_query(move |rt| match rt.get(k) {
+                0 => 1,
+                _ => rt.get(*m_cell.get().unwrap()) + 1,
+            })
+        };
+        let n = {
+            let x_cell = x_cell.clone();
+            rt.create_query(move |rt| rt.get(*x_cell.get().unwrap()) + 100 * rt.get(k))
+        };
+        let m = {
+            let x_cell = x_cell.clone();
+            rt.create_query_with_fallback(
+                move |rt| match (release, rt.get(k)) {
+                    (_, 0) => 0,
+                    (Release::Step1, _) => rt.get(*x_cell.get().unwrap()) + 10,
+                    (Release::Tainted, _) => rt.get(n) + 10,
+                },
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let gate = Gate::new();
+        let x = {
+            let gate = gate.clone();
+            rt.create_query(move |rt| match (release, rt.get(k)) {
+                (Release::Step1, 0) => 0,
+                (Release::Tainted, 0) => rt.get(m),
+                _ => {
+                    gate.park();
+                    rt.get(r) + 1000
+                }
+            })
+        };
+        m_cell.set(m).unwrap();
+        x_cell.set(x).unwrap();
+        assert!(r.slot() < m.slot() && m.slot() < x.slot());
+        assert_eq!((rt.get(r), rt.get(m), rt.get(x), rt.get(n)), (1, 0, 0, 0));
+        match release {
+            Release::Step1 => {
+                rt.force_group_for_test(&[r.erase(), m.erase(), x.erase()]);
+                rt.leave_group(id(m), rt.nodes.get_with_flags(m.slot()).1);
+            }
+            Release::Tainted => rt.force_group_for_test(&[r.erase(), x.erase()]),
+        }
+        rt.set(k, 1);
+        let a_thread: Arc<OnceLock<thread::ThreadId>> = Arc::default();
+        let (tx, visits) = mpsc::channel();
+        let (a, tx) = (a_thread.clone(), Mutex::new(tx));
+        let hooked = rt.park_hook.set(Box::new(move |p| {
+            if let ParkPoint::BeforeComputeOne(id) | ParkPoint::ComputeWaits(id) = p {
+                if a.get() == Some(&thread::current().id()) {
+                    let _ = tx.lock().unwrap().send(id);
+                }
+            }
+        }));
+        assert!(hooked.is_ok());
+        Released {
+            rt,
+            r,
+            m,
+            n,
+            x,
+            gate,
+            a_thread,
+            visits: Mutex::new(visits),
+        }
+    }
+
+    fn read(&self, node: Incr<i64>) -> Result<i64, String> {
+        catch_unwind(AssertUnwindSafe(|| self.rt.get(node))).map_err(panic_message)
+    }
+
+    /// A's read of `r`, B's of `m`, then a read of every node.
+    fn outcome(&self, a: Result<i64, String>, b: Result<i64, String>) -> Vec<Result<i64, String>> {
+        vec![
+            a,
+            b,
+            self.read(self.r),
+            self.read(self.m),
+            self.read(self.x),
+        ]
+    }
+
+    fn single_thread(release: Release, a_first: bool) -> Vec<Result<i64, String>> {
+        let g = Released::new(release);
+        if a_first {
+            let a = g.read(g.r);
+            g.outcome(a, g.read(g.m))
+        } else {
+            let b = g.read(g.m);
+            g.outcome(g.read(g.r), b)
+        }
+    }
+
+    /// B parks in `x` holding its claims; A's read starts once it has
+    /// and B resumes once A waits on one of them, whether A registers
+    /// that wait or, holding no claim, waits unregistered.
+    fn concurrent(release: Release) -> Vec<Result<i64, String>> {
+        let g = Released::new(release);
+        g.gate.arm();
+        let (a, b) = thread::scope(|s| {
+            let g = &g;
+            let b = s.spawn(move || g.read(g.m));
+            g.gate.wait_parked();
+            let held: Vec<NodeId> = [g.r, g.m, g.n, g.x]
+                .into_iter()
+                .filter(|h| matches!(g.rt.state_of(*h), NodeState::Computing))
+                .map(id)
+                .collect();
+            let a = s.spawn(move || {
+                g.a_thread.set(thread::current().id()).unwrap();
+                g.read(g.r)
+            });
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while waits::registered() == 0 {
+                match g
+                    .visits
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_millis(1))
+                {
+                    Ok(at) if held.contains(&at) => break,
+                    _ => assert!(
+                        Instant::now() < deadline,
+                        "{release:?}: A never waited on B"
+                    ),
+                }
+            }
+            g.gate.release();
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let outcome = g.outcome(a, b);
+        g.rt.assert_invariant_i();
+        outcome
+    }
+}
+
+/// Group verify's releases keep the claims in their group, so a read
+/// after the releasing thread's wound gets a single-thread result.
+fn released_member_keeps_its_group(release: Release) {
+    let a_first = Released::single_thread(release, true);
+    let b_first = Released::single_thread(release, false);
+    for round in 0..20 {
+        let got = Released::concurrent(release);
+        assert!(
+            got == a_first || got == b_first,
+            "{release:?} round {round}: {got:?}, single-thread {a_first:?} or {b_first:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_group_verify_step_1_release_keeps_the_group() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_group_verify_step_1_release_keeps_the_group",
+        || released_member_keeps_its_group(Release::Step1),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_tainted_group_verify_release_keeps_the_group() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_tainted_group_verify_release_keeps_the_group",
+        || released_member_keeps_its_group(Release::Tainted),
     )
     .assert_clean();
 }

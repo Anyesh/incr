@@ -44,8 +44,8 @@ pub(super) enum PopEnd {
     Deferred,
     /// The episode landed every member.
     Landed,
-    /// Validation found the root alone: it computes as an ordinary node,
-    /// under the claim it holds.
+    /// Validation found the root alone: its caller ends the root's held
+    /// entry, and it computes as an ordinary node, under the claim it holds.
     Dissolved,
     /// A recorded dep went stale: every member landed New, and the root
     /// claims again.
@@ -632,13 +632,7 @@ impl<C: Cells> Runtime<C> {
                     ctl.lower(anchor);
                     let kind_now = cycle_state::unwind_kind();
                     let mut bag = Deferred::new();
-                    self.release_unwound_from(
-                        at + 1,
-                        slot,
-                        kind_now,
-                        kind_now.is_some() || replay::speculative(),
-                        &mut bag,
-                    );
+                    self.release_unwound_from(at + 1, slot, kind_now, kind_now.is_some(), &mut bag);
                     bag.drain(self);
                     return Some(Err(self.member_run_unwound(kind, payload)));
                 }
@@ -702,7 +696,7 @@ impl<C: Cells> Runtime<C> {
     /// Runs held node `slot`'s closure as a member run at position
     /// `cidx`: its value is buffered in the held map, with the deps it
     /// recorded. Returns the run's lowlink, or the panic it ended in, with
-    /// the node marked failed.
+    /// the node marked failed unless the run was speculative.
     pub(super) fn member_run(
         &self,
         slot: u32,
@@ -756,6 +750,14 @@ impl<C: Cells> Runtime<C> {
         }
         if result.is_err() {
             replay::unwind_past_since(self.runtime_id, cidx, first);
+            // A speculative run's panic or cycle is a discard, as in
+            // `compute_panicked`: callers land the run after its
+            // speculative guard has dropped.
+            if matches!(cycle_state::unwind_kind(), None | Some(UnwindKind::Cycle))
+                && replay::speculative()
+            {
+                cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+            }
             // A discard unwinds a run the unbounded run never makes: the
             // member keeps what its last run recorded, or its episode's
             // landing installs deps that the discard leaves New.
@@ -1343,10 +1345,6 @@ impl<C: Cells> Runtime<C> {
         if scc.len() == 1 && !graph[at].contains(&at) {
             cycle_state::dissolved_before(rt, root.0);
             self.release_members(members, Some(root.0), bag);
-            let entry = cycle_state::with_held(|h| h.remove(&(rt, root.0)));
-            if let Some(e) = entry {
-                bag.push_erased(Box::new((e.buf, e.s)));
-            }
             return Shrink::Dissolved;
         }
         if scc.len() == members.len() {
@@ -1361,6 +1359,16 @@ impl<C: Cells> Runtime<C> {
         cu.retain(|m| scc.binary_search(m).is_ok());
         *members = scc;
         Shrink::Shrunk
+    }
+
+    /// Ends the claim the root of a dissolved episode holds as a member,
+    /// returning whether it was taken from New and whether it wrote.
+    pub(super) fn end_dissolved(&self, root: NodeId, bag: &mut Deferred<C>) -> (bool, bool) {
+        let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)))
+            .expect("incr-core: a dissolved root is held");
+        let ended = (e.first, e.wrote);
+        bag.push_erased(Box::new((e.buf, e.s)));
+        ended
     }
 
     /// Stores episode `ep`, whose member run a doom discarded, in the
@@ -1434,7 +1442,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Releases `slots` from the held map with the discard landing,
-    /// except `keep`.
+    /// except `keep`. They leave their group, as the unbounded run's
+    /// episode cuts them at the same point.
     fn release_members(&self, slots: &[u32], keep: Option<u32>, bag: &mut Deferred<C>) {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
@@ -1561,7 +1570,9 @@ impl<C: Cells> Runtime<C> {
     /// stores `verified_at = 0` if it wrote nothing (rule (a)); one that
     /// wrote its slot is stamped and lands New, so that its retry writes
     /// and stamps unconditionally; any other lands Dirty. Recorded deps
-    /// are dropped and installed ones kept. It never lands Failed.
+    /// are dropped and installed ones kept. It never lands Failed. The node
+    /// leaves its group, so callers use it only for an attempt the unbounded
+    /// run releases the same way.
     pub(super) fn discard_land(
         &self,
         id: NodeId,
@@ -1579,7 +1590,9 @@ impl<C: Cells> Runtime<C> {
     /// A wound's and a T8 discard's keep the node in its group, as
     /// `unclaim_group` does: neither attempt is in the unbounded run or in
     /// any single-thread order, and a member it took out would make another
-    /// thread compute alone what that order verifies as a group.
+    /// thread compute alone what that order verifies as a group. A user
+    /// panic or a cycle error outside a speculative run unwinds the
+    /// unbounded run too, so its claims leave their group.
     pub(super) fn unwound_land(
         &self,
         id: NodeId,
@@ -1682,6 +1695,7 @@ impl<C: Cells> Runtime<C> {
                 node.set_verified_at(0);
             }
             self.children_landing(id, flags, ChildLanding::Discard, e.opened, bag);
+            // Leaving the group is safe: a New node's record is inert.
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
             false
         } else {
@@ -1696,6 +1710,8 @@ impl<C: Cells> Runtime<C> {
                 (NodeState::Clean, ChildLanding::Sweep)
             };
             self.children_landing(id, flags, children, e.opened, bag);
+            // The run computed the node alone, as the frame's run in the
+            // unbounded run does, so the node leaves its group.
             self.land_single(id, node, flags, target, NodeState::Dirty);
             self.record_trace(
                 id,
@@ -1752,6 +1768,8 @@ impl<C: Cells> Runtime<C> {
                     node.set_verified_at(0);
                 }
                 self.children_landing(NodeId(m), flags, ChildLanding::Discard, false, bag);
+                // Leaving the group is safe: a New member's record is inert,
+                // and the root's retry records the group again.
                 self.land_single(NodeId(m), node, flags, NodeState::New, NodeState::New);
                 bag.push_erased(Box::new((e.buf, e.s)));
             }
@@ -1880,7 +1898,7 @@ impl<C: Cells> Runtime<C> {
     /// Step 3 ended in a panic (a `PartialEq` of a member's value): every
     /// member whose slot was written is stamped and lands New, the member
     /// whose compare panicked lands through fix 5's panic path, and the
-    /// others take the discard landing. Each leaves its group.
+    /// others take the unwind's landing ([`Self::unwound_land`]).
     fn abort_landing(
         &self,
         entries: &mut [(u32, Held)],
@@ -1958,8 +1976,18 @@ impl<C: Cells> Runtime<C> {
         payload: Payload,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
+        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)));
+        cycle_state::set_unwind_kind(kind);
+        bag.drain_carried(payload)
+    }
+
+    /// Lands group verify's claims `claimed`, taken from Dirty, back to
+    /// Dirty and in their group, as if never claimed: no member ran, so
+    /// another thread's read of one must make the decision a read before
+    /// the claims would have made.
+    fn release_group_claims<'a>(&self, claimed: impl IntoIterator<Item = &'a u32>) {
         let rt = self.runtime_id;
-        for &c in claimed.iter().chain(std::iter::once(&x.0)) {
+        for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
             self.land(
                 NodeId(c),
@@ -1968,8 +1996,6 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty,
             );
         }
-        cycle_state::set_unwind_kind(kind);
-        bag.drain_carried(payload)
     }
 
     /// Group verification of the Dirty group member `x`, whose claim
@@ -2020,11 +2046,7 @@ impl<C: Cells> Runtime<C> {
                 ok = false;
             }
             if !ok {
-                for c in claimed {
-                    cycle_state::with_held(|h| h.remove(&(rt, c)));
-                    let (node, flags) = self.nodes.get_with_flags(c);
-                    self.land_single(NodeId(c), node, flags, NodeState::Dirty, NodeState::Dirty);
-                }
+                self.release_group_claims(&claimed);
                 return GroupEnd::Ordinary;
             }
             cycle_state::with_held(|h| {
@@ -2089,14 +2111,9 @@ impl<C: Cells> Runtime<C> {
 
         if let Visit::VerifyOnly(owner) = visit {
             // A tainted node never runs: release the group, and leave `x`
-            // Dirty for the closure that still reads it.
-            for c in claimed {
-                cycle_state::with_held(|h| h.remove(&(rt, c)));
-                let (node, flags) = self.nodes.get_with_flags(c);
-                self.land_single(NodeId(c), node, flags, NodeState::Dirty, NodeState::Dirty);
-            }
-            let (node, flags) = self.nodes.get_with_flags(x.0);
-            self.land_single(x, node, flags, NodeState::Dirty, NodeState::Dirty);
+            // Dirty for the closure that still reads it, whose read the
+            // taint memo makes compute `x` alone.
+            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)));
             self.memoize(x, owner);
             return GroupEnd::Done(Computed::Done);
         }
@@ -2115,7 +2132,10 @@ impl<C: Cells> Runtime<C> {
         match self.episode(x, cidx, bag) {
             PopEnd::Landed => GroupEnd::Done(Computed::Done),
             PopEnd::Deferred => GroupEnd::Done(Computed::Deferred),
-            PopEnd::Dissolved => GroupEnd::Ordinary,
+            PopEnd::Dissolved => {
+                self.end_dissolved(x, bag);
+                GroupEnd::Ordinary
+            }
             PopEnd::Retry => GroupEnd::Retry,
             PopEnd::Suspended | PopEnd::Dropped => GroupEnd::Done(Computed::Discarded),
         }

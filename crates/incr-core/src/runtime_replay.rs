@@ -1897,8 +1897,10 @@ impl<C: Cells> Runtime<C> {
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
     /// claim lands as if its run never happened, since no frame computes it
-    /// here: the entry below does. A suspended episode restarts the driver,
-    /// which runs the entries its doom pushed first.
+    /// here: the entry below does. It leaves the root's group, as the
+    /// unbounded run's frame goes on to compute the root alone and leaves
+    /// it there. A suspended episode restarts the driver, which runs the
+    /// entries its doom pushed first.
     fn episode_task_end(&self, root: NodeId, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         let pop = match end {
             PopEnd::Suspended => VPop::Restart,
@@ -1906,11 +1908,7 @@ impl<C: Cells> Runtime<C> {
             _ => VPop::Next,
         };
         if let PopEnd::Dissolved = end {
-            let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)));
-            let (first, wrote) = e.as_ref().map_or((false, false), |e| (e.first, e.wrote));
-            if let Some(e) = e {
-                bag.push_erased(Box::new((e.buf, e.s)));
-            }
+            let (first, wrote) = self.end_dissolved(root, &mut bag);
             let stamp_rev = self.current_revision();
             self.discard_land(root, first, wrote, stamp_rev, &mut bag);
         }
@@ -2010,11 +2008,12 @@ impl<C: Cells> Runtime<C> {
     /// Lands held node `slot`, whose run at `cidx` ended in an unwind, as
     /// a compute's frame would: the claims anchored at or above `cidx` are
     /// released, and the node lands Failed for a user panic, or takes the
-    /// discard landing for an engine unwind or in a speculative run.
+    /// discard landing for an engine unwind, which a speculative run's
+    /// panic is (`member_run`).
     fn continuation_unwound(&self, slot: u32, cidx: u32, bag: &mut Deferred<C>) {
         let rt = self.runtime_id;
         let kind = cycle_state::unwind_kind();
-        let discarding = kind.is_some() || replay::speculative();
+        let discarding = kind.is_some();
         // An episode's member stays held for its episode, as when the run
         // nests in its reader: only what the run left above it goes.
         if self.episode_member(slot) {
