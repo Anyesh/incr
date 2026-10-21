@@ -540,7 +540,11 @@ fn watch_against_model<C: Cells>(case: &Case) {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig {
+        cases: if cfg!(miri) { 6 } else { 64 },
+        failure_persistence: None,
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn drain_matches_the_model_local(case in case()) {
