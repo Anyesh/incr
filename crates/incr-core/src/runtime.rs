@@ -2130,7 +2130,9 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let inner = self.inner.read();
-        if self.nodes.get(handle.slot()).generation() != handle.generation() {
+        if inner.member_recs.is_empty()
+            || self.nodes.get(handle.slot()).generation() != handle.generation()
+        {
             return None;
         }
         inner
