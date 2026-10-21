@@ -2518,7 +2518,9 @@ impl<C: Cells> Runtime<C> {
         }
         if !C::SINGLE_THREADED && spins >= waits::REGISTER_AFTER {
             let node = self.nodes.get(id.0);
-            self.wait_registered(id, || !is_computing(state::load::<C>(node.state_cell())));
+            self.wait_registered(id, None, || {
+                !is_computing(state::load::<C>(node.state_cell()))
+            });
         } else {
             C::backoff(spins);
         }

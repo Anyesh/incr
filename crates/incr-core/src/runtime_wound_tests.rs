@@ -5,7 +5,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -13,6 +13,7 @@ use super::observe_impl::observed_is_clear;
 use super::race_tests::{id, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::Shared;
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
 use crate::handle::Incr;
 use crate::waits;
 
@@ -395,6 +396,53 @@ fn shared_swallowed_wound_in_a_recompute_whose_dep_cuts_off() {
             assert_eq!(q_runs.load(Ordering::Relaxed), 3);
             assert_wounded();
             rt.assert_invariant_i();
+        },
+    )
+    .assert_clean();
+}
+
+/// `below` (unseeded) and `m` (Fixpoint) form one cycle that is warm
+/// from a `get(m)`. After each `set` two threads read one member each,
+/// and their claim waits close a waits-for cycle. Every single-thread
+/// order gives `below = 6` and `m = 5`, so the wound must not change
+/// either result.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_concurrent_reads_of_a_warm_cycle_match_the_single_thread_result() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_concurrent_reads_of_a_warm_cycle_match_the_single_thread_result",
+        || {
+            let rt = Runtime::<Shared>::new();
+            let n = rt.create_input(10_i64);
+            let m_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+            let below = {
+                let m_cell = m_cell.clone();
+                rt.create_query(move |rt| rt.get(n).min(rt.get(*m_cell.get().unwrap()) + 1))
+            };
+            let m = rt.create_query_with(
+                move |rt| (rt.get(below) + 1).min(5),
+                QueryOpts {
+                    cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).max_iterations(20)),
+                    ..QueryOpts::default()
+                },
+            );
+            m_cell.set(m).unwrap();
+            assert_eq!((rt.get(m), rt.get(below)), (5, 6));
+            for round in 0..200_i64 {
+                rt.set(n, 11 + round);
+                let start = Barrier::new(2);
+                let read = |node: Incr<i64>| {
+                    start.wait();
+                    catch_unwind(AssertUnwindSafe(|| rt.get(node))).map_err(panic_message)
+                };
+                let (b, m) = thread::scope(|s| {
+                    let b = s.spawn(|| read(below));
+                    let m = s.spawn(|| read(m));
+                    (b.join().unwrap(), m.join().unwrap())
+                });
+                assert_eq!((b, m), (Ok(6), Ok(5)), "round {round}");
+                rt.assert_invariant_i();
+            }
         },
     )
     .assert_clean();

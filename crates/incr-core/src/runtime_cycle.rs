@@ -357,11 +357,17 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A claim wait on `on` that has spun `REGISTER_AFTER` times: it
-    /// registers with the claims this thread holds and waits until `done`,
-    /// unless a registration that closes a waits-for cycle wounds it.
+    /// registers with the claims this thread holds, `also` included, and
+    /// waits until `done`, unless a registration that closes a waits-for
+    /// cycle wounds it.
     #[cold]
     #[inline(never)]
-    pub(super) fn wait_registered(&self, on: NodeId, mut done: impl FnMut() -> bool) {
+    pub(super) fn wait_registered(
+        &self,
+        on: NodeId,
+        also: Option<NodeId>,
+        mut done: impl FnMut() -> bool,
+    ) {
         let mut holds: Vec<waits::Claim> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
@@ -369,6 +375,7 @@ impl<C: Cells> Runtime<C> {
                 .map(|f| (f.rt, f.node.0))
                 .collect()
         });
+        holds.extend(also.map(|x| (self.runtime_id, x.0)));
         holds.extend(cycle_state::held_keys());
         holds.extend(set_stack::claims());
         // A thread that holds nothing is no one's owner, so no waits-for
@@ -406,12 +413,25 @@ impl<C: Cells> Runtime<C> {
     /// spun long enough and then waits until `done`.
     #[inline]
     pub(super) fn spin_on(&self, on: NodeId, spins: &mut u32, done: impl FnMut() -> bool) {
+        self.spin_holding(on, None, spins, done);
+    }
+
+    /// [`Self::spin_on`] by a thread that also holds `also`'s claim
+    /// outside its frames and held claims.
+    #[inline]
+    fn spin_holding(
+        &self,
+        on: NodeId,
+        also: Option<NodeId>,
+        spins: &mut u32,
+        done: impl FnMut() -> bool,
+    ) {
         if *spins == 0 {
             crate::lock_order::assert_may_wait_on_claim();
         }
         *spins += 1;
         if !C::SINGLE_THREADED && *spins >= waits::REGISTER_AFTER {
-            self.wait_registered(on, done);
+            self.wait_registered(on, also, done);
         } else {
             C::backoff(*spins);
         }
@@ -1855,6 +1875,63 @@ impl<C: Cells> Runtime<C> {
         bag.drain_carried(payload)
     }
 
+    /// Claims group member `m`, Dirty to Computing, for the group verify
+    /// of `x`, which holds `claimed` too. Another thread's claim is waited
+    /// out, never given up: a verify that gave up would compute `x` alone,
+    /// and a winner left holding an unseeded `x` under its member raises a
+    /// cycle that no single-thread order raises. A wound in the wait lands
+    /// `x` and `claimed` Dirty and in their group, as if never claimed.
+    fn claim_member(&self, x: NodeId, m: u32, claimed: &[u32], bag: &mut Deferred<C>) -> bool {
+        let node = self.nodes.get(m);
+        let mut spins = 0;
+        loop {
+            match state::try_transition::<C>(
+                node.state_cell(),
+                NodeState::Dirty,
+                NodeState::Computing,
+            ) {
+                Ok(()) => return true,
+                Err(s)
+                    if !C::SINGLE_THREADED && is_computing(s) && !self.holds_claim(NodeId(m)) =>
+                {
+                    let waited = catch_unwind(AssertUnwindSafe(|| {
+                        self.spin_holding(NodeId(m), Some(x), &mut spins, || {
+                            !is_computing(state::load::<C>(node.state_cell()))
+                        })
+                    }));
+                    if let Err(payload) = waited {
+                        self.unclaim_group(x, claimed, bag, payload);
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unclaim_group(
+        &self,
+        x: NodeId,
+        claimed: &[u32],
+        bag: &mut Deferred<C>,
+        payload: Payload,
+    ) -> ! {
+        let kind = cycle_state::take_unwind_kind();
+        let rt = self.runtime_id;
+        for &c in claimed.iter().chain(std::iter::once(&x.0)) {
+            cycle_state::with_held(|h| h.remove(&(rt, c)));
+            self.land(
+                NodeId(c),
+                self.nodes.get(c),
+                NodeState::Dirty,
+                NodeState::Dirty,
+            );
+        }
+        cycle_state::set_unwind_kind(kind);
+        bag.drain_carried(payload)
+    }
+
     /// Group verification of the Dirty group member `x`, whose claim
     /// `compute_one` holds at generation `g`.
     pub(super) fn group_verify(
@@ -1897,13 +1974,7 @@ impl<C: Cells> Runtime<C> {
             // this thread's stack, whose claim the unbounded run fails.
             let virtual_member = value_code::thread_word() & value_code::REPLAY_BIT != 0
                 && self.virtual_position(m, generation).is_some();
-            let mut ok = !virtual_member
-                && state::try_transition::<C>(
-                    node.state_cell(),
-                    NodeState::Dirty,
-                    NodeState::Computing,
-                )
-                .is_ok();
+            let mut ok = !virtual_member && self.claim_member(x, m, &claimed, bag);
             if ok && node.generation() != generation {
                 self.land(NodeId(m), node, NodeState::Dirty, NodeState::Dirty);
                 ok = false;
