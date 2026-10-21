@@ -22,7 +22,8 @@ use crate::cycle::{ErasedOpts, QueryOpts};
 use crate::dep_stack::DepStack;
 use crate::directory::Directory;
 use crate::handle::{Incr, RuntimeId};
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 use crate::runtime::Runtime;
 use crate::value::Value;
 use crate::value_code;
@@ -141,7 +142,7 @@ type Sheet<C> = Owning<Column<C>, C>;
 pub struct GridTable<T: Value, C: Cells> {
     runtime_id: RuntimeId,
     sheets: Owning<Sheet<C>, C>,
-    miss: C::Lock<()>,
+    miss: OrderedLock<(), C>,
     _value: PhantomData<fn() -> T>,
 }
 
@@ -174,7 +175,7 @@ fn _fields_are_thread_safe() {
     fn thread_safe<X: Send + Sync>() {}
     thread_safe::<Directory<Sheet<Shared>, Shared>>();
     thread_safe::<<Shared as Cells>::U64>();
-    thread_safe::<<Shared as Cells>::Lock<()>>();
+    thread_safe::<OrderedLock<(), Shared>>();
 }
 
 impl<T: Value, C: Cells> GridTable<T, C> {
@@ -182,7 +183,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         Self {
             runtime_id,
             sheets: Owning::new(1),
-            miss: <C::Lock<()> as Lock<_>>::new(()),
+            miss: OrderedLock::new(LockKind::TableMiss, ()),
             _value: PhantomData,
         }
     }
