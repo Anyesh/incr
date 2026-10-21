@@ -815,7 +815,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
-        self.release_held_from(cidx + 1, true, None, &mut bag);
+        self.release_held_from(cidx + 1, true, Some(UnwindKind::Discard), &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
                 .and_then(|e| e.buf.take())
@@ -862,7 +862,7 @@ impl<C: Cells> Runtime<C> {
             // A speculative entry never runs an episode: the unbounded run
             // may enter this cycle at another member, or not at all. The
             // claims take the discard landing and the chain is dropped.
-            self.release_held_from(cidx, true, None, bag);
+            self.release_held_from(cidx, true, Some(UnwindKind::Discard), bag);
             if self.drop_cooperatively(None) {
                 return PopEnd::Dropped;
             }
@@ -1495,15 +1495,10 @@ impl<C: Cells> Runtime<C> {
         self.release_held_where(cidx, discarding, kind, subtree, &[], bag);
     }
 
-    /// [`Self::release_held_from`], keeping the claims in `keep`.
-    pub(super) fn release_held_except(
-        &self,
-        cidx: u32,
-        discarding: bool,
-        keep: &[u32],
-        bag: &mut Deferred<C>,
-    ) {
-        self.release_held_where(cidx, discarding, None, None, keep, bag);
+    /// [`Self::release_held_from`] for a doomed frame's discard, keeping
+    /// the claims in `keep`.
+    pub(super) fn release_held_except(&self, cidx: u32, keep: &[u32], bag: &mut Deferred<C>) {
+        self.release_held_where(cidx, true, Some(UnwindKind::Discard), None, keep, bag);
     }
 
     fn release_held_where(
@@ -1589,29 +1584,16 @@ impl<C: Cells> Runtime<C> {
         stamp_rev: u64,
         bag: &mut Deferred<C>,
     ) {
-        self.discard_land_with(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
-    }
-
-    /// [`Self::discard_land`] landing the attempt's children as `children`.
-    pub(super) fn discard_land_with(
-        &self,
-        id: NodeId,
-        first: bool,
-        wrote: bool,
-        stamp_rev: u64,
-        children: ChildLanding,
-        bag: &mut Deferred<C>,
-    ) {
-        let target = self.discard_target(id, first, wrote, stamp_rev, children, bag);
+        let target = self.discard_target(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         let (node, flags) = self.nodes.get_with_flags(id.0);
         self.land_single(id, node, flags, target, target);
     }
 
     /// [`Self::discard_land`] of a claim released by an unwind of `kind`.
-    /// A wound's keeps the node in its group, as `unclaim_group` does: the
-    /// wounded attempt is in no single-thread order, and a member it took
-    /// out would make the older thread compute alone what that order
-    /// verifies as a group.
+    /// A wound's and a T8 discard's keep the node in its group, as
+    /// `unclaim_group` does: neither attempt is in the unbounded run or in
+    /// any single-thread order, and a member it took out would make another
+    /// thread compute alone what that order verifies as a group.
     pub(super) fn unwound_land(
         &self,
         id: NodeId,
@@ -1621,13 +1603,26 @@ impl<C: Cells> Runtime<C> {
         kind: Option<UnwindKind>,
         bag: &mut Deferred<C>,
     ) {
-        if kind == Some(UnwindKind::Wound) {
-            let target =
-                self.discard_target(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
-            self.land(id, self.nodes.get(id.0), target, target);
+        if matches!(kind, Some(UnwindKind::Wound | UnwindKind::Discard)) {
+            self.discard_land_in_group(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         } else {
             self.discard_land(id, first, wrote, stamp_rev, bag);
         }
+    }
+
+    /// [`Self::discard_land`] landing the attempt's children as `children`
+    /// and leaving the node's `MemberRec` and `IN_GROUP` as they were.
+    pub(super) fn discard_land_in_group(
+        &self,
+        id: NodeId,
+        first: bool,
+        wrote: bool,
+        stamp_rev: u64,
+        children: ChildLanding,
+        bag: &mut Deferred<C>,
+    ) {
+        let target = self.discard_target(id, first, wrote, stamp_rev, children, bag);
+        self.land(id, self.nodes.get(id.0), target, target);
     }
 
     /// Lands the discarded attempt's children as `children` and stamps the
