@@ -197,8 +197,9 @@ pub fn inspect<T: Value, C: Cells>(rt: &Runtime<C>, q: Incr<T>) -> Option<Inspec
 }
 
 /// [`NodeTable::get_or_insert_query_with`] that hands a node the miss
-/// creates to `seed` before publishing it; a value `seed` returns, a
-/// failed seed's, drops after the miss mutex. A hit never calls `seed`.
+/// creates to `seed` before publishing it. A hit never calls `seed`.
+/// Everything the call does not keep, a failed seed's value among it,
+/// goes to `bag`, so none of it drops under the caller's own locks.
 pub fn get_or_insert_query_seeded<K, T, C, S, F>(
     table: &NodeTable<K, T, C, S>,
     rt: &Runtime<C>,
@@ -206,6 +207,7 @@ pub fn get_or_insert_query_seeded<K, T, C, S, F>(
     f: F,
     opts: QueryOpts<T>,
     seed: impl FnOnce(&Runtime<C>, Incr<T>) -> Option<T>,
+    bag: &mut Deferred<C>,
 ) -> Incr<T>
 where
     K: TableKey,
@@ -214,7 +216,7 @@ where
     S: BuildHasher,
     F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
 {
-    table.get_or_insert_query_seeded(rt, key, f, opts, seed)
+    table.get_or_insert_query_seeded(rt, key, f, opts, seed, bag)
 }
 
 /// The live node for `key`, if any, without `NodeTable::get`'s refusal

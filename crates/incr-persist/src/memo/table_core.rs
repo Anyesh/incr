@@ -74,11 +74,23 @@ pub(crate) trait ErasedTable<C: MemoCells> {
     fn as_any(&self) -> &dyn Any;
 
     /// The live node for an encoded key; `Err` if the key doesn't decode.
-    fn probe_bytes(&self, rt: &Runtime<C>, key: &[u8]) -> Result<Option<ErasedIncr>, ()>;
+    /// The decoded key goes to `bag`.
+    fn probe_bytes(
+        &self,
+        rt: &Runtime<C>,
+        key: &[u8],
+        bag: &mut Deferred<C>,
+    ) -> Result<Option<ErasedIncr>, ()>;
 
-    /// The node for an encoded key, created cold on a miss; `None` if the
-    /// key doesn't decode.
-    fn cold_bytes(&self, core: &CoreRef<C>, rt: &Runtime<C>, key: &[u8]) -> Option<ErasedIncr>;
+    /// [`TableCore::cold_into`] for an encoded key; `None` if it doesn't
+    /// decode.
+    fn cold_bytes(
+        &self,
+        core: &CoreRef<C>,
+        rt: &Runtime<C>,
+        key: &[u8],
+        bag: &mut Deferred<C>,
+    ) -> Option<ErasedIncr>;
 
     /// [`TableCore::seed`] for an encoded key; `None` if it doesn't decode.
     #[allow(clippy::too_many_arguments)]
@@ -95,8 +107,15 @@ pub(crate) trait ErasedTable<C: MemoCells> {
     ) -> Option<(ErasedIncr, Seeded)>;
 
     /// Every live entry that is Clean through `inspect`, with its deps
-    /// mapped under `map`'s hold.
-    fn snapshot(&self, rt: &Runtime<C>, map: &DepMap, memo: u64, out: &mut Vec<Snap>);
+    /// mapped under `map`'s hold. The keys of entries it skips go to `bag`.
+    fn snapshot(
+        &self,
+        rt: &Runtime<C>,
+        map: &DepMap,
+        memo: u64,
+        out: &mut Vec<Snap>,
+        bag: &mut Deferred<C>,
+    );
 }
 
 pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
@@ -121,9 +140,30 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
         self.nodes.get_or_insert_query(rt, key, f)
     }
 
+    /// [`Self::cold`] for a caller holding M: what the table doesn't keep
+    /// goes to `bag`.
+    pub(crate) fn cold_into(
+        &self,
+        core: &CoreRef<C>,
+        rt: &Runtime<C>,
+        key: K,
+        bag: &mut Deferred<C>,
+    ) -> Incr<T> {
+        let f = self.closure(core, with_value_code(|| key.clone()));
+        get_or_insert_query_seeded(
+            &self.nodes,
+            rt,
+            key,
+            f,
+            QueryOpts::default(),
+            |_, _| None,
+            bag,
+        )
+    }
+
     /// Creates `key`'s node seeded with the stored `value` and `deps`, or
-    /// cold if the value doesn't decode. The decoded value drops into
-    /// `bag` when the seed doesn't take it.
+    /// cold if the value doesn't decode. What the table doesn't keep,
+    /// the decoded value of a failed seed included, goes to `bag`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn seed(
         &self,
@@ -137,27 +177,29 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
         bag: &mut Deferred<C>,
     ) -> (Incr<T>, Seeded) {
         let Some(value) = decode::<T>(value) else {
-            return (self.cold(core, rt, key), Seeded::Corrupt);
+            return (self.cold_into(core, rt, key, bag), Seeded::Corrupt);
         };
-        // A failed seed's value comes back here rather than to the miss,
-        // so it drops in the restore's bag, after M.
         let mut value = Some(value);
         let mut seeded = Seeded::Live;
         let f = self.closure(core, with_value_code(|| key.clone()));
-        let handle =
-            get_or_insert_query_seeded(&self.nodes, rt, key, f, QueryOpts::default(), |rt, q| {
+        let handle = get_or_insert_query_seeded(
+            &self.nodes,
+            rt,
+            key,
+            f,
+            QueryOpts::default(),
+            |rt, q| {
                 let stored = value.take().expect("a miss seeds once");
                 match seed_query(rt, base, q, stored, deps, reuse) {
                     Ok(reuse) => {
                         seeded = Seeded::As(reuse);
                         None
                     }
-                    Err((_, failed)) => {
-                        value = Some(failed);
-                        None
-                    }
+                    Err((_, failed)) => Some(failed),
                 }
-            });
+            },
+            bag,
+        );
         if let Some(value) = value {
             bag.push(value);
         }
@@ -170,14 +212,27 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         self
     }
 
-    fn probe_bytes(&self, rt: &Runtime<C>, key: &[u8]) -> Result<Option<ErasedIncr>, ()> {
+    fn probe_bytes(
+        &self,
+        rt: &Runtime<C>,
+        key: &[u8],
+        bag: &mut Deferred<C>,
+    ) -> Result<Option<ErasedIncr>, ()> {
         let key = decode::<K>(key).ok_or(())?;
-        Ok(self.probe(rt, &key).map(Incr::erase))
+        let live = self.probe(rt, &key).map(Incr::erase);
+        bag.push(key);
+        Ok(live)
     }
 
-    fn cold_bytes(&self, core: &CoreRef<C>, rt: &Runtime<C>, key: &[u8]) -> Option<ErasedIncr> {
+    fn cold_bytes(
+        &self,
+        core: &CoreRef<C>,
+        rt: &Runtime<C>,
+        key: &[u8],
+        bag: &mut Deferred<C>,
+    ) -> Option<ErasedIncr> {
         let key = decode::<K>(key)?;
-        Some(self.cold(core, rt, key).erase())
+        Some(self.cold_into(core, rt, key, bag).erase())
     }
 
     fn seed_bytes(
@@ -196,13 +251,21 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         Some((handle.erase(), seeded))
     }
 
-    fn snapshot(&self, rt: &Runtime<C>, map: &DepMap, memo: u64, out: &mut Vec<Snap>) {
+    fn snapshot(
+        &self,
+        rt: &Runtime<C>,
+        map: &DepMap,
+        memo: u64,
+        out: &mut Vec<Snap>,
+        bag: &mut Deferred<C>,
+    ) {
         let mut live = Vec::new();
         self.nodes.for_each(rt, |key, handle| {
             live.push((with_value_code(|| key.clone()), handle));
         });
         for (key, handle) in live {
             let Some(seen) = inspect(rt, handle) else {
+                bag.push(key);
                 continue;
             };
             // Read after `inspect` returns, so an input's stamp check sees

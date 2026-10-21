@@ -54,6 +54,7 @@ impl<C: MemoCells> CoreRef<C> {
         bag: &mut Deferred<C>,
     ) -> Incr<T> {
         if let Some(handle) = t.probe(rt, &key) {
+            bag.push(key);
             return handle;
         }
         let index = self.index();
@@ -67,20 +68,22 @@ impl<C: MemoCells> CoreRef<C> {
         };
         let root = walk.visit(t.index, bytes);
         if !walk.read(state, root) {
-            return t.cold(self, rt, key);
+            return t.cold_into(self, rt, key, bag);
         }
         walk.run(state, root, &base, bag);
         // The root is seeded here, typed, so its stored key is checked
         // against the live one and its handle comes back typed.
         let entry = walk.visits[root].entry.as_ref().expect("read above");
-        let same = with_value_code(|| decode::<K>(&entry.key).is_some_and(|k| k == key));
+        let stored = decode::<K>(&entry.key);
+        let same = with_value_code(|| stored.as_ref() == Some(&key));
+        bag.push(stored);
         if !same {
             corrupt(state);
-            return t.cold(self, rt, key);
+            return t.cold_into(self, rt, key, bag);
         }
         let Some((deps, reuse)) = walk.seed_deps(state, root) else {
             state.stats.cold += 1;
-            return t.cold(self, rt, key);
+            return t.cold_into(self, rt, key, bag);
         };
         let (handle, seeded) = t.seed(self, rt, key, &entry.value, &deps, reuse, &base, bag);
         record(state, handle.erase(), entry, &base, seeded);
@@ -217,11 +220,11 @@ impl<C: MemoCells> Walk<'_, C> {
                 // treated as having no entry.
                 Some(Mark::OnStack) => {
                     if self.visits[child].handle.is_none() {
-                        self.cold(state, child);
+                        self.cold(state, child, bag);
                     }
                 }
                 None => {
-                    if self.open(state, child) {
+                    if self.open(state, child, bag) {
                         self.visits[child].mark = Some(Mark::OnStack);
                         stack.push((child, 0));
                     } else {
@@ -235,10 +238,10 @@ impl<C: MemoCells> Walk<'_, C> {
     /// Settles a dep that needs no restore, or reads it: `true` if it has
     /// an entry to restore. A live node is used as it is, and a dep with no
     /// entry is created cold through its own table.
-    fn open(&mut self, state: &mut MemoState, id: usize) -> bool {
+    fn open(&mut self, state: &mut MemoState, id: usize, bag: &mut Deferred<C>) -> bool {
         let visit = &self.visits[id];
         let table = &self.core.tables[visit.table as usize];
-        match table.probe_bytes(self.rt, &visit.key) {
+        match table.probe_bytes(self.rt, &visit.key, bag) {
             Ok(Some(live)) => {
                 self.visits[id].handle = Some(live);
                 false
@@ -247,7 +250,7 @@ impl<C: MemoCells> Walk<'_, C> {
                 if self.read(state, id) {
                     true
                 } else {
-                    self.cold(state, id);
+                    self.cold(state, id, bag);
                     false
                 }
             }
@@ -259,10 +262,10 @@ impl<C: MemoCells> Walk<'_, C> {
     }
 
     /// `false`, counted corrupt, if the key doesn't decode.
-    fn cold(&mut self, state: &mut MemoState, id: usize) -> bool {
+    fn cold(&mut self, state: &mut MemoState, id: usize, bag: &mut Deferred<C>) -> bool {
         let visit = &self.visits[id];
         let table = &self.core.tables[visit.table as usize];
-        let handle = table.cold_bytes(self.core, self.rt, &visit.key);
+        let handle = table.cold_bytes(self.core, self.rt, &visit.key, bag);
         if handle.is_none() {
             corrupt(state);
         }
@@ -276,7 +279,7 @@ impl<C: MemoCells> Walk<'_, C> {
             return;
         }
         let Some((deps, reuse)) = self.seed_deps(state, id) else {
-            if self.cold(state, id) {
+            if self.cold(state, id, bag) {
                 state.stats.cold += 1;
             }
             return;
