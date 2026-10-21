@@ -424,7 +424,6 @@ const AGGREGATE_ROUNDS: u64 = 300;
 /// `below = min(|S|, m + 1) = 6` and `m = 5` for ten or more elements.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T10-wound-cycle-timing: a wounded cycle member can panic as a dependency cycle"]
 fn an_aggregate_whose_combine_reads_a_node_computed_on_another_thread() {
     run_in_child(
         "an_aggregate_whose_combine_reads_a_node_computed_on_another_thread",

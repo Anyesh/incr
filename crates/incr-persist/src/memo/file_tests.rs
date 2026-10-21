@@ -46,8 +46,10 @@ fn entry(key: u8) -> Entry {
     }
 }
 
+/// Frames tagged for `header(1)`, which the tests that decode them write.
 fn entries(keys: std::ops::Range<u8>) -> Vec<EncodedEntry> {
-    keys.map(|key| EncodedEntry::new(&entry(key)).unwrap())
+    let tag = header(1).frame_tag();
+    keys.map(|key| EncodedEntry::new(&entry(key), tag).unwrap())
         .collect()
 }
 
@@ -119,7 +121,8 @@ fn every_byte_flip_outside_entries_loads_empty_and_inside_fails_decode() {
                 .find(|i| (i.loc..i.loc + u64::from(i.len)).contains(&at))
                 .unwrap();
             let frame = handle.read_entry(GenId(1), item).unwrap().unwrap();
-            assert!(decode_entry(&frame).is_err(), "flip at {at} decoded");
+            let tag = header(1).frame_tag();
+            assert!(decode_entry(&frame, tag).is_err(), "flip at {at} decoded");
         } else {
             assert_empty(loaded, 1);
         }
@@ -158,7 +161,7 @@ fn a_truncated_generation_reads_short_or_not_at_all() {
     file.set_len(last.loc + 3).unwrap();
     let frame = reader.read_entry(GenId(1), &last).unwrap().unwrap();
     assert_eq!(frame.len(), 3);
-    assert!(decode_entry(&frame).is_err());
+    assert!(decode_entry(&frame, header(1).frame_tag()).is_err());
     let fresh = FileMemo::open(dir.path()).unwrap();
     assert_eq!(fresh.read_entry(GenId(1), &last).unwrap(), None);
 }
@@ -316,7 +319,7 @@ fn checkpoints_merge_across_handles_and_reopen() {
         .iter()
         .map(|item| {
             let frame = reopened.read_entry(loaded.id(), item).unwrap().unwrap();
-            decode_entry(&frame).unwrap().key[0]
+            decode_entry(&frame, loaded.frame_tag()).unwrap().key[0]
         })
         .collect();
     keys.sort();

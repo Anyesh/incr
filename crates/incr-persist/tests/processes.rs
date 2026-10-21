@@ -565,7 +565,7 @@ fn a_memo_checkpoint_killed_midway_leaves_a_whole_generation() {
         assert_eq!(loaded.items().len() as u64, loaded.header().seq * 50);
         for item in loaded.items() {
             let frame = memo.read_entry(loaded.id(), item).unwrap().unwrap();
-            decode_entry(&frame).unwrap();
+            decode_entry(&frame, loaded.frame_tag()).unwrap();
         }
         let next = write_checkpoint(&memo, memo_input(0..7)).unwrap();
         assert_eq!(next.stats.corrupt, 0);

@@ -95,7 +95,7 @@ fn entries(count: u8) -> Vec<EncodedEntry> {
                 }],
                 last_used: u64::from(i),
             };
-            EncodedEntry::new(&entry).expect("encode")
+            EncodedEntry::new(&entry, 0).expect("encode")
         })
         .collect()
 }

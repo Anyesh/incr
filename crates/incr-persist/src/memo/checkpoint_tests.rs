@@ -47,7 +47,8 @@ fn stored(memo: &MemoryMemo) -> Vec<Entry> {
         .items()
         .iter()
         .map(|item| {
-            decode_entry(&memo.read_entry(generation.id(), item).unwrap().unwrap()).unwrap()
+            let frame = memo.read_entry(generation.id(), item).unwrap().unwrap();
+            decode_entry(&frame, generation.frame_tag()).unwrap()
         })
         .collect();
     out.sort_by(|a, b| (a.table, &a.key).cmp(&(b.table, &b.key)));
@@ -195,21 +196,26 @@ fn damaged_base_frames_are_skipped_and_counted() {
                 entry(0, 1, 10, vec![]),
                 entry(0, 2, 20, vec![]),
                 entry(0, 3, 30, vec![]),
+                entry(0, 4, 40, vec![]),
             ],
         ),
     )
     .unwrap()
     .generation;
     let items = first.items().to_vec();
+    let frame = memo.read_entry(first.id(), &items[2]).unwrap().unwrap();
+    let whole = decode_entry(&frame, first.frame_tag()).unwrap();
+    let other_generation = encode_entry(&whole, first.frame_tag() ^ 1).unwrap();
+    memo.replace_frame(first.id(), &items[2], other_generation);
     let mut flipped = memo.read_entry(first.id(), &items[0]).unwrap().unwrap();
     let last = flipped.len() - 1;
     flipped[last] ^= 1;
     memo.replace_frame(first.id(), &items[0], flipped);
-    let other_key = encode_entry(&entry(0, 9, 0, vec![])).unwrap();
+    let other_key = encode_entry(&entry(0, 9, 0, vec![]), first.frame_tag()).unwrap();
     memo.replace_frame(first.id(), &items[1], other_key);
 
     let done = write_checkpoint(&memo, input(tables, vec![])).unwrap();
-    assert_eq!(done.stats.corrupt, 2);
+    assert_eq!(done.stats.corrupt, 3);
     assert_eq!(done.stats.merged, 1);
     assert_eq!(stored(&memo).len(), 1);
 }
@@ -275,10 +281,14 @@ fn eviction_through_the_driver_keeps_the_newest_within_budget() {
     write_checkpoint(&memo, input(tables.clone(), vec![entry(0, 1, 10, vec![])])).unwrap();
     let newer = entry(0, 2, 20, vec![]);
     let mut next = input(tables, vec![newer.clone()]);
-    next.max_bytes = encode_entry(&Entry {
-        last_used: 2,
-        ..newer
-    })
+    let any_tag = 0;
+    next.max_bytes = encode_entry(
+        &Entry {
+            last_used: 2,
+            ..newer
+        },
+        any_tag,
+    )
     .unwrap()
     .len() as u64;
     let done = write_checkpoint(&memo, next).unwrap();
@@ -297,13 +307,13 @@ fn an_entry_too_large_for_a_frame_is_dropped_with_its_dependents() {
         entry(0, 2, 20, vec![]),
         entry(0, 3, 30, vec![on(0, 2)]),
     ];
-    let too_large = |e: &Entry| {
+    let too_large = |e: &Entry, tag| {
         if e.key == [2] {
             Err(Error::FrameTooLarge {
                 len: u64::from(u32::MAX) + 1,
             })
         } else {
-            EncodedEntry::new(e)
+            EncodedEntry::new(e, tag)
         }
     };
     let done = write_with(&memo, input(tables, fresh), too_large).unwrap();
@@ -323,7 +333,7 @@ fn a_base_whose_seq_cannot_advance_is_replaced_without_merging() {
         seq: u64::MAX,
         tables: tables.clone(),
     };
-    let old = EncodedEntry::new(&entry(0, 1, 10, vec![])).unwrap();
+    let old = EncodedEntry::new(&entry(0, 1, 10, vec![]), header.frame_tag()).unwrap();
     memo.write_generation(None, GenId(1), &header, &[old])
         .unwrap();
     let done = write_checkpoint(&memo, input(tables, vec![entry(0, 2, 20, vec![])])).unwrap();

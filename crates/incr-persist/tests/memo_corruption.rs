@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use incr_core::persist_hooks::assert_invariants;
 use incr_persist::memo::{
-    decode_entry, fingerprint, BuildId, EncodedEntry, Entry, FileMemo, GenId, Memo, MemoBackend,
-    MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo, StoredDep,
+    decode_entry, fingerprint, BuildId, EncodedEntry, Entry, FileMemo, GenId, Generation,
+    IndexItem, Memo, MemoBackend, MemoBuilder, MemoCells, MemoOptions, MemoTable, MemoryMemo,
+    StoredDep,
 };
 use incr_persist::{Input, Local, MemoryBackend, Options, Shared, Store};
 use serde::{Deserialize, Serialize, Serializer};
@@ -75,10 +76,14 @@ mod files {
         every_byte_flip_in_a_generation_file_is_caught,
         every_truncation_of_a_generation_file_runs_cold,
         swapped_generation_files_are_not_served,
+        a_generation_overwritten_in_place_is_not_served,
     );
 
     #[cfg(feature = "sqlite")]
-    file_tests!(a_lost_buffered_sqlite_generation_rolls_back_whole);
+    file_tests!(
+        a_lost_buffered_sqlite_generation_rolls_back_whole,
+        a_sqlite_store_replaced_in_place_is_not_served,
+    );
 }
 
 const BUILD: u128 = 0xc0aa;
@@ -172,6 +177,7 @@ impl<C: MemoCells> Chain<C> {
 const TOP: u32 = 4;
 const ENTRIES: u64 = TOP as u64 + 1;
 const GEN_1: &str = "MEMO_GEN.1";
+const GEN_2: &str = "MEMO_GEN.2";
 
 /// Writes `chain(0..=TOP)` over x = 3 as generation 1 of a `FileMemo` in
 /// `dir`, and returns every file the directory then holds.
@@ -280,7 +286,12 @@ struct Pair<C: MemoCells> {
 }
 
 impl<C: MemoCells> Pair<C> {
-    fn open(log: &MemoryBackend, dir: &Path, b_first: bool, runs: &Arc<AtomicUsize>) -> Self {
+    fn open(
+        log: &MemoryBackend,
+        backend: impl MemoBackend + 'static,
+        b_first: bool,
+        runs: &Arc<AtomicUsize>,
+    ) -> Self {
         let store = store::<C>(log);
         let x = store.input("x", 1_u64).unwrap().handle();
         let mut builder = MemoBuilder::new(options());
@@ -301,7 +312,7 @@ impl<C: MemoCells> Pair<C> {
             r.fetch_add(1, SeqCst);
             u64::from(k) * ctx.rt().get(x) + 1
         });
-        let memo = builder.open(&store, FileMemo::open(dir).unwrap()).unwrap();
+        let memo = builder.open(&store, backend).unwrap();
         Pair {
             _store: store,
             memo,
@@ -325,6 +336,29 @@ fn swap(dir: &Path, one: &str, two: &str) {
     fs::rename(&tmp, &two).unwrap();
 }
 
+/// Opens `Pair` over `backend`, declared `[b, a]` if `b_first`, checks
+/// it after `reused` restores and checkpoints both entries.
+fn checkpoint_pair<C: MemoCells>(
+    log: &MemoryBackend,
+    backend: impl MemoBackend + 'static,
+    b_first: bool,
+    reused: u64,
+    runs: &Arc<AtomicUsize>,
+) {
+    let w = Pair::<C>::open(log, backend, b_first, runs);
+    w.check();
+    assert_eq!(w.memo.stats().reused, reused);
+    assert_eq!(w.memo.checkpoint().unwrap().written, 2);
+}
+
+/// The frame at `b(1)`'s location in `current`'s index, read from
+/// `other`, is a whole frame of `a(1)` under the same table index and key.
+fn assert_misread(current: &Generation, other: &Generation, frame: impl Fn(&IndexItem) -> Vec<u8>) {
+    let b_item = current.items().iter().find(|item| item.table == 0).unwrap();
+    let misread = decode_entry(&frame(b_item), other.frame_tag()).unwrap();
+    assert_eq!((misread.table, misread.key.as_slice()), (0, &[1_u8][..]));
+}
+
 /// Generation 1 catalogs `[a, b]` and generation 2 `[b, a]` over the same
 /// x, so the frame at `b(1)`'s offset in generation 2's index is, in
 /// generation 1's file, a whole frame of `a(1)` under the same table
@@ -334,42 +368,29 @@ fn swapped_generation_files_are_not_served<C: MemoCells>() {
     let dir = tempfile::tempdir().unwrap();
     let log = MemoryBackend::new();
     let runs = counter();
-    {
-        let w = Pair::<C>::open(&log, dir.path(), false, &runs);
-        w.check();
-        assert_eq!(w.memo.checkpoint().unwrap().written, 2);
-    }
+    let file_memo = || FileMemo::open(dir.path()).unwrap();
+    checkpoint_pair::<C>(&log, file_memo(), false, 0, &runs);
     let first = fs::read(dir.path().join(GEN_1)).unwrap();
-    {
-        let w = Pair::<C>::open(&log, dir.path(), true, &runs);
-        w.check();
-        assert_eq!(w.memo.stats().reused, 2);
-        assert_eq!(w.memo.checkpoint().unwrap().written, 2);
-    }
+    let first_gen = file_memo().load().unwrap().unwrap();
+    checkpoint_pair::<C>(&log, file_memo(), true, 2, &runs);
     assert!(!dir.path().join(GEN_1).exists());
-    let second = FileMemo::open(dir.path()).unwrap().load().unwrap().unwrap();
-    let b_item = second
-        .items()
-        .iter()
-        .find(|item| item.table == 0)
-        .copied()
-        .unwrap();
-    let at = b_item.loc as usize..b_item.loc as usize + b_item.len as usize;
-    let misread = decode_entry(&first[at]).unwrap();
-    assert_eq!((misread.table, misread.key.as_slice()), (0, &[1_u8][..]));
+    let second = file_memo().load().unwrap().unwrap();
+    assert_misread(&second, &first_gen, |item| {
+        first[item.loc as usize..item.loc as usize + item.len as usize].to_vec()
+    });
 
     // Swapped after this process loaded generation 2: it keeps reading the
     // file it loaded.
-    let w = Pair::<C>::open(&log, dir.path(), true, &runs);
+    let w = Pair::<C>::open(&log, file_memo(), true, &runs);
     fs::write(dir.path().join(GEN_1), &first).unwrap();
-    swap(dir.path(), GEN_1, "MEMO_GEN.2");
+    swap(dir.path(), GEN_1, GEN_2);
     let before = runs.load(SeqCst);
     w.check();
     assert_eq!(runs.load(SeqCst), before);
     drop(w);
 
     // Swapped before: the file named generation 2 holds generation 1.
-    let w = Pair::<C>::open(&log, dir.path(), true, &runs);
+    let w = Pair::<C>::open(&log, file_memo(), true, &runs);
     let before = runs.load(SeqCst);
     w.check();
     assert_eq!(runs.load(SeqCst), before + 2);
@@ -377,9 +398,107 @@ fn swapped_generation_files_are_not_served<C: MemoCells>() {
     assert_eq!((stats.reused, stats.revalidated), (0, 0));
     assert_eq!(w.memo.checkpoint().unwrap().written, 2);
     drop(w);
-    let w = Pair::<C>::open(&log, dir.path(), true, &runs);
+    let w = Pair::<C>::open(&log, file_memo(), true, &runs);
     w.check();
     assert_eq!(w.memo.stats().reused, 2);
+}
+
+/// After `w` loaded the current generation, its frames were replaced in
+/// place by those of a generation catalogued `[a, b]`: both restores run
+/// cold, counted corrupt, and a checkpoint then makes the store whole.
+fn assert_replaced_runs_cold<C: MemoCells>(
+    w: Pair<C>,
+    reopen: impl Fn() -> Pair<C>,
+    runs: &Arc<AtomicUsize>,
+) {
+    let before = runs.load(SeqCst);
+    w.check();
+    assert_eq!(runs.load(SeqCst), before + 2);
+    let stats = w.memo.stats();
+    assert_eq!((stats.reused, stats.revalidated, stats.corrupt), (0, 0, 2));
+    assert_eq!(w.memo.checkpoint().unwrap().written, 2);
+    drop(w);
+    let w = reopen();
+    w.check();
+    assert_eq!(w.memo.stats().reused, 2);
+}
+
+/// Generation 2's file rewritten in place with generation 1's bytes after
+/// this process loaded it, so its open file now holds generation 1's
+/// frames at the offsets of generation 2's index.
+fn a_generation_overwritten_in_place_is_not_served<C: MemoCells>() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = MemoryBackend::new();
+    let runs = counter();
+    let file_memo = || FileMemo::open(dir.path()).unwrap();
+    checkpoint_pair::<C>(&log, file_memo(), false, 0, &runs);
+    let first = fs::read(dir.path().join(GEN_1)).unwrap();
+    checkpoint_pair::<C>(&log, file_memo(), true, 2, &runs);
+
+    let w = Pair::<C>::open(&log, file_memo(), true, &runs);
+    let gen_2 = dir.path().join(GEN_2);
+    let inode = file_inode(&gen_2);
+    fs::write(&gen_2, &first).unwrap();
+    assert_eq!(file_inode(&gen_2), inode);
+    assert_replaced_runs_cold(w, || Pair::open(&log, file_memo(), true, &runs), &runs);
+}
+
+#[cfg(unix)]
+fn file_inode(path: &Path) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap())
+}
+
+#[cfg(not(unix))]
+fn file_inode(_path: &Path) -> u64 {
+    0
+}
+
+/// Another store's database, at the same generation id with the catalog
+/// `[a, b]`, copied over this one's rows while a handle has it loaded, as
+/// restoring a backup in place does.
+#[cfg(feature = "sqlite")]
+fn a_sqlite_store_replaced_in_place_is_not_served<C: MemoCells>() {
+    use incr_persist::memo::SqliteMemo;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mine, other) = (
+        dir.path().join("mine.sqlite"),
+        dir.path().join("other.sqlite"),
+    );
+    let log = MemoryBackend::new();
+    let runs = counter();
+    checkpoint_pair::<C>(&log, SqliteMemo::open(&mine).unwrap(), true, 0, &runs);
+    checkpoint_pair::<C>(&log, SqliteMemo::open(&other).unwrap(), false, 0, &runs);
+    let loaded = SqliteMemo::open(&mine).unwrap().load().unwrap().unwrap();
+    let theirs = SqliteMemo::open(&other).unwrap();
+    let their_gen = theirs.load().unwrap().unwrap();
+    assert_eq!(loaded.id(), their_gen.id());
+    assert_misread(&loaded, &their_gen, |item| {
+        theirs.read_entry(their_gen.id(), item).unwrap().unwrap()
+    });
+    drop(theirs);
+
+    let w = Pair::<C>::open(&log, SqliteMemo::open(&mine).unwrap(), true, &runs);
+    let conn = rusqlite::Connection::open(&mine).unwrap();
+    conn.execute("ATTACH ?1 AS other", [other.to_str().unwrap()])
+        .unwrap();
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         DELETE FROM memo_entry;
+         DELETE FROM memo_generation;
+         DELETE FROM memo_current;
+         INSERT INTO memo_generation SELECT * FROM other.memo_generation;
+         INSERT INTO memo_current SELECT * FROM other.memo_current;
+         INSERT INTO memo_entry SELECT * FROM other.memo_entry;
+         COMMIT;",
+    )
+    .unwrap();
+    drop(conn);
+    assert_replaced_runs_cold(
+        w,
+        || Pair::open(&log, SqliteMemo::open(&mine).unwrap(), true, &runs),
+        &runs,
+    );
 }
 
 /// Under `Buffered`, a crash can lose the latest generation, which SQLite
@@ -556,6 +675,7 @@ fn crafted_cyclic_entries_restore_cold<C: MemoCells>() {
             .read_entry(first.id(), &first.items()[0])
             .unwrap()
             .unwrap(),
+        first.frame_tag(),
     )
     .unwrap();
     let x_dep = real.deps[0].clone();
@@ -587,7 +707,7 @@ fn crafted_cyclic_entries_restore_cold<C: MemoCells>() {
     header.seq = 2;
     let encoded: Vec<_> = crafted
         .iter()
-        .map(|e| EncodedEntry::new(e).unwrap())
+        .map(|e| EncodedEntry::new(e, header.frame_tag()).unwrap())
         .collect();
     backend
         .write_generation(Some(first.id()), GenId(2), &header, &encoded)

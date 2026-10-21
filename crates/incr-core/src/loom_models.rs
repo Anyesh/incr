@@ -704,9 +704,9 @@ fn loom_group_verify_under_set() {
 
 /// A (Fallback) ↔ B, landed and then made Dirty with no change. Two
 /// readers enter the group at different members, so one group verify can
-/// find the other member claimed and fall back to an ordinary compute,
-/// and a wound can release a member with the discard landing, after which
-/// a walk may reach the cycle at either member. The members read each
+/// find the other member claimed and wait on it, and a wound in that wait
+/// releases the younger reader's claim, after which a walk may reach the
+/// cycle at either member. The members read each
 /// other with `try_get`, so every entry lands the same values.
 #[test]
 fn loom_group_claim_partial() {
@@ -742,6 +742,46 @@ fn loom_group_claim_partial() {
         rt.assert_walks_complete();
         assert_eq!(rt.get(a), 100);
         assert_eq!(rt.get(b), 101);
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// A (Fallback) and B, which has no strategy, read each other with `get`,
+/// landed and then made Dirty. One reader enters the group at each member,
+/// so each can hold its member while it waits for the other's. B alone on
+/// a stack is a cycle error, so the result is the single-thread one only
+/// if the reader left holding the group verifies it as a group.
+#[test]
+fn loom_group_claim_contended() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let y = rt.create_input(0_u64);
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*bc.get().unwrap()) + rt.get(y),
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + 1);
+        bc.set(b).unwrap();
+        assert_eq!(rt.get(a), 100);
+        rt.set(y, 1);
+
+        let first = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(a))
+        };
+        let second = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(b))
+        };
+        assert_eq!(first.join().unwrap(), 100);
+        assert_eq!(second.join().unwrap(), 101);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
         assert_eq!(crate::waits::registered(), 0);
     });
 }
