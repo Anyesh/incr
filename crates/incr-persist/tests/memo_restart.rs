@@ -9,7 +9,7 @@
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
@@ -25,7 +25,7 @@ use incr_persist::memo::{
     MemoryMemo,
 };
 use incr_persist::{
-    Durability, Error, FileBackend, Input, Local, Options, PersistedCollection, Shared, Store,
+    Durability, FileBackend, Input, Local, Options, PersistedCollection, Shared, Store,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -1150,22 +1150,6 @@ fn checkpoints_under_concurrent_mapped_sets_restore_like_a_cold_run() {
     }
 }
 
-/// Opens the log at `dir`, waiting out the lock a child spawned by a
-/// parallel test inherits between its fork and its exec.
-fn open_log(dir: &Path) -> FileBackend {
-    let deadline = Instant::now() + CHILD_TIMEOUT;
-    loop {
-        match FileBackend::open(dir) {
-            Err(Error::Io(e))
-                if e.kind() == ErrorKind::ResourceBusy && Instant::now() < deadline =>
-            {
-                thread::sleep(Duration::from_millis(5))
-            }
-            backend => return backend.unwrap(),
-        }
-    }
-}
-
 /// After a count-1 `replace(0.0 -> -0.0)` the collection's fp is that of
 /// the new representative: an entry over it, removed and restored in the
 /// same process, recomputes, and once checkpointed it is reused by a
@@ -1175,7 +1159,7 @@ fn an_equal_replace_moves_the_collection_fp_to_the_new_representative() {
     let dir = tempfile::tempdir().unwrap();
     let runs = Arc::new(AtomicU64::new(0));
     let open = || {
-        let backend = open_log(&dir.path().join("log"));
+        let backend = FileBackend::open(dir.path().join("log")).unwrap();
         let store = Arc::new(Store::<Shared, _>::open(backend, Options::default()).unwrap());
         let floats = store.collection::<F>("floats").unwrap();
         let view = floats.handle().clone();

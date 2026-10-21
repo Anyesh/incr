@@ -356,3 +356,16 @@ fn a_load_racing_a_publish_and_remove_loads_the_new_generation() {
     assert_eq!(loaded.id(), GenId(2));
     assert_whole(&loaded, &reload(dir.path()).unwrap());
 }
+
+/// A duplicate of the lock file's descriptor, like the one a child spawned
+/// by another thread holds until it execs, must not keep the lock once the
+/// guard drops.
+#[test]
+fn a_duplicated_lock_descriptor_does_not_outlive_the_guard() {
+    let (_dir, memo) = store();
+    let guard = memo.lock_checkpoint().unwrap();
+    let copy = guard._lock.0.try_clone().unwrap();
+    drop(guard);
+    assert!(memo.lock_checkpoint().is_ok());
+    drop(copy);
+}

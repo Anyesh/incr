@@ -10,6 +10,7 @@ use super::{
     Generation, IndexItem, MemoBackend, FRAME_HEADER_LEN,
 };
 use crate::file::{sync_dir, write_synced};
+use crate::flock::Flock;
 use crate::{Error, Result};
 
 const CURRENT: &str = "MEMO_CURRENT";
@@ -65,7 +66,7 @@ pub struct FileMemo {
 /// The checkpoint lock of a [`FileMemo`], released on drop.
 #[derive(Debug)]
 pub struct FileMemoGuard {
-    _lock: File,
+    _lock: Flock,
 }
 
 impl FileMemo {
@@ -114,10 +115,10 @@ impl FileMemo {
         Ok(highest)
     }
 
-    fn lock_publish(&self) -> Result<File> {
+    fn lock_publish(&self) -> Result<Flock> {
         let file = open_lock_file(&self.dir.join(PUBLISH))?;
         file.lock()?;
-        Ok(file)
+        Ok(Flock(file))
     }
 
     /// Removes temp files and every generation file but the current one.
@@ -187,7 +188,7 @@ impl MemoBackend for FileMemo {
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
         self.remove_leftovers()?;
-        Ok(FileMemoGuard { _lock: lock })
+        Ok(FileMemoGuard { _lock: Flock(lock) })
     }
 
     fn load(&self) -> Result<Option<Generation>> {
