@@ -582,6 +582,35 @@ pub(crate) struct Walk {
     expanded: Option<Box<Expanded>>,
 }
 
+/// The most spare work buffers a thread keeps, and the largest capacity it
+/// keeps one at.
+const SPARE_WALKS: usize = 32;
+const SPARE_WALK_CAPACITY: usize = 256;
+
+thread_local! {
+    /// Emptied work buffers of dropped walks, reused by the next walks so a
+    /// walk does not allocate one.
+    static SPARE_WORK: std::cell::RefCell<Vec<Vec<Entry>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Drop for Walk {
+    fn drop(&mut self) {
+        if self.work.capacity() == 0 || self.work.capacity() > SPARE_WALK_CAPACITY {
+            return;
+        }
+        let mut work = std::mem::take(&mut self.work);
+        work.clear();
+        let _ = SPARE_WORK.try_with(|spare| {
+            if let Ok(mut spare) = spare.try_borrow_mut() {
+                if spare.len() < SPARE_WALKS {
+                    spare.push(work);
+                }
+            }
+        });
+    }
+}
+
 #[derive(Default, Clone)]
 struct Expanded {
     /// New nodes with installed deps the walk has expanded.
@@ -607,11 +636,17 @@ impl Walk {
     }
     #[inline]
     fn new(root: NodeId, root_state: NodeState) -> Self {
+        let mut work = SPARE_WORK
+            .try_with(|spare| spare.try_borrow_mut().ok().and_then(|mut s| s.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Vec::with_capacity(16));
+        work.push(Entry {
+            id: root,
+            taint: Self::visit_kind(root_state),
+        });
         Self {
-            work: vec![Entry {
-                id: root,
-                taint: Self::visit_kind(root_state),
-            }],
+            work,
             first_visits: 0,
             visited: None,
             expanded: None,
@@ -3523,6 +3558,7 @@ impl<C: Cells> Runtime<C> {
                 let value_changed = outcome == Outcome::Changed;
 
                 let published = self.publish_deps(id, &deps, None, verify_rev, bag);
+                self.dep_stack.recycle_deps(deps);
 
                 // The closure has already written its value into the slot, and
                 // the next recompute's early cutoff compares against it, so a

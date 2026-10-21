@@ -77,7 +77,15 @@ pub struct Frames {
     /// The index the frame a driver placed sits at, while it is placed:
     /// the frame below it is not its reader.
     pub(crate) placed: u32,
+    /// Emptied deps buffers of popped frames, reused by the next pushes so
+    /// a compute does not allocate one.
+    spare: Vec<Vec<(NodeId, u32)>>,
 }
+
+/// The most spare deps buffers a thread keeps, and the largest capacity
+/// it keeps one at, so a deep or wide compute pins little memory.
+const SPARE_DEPS: usize = 32;
+const SPARE_DEPS_CAPACITY: usize = 64;
 
 /// A placement [`DepStack::place_next_at`] replaced, to restore.
 #[doc(hidden)]
@@ -128,6 +136,7 @@ impl Frames {
             frames: Vec::new(),
             bias: 0,
             placed: u32::MAX,
+            spare: Vec::new(),
         }
     }
 
@@ -140,14 +149,22 @@ impl Frames {
     }
 
     #[inline(always)]
-    fn frame(node: NodeId, rt: RuntimeId, ctl: &ComputeCtl, cidx: u32) -> Frame {
+    fn frame(&mut self, node: NodeId, rt: RuntimeId, ctl: &ComputeCtl, cidx: u32) -> Frame {
         Frame {
             node,
             rt,
-            deps: Vec::with_capacity(4),
+            deps: self.spare.pop().unwrap_or_else(|| Vec::with_capacity(4)),
             ctl,
             cidx,
             reading: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn recycle(&mut self, mut deps: Vec<(NodeId, u32)>) {
+        if self.spare.len() < SPARE_DEPS && deps.capacity() <= SPARE_DEPS_CAPACITY {
+            deps.clear();
+            self.spare.push(deps);
         }
     }
 }
@@ -169,7 +186,8 @@ pub trait DepStack: 'static {
         crate::lock_order::enter_frame();
         self.with(|s| {
             let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
-            s.push(Frames::frame(node, rt, ctl, cidx));
+            let frame = s.frame(node, rt, ctl, cidx);
+            s.push(frame);
             cidx
         })
     }
@@ -179,7 +197,10 @@ pub trait DepStack: 'static {
     #[doc(hidden)]
     fn push_frame_at(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl, cidx: u32) {
         crate::lock_order::enter_frame();
-        self.with(|s| s.push(Frames::frame(node, rt, ctl, cidx)))
+        self.with(|s| {
+            let frame = s.frame(node, rt, ctl, cidx);
+            s.push(frame);
+        })
     }
 
     /// Pop the top frame and return the deps it recorded, each with the
@@ -194,6 +215,13 @@ pub trait DepStack: 'static {
         });
         crate::lock_order::leave_frame();
         deps
+    }
+
+    /// Keeps a buffer [`Self::pop_frame`] returned for a later frame.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn recycle_deps(&self, deps: Vec<(NodeId, u32)>) {
+        self.with(|s| s.recycle(deps));
     }
 
     /// Record `dep`, read at `generation`, as a dependency of runtime
@@ -510,6 +538,24 @@ mod tests {
         let frame = s.pop_frame();
         assert_eq!(frame, vec![(NodeId(0), 0), (NodeId(1), 0), (NodeId(2), 0)]);
         assert!(!s.current_frame_active(rt(1)));
+    }
+
+    #[test]
+    fn a_recycled_deps_buffer_comes_back_empty() {
+        let s = SharedDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        s.record_dep(rt(1), NodeId(1), 0);
+        s.record_dep(rt(1), NodeId(2), 0);
+        let deps = s.pop_frame();
+        let buffer = deps.as_ptr();
+        s.recycle_deps(deps);
+        s.push_frame(rt(1), NodeId(101), &ctl);
+        s.record_dep(rt(1), NodeId(3), 0);
+        let deps = s.pop_frame();
+        assert_eq!(deps, vec![(NodeId(3), 0)]);
+        assert_eq!(deps.as_ptr(), buffer);
+        s.recycle_deps(deps);
     }
 
     #[test]
