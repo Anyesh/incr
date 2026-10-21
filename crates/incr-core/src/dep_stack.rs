@@ -166,6 +166,7 @@ pub trait DepStack: 'static {
     #[doc(hidden)]
     #[inline(always)]
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
+        crate::lock_order::enter_frame();
         self.with(|s| {
             let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
             s.push(Frames::frame(node, rt, ctl, cidx));
@@ -177,6 +178,7 @@ pub trait DepStack: 'static {
     /// member runs all sit at the root's.
     #[doc(hidden)]
     fn push_frame_at(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl, cidx: u32) {
+        crate::lock_order::enter_frame();
         self.with(|s| s.push(Frames::frame(node, rt, ctl, cidx)))
     }
 
@@ -184,12 +186,14 @@ pub trait DepStack: 'static {
     /// generation it was read at.
     #[inline(always)]
     fn pop_frame(&self) -> Vec<(NodeId, u32)> {
-        self.with(|s| {
+        let deps = self.with(|s| {
             s.frames
                 .pop()
                 .expect("incr-core: pop_frame on an empty stack")
                 .deps
-        })
+        });
+        crate::lock_order::leave_frame();
+        deps
     }
 
     /// Record `dep`, read at `generation`, as a dependency of runtime
@@ -332,6 +336,13 @@ pub trait DepStack: 'static {
     /// compute closures).
     fn current_frame_active(&self, rt: RuntimeId) -> bool {
         self.with(|s| s.active(rt).is_some())
+    }
+
+    /// True iff any runtime's compute frame is on this thread's stack,
+    /// at any depth. A callback's barrier frame belongs to no runtime and
+    /// does not count.
+    fn any_compute_frame(&self) -> bool {
+        self.with(|s| s.frames.iter().any(|f| f.rt != RuntimeId::SENTINEL))
     }
 
     /// The depth of the innermost frame on this stack computing `node`
@@ -597,6 +608,23 @@ mod tests {
         s.pop_frame();
         s.pop_frame();
         assert!(!active_frame_doomed());
+    }
+
+    #[test]
+    fn any_compute_frame_sees_every_runtime_but_not_a_barrier() {
+        let s = SharedDepStack::new();
+        let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
+        assert!(!s.any_compute_frame());
+        s.push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &a, u32::MAX);
+        assert!(!s.any_compute_frame());
+        s.pop_frame();
+        s.push_frame(rt(2), NodeId(5), &a);
+        s.push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &b, u32::MAX);
+        assert!(!s.current_frame_active(rt(1)));
+        assert!(s.any_compute_frame(), "a frame below the barrier counts");
+        s.pop_frame();
+        s.pop_frame();
+        assert!(!s.any_compute_frame());
     }
 
     #[test]

@@ -52,7 +52,9 @@ use std::sync::{Arc, OnceLock};
 use crate::cells::Cells;
 use crate::handle::{ErasedIncr, Incr};
 use crate::hashed_multiset::HashedMultiset;
-use crate::locks::Lock;
+use crate::lock_order::{self, LockKind, Ordered};
+use crate::locks::{Lock, OrderedLock};
+use crate::persist_hooks::{RepSide, RepSink};
 use crate::runtime::{ParkPoint, Runtime};
 use crate::value::Value;
 use crate::value_code;
@@ -72,18 +74,18 @@ pub(crate) fn park<C: Cells>(_rt: &Runtime<C>, _point: ParkPoint) {}
 /// a `RefCell` (no atomics, which is the point: collection ops on the
 /// single-threaded runtime pay no synchronization); under `Shared` it is
 /// the poison-ignoring `RwLock`.
-pub(crate) struct OpLock<T: 'static, C: Cells>(C::Lock<T>);
+pub(crate) struct OpLock<T: 'static, C: Cells>(OrderedLock<T, C>);
 
 impl<T: 'static, C: Cells> OpLock<T, C> {
-    pub(crate) fn new(v: T) -> Self {
-        Self(<C::Lock<T> as Lock<T>>::new(v))
+    pub(crate) fn new(kind: LockKind, v: T) -> Self {
+        Self(OrderedLock::new(kind, v))
     }
 
-    pub(crate) fn read(&self) -> <C::Lock<T> as Lock<T>>::ReadGuard<'_> {
+    pub(crate) fn read(&self) -> Ordered<<C::Lock<T> as Lock<T>>::ReadGuard<'_>> {
         self.0.read()
     }
 
-    pub(crate) fn write(&self) -> <C::Lock<T> as Lock<T>>::WriteGuard<'_> {
+    pub(crate) fn write(&self) -> Ordered<<C::Lock<T> as Lock<T>>::WriteGuard<'_>> {
         self.0.write()
     }
 }
@@ -220,8 +222,19 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// `Eq`) runs before anything changes; from the first change on no
     /// user code runs, and what the insert displaced comes back for the
     /// caller to drop.
-    pub(crate) fn insert_staged(&mut self, staged: StagedInsert<T>) -> Committed<T> {
-        let at = value_code::run(|| self.elements.locate_add(staged.hash, &staged.stored));
+    pub(crate) fn insert_staged<R: RepSink<T>>(
+        &mut self,
+        staged: StagedInsert<T>,
+        on_rep: &mut R,
+    ) -> Committed<T> {
+        let at = value_code::run(|| {
+            let at = self.elements.locate_add(staged.hash, &staged.stored);
+            if R::ACTIVE {
+                let rep = self.elements.stored_after_add(at, &staged.stored);
+                on_rep.on_rep(RepSide::Added, rep);
+            }
+            at
+        });
         let unused = self.elements.add(at, staged.stored);
         self.deltas.push(Delta::Insert(staged.delta));
         self.version += 1;
@@ -237,8 +250,18 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
 
     /// Phases 2 and 3 of a delete, as [`Self::insert_staged`]. A value
     /// that is not present records nothing and comes back displaced.
-    pub(crate) fn delete_staged(&mut self, staged: StagedDelete<T>) -> Committed<T> {
-        let found = value_code::run(|| self.elements.find(staged.hash, &staged.value));
+    pub(crate) fn delete_staged<R: RepSink<T>>(
+        &mut self,
+        staged: StagedDelete<T>,
+        on_rep: &mut R,
+    ) -> Committed<T> {
+        let found = value_code::run(|| {
+            let found = self.elements.find(staged.hash, &staged.value);
+            if let (true, Some(i)) = (R::ACTIVE, found) {
+                on_rep.on_rep(RepSide::Removed, self.elements.stored(i));
+            }
+            found
+        });
         let (version, value) = match found {
             Some(i) => {
                 let stored = self.elements.decrement_or_remove(i);
@@ -261,12 +284,26 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// Phases 2 and 3 of a replace: both lookups run before the first
     /// change, the add is applied before the remove, and both deltas are
     /// pushed under this one guard.
-    fn replace_staged(&mut self, staged: StagedReplace<T>) -> Committed<T, 2> {
+    fn replace_staged<R: RepSink<T>>(
+        &mut self,
+        staged: StagedReplace<T>,
+        on_rep: &mut R,
+    ) -> Committed<T, 2> {
         let at = value_code::run(|| {
-            self.elements.locate(
+            let at = self.elements.locate(
                 staged.remove.as_ref().map(|s| (s.hash, &s.value)),
                 Some((staged.add.hash, &staged.add.stored)),
-            )
+            );
+            if R::ACTIVE {
+                let [removed, added] = self.elements.representatives(at, &staged.add.stored);
+                if let Some(rep) = removed {
+                    on_rep.on_rep(RepSide::Removed, rep);
+                }
+                if let Some(rep) = added {
+                    on_rep.on_rep(RepSide::Added, rep);
+                }
+            }
+            at
         });
         let removed = at.removes();
         let [first, second] = self.elements.apply(at, Some(staged.add.stored));
@@ -302,20 +339,20 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
         keep: &mut Vec<Displaced<T>>,
     ) -> Option<u64> {
         let committed = match staged {
-            Staged::Insert(s) => self.insert_staged(s),
-            Staged::Delete(s) => self.delete_staged(s),
+            Staged::Insert(s) => self.insert_staged(s, &mut ()),
+            Staged::Delete(s) => self.delete_staged(s, &mut ()),
         };
         committed.keep(keep)
     }
 
     pub(crate) fn insert_kept(&mut self, value: T, keep: &mut Vec<Displaced<T>>) -> Option<u64> {
         let staged = StagedInsert::new(&self.hasher, value);
-        self.insert_staged(staged).keep(keep)
+        self.insert_staged(staged, &mut ()).keep(keep)
     }
 
     pub(crate) fn delete_kept(&mut self, value: T, keep: &mut Vec<Displaced<T>>) -> Option<u64> {
         let staged = StagedDelete::owned(&self.hasher, value);
-        self.delete_staged(staged).keep(keep)
+        self.delete_staged(staged, &mut ()).keep(keep)
     }
 
     /// The live elements and the log's end, under one guard, so the deltas
@@ -360,7 +397,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// is incremented. Returns the new version.
     pub fn insert(&mut self, value: T) -> u64 {
         let staged = StagedInsert::new(&self.hasher, value);
-        let committed = self.insert_staged(staged);
+        let committed = self.insert_staged(staged, &mut ());
         committed.version.expect("an insert always records a delta")
     }
 
@@ -369,7 +406,7 @@ impl<T: Hash + Eq + Clone> CollectionLog<T> {
     /// element was not in the collection (no delta recorded).
     pub fn delete(&mut self, value: &T) -> Option<u64> {
         let staged = StagedDelete::cloned(&self.hasher, value);
-        self.delete_staged(staged).version
+        self.delete_staged(staged, &mut ()).version
     }
 
     /// Snapshot of all live elements, with multiset duplicates expanded.
@@ -475,7 +512,8 @@ impl<T> Committed<T> {
 /// guard and setting the version node. A single insert or delete
 /// displaces at most one element, a replace at most two.
 #[must_use]
-pub(crate) struct Displaced<T, const N: usize = 1> {
+#[doc(hidden)]
+pub struct Displaced<T, const N: usize = 1> {
     values: [Option<T>; N],
     compacted: Vec<Delta<T>>,
 }
@@ -483,6 +521,21 @@ pub(crate) struct Displaced<T, const N: usize = 1> {
 impl<T, const N: usize> Displaced<T, N> {
     fn is_empty(&self) -> bool {
         self.values.iter().all(Option::is_none) && self.compacted.is_empty()
+    }
+
+    /// Moves everything displaced into `keep`, one element per entry, for
+    /// a caller that drops it later.
+    pub(crate) fn keep_into(self, keep: &mut Vec<Displaced<T>>) {
+        let mut compacted = Some(self.compacted);
+        for value in self.values {
+            let one = Displaced {
+                values: [value],
+                compacted: compacted.take().unwrap_or_default(),
+            };
+            if !one.is_empty() {
+                keep.push(one);
+            }
+        }
     }
 
     /// Drops everything displaced, at a point the type's rule allows, and
@@ -671,7 +724,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         let log = CollectionLog::new();
         Self {
             hasher: log.hasher.clone(),
-            log: Arc::new(OpLock::new(log)),
+            log: Arc::new(OpLock::new(LockKind::CollectionLog, log)),
             version_node: rt.create_input(0_u64),
             derived: false,
             _confine: std::marker::PhantomData,
@@ -699,7 +752,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         let log = CollectionLog::new();
         Self {
             hasher: log.hasher.clone(),
-            log: Arc::new(OpLock::new(log)),
+            log: Arc::new(OpLock::new(LockKind::CollectionLog, log)),
             version_node: rt.create_input_unchecked(0_u64),
             derived: true,
             _confine: std::marker::PhantomData,
@@ -727,10 +780,23 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     ///
     /// Panics if this collection is the output of an operator.
     pub fn insert(&self, rt: &Runtime<C>, value: T) {
+        self.insert_with(rt, value, &mut (), |d| d.release(&self.log));
+    }
+
+    /// [`Self::insert`] reporting its representative to `on_rep` and
+    /// handing what it displaced to `dispose`.
+    #[inline(always)]
+    pub(crate) fn insert_with<R: RepSink<T>>(
+        &self,
+        rt: &Runtime<C>,
+        value: T,
+        on_rep: &mut R,
+        dispose: impl FnOnce(Displaced<T>),
+    ) {
         self.check_mutable();
         value_code::check();
         let staged = StagedInsert::new(&self.hasher, value);
-        self.publish(rt, |log| log.insert_staged(staged));
+        self.publish(rt, |log| log.insert_staged(staged, on_rep), dispose);
     }
 
     /// Delete one occurrence. No-op (no log delta, no version bump) if
@@ -738,10 +804,22 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     ///
     /// Panics if this collection is the output of an operator.
     pub fn delete(&self, rt: &Runtime<C>, value: &T) -> bool {
+        self.delete_with(rt, value, &mut (), |d| d.release(&self.log))
+    }
+
+    /// [`Self::delete`] as [`Self::insert_with`].
+    #[inline(always)]
+    pub(crate) fn delete_with<R: RepSink<T>>(
+        &self,
+        rt: &Runtime<C>,
+        value: &T,
+        on_rep: &mut R,
+        dispose: impl FnOnce(Displaced<T>),
+    ) -> bool {
         self.check_mutable();
         value_code::check();
         let staged = StagedDelete::cloned(&self.hasher, value);
-        self.publish(rt, |log| log.delete_staged(staged))
+        self.publish(rt, |log| log.delete_staged(staged, on_rep), dispose)
     }
 
     /// Replace `old` (if present) with `new` as a single atomic step:
@@ -753,18 +831,31 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     ///
     /// Panics if this collection is the output of an operator.
     pub fn replace(&self, rt: &Runtime<C>, old: Option<&T>, new: T) -> bool {
+        self.replace_with(rt, old, new, &mut (), |d| d.release(&self.log))
+    }
+
+    /// [`Self::replace`] as [`Self::insert_with`].
+    #[inline(always)]
+    pub(crate) fn replace_with<R: RepSink<T>>(
+        &self,
+        rt: &Runtime<C>,
+        old: Option<&T>,
+        new: T,
+        on_rep: &mut R,
+        dispose: impl FnOnce(Displaced<T, 2>),
+    ) -> bool {
         self.check_mutable();
         value_code::check();
         let staged = StagedReplace {
             remove: old.map(|old| StagedDelete::cloned(&self.hasher, old)),
             add: StagedInsert::new(&self.hasher, new),
         };
-        self.publish(rt, |log| log.replace_staged(staged))
+        self.publish(rt, |log| log.replace_staged(staged, on_rep), dispose)
     }
 
     /// Runs a staged mutation's lookups and changes under the log guard,
-    /// then sets the version node, and only then drops what the change
-    /// displaced. User `Hash` and `Clone` ran in staging, before the guard,
+    /// then sets the version node, and only then hands what the change
+    /// displaced to `dispose`. User `Hash` and `Clone` ran in staging, before the guard,
     /// and user `Eq` runs before the first change, so a panic in either
     /// leaves the collection as it was. From the first change to the
     /// version set no user code runs. Returns whether a remove side found
@@ -774,12 +865,13 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
         &self,
         rt: &Runtime<C>,
         change: impl FnOnce(&mut CollectionLog<T>) -> Committed<T, N>,
+        dispose: impl FnOnce(Displaced<T, N>),
     ) -> bool {
         let committed = change(&mut self.log.write());
         if let Some(version) = committed.version {
             rt.set(self.version_node, version);
         }
-        committed.displaced.release(&self.log);
+        dispose(committed.displaced);
         committed.removed
     }
 
@@ -841,6 +933,7 @@ where
     where
         F: Fn(&T) -> bool + Send + Sync + 'static,
     {
+        let pred = lock_order::unlocked("pred", pred);
         self.per_element(rt, move |v| pred(&v).then_some(v))
     }
 
@@ -851,6 +944,7 @@ where
         U: Value + Hash + Eq,
         F: Fn(&T) -> U + Send + Sync + 'static,
     {
+        let f = lock_order::unlocked("f", f);
         self.per_element(rt, move |v| Some(f(&v)))
     }
 
@@ -869,7 +963,8 @@ where
 
         let output = CollectionLog::new();
         let out_hasher = output.hasher.clone();
-        let output_log: Arc<OpLock<CollectionLog<U>, C>> = Arc::new(OpLock::new(output));
+        let output_log: Arc<OpLock<CollectionLog<U>, C>> =
+            Arc::new(OpLock::new(LockKind::CollectionLog, output));
 
         // Bootstrap: seed the output from the live snapshot; the cursor
         // starts past everything the snapshot covered.
@@ -1016,12 +1111,14 @@ where
         Cmb: Fn(&U, &U) -> U + Send + Sync + 'static,
     {
         value_code::check();
+        let lift = lock_order::unlocked("lift", lift);
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
         let state = AggState::build(cloned(&identity), paired_with(&lift, bootstrap), &combine);
-        let state: Arc<OpLock<AggState<T, U>, C>> = Arc::new(OpLock::new(state));
+        let state: Arc<OpLock<AggState<T, U>, C>> =
+            Arc::new(OpLock::new(LockKind::AggregateState, state));
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
@@ -1096,6 +1193,8 @@ where
         FR: Fn(&U) -> K + Send + Sync + 'static,
     {
         value_code::check();
+        let left_key = lock_order::unlocked("left_key", left_key);
+        let right_key = lock_order::unlocked("right_key", right_key);
         let left_log = Arc::clone(&self.log);
         let right_log = Arc::clone(&right.log);
         let left_version = self.version_node;
@@ -1110,14 +1209,15 @@ where
             paired_with(&right_key, right_boot),
         );
         let output_log: Arc<OpLock<CollectionLog<(T, U)>, C>> =
-            Arc::new(OpLock::new(CollectionLog::new()));
+            Arc::new(OpLock::new(LockKind::CollectionLog, CollectionLog::new()));
         {
             let mut out = output_log.write();
             for pair in pairs {
                 out.insert(pair);
             }
         }
-        let state: Arc<OpLock<JoinState<T, U, K>, C>> = Arc::new(OpLock::new(st));
+        let state: Arc<OpLock<JoinState<T, U, K>, C>> =
+            Arc::new(OpLock::new(LockKind::OperatorState, st));
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
@@ -1227,13 +1327,15 @@ where
         F: Fn(&T) -> K + Send + Sync + 'static,
     {
         value_code::check();
+        let key_fn = lock_order::unlocked("key_fn", key_fn);
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
 
-        let groups: GroupMap<K, T, C> = Arc::new(OpLock::new(HashMap::new()));
-        let key_cache: Arc<OpLock<KeyCache<T, K>, C>> = Arc::new(OpLock::new(KeyCache::new()));
+        let groups: GroupMap<K, T, C> = Arc::new(OpLock::new(LockKind::GroupState, HashMap::new()));
+        let key_cache: Arc<OpLock<KeyCache<T, K>, C>> =
+            Arc::new(OpLock::new(LockKind::KeyCache, KeyCache::new()));
         let output_version_counter = Arc::new(AtomicU64::new(0));
 
         {

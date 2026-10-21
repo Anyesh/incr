@@ -3,13 +3,15 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
+use crate::flock::Flock;
 use crate::{Backend, Error, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use format::{
     decode_frames, header, journal_path, parse_header, push_frames, read_current, read_header,
-    remove_stale, scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current,
-    write_synced, HEADER_LEN, JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
+    remove_stale, scan, snapshot_path, snapshot_tmp_path, write_all_at, write_current, HEADER_LEN,
+    JOURNAL_MAGIC, LOCK, SNAPSHOT_MAGIC,
 };
+pub(crate) use format::{sync_dir, write_synced};
 
 mod format;
 #[cfg(test)]
@@ -42,8 +44,8 @@ pub struct FileBackend {
     dir: PathBuf,
     state: Mutex<State>,
     // Held for the handle's lifetime so that no second writer can open the
-    // log; dropping the file releases the lock. `None` for read-only handles.
-    lock: Option<File>,
+    // log; dropping it releases the lock. `None` for read-only handles.
+    lock: Option<Flock>,
 }
 
 #[derive(Debug)]
@@ -223,7 +225,7 @@ impl FileBackend {
                 synced,
                 failed: false,
             }),
-            lock: Some(lock),
+            lock: Some(Flock(lock)),
         })
     }
 

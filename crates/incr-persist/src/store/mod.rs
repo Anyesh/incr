@@ -1,21 +1,28 @@
 use std::any::Any;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Bound, RangeInclusive};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use incr_core::{with_value_code, Cells, DeleteError, Incr, Runtime, Value};
+use incr_core::lock_order::{LockKind, Ordered};
+use incr_core::persist_hooks::changed_at;
+use incr_core::{check_value_code, with_value_code, Cells, DeleteError, Incr, Runtime, Value};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use crate::{Backend, Error, Kind, Position, ReadOutcome, Record, Result, SnapshotId};
 
 use binding::{decode, encode, Binding, InputBinding};
+use dep_index::{fp_of, DepFp, DepIndex};
 use logged::{changes_between, fold, is_element_change, Declared, LoggedKey, LoggedKeys};
 
 pub use collection::PersistedCollection;
 
 mod binding;
 mod collection;
+pub(crate) mod dep_index;
+#[cfg(test)]
+#[path = "dep_index_tests.rs"]
+mod dep_index_tests;
 mod logged;
 
 /// The bound on values a [`Store`] persists: a runtime [`Value`] that serde
@@ -124,7 +131,10 @@ pub struct Batch<'s, C: Cells, B: Backend> {
 /// and is lost on restart.
 ///
 /// Store methods must not be called from inside a query's compute, because
-/// they create and set runtime inputs.
+/// they create and set runtime inputs, nor from a value, key or element
+/// type's trait method that the engine or the store is running, because
+/// that call may run under the store's own lock. Either call panics, in
+/// release builds too, before the store's lock is requested.
 ///
 /// A `Store<Local, _>` is confined to its thread like its runtime:
 ///
@@ -156,6 +166,8 @@ struct State<C: Cells> {
     next_id: u32,
     subscribers: Vec<(SubscriptionId, Subscriber)>,
     next_subscription: u64,
+    /// Kept current by every mapped write once a memo has opened it.
+    deps: Option<Arc<DepIndex>>,
 }
 
 impl<T: 'static> Input<T> {
@@ -334,6 +346,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
                 next_id: 0,
                 subscribers: Vec::new(),
                 next_subscription: 0,
+                deps: None,
             }),
         };
         {
@@ -341,6 +354,38 @@ impl<C: Cells, B: Backend> Store<C, B> {
             store.catch_up(&mut state, None)?;
         }
         Ok(store)
+    }
+
+    /// The store's [`DepIndex`], created on the first call with every key
+    /// this store has declared. From then on every mapped write keeps it
+    /// current.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn open_dep_index(&self) -> Result<Arc<DepIndex>> {
+        let mut guard = self.state()?;
+        let state = &mut *guard;
+        if let Some(deps) = &state.deps {
+            return Ok(Arc::clone(deps));
+        }
+        let mut entries = Vec::with_capacity(state.bound.len());
+        for (key, id) in &state.bound {
+            let binding = &state.bindings[id];
+            entries.push((
+                key,
+                binding.node(),
+                binding.kind(),
+                binding.dep_fp(&self.runtime)?,
+                binding.mapped_stamp(),
+            ));
+        }
+        let deps = Arc::new(DepIndex::default());
+        {
+            let mut map = deps.write();
+            for (key, handle, kind, fp, stamp) in entries {
+                map.register(key, handle, kind, fp, stamp);
+            }
+        }
+        state.deps = Some(Arc::clone(&deps));
+        Ok(deps)
     }
 
     /// The runtime the store keeps in sync with the log. Create queries and
@@ -384,17 +429,33 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         let declared = self.declare(state, key, Kind::Input, || encode(&default))?;
         let logged_default: T = decode(key, &declared.default)?;
-        let value = match &state.logged[key].value {
-            Some(bytes) => decode(key, bytes)?,
-            None => with_value_code(|| logged_default.clone()),
+        let default_fp = fp_of(&declared.default);
+        let (value, fp) = match &state.logged[key].value {
+            Some(bytes) => (decode(key, bytes)?, fp_of(bytes)),
+            None => (with_value_code(|| logged_default.clone()), default_fp),
         };
+        let mut hold = state.deps.as_deref().map(DepIndex::write);
         let handle = self.runtime.create_input(value);
+        let stamp = changed_at(&self.runtime, handle);
+        if let Some(map) = hold.as_deref_mut() {
+            map.register(
+                key,
+                handle.erase(),
+                Kind::Input,
+                DepFp::Known(fp),
+                Some(stamp),
+            );
+        }
+        drop(hold);
         let id = state.bind(
             key,
             Box::new(InputBinding {
                 key: key.to_owned(),
                 handle,
                 default: logged_default,
+                default_fp,
+                fp,
+                stamp,
             }),
         );
         Ok(Input { id, handle })
@@ -469,9 +530,19 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let binding = &state.bindings[&id];
         let key = binding.key().to_owned();
         let held = binding.unbind(&self.runtime)?;
+        let unregistered = state
+            .deps
+            .as_deref()
+            .and_then(|deps| deps.write().unregister(&key));
         match self.runtime.try_delete_node(binding.node()) {
             Ok(()) | Err(DeleteError::NotAlive) => {}
-            Err(DeleteError::HasDependents) => return Err(Error::HasDependents { key }),
+            Err(DeleteError::HasDependents) => {
+                if let (Some(deps), Some(entry)) = (state.deps.as_deref(), unregistered) {
+                    deps.write()
+                        .register(&key, entry.handle, entry.kind, entry.fp, entry.stamp);
+                }
+                return Err(Error::HasDependents { key });
+            }
         }
         state.bindings.remove(&id);
         state.bound.remove(&key);
@@ -756,10 +827,21 @@ impl<C: Cells, B: Backend> Store<C, B> {
         self.write(&mut state, vec![record])
     }
 
-    fn state(&self) -> Result<MutexGuard<'_, State<C>>> {
+    /// The only place the store mutex is locked. Both checks run in
+    /// release builds and before the lock: the holder may be waiting on a
+    /// claim the calling compute or value code's caller holds, and value
+    /// code may be running on the thread that holds the mutex.
+    fn state(&self) -> Result<Ordered<MutexGuard<'_, State<C>>>> {
+        assert!(
+            !self.runtime.frame_active(),
+            "incr-persist: Store methods must not be called from inside a query's compute",
+        );
+        check_value_code();
         // A panic while the mutex was held may have left the runtime and
         // the folded log out of step, which is the poisoned condition too.
-        let state = self.state.lock().map_err(|_| Error::Poisoned)?;
+        let state = Ordered::try_take(LockKind::Store, || {
+            self.state.lock().map_err(|_| Error::Poisoned)
+        })?;
         if state.poisoned {
             return Err(Error::Poisoned);
         }
@@ -971,7 +1053,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
     fn apply(&self, state: &mut State<C>, record: Record) -> Result<()> {
         if let Some(&id) = state.bound.get(record.key()) {
             let binding = bound_binding(&mut state.bindings, id);
-            binding.apply(&self.runtime, &record, state.logged.get(record.key()))?;
+            let deps = state.deps.as_deref();
+            binding.apply(&self.runtime, &record, state.logged.get(record.key()), deps)?;
             // A bound collection holds its elements by decoded value; folding
             // them by bytes as well would let the two disagree.
             if binding.kind() == Kind::Collection && is_element_change(&record) {
@@ -1066,7 +1149,8 @@ impl<C: Cells, B: Backend> Store<C, B> {
         }
         if let Some(id) = id {
             let changes = if rebuilt { None } else { changes };
-            bound_binding(&mut state.bindings, id).replace(&self.runtime, new, changes)?;
+            let deps = state.deps.as_deref();
+            bound_binding(&mut state.bindings, id).replace(&self.runtime, new, changes, deps)?;
         }
         Ok(())
     }

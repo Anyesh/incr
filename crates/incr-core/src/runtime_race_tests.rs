@@ -902,10 +902,10 @@ fn nested_superseded_dep_poisons_fast_path_publisher() {
 }
 
 /// A reader loads Q `Dirty` and stops before its claim. Meanwhile another
-/// reader cleans Q by cutoff and verifies D at revision 2, and a second
+/// reader cleans Q by cutoff and verifies D at revision 4, and a second
 /// set dirties both again. The stopped reader's claim then succeeds on
 /// the newer `Dirty`, so revisions captured before the claim predate the
-/// second set: Q's change would be stamped 2 and D, verified at 2, would
+/// second set: Q's change would be stamped 4 and D, verified at 4, would
 /// stay Clean over it.
 #[test]
 fn claim_on_a_later_dirty_stamps_that_dirty_revision() {
@@ -1523,4 +1523,35 @@ fn clean_try_get_vs_cyclic_landing() {
 fn clean_get_vs_cyclic_landing() {
     let msg = clean_read_vs_cyclic_landing(|rt, a| rt.get(a)).expect_err("a has no value");
     assert!(msg.contains("dependency cycle"), "got: {msg}");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn a_get_waiting_on_a_compute_checks_the_locks_it_holds() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let q = {
+        let gate = gate.clone();
+        rt.create_query(move |_: &Rt| {
+            gate.park();
+            1_u64
+        })
+    };
+    gate.arm();
+    let computer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(q))
+    };
+    gate.wait_parked();
+    let read = catch_unwind(AssertUnwindSafe(|| {
+        let _log = crate::lock_order::acquire(crate::lock_order::LockKind::CollectionLog);
+        rt.get(q)
+    }));
+    gate.release();
+    assert_eq!(computer.join().unwrap(), 1);
+    let msg = panic_message(read.expect_err("a claim wait under a collection log"));
+    assert!(
+        msg.contains("waiting on a claim while holding [CollectionLog]"),
+        "got: {msg}"
+    );
 }

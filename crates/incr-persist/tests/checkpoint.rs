@@ -571,9 +571,15 @@ fn a_compaction_by_another_writer_is_caught_up_and_retried() {
     let racer = Arc::clone(&other);
     let store = open::<Local, _>(Racing {
         inner: log.clone(),
+        // Another writer is another process: it never runs under this
+        // store's mutex on this thread.
         race: Mutex::new(Some(Box::new(move || {
-            racer.set(other_x, 2).unwrap();
-            racer.checkpoint().unwrap();
+            std::thread::spawn(move || {
+                racer.set(other_x, 2).unwrap();
+                racer.checkpoint().unwrap();
+            })
+            .join()
+            .unwrap();
         }))),
     });
     let x = store.input("x", 0u32).unwrap();

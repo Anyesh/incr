@@ -20,7 +20,8 @@ use std::marker::PhantomData;
 use std::ptr::{self, NonNull};
 
 use crate::cells::{Cells, PtrCell};
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 
 /// The front of a directory allocation; `len` entries follow it.
 #[repr(C)]
@@ -40,7 +41,7 @@ pub(crate) struct Directory<T: 'static, C: Cells> {
     current: C::Ptr<Header>,
     // Growth is rare (one per doubling), so a lock here costs nothing on
     // any path that does not grow.
-    retired: C::Lock<Vec<Retired>>,
+    retired: OrderedLock<Vec<Retired>, C>,
     // The directory holds pointers to `T` and never drops one, so it is
     // `Send` and `Sync` whatever `T` is, as `AtomicPtr<T>` is.
     _entries: PhantomData<fn() -> T>,
@@ -57,7 +58,7 @@ impl<T: 'static, C: Cells> Directory<T, C> {
         );
         Self {
             current: C::Ptr::new(Self::alloc(len).as_ptr()),
-            retired: <C::Lock<Vec<Retired>> as Lock<_>>::new(Vec::new()),
+            retired: OrderedLock::new(LockKind::Directory, Vec::new()),
             _entries: PhantomData,
         }
     }

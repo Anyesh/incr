@@ -31,6 +31,7 @@ use crate::collection::{
     IncrCollection, NeedsRebuild, OpLock,
 };
 use crate::handle::Incr;
+use crate::lock_order::{self, LockKind};
 use crate::runtime::Runtime;
 use crate::value::Value;
 use crate::value_code;
@@ -258,6 +259,7 @@ where
         F: Fn(&T) -> K + Send + Sync + 'static,
     {
         value_code::check();
+        let key_fn = lock_order::unlocked("key_fn", key_fn);
         let upstream_log = Arc::clone(&self.log);
         let upstream_version = self.version_node;
 
@@ -266,7 +268,8 @@ where
         for (v, key) in paired_with(&key_fn, bootstrap) {
             st.insert(v, key);
         }
-        let state: Arc<OpLock<SortedState<T, K>, C>> = Arc::new(OpLock::new(st));
+        let state: Arc<OpLock<SortedState<T, K>, C>> =
+            Arc::new(OpLock::new(LockKind::CollectionLog, st));
 
         let rebuild = NeedsRebuild::new();
         let state_for_query = Arc::clone(&state);
@@ -458,7 +461,7 @@ where
 
         let (cursor, bootstrap) = state.write().register_consumer();
         let output_log: Arc<OpLock<CollectionLog<O>, C>> =
-            Arc::new(OpLock::new(CollectionLog::new()));
+            Arc::new(OpLock::new(LockKind::CollectionLog, CollectionLog::new()));
         {
             let seeded = value_code::run(|| outputs(&bootstrap));
             let mut out = output_log.write();
@@ -466,7 +469,8 @@ where
                 out.insert(o);
             }
         }
-        let mirror: Arc<OpLock<Vec<T>, C>> = Arc::new(OpLock::new(bootstrap));
+        let mirror: Arc<OpLock<Vec<T>, C>> =
+            Arc::new(OpLock::new(LockKind::OperatorState, bootstrap));
 
         let rebuild = NeedsRebuild::new();
         let output_log_for_query = Arc::clone(&output_log);

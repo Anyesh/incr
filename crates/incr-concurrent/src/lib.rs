@@ -27,8 +27,11 @@
 use incr_core::Shared;
 
 #[doc(hidden)]
+pub use incr_core::persist_hooks;
+#[doc(hidden)]
 pub use incr_core::{
-    active_frame_doomed, engine_unwind, engine_unwind_in_progress, take_last_cycle, with_value_code,
+    active_frame_doomed, check_value_code, engine_unwind, engine_unwind_in_progress,
+    take_last_cycle, with_value_code,
 };
 pub use incr_core::{
     Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint, FxBuildHasher, FxHasher,
@@ -61,9 +64,9 @@ mod reexports {
     #[test]
     fn every_incr_core_item_is_reexported() {
         use crate::{
-            active_frame_doomed, engine_unwind, engine_unwind_in_progress, take_last_cycle,
-            with_value_code, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr, Fixpoint,
-            FxBuildHasher, FxHasher, GroupedCollection, GroupedCollectionInner, Incr,
+            active_frame_doomed, check_value_code, engine_unwind, engine_unwind_in_progress,
+            take_last_cycle, with_value_code, Cycle, CycleStrategy, DeleteError, Delta, ErasedIncr,
+            Fixpoint, FxBuildHasher, FxHasher, GroupedCollection, GroupedCollectionInner, Incr,
             IncrCollection, IncrCollectionInner, NodeId, NodeInfo, NodeKindInfo, NodeState,
             NodeTable, NodeTableInner, NodeTrace, ObserverId, PropagationTrace, QueryOpts, Replay,
             Runtime, RuntimeId, SortDelta, SortedCollection, SortedCollectionInner, TableKey,
@@ -71,6 +74,7 @@ mod reexports {
         };
 
         fn named<T: ?Sized>() {}
+        named::<crate::persist_hooks::SeedBase>();
         fn value<T: Value>() {}
         let _ = (
             active_frame_doomed,
@@ -113,5 +117,6 @@ mod reexports {
         named::<TraceAction>();
         value::<u32>();
         with_value_code(|| ());
+        check_value_code();
     }
 }

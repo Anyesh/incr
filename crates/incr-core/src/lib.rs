@@ -33,12 +33,17 @@ pub mod fx;
 pub mod generic_arena;
 pub mod handle;
 mod hashed_multiset;
+pub mod lock_order;
 pub mod locks;
 #[cfg(loom)]
 pub mod loom_cells;
 #[cfg(all(test, loom))]
 mod loom_models;
+#[cfg(all(test, loom))]
+mod loom_seed_models;
 pub mod node;
+#[doc(hidden)]
+pub mod persist_hooks;
 mod reclaim_probe;
 mod replay;
 pub mod runtime;
@@ -78,7 +83,7 @@ pub use table::{NodeTable, TableKey};
 pub use trace::{NodeInfo, NodeKindInfo, NodeTrace, PropagationTrace, TraceAction};
 pub use value::Value;
 #[doc(hidden)]
-pub use value_code::with_value_code;
+pub use value_code::{check_value_code, with_value_code};
 pub use value_slot::{LocalValueSlot, SharedValueSlot, ValueSlot};
 
 #[cfg(test)]

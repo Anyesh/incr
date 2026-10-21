@@ -37,7 +37,8 @@ use crate::dependent_list::DependentList;
 use crate::fx::FxBuildHasher;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
@@ -195,6 +196,14 @@ pub(crate) enum ParkPoint {
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
+    /// In `seed_query`'s `inner.write()`, before the trust check of the
+    /// trusted dep `NodeId`.
+    SeedBeforeTrust(NodeId),
+    /// In `seed_query`'s `inner.write()`, after the trust check of the
+    /// trusted dep `NodeId`.
+    SeedAfterTrust(NodeId),
+    /// In `inspect`, after its first read hold and before the clone.
+    InspectBetweenHolds(NodeId),
     /// In `stabilize`, after it took its observers and before the first
     /// one runs.
     StabilizeAfterDrain,
@@ -322,18 +331,20 @@ impl<C: Cells> SetClaim<'_, C> {
     /// releases the claim a second time. The release precedes the walk
     /// so that a delete or set waiting on the claim is not held up by it.
     #[inline(always)]
-    fn finish_written(mut self) {
+    fn finish_written(mut self) -> u64 {
         self.held = false;
         let rev = self.rt.bump_revision();
         let walk_done = WalkDone { rt: self.rt, rev };
         self.rt.park(ParkPoint::SetAfterBump);
-        self.node.settle_changed_at(rev);
+        let stamp = NodeData::<C>::input_stamp(rev);
+        self.node.settle_changed_at(stamp);
         self.node.release_set_claim(self.base, rev);
         set_stack::pop(self.rt.runtime_id, self.id.0);
         self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         std::mem::forget(self);
+        stamp
     }
 }
 
@@ -745,9 +756,9 @@ pub struct Runtime<C: Cells> {
     /// Read with no lock; written only under `inner.write()`, through
     /// `Inner::arena_tags`.
     pub(crate) arenas: ArenaRegistry<C>,
-    pub(crate) inner: <C as Cells>::Lock<Inner<C>>,
+    pub(crate) inner: OrderedLock<Inner<C>, C>,
     /// Taken only inside an `inner` section or with no lock held.
-    pub(crate) watch_queue: <C as Cells>::Lock<watch_impl::WatchQueue>,
+    pub(crate) watch_queue: OrderedLock<watch_impl::WatchQueue, C>,
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
@@ -851,10 +862,10 @@ impl<C: Cells> Runtime<C> {
         Self {
             nodes: SegmentedNodes::new(),
             arenas: ArenaRegistry::new(),
-            inner: <<C as Cells>::Lock<Inner<C>> as Lock<Inner<C>>>::new(Inner::new()),
-            watch_queue: Lock::new(watch_impl::WatchQueue::new()),
-            revision: C::new_u64(1),
-            walk: C::new_watermark(1),
+            inner: OrderedLock::new(LockKind::Inner, Inner::new()),
+            watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
+            revision: C::new_u64(2),
+            walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id: RuntimeId::allocate(),
             tracing_armed: C::new_u8(0),
@@ -965,7 +976,7 @@ impl<C: Cells> Runtime<C> {
         // fetch_add, not load+store: two concurrent set() calls must not
         // collapse into one revision or the cutoff protocol conflates
         // their changes.
-        C::u64_fetch_add(&self.revision, 1) + 1
+        C::u64_fetch_add(&self.revision, 2) + 2
     }
 
     /// Create an input node with an initial value.
@@ -1231,6 +1242,15 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     fn pending_out_of_reach(&self) -> ! {
         panic!("incr-core: pending handle used outside the replay attempt that produced it");
+    }
+
+    /// Whether this thread is inside a compute of any runtime. Every
+    /// runtime on a thread shares its frame stack, and a compute of
+    /// another runtime holds that runtime's claim as surely as one of this
+    /// runtime's does.
+    #[doc(hidden)]
+    pub fn frame_active(&self) -> bool {
+        self.dep_stack.any_compute_frame()
     }
 
     /// Whether this runtime's active frame on this thread is doomed.
@@ -2401,11 +2421,52 @@ impl<C: Cells> Runtime<C> {
         value_code::check();
         self.check_runtime(handle);
         let (claim, arena, arena_slot) = self.claim_input(handle);
-        let displaced = self.write_claimed(claim, arena, arena_slot, value);
+        let (displaced, _) = self.write_claimed(claim, arena, arena_slot, value, drop);
         // The old value's user `Drop`, or the reclaim its retire may run,
         // happens with no claim held and none of the locks this set took.
         drop(displaced);
         reclaim_probe::reached(RetireSite::SetRetire);
+    }
+
+    /// `handle`'s `changed_at`, loaded with Acquire. `u64::MAX` while a
+    /// `set` of it is between its compare and its settle.
+    pub(crate) fn changed_at<T: Value>(&self, handle: Incr<T>) -> u64 {
+        self.check_handle(handle);
+        self.nodes.get(handle.slot()).changed_at()
+    }
+
+    /// [`Self::changed_at`] of a handle that may be dead or recycled:
+    /// `None` unless the node is alive at the handle's generation through
+    /// the read.
+    pub(crate) fn changed_at_erased(&self, handle: ErasedIncr) -> Option<u64> {
+        if !self.is_alive(handle) {
+            return None;
+        }
+        let node = self.nodes.get(handle.slot());
+        let stamp = node.changed_at();
+        C::fence_acquire();
+        (node.generation() == handle.generation()).then_some(stamp)
+    }
+
+    /// [`Self::set`] that hands back what it would drop: the displaced
+    /// value if it wrote, or the rejected equal value if it did not, with
+    /// the input's `changed_at` as this call left it.
+    pub(crate) fn set_returning_displaced<T: Value>(
+        &self,
+        handle: Incr<T>,
+        value: T,
+    ) -> (Compared<T, Displaced<T, C>>, u64) {
+        value_code::check();
+        self.check_runtime(handle);
+        let (claim, arena, arena_slot) = self.claim_input(handle);
+        let mut rejected = None;
+        let (displaced, stamp) =
+            self.write_claimed(claim, arena, arena_slot, value, |r| rejected = Some(r));
+        let compared = match rejected {
+            Some(rejected) => Compared::Equal(rejected),
+            None => Compared::Replaced(displaced),
+        };
+        (compared, stamp)
     }
 
     /// Take `set`'s claim on `handle`'s input, with the arena and slot
@@ -2479,14 +2540,18 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// `set` from its claim to its walk. Returns what the write
-    /// displaced, if it wrote.
+    /// displaced, if it wrote, and the input's `changed_at` read under the
+    /// claim: the stamp this write settled, or the one an equal value
+    /// already carried. An equal value is handed to `rejected` once its
+    /// earlier change has walked.
     fn write_claimed<T: Value>(
         &self,
         claim: SetClaim<'_, C>,
         arena: &GenericArena<T, C>,
         arena_slot: u32,
         value: T,
-    ) -> Option<Displaced<T, C>> {
+        rejected: impl FnOnce(T),
+    ) -> (Option<Displaced<T, C>>, u64) {
         let node = claim.node;
         // Publication order is the protocol's backbone:
         // 1. pending marker, so no verifier can stamp past this change
@@ -2497,24 +2562,26 @@ impl<C: Cells> Runtime<C> {
         //    revision also observes the new value (swap is sequenced
         //    before the AcqRel fetch_add);
         // 3. revision bump;
-        // 4. settle changed_at to the concrete revision;
+        // 4. settle changed_at to the revision's input stamp;
         // 5. claim release, then the dirty walk, whose Release stores
         //    publish all of the above to claimants that Acquire the
         //    Dirty state.
         match arena.compare_and_write(arena_slot, value, || node.mark_changed_pending()) {
-            Compared::Equal(rejected) => {
+            Compared::Equal(equal) => {
                 // The set that wrote this value released its claim before
                 // its walk, and this call must not return before that
                 // change is visible to its caller's dependents.
                 let changed_at = node.changed_at();
                 drop(claim);
+                // The stamp is the odd one below its set's revision, and
+                // `walked` is even, so reaching the stamp reaches the set.
                 self.wait_walked(changed_at);
-                drop(rejected);
-                None
+                rejected(equal);
+                (None, changed_at)
             }
             Compared::Replaced(displaced) => {
-                claim.finish_written();
-                displaced
+                let stamp = claim.finish_written();
+                (displaced, stamp)
             }
         }
     }
@@ -2540,9 +2607,14 @@ impl<C: Cells> Runtime<C> {
             self.waits_on_own_claim(id);
         }
         self.refuse_wait_on_computing(id);
+        if spins == 1 {
+            crate::lock_order::assert_may_wait_on_claim();
+        }
         if !C::SINGLE_THREADED && spins >= waits::REGISTER_AFTER {
             let node = self.nodes.get(id.0);
-            self.wait_registered(id, || !is_computing(state::load::<C>(node.state_cell())));
+            self.wait_registered(id, None, || {
+                !is_computing(state::load::<C>(node.state_cell()))
+            });
         } else {
             C::backoff(spins);
         }
@@ -3947,70 +4019,8 @@ impl<C: Cells> Runtime<C> {
 // !Send + !Sync by auto-derive. We rely on auto traits here; no manual
 // impls needed.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl<C: Cells> Runtime<C> {
-    #[cfg(not(loom))]
-    /// Give `member` installed edges to `extra` on top of its own, with
-    /// the reverse edges, as an episode leaves a cycle's members.
-    pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
-        let mut inner = self.inner.write();
-        let id = NodeId(member.slot());
-        let node = self.nodes.get(id.0);
-        let mut deps = Vec::new();
-        node.for_each_dep(|d| deps.push(d));
-        for e in extra {
-            deps.push(NodeId(e.slot()));
-            inner.dependents[e.slot() as usize].push_unique(id);
-        }
-        if let Some(displaced) = node.install_deps(&deps) {
-            drop(displaced);
-        }
-    }
-
-    #[cfg(not(loom))]
-    pub(crate) fn force_state_for_test<T>(&self, h: Incr<T>, to: NodeState) {
-        state::store::<C>(self.nodes.get(h.slot()).state_cell(), to);
-    }
-
-    /// Moves a never-run query from New to Dirty, as no engine path does,
-    /// so that a verify meets an empty slot behind `verified_at = 0`.
-    #[cfg(not(loom))]
-    pub(crate) fn force_dirty_for_test<T>(&self, h: Incr<T>) {
-        let node = self.nodes.get(h.slot());
-        assert_eq!(node.dep_count(), 0, "a forced node has no installed deps");
-        assert_eq!(node.verified_at(), 0, "a forced node was never verified");
-        state::try_transition::<C>(node.state_cell(), NodeState::New, NodeState::Dirty)
-            .expect("a forced node is New");
-    }
-
-    /// Records `members` as one landed group, as an episode's step 2 does.
-    #[cfg(not(loom))]
-    pub(crate) fn force_group_for_test(&self, members: &[ErasedIncr]) {
-        let mut inner = self.inner.write();
-        let mut sorted: Vec<(u32, u32)> =
-            members.iter().map(|m| (m.slot(), m.generation())).collect();
-        sorted.sort_unstable();
-        let group = Arc::new(GroupInfo {
-            members: sorted,
-            cycle: Cycle::new(members.to_vec()),
-        });
-        for m in members {
-            inner.member_recs.insert(m.slot(), group.clone());
-            let flags = self.nodes.get_with_flags(m.slot()).1;
-            C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
-        }
-    }
-
-    #[cfg(not(loom))]
-    pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
-        self.nodes.get(h.slot()).verified_at()
-    }
-
-    #[cfg(not(loom))]
-    pub(crate) fn walk_pops(&self) -> u64 {
-        self.walk_pops.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Invariant (I) of the shared-protocol plan, checked at quiescence:
     /// every installed dep S of a `Clean` node X is alive, has X in
     /// `dependents[S]`, and is itself `Clean`. Also checks that no freed
@@ -4117,14 +4127,6 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    pub(crate) fn has_reverse_edge<T, U>(&self, dep: Incr<T>, dependent: Incr<U>) -> bool {
-        self.inner.read().dependents[dep.slot() as usize].contains(NodeId(dependent.slot()))
-    }
-
-    pub(crate) fn state_of<T>(&self, handle: Incr<T>) -> NodeState {
-        self.nodes.get(handle.slot()).state()
-    }
-
     /// Every installed dep of a node that is not `Dead` is alive and has
     /// the node in its dependents. Covers `Dirty`, `Failed` and recovered
     /// `New` nodes, where a missing edge would otherwise surface only
@@ -4153,6 +4155,79 @@ impl<C: Cells> Runtime<C> {
             });
         }
     }
+}
+
+#[cfg(test)]
+impl<C: Cells> Runtime<C> {
+    #[cfg(not(loom))]
+    /// Give `member` installed edges to `extra` on top of its own, with
+    /// the reverse edges, as an episode leaves a cycle's members.
+    pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
+        let mut inner = self.inner.write();
+        let id = NodeId(member.slot());
+        let node = self.nodes.get(id.0);
+        let mut deps = Vec::new();
+        node.for_each_dep(|d| deps.push(d));
+        for e in extra {
+            deps.push(NodeId(e.slot()));
+            inner.dependents[e.slot() as usize].push_unique(id);
+        }
+        if let Some(displaced) = node.install_deps(&deps) {
+            drop(displaced);
+        }
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn force_state_for_test<T>(&self, h: Incr<T>, to: NodeState) {
+        state::store::<C>(self.nodes.get(h.slot()).state_cell(), to);
+    }
+
+    /// Moves a never-run query from New to Dirty, as no engine path does,
+    /// so that a verify meets an empty slot behind `verified_at = 0`.
+    #[cfg(not(loom))]
+    pub(crate) fn force_dirty_for_test<T>(&self, h: Incr<T>) {
+        let node = self.nodes.get(h.slot());
+        assert_eq!(node.dep_count(), 0, "a forced node has no installed deps");
+        assert_eq!(node.verified_at(), 0, "a forced node was never verified");
+        state::try_transition::<C>(node.state_cell(), NodeState::New, NodeState::Dirty)
+            .expect("a forced node is New");
+    }
+
+    /// Records `members` as one landed group, as an episode's step 2 does.
+    #[cfg(not(loom))]
+    pub(crate) fn force_group_for_test(&self, members: &[ErasedIncr]) {
+        let mut inner = self.inner.write();
+        let mut sorted: Vec<(u32, u32)> =
+            members.iter().map(|m| (m.slot(), m.generation())).collect();
+        sorted.sort_unstable();
+        let group = Arc::new(GroupInfo {
+            members: sorted,
+            cycle: Cycle::new(members.to_vec()),
+        });
+        for m in members {
+            inner.member_recs.insert(m.slot(), group.clone());
+            let flags = self.nodes.get_with_flags(m.slot()).1;
+            C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
+        }
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
+        self.nodes.get(h.slot()).verified_at()
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn walk_pops(&self) -> u64 {
+        self.walk_pops.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn has_reverse_edge<T, U>(&self, dep: Incr<T>, dependent: Incr<U>) -> bool {
+        self.inner.read().dependents[dep.slot() as usize].contains(NodeId(dependent.slot()))
+    }
+
+    pub(crate) fn state_of<T>(&self, handle: Incr<T>) -> NodeState {
+        self.nodes.get(handle.slot()).state()
+    }
 
     pub(crate) fn assert_walks_complete(&self) {
         assert_eq!(
@@ -4180,6 +4255,13 @@ mod watch_impl;
 
 #[path = "runtime_observe.rs"]
 mod observe_impl;
+
+#[path = "runtime_seed.rs"]
+mod seed_impl;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_seed_tests.rs"]
+mod seed_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_watch_tests.rs"]
@@ -5212,6 +5294,24 @@ mod tests {
 
         rt.set(input, 5);
         assert_eq!(rt.get(parent), 12);
+    }
+
+    fn frame_active_inside_a_compute_only<C: Cells>() {
+        let rt: Runtime<C> = Runtime::new();
+        assert!(!rt.frame_active());
+        let q = rt.create_query(|rt| rt.frame_active());
+        assert!(rt.get(q));
+        assert!(!rt.frame_active());
+    }
+
+    #[test]
+    fn local_frame_active_inside_a_compute_only() {
+        frame_active_inside_a_compute_only::<Local>();
+    }
+
+    #[test]
+    fn shared_frame_active_inside_a_compute_only() {
+        frame_active_inside_a_compute_only::<Shared>();
     }
 
     /// A query may read more than 255 inputs; the u8 dep-count cell uses
