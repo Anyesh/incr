@@ -212,7 +212,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.query(rt, key, f, || ErasedOpts::NONE)
+        self.query(rt, key, || (f, ErasedOpts::NONE))
     }
 
     /// [`Self::get_or_insert_query`] with options for the query a miss
@@ -227,17 +227,34 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
-        self.query(rt, key, f, || rt.erase_query_opts(opts))
+        self.query(rt, key, || (f, rt.erase_query_opts(opts)))
     }
 
-    /// `opts` is erased only on a miss that creates the query.
+    /// [`Self::get_or_insert_query_with`] with the compute and options
+    /// built by `make` only on a miss that creates the query, so a hit
+    /// pays nothing for options that allocate. `make` runs with no lock
+    /// held.
+    pub fn get_or_insert_query_lazy<F>(
+        &self,
+        rt: &Runtime<C>,
+        key: GridKey,
+        make: impl FnOnce() -> (F, QueryOpts<T>),
+    ) -> Incr<T>
+    where
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
+        self.query(rt, key, || {
+            let (f, opts) = make();
+            (f, rt.erase_query_opts(opts))
+        })
+    }
+
     #[inline]
     fn query<F>(
         &self,
         rt: &Runtime<C>,
         key: GridKey,
-        f: F,
-        opts: impl FnOnce() -> ErasedOpts,
+        make: impl FnOnce() -> (F, ErasedOpts),
     ) -> Incr<T>
     where
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
@@ -250,7 +267,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         if rt.frame_doomed() {
             return rt.pending_handle();
         }
-        let opts = opts();
+        let (f, opts) = make();
         self.miss(rt, key, (f, opts), |rt, (f, opts)| {
             rt.create_query_erased::<false, _, _>(f, opts)
         })

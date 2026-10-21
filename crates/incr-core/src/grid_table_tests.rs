@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{GridKey, GridTable, PAGE_ROWS};
@@ -11,6 +12,8 @@ use crate::runtime::Runtime;
 fn key(sheet: u32, row: u32, column: u32) -> GridKey {
     GridKey::new(sheet, row, column)
 }
+
+type Built<C> = (fn(&Runtime<C>) -> i64, QueryOpts<i64>);
 
 fn replayable<T>() -> QueryOpts<T> {
     QueryOpts {
@@ -60,6 +63,7 @@ both!(
     grid_an_insert_with_a_repeated_key_creates_nothing,
     grid_an_insert_replaces_a_deleted_node,
     grid_type_fallback_queries_need_and_use_their_types_fallback,
+    grid_a_lazy_query_is_built_only_on_a_miss,
 );
 
 fn grid_a_hit_returns_the_first_node<C: Cells>(rt: &Runtime<C>) {
@@ -249,6 +253,10 @@ where
             assert!(!rt.is_alive(p));
             out.pending = Some(p);
             out.query = Some(t2.get_or_insert_query(rt, key(0, 3, 0), |_| 0));
+            let lazy = t2.get_or_insert_query_lazy(rt, key(0, 4, 0), || -> Built<C> {
+                unreachable!("a doomed miss builds nothing")
+            });
+            assert_eq!(lazy, p);
             0_i64
         },
         replayable(),
@@ -264,6 +272,7 @@ where
     assert_eq!(rt.node_count(), nodes, "a doomed miss creates nothing");
     assert_eq!(t.get(rt, key(0, 2, 0)), None, "and enters nothing");
     assert_eq!(t.get(rt, key(0, 3, 0)), None);
+    assert_eq!(t.get(rt, key(0, 4, 0)), None);
 }
 
 fn grid_insert_inputs_enters_every_node<C: Cells>(rt: &Runtime<C>) {
@@ -419,4 +428,51 @@ where
     let b = t.insert_queries_watched(rt, vec![(key(0, 1, 0), reads(0), type_fallback())]);
     assert_eq!(rt.get(a), 7);
     assert_eq!(rt.get(b[0]), 7);
+}
+
+fn grid_a_lazy_query_is_built_only_on_a_miss<C: Cells>(rt: &Runtime<C>)
+where
+    GridTable<i64, C>: Send + Sync,
+{
+    let t = Arc::new(rt.create_grid_table::<i64>());
+    let builds = Arc::new(AtomicU32::new(0));
+    let (t2, b2) = (t.clone(), builds.clone());
+    let cyclic = t.get_or_insert_query_lazy(rt, key(0, 0, 0), move || {
+        b2.fetch_add(1, Ordering::Relaxed);
+        let t3 = t2.clone();
+        let reads_itself = move |rt: &Runtime<C>| {
+            let me = t3.get_or_insert_query_lazy(rt, key(0, 0, 0), || -> Built<C> {
+                unreachable!("a hit inside a compute builds nothing")
+            });
+            rt.get(me) + 1
+        };
+        let opts = QueryOpts {
+            cycle: CycleStrategy::fallback(|_| -5),
+            ..Default::default()
+        };
+        (reads_itself, opts)
+    });
+    assert_eq!(builds.load(Ordering::Relaxed), 1);
+    assert_eq!(rt.get(cyclic), -5, "the options built on the miss apply");
+    let again = t.get_or_insert_query_lazy(rt, key(0, 0, 0), || -> Built<C> {
+        unreachable!("a hit builds nothing")
+    });
+    assert_eq!(again, cyclic);
+
+    let (t2, b2) = (t.clone(), builds.clone());
+    let outer = rt.create_query(move |rt| {
+        let b3 = b2.clone();
+        let inner = t2.get_or_insert_query_lazy(rt, key(0, 1, 0), move || -> Built<C> {
+            b3.fetch_add(1, Ordering::Relaxed);
+            (|_| 4, QueryOpts::default())
+        });
+        rt.get(inner) * 10
+    });
+    assert_eq!(rt.get(outer), 40);
+    assert_eq!(
+        builds.load(Ordering::Relaxed),
+        2,
+        "a miss inside a compute builds once"
+    );
+    assert!(t.get(rt, key(0, 1, 0)).is_some());
 }
