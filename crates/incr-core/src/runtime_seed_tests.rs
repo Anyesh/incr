@@ -13,8 +13,8 @@ use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::handle::{ErasedIncr, Incr};
 use crate::persist_hooks::{
-    get_or_insert_query_seeded, inspect, probe_unchecked, seed_base, seed_query, Reuse, SeedDep,
-    SeedError,
+    changed_at, changed_at_erased, frame_doomed, get_or_insert_query_seeded, inspect,
+    pending_handle, probe_unchecked, seed_base, seed_query, Reuse, SeedDep, SeedError,
 };
 use crate::state::NodeState;
 use crate::table::NodeTable;
@@ -52,6 +52,8 @@ both!(
     inspect_reads_a_clean_node_with_its_deps,
     table_seeds_only_a_node_it_creates,
     a_panicking_seed_hook_leaves_no_node,
+    changed_at_erased_refuses_dead_and_foreign_handles,
+    a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle,
 );
 
 fn dep<T>(h: Incr<T>) -> SeedDep {
@@ -410,6 +412,46 @@ fn a_panicking_seed_hook_leaves_no_node<C: Cells>() {
         let again = table.get_or_insert_query(&rt, 0, f);
         assert_eq!(rt.get(again), 40);
     }
+}
+
+fn changed_at_erased_refuses_dead_and_foreign_handles<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let other = Runtime::<C>::new();
+    let x = rt.create_input(1_u64);
+    rt.set(x, 2);
+    assert_eq!(changed_at_erased(&rt, x.erase()), Some(changed_at(&rt, x)));
+    assert_eq!(changed_at_erased(&other, x.erase()), None);
+    rt.delete_node(x);
+    assert_eq!(changed_at_erased(&rt, x.erase()), None);
+    let recycled = rt.create_input(3_u64);
+    assert_eq!(recycled.slot(), x.slot());
+    assert_eq!(changed_at_erased(&rt, x.erase()), None);
+}
+
+/// Outside a compute and in the retry nothing is doomed; in the doomed
+/// run the pending handle reads the placeholder.
+fn a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder::<u64>(9);
+    let gate = rt.doom_gate();
+    assert!(!frame_doomed(&rt));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    let q = rt.create_query_with(
+        move |rt| {
+            let open = rt.get(gate).0;
+            let doomed = frame_doomed(rt);
+            let read = doomed.then(|| rt.get(pending_handle::<u64, _>(rt)));
+            log.lock().unwrap().push((open, doomed, read));
+            0_u64
+        },
+        super::replay_tests::replayable(),
+    );
+    rt.get(q);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(false, true, Some(9)), (true, false, None)]
+    );
 }
 
 /// A dep seeded at W0 and trusted by R, claimed by a reader inside the

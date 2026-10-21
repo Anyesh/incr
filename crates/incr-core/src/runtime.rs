@@ -2337,6 +2337,19 @@ impl<C: Cells> Runtime<C> {
         self.nodes.get(handle.slot()).changed_at()
     }
 
+    /// [`Self::changed_at`] of a handle that may be dead or recycled:
+    /// `None` unless the node is alive at the handle's generation through
+    /// the read.
+    pub(crate) fn changed_at_erased(&self, handle: ErasedIncr) -> Option<u64> {
+        if !self.is_alive(handle) {
+            return None;
+        }
+        let node = self.nodes.get(handle.slot());
+        let stamp = node.changed_at();
+        C::fence_acquire();
+        (node.generation() == handle.generation()).then_some(stamp)
+    }
+
     /// [`Self::set`] that hands back what it would drop: the displaced
     /// value if it wrote, or the rejected equal value if it did not.
     pub(crate) fn set_returning_displaced<T: Value>(
