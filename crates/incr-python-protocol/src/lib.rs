@@ -107,8 +107,7 @@ pub fn raise_into_engine(e: PyErr) -> ! {
 /// Another runtime's call can run Python code over a doomed frame without
 /// pushing a frame of its own, and that code is not the doomed run's.
 fn active_frame_doomed() -> bool {
-    // SAFETY: set only while an `InRuntime` guard for `rt` is alive,
-    // inside a call that borrows that runtime throughout.
+    // SAFETY: set only inside `in_runtime`, which borrows `rt` throughout.
     ACTIVE_RT
         .with(Cell::get)
         .is_some_and(|active| unsafe { (active.frame_doomed)(active.rt) })
@@ -120,21 +119,20 @@ unsafe fn frame_doomed<C: Cells>(rt: *const ()) -> bool {
     unsafe { &*rt.cast::<Runtime<C>>() }.active_frame_doomed()
 }
 
-/// Records `rt` as the active runtime, restoring the enclosing one when
-/// the call returns or unwinds.
-pub struct InRuntime(Option<ActiveRuntime>);
-
-impl InRuntime {
-    pub fn enter<C: Cells>(rt: &Runtime<C>) -> Self {
-        let active = ActiveRuntime {
-            rt: (rt as *const Runtime<C>).cast(),
-            frame_doomed: frame_doomed::<C>,
-        };
-        InRuntime(ACTIVE_RT.with(|a| a.replace(Some(active))))
-    }
+/// Runs `f` with `rt` as the active runtime, restoring the enclosing one
+/// when `f` returns or unwinds.
+pub fn in_runtime<C: Cells, R>(rt: &Runtime<C>, f: impl FnOnce() -> R) -> R {
+    let active = ActiveRuntime {
+        rt: (rt as *const Runtime<C>).cast(),
+        frame_doomed: frame_doomed::<C>,
+    };
+    let _restore = RestoreActive(ACTIVE_RT.with(|a| a.replace(Some(active))));
+    f()
 }
 
-impl Drop for InRuntime {
+struct RestoreActive(Option<ActiveRuntime>);
+
+impl Drop for RestoreActive {
     fn drop(&mut self) {
         ACTIVE_RT.with(|a| a.set(self.0));
     }
@@ -414,5 +412,46 @@ impl PyFixpoint {
             });
         }
         fixpoint
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use incr_core::Local;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    fn active() -> Option<*const ()> {
+        ACTIVE_RT.with(Cell::get).map(|a| a.rt)
+    }
+
+    fn addr(rt: &Runtime<Local>) -> Option<*const ()> {
+        Some((rt as *const Runtime<Local>).cast())
+    }
+
+    #[test]
+    fn nested_in_runtime_restores_the_outer_runtime() {
+        let outer = Runtime::<Local>::new();
+        let inner = Runtime::<Local>::new();
+        in_runtime(&outer, || {
+            assert_eq!(active(), addr(&outer));
+            in_runtime(&inner, || assert_eq!(active(), addr(&inner)));
+            assert_eq!(active(), addr(&outer));
+        });
+        assert_eq!(active(), None);
+    }
+
+    #[test]
+    fn a_panicking_closure_restores_the_previous_runtime() {
+        let outer = Runtime::<Local>::new();
+        let inner = Runtime::<Local>::new();
+        in_runtime(&outer, || {
+            let unwound = catch_unwind(AssertUnwindSafe(|| {
+                in_runtime(&inner, || std::panic::resume_unwind(Box::new("unwind")))
+            }));
+            assert!(unwound.is_err());
+            assert_eq!(active(), addr(&outer));
+        });
+        assert_eq!(active(), None);
     }
 }
