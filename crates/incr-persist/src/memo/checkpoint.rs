@@ -62,11 +62,14 @@ pub struct Checkpointed {
 /// with transitive dependents, down to `max_bytes`, and writes the result as
 /// the next generation.
 ///
-/// The base is merged only when its build matches. A base table whose name
+/// The base is merged only when its build matches and its seq is below
+/// `u64::MAX`; otherwise numbering restarts at seq 1. A base table whose name
 /// matches a live table with a different descriptor is dropped; a base
 /// table with no live namesake is carried over, appended to the catalog.
 /// Fails with [`Error::Busy`](crate::Error::Busy) when another handle holds
-/// the lock or replaced the base meanwhile; nothing is written then.
+/// the lock or replaced the base meanwhile, and with
+/// [`Error::Corrupt`](crate::Error::Corrupt) when the base's id is
+/// `u64::MAX`; nothing is written then.
 pub fn write_checkpoint<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
@@ -81,8 +84,17 @@ fn write_with<B: MemoBackend + ?Sized>(
 ) -> Result<Checkpointed> {
     let _guard = backend.lock_checkpoint()?;
     let base = backend.load()?;
-    let seq = base.as_ref().map_or(0, |g| g.header().seq) + 1;
-    let id = GenId(base.as_ref().map_or(0, |g| g.id().0) + 1);
+    let id = base
+        .as_ref()
+        .map_or(Some(1), |g| g.id().0.checked_add(1))
+        .map(GenId)
+        .ok_or(Error::Corrupt(
+            "the current memo generation has the largest id",
+        ))?;
+    let next_seq = base
+        .as_ref()
+        .map_or(Some(1), |g| g.header().seq.checked_add(1));
+    let seq = next_seq.unwrap_or(1);
     let mut stats = CheckpointStats::default();
 
     let unkept = unkept(&input.fresh);
@@ -97,7 +109,8 @@ fn write_with<B: MemoBackend + ?Sized>(
     }
 
     let mut tables = input.tables;
-    if let Some(base) = base.as_ref().filter(|g| g.header().build == input.build) {
+    let mergeable = |g: &&Generation| next_seq.is_some() && g.header().build == input.build;
+    if let Some(base) = base.as_ref().filter(mergeable) {
         merge(backend, base, &mut tables, &mut entries, &mut stats)?;
     }
 
