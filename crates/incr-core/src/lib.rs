@@ -25,6 +25,7 @@ pub mod collection;
 pub mod cycle;
 mod cycle_state;
 mod deferred;
+mod dep_set;
 pub mod dep_stack;
 mod dependent_list;
 mod directory;

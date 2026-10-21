@@ -226,7 +226,10 @@ fn no_placeholder_recurses<C: Cells>(rt: &Runtime<C>) {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(
+    miri,
+    ignore = "Miri keeps a whole-stack backtrace per live heap allocation: O(depth^2) memory; passes with -Zmiri-disable-leak-backtraces"
+)]
 fn local_no_placeholder_recurses_natively() {
     on_stack(256 << 20, || {
         no_placeholder_recurses(&Runtime::<Local>::new())
@@ -234,7 +237,10 @@ fn local_no_placeholder_recurses_natively() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg_attr(
+    miri,
+    ignore = "Miri keeps a whole-stack backtrace per live heap allocation: O(depth^2) memory; passes with -Zmiri-disable-leak-backtraces"
+)]
 fn shared_no_placeholder_recurses_natively() {
     on_stack(256 << 20, || {
         no_placeholder_recurses(&Runtime::<Shared>::new())
