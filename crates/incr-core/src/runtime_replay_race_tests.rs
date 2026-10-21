@@ -628,7 +628,10 @@ struct WoundEntry {
 }
 
 fn wound_entry_shape() -> WoundEntry {
-    let rt = Arc::new(Rt::new());
+    // The entry counts below assume only the queries marked replayable are.
+    let mut rt = Rt::new();
+    rt.all_replayable = false;
+    let rt = Arc::new(rt);
     rt.set_placeholder(0_u64);
     let (s, t, i, k) = (
         rt.create_input(0_u64),

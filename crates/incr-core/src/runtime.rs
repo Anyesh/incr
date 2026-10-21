@@ -1964,7 +1964,7 @@ impl<C: Cells> Runtime<C> {
         {
             return self.read_cold(handle, observed, kind, frame, word);
         }
-        self.read_walk::<T, 0>(handle, observed, kind, word, frame)
+        self.read_walk::<T, 0>(handle, node, observed, kind, word, frame)
     }
 
     /// Whether a read from frame `f` must take the cold path: the frame
@@ -1988,13 +1988,13 @@ impl<C: Cells> Runtime<C> {
     fn read_walk<T: Value, const MODE: u8>(
         &self,
         handle: Incr<T>,
+        node: &NodeData<C>,
         mut observed: NodeState,
         kind: ReadKind,
         word: u64,
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
-        let node = self.nodes.get(slot);
         loop {
             if observed == NodeState::Cyclic || is_computing(observed) {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
@@ -2338,6 +2338,19 @@ impl<C: Cells> Runtime<C> {
     pub(crate) fn changed_at<T: Value>(&self, handle: Incr<T>) -> u64 {
         self.check_handle(handle);
         self.nodes.get(handle.slot()).changed_at()
+    }
+
+    /// [`Self::changed_at`] of a handle that may be dead or recycled:
+    /// `None` unless the node is alive at the handle's generation through
+    /// the read.
+    pub(crate) fn changed_at_erased(&self, handle: ErasedIncr) -> Option<u64> {
+        if !self.is_alive(handle) {
+            return None;
+        }
+        let node = self.nodes.get(handle.slot());
+        let stamp = node.changed_at();
+        C::fence_acquire();
+        (node.generation() == handle.generation()).then_some(stamp)
     }
 
     /// [`Self::set`] that hands back what it would drop: the displaced
