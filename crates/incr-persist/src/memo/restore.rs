@@ -28,13 +28,13 @@ impl<C: MemoCells> CoreRef<C> {
         if frame_doomed(rt) {
             return pending_handle(rt);
         }
+        check_value_code();
         let Some(bytes) = encode(&key) else {
             return t.cold(self, rt, key);
         };
         if !self.index().holds(table.index, &bytes) {
             return t.cold(self, rt, key);
         }
-        check_value_code();
         let mut bag = Deferred::new();
         let handle = {
             let mut state = self.lock_memo();
@@ -258,7 +258,8 @@ impl<C: MemoCells> Walk<'_, C> {
         }
     }
 
-    fn cold(&mut self, state: &mut MemoState, id: usize) {
+    /// `false`, counted corrupt, if the key doesn't decode.
+    fn cold(&mut self, state: &mut MemoState, id: usize) -> bool {
         let visit = &self.visits[id];
         let table = &self.core.tables[visit.table as usize];
         let handle = table.cold_bytes(self.core, self.rt, &visit.key);
@@ -266,6 +267,7 @@ impl<C: MemoCells> Walk<'_, C> {
             corrupt(state);
         }
         self.visits[id].handle = handle;
+        handle.is_some()
     }
 
     /// Seeds a dep whose own deps are all settled, or creates it cold.
@@ -274,8 +276,9 @@ impl<C: MemoCells> Walk<'_, C> {
             return;
         }
         let Some((deps, reuse)) = self.seed_deps(state, id) else {
-            state.stats.cold += 1;
-            self.cold(state, id);
+            if self.cold(state, id) {
+                state.stats.cold += 1;
+            }
             return;
         };
         let visit = &self.visits[id];
@@ -332,7 +335,7 @@ impl<C: MemoCells> Walk<'_, C> {
                     });
                 }
                 stored => {
-                    let (handle, same) = map_stored(&map, self.rt, stored)?;
+                    let (handle, same) = map_stored(&map, self.rt, self.core.id, stored)?;
                     unchanged &= same;
                     deps.push(SeedDep {
                         dep: handle,

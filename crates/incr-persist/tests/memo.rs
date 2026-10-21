@@ -42,6 +42,11 @@ both!(
     a_restore_inside_a_compute_reuses_the_entry,
     get_finds_only_live_nodes,
     an_input_written_around_the_store_is_never_trusted,
+    an_entry_over_a_bypassed_input_is_not_checkpointed,
+    externals_belong_to_their_memo,
+    an_external_written_around_set_external_is_not_checkpointed,
+    another_value_type_drops_the_table,
+    a_checkpoint_removes_the_generation_it_replaces,
     an_undefined_table_fails_open,
 );
 
@@ -396,6 +401,113 @@ fn an_input_written_around_the_store_is_never_trusted<C: MemoCells>() {
     w.memo.runtime().set(w.x.handle(), 5);
     assert_eq!(read(&w, 2), 10);
     assert_eq!(runs.load(SeqCst), 2);
+}
+
+/// A bypass stamps the input past its mapped stamp, and an equal mapped
+/// write after it is a no-op that leaves the stamp behind, so nothing
+/// over the input is checkpointed.
+fn an_entry_over_a_bypassed_input_is_not_checkpointed<C: MemoCells>() {
+    let backends = Backends::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let w = scaled::<C>(&backends, options(), 1, &runs);
+    w.memo.runtime().set(w.x.handle(), 5);
+    assert_eq!(read(&w, 2), 10);
+    assert_eq!(w.memo.checkpoint().unwrap().written, 0);
+    // Debug builds refuse the write as a bypass; release builds apply it.
+    match w.store.set(w.x, 5) {
+        Ok(_) | Err(Error::Bypassed { .. }) => {}
+        Err(other) => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(w.memo.checkpoint().unwrap().written, 0);
+}
+
+/// One memo sets an external and is dropped; another memo on the same
+/// store restores its entry before setting the external, so it must not
+/// trust the first memo's node.
+fn externals_belong_to_their_memo<C: MemoCells>() {
+    let backends = Backends::new();
+    let store = backends.store::<C>();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let open = || {
+        let mut builder = MemoBuilder::new(options());
+        let t = builder.table::<u32, u128>("t", 1);
+        let runs = Arc::clone(&runs);
+        builder.define(t, move |ctx, k| {
+            runs.fetch_add(1, SeqCst);
+            ctx.external("cfg") + u128::from(*k)
+        });
+        (builder.open(&store, backends.memo.clone()).unwrap(), t)
+    };
+    {
+        let (memo, t) = open();
+        memo.set_external("cfg", 1);
+        let q = memo.get_or_insert(t, 1);
+        assert_eq!(memo.runtime().get(q), 2);
+        memo.checkpoint().unwrap();
+    }
+    let (memo, t) = open();
+    let q = memo.get_or_insert(t, 1);
+    assert_eq!(memo.runtime().get(q), 1);
+    assert_eq!(runs.load(SeqCst), 2);
+    memo.set_external("cfg", 5);
+    assert_eq!(memo.runtime().get(q), 6);
+}
+
+fn an_external_written_around_set_external_is_not_checkpointed<C: MemoCells>() {
+    let backends = Backends::new();
+    let store = backends.store::<C>();
+    let mut builder = MemoBuilder::new(options());
+    let t = builder.table::<u32, u128>("t", 1);
+    builder.define(t, |ctx, k| ctx.external("cfg") + u128::from(*k));
+    let memo = builder.open(&store, backends.memo.clone()).unwrap();
+    let cfg = memo.set_external("cfg", 1);
+    memo.runtime().set(cfg, 2);
+    let q = memo.get_or_insert(t, 1);
+    assert_eq!(memo.runtime().get(q), 3);
+    assert_eq!(memo.checkpoint().unwrap().written, 0);
+}
+
+fn another_value_type_drops_the_table<C: MemoCells>() {
+    let backends = Backends::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+    {
+        let w = scaled::<C>(&backends, options(), 1, &runs);
+        assert_eq!(read(&w, 2), 2);
+        w.memo.checkpoint().unwrap();
+    }
+    let store = backends.store::<C>();
+    let mut builder = MemoBuilder::new(options());
+    let scaled = builder.table::<u32, u32>("scaled", 1);
+    let r = Arc::clone(&runs);
+    builder.define(scaled, move |_, &k| {
+        r.fetch_add(1, SeqCst);
+        k
+    });
+    let memo = builder.open(&store, backends.memo.clone()).unwrap();
+    let q = memo.get_or_insert(scaled, 2);
+    assert_eq!(memo.runtime().get(q), 2);
+    assert_eq!(runs.load(SeqCst), 2);
+    assert_eq!(memo.stats().reused, 0);
+}
+
+fn a_checkpoint_removes_the_generation_it_replaces<C: MemoCells>() {
+    let backends = Backends::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let w = scaled::<C>(&backends, options(), 1, &runs);
+    assert_eq!(read(&w, 2), 2);
+    w.memo.checkpoint().unwrap();
+    let first = backends.memo.load().unwrap().unwrap();
+    let item = first.items()[0];
+    assert!(backends
+        .memo
+        .read_entry(first.id(), &item)
+        .unwrap()
+        .is_some());
+    w.memo.checkpoint().unwrap();
+    let second = backends.memo.load().unwrap().unwrap();
+    assert_ne!(second.id(), first.id());
+    assert_eq!(backends.memo.read_entry(first.id(), &item).unwrap(), None);
+    assert_eq!(w.memo.stats().stale_generations, 0);
 }
 
 fn get_finds_only_live_nodes<C: MemoCells>() {

@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 
+use incr_core::persist_hooks::changed_at_erased;
 use incr_core::{check_value_code, ErasedIncr, Runtime};
 
 use super::mapping::LiveDep;
@@ -20,7 +21,7 @@ impl<C: MemoCells> CoreRef<C> {
         );
         check_value_code();
         let _checkpoint = self.lock_checkpoint();
-        let snaps = {
+        let (snaps, moved) = {
             let mut state = self.lock_memo();
             state.seed_info.retain(|&handle, _| rt.is_alive(handle));
             // The read hold excludes every mapped write, and each finishes
@@ -29,10 +30,16 @@ impl<C: MemoCells> CoreRef<C> {
             let map = self.deps.read();
             let mut snaps = Vec::new();
             for table in &self.tables {
-                table.snapshot(rt, &map, &mut snaps);
+                table.snapshot(rt, &map, self.id, &mut snaps);
             }
-            snaps
+            // A node that landed again since its `inspect`, which only a
+            // write around the store allows, may have dependents inspected
+            // over its new value; dropping it drops them as unmapped.
+            snaps.into_iter().partition::<Vec<_>, _>(|snap| {
+                changed_at_erased(rt, snap.handle) == Some(snap.stamp)
+            })
         };
+        drop(moved);
         let done = self.backend.checkpoint(CheckpointInput {
             build: self.build,
             tables: self.catalog.clone(),
@@ -43,8 +50,12 @@ impl<C: MemoCells> CoreRef<C> {
         self.swap_index(IndexGen::new(done.generation, self.build, &self.catalog));
         state.stats.checkpoints += 1;
         // Restores hold M, so none is still reading the old generation.
+        // The new one is current either way, so a failed removal only
+        // leaves a stale generation behind.
         if let Some(old) = done.replaced {
-            self.backend.remove_generation(old)?;
+            if self.backend.remove_generation(old).is_err() {
+                state.stats.stale_generations += 1;
+            }
         }
         Ok(done.stats)
     }

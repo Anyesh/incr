@@ -1,5 +1,5 @@
 use std::any::{type_name, Any};
-use std::panic::resume_unwind;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -250,9 +250,11 @@ impl AutoCheckpoint {
                 return;
             }
             drop(stopped);
-            match core.checkpoint(store.runtime()) {
-                Ok(_) | Err(Error::Busy) => {}
-                Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
+            // A panic in a key's or value's code fails this checkpoint, not
+            // the thread, so later intervals still run.
+            match catch_unwind(AssertUnwindSafe(|| core.checkpoint(store.runtime()))) {
+                Ok(Ok(_) | Err(Error::Busy)) => {}
+                Ok(Err(_)) | Err(_) => core.lock_memo().stats.auto_checkpoint_errors += 1,
             }
         });
         AutoCheckpoint { stop, thread }

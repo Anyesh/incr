@@ -30,6 +30,14 @@ pub(crate) struct DepEntry {
     pub(crate) stamp: Option<u64>,
 }
 
+/// A memo external's input, its fp and the stamp the fp vouches for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct External {
+    pub(crate) handle: Incr<u128>,
+    pub(crate) fp: u128,
+    pub(crate) stamp: u64,
+}
+
 /// Every declared key of a store, with its node and fingerprint, while a
 /// memo is open over the store.
 #[derive(Default)]
@@ -41,9 +49,11 @@ pub(crate) struct DepIndex {
 pub(crate) struct DepMap {
     by_key: HashMap<String, DepEntry>,
     by_handle: HashMap<ErasedIncr, String>,
-    /// A memo's externals: an input per name whose value is its fp.
-    externals: HashMap<String, (Incr<u128>, u128)>,
-    external_names: HashMap<ErasedIncr, String>,
+    /// Each memo's externals by (memo id, name): an input whose value is
+    /// its fp. Keyed by memo too, because every memo on a store shares
+    /// this map but owns its own external nodes.
+    externals: HashMap<(u64, String), External>,
+    external_names: HashMap<ErasedIncr, (u64, String)>,
 }
 
 impl DepIndex {
@@ -146,18 +156,23 @@ impl DepMap {
         self.by_handle.get(&handle).map(String::as_str)
     }
 
-    pub(crate) fn external(&self, name: &str) -> Option<(Incr<u128>, u128)> {
-        self.externals.get(name).copied()
+    pub(crate) fn external(&self, memo: u64, name: &str) -> Option<External> {
+        self.externals.get(&(memo, name.to_owned())).copied()
     }
 
-    pub(crate) fn external_name(&self, handle: ErasedIncr) -> Option<&str> {
-        self.external_names.get(&handle).map(String::as_str)
+    /// The memo and name of the external whose input is `handle`.
+    pub(crate) fn external_of(&self, handle: ErasedIncr) -> Option<(u64, &str)> {
+        self.external_names
+            .get(&handle)
+            .map(|(memo, name)| (*memo, name.as_str()))
     }
 
-    /// Records `name`'s input and the fp it was just set to.
-    pub(crate) fn set_external(&mut self, name: &str, handle: Incr<u128>, fp: u128) {
-        self.externals.insert(name.to_owned(), (handle, fp));
-        self.external_names.insert(handle.erase(), name.to_owned());
+    /// Records the input of `memo`'s external `name`, the fp it was just
+    /// set to and its `changed_at` after that set.
+    pub(crate) fn set_external(&mut self, memo: u64, name: &str, external: External) {
+        self.externals.insert((memo, name.to_owned()), external);
+        self.external_names
+            .insert(external.handle.erase(), (memo, name.to_owned()));
     }
 
     pub(crate) fn untrust(&mut self, key: &str) {

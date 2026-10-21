@@ -4,6 +4,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use incr_core::lock_order::{LockKind, Ordered};
+use incr_core::persist_hooks::changed_at;
 use incr_core::{Cells, ErasedIncr, Incr, Local, NodeTable, Runtime, Shared};
 
 use super::table_core::ErasedTable;
@@ -11,7 +12,7 @@ use super::{
     decode_entry, key_hash, write_checkpoint, CheckpointInput, Checkpointed, Entry, GenId,
     Generation, IndexItem, MemoBackend, TableDesc,
 };
-use crate::store::dep_index::DepIndex;
+use crate::store::dep_index::{DepIndex, External};
 use crate::Result;
 
 /// Restores and checkpoints by count, since the memo opened.
@@ -29,8 +30,11 @@ pub struct MemoStats {
     pub corrupt: u64,
     /// Checkpoints that wrote a generation.
     pub checkpoints: u64,
-    /// Automatic checkpoints that failed with an error other than `Busy`.
+    /// Automatic checkpoints that failed with an error other than `Busy`,
+    /// or panicked.
     pub auto_checkpoint_errors: u64,
+    /// Generations a checkpoint replaced but could not remove.
+    pub stale_generations: u64,
 }
 
 /// [`MemoBackend`] with its guard type erased.
@@ -231,12 +235,25 @@ impl<C: MemoCells> MemoCore<C> {
     /// Its value changes only under the `DepIndex` write hold, so the fp
     /// registered there always equals it.
     pub(crate) fn external(&self, rt: &Runtime<C>, name: &str) -> Incr<u128> {
+        if let Some(external) = self.deps.read().external(self.id, name) {
+            return external.handle;
+        }
+        // Created before the hold: a table miss ranks below `DepIndex`.
         let handle = self
             .externals
             .get_or_insert_input(rt, name.to_owned(), || 0);
         let mut map = self.deps.write();
-        if map.external(name).is_none() {
-            map.set_external(name, handle, 0);
+        if map.external(self.id, name).is_none() {
+            let stamp = changed_at(rt, handle);
+            map.set_external(
+                self.id,
+                name,
+                External {
+                    handle,
+                    fp: 0,
+                    stamp,
+                },
+            );
         }
         handle
     }
@@ -249,7 +266,8 @@ impl<C: MemoCells> MemoCore<C> {
             .get_or_insert_input(rt, name.to_owned(), || 0);
         let mut map = self.deps.write();
         rt.set(handle, fp);
-        map.set_external(name, handle, fp);
+        let stamp = changed_at(rt, handle);
+        map.set_external(self.id, name, External { handle, fp, stamp });
         handle
     }
 }
@@ -285,18 +303,15 @@ mod sealed {
     impl Sealed for incr_core::Shared {}
 }
 
-// SAFETY: `MemoCells` is sealed to `Local` and `Shared`.
-// - `Shared`: a `MemoCore<Shared>`'s tables are `TableCore<K, T, Shared>`,
-//   whose `NodeTable` and closure are `Send + Sync` for any `K: MemoKey`
-//   and `T: MemoValue`, and every other field, the externals' table
-//   included, is `Send + Sync`; the trait
-//   object only hides that (see `table_core::tests`).
-// - `Local`: a `CoreRef<Local>` is held only by the `Memo` that opened it
-//   and by its runtime's node closures. The `Memo` holds an
-//   `Arc<Store<Local, _>>`, which is neither `Send` nor `Sync`, so while it
-//   lives the store, and with it every closure, stays on its thread; once
-//   it drops only the closures remain, on whichever one thread holds the
-//   runtime.
+// SAFETY: `MemoCells` is sealed to `Local` and `Shared`, and for both
+// every field of `MemoCore` is `Send + Sync` on its own: the externals'
+// `NodeTable<String, u128, C>` by core's impls for either `Cells`, the
+// backend by `ErasedBackend`'s supertraits, the locks and `Arc<DepIndex>`
+// by std. The one field that hides its auto traits is the boxed
+// `dyn ErasedTable<C>`, and its only implementor is `TableCore<K, T, C>`:
+// a `NodeTable<K, T, C>` (core's impls again, as `K: MemoKey` and
+// `T: MemoValue` are `Send + Sync`) and an `Arc` of a `Send + Sync`
+// closure. `table_core::tests` checks both under each `Cells`.
 unsafe impl<C: MemoCells> Send for CoreRef<C> {}
 // SAFETY: as for `Send`.
 unsafe impl<C: MemoCells> Sync for CoreRef<C> {}

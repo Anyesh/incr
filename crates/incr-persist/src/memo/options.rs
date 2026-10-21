@@ -53,7 +53,12 @@ impl MemoOptions {
     /// Checkpoints on a background thread every `secs` seconds, joined
     /// when the memo drops. `Shared` only: opening a `Local` memo with it
     /// fails with `Error::AutoCheckpointNeedsShared`.
+    /// Panics if `secs` is 0.
     pub fn auto_checkpoint_secs(mut self, secs: u64) -> Self {
+        assert!(
+            secs > 0,
+            "incr-persist: auto_checkpoint_secs must be at least 1"
+        );
         self.auto_checkpoint_secs = Some(secs);
         self
     }

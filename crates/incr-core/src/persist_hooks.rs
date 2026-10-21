@@ -156,10 +156,12 @@ pub enum SeedError {
     ForeignBase,
 }
 
-/// A Clean query's value and the deps of the run that produced it.
+/// A Clean query's value, its `changed_at` and the deps of the run that
+/// produced it.
 #[derive(Clone, Debug)]
 pub struct Inspected<T> {
     pub value: T,
+    pub changed_at: u64,
     pub deps: Vec<ErasedIncr>,
     pub in_group: bool,
 }

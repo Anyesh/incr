@@ -17,13 +17,25 @@ pub(crate) enum LiveDep {
     Unmapped,
 }
 
-pub(crate) fn map_live<C: Cells>(map: &DepMap, rt: &Runtime<C>, dep: ErasedIncr) -> LiveDep {
+/// Whether a recorded fp still describes `handle`'s value: only while its
+/// `changed_at` is the stamp recorded with the fp. A write around the
+/// store or `set_external` moves it.
+fn vouches<C: Cells>(rt: &Runtime<C>, handle: ErasedIncr, stamp: Option<u64>) -> bool {
+    stamp.is_some() && changed_at_erased(rt, handle) == stamp
+}
+
+pub(crate) fn map_live<C: Cells>(
+    map: &DepMap,
+    rt: &Runtime<C>,
+    memo: u64,
+    dep: ErasedIncr,
+) -> LiveDep {
     if let Some(key) = map.key_of(dep) {
         let entry = map.entry(key).expect("a handle's key is registered");
         return match (entry.kind, entry.fp) {
             (_, DepFp::Untrusted) => LiveDep::Unmapped,
             (Kind::Input, DepFp::Known(fp)) => {
-                if entry.stamp.is_some() && changed_at_erased(rt, dep) == entry.stamp {
+                if vouches(rt, dep, entry.stamp) {
                     LiveDep::Stored(StoredDep::Input {
                         key: key.to_owned(),
                         fp,
@@ -38,14 +50,18 @@ pub(crate) fn map_live<C: Cells>(map: &DepMap, rt: &Runtime<C>, dep: ErasedIncr)
             }),
         };
     }
-    if let Some(name) = map.external_name(dep) {
-        let (_, fp) = map
-            .external(name)
+    if let Some((owner, name)) = map.external_of(dep) {
+        let external = map
+            .external(owner, name)
             .expect("an external's name is registered");
-        return LiveDep::Stored(StoredDep::External {
-            name: name.to_owned(),
-            fp,
-        });
+        return if owner == memo && vouches(rt, dep, Some(external.stamp)) {
+            LiveDep::Stored(StoredDep::External {
+                name: name.to_owned(),
+                fp: external.fp,
+            })
+        } else {
+            LiveDep::Unmapped
+        };
     }
     LiveDep::Query(dep)
 }
@@ -56,16 +72,14 @@ pub(crate) fn map_live<C: Cells>(map: &DepMap, rt: &Runtime<C>, dep: ErasedIncr)
 pub(crate) fn map_stored<C: Cells>(
     map: &DepMap,
     rt: &Runtime<C>,
+    memo: u64,
     dep: &StoredDep,
 ) -> Option<(ErasedIncr, bool)> {
     match dep {
         StoredDep::Input { key, fp } => {
             let entry = map.entry(key)?;
             match (entry.kind, entry.fp) {
-                (Kind::Input, DepFp::Known(live))
-                    if entry.stamp.is_some()
-                        && changed_at_erased(rt, entry.handle) == entry.stamp =>
-                {
+                (Kind::Input, DepFp::Known(live)) if vouches(rt, entry.handle, entry.stamp) => {
                     Some((entry.handle, live == *fp))
                 }
                 _ => None,
@@ -79,8 +93,9 @@ pub(crate) fn map_stored<C: Cells>(
             }
         }
         StoredDep::External { name, fp } => {
-            let (handle, live) = map.external(name)?;
-            Some((handle.erase(), live == *fp))
+            let external = map.external(memo, name)?;
+            let handle = external.handle.erase();
+            vouches(rt, handle, Some(external.stamp)).then_some((handle, external.fp == *fp))
         }
         StoredDep::Query { .. } => None,
     }

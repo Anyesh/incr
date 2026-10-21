@@ -31,6 +31,8 @@ pub(crate) enum Seeded {
 pub(crate) struct Snap {
     pub(crate) table: u32,
     pub(crate) handle: ErasedIncr,
+    /// The node's `changed_at` when `inspect` read it.
+    pub(crate) stamp: u64,
     pub(crate) deps: Vec<LiveDep>,
     pub(crate) in_group: bool,
     pub(crate) item: Box<dyn Encode>,
@@ -94,7 +96,7 @@ pub(crate) trait ErasedTable<C: MemoCells> {
 
     /// Every live entry that is Clean through `inspect`, with its deps
     /// mapped under `map`'s hold.
-    fn snapshot(&self, rt: &Runtime<C>, map: &DepMap, out: &mut Vec<Snap>);
+    fn snapshot(&self, rt: &Runtime<C>, map: &DepMap, memo: u64, out: &mut Vec<Snap>);
 }
 
 pub(crate) struct TableCore<K: MemoKey, T: MemoValue, C: MemoCells> {
@@ -137,18 +139,23 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> TableCore<K, T, C> {
         let Some(value) = decode::<T>(value) else {
             return (self.cold(core, rt, key), Seeded::Corrupt);
         };
+        // A failed seed's value comes back here rather than to the miss,
+        // so it drops in the restore's bag, after M.
         let mut value = Some(value);
         let mut seeded = Seeded::Live;
         let f = self.closure(core, with_value_code(|| key.clone()));
         let handle =
             get_or_insert_query_seeded(&self.nodes, rt, key, f, QueryOpts::default(), |rt, q| {
-                let value = value.take().expect("a miss seeds once");
-                match seed_query(rt, base, q, value, deps, reuse) {
+                let stored = value.take().expect("a miss seeds once");
+                match seed_query(rt, base, q, stored, deps, reuse) {
                     Ok(reuse) => {
                         seeded = Seeded::As(reuse);
                         None
                     }
-                    Err((_, value)) => Some(value),
+                    Err((_, failed)) => {
+                        value = Some(failed);
+                        None
+                    }
                 }
             });
         if let Some(value) = value {
@@ -189,7 +196,7 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
         Some((handle.erase(), seeded))
     }
 
-    fn snapshot(&self, rt: &Runtime<C>, map: &DepMap, out: &mut Vec<Snap>) {
+    fn snapshot(&self, rt: &Runtime<C>, map: &DepMap, memo: u64, out: &mut Vec<Snap>) {
         let mut live = Vec::new();
         self.nodes.for_each(rt, |key, handle| {
             live.push((with_value_code(|| key.clone()), handle));
@@ -200,10 +207,15 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
             };
             // Read after `inspect` returns, so an input's stamp check sees
             // at least the run whose value was cloned.
-            let deps = seen.deps.iter().map(|&d| map_live(map, rt, d)).collect();
+            let deps = seen
+                .deps
+                .iter()
+                .map(|&d| map_live(map, rt, memo, d))
+                .collect();
             out.push(Snap {
                 table: self.index,
                 handle: handle.erase(),
+                stamp: seen.changed_at,
                 deps,
                 in_group: seen.in_group,
                 item: Box::new(Typed {
@@ -218,13 +230,16 @@ impl<K: MemoKey, T: MemoValue, C: MemoCells> ErasedTable<C> for TableCore<K, T, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use incr_core::Shared;
+    use incr_core::{Local, Shared};
 
     fn send_sync<X: Send + Sync>() {}
 
-    // What `CoreRef<Shared>`'s `Send` and `Sync` rest on.
+    // What `CoreRef`'s `Send` and `Sync` rest on.
     #[test]
-    fn a_shared_table_core_is_send_and_sync() {
+    fn table_cores_and_the_externals_table_are_send_and_sync() {
         send_sync::<TableCore<String, Vec<u8>, Shared>>();
+        send_sync::<TableCore<String, Vec<u8>, Local>>();
+        send_sync::<NodeTable<String, u128, Shared>>();
+        send_sync::<NodeTable<String, u128, Local>>();
     }
 }
