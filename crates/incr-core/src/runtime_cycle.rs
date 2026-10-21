@@ -805,7 +805,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
-        self.release_held_from(cidx + 1, true, &mut bag);
+        self.release_held_from(cidx + 1, true, None, &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
                 .and_then(|e| e.buf.take())
@@ -852,7 +852,7 @@ impl<C: Cells> Runtime<C> {
             // A speculative entry never runs an episode: the unbounded run
             // may enter this cycle at another member, or not at all. The
             // claims take the discard landing and the chain is dropped.
-            self.release_held_from(cidx, true, bag);
+            self.release_held_from(cidx, true, None, bag);
             if self.drop_cooperatively(None) {
                 return PopEnd::Dropped;
             }
@@ -1454,8 +1454,14 @@ impl<C: Cells> Runtime<C> {
     /// whose own code panicked in user code takes fix 5's panic path, and
     /// every other claim, and every claim under an engine unwind or a
     /// discard (`discarding`), the discard landing.
-    pub(super) fn release_held_from(&self, cidx: u32, discarding: bool, bag: &mut Deferred<C>) {
-        self.release_held_where(cidx, discarding, None, &[], bag);
+    pub(super) fn release_held_from(
+        &self,
+        cidx: u32,
+        discarding: bool,
+        kind: Option<UnwindKind>,
+        bag: &mut Deferred<C>,
+    ) {
+        self.release_held_where(cidx, discarding, kind, None, &[], bag);
     }
 
     /// [`Self::release_held_from`] for a frame at `cidx` that unwound with
@@ -1472,7 +1478,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, subtree, &[], bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &[], bag);
     }
 
     /// [`Self::release_held_from`], keeping the claims in `keep`.
@@ -1483,13 +1489,14 @@ impl<C: Cells> Runtime<C> {
         keep: &[u32],
         bag: &mut Deferred<C>,
     ) {
-        self.release_held_where(cidx, discarding, None, keep, bag);
+        self.release_held_where(cidx, discarding, None, None, keep, bag);
     }
 
     fn release_held_where(
         &self,
         cidx: u32,
         discarding: bool,
+        kind: Option<UnwindKind>,
         subtree: Option<u32>,
         keep: &[u32],
         bag: &mut Deferred<C>,
@@ -1548,7 +1555,7 @@ impl<C: Cells> Runtime<C> {
                 };
                 self.land_failed(id, node, flags, attempt, e.wrote, &e.deps, &released, bag);
             } else {
-                self.discard_land(id, e.first, e.wrote, stamp_rev, bag);
+                self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
             bag.push_erased(Box::new((e.buf, e.s)));
         }
@@ -1581,9 +1588,48 @@ impl<C: Cells> Runtime<C> {
         children: ChildLanding,
         bag: &mut Deferred<C>,
     ) {
+        let target = self.discard_target(id, first, wrote, stamp_rev, children, bag);
+        let (node, flags) = self.nodes.get_with_flags(id.0);
+        self.land_single(id, node, flags, target, target);
+    }
+
+    /// [`Self::discard_land`] of a claim released by an unwind of `kind`.
+    /// A wound's keeps the node in its group, as `unclaim_group` does: the
+    /// wounded attempt is in no single-thread order, and a member it took
+    /// out would make the older thread compute alone what that order
+    /// verifies as a group.
+    pub(super) fn unwound_land(
+        &self,
+        id: NodeId,
+        first: bool,
+        wrote: bool,
+        stamp_rev: u64,
+        kind: Option<UnwindKind>,
+        bag: &mut Deferred<C>,
+    ) {
+        if kind == Some(UnwindKind::Wound) {
+            let target =
+                self.discard_target(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
+            self.land(id, self.nodes.get(id.0), target, target);
+        } else {
+            self.discard_land(id, first, wrote, stamp_rev, bag);
+        }
+    }
+
+    /// Lands the discarded attempt's children as `children` and stamps the
+    /// node for its discard landing, which lands it in the state returned.
+    fn discard_target(
+        &self,
+        id: NodeId,
+        first: bool,
+        wrote: bool,
+        stamp_rev: u64,
+        children: ChildLanding,
+        bag: &mut Deferred<C>,
+    ) -> NodeState {
         let (node, flags) = self.nodes.get_with_flags(id.0);
         self.children_landing(id, flags, children, false, bag);
-        let target = if wrote {
+        if wrote {
             node.max_changed_at(stamp_rev);
             NodeState::New
         } else if first {
@@ -1591,8 +1637,7 @@ impl<C: Cells> Runtime<C> {
             NodeState::New
         } else {
             NodeState::Dirty
-        };
-        self.land_single(id, node, flags, target, target);
+        }
     }
 
     /// Lands held node `slot` from its last run's buffer, as
@@ -1866,7 +1911,7 @@ impl<C: Cells> Runtime<C> {
                 let deps = std::mem::take(&mut e.deps);
                 self.land_failed(id, node, flags, attempt, false, &deps, &members, bag);
             } else {
-                self.discard_land(id, e.first, e.wrote, stamp_rev, bag);
+                self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
             bag.push_erased(Box::new((e.buf.take(), e.s.take())));
         }

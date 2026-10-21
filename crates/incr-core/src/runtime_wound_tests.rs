@@ -447,3 +447,191 @@ fn shared_concurrent_reads_of_a_warm_cycle_match_the_single_thread_result() {
     )
     .assert_clean();
 }
+
+/// How [`Duel`] puts the unseeded `x` and the Fallback `m` (100) in a
+/// group whose cycle runs through `w` (Fallback 500) once `k` is 1.
+#[derive(Copy, Clone, Debug)]
+enum GroupShape {
+    /// The group is warm from a `get(m)`, so B's `get(m)` verifies it and
+    /// runs its episode, and B is wounded in a member run.
+    Episode,
+    /// Only `x` keeps the record, as a single-node landing of `m` leaves
+    /// it, so B computes `m` alone and its group verify of `x` finds `m`
+    /// on B's stack and computes `x` alone too.
+    MemberAlone,
+}
+
+/// Thread A reads `w`, which reads `x`; thread B reads `m`, which reads
+/// `x` and then `w`. One of them parks before its claim wait until the
+/// other has registered its own, so the other holds the older ticket.
+struct Duel {
+    rt: Arc<Runtime<Shared>>,
+    x: Incr<i64>,
+    m: Incr<i64>,
+    w: Incr<i64>,
+    a_gate: Gate,
+    b_gate: Gate,
+}
+
+impl Duel {
+    fn new(shape: GroupShape) -> Self {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let k = rt.create_input(0_i64);
+        let m_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let w_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let x = {
+            let m_cell = m_cell.clone();
+            rt.create_query(move |rt| match (shape, rt.get(k)) {
+                (GroupShape::MemberAlone, 0) => 1,
+                _ => rt.get(*m_cell.get().unwrap()) + 1,
+            })
+        };
+        let (a_gate, b_gate) = (Gate::new(), Gate::new());
+        let w = {
+            let a_gate = a_gate.clone();
+            rt.create_query_with_fallback(
+                move |rt| {
+                    a_gate.park();
+                    match rt.get(k) {
+                        0 => 0,
+                        _ => rt.get(x) + 1000,
+                    }
+                },
+                |_c: &crate::cycle::Cycle| 500,
+            )
+        };
+        let m = {
+            let (w_cell, b_gate) = (w_cell.clone(), b_gate.clone());
+            rt.create_query_with_fallback(
+                move |rt| match (shape, rt.get(k)) {
+                    (GroupShape::MemberAlone, 0) => 0,
+                    (_, 0) => rt.get(x),
+                    _ => {
+                        let x = rt.get(x);
+                        b_gate.park();
+                        x + rt.get(*w_cell.get().unwrap())
+                    }
+                },
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        m_cell.set(m).unwrap();
+        w_cell.set(w).unwrap();
+        match shape {
+            GroupShape::Episode => assert_eq!((rt.get(m), rt.get(x), rt.get(w)), (100, 101, 0)),
+            GroupShape::MemberAlone => {
+                assert_eq!((rt.get(m), rt.get(x), rt.get(w)), (0, 1, 0));
+                rt.force_group_for_test(&[x.erase(), m.erase()]);
+                let flags = rt.nodes.get_with_flags(m.slot()).1;
+                rt.leave_group(id(m), flags);
+            }
+        }
+        rt.set(k, 1);
+        Duel {
+            rt,
+            x,
+            m,
+            w,
+            a_gate,
+            b_gate,
+        }
+    }
+
+    fn read(&self, node: Incr<i64>) -> Result<i64, String> {
+        catch_unwind(AssertUnwindSafe(|| self.rt.get(node))).map_err(panic_message)
+    }
+
+    /// A's read of `w`, B's of `m`, then a read of every node.
+    fn outcome(&self, a: Result<i64, String>, b: Result<i64, String>) -> Vec<Result<i64, String>> {
+        vec![
+            a,
+            b,
+            self.read(self.w),
+            self.read(self.m),
+            self.read(self.x),
+        ]
+    }
+
+    fn single_thread(shape: GroupShape, a_first: bool) -> Vec<Result<i64, String>> {
+        let g = Duel::new(shape);
+        if a_first {
+            let a = g.read(g.w);
+            g.outcome(a, g.read(g.m))
+        } else {
+            let b = g.read(g.m);
+            g.outcome(g.read(g.w), b)
+        }
+    }
+
+    fn concurrent(shape: GroupShape, a_older: bool) -> Vec<Result<i64, String>> {
+        let g = Duel::new(shape);
+        let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+        let first = if a_older { &g.b_gate } else { &g.a_gate };
+        first.arm();
+        let (a, b) = thread::scope(|s| {
+            let g = &g;
+            let parked = |n: Incr<i64>| {
+                let read = s.spawn(move || g.read(n));
+                first.wait_parked();
+                read
+            };
+            let (a, b) = if a_older {
+                let b = parked(g.m);
+                (s.spawn(|| g.read(g.w)), b)
+            } else {
+                let a = parked(g.w);
+                (a, s.spawn(|| g.read(g.m)))
+            };
+            wait_registered(1);
+            first.release();
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(
+            waits::WOUNDS.load(Ordering::Relaxed) > wounds,
+            "{shape:?} a_older {a_older}: no wound"
+        );
+        let outcome = g.outcome(a, b);
+        g.rt.assert_invariant_i();
+        outcome
+    }
+}
+
+/// A wound's discard landing of a group member keeps it in its group, so
+/// the older thread verifies the group as a single thread would. Out of
+/// it, `x` is computed alone at A's root, and in the `MemberAlone` shape
+/// that enters the cycle at the unseeded `x`: a cycle error that no
+/// single-thread order raises.
+fn wounded_member_keeps_its_group(shape: GroupShape) {
+    let a_first = Duel::single_thread(shape, true);
+    let b_first = Duel::single_thread(shape, false);
+    for round in 0..20 {
+        for a_older in [true, false] {
+            let got = Duel::concurrent(shape, a_older);
+            assert!(
+                got == a_first || got == b_first,
+                "{shape:?} round {round} a_older {a_older}: {got:?}, \
+                 single-thread {a_first:?} or {b_first:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wound_in_a_group_episode_keeps_the_group() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_wound_in_a_group_episode_keeps_the_group",
+        || wounded_member_keeps_its_group(GroupShape::Episode),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wound_of_a_member_computed_alone_keeps_its_group() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_wound_of_a_member_computed_alone_keeps_its_group",
+        || wounded_member_keeps_its_group(GroupShape::MemberAlone),
+    )
+    .assert_clean();
+}
