@@ -191,11 +191,21 @@ impl MemoBackend for FileMemo {
     }
 
     fn load(&self) -> Result<Option<Generation>> {
-        let Some(id) = self.current()? else {
+        let Some(mut id) = self.current()? else {
             return Ok(None);
         };
-        let Some(file) = self.generation_file(id)? else {
-            return Ok(Some(Generation::empty(id)));
+        #[cfg(test)]
+        tests::after_load_reads_current();
+        // Another handle may publish the next generation and remove this
+        // one between reading `MEMO_CURRENT` and opening the file.
+        let file = loop {
+            if let Some(file) = self.generation_file(id)? {
+                break file;
+            }
+            match self.current()? {
+                Some(now) if now != id => id = now,
+                _ => return Ok(Some(Generation::empty(id))),
+            }
         };
         Ok(Some(
             read_generation(&file, id)?.unwrap_or_else(|| Generation::empty(id)),
