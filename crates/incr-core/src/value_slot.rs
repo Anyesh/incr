@@ -54,6 +54,16 @@ pub trait ValueSlot<T: Value>: 'static {
     /// any reader reaches its slot).
     fn read(&self) -> T;
     fn try_read(&self) -> Option<T>;
+    /// [`Self::try_read`] with `missing` run in place of `None`, so a
+    /// slot that clones in place hands the value back with no `Option`
+    /// to unwrap and copy.
+    #[inline(always)]
+    fn read_or(&self, missing: impl FnOnce() -> T) -> T {
+        match self.try_read() {
+            Some(v) => v,
+            None => missing(),
+        }
+    }
     /// Store `v` and hand back the displaced value. The slot owns `v`
     /// before the displaced value can run any user code.
     #[must_use]
@@ -148,6 +158,15 @@ impl<T: Value> ValueSlot<T> for LocalValueSlot<T> {
     fn try_read(&self) -> Option<T> {
         // SAFETY: see read().
         unsafe { (*self.0.get()).as_ref().cloned() }
+    }
+
+    #[inline(always)]
+    fn read_or(&self, missing: impl FnOnce() -> T) -> T {
+        // SAFETY: see read().
+        match unsafe { (*self.0.get()).as_ref() } {
+            Some(v) => v.clone(),
+            None => missing(),
+        }
     }
 
     #[inline(always)]

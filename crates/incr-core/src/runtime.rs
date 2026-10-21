@@ -2060,6 +2060,9 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+            if C::SINGLE_THREADED {
+                return self.read_clean_local(handle, type_tag, arena_slot);
+            }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => value,
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
@@ -2097,6 +2100,9 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+            if C::SINGLE_THREADED {
+                return Ok(self.read_clean_local(handle, type_tag, arena_slot));
+            }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => Ok(value),
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
@@ -2344,6 +2350,20 @@ impl<C: Cells> Runtime<C> {
             Some(value) => value,
             None => self.read_failed(handle),
         }
+    }
+
+    /// [`Self::try_read_slot`] for a Clean `get` or `try_get` under
+    /// `Local`, where an empty slot is [`Self::read_failed`]
+    /// (`reload_after_empty_slot`), and the value is cloned straight into
+    /// the return place.
+    #[inline(always)]
+    fn read_clean_local<T: Value>(&self, handle: Incr<T>, type_tag: u16, arena_slot: u32) -> T {
+        debug_assert!(C::SINGLE_THREADED);
+        self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
+        let Some(arena) = self.arenas.tagged_arena::<T>(type_tag) else {
+            self.read_failed(handle)
+        };
+        value_code::run(|| arena.read_or(arena_slot, || self.read_failed(handle)))
     }
 
     /// [`Self::read_slot`], with `None` for an empty slot.
