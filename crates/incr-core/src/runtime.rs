@@ -31,6 +31,7 @@ use crate::cycle::{
 };
 use crate::cycle_state::{self, EntryDepth, UnwindKind};
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
+use crate::dep_set::{self, DepDiff, DepHashSet, DepLookup};
 use crate::dep_stack::{ActiveRead, DepStack};
 use crate::dependent_list::DependentList;
 use crate::fx::FxBuildHasher;
@@ -3717,13 +3718,7 @@ impl<C: Cells> Runtime<C> {
         let mut old_deps: Vec<NodeId> = Vec::with_capacity(8);
         node.for_each_dep(|d| old_deps.push(d));
         let new_deps: Vec<NodeId> = if panicked {
-            let mut union = old_deps.clone();
-            for &(d, _) in recorded {
-                if !union.contains(&d) {
-                    union.push(d);
-                }
-            }
-            union
+            dep_set::union(&old_deps, recorded)
         } else {
             recorded.iter().map(|&(d, _)| d).collect()
         };
@@ -3731,7 +3726,61 @@ impl<C: Cells> Runtime<C> {
         if old_deps == new_deps {
             return Publish::Published;
         }
+        if dep_set::needs_hashing(old_deps.len(), new_deps.len()) {
+            return self.publish_large_diff(
+                id, node, recorded, panic, verify_rev, bag, &old_deps, &new_deps,
+            );
+        }
+        let diff = DepDiff {
+            old: &old_deps,
+            new: &new_deps,
+            old_set: &old_deps[..],
+            new_set: &new_deps[..],
+        };
+        self.publish_diff(id, node, recorded, panic, verify_rev, bag, diff)
+    }
 
+    /// `publish_deps` for lists long enough that scanning one per entry
+    /// of the other would be quadratic. Out of line so the short-list
+    /// path compiles to plain scans.
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_large_diff(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        recorded: &[(NodeId, u32)],
+        panic: Option<&[u32]>,
+        verify_rev: u64,
+        bag: &mut Deferred<C>,
+        old_deps: &[NodeId],
+        new_deps: &[NodeId],
+    ) -> Publish {
+        // Built before the write hold, which every reader of the graph waits on.
+        let old_set = DepHashSet::new(old_deps);
+        let new_set = DepHashSet::new(new_deps);
+        let diff = DepDiff {
+            old: old_deps,
+            new: new_deps,
+            old_set: &old_set,
+            new_set: &new_set,
+        };
+        self.publish_diff(id, node, recorded, panic, verify_rev, bag, diff)
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_diff<S: DepLookup + ?Sized>(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        recorded: &[(NodeId, u32)],
+        panic: Option<&[u32]>,
+        verify_rev: u64,
+        bag: &mut Deferred<C>,
+        diff: DepDiff<'_, S>,
+    ) -> Publish {
         let mut inner = self.inner.write();
         let stale = recorded.iter().any(|&(d, generation)| {
             let dep = self.nodes.get(d.0);
@@ -3745,34 +3794,32 @@ impl<C: Cells> Runtime<C> {
         // through an edge it lacks, and a dep recomputed for that set
         // lands Clean with a changed_at up to the stamp revision.
         let settled = |d: &NodeId| {
-            old_deps.contains(d)
+            diff.old_set.has(*d)
                 || self.observed_clean(*d, verify_rev)
                 || panic.is_some_and(|members| {
                     self.nodes.get(d.0).state() == NodeState::Failed
                         || members.binary_search(&d.0).is_ok()
                 })
         };
-        let superseded = !new_deps.iter().all(settled);
+        let superseded = !diff.new.iter().all(settled);
 
         // The displaced list is retired at the attempt's drain, after its
         // landing: a retire can reclaim pending values and run their
         // `Drop` under this hold otherwise.
-        if let Some(displaced) = node.install_deps(&new_deps) {
+        if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
         }
 
-        // Linear scans for small dep sets are faster than HashSet
-        // construction below ~16 items.
-        for old_dep in &old_deps {
-            if !new_deps.contains(old_dep) {
+        for old_dep in diff.old {
+            if !diff.new_set.has(*old_dep) {
                 inner.dependents[old_dep.0 as usize].remove(id);
             }
         }
         // A dep read twice is in `new_deps` twice, and its list already
         // ends with `id` from the first push, so each list holds `id` at
         // most once and a delete's back-to-front remove finds it.
-        for new_dep in &new_deps {
-            if !old_deps.contains(new_dep) {
+        for new_dep in diff.new {
+            if !diff.old_set.has(*new_dep) {
                 inner.dependents[new_dep.0 as usize].push_unique(id);
             }
         }
@@ -5082,5 +5129,87 @@ mod tests {
             let _ = rt.get(dynamic);
         }
         drop(rt);
+    }
+
+    const BIG: usize = 50_000;
+    const SHIFT: usize = 10_000;
+
+    /// `BIG + SHIFT` inputs and a query that reads the first `BIG` in
+    /// order while `flip` is false, and the last `BIG` in reverse after.
+    fn big_reordered_query(
+        rt: &Runtime<Local>,
+        panic_after: bool,
+    ) -> (Incr<bool>, Vec<Incr<i64>>, Incr<i64>) {
+        let flip = rt.create_input(false);
+        let inputs: Vec<_> = (0..(BIG + SHIFT) as i64)
+            .map(|v| rt.create_input(v))
+            .collect();
+        let captured = inputs.clone();
+        let sum = rt.create_query(move |rt| {
+            if !rt.get(flip) {
+                return captured[..BIG].iter().map(|&i| rt.get(i)).sum::<i64>();
+            }
+            let total = captured[SHIFT..].iter().rev().map(|&i| rt.get(i)).sum();
+            assert!(!panic_after, "panic after the reordered reads");
+            total
+        });
+        (flip, inputs, sum)
+    }
+
+    fn installed_deps(rt: &Runtime<Local>, h: Incr<i64>) -> Vec<NodeId> {
+        let mut deps = Vec::new();
+        rt.nodes.get(h.slot()).for_each_dep(|d| deps.push(d));
+        deps
+    }
+
+    /// A recompute whose 50k-entry dep list is shifted and reversed
+    /// publishes in time linear in the list, installing exactly the new
+    /// list and moving the reverse edges with it.
+    #[test]
+    fn local_large_reordered_dep_list_publishes_new_edges() {
+        let rt: Runtime<Local> = Runtime::new();
+        let (flip, inputs, sum) = big_reordered_query(&rt, false);
+        assert_eq!(rt.get(sum), (0..BIG as i64).sum());
+
+        rt.set(flip, true);
+        let start = std::time::Instant::now();
+        assert_eq!(rt.get(sum), (SHIFT as i64..(BIG + SHIFT) as i64).sum());
+        let took = start.elapsed();
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+
+        let expected: Vec<NodeId> = std::iter::once(NodeId(flip.slot()))
+            .chain(inputs[SHIFT..].iter().rev().map(|i| NodeId(i.slot())))
+            .collect();
+        assert_eq!(installed_deps(&rt, sum), expected);
+        for (i, &input) in inputs.iter().enumerate() {
+            assert_eq!(rt.has_reverse_edge(input, sum), i >= SHIFT, "input {i}");
+        }
+        rt.assert_invariant_i();
+    }
+
+    /// A panicking recompute over the same lists publishes the union of
+    /// the old and recorded deps, each once, in linear time.
+    #[test]
+    fn local_large_panicked_dep_list_publishes_the_union() {
+        let rt: Runtime<Local> = Runtime::new();
+        let (flip, inputs, sum) = big_reordered_query(&rt, true);
+        assert_eq!(rt.get(sum), (0..BIG as i64).sum());
+
+        rt.set(flip, true);
+        let start = std::time::Instant::now();
+        let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.get(sum)));
+        let took = start.elapsed();
+        assert!(read.is_err());
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+
+        let expected: Vec<NodeId> = std::iter::once(NodeId(flip.slot()))
+            .chain(inputs[..BIG].iter().map(|i| NodeId(i.slot())))
+            .chain(inputs[BIG..].iter().rev().map(|i| NodeId(i.slot())))
+            .collect();
+        assert_eq!(installed_deps(&rt, sum), expected);
+        for &input in &inputs {
+            assert!(rt.has_reverse_edge(input, sum));
+        }
+        rt.assert_edges_complete();
     }
 }

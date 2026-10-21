@@ -1015,3 +1015,82 @@ costs plus a2077e7's larger inlined compute body in `clean_walk`, about
 +33 per walk-driven compute under Local (Shared's whole per-compute
 rise is +9), which the gate's "adds nothing per visit" did not foresee;
 the codegen pass above recovered under 10 of it.
+
+## T-core-publish-deps-quadratic
+
+- Engine: `aebe6b6` (branch `w/T-core-publish-deps-quadratic`), against
+  its base `c63f074` (`spreadsheet-t9`), both built in the same
+  worktree. One run of `icount.sh` at the default N for each column.
+  No workloads added.
+
+| workload | N | base | after | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,646.02 | 4,646.01 | -0.01 | -0.00 | none |
+| `chain_local/propagate/10` | 1,000,000 | 10,034.02 | 10,034.03 | +0.01 | +0.00 | none |
+| `chain_local/propagate/100` | 100,000 | 91,613.31 | 91,613.14 | -0.17 | -0.00 | none |
+| `chain_shared/propagate/4` | 1,000,000 | 9,382.26 | 9,382.27 | +0.01 | +0.00 | none |
+| `chain_shared/propagate/10` | 1,000,000 | 20,415.96 | 20,415.91 | -0.05 | -0.00 | none |
+| `chain_shared/propagate/100` | 100,000 | 186,939.55 | 186,939.17 | -0.38 | -0.00 | none |
+| `diamond_local` | 1,000,000 | 3,934.01 | 3,934.00 | -0.01 | -0.00 | none |
+| `diamond_shared` | 1,000,000 | 7,818.00 | 7,817.99 | -0.01 | -0.00 | none |
+| `early_cutoff_local` | 1,000,000 | 2,306.00 | 2,306.00 | +0.00 | +0.00 | none |
+| `early_cutoff_shared` | 1,000,000 | 3,583.86 | 3,583.86 | +0.00 | +0.00 | none |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,740.95 | 4,741.07 | +0.12 | +0.00 | none |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,379.06 | 7,378.89 | -0.17 | -0.00 | none |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,273.88 | 92,273.13 | -0.75 | -0.00 | none |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,734.58 | 4,734.16 | -0.42 | -0.01 | none |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,353.25 | 7,353.53 | +0.28 | +0.00 | none |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,876.88 | 158,875.49 | -1.39 | -0.00 | none |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,742.19 | 4,740.45 | -1.74 | -0.04 | none |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,357.87 | 7,357.75 | -0.12 | -0.00 | none |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,564.46 | 1,490,574.47 | +10.01 | +0.00 | none |
+| `simple_count/local/1000` | 100,000 | 2,131.77 | 2,131.88 | +0.11 | +0.01 | none |
+| `simple_count/shared/1000` | 100,000 | 4,080.93 | 4,080.65 | -0.28 | -0.01 | none |
+| `simple_count/local/10000` | 100,000 | 2,127.98 | 2,129.07 | +1.09 | +0.05 | none |
+| `simple_count/shared/10000` | 100,000 | 4,060.52 | 4,060.35 | -0.17 | -0.00 | none |
+| `get_clean_local` | 10,000,000 | 102.00 | 102.00 | +0.00 | +0.00 | none |
+| `get_clean_shared` | 10,000,000 | 196.00 | 196.00 | +0.00 | +0.00 | none |
+| `get_contended_shared` | 2,000 | 7,791,665.07 | 7,791,645.85 | -19.22 | -0.00 | none |
+| `fanout_local_4` | 100,000 | 17,067.01 | 17,140.02 | +73.01 | +0.43 | changed-dep publish (below) |
+| `fanout_local_5` | 100,000 | 21,620.04 | 21,708.01 | +87.97 | +0.41 | changed-dep publish (below) |
+| `fanout_local_1000` | 1,000 | 3,432,230.77 | 3,447,237.82 | +15,007.05 | +0.44 | changed-dep publish (below) |
+| `fanout_shared_4` | 100,000 | 23,502.23 | 23,510.07 | +7.84 | +0.03 | none |
+| `fanout_shared_5` | 100,000 | 28,850.83 | 28,858.69 | +7.86 | +0.03 | none |
+| `fanout_shared_1000` | 1,000 | 4,745,362.78 | 4,745,364.66 | +1.88 | +0.00 | none |
+| `delete_single_local` | 200,000 | 707.00 | 707.00 | +0.00 | +0.00 | none |
+| `delete_single_shared` | 200,000 | 1,527.25 | 1,527.24 | -0.01 | -0.00 | none |
+| `delete_cascade_local` | 1,000 | 3,223,212.18 | 3,237,210.01 | +13,997.83 | +0.43 | changed-dep publish (below) |
+| `delete_cascade_shared` | 1,000 | 4,528,908.39 | 4,532,910.59 | +4,002.20 | +0.09 | changed-dep publish (below) |
+| `delete_owned_tree_local` | 10,000 | 604,062.54 | 604,814.43 | +751.89 | +0.12 | run spread (below) |
+| `delete_owned_tree_shared` | 10,000 | 985,127.63 | 985,033.41 | -94.22 | -0.01 | none |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 218.14 | 218.14 | +0.00 | +0.00 | none |
+| `table_hit_sip_local` | 10,000,000 | 300.22 | 300.91 | +0.69 | +0.23 | none (run spread) |
+| `table_miss_local` | 100,000 | 871.16 | 871.17 | +0.01 | +0.00 | none |
+| `table_miss_shared` | 100,000 | 2,164.22 | 2,164.23 | +0.01 | +0.00 | none |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,999.08 | 217,999.21 | +0.13 | +0.00 | none |
+| `children_rerun_1k_shared` | 10,000 | 224,944.41 | 224,944.96 | +0.55 | +0.00 | none |
+| `children_churn_local` | 100,000 | 16,532.53 | 16,531.70 | -0.83 | -0.01 | none |
+| `children_churn_shared` | 100,000 | 19,416.99 | 19,417.68 | +0.69 | +0.00 | none |
+
+- **Changed-dep publish (every `publish_deps` that misses the static
+  fast path; under Local +14 per call, under Shared +4).** Every first
+  compute takes it, which is all of `delete_cascade_*`'s setup (1,000
+  per iteration) and `fanout_*`'s (`width + 1` per iteration); the
+  static-dep fast path is untouched, so `chain_*`, `diamond_*` and
+  `early_cutoff_*` read the same. Intel PT on `fanout_local_4` (20
+  iterations, no lost data) puts the whole Local rise in
+  `publish_deps`: 169 straight-line instructions per call against 156,
+  plus one more per pass of a loop that runs 1.6 times per call. About 5 are the
+  length test that picks the scan or the hashed path (two lengths
+  loaded from the stack, two `setae`, a branch); the rest is register
+  reallocation around the new cold call (+4 stack moves, a loop bound
+  compared on the stack). Variants measured and dropped: an enum
+  holding either a slice or a hash set (about +80 Local per call), the
+  length test and the generic diff left to the inliner (+17 Local, +14
+  Shared), and deciding
+  from the dep-count cell before the lists are built (+55 Local).
+- **Run spread (`delete_owned_tree_local` +752):** inside T8's
+  recorded spread of about 2,700 between runs of one binary.
