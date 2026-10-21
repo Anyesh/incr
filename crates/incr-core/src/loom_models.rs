@@ -1170,6 +1170,40 @@ fn table_hit_vs_remove_rehash() {
     });
 }
 
+/// A `GridTable` hit races a delete of the entry's node and a recycle of
+/// its slot by an input outside the table: the reader gets a miss or the
+/// entry's own handle, which reads its value or unwinds as stale, and
+/// loom checks the page and directory cells for races.
+#[test]
+fn grid_hit_vs_recycle() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let table = Arc::new(rt.create_grid_table::<u64>());
+        let k = crate::GridKey::new(0, 1, 0);
+        let v = table.get_or_insert_input(&rt, k, || 7);
+        let recycler = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                rt.delete_node(v);
+                rt.create_input(99_u64)
+            })
+        };
+        let reader = {
+            let (rt, table) = (Arc::clone(&rt), Arc::clone(&table));
+            thread::spawn(move || table.get(&rt, k).map(|h| (h, may_unwind(|| rt.get(h)))))
+        };
+        let new = recycler.join().unwrap();
+        let seen = reader.join().unwrap();
+        assert_eq!(new.slot(), v.slot(), "the recycle reused v's slot");
+        if let Some((h, read)) = seen {
+            assert_eq!(h, v, "a hit is the entry's own node");
+            assert!(read.is_none_or(|value| value == 7));
+        }
+        assert_eq!(table.get(&rt, k), None);
+        rt.assert_invariant_i();
+    });
+}
+
 /// A strict delete of an owner races a compute of the query it owns:
 /// `claim_set` finds the child `Computing` and rolls back, or claims the
 /// whole set first and the compute finds its node deleted.

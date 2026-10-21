@@ -197,10 +197,12 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         init: impl FnOnce() -> T,
     ) -> Incr<T> {
         self.check_runtime(rt);
-        key.check();
+        // Only `entry_or_create` makes entries, after this check, so an
+        // out-of-range key never hits and is checked on the miss.
         if let Some(handle) = self.find(rt, key) {
             return handle;
         }
+        key.check();
         if rt.frame_doomed() {
             return rt.pending_handle();
         }
@@ -264,10 +266,12 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
         self.check_runtime(rt);
-        key.check();
+        // Only `entry_or_create` makes entries, after this check, so an
+        // out-of-range key never hits and is checked on the miss.
         if let Some(handle) = self.find(rt, key) {
             return handle;
         }
+        key.check();
         if rt.frame_doomed() {
             return rt.pending_handle();
         }
@@ -381,8 +385,10 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         if word == EMPTY || word == CLAIMED {
             return None;
         }
-        let handle = Incr::new((word as u32) - 1, (word >> 32) as u32, self.runtime_id);
-        rt.is_alive(handle).then_some(handle)
+        let (slot, generation) = ((word as u32) - 1, (word >> 32) as u32);
+        // `rt` is this table's runtime: every caller ran `check_runtime`.
+        rt.is_alive_at(slot, generation)
+            .then(|| Incr::new(slot, generation, self.runtime_id))
     }
 
     #[inline(always)]

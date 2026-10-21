@@ -194,6 +194,15 @@ impl<T: Value, C: Cells> GenericArena<T, C> {
         self.slot(slot)?.try_read()
     }
 
+    /// [`Self::try_read`] with `missing` run in place of `None`.
+    #[inline(always)]
+    pub fn read_or(&self, slot: u32, missing: impl FnOnce() -> T) -> T {
+        match self.slot(slot) {
+            Some(s) => s.read_or(missing),
+            None => missing(),
+        }
+    }
+
     /// Publish a new value at `slot` and hand back the displaced one.
     /// Under `Shared` this is an atomic pointer swap; concurrent readers
     /// finish their clone against the displaced value, which is
