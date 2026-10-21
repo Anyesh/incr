@@ -232,9 +232,12 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     }
 
     /// [`Self::get_or_insert_query_with`] with the compute and options
-    /// built by `make` only on a miss that creates the query, so a hit
-    /// pays nothing for options that allocate. `make` runs with no lock
-    /// held.
+    /// built by `make` only on a miss, so a hit pays nothing for options
+    /// that allocate. `make` runs with no lock held, so it may run on a
+    /// miss that does not create the query: when threads miss the same
+    /// key together each runs `make`, or when `make` itself creates the
+    /// key; every build but the one that created the node is dropped
+    /// unused and the call returns the created node.
     pub fn get_or_insert_query_lazy<F>(
         &self,
         rt: &Runtime<C>,

@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use super::{GridKey, GridTable, PAGE_ROWS};
 use crate::cells::{Cells, Shared};
@@ -476,6 +476,32 @@ fn grid_shared_racing_misses_agree_on_one_node() {
     for (row, &h) in seen[0].iter().enumerate() {
         assert_eq!(rt.get(h), row as i64);
     }
+}
+
+#[test]
+fn grid_shared_lazy_misses_together_both_build_and_agree_on_one_node() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let t = Arc::new(rt.create_grid_table::<i64>());
+    let both_missed = Arc::new(Barrier::new(2));
+    let builds = Arc::new(AtomicU32::new(0));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let (rt, t) = (rt.clone(), t.clone());
+            let (both_missed, builds) = (both_missed.clone(), builds.clone());
+            std::thread::spawn(move || {
+                t.get_or_insert_query_lazy(&rt, key(0, 0, 0), || -> Built<Shared> {
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    both_missed.wait();
+                    (|_| 3, QueryOpts::default())
+                })
+            })
+        })
+        .collect();
+    let seen: Vec<Incr<i64>> = threads.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(builds.load(Ordering::Relaxed), 2, "each misser builds");
+    assert_eq!(rt.node_count(), 1, "the loser's build is dropped");
+    assert_eq!(rt.get(seen[0]), 3);
 }
 
 fn grid_type_fallback_queries_need_and_use_their_types_fallback<C: Cells>(rt: &Runtime<C>)
