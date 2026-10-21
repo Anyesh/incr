@@ -163,20 +163,21 @@ def test_a_swallowed_exception_is_dropped_when_the_call_returns(module):
 
 
 @BOTH
-def test_another_runtimes_callback_inside_a_doomed_query_raises_as_itself(module):
+def test_a_doomed_querys_read_of_another_runtime_discards_its_error(module):
     other = module.Runtime()
     col = other.create_collection()
 
     def bad(x):
         raise ValueError("from the other runtime")
 
-    # Built empty, so `bad` first runs inside the doomed query's read.
     count = col.map(bad).count()
     col.insert(1)
     rt = doom_ready(module)
     a = rt.create_query(lambda r: 2, replay=True)
     seen = []
 
+    # The doomed run reached the read only through its placeholder, so the
+    # read is speculative: its error is discarded, not raised.
     def top(r):
         if r.get(a) == PLACEHOLDER:
             try:
@@ -187,4 +188,6 @@ def test_another_runtimes_callback_inside_a_doomed_query_raises_as_itself(module
 
     t = rt.create_query(top, replay=True)
     assert rt.get(t) == 0
-    assert seen == ["ValueError"]
+    assert seen == []
+    with pytest.raises(ValueError, match="from the other runtime"):
+        other.get(count)
