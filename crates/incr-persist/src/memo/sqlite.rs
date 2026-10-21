@@ -115,6 +115,9 @@ impl SqliteMemo {
         )
         .map_err(sql)?;
         writer.busy_timeout(options.busy_timeout).map_err(sql)?;
+        // After the schema check, because the journal mode is stored in the
+        // file and a refused file must be left as it was.
+        create_schema(&mut writer)?;
         enable_wal(&writer, options.busy_timeout)?;
         let synchronous = match options.durability {
             SqliteDurability::Full => "FULL",
@@ -123,7 +126,6 @@ impl SqliteMemo {
         writer
             .pragma_update(None, "synchronous", synchronous)
             .map_err(sql)?;
-        create_schema(&mut writer)?;
 
         let reader = Connection::open_with_flags(
             path,
@@ -366,8 +368,11 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
     let version: i64 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(sql)?;
+    let objects: i64 = tx
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .map_err(sql)?;
     match (application_id, version) {
-        (0, 0) => {
+        (0, 0) if objects == 0 => {
             tx.execute_batch(SCHEMA).map_err(sql)?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)
                 .map_err(sql)?;
@@ -375,6 +380,11 @@ fn create_schema(conn: &mut Connection) -> Result<()> {
                 .map_err(sql)?;
         }
         (APPLICATION_ID, SCHEMA_VERSION) => {}
+        (0, 0) => {
+            return Err(Error::Backend(
+                "not an incr-persist memo store: the database holds another schema".into(),
+            ))
+        }
         _ => {
             return Err(Error::Backend(
                 format!(
