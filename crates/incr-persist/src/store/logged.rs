@@ -27,15 +27,28 @@ pub(crate) struct LoggedKey {
 /// A collection's elements folded without knowing their type.
 ///
 /// Two equal elements may serialize to different bytes (a `HashMap` field
-/// iterates in an arbitrary order), so a `Remove` whose bytes match no live
-/// element might still remove one by value. Up to the first such `Remove`
-/// the byte multiset is exact, because equal bytes always decode to equal
-/// values; from it on, element records are kept raw in `tail` until a
-/// binding decodes them or a `Delete` clears them.
+/// iterates in an arbitrary order), and the runtime keeps the first
+/// inserted of equal elements as the one it stores. So live bytes keep the
+/// order they were first inserted in, and a change is folded only when the
+/// result holds whatever `T`'s `Eq` is: an insert, a remove from no
+/// elements, or a remove of bytes with more than one live occurrence or of
+/// the only occurrence of the latest inserted bytes. Any other remove might remove an equal element
+/// stored under other bytes, or one an earlier equal element must outlive;
+/// from it on, element records are kept raw in `tail` until a binding
+/// decodes them or a `Delete` clears them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Elements {
-    live: HashMap<Vec<u8>, usize>,
+    live: HashMap<Vec<u8>, Live>,
     tail: Vec<ElementOp>,
+}
+
+/// One live element's occurrences and its place in insertion order. Only
+/// the latest inserted bytes are ever dropped, so the places are always
+/// `0..live.len()`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Live {
+    count: usize,
+    at: usize,
 }
 
 /// One element change kept raw in [`Elements`]' tail.
@@ -135,12 +148,15 @@ impl Elements {
         self.live.is_empty() && self.tail.is_empty()
     }
 
-    /// Live elements by serialized bytes with their multiplicity. Apply
-    /// [`Elements::tail`] after them to reach the current state.
-    pub fn live(&self) -> impl Iterator<Item = (&[u8], usize)> {
-        self.live
-            .iter()
-            .map(|(bytes, &count)| (bytes.as_slice(), count))
+    /// Live elements by serialized bytes with their multiplicity, in the
+    /// order first inserted. Apply [`Elements::tail`] after them to reach
+    /// the current state.
+    pub fn live(&self) -> impl DoubleEndedIterator<Item = (&[u8], usize)> {
+        let mut live = vec![(&[][..], 0); self.live.len()];
+        for (bytes, entry) in &self.live {
+            live[entry.at] = (bytes.as_slice(), entry.count);
+        }
+        live.into_iter()
     }
 
     pub fn tail(&self) -> &[ElementOp] {
@@ -150,10 +166,10 @@ impl Elements {
     /// Pushes one `Insert` per live element occurrence, then the raw tail,
     /// the records that fold back to these elements from none.
     fn records(&self, key: &str, out: &mut Vec<Record>) {
-        for (element, &count) in &self.live {
+        for (element, count) in self.live() {
             out.extend((0..count).map(|_| Record::Insert {
                 key: key.to_owned(),
-                element: element.clone(),
+                element: element.to_vec(),
             }));
         }
         out.extend(self.tail.iter().map(|op| match op {
@@ -168,44 +184,78 @@ impl Elements {
         }));
     }
 
-    /// Pushes a `Remove` or `Insert` per occurrence that differs between
-    /// `self` and `new`. Exact only while neither has a raw tail.
-    fn diff(&self, key: &str, new: &Elements, out: &mut Vec<Record>) {
-        for (element, &have) in &self.live {
-            let want = new.live.get(element).copied().unwrap_or(0);
-            out.extend((want..have).map(|_| Record::Remove {
-                key: key.to_owned(),
-                element: element.clone(),
-            }));
+    /// Pushes a `Remove` per occurrence `new` lacks, latest inserted first,
+    /// then an `Insert` per occurrence it adds, in its order. Pushes nothing
+    /// and returns false when those records do not fold `self` into exactly
+    /// `new`: either has a raw tail, or `new`'s order is not one they reach.
+    fn diff(&self, key: &str, new: &Elements, out: &mut Vec<Record>) -> bool {
+        if !self.tail.is_empty() || !new.tail.is_empty() {
+            return false;
         }
-        for (element, &want) in &new.live {
-            let have = self.live.get(element).copied().unwrap_or(0);
-            out.extend((have..want).map(|_| Record::Insert {
-                key: key.to_owned(),
-                element: element.clone(),
-            }));
+        let count = |elements: &Elements, element: &[u8]| {
+            elements.live.get(element).map_or(0, |entry| entry.count)
+        };
+        let mut changes = Vec::new();
+        for (element, have) in self.live().rev() {
+            let want = count(new, element);
+            changes.extend((want..have).map(|_| ElementOp::Remove(element.to_vec())));
         }
+        for (element, want) in new.live() {
+            let have = count(self, element);
+            changes.extend((have..want).map(|_| ElementOp::Insert(element.to_vec())));
+        }
+        let mut reached = self.clone();
+        for op in &changes {
+            match op {
+                ElementOp::Insert(element) => reached.insert(element.clone()),
+                ElementOp::Remove(element) => reached.remove(element.clone()),
+            }
+        }
+        if reached != *new {
+            return false;
+        }
+        out.extend(changes.into_iter().map(|op| match op {
+            ElementOp::Insert(element) => Record::Insert {
+                key: key.to_owned(),
+                element,
+            },
+            ElementOp::Remove(element) => Record::Remove {
+                key: key.to_owned(),
+                element,
+            },
+        }));
+        true
     }
 
     fn insert(&mut self, element: Vec<u8>) {
         if self.tail.is_empty() {
-            *self.live.entry(element).or_insert(0) += 1;
+            let at = self.live.len();
+            self.live
+                .entry(element)
+                .or_insert(Live { count: 0, at })
+                .count += 1;
         } else {
             self.tail.push(ElementOp::Insert(element));
         }
     }
 
     fn remove(&mut self, element: Vec<u8>) {
-        if !self.tail.is_empty() {
-            self.tail.push(ElementOp::Remove(element));
-        } else if let Some(count) = self.live.get_mut(&element) {
-            *count -= 1;
-            if *count == 0 {
-                self.live.remove(&element);
+        if self.tail.is_empty() {
+            let latest = self.live.len().checked_sub(1);
+            match self.live.get_mut(&element) {
+                Some(entry) if entry.count > 1 => {
+                    entry.count -= 1;
+                    return;
+                }
+                Some(entry) if Some(entry.at) == latest => {
+                    self.live.remove(&element);
+                    return;
+                }
+                None if latest.is_none() => return,
+                _ => {}
             }
-        } else if !self.live.is_empty() {
-            self.tail.push(ElementOp::Remove(element));
         }
+        self.tail.push(ElementOp::Remove(element));
     }
 }
 
@@ -260,10 +310,12 @@ pub(crate) fn changes_between(
         return false;
     }
     let elements_changed = old.elements != new.elements;
-    let raw = !old.elements.tail.is_empty() || !new.elements.tail.is_empty();
-    // A value going back to unset has no Set to express it, and raw tails
-    // cannot be diffed by bytes; both are a Delete and the full new state.
-    if (old.value.is_some() && new.value.is_none()) || (elements_changed && raw) {
+    let mut diff = Vec::new();
+    let diffed = elements_changed && old.elements.diff(key, &new.elements, &mut diff);
+    // A value going back to unset has no Set to express it, and elements
+    // no diff reaches have no records that do; both are a Delete and the
+    // full new state.
+    if (old.value.is_some() && new.value.is_none()) || (elements_changed && !diffed) {
         out.push(Record::Delete {
             key: key.to_owned(),
         });
@@ -284,9 +336,7 @@ pub(crate) fn changes_between(
             });
         }
     }
-    if elements_changed {
-        old.elements.diff(key, &new.elements, out);
-    }
+    out.extend(diff);
     false
 }
 
@@ -387,11 +437,48 @@ mod tests {
         ] {
             fold(&mut keys, record);
         }
-        let expected = HashMap::from([(vec![1], 1), (vec![3], 2)]);
-        assert_eq!(keys["c"].elements.live, expected);
+        assert_eq!(live(&keys["c"].elements), [(vec![1], 1), (vec![3], 2)]);
         assert!(keys["c"].elements.tail.is_empty());
         fold(&mut keys, Record::Delete { key: "c".into() });
         assert!(!keys.contains_key("c"), "nothing is left without a Declare");
+    }
+
+    fn live(elements: &Elements) -> Vec<(Vec<u8>, usize)> {
+        elements
+            .live()
+            .map(|(bytes, count)| (bytes.to_vec(), count))
+            .collect()
+    }
+
+    fn remove(element: u8) -> Record {
+        Record::Remove {
+            key: "c".into(),
+            element: vec![element],
+        }
+    }
+
+    // Equal elements may encode as 1 and 2, so the remove of 1's only
+    // occurrence might have to leave 1 as what an equal 2 is stored as.
+    #[test]
+    fn live_bytes_keep_insertion_order_and_fold_only_removes_any_eq_allows() {
+        let mut keys = LoggedKeys::new();
+        for record in [
+            insert(2),
+            insert(1),
+            insert(2),
+            insert(3),
+            remove(3),
+            remove(2),
+        ] {
+            fold(&mut keys, record);
+        }
+        assert_eq!(live(&keys["c"].elements), [(vec![2], 1), (vec![1], 1)]);
+        assert!(keys["c"].elements.tail.is_empty());
+        fold(&mut keys, remove(2));
+        assert_eq!(live(&keys["c"].elements), [(vec![2], 1), (vec![1], 1)]);
+        assert_eq!(keys["c"].elements.tail, [ElementOp::Remove(vec![2])]);
+        let records = keys["c"].records("c");
+        assert_eq!(records[..2], [insert(2), insert(1)]);
     }
 
     #[test]
@@ -405,7 +492,7 @@ mod tests {
             fold(&mut keys, record);
         }
         let elements = &keys["c"].elements;
-        assert_eq!(elements.live, HashMap::from([(vec![1], 1), (vec![2], 1)]));
+        assert_eq!(live(elements), [(vec![1], 1), (vec![2], 1)]);
         assert_eq!(
             elements.tail,
             [
@@ -492,6 +579,9 @@ mod tests {
             (vec![declare.clone(), insert(5)], vec![insert(5), insert(6)]),
             (vec![declare_input(1)], vec![declare.clone(), insert(5)]),
             (vec![set(1), insert(2)], vec![]),
+            (vec![insert(1), insert(2)], vec![insert(2)]),
+            (vec![insert(1)], vec![insert(2), insert(1)]),
+            (vec![insert(1), insert(2)], vec![insert(1), insert(3)]),
         ];
         for (old, new) in cases {
             let (old, new) = (folded(&old), folded(&new));
@@ -503,6 +593,17 @@ mod tests {
             }
             assert_eq!(replayed, new, "{old:?} -> {new:?}");
         }
+        let (old, new) = (
+            folded(&[insert(1), insert(1), insert(2)]),
+            folded(&[insert(1), insert(3)]),
+        );
+        let mut changes = Vec::new();
+        changes_between("c", Some(&old), Some(&new), true, &mut changes);
+        assert_eq!(
+            changes,
+            [remove(2), remove(1), insert(3)],
+            "diffed, not rebuilt"
+        );
         let same = folded(&[declare, set(1), insert(2)]);
         let mut changes = Vec::new();
         changes_between("c", Some(&same), Some(&same), true, &mut changes);
