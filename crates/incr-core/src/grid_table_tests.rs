@@ -57,6 +57,7 @@ both!(
     grid_another_runtime_is_refused,
     grid_a_dead_or_recycled_entry_is_a_miss,
     grid_a_key_out_of_range_is_refused,
+    grid_a_doomed_frame_refuses_a_key_out_of_range,
     grid_a_doomed_miss_returns_a_pending_handle_and_creates_nothing,
     grid_insert_inputs_enters_every_node,
     grid_insert_queries_watched_watches_every_node,
@@ -234,24 +235,110 @@ fn grid_a_dead_or_recycled_entry_is_a_miss<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(t.get(rt, recycled), Some(r2));
 }
 
-fn grid_a_key_out_of_range_is_refused<C: Cells>(rt: &Runtime<C>) {
-    let t = rt.create_grid_table::<i64>();
-    for k in [
+fn out_of_range_keys() -> [GridKey; 4] {
+    [
         key(GridKey::SHEETS, 0, 0),
         key(0, GridKey::ROWS, 0),
+        key(0, GridKey::ROWS + PAGE_ROWS - 1, 0),
         key(0, 0, GridKey::COLUMNS),
-    ] {
-        panics_with("out of range", || {
-            t.get_or_insert_input(rt, k, || 1);
-        });
-        panics_with("out of range", || {
-            t.get(rt, k);
-        });
-        panics_with("out of range", || {
-            t.insert_inputs(rt, vec![(k, 1)]);
-        });
+    ]
+}
+
+/// Whether `f` panicked with the out-of-range message.
+fn refused_out_of_range<R>(f: impl FnOnce() -> R) -> bool {
+    catch_unwind(AssertUnwindSafe(f)).is_err_and(|payload| {
+        payload
+            .downcast_ref::<String>()
+            .is_some_and(|m| m.contains("out of range"))
+    })
+}
+
+/// A lookup checks the key's range only on a miss, which an out-of-range
+/// key always is, so it is refused whether or not the table has entries
+/// at the edge of every bound.
+fn grid_a_key_out_of_range_is_refused<C: Cells>(rt: &Runtime<C>) {
+    let t = rt.create_grid_table::<i64>();
+    let mut edges = vec![key(1, PAGE_ROWS, 1)];
+    // Directories that large are too slow to initialize under Miri.
+    if !cfg!(miri) {
+        edges.extend([
+            key(GridKey::SHEETS - 1, 0, 0),
+            key(0, GridKey::ROWS - 1, 0),
+            key(0, 0, GridKey::COLUMNS - 1),
+        ]);
     }
-    assert_eq!(rt.node_count(), 0);
+    for populated in [false, true] {
+        if populated {
+            for &k in &edges {
+                t.get_or_insert_input(rt, k, || 1);
+            }
+        }
+        let nodes = rt.node_count();
+        for k in out_of_range_keys() {
+            let calls: [(&str, &dyn Fn()); 5] = [
+                ("get_or_insert_input", &|| {
+                    t.get_or_insert_input(rt, k, || 1);
+                }),
+                ("get_or_insert_query", &|| {
+                    t.get_or_insert_query(rt, k, |_| 1);
+                }),
+                ("get_or_insert_query_lazy", &|| {
+                    t.get_or_insert_query_lazy(rt, k, || -> Built<C> {
+                        (|_| 1, QueryOpts::default())
+                    });
+                }),
+                ("get", &|| {
+                    t.get(rt, k);
+                }),
+                ("insert_inputs", &|| {
+                    t.insert_inputs(rt, vec![(k, 1)]);
+                }),
+            ];
+            for (call, f) in calls {
+                assert!(
+                    refused_out_of_range(f),
+                    "{call} {k:?}, populated {populated}"
+                );
+            }
+        }
+        assert_eq!(rt.node_count(), nodes);
+    }
+}
+
+/// The range check comes before the doomed frame's pending handle, so a
+/// doomed compute's out-of-range key panics as it would undoomed.
+fn grid_a_doomed_frame_refuses_a_key_out_of_range<C: Cells>(rt: &Runtime<C>)
+where
+    GridTable<i64, C>: Send + Sync,
+{
+    rt.set_placeholder::<i64>(-1);
+    let gate = rt.doom_gate();
+    let t = Arc::new(rt.create_grid_table::<i64>());
+    t.get_or_insert_input(rt, key(0, 0, 0), || 1);
+    let refused = Arc::new(AtomicU32::new(0));
+    let doomed = Arc::new(AtomicU32::new(0));
+    let (t2, count, pending) = (t.clone(), refused.clone(), doomed.clone());
+    let q = rt.create_query_with(
+        move |rt| {
+            if rt.get(gate).0 {
+                return 0;
+            }
+            let p = t2.get_or_insert_input(rt, key(0, 5, 0), || 0);
+            pending.fetch_add(u32::from(!rt.is_alive(p)), Ordering::Relaxed);
+            for k in out_of_range_keys() {
+                let input = refused_out_of_range(|| t2.get_or_insert_input(rt, k, || 0));
+                let query = refused_out_of_range(|| t2.get_or_insert_query(rt, k, |_| 0));
+                count.fetch_add(u32::from(input) + u32::from(query), Ordering::Relaxed);
+            }
+            0_i64
+        },
+        replayable(),
+    );
+    let nodes = rt.node_count();
+    assert_eq!(rt.get(q), 0);
+    assert_eq!(doomed.load(Ordering::Relaxed), 1, "one doomed run");
+    assert_eq!(refused.load(Ordering::Relaxed), 8);
+    assert_eq!(rt.node_count(), nodes);
 }
 
 #[derive(Default)]

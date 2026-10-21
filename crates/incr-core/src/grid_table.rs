@@ -197,10 +197,12 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         init: impl FnOnce() -> T,
     ) -> Incr<T> {
         self.check_runtime(rt);
-        key.check();
+        // Only `entry_or_create` makes entries, after this check, so an
+        // out-of-range key never hits and is checked on the miss.
         if let Some(handle) = self.find(rt, key) {
             return handle;
         }
+        key.check();
         if rt.frame_doomed() {
             return rt.pending_handle();
         }
@@ -261,10 +263,12 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
         self.check_runtime(rt);
-        key.check();
+        // Only `entry_or_create` makes entries, after this check, so an
+        // out-of-range key never hits and is checked on the miss.
         if let Some(handle) = self.find(rt, key) {
             return handle;
         }
+        key.check();
         if rt.frame_doomed() {
             return rt.pending_handle();
         }
