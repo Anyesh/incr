@@ -850,3 +850,167 @@ T6; every Shared rise is the bench binary's partitioning, the ninth
 state's decode, haphazard's reclaim cadence or the walk's register
 allocation, each measured above; the delete benches fall except the
 owned-tree pair, whose rise is the plan's named `claim_set` cost.
+
+## T8
+
+- Engine: `92521e2` (branch `spreadsheet-t8`). Machine and toolchain as
+  for T0.
+- T7 is `main` at `9346b5a`, built in a worktree at a path of the same
+  length as T8's. The "T8, T7 benches" column is T8's library built with
+  T7's bench sources, which T8 does not change, so the two T8 columns
+  differ only by run; one run of `icount.sh` at the default N for each
+  column. T8 adds no workloads.
+
+| workload | N | T7 | T8, T7 benches | T8 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,428.00 | 4,612.00 | 4,612.00 | +184.00 | +4.16 | per-compute and per-get sources (below) |
+| `chain_local/propagate/10` | 1,000,000 | 9,558.00 | 9,976.00 | 9,976.00 | +418.00 | +4.37 | per-compute and per-get sources (below) |
+| `chain_local/propagate/100` | 100,000 | 87,267.03 | 91,195.06 | 91,195.11 | +3,928.08 | +4.50 | per-compute and per-get sources (below) |
+| `chain_shared/propagate/4` | 1,000,000 | 9,294.23 | 9,349.25 | 9,349.29 | +55.06 | +0.59 | per-compute and per-get sources (below) |
+| `chain_shared/propagate/10` | 1,000,000 | 20,243.86 | 20,352.98 | 20,352.88 | +109.02 | +0.54 | per-compute and per-get sources (below) |
+| `chain_shared/propagate/100` | 100,000 | 185,505.97 | 186,426.40 | 186,426.13 | +920.16 | +0.50 | per-compute and per-get sources (below) |
+| `diamond_local` | 1,000,000 | 3,760.00 | 3,903.01 | 3,903.01 | +143.01 | +3.80 | per-compute and per-get sources (below) |
+| `diamond_shared` | 1,000,000 | 7,756.93 | 7,787.96 | 7,787.98 | +31.05 | +0.40 | per-compute and per-get sources (below) |
+| `early_cutoff_local` | 1,000,000 | 2,202.00 | 2,280.01 | 2,280.00 | +78.00 | +3.54 | per-compute and per-get sources (below) |
+| `early_cutoff_shared` | 1,000,000 | 3,515.85 | 3,559.86 | 3,559.85 | +44.00 | +1.25 | per-compute and per-get sources (below) |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,480.84 | 4,710.52 | 4,710.67 | +229.83 | +5.13 | per-compute and per-get sources (below) |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,210.94 | 7,349.15 | 7,349.72 | +138.78 | +1.92 | per-compute and per-get sources (below) |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,272.75 | 92,272.30 | 92,273.35 | +0.60 | +0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,473.69 | 4,704.78 | 4,703.76 | +230.07 | +5.14 | per-compute and per-get sources (below) |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,184.80 | 7,323.85 | 7,324.04 | +139.24 | +1.94 | per-compute and per-get sources (below) |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,876.70 | 158,876.29 | 158,875.51 | -1.19 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,481.54 | 4,710.89 | 4,711.25 | +229.71 | +5.13 | per-compute and per-get sources (below) |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,190.73 | 7,327.33 | 7,329.18 | +138.45 | +1.93 | per-compute and per-get sources (below) |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,561.29 | 1,490,551.57 | 1,490,561.74 | +0.45 | +0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,043.51 | 2,109.70 | 2,109.56 | +66.05 | +3.23 | per-compute and per-get sources (below) |
+| `simple_count/shared/1000` | 100,000 | 4,035.66 | 4,062.80 | 4,062.55 | +26.89 | +0.67 | per-compute and per-get sources (below) |
+| `simple_count/local/10000` | 100,000 | 2,040.15 | 2,106.48 | 2,106.37 | +66.22 | +3.25 | per-compute and per-get sources (below) |
+| `simple_count/shared/10000` | 100,000 | 4,015.35 | 4,043.02 | 4,042.69 | +27.34 | +0.68 | per-compute and per-get sources (below) |
+| `get_clean_local` | 10,000,000 | 97.00 | 102.00 | 102.00 | +5.00 | +5.15 | thread-wide frame stack (below) |
+| `get_clean_shared` | 10,000,000 | 201.00 | 196.00 | 196.00 | -5.00 | -2.49 | frame stack thread-local (below) |
+| `get_contended_shared` | 2,000 | 7,993,284.39 | 7,791,636.96 | 7,791,679.35 | -201,605.04 | -2.52 | frame stack thread-local (below) |
+| `fanout_local_4` | 100,000 | 16,683.01 | 17,205.04 | 17,205.00 | +521.99 | +3.13 | per-compute and per-get sources; delete path (below) |
+| `fanout_local_5` | 100,000 | 21,151.01 | 21,781.05 | 21,781.01 | +630.00 | +2.98 | per-compute and per-get sources; delete path (below) |
+| `fanout_local_1000` | 1,000 | 3,348,168.25 | 3,455,272.78 | 3,455,269.25 | +107,101.00 | +3.20 | per-compute and per-get sources; delete path (below) |
+| `fanout_shared_4` | 100,000 | 23,492.03 | 23,633.18 | 23,633.12 | +141.09 | +0.60 | per-compute and per-get sources; delete path (below) |
+| `fanout_shared_5` | 100,000 | 28,824.78 | 29,003.74 | 29,003.71 | +178.93 | +0.62 | per-compute and per-get sources; delete path (below) |
+| `fanout_shared_1000` | 1,000 | 4,730,861.58 | 4,767,399.36 | 4,767,388.41 | +36,526.83 | +0.77 | per-compute and per-get sources; delete path (below) |
+| `delete_single_local` | 200,000 | 726.00 | 730.00 | 730.00 | +4.00 | +0.55 | delete path (below) |
+| `delete_single_shared` | 200,000 | 1,570.25 | 1,546.24 | 1,546.24 | -24.01 | -1.53 | delete path (below) |
+| `delete_cascade_local` | 1,000 | 3,163,258.32 | 3,246,233.20 | 3,246,233.65 | +82,975.33 | +2.62 | per-compute and per-get sources; delete path (below) |
+| `delete_cascade_shared` | 1,000 | 4,542,105.65 | 4,550,927.86 | 4,550,918.71 | +8,813.06 | +0.19 | per-compute and per-get sources; delete path (below) |
+| `delete_owned_tree_local` | 10,000 | 603,427.40 | 604,532.82 | 607,202.29 | +3,774.89 | +0.63 | run spread (below) |
+| `delete_owned_tree_shared` | 10,000 | 982,399.12 | 980,140.43 | 979,479.05 | -2,920.07 | -0.30 | none |
+| `table_hit_local` | 10,000,000 | 155.14 | 155.14 | 155.14 | +0.00 | +0.00 | none |
+| `table_hit_shared` | 10,000,000 | 219.14 | 218.14 | 218.14 | -1.00 | -0.46 | none |
+| `table_hit_sip_local` | 10,000,000 | 301.08 | 300.32 | 301.84 | +0.76 | +0.25 | none (run spread) |
+| `table_miss_local` | 100,000 | 865.87 | 871.17 | 871.18 | +5.31 | +0.61 | per-compute and per-get sources (below) |
+| `table_miss_shared` | 100,000 | 2,178.10 | 2,164.21 | 2,164.22 | -13.88 | -0.64 | none |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 90.00 | 87.00 | 87.00 | -3.00 | -3.33 | none |
+| `children_rerun_1k_local` | 10,000 | 217,910.10 | 217,977.58 | 217,977.16 | +67.06 | +0.03 | per-compute and per-get sources (below) |
+| `children_rerun_1k_shared` | 10,000 | 236,896.63 | 224,925.55 | 224,925.11 | -11,971.52 | -5.05 | haphazard reclaim cadence (below) |
+| `children_churn_local` | 100,000 | 16,465.47 | 16,532.24 | 16,530.69 | +65.22 | +0.40 | per-compute and per-get sources (below) |
+| `children_churn_shared` | 100,000 | 19,602.39 | 19,420.17 | 19,417.11 | -185.28 | -0.95 | none |
+
+- **Per-compute and per-get sources (every workload that computes).**
+  A walk-driven compute costs +39 instructions under Local and +9 under
+  Shared, from the slope of `chain_*/propagate/100` against `/10`
+  ((3,928.08 − 418.00) / 90 and (920.16 − 109.02) / 90). Intel PT per
+  instruction address on `chain_local/propagate/10`, with line-table
+  builds of T7 and T8 and each source line mapped across the T7-to-T8
+  diff, splits the Local +39 as follows:
+  - named T8 lines, about +6 per compute: the frame stack's cached
+    pointer and borrow (+1, below), the first-push capacity test that
+    registers the stack's guard (+2), the frame index bias the replay
+    driver needs (+2), the `DOOMED` test folded into the `LOW` test at
+    the pop (+1) and the `top.rt` compare (+1); folding `REPLAY_BIT`
+    into the post-pop word test saves 1;
+  - `for_each_dep`, out of line in T7 (380 per 10 computes), is inlined
+    into `clean_walk`; its body lands on the iterator, cell and range
+    lines inside the walk and nets about zero;
+  - the rest, about +33 per compute, is a2077e7's larger inlined compute
+    body. `clean_walk` inlines `compute_attempts`, and with T8's replay
+    arms in it the walk executes per compute +16 stack loads, +6 stack
+    stores, +14 compares and +11 branches on lines whose source did not
+    change. Of that, +4 Local and +8 Shared is the `Skipped(u32)` result
+    (579f0a4, merged in bb737b6): its payload makes `Computed` two words,
+    so the walk keeps a second register live through the compute and
+    reloads it on the loop's back edge.
+
+  By commit (first-parent sweep of `spreadsheet-t8` built with T7's
+  bench sources, `chain_local/propagate/10` and `chain_shared/propagate/10`,
+  per 10 computes): commits before a2077e7 −1 and +10; a2077e7 (the
+  replay feature) +655 and +739, of which an out-of-line `Frames::frame`
+  was 310 under Local; 1a57101 (entry, frame push and landing paths
+  inline) −342 and −449; 49cbc8a +70 and +40; bb737b6 +41 and +78;
+  aba5fe3, dfb67d4, bdc8ebe and 42b8c2b together −37 and −60; the
+  thread-wide frame stack (8c8a521 with fe65b0e) +59 and −141, measured
+  against fe65b0e with 8c8a521 reverted; the other commits up to
+  fe65b0e −26 and −67; b393429 −2 and −40. The steps sum to the table's
+  +418 and +109.
+
+  A codegen pass (T8-walk-codegen) tried to get the +33 back: one cold
+  call for the post-pop replay checks (b393429, kept: −2 Local, −40
+  Shared per 10 computes); `compute_attempts` out of line (+99 and +322,
+  rejected); `for_each_dep` out of line (+366 Local, rejected);
+  `walk_stopped` deriving its visit itself, so the loop keeps fewer
+  values live (0, dropped).
+
+  Every top-level non-Clean `get` adds +28 Local and +21 Shared in
+  `get_slow`: about +11 on T8 lines (the entry guard, the active-context
+  test, the frame checks after the walk) and +16 from two more node
+  lookups (`segmented_nodes` 8 to 21, `directory` 6 to 9 per call) that
+  re-derive node pointers T7 kept across the walk call. A nested
+  non-Clean read (`fanout_*`) adds +45 per `get_slow`: +12 on T8 lines
+  (`record_read`'s `reading` store and `ActiveRead`, the depth compare
+  and the `DOOMED` test), +16 from the same lookups and +17 of glue.
+
+  The workloads compose from these: `diamond_local` +143,
+  `early_cutoff_local` +78, `simple_count/local` +66 and the children
+  pair (+67 and +65 Local) are one top-level get plus their computes;
+  `collection_insert_then_read/local_incremental` +230 adds to that
+  `Provisional::drop` moving out of `insert_staged` (+69 and −104) and
+  +44 in the collection's compute closure; `delete_cascade_local`
+  +82,975 is its 1,000 setup gets and computes (about +67 each, so about
+  +67,000) and about +16 per node of the cascade's delete path, which
+  this record does not split further: Intel PT loses AUX data on the
+  cascade benches at every N. Shared pays the same sources at its
+  smaller per-compute cost.
+- **Thread-wide frame stack (`get_clean_local` +5):** Local Clean get
+  +5 is the thread-wide frame stack's TLS address and the `top.rt`
+  compare the cross-runtime rule needs. The stack's thread-local has no
+  destructor (its buffer is freed by a guard registered on the first
+  push) and each Local runtime caches its address at `Runtime::new`
+  (fe65b0e), which took the count from 109 to 102.
+- **Frame stack thread-local (`get_clean_shared` −5,
+  `get_contended_shared` −2.52%):** the same destructor-free
+  thread-local takes Shared's Clean get from 201 to 196; the contended
+  bench is Clean gets on four threads and falls by the same fraction
+  (−2.49% and −2.52%).
+- **Delete path (`delete_single_*`, and the delete half of
+  `fanout_*` and `delete_cascade_*`):** every delete tests `REPLAY_BIT`
+  in the thread word before the virtual-frame scan (483a1c8), and the
+  scan sits in a cold function so the own-compute assert stays inline
+  (d37613e): `delete_single_local` +4 (726 to 730), `delete_single_shared`
+  −24. Before those two fixes the scan ran on every delete
+  (`delete_single_local` 807).
+- **Haphazard reclaim cadence (`children_rerun_1k_shared` −11,972):**
+  the drop is in the allocator and haphazard's `Domain::push_list`, the
+  bulk-reclaim cadence T7's note describes: a two-iteration Intel PT
+  trace puts `push_list` at 41,156 per iteration in T7 against 94 in T8.
+  That workload's traces lose AUX data at every N, so the split is not
+  exact.
+- **Run spread (`delete_owned_tree_local` +3,775, +0.63%):** the two T8
+  columns, built from the same library and bench sources, read 604,533
+  and 607,202, and T7 read 602,402 in T7's record and 603,427 here, so
+  the bench moves by up to about 2,700 between runs of one binary;
+  against the "T8, T7 benches" column the rise is +1,105 (+0.18%).
+
+Gate against T7 (plan T8 **Gate**): the Clean get is 102 Local (+5,
+the thread-wide frame stack, a recorded departure from "unchanged") and
+196 Shared (−5). Every other rise is the named per-read and per-delete
+costs plus a2077e7's larger inlined compute body in `clean_walk`, about
++33 per walk-driven compute under Local (Shared's whole per-compute
+rise is +9), which the gate's "adds nothing per visit" did not foresee;
+the codegen pass above recovered under 10 of it.
