@@ -517,8 +517,8 @@ fn pick(rng: &mut u64, n: usize) -> usize {
 /// A random mapped write for churn; `None` when the spec has nothing churn
 /// may write.
 fn churn_write(spec: &Spec, rng: &mut u64) -> Option<Op> {
-    let float = |rng: &mut u64| element(FLOATS[pick(rng, FLOATS.len())]);
-    let tag = |rng: &mut u64| element_tag((pick(rng, 3) as u8, pick(rng, 3) as u8));
+    let float = |rng: &mut u64| F(FLOATS[pick(rng, FLOATS.len())]);
+    let tag = |rng: &mut u64| tag((pick(rng, 3) as u8, pick(rng, 3) as u8));
     let kinds = if spec.collections { 5 } else { 1 };
     Some(match pick(rng, kinds) {
         0 if spec.inputs > 1 => {
@@ -775,22 +775,12 @@ fn resolve_dep(shape: Shape, i: u32, (kind, a, b): RawDep) -> Dep {
     }
 }
 
-/// A random collection element. Equal elements that encode differently,
-/// -0.0 and 0.0 or tags that differ only in their note, give a restart a
-/// representative that depends on hash order until the board item
-/// T10-collection-rep-order lands, so random ops draw one encoding per
-/// class and the pinned edge tests carry the rest.
-fn element(x: f64) -> F {
-    F(if x == 0.0 { 0.0 } else { x })
-}
-
-fn element_tag((id, _): (u8, u8)) -> Tag {
-    Tag { id, note: 0 }
+fn tag((id, note): (u8, u8)) -> Tag {
+    Tag { id, note }
 }
 
 fn resolve_op(shape: Shape, (kind, a, x, y, t, u, some): RawOp) -> Op {
     let node = a % shape.nodes;
-    let tag = element_tag;
     match kind % 14 {
         0..=2 => Op::Read(node),
         3 if shape.drops => Op::Drop(node),
@@ -799,9 +789,9 @@ fn resolve_op(shape: Shape, (kind, a, x, y, t, u, some): RawOp) -> Op {
         6 if shape.externals > 0 => {
             Op::External((a % u32::from(shape.externals)) as u8, u128::from(a % 3))
         }
-        7 if shape.collections => Op::Insert(element(x)),
-        8 if shape.collections => Op::Delete(element(x)),
-        9 if shape.collections => Op::Replace(some.then_some(element(x)), element(y)),
+        7 if shape.collections => Op::Insert(F(x)),
+        8 if shape.collections => Op::Delete(F(x)),
+        9 if shape.collections => Op::Replace(some.then_some(F(x)), F(y)),
         10 if shape.collections => Op::InsertTag(tag(t)),
         11 if shape.collections => Op::ReplaceTag(some.then_some(tag(t)), tag(u)),
         12 if shape.collections => Op::DeleteTag(tag(t)),
@@ -987,7 +977,6 @@ fn a_zero_element_replaced_by_minus_zero_restarts_like_a_cold_run() {
 /// of both occurrences.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T10-collection-rep-order: a restart folds a collection's elements in hash order"]
 fn zero_elements_of_both_signs_restart_like_a_cold_run() {
     let writes = vec![Op::Insert(F(-0.0)), Op::Insert(F(0.0))];
     edge_case::<Shared>(

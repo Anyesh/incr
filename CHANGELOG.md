@@ -34,6 +34,7 @@ All notable changes to this project are documented here. Format roughly follows 
 - A `set` that raced a delete and recycle of its input could write its value into the node that reused the slot, stamp that node and walk dependents it never had a handle to. It now panics as stale and leaves the new occupant untouched.
 - A `set` of an owned input (a `group_by` group's version node) no longer loses its claim to a concurrent delete of the owner: the delete waits for the `set` to land. Before, the delete stole the claim (a debug assertion in debug builds).
 - Under `Local`, a `Drop` of the value a `set` displaced that panicked left the slot holding the dropped value; the slot now holds the new value before the old one is dropped.
+- A `PersistedCollection` reopened, declared late or caught up across a compaction could store a different one of two equal elements that encode differently (`0.0` and `-0.0`, say) than the process that wrote them, because the log's elements were folded in hash order and removed by bytes. The fold now keeps insertion order and keeps element records raw from the first remove whose result depends on the element type's `Eq`, so every process stores the first inserted of equal elements, as the runtime does.
 
 ## [0.2.0-beta.5] - unreleased
 

@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 
@@ -219,6 +219,7 @@ impl<C: Cells, B: Backend> Store<C, B> {
         let plan = Converge {
             current: HashMap::new(),
             target: elements,
+            moved: HashSet::new(),
         };
         let mut spent = Spent::default();
         let mut hold = state.deps.as_deref().map(DepIndex::write);
@@ -288,6 +289,24 @@ enum Op<T> {
 struct Converge<T> {
     current: HashMap<T, usize>,
     target: HashMap<T, usize>,
+    /// Elements in both whose stored values encode differently: all of
+    /// their occurrences are removed and the target's inserted, so the
+    /// collection ends up storing the target's.
+    moved: HashSet<T>,
+}
+
+impl<T: Hash + Eq> Converge<T> {
+    /// How many occurrences of `value`, an element of one side, the other
+    /// side has that converging keeps.
+    fn kept(&self, value: &T, other: &HashMap<T, usize>) -> usize {
+        with_value_code(|| {
+            if self.moved.contains(value) {
+                0
+            } else {
+                other.get(value).copied().unwrap_or(0)
+            }
+        })
+    }
 }
 
 /// Values a mapped write is done with, dropped after its hold is released.
@@ -355,12 +374,12 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         drop(spent);
     }
 
-    /// Brings the collection to exactly `target` by applying only the
-    /// multiplicity differences, removes first, so queries over it see one
-    /// change per differing occurrence rather than a rebuild. Each change is
-    /// also pushed onto `changes`, when given, as the record that makes it.
-    /// The changes are a mapped write, and the fingerprint is recomputed
-    /// after them.
+    /// Brings the collection to exactly `target`, stored values included,
+    /// by applying only the multiplicity differences, removes first, so
+    /// queries over it see one change per differing occurrence rather than
+    /// a rebuild. Each change is also pushed onto `changes`, when given, as
+    /// the record that makes it. The changes are a mapped write, and the
+    /// fingerprint is recomputed after them.
     fn converge(
         &self,
         rt: &Runtime<C>,
@@ -368,13 +387,23 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         changes: Option<&mut Vec<Record>>,
         deps: Option<&DepIndex>,
     ) -> Result<()> {
+        let current = count(self.collection.values(rt));
+        let mut moved = HashSet::new();
+        for stored in current.keys() {
+            if let Some((wanted, _)) = with_value_code(|| target.get_key_value(stored)) {
+                if encode(stored)? != encode(wanted)? {
+                    moved.insert(with_value_code(|| stored.clone()));
+                }
+            }
+        }
         let plan = Converge {
-            current: count(self.collection.values(rt)),
+            current,
             target,
+            moved,
         };
         if let Some(changes) = changes {
             for (value, &have) in &plan.current {
-                let want = with_value_code(|| plan.target.get(value).copied()).unwrap_or(0);
+                let want = plan.kept(value, &plan.target);
                 if want < have {
                     let element = encode(value)?;
                     changes.extend((want..have).map(|_| Record::Remove {
@@ -384,7 +413,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
                 }
             }
             for (value, &want) in &plan.target {
-                let have = with_value_code(|| plan.current.get(value).copied()).unwrap_or(0);
+                let have = plan.kept(value, &plan.current);
                 if have < want {
                     let element = encode(value)?;
                     changes.extend((have..want).map(|_| Record::Insert {
@@ -417,7 +446,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
     ) -> Option<DepFp> {
         let mut guard = PanicGuard::new(map, &self.key);
         for (value, &have) in &plan.current {
-            let want = with_value_code(|| plan.target.get(value).copied()).unwrap_or(0);
+            let want = plan.kept(value, &plan.target);
             for _ in want..have {
                 persist_hooks::collection_delete(
                     rt,
@@ -429,7 +458,7 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
             }
         }
         for (value, &want) in &plan.target {
-            let have = with_value_code(|| plan.current.get(value).copied()).unwrap_or(0);
+            let have = plan.kept(value, &plan.current);
             for _ in have..want {
                 let value = with_value_code(|| value.clone());
                 persist_hooks::collection_insert(
@@ -582,7 +611,9 @@ fn count<T: Hash + Eq>(values: Vec<T>) -> HashMap<T, usize> {
 }
 
 /// Folds byte-level elements into a multiset by decoded value: the live
-/// bytes first, then the raw tail in order, removing by `T`'s equality.
+/// bytes in the order first inserted, then the raw tail in order, removing
+/// by `T`'s equality. Each key is the first inserted of its equal elements,
+/// the value the runtime stores for them.
 fn decode_elements<T: Hash + Eq + DeserializeOwned>(
     key: &str,
     elements: &Elements,

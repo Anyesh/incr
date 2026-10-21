@@ -1,4 +1,5 @@
 use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 
 use incr_persist::{
     Backend, Cells, Error, FileBackend, Kind, Local, MemoryBackend, Options, Position, ReadOutcome,
@@ -357,4 +358,113 @@ fn checkpoints_fold_loose_elements_by_value_whether_bound_or_not() {
     let store = open::<Local, _>(log);
     let items = store.collection::<Loose>("loose").unwrap();
     assert_eq!(ids(items.handle().values(store.runtime())), live);
+}
+
+fn reps(values: Vec<Loose>) -> Vec<(u32, u32)> {
+    sorted(values.into_iter().map(|v| (v.id, v.noise)).collect())
+}
+
+/// A class keeps the first inserted of its equal elements: 1 keeps noise 1
+/// after the occurrence written with it is deleted, 2 keeps 5 over the
+/// later 6, 4 is reborn with 2 after it emptied, and 5 swaps to 3 through
+/// a count-1 replace.
+fn write_rep_history<C: Cells, B: Backend>(store: &Store<C, B>) -> Vec<(u32, u32)> {
+    let items = store.collection::<Loose>("loose").unwrap();
+    for value in [loose(1, 1), loose(2, 5), loose(1, 2), loose(2, 6)] {
+        items.insert(store, value).unwrap();
+    }
+    items.delete(store, &loose(1, 1)).unwrap();
+    items.insert(store, loose(4, 1)).unwrap();
+    items.delete(store, &loose(4, 1)).unwrap();
+    items.insert(store, loose(4, 2)).unwrap();
+    items.insert(store, loose(5, 0)).unwrap();
+    items
+        .replace(store, Some(&loose(5, 0)), loose(5, 3))
+        .unwrap();
+    reps(items.handle().values(store.runtime()))
+}
+
+const REPS: [(u32, u32); 5] = [(1, 1), (2, 5), (2, 5), (4, 2), (5, 3)];
+
+fn restored_reps(log: &MemoryBackend) -> Vec<(u32, u32)> {
+    let store = open::<Local, _>(log.clone());
+    let items = store.collection::<Loose>("loose").unwrap();
+    reps(items.handle().values(store.runtime()))
+}
+
+// Each restart folds in a fresh hash order, so a fold that follows hash
+// order rather than insertion order shows up within a few of them.
+#[test]
+fn a_restart_keeps_the_representatives_the_writer_had() {
+    let log = MemoryBackend::new();
+    assert_eq!(write_rep_history(&open::<Local, _>(log.clone())), REPS);
+    for _ in 0..8 {
+        assert_eq!(restored_reps(&log), REPS);
+    }
+}
+
+#[test]
+fn a_collection_declared_late_keeps_the_writers_representatives() {
+    for _ in 0..8 {
+        let log = MemoryBackend::new();
+        let writer = open::<Local, _>(log.clone());
+        let reader = open::<Local, _>(log.clone());
+        write_rep_history(&writer);
+        reader.refresh().unwrap();
+        let items = reader.collection::<Loose>("loose").unwrap();
+        assert_eq!(reps(items.handle().values(reader.runtime())), REPS);
+    }
+}
+
+#[test]
+fn checkpoints_keep_representatives_whether_bound_or_not() {
+    for bound in [true, false] {
+        for _ in 0..8 {
+            let log = MemoryBackend::new();
+            let writer = open::<Local, _>(log.clone());
+            write_rep_history(&writer);
+            if bound {
+                writer.checkpoint().unwrap();
+            } else {
+                open::<Local, _>(log.clone()).checkpoint().unwrap();
+            }
+            drop(writer);
+            assert_eq!(restored_reps(&log), REPS, "bound: {bound}");
+        }
+    }
+}
+
+// The other store's delete and insert land in its snapshot, so `a` takes
+// the class's new representative from a fold whose count is unchanged.
+#[test]
+fn a_catch_up_across_a_compaction_takes_a_moved_representative() {
+    let log = MemoryBackend::new();
+    let a = open::<Local, _>(log.clone());
+    let items_a = a.collection::<Loose>("loose").unwrap();
+    items_a.insert(&a, loose(1, 1)).unwrap();
+    let b = open::<Local, _>(log.clone());
+    let items_b = b.collection::<Loose>("loose").unwrap();
+    items_b.delete(&b, &loose(1, 1)).unwrap();
+    items_b.insert(&b, loose(1, 2)).unwrap();
+    b.checkpoint().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    a.subscribe(move |_, record, _| sink.lock().unwrap().push(record.clone()))
+        .unwrap();
+    a.refresh().unwrap();
+    assert_eq!(reps(items_a.handle().values(a.runtime())), [(1, 2)]);
+    let element = |value: Loose| postcard::to_stdvec(&value).unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            Record::Remove {
+                key: "loose".into(),
+                element: element(loose(1, 1)),
+            },
+            Record::Insert {
+                key: "loose".into(),
+                element: element(loose(1, 2)),
+            },
+        ]
+    );
 }
