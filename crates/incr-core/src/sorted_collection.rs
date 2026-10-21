@@ -45,7 +45,8 @@ pub enum SortDelta<T> {
     Remove { pos: usize, value: T },
 }
 
-const COMPACT_EVERY: usize = 1024;
+/// Smaller under Miri, as in `collection`.
+const COMPACT_EVERY: usize = if cfg!(miri) { 128 } else { 1024 };
 
 /// Sorted-view state shared between the sort operator and its downstream
 /// consumers. The `(key, element)` vec is the source of truth for the

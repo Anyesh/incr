@@ -4863,14 +4863,15 @@ mod tests {
             })
             .collect();
 
-        for v in 1..=1000_i64 {
+        let sets = if cfg!(miri) { 20 } else { 1000 };
+        for v in 1..=sets {
             rt.set(input, v);
         }
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for r in readers {
             r.join().unwrap();
         }
-        assert_eq!(rt.get(doubled), 2000);
+        assert_eq!(rt.get(doubled), sets * 2);
     }
 
     #[test]
