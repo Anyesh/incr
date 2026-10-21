@@ -1,0 +1,15 @@
+[package]
+name = "incr-python-protocol"
+version.workspace = true
+edition = "2021"
+rust-version = "1.88"
+description = "The exception and unwind protocol shared by incr's Python bindings"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+doc = false
+
+[dependencies]
+incr-core.workspace = true
+pyo3 = "0.26"
