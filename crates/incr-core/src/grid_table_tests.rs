@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use super::{GridKey, GridTable, PAGE_ROWS};
 use crate::cells::{Cells, Shared};
@@ -57,6 +57,8 @@ both!(
     grid_another_runtime_is_refused,
     grid_a_key_out_of_range_is_refused,
     grid_a_doomed_miss_returns_a_pending_handle_and_creates_nothing,
+    grid_a_make_that_dooms_its_frame_creates_nothing,
+    grid_an_init_that_dooms_its_frame_creates_nothing,
     grid_insert_inputs_enters_every_node,
     grid_insert_queries_watched_watches_every_node,
     grid_an_insert_with_a_live_key_creates_nothing,
@@ -275,6 +277,84 @@ where
     assert_eq!(t.get(rt, key(0, 4, 0)), None);
 }
 
+/// The doomed attempt's handles, recorded as whether each is alive.
+type Attempts = Arc<Mutex<Vec<bool>>>;
+
+fn grid_a_make_that_dooms_its_frame_creates_nothing<C: Cells>(rt: &Runtime<C>)
+where
+    GridTable<i64, C>: Send + Sync,
+{
+    rt.set_placeholder::<i64>(-1);
+    let gate = rt.doom_gate();
+    let t = Arc::new(rt.create_grid_table::<i64>());
+    let builds = Arc::new(AtomicU32::new(0));
+    let doomed: Attempts = Arc::default();
+    let (t2, b2, d2) = (t.clone(), builds.clone(), doomed.clone());
+    let q = rt.create_query_with(
+        move |rt| {
+            let n = t2.get_or_insert_query_lazy(rt, key(0, 5, 0), || {
+                b2.fetch_add(1, Ordering::Relaxed);
+                let _ = rt.get(gate);
+                let p = t2.get_or_insert_input(rt, key(0, 6, 0), || 6);
+                (move |rt: &Runtime<C>| rt.get(p), QueryOpts::default())
+            });
+            if !rt.get(gate).0 {
+                d2.lock().unwrap().push(rt.is_alive(n));
+                return 0;
+            }
+            rt.get(n)
+        },
+        replayable(),
+    );
+    let nodes = rt.node_count();
+    assert_eq!(rt.get(q), 6);
+    assert_eq!(
+        *doomed.lock().unwrap(),
+        [false],
+        "the doomed make's build is dropped"
+    );
+    assert_eq!(builds.load(Ordering::Relaxed), 2);
+    assert_eq!(rt.node_count(), nodes + 2, "only the retry creates nodes");
+    assert!(t.get(rt, key(0, 5, 0)).is_some());
+}
+
+fn grid_an_init_that_dooms_its_frame_creates_nothing<C: Cells>(rt: &Runtime<C>)
+where
+    GridTable<i64, C>: Send + Sync,
+{
+    rt.set_placeholder::<i64>(-1);
+    let gate = rt.doom_gate();
+    let t = Arc::new(rt.create_grid_table::<i64>());
+    let doomed: Attempts = Arc::default();
+    let (t2, d2) = (t.clone(), doomed.clone());
+    let q = rt.create_query_with(
+        move |rt| {
+            let i = t2.get_or_insert_input(rt, key(0, 7, 0), || {
+                let _ = rt.get(gate);
+                7
+            });
+            if !rt.get(gate).0 {
+                d2.lock().unwrap().push(rt.is_alive(i));
+                return 0;
+            }
+            rt.get(i)
+        },
+        replayable(),
+    );
+    let nodes = rt.node_count();
+    assert_eq!(rt.get(q), 7);
+    assert_eq!(
+        *doomed.lock().unwrap(),
+        [false],
+        "the doomed init's value is dropped"
+    );
+    assert_eq!(
+        rt.node_count(),
+        nodes + 1,
+        "only the retry creates the input"
+    );
+}
+
 fn grid_insert_inputs_enters_every_node<C: Cells>(rt: &Runtime<C>) {
     let t = rt.create_grid_table::<i64>();
     let entries: Vec<(GridKey, i64)> = (0..200)
@@ -396,6 +476,32 @@ fn grid_shared_racing_misses_agree_on_one_node() {
     for (row, &h) in seen[0].iter().enumerate() {
         assert_eq!(rt.get(h), row as i64);
     }
+}
+
+#[test]
+fn grid_shared_lazy_misses_together_both_build_and_agree_on_one_node() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let t = Arc::new(rt.create_grid_table::<i64>());
+    let both_missed = Arc::new(Barrier::new(2));
+    let builds = Arc::new(AtomicU32::new(0));
+    let threads: Vec<_> = (0..2)
+        .map(|_| {
+            let (rt, t) = (rt.clone(), t.clone());
+            let (both_missed, builds) = (both_missed.clone(), builds.clone());
+            std::thread::spawn(move || {
+                t.get_or_insert_query_lazy(&rt, key(0, 0, 0), || -> Built<Shared> {
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    both_missed.wait();
+                    (|_| 3, QueryOpts::default())
+                })
+            })
+        })
+        .collect();
+    let seen: Vec<Incr<i64>> = threads.into_iter().map(|h| h.join().unwrap()).collect();
+    assert_eq!(seen[0], seen[1]);
+    assert_eq!(builds.load(Ordering::Relaxed), 2, "each misser builds");
+    assert_eq!(rt.node_count(), 1, "the loser's build is dropped");
+    assert_eq!(rt.get(seen[0]), 3);
 }
 
 fn grid_type_fallback_queries_need_and_use_their_types_fallback<C: Cells>(rt: &Runtime<C>)

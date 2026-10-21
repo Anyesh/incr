@@ -232,9 +232,12 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     }
 
     /// [`Self::get_or_insert_query_with`] with the compute and options
-    /// built by `make` only on a miss that creates the query, so a hit
-    /// pays nothing for options that allocate. `make` runs with no lock
-    /// held.
+    /// built by `make` only on a miss, so a hit pays nothing for options
+    /// that allocate. `make` runs with no lock held, so it may run on a
+    /// miss that does not create the query: when threads miss the same
+    /// key together each runs `make`, or when `make` itself creates the
+    /// key; every build but the one that created the node is dropped
+    /// unused and the call returns the created node.
     pub fn get_or_insert_query_lazy<F>(
         &self,
         rt: &Runtime<C>,
@@ -412,7 +415,9 @@ impl<T: Value, C: Cells> GridTable<T, C> {
 
     /// Probes again under the miss mutex and creates the node with
     /// `create` if the entry still has no live one. A live hit there
-    /// drops `payload` after unlocking and returns the winner.
+    /// drops `payload` after unlocking and returns the winner. A frame
+    /// doomed while `payload` was built drops it and gets a pending
+    /// handle, since the build may hold pending handles of its own.
     fn miss<P>(
         &self,
         rt: &Runtime<C>,
@@ -420,6 +425,10 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         payload: P,
         create: impl FnOnce(&Runtime<C>, P) -> Incr<T>,
     ) -> Incr<T> {
+        if rt.frame_doomed() {
+            drop(payload);
+            return rt.pending_handle();
+        }
         // Checked before the mutex, so a value method that misses panics
         // with the contract message instead of re-entering it.
         value_code::check();

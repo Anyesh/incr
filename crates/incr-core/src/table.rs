@@ -755,6 +755,13 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         payload: P,
         create: impl FnOnce(&Runtime<C>, P) -> Incr<T>,
     ) -> Incr<T> {
+        // An input's `init` runs after the caller's doom check and may doom
+        // the frame, and its value may hold pending handles of its own.
+        if rt.frame_doomed() {
+            drop(payload);
+            drop(key);
+            return rt.pending_handle();
+        }
         let mut bag = Deferred::<C>::new();
         let handle = match self.miss(rt, hash, key, payload, &mut bag, create) {
             Ok(handle) => handle,
