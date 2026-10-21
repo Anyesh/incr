@@ -29,12 +29,13 @@ use std::rc::Rc;
 use haphazard::{AtomicPtr as HzAtomicPtr, Global, Replaced};
 
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{ErasedOpts, QueryOpts};
-use crate::deferred::Deferred;
+use crate::cycle::{self, ErasedOpts, QueryOpts};
+use crate::deferred::{isolate, Deferred};
 use crate::dep_stack::DepStack;
 use crate::fx::FxBuildHasher;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
-use crate::locks::Lock;
+use crate::lock_order::LockKind;
+use crate::locks::OrderedLock;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::runtime::{DeleteError, Runtime};
 use crate::value::Value;
@@ -455,7 +456,7 @@ struct Counts {
 pub struct NodeTable<K: TableKey, T: Value, C: Cells, S = FxBuildHasher> {
     runtime_id: RuntimeId,
     array: C::TableArray<K>,
-    counts: C::Lock<Counts>,
+    counts: OrderedLock<Counts, C>,
     hasher: S,
     _value: PhantomData<fn() -> T>,
 }
@@ -496,11 +497,11 @@ unsafe impl<K: TableKey, T: Value, S: Send + Sync> Sync
 fn _fields_are_thread_safe<K: TableKey>() {
     fn thread_safe<X: Send + Sync>() {}
     thread_safe::<<Shared as Cells>::TableArray<K>>();
-    thread_safe::<<Shared as Cells>::Lock<Counts>>();
+    thread_safe::<OrderedLock<Counts, Shared>>();
     #[cfg(loom)]
     thread_safe::<<crate::loom_cells::Loom as Cells>::TableArray<K>>();
     #[cfg(loom)]
-    thread_safe::<<crate::loom_cells::Loom as Cells>::Lock<Counts>>();
+    thread_safe::<OrderedLock<Counts, crate::loom_cells::Loom>>();
 }
 
 impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
@@ -508,10 +509,13 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         Self {
             runtime_id,
             array: <C::TableArray<K> as ArrayCell<_>>::new(Array::with_capacity(MIN_CAPACITY)),
-            counts: <C::Lock<Counts> as Lock<_>>::new(Counts {
-                live: 0,
-                tombstones: 0,
-            }),
+            counts: OrderedLock::new(
+                LockKind::TableMiss,
+                Counts {
+                    live: 0,
+                    tombstones: 0,
+                },
+            ),
             hasher,
             _value: PhantomData,
         }
@@ -534,7 +538,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
             return rt.pending_handle();
         }
         let value = init();
-        self.miss(rt, hash, key, value, |rt, value| {
+        self.miss_dropping(rt, hash, key, value, |rt, value| {
             rt.create_input_unchecked(value)
         })
     }
@@ -576,9 +580,94 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
             return rt.pending_handle();
         }
         let opts = opts();
-        self.miss(rt, hash, key, (f, opts), |rt, (f, opts)| {
+        self.miss_dropping(rt, hash, key, (f, opts), |rt, (f, opts)| {
             rt.create_query_erased::<false, _, _>(f, opts)
         })
+    }
+
+    /// [`Self::get_or_insert_query_with`] that hands a node the miss
+    /// creates to `seed` under the miss mutex, before the node is in the
+    /// table, so no reader has claimed it. If `seed` panics, the node is
+    /// deleted after the mutex and the panic resumes; a panic after the
+    /// insert leaves it. Whatever the call does not keep (the key and `f`
+    /// on a hit, a value `seed` returns, what a growth retires) goes to
+    /// `bag`, for a caller that holds its own lock to drain after it.
+    pub(crate) fn get_or_insert_query_seeded<F>(
+        &self,
+        rt: &Runtime<C>,
+        key: K,
+        f: F,
+        opts: QueryOpts<T>,
+        seed: impl FnOnce(&Runtime<C>, Incr<T>) -> Option<T>,
+        bag: &mut Deferred<C>,
+    ) -> Incr<T>
+    where
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
+        self.check_runtime(rt);
+        let hash = self.hash(&key);
+        let found = self.find(rt, hash, &key);
+        if found.is_none() && !rt.frame_doomed() {
+            return self.seeded_miss(rt, hash, key, f, opts, seed, bag);
+        }
+        bag.push((key, f, opts));
+        found.unwrap_or_else(|| rt.pending_handle())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seeded_miss<F>(
+        &self,
+        rt: &Runtime<C>,
+        hash: u64,
+        key: K,
+        f: F,
+        opts: QueryOpts<T>,
+        seed: impl FnOnce(&Runtime<C>, Incr<T>) -> Option<T>,
+        bag: &mut Deferred<C>,
+    ) -> Incr<T>
+    where
+        F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
+    {
+        let opts = cycle::erase_opts(opts);
+        let mut created = None;
+        // Once `seed` returns the node may be in the table, so an unwind
+        // after that must leave the published node alone.
+        let mut seeded = false;
+        let mut unseeded = None;
+        let missed = catch_unwind(AssertUnwindSafe(|| {
+            self.miss(rt, hash, key, (f, opts), &mut *bag, |rt, (f, opts)| {
+                let q = rt.create_query_erased::<false, _, _>(f, opts);
+                created = Some(q);
+                unseeded = seed(rt, q);
+                seeded = true;
+                q
+            })
+        }));
+        if let Some(value) = unseeded {
+            bag.push(value);
+        }
+        match missed {
+            Ok(Ok(handle)) => handle,
+            Ok(Err((handle, key, payload))) => {
+                bag.push((key, payload));
+                handle
+            }
+            Err(unwind) => {
+                if let (Some(q), false) = (created, seeded) {
+                    isolate(|| match rt.try_delete_node(q) {
+                        // q never reached the table, so only the hook could
+                        // have deleted it or computed a node against it.
+                        Ok(()) | Err(DeleteError::NotAlive | DeleteError::HasDependents) => {}
+                    });
+                }
+                bag.drain_carried(unwind)
+            }
+        }
+    }
+
+    pub(crate) fn probe_unchecked(&self, rt: &Runtime<C>, key: &K) -> Option<Incr<T>> {
+        self.check_runtime(rt);
+        self.find(rt, self.hash(key), key)
     }
 
     /// The node for `key`, if the table holds a live one. Not a
@@ -656,11 +745,9 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
             .map(|(slot, generation)| Incr::new(slot, generation, self.runtime_id))
     }
 
-    /// Steps 4 to 7 of a miss: probe again under the miss mutex, rehash
-    /// if the insert needs room, create the node with `create` and insert
-    /// it. A live hit under the mutex drops `payload` and `key` after
-    /// unlocking and returns the winner.
-    fn miss<P>(
+    /// [`Self::miss`] that drops what a hit leaves unused and drains its
+    /// own bag.
+    fn miss_dropping<P>(
         &self,
         rt: &Runtime<C>,
         hash: u64,
@@ -668,17 +755,42 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         payload: P,
         create: impl FnOnce(&Runtime<C>, P) -> Incr<T>,
     ) -> Incr<T> {
+        let mut bag = Deferred::<C>::new();
+        let handle = match self.miss(rt, hash, key, payload, &mut bag, create) {
+            Ok(handle) => handle,
+            Err((handle, key, payload)) => {
+                drop(payload);
+                drop(key);
+                handle
+            }
+        };
+        bag.drain(rt);
+        handle
+    }
+
+    /// Steps 4 to 7 of a miss: probe again under the miss mutex, rehash
+    /// if the insert needs room, create the node with `create` and insert
+    /// it. A live hit under the mutex unlocks and returns the winner in
+    /// `Err` with the unused `key` and `payload`. What a rehash retires
+    /// goes to `bag`, for the caller to drain.
+    #[allow(clippy::type_complexity)]
+    fn miss<P>(
+        &self,
+        rt: &Runtime<C>,
+        hash: u64,
+        key: K,
+        payload: P,
+        bag: &mut Deferred<C>,
+        create: impl FnOnce(&Runtime<C>, P) -> Incr<T>,
+    ) -> Result<Incr<T>, (Incr<T>, K, P)> {
         // Checked before the mutex, so a key method that misses panics
         // with the contract message instead of re-entering it.
         value_code::check();
-        let mut bag = Deferred::<C>::new();
         let mut counts = self.counts.write();
         match self.array.read(|array| array.find_locked(rt, hash, &key)) {
             Locked::Hit(slot, generation) => {
                 drop(counts);
-                drop(payload);
-                drop(key);
-                return Incr::new(slot, generation, self.runtime_id);
+                return Err((Incr::new(slot, generation, self.runtime_id), key, payload));
             }
             Locked::Miss(tombstoned) => {
                 counts.live -= tombstoned;
@@ -688,7 +800,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         let capacity = self.array.read(Array::capacity);
         if (counts.live + counts.tombstones + 1) * 8 > capacity * 7 {
             match catch_unwind(AssertUnwindSafe(|| {
-                self.array.read(|old| old.rehashed(rt, &mut bag))
+                self.array.read(|old| old.rehashed(rt, &mut *bag))
             })) {
                 Ok(rehashed) => {
                     bag.push_erased(Box::new(self.array.replace(rehashed.array)));
@@ -708,8 +820,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
             .read(|array| array.insert(hash, handle.slot(), handle.generation(), key));
         counts.live += 1;
         drop(counts);
-        bag.drain(rt);
-        handle
+        Ok(handle)
     }
 
     fn check_runtime(&self, rt: &Runtime<C>) {

@@ -311,8 +311,44 @@ impl<T> HashedMultiset<T> {
         unsafe { entries[i].assume_init_mut() }
     }
 
+    fn entry(&self, i: usize) -> &Entry<T> {
+        assert!(
+            self.table.ctrl()[i] & FULL != 0,
+            "incr-core: multiset index {i} is not a live entry"
+        );
+        // SAFETY: checked full just above.
+        unsafe { self.table.entries()[i].assume_init_ref() }
+    }
+
     fn count(&mut self, i: usize) -> usize {
         self.entry_mut(i).count
+    }
+
+    /// The value stored at `i`, a live entry.
+    pub(crate) fn stored(&self, i: usize) -> &T {
+        &self.entry(i).value
+    }
+
+    /// The value stored for the element an add at `at` lands on, once
+    /// the add has run: `value` itself if the element is new.
+    pub(crate) fn stored_after_add<'a>(&'a self, at: AddAt, value: &'a T) -> &'a T {
+        match at {
+            AddAt::Existing(i) => self.stored(i),
+            AddAt::Absent { .. } => value,
+        }
+    }
+
+    /// The stored values a located change removes and adds an occurrence
+    /// of, read before [`Self::apply`] runs: the removed side's as stored
+    /// now, the added side's as stored after, which is `add` itself for a
+    /// new element or for a count-1 entry that `apply` swaps.
+    pub(crate) fn representatives<'a>(&'a self, at: Located, add: &'a T) -> [Option<&'a T>; 2] {
+        let removed = at.remove.map(|i| self.stored(i));
+        let added = at.add.map(|a| match a {
+            AddAt::Existing(i) if at.remove == Some(i) && self.entry(i).count == 1 => add,
+            a => self.stored_after_add(a, add),
+        });
+        [removed, added]
     }
 
     fn increment(&mut self, i: usize) {

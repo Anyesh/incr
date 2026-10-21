@@ -147,6 +147,43 @@ fn shared_noop_set_bumps_and_walks_nothing() {
     noop_set_bumps_and_walks_nothing(&Rt::new());
 }
 
+/// Revisions step by 2 from 2. An input carries the odd stamp below the
+/// revision it was created, recycled or set at, and a compute carries the
+/// even revision it ran at.
+fn inputs_carry_odd_stamps<C: Cells>(rt: &Runtime<C>) {
+    let changed = |slot: u32| rt.nodes.get(slot).changed_at();
+    let walked = || C::walked(&rt.walk, &rt.revision);
+    assert_eq!((rt.current_revision(), walked()), (2, 2));
+    let x = rt.create_input(1_u64);
+    assert_eq!(changed(x.slot()), 1);
+    assert_eq!(rt.nodes.get(x.slot()).verified_at(), 2);
+    let d = rt.create_query(move |rt: &Runtime<C>| rt.get(x) + 1);
+    assert_eq!(rt.get(d), 2);
+    assert_eq!(changed(d.slot()), 2);
+
+    rt.set(x, 2);
+    assert_eq!((rt.current_revision(), walked()), (4, 4));
+    assert_eq!(changed(x.slot()), 3);
+    assert_eq!(rt.nodes.get(x.slot()).verified_at(), 4);
+    assert_eq!(rt.get(d), 3);
+    assert_eq!(changed(d.slot()), 4);
+
+    rt.delete_node(d);
+    let y = rt.create_input(5_u64);
+    assert_eq!(y.slot(), d.slot());
+    assert_eq!(changed(y.slot()), 3);
+}
+
+#[test]
+fn local_inputs_carry_odd_stamps() {
+    inputs_carry_odd_stamps(&Runtime::<Local>::new());
+}
+
+#[test]
+fn shared_inputs_carry_odd_stamps() {
+    inputs_carry_odd_stamps(&Rt::new());
+}
+
 /// A set equal to a value another set has written but not yet walked
 /// returns only once that walk is recorded, so its caller can rely on
 /// dependents having been dirtied.
@@ -331,4 +368,93 @@ fn delete_of_an_owner_waits_for_a_set_of_an_owned_input() {
     assert!(!rt.is_alive(router));
     assert!(versions.iter().all(|&v| !rt.is_alive(v)));
     rt.assert_invariant_i();
+}
+
+/// A mapped write records the stamp its own write settled (T10 mapped
+/// stamp). A second `set` of the input can claim and settle as soon as the
+/// first releases its claim, before the first returns, so a stamp loaded
+/// after the return would be the second write's.
+#[test]
+fn set_returning_displaced_returns_the_stamp_it_settled() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(0_u64);
+    let gate = Gate::new();
+    park_at(&rt, vec![(ParkPoint::SetAfterWalk, gate.clone())]);
+    let mapped = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set_returning_displaced(x, 1).1)
+    };
+    gate.wait_parked();
+    let settled = rt.changed_at(x);
+    rt.set(x, 2);
+    let bypass = rt.changed_at(x);
+    assert_ne!(bypass, settled);
+    gate.release();
+    let stamp = mapped.join().unwrap();
+    assert_eq!(stamp, settled, "the stamp is the mapped write's own");
+    assert_ne!(stamp, rt.changed_at(x), "a later set changes changed_at");
+}
+
+#[test]
+fn set_returning_displaced_returns_the_current_stamp_on_an_equal_value() {
+    let rt = Rt::new();
+    let x = rt.create_input(4_u64);
+    rt.set(x, 5);
+    let before = rt.changed_at(x);
+    let (compared, stamp) = rt.set_returning_displaced(x, 5);
+    assert!(matches!(compared, crate::value_slot::Compared::Equal(5)));
+    assert_eq!(stamp, before);
+}
+
+/// One input read by 50k queries, half of which then drop it, and a
+/// quarter of the rest are deleted. Each unhook from the input's
+/// dependent list must not scan or shift the whole list.
+fn wide_input_rewires_in_sublinear_time<C: Cells>(rt: &Runtime<C>) {
+    const N: usize = 50_000;
+    let x = rt.create_input(1_i64);
+    let drop_x = rt.create_input(false);
+    let queries: Vec<_> = (0..N)
+        .map(|i| {
+            rt.create_query(move |rt| {
+                if i % 2 == 0 && rt.get(drop_x) {
+                    0
+                } else {
+                    rt.get(x)
+                }
+            })
+        })
+        .collect();
+    for &q in &queries {
+        assert_eq!(rt.get(q), 1);
+    }
+    let start = std::time::Instant::now();
+    rt.set(drop_x, true);
+    for &q in queries.iter().step_by(2) {
+        assert_eq!(rt.get(q), 0);
+    }
+    for &q in queries.iter().skip(1).step_by(4) {
+        rt.delete_node(q);
+    }
+    let took = start.elapsed();
+    assert_eq!(
+        rt.inner.read().dependents[x.slot() as usize].iter().count(),
+        N / 4
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "unhooking {} dependents took {took:?}",
+        N / 2 + N / 8
+    );
+}
+
+#[cfg(not(miri))]
+#[test]
+fn local_wide_input_rewires_in_sublinear_time() {
+    wide_input_rewires_in_sublinear_time(&Runtime::<Local>::new());
+}
+
+#[cfg(not(miri))]
+#[test]
+fn shared_wide_input_rewires_in_sublinear_time() {
+    wide_input_rewires_in_sublinear_time(&Runtime::<Shared>::new());
 }

@@ -112,6 +112,15 @@ pub fn with_value_code<R>(f: impl FnOnce() -> R) -> R {
     run(f)
 }
 
+/// Panics with the contract message if this thread is inside value code,
+/// for the crates whose own locks value code can run under, before they
+/// take one.
+#[doc(hidden)]
+#[inline(always)]
+pub fn check_value_code() {
+    check();
+}
+
 /// The contract panic of a checked path reached from value code.
 #[cold]
 #[inline(never)]
@@ -174,6 +183,18 @@ mod tests {
         clear_memo_bit();
         assert_eq!(thread_word(), 0);
         assert_eq!(with_value_code(thread_word), 1);
+        assert_eq!(thread_word(), 0);
+    }
+
+    #[test]
+    fn check_value_code_refuses_only_a_count() {
+        set_memo_bit();
+        check_value_code();
+        clear_memo_bit();
+        let err = std::panic::catch_unwind(|| with_value_code(check_value_code))
+            .expect_err("value code was let through");
+        let message = err.downcast::<String>().map(|s| *s).unwrap_or_default();
+        assert!(message.contains(CONTRACT_MESSAGE), "{message}");
         assert_eq!(thread_word(), 0);
     }
 }

@@ -286,7 +286,7 @@ mod tests {
     #[test]
     fn local_push_get() {
         let store: SegmentedNodes<Local> = SegmentedNodes::new();
-        let slot = store.push(NodeData::<Local>::new_input(0, 42, 0));
+        let slot = store.push(NodeData::<Local>::new_input(0, 42, 2));
         assert_eq!(store.get(slot).arena_slot(), 42);
         assert_eq!(store.len(), 1);
     }
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn shared_push_get() {
         let store: SegmentedNodes<Shared> = SegmentedNodes::new();
-        let slot = store.push(NodeData::<Shared>::new_input(0, 42, 0));
+        let slot = store.push(NodeData::<Shared>::new_input(0, 42, 2));
         assert_eq!(store.get(slot).arena_slot(), 42);
         assert_eq!(store.len(), 1);
     }
@@ -305,7 +305,7 @@ mod tests {
         let count = SEGMENT_SIZE + 100;
         let mut slots = Vec::with_capacity(count);
         for i in 0..count {
-            slots.push(store.push(NodeData::<Local>::new_input(0, i as u32, 0)));
+            slots.push(store.push(NodeData::<Local>::new_input(0, i as u32, 2)));
         }
         for (i, slot) in slots.into_iter().enumerate() {
             assert_eq!(store.get(slot).arena_slot(), i as u32);
@@ -319,7 +319,7 @@ mod tests {
         let count = SEGMENT_SIZE + 100;
         let mut slots = Vec::with_capacity(count);
         for i in 0..count {
-            slots.push(store.push(NodeData::<Shared>::new_input(0, i as u32, 0)));
+            slots.push(store.push(NodeData::<Shared>::new_input(0, i as u32, 2)));
         }
         for (i, slot) in slots.into_iter().enumerate() {
             assert_eq!(store.get(slot).arena_slot(), i as u32);
@@ -330,10 +330,10 @@ mod tests {
     #[test]
     fn local_references_stay_valid_across_growth() {
         let store: SegmentedNodes<Local> = SegmentedNodes::new();
-        let slot_a = store.push(NodeData::<Local>::new_input(0, 111, 0));
+        let slot_a = store.push(NodeData::<Local>::new_input(0, 111, 2));
         let ref_a = store.get(slot_a);
         for i in 0..(SEGMENT_SIZE as u32 + 10) {
-            store.push(NodeData::<Local>::new_input(0, 1000 + i, 0));
+            store.push(NodeData::<Local>::new_input(0, 1000 + i, 2));
         }
         assert_eq!(ref_a.arena_slot(), 111);
     }
@@ -341,10 +341,10 @@ mod tests {
     #[test]
     fn shared_references_stay_valid_across_growth() {
         let store: SegmentedNodes<Shared> = SegmentedNodes::new();
-        let slot_a = store.push(NodeData::<Shared>::new_input(0, 111, 0));
+        let slot_a = store.push(NodeData::<Shared>::new_input(0, 111, 2));
         let ref_a = store.get(slot_a);
         for i in 0..(SEGMENT_SIZE as u32 + 10) {
-            store.push(NodeData::<Shared>::new_input(0, 1000 + i, 0));
+            store.push(NodeData::<Shared>::new_input(0, 1000 + i, 2));
         }
         assert_eq!(ref_a.arena_slot(), 111);
     }

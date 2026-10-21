@@ -1,22 +1,30 @@
 //! The value-code contract through the store: a `Serialize`, `Hash` or
 //! `Eq` of a persisted element may read Clean nodes and must not
-//! otherwise call into the runtime.
+//! otherwise call into the runtime or the store, and a compute must not
+//! call into the store.
+
+#[path = "../../incr-core/tests/common/child.rs"]
+mod child;
 
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
+use child::run_in_child;
+use incr_core::with_value_code;
 use incr_persist::{Cells, Error, Local, MemoryBackend, Options, Shared, Store};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
+const FRAME_MESSAGE: &str = "Store methods must not be called from inside a query's compute";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Op {
     Serialize,
     Hash,
+    Compute,
 }
 
 type Hook = (Op, Box<dyn Fn()>);
@@ -132,4 +140,119 @@ fn local_hash_that_reads_a_node() {
 #[test]
 fn shared_hash_that_reads_a_node() {
     insert_whose_element_reads_a_node::<Shared>(Op::Hash);
+}
+
+/// Value code that calls the store panics before the store mutex is
+/// requested, so the store is not poisoned.
+fn store_call_from_value_code<C: Cells>() {
+    let store = Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap();
+    let err = catch_unwind(AssertUnwindSafe(|| {
+        with_value_code(|| store.restored_keys(""))
+    }))
+    .expect_err("the store call was allowed");
+    let message = panic_message(err);
+    assert!(
+        message.contains(CONTRACT_MESSAGE),
+        "expected the contract panic, got: {message}"
+    );
+    assert!(store.restored_keys("").unwrap().is_empty());
+}
+
+#[test]
+fn local_store_call_from_value_code() {
+    store_call_from_value_code::<Local>();
+}
+
+#[test]
+fn shared_store_call_from_value_code() {
+    store_call_from_value_code::<Shared>();
+}
+
+/// A compute that calls the store panics in release builds too, for a
+/// method that would otherwise succeed.
+fn store_call_from_a_compute<C: Cells>() {
+    let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let q = store.runtime().create_query(|_| fire(Op::Compute));
+    let hooked = Rc::clone(&store);
+    arm(Op::Compute, move || {
+        hooked.restored_keys("").unwrap();
+    });
+    let err = catch_unwind(AssertUnwindSafe(|| store.runtime().get(q)))
+        .expect_err("the store call was allowed");
+    let message = panic_message(err);
+    assert!(
+        message.contains(FRAME_MESSAGE),
+        "expected the frame panic, got: {message}"
+    );
+    assert!(store.restored_keys("").unwrap().is_empty());
+}
+
+#[test]
+fn local_store_call_from_a_compute() {
+    store_call_from_a_compute::<Local>();
+}
+
+#[test]
+fn shared_store_call_from_a_compute() {
+    store_call_from_a_compute::<Shared>();
+}
+
+/// A compute of another runtime holds that runtime's claim as surely as
+/// the store's own, and the thread's frame stack is shared by both.
+fn store_call_from_another_runtimes_compute<C: Cells>() {
+    let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let other = incr_core::Runtime::<C>::new();
+    let q = other.create_query(|_| fire(Op::Compute));
+    let hooked = Rc::clone(&store);
+    arm(Op::Compute, move || {
+        hooked.restored_keys("").unwrap();
+    });
+    let err =
+        catch_unwind(AssertUnwindSafe(|| other.get(q))).expect_err("the store call was allowed");
+    let message = panic_message(err);
+    assert!(
+        message.contains(FRAME_MESSAGE),
+        "expected the frame panic, got: {message}"
+    );
+}
+
+#[test]
+fn local_store_call_from_another_runtimes_compute() {
+    store_call_from_another_runtimes_compute::<Local>();
+}
+
+#[test]
+fn shared_store_call_from_another_runtimes_compute() {
+    store_call_from_another_runtimes_compute::<Shared>();
+}
+
+/// A hang test: the element's `Hash` runs under the store mutex, so a
+/// `Store::input` from it would wait on that mutex forever. It panics
+/// with the contract message instead, and the child exits.
+fn insert_whose_element_hash_declares_an_input<C: Cells>() {
+    let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let tags = store.collection::<Hooked>("tags").unwrap();
+    let hooked = Rc::clone(&store);
+    arm(Op::Hash, move || {
+        hooked.input("other", 0u32).unwrap();
+    });
+    tags.insert(&store, Hooked(1)).unwrap();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_insert_whose_element_hash_declares_an_input() {
+    run_in_child("local_insert_whose_element_hash_declares_an_input", || {
+        insert_whose_element_hash_declares_an_input::<Local>();
+    })
+    .assert_panicked_with(CONTRACT_MESSAGE);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_insert_whose_element_hash_declares_an_input() {
+    run_in_child("shared_insert_whose_element_hash_declares_an_input", || {
+        insert_whose_element_hash_declares_an_input::<Shared>();
+    })
+    .assert_panicked_with(CONTRACT_MESSAGE);
 }

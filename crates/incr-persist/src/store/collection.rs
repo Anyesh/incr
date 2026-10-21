@@ -3,10 +3,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::Hash;
 
+use incr_core::persist_hooks::{self, Displaced, RepSide, RepSink};
 use incr_core::{with_value_code, Cells, ErasedIncr, Incr, IncrCollection, Runtime, Value};
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 
 use super::binding::{decode, encode, Binding};
+use super::dep_index::{fp_of, DepFp, DepIndex, DepMap, PanicGuard};
 use super::logged::{ElementOp, Elements, LoggedKey};
 use super::{Batch, KeyRef, PersistValue, State, Store};
 use crate::{Backend, Error, Kind, Position, Record, Result};
@@ -213,72 +216,246 @@ impl<C: Cells, B: Backend> Store<C, B> {
         if let Some(logged) = logged {
             logged.elements = Elements::default();
         }
+        let plan = Converge {
+            current: HashMap::new(),
+            target: elements,
+        };
+        let mut spent = Spent::default();
+        let mut hold = state.deps.as_deref().map(DepIndex::write);
         let binding = CollectionBinding {
             key: key.to_owned(),
             collection: self.runtime.create_collection(),
         };
-        binding.converge(&self.runtime, elements, None)?;
+        let fp = binding.run_converge(&self.runtime, &plan, hold.as_deref_mut(), &mut spent);
+        if let (Some(map), Some(fp)) = (hold.as_deref_mut(), fp) {
+            map.register(key, binding.node(), Kind::Collection, fp, None);
+        }
+        drop(hold);
+        drop(spent);
         let view = binding.collection.as_view();
         let id = state.bind(key, Box::new(binding));
         Ok(PersistedCollection { id, view })
     }
 }
 
-impl<T: Value + Hash + Eq, C: Cells> CollectionBinding<T, C> {
+/// The sum, mod 2^128, of the fingerprints of the encodings of `values`,
+/// one per stored occurrence: a collection's fingerprint.
+pub(super) fn fp_of_elements<T: Serialize>(values: &[T]) -> Result<u128> {
+    values.iter().try_fold(0u128, |sum, value| {
+        Ok(sum.wrapping_add(fp_of(&encode(value)?)))
+    })
+}
+
+/// What a single mutation changes in a collection's fingerprint, from the
+/// representatives the core reports for it.
+#[derive(Default)]
+struct FpDelta {
+    delta: u128,
+    failed: bool,
+}
+
+impl<T: Serialize> RepSink<T> for FpDelta {
+    fn on_rep(&mut self, side: RepSide, rep: &T) {
+        let Ok(bytes) = encode(rep) else {
+            self.failed = true;
+            return;
+        };
+        let fp = fp_of(&bytes);
+        self.delta = match side {
+            RepSide::Removed => self.delta.wrapping_sub(fp),
+            RepSide::Added => self.delta.wrapping_add(fp),
+        };
+    }
+}
+
+impl FpDelta {
+    fn apply_to(&self, map: &mut DepMap, key: &str) {
+        match map.entry(key).map(|entry| entry.fp) {
+            _ if self.failed => map.untrust(key),
+            Some(DepFp::Known(fp)) => map.set_fp(key, fp.wrapping_add(self.delta)),
+            _ => {}
+        }
+    }
+}
+
+enum Op<T> {
+    Insert(T),
+    Remove(T),
+    Replace(Option<T>, T),
+}
+
+/// What [`CollectionBinding::converge`] works out before taking the hold.
+struct Converge<T> {
+    current: HashMap<T, usize>,
+    target: HashMap<T, usize>,
+}
+
+/// Values a mapped write is done with, dropped after its hold is released.
+struct Spent<T> {
+    displaced: Vec<Displaced<T>>,
+    values: Vec<T>,
+}
+
+impl<T> Default for Spent<T> {
+    fn default() -> Self {
+        Spent {
+            displaced: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
+impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
+    fn mutate<R: RepSink<T>>(
+        &self,
+        rt: &Runtime<C>,
+        op: Op<T>,
+        sink: &mut R,
+        spent: &mut Spent<T>,
+    ) {
+        let keep = &mut spent.displaced;
+        match op {
+            Op::Insert(value) => {
+                persist_hooks::collection_insert(rt, &self.collection, value, sink, keep)
+            }
+            Op::Remove(value) => {
+                persist_hooks::collection_delete(rt, &self.collection, &value, sink, keep);
+                spent.values.push(value);
+            }
+            Op::Replace(old, new) => {
+                persist_hooks::collection_replace(
+                    rt,
+                    &self.collection,
+                    old.as_ref(),
+                    new,
+                    sink,
+                    keep,
+                );
+                spent.values.extend(old);
+            }
+        }
+    }
+
+    /// Applies one mutation as a mapped write.
+    fn apply_op(&self, rt: &Runtime<C>, op: Op<T>, deps: Option<&DepIndex>) {
+        let mut spent = Spent::default();
+        let mut hold = deps.map(DepIndex::write);
+        let mut guard = PanicGuard::new(hold.as_deref_mut(), &self.key);
+        if guard.deps().is_some() {
+            let mut sink = FpDelta::default();
+            self.mutate(rt, op, &mut sink, &mut spent);
+            if let Some(map) = guard.deps() {
+                sink.apply_to(map, &self.key);
+            }
+        } else {
+            self.mutate(rt, op, &mut (), &mut spent);
+        }
+        guard.disarm();
+        drop(hold);
+        drop(spent);
+    }
+
     /// Brings the collection to exactly `target` by applying only the
     /// multiplicity differences, removes first, so queries over it see one
     /// change per differing occurrence rather than a rebuild. Each change is
     /// also pushed onto `changes`, when given, as the record that makes it.
+    /// The changes are a mapped write, and the fingerprint is recomputed
+    /// after them.
     fn converge(
         &self,
         rt: &Runtime<C>,
         target: HashMap<T, usize>,
-        mut changes: Option<&mut Vec<Record>>,
-    ) -> Result<()>
-    where
-        T: serde::Serialize,
-    {
-        let current = count(self.collection.values(rt));
-        for (value, &have) in &current {
-            let want = with_value_code(|| target.get(value).copied()).unwrap_or(0);
-            if want >= have {
-                continue;
+        changes: Option<&mut Vec<Record>>,
+        deps: Option<&DepIndex>,
+    ) -> Result<()> {
+        let plan = Converge {
+            current: count(self.collection.values(rt)),
+            target,
+        };
+        if let Some(changes) = changes {
+            for (value, &have) in &plan.current {
+                let want = with_value_code(|| plan.target.get(value).copied()).unwrap_or(0);
+                if want < have {
+                    let element = encode(value)?;
+                    changes.extend((want..have).map(|_| Record::Remove {
+                        key: self.key.clone(),
+                        element: element.clone(),
+                    }));
+                }
             }
-            if let Some(changes) = changes.as_deref_mut() {
-                let element = encode(value)?;
-                changes.extend((want..have).map(|_| Record::Remove {
-                    key: self.key.clone(),
-                    element: element.clone(),
-                }));
-            }
-            for _ in want..have {
-                self.collection.delete(rt, value);
-            }
-        }
-        for (value, want) in target {
-            let have = with_value_code(|| current.get(&value).copied()).unwrap_or(0);
-            if have >= want {
-                continue;
-            }
-            if let Some(changes) = changes.as_deref_mut() {
-                let element = encode(&value)?;
-                changes.extend((have..want).map(|_| Record::Insert {
-                    key: self.key.clone(),
-                    element: element.clone(),
-                }));
-            }
-            for _ in have..want {
-                self.collection
-                    .insert(rt, with_value_code(|| value.clone()));
+            for (value, &want) in &plan.target {
+                let have = with_value_code(|| plan.current.get(value).copied()).unwrap_or(0);
+                if have < want {
+                    let element = encode(value)?;
+                    changes.extend((have..want).map(|_| Record::Insert {
+                        key: self.key.clone(),
+                        element: element.clone(),
+                    }));
+                }
             }
         }
+        let mut spent = Spent::default();
+        let mut hold = deps.map(DepIndex::write);
+        if let Some(fp) = self.run_converge(rt, &plan, hold.as_deref_mut(), &mut spent) {
+            if let Some(map) = hold.as_deref_mut() {
+                map.store_fp(&self.key, fp);
+            }
+        }
+        drop(hold);
+        drop(spent);
         Ok(())
+    }
+
+    /// The changes of a [`Converge`], made inside the caller's hold of
+    /// `map`, if any. With `map`, returns the fingerprint after them.
+    fn run_converge(
+        &self,
+        rt: &Runtime<C>,
+        plan: &Converge<T>,
+        map: Option<&mut DepMap>,
+        spent: &mut Spent<T>,
+    ) -> Option<DepFp> {
+        let mut guard = PanicGuard::new(map, &self.key);
+        for (value, &have) in &plan.current {
+            let want = with_value_code(|| plan.target.get(value).copied()).unwrap_or(0);
+            for _ in want..have {
+                persist_hooks::collection_delete(
+                    rt,
+                    &self.collection,
+                    value,
+                    &mut (),
+                    &mut spent.displaced,
+                );
+            }
+        }
+        for (value, &want) in &plan.target {
+            let have = with_value_code(|| plan.current.get(value).copied()).unwrap_or(0);
+            for _ in have..want {
+                let value = with_value_code(|| value.clone());
+                persist_hooks::collection_insert(
+                    rt,
+                    &self.collection,
+                    value,
+                    &mut (),
+                    &mut spent.displaced,
+                );
+            }
+        }
+        let fp = guard.deps().is_some().then(|| {
+            spent.values = self.collection.values(rt);
+            match fp_of_elements(&spent.values) {
+                Ok(fp) => DepFp::Known(fp),
+                Err(_) => DepFp::Untrusted,
+            }
+        });
+        guard.disarm();
+        fp
     }
 }
 
 impl<T, C> Binding<C> for CollectionBinding<T, C>
 where
-    T: Value + Hash + Eq + serde::Serialize + DeserializeOwned,
+    T: Value + Hash + Eq + Serialize + DeserializeOwned,
     C: Cells,
 {
     fn kind(&self) -> Kind {
@@ -310,32 +487,41 @@ where
         Ok(Some(Elements::from_encoded(encoded)))
     }
 
+    fn mapped_stamp(&self) -> Option<u64> {
+        None
+    }
+
+    fn dep_fp(&self, rt: &Runtime<C>) -> Result<DepFp> {
+        // Deleted through the runtime: nothing can say what it holds.
+        if !rt.is_alive(self.node()) {
+            return Ok(DepFp::Untrusted);
+        }
+        Ok(DepFp::Known(fp_of_elements(&self.collection.values(rt))?))
+    }
+
     fn apply(
         &mut self,
         rt: &Runtime<C>,
         record: &Record,
         _before: Option<&LoggedKey>,
+        deps: Option<&DepIndex>,
     ) -> Result<()> {
-        match record {
-            Record::Insert { element, .. } => {
-                self.collection.insert(rt, decode(&self.key, element)?);
-            }
-            Record::Remove { element, .. } => {
-                self.collection.delete(rt, &decode(&self.key, element)?);
-            }
+        let op = match record {
+            Record::Insert { element, .. } => Op::Insert(decode(&self.key, element)?),
+            Record::Remove { element, .. } => Op::Remove(decode(&self.key, element)?),
             Record::Replace { old, new, .. } => {
                 let old: Option<T> = old
                     .as_deref()
                     .map(|old| decode(&self.key, old))
                     .transpose()?;
-                let new = decode(&self.key, new)?;
-                self.collection.replace(rt, old.as_ref(), new);
+                Op::Replace(old, decode(&self.key, new)?)
             }
             Record::Delete { .. } | Record::Forget { .. } => {
-                self.converge(rt, HashMap::new(), None)?
+                return self.converge(rt, HashMap::new(), None, deps);
             }
-            Record::Declare { .. } | Record::Set { .. } => {}
-        }
+            Record::Declare { .. } | Record::Set { .. } => return Ok(()),
+        };
+        self.apply_op(rt, op, deps);
         Ok(())
     }
 
@@ -344,6 +530,7 @@ where
         rt: &Runtime<C>,
         logged: Option<&mut LoggedKey>,
         changes: Option<&mut Vec<Record>>,
+        deps: Option<&DepIndex>,
     ) -> Result<()> {
         let target = match logged {
             Some(logged) => {
@@ -353,7 +540,7 @@ where
             }
             None => HashMap::new(),
         };
-        self.converge(rt, target, changes)
+        self.converge(rt, target, changes, deps)
     }
 
     // The handle a PersistedCollection exposes is a view whose mutators

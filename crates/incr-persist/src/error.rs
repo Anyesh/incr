@@ -87,7 +87,33 @@ pub enum Error {
     #[error("input {key:?} was written through the runtime, bypassing the store's log")]
     Bypassed { key: String },
 
+    /// Another handle holds the memo checkpoint lock, or wrote a newer
+    /// memo generation since this one loaded its base. The checkpoint wrote
+    /// nothing; a later one can try again.
+    #[error("another memo checkpoint holds the lock or has replaced the generation")]
+    Busy,
+
     /// A handle passed to a store was not issued by that store.
     #[error("handle was not issued by this store")]
     UnknownHandle,
+
+    /// `BuildId::CurrentExe` could not read the running executable.
+    #[error("cannot fingerprint the running executable for the memo build id")]
+    BuildIdUnavailable(#[source] std::io::Error),
+
+    /// A memo table was declared with `MemoBuilder::table` but never given
+    /// a closure with `MemoBuilder::define`.
+    #[error("memo table {0:?} is declared but not defined")]
+    UndefinedTable(String),
+
+    /// `MemoOptions::auto_checkpoint_secs` was set on a `Local` runtime,
+    /// which has no thread to run it on.
+    #[error("automatic memo checkpoints need a Shared runtime")]
+    AutoCheckpointNeedsShared,
+
+    /// A memo entry, header or index encodes to a frame whose length does
+    /// not fit the `u32` a frame records. A checkpoint drops such an entry,
+    /// with every entry that reads it, instead of failing.
+    #[error("a memo frame of {len} bytes exceeds the 4 GiB frame limit")]
+    FrameTooLarge { len: u64 },
 }

@@ -27,6 +27,8 @@
 use incr_core::Local;
 
 #[doc(hidden)]
+pub use incr_core::persist_hooks;
+#[doc(hidden)]
 pub use incr_core::{
     active_frame_doomed, engine_unwind, engine_unwind_in_progress, take_last_cycle, with_value_code,
 };
@@ -71,6 +73,7 @@ mod reexports {
         };
 
         fn named<T: ?Sized>() {}
+        named::<crate::persist_hooks::SeedBase>();
         fn value<T: Value>() {}
         let _ = (
             active_frame_doomed,

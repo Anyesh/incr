@@ -12,7 +12,13 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use incr_persist::{Backend, FileBackend, Local, Options, Position, ReadOutcome, Record, Store};
+use incr_persist::memo::{
+    decode_entry, write_checkpoint, CheckpointInput, Entry, FileMemo, MemoBackend, StoredDep,
+    TableDesc, DEFAULT_MAX_BYTES,
+};
+use incr_persist::{
+    Backend, Error, FileBackend, Local, Options, Position, ReadOutcome, Record, Store,
+};
 
 const CHILD: &str = "INCR_PERSIST_CHILD";
 const DIR: &str = "INCR_PERSIST_DIR";
@@ -453,4 +459,116 @@ fn a_file_reader_process_follows_a_writer_across_compactions() {
     items.insert(&writer, 30).unwrap();
     assert_eq!(check(&mut peer), after_two);
     peer.finish();
+}
+
+fn memo_input(keys: std::ops::Range<u32>) -> CheckpointInput {
+    let table = TableDesc {
+        name: "t".into(),
+        version: 1,
+        key_type: "u32".into(),
+        value_type: "u32".into(),
+    };
+    CheckpointInput {
+        build: 1,
+        tables: vec![table],
+        fresh: keys
+            .map(|key| Entry {
+                table: 0,
+                key: key.to_le_bytes().to_vec(),
+                value: vec![key as u8; 64],
+                deps: vec![StoredDep::External {
+                    name: format!("x{key}"),
+                    fp: u128::from(key),
+                }],
+                last_used: 0,
+            })
+            .collect(),
+        max_bytes: DEFAULT_MAX_BYTES,
+    }
+}
+
+fn memo_lock_holder() {
+    let memo = FileMemo::open(child_dir()).unwrap();
+    let guard = memo.lock_checkpoint().unwrap();
+    say("locked");
+    let mut lines = std::io::stdin().lines();
+    assert_eq!(lines.next().unwrap().unwrap(), "release");
+    drop(guard);
+    say("released");
+}
+
+#[test]
+fn a_memo_checkpoint_lock_held_by_another_process_is_busy() {
+    if let Some(role) = child_role() {
+        if role == "memo-lock-holder" {
+            memo_lock_holder();
+        }
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let memo = FileMemo::open(dir.path()).unwrap();
+    let mut peer = Peer::spawn(
+        "a_memo_checkpoint_lock_held_by_another_process_is_busy",
+        "memo-lock-holder",
+        dir.path(),
+    );
+    assert_eq!(peer.expect(), "locked");
+    assert!(matches!(memo.lock_checkpoint(), Err(Error::Busy)));
+    assert!(matches!(
+        write_checkpoint(&memo, memo_input(0..3)),
+        Err(Error::Busy)
+    ));
+    assert!(memo.load().unwrap().is_none());
+    peer.send("release");
+    assert_eq!(peer.expect(), "released");
+    write_checkpoint(&memo, memo_input(0..3)).unwrap();
+    peer.finish();
+}
+
+fn memo_checkpoint_loop() {
+    let memo = FileMemo::open(child_dir()).unwrap();
+    for round in 1.. {
+        let done = write_checkpoint(&memo, memo_input(0..round * 50)).unwrap();
+        if let Some(old) = done.replaced {
+            memo.remove_generation(old).unwrap();
+        }
+        say(&format!("wrote {round}"));
+    }
+}
+
+/// Kills a process that checkpoints in a loop at varying points, then
+/// checks that the store holds a whole generation and takes the next
+/// checkpoint.
+#[test]
+fn a_memo_checkpoint_killed_midway_leaves_a_whole_generation() {
+    if let Some(role) = child_role() {
+        if role == "memo-checkpoint-loop" {
+            memo_checkpoint_loop();
+        }
+        return;
+    }
+    for delay_us in [0, 150, 400, 900, 2000] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut peer = Peer::spawn(
+            "a_memo_checkpoint_killed_midway_leaves_a_whole_generation",
+            "memo-checkpoint-loop",
+            dir.path(),
+        );
+        assert_eq!(peer.expect(), "wrote 1");
+        std::thread::sleep(std::time::Duration::from_micros(delay_us));
+        peer.child.kill().unwrap();
+        peer.child.wait().unwrap();
+
+        let memo = FileMemo::open(dir.path()).unwrap();
+        let loaded = memo.load().unwrap().unwrap();
+        assert!(!loaded.items().is_empty(), "a written generation is whole");
+        assert_eq!(loaded.items().len() as u64, loaded.header().seq * 50);
+        for item in loaded.items() {
+            let frame = memo.read_entry(loaded.id(), item).unwrap().unwrap();
+            decode_entry(&frame, loaded.frame_tag()).unwrap();
+        }
+        let next = write_checkpoint(&memo, memo_input(0..7)).unwrap();
+        assert_eq!(next.stats.corrupt, 0);
+        assert_eq!(memo.load().unwrap().unwrap().id(), next.generation.id());
+    }
 }

@@ -178,7 +178,7 @@ impl IndexState {
     }
 
     /// Every child the index names, bound or orphaned.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn children(&self) -> Vec<ErasedIncr> {
         let mut out = self.orphans.clone();
         for (_, map) in &self.maps {
