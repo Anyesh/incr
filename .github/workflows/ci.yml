@@ -45,8 +45,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-wasm-tests --features incr-persist/sqlite
-      - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-wasm-tests --features incr-persist/sqlite
+      - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-python-protocol --exclude incr-wasm-tests --features incr-persist/sqlite
+      - run: cargo test --workspace --exclude incr-python --exclude incr-concurrent-python --exclude incr-python-protocol --exclude incr-wasm-tests --features incr-persist/sqlite
         env:
           INCR_MAX_DEPTH: "1"
           INCR_TEST_ALL_REPLAYABLE: "1"
@@ -81,7 +81,7 @@ jobs:
         with:
           python-version: "3.14"
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +1.88 check -p incr-core -p incr-compute -p incr-concurrent -p incr-python -p incr-concurrent-python --all-features --all-targets
+      - run: cargo +1.88 check -p incr-core -p incr-compute -p incr-concurrent -p incr-python -p incr-concurrent-python -p incr-python-protocol --all-features --all-targets
       - run: cargo +1.89 check -p incr-persist -p incr-kube --all-features --all-targets
       - run: cargo +1.88 check -p incr-core --lib --target wasm32-unknown-unknown
       - run: cargo +1.88 check -p incr-wasm-tests --all-targets --target wasm32-unknown-unknown
