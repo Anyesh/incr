@@ -1333,8 +1333,7 @@ where
 
         let (cursor, bootstrap) = upstream_log.write().register_consumer();
 
-        let groups: GroupMap<K, T, C> =
-            Arc::new(OpLock::new(LockKind::OperatorState, HashMap::new()));
+        let groups: GroupMap<K, T, C> = Arc::new(OpLock::new(LockKind::GroupState, HashMap::new()));
         let key_cache: Arc<OpLock<KeyCache<T, K>, C>> =
             Arc::new(OpLock::new(LockKind::KeyCache, KeyCache::new()));
         let output_version_counter = Arc::new(AtomicU64::new(0));

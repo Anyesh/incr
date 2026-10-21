@@ -22,9 +22,10 @@ pub enum LockKind {
     TableMiss,
     /// incr-persist's `DepIndex`.
     DepIndex,
-    /// An operator's state lock: `group_by`'s `groups`, `join`'s state, or
-    /// a positional operator's mirror.
+    /// `join`'s state or a positional operator's mirror.
     OperatorState,
+    /// `group_by`'s `groups`, which the router's `rt.set` runs under.
+    GroupState,
     /// `aggregate`'s state lock, which `combine` runs under.
     AggregateState,
     /// `group_by`'s `key_cache`, taken after its `groups`.
@@ -51,7 +52,7 @@ impl LockKind {
             LockKind::MemoIndex => 30,
             LockKind::TableMiss => 40,
             LockKind::DepIndex => 50,
-            LockKind::OperatorState | LockKind::AggregateState => 55,
+            LockKind::OperatorState | LockKind::GroupState | LockKind::AggregateState => 55,
             LockKind::KeyCache => 56,
             LockKind::CollectionLog => 58,
             LockKind::Inner => 60,
@@ -262,8 +263,9 @@ pub(crate) fn unlocked<F>(_closure: &'static str, f: F) -> F {
 }
 
 /// A thread is about to wait on a claim. It may hold only the Store mutex,
-/// the `DepIndex` (a `set` waiting on another `set`) and operator state locks
-/// (the router's `rt.set`, `combine`): no claim holder ever requests these.
+/// the `DepIndex` (a `set` waiting on another `set`), `groups` and `key_cache`
+/// (the router's `rt.set`) and an aggregate's state (`combine`): no claim
+/// holder ever requests these.
 #[inline]
 pub(crate) fn assert_may_wait_on_claim() {
     #[cfg(all(debug_assertions, not(loom)))]
@@ -276,7 +278,7 @@ pub(crate) fn assert_may_wait_on_claim() {
                 k,
                 LockKind::Store
                     | LockKind::DepIndex
-                    | LockKind::OperatorState
+                    | LockKind::GroupState
                     | LockKind::AggregateState
                     | LockKind::KeyCache
             )),
@@ -293,7 +295,7 @@ mod tests {
     fn locks_taken_in_rising_rank_are_allowed() {
         let _s = acquire(LockKind::Store);
         let _d = acquire(LockKind::DepIndex);
-        let _g = acquire(LockKind::OperatorState);
+        let _g = acquire(LockKind::GroupState);
         let _k = acquire(LockKind::KeyCache);
         let _l = acquire(LockKind::CollectionLog);
         let _i = acquire(LockKind::Inner);
@@ -318,7 +320,7 @@ mod tests {
 
     #[test]
     fn locks_may_be_released_out_of_order() {
-        let groups = acquire(LockKind::OperatorState);
+        let groups = acquire(LockKind::GroupState);
         let _keys = acquire(LockKind::KeyCache);
         drop(groups);
         let _log = acquire(LockKind::CollectionLog);
@@ -369,6 +371,20 @@ mod tests {
     #[should_panic(expected = "waiting on a claim while holding [Inner]")]
     fn waiting_on_a_claim_under_inner_panics() {
         let _i = acquire(LockKind::Inner);
+        assert_may_wait_on_claim();
+    }
+
+    #[test]
+    #[should_panic(expected = "waiting on a claim while holding [OperatorState]")]
+    fn waiting_on_a_claim_under_a_join_state_panics() {
+        let _j = acquire(LockKind::OperatorState);
+        assert_may_wait_on_claim();
+    }
+
+    #[test]
+    fn waiting_on_a_claim_under_the_routers_locks_is_allowed() {
+        let _g = acquire(LockKind::GroupState);
+        let _k = acquire(LockKind::KeyCache);
         assert_may_wait_on_claim();
     }
 
