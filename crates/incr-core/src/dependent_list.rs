@@ -437,7 +437,7 @@ impl DependentList {
         };
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     fn is_indexed(&self) -> bool {
         // SAFETY: a non-null block is live.
         self.has_block() && !unsafe { (*self.block()).index }.is_null()
