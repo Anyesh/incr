@@ -1230,12 +1230,13 @@ impl<C: Cells> Runtime<C> {
         panic!("incr-core: pending handle used outside the replay attempt that produced it");
     }
 
-    /// Whether this thread is inside a compute of this runtime, or under
-    /// `Shared` of any `Shared` runtime, since that frame stack is per
-    /// thread.
+    /// Whether this thread is inside a compute of any runtime. Every
+    /// runtime on a thread shares its frame stack, and a compute of
+    /// another runtime holds that runtime's claim as surely as one of this
+    /// runtime's does.
     #[doc(hidden)]
     pub fn frame_active(&self) -> bool {
-        self.dep_stack.current_frame_active(self.runtime_id)
+        self.dep_stack.any_compute_frame()
     }
 
     /// Whether this runtime's active frame on this thread is doomed.

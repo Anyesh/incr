@@ -197,6 +197,35 @@ fn shared_store_call_from_a_compute() {
     store_call_from_a_compute::<Shared>();
 }
 
+/// A compute of another runtime holds that runtime's claim as surely as
+/// the store's own, and the thread's frame stack is shared by both.
+fn store_call_from_another_runtimes_compute<C: Cells>() {
+    let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let other = incr_core::Runtime::<C>::new();
+    let q = other.create_query(|_| fire(Op::Compute));
+    let hooked = Rc::clone(&store);
+    arm(Op::Compute, move || {
+        hooked.restored_keys("").unwrap();
+    });
+    let err =
+        catch_unwind(AssertUnwindSafe(|| other.get(q))).expect_err("the store call was allowed");
+    let message = panic_message(err);
+    assert!(
+        message.contains(FRAME_MESSAGE),
+        "expected the frame panic, got: {message}"
+    );
+}
+
+#[test]
+fn local_store_call_from_another_runtimes_compute() {
+    store_call_from_another_runtimes_compute::<Local>();
+}
+
+#[test]
+fn shared_store_call_from_another_runtimes_compute() {
+    store_call_from_another_runtimes_compute::<Shared>();
+}
+
 /// A hang test: the element's `Hash` runs under the store mutex, so a
 /// `Store::input` from it would wait on that mutex forever. It panics
 /// with the contract message instead, and the child exits.
