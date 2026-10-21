@@ -119,9 +119,10 @@ fn raise_into_engine(e: PyErr) -> ! {
     std::panic::resume_unwind(Box::new(PyStashPanic { token, msg }))
 }
 
-/// Whether Python code raising now runs in a doomed frame. A Local runtime
-/// keeps its frames to itself, so this asks the runtime of the innermost
-/// engine call or query callback, whose active frame is the one running.
+/// Whether Python code raising now runs in a doomed frame: the active
+/// frame of the runtime whose engine call or query callback is innermost.
+/// Another runtime's call can run Python code over a doomed frame without
+/// pushing a frame of its own, and that code is not the doomed run's.
 fn active_frame_doomed() -> bool {
     let rt = ACTIVE_RT.with(Cell::get);
     // SAFETY: non-null only while an `InRuntime` guard for it is alive,
