@@ -18,7 +18,8 @@ use crate::memo::{
     decode_entry, BuildId, Entry, Memo, MemoBackend, MemoBuilder, MemoCells, MemoOptions,
     MemoStats, MemoTable, MemoryMemo, StoredDep,
 };
-use crate::{Input, Local, MemoryBackend, Options, Shared, Store};
+use crate::store::UNDECLARE_PARK;
+use crate::{Error, Input, Local, MemoryBackend, Options, Shared, Store};
 
 const BUILD: u128 = 0x9a7c;
 
@@ -271,6 +272,37 @@ kinds!(
     a_set_between_the_fp_read_and_the_seed_reruns_the_entry,
     a_set_between_a_deps_fp_read_and_its_seed_reruns_both,
 );
+
+#[test]
+fn a_checkpoint_during_a_refused_undeclare_keeps_the_entries_over_its_key() {
+    let backends = Backends::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let w = World::open(&backends, Dep::Input, &runs);
+    assert_eq!(w.read(w.plus, 2), 3);
+    let gate = Arc::new(Gate::default());
+    gate.arm();
+    let w = &w;
+    let (refused, checkpointed) = thread::scope(|s| {
+        let undeclarer = {
+            let gate = Arc::clone(&gate);
+            s.spawn(move || {
+                UNDECLARE_PARK.set(Some(Box::new(move || gate.park())));
+                w.store.undeclare(w.x)
+            })
+        };
+        gate.wait_parked();
+        let checkpointed = w.memo.checkpoint().unwrap();
+        gate.release();
+        (undeclarer.join().unwrap(), checkpointed)
+    });
+    assert!(matches!(refused, Err(Error::HasDependents { .. })));
+    assert_eq!(
+        (checkpointed.written, checkpointed.unkept),
+        (2, 0),
+        "x stays mapped while its undeclare is undecided"
+    );
+    assert_invariants(w.memo.runtime());
+}
 
 /// Checkpoints `plus(2) = x * 2 + 1` (and `scaled(2)` under it), reopens
 /// under `C`, deletes x's node at the first `BeforeSeed` a restore of
