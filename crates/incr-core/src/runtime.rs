@@ -2048,8 +2048,9 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(slot);
         self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
 
-        let observed = state::load::<C>(node.state_cell());
-        if observed == NodeState::Clean {
+        // The raw byte, so the Clean test skips `from_u8`'s range check.
+        let observed = C::state_load_acquire(node.state_cell());
+        if observed == NodeState::Clean.as_u8() {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
@@ -2061,7 +2062,7 @@ impl<C: Cells> Runtime<C> {
                 },
             };
         }
-        self.get_slow(handle, observed)
+        self.get_slow(handle, NodeState::from_u8(observed))
     }
 
     /// The non-Clean arm of [`Self::get`]: walk, then read. `observed`
@@ -2351,9 +2352,14 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
         let arena = self.arenas.tagged_arena::<T>(type_tag);
         let value = value_code::run(|| arena.and_then(|arena| arena.try_read(arena_slot)));
-        C::fence_acquire();
-        if node.generation() != handle.generation() {
-            self.stale_handle(handle);
+        // Under `Local` the generation the caller checked cannot move
+        // during the clone: no other thread exists, and the clone runs as
+        // value code, where every delete and recycle panics.
+        if !C::SINGLE_THREADED {
+            C::fence_acquire();
+            if node.generation() != handle.generation() {
+                self.stale_handle(handle);
+            }
         }
         value
     }
