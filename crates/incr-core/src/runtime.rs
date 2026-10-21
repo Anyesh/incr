@@ -5166,6 +5166,10 @@ mod tests {
     /// publishes in time linear in the list, installing exactly the new
     /// list and moving the reverse edges with it.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a timing test; dep_set::tests cover the hashed diff under Miri"
+    )]
     fn local_large_reordered_dep_list_publishes_new_edges() {
         let rt: Runtime<Local> = Runtime::new();
         let (flip, inputs, sum) = big_reordered_query(&rt, false);
@@ -5190,6 +5194,10 @@ mod tests {
     /// A panicking recompute over the same lists publishes the union of
     /// the old and recorded deps, each once, in linear time.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a timing test; dep_set::tests cover the hashed diff under Miri"
+    )]
     fn local_large_panicked_dep_list_publishes_the_union() {
         let rt: Runtime<Local> = Runtime::new();
         let (flip, inputs, sum) = big_reordered_query(&rt, true);
