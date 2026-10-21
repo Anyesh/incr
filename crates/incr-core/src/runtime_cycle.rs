@@ -1343,10 +1343,6 @@ impl<C: Cells> Runtime<C> {
         if scc.len() == 1 && !graph[at].contains(&at) {
             cycle_state::dissolved_before(rt, root.0);
             self.release_members(members, Some(root.0), bag);
-            let entry = cycle_state::with_held(|h| h.remove(&(rt, root.0)));
-            if let Some(e) = entry {
-                bag.push_erased(Box::new((e.buf, e.s)));
-            }
             return Shrink::Dissolved;
         }
         if scc.len() == members.len() {
@@ -1361,6 +1357,16 @@ impl<C: Cells> Runtime<C> {
         cu.retain(|m| scc.binary_search(m).is_ok());
         *members = scc;
         Shrink::Shrunk
+    }
+
+    /// Ends the claim the root of a dissolved episode holds as a member,
+    /// returning whether it was taken from New and whether it wrote.
+    pub(super) fn end_dissolved(&self, root: NodeId, bag: &mut Deferred<C>) -> (bool, bool) {
+        let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)))
+            .expect("incr-core: a dissolved root is held");
+        let ended = (e.first, e.wrote);
+        bag.push_erased(Box::new((e.buf, e.s)));
+        ended
     }
 
     /// Stores episode `ep`, whose member run a doom discarded, in the
@@ -2114,7 +2120,10 @@ impl<C: Cells> Runtime<C> {
         match self.episode(x, cidx, bag) {
             PopEnd::Landed => GroupEnd::Done(Computed::Done),
             PopEnd::Deferred => GroupEnd::Done(Computed::Deferred),
-            PopEnd::Dissolved => GroupEnd::Ordinary,
+            PopEnd::Dissolved => {
+                self.end_dissolved(x, bag);
+                GroupEnd::Ordinary
+            }
             PopEnd::Retry => GroupEnd::Retry,
             PopEnd::Suspended | PopEnd::Dropped => GroupEnd::Done(Computed::Discarded),
         }

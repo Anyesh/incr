@@ -1897,8 +1897,10 @@ impl<C: Cells> Runtime<C> {
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
     /// claim lands as if its run never happened, since no frame computes it
-    /// here: the entry below does. A suspended episode restarts the driver,
-    /// which runs the entries its doom pushed first.
+    /// here: the entry below does. It leaves the root's group, as the
+    /// unbounded run's frame goes on to compute the root alone and leaves
+    /// it there. A suspended episode restarts the driver, which runs the
+    /// entries its doom pushed first.
     fn episode_task_end(&self, root: NodeId, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         let pop = match end {
             PopEnd::Suspended => VPop::Restart,
@@ -1906,11 +1908,7 @@ impl<C: Cells> Runtime<C> {
             _ => VPop::Next,
         };
         if let PopEnd::Dissolved = end {
-            let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)));
-            let (first, wrote) = e.as_ref().map_or((false, false), |e| (e.first, e.wrote));
-            if let Some(e) = e {
-                bag.push_erased(Box::new((e.buf, e.s)));
-            }
+            let (first, wrote) = self.end_dissolved(root, &mut bag);
             let stamp_rev = self.current_revision();
             self.discard_land(root, first, wrote, stamp_rev, &mut bag);
         }

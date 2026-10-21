@@ -3363,7 +3363,10 @@ impl<C: Cells> Runtime<C> {
                         PopEnd::Deferred => return Computed::Deferred,
                         PopEnd::Landed => return self.episode_landed(node),
                         PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
-                        PopEnd::Dissolved => continue 'run,
+                        PopEnd::Dissolved => {
+                            self.end_dissolved(id, bag);
+                            continue 'run;
+                        }
                         PopEnd::Retry => {
                             self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                             continue 'attempt;
