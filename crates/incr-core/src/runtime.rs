@@ -1869,12 +1869,18 @@ impl<C: Cells> Runtime<C> {
         if handle.runtime_id() != self.runtime_id {
             return false;
         }
-        let node = self.nodes.get(handle.slot());
+        self.is_alive_at(handle.slot(), handle.generation())
+    }
+
+    /// [`Self::is_alive`] for a slot and generation of this runtime.
+    #[inline(always)]
+    pub(crate) fn is_alive_at(&self, slot: u32, generation: u32) -> bool {
+        let node = self.nodes.get(slot);
         // State before generation: a recycle bumps the generation before
         // it Release-stores the new occupant's state, so if the Acquire
         // load below sees that occupant, the generation load sees the bump.
-        let state = node.state();
-        state != NodeState::Dead && node.generation() == handle.generation()
+        let state = C::state_load_acquire(node.state_cell());
+        state != NodeState::Dead.as_u8() && node.generation() == generation
     }
 
     /// The typed handle behind `handle`: `Some` only if it names a live

@@ -378,8 +378,10 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         if word == EMPTY || word == CLAIMED {
             return None;
         }
-        let handle = Incr::new((word as u32) - 1, (word >> 32) as u32, self.runtime_id);
-        rt.is_alive(handle).then_some(handle)
+        let (slot, generation) = ((word as u32) - 1, (word >> 32) as u32);
+        // `rt` is this table's runtime: every caller ran `check_runtime`.
+        rt.is_alive_at(slot, generation)
+            .then(|| Incr::new(slot, generation, self.runtime_id))
     }
 
     #[inline(always)]

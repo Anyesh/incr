@@ -55,6 +55,7 @@ both!(
     grid_computes_create_their_nodes_through_the_table,
     grid_lookups_and_inserts_refuse_a_compute,
     grid_another_runtime_is_refused,
+    grid_a_dead_or_recycled_entry_is_a_miss,
     grid_a_key_out_of_range_is_refused,
     grid_a_doomed_miss_returns_a_pending_handle_and_creates_nothing,
     grid_insert_inputs_enters_every_node,
@@ -202,6 +203,35 @@ fn grid_another_runtime_is_refused<C: Cells>(rt: &Runtime<C>) {
     panics_with("GridTable of runtime", || {
         t.insert_inputs(rt, vec![(key(0, 0, 0), 1)]);
     });
+}
+
+/// A hit takes the entry's node only while that node is alive under the
+/// entry's generation: a deleted node is a miss, and so is a slot another
+/// node recycled, which is alive under a newer generation.
+fn grid_a_dead_or_recycled_entry_is_a_miss<C: Cells>(rt: &Runtime<C>) {
+    let t = rt.create_grid_table::<i64>();
+    let (dead, recycled) = (key(0, 1, 1), key(0, 2, 1));
+    let d = t.get_or_insert_input(rt, dead, || 10);
+    let r = t.get_or_insert_query(rt, recycled, |_| 11);
+    assert_eq!(rt.get(r), 11);
+    rt.delete_node(r);
+    let occupant = rt.create_input(99_i64);
+    assert_eq!(occupant.slot(), r.slot(), "the occupant reuses the slot");
+    rt.delete_node(d);
+    assert_eq!(t.get(rt, dead), None);
+    assert_eq!(t.get(rt, recycled), None);
+
+    let ran = Cell::new(0);
+    let d2 = t.get_or_insert_input(rt, dead, || {
+        ran.set(ran.get() + 1);
+        20
+    });
+    let r2 = t.get_or_insert_query(rt, recycled, |_| 21);
+    assert_eq!(ran.get(), 1, "a dead entry is a miss");
+    assert!(r2 != occupant && r2 != r, "a recycled entry is a miss");
+    assert_eq!((rt.get(d2), rt.get(r2), rt.get(occupant)), (20, 21, 99));
+    assert_eq!(t.get(rt, dead), Some(d2));
+    assert_eq!(t.get(rt, recycled), Some(r2));
 }
 
 fn grid_a_key_out_of_range_is_refused<C: Cells>(rt: &Runtime<C>) {
