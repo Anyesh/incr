@@ -632,13 +632,7 @@ impl<C: Cells> Runtime<C> {
                     ctl.lower(anchor);
                     let kind_now = cycle_state::unwind_kind();
                     let mut bag = Deferred::new();
-                    self.release_unwound_from(
-                        at + 1,
-                        slot,
-                        kind_now,
-                        kind_now.is_some() || replay::speculative(),
-                        &mut bag,
-                    );
+                    self.release_unwound_from(at + 1, slot, kind_now, kind_now.is_some(), &mut bag);
                     bag.drain(self);
                     return Some(Err(self.member_run_unwound(kind, payload)));
                 }
@@ -702,7 +696,7 @@ impl<C: Cells> Runtime<C> {
     /// Runs held node `slot`'s closure as a member run at position
     /// `cidx`: its value is buffered in the held map, with the deps it
     /// recorded. Returns the run's lowlink, or the panic it ended in, with
-    /// the node marked failed.
+    /// the node marked failed unless the run was speculative.
     pub(super) fn member_run(
         &self,
         slot: u32,
@@ -756,6 +750,14 @@ impl<C: Cells> Runtime<C> {
         }
         if result.is_err() {
             replay::unwind_past_since(self.runtime_id, cidx, first);
+            // A speculative run's panic or cycle is a discard, as in
+            // `compute_panicked`: callers land the run after its
+            // speculative guard has dropped.
+            if matches!(cycle_state::unwind_kind(), None | Some(UnwindKind::Cycle))
+                && replay::speculative()
+            {
+                cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+            }
             // A discard unwinds a run the unbounded run never makes: the
             // member keeps what its last run recorded, or its episode's
             // landing installs deps that the discard leaves New.
