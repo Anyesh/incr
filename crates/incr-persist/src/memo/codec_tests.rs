@@ -107,7 +107,7 @@ fn header_roundtrips_and_checks_magic_and_format() {
     body.push(FORMAT + 1);
     body.extend(postcard::to_stdvec(&header).unwrap());
     assert!(matches!(
-        decode_header(&frame_bytes(&body)),
+        decode_header(&frame_bytes(&body).unwrap()),
         Err(Error::UnsupportedFormat { found, supported }) if found == FORMAT + 1 && supported == FORMAT
     ));
 }
@@ -168,4 +168,18 @@ fn hashes_are_xxh3() {
     assert_eq!(fingerprint(b"abc"), xxhash_rust::xxh3::xxh3_128(b"abc"));
     assert_eq!(key_hash(b"abc"), xxhash_rust::xxh3::xxh3_64(b"abc"));
     assert_ne!(fingerprint(b"abc"), fingerprint(b"abd"));
+}
+
+#[test]
+fn a_frame_length_must_fit_a_u32() {
+    let largest = u32::MAX as usize - FRAME_HEADER_LEN;
+    assert_eq!(frame_word(largest).unwrap(), u32::MAX - 8);
+    assert!(matches!(
+        frame_word(largest + 1),
+        Err(Error::FrameTooLarge { len }) if len == u64::from(u32::MAX) + 1
+    ));
+    assert!(matches!(
+        frame_word(usize::MAX),
+        Err(Error::FrameTooLarge { len: u64::MAX })
+    ));
 }

@@ -285,3 +285,31 @@ fn eviction_through_the_driver_keeps_the_newest_within_budget() {
     assert_eq!(done.stats.evicted, 1);
     assert_eq!(ids(&stored(&memo)), [(0, 2, 20, 2)]);
 }
+
+#[test]
+fn an_entry_too_large_for_a_frame_is_dropped_with_its_dependents() {
+    let memo = MemoryMemo::new();
+    let tables = vec![desc("a", 1)];
+    let base = vec![entry(0, 2, 2, vec![]), entry(0, 4, 40, vec![on(0, 2)])];
+    write_checkpoint(&memo, input(tables.clone(), base)).unwrap();
+    let fresh = vec![
+        entry(0, 1, 10, vec![]),
+        entry(0, 2, 20, vec![]),
+        entry(0, 3, 30, vec![on(0, 2)]),
+    ];
+    let too_large = |e: &Entry| {
+        if e.key == [2] {
+            Err(Error::FrameTooLarge {
+                len: u64::from(u32::MAX) + 1,
+            })
+        } else {
+            EncodedEntry::new(e)
+        }
+    };
+    let done = write_with(&memo, input(tables, fresh), too_large).unwrap();
+    assert_eq!(done.stats.merged, 1);
+    assert_eq!(done.stats.oversized, 3);
+    assert_eq!(done.stats.evicted, 0);
+    assert_eq!(done.stats.written, 1);
+    assert_eq!(ids(&stored(&memo)), [(0, 1, 10, 2)]);
+}

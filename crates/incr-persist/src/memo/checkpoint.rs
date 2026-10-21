@@ -4,7 +4,7 @@ use super::{
     decode_entry, key_hash, EncodedEntry, Entry, GenHeader, GenId, Generation, MemoBackend,
     StoredDep, TableDesc,
 };
-use crate::Result;
+use crate::{Error, Result};
 
 /// The `max_bytes` a memo uses unless configured otherwise: 512 MiB.
 pub const DEFAULT_MAX_BYTES: u64 = 512 << 20;
@@ -39,6 +39,9 @@ pub struct CheckpointStats {
     pub corrupt: usize,
     /// Entries dropped to fit `max_bytes`.
     pub evicted: usize,
+    /// Entries dropped because their frame would exceed the frame length
+    /// limit, each with every entry that reads it transitively.
+    pub oversized: usize,
 }
 
 #[derive(Debug)]
@@ -54,9 +57,10 @@ pub struct Checkpointed {
 /// Runs a checkpoint's write step against `backend`: takes the checkpoint
 /// lock, loads the current generation as the base, keeps the fresh entries
 /// whose query deps are kept (to a fixpoint), stamps them with the new
-/// sequence number, merges the base entries that were not rewritten, evicts
-/// by oldest `last_used` with transitive dependents down to `max_bytes`,
-/// and writes the result as the next generation.
+/// sequence number, merges the base entries that were not rewritten, drops
+/// the entries too large for a frame and evicts by oldest `last_used`, each
+/// with transitive dependents, down to `max_bytes`, and writes the result as
+/// the next generation.
 ///
 /// The base is merged only when its build matches. A base table whose name
 /// matches a live table with a different descriptor is dropped; a base
@@ -66,6 +70,14 @@ pub struct Checkpointed {
 pub fn write_checkpoint<B: MemoBackend + ?Sized>(
     backend: &B,
     input: CheckpointInput,
+) -> Result<Checkpointed> {
+    write_with(backend, input, EncodedEntry::new)
+}
+
+fn write_with<B: MemoBackend + ?Sized>(
+    backend: &B,
+    input: CheckpointInput,
+    encode: impl Fn(&Entry) -> Result<EncodedEntry>,
 ) -> Result<Checkpointed> {
     let _guard = backend.lock_checkpoint()?;
     let base = backend.load()?;
@@ -89,10 +101,7 @@ pub fn write_checkpoint<B: MemoBackend + ?Sized>(
         merge(backend, base, &mut tables, &mut entries, &mut stats)?;
     }
 
-    let encoded = entries
-        .iter()
-        .map(EncodedEntry::new)
-        .collect::<Result<Vec<_>>>()?;
+    let (entries, encoded) = encode_fitting(entries, encode, &mut stats.oversized)?;
     let sizes: Vec<u64> = encoded.iter().map(|e| e.frame.len() as u64).collect();
     let evicted = evict(&entries, &sizes, input.max_bytes);
     let encoded: Vec<_> = encoded
@@ -235,6 +244,35 @@ fn merge<B: MemoBackend + ?Sized>(
         }
     }
     Ok(())
+}
+
+/// Encodes `entries`, dropping each whose frame would be too long with
+/// every entry that reads it transitively, and counting them in `oversized`.
+fn encode_fitting(
+    entries: Vec<Entry>,
+    encode: impl Fn(&Entry) -> Result<EncodedEntry>,
+    oversized: &mut usize,
+) -> Result<(Vec<Entry>, Vec<EncodedEntry>)> {
+    let encoded = entries
+        .iter()
+        .map(|entry| match encode(entry) {
+            Err(Error::FrameTooLarge { .. }) => Ok(None),
+            other => other.map(Some),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut dropped = vec![false; entries.len()];
+    if encoded.iter().any(Option::is_none) {
+        let (dependents, _) = query_edges(&entries);
+        for (i, _) in encoded.iter().enumerate().filter(|(_, e)| e.is_none()) {
+            mark_with_dependents(&dependents, &mut dropped, i, |_| *oversized += 1);
+        }
+    }
+    Ok(entries
+        .into_iter()
+        .zip(encoded)
+        .zip(dropped)
+        .filter_map(|((entry, frame), gone)| Some((entry, frame.filter(|_| !gone)?)))
+        .unzip())
 }
 
 /// Index `i` is `true` when `entries[i]` must go so that the summed `sizes`
