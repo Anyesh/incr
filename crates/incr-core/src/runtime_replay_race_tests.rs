@@ -1837,6 +1837,50 @@ fn shared_vframe_dirtied_while_the_retry_claims() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// W reads X, which reads Y. The other thread's X lets Y's failed read
+/// out, and a set and a read reland X Clean before the retry of X's frame.
+/// Only the order with this thread first is serial, so the retry takes the
+/// payload over the Clean X, and W lets it out.
+#[test]
+#[ignore = "W's retry reads X Clean on the fast path and never takes the delivery"]
+fn shared_vframe_relanded_clean_below_its_reader() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let i = rt.create_input(0_u64);
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |rt: &Rt| -> u64 {
+                if rt.get(i) == 1 {
+                    return 7;
+                }
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let w = rt.create_query_with(move |rt: &Rt| rt.get(x) + 1, replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(w)))
+    };
+    gate.wait_parked();
+    let other = outcome(|| rt.get(x));
+    assert!(failed(&other), "{other:?}");
+    rt.set(i, 1);
+    assert_eq!(outcome(|| rt.get(x)), Ok(8));
+    gate.release();
+    let first = first.join();
+    assert_eq!(first, Err("y boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
 /// As `keeps_the_payload`, but after the retry's read of X found the
 /// payload and loaded X's generation, another thread deletes X and
 /// recycles its slot into Z, landed Failed by its own panic, before the
