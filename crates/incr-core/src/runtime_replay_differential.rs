@@ -2476,10 +2476,10 @@ fn a_stand_in_run_contains_a_panic_as_its_walk_does() {
 /// compute panicked" where the unbounded run raises "boom 0:9". As with
 /// 0xeead60a378ca2b4, a retry's rerun of a caught read landed a node
 /// Failed that the unbounded run leaves Dirty for a later read to compute
-/// again, so that read is owed the payload held for the node's frame.
+/// again, so the rerun must land it as its first take did.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn a_failed_read_takes_the_payload_its_rerun_let_out() {
+fn a_rerun_of_a_caught_read_lands_its_node_as_its_first_take_did() {
     for seed in [0x0eea_d60a_378c_a2b4, 0x6b0e_30c5_cf9d_0858] {
         let case = gen_case(seed, false, false);
         quiet(|| {
