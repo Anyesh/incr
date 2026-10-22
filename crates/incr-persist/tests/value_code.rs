@@ -1,5 +1,5 @@
-//! The value-code contract through the store: a `Serialize`, `Hash` or
-//! `Eq` of a persisted element may read Clean nodes and must not
+//! The value-code contract through the store: a `Serialize`, `Hash`,
+//! `Eq` or `Clone` of a persisted value may read Clean nodes and must not
 //! otherwise call into the runtime or the store, and a compute must not
 //! call into the store.
 
@@ -10,9 +10,12 @@ use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use child::run_in_child;
+use incr_core::persist_hooks::inspect;
 use incr_core::with_value_code;
+use incr_persist::memo::{BuildId, MemoBuilder, MemoCells, MemoOptions, MemoryMemo};
 use incr_persist::{Cells, Error, Local, MemoryBackend, Options, Shared, Store};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
@@ -24,6 +27,7 @@ const FRAME_MESSAGE: &str = "Store methods must not be called from inside a quer
 enum Op {
     Serialize,
     Hash,
+    Clone,
     Compute,
 }
 
@@ -50,8 +54,15 @@ fn fire(op: Op) {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
+#[derive(PartialEq, Eq, Debug, Deserialize)]
 struct Hooked(u32);
+
+impl Clone for Hooked {
+    fn clone(&self) -> Self {
+        fire(Op::Clone);
+        Hooked(self.0)
+    }
+}
 
 impl Serialize for Hooked {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -255,4 +266,86 @@ fn shared_insert_whose_element_hash_declares_an_input() {
         insert_whose_element_hash_declares_an_input::<Shared>();
     })
     .assert_panicked_with(CONTRACT_MESSAGE);
+}
+
+fn assert_contract_panic(what: &str, op: impl FnOnce()) {
+    let err =
+        catch_unwind(AssertUnwindSafe(op)).expect_err(&format!("{what}: the call was allowed"));
+    let message = panic_message(err);
+    assert!(
+        message.contains(CONTRACT_MESSAGE),
+        "{what}: expected the contract panic, got: {message}"
+    );
+    assert!(
+        HOOK.with(|h| h.borrow().is_none()),
+        "{what}: the hook never ran"
+    );
+}
+
+/// A Clean read whose `Clone` sets the input it reads through the store
+/// is refused before the store mutex is taken, so the input stays Clean
+/// on its old value and the store is not poisoned.
+fn clone_of_a_clean_read_that_sets_its_input<C: Cells>() {
+    let store = Rc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let x = store.input("x", Hooked(1)).unwrap();
+    let hooked = Rc::clone(&store);
+    arm(Op::Clone, move || {
+        let _ = hooked.set(x, Hooked(2));
+    });
+    assert_contract_panic("Store::set from Clone", || {
+        store.runtime().get(x.handle());
+    });
+    let rt = store.runtime();
+    assert!(rt.is_alive(x.handle()));
+    assert_eq!(inspect(rt, x.handle()).map(|i| i.value), Some(Hooked(1)));
+    store.set(x, Hooked(3)).unwrap();
+    assert_eq!(rt.get(x.handle()), Hooked(3));
+}
+
+#[test]
+fn local_clone_of_a_clean_read_that_sets_its_input() {
+    clone_of_a_clean_read_that_sets_its_input::<Local>();
+}
+
+#[test]
+fn shared_clone_of_a_clean_read_that_sets_its_input() {
+    clone_of_a_clean_read_that_sets_its_input::<Shared>();
+}
+
+fn memo_options() -> MemoOptions {
+    MemoOptions::new(BuildId::Fixed(0x0dea_d10c))
+}
+
+/// A Clean read whose `Clone` opens a memo over the store is refused at
+/// the store mutex, and the store opens one normally afterwards.
+fn clone_of_a_clean_read_that_opens_a_memo<C: MemoCells>() {
+    let store = Arc::new(Store::<C, _>::open(MemoryBackend::new(), Options::default()).unwrap());
+    let x = store.input("x", Hooked(1)).unwrap();
+    let hooked = Arc::clone(&store);
+    arm(Op::Clone, move || {
+        let mut builder = MemoBuilder::<C>::new(memo_options());
+        let t = builder.table::<u32, u32>("t", 1);
+        builder.define(t, |_, &k| k);
+        let _ = builder.open(&hooked, MemoryMemo::new());
+    });
+    assert_contract_panic("MemoBuilder::open from Clone", || {
+        store.runtime().get(x.handle());
+    });
+    let rt = store.runtime();
+    assert_eq!(inspect(rt, x.handle()).map(|i| i.value), Some(Hooked(1)));
+    let mut builder = MemoBuilder::<C>::new(memo_options());
+    let t = builder.table::<u32, u32>("t", 1);
+    builder.define(t, |_, &k| k + 1);
+    let memo = builder.open(&store, MemoryMemo::new()).unwrap();
+    assert_eq!(rt.get(memo.get_or_insert(t, 2)), 3);
+}
+
+#[test]
+fn local_clone_of_a_clean_read_that_opens_a_memo() {
+    clone_of_a_clean_read_that_opens_a_memo::<Local>();
+}
+
+#[test]
+fn shared_clone_of_a_clean_read_that_opens_a_memo() {
+    clone_of_a_clean_read_that_opens_a_memo::<Shared>();
 }

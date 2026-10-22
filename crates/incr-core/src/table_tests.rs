@@ -11,6 +11,7 @@ use crate::handle::Incr;
 use crate::node::NodeId;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::runtime::{DeleteError, Runtime};
+use crate::state::NodeState;
 use crate::value_code::CONTRACT_MESSAGE;
 
 fn replayable<T>() -> QueryOpts<T> {
@@ -65,6 +66,7 @@ both!(
     a_key_on_a_lock_free_hit_may_read_a_clean_node,
     a_key_that_misses_under_the_miss_mutex_hits_the_contract,
     a_clone_that_misses_hits_the_contract,
+    a_clean_reads_clone_that_misses_or_removes_hits_the_contract,
     pending_handles_in_their_doomed_frame,
     pending_handles_out_of_their_frame,
     a_doomed_miss_needs_a_placeholder,
@@ -395,6 +397,72 @@ fn a_clone_that_misses_hits_the_contract<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(rt.node_count(), nodes);
     assert_eq!(t.shape(), (16, 14, 0));
     assert_eq!(rt.get(t.get_or_insert_input(rt, HookKey(99), || 99)), 99);
+}
+
+/// A value whose `Clone` runs the key hook.
+#[derive(Debug, PartialEq)]
+struct HookValue(i64);
+
+impl Clone for HookValue {
+    fn clone(&self) -> Self {
+        run_key_hook();
+        HookValue(self.0)
+    }
+}
+
+/// A Clean read's `Clone` that misses in, or removes from, the table of
+/// the node it reads is refused before the miss rehashes or the delete
+/// claims, so the node stays alive, Clean and on its value.
+fn a_clean_reads_clone_that_misses_or_removes_hits_the_contract<C: Cells>(rt: &Runtime<C>) {
+    type Table<C> = NodeTable<u64, HookValue, C>;
+    type Change<C> = (&'static str, fn(&Runtime<C>, &Table<C>));
+    let changes: [Change<C>; 3] = [
+        ("get_or_insert_input", |rt, t| {
+            t.get_or_insert_input(rt, 99, || HookValue(99));
+        }),
+        ("get_or_insert_query", |rt, t| {
+            t.get_or_insert_query(rt, 99, |_| HookValue(99));
+        }),
+        ("remove", |rt, t| {
+            let _ = t.remove(rt, &0);
+        }),
+    ];
+    let t = rt.create_table::<u64, HookValue>();
+    for i in 0..14 {
+        t.get_or_insert_input(rt, i, || HookValue(i as i64));
+    }
+    assert_eq!(t.shape(), (16, 14, 0), "one insert short of a rehash");
+    let read = t.get(rt, &0).unwrap();
+    let nodes = rt.node_count();
+    let (rt_ptr, t_ptr) = (rt as *const Runtime<C>, &t as *const Table<C>);
+    for (name, change) in changes {
+        for try_get in [false, true] {
+            arm_key_hook(1, move || {
+                // SAFETY: both outlive the hook, which is disarmed below.
+                let (rt, t) = unsafe { (&*rt_ptr, &*t_ptr) };
+                change(rt, t);
+            });
+            panics_with(CONTRACT_MESSAGE, || {
+                if try_get {
+                    let _ = rt.try_get(read);
+                } else {
+                    rt.get(read);
+                }
+            });
+            disarm_key_hook();
+            assert!(rt.is_alive(read), "{name}");
+            assert_eq!(rt.state_of(read), NodeState::Clean, "{name}");
+            assert_eq!(rt.get(read).0, 0, "{name}");
+            assert_eq!(t.get(rt, &0), Some(read), "{name}");
+            assert_eq!(t.shape(), (16, 14, 0), "{name}");
+            assert_eq!(rt.node_count(), nodes, "{name}");
+        }
+    }
+    assert_eq!(
+        rt.get(t.get_or_insert_input(rt, 99, || HookValue(99))).0,
+        99
+    );
+    assert_eq!(t.remove(rt, &0), Ok(()));
 }
 
 fn an_init_that_dooms_its_frame_creates_nothing<C: Cells>(rt: &Runtime<C>)

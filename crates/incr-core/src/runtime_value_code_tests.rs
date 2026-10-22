@@ -9,12 +9,13 @@ use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::drop_panic_tests::prime_reclaim_timer;
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
+use crate::persist_hooks::{seed_base, seed_query, Reuse, SeedDep};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::set_stack;
 use crate::state::NodeState;
@@ -338,7 +339,7 @@ fn clone_that_reads_a_clean_node<C: Cells>(rt: Rc<Runtime<C>>) {
 /// it is cloning; each attempt panics and leaves the node as it was.
 fn clone_that_deletes_or_sets_the_node_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
     type Change<C> = (&'static str, fn(&Runtime<C>, crate::Incr<Hooked>));
-    let changes: [Change<C>; 4] = [
+    let changes: [Change<C>; 6] = [
         ("delete_node", |rt, a| rt.delete_node(a)),
         ("try_delete_node", |rt, a| {
             let _ = rt.try_delete_node(a);
@@ -346,7 +347,15 @@ fn clone_that_deletes_or_sets_the_node_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
         ("delete_with_dependents", |rt, a| {
             rt.delete_with_dependents(a);
         }),
+        // Reached in the engine only through `delete_with_dependents`,
+        // whose own check comes first.
+        ("delete_erased", |rt, a| {
+            rt.delete_erased(a.erase());
+        }),
         ("set", |rt, a| rt.set(a, Hooked(2))),
+        ("set_returning_displaced", |rt, a| {
+            crate::persist_hooks::set_returning_displaced(rt, a, Hooked(2));
+        }),
     ];
     let a = rt.create_input(Hooked(1));
     for (name, change) in changes {
@@ -367,18 +376,270 @@ fn clone_that_deletes_or_sets_the_node_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
     }
 }
 
+/// The created input's type has no arena yet, so a create that got past
+/// its check would register one before the arena's own reserve refuses.
 fn clone_that_creates_a_node<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
     let hooked = Rc::clone(&rt);
     arm(Op::Clone, move || {
         hooked.create_input(0u32);
     });
-    let before = rt.node_count();
+    let (nodes, arenas) = (rt.node_count(), rt.arenas.arena_count());
     assert_contract_panic("create from Clone", || {
         rt.get(a);
     });
-    assert_eq!(rt.node_count(), before);
+    assert_eq!(rt.node_count(), nodes);
+    assert_eq!(rt.arenas.arena_count(), arenas, "an arena was registered");
+    assert_eq!(rt.state_of(a), NodeState::Clean);
     assert_eq!(rt.get(a).0, 1);
+}
+
+/// A query that owns a child input, created on its first run.
+fn owner_with_child<C: Cells>(rt: &Runtime<C>) -> (crate::Incr<Hooked>, crate::Incr<u32>) {
+    let made = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&made);
+    let owner = rt.create_query(move |rt: &Runtime<C>| {
+        *record.lock().unwrap() = Some(rt.child_input(0u8, || 7u32));
+        Hooked(1)
+    });
+    assert_eq!(rt.get(owner).0, 1);
+    let child = made.lock().unwrap().expect("the owner made no child");
+    (owner, child)
+}
+
+/// A delete of an owner from the `Clone` of its own Clean read is
+/// refused before its owned set is claimed: the owner and its child stay.
+fn clone_that_deletes_the_owner_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
+    type Change<C> = (&'static str, fn(&Runtime<C>, crate::Incr<Hooked>));
+    let changes: [Change<C>; 3] = [
+        ("delete_node", |rt, q| rt.delete_node(q)),
+        ("try_delete_node", |rt, q| {
+            let _ = rt.try_delete_node(q);
+        }),
+        ("delete_with_dependents", |rt, q| {
+            rt.delete_with_dependents(q);
+        }),
+    ];
+    let (owner, child) = owner_with_child(&rt);
+    for (name, change) in changes {
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || change(&hooked, owner));
+        assert_contract_panic(name, || {
+            rt.get(owner);
+        });
+        assert!(rt.is_alive(owner), "{name}");
+        assert_eq!(rt.state_of(owner), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(owner).0, 1, "{name}");
+        assert!(rt.is_alive(child), "{name}");
+        assert_eq!(rt.get(child), 7, "{name}");
+    }
+}
+
+/// `child_input` and `child_query` from the `Clone` of a read inside
+/// their creator's compute are refused, even for a key the creator
+/// already bound, which needs no new node.
+fn clone_in_a_compute_that_asks_for_a_child<C: Cells>(rt: Rc<Runtime<C>>) {
+    type Ask<C> = (&'static str, fn(&Runtime<C>));
+    let asks: [Ask<C>; 2] = [
+        ("child_input", |rt| {
+            rt.child_input(0u8, || 9u32);
+        }),
+        ("child_query", |rt| {
+            rt.child_query(1u8, |_| 9u32);
+        }),
+    ];
+    let a = rt.create_input(Hooked(1));
+    let s = rt.create_input(0u32);
+    let made = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&made);
+    let q = rt.create_query(move |rt: &Runtime<C>| {
+        let input = rt.child_input(0u8, || 7u32);
+        let query = rt.child_query(1u8, |_| 8u32);
+        *record.lock().unwrap() = Some((input, query));
+        rt.get(s) + rt.get(a).0
+    });
+    assert_eq!(rt.get(q), 1);
+    let (input, query) = made.lock().unwrap().expect("the creator made no children");
+    for (i, (name, ask)) in asks.into_iter().enumerate() {
+        rt.set(s, i as u32 + 1);
+        let nodes = rt.node_count();
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || ask(&hooked));
+        assert_contract_panic(name, || {
+            rt.get(q);
+        });
+        assert_eq!(rt.node_count(), nodes, "{name}");
+        assert_eq!(rt.state_of(a), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(a).0, 1, "{name}");
+        assert!(rt.is_alive(input) && rt.is_alive(query), "{name}");
+        assert_eq!(rt.get(input), 7, "{name}");
+        assert_eq!(rt.get(query), 8, "{name}");
+    }
+    rt.set(s, 10);
+    assert_eq!(rt.get(q), 11);
+}
+
+/// `watch`, `unwatch` and `drain_dirtied_watched` from the `Clone` of a
+/// Clean read leave the watch queue and the watched set as they were.
+fn clone_that_changes_what_is_watched<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let s = rt.create_input(0u32);
+    let watched = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 1);
+    let unwatched = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 2);
+    assert_eq!(rt.get(watched) + rt.get(unwatched), 3);
+    rt.watch(watched);
+    rt.set(s, 1);
+    type Change<C> = (
+        &'static str,
+        fn(&Runtime<C>, crate::Incr<u32>, crate::Incr<u32>),
+    );
+    let changes: [Change<C>; 3] = [
+        ("watch", |rt, _, unwatched| rt.watch(unwatched)),
+        ("unwatch", |rt, watched, _| rt.unwatch(watched)),
+        ("drain_dirtied_watched", |rt, _, _| {
+            rt.drain_dirtied_watched();
+        }),
+    ];
+    for (name, change) in changes {
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || change(&hooked, watched, unwatched));
+        assert_contract_panic(name, || {
+            rt.get(a);
+        });
+        assert_eq!(rt.state_of(a), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(a).0, 1, "{name}");
+        assert_eq!(rt.queued_slots(), vec![watched.slot()], "{name}");
+    }
+    assert_eq!(rt.drain_dirtied_watched(), vec![watched.erase()]);
+    assert_eq!(rt.get(unwatched), 3);
+    rt.set(s, 2);
+    assert_eq!(
+        rt.drain_dirtied_watched(),
+        Vec::<crate::ErasedIncr>::new(),
+        "a stopped walk reported again"
+    );
+    rt.get(watched);
+    rt.set(s, 3);
+    assert_eq!(rt.drain_dirtied_watched(), vec![watched.erase()]);
+}
+
+/// `observe`, `unobserve` and `stabilize` from the `Clone` of a Clean
+/// read register nothing, remove nothing and fire nothing.
+fn clone_that_observes_or_stabilizes<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let s = rt.create_input(0u32);
+    let q = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 1);
+    let fired = Arc::new(AtomicU32::new(0));
+    let count = Arc::clone(&fired);
+    let observer = rt.observe(q, move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+    });
+    rt.stabilize();
+    assert_eq!(fired.load(Ordering::Relaxed), 1);
+    // Queued by the set and Clean again, so a stabilize fires without
+    // computing anything.
+    rt.set(s, 1);
+    assert_eq!(rt.get(q), 2);
+    let added = Arc::new(AtomicU32::new(0));
+    type Change<C> = (&'static str, Box<dyn Fn(&Runtime<C>)>);
+    let changes: [Change<C>; 3] = [
+        ("observe", {
+            let added = Arc::clone(&added);
+            Box::new(move |rt: &Runtime<C>| {
+                let added = Arc::clone(&added);
+                rt.observe(q, move |_| {
+                    added.fetch_add(1, Ordering::Relaxed);
+                });
+            })
+        }),
+        (
+            "unobserve",
+            Box::new(move |rt: &Runtime<C>| rt.unobserve(observer)),
+        ),
+        ("stabilize", Box::new(|rt: &Runtime<C>| rt.stabilize())),
+    ];
+    for (name, change) in changes {
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || change(&hooked));
+        assert_contract_panic(name, || {
+            rt.get(a);
+        });
+        assert_eq!(rt.state_of(a), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(a).0, 1, "{name}");
+        assert_eq!(fired.load(Ordering::Relaxed), 1, "{name}");
+    }
+    rt.stabilize();
+    assert_eq!(fired.load(Ordering::Relaxed), 2, "the observer was removed");
+    assert_eq!(added.load(Ordering::Relaxed), 0, "an observer was added");
+}
+
+/// A `get` of a Dirty creator from value code does not start its
+/// compute, whose landing would sweep the child this run stops asking
+/// for: the creator stays Dirty and unrun, and the child stays.
+fn clone_that_reads_a_dirty_creator<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let keep = rt.create_input(true);
+    let runs = Arc::new(AtomicU32::new(0));
+    let made = Arc::new(Mutex::new(None));
+    let (counted, record) = (Arc::clone(&runs), Arc::clone(&made));
+    let creator = rt.create_query(move |rt: &Runtime<C>| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        if rt.get(keep) {
+            *record.lock().unwrap() = Some(rt.child_input(0u8, || 7u32));
+        }
+        0u32
+    });
+    rt.get(creator);
+    let child = made.lock().unwrap().expect("the creator made no child");
+    rt.set(keep, false);
+    let hooked = Rc::clone(&rt);
+    arm(Op::Clone, move || {
+        hooked.get(creator);
+    });
+    assert_contract_panic("get of a Dirty creator", || {
+        rt.get(a);
+    });
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "the creator ran");
+    assert_eq!(rt.state_of(creator), NodeState::Dirty);
+    assert!(rt.is_alive(child));
+    assert_eq!(rt.get(child), 7);
+    assert_eq!(rt.get(a).0, 1);
+    rt.get(creator);
+    assert!(!rt.is_alive(child), "the creator's landing kept its child");
+}
+
+/// A restore's `seed_query` from a Clean read's `Clone` is refused before
+/// it claims the target or installs an edge, so the target stays New and
+/// seeds normally afterwards.
+fn clone_that_seeds_a_query<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let x = rt.create_input(3u64);
+    let q = rt.create_query(move |rt| rt.get(x) * 10);
+    let base = seed_base(&rt);
+    let dep = SeedDep {
+        dep: x.erase(),
+        trusted_stamp: None,
+    };
+    let hooked = Rc::clone(&rt);
+    arm(Op::Clone, move || {
+        let _ = seed_query(&hooked, &base, q, 30, &[dep], Reuse::IfUnchanged);
+    });
+    assert_contract_panic("seed_query from Clone", || {
+        rt.get(a);
+    });
+    assert!(rt.is_alive(a));
+    assert_eq!(rt.state_of(a), NodeState::Clean);
+    assert_eq!(rt.get(a).0, 1);
+    assert_eq!(rt.state_of(q), NodeState::New);
+    assert_eq!(rt.nodes.get(q.slot()).dep_count(), 0);
+    assert!(rt.inner.read().dependents[x.slot() as usize].is_empty());
+    assert_eq!(
+        seed_query(&rt, &base, q, 30, &[dep], Reuse::IfUnchanged),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.get(q), 30);
+    rt.set(x, 4);
+    assert_eq!(rt.get(q), 40);
 }
 
 /// A read from the `PartialEq` of a recompute runs inside the query's
@@ -738,6 +999,12 @@ both!(
     clone_that_reads_a_clean_node,
     clone_that_deletes_or_sets_the_node_it_reads,
     clone_that_creates_a_node,
+    clone_that_deletes_the_owner_it_reads,
+    clone_in_a_compute_that_asks_for_a_child,
+    clone_that_changes_what_is_watched,
+    clone_that_observes_or_stabilizes,
+    clone_that_reads_a_dirty_creator,
+    clone_that_seeds_a_query,
     partial_eq_of_a_recompute_that_reads_a_node,
     hash_that_reads_a_node_on_insert,
     eq_that_reads_a_node_on_insert,
@@ -800,4 +1067,126 @@ mod every_collection_path_is_refused {
     fn shared() {
         every_path_is_refused(Rc::new(Runtime::<Shared>::new()), collection_paths());
     }
+}
+
+/// Value code that runs under a collection's own lock: an element's
+/// `PartialEq` under the log guard of an insert, and an element's `Clone`
+/// under the sorted view's lock while it files a delta. Each path that
+/// would take that lock again panics with the contract message and
+/// leaves the collection as it was.
+mod under_a_collection_lock {
+    use super::*;
+
+    type LogPath<C> = (
+        &'static str,
+        fn(&Runtime<C>, &crate::IncrCollection<Hooked, C>),
+    );
+
+    fn log_paths<C: Cells>() -> Vec<LogPath<C>> {
+        vec![
+            ("insert", |rt, c| c.insert(rt, Hooked(2))),
+            ("delete", |rt, c| {
+                c.delete(rt, &Hooked(1));
+            }),
+            ("replace", |rt, c| {
+                c.replace(rt, Some(&Hooked(1)), Hooked(2));
+            }),
+            ("values", |rt, c| {
+                c.values(rt);
+            }),
+            ("snapshot_len", |_, c| {
+                c.snapshot_len();
+            }),
+            ("filter", |rt, c| {
+                c.filter(rt, |_| true);
+            }),
+            ("map", |rt, c| {
+                c.map(rt, |h| h.0);
+            }),
+            ("count", |rt, c| {
+                c.count(rt);
+            }),
+            ("reduce", |rt, c| {
+                c.reduce(rt, |v| v.len());
+            }),
+            ("aggregate", |rt, c| {
+                c.aggregate(rt, 0u32, |h| h.0, |a, b| a + b);
+            }),
+            ("join", |rt, c| {
+                c.join(rt, c, |h| h.0, |h| h.0);
+            }),
+            ("group_by", |rt, c| {
+                c.group_by(rt, |h| h.0);
+            }),
+            ("sort_by_key", |rt, c| {
+                c.sort_by_key(rt, |h| h.0);
+            }),
+        ]
+    }
+
+    fn log_paths_are_refused<C: Cells>(rt: Rc<Runtime<C>>) {
+        let c = rt.create_collection::<Hooked>();
+        c.insert(&rt, Hooked(1));
+        for (name, path) in log_paths() {
+            let version = rt.get(c.version_node());
+            let nodes = rt.node_count();
+            let (hooked, target) = (Rc::clone(&rt), c.clone());
+            arm(Op::Eq, move || path(&hooked, &target));
+            assert_contract_panic(name, || c.insert(&rt, Hooked(1)));
+            assert_eq!(ids(&rt, &c), vec![1], "{name}");
+            assert_eq!(rt.get(c.version_node()), version, "{name}");
+            assert_eq!(rt.node_count(), nodes, "{name}");
+        }
+        c.insert(&rt, Hooked(1));
+        assert_eq!(ids(&rt, &c), vec![1, 1]);
+    }
+
+    type ViewPath<C> = (
+        &'static str,
+        fn(&Runtime<C>, &crate::SortedCollection<Hooked, u32, C>),
+    );
+
+    fn view_paths<C: Cells>() -> Vec<ViewPath<C>> {
+        vec![
+            ("sorted snapshot", |_, s| {
+                s.snapshot();
+            }),
+            ("sorted snapshot_len", |_, s| {
+                s.snapshot_len();
+            }),
+            ("pairwise", |rt, s| {
+                s.pairwise(rt);
+            }),
+            ("window", |rt, s| {
+                s.window(rt, 2);
+            }),
+        ]
+    }
+
+    /// Each path gets a fresh view, because a refused compute leaves its
+    /// node Failed until the next upstream change.
+    fn view_paths_are_refused<C: Cells>(rt: Rc<Runtime<C>>) {
+        for (name, path) in view_paths() {
+            let c = rt.create_collection::<Hooked>();
+            let sorted = Rc::new(c.sort_by_key(&rt, |h| h.0));
+            c.insert(&rt, Hooked(1));
+            rt.get(sorted.version_node());
+            c.insert(&rt, Hooked(2));
+            let nodes = rt.node_count();
+            let (hooked, target) = (Rc::clone(&rt), Rc::clone(&sorted));
+            // The first clone stages the pending delta, the second files
+            // it under the view's lock.
+            arm_nth(Op::Clone, 2, move || path(&hooked, &target));
+            assert_contract_panic(name, || {
+                rt.get(sorted.version_node());
+            });
+            assert_eq!(rt.node_count(), nodes, "{name}");
+            c.insert(&rt, Hooked(3));
+            rt.get(sorted.version_node());
+            let order: Vec<u32> = sorted.snapshot().iter().map(|h| h.0).collect();
+            assert_eq!(order, vec![1, 2, 3], "{name}");
+        }
+    }
+
+    both!(log_paths_are_refused, view_paths_are_refused);
 }

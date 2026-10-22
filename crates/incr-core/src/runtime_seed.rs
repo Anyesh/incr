@@ -23,6 +23,7 @@ impl<C: Cells> Runtime<C> {
         deps: &[SeedDep],
         reuse: Reuse,
     ) -> Result<Reuse, (SeedError, T)> {
+        value_code::check();
         if base.rid != self.runtime_id || q.runtime_id() != self.runtime_id {
             return Err((SeedError::ForeignBase, value));
         }
