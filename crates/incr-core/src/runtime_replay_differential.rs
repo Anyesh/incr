@@ -3212,15 +3212,9 @@ proptest! {
         quiet(|| differential::<Shared>(&gen_case(seed, false, false), seed));
     }
 
-    // Only a case without panics or cycles: which of two overlapping reads
-    // computes a node first decides which one gets a closure's panic
-    // payload and which gets "last compute panicked", and where a cycle is
-    // entered decides its root and strategy, at every budget, unbounded
-    // included.
     #[test]
     #[cfg_attr(miri, ignore)]
     fn replay_differential_shared_two_threads(seed in any::<u64>()) {
-        let seed = seed / 6 * 6;
         quiet(|| differential_two(&gen_case(seed, false, true), seed));
     }
 
@@ -3245,12 +3239,6 @@ fn shared() -> bool {
 
 fn two_threads() -> bool {
     std::env::var_os("REPLAY_TWO").is_some()
-}
-
-/// Whether a two-thread scan takes seeds with panics or cycles too, which
-/// the proptest leaves out.
-fn all_seeds() -> bool {
-    std::env::var_os("REPLAY_ALL_SEEDS").is_some()
 }
 
 /// The case for `seed`, the base one if `REPLAY_BASE` is set, with a
@@ -3353,8 +3341,7 @@ fn replay_scan() {
         return;
     }
     let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
-    let seeds = (from..n).filter(|seed| !two_threads() || seed.is_multiple_of(6) || all_seeds());
-    scan(seeds, std::env::var_os("REPLAY_ALL").is_some(), check);
+    scan(from..n, std::env::var_os("REPLAY_ALL").is_some(), check);
 }
 
 /// Runs `check` on each seed and panics at the end if any failed, naming
