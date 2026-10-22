@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here. Format roughly follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0-beta.6] - unreleased
+## [0.2.0-beta.6] - YYYY-MM-DD
 
 ### Added
 
@@ -51,7 +51,7 @@ All notable changes to this project are documented here. Format roughly follows 
 - Python: a `RuntimeRef` kept by a query that raised now raises `RuntimeError` ("RuntimeRef is no longer valid") when used, as one kept by a query that returned does. Before, it stayed valid and could reach a dropped runtime.
 - Python (`incr_concurrent`): a binding call that waited on an engine lock while holding the GIL could deadlock against a thread holding that lock in a value's `__eq__` or `__hash__` or in a clone of a Python value, each of which waits for the GIL, for example a collection read racing another thread's `insert`. Every binding call now releases the GIL while it is in the engine.
 
-## [0.2.0-beta.5] - unreleased
+## [0.2.0-beta.5] - 2026-10-16
 
 ### Added
 

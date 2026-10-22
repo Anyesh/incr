@@ -3,8 +3,8 @@ resolver = "2"
 members = ["crates/incr-bench", "crates/incr-compute", "crates/incr-concurrent", "crates/incr-concurrent-python", "crates/incr-core", "crates/incr-kube", "crates/incr-persist", "crates/incr-python", "crates/incr-python-protocol", "crates/incr-wasm-tests", "examples/concurrent-server", "examples/persist-config", "examples/spreadsheet"]
 
 [workspace.package]
-version = "0.2.0-beta.5"
+version = "0.2.0-beta.6"
 
 [workspace.dependencies]
-incr-core = { version = "=0.2.0-beta.5", path = "crates/incr-core" }
-incr-concurrent = { version = "0.2.0-beta.5", path = "crates/incr-concurrent" }
+incr-core = { version = "=0.2.0-beta.6", path = "crates/incr-core" }
+incr-concurrent = { version = "0.2.0-beta.6", path = "crates/incr-concurrent" }
