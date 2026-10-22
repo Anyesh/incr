@@ -346,6 +346,7 @@ impl<C: Cells> SetClaim<'_, C> {
         self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
+        self.rt.drop_released_tickets();
         std::mem::forget(self);
         stamp
     }
@@ -3705,7 +3706,7 @@ impl<C: Cells> Runtime<C> {
             if !C::SINGLE_THREADED {
                 self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
             }
-            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload);
+            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, bag);
         }
         let flagged = if landing == NodeState::New {
             NodeState::New
@@ -3732,7 +3733,7 @@ impl<C: Cells> Runtime<C> {
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {
-            self.left_failed(id, mark);
+            self.left_failed_landing(id, mark, bag);
         }
     }
 

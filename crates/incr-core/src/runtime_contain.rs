@@ -38,8 +38,9 @@ pub(super) struct Left;
 pub(crate) struct Tickets {
     next: u64,
     held: Vec<Ticket>,
-    /// The tickets of deleted nodes, dropped by the bag of the delete or
-    /// sweep that buried them once it holds no lock.
+    /// The tickets of deleted nodes and of nodes a set's walk flipped,
+    /// dropped once the delete, sweep or walk that released them holds no
+    /// lock and has finished.
     buried: Vec<Ticket>,
 }
 
@@ -174,6 +175,14 @@ fn release(t: &mut Tickets, mark: u64, landing: impl Fn((u32, u32)) -> bool) -> 
     stale
 }
 
+/// Hands `stale` to `bag`, which drops it with no lock held and a panic
+/// of its `Drop` handled as any bag item's.
+fn defer<C: Cells>(stale: Vec<Ticket>, bag: &mut Deferred<C>) {
+    if !stale.is_empty() {
+        bag.push_erased(Box::new(stale));
+    }
+}
+
 impl<C: Cells> Runtime<C> {
     /// Whether any ticket may be held. Set under the lock before a node's
     /// Failed store, so a reader that sees the node Failed sees it.
@@ -233,6 +242,7 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         cidx: u32,
         payload: Option<&(dyn Any + Send)>,
+        bag: &mut Deferred<C>,
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
@@ -261,7 +271,7 @@ impl<C: Cells> Runtime<C> {
             self.sync_held(&t);
             (stale, t.next)
         };
-        drop(stale);
+        defer(stale, bag);
         mark
     }
 
@@ -354,17 +364,47 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// `id` left the Failed landing that ordered before `mark`, so no read
-    /// takes a payload for it any more.
+    /// takes a payload for it any more. A set's walk flipped it: the
+    /// payloads it alone kept wait with the buried ones until the walk
+    /// has flagged every dependent.
     #[cold]
     #[inline(never)]
     pub(super) fn left_failed(&self, id: NodeId, mark: u64) {
-        let stale = {
-            let mut t = self.tickets.write();
-            let stale = release(&mut t, mark, |(n, _)| n == id.0);
-            self.sync_held(&t);
-            stale
-        };
-        drop(stale);
+        let mut t = self.tickets.write();
+        let stale = release(&mut t, mark, |(n, _)| n == id.0);
+        t.buried.extend(stale);
+        self.sync_held(&t);
+    }
+
+    /// After a set's walk: drops the tickets its flips released.
+    #[inline(always)]
+    pub(super) fn drop_released_tickets(&self) {
+        if self.tickets_held() {
+            self.drop_released();
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn drop_released(&self) {
+        if let Some(payload) = self.drop_buried() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// [`Self::left_failed`] where `id`'s own compute landed it Dirty past
+    /// the walk: the payloads join the compute's bag.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn left_failed_landing(&self, id: NodeId, mark: u64, bag: &mut Deferred<C>) {
+        defer(self.release_left(id, mark), bag);
+    }
+
+    fn release_left(&self, id: NodeId, mark: u64) -> Vec<Ticket> {
+        let mut t = self.tickets.write();
+        let stale = release(&mut t, mark, |(n, _)| n == id.0);
+        self.sync_held(&t);
+        stale
     }
 
     /// Node `slot` at `generation` is being deleted under the runtime's
@@ -384,24 +424,28 @@ impl<C: Cells> Runtime<C> {
         t.buried.extend(stale);
     }
 
-    /// A delete's bag drains: drops the tickets its deletes buried.
+    /// A delete's bag drains: drops the tickets its deletes buried, and
+    /// returns the panic of a payload's `Drop` for the bag to raise once
+    /// its own items have dropped.
     #[inline(always)]
-    pub(crate) fn drop_buried_tickets(&self) {
+    pub(crate) fn drop_buried_tickets(&self) -> Option<Box<dyn Any + Send>> {
         if self.tickets_held() {
-            self.drop_buried();
+            self.drop_buried()
+        } else {
+            None
         }
     }
 
     #[cold]
     #[inline(never)]
-    fn drop_buried(&self) {
+    fn drop_buried(&self) -> Option<Box<dyn Any + Send>> {
         let buried = {
             let mut t = self.tickets.write();
             let buried = std::mem::take(&mut t.buried);
             self.sync_held(&t);
             buried
         };
-        drop(buried);
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(buried))).err()
     }
 
     /// A compute's sweep released nodes: the tickets they buried join its
@@ -422,9 +466,7 @@ impl<C: Cells> Runtime<C> {
             self.sync_held(&t);
             buried
         };
-        if !buried.is_empty() {
-            bag.push_erased(Box::new(buried));
-        }
+        defer(buried, bag);
     }
 
     /// Notes `nodes`, landings a read took `payload` for, just above the
