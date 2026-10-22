@@ -2,7 +2,7 @@
 //! type `T`, parameterized over the [`Cells`] strategy.
 //!
 //! The slots live in never-moving segments of `SEGMENT_SIZE` behind a
-//! [`Directory`], so reads, writes and compares index without a lock:
+//! `Directory`, so reads, writes and compares index without a lock:
 //! one Acquire load of the directory, a bounds compare, one Acquire load
 //! of the segment and a null test. A segment is allocated on the first
 //! `reserve` that reaches it, under the arena lock, which also guards the
