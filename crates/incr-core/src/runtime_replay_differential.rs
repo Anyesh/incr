@@ -3971,8 +3971,9 @@ fn two_thread_oracle_takes_a_cycle_built_from_this_threads_frames() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_made_up_cycle() {
-    // Slot 14 is no order's participant.
-    assert!(!cycle_from_own_frames(|c| c.push(14)));
+    // Slots 11 and 15 are each one order's participant, so a cycle with
+    // both is a part of neither order's.
+    assert!(!cycle_from_own_frames(|c| c.extend([11, 15])));
     assert!(!cycle_from_own_frames(|c| c.clear()));
 }
 
