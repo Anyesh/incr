@@ -3100,7 +3100,7 @@ impl<C: Cells> Runtime<C> {
                 // whose rerun reads it only if it still needs it.
                 NodeState::Failed if walked => return Computed::Done,
                 NodeState::Failed => {
-                    self.read_failed_node::<MODE>(id, bag);
+                    self.read_failed_node(id);
                     continue;
                 }
                 NodeState::Dead => {
@@ -3666,7 +3666,9 @@ impl<C: Cells> Runtime<C> {
 
     /// Fix 5's landing of a claim whose closure panicked: the union of
     /// the old and recorded deps is published, and the node lands Failed,
-    /// or Dirty or New where publication says the panic may hide a change.
+    /// or Dirty or New where publication says the panic may hide a change,
+    /// or Dirty where a replay delivery raised the panic and its first take
+    /// landed the node Dirty (`retaken_landing`).
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
     #[allow(clippy::too_many_arguments)]
@@ -3697,6 +3699,8 @@ impl<C: Cells> Runtime<C> {
             // mid-compute, land Dirty now so the next reader retries.
             Publish::Published => NodeState::Failed,
         };
+        let landing =
+            self.retaken_landing(id, node.generation(), attempt.cidx, deps, payload, landing);
         let mut mark = 0;
         if landing == NodeState::Failed {
             if !C::SINGLE_THREADED {
@@ -3726,9 +3730,6 @@ impl<C: Cells> Runtime<C> {
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
-        if let Some(payload) = payload.filter(|_| landed == NodeState::Failed) {
-            self.after_failed_store(id, node.generation(), attempt.cidx, deps, payload);
-        }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {

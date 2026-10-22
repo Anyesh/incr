@@ -19,6 +19,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
+use crate::deferred::Unbuilt;
 use crate::{set_stack, waits};
 
 /// What a compute attempt carries into its landings.
@@ -314,7 +315,13 @@ impl<C: Cells> Runtime<C> {
                 cycle_state::held_keys().is_empty(),
                 "incr-core: a wounded thread waits for its winner holding claims"
             );
-            waits::await_winner(C::backoff);
+            waits::await_winner(C::backoff, |(rt, slot)| {
+                rt == self.runtime_id
+                    && !matches!(
+                        state::load::<C>(self.nodes.get(slot).state_cell()),
+                        NodeState::New | NodeState::Dirty
+                    )
+            });
             return None;
         }
         match cycle_state::take_unwind_kind() {
@@ -824,10 +831,10 @@ impl<C: Cells> Runtime<C> {
         cycle_state::take_unwind_kind();
         let mut bag = Deferred::new();
         if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
-            bag.push_erased(payload);
+            bag.push_erased(Box::new(Unbuilt::new(payload)));
         }
         if let Some(value) = ctl.buf.take() {
-            bag.push_erased(value);
+            bag.push_erased(Box::new(Unbuilt::new(value)));
         }
         self.release_held_from(cidx + 1, true, Some(UnwindKind::Discard), &mut bag);
         let old = cycle_state::with_held(|h| {
@@ -1007,12 +1014,12 @@ impl<C: Cells> Runtime<C> {
 
     /// Whether episode member `slot` has no buffer, a speculative run's
     /// settled first.
-    fn unbuffered(&self, slot: u32, cidx: u32, bag: &mut Deferred<C>) -> bool {
+    fn unbuffered(&self, slot: u32) -> bool {
         let (spec_buf, none) = self.take_held(slot, |e| {
             let (seen, spec_buf) = e.look(Look::here());
             (spec_buf, seen.buf().is_none())
         });
-        self.drop_member_value(slot, cidx, spec_buf, bag);
+        drop(spec_buf);
         none
     }
 
@@ -1044,12 +1051,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Drops what settles took off claims, outside the held map.
-    fn drop_spec_bufs(&self, spec_bufs: impl IntoIterator<Item = Erased>) {
-        let mut bag = Deferred::new();
-        for spec_buf in spec_bufs {
-            bag.push_erased(spec_buf);
-        }
-        bag.drain(self);
+    fn drop_spec_bufs(&self, spec_bufs: impl IntoIterator<Item = Unbuilt>) {
+        spec_bufs.into_iter().for_each(drop);
     }
 
     fn take_held<R>(&self, slot: u32, f: impl FnOnce(&mut Held) -> R) -> R {
@@ -1179,7 +1182,7 @@ impl<C: Cells> Runtime<C> {
                 // A restart clears what the members installed, which a later
                 // settle would put back.
                 let look = Look::here();
-                let settled: Vec<(u32, Erased)> = cycle_state::with_held(|h| {
+                let settled: Vec<Unbuilt> = cycle_state::with_held(|h| {
                     h.root_at(rt, &ep.members, cidx);
                     ep.members
                         .iter()
@@ -1192,13 +1195,11 @@ impl<C: Cells> Runtime<C> {
                             e.ep = id;
                             e.in_cu = ep.cu.binary_search(m).is_ok();
                             e.clear_installed();
-                            spec_buf.map(|v| (*m, v))
+                            spec_buf
                         })
                         .collect()
                 });
-                for (m, v) in settled {
-                    self.drop_member_value(m, cidx, Some(v), bag);
-                }
+                drop(settled);
                 // Every claim precedes this capture, because membership growth
                 // restarts the episode.
                 let stamp_rev = self.current_revision();
@@ -1259,7 +1260,7 @@ impl<C: Cells> Runtime<C> {
                             r.step = Step::Check;
                             continue;
                         };
-                        if self.unbuffered(m, cidx, bag)
+                        if self.unbuffered(m)
                             && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
                         {
                             return self.suspend_episode(ep);
@@ -1429,7 +1430,7 @@ impl<C: Cells> Runtime<C> {
                             break;
                         };
                         *next += 1;
-                        if self.unbuffered(m, cidx, bag)
+                        if self.unbuffered(m)
                             && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
                         {
                             *next -= 1;
@@ -1710,7 +1711,7 @@ impl<C: Cells> Runtime<C> {
         for (slot, e) in entries {
             let (e, spec_buf) = e.into_look(look);
             if let Some(spec_buf) = spec_buf {
-                bag.push_erased(spec_buf);
+                bag.push_erased(Box::new(spec_buf));
             }
             let id = NodeId(slot);
             let attempt = Attempt {
@@ -1737,7 +1738,13 @@ impl<C: Cells> Runtime<C> {
             } else {
                 self.land_panic_released(id, attempt, e.wrote, e.deps(), &released, bag);
             }
-            bag.push_erased(Box::new(e.into_values()));
+            // A discarded claim's run is one the unbounded run never makes,
+            // or makes again on the retry.
+            if kind == Some(UnwindKind::Discard) {
+                bag.push_erased(Box::new(Unbuilt::new(Box::new(e.into_values()))));
+            } else {
+                bag.push_erased(Box::new(e.into_values()));
+            }
         }
     }
 
@@ -1813,7 +1820,12 @@ impl<C: Cells> Runtime<C> {
     ) -> NodeState {
         let (node, flags) = self.nodes.get_with_flags(id.0);
         self.children_landing(id, flags, children, false, bag);
-        if wrote {
+        if wrote && replay::speculative() {
+            self.unwrite_speculative(node, bag);
+            node.max_changed_at(stamp_rev);
+            node.set_verified_at(0);
+            NodeState::New
+        } else if wrote {
             node.max_changed_at(stamp_rev);
             NodeState::New
         } else if first {
@@ -1821,6 +1833,19 @@ impl<C: Cells> Runtime<C> {
             NodeState::New
         } else {
             NodeState::Dirty
+        }
+    }
+
+    /// Takes back the value a discarded speculative run wrote into `node`'s
+    /// slot, which the unbounded run may never build, so that no later
+    /// write displaces it into a real run's bag. The node lands New with an
+    /// empty slot, as a first compute that wrote nothing.
+    #[cold]
+    #[inline(never)]
+    fn unwrite_speculative(&self, node: &NodeData<C>, bag: &mut Deferred<C>) {
+        let arena = self.arenas.erased(node.type_tag());
+        if let Some(value) = arena.clear_unbuilt(node.arena_slot()) {
+            bag.push_erased(Box::new(value));
         }
     }
 
@@ -1848,7 +1873,7 @@ impl<C: Cells> Runtime<C> {
         );
         let (mut e, spec_buf) = e.into_look(Look::here());
         if let Some(spec_buf) = spec_buf {
-            bag.push_erased(spec_buf);
+            bag.push_erased(Box::new(spec_buf));
         }
         let value = e.take_buf().expect("incr-core: a finished run has a value");
         let arena = self.arenas.erased(node.type_tag());
@@ -1945,7 +1970,7 @@ impl<C: Cells> Runtime<C> {
             .map(|(m, e)| {
                 let (e, spec_buf) = e.into_look(look);
                 if let Some(spec_buf) = spec_buf {
-                    bag.push_erased(spec_buf);
+                    bag.push_erased(Box::new(spec_buf));
                 }
                 (m, e)
             })

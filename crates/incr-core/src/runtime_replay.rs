@@ -7,6 +7,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle_state::{Held, Look};
+use crate::deferred::Unbuilt;
 use crate::dep_stack::Placement;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
@@ -955,34 +956,6 @@ impl<C: Cells> Runtime<C> {
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
 
-    /// The active frame's read of `id` took `payload` from a walk's ticket.
-    /// If a budget is set, the frame may be doomed after its closure has
-    /// dropped the payload, and its retry's read must take it again, as the
-    /// unbounded run's one read did.
-    pub(super) fn note_ticket_read(&self, id: NodeId, payload: &(dyn std::any::Any + Send)) {
-        if !self.budgeted() {
-            return;
-        }
-        let Some((ctl, cidx, reading, ordinal)) = self.dep_stack.unwound_reader(self.runtime_id)
-        else {
-            return;
-        };
-        if reading != u64::from(id.0) | (u64::from(self.nodes.get(id.0).generation()) << 32) {
-            return;
-        }
-        let Some(copy) = replay::copy_payload(payload) else {
-            return;
-        };
-        let what = Delivered::Unwind {
-            cycle: false,
-            poison: true,
-            attributed: false,
-            payload: copy,
-            nodes: self.copy_notes(payload),
-        };
-        self.keep_read(ctl, cidx, reading, ordinal, what);
-    }
-
     fn budgeted(&self) -> bool {
         self.max_frames.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX
             || self
@@ -1246,8 +1219,8 @@ impl<C: Cells> Runtime<C> {
                         what,
                         provenance: None,
                         below: Vec::new(),
-                        escaped: false,
                         resumed: None,
+                        landed: None,
                     });
                 }
             }
@@ -1301,10 +1274,10 @@ impl<C: Cells> Runtime<C> {
         let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
         self.release_held_except(attempt.cidx, &keep, bag);
         if let Some(value) = ctl.buf.take() {
-            bag.push_erased(value);
+            bag.push_erased(Box::new(Unbuilt::new(value)));
         }
         if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
-            bag.push_erased(payload);
+            bag.push_erased(Box::new(Unbuilt::new(payload)));
         }
         let wrote = ctl.wrote.get() != 0;
         match rooted {
@@ -2214,7 +2187,7 @@ impl<C: Cells> Runtime<C> {
             );
         }
         if let Some(spec_buf) = spec_buf {
-            bag.push_erased(spec_buf);
+            bag.push_erased(Box::new(spec_buf));
         }
         bag.push_erased(Box::new(e.into_values()));
         payload
@@ -2627,10 +2600,11 @@ impl<C: Cells> Runtime<C> {
         }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
-        // passes on, as `entered` does.
+        // passes on as an ordinary panic, as `entered` does.
         let payload = match payload.downcast::<crate::cycle::CycleUnwind>() {
             Ok(unwind) if kind == ReadKind::TryGet => return Some(Err(unwind.0)),
             Ok(unwind) => unwind,
+            Err(payload) if kind == ReadKind::TryGet => resume_unwind(payload),
             Err(payload) => payload,
         };
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
