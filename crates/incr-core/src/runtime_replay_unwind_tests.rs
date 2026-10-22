@@ -1256,3 +1256,266 @@ local_and_shared!(
     local_doomed_child_query_read_terminates,
     shared_doomed_child_query_read_terminates
 );
+
+/// A (Fallback 4) reads X inside a `catch_unwind`, then reads X again;
+/// X reads B, and B reads A and panics on A's fallback. In the unbounded
+/// run B's first panic lands X and B Dirty, since A, a new dep, is still
+/// computing, so A's second read runs them again and B's second panic
+/// reaches `get(A)` with its payload. At budget 2 both of X's reads of B
+/// doom, and the level-0 retry that takes the second delivery first runs
+/// the caught read again, which takes the first delivery.
+fn caught_member_panic_read_twice<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    caught_member_panic_rig::<C>(frames, None)
+}
+
+/// Each speculative read's message, and whether a delivery for X's frame
+/// was still untaken after it.
+type Seen = Arc<Mutex<Vec<(String, bool)>>>;
+
+/// With `seen`, A makes a second read of X that finds X Failed inside a
+/// speculative run's guard, catches it and records its message and
+/// whether a delivery for X's frame is still untaken.
+fn caught_member_panic_rig<C: Cells>(
+    frames: Option<u32>,
+    seen: Option<Seen>,
+) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("b boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(move |rt| rt.get(b) + 4, replayable());
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else if let Some(seen) = seen
+                .as_ref()
+                .filter(|_| rt.state_of(x) == NodeState::Failed)
+            {
+                let read = {
+                    let _speculating = crate::replay::Speculating::enter();
+                    catch_unwind(AssertUnwindSafe(|| rt.get(x)))
+                };
+                let held = crate::replay::with(|c| {
+                    c.iter().any(|ctx| {
+                        ctx.pending
+                            .iter()
+                            .any(|d| !d.taken && d.key.node == x.slot())
+                    })
+                });
+                seen.lock()
+                    .unwrap()
+                    .push((read.err().map(message).unwrap_or_default(), held));
+                7
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, b].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+fn caught_member_panic_keeps_its_payload<C: Cells>() {
+    let unbounded = caught_member_panic_read_twice::<C>(None);
+    assert_eq!(
+        unbounded,
+        (Out::Panic("b boom".into()), vec![NodeState::Failed; 3])
+    );
+    for frames in [1, 2, 3] {
+        assert_eq!(
+            caught_member_panic_read_twice::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+#[test]
+fn local_caught_member_panic_keeps_its_payload() {
+    caught_member_panic_keeps_its_payload::<Local>();
+}
+
+#[test]
+fn shared_caught_member_panic_keeps_its_payload() {
+    caught_member_panic_keeps_its_payload::<Shared>();
+}
+
+/// The caught-member shape at budget 2 with A's second read of X made as
+/// a speculative run's: that read must not take the delivery held for
+/// X's frame there, which a closure in the run could catch and drop.
+fn speculative_failed_read_keeps_the_delivery<C: Cells>() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let _ = caught_member_panic_rig::<C>(Some(2), Some(seen.clone()));
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty(), "the speculative read never ran");
+    for (msg, held) in seen.iter() {
+        assert!(msg.contains("last compute panicked"), "{msg}");
+        assert!(held, "the speculative read took the delivery");
+    }
+}
+
+#[test]
+fn local_speculative_failed_read_keeps_the_delivery() {
+    speculative_failed_read_keeps_the_delivery::<Local>();
+}
+
+#[test]
+fn shared_speculative_failed_read_keeps_the_delivery() {
+    speculative_failed_read_keeps_the_delivery::<Shared>();
+}
+
+/// The caught-member shape with X first catching its read of C, which
+/// reads A and panics "c boom" on A's fallback, and then reading B. Both
+/// of X's reads doom at a budget, so X's frames hold a delivery for each,
+/// and at budget 2 the frame of A's second read holds only C's.
+fn caught_member_panic_two_deliveries<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let member = |text: &'static str| {
+        let al = a_later.clone();
+        rt.create_query_with(
+            move |rt| {
+                let a = rt.get(later(&al));
+                if a == 4 {
+                    std::panic::panic_any(String::from(text));
+                }
+                a
+            },
+            replayable(),
+        )
+    };
+    let c = member("c boom");
+    let b = member("b boom");
+    let x = rt.create_query_with(
+        move |rt| {
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
+            rt.get(b) + 4
+        },
+        replayable(),
+    );
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, b, c].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+/// X's Failed read must not take the caught read's payload, "c boom",
+/// where the unbounded run raises "b boom".
+fn failed_read_takes_no_caught_delivery<C: Cells>() {
+    let unbounded = caught_member_panic_two_deliveries::<C>(None);
+    assert_eq!(
+        unbounded,
+        (Out::Panic("b boom".into()), vec![NodeState::Failed; 4])
+    );
+    for frames in 1..=4 {
+        let got = caught_member_panic_two_deliveries::<C>(Some(frames));
+        // Accepted residual: X's compute caught the read the only delivery
+        // on this path is for, so the read takes none and raises "last
+        // compute panicked" where the unbounded run raises "b boom".
+        let residual = matches!(&got.0, Out::Panic(m) if m.contains("last compute panicked"));
+        assert!(got == unbounded || residual, "budget {frames}: {got:?}");
+    }
+}
+
+local_and_shared!(
+    failed_read_takes_no_caught_delivery,
+    local_failed_read_takes_no_caught_delivery,
+    shared_failed_read_takes_no_caught_delivery
+);
+
+/// The caught-member shape with A a walk's non-root entry: R reads A
+/// while `sel` is 0, and A reads X only once `on` is set. Setting both
+/// makes R's walk run A, whose panic the walk contains, and R reruns
+/// without A. Returns R's read, then X's and A's.
+fn walked_caught_member<C: Cells>(frames: Option<u32>) -> (Out, Out, Out) {
+    let rt = runtime::<C>(frames);
+    let on = rt.create_input(0_u64);
+    let sel = rt.create_input(0_u64);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("b boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(move |rt| rt.get(b) + 4, replayable());
+    let a = rt.create_query_with(
+        move |rt| {
+            if rt.get(on) == 0 {
+                return 1;
+            }
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let r = rt.create_query_with(
+        move |rt| if rt.get(sel) == 0 { rt.get(a) } else { 100 },
+        replayable(),
+    );
+    assert_eq!(get(&rt, r), Out::Value(1));
+    rt.set(on, 1);
+    rt.set(sel, 1);
+    let got = (get(&rt, r), get(&rt, x), get(&rt, a));
+    rt.assert_invariant_i();
+    got
+}
+
+/// At budget 2 A's second read takes "b boom" for X's frame by its path,
+/// and that read stands for X's compute, so the walk's ticket holds X's
+/// landing and X's read gets the payload, as in the unbounded run.
+fn walked_caught_member_keeps_its_ticket<C: Cells>() {
+    let unbounded = walked_caught_member::<C>(None);
+    assert_eq!(
+        (&unbounded.0, &unbounded.1),
+        (&Out::Value(100), &Out::Panic("b boom".into()))
+    );
+    for frames in 1..=5 {
+        assert_eq!(
+            walked_caught_member::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    walked_caught_member_keeps_its_ticket,
+    local_walked_caught_member_keeps_its_ticket,
+    shared_walked_caught_member_keeps_its_ticket
+);

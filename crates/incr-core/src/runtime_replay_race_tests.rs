@@ -2226,3 +2226,194 @@ fn shared_vframe_landed_failed_by_an_episode_member() {
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
+
+/// The position and path of an untaken delivery for a frame of X.
+type Held = Option<(u32, u64)>;
+
+/// W reads X, which reads Y, which panics "y boom"; once `switch` is set,
+/// W first reads Z, which reads Z2. At budget 2 this thread's `get(W)`
+/// dooms W and X, Y's entry lands Failed, and the driver parks before
+/// W's retry with Y's payload held for X's frame at position 1. The other
+/// thread lands X Failed, then sets the switch and reads W, whose read of
+/// Z dooms W, so W's retry reads X Failed in a replay of its own at the
+/// same position and path as the held payload's frame. A context is one
+/// thread's, so that read raises "last compute panicked" and the payload
+/// is still held when this thread goes on.
+#[test]
+fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(2);
+    let gate = Gate::new();
+    let y_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let y = {
+        let (gate, y_ran) = (gate.clone(), y_ran.clone());
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                y_ran.store(true, SeqCst);
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let z2 = rt.create_query_with(|_: &Rt| 1_u64, replayable());
+    let z = rt.create_query_with(move |rt: &Rt| rt.get(z2), replayable());
+    let switch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let w = {
+        let switch = switch.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if switch.load(SeqCst) {
+                    rt.get(z);
+                }
+                rt.get(x) + 1
+            },
+            replayable(),
+        )
+    };
+    let held = |x: Incr<u64>| {
+        crate::replay::with(|c| {
+            c.iter().flat_map(|ctx| &ctx.pending).find_map(|d| {
+                (!d.taken && d.key.node == x.slot()).then_some((d.key.cidx, d.key.path))
+            })
+        })
+    };
+    let seen: Arc<Mutex<Vec<Held>>> = Arc::default();
+    {
+        let (gate, seen) = (gate.clone(), seen.clone());
+        let installed = rt.park_hook.set(Box::new(move |p| {
+            if p == ParkPoint::BeforeEntry(id(w)) && y_ran.swap(false, SeqCst) {
+                seen.lock().unwrap().push(held(x));
+                gate.park();
+                seen.lock().unwrap().push(held(x));
+            }
+        }));
+        assert!(installed.is_ok(), "park hook installed twice");
+    }
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(w)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    let landed = outcome(|| rt.get(x));
+    assert!(failed(&landed), "{landed:?}");
+    switch.store(true, SeqCst);
+    let other = outcome(|| rt.get(w));
+    assert!(
+        failed(&other),
+        "the other thread took the held payload: {other:?}"
+    );
+    gate.release();
+    let first = first.join();
+    assert!(
+        first == Err("y boom".to_string()) || failed(&first),
+        "{first:?}"
+    );
+    let path = crate::replay::extend_path(
+        0,
+        crate::replay::Step::of(
+            rt.runtime_id,
+            w.slot(),
+            false,
+            u64::from(x.slot()) | (u64::from(x.generation()) << 32),
+            1,
+        ),
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(*seen, vec![Some((1, path)); 2], "the held payload moved");
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// The caught-member shape (A, Fallback 4, catches its read of X, then
+/// reads X again; X reads B, which reads A and panics on A's fallback) at
+/// budget 2, with X also reading input I. The retry's rerun of the caught
+/// read parks in X's compute while the other thread sets I, so X panics
+/// and lands Dirty, not Failed. This thread never landed X Failed, so no
+/// delivery held for X's frame may be marked for a Failed read to take
+/// by its path. Another thread's later Failed landing of X can't be
+/// ordered before A's second read here: its walk waits on A's claim.
+#[test]
+fn shared_dirty_landing_leaves_the_delivery_unmarked() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(2);
+    let i = rt.create_input(0_u64);
+    let a_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let b = {
+        let a_cell = a_cell.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let a = rt.get(*a_cell.get().unwrap());
+                if a == 4 {
+                    std::panic::panic_any(String::from("b boom"));
+                }
+                a
+            },
+            replayable(),
+        )
+    };
+    let in_x = Gate::new();
+    in_x.arm();
+    let x_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let x = {
+        let (in_x, x_parked) = (in_x.clone(), x_parked.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                rt.get(i);
+                if rt.state_of(b) == NodeState::Failed && !x_parked.swap(true, SeqCst) {
+                    in_x.park();
+                }
+                rt.get(b) + 4
+            },
+            replayable(),
+        )
+    };
+    let seen: Arc<Mutex<Vec<(NodeState, bool)>>> = Arc::default();
+    let a = {
+        let (x_parked, seen) = (x_parked.clone(), seen.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+                if caught % 2 == 0 {
+                    return 3;
+                }
+                if x_parked.load(SeqCst) {
+                    let marked = crate::replay::with(|c| {
+                        c.iter()
+                            .flat_map(|ctx| &ctx.pending)
+                            .any(|d| d.key.node == x.slot() && d.escaped)
+                    });
+                    seen.lock().unwrap().push((rt.state_of(x), marked));
+                }
+                rt.get(x)
+            },
+            QueryOpts {
+                replay: Replay::Allowed,
+                cycle: CycleStrategy::fallback(|_| 4),
+            },
+        )
+    };
+    a_cell.set(a).unwrap();
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(a)))
+    };
+    in_x.wait_parked();
+    rt.set(i, 1);
+    in_x.release();
+    let first = first.join();
+    assert!(first.is_err(), "{first:?}");
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty(), "A never read X again after the park");
+    assert_eq!(
+        seen[0],
+        (NodeState::Dirty, false),
+        "a Dirty landing marked the delivery"
+    );
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}

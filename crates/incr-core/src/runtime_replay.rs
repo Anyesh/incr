@@ -1218,6 +1218,7 @@ impl<C: Cells> Runtime<C> {
                         what,
                         provenance: None,
                         below: Vec::new(),
+                        escaped: false,
                     });
                 }
             }
@@ -2774,7 +2775,7 @@ impl<C: Cells> Runtime<C> {
 
     /// The path of a frame at position `cidx`: the highest virtual frame
     /// below it extended by the frames on the stack between them.
-    fn path_at(&self, cidx: u32) -> u64 {
+    pub(super) fn path_at(&self, cidx: u32) -> u64 {
         let rt = self.runtime_id;
         let base = replay::with(|c| {
             c.iter()
