@@ -523,8 +523,8 @@ impl Duel {
             GroupShape::MemberAlone => {
                 assert_eq!((rt.get(m), rt.get(x), rt.get(w)), (0, 1, 0));
                 rt.force_group_for_test(&[x.erase(), m.erase()]);
-                let flags = rt.nodes.get_with_flags(m.slot()).1;
-                rt.leave_group(id(m), flags);
+                let (node, flags) = rt.nodes.get_with_flags(m.slot());
+                rt.leave_group(id(m), node, flags, NodeState::Clean);
             }
         }
         rt.set(k, 1);
@@ -719,7 +719,8 @@ impl Released {
         match release {
             Release::Step1 => {
                 rt.force_group_for_test(&[r.erase(), m.erase(), x.erase()]);
-                rt.leave_group(id(m), rt.nodes.get_with_flags(m.slot()).1);
+                let (node, flags) = rt.nodes.get_with_flags(m.slot());
+                rt.leave_group(id(m), node, flags, NodeState::Clean);
             }
             Release::Tainted => rt.force_group_for_test(&[r.erase(), x.erase()]),
         }

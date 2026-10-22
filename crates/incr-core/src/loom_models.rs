@@ -828,9 +828,12 @@ fn loom_wound_keeps_a_member_computed_alone_in_its_group() {
         wc.set(w).unwrap();
         assert_eq!((rt.get(m), rt.get(x), rt.get(w)), (0, 1, 0));
         rt.force_group_for_test(&[x.erase(), m.erase()]);
+        let (node, flags) = rt.nodes.get_with_flags(m.slot());
         rt.leave_group(
             crate::node::NodeId(m.slot()),
-            rt.nodes.get_with_flags(m.slot()).1,
+            node,
+            flags,
+            crate::state::NodeState::Clean,
         );
         rt.set(k, 1);
 
