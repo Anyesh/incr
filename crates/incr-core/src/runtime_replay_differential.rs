@@ -13,14 +13,18 @@
 //! a second form steps two threads through barriers: one thread makes
 //! each set, delete or recreate while the other waits, and reads overlap
 //! only reads, so each result is still the unbounded run's at its
-//! sequence point, with either of two overlapping reads first. The Failed
-//! and Cyclic sets after two overlapping reads are history, as the states
-//! are: a walk computes from its plan, so it can land a node Failed from a
-//! dep the other thread landed Failed after the walk expanded it. Where no
-//! order gives those sets, each node the reads left settled must have a
-//! Failed or Cyclic dep or a closure that panics or cycles when re-run,
-//! each node an order settles that they left Dirty or New must still read
-//! so, and the run ends there.
+//! sequence point, with either of two overlapping reads first, except
+//! that a panic is one outcome kind whatever its text: which of two
+//! racing readers of a panicked node gets the closure's payload and which
+//! gets "last compute panicked" is not part of the result (the wiki
+//! decision "Shared panic payload contract"). The Failed and Cyclic sets
+//! after two overlapping reads are history, as the states are: a walk
+//! computes from its plan, so it can land a node Failed from a dep the
+//! other thread landed Failed after the walk expanded it. Where no order
+//! gives those sets, each node the reads left settled must have a Failed
+//! or Cyclic dep or a closure that panics or cycles when re-run, each
+//! node an order settles that they left Dirty or New must still read so,
+//! and the run ends there.
 //!
 //! A speculative entry can land a node the unbounded run leaves New, and
 //! with panics the engine's outcomes depend on that history: a walk
@@ -1169,7 +1173,15 @@ fn orders(
         // Every order that runs the same read first in each phase up to
         // operation j's differs at j too, or matches there: search
         // depth-first, the k-th phase with two reads at depth k.
-        let j = match first_diff(&order.case, want, &order.arrange(got), Some(&settles)) {
+        let arranged = order.arrange(got);
+        let diff = first_diff(
+            &order.case,
+            want,
+            &arranged,
+            Some(&settles),
+            PanicText::Ignored,
+        );
+        let j = match diff {
             Some((j, what)) => {
                 if closest.as_ref().is_none_or(|c| j > c.0) {
                     closest = Some((j, swaps, what));
@@ -1435,6 +1447,25 @@ fn consistent(
     Err(first.expect("an order has the trace's outcomes"))
 }
 
+/// How [`first_diff`] compares two panics.
+#[derive(Copy, Clone, Debug)]
+enum PanicText {
+    Exact,
+    /// Any two panics are equal: under Shared with racing threads, which
+    /// reader of a panicked node gets the closure's payload and which gets
+    /// "last compute panicked" is not part of the result.
+    Ignored,
+}
+
+impl PanicText {
+    fn same(self, a: &Out, b: &Out) -> bool {
+        match (self, a, b) {
+            (PanicText::Ignored, Out::Panic(_), Out::Panic(_)) => true,
+            _ => a == b,
+        }
+    }
+}
+
 /// The first operation at which `got` differs from the unbounded run's
 /// `want`, with both sides of it, comparing the states only after the
 /// operations `settles` marks.
@@ -1443,6 +1474,7 @@ fn first_diff(
     want: &Trace,
     got: &Trace,
     settles: Option<&[bool]>,
+    text: PanicText,
 ) -> Option<(usize, String)> {
     // A closure's read of a deleted node panics as stale, so a case with
     // deletes has panics.
@@ -1493,11 +1525,9 @@ fn first_diff(
             break;
         }
         let settles = settles.is_none_or(|s| s[i]);
-        let compared = |out: &Out, snap: &Snapshot| {
-            (out.clone(), (agree && settles).then(|| settled(&snap.0)))
-        };
-        let (w, g) = (compared(want_out, want), compared(got_out, got));
-        if w != g {
+        let sets = |snap: &Snapshot| (agree && settles).then(|| settled(&snap.0));
+        if !text.same(want_out, got_out) || sets(want) != sets(got) {
+            let (w, g) = ((want_out, sets(want)), (got_out, sets(got)));
             return Some((i, format!("want {w:?}\n got {g:?}")));
         }
         // A dep list is history too: under a panic a read can stop the
@@ -1512,7 +1542,7 @@ fn first_diff(
 /// Panics, naming the case, at the first operation at which `got` differs
 /// from the unbounded run's `want`.
 fn compare(case: &Case, want: &Trace, got: &Trace, label: &str) {
-    if let Some((i, what)) = first_diff(case, want, got, None) {
+    if let Some((i, what)) = first_diff(case, want, got, None, PanicText::Exact) {
         panic!(
             "{label}: operation {i} ({:?}) differs from the unbounded run\n{what}\n{}",
             case.ops[i],
@@ -1806,7 +1836,7 @@ fn cross_two_thread_seeds() {
 /// differ from the case-order runs: 0x524's closure payload goes to the
 /// other read, and 0x3c9's cycle is entered elsewhere. The two-thread
 /// oracle takes each, and not with the read that differs given an outcome
-/// no order gives.
+/// of a kind no order gives.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_either_order_of_a_read_pair() {
@@ -1823,18 +1853,56 @@ fn two_thread_oracle_takes_either_order_of_a_read_pair() {
             let got: Trace = got.into_iter().map(Option::unwrap).collect();
             let in_order = Order::new(&case, &phases, 0);
             let unbounded = run::<Shared>(&case, None, 0);
-            let (i, _) = first_diff(&case, &unbounded, &got, Some(&in_order.settles()))
+            let settles = in_order.settles();
+            let (i, _) = first_diff(&case, &unbounded, &got, Some(&settles), PanicText::Exact)
                 .unwrap_or_else(|| panic!("seed {seed:#x}: the swap changes no outcome"));
             assert_serial(&case, &phases, &mut HashMap::new(), &got, "swapped");
 
             let mut bad = got;
-            bad[i].0 = Out::Panic("no order's outcome".to_owned());
+            bad[i].0 = match bad[i].0 {
+                Out::Value(_) => Out::Panic("no order's outcome".to_owned()),
+                _ => Out::Value(u64::MAX),
+            };
             let caught = catch_unwind(AssertUnwindSafe(|| {
                 assert_serial(&case, &phases, &mut HashMap::new(), &bad, "bad");
             }));
             assert!(caught.is_err(), "seed {seed:#x}: a wrong outcome passed");
         });
     }
+}
+
+/// The two-thread oracle takes a panic of any text where an order panics,
+/// but not a value there, while the single-thread differential still
+/// compares the text (the Shared panic payload contract).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_takes_a_panic_of_any_text() {
+    let case = gen_case(0x524, false, true);
+    let phases = phases(&case, 0x524);
+    quiet(|| {
+        let unbounded = run::<Shared>(&case, None, 0);
+        let i = unbounded
+            .iter()
+            .position(|(out, _)| matches!(out, Out::Panic(_)))
+            .expect("0x524 panics");
+        let mut other = unbounded.clone();
+        other[i].0 = Out::Panic("another payload".to_owned());
+        assert_serial(&case, &phases, &mut HashMap::new(), &other, "other text");
+        let one = catch_unwind(AssertUnwindSafe(|| {
+            compare(&case, &unbounded, &other, "one thread");
+        }));
+        assert!(
+            one.is_err(),
+            "the single-thread differential took other text"
+        );
+
+        let mut value = unbounded;
+        value[i].0 = Out::Value(u64::MAX);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            assert_serial(&case, &phases, &mut HashMap::new(), &value, "value");
+        }));
+        assert!(caught.is_err(), "a value passed where every order panics");
+    });
 }
 
 /// Two-thread seeds with panics or cycles whose overlapping reads, at most
