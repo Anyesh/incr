@@ -817,3 +817,46 @@ fn local_running_total_chain_recomputes_without_nesting() {
 fn shared_running_total_chain_recomputes_without_nesting() {
     assert_eq!(on_8_mib_stack(running_total_chain::<Shared>), 200_000);
 }
+
+struct Counted(Arc<AtomicU64>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// A child swept while it holds a contained panic drops that payload.
+fn swept_child_drops_its_contained_panic<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let drops = Arc::new(AtomicU64::new(0));
+    let sel = rt.create_input(0_i64);
+    let dc = drops.clone();
+    let x = rt.create_query(move |rt| {
+        let s = rt.get(sel);
+        let dc = dc.clone();
+        let c = rt.child_query(s, move |rt| {
+            if rt.get(sel) != s {
+                std::panic::panic_any(Counted(dc.clone()));
+            }
+            s
+        });
+        rt.get(c)
+    });
+    assert_eq!(rt.get(x), 0);
+    for k in 1..=8 {
+        rt.set(sel, k);
+        assert_eq!(rt.get(x), k);
+    }
+    assert_eq!(drops.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn local_swept_child_drops_its_contained_panic() {
+    swept_child_drops_its_contained_panic::<Local>();
+}
+
+#[test]
+fn shared_swept_child_drops_its_contained_panic() {
+    swept_child_drops_its_contained_panic::<Shared>();
+}
