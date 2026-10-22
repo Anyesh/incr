@@ -167,6 +167,10 @@ pub(crate) struct Delivery {
     /// doomed again, lands it so again: the deps it finds may have landed
     /// since in ways the unbounded run's frame never saw.
     pub(crate) landed: Option<NodeState>,
+    /// A run of the frame has read past it: the landings it carries stood
+    /// as notes in the unbounded run from then on, so a later pop above
+    /// the frame retires them as it retires notes.
+    pub(crate) passed: bool,
 }
 
 /// A context's deliveries. Each keeps its index until it is removed, and
@@ -182,6 +186,9 @@ pub(crate) struct Pending {
     by_maker: HashMap<u32, Vec<usize>>,
     by_frame: HashMap<(u32, u32, u32), Vec<usize>>,
     traced: Vec<usize>,
+    /// The passed deliveries that carry a landing deeper than just above
+    /// their frame, which a pop can retire.
+    deep: Vec<usize>,
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -207,6 +214,9 @@ impl Pending {
         if d.provenance.is_some() {
             self.traced.push(i);
         }
+        if d.passed && d.is_deep() {
+            self.deep.push(i);
+        }
         self.slots.push(Some(d));
         self.live += 1;
     }
@@ -220,6 +230,9 @@ impl Pending {
         unlist(&mut self.by_frame, &frame_of(&d.key), i);
         if d.provenance.is_some() {
             self.traced.retain(|&j| j != i);
+        }
+        if d.passed {
+            self.deep.retain(|&j| j != i);
         }
         self.live -= 1;
         // No index is held across a point where none is live.
@@ -239,6 +252,37 @@ impl Pending {
         self.slots[i]
             .as_mut()
             .expect("incr-core: a delivery's index is live")
+    }
+
+    /// Delivery `i`'s frame has read past it.
+    pub(crate) fn pass(&mut self, i: usize) {
+        let d = self.get_mut(i);
+        if !d.passed {
+            d.passed = true;
+            if d.is_deep() {
+                self.deep.push(i);
+            }
+        }
+    }
+
+    /// A frame at `cidx` popped with a value: the passed deliveries of the
+    /// frames below it lose the landings above `cidx`, as the unbounded
+    /// run's notes do at that pop.
+    fn retire_above(&mut self, cidx: u32) {
+        let slots = &mut self.slots;
+        self.deep.retain(|&i| {
+            let d = slots[i]
+                .as_mut()
+                .expect("incr-core: a delivery's index is live");
+            if d.key.cidx >= cidx {
+                return true;
+            }
+            let keep = cidx - d.key.cidx - 1;
+            if let Delivered::Unwind { nodes, .. } = &mut d.what {
+                nodes.retain(|&(_, depth)| depth <= keep);
+            }
+            d.is_deep()
+        });
     }
 
     /// The deliveries for read `key`, oldest first.
@@ -313,6 +357,10 @@ impl Pending {
 }
 
 impl Delivery {
+    fn is_deep(&self) -> bool {
+        matches!(&self.what, Delivered::Unwind { nodes, .. } if nodes.iter().any(|&(_, depth)| depth > 0))
+    }
+
     fn is_untaken_panic(&self) -> bool {
         !self.taken && matches!(self.what, Delivered::Unwind { cycle: false, .. })
     }
@@ -346,8 +394,9 @@ pub(crate) enum Delivered {
         attributed: bool,
         payload: Box<dyn Any + Send>,
         /// The landings the panic made that a walk's entry may contain
-        /// with it (`runtime_provenance`), which follow each copy taken.
-        nodes: Vec<(u32, u32)>,
+        /// with it (`runtime_provenance`), which follow each copy taken,
+        /// each with its depth above the reading frame.
+        nodes: crate::runtime::Noted,
     },
     /// The entry landed without a Clean value. The unbounded run's read
     /// takes the slot as the compute left it, poisoned, where a later read
@@ -538,6 +587,7 @@ impl Context {
             below: Vec::new(),
             resumed: None,
             landed: None,
+            passed: false,
         });
     }
 
@@ -653,6 +703,7 @@ impl Context {
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
         let key = self.pending.get(i).key;
         self.pending.take_keyed(&key);
+        self.pending.pass(i);
         let Delivered::Unwind {
             cycle,
             poison,
@@ -695,6 +746,7 @@ impl Context {
             below: Vec::new(),
             resumed: None,
             landed: None,
+            passed: false,
         });
     }
 
@@ -719,6 +771,7 @@ impl Context {
                 below: Vec::new(),
                 resumed: None,
                 landed: None,
+                passed: false,
             });
         }
     }
@@ -1246,6 +1299,16 @@ fn clear() {
 /// as an index into the stack.
 pub(crate) fn covering(c: &[Context], rt: RuntimeId, cidx: u32) -> Option<usize> {
     c.iter().rposition(|x| x.rt == rt && x.boundary <= cidx)
+}
+
+/// A frame of runtime `rt` at `cidx` popped with a value outside a
+/// speculative run.
+pub(crate) fn retire_delivered_above(rt: RuntimeId, cidx: u32) {
+    with(|c| {
+        for x in c.iter_mut().filter(|x| x.rt == rt) {
+            x.pending.retire_above(cidx);
+        }
+    });
 }
 
 /// A run at position `cidx` that is not a driver entry's, a member run,

@@ -977,6 +977,9 @@ impl<C: Cells> Runtime<C> {
         let kind = cycle_state::take_unwind_kind();
         let contain = self.episode_contains(cidx, kind, &*payload);
         self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), Some(&*payload), bag);
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
+        }
         if contain {
             self.raise_contained(cidx, payload);
         }
@@ -986,8 +989,9 @@ impl<C: Cells> Runtime<C> {
     /// Whether the walk's entry whose compute roots the episode at `cidx`,
     /// if one does, contains its abort, asked before the releases as
     /// `compute_panicked` asks. A contained abort drops the replay contexts
-    /// the root's frame opened, as that frame's unwind would; any other
-    /// tells the reading frame its read unwound.
+    /// the root's frame opened, as that frame's unwind would; the caller
+    /// tells the reading frame of any other that its read unwound, after
+    /// the landings it keeps a copy of.
     fn episode_contains(
         &self,
         cidx: u32,
@@ -998,8 +1002,6 @@ impl<C: Cells> Runtime<C> {
             .is_some_and(|root| self.containable(root, cidx, kind, payload));
         if contain {
             replay::unwind_past(self.runtime_id, cidx);
-        } else {
-            self.note_unwound_read(payload, kind);
         }
         contain
     }
@@ -2166,6 +2168,9 @@ impl<C: Cells> Runtime<C> {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
             bag.push_erased(Box::new((e.take_buf(), e.s.take())));
+        }
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
         }
         if contain {
             self.raise_contained(cidx, payload);

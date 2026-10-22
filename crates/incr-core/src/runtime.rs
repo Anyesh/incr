@@ -3577,9 +3577,6 @@ impl<C: Cells> Runtime<C> {
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
         let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
-        if !contain {
-            self.note_unwound_read(&*payload, kind);
-        }
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -3612,6 +3609,10 @@ impl<C: Cells> Runtime<C> {
                 Some(&*payload),
                 bag,
             );
+        }
+        // After the landings, whose notes the kept copy carries.
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
         }
         if contain {
             self.contain(attempt.cidx, payload, bag);
@@ -3789,6 +3790,9 @@ impl<C: Cells> Runtime<C> {
     ) -> Option<Computed> {
         if word & value_code::NOTES_BIT != 0 && result.is_ok() {
             self.retire_notes_above(attempt.cidx);
+        }
+        if word & value_code::REPLAY_BIT != 0 && result.is_ok() && !replay::speculative() {
+            replay::retire_delivered_above(self.runtime_id, attempt.cidx);
         }
         if self.after_pop(word, result.is_ok()) {
             *result = Err(match UnwindKind::of_word(word) {
@@ -4412,6 +4416,7 @@ mod observer_read_tests;
 mod stabilize_tests;
 
 pub(crate) use children_impl::ChildLanding;
+pub(crate) use contain_impl::Noted;
 pub(crate) use observe_impl::ObserverEntry;
 use observe_impl::Observers;
 
