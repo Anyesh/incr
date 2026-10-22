@@ -154,9 +154,11 @@ impl<C: Cells> Runtime<C> {
     /// The ticket's nodes are noted against the payload just above the
     /// reading frame: a read from a compute whose panic a walk's entry
     /// below contains again is no reader's observation, so that entry
-    /// holds them too.
+    /// holds them too. A speculative run's read takes none: a closure in
+    /// the run can catch and drop the payload before the run's discard
+    /// would hold it again, and the real run's read is owed it.
     pub(super) fn take_contained(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
-        if !self.tickets_held() {
+        if !self.tickets_held() || replay::speculative() {
             return Ok(None);
         }
         let node = self.nodes.get(id.0);

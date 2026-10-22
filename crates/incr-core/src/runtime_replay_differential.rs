@@ -2661,6 +2661,70 @@ fn two_thread_oracle_takes_a_history_failed_set() {
     });
 }
 
+/// Seed 0xc5001c2ab73c2d33, shrunk: `Get(0)` leaves the cycles
+/// 6 -> 7 -> 8 -> 9 -> 6 and 4 -> 10 -> 11 -> 9 -> 6 -> 7 -> 8 -> 21 ->
+/// 22 -> 23 -> 5 -> 3 -> 4 without values, so 6 can be deleted, and then
+/// `Get(14)` reaches 9's read of the deleted 6 through 15, 16, 22, 23, 5,
+/// 3, 4, 10 and 11. Every node on the way fails with the stale-handle
+/// panic, which reaches `Get(14)` at every budget, as in the unbounded
+/// run. At budget 3 a walk's entry contains 5's panic and a speculative
+/// run reads 5 before the real run does, under 17's `Catch`, which drops
+/// the payload it catches.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stale_read_payload_reaches_the_root_through_replayed_frames() {
+    let query = |expr| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let try_read = |n| Box::new(Expr::Read(n, true));
+    let one = || Box::new(Expr::Const(1));
+    let mut specs: Vec<Spec> = (0..25).map(|_| query(Expr::Const(1))).collect();
+    specs[0] = query(Expr::If(
+        Box::new(Expr::Add(try_read(1), one())),
+        read(0),
+        one(),
+    ));
+    for (at, to, try_) in [
+        (1, 4, true),
+        (3, 4, false),
+        (4, 10, false),
+        (5, 3, false),
+        (6, 7, false),
+        (7, 8, false),
+        (10, 11, false),
+        (11, 9, false),
+        (15, 16, false),
+        (16, 22, false),
+        (21, 22, false),
+        (22, 23, false),
+        (23, 5, true),
+    ] {
+        specs[at] = query(Expr::Read(to, try_));
+    }
+    specs[8] = query(Expr::Add(read(21), read(9)));
+    specs[9] = query(Expr::If(read(6), one(), one()));
+    specs[14] = query(Expr::If(try_read(15), read(17), one()));
+    specs[17] = query(Expr::Catch(read(16)));
+    specs.push(Spec::Input(1));
+    let case = Case {
+        queries: 25,
+        specs,
+        panics: true,
+        cycles: true,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Delete(6), Op::Get(14)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0xc500_1c2a_b73c_2d33);
+        differential::<Shared>(&case, 0xc500_1c2a_b73c_2d33);
+    });
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
