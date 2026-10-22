@@ -10,7 +10,7 @@
 
 Most software recomputes everything from scratch whenever anything changes. Your CI rebuilds the whole project when you edit one file, your dashboard re-queries the whole database when one row updates. There are domain-specific fixes for this (React diffs the DOM, Salsa caches compiler queries, Materialize does incremental SQL) but if you just want to make your own code incremental, theres nothing to reach for.
 
-incr is a crack at solving that. It's a Rust library (with Python bindings, `pip install incr-compute` or `incr-concurrent`) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. The engine lives in `incr-core` and is parameterized over a concurrency strategy; two surface crates expose it: `incr-compute` (`Local` strategy, single-threaded, zero atomic-fence cost) and `incr-concurrent` (`Shared` strategy, `Send + Sync`: reader threads pull values while a writer mutates, with hazard-pointer-protected reads that can never tear). Same public API, one-line dependency swap.
+incr is a crack at solving that. It's a Rust library (with Python bindings, `pip install --pre incr-compute` or `incr-concurrent`) that tracks dependencies between computations automatically and only reruns what's actually affected by a change. The engine lives in `incr-core` and is parameterized over a concurrency strategy; two surface crates expose it: `incr-compute` (`Local` strategy, single-threaded, zero atomic-fence cost) and `incr-concurrent` (`Shared` strategy, `Send + Sync`: reader threads pull values while a writer mutates, with hazard-pointer-protected reads that can never tear). Same public API, one-line dependency swap.
 
 ![Live spreadsheet demo showing formula cells updating incrementally as values change, powered by incr-concurrent with real-time WebSocket sync](examples/spreadsheet/demo.gif)
 
@@ -117,9 +117,9 @@ The engine itself lives in [`incr-core`](crates/incr-core/) under a `Cells` stra
 
 ```toml
 [dependencies]
-incr-compute = "0.2"      # single-threaded
+incr-compute = "0.2.0-beta.6"      # single-threaded
 # or
-incr-concurrent = "0.2"   # multi-threaded (Send + Sync)
+incr-concurrent = "0.2.0-beta.6"   # multi-threaded (Send + Sync)
 ```
 
 **Running the tests:**

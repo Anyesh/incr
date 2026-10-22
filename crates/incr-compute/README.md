@@ -79,4 +79,4 @@ User types stored in the runtime must implement `Value`, which is `Clone + Parti
 
 ## Python
 
-`pip install incr-compute` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr import Runtime`).
+`pip install --pre incr-compute` ships the same engine as an abi3 wheel for CPython 3.10+ (`from incr import Runtime`).
