@@ -18,10 +18,11 @@
 //! whatever created it, a miss in a doomed frame returns a pending handle
 //! and creates nothing, and `get` refuses a compute of its runtime.
 
+use std::cell::Cell;
 use std::marker::PhantomData;
 
 use crate::cells::{Cells, Local, PtrCell, Shared};
-use crate::cycle::{ErasedOpts, QueryOpts};
+use crate::cycle::{self, CycleStrategy, ErasedOpts, QueryOpts};
 use crate::dep_stack::DepStack;
 use crate::directory::Directory;
 use crate::handle::{Incr, RuntimeId};
@@ -186,6 +187,62 @@ type Mid<C> = Fixed<Chunk<C>, C>;
 type Column<C> = Owning<Mid<C>, C>;
 type Sheet<C> = Owning<Column<C>, C>;
 
+/// Walks to the entries of keys under the miss mutex, reusing the page
+/// of the key before, since a batch usually runs down a column.
+struct Pages<'a, T: Value, C: Cells> {
+    table: &'a GridTable<T, C>,
+    last: Option<(GridKey, &'a Page<C>)>,
+}
+
+impl<'a, T: Value, C: Cells> Pages<'a, T, C> {
+    fn new(table: &'a GridTable<T, C>) -> Self {
+        Self { table, last: None }
+    }
+
+    fn entry_or_create(&mut self, key: GridKey) -> &'a C::U64 {
+        let at = GridKey::new(key.sheet, key.row >> PAGE_SHIFT, key.column);
+        let page = match self.last {
+            Some((was, page)) if was == at => page,
+            _ => self.last.insert((at, self.table.page_or_create(key))).1,
+        };
+        &page.0[(key.row & (PAGE_ROWS - 1)) as usize]
+    }
+}
+
+/// A claimed batch as the runtime consumes it. `taken` names the key
+/// whose node is being created until the commit enters it, so dropping
+/// the batch on a panic puts back every claim no node was entered for.
+struct Claimed<'a, T: Value, C: Cells, X, I: Iterator<Item = (GridKey, X)>> {
+    table: &'a GridTable<T, C>,
+    rest: I,
+    taken: &'a Cell<Option<GridKey>>,
+}
+
+impl<T: Value, C: Cells, X, I: Iterator<Item = (GridKey, X)>> Iterator for Claimed<'_, T, C, X, I> {
+    type Item = (GridKey, X);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (key, x) = self.rest.next()?;
+        self.taken.set(Some(key));
+        Some((key, x))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rest.size_hint()
+    }
+}
+
+impl<T: Value, C: Cells, X, I: Iterator<Item = (GridKey, X)>> Drop for Claimed<'_, T, C, X, I> {
+    fn drop(&mut self) {
+        if let Some(key) = self.taken.take() {
+            self.table.unclaim(key);
+        }
+        for (key, _) in self.rest.by_ref() {
+            self.table.unclaim(key);
+        }
+    }
+}
+
 /// A map from `(sheet, row, column)` to nodes of the runtime that created
 /// it, through [`Runtime::create_grid_table`]. A hit returns the existing
 /// entry whichever call created it. Dropping the table leaves its nodes
@@ -348,8 +405,15 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     pub fn insert_inputs(&self, rt: &Runtime<C>, entries: Vec<(GridKey, T)>) -> Vec<Incr<T>> {
         self.check_runtime(rt);
         self.refuse_in_compute(rt, "insert_inputs");
-        let (keys, values): (Vec<GridKey>, Vec<T>) = entries.into_iter().unzip();
-        self.insert_many(rt, &keys, values, |rt, values| rt.create_inputs(values))
+        value_code::check();
+        let miss = self.claim(rt, &entries, |&(key, _)| key, self.miss.write());
+        let taken = Cell::new(None);
+        let handles = rt.create_inputs(
+            self.claimed(entries.into_iter(), &taken),
+            self.commit(&taken),
+        );
+        drop(miss);
+        handles
     }
 
     /// Creates a query node for each `(key, f, opts)`, all under one hold
@@ -367,53 +431,39 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     {
         self.check_runtime(rt);
         self.refuse_in_compute(rt, "insert_queries_watched");
-        let mut keys = Vec::with_capacity(entries.len());
-        let queries: Vec<(F, ErasedOpts)> = entries
+        if entries
+            .iter()
+            .any(|(_, _, opts)| matches!(opts.cycle, CycleStrategy::TypeFallback))
+        {
+            rt.expect_type_fallback::<T>();
+        }
+        value_code::check();
+        let miss = self.claim(rt, &entries, |&(key, _, _)| key, self.miss.write());
+        let taken = Cell::new(None);
+        let queries = entries
             .into_iter()
-            .map(|(key, f, opts)| {
-                keys.push(key);
-                (f, rt.erase_query_opts(opts))
-            })
-            .collect();
-        self.insert_many(rt, &keys, queries, |rt, queries| {
-            rt.create_queries_watched(queries)
-        })
+            .map(|(key, f, opts)| (key, (f, cycle::erase_opts(opts))));
+        let handles = rt.create_queries_watched(self.claimed(queries, &taken), self.commit(&taken));
+        drop(miss);
+        handles
     }
 
-    /// Checks every key under the miss mutex before `create` makes any
-    /// node, so a refused batch leaves nothing behind.
-    fn insert_many<P>(
+    /// Sets every entry of the batch to `CLAIMED` under `miss`, the held
+    /// miss mutex, so a repeated key finds its entry taken. Refuses the
+    /// batch, putting every claim back, if a key repeats or has a live
+    /// node.
+    fn claim<E, G>(
         &self,
         rt: &Runtime<C>,
-        keys: &[GridKey],
-        payload: P,
-        create: impl FnOnce(&Runtime<C>, P) -> Vec<Incr<T>>,
-    ) -> Vec<Incr<T>> {
-        value_code::check();
-        let miss = self.miss.write();
-        // Each entry of the batch holds `CLAIMED` until its node exists,
-        // so a repeated key finds its entry taken; dropping the claims
-        // without committing them puts the old words back.
-        struct Claims<'a, C: Cells>(Vec<(&'a C::U64, u64)>);
-        impl<C: Cells> Drop for Claims<'_, C> {
-            fn drop(&mut self) {
-                for &(entry, word) in self.0.iter().rev() {
-                    C::u64_store_relaxed(entry, word);
-                }
-            }
-        }
-        let mut claims = Claims::<C>(Vec::with_capacity(keys.len()));
-        // A batch usually runs down a column, so most keys share the page
-        // of the key before them.
-        let mut last: Option<(GridKey, &Page<C>)> = None;
-        for &key in keys {
+        batch: &[E],
+        key_of: impl Fn(&E) -> GridKey,
+        miss: G,
+    ) -> G {
+        let mut pages = Pages::new(self);
+        for (n, e) in batch.iter().enumerate() {
+            let key = key_of(e);
             key.check();
-            let at = GridKey::new(key.sheet, key.row >> PAGE_SHIFT, key.column);
-            let page = match last {
-                Some((was, page)) if was == at => page,
-                _ => last.insert((at, self.page_or_create(key))).1,
-            };
-            let entry = &page.0[(key.row & (PAGE_ROWS - 1)) as usize];
+            let entry = pages.entry_or_create(key);
             let word = C::u64_load_relaxed(entry);
             let refused = if word == CLAIMED {
                 Some("appears twice")
@@ -423,19 +473,45 @@ impl<T: Value, C: Cells> GridTable<T, C> {
                 None
             };
             if let Some(why) = refused {
-                drop(claims);
+                for e in &batch[..n] {
+                    self.unclaim(key_of(e));
+                }
                 drop(miss);
                 panic!("incr-core: GridTable insert refused: {key:?} {why}");
             }
             C::u64_store_relaxed(entry, CLAIMED);
-            claims.0.push((entry, word));
         }
-        let handles = create(rt, payload);
-        for ((entry, _), &handle) in std::mem::take(&mut claims.0).into_iter().zip(&handles) {
-            C::u64_store_release(entry, encode(handle));
+        miss
+    }
+
+    /// Puts `EMPTY` back in `key`'s entry if a batch still claims it. A
+    /// dead node's word it replaced was a miss as well.
+    fn unclaim(&self, key: GridKey) {
+        let entry = self.entry(key).expect("a claimed entry exists");
+        if C::u64_load_relaxed(entry) == CLAIMED {
+            C::u64_store_relaxed(entry, EMPTY);
         }
-        drop(miss);
-        handles
+    }
+
+    fn claimed<'a, X, I: Iterator<Item = (GridKey, X)>>(
+        &'a self,
+        rest: I,
+        taken: &'a Cell<Option<GridKey>>,
+    ) -> Claimed<'a, T, C, X, I> {
+        Claimed {
+            table: self,
+            rest,
+            taken,
+        }
+    }
+
+    /// Enters each node the runtime creates for a claimed key.
+    fn commit<'a>(&'a self, taken: &'a Cell<Option<GridKey>>) -> impl FnMut(GridKey, Incr<T>) + 'a {
+        let mut pages = Pages::new(self);
+        move |key, handle| {
+            taken.set(None);
+            C::u64_store_release(pages.entry_or_create(key), encode(handle));
+        }
     }
 
     /// The handle in `word`, if it names a live node of this runtime.

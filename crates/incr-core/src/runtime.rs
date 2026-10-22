@@ -1130,16 +1130,23 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// An input node for each of `values`, in order, under one hold of
-    /// the inner lock. The caller checks that no compute is running.
-    pub(crate) fn create_inputs<T: Value>(&self, values: Vec<T>) -> Vec<Incr<T>> {
+    /// the inner lock, handing each to `created` with its key as it is
+    /// made. The caller checks that no compute is running.
+    pub(crate) fn create_inputs<T: Value, K>(
+        &self,
+        values: impl Iterator<Item = (K, T)>,
+        mut created: impl FnMut(K, Incr<T>),
+    ) -> Vec<Incr<T>> {
         value_code::check();
         let revision = self.current_revision();
-        let mut handles = Vec::with_capacity(values.len());
+        let mut handles = Vec::with_capacity(values.size_hint().0);
         let mut inner = self.inner.write();
         let (type_tag, arena) = self.arenas.ensure_tagged::<T>(&mut inner.arena_tags);
-        for value in values {
+        for (key, value) in values {
             let (slot, generation) = push_input!(self, inner, type_tag, arena, value, revision);
-            handles.push(Incr::new(slot, generation, self.runtime_id));
+            let handle = Incr::new(slot, generation, self.runtime_id);
+            created(key, handle);
+            handles.push(handle);
         }
         handles
     }
@@ -1239,22 +1246,29 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A query node for each of `queries`, in order, each watched as
-    /// [`Self::watch`] does, under one hold of the inner lock. The caller
-    /// checks that no compute is running.
-    pub(crate) fn create_queries_watched<T, F>(&self, queries: Vec<(F, ErasedOpts)>) -> Vec<Incr<T>>
+    /// [`Self::watch`] does, under one hold of the inner lock, handing each
+    /// to `created` as [`Self::create_inputs`] does. The caller checks
+    /// that no compute is running.
+    pub(crate) fn create_queries_watched<T, F, K>(
+        &self,
+        queries: impl Iterator<Item = (K, (F, ErasedOpts))>,
+        mut created: impl FnMut(K, Incr<T>),
+    ) -> Vec<Incr<T>>
     where
         T: Value,
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
         value_code::check();
-        let mut handles = Vec::with_capacity(queries.len());
+        let mut handles = Vec::with_capacity(queries.size_hint().0);
         let mut inner = self.inner.write();
         let (type_tag, shared_arena) = self.arenas.ensure_tagged_shared::<T>(&mut inner.arena_tags);
-        for (f, opts) in queries {
+        for (key, (f, opts)) in queries {
             let arena = Arc::clone(&shared_arena);
             let (slot, generation) = push_query!(self, inner, type_tag, arena, f, opts);
             self.watch_held(slot, generation);
-            handles.push(Incr::new(slot, generation, self.runtime_id));
+            let handle = Incr::new(slot, generation, self.runtime_id);
+            created(key, handle);
+            handles.push(handle);
         }
         handles
     }
@@ -1470,7 +1484,7 @@ impl<C: Cells> Runtime<C> {
 
     #[cold]
     #[inline(never)]
-    fn expect_type_fallback<T: Value>(&self) {
+    pub(crate) fn expect_type_fallback<T: Value>(&self) {
         let has = {
             let inner = self.inner.read();
             inner.arena_tags.tag::<T>().is_some_and(|tag| {

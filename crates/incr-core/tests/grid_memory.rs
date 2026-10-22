@@ -1,7 +1,8 @@
 //! Heap bytes a `GridTable` adds beyond its nodes, counted by a global
 //! allocator: a column holding one node far down costs about what a
 //! column holding one node at the top does, and a dense column costs
-//! about one 8 B entry per row.
+//! about one 8 B entry per row, and a batch insert holds no copy of its
+//! batch.
 #![cfg(not(miri))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -12,12 +13,18 @@ use incr_core::{Cells, GridKey, Local, Runtime, Shared};
 struct Counting;
 
 static BYTES: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
+
+fn grew(by: isize) {
+    let now = BYTES.fetch_add(by, Ordering::Relaxed) + by;
+    PEAK.fetch_max(now, Ordering::Relaxed);
+}
 
 // SAFETY: forwards to `System` unchanged; the counter is only
 // bookkeeping.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        BYTES.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        grew(layout.size() as isize);
         System.alloc(layout)
     }
 
@@ -27,10 +34,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        BYTES.fetch_add(
-            new_size as isize - layout.size() as isize,
-            Ordering::Relaxed,
-        );
+        grew(new_size as isize - layout.size() as isize);
         System.realloc(ptr, layout, new_size)
     }
 }
@@ -76,14 +80,38 @@ fn dense_overhead<C: Cells>() -> f64 {
     (bytes() - before - nodes) as f64 / f64::from(DENSE_ROWS)
 }
 
+/// Peak bytes per entry an `insert_inputs` batch allocates beyond the
+/// nodes and handles it returns, with the batch itself still counted.
+fn batch_temporaries<C: Cells>() -> f64 {
+    let rt: Runtime<C> = Runtime::new();
+    let t = rt.create_grid_table::<u64>();
+    let entries: Vec<(GridKey, u64)> = (0..DENSE_ROWS)
+        .map(|row| (GridKey::new(0, row, 0), u64::from(row)))
+        .collect();
+    let batch = (entries.capacity() * std::mem::size_of::<(GridKey, u64)>()) as isize;
+    let before = bytes();
+    PEAK.store(before, Ordering::Relaxed);
+    let handles = t.insert_inputs(&rt, entries);
+    let kept = bytes() - before + batch;
+    let peak = PEAK.load(Ordering::Relaxed) - before;
+    drop(handles);
+    (peak - kept) as f64 / f64::from(DENSE_ROWS)
+}
+
 fn grid_columns_are_sparse<C: Cells>() {
     let top = per_column::<C>(0);
     let far = per_column::<C>(1 << 20);
     let dense = dense_overhead::<C>();
+    let temporaries = batch_temporaries::<C>();
     println!(
         "{}: {top:.0} B per column at row 0, {far:.0} B at row 1<<20, \
-         {dense:.2} B per row in a dense column",
+         {dense:.2} B per row in a dense column, {temporaries:.2} B per entry \
+         of batch temporaries",
         std::any::type_name::<C>()
+    );
+    assert!(
+        temporaries <= 1.0,
+        "an insert_inputs batch allocates {temporaries:.2} B per entry of temporaries"
     );
     assert!(
         dense <= 9.0,

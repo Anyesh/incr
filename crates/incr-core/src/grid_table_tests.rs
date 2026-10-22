@@ -65,6 +65,7 @@ both!(
     grid_insert_queries_watched_watches_every_node,
     grid_an_insert_with_a_live_key_creates_nothing,
     grid_an_insert_with_a_repeated_key_creates_nothing,
+    grid_a_batch_dropped_mid_creation_frees_its_uncommitted_claims,
     grid_an_insert_replaces_a_deleted_node,
     grid_type_fallback_queries_need_and_use_their_types_fallback,
     grid_a_lazy_query_is_built_only_on_a_miss,
@@ -559,6 +560,30 @@ fn grid_an_insert_with_a_repeated_key_creates_nothing<C: Cells>(rt: &Runtime<C>)
     assert_eq!(t.get(rt, key(0, 2, 0)), None);
     let h = t.get_or_insert_input(rt, key(0, 1, 0), || 1);
     assert_eq!(t.get(rt, key(0, 1, 0)), Some(h));
+}
+
+/// What a panic while the runtime creates a batch's nodes leaves: the
+/// first key committed, the second taken with no node entered, the third
+/// not reached. Dropping the batch must free the last two.
+fn grid_a_batch_dropped_mid_creation_frees_its_uncommitted_claims<C: Cells>(rt: &Runtime<C>) {
+    let t = rt.create_grid_table::<i64>();
+    let entries = vec![(key(0, 1, 0), 1), (key(0, 2, 0), 2), (key(0, 3, 0), 3)];
+    let made = rt.create_input(1_i64);
+    let miss = t.claim(rt, &entries, |&(k, _)| k, t.miss.write());
+    let taken = Cell::new(None);
+    let mut batch = t.claimed(entries.into_iter(), &taken);
+    let mut commit = t.commit(&taken);
+    let (first, _) = batch.next().expect("three entries");
+    commit(first, made);
+    batch.next().expect("three entries");
+    drop(batch);
+    drop(miss);
+    assert_eq!(t.get(rt, key(0, 1, 0)), Some(made));
+    assert_eq!(t.get(rt, key(0, 2, 0)), None);
+    assert_eq!(t.get(rt, key(0, 3, 0)), None);
+    let h = t.insert_inputs(rt, vec![(key(0, 2, 0), 2), (key(0, 3, 0), 3)]);
+    assert_eq!(t.get(rt, key(0, 2, 0)), Some(h[0]));
+    assert_eq!(t.get(rt, key(0, 3, 0)), Some(h[1]));
 }
 
 fn grid_an_insert_replaces_a_deleted_node<C: Cells>(rt: &Runtime<C>) {
