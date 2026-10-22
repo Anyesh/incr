@@ -813,3 +813,280 @@ fn local_delete_of_a_node_claimed_dead_panics_instead_of_spinning() {
     )
     .assert_panicked_with("claimed by a delete on this thread");
 }
+
+/// A contained payload whose `Drop` panics, released by a set's dirty walk,
+/// must not stop that walk before it flags the input's other dependents.
+fn ticket_drop_panic_keeps_the_set_walk<C: Cells>(rt: &Runtime<C>) {
+    let i = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let e = rt.create_query(move |rt| {
+        let v = rt.get(i);
+        if v == 1 {
+            std::panic::panic_any(Boom(7));
+        }
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(e) } else { 100 });
+    let k = rt.create_query(move |rt| rt.get(i) * 10);
+    assert_eq!(rt.get(k), 0);
+    assert_eq!(rt.get(x), 0);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(rt.contained_payloads(), 1);
+    assert_eq!(rt.get(k), 10);
+    arm(7);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.set(i, 2))).unwrap_err();
+    arm(i64::MIN);
+    assert!(panic_message(err).contains("drop of Boom(7)"));
+    assert_eq!(rt.get(k), 20);
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_drop_panic_keeps_the_set_walk() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_ticket_drop_panic_keeps_the_set_walk",
+        || ticket_drop_panic_keeps_the_set_walk(&Runtime::<Local>::new()),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_drop_panic_keeps_the_set_walk() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_ticket_drop_panic_keeps_the_set_walk",
+        || ticket_drop_panic_keeps_the_set_walk(&Runtime::<Shared>::new()),
+    )
+    .assert_clean();
+}
+
+/// A deleted node's contained payload whose `Drop` panics must not stop
+/// the delete releasing the node's own value.
+fn ticket_drop_panic_keeps_the_delete<C: Cells>(rt: &Runtime<C>) {
+    let probe = Arc::new(());
+    let i = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let p = probe.clone();
+    let e = rt.create_query(move |rt| {
+        if rt.get(i) == 1 {
+            std::panic::panic_any(Boom(8));
+        }
+        Held(p.clone())
+    });
+    let x = rt.create_query(move |rt| {
+        if rt.get(sel) == 0 {
+            let _ = rt.get(e);
+            0
+        } else {
+            100
+        }
+    });
+    assert_eq!(rt.get(x), 0);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(rt.contained_payloads(), 1);
+    arm(8);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.delete_node(e))).unwrap_err();
+    arm(i64::MIN);
+    assert!(panic_message(err).contains("drop of Boom(8)"));
+    assert_eq!(
+        Arc::strong_count(&probe),
+        1,
+        "the deleted node's value stayed"
+    );
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_eq!(rt.get(x), 100);
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_drop_panic_keeps_the_delete() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_ticket_drop_panic_keeps_the_delete",
+        || ticket_drop_panic_keeps_the_delete(&Runtime::<Local>::new()),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_drop_panic_keeps_the_delete() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_ticket_drop_panic_keeps_the_delete",
+        || {
+            let rt = Runtime::<Shared>::new();
+            prime_reclaim_timer(&rt);
+            reclaim_probe::force(RetireSite::DeleteRetire);
+            ticket_drop_panic_keeps_the_delete(&rt);
+        },
+    )
+    .assert_clean();
+}
+
+/// A compute the walk contains, flagged by its own `set` so it lands Dirty
+/// past the walk, releases the ticket it just took: that payload's
+/// panicking `Drop` leaves the read once the landing is done.
+fn ticket_drop_panic_keeps_a_flagged_landing<C: Cells>(rt: &Runtime<C>) {
+    let i = rt.create_input(0_i64);
+    let j = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let e = rt.create_query(move |rt| {
+        let a = rt.get(j);
+        if rt.get(i) == 1 && a == 0 {
+            rt.set(j, 1);
+            std::panic::panic_any(Boom(9));
+        }
+        a
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(e) } else { 100 });
+    assert_eq!(rt.get(x), 0);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    arm(9);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+    arm(i64::MIN);
+    assert!(panic_message(err).contains("drop of Boom(9)"));
+    rt.assert_invariant_i();
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_eq!(rt.get(e), 1);
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_drop_panic_keeps_a_flagged_landing() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_ticket_drop_panic_keeps_a_flagged_landing",
+        || ticket_drop_panic_keeps_a_flagged_landing(&Runtime::<Local>::new()),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_drop_panic_keeps_a_flagged_landing() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_ticket_drop_panic_keeps_a_flagged_landing",
+        || ticket_drop_panic_keeps_a_flagged_landing(&Runtime::<Shared>::new()),
+    )
+    .assert_clean();
+}
+
+/// Two contained payloads released by one set's walk: the first one's
+/// panicking `Drop` neither stops the walk nor keeps the second.
+fn ticket_drop_panic_keeps_a_walk_holding_two<C: Cells>(rt: &Runtime<C>) {
+    let i = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let e1 = rt.create_query(move |rt| {
+        let v = rt.get(i);
+        if v == 1 {
+            std::panic::panic_any(Boom(10));
+        }
+        v
+    });
+    let e2 = rt.create_query(move |rt| {
+        let v = rt.get(i);
+        if v == 1 {
+            std::panic::panic_any(Boom(11));
+        }
+        v
+    });
+    let x = rt.create_query(move |rt| {
+        if rt.get(sel) == 0 {
+            rt.get(e1) + rt.get(e2)
+        } else {
+            100
+        }
+    });
+    let k = rt.create_query(move |rt| rt.get(i) * 10);
+    assert_eq!(rt.get(k), 0);
+    assert_eq!(rt.get(x), 0);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(rt.contained_payloads(), 2);
+    assert_eq!(rt.get(k), 10);
+    arm(10);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.set(i, 2))).unwrap_err();
+    arm(i64::MIN);
+    assert!(panic_message(err).contains("drop of Boom(10)"));
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_eq!(rt.get(k), 20);
+    assert_eq!(rt.get(e1) + rt.get(e2), 4);
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_drop_panic_keeps_a_walk_holding_two() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_ticket_drop_panic_keeps_a_walk_holding_two",
+        || ticket_drop_panic_keeps_a_walk_holding_two(&Runtime::<Local>::new()),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_drop_panic_keeps_a_walk_holding_two() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_ticket_drop_panic_keeps_a_walk_holding_two",
+        || ticket_drop_panic_keeps_a_walk_holding_two(&Runtime::<Shared>::new()),
+    )
+    .assert_clean();
+}
+
+/// A delete whose own value's `Drop` panics still drops the tickets it
+/// buried, so no later, unrelated delete raises their payloads.
+fn delete_drop_panic_drops_its_buried_tickets<C: Cells>(rt: &Runtime<C>) {
+    let i = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let e = rt.create_query(move |rt| {
+        if rt.get(i) == 1 {
+            std::panic::panic_any(Boom(22));
+        }
+        Boom(21)
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(e).0 } else { 100 });
+    assert_eq!(rt.get(x), 21);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(rt.contained_payloads(), 1);
+    arm(21);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.delete_node(e))).unwrap_err();
+    arm(i64::MIN);
+    assert!(panic_message(err).contains("drop of Boom(21)"));
+    assert_eq!(rt.contained_payloads(), 0);
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_delete_drop_panic_drops_its_buried_tickets() {
+    run_in_child(
+        "runtime::drop_panic_tests::local_delete_drop_panic_drops_its_buried_tickets",
+        || delete_drop_panic_drops_its_buried_tickets(&Runtime::<Local>::new()),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_delete_drop_panic_drops_its_buried_tickets() {
+    run_in_child(
+        "runtime::drop_panic_tests::shared_delete_drop_panic_drops_its_buried_tickets",
+        || {
+            let rt = Runtime::<Shared>::new();
+            prime_reclaim_timer(&rt);
+            reclaim_probe::force(RetireSite::DeleteRetire);
+            delete_drop_panic_drops_its_buried_tickets(&rt);
+        },
+    )
+    .assert_clean();
+}

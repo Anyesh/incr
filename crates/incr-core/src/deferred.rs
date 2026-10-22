@@ -286,7 +286,9 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
     /// Normal mode: see the module docs.
     #[inline(always)]
     pub(crate) fn drain(mut self, rt: &Runtime<C>) {
-        rt.drop_buried_tickets();
+        if let Some(payload) = rt.drop_buried_tickets() {
+            self.drain_after(rt, payload);
+        }
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
             self.node.drop_parts();
             if self.dep_list.is_some() || self.members.is_some() {
@@ -334,10 +336,25 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
         }
     }
 
+    /// A buried ticket's payload panicked as it dropped: the inline node's
+    /// steps still run, a second panic among them isolated, and the rest
+    /// drops, in push order, with the bag as that panic resumes.
+    #[cold]
+    fn drain_after(mut self, rt: &Runtime<C>, payload: Box<dyn Any + Send>) -> ! {
+        isolate(|| self.node.drop_parts());
+        rt.dep_stack.poison_current_frame(rt.runtime_id);
+        resume_unwind(payload)
+    }
+
     /// The normal-mode panic exit: poison the reading frame and resume,
     /// leaving the items not yet dropped to drop, in order, with the bag.
+    /// The tickets the delete buried drop first, a panic of theirs
+    /// isolated, so no later delete raises it.
     #[cold]
     fn unwind(&mut self, rt: &Runtime<C>, payload: Box<dyn Any + Send>) -> ! {
+        if let Some(secondary) = rt.drop_buried_tickets() {
+            mem::forget(secondary);
+        }
         if let Some(members) = self.members.as_mut() {
             members.reverse();
         }
