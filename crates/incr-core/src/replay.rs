@@ -157,6 +157,12 @@ pub(crate) struct Delivery {
     pub(crate) escaped: bool,
 }
 
+impl Delivery {
+    fn is_untaken_panic(&self) -> bool {
+        !self.taken && matches!(self.what, Delivered::Unwind { cycle: false, .. })
+    }
+}
+
 /// A delivery's hold on its runtime's provenance record, which stays
 /// live while some delivery holds it.
 pub(crate) trait Provenance {
@@ -404,31 +410,41 @@ impl Context {
         (v.cidx == cidx).then_some(v)
     }
 
-    /// The untaken user-panic deliveries a read of `node` at position `at`
-    /// may be owed, as `(index, record)`. With a record: those for that
-    /// frame, and those whose frame's pops reached it, owed once the
-    /// record says so. Without one: for a Failed read along `path`, those
-    /// for the node's frame at that position and path whose read let its
-    /// payload out of the node's compute ([`Delivery::escaped`]), which
-    /// the unbounded run's compute of the node there raises.
+    /// The untaken user-panic deliveries with a record that a read of
+    /// `node` at position `at` stands for: those for that frame, and those
+    /// whose frame's pops reached it, as `(index, record)`.
     pub(crate) fn landed_payloads(
         &self,
         at: u32,
         node: u32,
         generation: u32,
-        path: Option<u64>,
-    ) -> impl Iterator<Item = (usize, Option<u64>)> + '_ {
+    ) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.pending.iter().enumerate().filter_map(move |(i, d)| {
-            if d.taken || !matches!(d.what, Delivered::Unwind { cycle: false, .. }) {
-                return None;
-            }
             let k = d.key;
-            let frame = k.cidx == at && k.node == node && k.generation == generation;
-            if frame && path == Some(k.path) && d.escaped {
-                return Some((i, None));
-            }
             let p = d.provenance.as_ref()?;
-            (frame || d.below.contains(&(at, node, generation))).then(|| (i, Some(p.record())))
+            (d.is_untaken_panic()
+                && ((k.cidx == at && k.node == node && k.generation == generation)
+                    || d.below.contains(&(at, node, generation))))
+            .then(|| (i, p.record()))
+        })
+    }
+
+    /// The untaken user-panic deliveries for the frame of `node` at
+    /// position `at` marked [`Delivery::escaped`], as `(index, path)`.
+    pub(crate) fn escaped_payloads(
+        &self,
+        at: u32,
+        node: u32,
+        generation: u32,
+    ) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.pending.iter().enumerate().filter_map(move |(i, d)| {
+            let k = d.key;
+            (d.escaped
+                && d.is_untaken_panic()
+                && k.cidx == at
+                && k.node == node
+                && k.generation == generation)
+                .then_some((i, k.path))
         })
     }
 

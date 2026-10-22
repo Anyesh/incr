@@ -3075,10 +3075,8 @@ impl<C: Cells> Runtime<C> {
             let observed = state::load::<C>(node.state_cell());
             // After the load, so a landing that passed the held payload's
             // failure on is seen whatever state it left the node in since.
-            let failed = observed == NodeState::Failed;
-            if MODE & VIRT != 0 && (!C::SINGLE_THREADED || failed) && !walked {
-                let g = g0.unwrap_or(node.generation());
-                if let Some(payload) = self.owed_payload(id, g, failed) {
+            if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
+                if let Some(payload) = self.owed_payload(id, g0.unwrap_or(node.generation())) {
                     self.raise_owed(payload, bag);
                 }
             }
@@ -3107,7 +3105,7 @@ impl<C: Cells> Runtime<C> {
                 // whose rerun reads it only if it still needs it.
                 NodeState::Failed if walked => return Computed::Done,
                 NodeState::Failed => {
-                    self.read_failed_node(id);
+                    self.read_failed_node::<MODE>(id, g0.unwrap_or(node.generation()), bag);
                     continue;
                 }
                 NodeState::Dead => {
@@ -3208,7 +3206,7 @@ impl<C: Cells> Runtime<C> {
             // made since the load, and until it is released no landing of
             // the node can pass the failure on.
             if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
-                if let Some(payload) = self.owed_payload(id, g, false) {
+                if let Some(payload) = self.owed_payload(id, g) {
                     let discard = if claimed_dirty {
                         NodeState::Dirty
                     } else {

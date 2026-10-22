@@ -13,7 +13,9 @@
 //! it after each load of the node's state and again after its claim, which
 //! can succeed on a Dirty that such a landing and a set made since. A
 //! Failed read also takes, with no record, the payload held for its
-//! node's own frame along the read's path (`owed_payload`).
+//! node's own frame along the read's path once this thread stored a
+//! Failed landing of the node that the same read's payload left
+//! (`path_payload`), under `Local` and `Shared` alike.
 
 use std::any::Any;
 use std::panic::resume_unwind;
@@ -96,13 +98,25 @@ fn failed_read_message(slot: u32) -> String {
 
 impl<C: Cells> Runtime<C> {
     /// `compute_attempts`' Failed arm: the read panics "last compute
-    /// panicked", or takes the payload a walk contained for the landing it
-    /// sees (`take_contained`). Returns when the node has left Failed since
-    /// the read saw it, to be read again. A payload this thread holds for
-    /// the read was taken after the load, by `owed_payload`.
+    /// panicked", or takes the payload held for `id`'s frame at
+    /// `generation` along the read's path (`path_payload`) or the one a
+    /// walk contained for the landing it sees (`take_contained`). Returns
+    /// when the node has left Failed since the read saw it, to be read
+    /// again. A payload a record owes the read was taken after the load,
+    /// by `owed_payload`.
     #[cold]
     #[inline(never)]
-    pub(super) fn read_failed_node(&self, id: NodeId) {
+    pub(super) fn read_failed_node<const MODE: u8>(
+        &self,
+        id: NodeId,
+        generation: u32,
+        bag: &mut Deferred<C>,
+    ) {
+        if MODE & VIRT != 0 {
+            if let Some(payload) = self.path_payload(id, generation) {
+                self.raise_owed(payload, bag);
+            }
+        }
         let Ok(payload) = self.take_contained(id) else {
             return;
         };
@@ -121,20 +135,11 @@ impl<C: Cells> Runtime<C> {
     /// The payload held for the frame of `id` at `generation` at the
     /// position its compute would take, or for a frame above it whose pops
     /// reached `id`'s frame there, if a landing of `id` on another thread
-    /// let that payload's read failure out. A read that saw `id` `failed`
-    /// also takes the payload held for that frame along the read's path
-    /// once this thread landed `id` Failed (`Context::landed_payloads`): a
-    /// retry's rerun of an earlier read can land it Failed where the
-    /// unbounded run leaves it Dirty for this read to compute again. A
-    /// speculative run's read takes none.
+    /// let that payload's read failure out. A speculative run's read takes
+    /// none.
     #[cold]
     #[inline(never)]
-    pub(super) fn owed_payload(
-        &self,
-        id: NodeId,
-        generation: u32,
-        failed: bool,
-    ) -> Option<Box<dyn Any + Send>> {
+    pub(super) fn owed_payload(&self, id: NodeId, generation: u32) -> Option<Box<dyn Any + Send>> {
         // As `take_delivery`'s scope: a closure in a speculative run can
         // catch and drop the payload the real run's read is owed.
         if replay::speculative() {
@@ -142,12 +147,11 @@ impl<C: Cells> Runtime<C> {
         }
         let rt = self.runtime_id;
         let at = self.dep_stack.next_cidx();
-        let path = failed.then(|| self.path_at(at));
-        let candidates: Vec<(u64, usize, Option<u64>)> = replay::with(|c| {
+        let candidates: Vec<(u64, usize, u64)> = replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
                 .flat_map(|x| {
-                    x.landed_payloads(at, id.0, generation, path)
+                    x.landed_payloads(at, id.0, generation)
                         .map(|(i, record)| (x.id, i, record))
                 })
                 .collect()
@@ -155,27 +159,60 @@ impl<C: Cells> Runtime<C> {
         if candidates.is_empty() {
             return None;
         }
-        // Two along the path leave no way to tell which one the node's
-        // compute lets out here.
-        let mut by_path = candidates
-            .iter()
-            .filter(|&&(_, _, record)| record.is_none());
-        let found = match (by_path.next(), by_path.next()) {
-            (Some(&found), None) => found,
-            _ => {
-                self.park(ParkPoint::FailedReadBeforeRecheck(id));
-                let records = self.provenance.read();
-                candidates.into_iter().find(|&(_, _, record)| {
-                    record.is_some_and(|record| {
-                        records
-                            .live
-                            .iter()
-                            .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
-                    })
-                })?
-            }
+        self.park(ParkPoint::FailedReadBeforeRecheck(id));
+        let found = {
+            let records = self.provenance.read();
+            candidates.into_iter().find(|&(_, _, record)| {
+                records
+                    .live
+                    .iter()
+                    .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
+            })
         };
-        let (context, i, _) = found;
+        let (context, i, _) = found?;
+        Some(self.take_payload(context, i, at))
+    }
+
+    /// The payload held for the frame of `id` at `generation` at the
+    /// position its compute would take, along the read's path, for a read
+    /// that found `id` Failed: a retry's rerun of an earlier read can land
+    /// `id` Failed where the unbounded run leaves it Dirty for this read to
+    /// compute again and raise that payload. Under `Local` and `Shared`
+    /// alike, only a delivery whose read let its payload out of a Failed
+    /// landing of `id` this thread stored qualifies
+    /// (`Delivery::escaped`), and only when exactly one does: another
+    /// thread's landing is a record's to judge. A speculative run's read
+    /// takes none.
+    fn path_payload(&self, id: NodeId, generation: u32) -> Option<Box<dyn Any + Send>> {
+        if replay::speculative() {
+            return None;
+        }
+        let rt = self.runtime_id;
+        let at = self.dep_stack.next_cidx();
+        let held: Vec<(u64, usize, u64)> = replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| {
+                    x.escaped_payloads(at, id.0, generation)
+                        .map(|(i, path)| (x.id, i, path))
+                })
+                .collect()
+        });
+        if held.is_empty() {
+            return None;
+        }
+        let path = self.path_at(at);
+        let mut on_path = held.into_iter().filter(|&(_, _, p)| p == path);
+        // Two leave no way to tell which one the node's compute lets out.
+        let (Some((context, i, _)), None) = (on_path.next(), on_path.next()) else {
+            return None;
+        };
+        Some(self.take_payload(context, i, at))
+    }
+
+    /// Takes the payload of delivery `i` in context `context` for a read
+    /// at position `at`.
+    fn take_payload(&self, context: u64, i: usize, at: u32) -> Box<dyn Any + Send> {
         let (attributed, payload) = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == context)
@@ -185,7 +222,7 @@ impl<C: Cells> Runtime<C> {
         if attributed {
             cycle_state::count_failure();
         }
-        Some(payload)
+        payload
     }
 
     /// Raises `payload`, which [`Self::owed_payload`] took, as the read's
