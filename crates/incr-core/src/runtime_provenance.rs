@@ -9,7 +9,9 @@
 //! which landings did, and keeps them: once a landing let the failure out,
 //! the other thread has observed it, so the retry is owed the payload
 //! whatever happens to the node after, a reland Clean or Failed or the
-//! recycling of its slot.
+//! recycling of its slot. The replay driver's compute of a node checks for
+//! it after each load of the node's state and again after its claim, which
+//! can succeed on a Dirty that such a landing and a set made since.
 
 use std::any::Any;
 use std::panic::resume_unwind;
@@ -135,7 +137,9 @@ impl<C: Cells> Runtime<C> {
     /// position its compute would take, or for a frame above it whose pops
     /// reached `id`'s frame there, if a landing of `id` on another thread
     /// let that payload's read failure out.
-    fn owed_payload(&self, id: NodeId, generation: u32) -> Option<Box<dyn Any + Send>> {
+    #[cold]
+    #[inline(never)]
+    pub(super) fn owed_payload(&self, id: NodeId, generation: u32) -> Option<Box<dyn Any + Send>> {
         let rt = self.runtime_id;
         let at = self.dep_stack.next_cidx();
         let candidates: Vec<(u64, usize, u64)> = replay::with(|c| {
@@ -171,6 +175,15 @@ impl<C: Cells> Runtime<C> {
             cycle_state::count_failure();
         }
         Some(payload)
+    }
+
+    /// Raises `payload`, which [`Self::owed_payload`] took, as the read's
+    /// panic.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn raise_owed(&self, payload: Box<dyn Any + Send>) -> ! {
+        self.dep_stack.poison_current_frame(self.runtime_id);
+        resume_unwind(payload)
     }
 
     /// A Failed read on this thread: if it is made for the read a record

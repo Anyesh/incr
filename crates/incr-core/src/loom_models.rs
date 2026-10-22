@@ -1448,7 +1448,7 @@ fn vframe_failed_provenance() {
 /// The three outcomes must be those of a serial order of this thread's
 /// read among the other's.
 #[test]
-#[ignore = "a reland drops the record's propagated entry: no read gets \"y boom\""]
+#[ignore = "X lands from two computes after one set: (x fresh, y boom, x fresh), as at 978b407"]
 fn vframe_failed_provenance_relanded() {
     run(|| {
         let rt = Arc::new(Rt::new());
