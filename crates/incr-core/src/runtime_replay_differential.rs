@@ -1806,7 +1806,8 @@ impl<'a> Serial<'a> {
 /// cycle. One it left Failed must have a cause none of those Failed nodes
 /// stands in for unless it has one too: the re-run panics with the
 /// closure's own payload, or through a read of a node left Failed or
-/// Cyclic that is not such a node. A node the order settles that the phase left
+/// Cyclic that is not such a node, or of one the re-runs landed Failed
+/// that has such a cause itself. A node the order settles that the phase left
 /// Dirty or New must still read so on a later `get`: a panic for Failed,
 /// the cycle for Cyclic. The re-runs and gets run on this thread, in that
 /// order, and change the world.
@@ -1843,15 +1844,35 @@ fn consistent(
             ((side, h.erased().slot()), x)
         })
         .collect();
+    // What the phase left, read before the re-runs change it.
+    let key = |x: usize| {
+        let (side, _, h) = node(x);
+        (side, h.erased().slot())
+    };
+    let left: HashSet<(usize, u32)> = got.iter().map(|&(x, _)| key(x)).collect();
+    let cyclic_dep: HashSet<usize> = extra
+        .iter()
+        .filter(|&&(x, s)| {
+            let (side, _, h) = node(x);
+            s == NodeState::Cyclic && settled_dep(w.rt(side), h, true)
+        })
+        .map(|&(x, _)| x)
+        .collect();
     let mut why: HashMap<usize, String> = HashMap::new();
-    // Failed nodes whose re-run failed only through reads, with its side
-    // and the nodes it read.
-    let mut through: Vec<(usize, usize, Vec<u32>)> = Vec::new();
+    // Failed nodes that fail only through reads: an extra one whose re-run
+    // did, or one the re-runs landed Failed, which has no node index to
+    // report.
+    struct Open {
+        x: Option<usize>,
+        key: (usize, u32),
+        read: Vec<u32>,
+    }
+    let mut through: Vec<Open> = Vec::new();
     for &(x, s) in &extra {
-        let (side, q, h) = node(x);
-        if s == NodeState::Cyclic && settled_dep(w.rt(side), h, true) {
+        if cyclic_dep.contains(&x) {
             continue;
         }
+        let (side, q, _) = node(x);
         let spec = spec_at(case, prefix, side, q);
         let rerun = make(&live.world, side, q, &spec, true);
         let out = read_out(w.rt(side), rerun, false);
@@ -1873,27 +1894,45 @@ fn consistent(
                     .nodes
                     .get(rerun.erased().slot())
                     .for_each_dep(|d| read.push(d.0));
-                through.push((x, side, read));
+                through.push(Open {
+                    x: Some(x),
+                    key: key(x),
+                    read,
+                });
             }
             _ => {}
         }
     }
+    for (x, &state) in states.iter().enumerate() {
+        let (side, slot) = key(x);
+        let n = w.rt(side).nodes.get(slot);
+        if state != NodeState::Dead
+            && !left.contains(&(side, slot))
+            && n.state() == NodeState::Failed
+        {
+            let mut read = Vec::new();
+            n.for_each_dep(|d| read.push(d.0));
+            through.push(Open {
+                x: None,
+                key: (side, slot),
+                read,
+            });
+        }
+    }
     loop {
         let open = through.len();
-        let stands = |side: usize,
-                      d: u32,
-                      why: &HashMap<usize, String>,
-                      through: &[(usize, usize, Vec<u32>)]| {
+        let stands = |side: usize, d: u32, why: &HashMap<usize, String>, through: &[Open]| {
             matches!(
                 w.rt(side).nodes.get(d).state(),
                 NodeState::Failed | NodeState::Cyclic
-            ) && failed_extra
-                .get(&(side, d))
-                .is_none_or(|y| !why.contains_key(y) && !through.iter().any(|(t, _, _)| t == y))
+            ) && !through.iter().any(|t| t.key == (side, d))
+                && failed_extra
+                    .get(&(side, d))
+                    .is_none_or(|y| !why.contains_key(y))
         };
         let grounded: Vec<bool> = through
             .iter()
-            .map(|(_, side, read)| read.iter().any(|&d| stands(*side, d, &why, &through)))
+            .map(|t| t.read.iter().any(|&d| stands(t.key.0, d, &why, &through)))
             .collect();
         let mut grounded = grounded.into_iter();
         through.retain(|_| !grounded.next().unwrap());
@@ -1901,7 +1940,7 @@ fn consistent(
             break;
         }
     }
-    for (x, _, _) in through {
+    for x in through.into_iter().filter_map(|t| t.x) {
         why.insert(
             x,
             format!(
@@ -3042,6 +3081,40 @@ fn two_thread_oracle_rejects_a_failed_set_that_justifies_itself() {
     match overlap_verdict(&case, &[0, 1], NodeState::Failed, true) {
         Some(Err(_)) => {}
         v => panic!("a self-justified Failed set passed: {v:?}"),
+    }
+}
+
+/// 0's first run is `Const(1)`, so no order computes 1 and none leaves
+/// anything Failed. With 0 patched Failed, its re-run reads 1, which
+/// computes, reads the patched 0 and lands Failed: a ground the check
+/// itself made, so 0 Failed has no cause and must be rejected.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_two_thread_oracle_rejects_a_failed_node_grounded_by_its_own_rerun() {
+    let q = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            q(Expr::FirstRun(
+                Box::new(Expr::Const(1)),
+                Box::new(Expr::Read(1, false)),
+            )),
+            q(Expr::Read(0, false)),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(0)],
+    };
+    match overlap_verdict(&case, &[0], NodeState::Failed, true) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("node 0 Failed with no panic anywhere passed: {v:?}"),
     }
 }
 
