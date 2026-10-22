@@ -860,3 +860,57 @@ fn local_swept_child_drops_its_contained_panic() {
 fn shared_swept_child_drops_its_contained_panic() {
     swept_child_drops_its_contained_panic::<Shared>();
 }
+
+/// A closure that catches a nested read's panic and raises a fresh box
+/// must not hand the caught node's stale note to its own contained ticket,
+/// even when the allocator gives the new box the freed address.
+fn caught_note_stays_out_of_a_reused_address_ticket<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let x = rt.create_query(|_: &Runtime<C>| -> i64 { panic!("pX") });
+    let reused = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let r = reused.clone();
+    let d = rt.create_query(move |rt| {
+        if rt.get(t) == 1 {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+            let freed = &*caught as *const _ as *const u8 as usize;
+            drop(caught);
+            let fresh: Box<dyn std::any::Any + Send> = Box::new("pD");
+            r.store(
+                &*fresh as *const _ as *const u8 as usize == freed,
+                Ordering::SeqCst,
+            );
+            std::panic::resume_unwind(fresh);
+        }
+        0
+    });
+    let n = rt.create_query(move |rt| {
+        if rt.get(sel) == 1 {
+            rt.get(x)
+        } else {
+            rt.get(d)
+        }
+    });
+    assert_eq!(rt.get(n), 0);
+    rt.set(t, 1);
+    rt.set(sel, 1);
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err());
+    assert!(
+        reused.load(Ordering::SeqCst),
+        "precondition: the fresh box reused the freed address"
+    );
+    assert_ne!(got, "pD", "x's read took d's contained payload");
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err());
+    assert_eq!(got, "pD");
+}
+
+#[test]
+fn local_caught_note_stays_out_of_a_reused_address_ticket() {
+    caught_note_stays_out_of_a_reused_address_ticket::<Local>();
+}
+
+#[test]
+fn shared_caught_note_stays_out_of_a_reused_address_ticket() {
+    caught_note_stays_out_of_a_reused_address_ticket::<Shared>();
+}
