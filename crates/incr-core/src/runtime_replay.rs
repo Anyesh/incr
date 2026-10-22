@@ -1560,11 +1560,11 @@ impl<C: Cells> Runtime<C> {
             // read doomed. Without a buffer it runs as a buffered member run,
             // which finishes the run its frame would have; with one it is
             // done.
-            let held = cycle_state::with_held(|h| {
-                h.get(&(self.runtime_id, entry.node))
-                    .filter(|e| e.generation == entry.generation)
-                    .map(|e| e.buf.is_some())
-            });
+            let held = self
+                .look_held(entry.node, replay::speculative() || entry.spec, |e| {
+                    (e.generation == entry.generation).then_some(e.buf.is_some())
+                })
+                .flatten();
             if let Some(buffered) = held {
                 if !buffered {
                     let cidx = boundary + level;
@@ -1805,7 +1805,8 @@ impl<C: Cells> Runtime<C> {
         // The run that retries the frame takes its lowlink, a suspended
         // episode's member run as much as a stand-in.
         let mut low = v.low;
-        let unbuffered = cycle_state::with_held(|h| h.get(&(rt, v.node)).map(|e| e.buf.is_none()));
+        let unbuffered =
+            self.look_held(v.node, replay::speculative() || v.spec, |e| e.buf.is_none());
         if low < v.cidx && unbuffered != Some(false) {
             replay::with(|c| {
                 if let Some(x) = c.iter_mut().find(|x| x.id == id) {
@@ -1920,6 +1921,16 @@ impl<C: Cells> Runtime<C> {
         });
         if let (Some(revs), false) = (stand_in, rooted) {
             if !(v.spec && self.alone_lands_dirty(v.node)) {
+                if v.spec {
+                    // `land_alone` takes a speculative run's buffer only when
+                    // adopted: over Clean deps alone it is the value the
+                    // unbounded run's own run of the node gives.
+                    cycle_state::with_held(|h| {
+                        h.get_mut(&(rt, v.node))
+                            .expect("incr-core: a stand-in is held")
+                            .adopt();
+                    });
+                }
                 let mut bag = Deferred::new();
                 return match self.land_alone(v.node, revs, &mut bag) {
                     Ok(landed) => {
