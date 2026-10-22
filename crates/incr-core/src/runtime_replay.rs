@@ -109,6 +109,16 @@ impl<C: Cells> Runtime<C> {
         node.generation() == (reading >> 32) as u32 && self.arenas.erased(tag).has_placeholder()
     }
 
+    /// Keeps another runtime's frame on top, whose read of this runtime no
+    /// kept read carries, from being doomed, within this runtime's budget
+    /// only: past it the stack bound wins, as for a ticket payload, and the
+    /// frame's retry reads the node again.
+    pub(super) fn keep_foreign_reader_undoomed(&self) {
+        if !self.over_budget(self.dep_stack.depth() as u32) {
+            self.dep_stack.keep_top_undoomed();
+        }
+    }
+
     /// Whether a read from a frame `depth` frames deep is at or past a
     /// budget.
     fn over_budget(&self, depth: u32) -> bool {
@@ -1109,7 +1119,7 @@ impl<C: Cells> Runtime<C> {
             Err(payload) => {
                 let copy = replay::copy_payload(&**payload);
                 if copy.is_none() {
-                    self.dep_stack.keep_top_undoomed();
+                    self.keep_foreign_reader_undoomed();
                 }
                 copy.map(|payload| Delivered::Unwind {
                     cycle: false,
