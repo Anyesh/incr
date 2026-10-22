@@ -1675,9 +1675,9 @@ fn shared_vframe_landed_failed_by_a_walk_into_its_dep() {
 }
 
 /// The other thread's X lets Y's failed read out, a set flips X and Y
-/// Dirty, and the next run of X lands it Failed by its own panic. The retry
-/// reads that later landing, so only the order with the other threads
-/// first is serial.
+/// Dirty, and the next run of X lands it Failed by its own panic. The other
+/// thread observed Y's failure, so only the order with this thread first
+/// is serial, and the retry takes the payload over the later landing.
 #[test]
 fn shared_vframe_relanded_failed_by_its_own_panic() {
     let rt = Arc::new(Rt::new());
@@ -1722,20 +1722,18 @@ fn shared_vframe_relanded_failed_by_its_own_panic() {
     assert_eq!(rt.state_of(x), NodeState::Failed);
     gate.release();
     let first = first.join();
-    assert!(failed(&first), "{first:?}");
+    assert_eq!(first, Err("y boom".to_string()));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// As `keeps_the_payload`, but after the retry's Failed read of X found
-/// the payload and loaded X's generation, another thread deletes X and
+/// As `keeps_the_payload`, but after the retry's read of X found the
+/// payload and loaded X's generation, another thread deletes X and
 /// recycles its slot into Z, landed Failed by its own panic, before the
 /// read takes the record lock. The other thread's read let the failure
 /// out, so only the order with this thread first is serial, where the
-/// retry takes the payload; the re-check under the lock instead sends the
-/// read back, and it panics "last compute panicked" for Z.
+/// retry takes the payload.
 #[test]
-#[ignore = "the generation re-check reads Z's landing through X's id"]
 fn shared_vframe_failed_read_of_a_recycled_slot() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);

@@ -6,7 +6,10 @@
 //! allows the serial order with this thread first, where the retry gets
 //! the payload; any other allows only the other thread first, where the
 //! retry reads X Failed. The record published before Y lands carries
-//! which landings did.
+//! which landings did, and keeps them: once a landing let the failure out,
+//! the other thread has observed it, so the retry is owed the payload
+//! whatever happens to the node after, a reland Clean or Failed or the
+//! recycling of its slot.
 
 use std::any::Any;
 use std::panic::resume_unwind;
@@ -41,8 +44,9 @@ impl From<ReadKey> for Reader {
 struct Record {
     id: u64,
     reader: Reader,
-    /// The nodes, as `(node, generation)`, whose latest Failed landing on
-    /// another thread let the record's read failure out unchanged.
+    /// The nodes, as `(node, generation)`, a Failed landing of which on
+    /// another thread let the record's read failure out unchanged. A later
+    /// landing never removes one.
     propagated: Vec<(u32, u32)>,
 }
 
@@ -121,14 +125,18 @@ impl<C: Cells> Runtime<C> {
         panic!("{}", failed_read_message(id.0));
     }
 
-    /// The payload held for the frame of `id` at the position its compute
-    /// would take, or for a frame above it whose pops reached `id`'s frame
-    /// there, if the landing of `id` this read sees let that payload's
-    /// read failure out.
+    /// The payload [`Self::owed_payload`] finds for the generation of `id`
+    /// this read sees.
     fn take_landed_payload(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
+        Ok(self.owed_payload(id, self.nodes.get(id.0).generation()))
+    }
+
+    /// The payload held for the frame of `id` at `generation` at the
+    /// position its compute would take, or for a frame above it whose pops
+    /// reached `id`'s frame there, if a landing of `id` on another thread
+    /// let that payload's read failure out.
+    fn owed_payload(&self, id: NodeId, generation: u32) -> Option<Box<dyn Any + Send>> {
         let rt = self.runtime_id;
-        let node = self.nodes.get(id.0);
-        let generation = node.generation();
         let at = self.dep_stack.next_cidx();
         let candidates: Vec<(u64, usize, u64)> = replay::with(|c| {
             c.iter()
@@ -140,20 +148,11 @@ impl<C: Cells> Runtime<C> {
                 .collect()
         });
         if candidates.is_empty() {
-            return Ok(None);
+            return None;
         }
         self.park(ParkPoint::FailedReadBeforeRecheck(id));
         let found = {
             let records = self.provenance.read();
-            // Every Failed landing updates the records before its store, so
-            // under the lock a node still Failed at the same generation was
-            // landed by the latest update; one that left Failed, or whose
-            // slot was recycled, is read again.
-            if state::load::<C>(node.state_cell()) != NodeState::Failed
-                || node.generation() != generation
-            {
-                return Err(Left);
-            }
             candidates.into_iter().find(|&(_, _, record)| {
                 records
                     .live
@@ -161,9 +160,7 @@ impl<C: Cells> Runtime<C> {
                     .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
             })
         };
-        let Some((context, i, _)) = found else {
-            return Ok(None);
-        };
+        let (context, i, _) = found?;
         let (attributed, payload) = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == context)
@@ -173,7 +170,7 @@ impl<C: Cells> Runtime<C> {
         if attributed {
             cycle_state::count_failure();
         }
-        Ok(Some(payload))
+        Some(payload)
     }
 
     /// A Failed read on this thread: if it is made for the read a record
@@ -221,12 +218,11 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Before `id` lands Failed, from `land_failed`, which every Failed
-    /// landing goes through. The landing replaces whatever an earlier
-    /// landing of `id` recorded, adding `id` where it lets a carried
-    /// Failed read's panic out unchanged; and when it is the running
-    /// frame's above a virtual frame blocked reading `id`, it publishes
-    /// the record for the delivery that frame's unwind makes, before
-    /// another thread can read `id` Failed.
+    /// landing goes through. The landing adds `id` to the record of a
+    /// carried Failed read whose panic it lets out unchanged; and when it
+    /// is the running frame's above a virtual frame blocked reading `id`,
+    /// it publishes the record for the delivery that frame's unwind makes,
+    /// before another thread can read `id` Failed.
     #[cold]
     #[inline(never)]
     pub(super) fn before_failed_landing(
@@ -243,15 +239,15 @@ impl<C: Cells> Runtime<C> {
                     .and_then(|p| p.downcast_ref::<String>())
                     .is_some_and(|m| *m == failed_read_message(c.node))
         });
-        // With no live record there is nothing to replace: a record
-        // published after this check names no landing yet, and only this
-        // landing's claim can land `id` before its store.
-        if !self.provenance.read().live.is_empty() {
-            let mut records = self.provenance.write();
-            for r in &mut records.live {
-                r.propagated.retain(|&landed| landed != (id.0, generation));
-                if carried.is_some_and(|c| c.record == r.id) {
-                    r.propagated.push((id.0, generation));
+        // Under the write lock before the store: a read that sees this
+        // landing, or any later state of `id`, then finds the entry.
+        if let Some(c) = carried {
+            if !self.provenance.read().live.is_empty() {
+                let mut records = self.provenance.write();
+                if let Some(r) = records.live.iter_mut().find(|r| r.id == c.record) {
+                    if !r.propagated.contains(&(id.0, generation)) {
+                        r.propagated.push((id.0, generation));
+                    }
                 }
             }
         }
@@ -291,6 +287,6 @@ impl<C: Cells> Runtime<C> {
     }
 }
 
-/// A Failed read's node left Failed, or its slot was recycled, before the
-/// read could tell which landing it saw.
+/// A Failed read's node left Failed before the read could tell which
+/// landing it saw.
 pub(super) struct Left;
