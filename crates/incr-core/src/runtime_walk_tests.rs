@@ -1526,7 +1526,7 @@ fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 
 fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
     // Frames that are never doomed overflow this stack at 1000 to 2000
     // levels.
-    let n = test_size(10_000);
+    let n = test_size(100_000);
     let got = thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(move || ticket_catching_chain::<C>(n, failed, custom))
