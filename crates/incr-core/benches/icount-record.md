@@ -1386,3 +1386,35 @@ has spilled to a block, plus 16 bytes per block.
 
 Gate: the Clean get, table hit and value slot are unchanged; the dirty
 walk falls 0.1 percent Local and rises 0.5 to 0.6 percent Shared.
+
+## Episode containment
+
+- Engine: branch `w/T8-walk-contain-episode-panics` against its base
+  `spreadsheet-t10` at `a06016d`, each built in its own worktree; one run
+  of `icount.sh` at the default N for each column. No workloads added.
+- Change: an episode rooted at a walk's entry runs under a catch at
+  `run_episode`, and its abort decides containment as `compute_panicked`
+  does; every contained unwind's noted landings become its ticket in one
+  function. All of it is on the episode and panic paths, and the walk's
+  path gains only an argument to `group_verify` and a `PopEnd` arm.
+- Attribution: Intel PT on line-table builds of `chain_local/propagate/10`
+  and `chain_shared/propagate/10`, N = 10 with 100 warm-up, traced totals
+  equal to `perf stat`.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local`, `value_slot_read_local` | 155.14, 5 | 155.14, 5 | 0 |
+| `diamond_local` / `diamond_shared` | 3,918 / 7,855 | 3,915 / 7,849 | −3 / −6 |
+| `chain_local/propagate/100` | 91,306 | 91,206 | −100 |
+| `chain_shared/propagate/100` | 188,238 | 188,038 | −200 |
+| `fanout_shared_1000` | 4,776,649 | 4,773,642 | −3,007 |
+| `delete_single_local` / `_shared` | 712 / 1,534 | 712 / 1,534 | 0 |
+
+- **Codegen in the walk's inlined `compute_attempts`:** no line of the
+  change runs on the traced path. Local drops one `directory.rs:76`
+  bounds compare per compute (−10 per iteration); Shared shifts ±1 across
+  a dozen lines of the same body and nets −2 per compute.
+
+Gate: the Clean get, table hit and value slot are unchanged; the dirty
+walk falls about 0.1 percent under both strategies.
