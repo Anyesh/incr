@@ -1256,3 +1256,69 @@ local_and_shared!(
     local_doomed_child_query_read_terminates,
     shared_doomed_child_query_read_terminates
 );
+
+/// A (Fallback 4) reads X inside a `catch_unwind`, then reads X again;
+/// X reads B, and B reads A and panics on A's fallback. In the unbounded
+/// run B's first panic lands X and B Dirty, since A, a new dep, is still
+/// computing, so A's second read runs them again and B's second panic
+/// reaches `get(A)` with its payload. At budget 2 both of X's reads of B
+/// doom, and the level-0 retry that takes the second delivery first runs
+/// the caught read again, which takes the first delivery.
+fn caught_member_panic_read_twice<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("b boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(move |rt| rt.get(b) + 4, replayable());
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, b].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+fn caught_member_panic_keeps_its_payload<C: Cells>() {
+    let unbounded = caught_member_panic_read_twice::<C>(None);
+    assert_eq!(
+        unbounded,
+        (Out::Panic("b boom".into()), vec![NodeState::Failed; 3])
+    );
+    for frames in [1, 2, 3] {
+        assert_eq!(
+            caught_member_panic_read_twice::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "the retry's rerun of the caught read lands X Failed, so the second read never takes its delivery"]
+fn local_caught_member_panic_keeps_its_payload() {
+    caught_member_panic_keeps_its_payload::<Local>();
+}
+
+#[test]
+#[ignore = "the retry's rerun of the caught read lands X Failed, so the second read never takes its delivery"]
+fn shared_caught_member_panic_keeps_its_payload() {
+    caught_member_panic_keeps_its_payload::<Shared>();
+}
