@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
@@ -8,6 +8,8 @@ use crate::cells::{Cells, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
 use crate::handle::Incr;
 use crate::runtime::Runtime;
+use crate::state::NodeState;
+use crate::value_code::CONTRACT_MESSAGE;
 
 fn key(sheet: u32, row: u32, column: u32) -> GridKey {
     GridKey::new(sheet, row, column)
@@ -66,6 +68,7 @@ both!(
     grid_an_insert_with_a_live_key_creates_nothing,
     grid_an_insert_with_a_repeated_key_creates_nothing,
     grid_an_insert_replaces_a_deleted_node,
+    grid_a_clean_reads_clone_that_misses_or_inserts_hits_the_contract,
     grid_type_fallback_queries_need_and_use_their_types_fallback,
     grid_a_lazy_query_is_built_only_on_a_miss,
 );
@@ -568,6 +571,92 @@ fn grid_an_insert_replaces_a_deleted_node<C: Cells>(rt: &Runtime<C>) {
     let new = t.insert_inputs(rt, vec![(key(0, 0, 0), 2)]);
     assert_eq!(t.get(rt, key(0, 0, 0)), Some(new[0]));
     assert_eq!(rt.get(new[0]), 2);
+}
+
+thread_local! {
+    static CLONE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// A value whose next `Clone` runs the armed hook.
+#[derive(Debug, PartialEq)]
+struct HookValue(i64);
+
+impl Clone for HookValue {
+    fn clone(&self) -> Self {
+        if let Some(hook) = CLONE_HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+        HookValue(self.0)
+    }
+}
+
+/// A Clean read's `Clone` that misses or inserts in the grid of the node
+/// it reads is refused before the miss mutex, so the node stays alive,
+/// Clean and on its value, and the key's levels are never made.
+fn grid_a_clean_reads_clone_that_misses_or_inserts_hits_the_contract<C: Cells>(rt: &Runtime<C>) {
+    type Change<C> = (&'static str, fn(&Runtime<C>, &GridTable<HookValue, C>));
+    let fresh = key(1, 0, 0);
+    let changes: [Change<C>; 5] = [
+        ("get_or_insert_input", |rt, t| {
+            t.get_or_insert_input(rt, key(1, 0, 0), || HookValue(9));
+        }),
+        ("get_or_insert_query", |rt, t| {
+            t.get_or_insert_query(rt, key(1, 0, 0), |_| HookValue(9));
+        }),
+        ("get_or_insert_query_lazy", |rt, t| {
+            t.get_or_insert_query_lazy(rt, key(1, 0, 0), || {
+                (|_: &Runtime<C>| HookValue(9), QueryOpts::default())
+            });
+        }),
+        ("insert_inputs", |rt, t| {
+            t.insert_inputs(rt, vec![(key(1, 0, 0), HookValue(9))]);
+        }),
+        ("insert_queries_watched", |rt, t| {
+            t.insert_queries_watched(
+                rt,
+                vec![(
+                    key(1, 0, 0),
+                    |_: &Runtime<C>| HookValue(9),
+                    QueryOpts::default(),
+                )],
+            );
+        }),
+    ];
+    let t = rt.create_grid_table::<HookValue>();
+    let read = t.get_or_insert_input(rt, key(0, 0, 0), || HookValue(1));
+    let nodes = rt.node_count();
+    let (rt_ptr, t_ptr) = (
+        rt as *const Runtime<C>,
+        &t as *const GridTable<HookValue, C>,
+    );
+    for (name, change) in changes {
+        for try_get in [false, true] {
+            CLONE_HOOK.with(|h| {
+                *h.borrow_mut() = Some(Box::new(move || {
+                    // SAFETY: both outlive the hook, which fires in the
+                    // read below.
+                    let (rt, t) = unsafe { (&*rt_ptr, &*t_ptr) };
+                    change(rt, t);
+                }))
+            });
+            panics_with(CONTRACT_MESSAGE, || {
+                if try_get {
+                    let _ = rt.try_get(read);
+                } else {
+                    rt.get(read);
+                }
+            });
+            assert!(CLONE_HOOK.with(|h| h.borrow().is_none()), "{name}");
+            assert!(rt.is_alive(read), "{name}");
+            assert_eq!(rt.state_of(read), NodeState::Clean, "{name}");
+            assert_eq!(rt.get(read).0, 1, "{name}");
+            assert_eq!(t.get(rt, key(0, 0, 0)), Some(read), "{name}");
+            assert!(t.entry(fresh).is_none(), "{name}: the miss made levels");
+            assert_eq!(rt.node_count(), nodes, "{name}");
+        }
+    }
+    let made = t.get_or_insert_input(rt, fresh, || HookValue(9));
+    assert_eq!(rt.get(made).0, 9);
 }
 
 #[test]
