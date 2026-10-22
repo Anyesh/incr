@@ -11,7 +11,9 @@
 //! whatever happens to the node after, a reland Clean or Failed or the
 //! recycling of its slot. The replay driver's compute of a node checks for
 //! it after each load of the node's state and again after its claim, which
-//! can succeed on a Dirty that such a landing and a set made since.
+//! can succeed on a Dirty that such a landing and a set made since. A
+//! Failed read also takes, with no record, the payload held for its
+//! node's own frame along the read's path (`owed_payload`).
 
 use std::any::Any;
 use std::panic::resume_unwind;
@@ -119,17 +121,27 @@ impl<C: Cells> Runtime<C> {
     /// The payload held for the frame of `id` at `generation` at the
     /// position its compute would take, or for a frame above it whose pops
     /// reached `id`'s frame there, if a landing of `id` on another thread
-    /// let that payload's read failure out.
+    /// let that payload's read failure out. A read that saw `id` `failed`
+    /// also takes the payload held for that frame along the read's path
+    /// once this thread landed `id` Failed (`Context::landed_payloads`): a
+    /// retry's rerun of an earlier read can land it Failed where the
+    /// unbounded run leaves it Dirty for this read to compute again.
     #[cold]
     #[inline(never)]
-    pub(super) fn owed_payload(&self, id: NodeId, generation: u32) -> Option<Box<dyn Any + Send>> {
+    pub(super) fn owed_payload(
+        &self,
+        id: NodeId,
+        generation: u32,
+        failed: bool,
+    ) -> Option<Box<dyn Any + Send>> {
         let rt = self.runtime_id;
         let at = self.dep_stack.next_cidx();
-        let candidates: Vec<(u64, usize, u64)> = replay::with(|c| {
+        let path = failed.then(|| self.path_at(at));
+        let candidates: Vec<(u64, usize, Option<u64>)> = replay::with(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
                 .flat_map(|x| {
-                    x.landed_payloads(at, id.0, generation)
+                    x.landed_payloads(at, id.0, generation, path, !C::SINGLE_THREADED)
                         .map(|(i, record)| (x.id, i, record))
                 })
                 .collect()
@@ -137,17 +149,20 @@ impl<C: Cells> Runtime<C> {
         if candidates.is_empty() {
             return None;
         }
-        self.park(ParkPoint::FailedReadBeforeRecheck(id));
-        let found = {
-            let records = self.provenance.read();
-            candidates.into_iter().find(|&(_, _, record)| {
-                records
-                    .live
-                    .iter()
-                    .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
-            })
+        let found = match candidates.iter().find(|&&(_, _, record)| record.is_none()) {
+            Some(&found) => found,
+            None => {
+                self.park(ParkPoint::FailedReadBeforeRecheck(id));
+                let records = self.provenance.read();
+                candidates.into_iter().find(|&(_, _, record)| {
+                    records
+                        .live
+                        .iter()
+                        .any(|r| Some(r.id) == record && r.propagated.contains(&(id.0, generation)))
+                })?
+            }
         };
-        let (context, i, _) = found?;
+        let (context, i, _) = found;
         let (attributed, payload) = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == context)
@@ -252,6 +267,13 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         replay::with(|c| {
+            for x in c.iter_mut().filter(|x| x.rt == rt) {
+                for d in x.pending.iter_mut() {
+                    if d.key.node == id.0 && d.key.generation == generation {
+                        d.failed_here = true;
+                    }
+                }
+            }
             let Some((x, key)) = c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
                 let key = x.landing_reader(id.0, generation, cidx)?;
                 Some((x, key))

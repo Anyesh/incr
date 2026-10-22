@@ -149,6 +149,10 @@ pub(crate) struct Delivery {
     /// generation)`: a read of one of their nodes stands for its frame's
     /// run.
     pub(crate) below: Vec<(u32, u32, u32)>,
+    /// This thread landed the frame's node Failed while the delivery
+    /// waited. Under `Shared` a Failed read takes it by its path only
+    /// then: another thread's landing is the record's to judge.
+    pub(crate) failed_here: bool,
 }
 
 /// A delivery's hold on its runtime's provenance record, which stays
@@ -369,6 +373,7 @@ impl Context {
             what,
             provenance,
             below: Vec::new(),
+            failed_here: false,
         });
     }
 
@@ -397,23 +402,32 @@ impl Context {
         (v.cidx == cidx).then_some(v)
     }
 
-    /// The untaken user-panic deliveries with a record that a read of
-    /// `node` at position `at` stands for: those for that frame, and those
-    /// whose frame's pops reached it, as `(index, record)`.
+    /// The untaken user-panic deliveries a read of `node` at position `at`
+    /// may be owed, as `(index, record)`. With a record: those for that
+    /// frame, and those whose frame's pops reached it, owed once the
+    /// record says so. Without one: for a Failed read along `path`, the
+    /// one for the node's frame at that position and path, whose payload
+    /// the unbounded run's compute of the node there raises, and under
+    /// `own` only once this thread landed the node Failed.
     pub(crate) fn landed_payloads(
         &self,
         at: u32,
         node: u32,
         generation: u32,
-    ) -> impl Iterator<Item = (usize, u64)> + '_ {
+        path: Option<u64>,
+        own: bool,
+    ) -> impl Iterator<Item = (usize, Option<u64>)> + '_ {
         self.pending.iter().enumerate().filter_map(move |(i, d)| {
+            if d.taken || !matches!(d.what, Delivered::Unwind { cycle: false, .. }) {
+                return None;
+            }
             let k = d.key;
+            let frame = k.cidx == at && k.node == node && k.generation == generation;
+            if frame && path == Some(k.path) && (!own || d.failed_here) {
+                return Some((i, None));
+            }
             let p = d.provenance.as_ref()?;
-            (!d.taken
-                && matches!(d.what, Delivered::Unwind { cycle: false, .. })
-                && ((k.cidx == at && k.node == node && k.generation == generation)
-                    || d.below.contains(&(at, node, generation))))
-            .then(|| (i, p.record()))
+            (frame || d.below.contains(&(at, node, generation))).then(|| (i, Some(p.record())))
         })
     }
 
@@ -481,6 +495,7 @@ impl Context {
             what: Delivered::Walk(Box::new(walk)),
             provenance: None,
             below: Vec::new(),
+            failed_here: false,
         });
     }
 
@@ -503,6 +518,7 @@ impl Context {
                 what: Delivered::Direct,
                 provenance: None,
                 below: Vec::new(),
+                failed_here: false,
             });
         }
     }

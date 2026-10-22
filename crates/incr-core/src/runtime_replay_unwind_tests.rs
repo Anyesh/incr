@@ -1312,13 +1312,11 @@ fn caught_member_panic_keeps_its_payload<C: Cells>() {
 }
 
 #[test]
-#[ignore = "the retry's rerun of the caught read lands X Failed, so the second read never takes its delivery"]
 fn local_caught_member_panic_keeps_its_payload() {
     caught_member_panic_keeps_its_payload::<Local>();
 }
 
 #[test]
-#[ignore = "the retry's rerun of the caught read lands X Failed, so the second read never takes its delivery"]
 fn shared_caught_member_panic_keeps_its_payload() {
     caught_member_panic_keeps_its_payload::<Shared>();
 }
