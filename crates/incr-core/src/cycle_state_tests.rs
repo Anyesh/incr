@@ -1,5 +1,6 @@
 use super::{Held, Look};
 use crate::cycle::Erased;
+use crate::deferred::Unbuilt;
 use crate::node::NodeId;
 use crate::replay;
 
@@ -9,6 +10,11 @@ fn value(v: u32) -> Option<Erased> {
 
 fn read(b: &Option<Erased>) -> Option<u32> {
     b.as_ref().map(|v| *v.downcast_ref::<u32>().expect("a u32"))
+}
+
+fn read_unbuilt(b: &Option<Unbuilt>) -> Option<u32> {
+    b.as_ref()
+        .map(|v| *v.value().downcast_ref::<u32>().expect("a u32"))
 }
 
 #[test]
@@ -34,7 +40,7 @@ fn a_real_look_settles_what_a_speculative_run_wrote() {
     }
     assert!(e.spec_written());
     let (seen, settled) = e.look(Look::REAL);
-    assert_eq!(read(&settled), Some(7777));
+    assert_eq!(read_unbuilt(&settled), Some(7777));
     assert!(seen.buf().is_none());
     assert_eq!(seen.deps(), &[(NodeId(2), 0)]);
     assert_eq!(seen.last(), &[(NodeId(2), 0)]);
@@ -56,7 +62,7 @@ fn a_real_write_settles_before_it_records() {
     );
     let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(4), 0)], value(5), true, false);
     assert!(replaced.is_none());
-    assert_eq!(read(&spec), Some(7777));
+    assert_eq!(read_unbuilt(&spec), Some(7777));
     let (seen, settled) = e.look(Look::REAL);
     assert!(settled.is_none());
     assert_eq!(read(seen.buf()), Some(5));
@@ -104,7 +110,7 @@ fn a_settle_restores_the_record_from_before_the_first_speculative_run() {
     );
     assert_eq!(read(&replaced), Some(7));
     let (seen, settled) = e.look(Look::REAL);
-    assert_eq!(read(&settled), Some(8));
+    assert_eq!(read_unbuilt(&settled), Some(8));
     assert_eq!(seen.deps(), &[(NodeId(2), 0)]);
     assert_eq!(seen.last(), &[(NodeId(2), 0)]);
     assert_eq!(seen.installed(), &[NodeId(2)]);
