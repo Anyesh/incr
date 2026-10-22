@@ -13,7 +13,7 @@ use super::race_tests::{id, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
-use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::deferred::{ErasedDrop, SPILL_ALLOCS};
 use crate::handle::Incr;
 use crate::reclaim_probe::{self, RetireSite};
@@ -1096,8 +1096,27 @@ fn shared_delete_drop_panic_drops_its_buried_tickets() {
 /// `Boom`), whose member `b` panics once `a` holds `Boom(3)`, so the walk
 /// contains the abort. The released `Boom(3)` panics in its `Drop`; that
 /// panic leaves the read once the landings are done, as it does for a
-/// compute the walk contains, and `a` keeps the episode's payload.
-fn contained_episode_abort_keeps_member_drop_panic<C: Cells>(rt: &Runtime<C>) {
+/// compute the walk contains, and `a` keeps the episode's payload. With
+/// `frames`, every query may replay under that frame budget.
+fn contained_episode_abort_keeps_member_drop_panic<C: Cells>(
+    rt: &Runtime<C>,
+    frames: Option<u32>,
+    chain: usize,
+) {
+    let replay = if frames.is_some() {
+        Replay::Allowed
+    } else {
+        Replay::Native
+    };
+    if let Some(frames) = frames {
+        rt.set_max_frames(frames);
+        rt.set_placeholder(0_i64);
+        rt.set_placeholder(Boom(i64::MIN + 1));
+    }
+    let opts = || QueryOpts {
+        replay,
+        ..Default::default()
+    };
     let sel = rt.create_input(0_i64);
     let j = rt.create_input(1_i64);
     let k = rt.create_input(0_i64);
@@ -1114,27 +1133,41 @@ fn contained_episode_abort_keeps_member_drop_panic<C: Cells>(rt: &Runtime<C>) {
             },
             QueryOpts {
                 cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| Boom(0))),
-                ..Default::default()
+                replay,
             },
         )
     };
-    let b = rt.create_query(move |rt| {
-        let v = rt.get(a).0;
-        if v >= 3 && rt.get(j) == 0 {
-            arm(3);
-            panic!("b boom");
-        }
-        v + 1
-    });
+    let mut last: Option<Incr<i64>> = None;
+    for _ in 0..chain {
+        let prev = last;
+        last = Some(rt.create_query_with(
+            move |rt| prev.map_or_else(|| rt.get(a).0, |p| rt.get(p)),
+            opts(),
+        ));
+    }
+    let b = rt.create_query_with(
+        move |rt| {
+            let v = last.map_or_else(|| rt.get(a).0, |l| rt.get(l));
+            if v >= 3 && rt.get(j) == 0 {
+                arm(3);
+                panic!("b boom");
+            }
+            v + 1
+        },
+        opts(),
+    );
     cell.set(b).unwrap();
-    let x = rt.create_query(move |rt| {
-        let s = rt.get(sel);
-        if s == 0 {
-            s + rt.get(a).0
-        } else {
-            100
-        }
-    });
+    let x = rt.create_query_with(
+        move |rt| {
+            let s = rt.get(sel);
+            if s == 0 {
+                s + rt.get(a).0
+            } else {
+                100
+            }
+        },
+        opts(),
+    );
     assert_eq!(rt.get(x), 1);
     assert_eq!(rt.get(b), 2);
     rt.set(k, 1);
@@ -1146,6 +1179,11 @@ fn contained_episode_abort_keeps_member_drop_panic<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(armed, i64::MIN, "Boom(3) was never dropped");
     let err = got.expect_err("the released Boom(3)'s Drop panic must leave the read");
     assert!(panic_message(err).contains("drop of Boom(3)"));
+    assert!(
+        crate::replay::with(|c| c.is_empty()),
+        "a replay context is left open"
+    );
+    assert!(crate::replay::vindexes_empty());
     let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
     assert_eq!(panic_message(err), "b boom");
     rt.assert_invariant_i();
@@ -1156,7 +1194,27 @@ fn contained_episode_abort_keeps_member_drop_panic<C: Cells>(rt: &Runtime<C>) {
 fn wave6_contained_episode_abort_keeps_member_drop_panic() {
     run_in_child(
         "runtime::drop_panic_tests::wave6_contained_episode_abort_keeps_member_drop_panic",
-        || contained_episode_abort_keeps_member_drop_panic(&Runtime::<Local>::new()),
+        || contained_episode_abort_keeps_member_drop_panic(&Runtime::<Local>::new(), None, 0),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_contained_episode_abort_keeps_member_drop_panic_under_replay() {
+    run_in_child(
+        "runtime::drop_panic_tests::wave6_contained_episode_abort_keeps_member_drop_panic_under_replay",
+        || {
+            for chain in 0..=4 {
+                for frames in 1..=6 {
+                    contained_episode_abort_keeps_member_drop_panic(
+                        &Runtime::<Local>::new(),
+                        Some(frames),
+                        chain,
+                    );
+                }
+            }
+        },
     )
     .assert_clean();
 }
