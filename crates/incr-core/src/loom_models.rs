@@ -1441,6 +1441,64 @@ fn vframe_failed_provenance() {
     });
 }
 
+/// As `vframe_failed_provenance`, but once s is 1 Y returns 7 and X
+/// panics "x fresh" on it, and the other thread reads X, sets s and reads
+/// X again, so X's own panic can reland X Failed over the landing that let
+/// the held payload's failure out before this thread's retry reads X. X
+/// reads only Y, so the set's walk reaches X once. The three outcomes must
+/// be those of a serial order of this thread's read among the other's.
+#[test]
+fn vframe_failed_provenance_relanded() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let s = rt.create_input(0_u64);
+        let y = rt.create_query_with(
+            move |rt: &Rt| -> u64 {
+                if rt.get(s) == 1 {
+                    return 7;
+                }
+                panic!("y boom")
+            },
+            replayable(),
+        );
+        let x = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(y);
+                if v == 7 {
+                    panic!("x fresh")
+                }
+                v + 1
+            },
+            replayable(),
+        );
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                let before = panic_message(|| rt.get(x));
+                rt.set(s, 1);
+                (before, panic_message(|| rt.get(x)))
+            })
+        };
+        let mine = panic_message(|| rt.get(x));
+        let (before, after) = other.join().unwrap();
+        let kind = |r: &Result<u64, String>| match r {
+            Err(m) if m == "y boom" => 'Y',
+            Err(m) if m == "x fresh" => 'F',
+            Err(m) if m.contains("last compute panicked") => 'L',
+            _ => '?',
+        };
+        let got = [kind(&mine), kind(&before), kind(&after)];
+        assert!(
+            [['Y', 'L', 'F'], ['L', 'Y', 'F'], ['F', 'Y', 'L']].contains(&got),
+            "no serial order: {mine:?} {before:?} {after:?}"
+        );
+        assert_eq!(rt.provenance_records(), 0);
+        rt.assert_invariant_i();
+    });
+}
+
 /// x -> Q, both Clean, with x watched. One thread sets x while another
 /// watches Q and drains. The walk's flip and `watch`'s state load are
 /// ordered only through `inner`, with no SeqCst: whichever section comes

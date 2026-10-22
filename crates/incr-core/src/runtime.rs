@@ -193,6 +193,9 @@ pub(crate) enum ParkPoint {
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
+    /// In a Failed read that found a payload it may take, after it loaded
+    /// the node's generation and before the record lock.
+    FailedReadBeforeRecheck(NodeId),
     /// In `seed_query`'s `inner.write()`, before the trust check of the
     /// trusted dep `NodeId`.
     SeedBeforeTrust(NodeId),
@@ -3067,6 +3070,13 @@ impl<C: Cells> Runtime<C> {
 
         'attempt: loop {
             let observed = state::load::<C>(node.state_cell());
+            // After the load, so a landing that passed the held payload's
+            // failure on is seen whatever state it left the node in since.
+            if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
+                if let Some(payload) = self.owed_payload(id, g0.unwrap_or(node.generation())) {
+                    self.raise_owed(payload, bag);
+                }
+            }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
                 NodeState::Computing | NodeState::ComputingDirty => {
@@ -3188,6 +3198,20 @@ impl<C: Cells> Runtime<C> {
                 };
                 self.land(id, node, discard, discard);
                 return Computed::Gone;
+            }
+            // The claim succeeds on a Dirty that such a landing and a set
+            // made since the load, and until it is released no landing of
+            // the node can pass the failure on.
+            if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
+                if let Some(payload) = self.owed_payload(id, g) {
+                    let discard = if claimed_dirty {
+                        NodeState::Dirty
+                    } else {
+                        NodeState::New
+                    };
+                    self.land(id, node, discard, discard);
+                    self.raise_owed(payload, bag);
+                }
             }
 
             // Capture the revisions after the claim and BEFORE verifying or

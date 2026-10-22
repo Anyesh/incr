@@ -17,9 +17,12 @@ use std::cell::RefCell;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, PoisonError};
 
-use super::provenance_impl::Left;
 use super::*;
 use crate::locks::Lock;
+
+/// A Failed read's node left Failed before the read could tell which
+/// landing it saw.
+pub(super) struct Left;
 
 /// The tickets every thread's walks hold.
 #[derive(Default)]
