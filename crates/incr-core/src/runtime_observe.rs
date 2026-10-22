@@ -320,7 +320,10 @@ impl<C: Cells> Runtime<C> {
         };
         // No kept read carries an observer's read to a retry of another
         // runtime's frame.
-        if self.dep_stack.record_dep(self.runtime_id, id, gen) {
+        if self
+            .dep_stack
+            .record_dep_or_foreign(self.runtime_id, id, gen)
+        {
             self.dep_stack.keep_top_undoomed();
         }
         self.park(ParkPoint::ObserverAfterEntryCheck(id));

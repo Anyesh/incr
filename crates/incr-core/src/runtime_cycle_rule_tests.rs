@@ -1240,18 +1240,36 @@ mod flags_reload {
     }
 }
 
+/// What a replayable frame reads first in [`foreign_reader_is_doomed_and_retried`].
+#[derive(Clone, Copy, Debug)]
+enum FirstRead {
+    Own,
+    /// Another runtime's input, Clean when read.
+    ForeignClean,
+    /// Another runtime's query over that input, New when read, so the
+    /// read computes it.
+    ForeignComputed,
+}
+
 /// A replayable frame at budget 1 that reads 64 leaves runs twice, once
-/// doomed, whether or not it first reads another runtime's input. The last
-/// leaf sets that input when it runs, which is after the read in the
-/// unbounded run and between the doomed run and its retry here, so the
-/// retry takes the doomed run's read again rather than reading the input.
+/// doomed, whatever it first reads. The last leaf sets another runtime's
+/// input when it runs, which is after the first read in the unbounded run
+/// and between the doomed run and its retry here. A retry takes a non-Clean
+/// foreign read's outcome again, so it agrees with the unbounded run; a
+/// Clean foreign read keeps nothing, so the retry reads the node again and
+/// sees the set, the documented limitation.
 fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
-    for foreign in [false, true] {
+    for first in [
+        FirstRead::Own,
+        FirstRead::ForeignClean,
+        FirstRead::ForeignComputed,
+    ] {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_placeholder(0_u64);
         r1.set_max_frames(1);
         let x = r2.create_input(1000_u64);
+        let q = r2.create_query(move |rt| rt.get(x));
         let mut leaves: Vec<Incr<u64>> = (0..63_u64).map(|i| r1.create_query(move |_| i)).collect();
         let r2_ = OtherRt(&*r2);
         leaves.push(r1.create_query(move |_| {
@@ -1264,7 +1282,11 @@ fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
             r1.create_query_with(
                 move |rt| {
                     runs.fetch_add(1, Ordering::Relaxed);
-                    let base = if foreign { r2.get(x) } else { 1000 };
+                    let base = match first {
+                        FirstRead::Own => 1000,
+                        FirstRead::ForeignClean => r2.get(x),
+                        FirstRead::ForeignComputed => r2.get(q),
+                    };
                     base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
                 },
                 QueryOpts {
@@ -1273,13 +1295,13 @@ fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
                 },
             )
         };
-        assert_eq!(
-            r1.get(wide),
-            1000 + (0..64).sum::<u64>(),
-            "foreign {foreign}"
-        );
-        assert_eq!(runs.load(Ordering::Relaxed), 2, "foreign {foreign}");
-        assert!(!r1.dooms.lock().unwrap().is_empty(), "foreign {foreign}");
+        let base = match first {
+            FirstRead::ForeignClean => 2000,
+            FirstRead::Own | FirstRead::ForeignComputed => 1000,
+        };
+        assert_eq!(r1.get(wide), base + (0..64).sum::<u64>(), "{first:?}");
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "{first:?}");
+        assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
     }
 }
 

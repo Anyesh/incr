@@ -119,6 +119,16 @@ impl Frames {
     /// kept read can carry: that frame can no longer be doomed, because its
     /// retry would read the other runtime again. A frame doomed already
     /// keeps its doom.
+    /// A Clean read another runtime serves to the top frame, which keeps no
+    /// read: the frame's retry reads the node again. A call, not an empty
+    /// arm, because with an empty arm the Clean read inlined into `get`
+    /// spills two more registers, 2 to 10 instructions per read.
+    #[cold]
+    #[inline(never)]
+    fn foreign_clean_read(&mut self) {
+        std::hint::black_box(&mut *self);
+    }
+
     #[cold]
     #[inline(never)]
     fn keep_top_undoomed(&mut self) {
@@ -221,10 +231,19 @@ pub trait DepStack: 'static {
     /// Record `dep`, read at `generation`, as a dependency of runtime
     /// `rt`'s active frame, if it has one. The generation lets publish
     /// detect a dep that was deleted, and possibly recycled, after the
-    /// read. True if the top frame is another runtime's, which records
-    /// nothing.
+    /// read. A top frame of another runtime's records nothing.
     #[inline(always)]
-    fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> bool {
+    fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) {
+        self.with(|s| match s.frames.last_mut() {
+            Some(top) if top.rt == rt => top.deps.push((dep, generation)),
+            Some(_) => s.foreign_clean_read(),
+            None => {}
+        })
+    }
+
+    /// [`Self::record_dep`], true if the top frame is another runtime's.
+    #[inline(always)]
+    fn record_dep_or_foreign(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> bool {
         self.with(|s| match s.frames.last_mut() {
             Some(top) if top.rt == rt => {
                 top.deps.push((dep, generation));

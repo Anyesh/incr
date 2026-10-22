@@ -1071,26 +1071,9 @@ impl<C: Cells> Runtime<C> {
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
         let kept = flags.has(cycle::KEPT_READ);
         let ordinal = replay::foreign_ordinal(reader, cidx, ctl, reading, rt, kept);
-        let taken = (word & value_code::REPLAY_BIT != 0 && !replay::speculative())
-            .then(|| replay::frame_keys(reader))
-            .flatten()
-            .and_then(|keys| {
-                let member = flags.has(cycle::BUFFERED);
-                // SAFETY: the keys come from an open context of `reader`.
-                let (generation, path, episode) =
-                    unsafe { (keys.parts)(keys.owner, node.0, cidx, member) };
-                let key = ReadKey {
-                    node: node.0,
-                    generation,
-                    cidx,
-                    reading,
-                    ordinal,
-                    path,
-                    episode,
-                    foreign: Some(rt),
-                };
-                replay::take_pending(reader, &key, clone_landed::<T>)
-            });
+        let taken = self
+            .foreign_key(word, (reader, node, flags, cidx), reading, ordinal)
+            .and_then(|key| replay::take_pending(reader, &key, clone_landed::<T>));
         let outcome = match taken {
             Some(Delivered::Landed(value)) => Ok(Ok(*value
                 .downcast::<T>()
@@ -1155,6 +1138,36 @@ impl<C: Cells> Runtime<C> {
             Ok(read) => read,
             Err(payload) => resume_unwind(payload),
         }
+    }
+
+    /// The key of the read of this runtime's node `reading` that `frame`,
+    /// another runtime's, makes for the `ordinal`th time, when the read is
+    /// a retry's in an open context of that runtime.
+    fn foreign_key(
+        &self,
+        word: u64,
+        frame: (RuntimeId, NodeId, &cycle::ComputeCtl, u32),
+        reading: u64,
+        ordinal: u32,
+    ) -> Option<ReadKey> {
+        let (reader, node, flags, cidx) = frame;
+        if word & value_code::REPLAY_BIT == 0 || replay::speculative() {
+            return None;
+        }
+        let keys = replay::frame_keys(reader)?;
+        let member = flags.has(cycle::BUFFERED);
+        // SAFETY: the keys come from an open context of `reader`.
+        let (generation, path, episode) = unsafe { (keys.parts)(keys.owner, node.0, cidx, member) };
+        Some(ReadKey {
+            node: node.0,
+            generation,
+            cidx,
+            reading,
+            ordinal,
+            path,
+            episode,
+            foreign: Some(self.runtime_id),
+        })
     }
 
     /// A read of `handle` that records nothing in the frame on top of the

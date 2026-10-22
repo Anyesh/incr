@@ -1881,12 +1881,8 @@ impl<C: Cells> Runtime<C> {
         let observed = state::load::<C>(node.state_cell());
         if observed == NodeState::Clean {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            if self
-                .dep_stack
-                .record_dep(self.runtime_id, NodeId(slot), handle.generation())
-            {
-                return self.get_slow(handle, observed);
-            }
+            self.dep_stack
+                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => value,
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
@@ -1922,12 +1918,8 @@ impl<C: Cells> Runtime<C> {
         let observed = state::load::<C>(node.state_cell());
         if observed == NodeState::Clean {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            if self
-                .dep_stack
-                .record_dep(self.runtime_id, NodeId(slot), handle.generation())
-            {
-                return self.try_get_slow(handle, observed);
-            }
+            self.dep_stack
+                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => Ok(value),
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
