@@ -146,3 +146,60 @@ fn shared_concurrent_get_traced_is_refused_and_keeps_owner_trace() {
     let (value, _) = rt.get_traced(x);
     assert_eq!(value, 7);
 }
+
+#[test]
+fn shared_get_traced_started_during_the_owners_hand_off_keeps_the_owner_trace() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let a = rt.create_input(1_i64);
+    let x = rt.create_input(7_i64);
+    let q = rt.create_query(move |r| r.get(a) + 1);
+    let y = rt.create_query(move |r| r.get(x) * 2);
+    rt.get(q);
+    rt.get(y);
+    rt.set(a, 2);
+    rt.set(x, 8);
+    let intruder = Arc::new(Mutex::new(None::<Result<usize, String>>));
+    let first = Arc::new(AtomicBool::new(true));
+    {
+        let weak = Arc::downgrade(&rt);
+        let (intruder, first) = (Arc::clone(&intruder), Arc::clone(&first));
+        let installed = rt.park_hook.set(Box::new(move |point| {
+            if !matches!(point, super::ParkPoint::TraceHandOff)
+                || !first.swap(false, Ordering::SeqCst)
+            {
+                return;
+            }
+            let rt = weak.upgrade().expect("the runtime outlives its get_traced");
+            let result = thread::spawn(move || {
+                catch_unwind(AssertUnwindSafe(|| recomputed(&rt.get_traced(y).1)))
+                    .map_err(panic_message)
+            })
+            .join()
+            .expect("the intruder thread joins");
+            *intruder.lock().unwrap() = Some(result);
+        }));
+        assert!(installed.is_ok());
+    }
+    let (v, trace) = rt.get_traced(q);
+    assert_eq!(v, 3);
+    assert!(
+        trace
+            .node_traces
+            .iter()
+            .any(|t| t.id.0 == q.slot() && matches!(t.action, TraceAction::Recomputed { .. })),
+        "the owner lost q's event: {:?}",
+        trace.node_traces
+    );
+    assert!(
+        trace.node_traces.iter().all(|t| t.id.0 != y.slot()),
+        "the owner's trace holds the intruder's event: {:?}",
+        trace.node_traces
+    );
+    let intruded = intruder
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the hand-off park ran");
+    assert_eq!(intruded, Err(NESTED.to_string()));
+    assert_eq!(recomputed(&rt.get_traced(y).1), 1);
+}

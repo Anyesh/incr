@@ -220,6 +220,9 @@ pub struct ObserverId(u64);
 /// inline function, so these compile away.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ParkPoint {
+    /// In `get_traced`, between the traced read and the end of the trace
+    /// log's hand-off to the caller.
+    TraceHandOff,
     /// In `ensure_clean`, just before `compute_one` on a visited node, or
     /// before the walk waits on a node another thread is computing.
     BeforeComputeOne(NodeId),
@@ -2465,11 +2468,13 @@ impl<C: Cells> Runtime<C> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let (value, elapsed_ns) = (self.get(handle), 0);
 
-        drop(disarm);
+        self.park(ParkPoint::TraceHandOff);
+        // Taken before disarming: the next tracer's CAS clears the log.
         let node_traces: Vec<crate::trace::NodeTrace> = {
             let mut inner = self.inner.write();
             std::mem::take(&mut inner.trace_log)
         };
+        drop(disarm);
 
         let nodes_recomputed = node_traces
             .iter()
