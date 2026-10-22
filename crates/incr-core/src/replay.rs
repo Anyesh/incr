@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::handle::RuntimeId;
+use crate::state::NodeState;
 use crate::taint_memo;
 use crate::value_code;
 
@@ -112,6 +113,15 @@ pub(crate) struct ReadKey {
 }
 
 impl ReadKey {
+    /// It is for the read `last`, as `(reading, ordinal)`, of the frame of
+    /// `node` at `cidx`, on any path.
+    fn read_by(&self, node: u32, generation: u32, cidx: u32, last: (u64, u32)) -> bool {
+        self.node == node
+            && self.generation == generation
+            && self.cidx == cidx
+            && (self.reading, self.ordinal) == last
+    }
+
     /// The read virtual frame `v` was blocked in.
     pub(crate) fn blocked(v: &VFrame) -> Self {
         Self {
@@ -158,6 +168,11 @@ pub(crate) struct Delivery {
     pub(crate) escaped: bool,
     /// The copy of the payload the latest take of it raised.
     pub(crate) resumed: Option<PayloadKey>,
+    /// The landing, Dirty or Failed, that the payload's first take out of
+    /// the frame's compute gave the frame's node. A later take, in a retry
+    /// doomed again, lands it so again: the deps it finds may have landed
+    /// since in ways the unbounded run's frame never saw.
+    pub(crate) landed: Option<NodeState>,
 }
 
 impl Delivery {
@@ -386,6 +401,7 @@ impl Context {
             below: Vec::new(),
             escaped: false,
             resumed: None,
+            landed: None,
         });
     }
 
@@ -452,12 +468,34 @@ impl Context {
         })
     }
 
-    /// The frame of `node` at `cidx` landed Failed with `payload`, and
-    /// `last`, as `(reading, ordinal)`, was its compute's last read: marks
-    /// [`Delivery::escaped`] the deliveries, on any path, for that read when
-    /// `payload` is the copy a take of one of them raised. A read after the
+    /// The delivery for the frame of `node` at `cidx`, along `path` if
+    /// given, whose latest take raised `payload`, when `last`, as
+    /// `(reading, ordinal)`, was the compute's last read. A read after the
     /// take means the compute caught that copy, so a payload at its freed
     /// address with the same text is another panic.
+    fn raised(
+        &self,
+        node: u32,
+        generation: u32,
+        cidx: u32,
+        last: (u64, u32),
+        payload: &(dyn Any + Send),
+        path: Option<u64>,
+    ) -> Option<usize> {
+        let unwind = Some(payload_key(payload));
+        self.pending.iter().position(|d| {
+            d.taken
+                && d.key.read_by(node, generation, cidx, last)
+                && path.is_none_or(|p| p == d.key.path)
+                && d.resumed == unwind
+                && matches!(d.what, Delivered::Unwind { cycle: false, .. })
+        })
+    }
+
+    /// The frame of `node` at `cidx` landed Failed with `payload`, and
+    /// `last` was its compute's last read: marks [`Delivery::escaped`] the
+    /// deliveries, on any path, for that read when a take of one of them
+    /// raised `payload` ([`Self::raised`]).
     pub(crate) fn mark_escaped(
         &mut self,
         node: u32,
@@ -466,24 +504,43 @@ impl Context {
         last: (u64, u32),
         payload: &(dyn Any + Send),
     ) {
-        let read = |k: &ReadKey| {
-            k.node == node
-                && k.generation == generation
-                && k.cidx == cidx
-                && (k.reading, k.ordinal) == last
-        };
-        let unwind = Some(payload_key(payload));
-        let escaped = self.pending.iter().any(|d| {
-            d.taken
-                && read(&d.key)
-                && d.resumed == unwind
-                && matches!(d.what, Delivered::Unwind { cycle: false, .. })
-        });
-        if escaped {
-            for d in self.pending.iter_mut().filter(|d| read(&d.key)) {
+        if self
+            .raised(node, generation, cidx, last, payload, None)
+            .is_some()
+        {
+            for d in self
+                .pending
+                .iter_mut()
+                .filter(|d| d.key.read_by(node, generation, cidx, last))
+            {
                 d.escaped = true;
             }
         }
+    }
+
+    /// The landing, Dirty or Failed, for the frame of `node` at `cidx`
+    /// along `path` whose compute unwound with `payload` after its last
+    /// read `last`, where the landing checks chose `landing`, if a take of
+    /// the delivery for that read on that path raised `payload`: its first
+    /// take records `landing` in [`Delivery::landed`], and a later one
+    /// lands Dirty when the first did. A Dirty `landing` stays: it says a
+    /// change was in flight, which a Failed landing would hide. The path
+    /// tells this frame's delivery from another run's at the position,
+    /// whose taken copy's freed box can hold a fresh copy of this one.
+    pub(crate) fn retaken_landing(
+        &mut self,
+        (node, generation, cidx, path): (u32, u32, u32, u64),
+        last: (u64, u32),
+        payload: &(dyn Any + Send),
+        landing: NodeState,
+    ) -> Option<NodeState> {
+        let i = self.raised(node, generation, cidx, last, payload, Some(path))?;
+        let first = self.pending[i].landed.get_or_insert(landing);
+        Some(if *first == NodeState::Dirty {
+            NodeState::Dirty
+        } else {
+            landing
+        })
     }
 
     /// Takes the payload of delivery `i` for a read at `at`, as
@@ -566,6 +623,7 @@ impl Context {
             below: Vec::new(),
             escaped: false,
             resumed: None,
+            landed: None,
         });
     }
 
@@ -590,6 +648,7 @@ impl Context {
                 below: Vec::new(),
                 escaped: false,
                 resumed: None,
+                landed: None,
             });
         }
     }
