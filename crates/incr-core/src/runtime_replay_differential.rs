@@ -2013,6 +2013,22 @@ fn regressions() {
         });
     }
 }
+
+/// 0x1dd5_ac14_6f19_4569 at budget 2: a doomed member run's speculative
+/// R5 run of another member buffered a value read off the doom (a cycle's
+/// `Err`), and the episode's retry read that buffer where the unbounded
+/// run runs the member: `Get(6)` returned 7782 for 8.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_member_run_leaves_no_buffer() {
+    let seed = 0x1dd5_ac14_6f19_4569;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// Cases with deletes whose readers a speculative entry landed Clean, so
 /// the bounded run's delete is refused where the unbounded one's is not.
 #[test]

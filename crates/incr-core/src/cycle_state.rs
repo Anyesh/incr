@@ -120,6 +120,9 @@ pub(crate) struct Held {
     /// The member is in the episode's set of unseeded members that read
     /// each other.
     pub(crate) in_cu: bool,
+    /// While the buffer and run record come from a run made under
+    /// speculation: the record from before that run's write.
+    pre_spec: Option<Box<RunRecord>>,
 }
 
 impl Held {
@@ -157,6 +160,7 @@ impl Held {
             episode: None,
             ep: 0,
             in_cu: false,
+            pre_spec: None,
         }
     }
 
@@ -172,6 +176,54 @@ impl Held {
         }
         self.last = deps;
     }
+
+    /// Before a run's buffer and record are written under speculation:
+    /// keeps the record they replace, unless an earlier speculative run's
+    /// write already did.
+    pub(crate) fn before_spec_write(&mut self) {
+        if self.pre_spec.is_none() {
+            self.pre_spec = Some(Box::new(RunRecord {
+                deps: self.deps.clone(),
+                last: self.last.clone(),
+                installed: self.installed.clone(),
+                opened: self.opened,
+                poisoned: self.poisoned,
+            }));
+        }
+    }
+
+    /// Whether the buffer and record are a speculative run's.
+    pub(crate) fn spec_written(&self) -> bool {
+        self.pre_spec.is_some()
+    }
+
+    /// Keeps a speculative run's buffer and record as the claim's own, for
+    /// a landing that speculation may make.
+    pub(crate) fn adopt(&mut self) {
+        self.pre_spec = None;
+    }
+
+    /// For a look at the claim that is not speculative: puts back the
+    /// record a speculative run replaced and returns the value it
+    /// buffered, as the unbounded run may never make that run.
+    pub(crate) fn settle(&mut self) -> Option<Erased> {
+        let r = self.pre_spec.take()?;
+        self.deps = r.deps;
+        self.last = r.last;
+        self.installed = r.installed;
+        self.opened = r.opened;
+        self.poisoned = r.poisoned;
+        self.buf.take()
+    }
+}
+
+/// A claim's run record, kept by [`Held::before_spec_write`].
+struct RunRecord {
+    deps: Vec<(NodeId, u32)>,
+    last: Vec<(NodeId, u32)>,
+    installed: Vec<NodeId>,
+    opened: bool,
+    poisoned: bool,
 }
 
 /// An episode between member runs. A doom that discards a member run

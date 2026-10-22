@@ -522,16 +522,14 @@ impl<C: Cells> Runtime<C> {
                 .find(|f| f.node.0 == slot && f.rt == rt)
                 .map(|f| f.cidx)
         });
-        let held = cycle_state::with_held(|h| {
-            h.get(&(rt, slot)).map(|e| {
-                (
-                    e.anchor(),
-                    e.in_cu,
-                    e.buf.is_some(),
-                    e.episode.clone(),
-                    e.ep,
-                )
-            })
+        let held = self.look_held(slot, replay::speculative(), |e| {
+            (
+                e.anchor(),
+                e.in_cu,
+                e.buf.is_some(),
+                e.episode.clone(),
+                e.ep,
+            )
         });
         // A held node with a virtual frame stands for a frame on the stack.
         let on_stack = match on_stack {
@@ -780,10 +778,17 @@ impl<C: Cells> Runtime<C> {
                 return result.map(|_| None);
             }
         }
-        let replaced = cycle_state::with_held(|h| {
+        let speculative = replay::speculative();
+        let (replaced, spec_buf) = cycle_state::with_held(|h| {
             let e = h
                 .get_mut(&(self.runtime_id, slot))
                 .expect("incr-core: a member run's node is held");
+            let spec_buf = if speculative {
+                e.before_spec_write();
+                None
+            } else {
+                e.settle()
+            };
             e.record_run(deps);
             e.opened = !ctl.children.get().is_null();
             e.poisoned |= ctl.has(cycle::POISONED);
@@ -794,9 +799,10 @@ impl<C: Cells> Runtime<C> {
             {
                 cycle_state::mark_failed(e);
             }
-            std::mem::replace(&mut e.buf, ctl.buf.take())
+            (std::mem::replace(&mut e.buf, ctl.buf.take()), spec_buf)
         });
         drop(replaced);
+        drop(spec_buf);
         result.map(|_| Some(ctl.lowlink.get()))
     }
 
@@ -853,6 +859,9 @@ impl<C: Cells> Runtime<C> {
         let lowlink = ctl.lowlink.get().min(cidx);
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
+        if replay::speculative() {
+            held.before_spec_write();
+        }
         held.buf = ctl.buf.take();
         held.poisoned = ctl.has(cycle::POISONED);
         held.wrote = ctl.wrote.get() != 0;
@@ -963,6 +972,40 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Whether episode member `slot` has no buffer, a speculative run's
+    /// settled first.
+    fn unbuffered(&self, slot: u32, cidx: u32, bag: &mut Deferred<C>) -> bool {
+        let settling = !replay::speculative();
+        let (spec_buf, none) = self.take_held(slot, |e| {
+            (if settling { e.settle() } else { None }, e.buf.is_none())
+        });
+        self.drop_member_value(slot, cidx, spec_buf, bag);
+        none
+    }
+
+    /// `f` on held node `slot`, if held, as a look under speculation when
+    /// `speculative`; a look outside speculation settles the claim first.
+    pub(super) fn look_held<R>(
+        &self,
+        slot: u32,
+        speculative: bool,
+        f: impl FnOnce(&Held) -> R,
+    ) -> Option<R> {
+        let (seen, spec_buf) = cycle_state::with_held(|h| {
+            h.get_mut(&(self.runtime_id, slot))
+                .map_or((None, None), |e| {
+                    let spec_buf = if speculative { None } else { e.settle() };
+                    (Some(f(e)), spec_buf)
+                })
+        });
+        if let Some(spec_buf) = spec_buf {
+            let mut bag = Deferred::new();
+            bag.push_erased(spec_buf);
+            bag.drain(self);
+        }
+        seen
+    }
+
     fn take_held<R>(&self, slot: u32, f: impl FnOnce(&mut Held) -> R) -> R {
         cycle_state::with_held(|h| {
             f(h.get_mut(&(self.runtime_id, slot))
@@ -1063,18 +1106,29 @@ impl<C: Cells> Runtime<C> {
                     .copied()
                     .filter(|m| strategies.binary_search_by_key(m, |(s, _)| *s).is_err())
                     .collect();
-                cycle_state::with_held(|h| {
+                // A restart clears what the members installed, which a later
+                // settle would put back.
+                let settling = !replay::speculative();
+                let settled: Vec<(u32, Erased)> = cycle_state::with_held(|h| {
                     h.root_at(rt, &ep.members, cidx);
-                    for m in &ep.members {
-                        let e = h
-                            .get_mut(&(rt, *m))
-                            .expect("incr-core: an episode member is held");
-                        e.episode = Some(cycle.clone());
-                        e.ep = id;
-                        e.in_cu = ep.cu.binary_search(m).is_ok();
-                        e.installed.clear();
-                    }
+                    ep.members
+                        .iter()
+                        .filter_map(|m| {
+                            let e = h
+                                .get_mut(&(rt, *m))
+                                .expect("incr-core: an episode member is held");
+                            let spec_buf = if settling { e.settle() } else { None };
+                            e.episode = Some(cycle.clone());
+                            e.ep = id;
+                            e.in_cu = ep.cu.binary_search(m).is_ok();
+                            e.installed.clear();
+                            spec_buf.map(|v| (*m, v))
+                        })
+                        .collect()
                 });
+                for (m, v) in settled {
+                    self.drop_member_value(m, cidx, Some(v), bag);
+                }
                 // Every claim precedes this capture, because membership growth
                 // restarts the episode.
                 let stamp_rev = self.current_revision();
@@ -1135,7 +1189,7 @@ impl<C: Cells> Runtime<C> {
                             r.step = Step::Check;
                             continue;
                         };
-                        if self.take_held(m, |e| e.buf.is_none())
+                        if self.unbuffered(m, cidx, bag)
                             && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
                         {
                             return self.suspend_episode(ep);
@@ -1297,7 +1351,7 @@ impl<C: Cells> Runtime<C> {
                             break;
                         };
                         *next += 1;
-                        if self.take_held(m, |e| e.buf.is_none())
+                        if self.unbuffered(m, cidx, bag)
                             && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
                         {
                             *next -= 1;
@@ -1566,7 +1620,13 @@ impl<C: Cells> Runtime<C> {
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
         let stamp_rev = self.current_revision();
         let verify_rev = C::walked(&self.walk, &self.revision);
-        for (slot, e) in entries {
+        let settling = !replay::speculative();
+        for (slot, mut e) in entries {
+            if settling {
+                if let Some(spec_buf) = e.settle() {
+                    bag.push_erased(spec_buf);
+                }
+            }
             let id = NodeId(slot);
             if e.failed && !discarding {
                 let (node, flags) = self.nodes.get_with_flags(slot);
@@ -1687,6 +1747,10 @@ impl<C: Cells> Runtime<C> {
         let (node, flags) = self.nodes.get_with_flags(slot);
         let mut e = cycle_state::with_held(|h| h.remove(&(rt, slot)))
             .expect("incr-core: a landing claim is held");
+        debug_assert!(
+            !e.spec_written() || replay::speculative(),
+            "incr-core: a held node lands a speculative run's buffer"
+        );
         let value = e.buf.take().expect("incr-core: a finished run has a value");
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
@@ -1772,6 +1836,10 @@ impl<C: Cells> Runtime<C> {
                 })
                 .collect()
         });
+        debug_assert!(
+            replay::speculative() || entries.iter().all(|(_, e)| !e.spec_written()),
+            "incr-core: an episode lands a speculative run's record"
+        );
 
         // Step 2: validate, install and record the group under one hold.
         let mut inner = self.inner.write();
