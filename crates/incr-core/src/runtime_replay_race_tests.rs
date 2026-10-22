@@ -1528,6 +1528,48 @@ fn shared_vframe_chain_landed_failed() {
     assert!(failed(&first), "{first:?}");
 }
 
+/// R reads F, then N; F and N both read V, which reads Y. At budget 3
+/// V's read of Y dooms R, F and V, and R's read of N after F's
+/// placeholder pushes N as a speculative entry. The driver parks before
+/// it while the other thread lands V Failed over Y. N's run reads V at
+/// V's frame position: the payload waiting there is owed to the real
+/// retry's read of V through F, not to N.
+#[test]
+fn speculative_entry_leaves_a_landed_payload_for_the_real_retry() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let gate = Gate::new();
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let v = panicking_reader(&rt, y, Panics::Out, "");
+    let f = panicking_reader(&rt, v, Panics::Out, "");
+    let n = panicking_reader(&rt, v, Panics::Out, "");
+    let r = rt.create_query_with(move |rt: &Rt| rt.get(f) + rt.get(n), replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(n)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(r)))
+    };
+    gate.wait_parked();
+    let other = outcome(|| rt.get(v));
+    assert_eq!(rt.state_of(v), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    rt.assert_invariant_i();
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()), "the payload was taken");
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
 /// X is still computing on the other thread when the retry of X claims
 /// it, so the retry waits and then reads X Failed.
 #[test]
