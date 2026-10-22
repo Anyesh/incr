@@ -9,7 +9,7 @@ use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::drop_panic_tests::prime_reclaim_timer;
 use super::Runtime;
@@ -338,7 +338,7 @@ fn clone_that_reads_a_clean_node<C: Cells>(rt: Rc<Runtime<C>>) {
 /// it is cloning; each attempt panics and leaves the node as it was.
 fn clone_that_deletes_or_sets_the_node_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
     type Change<C> = (&'static str, fn(&Runtime<C>, crate::Incr<Hooked>));
-    let changes: [Change<C>; 4] = [
+    let changes: [Change<C>; 6] = [
         ("delete_node", |rt, a| rt.delete_node(a)),
         ("try_delete_node", |rt, a| {
             let _ = rt.try_delete_node(a);
@@ -346,7 +346,15 @@ fn clone_that_deletes_or_sets_the_node_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
         ("delete_with_dependents", |rt, a| {
             rt.delete_with_dependents(a);
         }),
+        // Reached in the engine only through `delete_with_dependents`,
+        // whose own check comes first.
+        ("delete_erased", |rt, a| {
+            rt.delete_erased(a.erase());
+        }),
         ("set", |rt, a| rt.set(a, Hooked(2))),
+        ("set_returning_displaced", |rt, a| {
+            crate::persist_hooks::set_returning_displaced(rt, a, Hooked(2));
+        }),
     ];
     let a = rt.create_input(Hooked(1));
     for (name, change) in changes {
@@ -367,18 +375,236 @@ fn clone_that_deletes_or_sets_the_node_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
     }
 }
 
+/// The created input's type has no arena yet, so a create that got past
+/// its check would register one before the arena's own reserve refuses.
 fn clone_that_creates_a_node<C: Cells>(rt: Rc<Runtime<C>>) {
     let a = rt.create_input(Hooked(1));
     let hooked = Rc::clone(&rt);
     arm(Op::Clone, move || {
         hooked.create_input(0u32);
     });
-    let before = rt.node_count();
+    let (nodes, arenas) = (rt.node_count(), rt.arenas.arena_count());
     assert_contract_panic("create from Clone", || {
         rt.get(a);
     });
-    assert_eq!(rt.node_count(), before);
+    assert_eq!(rt.node_count(), nodes);
+    assert_eq!(rt.arenas.arena_count(), arenas, "an arena was registered");
+    assert_eq!(rt.state_of(a), NodeState::Clean);
     assert_eq!(rt.get(a).0, 1);
+}
+
+/// A query that owns a child input, created on its first run.
+fn owner_with_child<C: Cells>(rt: &Runtime<C>) -> (crate::Incr<Hooked>, crate::Incr<u32>) {
+    let made = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&made);
+    let owner = rt.create_query(move |rt: &Runtime<C>| {
+        *record.lock().unwrap() = Some(rt.child_input(0u8, || 7u32));
+        Hooked(1)
+    });
+    assert_eq!(rt.get(owner).0, 1);
+    let child = made.lock().unwrap().expect("the owner made no child");
+    (owner, child)
+}
+
+/// A delete of an owner from the `Clone` of its own Clean read is
+/// refused before its owned set is claimed: the owner and its child stay.
+fn clone_that_deletes_the_owner_it_reads<C: Cells>(rt: Rc<Runtime<C>>) {
+    type Change<C> = (&'static str, fn(&Runtime<C>, crate::Incr<Hooked>));
+    let changes: [Change<C>; 3] = [
+        ("delete_node", |rt, q| rt.delete_node(q)),
+        ("try_delete_node", |rt, q| {
+            let _ = rt.try_delete_node(q);
+        }),
+        ("delete_with_dependents", |rt, q| {
+            rt.delete_with_dependents(q);
+        }),
+    ];
+    let (owner, child) = owner_with_child(&rt);
+    for (name, change) in changes {
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || change(&hooked, owner));
+        assert_contract_panic(name, || {
+            rt.get(owner);
+        });
+        assert!(rt.is_alive(owner), "{name}");
+        assert_eq!(rt.state_of(owner), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(owner).0, 1, "{name}");
+        assert!(rt.is_alive(child), "{name}");
+        assert_eq!(rt.get(child), 7, "{name}");
+    }
+}
+
+/// `child_input` and `child_query` from the `Clone` of a read inside
+/// their creator's compute are refused, even for a key the creator
+/// already bound, which needs no new node.
+fn clone_in_a_compute_that_asks_for_a_child<C: Cells>(rt: Rc<Runtime<C>>) {
+    type Ask<C> = (&'static str, fn(&Runtime<C>));
+    let asks: [Ask<C>; 2] = [
+        ("child_input", |rt| {
+            rt.child_input(0u8, || 9u32);
+        }),
+        ("child_query", |rt| {
+            rt.child_query(1u8, |_| 9u32);
+        }),
+    ];
+    let a = rt.create_input(Hooked(1));
+    let s = rt.create_input(0u32);
+    let made = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&made);
+    let q = rt.create_query(move |rt: &Runtime<C>| {
+        let input = rt.child_input(0u8, || 7u32);
+        let query = rt.child_query(1u8, |_| 8u32);
+        *record.lock().unwrap() = Some((input, query));
+        rt.get(s) + rt.get(a).0
+    });
+    assert_eq!(rt.get(q), 1);
+    let (input, query) = made.lock().unwrap().expect("the creator made no children");
+    for (i, (name, ask)) in asks.into_iter().enumerate() {
+        rt.set(s, i as u32 + 1);
+        let nodes = rt.node_count();
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || ask(&hooked));
+        assert_contract_panic(name, || {
+            rt.get(q);
+        });
+        assert_eq!(rt.node_count(), nodes, "{name}");
+        assert_eq!(rt.state_of(a), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(a).0, 1, "{name}");
+        assert!(rt.is_alive(input) && rt.is_alive(query), "{name}");
+        assert_eq!(rt.get(input), 7, "{name}");
+        assert_eq!(rt.get(query), 8, "{name}");
+    }
+    rt.set(s, 10);
+    assert_eq!(rt.get(q), 11);
+}
+
+/// `watch`, `unwatch` and `drain_dirtied_watched` from the `Clone` of a
+/// Clean read leave the watch queue and the watched set as they were.
+fn clone_that_changes_what_is_watched<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let s = rt.create_input(0u32);
+    let watched = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 1);
+    let unwatched = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 2);
+    assert_eq!(rt.get(watched) + rt.get(unwatched), 3);
+    rt.watch(watched);
+    rt.set(s, 1);
+    type Change<C> = (
+        &'static str,
+        fn(&Runtime<C>, crate::Incr<u32>, crate::Incr<u32>),
+    );
+    let changes: [Change<C>; 3] = [
+        ("watch", |rt, _, unwatched| rt.watch(unwatched)),
+        ("unwatch", |rt, watched, _| rt.unwatch(watched)),
+        ("drain_dirtied_watched", |rt, _, _| {
+            rt.drain_dirtied_watched();
+        }),
+    ];
+    for (name, change) in changes {
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || change(&hooked, watched, unwatched));
+        assert_contract_panic(name, || {
+            rt.get(a);
+        });
+        assert_eq!(rt.state_of(a), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(a).0, 1, "{name}");
+        assert_eq!(rt.queued_slots(), vec![watched.slot()], "{name}");
+    }
+    assert_eq!(rt.drain_dirtied_watched(), vec![watched.erase()]);
+    assert_eq!(rt.get(unwatched), 3);
+    rt.set(s, 2);
+    assert_eq!(
+        rt.drain_dirtied_watched(),
+        Vec::<crate::ErasedIncr>::new(),
+        "a stopped walk reported again"
+    );
+    rt.get(watched);
+    rt.set(s, 3);
+    assert_eq!(rt.drain_dirtied_watched(), vec![watched.erase()]);
+}
+
+/// `observe`, `unobserve` and `stabilize` from the `Clone` of a Clean
+/// read register nothing, remove nothing and fire nothing.
+fn clone_that_observes_or_stabilizes<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let s = rt.create_input(0u32);
+    let q = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 1);
+    let fired = Arc::new(AtomicU32::new(0));
+    let count = Arc::clone(&fired);
+    let observer = rt.observe(q, move |_| {
+        count.fetch_add(1, Ordering::Relaxed);
+    });
+    rt.stabilize();
+    assert_eq!(fired.load(Ordering::Relaxed), 1);
+    // Queued by the set and Clean again, so a stabilize fires without
+    // computing anything.
+    rt.set(s, 1);
+    assert_eq!(rt.get(q), 2);
+    let added = Arc::new(AtomicU32::new(0));
+    type Change<C> = (&'static str, Box<dyn Fn(&Runtime<C>)>);
+    let changes: [Change<C>; 3] = [
+        ("observe", {
+            let added = Arc::clone(&added);
+            Box::new(move |rt: &Runtime<C>| {
+                let added = Arc::clone(&added);
+                rt.observe(q, move |_| {
+                    added.fetch_add(1, Ordering::Relaxed);
+                });
+            })
+        }),
+        (
+            "unobserve",
+            Box::new(move |rt: &Runtime<C>| rt.unobserve(observer)),
+        ),
+        ("stabilize", Box::new(|rt: &Runtime<C>| rt.stabilize())),
+    ];
+    for (name, change) in changes {
+        let hooked = Rc::clone(&rt);
+        arm(Op::Clone, move || change(&hooked));
+        assert_contract_panic(name, || {
+            rt.get(a);
+        });
+        assert_eq!(rt.state_of(a), NodeState::Clean, "{name}");
+        assert_eq!(rt.get(a).0, 1, "{name}");
+        assert_eq!(fired.load(Ordering::Relaxed), 1, "{name}");
+    }
+    rt.stabilize();
+    assert_eq!(fired.load(Ordering::Relaxed), 2, "the observer was removed");
+    assert_eq!(added.load(Ordering::Relaxed), 0, "an observer was added");
+}
+
+/// A `get` of a Dirty creator from value code does not start its
+/// compute, whose landing would sweep the child this run stops asking
+/// for: the creator stays Dirty and unrun, and the child stays.
+fn clone_that_reads_a_dirty_creator<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let keep = rt.create_input(true);
+    let runs = Arc::new(AtomicU32::new(0));
+    let made = Arc::new(Mutex::new(None));
+    let (counted, record) = (Arc::clone(&runs), Arc::clone(&made));
+    let creator = rt.create_query(move |rt: &Runtime<C>| {
+        counted.fetch_add(1, Ordering::Relaxed);
+        if rt.get(keep) {
+            *record.lock().unwrap() = Some(rt.child_input(0u8, || 7u32));
+        }
+        0u32
+    });
+    rt.get(creator);
+    let child = made.lock().unwrap().expect("the creator made no child");
+    rt.set(keep, false);
+    let hooked = Rc::clone(&rt);
+    arm(Op::Clone, move || {
+        hooked.get(creator);
+    });
+    assert_contract_panic("get of a Dirty creator", || {
+        rt.get(a);
+    });
+    assert_eq!(runs.load(Ordering::Relaxed), 1, "the creator ran");
+    assert_eq!(rt.state_of(creator), NodeState::Dirty);
+    assert!(rt.is_alive(child));
+    assert_eq!(rt.get(child), 7);
+    assert_eq!(rt.get(a).0, 1);
+    rt.get(creator);
+    assert!(!rt.is_alive(child), "the creator's landing kept its child");
 }
 
 /// A read from the `PartialEq` of a recompute runs inside the query's
@@ -738,6 +964,11 @@ both!(
     clone_that_reads_a_clean_node,
     clone_that_deletes_or_sets_the_node_it_reads,
     clone_that_creates_a_node,
+    clone_that_deletes_the_owner_it_reads,
+    clone_in_a_compute_that_asks_for_a_child,
+    clone_that_changes_what_is_watched,
+    clone_that_observes_or_stabilizes,
+    clone_that_reads_a_dirty_creator,
     partial_eq_of_a_recompute_that_reads_a_node,
     hash_that_reads_a_node_on_insert,
     eq_that_reads_a_node_on_insert,
