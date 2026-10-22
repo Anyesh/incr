@@ -1831,6 +1831,12 @@ impl<C: Cells> Runtime<C> {
                         }
                     }
                     Err(payload) => {
+                        // The landing finishes the stand-in's run, whose
+                        // speculative guard has dropped.
+                        cycle_state::set_unwind_kind(replay::run_unwind_kind(
+                            cycle_state::unwind_kind(),
+                            v.spec || replay::speculative(),
+                        ));
                         bag.drain(self);
                         self.vframe_unwound(id, v, v.node, true, payload, failures)
                     }

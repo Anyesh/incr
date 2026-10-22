@@ -497,6 +497,30 @@ local_and_shared!(
     shared_panic_in_a_speculative_entrys_continuation
 );
 
+/// The rule `compute_panicked`, `member_run` and a speculative virtual
+/// frame's lone landing share: a speculative run's panic or cycle goes on
+/// as a discard, and every other unwind keeps its kind.
+#[test]
+fn speculative_run_unwind_kind() {
+    use crate::cycle_state::UnwindKind::{Cycle, Discard, Wound};
+    for (kind, speculative, want) in [
+        (None, true, Some(Discard)),
+        (Some(Cycle), true, Some(Discard)),
+        (Some(Wound), true, Some(Wound)),
+        (Some(Discard), true, Some(Discard)),
+        (None, false, None),
+        (Some(Cycle), false, Some(Cycle)),
+        (Some(Wound), false, Some(Wound)),
+        (Some(Discard), false, Some(Discard)),
+    ] {
+        assert_eq!(
+            crate::replay::run_unwind_kind(kind, speculative),
+            want,
+            "{kind:?}, speculative: {speculative}"
+        );
+    }
+}
+
 /// A cycle value whose drop panics "drop boom" when `marked`; a clone is
 /// unmarked, so only the iterate a step marked panics.
 struct Marked {

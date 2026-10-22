@@ -14,7 +14,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 
-use crate::cycle_state::{held_episode, Episode};
+use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::handle::RuntimeId;
 use crate::taint_memo;
 use crate::value_code;
@@ -686,6 +686,19 @@ pub(crate) fn take_episode(id: u64, ep: u64) -> Option<Box<Episode>> {
 /// Whether a speculative entry's run is in progress on this thread.
 pub(crate) fn speculative() -> bool {
     SPECULATIVE.with(Cell::get) != 0
+}
+
+/// The kind an unwind of `kind` out of a run goes on as. A speculative
+/// run may evaluate nodes the unbounded run never does, so a panic in it
+/// lands nothing Failed, and a cycle it raises is no read's result: the
+/// real run raises either again if it does reach the node. Either goes on
+/// as a discard.
+pub(crate) fn run_unwind_kind(kind: Option<UnwindKind>, speculative: bool) -> Option<UnwindKind> {
+    if speculative && matches!(kind, None | Some(UnwindKind::Cycle)) {
+        Some(UnwindKind::Discard)
+    } else {
+        kind
+    }
 }
 
 /// Counts a speculative entry's run while it lives; dropping it, by an

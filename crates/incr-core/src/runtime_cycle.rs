@@ -750,14 +750,11 @@ impl<C: Cells> Runtime<C> {
         }
         if result.is_err() {
             replay::unwind_past_since(self.runtime_id, cidx, first);
-            // A speculative run's panic or cycle is a discard, as in
-            // `compute_panicked`: callers land the run after its
-            // speculative guard has dropped.
-            if matches!(cycle_state::unwind_kind(), None | Some(UnwindKind::Cycle))
-                && replay::speculative()
-            {
-                cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
-            }
+            // Callers land the run after its speculative guard has dropped.
+            cycle_state::set_unwind_kind(replay::run_unwind_kind(
+                cycle_state::unwind_kind(),
+                replay::speculative(),
+            ));
             // A discard unwinds a run the unbounded run never makes: the
             // member keeps what its last run recorded, or its episode's
             // landing installs deps that the discard leaves New.
