@@ -1421,3 +1421,78 @@ mod foreign_chain {
         super::foreign_reading_chain_stays_within_the_stack::<Shared, Shared>();
     }
 }
+
+/// A panic payload no copy can stand for.
+struct Uncopyable;
+
+/// Silences the panics of [`Uncopyable`] payloads, one per level of
+/// `foreign_panicking_chain_stays_within_the_stack`, and leaves every
+/// other panic to the default hook.
+fn quiet_uncopyable() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.payload().is::<Uncopyable>() {
+                default(info);
+            }
+        }));
+    });
+}
+
+/// As [`foreign_reading_chain_stays_within_the_stack`], with every level
+/// catching the panic of its own node of runtime B, whose payload no kept
+/// read can carry. Such a reader stays undoomed only within the budget, so
+/// the chain is bounded as one with a ticket payload is.
+fn foreign_panicking_chain_stays_within_the_stack<A: Cells, B: Cells>() {
+    quiet_uncopyable();
+    let n = crate::test_size::test_size(100_000);
+    let got = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        let mut below: Option<Incr<i64>> = None;
+        for _ in 0..n {
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let (r2, next) = (OtherRt(&*r2), below);
+            below = Some(r1.create_query_with(
+                move |rt| {
+                    let caught = quiet(|| r2.get(bq)).is_err();
+                    i64::from(caught) + next.map_or(0, |b| rt.get(b))
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(got, n as i64);
+}
+
+mod foreign_panic_chain {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_shared() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>();
+    }
+}
