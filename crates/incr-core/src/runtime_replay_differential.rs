@@ -1382,6 +1382,7 @@ fn orders(
     settle_last: bool,
     all: bool,
     per_read: &PerRead,
+    cycles: &CycleReads,
 ) -> (Vec<u64>, Option<(usize, u64, String)>) {
     let mut found = Vec::new();
     let mut swaps = 0;
@@ -1405,6 +1406,9 @@ fn orders(
         let per: PerRead = (order.of.iter().enumerate())
             .filter_map(|(j, i)| Some((j, per_read.get(i)?.clone())))
             .collect();
+        let cyc: CycleReads = (order.of.iter().enumerate())
+            .filter_map(|(j, i)| Some((j, cycles.get(i)?.clone())))
+            .collect();
         let diff = first_diff(
             &order.case,
             want,
@@ -1412,6 +1416,7 @@ fn orders(
             Some(&settles),
             PanicText::Ignored,
             &per,
+            &cyc,
         );
         let j = match diff {
             Some((j, what)) => {
@@ -1446,10 +1451,19 @@ fn assert_serial(
     got: &Trace,
     label: &str,
 ) {
-    assert_serial_with(case, phases, wants, got, label, &PerRead::new());
+    assert_serial_with(
+        case,
+        phases,
+        wants,
+        got,
+        label,
+        &PerRead::new(),
+        &CycleReads::new(),
+    );
 }
 
-/// [`assert_serial`], with the gets `per_read` orders per read.
+/// [`assert_serial`], with the gets `per_read` orders per read and the
+/// cycles `cycles` verified.
 fn assert_serial_with(
     case: &Case,
     phases: &[Phase],
@@ -1457,8 +1471,11 @@ fn assert_serial_with(
     got: &Trace,
     label: &str,
     per_read: &PerRead,
+    cycles: &CycleReads,
 ) {
-    let (found, closest) = orders(case, phases, wants, got, label, true, false, per_read);
+    let (found, closest) = orders(
+        case, phases, wants, got, label, true, false, per_read, cycles,
+    );
     if !found.is_empty() {
         return;
     }
@@ -1481,6 +1498,7 @@ struct Serial<'a> {
     /// Each order's closure runs, by operation, for [`Self::per_read`].
     logs: Mutex<HashMap<u64, Vec<Vec<Eval>>>>,
     per_read: Mutex<PerRead>,
+    cycles: Mutex<CycleReads>,
 }
 
 impl<'a> Serial<'a> {
@@ -1491,6 +1509,7 @@ impl<'a> Serial<'a> {
             wants: Mutex::new(HashMap::new()),
             logs: Mutex::new(HashMap::new()),
             per_read: Mutex::new(PerRead::new()),
+            cycles: Mutex::new(CycleReads::new()),
         }
     }
 
@@ -1510,10 +1529,12 @@ impl<'a> Serial<'a> {
     ) -> Option<Result<(), String>> {
         let (case, phases) = (self.case, self.phases);
         self.per_read(label, prefix, live);
+        self.cycle_reads(prefix, live);
         let per_read = self.per_read.lock().unwrap().clone();
+        let cycles = self.cycles.lock().unwrap().clone();
         let mut wants = self.wants.lock().unwrap();
         if !orders(
-            case, phases, &mut wants, prefix, label, true, false, &per_read,
+            case, phases, &mut wants, prefix, label, true, false, &per_read, &cycles,
         )
         .0
         .is_empty()
@@ -1521,7 +1542,7 @@ impl<'a> Serial<'a> {
             return None;
         }
         let (found, _) = orders(
-            case, phases, &mut wants, prefix, label, false, true, &per_read,
+            case, phases, &mut wants, prefix, label, false, true, &per_read, &cycles,
         );
         if found.is_empty() {
             return None;
@@ -1587,6 +1608,72 @@ impl<'a> Serial<'a> {
         }
     }
 
+    /// Checks each read of the read phase `prefix` ends with that got
+    /// `Err(Cycle)`, for [`CycleReads`]. The edges are runtime 0's: each
+    /// read a closure run of that operation made, and the dep lists the
+    /// phase left, which hold the walk's way through settled nodes.
+    fn cycle_reads(&self, prefix: &Trace, live: &Live<Shared>) {
+        let end = prefix.len() - 1;
+        let Some(p) = (self.phases.iter()).position(|ph| ph.ops().last() == Some(&end)) else {
+            return;
+        };
+        let w = &*live.world;
+        let slot = |x: usize| w.handle(0, x).erased().slot();
+        let evals = live.evals.lock().unwrap().clone();
+        let deps = &prefix[end].1 .1;
+        for i in self.phases[p].ops() {
+            let (Out::Cycle(parts), Op::Get(q) | Op::TryGet(q)) = (&prefix[i].0, &self.case.ops[i])
+            else {
+                continue;
+            };
+            let mut edges: HashMap<u32, Vec<u32>> = HashMap::new();
+            for e in evals
+                .get(&i)
+                .into_iter()
+                .flatten()
+                .filter(|e| e.node.0 == 0)
+            {
+                let reads = e.reads.iter().filter(|r| r.0 == 0).map(|r| slot(r.1));
+                edges.entry(slot(e.node.1)).or_default().extend(reads);
+            }
+            for (n, d) in deps.iter().enumerate().take(w.rt(0).nodes.len() as usize) {
+                edges.entry(n as u32).or_default().extend(d);
+            }
+            // The nodes one or more edges away.
+            let reach = |from: u32| {
+                let mut seen = HashSet::new();
+                let mut todo = vec![from];
+                while let Some(n) = todo.pop() {
+                    for &m in edges.get(&n).into_iter().flatten() {
+                        if seen.insert(m) {
+                            todo.push(m);
+                        }
+                    }
+                }
+                seen
+            };
+            let target = slot(*q);
+            let verdict = if parts.is_empty() {
+                Err(format!("op {i}: a cycle with no participant"))
+            } else if !parts.contains(&target) && !reach(target).iter().any(|n| parts.contains(n)) {
+                Err(format!(
+                    "op {i}: no participant of {parts:?} is node {q} or on its path"
+                ))
+            } else if let Some(a) = parts.iter().find(|&&a| {
+                let r = reach(a);
+                !parts.iter().all(|b| r.contains(b))
+            }) {
+                Err(format!(
+                    "op {i}: participant {a} of {parts:?} does not reach every participant \
+                     over the recorded reads and dep lists"
+                ))
+            } else {
+                Ok(())
+            };
+            self.cycles.lock().unwrap().insert(i, verdict);
+        }
+    }
+
     /// The outcome node `q`'s closure gives over `run`'s reads, for op `i`
     /// of phase `p`, or why a read is no order's outcome for it, an
     /// order's outcome being that of a read in the order's last run of `q`
@@ -1609,9 +1696,10 @@ impl<'a> Serial<'a> {
         } else {
             let before = prefix[..start].to_vec();
             let per_read = self.per_read.lock().unwrap().clone();
+            let cycles = self.cycles.lock().unwrap().clone();
             let mut wants = self.wants.lock().unwrap();
             orders(
-                case, phases, &mut wants, &before, label, true, true, &per_read,
+                case, phases, &mut wants, &before, label, true, true, &per_read, &cycles,
             )
             .0
         };
@@ -1665,6 +1753,7 @@ impl<'a> Serial<'a> {
                 got,
                 label,
                 &self.per_read.lock().unwrap(),
+                &self.cycles.lock().unwrap(),
             ),
             Some(Ok(())) => {}
             Some(Err(why)) => {
@@ -1688,6 +1777,7 @@ impl<'a> Serial<'a> {
         rig: &dyn Fn(&Live<Shared>),
     ) {
         self.per_read.lock().unwrap().clear();
+        self.cycles.lock().unwrap().clear();
         let verdict = Mutex::new(None);
         let got = labelled(label, || {
             run_two_until(
@@ -1883,6 +1973,12 @@ fn spec_at(case: &Case, prefix: &Trace, side: usize, q: usize) -> Spec {
 /// over its run's reads, or why those reads are no orders' outcomes.
 type PerRead = HashMap<usize, Result<Out, String>>;
 
+/// By operation, for a read that got `Err(Cycle)` on two threads: whether
+/// its participants include the read's target or a node on its path and
+/// each reaches every other over the reads its closure runs recorded and
+/// the dep lists the phase left, or why not.
+type CycleReads = HashMap<usize, Result<(), String>>;
+
 /// How [`first_diff`] compares two panics.
 #[derive(Copy, Clone, Debug)]
 enum PanicText {
@@ -1912,6 +2008,7 @@ fn first_diff(
     settles: Option<&[bool]>,
     text: PanicText,
     per_read: &PerRead,
+    cycles: &CycleReads,
 ) -> Option<(usize, String)> {
     // A closure's read of a deleted node panics as stale, so a case with
     // deletes has panics.
@@ -1965,11 +2062,22 @@ fn first_diff(
         }
         let settles = settles.is_none_or(|s| s[i]);
         let sets = |snap: &Snapshot| (agree && settles).then(|| settled(&snap.0));
+        // Under two threads the cycle a read reports is built from this
+        // thread's frames, so members another thread landed first are left
+        // out of it: a verified part of an order's participants matches.
+        let same = |want: &Out, got: &Out| {
+            text.same(want, got)
+                || matches!(
+                    (text, want, got, cycles.get(&i)),
+                    (PanicText::Ignored, Out::Cycle(w), Out::Cycle(g), Some(Ok(())))
+                        if !g.is_empty() && g.iter().all(|p| w.contains(p))
+                )
+        };
         // A get ordered per read: its outcome is its closure's over its
         // reads, and the rest is compared as for any other operation.
-        if let Some(by_reads) = per_read.get(&i).filter(|_| !text.same(want_out, got_out)) {
+        if let Some(by_reads) = per_read.get(&i).filter(|_| !same(want_out, got_out)) {
             let wrong = match by_reads {
-                Ok(out) if text.same(out, got_out) => None,
+                Ok(out) if same(out, got_out) => None,
                 Ok(out) => Some(format!("its closure over its reads gives {out:?}")),
                 Err(why) => Some(why.clone()),
             };
@@ -1981,9 +2089,13 @@ fn first_diff(
                     format!("want {w:?}\n got {g:?}\nordered per read: {wrong}"),
                 ));
             }
-        } else if !text.same(want_out, got_out) || sets(want) != sets(got) {
+        } else if !same(want_out, got_out) || sets(want) != sets(got) {
             let (w, g) = ((want_out, sets(want)), (got_out, sets(got)));
-            return Some((i, format!("want {w:?}\n got {g:?}")));
+            let why = match cycles.get(&i) {
+                Some(Err(why)) => format!("\n{why}"),
+                _ => String::new(),
+            };
+            return Some((i, format!("want {w:?}\n got {g:?}{why}")));
         }
         // A dep list is history too: under a panic a read can stop the
         // closure short of the reads after it.
@@ -1997,7 +2109,15 @@ fn first_diff(
 /// Panics, naming the case, at the first operation at which `got` differs
 /// from the unbounded run's `want`.
 fn compare(case: &Case, want: &Trace, got: &Trace, label: &str) {
-    if let Some((i, what)) = first_diff(case, want, got, None, PanicText::Exact, &PerRead::new()) {
+    if let Some((i, what)) = first_diff(
+        case,
+        want,
+        got,
+        None,
+        PanicText::Exact,
+        &PerRead::new(),
+        &CycleReads::new(),
+    ) {
         panic!(
             "{label}: operation {i} ({:?}) differs from the unbounded run\n{what}\n{}",
             case.ops[i],
@@ -2391,6 +2511,7 @@ fn two_thread_oracle_takes_either_order_of_a_read_pair() {
                 Some(&settles),
                 PanicText::Exact,
                 &PerRead::new(),
+                &CycleReads::new(),
             )
             .unwrap_or_else(|| panic!("seed {seed:#x}: the swap changes no outcome"));
             assert_serial(&case, &phases, &mut HashMap::new(), &got, "swapped");
