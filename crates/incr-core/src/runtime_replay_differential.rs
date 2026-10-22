@@ -12,7 +12,7 @@
 //! a second form steps two threads through barriers: one thread makes
 //! each set, delete or recreate while the other waits, and reads overlap
 //! only reads, so each result is still the unbounded run's at its
-//! sequence point.
+//! sequence point, with either of two overlapping reads first.
 //!
 //! A speculative entry can land a node the unbounded run leaves New, and
 //! with panics the engine's outcomes depend on that history: a walk
@@ -23,6 +23,7 @@
 //! and a case without them, a third of the seeds, compares the results to
 //! the end.
 
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Barrier, Mutex};
@@ -131,6 +132,7 @@ impl Rng {
 /// laid out the same way in `specs2`; its first `lower` queries read
 /// only their own runtime, and only they and its inputs are read by the
 /// first runtime.
+#[derive(Clone)]
 struct Case {
     specs: Vec<Spec>,
     panics: bool,
@@ -890,8 +892,8 @@ impl Phase {
 }
 
 /// Pairs consecutive reads into a read phase, in the case's order, so the
-/// unbounded single-thread run of the case gives each read's expected
-/// result at its sequence point.
+/// unbounded single-thread run of the case, with either read of each pair
+/// first, gives each read's expected result at its sequence point.
 fn phases(case: &Case, seed: u64) -> Vec<Phase> {
     let mut rng = Rng(seed ^ 0xbb67_ae85_84ca_a73b);
     let mut phases = Vec::new();
@@ -918,8 +920,8 @@ fn phases(case: &Case, seed: u64) -> Vec<Phase> {
 }
 
 /// The case's operations on two threads by `phases`, with each phase's
-/// snapshot on its operations, and which operations end a phase.
-fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> (Trace, Vec<bool>) {
+/// snapshot on its operations.
+fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> Trace {
     let rts = runtimes::<Shared>(frames, bytes);
     let live = Live::new(&rts, case);
     let n = case.ops.len();
@@ -970,21 +972,128 @@ fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> 
     assert!(failures.is_empty(), "{failures:#?}");
     let (outs, snaps) = (outs.into_inner().unwrap(), snaps.into_inner().unwrap());
     let mut trace: Vec<Option<(Out, Snapshot)>> = vec![None; n];
-    let mut settles = vec![false; n];
     for (phase, snap) in phases.iter().zip(snaps) {
         let snap = snap.expect("every phase snapshots");
-        let ops = phase.ops();
-        settles[*ops.last().unwrap()] = true;
-        for i in ops {
+        for i in phase.ops() {
             trace[i] = Some((outs[i].clone().expect("every operation ran"), snap.clone()));
         }
     }
-    (trace.into_iter().map(Option::unwrap).collect(), settles)
+    trace.into_iter().map(Option::unwrap).collect()
 }
 
-/// Compares `got` with the unbounded run's `want`, the states only after
-/// the operations `settles` marks.
-fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, label: &str) {
+/// The case's operations in their phases' order, with the two reads of
+/// each read phase whose bit `swaps` sets (bit k for the k-th phase with
+/// two) in the other order.
+struct Order {
+    case: Case,
+    /// Each operation's index in the original case.
+    of: Vec<usize>,
+    /// Each operation's phase's last operation, by index here.
+    ends: Vec<usize>,
+    /// How many phases with two reads run up to and including each
+    /// operation's.
+    pairs: Vec<u32>,
+}
+
+impl Order {
+    fn new(case: &Case, phases: &[Phase], swaps: u64) -> Self {
+        let (mut of, mut ends, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+        let mut pair = 0;
+        for phase in phases {
+            let mut ops = phase.ops();
+            if ops.len() == 2 {
+                if swaps >> pair & 1 == 1 {
+                    ops.swap(0, 1);
+                }
+                pair += 1;
+            }
+            let end = of.len() + ops.len() - 1;
+            for i in ops {
+                of.push(i);
+                ends.push(end);
+                pairs.push(pair);
+            }
+        }
+        assert!(pair < 64, "a swap mask holds 63 read phases");
+        let ops = of.iter().map(|&i| case.ops[i].clone()).collect();
+        Order {
+            case: Case {
+                ops,
+                ..case.clone()
+            },
+            of,
+            ends,
+            pairs,
+        }
+    }
+
+    /// A two-thread trace of the original case in this order.
+    fn arrange(&self, got: &Trace) -> Trace {
+        self.of.iter().map(|&i| got[i].clone()).collect()
+    }
+
+    fn settles(&self) -> Vec<bool> {
+        self.ends.iter().enumerate().map(|(j, &e)| j == e).collect()
+    }
+}
+
+/// Panics unless the two-thread trace `got` equals the unbounded
+/// single-thread run of some order of each read phase's two reads, keeping
+/// each order's run in `wants`. Under Shared the unbounded run is the one
+/// with the landings this thread observes in the order it observes them
+/// (T8, the read case table), so either read of a pair may land a node
+/// both read first.
+fn assert_serial(
+    case: &Case,
+    phases: &[Phase],
+    wants: &mut HashMap<u64, Trace>,
+    got: &Trace,
+    label: &str,
+) {
+    let mut swaps = 0;
+    let mut closest: Option<(usize, u64, String)> = None;
+    loop {
+        let order = Order::new(case, phases, swaps);
+        let want = wants.entry(swaps).or_insert_with(|| {
+            labelled(&format!("{label}, unbounded, swaps {swaps:#b}"), || {
+                run::<Shared>(&order.case, None, 0)
+            })
+        });
+        let settles = order.settles();
+        let Some((j, what)) = first_diff(&order.case, want, &order.arrange(got), Some(&settles))
+        else {
+            return;
+        };
+        if closest.as_ref().is_none_or(|c| j > c.0) {
+            closest = Some((j, swaps, what));
+        }
+        // Every order that runs the same read first in each phase up to
+        // operation j's differs at j too: search depth-first, the k-th
+        // phase with two reads at depth k.
+        let Some(k) = (0..order.pairs[j]).rev().find(|&k| swaps >> k & 1 == 0) else {
+            break;
+        };
+        swaps = swaps & ((1 << k) - 1) | 1 << k;
+    }
+    let (j, swaps, what) = closest.expect("an order was tried");
+    let i = Order::new(case, phases, swaps).of[j];
+    panic!(
+        "{label}: operation {i} ({:?}) differs from the unbounded run of every order of \
+         the overlapping reads, the closest swapping {swaps:#b}\n{what}\n{}",
+        case.ops[i],
+        describe(case)
+    );
+}
+
+/// The first operation at which `got` differs from the unbounded run's
+/// `want`, with both sides of it, comparing the states only after the
+/// operations `settles` marks.
+fn first_diff(
+    case: &Case,
+    want: &Trace,
+    got: &Trace,
+    settles: Option<&[bool]>,
+) -> Option<(usize, String)> {
     // A closure's read of a deleted node panics as stale, so a case with
     // deletes has panics.
     let panics = case.panics || case.ops.iter().any(|op| matches!(op, Op::Delete(_)));
@@ -1037,22 +1146,36 @@ fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, lab
         let compared = |out: &Out, snap: &Snapshot| {
             (out.clone(), (agree && settles).then(|| settled(&snap.0)))
         };
-        assert_eq!(
-            compared(want_out, want),
-            compared(got_out, got),
-            "{label}: operation {i} ({:?}) differs from the unbounded run\nops: {:?}\n\
-             case: {:#?}\nsecond runtime: {:#?}",
-            case.ops[i],
-            case.ops,
-            case.specs,
-            case.specs2,
-        );
+        let (w, g) = (compared(want_out, want), compared(got_out, got));
+        if w != g {
+            return Some((i, format!("want {w:?}\n got {g:?}")));
+        }
         // A dep list is history too: under a panic a read can stop the
         // closure short of the reads after it.
         if settles {
             agree &= want.0 == got.0 && want.1 == got.1;
         }
     }
+    None
+}
+
+/// Panics, naming the case, at the first operation at which `got` differs
+/// from the unbounded run's `want`.
+fn compare(case: &Case, want: &Trace, got: &Trace, label: &str) {
+    if let Some((i, what)) = first_diff(case, want, got, None) {
+        panic!(
+            "{label}: operation {i} ({:?}) differs from the unbounded run\n{what}\n{}",
+            case.ops[i],
+            describe(case)
+        );
+    }
+}
+
+fn describe(case: &Case) -> String {
+    format!(
+        "ops: {:?}\ncase: {:#?}\nsecond runtime: {:#?}",
+        case.ops, case.specs, case.specs2
+    )
 }
 
 /// Runs `f`, prefixing the message of any panic out of it with `label`.
@@ -1075,23 +1198,24 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
         for bytes in [0, 16 * 1024] {
             let label = format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes");
             let bounded = labelled(&label, || run::<C>(case, Some(frames), bytes));
-            compare(case, &unbounded, &bounded, None, &label);
+            compare(case, &unbounded, &bounded, &label);
         }
     }
 }
 
 /// The two-thread form: every phase schedule at every budget, unbounded
-/// included, against the unbounded single-thread run.
+/// included, against the unbounded single-thread run of some order of each
+/// phase's two reads.
 fn differential_two(case: &Case, seed: u64) {
     let phases = phases(case, seed);
-    let unbounded = run::<Shared>(case, None, 0);
+    let mut wants = HashMap::new();
     for frames in [None, Some(1), Some(2), Some(3)] {
         for bytes in [0, 16 * 1024] {
             let label = format!(
                 "seed {seed:#x}, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
             );
-            let (got, settles) = labelled(&label, || run_two(case, &phases, frames, bytes));
-            compare(case, &unbounded, &got, Some(&settles), &label);
+            let got = labelled(&label, || run_two(case, &phases, frames, bytes));
+            assert_serial(case, &phases, &mut wants, &got, &label);
         }
     }
 }
@@ -1325,6 +1449,59 @@ fn cross_two_thread_seeds() {
             }
         }
     });
+}
+
+/// The unbounded single-thread runs of 0x524 and 0x3c9 with their first
+/// read phase's reads in the other order, laid out as two-thread traces,
+/// differ from the case-order runs: 0x524's closure payload goes to the
+/// other read, and 0x3c9's cycle is entered elsewhere. The two-thread
+/// oracle takes each, and not with the read that differs given an outcome
+/// no order gives.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_takes_either_order_of_a_read_pair() {
+    for seed in [0x524, 0x3c9] {
+        let case = gen_case(seed, false, true);
+        let phases = phases(&case, seed);
+        let swapped = Order::new(&case, &phases, 1);
+        quiet(|| {
+            let serial = run::<Shared>(&swapped.case, None, 0);
+            let mut got = vec![None; case.ops.len()];
+            for (j, &i) in swapped.of.iter().enumerate() {
+                got[i] = Some((serial[j].0.clone(), serial[swapped.ends[j]].1.clone()));
+            }
+            let got: Trace = got.into_iter().map(Option::unwrap).collect();
+            let in_order = Order::new(&case, &phases, 0);
+            let unbounded = run::<Shared>(&case, None, 0);
+            let (i, _) = first_diff(&case, &unbounded, &got, Some(&in_order.settles()))
+                .unwrap_or_else(|| panic!("seed {seed:#x}: the swap changes no outcome"));
+            assert_serial(&case, &phases, &mut HashMap::new(), &got, "swapped");
+
+            let mut bad = got;
+            bad[i].0 = Out::Panic("no order's outcome".to_owned());
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                assert_serial(&case, &phases, &mut HashMap::new(), &bad, "bad");
+            }));
+            assert!(caught.is_err(), "seed {seed:#x}: a wrong outcome passed");
+        });
+    }
+}
+
+/// Two-thread seeds with panics or cycles whose overlapping reads, at most
+/// budgets, come out as the unbounded run of the other order: which read
+/// lands a node both read first decides which gets a closure's payload,
+/// or where a cycle is entered.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_swapped_order_seeds() {
+    for seed in [0x245, 0x3c9] {
+        let case = gen_case(seed, false, true);
+        quiet(|| {
+            for _ in 0..4 {
+                differential_two(&case, seed);
+            }
+        });
+    }
 }
 
 /// Seeds the scans found failing at a frame budget, each a replay fault
