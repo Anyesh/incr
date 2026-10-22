@@ -1457,6 +1457,80 @@ fn read_of_cycle_member_vs_claim_after_landing() {
     rt.assert_invariant_i();
 }
 
+/// a <-> b, a cycle `a`'s fallback resolves, with `b` catching a
+/// panicking read so that every episode lands its members Dirty, and
+/// `x` reading `a`. Returns `x`, `a` and the gate in `a`'s closure.
+fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate) {
+    let failed = rt.create_query(|_: &Rt| -> u64 { panic!("boom") });
+    let in_a = Gate::new();
+    let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
+    let a = {
+        let (in_a, b_cell) = (in_a.clone(), Arc::clone(&b_cell));
+        rt.create_query_with_fallback(
+            move |rt: &Rt| {
+                in_a.park();
+                rt.get(*b_cell.get().unwrap()) + 1
+            },
+            |_: &crate::Cycle| 0,
+        )
+    };
+    let b = rt.create_query(move |rt: &Rt| {
+        let v = catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1);
+        rt.get(a) + v
+    });
+    b_cell.set(b).unwrap();
+    let x = rt.create_query(move |rt: &Rt| rt.get(a) + 100);
+    (x, a, in_a)
+}
+
+/// The episode that `x`'s recompute runs through its read of `a`, a
+/// group member, lands `a` Dirty, and before the read learns how,
+/// another thread claims `a`. `x`, whose deps are unchanged and so not
+/// validated at publish, must still not land Clean over it (seed 0x74f on
+/// two threads, budget None).
+#[test]
+fn reader_of_group_episode_root_claimed_after_landing() {
+    let rt = Arc::new(Rt::new());
+    let (x, a, in_a) = poisoned_episode(&rt);
+    rt.get(x);
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    rt.group_verifies.lock().unwrap().clear();
+    // The first landing is the walk's, before x runs; the second is the
+    // one x's own read runs, as the walk's root.
+    let landed = Gate::new();
+    landed.arm();
+    let hits = AtomicUsize::new(0);
+    let hook = {
+        let landed = landed.clone();
+        move |p| {
+            if p == ParkPoint::EpisodeLanded(id(a)) && hits.fetch_add(1, Ordering::SeqCst) == 1 {
+                landed.park();
+            }
+        }
+    };
+    assert!(rt.park_hook.set(Box::new(hook)).is_ok());
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(x))
+    };
+    landed.wait_parked();
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    in_a.arm();
+    let claimer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(a))
+    };
+    in_a.wait_parked();
+    assert_eq!(rt.state_of(a), NodeState::Computing);
+    landed.release();
+    reader.join().unwrap();
+    in_a.release();
+    claimer.join().unwrap();
+    assert_eq!(rt.group_verifies.lock().unwrap().first(), Some(&id(a).0));
+    rt.assert_invariant_i();
+}
+
 /// `a` and `b` read each other while `g` is 0, and `a` reads only `g`
 /// otherwise. Returns them with `a` Clean at 7.
 pub(super) fn clean_node_that_can_turn_cyclic(rt: &Rt) -> (Incr<u64>, Incr<i64>, Incr<i64>) {
