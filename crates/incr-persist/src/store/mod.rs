@@ -93,8 +93,11 @@ pub enum Origin {
     /// one whose `Declare` was forgotten or changed is a `Forget` followed
     /// by the key's full state, since a first-wins fold ignores a second
     /// `Declare`. A collection this store did not declare whose elements
-    /// cannot be compared by bytes is reported as a `Delete` followed by its
-    /// full contents.
+    /// cannot be compared by bytes, or whose snapshot lists them in an order
+    /// its own records do not reach, is reported as a `Delete` followed by
+    /// its full contents. A writer that declared the collection lists them
+    /// in the order it stores them, so a key with more than one distinct
+    /// element may be reported that way.
     Snapshot,
 }
 

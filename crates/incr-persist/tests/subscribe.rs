@@ -205,8 +205,11 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
     writer.delete(gone).unwrap();
     items.delete(&writer, &1).unwrap();
     items.insert(&writer, 3).unwrap();
+    // A writer folds a collection it declared in its stored order, not its
+    // insertion order, so `raw` ends with one distinct element to keep the
+    // reader's byte diff from depending on hash order.
     raw.delete(&writer, &2).unwrap();
-    raw.insert(&writer, 6).unwrap();
+    raw.insert(&writer, 1).unwrap();
     let fresh = writer.input("fresh", 8u32).unwrap();
     writer.set(fresh, 3).unwrap();
     let at = writer.checkpoint().unwrap();
@@ -257,7 +260,7 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
             },
             Record::Insert {
                 key: "raw".into(),
-                element: enc(&6u32),
+                element: enc(&1u32),
             },
         ]),
         "a key this store never declared is diffed by bytes"
