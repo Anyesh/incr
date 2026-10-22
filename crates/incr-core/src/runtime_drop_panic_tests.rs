@@ -1220,44 +1220,16 @@ fn wave6_contained_episode_abort_keeps_member_drop_panic_under_replay() {
     .assert_clean();
 }
 
-/// A value whose `Drop` panics when only a run the unbounded one never
-/// makes could have built it: a speculative run, or a doomed one fed the
-/// `u64` placeholder (`v == 0`). A clone is its reader's, so it never
-/// panics.
-#[derive(Debug)]
-struct Stray {
-    v: u64,
-    spec: bool,
-}
+/// A value whose `Drop` panics when it is odd, on its contents alone.
+/// Each case below builds odd values only in a run the unbounded one
+/// never makes, so an odd drop is never that run's to raise.
+#[derive(Clone, Debug, PartialEq)]
+struct Odd(u64);
 
-impl Stray {
-    fn new(v: u64) -> Self {
-        Stray {
-            v,
-            spec: crate::replay::speculative(),
-        }
-    }
-}
-
-impl Clone for Stray {
-    fn clone(&self) -> Self {
-        Stray {
-            v: self.v,
-            spec: false,
-        }
-    }
-}
-
-impl PartialEq for Stray {
-    fn eq(&self, other: &Self) -> bool {
-        self.v == other.v
-    }
-}
-
-impl Drop for Stray {
+impl Drop for Odd {
     fn drop(&mut self) {
-        if (self.spec || self.v == 0) && !std::thread::panicking() {
-            panic!("stray {} dropped", self.v);
+        if self.0 % 2 == 1 && !std::thread::panicking() {
+            panic!("odd {} dropped", self.0);
         }
     }
 }
@@ -1278,9 +1250,9 @@ fn doomed_runs_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
     let b = rt.create_query(|_| 5_u64);
-    let r = rt.create_query_with(move |rt| Stray::new(rt.get(b)), replayable());
-    let got = catch_unwind(AssertUnwindSafe(|| rt.get(r).v));
-    assert_eq!(got.ok(), Some(5));
+    let r = rt.create_query_with(move |rt| Odd(rt.get(b) + 1), replayable());
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(r).0));
+    assert_eq!(got.ok(), Some(6));
     assert!(!rt.dooms.lock().unwrap().is_empty(), "the read of b dooms");
 }
 
@@ -1307,15 +1279,14 @@ fn speculative_clean_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
     rt.set_max_frames(1);
     let input = rt.create_input(1_u64);
     let b = rt.create_query(|_| 5_u64);
-    let c = rt.create_query(move |rt| Stray::new(rt.get(input) + 10));
+    let c = rt.create_query(move |rt| Odd(rt.get(input) + 10));
     let r = rt.create_query_with(
         move |rt| {
             let x = rt.get(b);
             if x == 0 {
-                rt.get(c).v
-            } else {
-                x
+                std::mem::forget(rt.get(c));
             }
+            x
         },
         replayable(),
     );
@@ -1326,7 +1297,7 @@ fn speculative_clean_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
         "the speculative run landed c"
     );
     rt.set(input, 2);
-    let got = catch_unwind(AssertUnwindSafe(|| rt.get(c).v));
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(c).0));
     assert_eq!(got.ok(), Some(12));
 }
 
@@ -1341,5 +1312,54 @@ fn shared_speculative_clean_value_drop_is_not_raised() {
     in_shared_child(
         "runtime::drop_panic_tests::shared_speculative_clean_value_drop_is_not_raised",
         speculative_clean_value_drop_is_not_raised,
+    );
+}
+
+/// A doomed run's placeholder leads it to read `c` natively, and `c`
+/// catches the panic of `d`, so the speculative run of `c` writes its
+/// slot and its landing takes the value back. Under `Shared` that value
+/// is retired, and a later reclaim, forced at a real compute's write,
+/// must not raise its drop there.
+fn unwritten_speculative_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let b = rt.create_query(|_| 5_u64);
+    let d = rt.create_query(|_| -> u64 { panic!("d boom") });
+    let c = rt.create_query(move |rt| {
+        let got = catch_unwind(AssertUnwindSafe(|| rt.get(d)));
+        Odd(got.unwrap_or(7) + 10)
+    });
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                std::mem::forget(rt.get(c));
+            }
+            x
+        },
+        replayable(),
+    );
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+    assert_eq!(got.ok(), Some(5));
+    assert_ne!(
+        rt.state_of(c),
+        NodeState::Clean,
+        "c's landing was taken back"
+    );
+    let e = rt.create_query(|_| 2_u64);
+    assert_eq!(rt.get(e), 2);
+}
+
+#[test]
+fn local_unwritten_speculative_value_drop_is_not_raised() {
+    unwritten_speculative_value_drop_is_not_raised(&Runtime::<Local>::new());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unwritten_speculative_value_drop_is_not_raised() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_unwritten_speculative_value_drop_is_not_raised",
+        unwritten_speculative_value_drop_is_not_raised,
     );
 }
