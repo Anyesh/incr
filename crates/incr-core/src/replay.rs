@@ -326,14 +326,32 @@ impl Context {
     /// Pops the top virtual frame.
     /// Delivers `what` to the read virtual frame `below` was blocked in.
     pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) {
+        self.push_blocked(below, what, None);
+    }
+
+    /// Delivers the unwind out of the running frame at `cidx` to the
+    /// read of [`Self::unwind_target`], with the provenance record
+    /// published for that read.
+    pub(crate) fn deliver_unwind(&mut self, cidx: u32, what: Delivered) {
+        let below = self
+            .unwind_target(cidx)
+            .expect("incr-core: an unwind is delivered to a virtual frame")
+            .clone();
+        let key = ReadKey::blocked(&below);
+        let provenance = self
+            .provenance
+            .take()
+            .and_then(|(k, p)| (k == key).then_some(p));
+        self.push_blocked(&below, what, provenance);
+    }
+
+    fn push_blocked(
+        &mut self,
+        below: &VFrame,
+        what: Delivered,
+        provenance: Option<Rc<dyn Provenance>>,
+    ) {
         let key = ReadKey::blocked(below);
-        let provenance = match self.provenance.take() {
-            Some((k, p)) if k == key => Some(p),
-            other => {
-                self.provenance = other;
-                None
-            }
-        };
         self.pending.retain(|d| !(d.blocked && d.key == key));
         self.pending.push(Delivery {
             key,
@@ -346,14 +364,22 @@ impl Context {
         });
     }
 
-    /// The read of the virtual frame below a landing of `node` at `cidx`,
-    /// when that landing is the running frame's, whose unwind is
-    /// delivered to that read.
+    /// The virtual frame the driver delivers an unwind out of the frame at
+    /// `cidx` to, when that is the running frame: the running entry's, or
+    /// the one a pop finishes.
+    pub(crate) fn unwind_target(&self, cidx: u32) -> Option<&VFrame> {
+        let level = self.running?;
+        if self.boundary + level != cidx {
+            return None;
+        }
+        self.vframe_at(cidx.checked_sub(1)?)
+    }
+
+    /// The read of [`Self::unwind_target`] for a landing of `node` at
+    /// `cidx`, when that read is of `node`.
     pub(crate) fn landing_reader(&self, node: u32, generation: u32, cidx: u32) -> Option<ReadKey> {
-        let below = self.vstack.last()?;
-        (self.running == Some(cidx.wrapping_sub(self.boundary))
-            && below.cidx + 1 == cidx
-            && below.reading == u64::from(node) | (u64::from(generation) << 32))
+        let below = self.unwind_target(cidx)?;
+        (below.reading == u64::from(node) | (u64::from(generation) << 32))
             .then(|| ReadKey::blocked(below))
     }
 
@@ -384,18 +410,13 @@ impl Context {
     }
 
     /// Takes the payload of delivery `i` for a read at `at`, as
-    /// [`Self::take_unwind`] does. When the read is the running entry's
-    /// own compute, the entry's unwind carries the record on to the frame
-    /// below.
+    /// [`Self::take_unwind`] does. When the read is the running frame's
+    /// own compute, its unwind carries the record on to
+    /// [`Self::unwind_target`].
     pub(crate) fn take_landed(&mut self, i: usize, at: u32) -> (bool, Box<dyn Any + Send>) {
-        if self
-            .running
-            .is_some_and(|level| self.boundary + level == at)
-        {
-            if let Some(below) = self.vstack.last() {
-                let key = ReadKey::blocked(below);
-                self.provenance = self.pending[i].provenance.clone().map(|p| (key, p));
-            }
+        if let Some(below) = self.unwind_target(at) {
+            let key = ReadKey::blocked(below);
+            self.provenance = self.pending[i].provenance.clone().map(|p| (key, p));
         }
         match self.take_unwind(i) {
             Delivered::Unwind {

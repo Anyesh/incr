@@ -1976,17 +1976,12 @@ impl<C: Cells> Runtime<C> {
         if continuation {
             self.continuation_unwound(v.node, v.cidx, &*payload, &mut bag);
         }
-        let (boundary, pos, below) = replay::with(|c| {
+        let (boundary, pos) = replay::with(|c| {
             let x = c
                 .iter()
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
-            let pos = v.cidx - x.boundary;
-            (
-                x.boundary,
-                pos,
-                pos.checked_sub(1).map(|b| x.vstack[b as usize].clone()),
-            )
+            (x.boundary, v.cidx - x.boundary)
         });
         if kind == Some(UnwindKind::Wound) {
             bag.drain(self);
@@ -2016,20 +2011,20 @@ impl<C: Cells> Runtime<C> {
             bag.drain(self);
             return VPop::Restart;
         }
-        let Some(below) = below else {
+        if pos == 0 {
             // The read that ran the loop reads the target as a compute's
             // unwind leaves its reader.
             self.dep_stack.poison_current_frame(self.runtime_id);
             bag.drain(self);
             self.close_unwound(id, boundary, kind);
             resume_unwind(payload);
-        };
+        }
         cycle_state::take_unwind_kind();
         let poison = !(continuation && self.episode_member(node));
         replay::with(|c| {
             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                x.deliver_blocked(
-                    &below,
+                x.deliver_unwind(
+                    v.cidx,
                     Delivered::Unwind {
                         cycle: kind == Some(UnwindKind::Cycle),
                         poison,
@@ -2269,9 +2264,8 @@ impl<C: Cells> Runtime<C> {
                 .iter_mut()
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
-            let below = x.vstack[level as usize - 1].clone();
-            x.deliver_blocked(
-                &below,
+            x.deliver_unwind(
+                boundary + level,
                 Delivered::Unwind {
                     cycle: kind == Some(UnwindKind::Cycle),
                     poison,
