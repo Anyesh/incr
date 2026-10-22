@@ -2398,6 +2398,21 @@ fn a_failed_read_takes_the_payload_its_rerun_let_out() {
     }
 }
 
+/// Seed 0xa18d458163c687fe at budget 1: op 0's Get(0) left node 1 Dirty
+/// where the unbounded run lands it Failed. A `try_get` delivered a
+/// closure's own panic after it swallowed a cycle as a cycle unwind, so
+/// its reader landed as if it never ran.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_try_get_passes_on_a_swallowing_closures_panic() {
+    let seed = 0xa18d_4581_63c6_87fe;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
