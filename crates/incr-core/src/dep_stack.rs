@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, DOOMED, NO_DOOM, POISONED};
+use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, NO_DOOM, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 
@@ -291,14 +291,20 @@ pub trait DepStack: 'static {
         self.with(|s| s.active(rt).map_or(0, |top| top.reads_of_reading()))
     }
 
-    /// For `rt`'s frames at positions `from..to`, bottom first, the node
-    /// each reads now and how many times it has read it.
-    fn read_steps(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<(u64, u32)> {
+    /// For `rt`'s frames at positions `from..to`, bottom first, each
+    /// frame's node, whether it is a member run, the node it reads now
+    /// and how many times it has read it.
+    fn read_steps(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<(u32, bool, u64, u32)> {
         self.with(|s| {
             s.frames
                 .iter()
                 .filter(|f| f.rt == rt && (from..to).contains(&f.cidx))
-                .map(|f| (f.reading, f.reads_of_reading()))
+                .map(|f| {
+                    // SAFETY: a frame's control block is live while it is
+                    // on the stack.
+                    let member = unsafe { &*f.ctl }.has(BUFFERED);
+                    (f.node.0, member, f.reading, f.reads_of_reading())
+                })
                 .collect()
         })
     }

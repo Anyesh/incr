@@ -1135,6 +1135,47 @@ fn delete_seeds() {
     }
 }
 
+/// Seed 0x51ea546ca5385809, shrunk. Query 0, a Fallback member of its own
+/// cycle, reads 1, which reads 2 and then catches a second read of 2; 2
+/// `try_get`s 3 and 3 reads 2. At budget 3, 3's entry unwinds into 2's
+/// virtual frame, and the retry that reads 2's landing instead never
+/// takes that delivery. 0's episode then runs 2 at the same position,
+/// under 3 (its walk of 1 computes 3 first): that frame took the
+/// delivery in place of its own cycle read, and 0 landed its fallback
+/// where the unbounded run panics.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn member_run_frames_take_no_discovery_delivery() {
+    let query = |expr, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let case = Case {
+        specs: vec![
+            query(Expr::Add(read(1), read(0)), Strat::Fallback(1)),
+            query(
+                Expr::Add(read(2), Box::new(Expr::Catch(read(2)))),
+                Strat::None,
+            ),
+            query(Expr::Read(3, true), Strat::None),
+            query(Expr::Read(2, false), Strat::None),
+        ],
+        panics: false,
+        cycles: true,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x51ea_546c_a538_5809);
+        differential::<Shared>(&case, 0x51ea_546c_a538_5809);
+    });
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]

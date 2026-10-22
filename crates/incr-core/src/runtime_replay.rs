@@ -998,13 +998,16 @@ impl<C: Cells> Runtime<C> {
                 .collect()
         });
         // Bottom up, each frame's path extends the one below it.
-        let mut below: Option<(u32, u64, (u64, u32))> = None;
+        let mut below: Option<(u32, u64, replay::Step)> = None;
         for f in frames.iter_mut().rev() {
             f.path = match below {
                 Some((cidx, path, step)) if cidx + 1 == f.cidx => replay::extend_path(path, step),
                 _ => self.path_at(f.cidx),
             };
-            below = Some((f.cidx, f.path, (f.reading, f.ordinal)));
+            // SAFETY: the frame is on the stack, so its control block is live.
+            let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
+            let step = replay::Step::of(rt, f.node, member, f.reading, f.ordinal);
+            below = Some((f.cidx, f.path, step));
         }
         let top = frames
             .first()
@@ -2625,13 +2628,18 @@ impl<C: Cells> Runtime<C> {
                 .filter(|x| x.rt == rt)
                 .filter_map(|x| x.vframe_below(cidx))
                 .max_by_key(|v| v.cidx)
-                .map(|v| (v.cidx, replay::extend_path(v.path, (v.reading, v.ordinal))))
+                .map(|v| {
+                    let step = replay::Step::virtual_frame(v);
+                    (v.cidx, replay::extend_path(v.path, step))
+                })
         });
         let (from, path) = base.map_or((0, 0), |(at, path)| (at + 1, path));
-        self.dep_stack
-            .read_steps(rt, from, cidx)
-            .into_iter()
-            .fold(path, replay::extend_path)
+        self.dep_stack.read_steps(rt, from, cidx).into_iter().fold(
+            path,
+            |path, (node, member, reading, ordinal)| {
+                replay::extend_path(path, replay::Step::of(rt, node, member, reading, ordinal))
+            },
+        )
     }
 
     /// The lowlink a popped virtual frame of `node` at `cidx`, along this
