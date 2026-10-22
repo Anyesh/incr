@@ -6,7 +6,7 @@
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
-use crate::cycle_state::Held;
+use crate::cycle_state::{Held, Look};
 use crate::dep_stack::Placement;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
@@ -1561,8 +1561,8 @@ impl<C: Cells> Runtime<C> {
             // which finishes the run its frame would have; with one it is
             // done.
             let held = self
-                .look_held(entry.node, replay::speculative() || entry.spec, |e| {
-                    (e.generation == entry.generation).then_some(e.buf.is_some())
+                .look_held(entry.node, Look::here_or(entry.spec), |e| {
+                    (e.generation == entry.generation).then_some(e.buf().is_some())
                 })
                 .flatten();
             if let Some(buffered) = held {
@@ -1805,8 +1805,7 @@ impl<C: Cells> Runtime<C> {
         // The run that retries the frame takes its lowlink, a suspended
         // episode's member run as much as a stand-in.
         let mut low = v.low;
-        let unbuffered =
-            self.look_held(v.node, replay::speculative() || v.spec, |e| e.buf.is_none());
+        let unbuffered = self.look_held(v.node, Look::here_or(v.spec), |e| e.buf().is_none());
         if low < v.cidx && unbuffered != Some(false) {
             replay::with(|c| {
                 if let Some(x) = c.iter_mut().find(|x| x.id == id) {
@@ -1912,15 +1911,14 @@ impl<C: Cells> Runtime<C> {
         let rooted = cycle_state::with_held(|h| {
             h.anchored(rt, v.cidx)
                 .any(|slot| stand_in.is_none() || slot != v.node)
-                || stand_in.is_some()
-                    && h.get(&(rt, v.node))
-                        .expect("incr-core: a stand-in is held")
-                        .last
-                        .iter()
-                        .any(|&(d, _)| d.0 == v.node)
-        });
+        }) || stand_in.is_some()
+            && self
+                .look_held(v.node, Look::here_or(v.spec), |e| {
+                    e.last().iter().any(|&(d, _)| d.0 == v.node)
+                })
+                .expect("incr-core: a stand-in is held");
         if let (Some(revs), false) = (stand_in, rooted) {
-            if !(v.spec && self.alone_lands_dirty(v.node)) {
+            if !(v.spec && self.alone_lands_dirty(v.node, v.spec)) {
                 if v.spec {
                     // `land_alone` takes a speculative run's buffer only when
                     // adopted: over Clean deps alone it is the value the
@@ -2001,18 +1999,19 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether held node `slot`, landing alone in a speculative run, would
-    /// land other than Clean, which such a run never does.
-    fn alone_lands_dirty(&self, slot: u32) -> bool {
-        cycle_state::with_held(|h| {
-            let e = &h[&(self.runtime_id, slot)];
-            e.poisoned
-                || e.last.iter().any(|&(d, _)| {
+    /// land other than Clean, which such a run never does. `spec` is the
+    /// popping frame's own flag.
+    fn alone_lands_dirty(&self, slot: u32, spec: bool) -> bool {
+        self.look_held(slot, Look::here_or(spec), |e| {
+            e.poisoned()
+                || e.last().iter().any(|&(d, _)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
                         NodeState::Clean | NodeState::Cyclic
                     )
                 })
         })
+        .expect("incr-core: a landing claim is held")
     }
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
@@ -2158,6 +2157,7 @@ impl<C: Cells> Runtime<C> {
         let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) else {
             return payload;
         };
+        let (e, spec_buf) = e.into_look(Look::here());
         self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
         let id = NodeId(slot);
         let stamp_rev = self.current_revision();
@@ -2177,13 +2177,16 @@ impl<C: Cells> Runtime<C> {
                 flags,
                 attempt,
                 e.wrote,
-                &e.deps,
+                e.deps(),
                 &[],
                 Some(&*payload),
                 bag,
             );
         }
-        bag.push_erased(Box::new((e.buf, e.s)));
+        if let Some(spec_buf) = spec_buf {
+            bag.push_erased(spec_buf);
+        }
+        bag.push_erased(Box::new(e.into_values()));
         payload
     }
 
@@ -2274,7 +2277,7 @@ impl<C: Cells> Runtime<C> {
         for slot in slots {
             if let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) {
                 self.unwound_land(NodeId(slot), e.first, e.wrote, stamp_rev, kind, bag);
-                bag.push_erased(Box::new((e.buf, e.s)));
+                bag.push_erased(Box::new(e.into_values()));
             }
         }
     }

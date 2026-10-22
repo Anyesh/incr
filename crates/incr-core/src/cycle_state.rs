@@ -4,14 +4,17 @@
 //! cycle an uncaught cycle panic reported, and the roots whose episodes
 //! dissolved during the current outermost entry.
 
+use std::borrow::{Borrow, BorrowMut};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
+use std::ops::{Deref, DerefMut};
 
 use std::sync::Arc;
 
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
+use crate::replay;
 use crate::value_code;
 
 /// The frame whose unwind releases a claim: the frame it stands for, or
@@ -93,24 +96,24 @@ pub(crate) struct Held {
     /// The claim was taken from New.
     pub(crate) first: bool,
     /// The last run's value, or for a seeded member its last output.
-    pub(crate) buf: Option<Erased>,
+    buf: Option<Erased>,
     /// A seeded member's current value inside an episode.
     pub(crate) s: Option<Erased>,
     /// Every dep any run of this claim recorded, for the stale check.
-    pub(crate) deps: Vec<(NodeId, u32)>,
+    deps: Vec<(NodeId, u32)>,
     /// The deps of the last run: its reads of other members are the
     /// iteration's graph.
-    pub(crate) last: Vec<(NodeId, u32)>,
+    last: Vec<(NodeId, u32)>,
     /// Every dep the runs since the episode's last restart recorded, in
     /// first-read order: the landed value depends on all of them, so the
     /// landing installs them all.
-    pub(crate) installed: Vec<NodeId>,
+    installed: Vec<NodeId>,
     pub(crate) wrote: bool,
     /// The last run reached the node's child index.
-    pub(crate) opened: bool,
+    opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    pub(crate) poisoned: bool,
+    poisoned: bool,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
@@ -164,8 +167,25 @@ impl Held {
         }
     }
 
-    /// Records one run's deps.
-    pub(crate) fn record_run(&mut self, deps: Vec<(NodeId, u32)>) {
+    /// Records a finished run: its deps, buffer, whether it reached the
+    /// child index and whether it was poisoned. Under speculation it first
+    /// keeps the record it replaces; outside, it settles first. Returns
+    /// the buffer it replaces and the value a settle dropped, for the
+    /// caller to drop outside the held map.
+    pub(crate) fn record(
+        &mut self,
+        look: Look,
+        deps: Vec<(NodeId, u32)>,
+        buf: Option<Erased>,
+        opened: bool,
+        poisoned: bool,
+    ) -> (Option<Erased>, Option<Erased>) {
+        let spec_buf = if look.speculative {
+            self.keep_record();
+            None
+        } else {
+            self.settle()
+        };
         for &d in &deps {
             if !self.deps.contains(&d) {
                 self.deps.push(d);
@@ -175,20 +195,36 @@ impl Held {
             }
         }
         self.last = deps;
+        self.opened = opened;
+        self.poisoned |= poisoned;
+        (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
 
-    /// Before a run's buffer and record are written under speculation:
-    /// keeps the record they replace, unless an earlier speculative run's
-    /// write already did.
-    pub(crate) fn before_spec_write(&mut self) {
-        if self.pre_spec.is_none() {
-            self.pre_spec = Some(Box::new(RunRecord {
-                deps: self.deps.clone(),
-                last: self.last.clone(),
-                installed: self.installed.clone(),
-                opened: self.opened,
-                poisoned: self.poisoned,
-            }));
+    /// The claim's run as `look` sees it, and the value a settle dropped,
+    /// for the caller to drop outside the held map.
+    pub(crate) fn look(&mut self, look: Look) -> (Seen<&mut Held>, Option<Erased>) {
+        let spec_buf = self.settle_for(look);
+        (Seen(self), spec_buf)
+    }
+
+    /// [`Self::look`] at a claim out of the held map.
+    pub(crate) fn into_look(mut self, look: Look) -> (Seen<Held>, Option<Erased>) {
+        let spec_buf = self.settle_for(look);
+        (Seen(self), spec_buf)
+    }
+
+    /// Takes the buffer to drop it, leaving the run record as it is.
+    pub(crate) fn discard_buf(&mut self) -> Option<Discarded> {
+        self.buf.take().map(|buf| Discarded {
+            _values: (Some(buf), None),
+        })
+    }
+
+    /// The buffer and seeded value to drop, for a claim released without a
+    /// landing that reads its run.
+    pub(crate) fn into_values(self) -> Discarded {
+        Discarded {
+            _values: (self.buf, self.s),
         }
     }
 
@@ -203,10 +239,32 @@ impl Held {
         self.pre_spec = None;
     }
 
-    /// For a look at the claim that is not speculative: puts back the
-    /// record a speculative run replaced and returns the value it
-    /// buffered, as the unbounded run may never make that run.
-    pub(crate) fn settle(&mut self) -> Option<Erased> {
+    /// Before a run's buffer and record are written under speculation:
+    /// keeps the record they replace, unless an earlier speculative run's
+    /// write already did.
+    fn keep_record(&mut self) {
+        if self.pre_spec.is_none() {
+            self.pre_spec = Some(Box::new(RunRecord {
+                deps: self.deps.clone(),
+                last: self.last.clone(),
+                installed: self.installed.clone(),
+                opened: self.opened,
+                poisoned: self.poisoned,
+            }));
+        }
+    }
+
+    fn settle_for(&mut self, look: Look) -> Option<Erased> {
+        if look.speculative {
+            None
+        } else {
+            self.settle()
+        }
+    }
+
+    /// Puts back the record a speculative run replaced and returns the
+    /// value it buffered, as the unbounded run may never make that run.
+    fn settle(&mut self) -> Option<Erased> {
         let r = self.pre_spec.take()?;
         self.deps = r.deps;
         self.last = r.last;
@@ -217,7 +275,110 @@ impl Held {
     }
 }
 
-/// A claim's run record, kept by [`Held::before_spec_write`].
+/// How a look at a claim's run stands to speculation: one made under it
+/// sees what a speculative run left, one made outside it settles the
+/// claim first. Only the thread's speculation and a driver entry's or
+/// virtual frame's own flag make one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Look {
+    speculative: bool,
+}
+
+impl Look {
+    #[cfg(all(test, not(loom)))]
+    const SPECULATIVE: Self = Self { speculative: true };
+    #[cfg(all(test, not(loom)))]
+    const REAL: Self = Self { speculative: false };
+
+    /// A look from this thread's run.
+    pub(crate) fn here() -> Self {
+        Self::here_or(false)
+    }
+
+    /// [`Self::here`], speculative also when `spec`: a driver entry's or
+    /// virtual frame's own check of its node.
+    pub(crate) fn here_or(spec: bool) -> Self {
+        Self {
+            speculative: spec || replay::speculative(),
+        }
+    }
+}
+
+/// A claim whose run a [`Look`] has seen: the only way to read its buffer
+/// and run record. [`Held::discard_buf`] and [`Held::into_values`] only hand
+/// them over to be dropped.
+pub(crate) struct Seen<H>(H);
+
+impl<H: Borrow<Held>> Deref for Seen<H> {
+    type Target = Held;
+
+    fn deref(&self) -> &Held {
+        self.0.borrow()
+    }
+}
+
+impl<H: BorrowMut<Held>> DerefMut for Seen<H> {
+    fn deref_mut(&mut self) -> &mut Held {
+        self.0.borrow_mut()
+    }
+}
+
+impl<H: Borrow<Held>> Seen<H> {
+    pub(crate) fn buf(&self) -> &Option<Erased> {
+        &self.0.borrow().buf
+    }
+
+    pub(crate) fn deps(&self) -> &[(NodeId, u32)] {
+        &self.0.borrow().deps
+    }
+
+    pub(crate) fn last(&self) -> &[(NodeId, u32)] {
+        &self.0.borrow().last
+    }
+
+    pub(crate) fn installed(&self) -> &[NodeId] {
+        &self.0.borrow().installed
+    }
+
+    pub(crate) fn opened(&self) -> bool {
+        self.0.borrow().opened
+    }
+
+    pub(crate) fn poisoned(&self) -> bool {
+        self.0.borrow().poisoned
+    }
+}
+
+impl<H: BorrowMut<Held>> Seen<H> {
+    pub(crate) fn take_buf(&mut self) -> Option<Erased> {
+        self.0.borrow_mut().buf.take()
+    }
+
+    pub(crate) fn take_deps(&mut self) -> Vec<(NodeId, u32)> {
+        std::mem::take(&mut self.0.borrow_mut().deps)
+    }
+
+    pub(crate) fn clear_installed(&mut self) {
+        self.0.borrow_mut().installed.clear();
+    }
+}
+
+impl Seen<Held> {
+    pub(crate) fn into_values(self) -> Discarded {
+        self.0.into_values()
+    }
+
+    pub(crate) fn into_held(self) -> Held {
+        self.0
+    }
+}
+
+/// Values taken off a claim only to be dropped.
+pub(crate) struct Discarded {
+    _values: (Option<Erased>, Option<Erased>),
+}
+
+/// A claim's run record, kept while a speculative run's is written over it.
 struct RunRecord {
     deps: Vec<(NodeId, u32)>,
     last: Vec<(NodeId, u32)>,
@@ -921,3 +1082,7 @@ pub(crate) fn reset_outermost() {
         });
     }
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "cycle_state_tests.rs"]
+mod tests;
