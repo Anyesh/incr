@@ -20,7 +20,7 @@
 //! fresh one at the freed address with no engine call between, so the key
 //! also holds the text of a `&str` or `String` payload.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::sync::atomic::Ordering::Relaxed;
@@ -121,7 +121,11 @@ pub(super) fn walked_episode(cidx: u32) -> Option<NodeId> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Key {
+    /// Every zero-sized payload's box has its type's dangling address, so
+    /// only the type tells two of them apart, the engine's own unwinds
+    /// included.
     address: usize,
+    ty: TypeId,
     /// A hash of the payload's text, 0 for a payload of another type.
     text: u64,
 }
@@ -130,6 +134,7 @@ fn key(payload: &(dyn Any + Send)) -> Key {
     let text = |s: &str| BuildHasherDefault::<DefaultHasher>::default().hash_one(s);
     Key {
         address: std::ptr::from_ref(payload).cast::<()>() as usize,
+        ty: Any::type_id(payload),
         text: match payload.downcast_ref::<&'static str>() {
             Some(s) => text(s),
             None => payload.downcast_ref::<String>().map_or(0, |s| text(s)),
