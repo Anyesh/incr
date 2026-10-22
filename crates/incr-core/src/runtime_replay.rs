@@ -2685,7 +2685,7 @@ impl<C: Cells> Runtime<C> {
         // no delivery can intercept, so the read's outcome may not be the
         // unbounded run's.
         #[cfg(test)]
-        for d in ended.iter().filter(|d| !d.taken) {
+        for d in ended.iter().filter(|d| !d.taken && d.key.foreign.is_none()) {
             let slot = d.key.reading as u32;
             if state::load::<C>(self.nodes.get(slot).state_cell()) == NodeState::Clean {
                 self.dirty_reads.lock().unwrap().push(slot);
