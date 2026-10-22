@@ -323,14 +323,15 @@ fn deleted_while_reading(id: NodeId) -> ! {
 /// A `Local` read skips the post-clone generation recheck because every
 /// delete and recycle path refuses value code; this catches, in debug
 /// builds, a path that retired the node during the clone without that
-/// refusal.
-#[inline(always)]
-fn debug_assert_local_read_kept<C: Cells>(node: &NodeData<C>, generation: u32) {
-    debug_assert!(
-        node.generation() == generation,
-        "incr-core: a node was retired while value code cloned it (a delete \
-         or recycle path reached from value code without value_code::check)",
-    );
+/// refusal. A macro so a release build evaluates neither argument.
+macro_rules! debug_assert_local_read_kept {
+    ($node:expr, $generation:expr) => {
+        debug_assert!(
+            $node.generation() == $generation,
+            "incr-core: a node was retired while value code cloned it (a delete \
+             or recycle path reached from value code without value_code::check)",
+        )
+    };
 }
 
 /// What [`Runtime::delete_erased`] did with a node.
@@ -2397,7 +2398,7 @@ impl<C: Cells> Runtime<C> {
             self.read_failed(handle)
         };
         let value = value_code::run(|| arena.read_or(arena_slot, || self.read_failed(handle)));
-        debug_assert_local_read_kept(self.nodes.get(handle.slot()), handle.generation());
+        debug_assert_local_read_kept!(self.nodes.get(handle.slot()), handle.generation());
         value
     }
 
@@ -2422,7 +2423,7 @@ impl<C: Cells> Runtime<C> {
                 self.stale_handle(handle);
             }
         } else {
-            debug_assert_local_read_kept(node, handle.generation());
+            debug_assert_local_read_kept!(node, handle.generation());
         }
         value
     }
