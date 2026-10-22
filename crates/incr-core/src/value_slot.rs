@@ -486,6 +486,45 @@ mod tests {
         assert_eq!(rejected, Boom(4));
     }
 
+    /// A value whose `Drop` always panics, counting its drops.
+    #[derive(Clone, PartialEq, Debug)]
+    struct Bang;
+
+    static BANGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    impl Drop for Bang {
+        fn drop(&mut self) {
+            BANGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("bang");
+        }
+    }
+
+    /// An unbuilt value's `Drop` runs under isolation under both
+    /// strategies, under `Shared` at the reclaim its retire defers it to.
+    #[test]
+    fn isolating_displaced_value_drops_under_isolation() {
+        let local: LocalValueSlot<Bang> = ValueSlot::new_with(Bang);
+        let old = local.clear().expect("the slot held a value");
+        drop(crate::deferred::Unbuilt::new(LocalValueSlot::isolating(
+            old,
+        )));
+        assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A hazard on the value keeps the retire itself from reclaiming it.
+        let shared: SharedValueSlot<Bang> = ValueSlot::new_with(Bang);
+        let mut hp = HazardPointer::new();
+        // SAFETY: see `SharedValueSlot::read`.
+        assert!(unsafe { shared.0.load(&mut hp) }.is_some());
+        let old = shared.clear().expect("the slot held a value");
+        drop(crate::deferred::Unbuilt::new(SharedValueSlot::isolating(
+            old,
+        )));
+        assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(hp);
+        haphazard::Domain::global().eager_reclaim();
+        assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn shared_slot_is_send_sync() {
         fn assert_send_sync<X: Send + Sync>() {}
