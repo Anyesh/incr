@@ -2845,11 +2845,12 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
 /// 0x741b's first phase overlaps op 0 (`Get(0)`) with op 1 (`TryGet(2)`).
 /// At a frame budget of 2, about one run in three, op 1's replayed
 /// episode lands node 10 Failed before it reaches 9, and op 0's walk,
-/// planned before that, meets 10 Failed through 9 and leaves {0, 9, 10}
-/// Failed, which neither order leaves: op 0 first enters a cycle and op
-/// 1 leaves {10}, and op 1 first leaves {0, 4, 5, 9, 10, 11}.
-/// The oracle takes the set as history: 0 and 9 fail through 10, and 4, 5
-/// and 11 still panic when read. Holding either thread at a park point
+/// planned before that, meets 10 Failed through 9 and leaves 0, 9, 10
+/// and others the interleaving picks Failed, a set neither order leaves:
+/// op 0 first enters a cycle and op 1 leaves {10}, and op 1 first leaves
+/// {0, 2, 3, 4, 5, 9, 10, 11, 12}. The oracle takes the set as history:
+/// its nodes fail through 10, and the second order's others still panic
+/// when read. Holding either thread at a park point
 /// gives a serial run, so the runs are free and the test reruns until the
 /// oracle takes one, each run checked.
 #[test]
@@ -2865,7 +2866,10 @@ fn two_thread_oracle_takes_a_history_failed_set() {
             .map(|&x| (x, NodeState::Failed))
             .collect::<Vec<_>>()
     };
-    assert_eq!(orders, [failed(&[10]), failed(&[0, 4, 5, 9, 10, 11])]);
+    assert_eq!(
+        orders,
+        [failed(&[10]), failed(&[0, 2, 3, 4, 5, 9, 10, 11, 12])]
+    );
     quiet(|| {
         for _ in 0..2000 {
             let serial = Serial::new(&case, &phases);
@@ -2880,7 +2884,12 @@ fn two_thread_oracle_takes_a_history_failed_set() {
             let history = verdict.is_some();
             serial.check("0x741b", &got, verdict);
             if history {
-                assert_eq!(settled(&got[1].1 .0), failed(&[0, 9, 10]));
+                let set = settled(&got[1].1 .0);
+                assert!(
+                    failed(&[0, 9, 10]).iter().all(|f| set.contains(f)),
+                    "{set:?}"
+                );
+                assert!(!orders.contains(&set), "{set:?}");
                 return;
             }
         }

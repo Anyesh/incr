@@ -3740,6 +3740,34 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// The landing of a claim a user panic released without failing it.
+    /// The node that lands Failed read it, directly or through other
+    /// released claims, so a set that would cure the failure may reach
+    /// that node only through this one: the union of its old and recorded
+    /// deps is published, as [`Self::land_failed`] publishes them, and it
+    /// lands New, which a set's walk passes through where Dirty stops it.
+    /// `co_members`, sorted, are the claims released with it.
+    fn land_panic_released(
+        &self,
+        id: NodeId,
+        attempt: Attempt,
+        wrote: bool,
+        deps: &[(NodeId, u32)],
+        co_members: &[u32],
+        bag: &mut Deferred<C>,
+    ) {
+        let (node, flags) = self.nodes.get_with_flags(id.0);
+        // Any outcome lands New, which recomputes.
+        self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag);
+        if wrote {
+            node.max_changed_at(attempt.stamp_rev);
+        } else if attempt.first {
+            node.set_verified_at(0);
+        }
+        self.children_landing(id, flags, ChildLanding::Discard, false, bag);
+        self.land_single(id, node, flags, NodeState::New, NodeState::New);
+    }
+
     /// A frame pop found the memo, unwind or replay bit in the thread word.
     /// A wound or discard rewrites `result` into its unwind; `Some` is a
     /// speculative run dropped in place.
