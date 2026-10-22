@@ -926,10 +926,11 @@ struct Live<C: Cells> {
 }
 
 /// After an operation: every query's state, every node's dependencies in
-/// the order its last landing installed them, and whether a read returned
-/// a node's Dirty value, or had a delivery, that a later landing made
-/// Clean. Both runtimes' entries, the first's first.
-type Snapshot = (Vec<NodeState>, Vec<Vec<u32>>, bool);
+/// the order its last landing installed them, whether a read returned a
+/// node's Dirty value, or had a delivery, that a later landing made Clean,
+/// and which queries are Dirty over a recorded dep Failed or Cyclic. Both
+/// runtimes' entries, the first's first.
+type Snapshot = (Vec<NodeState>, Vec<Vec<u32>>, bool, Vec<bool>);
 
 impl<C: Cells> Live<C> {
     fn new(rts: &[Box<Runtime<C>>; 2], case: &Case) -> Self {
@@ -1011,15 +1012,18 @@ impl<C: Cells> Live<C> {
         let mut states = Vec::new();
         let mut deps = Vec::new();
         let mut replaced = false;
+        let mut over_settled = Vec::new();
         for side in 0..2 {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
                 let h = w.handle(side, q);
-                states.push(if rt.is_alive(h.erased()) {
+                let state = if rt.is_alive(h.erased()) {
                     h.state(rt)
                 } else {
                     NodeState::Dead
-                });
+                };
+                states.push(state);
+                over_settled.push(state == NodeState::Dirty && settled_dep(rt, h, false));
             }
             for x in 0..rt.nodes.len() {
                 let mut d = Vec::new();
@@ -1030,8 +1034,21 @@ impl<C: Cells> Live<C> {
                 .into_iter()
                 .any(|n| rt.nodes.get(n).state() == NodeState::Clean);
         }
-        (states, deps, replaced)
+        (states, deps, replaced, over_settled)
     }
+}
+
+/// Whether a recorded dep of `h` is Cyclic, or Failed too unless `cyclic`.
+fn settled_dep<C: Cells>(rt: &Runtime<C>, h: Handle, cyclic: bool) -> bool {
+    let mut any = false;
+    rt.nodes.get(h.erased().slot()).for_each_dep(|d| {
+        any |= match rt.nodes.get(d.0).state() {
+            NodeState::Cyclic => true,
+            NodeState::Failed => !cyclic,
+            _ => false,
+        };
+    });
+    any
 }
 
 /// The Failed and Cyclic nodes, by index.
@@ -1694,9 +1711,12 @@ impl<'a> Serial<'a> {
 /// Whether the Failed and Cyclic nodes after `prefix`'s last phase are
 /// true of their inputs for one of `sets`, each the Failed and Cyclic set
 /// an order with the trace's outcomes leaves. A node the phase left
-/// settled where the order does not must have a recorded dep Failed or
-/// Cyclic, or its closure, re-run as a fresh query from the phase's end,
-/// must panic or cycle. A node the order settles that the phase left
+/// Cyclic where the order does not must have a recorded dep Cyclic, or its
+/// closure, re-run as a fresh query from the phase's end, must panic or
+/// cycle. One it left Failed must have a cause none of those Failed nodes
+/// stands in for unless it has one too: the re-run panics with the
+/// closure's own payload, or through a read of a node left Failed or
+/// Cyclic that is not such a node. A node the order settles that the phase left
 /// Dirty or New must still read so on a later `get`: a panic for Failed,
 /// the cycle for Cyclic. The re-runs and gets run on this thread, in that
 /// order, and change the world.
@@ -1725,35 +1745,80 @@ fn consistent(
     missing.sort_unstable_by_key(|&(x, _)| x);
     missing.dedup();
 
-    let settled_dep = |x: usize| {
-        let (side, _, h) = node(x);
-        let rt = w.rt(side);
-        let mut any = false;
-        rt.nodes.get(h.erased().slot()).for_each_dep(|d| {
-            any |= matches!(
-                rt.nodes.get(d.0).state(),
-                NodeState::Failed | NodeState::Cyclic
-            );
-        });
-        any
-    };
-    let by_deps: Vec<bool> = extra.iter().map(|&(x, _)| settled_dep(x)).collect();
+    let failed_extra: HashMap<(usize, u32), usize> = extra
+        .iter()
+        .filter(|&&(_, s)| s == NodeState::Failed)
+        .map(|&(x, _)| {
+            let (side, _, h) = node(x);
+            ((side, h.erased().slot()), x)
+        })
+        .collect();
     let mut why: HashMap<usize, String> = HashMap::new();
-    for (&(x, s), by_deps) in extra.iter().zip(by_deps) {
-        if by_deps {
+    // Failed nodes whose re-run failed only through reads, with its side
+    // and the nodes it read.
+    let mut through: Vec<(usize, usize, Vec<u32>)> = Vec::new();
+    for &(x, s) in &extra {
+        let (side, q, h) = node(x);
+        if s == NodeState::Cyclic && settled_dep(w.rt(side), h, true) {
             continue;
         }
-        let (side, q, _) = node(x);
         let spec = spec_at(case, prefix, side, q);
         let rerun = make(&live.world, side, q, &spec, true);
         let out = read_out(w.rt(side), rerun, false);
-        if matches!(out, Out::Value(_)) {
-            let deps = "no recorded dep is Failed or Cyclic";
-            why.insert(
-                x,
-                format!("node {x} {s:?}: {deps}, and a re-run returned {out:?}"),
-            );
+        match (&out, s) {
+            (Out::Value(_), _) => {
+                let deps = if s == NodeState::Cyclic {
+                    "no recorded dep is Cyclic, and "
+                } else {
+                    ""
+                };
+                why.insert(
+                    x,
+                    format!("node {x} {s:?}: {deps}a re-run returned {out:?}"),
+                );
+            }
+            (Out::Panic(c), NodeState::Failed) if c == "failed" || c == "cycle" => {
+                let mut read = Vec::new();
+                w.rt(side)
+                    .nodes
+                    .get(rerun.erased().slot())
+                    .for_each_dep(|d| read.push(d.0));
+                through.push((x, side, read));
+            }
+            _ => {}
         }
+    }
+    loop {
+        let open = through.len();
+        let stands = |side: usize,
+                      d: u32,
+                      why: &HashMap<usize, String>,
+                      through: &[(usize, usize, Vec<u32>)]| {
+            matches!(
+                w.rt(side).nodes.get(d).state(),
+                NodeState::Failed | NodeState::Cyclic
+            ) && failed_extra
+                .get(&(side, d))
+                .is_none_or(|y| !why.contains_key(y) && !through.iter().any(|(t, _, _)| t == y))
+        };
+        let grounded: Vec<bool> = through
+            .iter()
+            .map(|(_, side, read)| read.iter().any(|&d| stands(*side, d, &why, &through)))
+            .collect();
+        let mut grounded = grounded.into_iter();
+        through.retain(|_| !grounded.next().unwrap());
+        if through.len() == open {
+            break;
+        }
+    }
+    for (x, _, _) in through {
+        why.insert(
+            x,
+            format!(
+                "node {x} Failed: a re-run fails only through nodes the phase left Failed \
+                 that no order does and that have no other cause"
+            ),
+        );
     }
     let mut after: HashMap<usize, Result<Out, String>> = HashMap::new();
     for &(x, _) in &missing {
@@ -1878,7 +1943,9 @@ fn first_diff(
             Op::Get2(q, _) => Some(case.queries + q),
             _ => None,
         };
-        if target.is_some_and(|q| want.0[q] == NodeState::Dirty) {
+        // A target Dirty over a dep it read Failed or Cyclic was poisoned by
+        // that read, which leaves no value to come out later.
+        if target.is_some_and(|q| want.0[q] == NodeState::Dirty && !want.3[q]) {
             agree = false;
             continue;
         }
@@ -2588,7 +2655,7 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
         (
             1,
             NodeState::Failed,
-            "node 1 Failed: no recorded dep is Failed or Cyclic",
+            "node 1 Failed: a re-run returned Value(1)",
         ),
         (
             10,
