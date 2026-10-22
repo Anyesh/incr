@@ -348,6 +348,7 @@ impl<C: Cells> Runtime<C> {
             });
             done.insert(*root);
         }
+        self.defer_buried_tickets(bag);
         done
     }
 
