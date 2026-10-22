@@ -1019,11 +1019,18 @@ fn caught_note_stays_out_of_a_reused_address_ticket<C: Cells>() {
     rt.set(t, 1);
     rt.set(sel, 1);
     let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err());
+    // Whether the allocator reused the address is its choice (Miri often
+    // does not): either way d's catch dropped x's payload, so x's read has
+    // none to raise.
+    let path = if reused.load(Ordering::SeqCst) {
+        "at the freed address"
+    } else {
+        "at a fresh address"
+    };
     assert!(
-        reused.load(Ordering::SeqCst),
-        "precondition: the fresh box reused the freed address"
+        got.contains("last compute panicked"),
+        "x's read raised {got:?} with d's box {path}"
     );
-    assert_ne!(got, "pD", "x's read took d's contained payload");
     let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err());
     assert_eq!(got, "pD");
 }
