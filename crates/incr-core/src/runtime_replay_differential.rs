@@ -2056,6 +2056,52 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
     }
 }
 
+/// 0x741b's first phase overlaps op 0 (`Get(0)`) with op 1 (`TryGet(2)`).
+/// At a frame budget of 2, about one run in three, op 1's replayed
+/// episode lands node 10 Failed before it reaches 9, and op 0's walk,
+/// planned before that, meets 10 Failed through 9 and leaves {0, 9, 10}
+/// Failed, which neither order leaves: op 0 first enters a cycle and op
+/// 1 leaves {10}, and op 1 first leaves {0, 4, 5, 9, 10, 11}.
+/// The oracle takes the set as history: 0 and 9 fail through 10, and 4, 5
+/// and 11 still panic when read. Holding either thread at a park point
+/// gives a serial run, so the runs are free and the test reruns until the
+/// oracle takes one, each run checked.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_takes_a_history_failed_set() {
+    let case = gen_case(0x741b, false, true);
+    let phases = phases(&case, 0x741b);
+    assert_eq!(phases[0].ops(), [0, 1]);
+    let orders = [Order::new(&case, &phases, 0), Order::new(&case, &phases, 1)]
+        .map(|o| settled(&run::<Shared>(&o.case, None, 0)[1].1 .0));
+    let failed = |xs: &[usize]| {
+        xs.iter()
+            .map(|&x| (x, NodeState::Failed))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(orders, [failed(&[10]), failed(&[0, 4, 5, 9, 10, 11])]);
+    quiet(|| {
+        for _ in 0..2000 {
+            let serial = Serial::new(&case, &phases);
+            let verdict = Mutex::new(None);
+            let got = run_two_until(&case, &phases, Some(2), 0, &|_| {}, &|_, prefix, live| {
+                let v = serial.at_overlap("0x741b", prefix, live);
+                let stop = v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            let verdict = verdict.into_inner().unwrap();
+            let history = verdict.is_some();
+            serial.check("0x741b", &got, verdict);
+            if history {
+                assert_eq!(settled(&got[1].1 .0), failed(&[0, 9, 10]));
+                return;
+            }
+        }
+        panic!("no run of 0x741b left a history Failed set");
+    });
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
