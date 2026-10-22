@@ -1012,6 +1012,85 @@ fn wave7_shared_kept_read_keeps_the_read_nodes_deeper_landing_retired() {
     wave7_kept_read_keeps_the_read_nodes_landing::<Shared>(true);
 }
 
+/// g takes a's held ticket, sets k (flipping a Dirty) and rereads a, directly
+/// or through b, so a lands Failed again with "a boom 1"; g drops that and
+/// re-raises the taken "a boom 0". No ticket may hold the superseded payload:
+/// get(a) reports "last compute panicked".
+fn wave7_relanded_node_drops_its_taken_ticket_note<C: Cells>(via_b: bool) {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let k = rt.create_input(0_i64);
+    let a = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        let v = rt.get(j);
+        let kk = rt.get(k);
+        if v == 0 {
+            panic!("a boom {kk}")
+        }
+        v
+    });
+    let b = rt.create_query(move |rt: &Runtime<C>| rt.get(a));
+    let g = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        match catch_unwind(AssertUnwindSafe(|| rt.get(a))) {
+            Ok(v) => v,
+            Err(p) => {
+                rt.set(k, 1);
+                let _ = catch_unwind(AssertUnwindSafe(
+                    || {
+                        if via_b {
+                            rt.get(b)
+                        } else {
+                            rt.get(a)
+                        }
+                    },
+                ));
+                std::panic::resume_unwind(p)
+            }
+        }
+    });
+    let w = rt.create_query(move |rt: &Runtime<C>| rt.get(g));
+    let x = rt.create_query(move |rt: &Runtime<C>| if rt.get(sel) == 0 { rt.get(w) } else { 100 });
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_no_notes();
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err());
+    assert!(
+        got.contains("last compute panicked"),
+        "via_b={via_b}: a raised {got:?}, a superseded landing's payload"
+    );
+    // w's walk reran g after its flagged Dirty landing, and that run
+    // re-raised what its read of a raised.
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
+    assert!(
+        got.contains("last compute panicked"),
+        "via_b={via_b}: g raised {got:?}"
+    );
+    assert_eq!(rt.contained_payloads(), 0, "via_b={via_b}");
+    assert_no_notes();
+}
+
+#[test]
+fn wave7_local_relanded_node_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Local>(false);
+}
+
+#[test]
+fn wave7_shared_relanded_node_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Shared>(false);
+}
+
+#[test]
+fn wave7_local_relanded_node_via_dependent_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Local>(true);
+}
+
+#[test]
+fn wave7_shared_relanded_node_via_dependent_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Shared>(true);
+}
+
 #[test]
 fn local_walked_dep_panic_reaches_the_rerun_that_reads_it() {
     walked_dep_panic_reaches_the_rerun_that_reads_it::<Local>();
