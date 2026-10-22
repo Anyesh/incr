@@ -1412,9 +1412,9 @@ fn caught_read_same_text_as_escape<C: Cells>(frames: Option<u32>) -> (Out, Vec<N
     (got, [a, x, d, c].iter().map(|&h| rt.state_of(h)).collect())
 }
 
-/// D's landing must not mark X's caught read of C escaped just because
-/// the two payloads share a text: A's second read finds X Failed and must
-/// raise "last compute panicked", as the unbounded run does, not "c boom".
+/// D's panic shares the text of C's, which X caught, but A's second
+/// read finds X Failed and must raise "last compute panicked", as the
+/// unbounded run does, not "c boom".
 fn wave6_escape_match_by_text_marks_caught_read<C: Cells>() {
     let unbounded = caught_read_same_text_as_escape::<C>(None);
     assert!(
@@ -1506,9 +1506,8 @@ fn walked_caught_member<C: Cells>(frames: Option<u32>) -> (Out, Out, Out) {
     got
 }
 
-/// At budget 2 A's second read takes "b boom" for X's frame by its path,
-/// and that read stands for X's compute, so the walk's ticket holds X's
-/// landing and X's read gets the payload, as in the unbounded run.
+/// At every budget the walk's ticket holds X's landing and X's read gets
+/// "b boom", as in the unbounded run.
 fn walked_caught_member_keeps_its_ticket<C: Cells>() {
     let unbounded = walked_caught_member::<C>(None);
     assert_eq!(

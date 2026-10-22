@@ -3100,7 +3100,7 @@ impl<C: Cells> Runtime<C> {
                 // whose rerun reads it only if it still needs it.
                 NodeState::Failed if walked => return Computed::Done,
                 NodeState::Failed => {
-                    self.read_failed_node::<MODE>(id, bag);
+                    self.read_failed_node(id);
                     continue;
                 }
                 NodeState::Dead => {
@@ -3730,9 +3730,6 @@ impl<C: Cells> Runtime<C> {
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
-        if let Some(payload) = payload.filter(|_| landed == NodeState::Failed) {
-            self.after_failed_store(id, node.generation(), attempt.cidx, deps, payload);
-        }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {
