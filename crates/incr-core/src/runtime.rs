@@ -3478,16 +3478,9 @@ impl<C: Cells> Runtime<C> {
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
         replay::unwind_past(self.runtime_id, attempt.cidx);
-        // A speculative entry's run may evaluate nodes the unbounded run
-        // never does, so a panic in it lands nothing Failed, and a cycle
-        // it raises is no read's result: the real run raises either again
-        // if it does reach the node. It goes on as a discard unwind, which
-        // a closure that catches it can't land a value over.
-        let kind = if matches!(kind, None | Some(UnwindKind::Cycle)) && replay::speculative() {
-            Some(UnwindKind::Discard)
-        } else {
-            kind
-        };
+        // A closure that catches a speculative run's discard can't land a
+        // value over it.
+        let kind = replay::run_unwind_kind(kind, replay::speculative());
         self.note_unwound_read(&*payload, kind);
         self.release_unwound_from(attempt.cidx, id.0, kind, kind.is_some(), bag);
         let wrote = ctl.wrote.get() != 0;
