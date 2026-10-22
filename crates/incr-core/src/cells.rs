@@ -87,6 +87,8 @@ pub trait Cells: 'static + Sized {
     fn u8_store_release(c: &Self::U8, v: u8);
     fn u8_load_relaxed(c: &Self::U8) -> u8;
     fn u8_store_relaxed(c: &Self::U8, v: u8);
+    /// Atomic compare-exchange; AcqRel/Acquire under Shared.
+    fn u8_compare_exchange(c: &Self::U8, current: u8, new: u8) -> Result<u8, u8>;
 
     fn u32_load_acquire(c: &Self::U32) -> u32;
     fn u32_store_release(c: &Self::U32, v: u32);
@@ -276,6 +278,16 @@ impl Cells for Local {
     fn u8_store_relaxed(c: &Self::U8, v: u8) {
         c.set(v);
     }
+    #[inline(always)]
+    fn u8_compare_exchange(c: &Self::U8, current: u8, new: u8) -> Result<u8, u8> {
+        let prev = c.get();
+        if prev == current {
+            c.set(new);
+            Ok(prev)
+        } else {
+            Err(prev)
+        }
+    }
 
     #[inline(always)]
     fn u32_load_acquire(c: &Self::U32) -> u32 {
@@ -435,6 +447,10 @@ impl Cells for Shared {
     #[inline(always)]
     fn u8_store_relaxed(c: &Self::U8, v: u8) {
         c.store(v, Ordering::Relaxed);
+    }
+    #[inline(always)]
+    fn u8_compare_exchange(c: &Self::U8, current: u8, new: u8) -> Result<u8, u8> {
+        c.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
     }
 
     #[inline(always)]
