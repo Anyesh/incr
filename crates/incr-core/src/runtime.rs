@@ -3272,7 +3272,7 @@ impl<C: Cells> Runtime<C> {
                         return Computed::Done;
                     }
                 }
-                match self.group_verify(id, g, visit, bag) {
+                match self.group_verify(id, g, visit, walked, bag) {
                     // A tainted verify leaves the node Dirty for the root's
                     // compute to read again, which poisons where needed.
                     GroupEnd::Done(Computed::Done) if !matches!(visit, Visit::VerifyOnly(_)) => {
@@ -3449,6 +3449,7 @@ impl<C: Cells> Runtime<C> {
                             return self.episode_landed(node);
                         }
                         PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
+                        PopEnd::Contained => return Computed::Unsettled,
                         PopEnd::Dissolved => {
                             self.end_dissolved(id, bag);
                             continue 'run;
@@ -3592,24 +3593,14 @@ impl<C: Cells> Runtime<C> {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
             self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
-            if contain {
-                self.retire_notes_above(attempt.cidx);
-                return Computed::Unsettled;
-            }
-            // A closure that catches the unwind has read a dep that did not
-            // land, which its publish counts as settled if it read it before.
-            self.dep_stack.poison_current_frame(self.runtime_id);
-            cycle_state::set_unwind_kind(kind);
-            bag.drain_carried(payload);
-        }
-        // Publish the union of the old deps and whatever was recorded
-        // before the panic. Without the recorded subset, a first-compute
-        // panic leaves no reverse edges at all and no set() can ever flip
-        // the node out of Failed; without the old set, a recompute panic
-        // would lose recovery paths through deps the failed run had not
-        // reached yet. Extra edges only cause spurious re-verification,
-        // never staleness.
-        if contain {
+        } else {
+            // Publish the union of the old deps and whatever was recorded
+            // before the panic. Without the recorded subset, a first-compute
+            // panic leaves no reverse edges at all and no set() can ever
+            // flip the node out of Failed; without the old set, a recompute
+            // panic would lose recovery paths through deps the failed run
+            // had not reached yet. Extra edges only cause spurious
+            // re-verification, never staleness.
             self.land_failed(
                 id,
                 node,
@@ -3618,40 +3609,41 @@ impl<C: Cells> Runtime<C> {
                 wrote,
                 deps,
                 &[],
-                None,
-                Some(payload),
+                Some(&*payload),
                 bag,
             );
-            // Spent even if the landing was not Failed, which drops the box.
-            self.retire_notes_above(attempt.cidx);
+        }
+        if contain {
+            self.contain(attempt.cidx, payload, bag);
             return Computed::Unsettled;
         }
-        self.land_failed(
-            id,
-            node,
-            flags,
-            attempt,
-            wrote,
-            deps,
-            &[],
-            Some(&*payload),
-            None,
-            bag,
-        );
-        // An enclosing closure that catches the unwind has still read a
-        // dep that did not land Clean.
-        self.dep_stack.poison_current_frame(self.runtime_id);
-        bag.drain_carried(payload);
+        self.leave_frame(kind, payload, bag)
     }
 
-    /// Whether walk entry `entry` contains an unwind out of its compute: a
-    /// panic, or a cycle none of whose members this thread still holds or
-    /// has a virtual frame of, so that every member ran above the walk and
-    /// the unwind released it. The entry's own claim is not counted: the
-    /// unwind releases it too, and a virtual frame's run still holds it
-    /// when this is asked. A wounded thread must reach its outermost entry,
-    /// so it contains none.
-    fn containable(
+    /// The unwind out of a frame whose claims have landed goes on to the
+    /// reading frame: a closure that catches it has read a dep that did not
+    /// land Clean.
+    #[cold]
+    pub(super) fn leave_frame(
+        &self,
+        kind: Option<UnwindKind>,
+        payload: Box<dyn std::any::Any + Send>,
+        bag: &mut Deferred<C>,
+    ) -> ! {
+        self.dep_stack.poison_current_frame(self.runtime_id);
+        cycle_state::set_unwind_kind(kind);
+        bag.drain_carried(payload)
+    }
+
+    /// Whether walk entry `entry` contains an unwind out of its compute,
+    /// asked before the compute's frame releases its claims: a panic, or a
+    /// cycle none of whose members this thread still holds or has a virtual
+    /// frame of, so that every member ran above the walk and the unwind
+    /// released it. The entry's own claim is not counted: the unwind
+    /// releases it too, and a virtual frame's run still holds it when this
+    /// is asked. A wounded thread must reach its outermost entry, so it
+    /// contains none.
+    pub(super) fn containable(
         &self,
         entry: NodeId,
         kind: Option<UnwindKind>,
@@ -3679,8 +3671,7 @@ impl<C: Cells> Runtime<C> {
     /// the old and recorded deps is published, and the node lands Failed,
     /// or Dirty or New where publication says the panic may hide a change.
     /// `co_members`, sorted, are the claims released with it, which count
-    /// as settled. `payload` is the panic, when the caller has it, or
-    /// `contained` when a walk contained it and the node keeps it.
+    /// as settled. `payload` is the panic, when the caller has it.
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -3692,10 +3683,8 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         co_members: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
-        contained: Option<Box<dyn std::any::Any + Send>>,
         bag: &mut Deferred<C>,
     ) {
-        let view = payload.or(contained.as_deref());
         let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
             // A stale dep's slot may already belong to another node, so no
             // union is published. The old deps keep their reverse edges.
@@ -3714,9 +3703,9 @@ impl<C: Cells> Runtime<C> {
         let mut mark = 0;
         if landing == NodeState::Failed {
             if !C::SINGLE_THREADED {
-                self.before_failed_landing(id, node.generation(), attempt.cidx, view);
+                self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
             }
-            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, contained);
+            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload);
         }
         let flagged = if landing == NodeState::New {
             NodeState::New
