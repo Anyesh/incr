@@ -408,9 +408,9 @@ fn retire_dep_list<C: Cells>(token: RetiredDeps<C>) {
     reclaim_probe::reached(RetireSite::DepListRetire);
 }
 
-/// A value only a speculative run made, which the unbounded run never
-/// builds: its `Drop` is no event of that run's, so it drops under
-/// [`isolate`] wherever it drops.
+/// A value only a speculative or discarded run made, which the unbounded
+/// run never builds, or builds again on the retry: its `Drop` is no event
+/// of that run's, so it drops under [`isolate`] wherever it drops.
 pub(crate) struct Unbuilt(Option<Box<dyn Any>>);
 
 impl Unbuilt {
