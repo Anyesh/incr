@@ -248,13 +248,16 @@ impl<C: Cells> Runtime<C> {
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
+        // This landing replaces the node's earlier Failed landings, so no
+        // payload noted for them may hold the node again.
+        let replaced = |w: &Unwound| w.rt == rt && w.node == landing;
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
             // frame's, whose closure may still hold the payload they follow.
             let at = payload_key(payload);
             with_notes(|u| {
-                u.retain(|w| !(w.cidx > cidx && w.payload != at));
+                u.retain(|w| !(w.cidx > cidx && w.payload != at || replaced(w)));
                 u.push(Unwound {
                     rt,
                     cidx,
@@ -263,6 +266,8 @@ impl<C: Cells> Runtime<C> {
                     restorable: false,
                 });
             });
+        } else if notes_held() {
+            with_notes(|u| u.retain(|w| !replaced(w)));
         }
         if !self.tickets_held() {
             return 0;
