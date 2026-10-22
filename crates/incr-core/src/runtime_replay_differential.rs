@@ -660,6 +660,8 @@ struct Eval {
     /// When each read that got a cycle returned, by its index in
     /// `reads`, on the same clock.
     caught: Vec<(usize, u64)>,
+    /// When each read that got a value returned, likewise.
+    returned: Vec<(usize, u64)>,
 }
 
 thread_local! {
@@ -695,6 +697,7 @@ impl Running {
                     value: None,
                     end: 0,
                     caught: Vec::new(),
+                    returned: Vec::new(),
                 })
             });
         }
@@ -753,7 +756,12 @@ fn read_logged<C: Cells>(rt: &Runtime<C>, h: Handle, target: (usize, usize), try
         let v = read_value(rt, h, false);
         (v, ReadOut::Value(v))
     };
-    OPEN.with(|o| o.borrow_mut()[depth].reads[k].3 = out);
+    let returned = matches!(out, ReadOut::Value(_)).then(|| EVAL_CLOCK.fetch_add(1, SeqCst));
+    OPEN.with(|o| {
+        let mut o = o.borrow_mut();
+        o[depth].reads[k].3 = out;
+        o[depth].returned.extend(returned.map(|at| (k, at)));
+    });
     v
 }
 
@@ -970,8 +978,6 @@ fn set_out<C: Cells>(rt: &Runtime<C>, h: Handle, v: u64) -> Out {
     }
 }
 
-/// A run's two runtimes, its node tables, and the handles recreates
-/// replaced.
 /// The caches of one [`Serial::history_cause`].
 struct History<'a> {
     label: &'a str,
@@ -983,6 +989,8 @@ struct History<'a> {
     taken: HashMap<u64, bool>,
 }
 
+/// A run's two runtimes, its node tables, and the handles recreates
+/// replaced.
 struct Live<C: Cells> {
     world: Arc<World<C>>,
     retired: Mutex<Vec<Handle>>,
@@ -1895,18 +1903,16 @@ impl<'a> Serial<'a> {
             }
             Spec::Input(_) => false,
         };
-        let taken = gives
-            && run
-                .reads
-                .iter()
-                .all(|r| self.read_taken(cx, i, q, run.end, r));
+        let taken = gives && (0..run.reads.len()).all(|k| self.read_taken(cx, i, run, k));
         cx.taken.insert(run.end, taken);
         taken
     }
 
-    /// Whether the oracle takes read `r` of a run of node `q` in op `i`
-    /// that ended at `end`, as [`Self::history_cause`] takes it.
-    fn read_taken(&self, cx: &mut History<'_>, i: usize, q: usize, end: u64, r: &Read) -> bool {
+    /// Whether the oracle takes read `k` of `run`, of op `i`, as
+    /// [`Self::history_cause`] takes it: a value read's earlier run must
+    /// have ended before the read returned.
+    fn read_taken(&self, cx: &mut History<'_>, i: usize, run: &Eval, k: usize) -> bool {
+        let (q, r) = (run.node.1, &run.reads[k]);
         let &(side, d, _, ref out) = r;
         if side != 0 {
             return false;
@@ -1928,8 +1934,11 @@ impl<'a> Serial<'a> {
             let w = &*cx.live.world;
             return read_out(w.rt(0), w.handle(0, d), false) == Out::Value(v);
         }
+        let Some(&(_, at)) = run.returned.iter().find(|&&(j, _)| j == k) else {
+            return false;
+        };
         let earlier: Vec<(usize, Eval)> = (cx.runs.iter())
-            .filter(|(_, f)| f.node.1 == d && f.value == Some(v) && f.end < end)
+            .filter(|(_, f)| f.node.1 == d && f.value == Some(v) && f.end < at)
             .cloned()
             .collect();
         earlier
@@ -3984,8 +3993,8 @@ fn two_thread_oracle_rejects_a_made_up_cycle() {
 /// through 4, and the phase leaves 1 to 6 Failed. In the first such run,
 /// `patch` edits the phase's recorded closure runs before the oracle sees
 /// them; returns whether the oracle took the run, every run before it
-/// checked as usual.
-fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> bool {
+/// checked as usual, and whether 4's history grounds it.
+fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> (bool, bool) {
     let case = gen_case(0x3904, false, true);
     let phases = phases(&case, 0x3904);
     assert_eq!(phases[0].ops(), [0, 1]);
@@ -3995,11 +4004,13 @@ fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> bo
             let serial = Serial::new(&case, &phases);
             let verdict = Mutex::new(None);
             let hit = AtomicBool::new(false);
+            let grounded = AtomicBool::new(false);
             let got = run_two_until(&case, &phases, Some(1), 0, &|_| {}, &|_, prefix, live| {
                 let states = &prefix.last().unwrap().1 .0;
                 if prefix.len() == 2 && (1..=6).all(|x| states[x] == NodeState::Failed) {
                     hit.store(true, SeqCst);
                     patch(&mut live.evals.lock().unwrap());
+                    grounded.store(serial.history_cause("0x3904", prefix, live, 4), SeqCst);
                 }
                 let v = serial.at_overlap("0x3904", prefix, live);
                 let stop = v.is_some();
@@ -4011,9 +4022,10 @@ fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> bo
                 serial.check("0x3904", &got, verdict);
                 continue;
             }
-            took = Some(
+            took = Some((
                 catch_unwind(AssertUnwindSafe(|| serial.check("0x3904", &got, verdict))).is_ok(),
-            );
+                grounded.load(SeqCst),
+            ));
             return;
         }
     });
@@ -4023,17 +4035,42 @@ fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> bo
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_failed_set_grounded_in_its_history() {
-    assert!(cascade_from_a_history_panic(|_| {}));
+    assert_eq!(cascade_from_a_history_panic(|_| {}), (true, true));
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_history_grounding_over_a_wrong_value() {
-    assert!(!cascade_from_a_history_panic(|evals| {
-        for e in evals.values_mut().flatten() {
-            if e.node == (0, 5) && e.value == Some(2) {
-                e.value = Some(3);
+    assert_eq!(
+        cascade_from_a_history_panic(|evals| {
+            for e in evals.values_mut().flatten() {
+                if e.node == (0, 5) && e.value == Some(2) {
+                    e.value = Some(3);
+                }
             }
-        }
-    }));
+        }),
+        (false, false)
+    );
+}
+
+/// As above with every value kept but 1's caught cycle naming no
+/// participant, which no order's read of 2 gives: 7777 still follows from
+/// it, but 6, 5 and 4 ground through a read the oracle does not take.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_rejects_a_history_grounding_over_an_untaken_read() {
+    assert_eq!(
+        cascade_from_a_history_panic(|evals| {
+            for e in evals.values_mut().flatten() {
+                if e.node == (0, 1) && e.value == Some(7777) {
+                    for r in &mut e.reads {
+                        if let ReadOut::Cycle(c) = &mut r.3 {
+                            c.clear();
+                        }
+                    }
+                }
+            }
+        }),
+        (false, false)
+    );
 }
