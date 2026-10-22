@@ -657,6 +657,50 @@ fn shared_stale_dep_in_a_cycle_is_not_read() {
     stale_dep_in_a_cycle_is_not_read::<Shared>();
 }
 
+/// As above, but `a` first reads `s`, which `try_get`s `a` and so becomes a
+/// held claim anchored at `a`'s own position before `b` closes the cycle.
+/// `a`'s unwind releases that claim, so the walk still contains the cycle:
+/// `get(x)` gives 100, as from scratch, and only a direct `get(a)` raises it.
+fn wave6_containable_counts_claim_anchored_at_walk_entry<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let s_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let (s_cell, b_cell) = (s_cell.clone(), b_cell.clone());
+        rt.create_query(move |rt| {
+            if rt.get(k) == 0 {
+                1
+            } else {
+                rt.get(*s_cell.get().unwrap()) + rt.get(*b_cell.get().unwrap()) + 1
+            }
+        })
+    };
+    let s = rt.create_query(move |rt| rt.try_get(a).unwrap_or(5));
+    let b = rt.create_query(move |rt| rt.get(a) + 1);
+    s_cell.set(s).unwrap();
+    b_cell.set(b).unwrap();
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(a) } else { 100 });
+    assert_eq!(rt.get(x), 1);
+
+    rt.set(k, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
+    assert!(panic_message(err).contains("cycle"));
+}
+
+#[test]
+fn wave6_local_containable_counts_claim_anchored_at_walk_entry() {
+    wave6_containable_counts_claim_anchored_at_walk_entry::<Local>();
+}
+
+#[test]
+fn wave6_shared_containable_counts_claim_anchored_at_walk_entry() {
+    wave6_containable_counts_claim_anchored_at_walk_entry::<Shared>();
+}
+
 /// The walk cleans every recorded dep before a node's rerun, so it runs
 /// `e` after `sel` has stopped `x` reading it: a cost beta.5 has too,
 /// which the result must not show.
@@ -768,6 +812,70 @@ fn local_unread_contained_panic_is_released() {
 #[test]
 fn shared_unread_contained_panic_is_released() {
     unread_contained_panic_is_released::<Shared>();
+}
+
+/// Builds the held "f boom" ticket of `unread_contained_panic_is_released`,
+/// then has a replayable h catch f's panic, fold its text length into its
+/// value and read a New g, at frame budget `budget` (or the default).
+fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>) -> i64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v != 0, "f boom");
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(f) } else { 100 });
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(rt.contained_payloads(), 1);
+    let g = rt.create_query(move |rt| rt.get(j) + 10);
+    let h = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            let n = match catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                Ok(v) => v,
+                Err(p) => panic_message(p).len() as i64,
+            };
+            n + rt.get(g)
+        },
+        QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        },
+    );
+    if let Some(b) = budget {
+        rt.set_max_frames(b);
+    }
+    rt.get(h)
+}
+
+/// A replayable run that takes a contained ticket, drops the payload and is
+/// doomed by a later read past the budget must leave its retry the same
+/// payload: h is `"f boom".len() + g` = 16 at every budget, as unbounded.
+fn wave6_doomed_run_keeps_the_ticket_it_took<C: Cells>() {
+    let unbounded = wave6_doomed_run_after_taking_a_ticket::<C>(None);
+    assert_eq!(unbounded, 6 + 10);
+    for b in 1..=3 {
+        assert_eq!(
+            wave6_doomed_run_after_taking_a_ticket::<C>(Some(b)),
+            unbounded,
+            "budget {b}"
+        );
+    }
+}
+
+#[test]
+fn wave6_local_doomed_run_keeps_the_ticket_it_took() {
+    wave6_doomed_run_keeps_the_ticket_it_took::<Local>();
+}
+
+#[test]
+fn wave6_shared_doomed_run_keeps_the_ticket_it_took() {
+    wave6_doomed_run_keeps_the_ticket_it_took::<Shared>();
 }
 
 #[test]
@@ -1092,4 +1200,238 @@ fn local_caught_zst_note_stays_out_of_another_types_ticket() {
 #[test]
 fn shared_caught_zst_note_stays_out_of_another_types_ticket() {
     caught_zst_note_stays_out_of_another_types_ticket::<Shared>();
+}
+
+struct SameZst;
+
+/// d catches x's zero-sized payload, drops it, reads an input and a query
+/// child, then raises a fresh payload of the same zero-sized type. Both
+/// boxes share one dangling address, type and empty text, yet x never had
+/// its payload contained, so x's read must raise "last compute panicked"
+/// and d's read must keep d's payload.
+fn wave6_same_type_zst_note_joins_ticket_after_engine_call<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let o = rt.create_input(0_i64);
+    let x = rt.create_query(|_: &Runtime<C>| -> i64 { std::panic::panic_any(SameZst) });
+    let c = rt.create_query(move |rt| rt.get(o));
+    let d = rt.create_query(move |rt| {
+        if rt.get(t) == 1 {
+            drop(catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err());
+            let _ = rt.get(o);
+            let _ = rt.get(c);
+            std::panic::panic_any(SameZst);
+        }
+        0
+    });
+    let n = rt.create_query(move |rt| {
+        if rt.get(sel) == 1 {
+            rt.get(x)
+        } else {
+            rt.get(d)
+        }
+    });
+    assert_eq!(rt.get(n), 0);
+    rt.set(t, 1);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err();
+    assert!(!got.is::<SameZst>(), "x's read took d's contained payload");
+    assert!(
+        panic_message(got).contains("last compute panicked"),
+        "x's read raised a payload"
+    );
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err();
+    assert!(got.is::<SameZst>(), "d's read lost its payload");
+}
+
+#[test]
+#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+fn wave6_local_same_type_zst_note_joins_ticket_after_engine_call() {
+    wave6_same_type_zst_note_joins_ticket_after_engine_call::<Local>();
+}
+
+#[test]
+#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+fn wave6_shared_same_type_zst_note_joins_ticket_after_engine_call() {
+    wave6_same_type_zst_note_joins_ticket_after_engine_call::<Shared>();
+}
+/// The control of `wave6_same_type_zst_note_joins_ticket_after_engine_call`:
+/// d re-raises the box it caught after the same engine calls, so the
+/// payload failed x too and x's read takes it. The engine sees the same
+/// address, type and text as for the fresh box there.
+fn zst_reraised_after_engine_calls_joins_the_caught_ticket<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let o = rt.create_input(0_i64);
+    let x = rt.create_query(|_: &Runtime<C>| -> i64 { std::panic::panic_any(SameZst) });
+    let c = rt.create_query(move |rt| rt.get(o));
+    let d = rt.create_query(move |rt| {
+        if rt.get(t) == 1 {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+            let _ = rt.get(o);
+            let _ = rt.get(c);
+            std::panic::resume_unwind(caught);
+        }
+        0
+    });
+    let n = rt.create_query(move |rt| {
+        if rt.get(sel) == 1 {
+            rt.get(x)
+        } else {
+            rt.get(d)
+        }
+    });
+    assert_eq!(rt.get(n), 0);
+    rt.set(t, 1);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err();
+    assert!(got.is::<SameZst>(), "x's read lost the payload d re-raised");
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err());
+    assert!(got.contains("last compute panicked"), "d raised {got:?}");
+}
+
+#[test]
+fn local_zst_reraised_after_engine_calls_joins_the_caught_ticket() {
+    zst_reraised_after_engine_calls_joins_the_caught_ticket::<Local>();
+}
+
+#[test]
+fn shared_zst_reraised_after_engine_calls_joins_the_caught_ticket() {
+    zst_reraised_after_engine_calls_joins_the_caught_ticket::<Shared>();
+}
+
+/// f catches t's held payload, then reads r2, whose walk entry e runs at the
+/// cidx the read was noted at, then re-raises the payload, which q's walk
+/// contains. Whether e panics must not change who holds t's payload: t's
+/// read keeps raising "pT" and f's read reports a panicked last compute.
+fn wave6_ticket_note_survives_a_sibling_entry<C: Cells>(sibling_panics: bool) {
+    let rt = Runtime::<C>::new();
+    let i = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let m = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let qs = rt.create_input(0_i64);
+    let t = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        if rt.get(i) == 1 {
+            panic!("pT")
+        }
+        0
+    });
+    let rec = rt.create_query(move |rt: &Runtime<C>| if rt.get(sel) == 0 { rt.get(t) } else { 5 });
+    let e = rt.create_query(move |rt: &Runtime<C>| {
+        let v = rt.get(j);
+        assert!(v != 0, "pE");
+        v
+    });
+    let r2 = rt.create_query(move |rt: &Runtime<C>| if rt.get(m) == 0 { rt.get(e) } else { 1 });
+    let f = rt.create_query(move |rt: &Runtime<C>| {
+        if rt.get(k) == 0 {
+            return 0;
+        }
+        let c = catch_unwind(AssertUnwindSafe(|| rt.get(t)));
+        let w = rt.get(r2);
+        match c {
+            Ok(v) => v + w,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    });
+    let q = rt.create_query(move |rt: &Runtime<C>| if rt.get(qs) == 0 { rt.get(f) } else { 7 });
+    assert_eq!(rt.get(rec), 0);
+    assert_eq!(rt.get(r2), 1);
+    assert_eq!(rt.get(q), 0);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(rec), 5);
+    assert_eq!(rt.contained_payloads(), 1);
+    rt.set(j, if sibling_panics { 0 } else { 2 });
+    rt.set(m, 1);
+    rt.set(k, 1);
+    rt.set(qs, 1);
+    assert_eq!(rt.get(q), 7);
+    assert_no_notes();
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(t))).unwrap_err());
+    assert_eq!(got, "pT", "sibling_panics={sibling_panics}");
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err());
+    assert!(
+        got.contains("last compute panicked"),
+        "sibling_panics={sibling_panics}: f raised {got:?}"
+    );
+    assert_no_notes();
+}
+
+#[test]
+fn wave6_contained_sibling_entry_keeps_a_caught_ticket_note() {
+    wave6_ticket_note_survives_a_sibling_entry::<Local>(false);
+    wave6_ticket_note_survives_a_sibling_entry::<Shared>(false);
+    wave6_ticket_note_survives_a_sibling_entry::<Local>(true);
+    wave6_ticket_note_survives_a_sibling_entry::<Shared>(true);
+}
+
+/// As `wave6_ticket_note_survives_a_sibling_entry`, with f's second read a
+/// New s that lands Failed at the position t's read was noted at, and f
+/// catches s's panic too before it re-raises t's payload.
+fn ticket_note_survives_a_sibling_landing<C: Cells>(sibling_panics: bool) {
+    let rt = Runtime::<C>::new();
+    let i = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(i64::from(!sibling_panics));
+    let k = rt.create_input(0_i64);
+    let qs = rt.create_input(0_i64);
+    let t = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        if rt.get(i) == 1 {
+            panic!("pT")
+        }
+        0
+    });
+    let rec = rt.create_query(move |rt: &Runtime<C>| if rt.get(sel) == 0 { rt.get(t) } else { 5 });
+    let s = rt.create_query(move |rt: &Runtime<C>| {
+        let v = rt.get(j);
+        assert!(v != 0, "pS");
+        v
+    });
+    let f = rt.create_query(move |rt: &Runtime<C>| {
+        if rt.get(k) == 0 {
+            return 0;
+        }
+        let c = catch_unwind(AssertUnwindSafe(|| rt.get(t)));
+        let w = catch_unwind(AssertUnwindSafe(|| rt.get(s))).unwrap_or(1);
+        match c {
+            Ok(v) => v + w,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    });
+    let q = rt.create_query(move |rt: &Runtime<C>| if rt.get(qs) == 0 { rt.get(f) } else { 7 });
+    assert_eq!(rt.get(rec), 0);
+    assert_eq!(rt.get(q), 0);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(rec), 5);
+    assert_eq!(rt.contained_payloads(), 1);
+    rt.set(k, 1);
+    rt.set(qs, 1);
+    assert_eq!(rt.get(q), 7);
+    assert_no_notes();
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(t))).unwrap_err());
+    assert_eq!(got, "pT", "sibling_panics={sibling_panics}");
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err());
+    assert!(
+        got.contains("last compute panicked"),
+        "sibling_panics={sibling_panics}: f raised {got:?}"
+    );
+    if sibling_panics {
+        let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(s))).unwrap_err());
+        assert!(got.contains("last compute panicked"), "s raised {got:?}");
+    }
+    assert_no_notes();
+}
+
+#[test]
+fn caught_sibling_landing_keeps_a_caught_ticket_note() {
+    ticket_note_survives_a_sibling_landing::<Local>(false);
+    ticket_note_survives_a_sibling_landing::<Shared>(false);
+    ticket_note_survives_a_sibling_landing::<Local>(true);
+    ticket_note_survives_a_sibling_landing::<Shared>(true);
 }

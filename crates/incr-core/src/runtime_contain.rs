@@ -20,14 +20,14 @@
 //! fresh one at the freed address with no engine call between, so the key
 //! also holds the text of a `&str` or `String` payload.
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
+use crate::replay::{payload_key, PayloadKey};
 
 /// A Failed read's node left Failed before the read could tell which
 /// landing it saw.
@@ -70,7 +70,7 @@ struct Unwound {
     /// which every runtime on the thread shares.
     cidx: u32,
     node: (u32, u32),
-    payload: Key,
+    payload: PayloadKey,
     /// Taken from a ticket by a read: a discarded run's read was no
     /// reader's observation, so its drop holds the ticket again.
     restorable: bool,
@@ -117,29 +117,6 @@ pub(super) fn walked_episode(cidx: u32) -> Option<NodeId> {
         let (at, root) = w.get();
         (at == cidx).then_some(NodeId(root))
     })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Key {
-    /// Every zero-sized payload's box has its type's dangling address, so
-    /// only the type tells two of them apart, the engine's own unwinds
-    /// included.
-    address: usize,
-    ty: TypeId,
-    /// A hash of the payload's text, 0 for a payload of another type.
-    text: u64,
-}
-
-fn key(payload: &(dyn Any + Send)) -> Key {
-    let text = |s: &str| BuildHasherDefault::<DefaultHasher>::default().hash_one(s);
-    Key {
-        address: std::ptr::from_ref(payload).cast::<()>() as usize,
-        ty: Any::type_id(payload),
-        text: match payload.downcast_ref::<&'static str>() {
-            Some(s) => text(s),
-            None => payload.downcast_ref::<String>().map_or(0, |s| text(s)),
-        },
-    }
 }
 
 /// Edits this thread's notes and keeps `value_code::NOTES_BIT` in step.
@@ -252,11 +229,12 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
         if let Some(payload) = payload {
-            // The frames at and above `cidx` belong to this unwind, so an
-            // earlier unwind's notes there are spent.
-            let at = key(payload);
+            // The frames above `cidx` belong to this unwind, so an earlier
+            // unwind's notes there are spent. Notes at `cidx` are the reading
+            // frame's, whose closure may still hold the payload they follow.
+            let at = payload_key(payload);
             with_notes(|u| {
-                u.retain(|w| !(w.cidx >= cidx && w.payload != at));
+                u.retain(|w| !(w.cidx > cidx && w.payload != at));
                 u.push(Unwound {
                     rt,
                     cidx,
@@ -282,16 +260,14 @@ impl<C: Cells> Runtime<C> {
 
     /// The episode at `cidx`, rooted at a walk's entry, aborts with
     /// `payload`, which the entry contains: the unwind goes on, past what
-    /// it would tell the reading frame, to the episode's boundary.
+    /// it would tell the reading frame, to the episode's boundary. What the
+    /// abort released stays in the episode's bag: the containment ends the
+    /// unwind, so the bag drains in normal mode and a panicking `Drop` in
+    /// it reaches the read.
     #[cold]
     #[inline(never)]
-    pub(super) fn raise_contained(
-        &self,
-        cidx: u32,
-        payload: Box<dyn Any + Send>,
-        bag: &mut Deferred<C>,
-    ) -> ! {
-        bag.drain_carried(Box::new(Contained { cidx, payload }))
+    pub(super) fn raise_contained(&self, cidx: u32, payload: Box<dyn Any + Send>) -> ! {
+        std::panic::resume_unwind(Box::new(Contained { cidx, payload }))
     }
 
     /// An unwind out of the rounds of an episode rooted at a walk's entry:
@@ -306,20 +282,21 @@ impl<C: Cells> Runtime<C> {
         self.contain(c.cidx, c.payload, bag);
     }
 
-    /// Stops an unwind a walk's entry at `cidx` contains: the notes at and
-    /// above `cidx` are spent, and the Failed landings `payload` made there
-    /// hold it for their first read.
+    /// Stops an unwind a walk's entry at `cidx` contains: the notes above
+    /// `cidx` and those of `payload` at it are spent, and the Failed
+    /// landings `payload` made there hold it for their first read. Another
+    /// payload's notes at `cidx` are the reading frame's, as at a landing.
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
-        let (rt, at) = (self.runtime_id, key(&*payload));
+        let (rt, at) = (self.runtime_id, payload_key(&*payload));
         let mut nodes = Vec::new();
         if notes_held() {
             with_notes(|u| {
                 u.retain(|w| {
-                    let above = w.cidx >= cidx;
-                    if above && w.rt == rt && w.payload == at && !nodes.contains(&w.node) {
+                    let ours = w.cidx >= cidx && w.payload == at;
+                    if ours && w.rt == rt && !nodes.contains(&w.node) {
                         nodes.push(w.node);
                     }
-                    !above
+                    !(ours || w.cidx > cidx)
                 });
             });
         }
@@ -359,26 +336,25 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Where `id` is about to leave Failed for Dirty: the mark its
-    /// `left_failed` takes, so that it keeps the ticket of a landing made
-    /// after the flip. `None` when no ticket is held.
+    /// A set's walk flips `id` from Failed to Dirty, under the tickets'
+    /// lock: a `hold` of the landing either precedes the flip, which then
+    /// releases its ticket, or sees the node Dirty and holds nothing. The
+    /// payloads it alone kept wait with the buried ones until the walk has
+    /// flagged every dependent. False if the state moved first.
     #[cold]
     #[inline(never)]
-    pub(super) fn ticket_mark(&self) -> Option<u64> {
-        self.tickets_held().then(|| self.tickets.read().next)
-    }
-
-    /// `id` left the Failed landing that ordered before `mark`, so no read
-    /// takes a payload for it any more. A set's walk flipped it: the
-    /// payloads it alone kept wait with the buried ones until the walk
-    /// has flagged every dependent.
-    #[cold]
-    #[inline(never)]
-    pub(super) fn left_failed(&self, id: NodeId, mark: u64) {
+    pub(super) fn flip_failed(&self, id: NodeId) -> bool {
+        let node = self.nodes.get(id.0);
         let mut t = self.tickets.write();
-        let stale = release(&mut t, mark, |(n, _)| n == id.0);
+        if state::try_transition::<C>(node.state_cell(), NodeState::Failed, NodeState::Dirty)
+            .is_err()
+        {
+            return false;
+        }
+        let stale = release(&mut t, u64::MAX, |(n, _)| n == id.0);
         t.buried.extend(stale);
         self.sync_held(&t);
+        true
     }
 
     /// After a set's walk: drops the tickets its flips released.
@@ -397,8 +373,9 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// [`Self::left_failed`] where `id`'s own compute landed it Dirty past
-    /// the walk: the payloads join the compute's bag.
+    /// `id`'s own compute landed it Dirty past the walk that would have
+    /// flipped it, leaving the Failed landing that ordered before `mark`:
+    /// the payloads join the compute's bag.
     #[cold]
     #[inline(never)]
     pub(super) fn left_failed_landing(&self, id: NodeId, mark: u64, bag: &mut Deferred<C>) {
@@ -481,7 +458,11 @@ impl<C: Cells> Runtime<C> {
         if nodes.is_empty() {
             return;
         }
-        let (rt, cidx, at) = (self.runtime_id, self.dep_stack.next_cidx(), key(payload));
+        let (rt, cidx, at) = (
+            self.runtime_id,
+            self.dep_stack.next_cidx(),
+            payload_key(payload),
+        );
         with_notes(|u| {
             u.extend(nodes.into_iter().map(|node| Unwound {
                 rt,
@@ -508,7 +489,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Vec::new();
         }
-        let (rt, at) = (self.runtime_id, key(payload));
+        let (rt, at) = (self.runtime_id, payload_key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             for w in u.iter_mut().filter(|w| w.payload == at) {
@@ -527,7 +508,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Vec::new();
         }
-        let (rt, at) = (self.runtime_id, key(payload));
+        let (rt, at) = (self.runtime_id, payload_key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             u.retain(|w| {
@@ -574,7 +555,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Some(payload);
         }
-        let (rt, at) = (self.runtime_id, key(&*payload));
+        let (rt, at) = (self.runtime_id, payload_key(&*payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             u.retain(|w| {

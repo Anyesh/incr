@@ -127,6 +127,7 @@ impl<C: Cells> Runtime<C> {
         // value, so it must not land Clean over it.
         self.dep_stack.poison_current_frame(self.runtime_id);
         if let Some(payload) = payload {
+            self.note_ticket_read(id, &*payload);
             resume_unwind(payload);
         }
         if !C::SINGLE_THREADED {
@@ -370,8 +371,9 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// After this thread's landing stored `id`'s frame at `cidx` Failed
-    /// with `payload`, from `land_failed`: marks the deliveries for the
-    /// read that let it out (`Context::mark_escaped`).
+    /// with `payload`, from `land_failed`, whose compute recorded `deps`:
+    /// marks the deliveries for the read that let it out
+    /// (`Context::mark_escaped`).
     #[cold]
     #[inline(never)]
     pub(super) fn after_failed_store(
@@ -379,15 +381,21 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         generation: u32,
         cidx: u32,
+        deps: &[(NodeId, u32)],
         payload: &(dyn Any + Send),
     ) {
         if value_code::thread_word() & value_code::REPLAY_BIT == 0 || replay::speculative() {
             return;
         }
+        let Some(&last) = deps.last() else {
+            return;
+        };
+        let reading = u64::from(last.0 .0) | (u64::from(last.1) << 32);
+        let ordinal = deps.iter().filter(|&&d| d == last).count() as u32;
         let rt = self.runtime_id;
         replay::with(|c| {
             for x in c.iter_mut().filter(|x| x.rt == rt) {
-                x.mark_escaped(id.0, generation, cidx, payload);
+                x.mark_escaped(id.0, generation, cidx, (reading, ordinal), payload);
             }
         });
     }

@@ -609,6 +609,9 @@ struct Eval {
     reads: Vec<Read>,
     value: Option<u64>,
     end: u64,
+    /// When each read that got a cycle returned, by its index in
+    /// `reads`, on the same clock.
+    caught: Vec<(usize, u64)>,
 }
 
 thread_local! {
@@ -643,6 +646,7 @@ impl Running {
                     reads: Vec::new(),
                     value: None,
                     end: 0,
+                    caught: Vec::new(),
                 })
             });
         }
@@ -688,10 +692,14 @@ fn read_logged<C: Cells>(rt: &Runtime<C>, h: Handle, target: (usize, usize), try
     let (v, out) = if try_ {
         match try_value(rt, h) {
             Ok(v) => (v, ReadOut::Value(v)),
-            Err(c) => (
-                7777,
-                ReadOut::Cycle(c.participants().iter().map(|p| p.slot()).collect()),
-            ),
+            Err(c) => {
+                let at = EVAL_CLOCK.fetch_add(1, SeqCst);
+                OPEN.with(|o| o.borrow_mut()[depth].caught.push((k, at)));
+                (
+                    7777,
+                    ReadOut::Cycle(c.participants().iter().map(|p| p.slot()).collect()),
+                )
+            }
         }
     } else {
         let v = read_value(rt, h, false);
@@ -1555,8 +1563,9 @@ impl<'a> Serial<'a> {
 
     /// Orders per read each get of the read phase `prefix` ends with whose
     /// thread's `try_get` returned a cycle that the other read's get
-    /// landed: every participant ended the phase Clean, and its last run
-    /// that returned was on the other thread. Cycle results depend on the
+    /// landed after it: every participant ended the phase Clean, and its
+    /// last run that returned was on the other thread and ended after the
+    /// `try_get` returned. Cycle results depend on the
     /// member a get enters at, so the get may mix outcomes of both orders.
     /// Its value must still be
     /// its node's closure over its last run's reads, each an outcome some
@@ -1588,17 +1597,20 @@ impl<'a> Serial<'a> {
                 evals.get(&i).unwrap_or(&none),
                 evals.get(&j).unwrap_or(&none),
             );
-            let landed_there = |slot: &u32| {
+            let landed_there_after = |slot: &u32, at: u64| {
                 spec_of.get(slot).is_some_and(|&x| {
                     states[x] == NodeState::Clean
                         && (mine.iter().chain(theirs))
                             .filter(|e| e.node == (0, x) && e.value.is_some())
                             .max_by_key(|e| e.end)
-                            .is_some_and(|e| theirs.iter().any(|o| o.end == e.end))
+                            .is_some_and(|e| e.end > at && theirs.iter().any(|o| o.end == e.end))
                 })
             };
-            let caught = (mine.iter().flat_map(|e| &e.reads)).any(|(side, _, try_, out)| {
-                matches!(out, ReadOut::Cycle(c) if *side == 0 && *try_ && c.iter().all(landed_there))
+            let caught = mine.iter().any(|e| {
+                e.caught.iter().any(|&(k, at)| {
+                    matches!(&e.reads[k], (0, _, true, ReadOut::Cycle(c))
+                        if c.iter().all(|slot| landed_there_after(slot, at)))
+                })
             });
             let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
             if let (true, Some(run)) = (caught, last) {
@@ -1806,7 +1818,8 @@ impl<'a> Serial<'a> {
 /// cycle. One it left Failed must have a cause none of those Failed nodes
 /// stands in for unless it has one too: the re-run panics with the
 /// closure's own payload, or through a read of a node left Failed or
-/// Cyclic that is not such a node. A node the order settles that the phase left
+/// Cyclic that is not such a node, or of one the re-runs landed Failed
+/// that has such a cause itself. A node the order settles that the phase left
 /// Dirty or New must still read so on a later `get`: a panic for Failed,
 /// the cycle for Cyclic. The re-runs and gets run on this thread, in that
 /// order, and change the world.
@@ -1843,15 +1856,35 @@ fn consistent(
             ((side, h.erased().slot()), x)
         })
         .collect();
+    // What the phase left, read before the re-runs change it.
+    let key = |x: usize| {
+        let (side, _, h) = node(x);
+        (side, h.erased().slot())
+    };
+    let left: HashSet<(usize, u32)> = got.iter().map(|&(x, _)| key(x)).collect();
+    let cyclic_dep: HashSet<usize> = extra
+        .iter()
+        .filter(|&&(x, s)| {
+            let (side, _, h) = node(x);
+            s == NodeState::Cyclic && settled_dep(w.rt(side), h, true)
+        })
+        .map(|&(x, _)| x)
+        .collect();
     let mut why: HashMap<usize, String> = HashMap::new();
-    // Failed nodes whose re-run failed only through reads, with its side
-    // and the nodes it read.
-    let mut through: Vec<(usize, usize, Vec<u32>)> = Vec::new();
+    // Failed nodes that fail only through reads: an extra one whose re-run
+    // did, or one the re-runs landed Failed, which has no node index to
+    // report.
+    struct Open {
+        x: Option<usize>,
+        key: (usize, u32),
+        read: Vec<u32>,
+    }
+    let mut through: Vec<Open> = Vec::new();
     for &(x, s) in &extra {
-        let (side, q, h) = node(x);
-        if s == NodeState::Cyclic && settled_dep(w.rt(side), h, true) {
+        if cyclic_dep.contains(&x) {
             continue;
         }
+        let (side, q, _) = node(x);
         let spec = spec_at(case, prefix, side, q);
         let rerun = make(&live.world, side, q, &spec, true);
         let out = read_out(w.rt(side), rerun, false);
@@ -1873,27 +1906,45 @@ fn consistent(
                     .nodes
                     .get(rerun.erased().slot())
                     .for_each_dep(|d| read.push(d.0));
-                through.push((x, side, read));
+                through.push(Open {
+                    x: Some(x),
+                    key: key(x),
+                    read,
+                });
             }
             _ => {}
         }
     }
+    for (x, &state) in states.iter().enumerate() {
+        let (side, slot) = key(x);
+        let n = w.rt(side).nodes.get(slot);
+        if state != NodeState::Dead
+            && !left.contains(&(side, slot))
+            && n.state() == NodeState::Failed
+        {
+            let mut read = Vec::new();
+            n.for_each_dep(|d| read.push(d.0));
+            through.push(Open {
+                x: None,
+                key: (side, slot),
+                read,
+            });
+        }
+    }
     loop {
         let open = through.len();
-        let stands = |side: usize,
-                      d: u32,
-                      why: &HashMap<usize, String>,
-                      through: &[(usize, usize, Vec<u32>)]| {
+        let stands = |side: usize, d: u32, why: &HashMap<usize, String>, through: &[Open]| {
             matches!(
                 w.rt(side).nodes.get(d).state(),
                 NodeState::Failed | NodeState::Cyclic
-            ) && failed_extra
-                .get(&(side, d))
-                .is_none_or(|y| !why.contains_key(y) && !through.iter().any(|(t, _, _)| t == y))
+            ) && !through.iter().any(|t| t.key == (side, d))
+                && failed_extra
+                    .get(&(side, d))
+                    .is_none_or(|y| !why.contains_key(y))
         };
         let grounded: Vec<bool> = through
             .iter()
-            .map(|(_, side, read)| read.iter().any(|&d| stands(*side, d, &why, &through)))
+            .map(|t| t.read.iter().any(|&d| stands(t.key.0, d, &why, &through)))
             .collect();
         let mut grounded = grounded.into_iter();
         through.retain(|_| !grounded.next().unwrap());
@@ -1901,7 +1952,7 @@ fn consistent(
             break;
         }
     }
-    for (x, _, _) in through {
+    for x in through.into_iter().filter_map(|t| t.x) {
         why.insert(
             x,
             format!(
@@ -2797,6 +2848,119 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
     });
 }
 
+/// 0x1006's phase [6, 7] run serially: op 7 holds at its first park until
+/// op 6 has landed 8..12 Clean, so no race is possible and op 7's outcome
+/// must be the 6-first order's Value(8). With a stale-catch fault spliced
+/// in (op 7 carries the racing run's reads, its `try_get(4)` = Cycle, and
+/// returns 7781), the oracle must reject the trace: the cycle was caught
+/// after the partner landed it, not before.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
+    let case = gen_case(0x1006, false, true);
+    let phases = phases(&case, 0x1006);
+    let overlap = phases.iter().position(|p| p.ops() == [6, 7]).unwrap();
+    assert_eq!(phases[overlap].of(1), Some(7));
+    let (on, ready) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let race_rig = |live: &Live<Shared>| {
+        let (on, ready, world) = (on.clone(), ready.clone(), live.world.clone());
+        let slot = |q| NodeId(world.handle(0, q).erased().slot());
+        let (four, eight) = (slot(4), slot(8));
+        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+            if !on.load(SeqCst) {
+                return;
+            }
+            let state = |n: NodeId| world.rt(0).nodes.get(n.0).state();
+            match TWO_THREAD.with(std::cell::Cell::get) {
+                Some(0) => until(|| ready.load(SeqCst)),
+                Some(1)
+                    if p == ParkPoint::BeforeClaim(eight)
+                        && state(four) == NodeState::New
+                        && !ready.swap(true, SeqCst) =>
+                {
+                    until(|| state(eight) == NodeState::Clean)
+                }
+                _ => {}
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    let serial_rig = |live: &Live<Shared>| {
+        let (on, world) = (on.clone(), live.world.clone());
+        let hook: crate::runtime::ParkHook = Box::new(move |_| {
+            if on.load(SeqCst) && TWO_THREAD.with(std::cell::Cell::get) == Some(1) {
+                let clean = |q| {
+                    world
+                        .rt(0)
+                        .nodes
+                        .get(world.handle(0, q).erased().slot())
+                        .state()
+                        == NodeState::Clean
+                };
+                until(|| (8..=12).all(clean));
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    quiet(|| {
+        let racing = Serial::new(&case, &phases);
+        let race_evals = Mutex::new(None);
+        let race_got = run_two_until(&case, &phases, None, 0, &race_rig, &|p, prefix, live| {
+            if p == overlap {
+                on.store(false, SeqCst);
+                *race_evals.lock().unwrap() = Some(live.evals.lock().unwrap()[&7].clone());
+            }
+            let v = racing.at_overlap("0x1006 race", prefix, live);
+            if p + 1 == overlap {
+                on.store(true, SeqCst);
+            }
+            v.is_some()
+        });
+        assert_eq!(race_got[7].0, Out::Value(7781), "the race was driven");
+        let race_evals = race_evals.into_inner().unwrap().unwrap();
+
+        let serial = Serial::new(&case, &phases);
+        let verdict = Mutex::new(None);
+        let got = run_two_until(&case, &phases, None, 0, &serial_rig, &|p, prefix, live| {
+            let mut prefix = prefix.clone();
+            if p == overlap {
+                on.store(false, SeqCst);
+                assert_eq!(prefix[7].0, Out::Value(8), "the schedule was serial");
+                // The fault catches the cycle after op 6 landed it, so its
+                // runs take stamps after this run's.
+                let after = EVAL_CLOCK.load(SeqCst);
+                let mut stale = race_evals.clone();
+                for e in &mut stale {
+                    e.end += after;
+                    e.caught.iter_mut().for_each(|c| c.1 += after);
+                }
+                live.evals.lock().unwrap().insert(7, stale);
+                prefix[7].0 = Out::Value(7781);
+            }
+            let v = serial.at_overlap("0x1006 serial", &prefix, live);
+            if p + 1 == overlap {
+                on.store(true, SeqCst);
+            }
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+        let mut bad = got.clone();
+        bad[7].0 = Out::Value(7781);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            serial.check("0x1006 serial", &bad, verdict.into_inner().unwrap())
+        }));
+        assert!(
+            caught.is_err(),
+            "a cycle caught after the partner landed it was ordered per read: {:?}",
+            serial.per_read.lock().unwrap().get(&7)
+        );
+    });
+}
+
 /// After 0x934's overlapping ops 7 and 8, a trace whose Failed set holds
 /// node 1, which op 5 computed Clean, or lacks node 10, which every order
 /// leaves Failed, is still rejected: 1's deps are Clean and its re-run
@@ -3051,6 +3215,40 @@ fn two_thread_oracle_rejects_a_failed_set_that_justifies_itself() {
     match overlap_verdict(&case, &[0, 1], NodeState::Failed, true) {
         Some(Err(_)) => {}
         v => panic!("a self-justified Failed set passed: {v:?}"),
+    }
+}
+
+/// 0's first run is `Const(1)`, so no order computes 1 and none leaves
+/// anything Failed. With 0 patched Failed, its re-run reads 1, which
+/// computes, reads the patched 0 and lands Failed: a ground the check
+/// itself made, so 0 Failed has no cause and must be rejected.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_two_thread_oracle_rejects_a_failed_node_grounded_by_its_own_rerun() {
+    let q = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            q(Expr::FirstRun(
+                Box::new(Expr::Const(1)),
+                Box::new(Expr::Read(1, false)),
+            )),
+            q(Expr::Read(0, false)),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(0)],
+    };
+    match overlap_verdict(&case, &[0], NodeState::Failed, true) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("node 0 Failed with no panic anywhere passed: {v:?}"),
     }
 }
 

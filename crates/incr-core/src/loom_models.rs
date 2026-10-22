@@ -1543,3 +1543,58 @@ fn drain_vs_set() {
         rt.assert_invariant_i();
     });
 }
+
+/// A contained panic payload that counts the live copies.
+struct Boom(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Boom {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// As `unread_contained_panic_is_released`, with the set racing the read:
+/// x's walk contains F's panic and holds it in a ticket after F's Failed
+/// store, while a set of j flips F from Failed to Dirty. The flip must
+/// release F's ticket in every order, so once F recomputes Clean no
+/// payload is held.
+#[test]
+fn flip_racing_a_contained_hold_releases_the_ticket() {
+    run(|| {
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = Arc::new(Rt::new());
+        let sel = rt.create_input(0_u64);
+        let j = rt.create_input(1_u64);
+        let f = {
+            let live = live.clone();
+            rt.create_query(move |rt: &Rt| {
+                let v = rt.get(j);
+                if v == 0 {
+                    live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::panic::panic_any(Boom(live.clone()));
+                }
+                v
+            })
+        };
+        let x = rt.create_query(move |rt: &Rt| if rt.get(sel) == 0 { rt.get(f) } else { 100 });
+        assert_eq!(rt.get(x), 1);
+        rt.set(j, 0);
+        rt.set(sel, 1);
+
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(j, 3))
+        };
+        assert_eq!(may_unwind(|| rt.get(x)), Some(100));
+        setter.join().unwrap();
+
+        assert_eq!(rt.get(f), 3);
+        assert_eq!(rt.get(x), 100);
+        assert_eq!(
+            live.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "F is Clean but its contained payload is still held"
+        );
+        rt.assert_invariant_i();
+    });
+}
