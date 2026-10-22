@@ -306,7 +306,7 @@ impl Pending {
         self.slots.into_iter().flatten().collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Delivery> {
         self.slots.iter().flatten()
     }
