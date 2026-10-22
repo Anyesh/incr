@@ -181,6 +181,9 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a Stale publish landed `New` and before
     /// the retry, with the attempt's bag carried along.
     StaleRetry(NodeId),
+    /// In `compute_one`, after an episode landed the root, before its
+    /// reader learns how.
+    EpisodeLanded(NodeId),
     /// At a doom, after the node the read wanted was released and pushed
     /// and before the reading frame gets its placeholder.
     AfterDoom(NodeId),
@@ -3273,7 +3276,8 @@ impl<C: Cells> Runtime<C> {
                     // A tainted verify leaves the node Dirty for the root's
                     // compute to read again, which poisons where needed.
                     GroupEnd::Done(Computed::Done) if !matches!(visit, Visit::VerifyOnly(_)) => {
-                        return self.episode_landed(node)
+                        self.park(ParkPoint::EpisodeLanded(id));
+                        return self.episode_landed(node);
                     }
                     GroupEnd::Done(computed) => return computed,
                     GroupEnd::Retry => {
@@ -3440,7 +3444,10 @@ impl<C: Cells> Runtime<C> {
                     }
                     match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
                         PopEnd::Deferred => return Computed::Deferred,
-                        PopEnd::Landed => return self.episode_landed(node),
+                        PopEnd::Landed => {
+                            self.park(ParkPoint::EpisodeLanded(id));
+                            return self.episode_landed(node);
+                        }
                         PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
                         PopEnd::Dissolved => {
                             self.end_dissolved(id, bag);
@@ -3530,9 +3537,12 @@ impl<C: Cells> Runtime<C> {
 
     /// A root whose episode landed it: a reader that reads it Dirty, or
     /// New with no value, must not land Clean over it, as after a
-    /// single-node landing.
+    /// single-node landing. Under `Shared` another thread can claim the
+    /// root as soon as it lands, so any state but Clean or Cyclic poisons:
+    /// a Clean root leaves Clean only through a walk, which flags the
+    /// reader too.
     fn episode_landed(&self, node: &NodeData<C>) -> Computed {
-        if matches!(node.state(), NodeState::Dirty | NodeState::New) {
+        if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
             self.dep_stack.poison_current_frame(self.runtime_id);
         }
         Computed::Done
