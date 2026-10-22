@@ -988,7 +988,7 @@ impl<C: Cells> Runtime<C> {
         payload: &(dyn Any + Send),
     ) -> bool {
         let contain = contain_impl::walked_episode(cidx)
-            .is_some_and(|root| self.containable(root, kind, payload));
+            .is_some_and(|root| self.containable(root, cidx, kind, payload));
         if contain {
             replay::unwind_past(self.runtime_id, cidx);
         } else {
@@ -1639,6 +1639,18 @@ impl<C: Cells> Runtime<C> {
         self.release_held_where(cidx, discarding, kind, subtree, &[], payload, bag);
     }
 
+    /// Whether this thread holds no claim of `id` once the frame at `cidx`
+    /// unwinds: it has no frame of `id`, and holds no claim of it or one
+    /// anchored at or above `cidx` that the unwind releases.
+    pub(super) fn unwind_releases(&self, id: NodeId, cidx: u32) -> bool {
+        let rt = self.runtime_id;
+        self.dep_stack.frame_cidx(rt, id).is_none()
+            && cycle_state::with_held(|h| {
+                h.get(&(rt, id.0))
+                    .is_none_or(|e| e.anchor() >= cidx && released_at(rt, e, cidx))
+            })
+    }
+
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
     /// the claims in `keep`.
     pub(super) fn release_held_except(&self, cidx: u32, keep: &[u32], bag: &mut Deferred<C>) {
@@ -1680,11 +1692,7 @@ impl<C: Cells> Runtime<C> {
                 slots.dedup();
             }
             slots.retain(|m| {
-                !keep.contains(m)
-                    && h.get(&(rt, *m)).is_some_and(|e| {
-                        !replay::is_suspended(e.ep)
-                            && !replay::waits_for_suspended(rt, e.anchor(), cidx)
-                    })
+                !keep.contains(m) && h.get(&(rt, *m)).is_some_and(|e| released_at(rt, e, cidx))
             });
             slots
                 .into_iter()
@@ -2352,4 +2360,10 @@ fn cycle_panic(cycle: Cycle) -> ! {
     let message = format!("incr-core: dependency cycle: {cycle}");
     cycle_state::set_last_cycle(cycle);
     panic!("{message}");
+}
+
+/// Whether an unwind from position `cidx` releases held claim `e`: an
+/// episode suspended over it, or one it waits for, keeps it.
+fn released_at(rt: RuntimeId, e: &Held, cidx: u32) -> bool {
+    !replay::is_suspended(e.ep) && !replay::waits_for_suspended(rt, e.anchor(), cidx)
 }
