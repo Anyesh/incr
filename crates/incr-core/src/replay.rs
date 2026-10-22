@@ -323,7 +323,6 @@ impl Context {
         self.vstack[..above.min(self.vstack.len())].last()
     }
 
-    /// Pops the top virtual frame.
     /// Delivers `what` to the read virtual frame `below` was blocked in.
     pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) {
         self.push_blocked(below, what, None);
