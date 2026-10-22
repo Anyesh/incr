@@ -127,7 +127,7 @@ impl<C: Cells> Runtime<C> {
         // value, so it must not land Clean over it.
         self.dep_stack.poison_current_frame(self.runtime_id);
         if let Some(payload) = payload {
-            self.dep_stack.note_ticket_read(self.runtime_id);
+            self.note_ticket_read(id, &*payload);
             resume_unwind(payload);
         }
         if !C::SINGLE_THREADED {
