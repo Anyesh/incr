@@ -1418,3 +1418,48 @@ walk falls 0.1 percent Local and rises 0.5 to 0.6 percent Shared.
 
 Gate: the Clean get, table hit and value slot are unchanged; the dirty
 walk falls about 0.1 percent under both strategies.
+
+## Ticket drops
+
+- Engine: `w/T8-contain-ticket-drop-panic` (`2b6fc1f`) against its base
+  `spreadsheet-t10` at `03f279e`, and `675ac65` (the swept-ticket fix)
+  against its parent `7dbde7c`, each in a detached worktree; one run of
+  `icount.sh` at the default N per column, `getrandom` fixed by
+  `fixed_getrandom.so`. No workloads added.
+- Change: a set walk's Failed→Dirty flip parks the tickets it released
+  with the buried ones, and one flag check after the walk drops them; a
+  compute's failed landing hands its released tickets to its bag; a
+  delete's payload panic drops the bag's items on a cold path; a sweep
+  hands buried tickets to its compute's bag. Attributed by the diff, not
+  traced.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local`, `value_slot_read_local` | 155.14, 5 | 155.14, 5 | 0 |
+| `diamond_local` / `_shared` | 3,915 / 7,849 | 3,919 / 7,852 | +4 / +3 |
+| `chain_local/propagate/100` | 91,206 | 91,210 | +4 |
+| `chain_shared/propagate/100` | 188,038 | 188,040 | +2 |
+| `delete_single_local` / `_shared` | 712 / 1,534 | 712 / 1,534 | 0 |
+| `delete_owned_tree_local` / `_shared` | 600,829 / 980,844 | 601,629 / 981,443 | +800 / +599 |
+| `children_churn_local` / `_shared` (`675ac65`) | 16,523 / 19,429 | 16,526 / 19,433 | +3 / +4 |
+
+- **After the walk:** `drop_released_tickets` loads the ticket flag and
+  branches once per `set`: +4 Local and +3 Shared on every workload that
+  sets, independent of walk length (`chain_*/propagate/4` to `/100` all
+  move by the same amount). `delete_owned_tree_*` moves only through
+  its setup's 200 collection sets per iteration.
+- **The walk loop:** unchanged in source and in count. Each version that
+  edited the Failed arm (a returned `Option`, the queue by `&mut`, a
+  cold continuation holding the rest of the walk) cost +1 per visited
+  node on Shared or +4 to +8 per set on Local, though the arm never runs
+  here.
+- **Deletes:** the buried-ticket check before the bag's items is the
+  same load and branch as before; the panic path lives in the cold
+  `drain_after` and `DeleteBag::unwind`.
+- **Sweeps (`675ac65`):** `defer_buried_tickets` loads the ticket flag
+  once per `sweep_units` call: +3 Local and +4 Shared on
+  `children_churn_*`, the only workload that sweeps children.
+
+Gate: the Clean get, table hit, value slot and single delete are
+unchanged; a set costs 3 to 4 more instructions.
