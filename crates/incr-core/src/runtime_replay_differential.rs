@@ -3222,6 +3222,65 @@ fn stale_read_payload_reaches_the_root_through_replayed_frames() {
     });
 }
 
+/// Seed 0xeb379773cd1b3565, shrunk: 1 = `Catch(Read 2) + Read 2` over the
+/// cycle 2 -> 3 -> 4 -> 5 -> 2, where 4 also reads the deleted 0. 1's
+/// caught first read lands 2, 3 and 4 Dirty, and its second read lands them
+/// Failed and panics with the stale-handle payload. At budget 3 that second
+/// read dooms with 2 a virtual frame, and 1's retry must take its first
+/// read's unwind again rather than run the chain a second time, which lands
+/// it Failed under the `Catch` and leaves the second read "last compute
+/// panicked".
+#[test]
+#[cfg_attr(miri, ignore)]
+fn caught_read_of_a_virtual_frame_node_is_kept_for_the_retry() {
+    let query = |expr, replay, strategy| Spec::Query {
+        expr,
+        replay,
+        bare: false,
+        strategy,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let case = Case {
+        specs: vec![
+            query(Expr::Const(1), false, Strat::None),
+            query(Expr::Const(1), false, Strat::None),
+            query(
+                Expr::Read(3, false),
+                true,
+                Strat::Fixpoint {
+                    initial: 0,
+                    limit: 3,
+                },
+            ),
+            query(Expr::Read(4, false), false, Strat::None),
+            query(Expr::Add(read(5), read(0)), false, Strat::None),
+            query(Expr::Read(2, false), true, Strat::None),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 6,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![
+            Op::Delete(0),
+            Op::Delete(1),
+            Op::Recreate(
+                1,
+                query(
+                    Expr::Add(Box::new(Expr::Catch(read(2))), read(2)),
+                    true,
+                    Strat::None,
+                ),
+            ),
+            Op::TryGet(1),
+        ],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0xeb37_9773_cd1b_3565);
+        differential::<Shared>(&case, 0xeb37_9773_cd1b_3565);
+    });
+}
+
 /// A one-phase case's snapshots with nodes `xs` patched to `to`, judged
 /// by `at_overlap`; `live_too` also sets the live nodes' states.
 fn overlap_verdict(
