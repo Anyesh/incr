@@ -1598,7 +1598,7 @@ impl<C: Cells> Runtime<C> {
                             let kind = cycle_state::unwind_kind();
                             let contain = entry.walked
                                 && !self.episode_member(entry.node)
-                                && self.containable(kind, &*payload);
+                                && self.containable(NodeId(entry.node), kind, &*payload);
                             let mut bag = Deferred::new();
                             let left = self
                                 .continuation_unwound(entry.node, cidx, payload, contain, &mut bag);
@@ -2051,8 +2051,9 @@ impl<C: Cells> Runtime<C> {
         let mut bag = Deferred::new();
         let mut payload = payload;
         if continuation {
-            let contain =
-                v.walked && !self.episode_member(v.node) && self.containable(kind, &*payload);
+            let contain = v.walked
+                && !self.episode_member(v.node)
+                && self.containable(NodeId(v.node), kind, &*payload);
             let left = self.continuation_unwound(v.node, v.cidx, payload, contain, &mut bag);
             if contain {
                 cycle_state::take_unwind_kind();
