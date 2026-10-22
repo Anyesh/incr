@@ -1377,3 +1377,73 @@ fn local_speculative_failed_read_keeps_the_delivery() {
 fn shared_speculative_failed_read_keeps_the_delivery() {
     speculative_failed_read_keeps_the_delivery::<Shared>();
 }
+
+/// The caught-member shape with X first catching its read of C, which
+/// reads A and panics "c boom" on A's fallback, and then reading B. Both
+/// of X's reads doom at a budget, so X's frames hold a delivery for each,
+/// and at budget 2 the frame of A's second read holds only C's.
+fn caught_member_panic_two_deliveries<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let member = |text: &'static str| {
+        let al = a_later.clone();
+        rt.create_query_with(
+            move |rt| {
+                let a = rt.get(later(&al));
+                if a == 4 {
+                    std::panic::panic_any(String::from(text));
+                }
+                a
+            },
+            replayable(),
+        )
+    };
+    let c = member("c boom");
+    let b = member("b boom");
+    let x = rt.create_query_with(
+        move |rt| {
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
+            rt.get(b) + 4
+        },
+        replayable(),
+    );
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, b, c].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+/// X's Failed read must not take the caught read's payload, "c boom",
+/// where the unbounded run raises "b boom".
+fn failed_read_takes_no_caught_delivery<C: Cells>() {
+    let unbounded = caught_member_panic_two_deliveries::<C>(None);
+    assert_eq!(
+        unbounded,
+        (Out::Panic("b boom".into()), vec![NodeState::Failed; 4])
+    );
+    for frames in 1..=4 {
+        let got = caught_member_panic_two_deliveries::<C>(Some(frames));
+        // Accepted residual: X's compute caught the read the only delivery
+        // on this path is for, so the read takes none and raises "last
+        // compute panicked" where the unbounded run raises "b boom".
+        let residual = matches!(&got.0, Out::Panic(m) if m.contains("last compute panicked"));
+        assert!(got == unbounded || residual, "budget {frames}: {got:?}");
+    }
+}
+
+local_and_shared!(
+    failed_read_takes_no_caught_delivery,
+    local_failed_read_takes_no_caught_delivery,
+    shared_failed_read_takes_no_caught_delivery
+);

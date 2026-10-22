@@ -2385,7 +2385,7 @@ fn shared_dirty_landing_leaves_the_delivery_unmarked() {
                     let marked = crate::replay::with(|c| {
                         c.iter()
                             .flat_map(|ctx| &ctx.pending)
-                            .any(|d| d.key.node == x.slot() && d.failed_here)
+                            .any(|d| d.key.node == x.slot() && d.escaped)
                     });
                     seen.lock().unwrap().push((rt.state_of(x), marked));
                 }

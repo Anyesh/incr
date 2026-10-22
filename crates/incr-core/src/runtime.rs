@@ -3742,8 +3742,8 @@ impl<C: Cells> Runtime<C> {
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
-        if !C::SINGLE_THREADED && landed == NodeState::Failed {
-            self.after_failed_store(id, node.generation());
+        if let Some(payload) = payload.filter(|_| landed == NodeState::Failed) {
+            self.after_failed_store(id, node.generation(), attempt.cidx, payload);
         }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.

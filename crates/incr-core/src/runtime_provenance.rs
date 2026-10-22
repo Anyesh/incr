@@ -147,7 +147,7 @@ impl<C: Cells> Runtime<C> {
             c.iter()
                 .filter(|x| x.rt == rt)
                 .flat_map(|x| {
-                    x.landed_payloads(at, id.0, generation, path, !C::SINGLE_THREADED)
+                    x.landed_payloads(at, id.0, generation, path)
                         .map(|(i, record)| (x.id, i, record))
                 })
                 .collect()
@@ -155,16 +155,23 @@ impl<C: Cells> Runtime<C> {
         if candidates.is_empty() {
             return None;
         }
-        let found = match candidates.iter().find(|&&(_, _, record)| record.is_none()) {
-            Some(&found) => found,
-            None => {
+        // Two along the path leave no way to tell which one the node's
+        // compute lets out here.
+        let mut by_path = candidates
+            .iter()
+            .filter(|&&(_, _, record)| record.is_none());
+        let found = match (by_path.next(), by_path.next()) {
+            (Some(&found), None) => found,
+            _ => {
                 self.park(ParkPoint::FailedReadBeforeRecheck(id));
                 let records = self.provenance.read();
                 candidates.into_iter().find(|&(_, _, record)| {
-                    records
-                        .live
-                        .iter()
-                        .any(|r| Some(r.id) == record && r.propagated.contains(&(id.0, generation)))
+                    record.is_some_and(|record| {
+                        records
+                            .live
+                            .iter()
+                            .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
+                    })
                 })?
             }
         };
@@ -298,22 +305,25 @@ impl<C: Cells> Runtime<C> {
         });
     }
 
-    /// After this thread's landing stored `id` Failed: the deliveries held
-    /// for its frames may go to a Failed read by their path.
+    /// After this thread's landing stored `id`'s frame at `cidx` Failed
+    /// with `payload`, from `land_failed`: marks the deliveries for the
+    /// read that let it out (`Context::mark_escaped`).
     #[cold]
     #[inline(never)]
-    pub(super) fn after_failed_store(&self, id: NodeId, generation: u32) {
+    pub(super) fn after_failed_store(
+        &self,
+        id: NodeId,
+        generation: u32,
+        cidx: u32,
+        payload: &(dyn Any + Send),
+    ) {
         if value_code::thread_word() & value_code::REPLAY_BIT == 0 || replay::speculative() {
             return;
         }
         let rt = self.runtime_id;
         replay::with(|c| {
             for x in c.iter_mut().filter(|x| x.rt == rt) {
-                for d in x.pending.iter_mut() {
-                    if d.key.node == id.0 && d.key.generation == generation {
-                        d.failed_here = true;
-                    }
-                }
+                x.mark_escaped(id.0, generation, cidx, payload);
             }
         });
     }

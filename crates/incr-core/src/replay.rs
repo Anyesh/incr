@@ -149,10 +149,12 @@ pub(crate) struct Delivery {
     /// generation)`: a read of one of their nodes stands for its frame's
     /// run.
     pub(crate) below: Vec<(u32, u32, u32)>,
-    /// This thread landed the frame's node Failed while the delivery
-    /// waited. Under `Shared` a Failed read takes it by its path only
-    /// then: another thread's landing is the record's to judge.
-    pub(crate) failed_here: bool,
+    /// The same read of a frame of the node at this position let its
+    /// payload out of the node's compute, in a Failed landing this thread
+    /// stored while the delivery waited: a Failed read of the node along
+    /// the delivery's path may take it. A read the compute caught, or
+    /// another thread's landing, marks none.
+    pub(crate) escaped: bool,
 }
 
 /// A delivery's hold on its runtime's provenance record, which stays
@@ -373,7 +375,7 @@ impl Context {
             what,
             provenance,
             below: Vec::new(),
-            failed_here: false,
+            escaped: false,
         });
     }
 
@@ -405,17 +407,16 @@ impl Context {
     /// The untaken user-panic deliveries a read of `node` at position `at`
     /// may be owed, as `(index, record)`. With a record: those for that
     /// frame, and those whose frame's pops reached it, owed once the
-    /// record says so. Without one: for a Failed read along `path`, the
-    /// one for the node's frame at that position and path, whose payload
-    /// the unbounded run's compute of the node there raises, and under
-    /// `own` only once this thread landed the node Failed.
+    /// record says so. Without one: for a Failed read along `path`, those
+    /// for the node's frame at that position and path whose read let its
+    /// payload out of the node's compute ([`Delivery::escaped`]), which
+    /// the unbounded run's compute of the node there raises.
     pub(crate) fn landed_payloads(
         &self,
         at: u32,
         node: u32,
         generation: u32,
         path: Option<u64>,
-        own: bool,
     ) -> impl Iterator<Item = (usize, Option<u64>)> + '_ {
         self.pending.iter().enumerate().filter_map(move |(i, d)| {
             if d.taken || !matches!(d.what, Delivered::Unwind { cycle: false, .. }) {
@@ -423,12 +424,44 @@ impl Context {
             }
             let k = d.key;
             let frame = k.cidx == at && k.node == node && k.generation == generation;
-            if frame && path == Some(k.path) && (!own || d.failed_here) {
+            if frame && path == Some(k.path) && d.escaped {
                 return Some((i, None));
             }
             let p = d.provenance.as_ref()?;
             (frame || d.below.contains(&(at, node, generation))).then(|| (i, Some(p.record())))
         })
+    }
+
+    /// The frame of `node` at `cidx` landed Failed with `payload`: marks
+    /// [`Delivery::escaped`] the deliveries, on any path, for the read
+    /// whose taken delivery's payload that is.
+    pub(crate) fn mark_escaped(
+        &mut self,
+        node: u32,
+        generation: u32,
+        cidx: u32,
+        payload: &(dyn Any + Send),
+    ) {
+        let frame = |k: &ReadKey| k.node == node && k.generation == generation && k.cidx == cidx;
+        let reads: Vec<(u64, u32)> = self
+            .pending
+            .iter()
+            .filter(|d| d.taken && frame(&d.key))
+            .filter(|d| match &d.what {
+                Delivered::Unwind {
+                    cycle: false,
+                    payload: held,
+                    ..
+                } => same_text(&**held, payload),
+                _ => false,
+            })
+            .map(|d| (d.key.reading, d.key.ordinal))
+            .collect();
+        for d in self.pending.iter_mut() {
+            if frame(&d.key) && reads.contains(&(d.key.reading, d.key.ordinal)) {
+                d.escaped = true;
+            }
+        }
     }
 
     /// Takes the payload of delivery `i` for a read at `at`, as
@@ -495,7 +528,7 @@ impl Context {
             what: Delivered::Walk(Box::new(walk)),
             provenance: None,
             below: Vec::new(),
-            failed_here: false,
+            escaped: false,
         });
     }
 
@@ -518,7 +551,7 @@ impl Context {
                 what: Delivered::Direct,
                 provenance: None,
                 below: Vec::new(),
-                failed_here: false,
+                escaped: false,
             });
         }
     }
@@ -932,6 +965,18 @@ pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + S
     payload
         .downcast_ref::<&'static str>()
         .map(|message| Box::new(*message) as Box<dyn Any + Send>)
+}
+
+/// Both payloads are a `String` or `&str` panic with the same text: a
+/// delivery's payload and the copy of it a read raised.
+fn same_text(a: &(dyn Any + Send), b: &(dyn Any + Send)) -> bool {
+    let text = |p: &(dyn Any + Send)| {
+        p.downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| p.downcast_ref::<&'static str>().copied())
+            .map(str::to_owned)
+    };
+    text(a).is_some_and(|a| text(b).is_some_and(|b| a == b))
 }
 
 /// Opens a context, returning its id.
