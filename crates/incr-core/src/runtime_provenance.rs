@@ -234,7 +234,10 @@ impl<C: Cells> Runtime<C> {
                     .and_then(|p| p.downcast_ref::<String>())
                     .is_some_and(|m| *m == failed_read_message(c.node))
         });
-        {
+        // With no live record there is nothing to replace: a record
+        // published after this check names no landing yet, and only this
+        // landing's claim can land `id` before its store.
+        if !self.provenance.read().live.is_empty() {
             let mut records = self.provenance.write();
             for r in &mut records.live {
                 r.propagated.retain(|&landed| landed != (id.0, generation));
