@@ -3739,10 +3739,11 @@ impl<C: Cells> Runtime<C> {
 
     /// The landing of a claim a user panic released without failing it.
     /// A node that lands Failed, now or as the unwind goes on, read it,
-    /// directly or through other released claims, so a set that would cure the failure may reach
-    /// that node only through this one: the union of its old and recorded
-    /// deps is published, as [`Self::land_failed`] publishes them, and it
-    /// lands New, which a set's walk passes through where Dirty stops it.
+    /// directly or through other released claims, so a set that would cure
+    /// the failure may reach that node only through this one: the union of
+    /// its old and recorded deps is published, as [`Self::land_failed`]
+    /// publishes them, and it lands New, which a set's walk passes through
+    /// where Dirty stops it.
     /// `co_members`, sorted, are the claims released with it.
     fn land_panic_released(
         &self,
