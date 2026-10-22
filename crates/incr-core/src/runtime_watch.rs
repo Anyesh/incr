@@ -73,8 +73,14 @@ impl WatchQueue {
     }
 
     pub(super) fn take(&mut self) -> VecDeque<(u32, u32)> {
-        for &(slot, _) in &self.entries {
-            self.queued[slot as usize / 64] &= !(1 << (slot % 64));
+        // A store through `self.queued` may alias its own pointer and
+        // length, so iterating through it reloads both per entry.
+        let queued = self.queued.as_mut_slice();
+        let (front, back) = self.entries.as_slices();
+        for half in [front, back] {
+            for &(slot, _) in half {
+                queued[slot as usize / 64] &= !(1 << (slot % 64));
+            }
         }
         std::mem::take(&mut self.entries)
     }
@@ -203,6 +209,25 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn unwatch_deleted(&self, slot: u32, bits: u8) {
         if bits & WATCHED != 0 {
             self.watch_queue.write().remove(slot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WatchQueue;
+
+    #[test]
+    fn take_clears_both_halves_of_a_wrapped_queue() {
+        let mut queue = WatchQueue::new();
+        queue.push(2, 0);
+        queue.push(70, 0);
+        queue.push_front(1, 0);
+        let (front, back) = queue.entries.as_slices();
+        assert!(!front.is_empty() && !back.is_empty());
+        assert_eq!(queue.take().len(), 3);
+        for slot in [1, 2, 70] {
+            assert!(!queue.is_queued(slot), "{slot}");
         }
     }
 }
