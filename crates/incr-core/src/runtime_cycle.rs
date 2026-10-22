@@ -971,7 +971,7 @@ impl<C: Cells> Runtime<C> {
         let contain = self.episode_contains(cidx, kind, &*payload);
         self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), Some(&*payload), bag);
         if contain {
-            self.raise_contained(cidx, payload, bag);
+            self.raise_contained(cidx, payload);
         }
         self.leave_frame(kind, payload, bag)
     }
@@ -2128,7 +2128,7 @@ impl<C: Cells> Runtime<C> {
             bag.push_erased(Box::new((e.take_buf(), e.s.take())));
         }
         if contain {
-            self.raise_contained(cidx, payload, bag);
+            self.raise_contained(cidx, payload);
         }
         self.leave_frame(kind, payload, bag)
     }

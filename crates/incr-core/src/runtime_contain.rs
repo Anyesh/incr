@@ -282,16 +282,14 @@ impl<C: Cells> Runtime<C> {
 
     /// The episode at `cidx`, rooted at a walk's entry, aborts with
     /// `payload`, which the entry contains: the unwind goes on, past what
-    /// it would tell the reading frame, to the episode's boundary.
+    /// it would tell the reading frame, to the episode's boundary. What the
+    /// abort released stays in the episode's bag: the containment ends the
+    /// unwind, so the bag drains in normal mode and a panicking `Drop` in
+    /// it reaches the read.
     #[cold]
     #[inline(never)]
-    pub(super) fn raise_contained(
-        &self,
-        cidx: u32,
-        payload: Box<dyn Any + Send>,
-        bag: &mut Deferred<C>,
-    ) -> ! {
-        bag.drain_carried(Box::new(Contained { cidx, payload }))
+    pub(super) fn raise_contained(&self, cidx: u32, payload: Box<dyn Any + Send>) -> ! {
+        std::panic::resume_unwind(Box::new(Contained { cidx, payload }))
     }
 
     /// An unwind out of the rounds of an episode rooted at a walk's entry:
