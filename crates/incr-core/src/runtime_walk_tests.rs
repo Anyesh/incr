@@ -814,16 +814,23 @@ fn shared_unread_contained_panic_is_released() {
     unread_contained_panic_is_released::<Shared>();
 }
 
-/// Builds the held "f boom" ticket of `unread_contained_panic_is_released`,
-/// then has a replayable h catch f's panic, fold its text length into its
-/// value and read a New g, at frame budget `budget` (or the default).
-fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>) -> i64 {
+/// A payload no engine copy can stand for.
+struct NotClone(i64);
+
+/// Builds the held "f boom" ticket of `unread_contained_panic_is_released`
+/// (a `NotClone(6)` payload if `custom`), then has a replayable h catch f's
+/// panic, fold its text length or number into its value and read a New g,
+/// at frame budget `budget` (or the default).
+fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>, custom: bool) -> i64 {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     let sel = rt.create_input(0_i64);
     let j = rt.create_input(1_i64);
     let f = rt.create_query(move |rt| {
         let v = rt.get(j);
+        if v == 0 && custom {
+            std::panic::panic_any(NotClone(6));
+        }
         assert!(v != 0, "f boom");
         v
     });
@@ -838,7 +845,10 @@ fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>) -> i64 
         move |rt: &Runtime<C>| {
             let n = match catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
                 Ok(v) => v,
-                Err(p) => panic_message(p).len() as i64,
+                Err(p) => match p.downcast::<NotClone>() {
+                    Ok(n) => n.0,
+                    Err(p) => panic_message(p).len() as i64,
+                },
             };
             n + rt.get(g)
         },
@@ -855,16 +865,19 @@ fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>) -> i64 
 
 /// A replayable run that takes a contained ticket, drops the payload and is
 /// doomed by a later read past the budget must leave its retry the same
-/// payload: h is `"f boom".len() + g` = 16 at every budget, as unbounded.
+/// payload, whatever its type: h is `6 + g` = 16 at every budget, as
+/// unbounded.
 fn wave6_doomed_run_keeps_the_ticket_it_took<C: Cells>() {
-    let unbounded = wave6_doomed_run_after_taking_a_ticket::<C>(None);
-    assert_eq!(unbounded, 6 + 10);
-    for b in 1..=3 {
-        assert_eq!(
-            wave6_doomed_run_after_taking_a_ticket::<C>(Some(b)),
-            unbounded,
-            "budget {b}"
-        );
+    for custom in [false, true] {
+        let unbounded = wave6_doomed_run_after_taking_a_ticket::<C>(None, custom);
+        assert_eq!(unbounded, 6 + 10, "custom {custom}");
+        for b in 1..=3 {
+            assert_eq!(
+                wave6_doomed_run_after_taking_a_ticket::<C>(Some(b), custom),
+                unbounded,
+                "budget {b}, custom {custom}"
+            );
+        }
     }
 }
 

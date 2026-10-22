@@ -955,34 +955,6 @@ impl<C: Cells> Runtime<C> {
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
 
-    /// The active frame's read of `id` took `payload` from a walk's ticket.
-    /// If a budget is set, the frame may be doomed after its closure has
-    /// dropped the payload, and its retry's read must take it again, as the
-    /// unbounded run's one read did.
-    pub(super) fn note_ticket_read(&self, id: NodeId, payload: &(dyn std::any::Any + Send)) {
-        if !self.budgeted() {
-            return;
-        }
-        let Some((ctl, cidx, reading, ordinal)) = self.dep_stack.unwound_reader(self.runtime_id)
-        else {
-            return;
-        };
-        if reading != u64::from(id.0) | (u64::from(self.nodes.get(id.0).generation()) << 32) {
-            return;
-        }
-        let Some(copy) = replay::copy_payload(payload) else {
-            return;
-        };
-        let what = Delivered::Unwind {
-            cycle: false,
-            poison: true,
-            attributed: false,
-            payload: copy,
-            nodes: self.copy_notes(payload),
-        };
-        self.keep_read(ctl, cidx, reading, ordinal, what);
-    }
-
     fn budgeted(&self) -> bool {
         self.max_frames.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX
             || self

@@ -290,6 +290,25 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// `rt`'s active frame took a walk's one-shot contained payload: it can
+    /// no longer be doomed, because its closure may drop the payload before
+    /// a doom and its retry would read the node with the payload gone. A
+    /// frame doomed already keeps its doom.
+    #[cold]
+    #[inline(never)]
+    fn note_ticket_read(&self, rt: RuntimeId) {
+        self.with(|s| {
+            if let Some(top) = s.reader(rt) {
+                // SAFETY: the frame is on the stack, so its control block
+                // is live (see `Frame::ctl`).
+                let ctl = unsafe { &*top.ctl };
+                if !ctl.has(DOOMED) {
+                    ctl.raise(NO_DOOM);
+                }
+            }
+        })
+    }
+
     /// `rt`'s active frame as the reader of an unwind out of the compute
     /// that popped above it, with the node it reads and how many times it
     /// has read it.
