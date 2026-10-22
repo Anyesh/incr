@@ -972,6 +972,17 @@ fn set_out<C: Cells>(rt: &Runtime<C>, h: Handle, v: u64) -> Out {
 
 /// A run's two runtimes, its node tables, and the handles recreates
 /// replaced.
+/// The caches of one [`Serial::history_cause`].
+struct History<'a> {
+    label: &'a str,
+    prefix: &'a Trace,
+    p: usize,
+    live: &'a Live<Shared>,
+    runs: Vec<(usize, Eval)>,
+    allowed: HashMap<(usize, usize), HashSet<Read>>,
+    taken: HashMap<u64, bool>,
+}
+
 struct Live<C: Cells> {
     world: Arc<World<C>>,
     retired: Mutex<Vec<Handle>>,
@@ -1609,7 +1620,8 @@ impl<'a> Serial<'a> {
         let end = prefix.len() - 1;
         let sets: Vec<_> = found.iter().map(|m| settled(&wants[m][end].1 .0)).collect();
         drop(wants);
-        Some(consistent(case, prefix, &sets, live))
+        let history = |x: usize| self.history_cause(label, prefix, live, x);
+        Some(consistent(case, prefix, &sets, live, &history))
     }
 
     /// Orders per read each get of the read phase `prefix` ends with whose
@@ -1751,6 +1763,40 @@ impl<'a> Serial<'a> {
         q: usize,
         run: &Eval,
     ) -> Result<Out, String> {
+        let allowed = self.allowed_reads(label, prefix, p, i, q);
+        if let Some(r) = run.reads.iter().find(|r| !allowed.contains(*r)) {
+            return Err(format!(
+                "op {i}: node {q} read {r:?}, which no order gives that read"
+            ));
+        }
+        let Spec::Query { expr, .. } = spec_at(self.case, prefix, 0, q) else {
+            return Err(format!("op {i}: node {q} is an input"));
+        };
+        let mut reads = run.reads.iter();
+        let out = match formula(&expr, (0, q, run.first), &mut reads) {
+            Ok(v) => Out::Value(v),
+            Err(None) => Out::Panic(String::new()),
+            Err(Some(why)) => return Err(format!("op {i}: {why}")),
+        };
+        match reads.next() {
+            None => Ok(out),
+            Some(r) => Err(format!(
+                "op {i}: node {q}'s closure stops before its read {r:?}"
+            )),
+        }
+    }
+
+    /// The reads an order's last run of node `q` in op `i` of phase `p`
+    /// makes, over the orders an order of the phases before gives `prefix`
+    /// in, with either read of phase `p` first.
+    fn allowed_reads(
+        &self,
+        label: &str,
+        prefix: &Trace,
+        p: usize,
+        i: usize,
+        q: usize,
+    ) -> HashSet<Read> {
         let (case, phases) = (self.case, self.phases);
         let start = phases[p].ops()[0];
         let pair = phases[..p].iter().filter(|ph| ph.ops().len() == 2).count();
@@ -1783,26 +1829,112 @@ impl<'a> Serial<'a> {
             let last = (log[at].iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
             allowed.extend(last.into_iter().flat_map(|e| e.reads.iter().cloned()));
         }
-        if let Some(r) = run.reads.iter().find(|r| !allowed.contains(*r)) {
-            return Err(format!(
-                "op {i}: node {q} read {r:?}, which no order gives that read"
-            ));
-        }
-        let Spec::Query { expr, .. } = spec_at(case, prefix, 0, q) else {
-            return Err(format!("op {i}: node {q} is an input"));
+        allowed
+    }
+
+    /// Whether node `x`'s last run in the read phase `prefix` ends panicked
+    /// in its own closure over reads the oracle takes: each one a read an
+    /// order's last run of the node makes, the value an input holds, or the
+    /// value of an earlier run of the read node in the phase whose closure
+    /// gives it over reads the oracle takes in turn.
+    fn history_cause(&self, label: &str, prefix: &Trace, live: &Live<Shared>, x: usize) -> bool {
+        let end = prefix.len() - 1;
+        let Some(p) = (self.phases.iter()).position(|ph| ph.ops().last() == Some(&end)) else {
+            return false;
         };
-        let mut reads = run.reads.iter();
-        let out = match formula(&expr, (0, q, run.first), &mut reads) {
-            Ok(v) => Out::Value(v),
-            Err(None) => Out::Panic(String::new()),
-            Err(Some(why)) => return Err(format!("op {i}: {why}")),
+        let evals = live.evals.lock().unwrap().clone();
+        let runs: Vec<(usize, Eval)> = self.phases[p]
+            .ops()
+            .into_iter()
+            .flat_map(|i| {
+                evals
+                    .get(&i)
+                    .into_iter()
+                    .flatten()
+                    .map(move |e| (i, e.clone()))
+            })
+            .filter(|(_, e)| e.node.0 == 0)
+            .collect();
+        let Some((i, last)) = (runs.iter())
+            .filter(|(_, e)| e.node.1 == x)
+            .max_by_key(|(_, e)| e.end)
+            .cloned()
+        else {
+            return false;
         };
-        match reads.next() {
-            None => Ok(out),
-            Some(r) => Err(format!(
-                "op {i}: node {q}'s closure stops before its read {r:?}"
-            )),
+        let mut cx = History {
+            label,
+            prefix,
+            p,
+            live,
+            runs,
+            allowed: HashMap::new(),
+            taken: HashMap::new(),
+        };
+        self.run_taken(&mut cx, i, &last, None)
+    }
+
+    /// Whether `run`, of op `i`, gives `value` (its own panic for `None`)
+    /// over reads the oracle takes, as [`Self::history_cause`] takes them.
+    fn run_taken(&self, cx: &mut History<'_>, i: usize, run: &Eval, value: Option<u64>) -> bool {
+        if let Some(&t) = cx.taken.get(&run.end) {
+            return t;
         }
+        cx.taken.insert(run.end, false);
+        let q = run.node.1;
+        let gives = match spec_at(self.case, cx.prefix, 0, q) {
+            Spec::Query { expr, .. } => {
+                let mut reads = run.reads.iter();
+                let out = formula(&expr, (0, q, run.first), &mut reads);
+                reads.next().is_none()
+                    && match (out, value) {
+                        (Ok(v), Some(want)) => v == want,
+                        (Err(None), None) => !run.reads.iter().any(|r| r.3 == ReadOut::Unwound),
+                        _ => false,
+                    }
+            }
+            Spec::Input(_) => false,
+        };
+        let taken = gives
+            && run
+                .reads
+                .iter()
+                .all(|r| self.read_taken(cx, i, q, run.end, r));
+        cx.taken.insert(run.end, taken);
+        taken
+    }
+
+    /// Whether the oracle takes read `r` of a run of node `q` in op `i`
+    /// that ended at `end`, as [`Self::history_cause`] takes it.
+    fn read_taken(&self, cx: &mut History<'_>, i: usize, q: usize, end: u64, r: &Read) -> bool {
+        let &(side, d, _, ref out) = r;
+        if side != 0 {
+            return false;
+        }
+        let allowed = match cx.allowed.get(&(i, q)) {
+            Some(a) => a,
+            None => {
+                let a = self.allowed_reads(cx.label, cx.prefix, cx.p, i, q);
+                cx.allowed.entry((i, q)).or_insert(a)
+            }
+        };
+        if allowed.contains(r) {
+            return true;
+        }
+        let ReadOut::Value(v) = *out else {
+            return false;
+        };
+        if let Spec::Input(_) = spec_at(self.case, cx.prefix, 0, d) {
+            let w = &*cx.live.world;
+            return read_out(w.rt(0), w.handle(0, d), false) == Out::Value(v);
+        }
+        let earlier: Vec<(usize, Eval)> = (cx.runs.iter())
+            .filter(|(_, f)| f.node.1 == d && f.value == Some(v) && f.end < end)
+            .cloned()
+            .collect();
+        earlier
+            .iter()
+            .any(|(j, f)| self.run_taken(cx, *j, f, Some(v)))
     }
 
     /// Panics unless the run's trace `got` is an order's unbounded run, or
@@ -1870,7 +2002,9 @@ impl<'a> Serial<'a> {
 /// stands in for unless it has one too: the re-run panics with the
 /// closure's own payload, or through a read of a node left Failed or
 /// Cyclic that is not such a node, or of one the re-runs landed Failed
-/// that has such a cause itself. A node the order settles that the phase left
+/// that has such a cause itself, or its last run in the phase panicked in
+/// its own closure over reads the oracle takes
+/// ([`Serial::history_cause`]). A node the order settles that the phase left
 /// Dirty or New must still read so on a later `get`: a panic for Failed,
 /// the cycle for Cyclic. The re-runs and gets run on this thread, in that
 /// order, and change the world.
@@ -1879,6 +2013,7 @@ fn consistent(
     prefix: &Trace,
     sets: &[Vec<(usize, NodeState)>],
     live: &Live<Shared>,
+    history: &dyn Fn(usize) -> bool,
 ) -> Result<(), String> {
     let w = &*live.world;
     let states = &prefix.last().expect("a phase ran").1 .0;
@@ -1952,6 +2087,9 @@ fn consistent(
                 );
             }
             (Out::Panic(c), NodeState::Failed) if c == "failed" || c == "cycle" => {
+                if history(x) {
+                    continue;
+                }
                 let mut read = Vec::new();
                 w.rt(side)
                     .nodes
@@ -3836,4 +3974,65 @@ fn two_thread_oracle_rejects_a_made_up_cycle() {
     // Slot 14 is no order's participant.
     assert!(!cycle_from_own_frames(|c| c.push(14)));
     assert!(!cycle_from_own_frames(|c| c.clear()));
+}
+
+/// Seed 0x3904's first phase at a budget of 1 frame: op 0 `Get(0)` on one
+/// thread, op 1 `Get(6)` on the other. Some runs give 1's `try_get(2)` a
+/// cycle that 6 then reads as 7777, so 5 is 2 and 4 panics, which no order
+/// does; the members 4's claims released, read again in the phase, fail
+/// through 4, and the phase leaves 1 to 6 Failed. In the first such run,
+/// `patch` edits the phase's recorded closure runs before the oracle sees
+/// them; returns whether the oracle took the run, every run before it
+/// checked as usual.
+fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> bool {
+    let case = gen_case(0x3904, false, true);
+    let phases = phases(&case, 0x3904);
+    assert_eq!(phases[0].ops(), [0, 1]);
+    let mut took = None;
+    quiet(|| {
+        for _ in 0..2000 {
+            let serial = Serial::new(&case, &phases);
+            let verdict = Mutex::new(None);
+            let hit = AtomicBool::new(false);
+            let got = run_two_until(&case, &phases, Some(1), 0, &|_| {}, &|_, prefix, live| {
+                let states = &prefix.last().unwrap().1 .0;
+                if prefix.len() == 2 && (1..=6).all(|x| states[x] == NodeState::Failed) {
+                    hit.store(true, SeqCst);
+                    patch(&mut live.evals.lock().unwrap());
+                }
+                let v = serial.at_overlap("0x3904", prefix, live);
+                let stop = v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            let verdict = verdict.into_inner().unwrap();
+            if !hit.load(SeqCst) {
+                serial.check("0x3904", &got, verdict);
+                continue;
+            }
+            took = Some(
+                catch_unwind(AssertUnwindSafe(|| serial.check("0x3904", &got, verdict))).is_ok(),
+            );
+            return;
+        }
+    });
+    took.expect("no run of 0x3904 left 1 to 6 Failed")
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_takes_a_failed_set_grounded_in_its_history() {
+    assert!(cascade_from_a_history_panic(|_| {}));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_rejects_a_history_grounding_over_a_wrong_value() {
+    assert!(!cascade_from_a_history_panic(|evals| {
+        for e in evals.values_mut().flatten() {
+            if e.node == (0, 5) && e.value == Some(2) {
+                e.value = Some(3);
+            }
+        }
+    }));
 }
