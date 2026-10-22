@@ -2317,7 +2317,7 @@ fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
     };
     let held = |x: Incr<u64>| {
         crate::replay::with(|c| {
-            c.iter().flat_map(|ctx| &ctx.pending).find_map(|d| {
+            c.iter().flat_map(|ctx| ctx.pending.iter()).find_map(|d| {
                 (!d.taken && d.key.node == x.slot()).then_some((d.key.cidx, d.key.path))
             })
         })
@@ -2370,92 +2370,150 @@ fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// The caught-member shape (A, Fallback 4, catches its read of X, then
-/// reads X again; X reads B, which reads A and panics on A's fallback) at
-/// budget 2, with X also reading input I. The retry's rerun of the caught
-/// read parks in X's compute while the other thread sets I, so X panics
-/// and lands Dirty, not Failed. This thread never landed X Failed, so no
-/// delivery held for X's frame may be marked for a Failed read to take
-/// by its path. Another thread's later Failed landing of X can't be
-/// ordered before A's second read here: its walk waits on A's claim.
-#[test]
-fn shared_dirty_landing_leaves_the_delivery_unmarked() {
+/// The two-deliveries shape of `runtime_replay_unwind_tests`, with X
+/// switchable as in [`landed_shape`]: A (Fallback 4) catches its read of
+/// X and reads X again; X catches its read of C and reads B; B and C read
+/// A and panic on its fallback. Switched, X reads nothing and lands Clean
+/// 42 or panics, and B and C read nothing.
+struct Retaken {
+    rt: Arc<Rt>,
+    a: Incr<u64>,
+    x: Incr<u64>,
+    c: Incr<u64>,
+    mode: Arc<AtomicU8>,
+}
+
+fn retaken_shape() -> Retaken {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
-    rt.set_max_frames(2);
-    let i = rt.create_input(0_u64);
-    let a_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
-    let b = {
-        let a_cell = a_cell.clone();
+    let mode = Arc::new(AtomicU8::new(CHAIN));
+    let ac: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let member = |text: &'static str| {
+        let (ac, mode) = (ac.clone(), mode.clone());
         rt.create_query_with(
             move |rt: &Rt| {
-                let a = rt.get(*a_cell.get().unwrap());
+                if mode.load(SeqCst) != CHAIN {
+                    return 0;
+                }
+                let a = rt.get(*ac.get().unwrap());
                 if a == 4 {
-                    std::panic::panic_any(String::from("b boom"));
+                    std::panic::panic_any(String::from(text));
                 }
                 a
             },
             replayable(),
         )
     };
-    let in_x = Gate::new();
-    in_x.arm();
-    let x_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let c = member("c boom");
+    let b = member("b boom");
     let x = {
-        let (in_x, x_parked) = (in_x.clone(), x_parked.clone());
+        let mode = mode.clone();
         rt.create_query_with(
-            move |rt: &Rt| {
-                rt.get(i);
-                if rt.state_of(b) == NodeState::Failed && !x_parked.swap(true, SeqCst) {
-                    in_x.park();
+            move |rt: &Rt| match mode.load(SeqCst) {
+                CHAIN => {
+                    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
+                    rt.get(b) + 4
                 }
-                rt.get(b) + 4
+                CLEAN => 42,
+                _ => std::panic::panic_any(String::from("x failed")),
             },
             replayable(),
         )
     };
-    let seen: Arc<Mutex<Vec<(NodeState, bool)>>> = Arc::default();
-    let a = {
-        let (x_parked, seen) = (x_parked.clone(), seen.clone());
-        rt.create_query_with(
-            move |rt: &Rt| {
-                let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
-                if caught % 2 == 0 {
-                    return 3;
-                }
-                if x_parked.load(SeqCst) {
-                    let marked = crate::replay::with(|c| {
-                        c.iter()
-                            .flat_map(|ctx| &ctx.pending)
-                            .any(|d| d.key.node == x.slot() && d.escaped)
-                    });
-                    seen.lock().unwrap().push((rt.state_of(x), marked));
-                }
+    let a = rt.create_query_with(
+        move |rt: &Rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
                 rt.get(x)
-            },
-            QueryOpts {
-                replay: Replay::Allowed,
-                cycle: CycleStrategy::fallback(|_| 4),
-            },
-        )
-    };
-    a_cell.set(a).unwrap();
-    let first = {
-        let rt = rt.clone();
+            }
+        },
+        QueryOpts {
+            replay: Replay::Allowed,
+            cycle: CycleStrategy::fallback(|_| 4),
+        },
+    );
+    ac.set(a).unwrap();
+    Retaken { rt, a, x, c, mode }
+}
+
+/// The unbounded run in which the other thread's switch of X to `mode`
+/// and its `get(X)` come first: `get(A)`'s outcome and the states of A
+/// and X.
+fn retaken_first(mode: u8) -> (Outcome, [NodeState; 2]) {
+    let s = retaken_shape();
+    s.mode.store(mode, SeqCst);
+    let _ = outcome(|| s.rt.get(s.x));
+    let a = outcome(|| s.rt.get(s.a));
+    (a, [s.a, s.x].map(|h| s.rt.state_of(h)))
+}
+
+/// **A frame's node landed by another thread between two takes of its
+/// delivery**, at budget 2: the retry of A's caught read takes the
+/// delivery for X's read of B, which lands X Dirty, and a retry doomed
+/// again takes it a second time. Parked between the two takes, at the
+/// driver's second entry for C, another thread switches X and lands it,
+/// which it can since virtual frames hold no claims. The later take must
+/// not land X over that state, and A ends as in the unbounded run in which
+/// the other thread came first. The other thread's own read walks X's
+/// deps as the first take left them, so for a panicking X it can raise
+/// a Failed read of X rather than X's panic, as a serial walk would.
+fn retaken_delivery_after_another_landing(mode: u8) {
+    let s = retaken_shape();
+    s.rt.set_max_frames(2);
+    let gate = Gate::new();
+    {
+        let (gate, c, hits) = (gate.clone(), id(s.c), AtomicU32::new(0));
+        let installed = s.rt.park_hook.set(Box::new(move |p| {
+            if p == ParkPoint::BeforeEntry(c) && hits.fetch_add(1, SeqCst) == 1 {
+                gate.park();
+            }
+        }));
+        assert!(installed.is_ok(), "park hook installed twice");
+    }
+    gate.arm();
+    let reader = {
+        let (rt, a) = (s.rt.clone(), s.a);
         spawn(move || outcome(|| rt.get(a)))
     };
-    in_x.wait_parked();
-    rt.set(i, 1);
-    in_x.release();
-    let first = first.join();
-    assert!(first.is_err(), "{first:?}");
-    let seen = seen.lock().unwrap();
-    assert!(!seen.is_empty(), "A never read X again after the park");
+    gate.wait_parked();
     assert_eq!(
-        seen[0],
-        (NodeState::Dirty, false),
-        "a Dirty landing marked the delivery"
+        s.rt.state_of(s.x),
+        NodeState::Dirty,
+        "the first take landed X Dirty"
     );
-    rt.assert_invariant_i();
-    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+    s.mode.store(mode, SeqCst);
+    let x = outcome(|| s.rt.get(s.x));
+    let other = if mode == CLEAN {
+        assert_eq!(x, Ok(42));
+        NodeState::Clean
+    } else {
+        assert!(x.is_err(), "{x:?}");
+        NodeState::Failed
+    };
+    assert_eq!(s.rt.state_of(s.x), other);
+    gate.release();
+    let a = reader.join();
+
+    assert_eq!(
+        s.rt.state_of(s.x),
+        other,
+        "the later take landed X over the other thread's landing"
+    );
+    assert_eq!(
+        (a, [s.a, s.x].map(|h| s.rt.state_of(h))),
+        retaken_first(mode)
+    );
+    s.rt.assert_invariant_i();
+}
+
+#[test]
+fn shared_retaken_delivery_after_another_thread_lands_clean() {
+    retaken_delivery_after_another_landing(CLEAN);
+}
+
+#[test]
+fn shared_retaken_delivery_after_another_thread_lands_failed() {
+    retaken_delivery_after_another_landing(FAILED);
 }

@@ -7,6 +7,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle_state::{Held, Look};
+use crate::deferred::Unbuilt;
 use crate::dep_stack::Placement;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
@@ -1450,10 +1451,12 @@ impl<C: Cells> Runtime<C> {
             for (key, what) in kept {
                 // A frame marked again keeps the delivery its first mark, or
                 // the entry it was blocked on, made for the read.
-                if !x.pending.iter().any(|d| {
-                    matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
-                        && d.key == key
-                }) {
+                if x.pending
+                    .find_keyed(&key, |d| {
+                        matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
+                    })
+                    .is_none()
+                {
                     x.pending.push(Delivery {
                         key,
                         maker,
@@ -1462,8 +1465,8 @@ impl<C: Cells> Runtime<C> {
                         what,
                         provenance: None,
                         below: Vec::new(),
-                        escaped: false,
                         resumed: None,
+                        landed: None,
                     });
                 }
             }
@@ -1517,10 +1520,10 @@ impl<C: Cells> Runtime<C> {
         let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
         self.release_held_except(attempt.cidx, &keep, bag);
         if let Some(value) = ctl.buf.take() {
-            bag.push_erased(value);
+            bag.push_erased(Box::new(Unbuilt::new(value)));
         }
         if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
-            bag.push_erased(payload);
+            bag.push_erased(Box::new(Unbuilt::new(payload)));
         }
         let wrote = ctl.wrote.get() != 0;
         match rooted {
@@ -1676,7 +1679,7 @@ impl<C: Cells> Runtime<C> {
                 x.running_entry = None;
                 x.drop_point = None;
                 x.provenance = None;
-                let track = x.pending.iter().any(|d| d.provenance.is_some());
+                let track = !x.pending.traced().is_empty();
                 (level, entry, parked, track)
             });
             self.park(ParkPoint::BeforeEntry(NodeId(entry.node)));
@@ -1702,7 +1705,8 @@ impl<C: Cells> Runtime<C> {
                         };
                         let v = x.pop_vframe()?;
                         if track {
-                            for d in x.pending.iter_mut().filter(|d| d.provenance.is_some()) {
+                            for i in x.pending.traced().to_vec() {
+                                let d = x.pending.get_mut(i);
                                 if d.below.last().map_or(d.key.cidx, |b| b.0) == v.cidx + 1 {
                                     d.below.push((v.cidx, v.node, v.generation));
                                 }
@@ -1962,8 +1966,8 @@ impl<C: Cells> Runtime<C> {
             if matches!(ran, Ok(Computed::Discarded)) && dropped.is_none() {
                 replay::with(|c| {
                     if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                        for d in x.pending.iter_mut().filter(|d| d.maker == level) {
-                            d.taken = false;
+                        for i in x.pending.of_maker(level) {
+                            x.pending.get_mut(i).taken = false;
                         }
                     }
                 });
@@ -1971,7 +1975,7 @@ impl<C: Cells> Runtime<C> {
                 let unread: Vec<Delivery> = replay::with(|c| {
                     c.iter_mut()
                         .find(|x| x.id == id)
-                        .map(|x| x.pending.extract_if(.., |d| d.maker == level).collect())
+                        .map(|x| x.pending.extract_maker(level))
                         .unwrap_or_default()
                 });
                 self.drop_deliveries(unread);
@@ -2430,7 +2434,7 @@ impl<C: Cells> Runtime<C> {
             );
         }
         if let Some(spec_buf) = spec_buf {
-            bag.push_erased(spec_buf);
+            bag.push_erased(Box::new(spec_buf));
         }
         bag.push_erased(Box::new(e.into_values()));
         payload
@@ -2469,10 +2473,8 @@ impl<C: Cells> Runtime<C> {
     fn retry_deliveries(&self, id: u64, node: u32, generation: u32, cidx: u32) {
         replay::with(|c| {
             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                for d in x.pending.iter_mut().filter(|d| {
-                    d.key.node == node && d.key.generation == generation && d.key.cidx == cidx
-                }) {
-                    d.taken = false;
+                for i in x.pending.of_frame(node, generation, cidx) {
+                    x.pending.get_mut(i).taken = false;
                 }
             }
         });
@@ -2483,15 +2485,7 @@ impl<C: Cells> Runtime<C> {
         let ended: Vec<Delivery> = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == id)
-                .map(|x| {
-                    x.pending
-                        .extract_if(.., |d| {
-                            d.key.node == node
-                                && d.key.generation == generation
-                                && d.key.cidx == cidx
-                        })
-                        .collect()
-                })
+                .map(|x| x.pending.extract_frame(node, generation, cidx))
                 .unwrap_or_default()
         });
         self.drop_deliveries(ended);
@@ -2734,20 +2728,19 @@ impl<C: Cells> Runtime<C> {
             replay::with(|c| {
                 for x in c.iter_mut().filter(|x| x.rt == rt) {
                     x.direct = None;
-                    if let Some(d) = x
+                    if let Some(i) = x
                         .pending
-                        .iter_mut()
-                        .find(|d| !d.taken && matches!(d.what, Delivered::Direct) && d.key == key)
+                        .find_keyed(&key, |d| !d.taken && matches!(d.what, Delivered::Direct))
                     {
-                        d.taken = true;
+                        x.pending.get_mut(i).taken = true;
                         x.direct = Some((slot, handle.generation(), f.cidx));
                     }
                     x.resume = None;
-                    if let Some(d) = x
+                    if let Some(i) = x
                         .pending
-                        .iter_mut()
-                        .find(|d| !d.taken && matches!(d.what, Delivered::Walk(_)) && d.key == key)
+                        .find_keyed(&key, |d| !d.taken && matches!(d.what, Delivered::Walk(_)))
                     {
+                        let d = x.pending.get_mut(i);
                         d.taken = true;
                         if let Delivered::Walk(walk) = &d.what {
                             let walk = (**walk).clone();
@@ -2813,10 +2806,11 @@ impl<C: Cells> Runtime<C> {
         }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
-        // passes on, as `entered` does.
+        // passes on as an ordinary panic, as `entered` does.
         let payload = match payload.downcast::<crate::cycle::CycleUnwind>() {
             Ok(unwind) if kind == ReadKind::TryGet => return Some(Err(unwind.0)),
             Ok(unwind) => unwind,
+            Err(payload) if kind == ReadKind::TryGet => resume_unwind(payload),
             Err(payload) => payload,
         };
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
@@ -2910,10 +2904,13 @@ impl<C: Cells> Runtime<C> {
             // A walk the doom stopped short of its root goes on in the
             // retry after this compute, as the unbounded run's goes on.
             let key = ReadKey::blocked(&below);
-            let walk = x.pending.iter_mut().find_map(|d| match &mut d.what {
-                Delivered::Walk(walk) if d.key == key => Some(walk),
-                _ => None,
-            });
+            let walk = x
+                .pending
+                .find_keyed(&key, |d| matches!(d.what, Delivered::Walk(_)))
+                .and_then(|i| match &mut x.pending.get_mut(i).what {
+                    Delivered::Walk(walk) => Some(walk),
+                    _ => None,
+                });
             match (walk, what) {
                 (Some(walk), _) => {
                     walk.ran(node);
@@ -3125,9 +3122,8 @@ impl<C: Cells> Runtime<C> {
                         Some(walk) => x.deliver_walk(&v, std::mem::take(walk)),
                         None => {
                             let key = ReadKey::blocked(&v);
-                            x.pending.retain(|d| {
-                                !(matches!(d.what, Delivered::Walk(_)) && d.key == key)
-                            });
+                            x.pending
+                                .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(_)));
                         }
                     }
                     return;

@@ -20,10 +20,11 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::cells::{Cells, PtrCell};
+use crate::deferred::Unbuilt;
 use crate::directory::Directory;
 use crate::generic_arena::GenericArena;
 use crate::value::Value;
-use crate::value_slot::Compared;
+use crate::value_slot::{Compared, ValueSlot};
 
 /// Object-safe arena interface, for code that holds a node's tag but
 /// not its value type.
@@ -53,6 +54,11 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     /// the value it held.
     #[doc(hidden)]
     fn clear_value(&self, slot: u32) -> Option<Box<dyn Any>>;
+
+    /// [`Self::clear_value`] for a value no run the unbounded one makes
+    /// built, dropped under isolation wherever its `Drop` runs.
+    #[doc(hidden)]
+    fn clear_unbuilt(&self, slot: u32) -> Option<Unbuilt>;
 
     /// Whether `slot` holds a value. Clones it to find out, so it is for
     /// debug assertions only.
@@ -96,6 +102,11 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
 
     fn clear_value(&self, slot: u32) -> Option<Box<dyn Any>> {
         self.clear(slot).map(|d| Box::new(d) as Box<dyn Any>)
+    }
+
+    fn clear_unbuilt(&self, slot: u32) -> Option<Unbuilt> {
+        self.clear(slot)
+            .map(|d| Unbuilt::new(<C::ValueSlot<T> as ValueSlot<T>>::isolating(d)))
     }
 
     fn has_value(&self, slot: u32) -> bool {

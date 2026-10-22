@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use super::race_tests::{id, park_at, Gate};
+use super::replay_tests::replayable;
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
@@ -1217,4 +1218,149 @@ fn wave6_contained_episode_abort_keeps_member_drop_panic_under_replay() {
         },
     )
     .assert_clean();
+}
+
+/// A value whose `Drop` panics when it is odd, on its contents alone.
+/// Each case below builds odd values only in a run the unbounded one
+/// never makes, so an odd drop is never that run's to raise.
+#[derive(Clone, Debug, PartialEq)]
+struct Odd(u64);
+
+impl Drop for Odd {
+    fn drop(&mut self) {
+        if self.0 % 2 == 1 && !std::thread::panicking() {
+            panic!("odd {} dropped", self.0);
+        }
+    }
+}
+
+fn in_shared_child(name: &str, body: fn(&Runtime<Shared>)) {
+    run_in_child(name, || {
+        let rt = Runtime::<Shared>::new();
+        prime_reclaim_timer(&rt);
+        reclaim_probe::force(RetireSite::ComputeWrite);
+        body(&rt);
+    })
+    .assert_clean();
+}
+
+/// A doomed run reads the placeholder and still returns a value, which
+/// the unbounded run never builds: its drop is not the read's to raise.
+fn doomed_runs_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let b = rt.create_query(|_| 5_u64);
+    let r = rt.create_query_with(move |rt| Odd(rt.get(b) + 1), replayable());
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(r).0));
+    assert_eq!(got.ok(), Some(6));
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the read of b dooms");
+}
+
+#[test]
+fn local_doomed_runs_value_drop_is_not_raised() {
+    doomed_runs_value_drop_is_not_raised(&Runtime::<Local>::new());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_doomed_runs_value_drop_is_not_raised() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_doomed_runs_value_drop_is_not_raised",
+        doomed_runs_value_drop_is_not_raised,
+    );
+}
+
+/// A doomed run's placeholder leads it to read `c`, which no placeholder
+/// stands in for, so it computes natively, speculatively, and lands
+/// Clean. The unbounded run never reads `c`, so the value its recompute
+/// displaces is one that run never built.
+fn speculative_clean_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let b = rt.create_query(|_| 5_u64);
+    let c = rt.create_query(move |rt| Odd(rt.get(input) + 10));
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                std::mem::forget(rt.get(c));
+            }
+            x
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(
+        rt.state_of(c),
+        NodeState::Clean,
+        "the speculative run landed c"
+    );
+    rt.set(input, 2);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(c).0));
+    assert_eq!(got.ok(), Some(12));
+}
+
+#[test]
+#[ignore = "known limitation (CHANGELOG): under a frame budget, replay memoizes nodes the unbudgeted run does not reach, and their values drop like any memoized value"]
+fn local_speculative_clean_value_drop_is_not_raised() {
+    speculative_clean_value_drop_is_not_raised(&Runtime::<Local>::new());
+}
+
+#[test]
+#[ignore = "known limitation (CHANGELOG): under a frame budget, replay memoizes nodes the unbudgeted run does not reach, and their values drop like any memoized value"]
+fn shared_speculative_clean_value_drop_is_not_raised() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_speculative_clean_value_drop_is_not_raised",
+        speculative_clean_value_drop_is_not_raised,
+    );
+}
+
+/// A doomed run's placeholder leads it to read `c` natively, and `c`
+/// catches the panic of `d`, so the speculative run of `c` writes its
+/// slot and its landing takes the value back. Under `Shared` that value
+/// is retired, and a later reclaim, forced at a real compute's write,
+/// must not raise its drop there.
+fn unwritten_speculative_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let b = rt.create_query(|_| 5_u64);
+    let d = rt.create_query(|_| -> u64 { panic!("d boom") });
+    let c = rt.create_query(move |rt| {
+        let got = catch_unwind(AssertUnwindSafe(|| rt.get(d)));
+        Odd(got.unwrap_or(7) + 10)
+    });
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                std::mem::forget(rt.get(c));
+            }
+            x
+        },
+        replayable(),
+    );
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+    assert_eq!(got.ok(), Some(5));
+    assert_ne!(
+        rt.state_of(c),
+        NodeState::Clean,
+        "c's landing was taken back"
+    );
+    let e = rt.create_query(|_| 2_u64);
+    assert_eq!(rt.get(e), 2);
+}
+
+#[test]
+fn local_unwritten_speculative_value_drop_is_not_raised() {
+    unwritten_speculative_value_drop_is_not_raised(&Runtime::<Local>::new());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unwritten_speculative_value_drop_is_not_raised() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_unwritten_speculative_value_drop_is_not_raised",
+        unwritten_speculative_value_drop_is_not_raised,
+    );
 }

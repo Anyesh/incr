@@ -12,10 +12,15 @@
 //! recycling of its slot. The replay driver's compute of a node checks for
 //! it after each load of the node's state and again after its claim, which
 //! can succeed on a Dirty that such a landing and a set made since. A
-//! Failed read also takes, with no record, the payload held for its
-//! node's own frame along the read's path once this thread stored a
-//! Failed landing of the node that the same read's payload left
-//! (`path_delivery`), under `Local` and `Shared` alike.
+//! retry doomed again that takes a delivery's payload a second time lands
+//! the frame's node Dirty where the first take did (`retaken_landing`),
+//! whatever its deps have landed since, so a later read computes the node
+//! again as the unbounded run's does. Every Failed store goes through
+//! `land_failed`, which applies that rule, so on one thread a Failed read
+//! of the frame's node never stands for a compute the unbounded run makes,
+//! and it takes no delivery without a record. When another thread's
+//! landing made the node Failed, which reader gets the payload's text is
+//! outside the result under the Shared payload contract.
 
 use std::any::Any;
 use std::panic::resume_unwind;
@@ -88,6 +93,14 @@ impl<C: Cells> Drop for Hold<C> {
     }
 }
 
+/// A compute's last read in `deps`, as `(reading, ordinal)`.
+fn last_read(deps: &[(NodeId, u32)]) -> Option<(u64, u32)> {
+    let &last = deps.last()?;
+    let reading = u64::from(last.0 .0) | (u64::from(last.1) << 32);
+    let ordinal = deps.iter().filter(|&&d| d == last).count() as u32;
+    Some((reading, ordinal))
+}
+
 /// The message of a read of node `slot` landed Failed.
 fn failed_read_message(slot: u32) -> String {
     format!(
@@ -99,30 +112,15 @@ fn failed_read_message(slot: u32) -> String {
 impl<C: Cells> Runtime<C> {
     /// `compute_attempts`' Failed arm: the read panics "last compute
     /// panicked", or takes the payload a walk contained for the landing it
-    /// sees (`take_contained`), or else the one held for `id`'s frame
-    /// along the read's path (`path_delivery`). Returns
-    /// when the node has left Failed since the read saw it, to be read
-    /// again. A payload a record owes the read was taken after the load,
-    /// by `owed_payload`.
+    /// sees (`take_contained`). Returns when the node has left Failed since
+    /// the read saw it, to be read again. A payload a record owes the read
+    /// was taken after the load, by `owed_payload`.
     #[cold]
     #[inline(never)]
-    pub(super) fn read_failed_node<const MODE: u8>(&self, id: NodeId, bag: &mut Deferred<C>) {
+    pub(super) fn read_failed_node(&self, id: NodeId) {
         let Ok(payload) = self.take_contained(id) else {
             return;
         };
-        if MODE & VIRT != 0 {
-            let generation = self.nodes.get(id.0).generation();
-            if let Some((context, i)) = self.path_delivery(id, generation) {
-                // A ticket's landing is newer than the delivery's round, so
-                // the unbounded run's read gets the ticket's payload and
-                // the frame's run the delivery stands for never happens.
-                if payload.is_none() {
-                    let payload = self.take_path_payload(id, generation, context, i);
-                    self.raise_owed(payload, bag);
-                }
-                replay::with(|c| c.iter_mut().find(|x| x.id == context).map(|x| x.spend(i)));
-            }
-        }
         // A closure that catches this panic has still read a node with no
         // value, so it must not land Clean over it.
         self.dep_stack.poison_current_frame(self.runtime_id);
@@ -174,74 +172,7 @@ impl<C: Cells> Runtime<C> {
             })
         };
         let (context, i, _) = found?;
-        Some(self.take_payload(context, i, at).0)
-    }
-
-    /// The payload held for the frame of `id` at `generation` at the
-    /// position its compute would take, along the read's path, for a read
-    /// that found `id` Failed: a retry's rerun of an earlier read can land
-    /// `id` Failed where the unbounded run leaves it Dirty for this read to
-    /// compute again and raise that payload. Under `Local` and `Shared`
-    /// alike, only a delivery whose read let its payload out of a Failed
-    /// landing of `id` this thread stored qualifies
-    /// (`Delivery::escaped`), and only when exactly one does: another
-    /// thread's landing is a record's to judge. A speculative run's read
-    /// takes none. Returns the delivery's context and index.
-    fn path_delivery(&self, id: NodeId, generation: u32) -> Option<(u64, usize)> {
-        if replay::speculative() {
-            return None;
-        }
-        let rt = self.runtime_id;
-        let at = self.dep_stack.next_cidx();
-        let held: Vec<(u64, usize, u64)> = replay::with(|c| {
-            c.iter()
-                .filter(|x| x.rt == rt)
-                .flat_map(|x| {
-                    x.escaped_payloads(at, id.0, generation)
-                        .map(|(i, path)| (x.id, i, path))
-                })
-                .collect()
-        });
-        if held.is_empty() {
-            return None;
-        }
-        let path = self.path_at(at);
-        let mut on_path = held.into_iter().filter(|&(_, _, p)| p == path);
-        // Two leave no way to tell which one the node's compute lets out.
-        let (Some((context, i, _)), None) = (on_path.next(), on_path.next()) else {
-            return None;
-        };
-        Some((context, i))
-    }
-
-    /// Takes delivery `i` of context `context`, which `path_delivery` found
-    /// for a Failed read of `id`. The read stands for the node's compute,
-    /// whose landing at `generation` the payload left, so a walk's entry
-    /// below that contains it holds that landing too.
-    fn take_path_payload(
-        &self,
-        id: NodeId,
-        generation: u32,
-        context: u64,
-        i: usize,
-    ) -> Box<dyn Any + Send> {
-        let (payload, mut nodes) = self.take_payload(context, i, self.dep_stack.next_cidx());
-        if !nodes.contains(&(id.0, generation)) {
-            nodes.push((id.0, generation));
-        }
-        self.note_delivered(nodes, &*payload);
-        payload
-    }
-
-    /// Takes the payload of delivery `i` in context `context` for a read
-    /// at position `at`, with the landings its unwind made.
-    fn take_payload(
-        &self,
-        context: u64,
-        i: usize,
-        at: u32,
-    ) -> (Box<dyn Any + Send>, Vec<(u32, u32)>) {
-        let (attributed, payload, nodes) = replay::with(|c| {
+        let (attributed, payload) = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == context)
                 .expect("incr-core: the delivery's context is open")
@@ -250,7 +181,7 @@ impl<C: Cells> Runtime<C> {
         if attributed {
             cycle_state::count_failure();
         }
-        (payload, nodes)
+        Some(payload)
     }
 
     /// Raises `payload`, which [`Self::owed_payload`] took, as the read's
@@ -370,34 +301,38 @@ impl<C: Cells> Runtime<C> {
         });
     }
 
-    /// After this thread's landing stored `id`'s frame at `cidx` Failed
-    /// with `payload`, from `land_failed`, whose compute recorded `deps`:
-    /// marks the deliveries for the read that let it out
-    /// (`Context::mark_escaped`).
+    /// The landing `land_failed` stores for `id`'s frame at `cidx`, whose
+    /// compute recorded `deps` and unwound with `payload`, where its
+    /// landing checks chose `landing`: Dirty instead of Failed when a
+    /// delivery's take raised `payload` and that delivery's first take
+    /// landed the node Dirty (`Context::retaken_landing`).
     #[cold]
     #[inline(never)]
-    pub(super) fn after_failed_store(
+    pub(super) fn retaken_landing(
         &self,
         id: NodeId,
         generation: u32,
         cidx: u32,
         deps: &[(NodeId, u32)],
-        payload: &(dyn Any + Send),
-    ) {
-        if value_code::thread_word() & value_code::REPLAY_BIT == 0 || replay::speculative() {
-            return;
+        payload: Option<&(dyn Any + Send)>,
+        landing: NodeState,
+    ) -> NodeState {
+        if value_code::thread_word() & value_code::REPLAY_BIT == 0
+            || !matches!(landing, NodeState::Dirty | NodeState::Failed)
+        {
+            return landing;
         }
-        let Some(&last) = deps.last() else {
-            return;
+        let (Some(payload), Some(last)) = (payload, last_read(deps)) else {
+            return landing;
         };
-        let reading = u64::from(last.0 .0) | (u64::from(last.1) << 32);
-        let ordinal = deps.iter().filter(|&&d| d == last).count() as u32;
+        let frame = (id.0, generation, cidx, self.path_at(cidx));
         let rt = self.runtime_id;
         replay::with(|c| {
-            for x in c.iter_mut().filter(|x| x.rt == rt) {
-                x.mark_escaped(id.0, generation, cidx, (reading, ordinal), payload);
-            }
-        });
+            c.iter_mut()
+                .filter(|x| x.rt == rt)
+                .find_map(|x| x.retaken_landing(frame, last, payload, landing))
+        })
+        .unwrap_or(landing)
     }
 
     /// The provenance records still held, for tests.

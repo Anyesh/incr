@@ -55,9 +55,57 @@ use crate::node::NodeId;
 use crate::state::NodeState;
 use crate::Value;
 
-/// A value type with no placeholder: reads of it always nest natively.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Bare(u64);
+/// A value type with no placeholder unless [`BARE_PLACEHOLDER`] is set,
+/// so reads of it nest natively. `.1` records whether a speculative
+/// entry's run built it, and equality ignores it.
+#[derive(Clone, Debug)]
+struct Bare(u64, bool);
+
+impl PartialEq for Bare {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for Bare {}
+
+/// What [`Bare`]'s construction and `Drop` check, set only in a child
+/// process: the values the unbounded runs build, then a `Drop` that panics
+/// on a speculative run's value outside them, which only a bounded run can
+/// make.
+enum BareDrops {
+    Off,
+    Recording(HashSet<u64>),
+    Panicking(HashSet<u64>),
+}
+
+static BARE_DROPS: Mutex<BareDrops> = Mutex::new(BareDrops::Off);
+
+/// When set, [`Bare`] has a placeholder, so its reads replay as `u64`'s do.
+static BARE_PLACEHOLDER: AtomicBool = AtomicBool::new(false);
+
+impl Bare {
+    fn made(v: u64) -> Self {
+        let speculative = crate::replay::speculative();
+        if let BareDrops::Recording(built) = &mut *BARE_DROPS.lock().unwrap() {
+            built.insert(v);
+        }
+        Bare(v, speculative)
+    }
+}
+
+impl Drop for Bare {
+    fn drop(&mut self) {
+        let panics = self.1
+            && match &*BARE_DROPS.lock().unwrap() {
+                BareDrops::Panicking(built) => !built.contains(&self.0),
+                _ => false,
+            };
+        if panics {
+            std::panic::panic_any(String::from("speculative drop"));
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum Expr {
@@ -848,9 +896,9 @@ fn make<C: Cells>(
             };
             if *bare {
                 Handle::Bare(rt.create_query_with(
-                    move |rt| Bare(compute(rt)),
+                    move |rt| Bare::made(compute(rt)),
                     QueryOpts {
-                        cycle: strategy.build(Bare),
+                        cycle: strategy.build(|v| Bare(v, false)),
                         replay,
                     },
                 ))
@@ -1076,6 +1124,9 @@ fn runtimes<C: Cells>(frames: Option<u32>, bytes: usize) -> [Box<Runtime<C>>; 2]
     [(); 2].map(|()| {
         let rt = Box::new(Runtime::<C>::new());
         rt.set_placeholder(0_u64);
+        if BARE_PLACEHOLDER.load(SeqCst) {
+            rt.set_placeholder(Bare(0, false));
+        }
         rt.set_max_frames(frames.unwrap_or(u32::MAX));
         rt.set_max_stack_bytes(bytes);
         rt
@@ -2267,6 +2318,46 @@ fn speculative_member_run_leaves_no_buffer() {
     });
 }
 
+/// 0x1dd5_ac14_6f19_4569 with every query bare and [`Bare`] given a
+/// placeholder, whose `Drop` panics on a value only a speculative run
+/// builds. At budget 1 a speculative run buffers 9999 on a member, and
+/// the episode that lands outside speculation drops that buffer in its
+/// bag, so `TryGet(10)` panics where the unbounded run gives 3. The
+/// speculative rule must cover that drop: every budget's run matches the
+/// unbounded one.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_speculative_buffer_drop_outside_speculation_is_not_raised_into_a_read() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::wave6_speculative_buffer_drop_outside_speculation_is_not_raised_into_a_read",
+        || {
+            let seed = 0x1dd5_ac14_6f19_4569;
+            let mut case = gen_case(seed, false, false);
+            for spec in &mut case.specs {
+                if let Spec::Query { bare, .. } = spec {
+                    *bare = true;
+                }
+            }
+            BARE_PLACEHOLDER.store(true, SeqCst);
+            *BARE_DROPS.lock().unwrap() = BareDrops::Recording(HashSet::new());
+            quiet(|| {
+                run::<Local>(&case, None, 0);
+                run::<Shared>(&case, None, 0);
+            });
+            let mut drops = BARE_DROPS.lock().unwrap();
+            if let BareDrops::Recording(built) = std::mem::replace(&mut *drops, BareDrops::Off) {
+                *drops = BareDrops::Panicking(built);
+            }
+            drop(drops);
+            quiet(|| {
+                differential::<Local>(&case, seed);
+                differential::<Shared>(&case, seed);
+            });
+        },
+    )
+    .assert_clean();
+}
+
 /// Cases with deletes whose readers a speculative entry landed Clean, so
 /// the bounded run's delete is refused where the unbounded one's is not.
 #[test]
@@ -2385,10 +2476,10 @@ fn a_stand_in_run_contains_a_panic_as_its_walk_does() {
 /// compute panicked" where the unbounded run raises "boom 0:9". As with
 /// 0xeead60a378ca2b4, a retry's rerun of a caught read landed a node
 /// Failed that the unbounded run leaves Dirty for a later read to compute
-/// again, so that read is owed the payload held for the node's frame.
+/// again, so the rerun must land it as its first take did.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn a_failed_read_takes_the_payload_its_rerun_let_out() {
+fn a_rerun_of_a_caught_read_lands_its_node_as_its_first_take_did() {
     for seed in [0x0eea_d60a_378c_a2b4, 0x6b0e_30c5_cf9d_0858] {
         let case = gen_case(seed, false, false);
         quiet(|| {
@@ -2396,6 +2487,21 @@ fn a_failed_read_takes_the_payload_its_rerun_let_out() {
             differential::<Shared>(&case, seed);
         });
     }
+}
+
+/// Seed 0xa18d458163c687fe at budget 1: op 0's Get(0) left node 1 Dirty
+/// where the unbounded run lands it Failed. A `try_get` delivered a
+/// closure's own panic after it swallowed a cycle as a cycle unwind, so
+/// its reader landed as if it never ran.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_try_get_passes_on_a_swallowing_closures_panic() {
+    let seed = 0xa18d_4581_63c6_87fe;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
 }
 
 /// A case with cycles on two threads in which a thread is wounded out of

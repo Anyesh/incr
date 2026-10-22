@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
+use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay;
@@ -179,7 +180,7 @@ impl Held {
         buf: Option<Erased>,
         opened: bool,
         poisoned: bool,
-    ) -> (Option<Erased>, Option<Erased>) {
+    ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
             self.keep_record();
             None
@@ -202,13 +203,13 @@ impl Held {
 
     /// The claim's run as `look` sees it, and the value a settle dropped,
     /// for the caller to drop outside the held map.
-    pub(crate) fn look(&mut self, look: Look) -> (Seen<&mut Held>, Option<Erased>) {
+    pub(crate) fn look(&mut self, look: Look) -> (Seen<&mut Held>, Option<Unbuilt>) {
         let spec_buf = self.settle_for(look);
         (Seen(self), spec_buf)
     }
 
     /// [`Self::look`] at a claim out of the held map.
-    pub(crate) fn into_look(mut self, look: Look) -> (Seen<Held>, Option<Erased>) {
+    pub(crate) fn into_look(mut self, look: Look) -> (Seen<Held>, Option<Unbuilt>) {
         let spec_buf = self.settle_for(look);
         (Seen(self), spec_buf)
     }
@@ -254,7 +255,7 @@ impl Held {
         }
     }
 
-    fn settle_for(&mut self, look: Look) -> Option<Erased> {
+    fn settle_for(&mut self, look: Look) -> Option<Unbuilt> {
         if look.speculative {
             None
         } else {
@@ -264,14 +265,14 @@ impl Held {
 
     /// Puts back the record a speculative run replaced and returns the
     /// value it buffered, as the unbounded run may never make that run.
-    fn settle(&mut self) -> Option<Erased> {
+    fn settle(&mut self) -> Option<Unbuilt> {
         let r = self.pre_spec.take()?;
         self.deps = r.deps;
         self.last = r.last;
         self.installed = r.installed;
         self.opened = r.opened;
         self.poisoned = r.poisoned;
-        self.buf.take()
+        self.buf.take().map(|buf| Unbuilt::new(buf))
     }
 }
 

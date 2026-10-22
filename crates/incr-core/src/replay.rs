@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::handle::RuntimeId;
+use crate::state::NodeState;
 use crate::taint_memo;
 use crate::value_code;
 
@@ -92,7 +93,7 @@ pub(crate) struct VFrame {
 }
 
 /// The read a delivery is for.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ReadKey {
     pub(crate) node: u32,
     pub(crate) generation: u32,
@@ -115,6 +116,15 @@ pub(crate) struct ReadKey {
 }
 
 impl ReadKey {
+    /// It is for the read `last`, as `(reading, ordinal)`, of the frame of
+    /// `node` at `cidx`, on any path.
+    fn read_by(&self, node: u32, generation: u32, cidx: u32, last: (u64, u32)) -> bool {
+        self.node == node
+            && self.generation == generation
+            && self.cidx == cidx
+            && (self.reading, self.ordinal) == last
+    }
+
     /// The read virtual frame `v` was blocked in.
     pub(crate) fn blocked(v: &VFrame) -> Self {
         Self {
@@ -154,14 +164,156 @@ pub(crate) struct Delivery {
     /// generation)`: a read of one of their nodes stands for its frame's
     /// run.
     pub(crate) below: Vec<(u32, u32, u32)>,
-    /// The same read of a frame of the node at this position let its
-    /// payload out of the node's compute, in a Failed landing this thread
-    /// stored while the delivery waited: a Failed read of the node along
-    /// the delivery's path may take it. A read the compute caught, or
-    /// another thread's landing, marks none.
-    pub(crate) escaped: bool,
     /// The copy of the payload the latest take of it raised.
     pub(crate) resumed: Option<PayloadKey>,
+    /// The landing, Dirty or Failed, that the payload's first take out of
+    /// the frame's compute gave the frame's node. A later take, in a retry
+    /// doomed again, lands it so again: the deps it finds may have landed
+    /// since in ways the unbounded run's frame never saw.
+    pub(crate) landed: Option<NodeState>,
+}
+
+/// A context's deliveries. Each keeps its index until it is removed, and
+/// is found by its read, the level whose run made it, its frame, or the
+/// provenance record it carries, without a pass over the others: a deep
+/// chain's context holds a delivery per level, and its reads look them up
+/// per level.
+#[derive(Default)]
+pub(crate) struct Pending {
+    slots: Vec<Option<Delivery>>,
+    live: usize,
+    by_key: HashMap<ReadKey, Vec<usize>>,
+    by_maker: HashMap<u32, Vec<usize>>,
+    by_frame: HashMap<(u32, u32, u32), Vec<usize>>,
+    traced: Vec<usize>,
+}
+
+fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
+    (key.node, key.generation, key.cidx)
+}
+
+/// Drops index `i` from the list `map` holds under `at`.
+fn unlist<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Vec<usize>>, at: &K, i: usize) {
+    if let Some(list) = map.get_mut(at) {
+        list.retain(|&j| j != i);
+        if list.is_empty() {
+            map.remove(at);
+        }
+    }
+}
+
+impl Pending {
+    pub(crate) fn push(&mut self, d: Delivery) {
+        let i = self.slots.len();
+        self.by_key.entry(d.key).or_default().push(i);
+        self.by_maker.entry(d.maker).or_default().push(i);
+        self.by_frame.entry(frame_of(&d.key)).or_default().push(i);
+        if d.provenance.is_some() {
+            self.traced.push(i);
+        }
+        self.slots.push(Some(d));
+        self.live += 1;
+    }
+
+    pub(crate) fn remove(&mut self, i: usize) -> Delivery {
+        let d = self.slots[i]
+            .take()
+            .expect("incr-core: a delivery is removed once");
+        unlist(&mut self.by_key, &d.key, i);
+        unlist(&mut self.by_maker, &d.maker, i);
+        unlist(&mut self.by_frame, &frame_of(&d.key), i);
+        if d.provenance.is_some() {
+            self.traced.retain(|&j| j != i);
+        }
+        self.live -= 1;
+        // No index is held across a point where none is live.
+        if self.live == 0 {
+            self.slots.clear();
+        }
+        d
+    }
+
+    pub(crate) fn get(&self, i: usize) -> &Delivery {
+        self.slots[i]
+            .as_ref()
+            .expect("incr-core: a delivery's index is live")
+    }
+
+    pub(crate) fn get_mut(&mut self, i: usize) -> &mut Delivery {
+        self.slots[i]
+            .as_mut()
+            .expect("incr-core: a delivery's index is live")
+    }
+
+    /// The deliveries for read `key`, oldest first.
+    pub(crate) fn keyed(&self, key: &ReadKey) -> &[usize] {
+        self.by_key.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// The oldest delivery for read `key` that `f` accepts.
+    pub(crate) fn find_keyed(&self, key: &ReadKey, f: impl Fn(&Delivery) -> bool) -> Option<usize> {
+        self.keyed(key).iter().copied().find(|&i| f(self.get(i)))
+    }
+
+    /// Marks every delivery for read `key` taken.
+    pub(crate) fn take_keyed(&mut self, key: &ReadKey) {
+        for i in self.keyed(key).to_vec() {
+            self.get_mut(i).taken = true;
+        }
+    }
+
+    /// Removes the deliveries for read `key` that `f` accepts.
+    pub(crate) fn remove_keyed(&mut self, key: &ReadKey, f: impl Fn(&Delivery) -> bool) {
+        for i in self.keyed(key).to_vec() {
+            if f(self.get(i)) {
+                self.remove(i);
+            }
+        }
+    }
+
+    /// The deliveries the run at `level` made, oldest first.
+    pub(crate) fn of_maker(&self, level: u32) -> Vec<usize> {
+        self.by_maker.get(&level).cloned().unwrap_or_default()
+    }
+
+    /// Removes the deliveries the run at `level` made, oldest first.
+    pub(crate) fn extract_maker(&mut self, level: u32) -> Vec<Delivery> {
+        self.of_maker(level)
+            .into_iter()
+            .map(|i| self.remove(i))
+            .collect()
+    }
+
+    /// The deliveries for reads by the frame of `node` at `generation` and
+    /// `cidx`, oldest first.
+    pub(crate) fn of_frame(&self, node: u32, generation: u32, cidx: u32) -> Vec<usize> {
+        self.by_frame
+            .get(&(node, generation, cidx))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Removes the deliveries for reads by that frame, oldest first.
+    pub(crate) fn extract_frame(&mut self, node: u32, generation: u32, cidx: u32) -> Vec<Delivery> {
+        self.of_frame(node, generation, cidx)
+            .into_iter()
+            .map(|i| self.remove(i))
+            .collect()
+    }
+
+    /// The deliveries that carry a provenance record, oldest first.
+    pub(crate) fn traced(&self) -> &[usize] {
+        &self.traced
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<Delivery> {
+        self.slots.into_iter().flatten().collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &Delivery> {
+        self.slots.iter().flatten()
+    }
 }
 
 impl Delivery {
@@ -230,7 +382,7 @@ pub(crate) struct Context {
     /// The level of the entry the driver is running, or `None` until the
     /// loop starts.
     pub(crate) running: Option<u32>,
-    pub(crate) pending: Vec<Delivery>,
+    pub(crate) pending: Pending,
     pub(crate) running_entry: Option<Entry>,
     /// Every entry of this context is speculative: the context was opened
     /// inside a speculative entry's run.
@@ -304,7 +456,7 @@ impl Context {
             vindex: HashMap::new(),
             running: None,
             running_entry: None,
-            pending: Vec::new(),
+            pending: Pending::default(),
             spec_base: target.spec,
             claims: Vec::new(),
             episodes: Vec::new(),
@@ -401,7 +553,7 @@ impl Context {
         provenance: Option<Rc<dyn Provenance>>,
     ) {
         let key = ReadKey::blocked(below);
-        self.pending.retain(|d| !(d.blocked && d.key == key));
+        self.pending.remove_keyed(&key, |d| d.blocked);
         self.pending.push(Delivery {
             key,
             maker: below.maker,
@@ -410,8 +562,8 @@ impl Context {
             what,
             provenance,
             below: Vec::new(),
-            escaped: false,
             resumed: None,
+            landed: None,
         });
     }
 
@@ -449,7 +601,8 @@ impl Context {
         node: u32,
         generation: u32,
     ) -> impl Iterator<Item = (usize, u64)> + '_ {
-        self.pending.iter().enumerate().filter_map(move |(i, d)| {
+        self.pending.traced().iter().filter_map(move |&i| {
+            let d = self.pending.get(i);
             let k = d.key;
             let p = d.provenance.as_ref()?;
             (d.is_untaken_panic()
@@ -459,79 +612,62 @@ impl Context {
         })
     }
 
-    /// The untaken user-panic deliveries for the frame of `node` at
-    /// position `at` marked [`Delivery::escaped`], as `(index, path)`.
-    pub(crate) fn escaped_payloads(
-        &self,
-        at: u32,
-        node: u32,
-        generation: u32,
-    ) -> impl Iterator<Item = (usize, u64)> + '_ {
-        self.pending.iter().enumerate().filter_map(move |(i, d)| {
-            let k = d.key;
-            (d.escaped
-                && d.is_untaken_panic()
-                && k.cidx == at
-                && k.node == node
-                && k.generation == generation)
-                .then_some((i, k.path))
-        })
-    }
-
-    /// The frame of `node` at `cidx` landed Failed with `payload`, and
-    /// `last`, as `(reading, ordinal)`, was its compute's last read: marks
-    /// [`Delivery::escaped`] the deliveries, on any path, for that read when
-    /// `payload` is the copy a take of one of them raised. A read after the
-    /// take means the compute caught that copy, so a payload at its freed
-    /// address with the same text is another panic.
-    pub(crate) fn mark_escaped(
+    /// The landing, Dirty or Failed, for the frame of `node` at `cidx`
+    /// along `path` whose compute unwound with `payload` after its last
+    /// read `last`, as `(reading, ordinal)`, where the landing checks chose
+    /// `landing`, if the latest take of the delivery for that read on that
+    /// path raised `payload`: its first take records `landing` in
+    /// [`Delivery::landed`], and a later one lands Dirty when the first
+    /// did. A Dirty `landing` stays: it says a change was in flight, which
+    /// a Failed landing would hide. A read after the take means the compute
+    /// caught that copy, so a payload at its freed address with the same
+    /// text is another panic. The path tells this frame's delivery from
+    /// another run's at the position, whose taken copy's freed box can hold
+    /// a fresh copy of this one.
+    pub(crate) fn retaken_landing(
         &mut self,
-        node: u32,
-        generation: u32,
-        cidx: u32,
+        (node, generation, cidx, path): (u32, u32, u32, u64),
         last: (u64, u32),
         payload: &(dyn Any + Send),
-    ) {
-        let read = |k: &ReadKey| {
-            k.node == node
-                && k.generation == generation
-                && k.cidx == cidx
-                && (k.reading, k.ordinal) == last
-        };
+        landing: NodeState,
+    ) -> Option<NodeState> {
         let unwind = Some(payload_key(payload));
-        let escaped = self.pending.iter().any(|d| {
-            d.taken
-                && read(&d.key)
-                && d.resumed == unwind
-                && matches!(d.what, Delivered::Unwind { cycle: false, .. })
-        });
-        if escaped {
-            for d in self.pending.iter_mut().filter(|d| read(&d.key)) {
-                d.escaped = true;
-            }
-        }
+        let i = self
+            .pending
+            .of_frame(node, generation, cidx)
+            .into_iter()
+            .find(|&i| {
+                let d = self.pending.get(i);
+                d.taken
+                    && d.key.read_by(node, generation, cidx, last)
+                    && d.key.path == path
+                    && d.resumed == unwind
+                    && matches!(d.what, Delivered::Unwind { cycle: false, .. })
+            })?;
+        let d = self.pending.get_mut(i);
+        let first = d.landed.get_or_insert(landing);
+        Some(if *first == NodeState::Dirty {
+            NodeState::Dirty
+        } else {
+            landing
+        })
     }
 
     /// Takes the payload of delivery `i` for a read at `at`, as
     /// [`Self::take_unwind`] does. When the read is the running frame's
     /// own compute, its unwind carries the record on to
     /// [`Self::unwind_target`].
-    pub(crate) fn take_landed(
-        &mut self,
-        i: usize,
-        at: u32,
-    ) -> (bool, Box<dyn Any + Send>, Vec<(u32, u32)>) {
+    pub(crate) fn take_landed(&mut self, i: usize, at: u32) -> (bool, Box<dyn Any + Send>) {
         if let Some(below) = self.unwind_target(at) {
             let key = ReadKey::blocked(below);
-            self.provenance = self.pending[i].provenance.clone().map(|p| (key, p));
+            self.provenance = self.pending.get(i).provenance.clone().map(|p| (key, p));
         }
         match self.take_unwind(i) {
             Delivered::Unwind {
                 attributed,
                 payload,
-                nodes,
                 ..
-            } => (attributed, payload, nodes),
+            } => (attributed, payload),
             _ => unreachable!("incr-core: matched as an unwind"),
         }
     }
@@ -541,14 +677,15 @@ impl Context {
     /// for a retry doomed again; a payload that can't be copied is
     /// delivered once.
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
-        self.spend(i);
+        let key = self.pending.get(i).key;
+        self.pending.take_keyed(&key);
         let Delivered::Unwind {
             cycle,
             poison,
             attributed,
             payload,
             nodes,
-        } = &self.pending[i].what
+        } = &self.pending.get(i).what
         else {
             unreachable!("incr-core: taken as an unwind");
         };
@@ -563,17 +700,9 @@ impl Context {
             nodes: nodes.clone(),
         };
         if let Delivered::Unwind { payload, .. } = &what {
-            self.pending[i].resumed = Some(payload_key(&**payload));
+            self.pending.get_mut(i).resumed = Some(payload_key(&**payload));
         }
         what
-    }
-
-    /// Marks delivery `i`'s read taken, with every delivery for it.
-    pub(crate) fn spend(&mut self, i: usize) {
-        let key = self.pending[i].key;
-        for d in self.pending.iter_mut().filter(|d| d.key == key) {
-            d.taken = true;
-        }
     }
 
     /// Keeps the walk of the read virtual frame `below` was blocked in, from
@@ -581,7 +710,7 @@ impl Context {
     pub(crate) fn deliver_walk(&mut self, below: &VFrame, walk: crate::runtime::Walk) {
         let key = ReadKey::blocked(below);
         self.pending
-            .retain(|d| !(matches!(d.what, Delivered::Walk(_)) && d.key == key));
+            .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(_)));
         self.pending.push(Delivery {
             key,
             maker: below.maker,
@@ -590,8 +719,8 @@ impl Context {
             what: Delivered::Walk(Box::new(walk)),
             provenance: None,
             below: Vec::new(),
-            escaped: false,
             resumed: None,
+            landed: None,
         });
     }
 
@@ -601,10 +730,10 @@ impl Context {
     /// the delivery before the frame's retry reads it.
     pub(crate) fn deliver_direct(&mut self, below: &VFrame) {
         let key = ReadKey::blocked(below);
-        if !self
+        if self
             .pending
-            .iter()
-            .any(|d| matches!(d.what, Delivered::Direct) && d.key == key)
+            .find_keyed(&key, |d| matches!(d.what, Delivered::Direct))
+            .is_none()
         {
             self.pending.push(Delivery {
                 key,
@@ -614,8 +743,8 @@ impl Context {
                 what: Delivered::Direct,
                 provenance: None,
                 below: Vec::new(),
-                escaped: false,
                 resumed: None,
+                landed: None,
             });
         }
     }
@@ -1114,18 +1243,14 @@ pub(crate) fn take_pending(
 ) -> Option<Delivered> {
     with(|c| {
         c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
-            let at = x.pending.iter().position(|d| {
-                !d.taken
-                    && !matches!(d.what, Delivered::Walk(_) | Delivered::Direct)
-                    && d.key == *key
+            let at = x.pending.find_keyed(key, |d| {
+                !d.taken && !matches!(d.what, Delivered::Walk(_) | Delivered::Direct)
             })?;
             // The read has its outcome, which ended the walk it was
             // blocked in, so a later read under the same key in this
             // run must not resume that walk or recompute its node.
-            for d in x.pending.iter_mut().filter(|d| d.key == *key) {
-                d.taken = true;
-            }
-            Some(match &x.pending[at].what {
+            x.pending.take_keyed(key);
+            Some(match &x.pending.get(at).what {
                 Delivered::Landed(value) => Delivered::Landed(clone(&**value)),
                 Delivered::Walk(_) | Delivered::Direct => {
                     unreachable!("incr-core: a walk's direction is not a value")
@@ -1141,7 +1266,7 @@ pub(crate) fn take_pending(
 #[must_use]
 pub(crate) fn close(id: u64) -> Vec<Delivery> {
     let removed = with(|c| c.iter().position(|x| x.id == id).map(|at| c.remove(at)));
-    removed.map(|x| x.pending).unwrap_or_default()
+    removed.map(|x| x.pending.into_vec()).unwrap_or_default()
 }
 
 /// Removes every context of `rt` whose boundary is at or above `cidx`:
@@ -1228,12 +1353,12 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
         let x = &mut c[at];
         let level = cidx - x.boundary;
         if doomed {
-            for d in x.pending.iter_mut().filter(|d| d.maker == level) {
-                d.taken = false;
+            for i in x.pending.of_maker(level) {
+                x.pending.get_mut(i).taken = false;
             }
             return Vec::new();
         }
-        x.pending.extract_if(.., |d| d.maker == level).collect()
+        x.pending.extract_maker(level)
     })
 }
 

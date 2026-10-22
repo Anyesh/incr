@@ -408,6 +408,32 @@ fn retire_dep_list<C: Cells>(token: RetiredDeps<C>) {
     reclaim_probe::reached(RetireSite::DepListRetire);
 }
 
+/// A value only a speculative or discarded run made, which the unbounded
+/// run never builds, or builds again on the retry: its `Drop` is no event
+/// of that run's, so it drops under [`isolate`] wherever it drops.
+pub(crate) struct Unbuilt(Option<Box<dyn Any>>);
+
+impl Unbuilt {
+    pub(crate) fn new(value: Box<dyn Any>) -> Self {
+        Self(Some(value))
+    }
+
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn value(&self) -> &dyn Any {
+        self.0
+            .as_deref()
+            .expect("an unbuilt value is held until it drops")
+    }
+}
+
+impl Drop for Unbuilt {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            isolate(|| drop(value));
+        }
+    }
+}
+
 /// Runs one cleanup step and swallows its panic, so an exit that already
 /// carries a payload delivers that payload unchanged. The secondary
 /// payload is forgotten, not dropped, because its own `Drop` could
