@@ -1391,3 +1391,76 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
         "F's claim taken from New landed Dirty"
     );
 }
+
+/// X reads Y, which panics "y boom"; X lets that panic out, or with
+/// `repanic` catches it and panics "x own". At budget 1 `get(X)` dooms X
+/// on Y, Y's entry lands Failed and its payload waits for X's retry; the
+/// driver parks before that retry while another thread computes X, which
+/// reads Y Failed and lands X Failed. Each read's outcome must be one of
+/// a serial order's: X's first reader gets what X's closure makes of
+/// "y boom", and the other "last compute panicked".
+fn vframe_landed_failed_over_a_delivery(
+    repanic: bool,
+) -> (Result<u64, String>, Result<u64, String>) {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if repanic {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(y)));
+                panic!("x own")
+            }
+            rt.get(y) + 1
+        },
+        replayable(),
+    );
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    let other = outcome(|| rt.get(x));
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    rt.assert_invariant_i();
+    (first, other)
+}
+
+fn failed(r: &Result<u64, String>) -> bool {
+    r.as_ref()
+        .is_err_and(|m| m.contains("last compute panicked"))
+}
+
+/// Class A of the two-thread all-seeds scan (seed 0x172): the retry finds
+/// X landed and drops the payload, so both reads panic "last compute
+/// panicked". Handing the payload to X's reader whenever X is found
+/// landed fails the test below, whose X landed Failed by its own panic.
+#[test]
+#[ignore = "class A: awaits the rule for a payload whose frame another thread landed"]
+fn shared_vframe_landed_failed_keeps_the_payload() {
+    let (first, other) = vframe_landed_failed_over_a_delivery(false);
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()), "the payload was dropped");
+}
+
+#[test]
+fn shared_vframe_landed_failed_by_its_own_panic() {
+    let (first, other) = vframe_landed_failed_over_a_delivery(true);
+    assert_eq!(other, Err("x own".to_string()));
+    assert!(failed(&first), "{first:?}");
+}
