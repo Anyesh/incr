@@ -3790,7 +3790,7 @@ impl<C: Cells> Runtime<C> {
         flagged: NodeState,
     ) -> NodeState {
         if C::u8_load_relaxed(flags) & IN_GROUP != 0 {
-            self.leave_group(id, flags);
+            self.leave_group(id, node, flags, target);
         }
         self.land(id, node, target, flagged)
     }
@@ -3843,13 +3843,26 @@ impl<C: Cells> Runtime<C> {
             self.land_children(id, landing, !run.children.get().is_null(), bag);
         }
         if bits & IN_GROUP != 0 {
-            self.leave_group(id, flags);
+            self.leave_group(id, self.nodes.get(id.0), flags, target);
         }
     }
 
+    /// Takes `id` out of its group for a landing in `target`. A member's
+    /// value is its group's, which its own closure need not give, so one
+    /// landing Dirty is left unverified (rule (b)) and reruns rather than
+    /// verify on its own deps.
     #[cold]
     #[inline(never)]
-    pub(crate) fn leave_group(&self, id: NodeId, flags: &C::U8) {
+    pub(crate) fn leave_group(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        target: NodeState,
+    ) {
+        if target == NodeState::Dirty {
+            node.set_verified_at(0);
+        }
         let mut inner = self.inner.write();
         inner.member_recs.remove(&id.0);
         C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !IN_GROUP);

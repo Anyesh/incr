@@ -1203,7 +1203,8 @@ fn member_shape<C: Cells>(frames: u32) -> Member<C> {
     let t = rt.create_query_with(move |rt: &Runtime<C>| rt.get(m) + 7, replayable());
     assert_eq!((rt.get(t), rt.get(x), rt.get(w)), (7, 1, 0));
     rt.force_group_for_test(&[x.erase(), m.erase()]);
-    rt.leave_group(id(m), rt.nodes.get_with_flags(m.slot()).1);
+    let (node, flags) = rt.nodes.get_with_flags(m.slot());
+    rt.leave_group(id(m), node, flags, NodeState::Clean);
     rt.set(k, 1);
     Member { rt, t, x, m, w, d }
 }
