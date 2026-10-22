@@ -15,6 +15,7 @@ use super::drop_panic_tests::prime_reclaim_timer;
 use super::Runtime;
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
+use crate::persist_hooks::{seed_base, seed_query, Reuse, SeedDep};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::set_stack;
 use crate::state::NodeState;
@@ -607,6 +608,40 @@ fn clone_that_reads_a_dirty_creator<C: Cells>(rt: Rc<Runtime<C>>) {
     assert!(!rt.is_alive(child), "the creator's landing kept its child");
 }
 
+/// A restore's `seed_query` from a Clean read's `Clone` is refused before
+/// it claims the target or installs an edge, so the target stays New and
+/// seeds normally afterwards.
+fn clone_that_seeds_a_query<C: Cells>(rt: Rc<Runtime<C>>) {
+    let a = rt.create_input(Hooked(1));
+    let x = rt.create_input(3u64);
+    let q = rt.create_query(move |rt| rt.get(x) * 10);
+    let base = seed_base(&rt);
+    let dep = SeedDep {
+        dep: x.erase(),
+        trusted_stamp: None,
+    };
+    let hooked = Rc::clone(&rt);
+    arm(Op::Clone, move || {
+        let _ = seed_query(&hooked, &base, q, 30, &[dep], Reuse::IfUnchanged);
+    });
+    assert_contract_panic("seed_query from Clone", || {
+        rt.get(a);
+    });
+    assert!(rt.is_alive(a));
+    assert_eq!(rt.state_of(a), NodeState::Clean);
+    assert_eq!(rt.get(a).0, 1);
+    assert_eq!(rt.state_of(q), NodeState::New);
+    assert_eq!(rt.nodes.get(q.slot()).dep_count(), 0);
+    assert!(rt.inner.read().dependents[x.slot() as usize].is_empty());
+    assert_eq!(
+        seed_query(&rt, &base, q, 30, &[dep], Reuse::IfUnchanged),
+        Ok(Reuse::IfUnchanged)
+    );
+    assert_eq!(rt.get(q), 30);
+    rt.set(x, 4);
+    assert_eq!(rt.get(q), 40);
+}
+
 /// A read from the `PartialEq` of a recompute runs inside the query's
 /// frame, so it records a dependency: the query recomputes when the node
 /// it read changes.
@@ -969,6 +1004,7 @@ both!(
     clone_that_changes_what_is_watched,
     clone_that_observes_or_stabilizes,
     clone_that_reads_a_dirty_creator,
+    clone_that_seeds_a_query,
     partial_eq_of_a_recompute_that_reads_a_node,
     hash_that_reads_a_node_on_insert,
     eq_that_reads_a_node_on_insert,
