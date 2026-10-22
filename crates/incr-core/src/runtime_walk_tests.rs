@@ -1093,3 +1093,103 @@ fn local_caught_zst_note_stays_out_of_another_types_ticket() {
 fn shared_caught_zst_note_stays_out_of_another_types_ticket() {
     caught_zst_note_stays_out_of_another_types_ticket::<Shared>();
 }
+
+struct SameZst;
+
+/// d catches x's zero-sized payload, drops it, reads an input and a query
+/// child, then raises a fresh payload of the same zero-sized type. Both
+/// boxes share one dangling address, type and empty text, yet x never had
+/// its payload contained, so x's read must raise "last compute panicked"
+/// and d's read must keep d's payload.
+fn wave6_same_type_zst_note_joins_ticket_after_engine_call<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let o = rt.create_input(0_i64);
+    let x = rt.create_query(|_: &Runtime<C>| -> i64 { std::panic::panic_any(SameZst) });
+    let c = rt.create_query(move |rt| rt.get(o));
+    let d = rt.create_query(move |rt| {
+        if rt.get(t) == 1 {
+            drop(catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err());
+            let _ = rt.get(o);
+            let _ = rt.get(c);
+            std::panic::panic_any(SameZst);
+        }
+        0
+    });
+    let n = rt.create_query(move |rt| {
+        if rt.get(sel) == 1 {
+            rt.get(x)
+        } else {
+            rt.get(d)
+        }
+    });
+    assert_eq!(rt.get(n), 0);
+    rt.set(t, 1);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err();
+    assert!(!got.is::<SameZst>(), "x's read took d's contained payload");
+    assert!(
+        panic_message(got).contains("last compute panicked"),
+        "x's read raised a payload"
+    );
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err();
+    assert!(got.is::<SameZst>(), "d's read lost its payload");
+}
+
+#[test]
+#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+fn wave6_local_same_type_zst_note_joins_ticket_after_engine_call() {
+    wave6_same_type_zst_note_joins_ticket_after_engine_call::<Local>();
+}
+
+#[test]
+#[ignore = "payload identity residual (decision shared-panic-payload-contract): this fresh box is indistinguishable from the re-raised one in zst_reraised_after_engine_calls_joins_the_caught_ticket"]
+fn wave6_shared_same_type_zst_note_joins_ticket_after_engine_call() {
+    wave6_same_type_zst_note_joins_ticket_after_engine_call::<Shared>();
+}
+/// The control of `wave6_same_type_zst_note_joins_ticket_after_engine_call`:
+/// d re-raises the box it caught after the same engine calls, so the
+/// payload failed x too and x's read takes it. The engine sees the same
+/// address, type and text as for the fresh box there.
+fn zst_reraised_after_engine_calls_joins_the_caught_ticket<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let o = rt.create_input(0_i64);
+    let x = rt.create_query(|_: &Runtime<C>| -> i64 { std::panic::panic_any(SameZst) });
+    let c = rt.create_query(move |rt| rt.get(o));
+    let d = rt.create_query(move |rt| {
+        if rt.get(t) == 1 {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+            let _ = rt.get(o);
+            let _ = rt.get(c);
+            std::panic::resume_unwind(caught);
+        }
+        0
+    });
+    let n = rt.create_query(move |rt| {
+        if rt.get(sel) == 1 {
+            rt.get(x)
+        } else {
+            rt.get(d)
+        }
+    });
+    assert_eq!(rt.get(n), 0);
+    rt.set(t, 1);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err();
+    assert!(got.is::<SameZst>(), "x's read lost the payload d re-raised");
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err());
+    assert!(got.contains("last compute panicked"), "d raised {got:?}");
+}
+
+#[test]
+fn local_zst_reraised_after_engine_calls_joins_the_caught_ticket() {
+    zst_reraised_after_engine_calls_joins_the_caught_ticket::<Local>();
+}
+
+#[test]
+fn shared_zst_reraised_after_engine_calls_joins_the_caught_ticket() {
+    zst_reraised_after_engine_calls_joins_the_caught_ticket::<Shared>();
+}
