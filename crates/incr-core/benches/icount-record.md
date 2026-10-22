@@ -1814,3 +1814,106 @@ its walk.
 
 Gate: no workload rises; `get_clean_local` 102 to 94 and
 `get_clean_shared` 196 to 192.
+
+## T11 final
+
+- Engine: the `spreadsheet-t11` tip `b51d679` against T10 at `c84147f`,
+  the T10 column above, each built in a worktree at a path of the same
+  length; two runs of `icount.sh` at the default N for each column,
+  alternated, with the table giving their mean. Steps were split by full
+  runs at `3f8e8f3` (Clean read merged) and `a6b29f1` (`spreadsheet-t10`
+  merged into t11). No workloads added and no bench source changed.
+- Since the T11 section the tip gained the alloc pools and Clean read
+  (sections above), `GridTable` sparse columns, streamed batch inserts
+  and lazy queries, the value-code refusals behind a Clean read, the
+  `get_traced` owner, and `spreadsheet-t10` up to `cdadbac` (group
+  verify fixes, `ef23f14`).
+
+| workload | N | T10 | T11 | delta | delta % | sources |
+|---|--:|--:|--:|--:|--:|---|
+| `chain_local/propagate/4` | 1,000,000 | 4,639.00 | 3,898.00 | -741.00 | -15.97 | alloc pools; Clean read; T10 merge codegen |
+| `chain_local/propagate/10` | 1,000,000 | 10,027.00 | 8,584.00 | -1,443.00 | -14.39 | alloc pools; Clean read; T10 merge codegen |
+| `chain_local/propagate/100` | 100,000 | 91,606.01 | 78,874.01 | -12,732.00 | -13.90 | alloc pools; Clean read; T10 merge codegen |
+| `chain_shared/propagate/4` | 1,000,000 | 9,356.22 | 8,703.24 | -652.98 | -6.98 | alloc pools; Clean read |
+| `chain_shared/propagate/10` | 1,000,000 | 20,353.81 | 19,119.79 | -1,234.02 | -6.06 | alloc pools; Clean read |
+| `chain_shared/propagate/100` | 100,000 | 186,336.20 | 175,494.71 | -10,841.49 | -5.82 | alloc pools; Clean read |
+| `diamond_local` | 1,000,000 | 3,927.00 | 3,294.00 | -633.00 | -16.12 | alloc pools; Clean read; T10 merge codegen |
+| `diamond_shared` | 1,000,000 | 7,795.93 | 7,246.48 | -549.45 | -7.05 | alloc pools; Clean read |
+| `early_cutoff_local` | 1,000,000 | 2,299.00 | 1,899.00 | -400.00 | -17.40 | alloc pools; Clean read; T10 merge codegen |
+| `early_cutoff_shared` | 1,000,000 | 3,582.84 | 3,214.78 | -368.07 | -10.27 | alloc pools; Clean read |
+| `collection_insert_then_read/local_incremental/1000` | 100,000 | 4,738.56 | 4,219.50 | -519.06 | -10.95 | alloc pools; Clean read; T10 merge codegen |
+| `collection_insert_then_read/shared_incremental/1000` | 100,000 | 7,365.97 | 6,914.68 | -451.28 | -6.13 | alloc pools; Clean read |
+| `collection_insert_then_read/batch/1000` | 10,000 | 92,283.42 | 92,282.98 | -0.44 | -0.00 | none |
+| `collection_insert_then_read/local_incremental/10000` | 100,000 | 4,732.08 | 4,212.20 | -519.87 | -10.99 | alloc pools; Clean read; T10 merge codegen |
+| `collection_insert_then_read/shared_incremental/10000` | 100,000 | 7,340.19 | 6,889.13 | -451.06 | -6.15 | alloc pools; Clean read |
+| `collection_insert_then_read/batch/10000` | 1,000 | 158,886.04 | 158,883.72 | -2.32 | -0.00 | none (run spread) |
+| `collection_insert_then_read/local_incremental/100000` | 100,000 | 4,739.66 | 4,220.55 | -519.11 | -10.95 | alloc pools; Clean read; T10 merge codegen |
+| `collection_insert_then_read/shared_incremental/100000` | 100,000 | 7,344.54 | 6,893.85 | -450.69 | -6.14 | alloc pools; Clean read |
+| `collection_insert_then_read/batch/100000` | 1,000 | 1,490,570.54 | 1,490,567.59 | -2.95 | -0.00 | none (run spread) |
+| `simple_count/local/1000` | 100,000 | 2,129.73 | 1,962.98 | -166.75 | -7.83 | alloc pools; Clean read; T10 merge codegen |
+| `simple_count/shared/1000` | 100,000 | 4,076.59 | 3,941.36 | -135.23 | -3.32 | alloc pools; Clean read |
+| `simple_count/local/10000` | 100,000 | 2,126.07 | 1,959.11 | -166.97 | -7.85 | alloc pools; Clean read; T10 merge codegen |
+| `simple_count/shared/10000` | 100,000 | 4,056.61 | 3,921.61 | -135.00 | -3.33 | alloc pools; Clean read |
+| `get_clean_local` | 10,000,000 | 102.00 | 94.00 | -8.00 | -7.84 | Clean read |
+| `get_clean_shared` | 10,000,000 | 196.00 | 192.00 | -4.00 | -2.04 | Clean read |
+| `get_contended_shared` | 2,000 | 7,791,605.37 | 7,631,613.94 | -159,991.43 | -2.05 | Clean read |
+| `fanout_local_4` | 100,000 | 17,111.01 | 16,219.01 | -892.00 | -5.21 | alloc pools; Clean read; T10 merge codegen |
+| `fanout_local_5` | 100,000 | 21,719.00 | 19,999.00 | -1,720.00 | -7.92 | alloc pools; Clean read; T10 merge codegen |
+| `fanout_local_1000` | 1,000 | 3,449,234.93 | 3,316,405.06 | -132,829.87 | -3.85 | alloc pools; Clean read; T10 merge codegen |
+| `fanout_shared_4` | 100,000 | 23,467.14 | 22,745.77 | -721.37 | -3.07 | alloc pools; Clean read |
+| `fanout_shared_5` | 100,000 | 28,809.14 | 27,623.47 | -1,185.67 | -4.12 | alloc pools; Clean read |
+| `fanout_shared_1000` | 1,000 | 4,748,487.37 | 4,622,572.52 | -125,914.85 | -2.65 | alloc pools; Clean read |
+| `delete_single_local` | 200,000 | 706.00 | 700.00 | -6.00 | -0.85 | Clean read |
+| `delete_single_shared` | 200,000 | 1,530.25 | 1,524.30 | -5.95 | -0.39 | Clean read |
+| `delete_cascade_local` | 1,000 | 3,228,608.08 | 3,070,656.17 | -157,951.92 | -4.89 | alloc pools; Clean read; T10 merge codegen |
+| `delete_cascade_shared` | 1,000 | 4,534,069.21 | 4,342,193.39 | -191,875.82 | -4.23 | alloc pools; Clean read |
+| `delete_owned_tree_local` | 10,000 | 602,955.74 | 601,265.29 | -1,690.45 | -0.28 | run spread (below) |
+| `delete_owned_tree_shared` | 10,000 | 980,660.10 | 977,899.94 | -2,760.16 | -0.28 | run spread (below) |
+| `table_hit_local` | 10,000,000 | 155.14 | 150.14 | -5.00 | -3.22 | Clean read |
+| `table_hit_shared` | 10,000,000 | 218.14 | 216.14 | -2.00 | -0.92 | Clean read |
+| `table_hit_sip_local` | 10,000,000 | 301.66 | 296.00 | -5.67 | -1.88 | Clean read |
+| `table_miss_local` | 100,000 | 871.18 | 867.75 | -3.43 | -0.39 | Clean read |
+| `table_miss_shared` | 100,000 | 2,170.22 | 2,164.93 | -5.29 | -0.24 | Clean read |
+| `value_slot_read_local` | 10,000,000 | 5.00 | 5.00 | +0.00 | +0.00 | none |
+| `value_slot_read_shared` | 10,000,000 | 87.00 | 87.00 | +0.00 | +0.00 | none |
+| `children_rerun_1k_local` | 10,000 | 217,992.01 | 214,825.09 | -3,166.92 | -1.45 | alloc pools; Clean read; T10 merge codegen |
+| `children_rerun_1k_shared` | 10,000 | 224,936.19 | 222,796.98 | -2,139.21 | -0.95 | alloc pools; Clean read |
+| `children_churn_local` | 100,000 | 16,514.08 | 16,296.85 | -217.23 | -1.32 | alloc pools; Clean read; T10 merge codegen |
+| `children_churn_shared` | 100,000 | 19,401.15 | 19,226.75 | -174.40 | -0.90 | alloc pools; Clean read |
+
+- **Alloc pools; Clean read:** the step from `c84147f` to `3f8e8f3` is
+  the sum of the two sections above within run spread (for example
+  `chain_local/propagate/4` −703 and −46 there, −749 here;
+  `chain_shared/propagate/4` −632 and −21, −653 here).
+- **T10 merge codegen (Local workloads that compute):** merging
+  `spreadsheet-t10` at `a6b29f1` adds 2 per Local compute
+  (`chain_local/propagate/100` +200, `fanout_local_1000` and
+  `delete_cascade_local` +2,000) and nothing under Shared. A pinned-seed
+  trace of `chain_local/propagate/4` puts its +8 on eight lines of
+  `compute_one` and `DepStack::recycle` at ±1 per compute each, none of
+  them changed; the merge's only change to that function is an
+  `end_dissolved` call on the cold `PopEnd::Dissolved` branch. Standalone,
+  `c84147f..cdadbac` instead adds 3 per Shared compute (−1 per Local
+  compute), all three register copies after the post-compute
+  `thread_word` test in `clean_walk` (`runtime.rs:3301`), an unchanged
+  line; inside t11 that Shared cost does not appear.
+- **Release cost of a debug check (fixed):** `59393af` added
+  `debug_assert_local_read_kept` as a plain function called with
+  `self.nodes.get(handle.slot())`, so release builds kept the node
+  lookup: `get_clean_local` 94 to 100 and `chain_local/propagate/4`
+  3,898 to 3,926 (found by bisecting t11 by merge on five workloads).
+  `699ddce` makes it a macro, which restores 94 and 3,898; no other
+  debug-only helper in incr-core takes a non-trivial argument. The step
+  from `a6b29f1` to the tip nets to run spread.
+- **No workload:** `GridTable` sparse columns, streamed inserts and lazy
+  queries, and the `get_traced` changes run on no workload.
+- **Run spread:** `delete_owned_tree_*` move by less than their run
+  spread (T10 runs 800 and 2,799 apart, tip runs 3,132 and 1,975), and
+  the `collection_insert_then_read/batch/*` rows by under 5.
+- Traces ran with `-m 8,128`: 1 MB of AUX buffer no longer maps on this
+  box, so traces use 10 iterations.
+
+Gate: no workload rises against T10. `get_clean_local` 102 to 94,
+`get_clean_shared` 196 to 192, `table_hit_local` 155.14 to 150.14,
+`table_hit_shared` 218.14 to 216.14, and `value_slot_read_*` unchanged
+at 5 and 87.
