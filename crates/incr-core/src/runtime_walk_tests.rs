@@ -865,16 +865,19 @@ fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>, custom:
 
 /// A replayable run that takes a contained ticket, drops the payload and is
 /// doomed by a later read past the budget must leave its retry the same
-/// payload, whatever its type: h is `6 + g` = 16 at every budget, as
-/// unbounded.
+/// payload: h is `6 + g` = 16, as unbounded. A payload no copy can stand
+/// for keeps h from being doomed only while h is within the budget, so at
+/// budget 1, where h's first read is past it, the retry reads f Failed with
+/// no payload: 10 plus the length of that read's message.
 fn wave6_doomed_run_keeps_the_ticket_it_took<C: Cells>() {
     for custom in [false, true] {
         let unbounded = wave6_doomed_run_after_taking_a_ticket::<C>(None, custom);
         assert_eq!(unbounded, 6 + 10, "custom {custom}");
         for b in 1..=3 {
+            let want = if custom && b == 1 { 139 } else { unbounded };
             assert_eq!(
                 wave6_doomed_run_after_taking_a_ticket::<C>(Some(b), custom),
-                unbounded,
+                want,
                 "budget {b}, custom {custom}"
             );
         }
@@ -1447,4 +1450,145 @@ fn caught_sibling_landing_keeps_a_caught_ticket_note() {
     ticket_note_survives_a_sibling_landing::<Shared>(false);
     ticket_note_survives_a_sibling_landing::<Local>(true);
     ticket_note_survives_a_sibling_landing::<Shared>(true);
+}
+
+/// Silences the panics of `ticket_catching_chain`, one per level, and
+/// leaves every other panic to the default hook.
+fn quiet_ticket_booms() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let payload = info.payload();
+            if payload.downcast_ref::<&str>() != Some(&"ticket boom") && !payload.is::<NotClone>() {
+                default(info);
+            }
+        }));
+    });
+}
+
+/// A replayable chain of `n` levels read top-down, where level i catches
+/// f_i's panic and then reads level i + 1. With `failed`, every f_i is
+/// Failed with its own contained ticket, a `NotClone` payload if `custom`,
+/// so every level takes a ticket payload. Returns the count of caught
+/// panics.
+fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 {
+    quiet_ticket_booms();
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    let j = rt.create_input(1_i64);
+    let sel = rt.create_input(0_i64);
+    let fs: Vec<Incr<i64>> = (0..n)
+        .map(|_| {
+            rt.create_query(move |rt: &Runtime<C>| {
+                if rt.get(j) == 0 && custom {
+                    std::panic::panic_any(NotClone(1));
+                }
+                assert!(rt.get(j) != 0, "ticket boom");
+                0
+            })
+        })
+        .collect();
+    let all = fs.clone();
+    let x = rt.create_query(move |rt: &Runtime<C>| {
+        if rt.get(sel) == 0 {
+            all.iter().map(|&f| rt.get(f)).sum()
+        } else {
+            0
+        }
+    });
+    rt.get(x);
+    if failed {
+        rt.set(j, 0);
+        rt.set(sel, 1);
+        assert_eq!(rt.get(x), 0);
+        assert_eq!(rt.contained_payloads(), n);
+    }
+    let mut below: Option<Incr<i64>> = None;
+    for &f in fs.iter().rev() {
+        let next = below;
+        below = Some(rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                let caught = catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err();
+                i64::from(caught) + next.map_or(0, |b| rt.get(b))
+            },
+            QueryOpts {
+                replay: Replay::Allowed,
+                ..Default::default()
+            },
+        ));
+    }
+    rt.get(below.unwrap())
+}
+
+/// Runs the chain on a spawned thread's default stack, which the frame
+/// budget must bound.
+fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
+    // Frames that are never doomed overflow this stack at 1000 to 2000
+    // levels.
+    let n = test_size(100_000);
+    let got = thread::spawn(move || ticket_catching_chain::<C>(n, failed, custom))
+        .join()
+        .unwrap();
+    assert_eq!(got, if failed { n as i64 } else { 0 });
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+)]
+#[cfg_attr(miri, ignore)]
+fn local_catching_chain_stays_within_the_stack() {
+    ticket_catching_chain_on_a_thread::<Local>(false, false);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+)]
+#[cfg_attr(miri, ignore)]
+fn shared_catching_chain_stays_within_the_stack() {
+    ticket_catching_chain_on_a_thread::<Shared>(false, false);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+)]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_catching_chain_stays_within_the_stack() {
+    ticket_catching_chain_on_a_thread::<Local>(true, false);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+)]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_catching_chain_stays_within_the_stack() {
+    ticket_catching_chain_on_a_thread::<Shared>(true, false);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+)]
+#[cfg_attr(miri, ignore)]
+fn local_uncopyable_ticket_catching_chain_stays_within_the_stack() {
+    ticket_catching_chain_on_a_thread::<Local>(true, true);
+}
+
+#[test]
+#[cfg_attr(
+    debug_assertions,
+    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+)]
+#[cfg_attr(miri, ignore)]
+fn shared_uncopyable_ticket_catching_chain_stays_within_the_stack() {
+    ticket_catching_chain_on_a_thread::<Shared>(true, true);
 }

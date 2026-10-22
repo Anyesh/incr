@@ -22,6 +22,8 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::ops::RangeInclusive;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, PoisonError};
 
@@ -37,7 +39,12 @@ pub(super) struct Left;
 #[derive(Default)]
 pub(crate) struct Tickets {
     next: u64,
-    held: Vec<Ticket>,
+    /// By the order they were held in, so that a node's flip to Dirty
+    /// removes it only from tickets of landings before the flip.
+    held: BTreeMap<u64, Ticket>,
+    /// The ticket of each landing a held ticket keeps, which is one at
+    /// most: a landing joins a ticket only if it is in none.
+    landings: BTreeMap<(u32, u32), u64>,
     /// The tickets of deleted nodes and of nodes a set's walk flipped,
     /// dropped once the delete, sweep or walk that released them holds no
     /// lock and has finished.
@@ -49,9 +56,6 @@ pub(crate) struct Tickets {
 /// Failed landing. A node's later Failed landing, its flip to Dirty or its
 /// delete removes it.
 struct Ticket {
-    /// Orders tickets, so that a node's flip to Dirty removes it only from
-    /// tickets of landings before the flip.
-    seq: u64,
     nodes: Vec<(u32, u32)>,
     /// The mutex only makes the table `Sync`: the payload moves in and out
     /// under the write lock.
@@ -137,24 +141,34 @@ fn notes_held() -> bool {
     value_code::thread_word() & value_code::NOTES_BIT != 0
 }
 
-/// Removes `landing` from the tickets before `mark` (all of them for
-/// `u64::MAX`), returning the payloads left with no landing, which the
-/// caller drops outside the lock: a drop is user code.
-fn release(t: &mut Tickets, mark: u64, landing: impl Fn((u32, u32)) -> bool) -> Vec<Ticket> {
+/// Removes the landings in `landings` from the tickets before `mark` (all
+/// of them for `u64::MAX`), returning the payloads left with no landing,
+/// which the caller drops outside the lock: a drop is user code.
+fn release(t: &mut Tickets, mark: u64, landings: RangeInclusive<(u32, u32)>) -> Vec<Ticket> {
+    let found: Vec<((u32, u32), u64)> = t
+        .landings
+        .range(landings)
+        .filter(|&(_, &seq)| seq < mark)
+        .map(|(&landing, &seq)| (landing, seq))
+        .collect();
     let mut stale = Vec::new();
-    let mut i = 0;
-    while i < t.held.len() {
-        let c = &mut t.held[i];
-        if c.seq < mark {
-            c.nodes.retain(|&n| !landing(n));
-        }
+    for (landing, seq) in found {
+        t.landings.remove(&landing);
+        let c = t
+            .held
+            .get_mut(&seq)
+            .expect("incr-core: an indexed landing's ticket is held");
+        c.nodes.retain(|&n| n != landing);
         if c.nodes.is_empty() {
-            stale.push(t.held.swap_remove(i));
-        } else {
-            i += 1;
+            stale.extend(t.held.remove(&seq));
         }
     }
     stale
+}
+
+/// Every generation of node `slot`.
+fn slot_landings(slot: u32) -> RangeInclusive<(u32, u32)> {
+    (slot, 0)..=(slot, u32::MAX)
 }
 
 /// Hands `stale` to `bag`, which drops it with no lock held and a panic
@@ -200,10 +214,16 @@ impl<C: Cells> Runtime<C> {
         if state::load::<C>(node.state_cell()) != NodeState::Failed {
             return Err(Left);
         }
-        let Some(at) = t.held.iter().position(|c| c.nodes.contains(&landing)) else {
+        let Some(seq) = t.landings.get(&landing).copied() else {
             return Ok(None);
         };
-        let Ticket { nodes, payload, .. } = t.held.swap_remove(at);
+        let Ticket { nodes, payload } = t
+            .held
+            .remove(&seq)
+            .expect("incr-core: an indexed landing's ticket is held");
+        for n in &nodes {
+            t.landings.remove(n);
+        }
         self.sync_held(&t);
         drop(t);
         let payload = payload.into_inner().unwrap_or_else(PoisonError::into_inner);
@@ -249,7 +269,7 @@ impl<C: Cells> Runtime<C> {
         }
         let (stale, mark) = {
             let mut t = self.tickets.write();
-            let stale = release(&mut t, u64::MAX, |n| n == landing);
+            let stale = release(&mut t, u64::MAX, landing..=landing);
             t.next += 1;
             self.sync_held(&t);
             (stale, t.next)
@@ -320,18 +340,23 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(slot);
             node.generation() == generation
                 && state::load::<C>(node.state_cell()) == NodeState::Failed
-                && !t.held.iter().any(|c| c.nodes.contains(&(slot, generation)))
+                && !t.landings.contains_key(&(slot, generation))
         });
         if nodes.is_empty() {
             return Some(payload);
         }
         let seq = t.next;
         t.next += 1;
-        t.held.push(Ticket {
+        for &n in &nodes {
+            t.landings.insert(n, seq);
+        }
+        t.held.insert(
             seq,
-            nodes,
-            payload: Mutex::new(payload),
-        });
+            Ticket {
+                nodes,
+                payload: Mutex::new(payload),
+            },
+        );
         self.sync_held(&t);
         None
     }
@@ -351,7 +376,7 @@ impl<C: Cells> Runtime<C> {
         {
             return false;
         }
-        let stale = release(&mut t, u64::MAX, |(n, _)| n == id.0);
+        let stale = release(&mut t, u64::MAX, slot_landings(id.0));
         t.buried.extend(stale);
         self.sync_held(&t);
         true
@@ -384,7 +409,7 @@ impl<C: Cells> Runtime<C> {
 
     fn release_left(&self, id: NodeId, mark: u64) -> Vec<Ticket> {
         let mut t = self.tickets.write();
-        let stale = release(&mut t, mark, |(n, _)| n == id.0);
+        let stale = release(&mut t, mark, slot_landings(id.0));
         self.sync_held(&t);
         stale
     }
@@ -402,7 +427,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn bury(&self, slot: u32, generation: u32) {
         let mut t = self.tickets.write();
-        let stale = release(&mut t, u64::MAX, |n| n == (slot, generation));
+        let stale = release(&mut t, u64::MAX, (slot, generation)..=(slot, generation));
         t.buried.extend(stale);
     }
 
