@@ -1032,3 +1032,125 @@ mod every_collection_path_is_refused {
         every_path_is_refused(Rc::new(Runtime::<Shared>::new()), collection_paths());
     }
 }
+
+/// Value code that runs under a collection's own lock: an element's
+/// `PartialEq` under the log guard of an insert, and an element's `Clone`
+/// under the sorted view's lock while it files a delta. Each path that
+/// would take that lock again panics with the contract message and
+/// leaves the collection as it was.
+mod under_a_collection_lock {
+    use super::*;
+
+    type LogPath<C> = (
+        &'static str,
+        fn(&Runtime<C>, &crate::IncrCollection<Hooked, C>),
+    );
+
+    fn log_paths<C: Cells>() -> Vec<LogPath<C>> {
+        vec![
+            ("insert", |rt, c| c.insert(rt, Hooked(2))),
+            ("delete", |rt, c| {
+                c.delete(rt, &Hooked(1));
+            }),
+            ("replace", |rt, c| {
+                c.replace(rt, Some(&Hooked(1)), Hooked(2));
+            }),
+            ("values", |rt, c| {
+                c.values(rt);
+            }),
+            ("snapshot_len", |_, c| {
+                c.snapshot_len();
+            }),
+            ("filter", |rt, c| {
+                c.filter(rt, |_| true);
+            }),
+            ("map", |rt, c| {
+                c.map(rt, |h| h.0);
+            }),
+            ("count", |rt, c| {
+                c.count(rt);
+            }),
+            ("reduce", |rt, c| {
+                c.reduce(rt, |v| v.len());
+            }),
+            ("aggregate", |rt, c| {
+                c.aggregate(rt, 0u32, |h| h.0, |a, b| a + b);
+            }),
+            ("join", |rt, c| {
+                c.join(rt, c, |h| h.0, |h| h.0);
+            }),
+            ("group_by", |rt, c| {
+                c.group_by(rt, |h| h.0);
+            }),
+            ("sort_by_key", |rt, c| {
+                c.sort_by_key(rt, |h| h.0);
+            }),
+        ]
+    }
+
+    fn log_paths_are_refused<C: Cells>(rt: Rc<Runtime<C>>) {
+        let c = rt.create_collection::<Hooked>();
+        c.insert(&rt, Hooked(1));
+        for (name, path) in log_paths() {
+            let version = rt.get(c.version_node());
+            let nodes = rt.node_count();
+            let (hooked, target) = (Rc::clone(&rt), c.clone());
+            arm(Op::Eq, move || path(&hooked, &target));
+            assert_contract_panic(name, || c.insert(&rt, Hooked(1)));
+            assert_eq!(ids(&rt, &c), vec![1], "{name}");
+            assert_eq!(rt.get(c.version_node()), version, "{name}");
+            assert_eq!(rt.node_count(), nodes, "{name}");
+        }
+        c.insert(&rt, Hooked(1));
+        assert_eq!(ids(&rt, &c), vec![1, 1]);
+    }
+
+    type ViewPath<C> = (
+        &'static str,
+        fn(&Runtime<C>, &crate::SortedCollection<Hooked, u32, C>),
+    );
+
+    fn view_paths<C: Cells>() -> Vec<ViewPath<C>> {
+        vec![
+            ("sorted snapshot", |_, s| {
+                s.snapshot();
+            }),
+            ("sorted snapshot_len", |_, s| {
+                s.snapshot_len();
+            }),
+            ("pairwise", |rt, s| {
+                s.pairwise(rt);
+            }),
+            ("window", |rt, s| {
+                s.window(rt, 2);
+            }),
+        ]
+    }
+
+    /// Each path gets a fresh view, because a refused compute leaves its
+    /// node Failed until the next upstream change.
+    fn view_paths_are_refused<C: Cells>(rt: Rc<Runtime<C>>) {
+        for (name, path) in view_paths() {
+            let c = rt.create_collection::<Hooked>();
+            let sorted = Rc::new(c.sort_by_key(&rt, |h| h.0));
+            c.insert(&rt, Hooked(1));
+            rt.get(sorted.version_node());
+            c.insert(&rt, Hooked(2));
+            let nodes = rt.node_count();
+            let (hooked, target) = (Rc::clone(&rt), Rc::clone(&sorted));
+            // The first clone stages the pending delta, the second files
+            // it under the view's lock.
+            arm_nth(Op::Clone, 2, move || path(&hooked, &target));
+            assert_contract_panic(name, || {
+                rt.get(sorted.version_node());
+            });
+            assert_eq!(rt.node_count(), nodes, "{name}");
+            c.insert(&rt, Hooked(3));
+            rt.get(sorted.version_node());
+            let order: Vec<u32> = sorted.snapshot().iter().map(|h| h.0).collect();
+            assert_eq!(order, vec![1, 2, 3], "{name}");
+        }
+    }
+
+    both!(log_paths_are_refused, view_paths_are_refused);
+}
