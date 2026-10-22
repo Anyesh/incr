@@ -10,10 +10,13 @@
 //! the panic's box. A note lives only while that box unwinds: every point
 //! an unwind stops retires the notes above it, and a box the engine moves
 //! into a delivery or drops takes its notes with it, so no later box at a
-//! reused address meets them.
+//! reused address meets them. A closure can still catch a box and raise a
+//! fresh one at the freed address with no engine call between, so the key
+//! also holds the text of a `&str` or `String` payload.
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, PoisonError};
 
@@ -29,8 +32,8 @@ pub(super) struct Left;
 pub(crate) struct Tickets {
     next: u64,
     held: Vec<Ticket>,
-    /// The tickets of deleted nodes, dropped by the delete's bag once it
-    /// holds no lock.
+    /// The tickets of deleted nodes, dropped by the bag of the delete or
+    /// sweep that buried them once it holds no lock.
     buried: Vec<Ticket>,
 }
 
@@ -60,7 +63,7 @@ struct Unwound {
     /// which every runtime on the thread shares.
     cidx: u32,
     node: (u32, u32),
-    payload: usize,
+    payload: Key,
     /// Taken from a ticket by a read: a discarded run's read was no
     /// reader's observation, so its drop holds the ticket again.
     restorable: bool,
@@ -76,8 +79,22 @@ loom::thread_local! {
     static UNWOUND: RefCell<Vec<Unwound>> = RefCell::new(Vec::new());
 }
 
-fn address(payload: &(dyn Any + Send)) -> usize {
-    std::ptr::from_ref(payload).cast::<()>() as usize
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Key {
+    address: usize,
+    /// A hash of the payload's text, 0 for a payload of another type.
+    text: u64,
+}
+
+fn key(payload: &(dyn Any + Send)) -> Key {
+    let text = |s: &str| BuildHasherDefault::<DefaultHasher>::default().hash_one(s);
+    Key {
+        address: std::ptr::from_ref(payload).cast::<()>() as usize,
+        text: match payload.downcast_ref::<&'static str>() {
+            Some(s) => text(s),
+            None => payload.downcast_ref::<String>().map_or(0, |s| text(s)),
+        },
+    }
 }
 
 /// Edits this thread's notes and keeps `value_code::NOTES_BIT` in step.
@@ -184,7 +201,7 @@ impl<C: Cells> Runtime<C> {
         let landing = (id.0, generation);
         let nodes = match (&contained, payload) {
             (Some(contained), _) => {
-                let at = address(&**contained);
+                let at = key(&**contained);
                 let mut nodes = vec![landing];
                 with_notes(|u| {
                     u.retain(|w| {
@@ -200,7 +217,7 @@ impl<C: Cells> Runtime<C> {
             (None, Some(payload)) => {
                 // The frames at and above `cidx` belong to this unwind, so
                 // an earlier unwind's notes there are spent.
-                let at = address(payload);
+                let at = key(payload);
                 with_notes(|u| {
                     u.retain(|w| !(w.cidx >= cidx && w.payload != at));
                     u.push(Unwound {
@@ -297,6 +314,29 @@ impl<C: Cells> Runtime<C> {
         drop(buried);
     }
 
+    /// A compute's sweep released nodes: the tickets they buried join its
+    /// bag, which drops them as it drains.
+    #[inline(always)]
+    pub(super) fn defer_buried_tickets(&self, bag: &mut Deferred<C>) {
+        if self.tickets_held() {
+            self.defer_buried(bag);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn defer_buried(&self, bag: &mut Deferred<C>) {
+        let buried = {
+            let mut t = self.tickets.write();
+            let buried = std::mem::take(&mut t.buried);
+            self.sync_held(&t);
+            buried
+        };
+        if !buried.is_empty() {
+            bag.push_erased(Box::new(buried));
+        }
+    }
+
     /// Notes `nodes`, landings a read took `payload` for, just above the
     /// reading frame, so that a walk's entry below that contains the panic
     /// again holds them too.
@@ -304,11 +344,7 @@ impl<C: Cells> Runtime<C> {
         if nodes.is_empty() {
             return;
         }
-        let (rt, cidx, at) = (
-            self.runtime_id,
-            self.dep_stack.next_cidx(),
-            address(payload),
-        );
+        let (rt, cidx, at) = (self.runtime_id, self.dep_stack.next_cidx(), key(payload));
         with_notes(|u| {
             u.extend(nodes.into_iter().map(|node| Unwound {
                 rt,
@@ -335,7 +371,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Vec::new();
         }
-        let (rt, at) = (self.runtime_id, address(payload));
+        let (rt, at) = (self.runtime_id, key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             for w in u.iter_mut().filter(|w| w.payload == at) {
@@ -354,7 +390,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Vec::new();
         }
-        let (rt, at) = (self.runtime_id, address(payload));
+        let (rt, at) = (self.runtime_id, key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             u.retain(|w| {
@@ -401,7 +437,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Some(payload);
         }
-        let (rt, at) = (self.runtime_id, address(&*payload));
+        let (rt, at) = (self.runtime_id, key(&*payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             u.retain(|w| {
@@ -439,6 +475,7 @@ impl<C: Cells> Runtime<C> {
     /// The contained payloads still held, for tests.
     #[cfg(all(test, not(loom)))]
     pub(crate) fn contained_payloads(&self) -> usize {
-        self.tickets.read().held.len()
+        let t = self.tickets.read();
+        t.held.len() + t.buried.len()
     }
 }

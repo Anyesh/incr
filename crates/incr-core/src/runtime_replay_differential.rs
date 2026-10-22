@@ -1680,6 +1680,59 @@ fn member_run_frames_take_no_discovery_delivery() {
     });
 }
 
+/// Seed 0xfb9f33f99ad49897, shrunk. 0 reads 1, which reads 2 twice; 2
+/// reads 3, a bare query that `try_get`s 4 and panics on its value; 4, a
+/// Fallback(4) member, reads 5 twice, 5 `try_get`s 6 and 6 reads 3. 1's
+/// second read walks 2 from its Dirty landing and computes 4 first; at
+/// budget 1 a virtual hit makes 4 a stand-in, and the stand-in's run
+/// dooms. Its new virtual frame dropped the walk's flag, so the panic
+/// delivered there went to 1's read of 2 uncontained, and 2 never reran:
+/// 0, 1 and 2 stayed Dirty where the unbounded run fails them. Seed
+/// 0x7e17bf5981b9d32e failed the same way.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_stand_in_run_contains_a_panic_as_its_walk_does() {
+    let query = |expr, bare, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare,
+        strategy,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let case = Case {
+        specs: vec![
+            query(Expr::Read(1, false), false, Strat::None),
+            query(Expr::Add(read(2), read(2)), false, Strat::None),
+            query(Expr::Read(3, false), false, Strat::None),
+            query(
+                Expr::PanicIf(Box::new(Expr::Read(4, true)), 4),
+                true,
+                Strat::None,
+            ),
+            query(Expr::Add(read(5), read(5)), false, Strat::Fallback(4)),
+            query(Expr::Read(6, true), false, Strat::None),
+            query(Expr::Read(3, false), false, Strat::None),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 7,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0xfb9f_33f9_9ad4_9897);
+        differential::<Shared>(&case, 0xfb9f_33f9_9ad4_9897);
+    });
+    for seed in [0xfb9f_33f9_9ad4_9897, 0x7e17_bf59_81b9_d32e] {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
