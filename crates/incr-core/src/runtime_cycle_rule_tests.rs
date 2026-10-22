@@ -930,9 +930,9 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
     );
 }
 
-/// A group verify's episode panics in member b: b lands Failed and the
-/// Fixpoint co-member a, which b reads, takes the discard landing. A later
-/// set that reaches only a must still let b recompute, so with j back at
+/// A group verify's episode panics in member b: b lands Failed, released
+/// with the Fixpoint co-member a it reads. A later set that reaches only a
+/// must still let b recompute, so with j back at
 /// 1 the cycle converges to a = 2, b = 3 as it first did.
 fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
     let rt = Runtime::<C>::new();

@@ -2283,7 +2283,8 @@ impl<C: Cells> Runtime<C> {
 
     /// Releases, with the discard landing, the claims virtual hits took
     /// for the entries of context `id` at or above `level` that are still
-    /// held.
+    /// held. Each is the node of a virtual frame below, which that frame's
+    /// retry or pop lands again, so a user panic needs no other landing.
     fn release_claim_list(
         &self,
         id: u64,

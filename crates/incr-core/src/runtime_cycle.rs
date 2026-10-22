@@ -1606,11 +1606,10 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Lands every claim of this runtime held at or above `cidx`: under a
+    /// Lands every claim of this runtime held at or above `cidx`: with
+    /// `discarding`, each takes the discard landing; otherwise, under a
     /// user panic, a claim whose own code panicked takes fix 5's panic
-    /// path and every other claim [`Self::land_panic_released`]; under an
-    /// engine unwind or a discard (`discarding`), every claim takes the
-    /// discard landing.
+    /// path and every other claim [`Self::land_panic_released`].
     pub(super) fn release_held_from(
         &self,
         cidx: u32,
@@ -2096,8 +2095,9 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Step 3 ended in a panic (a `PartialEq` of a member's value): the
-    /// member whose compare panicked lands through fix 5's panic path, and
-    /// the others through [`Self::land_panic_released`] for a user panic,
+    /// member whose compare panicked lands through fix 5's panic path if
+    /// it wrote nothing, and the others through
+    /// [`Self::land_panic_released`] for a user panic,
     /// or the unwind's landing ([`Self::unwound_land`]) for an engine
     /// one, where a member whose slot was written is stamped and lands
     /// New.
