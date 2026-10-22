@@ -299,6 +299,9 @@ impl Cells for Loom {
     fn u8_store_relaxed(c: &Self::U8, v: u8) {
         c.store(v, Ordering::Relaxed);
     }
+    fn u8_compare_exchange(c: &Self::U8, current: u8, new: u8) -> Result<u8, u8> {
+        c.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+    }
 
     fn u32_load_acquire(c: &Self::U32) -> u32 {
         c.load(Ordering::Acquire)

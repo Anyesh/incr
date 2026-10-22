@@ -220,6 +220,9 @@ pub struct ObserverId(u64);
 /// inline function, so these compile away.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ParkPoint {
+    /// In `get_traced`, between the traced read and the end of the trace
+    /// log's hand-off to the caller.
+    TraceHandOff,
     /// In `ensure_clean`, just before `compute_one` on a visited node, or
     /// before the walk waits on a node another thread is computing.
     BeforeComputeOne(NodeId),
@@ -897,7 +900,8 @@ pub struct Runtime<C: Cells> {
     pub(crate) revision: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
-    /// `1` when `get_traced` is actively recording. Checked on every
+    /// `1` when `get_traced` is actively recording; the call that swaps it
+    /// from `0` to `1` owns the trace log until it stores `0`. Checked on every
     /// `compute_one` via a Relaxed load (~1 ns when disarmed) so the
     /// non-tracing hot path pays no measurable cost.
     pub(crate) tracing_armed: <C as Cells>::U8,
@@ -2426,21 +2430,24 @@ impl<C: Cells> Runtime<C> {
     /// Read the current value and return a propagation trace alongside.
     /// Records per-node events (Recomputed { value_changed } or
     /// VerifiedClean) for every compute or short-circuit that happens
-    /// during this `get`.
+    /// during this `get`. The runtime has one trace log, so under `Shared`
+    /// computes another thread runs meanwhile are recorded too.
+    ///
+    /// # Panics
+    ///
+    /// If another `get_traced` on this runtime is in progress, whether on
+    /// another thread or in a compute this one runs.
     pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
         use crate::trace::TraceAction;
         value_code::check();
 
-        // Arm tracing: clear any prior log, then flip the gate so
-        // compute_one starts appending events.
-        {
-            let mut inner = self.inner.write();
-            inner.trace_log.clear();
+        if C::u8_compare_exchange(&self.tracing_armed, 0, 1).is_err() {
+            panic!("incr-core: get_traced called while another get_traced is in progress");
         }
-        C::u8_store_release(&self.tracing_armed, 1);
 
-        // Disarm on every exit path: a panicking compute inside the
-        // traced get must not leave tracing armed forever.
+        // Only the call that armed tracing builds this, so a refused call
+        // never disarms the trace in progress. It disarms on every exit
+        // path: a panicking compute must not leave tracing armed forever.
         struct Disarm<'a, C2: Cells>(&'a Runtime<C2>);
         impl<C2: Cells> Drop for Disarm<'_, C2> {
             fn drop(&mut self) {
@@ -2448,6 +2455,7 @@ impl<C: Cells> Runtime<C> {
             }
         }
         let disarm = Disarm(self);
+        self.inner.write().trace_log.clear();
 
         // std has no clock on wasm32-unknown-unknown and `Instant::now()`
         // panics there, so the trace reports no elapsed time.
@@ -2460,11 +2468,13 @@ impl<C: Cells> Runtime<C> {
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         let (value, elapsed_ns) = (self.get(handle), 0);
 
-        drop(disarm);
+        self.park(ParkPoint::TraceHandOff);
+        // Taken before disarming: the next tracer's CAS clears the log.
         let node_traces: Vec<crate::trace::NodeTrace> = {
             let mut inner = self.inner.write();
             std::mem::take(&mut inner.trace_log)
         };
+        drop(disarm);
 
         let nodes_recomputed = node_traces
             .iter()
@@ -4522,6 +4532,10 @@ mod drop_panic_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_value_code_race_tests.rs"]
 mod value_code_race_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_trace_tests.rs"]
+mod trace_tests;
 
 #[cfg(test)]
 mod tests {

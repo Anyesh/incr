@@ -67,6 +67,7 @@ both!(
     grid_insert_queries_watched_watches_every_node,
     grid_an_insert_with_a_live_key_creates_nothing,
     grid_an_insert_with_a_repeated_key_creates_nothing,
+    grid_an_insert_with_a_later_key_out_of_range_claims_nothing,
     grid_a_batch_dropped_mid_creation_frees_its_uncommitted_claims,
     grid_an_insert_replaces_a_deleted_node,
     grid_a_clean_reads_clone_that_misses_or_inserts_hits_the_contract,
@@ -563,6 +564,27 @@ fn grid_an_insert_with_a_repeated_key_creates_nothing<C: Cells>(rt: &Runtime<C>)
     assert_eq!(t.get(rt, key(0, 2, 0)), None);
     let h = t.get_or_insert_input(rt, key(0, 1, 0), || 1);
     assert_eq!(t.get(rt, key(0, 1, 0)), Some(h));
+}
+
+fn grid_an_insert_with_a_later_key_out_of_range_claims_nothing<C: Cells>(rt: &Runtime<C>) {
+    let t = rt.create_grid_table::<i64>();
+    let bad = key(0, GridKey::ROWS, 0);
+    assert!(refused_out_of_range(|| {
+        t.insert_inputs(rt, vec![(key(0, 1, 0), 1), (bad, 2)]);
+    }));
+    assert!(refused_out_of_range(|| {
+        t.insert_queries_watched(
+            rt,
+            [key(0, 2, 0), bad]
+                .into_iter()
+                .map(|k| (k, |_: &Runtime<C>| 2, QueryOpts::default()))
+                .collect(),
+        );
+    }));
+    assert_eq!(rt.node_count(), 0);
+    let h = t.insert_inputs(rt, vec![(key(0, 1, 0), 1), (key(0, 2, 0), 2)]);
+    assert_eq!(t.get(rt, key(0, 1, 0)), Some(h[0]));
+    assert_eq!(t.get(rt, key(0, 2, 0)), Some(h[1]));
 }
 
 /// What a panic while the runtime creates a batch's nodes leaves: the

@@ -451,7 +451,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     /// Sets every entry of the batch to `CLAIMED` under `miss`, the held
     /// miss mutex, so a repeated key finds its entry taken. Refuses the
     /// batch, putting every claim back, if a key repeats or has a live
-    /// node.
+    /// node, and before claiming any if a key is out of range.
     fn claim<E, G>(
         &self,
         rt: &Runtime<C>,
@@ -459,10 +459,14 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         key_of: impl Fn(&E) -> GridKey,
         miss: G,
     ) -> G {
+        // Only the refusal below puts claims back, so nothing after the
+        // first claim may panic.
+        for e in batch {
+            key_of(e).check();
+        }
         let mut pages = Pages::new(self);
         for (n, e) in batch.iter().enumerate() {
             let key = key_of(e);
-            key.check();
             let entry = pages.entry_or_create(key);
             let word = C::u64_load_relaxed(entry);
             let refused = if word == CLAIMED {
