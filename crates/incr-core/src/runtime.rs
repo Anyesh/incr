@@ -193,6 +193,9 @@ pub(crate) enum ParkPoint {
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
+    /// In a Failed read that found a payload it may take, after it loaded
+    /// the node's generation and before the record lock.
+    FailedReadBeforeRecheck(NodeId),
     /// In `seed_query`'s `inner.write()`, before the trust check of the
     /// trusted dep `NodeId`.
     SeedBeforeTrust(NodeId),

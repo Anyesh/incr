@@ -1727,6 +1727,59 @@ fn shared_vframe_relanded_failed_by_its_own_panic() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// As `keeps_the_payload`, but after the retry's Failed read of X found
+/// the payload and loaded X's generation, another thread deletes X and
+/// recycles its slot into Z, landed Failed by its own panic, before the
+/// read takes the record lock. The other thread's read let the failure
+/// out, so only the order with this thread first is serial, where the
+/// retry takes the payload; the re-check under the lock instead sends the
+/// read back, and it panics "last compute panicked" for Z.
+#[test]
+#[ignore = "the generation re-check reads Z's landing through X's id"]
+fn shared_vframe_failed_read_of_a_recycled_slot() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let (gate, recheck) = (Gate::new(), Gate::new());
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    hook(
+        &rt,
+        vec![
+            (ParkPoint::BeforeEntry(id(x)), gate.clone()),
+            (ParkPoint::FailedReadBeforeRecheck(id(x)), recheck.clone()),
+        ],
+    );
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    let other = outcome(|| rt.get(x));
+    assert!(failed(&other), "{other:?}");
+    recheck.arm();
+    gate.release();
+    recheck.wait_parked();
+    rt.delete_node(x);
+    let z = rt.create_query_with(|_: &Rt| -> u64 { panic!("z boom") }, replayable());
+    assert_eq!(z.slot(), x.slot(), "Z reuses X's slot");
+    assert_eq!(outcome(|| rt.get(z)), Err("z boom".to_string()));
+    recheck.release();
+    let first = first.join();
+    assert_eq!(first, Err("y boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
 /// T reads F, and F (Fallback 100), X and Y read each other in a
 /// cycle. At budget 1 Y's read of F is a virtual hit, and F's virtual
 /// frame pops as the root of an episode in which F panics "f boom", so

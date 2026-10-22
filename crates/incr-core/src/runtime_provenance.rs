@@ -142,6 +142,7 @@ impl<C: Cells> Runtime<C> {
         if candidates.is_empty() {
             return Ok(None);
         }
+        self.park(ParkPoint::FailedReadBeforeRecheck(id));
         let found = {
             let records = self.provenance.read();
             // Every Failed landing updates the records before its store, so
