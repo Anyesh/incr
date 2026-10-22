@@ -3045,6 +3045,40 @@ fn two_thread_oracle_rejects_a_failed_set_that_justifies_itself() {
     }
 }
 
+/// 0's first run is `Const(1)`, so no order computes 1 and none leaves
+/// anything Failed. With 0 patched Failed, its re-run reads 1, which
+/// computes, reads the patched 0 and lands Failed: a ground the check
+/// itself made, so 0 Failed has no cause and must be rejected.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_two_thread_oracle_rejects_a_failed_node_grounded_by_its_own_rerun() {
+    let q = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            q(Expr::FirstRun(
+                Box::new(Expr::Const(1)),
+                Box::new(Expr::Read(1, false)),
+            )),
+            q(Expr::Read(0, false)),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(0)],
+    };
+    match overlap_verdict(&case, &[0], NodeState::Failed, true) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("node 0 Failed with no panic anywhere passed: {v:?}"),
+    }
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
