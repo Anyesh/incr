@@ -2429,6 +2429,7 @@ impl<C: Cells> Runtime<C> {
     /// during this `get`.
     pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
         use crate::trace::TraceAction;
+        value_code::check();
 
         // Arm tracing: clear any prior log, then flip the gate so
         // compute_one starts appending events.
