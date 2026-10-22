@@ -2076,7 +2076,7 @@ fn member_run_frames_take_no_discovery_delivery() {
 /// dooms. Its new virtual frame dropped the walk's flag, so the panic
 /// delivered there went to 1's read of 2 uncontained, and 2 never reran:
 /// 0, 1 and 2 stayed Dirty where the unbounded run fails them. Seed
-/// 0x7e17bf5981b9d32e failed the same way.
+/// 0x7e17bf5981b9d32e and 0x40b5c24298f0a6ba failed the same way.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_stand_in_run_contains_a_panic_as_its_walk_does() {
@@ -2112,7 +2112,11 @@ fn a_stand_in_run_contains_a_panic_as_its_walk_does() {
         differential::<Local>(&case, 0xfb9f_33f9_9ad4_9897);
         differential::<Shared>(&case, 0xfb9f_33f9_9ad4_9897);
     });
-    for seed in [0xfb9f_33f9_9ad4_9897, 0x7e17_bf59_81b9_d32e] {
+    for seed in [
+        0xfb9f_33f9_9ad4_9897,
+        0x7e17_bf59_81b9_d32e,
+        0x40b5_c242_98f0_a6ba,
+    ] {
         let case = gen_case(seed, false, false);
         quiet(|| {
             differential::<Local>(&case, seed);
