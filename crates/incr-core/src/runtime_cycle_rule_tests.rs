@@ -1444,13 +1444,18 @@ fn quiet_uncopyable() {
 /// catching the panic of its own node of runtime B, whose payload no kept
 /// read can carry. Such a reader stays undoomed only within the budget, so
 /// the chain is bounded as one with a ticket payload is.
-fn foreign_panicking_chain_stays_within_the_stack<A: Cells, B: Cells>() {
+/// `b_frames` is B's frame budget, if not the default: the reader is A's
+/// frame, so A's budget bounds it whatever B's is.
+fn foreign_panicking_chain_stays_within_the_stack<A: Cells, B: Cells>(b_frames: Option<u32>) {
     quiet_uncopyable();
     let n = crate::test_size::test_size(100_000);
     let got = std::thread::spawn(move || {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_placeholder(0_i64);
+        if let Some(frames) = b_frames {
+            r2.set_max_frames(frames);
+        }
         let mut below: Option<Incr<i64>> = None;
         for _ in 0..n {
             let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
@@ -1483,7 +1488,7 @@ mod foreign_panic_chain {
     )]
     #[cfg_attr(miri, ignore)]
     fn local_shared() {
-        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>();
+        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(None);
     }
 
     #[test]
@@ -1493,6 +1498,16 @@ mod foreign_panic_chain {
     )]
     #[cfg_attr(miri, ignore)]
     fn shared_shared() {
-        super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>();
+        super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>(None);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared_with_b_unbudgeted() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(Some(u32::MAX));
     }
 }
