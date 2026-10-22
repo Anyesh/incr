@@ -33,10 +33,15 @@ pub(crate) const UNWIND_MASK: u64 = 3 << UNWIND_SHIFT;
 /// counter whether it must look for virtual frames.
 pub(crate) const REPLAY_BIT: u64 = 1 << 60;
 
+/// Set while this thread holds notes of Failed landings a panic in flight
+/// made (`runtime_provenance`), so that a frame pop whose closure caught
+/// that panic retires them.
+pub(crate) const NOTES_BIT: u64 = 1 << 59;
+
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
-/// so a live memo, unwind kind or replay context never trips the
+/// so a live memo, unwind kind, replay context or note never trips the
 /// contract panic.
-pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT);
+pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT | NOTES_BIT);
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
@@ -69,6 +74,16 @@ pub(crate) fn set_replay_bit(open: bool) {
             w.get() | REPLAY_BIT
         } else {
             w.get() & !REPLAY_BIT
+        })
+    });
+}
+
+pub(crate) fn set_notes_bit(held: bool) {
+    THREAD_WORD.with(|w| {
+        w.set(if held {
+            w.get() | NOTES_BIT
+        } else {
+            w.get() & !NOTES_BIT
         })
     });
 }

@@ -159,14 +159,18 @@ fn landed_shape(rt: Rt, y_reads_x: bool) -> Landed {
     }
 }
 
+type Outcome = Result<u64, String>;
+
 /// The unbounded run in which X's switched landing comes first:
-/// `get(X)`'s outcome, then `get(T)`'s, and X's runs.
-fn landed_first(mode: u8, y_reads_x: bool) -> (Result<u64, String>, Result<u64, String>, u32) {
+/// `get(X)`'s outcome, then `get(T)`'s, X's runs, and a later `get(T)`'s
+/// outcome, which for a Failed T names T rather than X.
+fn landed_first(mode: u8, y_reads_x: bool) -> (Outcome, Outcome, u32, Outcome) {
     let s = landed_shape(Rt::new(), y_reads_x);
     s.mode.store(mode, SeqCst);
     let x = outcome(|| s.rt.get(s.x));
     let t = outcome(|| s.rt.get(s.t));
-    (x, t, s.x_runs.load(SeqCst))
+    let runs = s.x_runs.load(SeqCst);
+    (x, t, runs, outcome(|| s.rt.get(s.t)))
 }
 
 /// **A VFrame's node landed by another thread** (Virtual cycles step 1,
@@ -196,7 +200,7 @@ fn vframe_node_landed(mode: u8, y_reads_x: bool) {
     entry.release();
     let t = reader.join();
 
-    let (want_x, want_t, runs) = landed_first(mode, y_reads_x);
+    let (want_x, want_t, runs, want_later) = landed_first(mode, y_reads_x);
     assert_eq!(x, want_x);
     assert_eq!(t, want_t);
     assert_eq!(
@@ -210,7 +214,7 @@ fn vframe_node_landed(mode: u8, y_reads_x: bool) {
         _ => NodeState::Failed,
     };
     assert_eq!(s.rt.state_of(s.x), landed);
-    assert_eq!(outcome(|| s.rt.get(s.t)), want_t, "a later read agrees");
+    assert_eq!(outcome(|| s.rt.get(s.t)), want_later, "a later read agrees");
     s.rt.assert_invariant_i();
 }
 

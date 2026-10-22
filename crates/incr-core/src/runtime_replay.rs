@@ -58,9 +58,19 @@ enum VPop {
     /// A doom or a dropped chain pushed entries: the driver picks its next
     /// entry again.
     Restart,
-    /// The run of the frame at the popped position ended, landing this
-    /// node (`true`) or unwinding: no retry computes it again.
-    Finished(u32, bool),
+    /// The run of the frame at the popped position ended: no retry
+    /// computes it again.
+    Finished(u32, Ended),
+}
+
+/// How the run of a popped frame ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    Landed,
+    Unwound,
+    /// The walk that computed the node contained the run's unwind, so the
+    /// walk goes on as after a compute that did not settle.
+    Contained,
 }
 
 /// Places the frames a virtual frame's pop pushes above its position, and
@@ -759,6 +769,7 @@ impl<C: Cells> Runtime<C> {
                     suspect,
                     spec: spec || suspect,
                     retry: Retry::Walk,
+                    walked: false,
                 },
             );
         });
@@ -797,6 +808,7 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         claimed_dirty: bool,
         direct: bool,
+        walked: bool,
     ) -> Computed {
         let target = if claimed_dirty {
             NodeState::Dirty
@@ -821,6 +833,7 @@ impl<C: Cells> Runtime<C> {
             } else {
                 Retry::Compute
             },
+            walked,
         );
         self.park(ParkPoint::AfterDoom(id));
         Computed::Doomed
@@ -843,7 +856,7 @@ impl<C: Cells> Runtime<C> {
             depth: self.dep_stack.depth(),
             context: 0,
         });
-        self.mark(id, handle.generation(), Retry::Compute);
+        self.mark(id, handle.generation(), Retry::Compute, false);
         self.park(ParkPoint::AfterDoom(id));
         self.placeholder_read::<T>(Some(f))
     }
@@ -929,14 +942,15 @@ impl<C: Cells> Runtime<C> {
         else {
             return;
         };
-        let Some(payload) = replay::copy_payload(payload) else {
+        let Some(copy) = replay::copy_payload(payload) else {
             return;
         };
         let what = Delivered::Unwind {
             cycle: kind == Some(UnwindKind::Cycle),
             poison: true,
             attributed: false,
-            payload,
+            payload: copy,
+            nodes: self.copy_notes(payload),
         };
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
@@ -1028,7 +1042,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Marks the reading frame F and the frames below it that can be
     /// doomed, makes them virtual frames, and pushes `n` one level above F.
-    fn mark(&self, n: NodeId, generation: u32, retry: Retry) {
+    fn mark(&self, n: NodeId, generation: u32, retry: Retry, walked: bool) {
         let rt = self.runtime_id;
         #[cfg(test)]
         assert!(
@@ -1080,13 +1094,17 @@ impl<C: Cells> Runtime<C> {
         // for a member run, that of the episode's root: its pop or its
         // group verify ran the episode, and runs it again.
         // SAFETY: as above.
-        let (target, target_retry) = if unsafe { &*bottom.ctl }.has(cycle::BUFFERED) {
+        let (target, target_retry, target_walked) = if unsafe { &*bottom.ctl }.has(cycle::BUFFERED)
+        {
             (
                 replay::member_run_root(bottom.cidx).unwrap_or(bottom.node),
                 Retry::Compute,
+                false,
             )
         } else {
-            (bottom.node, Retry::Direct)
+            // SAFETY: as above.
+            let walked = unsafe { &*bottom.ctl }.has(cycle::WALKED);
+            (bottom.node, Retry::Direct, walked)
         };
         let id = match joined {
             Some(id) => id,
@@ -1099,6 +1117,7 @@ impl<C: Cells> Runtime<C> {
                     suspect: false,
                     spec,
                     retry: target_retry,
+                    walked: target_walked,
                 },
             ),
         };
@@ -1148,6 +1167,7 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         self.owned_claims(f.cidx, f.node, f.path)
                     },
+                    walked: ctl.has(cycle::WALKED),
                 }
             })
             .collect();
@@ -1215,6 +1235,7 @@ impl<C: Cells> Runtime<C> {
                     suspect,
                     spec: spec || suspect,
                     retry,
+                    walked,
                 },
             );
         });
@@ -1252,7 +1273,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
-        if let Some(payload) = payload {
+        if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
             bag.push_erased(payload);
         }
         let wrote = ctl.wrote.get() != 0;
@@ -1514,10 +1535,10 @@ impl<C: Cells> Runtime<C> {
                         popped_frames.push((v.clone(), false));
                     }
                     VPop::Restart => continue 'entries,
-                    VPop::Finished(node, landed) => {
-                        popped_frames.push((v.clone(), landed));
+                    VPop::Finished(node, ended) => {
+                        popped_frames.push((v.clone(), ended != Ended::Unwound));
                         if let Some(computed) =
-                            self.frame_finished(id, level, entry, &v, node, landed)
+                            self.frame_finished(id, level, entry, &v, node, ended)
                         {
                             return computed;
                         }
@@ -1574,14 +1595,46 @@ impl<C: Cells> Runtime<C> {
                         // and this entry stays for the retry.
                         Ok(None) => continue,
                         Err(payload) => {
+                            let kind = cycle_state::unwind_kind();
+                            let contain = entry.walked
+                                && !self.episode_member(entry.node)
+                                && self.containable(kind, &*payload);
                             let mut bag = Deferred::new();
-                            self.continuation_unwound(entry.node, cidx, &*payload, &mut bag);
-                            bag.drain(self);
-                            match self.entry_unwound(id, level, entry, boundary, payload, failures)
-                            {
-                                Some(computed) => return computed,
-                                None => continue,
+                            let left = self
+                                .continuation_unwound(entry.node, cidx, payload, contain, &mut bag);
+                            if !contain {
+                                bag.drain(self);
+                                let payload = left
+                                    .expect("incr-core: an uncontained unwind keeps its payload");
+                                match self
+                                    .entry_unwound(id, level, entry, boundary, payload, failures)
+                                {
+                                    Some(computed) => return computed,
+                                    None => continue,
+                                }
                             }
+                            // The run is the walk entry's compute, whose walk
+                            // contains it as `compute_panicked` does.
+                            cycle_state::take_unwind_kind();
+                            self.retire_notes_above(cidx);
+                            if let Some(left) = left {
+                                bag.push_erased(left);
+                            }
+                            bag.drain(self);
+                            if level > 0 {
+                                self.hold_landing(id, level, entry.node, entry.generation, true);
+                            }
+                            replay::with(|c| {
+                                if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                                    x.pop_entry(level);
+                                    x.claims.retain(|&(l, _)| l < level);
+                                }
+                            });
+                            if level == 0 {
+                                self.close_context(id, boundary);
+                                return Computed::Unsettled;
+                            }
+                            continue;
                         }
                     }
                 }
@@ -1631,15 +1684,25 @@ impl<C: Cells> Runtime<C> {
                         } else {
                             visit
                         };
-                        self.compute_one::<VIRT>(NodeId(entry.node), visit, Some(entry.generation))
+                        self.compute_one::<VIRT>(
+                            NodeId(entry.node),
+                            visit,
+                            Some(entry.generation),
+                            entry.walked,
+                        )
                     } else {
                         let (id, generation) = (NodeId(entry.node), Some(entry.generation));
                         match entry.retry {
                             Retry::Walk => self.ensure_clean_virt(id, entry.generation),
-                            Retry::Compute => self.compute_one::<VIRT>(id, Visit::Full, generation),
-                            Retry::Direct => {
-                                self.compute_one::<VIRT>(id, Visit::Direct, generation)
+                            Retry::Compute => {
+                                self.compute_one::<VIRT>(id, Visit::Full, generation, entry.walked)
                             }
+                            Retry::Direct => self.compute_one::<VIRT>(
+                                id,
+                                Visit::Direct,
+                                generation,
+                                entry.walked,
+                            ),
                         }
                     }
                 }))
@@ -1695,7 +1758,13 @@ impl<C: Cells> Runtime<C> {
             debug_assert!(dropped.is_none(), "incr-core: a dropped run landed");
             debug_assert_ne!(computed, Computed::Doomed);
             if matches!(computed, Computed::Done | Computed::Unsettled) && level > 0 {
-                self.hold_landing(id, level, entry.node, entry.generation);
+                self.hold_landing(
+                    id,
+                    level,
+                    entry.node,
+                    entry.generation,
+                    computed == Computed::Unsettled,
+                );
             }
             replay::with(|c| {
                 if let Some(x) = c.iter_mut().find(|x| x.id == id) {
@@ -1861,7 +1930,7 @@ impl<C: Cells> Runtime<C> {
                     Ok(landed) => {
                         bag.drain(self);
                         if landed {
-                            VPop::Finished(v.node, true)
+                            VPop::Finished(v.node, Ended::Landed)
                         } else {
                             VPop::Next
                         }
@@ -1949,7 +2018,7 @@ impl<C: Cells> Runtime<C> {
     fn episode_task_end(&self, root: NodeId, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         let pop = match end {
             PopEnd::Suspended => VPop::Restart,
-            PopEnd::Landed => VPop::Finished(root.0, true),
+            PopEnd::Landed => VPop::Finished(root.0, Ended::Landed),
             _ => VPop::Next,
         };
         if let PopEnd::Dissolved = end {
@@ -1980,8 +2049,21 @@ impl<C: Cells> Runtime<C> {
     ) -> VPop {
         let kind = cycle_state::unwind_kind();
         let mut bag = Deferred::new();
+        let mut payload = payload;
         if continuation {
-            self.continuation_unwound(v.node, v.cidx, &*payload, &mut bag);
+            let contain =
+                v.walked && !self.episode_member(v.node) && self.containable(kind, &*payload);
+            let left = self.continuation_unwound(v.node, v.cidx, payload, contain, &mut bag);
+            if contain {
+                cycle_state::take_unwind_kind();
+                self.retire_notes_above(v.cidx);
+                if let Some(left) = left {
+                    bag.push_erased(left);
+                }
+                bag.drain(self);
+                return VPop::Finished(node, Ended::Contained);
+            }
+            payload = left.expect("incr-core: an uncontained unwind keeps its payload");
         }
         let (boundary, pos) = replay::with(|c| {
             let x = c
@@ -2013,7 +2095,9 @@ impl<C: Cells> Runtime<C> {
                 resume_unwind(payload);
             }
             cycle_state::take_unwind_kind();
-            bag.push_erased(payload);
+            if let Some(payload) = self.restore_contained(payload) {
+                bag.push_erased(payload);
+            }
             self.drop_chain(id, q, false, &mut bag);
             bag.drain(self);
             return VPop::Restart;
@@ -2036,44 +2120,48 @@ impl<C: Cells> Runtime<C> {
                         cycle: kind == Some(UnwindKind::Cycle),
                         poison,
                         attributed: cycle_state::failures() != failures,
+                        nodes: self.take_notes(&*payload),
                         payload,
                     },
                 );
             }
         });
         bag.drain(self);
-        VPop::Finished(node, false)
+        VPop::Finished(node, Ended::Unwound)
     }
 
     /// Lands held node `slot`, whose run at `cidx` ended in an unwind, as
     /// a compute's frame would: the claims anchored at or above `cidx` are
     /// released, and the node lands Failed for a user panic, or takes the
     /// discard landing for an engine unwind, which a speculative run's
-    /// panic is (`member_run`).
+    /// panic is (`member_run`). A `contain`ed panic stays with the Failed
+    /// node; otherwise the payload comes back.
     fn continuation_unwound(
         &self,
         slot: u32,
         cidx: u32,
-        payload: &(dyn std::any::Any + Send),
+        payload: Box<dyn std::any::Any + Send>,
+        contain: bool,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> Option<Box<dyn std::any::Any + Send>> {
         let rt = self.runtime_id;
         let kind = cycle_state::unwind_kind();
         let discarding = kind.is_some();
         // An episode's member stays held for its episode, as when the run
         // nests in its reader: only what the run left above it goes.
         if self.episode_member(slot) {
-            self.release_unwound_from(cidx, slot, kind, discarding, Some(payload), bag);
-            return;
+            self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
+            return Some(payload);
         }
         let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) else {
-            return;
+            return Some(payload);
         };
-        self.release_unwound_from(cidx, slot, kind, discarding, Some(payload), bag);
+        self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
         let id = NodeId(slot);
         let stamp_rev = self.current_revision();
-        if discarding {
+        let left = if discarding {
             self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
+            Some(payload)
         } else {
             let (node, flags) = self.nodes.get_with_flags(slot);
             let attempt = Attempt {
@@ -2081,6 +2169,11 @@ impl<C: Cells> Runtime<C> {
                 cidx,
                 stamp_rev,
                 verify_rev: C::walked(&self.walk, &self.revision),
+            };
+            let (view, contained) = if contain {
+                (None, Some(payload))
+            } else {
+                (Some(payload), None)
             };
             self.land_failed(
                 id,
@@ -2090,11 +2183,14 @@ impl<C: Cells> Runtime<C> {
                 e.wrote,
                 &e.deps,
                 &[],
-                Some(payload),
+                view.as_deref(),
+                contained,
                 bag,
             );
-        }
+            view
+        };
         bag.push_erased(Box::new((e.buf, e.s)));
+        left
     }
 
     /// Whether held node `slot` is a member of a running episode.
@@ -2219,7 +2315,9 @@ impl<C: Cells> Runtime<C> {
             if let Some(q) = own {
                 cycle_state::take_unwind_kind();
                 let mut bag = Deferred::new();
-                bag.push_erased(payload);
+                if let Some(payload) = self.restore_contained(payload) {
+                    bag.push_erased(payload);
+                }
                 self.drop_chain(id, q, true, &mut bag);
                 bag.drain(self);
                 return None;
@@ -2257,7 +2355,9 @@ impl<C: Cells> Runtime<C> {
             }
             cycle_state::take_unwind_kind();
             let mut bag = Deferred::new();
-            bag.push_erased(payload);
+            if let Some(payload) = self.restore_contained(payload) {
+                bag.push_erased(payload);
+            }
             self.drop_chain(id, q, false, &mut bag);
             bag.drain(self);
             return None;
@@ -2277,6 +2377,7 @@ impl<C: Cells> Runtime<C> {
                     cycle: kind == Some(UnwindKind::Cycle),
                     poison,
                     attributed: cycle_state::failures() != failures,
+                    nodes: self.take_notes(&*payload),
                     payload,
                 },
             );
@@ -2449,16 +2550,17 @@ impl<C: Cells> Runtime<C> {
             // SAFETY: the active frame's control block is live.
             unsafe { &*f.ctl }.lower(anchor);
         }
-        let (cycle, poison, attributed, payload) = match what {
+        let (cycle, poison, attributed, payload, nodes) = match what {
             Delivered::Unwind {
                 cycle,
                 poison,
                 attributed,
                 payload,
+                nodes,
             } => {
                 #[cfg(test)]
                 self.dirty_reads.lock().unwrap().push(handle.slot());
-                (cycle, poison, attributed, payload)
+                (cycle, poison, attributed, payload, nodes)
             }
             Delivered::Walk(_) | Delivered::Direct => {
                 unreachable!("incr-core: a walk's direction is not a value")
@@ -2492,6 +2594,7 @@ impl<C: Cells> Runtime<C> {
             if attributed {
                 cycle_state::count_failure();
             }
+            self.note_delivered(nodes, &*payload);
             resume_unwind(payload);
         }
         // A closure that swallowed the cycle and then panicked on its own
@@ -2518,8 +2621,9 @@ impl<C: Cells> Runtime<C> {
         entry: Entry,
         v: &VFrame,
         node: u32,
-        landed: bool,
+        ended: Ended,
     ) -> Option<Computed> {
+        let landed = ended != Ended::Unwound;
         let generation = self.nodes.get(node).generation();
         let (pos, boundary) = replay::with(|c| {
             let x = c
@@ -2529,7 +2633,7 @@ impl<C: Cells> Runtime<C> {
             (v.cidx - x.boundary, x.boundary)
         });
         if landed && pos > 0 {
-            self.hold_landing(id, pos, node, generation);
+            self.hold_landing(id, pos, node, generation, ended == Ended::Contained);
         }
         if pos != level || entry.node != node || entry.generation != generation {
             return None;
@@ -2542,6 +2646,9 @@ impl<C: Cells> Runtime<C> {
         });
         if level == 0 {
             self.close_context(id, boundary);
+            if ended == Ended::Contained {
+                return Some(Computed::Unsettled);
+            }
             // The read that ran the loop reads the target as the native
             // compute's reader does after its landing.
             if landed {
@@ -2557,7 +2664,9 @@ impl<C: Cells> Runtime<C> {
     /// frame's retry reads the slot as it is, as the unbounded run reads
     /// it right after the compute. If an episode landed it with no value,
     /// that read gets the episode's cycle, as the read that ran it would.
-    fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32) {
+    /// A walk stopped short of its root drops the node's other entries if
+    /// the compute left it `unsettled`, as `walk_stopped` does.
+    fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32, unsettled: bool) {
         let state = state::load::<C>(self.nodes.get(node).state_cell());
         let reading = u64::from(node) | (u64::from(generation) << 32);
         let what = match state {
@@ -2574,6 +2683,7 @@ impl<C: Cells> Runtime<C> {
                         // left New, and not of one left Cyclic.
                         poison: state == NodeState::New,
                         payload: Box::new(cycle::CycleUnwind(g.cycle.clone())),
+                        nodes: Vec::new(),
                     })
             }
             _ => None,
@@ -2591,7 +2701,12 @@ impl<C: Cells> Runtime<C> {
                 _ => None,
             });
             match (walk, what) {
-                (Some(walk), _) => walk.ran(node),
+                (Some(walk), _) => {
+                    walk.ran(node);
+                    if unsettled {
+                        walk.unsettled(NodeId(node));
+                    }
+                }
                 (None, Some(what)) if below.reading == reading => {
                     x.deliver_blocked(&below, what);
                 }

@@ -366,35 +366,38 @@ pub(crate) fn erase_opts<T: Value>(opts: QueryOpts<T>) -> ErasedOpts {
 }
 
 /// `ComputeCtl::flags`: a recompute, whose write compares first.
-pub(crate) const RECOMPUTE: u8 = 1;
+pub(crate) const RECOMPUTE: u16 = 1;
 /// `ComputeCtl::flags`: an episode's member run, whose value is buffered.
-pub(crate) const BUFFERED: u8 = 2;
+pub(crate) const BUFFERED: u16 = 2;
 /// `ComputeCtl::flags`: the frame read a node of a cycle that is still
 /// open, so its value is provisional and is buffered, not written.
-pub(crate) const LOW: u8 = 4;
+pub(crate) const LOW: u16 = 4;
 /// `ComputeCtl::flags`: a dep read in the frame did not land `Clean`.
-pub(crate) const POISONED: u8 = 8;
+pub(crate) const POISONED: u16 = 8;
 /// `ComputeCtl::flags`: the frame is doomed, so a table miss in it
 /// returns a pending handle and creates nothing.
-pub(crate) const DOOMED: u8 = 16;
+pub(crate) const DOOMED: u16 = 16;
 /// `ComputeCtl::flags`: a read in the frame returned a placeholder, so
 /// every node it reads after is reached through a suspect edge.
-pub(crate) const PH_SEEN: u8 = 32;
+pub(crate) const PH_SEEN: u16 = 32;
 /// `ComputeCtl::flags`: a read in the frame returned a value a landing
 /// had left Dirty, or took an unwind, which `replay::keep_read` keeps for
 /// a retry.
-pub(crate) const KEPT_READ: u8 = 64;
+pub(crate) const KEPT_READ: u16 = 64;
 /// A member run at its anchor, below the frames that read it, or a frame
 /// that has read another runtime's node in this run: it is never doomed,
 /// and marking stops at it.
-pub(crate) const NO_DOOM: u8 = 128;
+pub(crate) const NO_DOOM: u16 = 128;
+/// `ComputeCtl::flags`: the compute is a walk's entry, or a replay of
+/// one, which contains a panic out of it (`compute_panicked`).
+pub(crate) const WALKED: u16 = 256;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
 /// it while the closure runs.
 #[doc(hidden)]
 pub struct ComputeCtl {
-    pub(crate) flags: Cell<u8>,
+    pub(crate) flags: Cell<u16>,
     /// The lowest conceptual-stack position this frame reached through a
     /// cycle read, as in Tarjan's algorithm. Starts at the frame's own.
     pub(crate) lowlink: Cell<u32>,
@@ -408,7 +411,7 @@ pub struct ComputeCtl {
 
 impl ComputeCtl {
     #[inline(always)]
-    pub(crate) fn new(flags: u8) -> Self {
+    pub(crate) fn new(flags: u16) -> Self {
         Self {
             flags: Cell::new(flags),
             lowlink: Cell::new(u32::MAX),
@@ -419,12 +422,12 @@ impl ComputeCtl {
     }
 
     #[inline(always)]
-    pub(crate) fn has(&self, flag: u8) -> bool {
+    pub(crate) fn has(&self, flag: u16) -> bool {
         self.flags.get() & flag != 0
     }
 
     #[inline(always)]
-    pub(crate) fn raise(&self, flag: u8) {
+    pub(crate) fn raise(&self, flag: u16) {
         self.flags.set(self.flags.get() | flag);
     }
 

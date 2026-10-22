@@ -1855,13 +1855,13 @@ fn two_thread_swapped_order_seeds() {
 }
 
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
-/// cycle, and each order of them leaves {7, 10, 11, 12, 13} Failed. Here
-/// op 7's walk is held at its first compute, node 3, while op 8 lands 10
-/// to 13 Failed; the walk then computes 3 from its plan, 3's read meets 12
-/// Failed, and 3 lands Failed with 7 left Dirty. That is history (T8, the
-/// read case table), and the oracle takes it: a re-run of 3 panics, and
-/// so does a get of 7. Swap bit 1, not bit 0 (ops 5 and 6), runs op 8 first,
-/// which gets the closure's payload.
+/// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
+/// walk is held at its first compute, node 3, while op 8 lands 10 to 13
+/// Failed; the walk then computes 3 from its plan, 3's read meets 12
+/// Failed, and the walk contains that, so its readers rerun and land
+/// Failed as in either order: the run is serial, with no history for
+/// the oracle to judge. Swap bit 1, not bit 0 (ops 5 and 6), runs op 8
+/// first, which gets the closure's payload.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
@@ -1890,6 +1890,10 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
         assert!(first(8) < first(7));
         let serial = run::<Shared>(&swapped.case, None, 0);
         assert_eq!(serial[first(8)].0, Out::Panic("boom 0:11".to_owned()));
+        let orders = [
+            settled(&run::<Shared>(&case, None, 0)[8].1 .0),
+            settled(&serial[first(7)].1 .0),
+        ];
 
         let hold = Arc::new(Hold {
             on: AtomicBool::new(false),
@@ -1930,10 +1934,11 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
             *verdict.lock().unwrap() = v;
             stop
         });
-        let failed = [3, 10, 11, 12, 13].map(|x| (x, NodeState::Failed));
+        let failed = [0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map(|x| (x, NodeState::Failed));
+        assert_eq!(orders, [failed, failed].map(Vec::from));
         assert_eq!(*left.lock().unwrap(), failed);
         let verdict = verdict.into_inner().unwrap();
-        assert_eq!(verdict, Some(Ok(())));
+        assert_eq!(verdict, None);
         serial.check("0x934", &got, verdict);
     });
 }

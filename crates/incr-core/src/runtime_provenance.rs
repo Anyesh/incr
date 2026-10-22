@@ -101,6 +101,14 @@ impl<C: Cells> Runtime<C> {
                 Ok(taken) => payload = taken,
             }
         }
+        // A held delivery's payload goes first: a ticket for a panic that
+        // passed the delivery's failure on is not the read's own.
+        if payload.is_none() {
+            match self.take_contained(id) {
+                Err(Left) => return,
+                Ok(taken) => payload = taken,
+            }
+        }
         // A closure that catches this panic has still read a node with no
         // value, so it must not land Clean over it.
         self.dep_stack.poison_current_frame(self.runtime_id);
@@ -171,8 +179,8 @@ impl<C: Cells> Runtime<C> {
     /// names, the read's panic is carried until a landing lets it out or
     /// another Failed read of the same node. That read's frame is the
     /// reading frame, or the virtual frame below when the read is a driver
-    /// entry's own compute; the Failed node is the read node, or a dep its
-    /// walk reached first.
+    /// entry's own compute; the Failed node is the read node, as a walk
+    /// takes a Failed dep as changed without reading it.
     fn note_failed_read(&self, id: NodeId) {
         let rt = self.runtime_id;
         if replay::carry().is_some_and(|c| c.rt == rt && c.node == id.0) {
@@ -284,4 +292,4 @@ impl<C: Cells> Runtime<C> {
 
 /// A Failed read's node left Failed, or its slot was recycled, before the
 /// read could tell which landing it saw.
-struct Left;
+pub(super) struct Left;
