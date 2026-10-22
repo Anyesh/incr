@@ -10,6 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use super::race_tests::{id, park_at, Gate};
+use super::replay_tests::replayable;
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
@@ -1217,4 +1218,124 @@ fn wave6_contained_episode_abort_keeps_member_drop_panic_under_replay() {
         },
     )
     .assert_clean();
+}
+
+/// A value whose `Drop` panics when only a run the unbounded one never
+/// makes could have built it: a speculative run, or a doomed one fed the
+/// `u64` placeholder (`v == 0`). A clone is its reader's, so it never
+/// panics.
+#[derive(Debug)]
+struct Stray {
+    v: u64,
+    spec: bool,
+}
+
+impl Stray {
+    fn new(v: u64) -> Self {
+        Stray {
+            v,
+            spec: crate::replay::speculative(),
+        }
+    }
+}
+
+impl Clone for Stray {
+    fn clone(&self) -> Self {
+        Stray {
+            v: self.v,
+            spec: false,
+        }
+    }
+}
+
+impl PartialEq for Stray {
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v
+    }
+}
+
+impl Drop for Stray {
+    fn drop(&mut self) {
+        if (self.spec || self.v == 0) && !std::thread::panicking() {
+            panic!("stray {} dropped", self.v);
+        }
+    }
+}
+
+fn in_shared_child(name: &str, body: fn(&Runtime<Shared>)) {
+    run_in_child(name, || {
+        let rt = Runtime::<Shared>::new();
+        prime_reclaim_timer(&rt);
+        reclaim_probe::force(RetireSite::ComputeWrite);
+        body(&rt);
+    })
+    .assert_clean();
+}
+
+/// A doomed run reads the placeholder and still returns a value, which
+/// the unbounded run never builds: its drop is not the read's to raise.
+fn doomed_runs_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let b = rt.create_query(|_| 5_u64);
+    let r = rt.create_query_with(move |rt| Stray::new(rt.get(b)), replayable());
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(r).v));
+    assert_eq!(got.ok(), Some(5));
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the read of b dooms");
+}
+
+#[test]
+fn local_doomed_runs_value_drop_is_not_raised() {
+    doomed_runs_value_drop_is_not_raised(&Runtime::<Local>::new());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_doomed_runs_value_drop_is_not_raised() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_doomed_runs_value_drop_is_not_raised",
+        doomed_runs_value_drop_is_not_raised,
+    );
+}
+
+/// A doomed run's placeholder leads it to read `c`, which no placeholder
+/// stands in for, so it computes natively, speculatively, and lands
+/// Clean. The unbounded run never reads `c`, so the value its recompute
+/// displaces is one that run never built.
+fn speculative_clean_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let b = rt.create_query(|_| 5_u64);
+    let c = rt.create_query(move |rt| Stray::new(rt.get(input) + 10));
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c).v
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(rt.state_of(c), NodeState::Clean, "the speculative run landed c");
+    rt.set(input, 2);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(c).v));
+    assert_eq!(got.ok(), Some(12));
+}
+
+#[test]
+fn local_speculative_clean_value_drop_is_not_raised() {
+    speculative_clean_value_drop_is_not_raised(&Runtime::<Local>::new());
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_speculative_clean_value_drop_is_not_raised() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_speculative_clean_value_drop_is_not_raised",
+        speculative_clean_value_drop_is_not_raised,
+    );
 }
