@@ -480,3 +480,47 @@ local_and_shared!(
     local_frame_paths_agree,
     shared_frame_paths_agree
 );
+
+/// Each round builds a runtime with a frame budget it never reaches, where
+/// f reads p and p caught q's panic, so f's read of p is Dirty. Once the
+/// round's runtime is dropped, no clone of p's value may survive it: the
+/// probe's strong count is back to 1 after every round.
+fn wave7_kept_dirty_read_outlives_runtime<C: Cells>() {
+    std::thread::spawn(|| {
+        let probe = Arc::new(());
+        for round in 1..=3_usize {
+            let rt = Runtime::<C>::new();
+            rt.set_max_frames(64);
+            let q = rt.create_query(|_rt| -> u64 { panic!("q boom") });
+            let pr = probe.clone();
+            let p = rt.create_query(move |rt| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+                pr.clone()
+            });
+            let f = rt.create_query(move |rt| {
+                let _ = rt.get(p);
+                0_u64
+            });
+            assert_eq!(rt.get(f), 0);
+            drop(rt);
+            haphazard::Domain::global().eager_reclaim();
+            assert_eq!(
+                Arc::strong_count(&probe),
+                1,
+                "round {round}: a kept read outlived its runtime"
+            );
+        }
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn wave7_local_kept_dirty_read_is_released_with_its_runtime() {
+    wave7_kept_dirty_read_outlives_runtime::<Local>();
+}
+
+#[test]
+fn wave7_shared_kept_dirty_read_is_released_with_its_runtime() {
+    wave7_kept_dirty_read_outlives_runtime::<Shared>();
+}
