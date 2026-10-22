@@ -139,6 +139,11 @@ pub(crate) struct Delivery {
     /// read of that node that finds it landed by a run that let the
     /// panic's failure out takes this payload instead.
     pub(crate) provenance: Option<Rc<dyn Provenance>>,
+    /// With a provenance record, the virtual frames below the frame's that
+    /// have popped since, contiguous and highest first, as `(cidx, node,
+    /// generation)`: a read of one of their nodes stands for its frame's
+    /// run.
+    pub(crate) below: Vec<(u32, u32, u32)>,
 }
 
 /// The shared record of a user panic held for a virtual frame whose
@@ -240,10 +245,6 @@ pub(crate) struct Context {
     /// The provenance record the running entry's unwind carries to the
     /// delivery it makes for the frame below.
     pub(crate) provenance: Option<Rc<dyn Provenance>>,
-    /// The virtual frames the running entry's start popped, as `(cidx,
-    /// node, generation)`, kept only while a delivery has a provenance
-    /// record: a read of one of their nodes stands for its frame's run.
-    pub(crate) popped: Vec<(u32, u32, u32)>,
 }
 
 impl Context {
@@ -268,7 +269,6 @@ impl Context {
             drop_at: None,
             drop_point: None,
             provenance: None,
-            popped: Vec::new(),
         }
     }
 
@@ -343,6 +343,7 @@ impl Context {
             blocked: true,
             what,
             provenance,
+            below: Vec::new(),
         });
     }
 
@@ -359,6 +360,7 @@ impl Context {
             blocked: false,
             what: Delivered::Walk(Box::new(walk)),
             provenance: None,
+            below: Vec::new(),
         });
     }
 
@@ -380,6 +382,7 @@ impl Context {
                 blocked: false,
                 what: Delivered::Direct,
                 provenance: None,
+                below: Vec::new(),
             });
         }
     }

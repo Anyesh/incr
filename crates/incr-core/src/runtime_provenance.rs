@@ -101,7 +101,7 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The payload held for the frame of `id` at the position its compute
-    /// would take, or for a frame above it that popped with `id`'s frame
+    /// would take, or for a frame above it whose pops reached `id`'s frame
     /// there, if another thread's landing of `id` let that payload's read
     /// failure out. Taken as `take_delivery` takes one: a copy, and the
     /// delivery kept for a retry doomed again, if the payload can be
@@ -113,15 +113,12 @@ impl<C: Cells> Runtime<C> {
         let at = self.dep_stack.next_cidx();
         let (attributed, payload) = replay::with(|c| {
             c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
-                let popped = |cidx, node, generation| x.popped.contains(&(cidx, node, generation));
                 let i = x.pending.iter().position(|d| {
                     let k = d.key;
                     !d.taken
                         && matches!(d.what, Delivered::Unwind { cycle: false, .. })
                         && ((k.cidx == at && k.node == id.0 && k.generation == generation)
-                            || (k.cidx > at
-                                && popped(at, id.0, generation)
-                                && popped(k.cidx, k.node, k.generation)))
+                            || d.below.contains(&(at, id.0, generation)))
                         && d.provenance
                             .as_ref()
                             .is_some_and(|p| p.propagated(id.0, generation))

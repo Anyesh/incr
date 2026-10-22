@@ -1190,6 +1190,7 @@ impl<C: Cells> Runtime<C> {
                         blocked: false,
                         what,
                         provenance: None,
+                        below: Vec::new(),
                     });
                 }
             }
@@ -1401,7 +1402,6 @@ impl<C: Cells> Runtime<C> {
                 x.running_entry = None;
                 x.drop_point = None;
                 x.provenance = None;
-                x.popped.clear();
                 let track = x.pending.iter().any(|d| d.provenance.is_some());
                 (level, entry, parked, track)
             });
@@ -1428,7 +1428,11 @@ impl<C: Cells> Runtime<C> {
                         };
                         let v = x.pop_vframe()?;
                         if track {
-                            x.popped.push((v.cidx, v.node, v.generation));
+                            for d in x.pending.iter_mut().filter(|d| d.provenance.is_some()) {
+                                if d.below.last().map_or(d.key.cidx, |b| b.0) == v.cidx + 1 {
+                                    d.below.push((v.cidx, v.node, v.generation));
+                                }
+                            }
                         }
                         Some((v, !x.vstack.is_empty(), kept))
                     } else {
