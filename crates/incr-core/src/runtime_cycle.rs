@@ -831,10 +831,10 @@ impl<C: Cells> Runtime<C> {
         cycle_state::take_unwind_kind();
         let mut bag = Deferred::new();
         if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
-            bag.push_erased(payload);
+            bag.push_erased(Box::new(Unbuilt::new(payload)));
         }
         if let Some(value) = ctl.buf.take() {
-            bag.push_erased(value);
+            bag.push_erased(Box::new(Unbuilt::new(value)));
         }
         self.release_held_from(cidx + 1, true, Some(UnwindKind::Discard), &mut bag);
         let old = cycle_state::with_held(|h| {
@@ -1736,7 +1736,13 @@ impl<C: Cells> Runtime<C> {
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
-            bag.push_erased(Box::new(e.into_values()));
+            // A discarded claim's run is one the unbounded run never makes,
+            // or makes again on the retry.
+            if kind == Some(UnwindKind::Discard) {
+                bag.push_erased(Box::new(Unbuilt::new(Box::new(e.into_values()))));
+            } else {
+                bag.push_erased(Box::new(e.into_values()));
+            }
         }
     }
 

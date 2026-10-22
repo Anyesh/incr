@@ -7,6 +7,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle_state::{Held, Look};
+use crate::deferred::Unbuilt;
 use crate::dep_stack::Placement;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
@@ -1273,10 +1274,10 @@ impl<C: Cells> Runtime<C> {
         let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
         self.release_held_except(attempt.cidx, &keep, bag);
         if let Some(value) = ctl.buf.take() {
-            bag.push_erased(value);
+            bag.push_erased(Box::new(Unbuilt::new(value)));
         }
         if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
-            bag.push_erased(payload);
+            bag.push_erased(Box::new(Unbuilt::new(payload)));
         }
         let wrote = ctl.wrote.get() != 0;
         match rooted {

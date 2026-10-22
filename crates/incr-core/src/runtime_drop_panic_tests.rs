@@ -1320,7 +1320,11 @@ fn speculative_clean_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
         replayable(),
     );
     assert_eq!(rt.get(r), 5);
-    assert_eq!(rt.state_of(c), NodeState::Clean, "the speculative run landed c");
+    assert_eq!(
+        rt.state_of(c),
+        NodeState::Clean,
+        "the speculative run landed c"
+    );
     rt.set(input, 2);
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(c).v));
     assert_eq!(got.ok(), Some(12));
