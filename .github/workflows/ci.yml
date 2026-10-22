@@ -148,6 +148,7 @@ jobs:
           - { model: "loom_models::vframe_failed_provenance", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance_relanded", bound: 2 }
           - { model: "loom_models::drain_vs_set", bound: 2 }
+          - { model: "loom_models::flip_racing_a_contained_hold_releases_the_ticket", bound: 2 }
           - { model: "loom_seed_models::seed_vs_set", bound: 2 }
           - { model: "loom_seed_models::seed_vs_dep_recompute", bound: 2 }
           - { model: "loom_seed_models::seed_vs_reader", bound: 2 }
