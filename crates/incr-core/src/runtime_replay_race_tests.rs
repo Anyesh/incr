@@ -1392,19 +1392,50 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
     );
 }
 
-/// X reads Y, which panics "y boom"; X lets that panic out, or with
-/// `repanic` catches it and panics "x own". At budget 1 `get(X)` dooms X
-/// on Y, Y's entry lands Failed and its payload waits for X's retry; the
-/// driver parks before that retry while another thread computes X, which
-/// reads Y Failed and lands X Failed. Each read's outcome must be one of
-/// a serial order's: X's first reader gets what X's closure makes of
-/// "y boom", and the other "last compute panicked".
-fn vframe_landed_failed_over_a_delivery(
-    repanic: bool,
+/// What a closure does with the panic of a read below it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Panics {
+    /// Lets it out.
+    Out,
+    /// Catches it and panics with its own payload.
+    Own,
+    /// Catches it, reads the node again and lets that read's panic out.
+    Twice,
+}
+
+fn panicking_reader(rt: &Rt, read: Incr<u64>, panics: Panics, own: &'static str) -> Incr<u64> {
+    rt.create_query_with(
+        move |rt: &Rt| match panics {
+            Panics::Out => rt.get(read) + 1,
+            Panics::Own => {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(read)));
+                panic!("{own}")
+            }
+            Panics::Twice => {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(read)));
+                rt.get(read) + 1
+            }
+        },
+        replayable(),
+    )
+}
+
+/// X reads Y, which panics "y boom", and X does `x` with that panic;
+/// with `w`, W reads X and does `w` with its panic. One thread's
+/// `get(top)`, W or else X, dooms the first frame whose read is at the
+/// budget, one frame per node, so Y's entry lands Failed and its payload
+/// waits for X's virtual frame. The driver parks before the next entry
+/// while another thread reads `other_reads` (X or W), which reads Y
+/// Failed and lands what it computed Failed. Each read's outcome must be
+/// one of a serial order's, and no provenance record outlives the reads.
+fn landed_failed_over_a_delivery(
+    x: Panics,
+    w: Option<Panics>,
+    other_reads_w: bool,
 ) -> (Result<u64, String>, Result<u64, String>) {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
-    rt.set_max_frames(1);
+    rt.set_max_frames(1 + u32::from(w.is_some()));
     let gate = Gate::new();
     let y = {
         let gate = gate.clone();
@@ -1416,28 +1447,23 @@ fn vframe_landed_failed_over_a_delivery(
             replayable(),
         )
     };
-    let x = rt.create_query_with(
-        move |rt: &Rt| {
-            if repanic {
-                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(y)));
-                panic!("x own")
-            }
-            rt.get(y) + 1
-        },
-        replayable(),
-    );
-    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let xn = panicking_reader(&rt, y, x, "x own");
+    let wn = w.map(|w| panicking_reader(&rt, xn, w, "w own"));
+    let top = wn.unwrap_or(xn);
+    let other_reads = if other_reads_w { top } else { xn };
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(top)), gate.clone())]);
     let first = {
         let rt = rt.clone();
-        spawn(move || outcome(|| rt.get(x)))
+        spawn(move || outcome(|| rt.get(top)))
     };
     gate.wait_parked();
     assert_eq!(rt.state_of(y), NodeState::Failed);
-    let other = outcome(|| rt.get(x));
-    assert_eq!(rt.state_of(x), NodeState::Failed);
+    let other = outcome(|| rt.get(other_reads));
+    assert_eq!(rt.state_of(other_reads), NodeState::Failed);
     gate.release();
     let first = first.join();
     rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
     (first, other)
 }
 
@@ -1446,21 +1472,162 @@ fn failed(r: &Result<u64, String>) -> bool {
         .is_err_and(|m| m.contains("last compute panicked"))
 }
 
-/// Class A of the two-thread all-seeds scan (seed 0x172): the retry finds
-/// X landed and drops the payload, so both reads panic "last compute
-/// panicked". Handing the payload to X's reader whenever X is found
-/// landed fails the test below, whose X landed Failed by its own panic.
+/// Class A of the two-thread all-seeds scan (seed 0x172), at budget 1:
+/// the other thread's X let Y's failed read out, so only the order with
+/// this thread first is serial, and its retry of X takes the payload.
 #[test]
-#[ignore = "class A: awaits the rule for a payload whose frame another thread landed"]
 fn shared_vframe_landed_failed_keeps_the_payload() {
-    let (first, other) = vframe_landed_failed_over_a_delivery(false);
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, None, false);
     assert!(failed(&other), "{other:?}");
     assert_eq!(first, Err("y boom".to_string()), "the payload was dropped");
 }
 
+/// X's own panic makes only the other thread's order serial.
 #[test]
 fn shared_vframe_landed_failed_by_its_own_panic() {
-    let (first, other) = vframe_landed_failed_over_a_delivery(true);
+    let (first, other) = landed_failed_over_a_delivery(Panics::Own, None, false);
     assert_eq!(other, Err("x own".to_string()));
     assert!(failed(&first), "{first:?}");
+}
+
+/// X lets out its second read of Y, not the one the payload is for: in
+/// either order both reads panic "last compute panicked".
+#[test]
+fn shared_vframe_landed_failed_by_a_later_read() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Twice, None, false);
+    assert!(failed(&other), "{other:?}");
+    assert!(failed(&first), "{first:?}");
+}
+
+/// At budget 2 X's virtual frame sits above W's, and W's retry reads X
+/// natively.
+#[test]
+fn shared_vframe_landed_failed_under_a_native_read() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Out), false);
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    let (first, other) = landed_failed_over_a_delivery(Panics::Own, Some(Panics::Out), false);
+    assert_eq!(other, Err("x own".to_string()));
+    assert!(failed(&first), "{first:?}");
+}
+
+/// The other thread lands both W and X, the frames of a chain, and only
+/// a landing of W that let the failure out allows this thread first.
+#[test]
+fn shared_vframe_chain_landed_failed() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Out), true);
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Own), true);
+    assert_eq!(other, Err("w own".to_string()));
+    assert!(failed(&first), "{first:?}");
+}
+
+/// X is still computing on the other thread when the retry of X claims
+/// it, so the retry waits and then reads X Failed.
+#[test]
+fn shared_vframe_landed_failed_while_the_retry_waits() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let (gate, inside, waits) = (Gate::new(), Gate::new(), Gate::new());
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = {
+        let inside = inside.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                inside.park();
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
+    hook(
+        &rt,
+        vec![
+            (ParkPoint::BeforeEntry(id(x)), gate.clone()),
+            (ParkPoint::ComputeWaits(id(x)), waits.clone()),
+        ],
+    );
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    inside.arm();
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    inside.wait_parked();
+    waits.arm();
+    gate.release();
+    waits.wait_parked();
+    inside.release();
+    let other = other.join();
+    waits.release();
+    let first = first.join();
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// The other thread's read of X dooms too, before Y lands, so its Failed
+/// read of Y is its Y entry's compute, delivered to its own retry of X,
+/// which lets it out.
+#[test]
+fn shared_vframe_landed_failed_by_a_replayed_read() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let (gate, other_entry) = (Gate::new(), Gate::new());
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    hook(
+        &rt,
+        vec![
+            (ParkPoint::BeforeEntry(id(x)), gate.clone()),
+            (ParkPoint::BeforeEntry(id(y)), other_entry.clone()),
+        ],
+    );
+    other_entry.arm();
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    other_entry.wait_parked();
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    other_entry.release();
+    let other = other.join();
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }

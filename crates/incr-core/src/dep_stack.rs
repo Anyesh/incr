@@ -300,6 +300,15 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// `rt`'s active frame's node and position, the node it reads now and
+    /// how many times it has read it, this read included.
+    fn active_read(&self, rt: RuntimeId) -> Option<(NodeId, u32, u64, u32)> {
+        self.with(|s| {
+            s.active(rt)
+                .map(|top| (top.node, top.cidx, top.reading, top.reads_of_reading()))
+        })
+    }
+
     /// How many times `rt`'s active frame has read the node it reads
     /// now, this read included.
     fn reads_of_current(&self, rt: RuntimeId) -> u32 {

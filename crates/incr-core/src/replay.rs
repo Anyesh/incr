@@ -13,6 +13,7 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::handle::RuntimeId;
@@ -133,6 +134,28 @@ pub(crate) struct Delivery {
     /// outcome of the same read replaces; otherwise an earlier read's.
     pub(crate) blocked: bool,
     pub(crate) what: Delivered,
+    /// For a user panic out of an entry whose node landed Failed, the
+    /// record another thread's run of the frame's node consults: a Failed
+    /// read of that node that finds it landed by a run that let the
+    /// panic's failure out takes this payload instead.
+    pub(crate) provenance: Option<Rc<dyn Provenance>>,
+}
+
+/// The shared record of a user panic held for a virtual frame whose
+/// node another thread may compute and land Failed.
+pub(crate) trait Provenance {
+    /// Whether the landing of `node` at `generation` let the read failure
+    /// of the record's node out unchanged.
+    fn propagated(&self, node: u32, generation: u32) -> bool;
+}
+
+/// This thread's Failed read that a provenance record names: the
+/// runtime, the record and the node read.
+#[derive(Clone, Copy)]
+pub(crate) struct Carry {
+    pub(crate) rt: RuntimeId,
+    pub(crate) record: u64,
+    pub(crate) node: u32,
 }
 
 pub(crate) enum Delivered {
@@ -214,6 +237,13 @@ pub(crate) struct Context {
     /// cooperatively, by dooming every frame of the run: the driver drops
     /// it once the run comes back discarded.
     pub(crate) drop_point: Option<u32>,
+    /// The provenance record the running entry's unwind carries to the
+    /// delivery it makes for the frame below.
+    pub(crate) provenance: Option<Rc<dyn Provenance>>,
+    /// The virtual frames the running entry's start popped, as `(cidx,
+    /// node, generation)`, kept only while a delivery has a provenance
+    /// record: a read of one of their nodes stands for its frame's run.
+    pub(crate) popped: Vec<(u32, u32, u32)>,
 }
 
 impl Context {
@@ -237,6 +267,8 @@ impl Context {
             lows: Vec::new(),
             drop_at: None,
             drop_point: None,
+            provenance: None,
+            popped: Vec::new(),
         }
     }
 
@@ -296,7 +328,12 @@ impl Context {
 
     /// Pops the top virtual frame.
     /// Delivers `what` to the read virtual frame `below` was blocked in.
-    pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) {
+    pub(crate) fn deliver_blocked(
+        &mut self,
+        below: &VFrame,
+        what: Delivered,
+        provenance: Option<Rc<dyn Provenance>>,
+    ) {
         let key = ReadKey::blocked(below);
         self.pending.retain(|d| !(d.blocked && d.key == key));
         self.pending.push(Delivery {
@@ -305,6 +342,7 @@ impl Context {
             taken: false,
             blocked: true,
             what,
+            provenance,
         });
     }
 
@@ -320,6 +358,7 @@ impl Context {
             taken: false,
             blocked: false,
             what: Delivered::Walk(Box::new(walk)),
+            provenance: None,
         });
     }
 
@@ -340,6 +379,7 @@ impl Context {
                 taken: false,
                 blocked: false,
                 what: Delivered::Direct,
+                provenance: None,
             });
         }
     }
@@ -410,6 +450,7 @@ thread_local! {
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
+    static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
 }
@@ -420,6 +461,7 @@ loom::thread_local! {
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
+    static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
 }
@@ -727,6 +769,16 @@ pub(crate) fn with<R>(f: impl FnOnce(&mut Vec<Context>) -> R) -> R {
         value_code::set_replay_bit(!c.is_empty());
         r
     })
+}
+
+/// The Failed read a provenance record named, until a later Failed read
+/// of the same node on this thread.
+pub(crate) fn carry() -> Option<Carry> {
+    CARRY.with(Cell::get)
+}
+
+pub(crate) fn set_carry(carry: Option<Carry>) {
+    CARRY.with(|c| c.set(carry));
 }
 
 /// Opens a context, returning its id.

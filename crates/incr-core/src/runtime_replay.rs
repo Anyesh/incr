@@ -1189,6 +1189,7 @@ impl<C: Cells> Runtime<C> {
                         taken: false,
                         blocked: false,
                         what,
+                        provenance: None,
                     });
                 }
             }
@@ -1379,7 +1380,7 @@ impl<C: Cells> Runtime<C> {
     /// run left it.
     fn run_loop(&self, id: u64, visit: Visit) -> Computed {
         'entries: loop {
-            let (level, entry, parked) = replay::with(|c| {
+            let (level, entry, parked, track) = replay::with(|c| {
                 let x = c
                     .iter_mut()
                     .find(|x| x.id == id)
@@ -1399,7 +1400,10 @@ impl<C: Cells> Runtime<C> {
                 x.running = Some(level);
                 x.running_entry = None;
                 x.drop_point = None;
-                (level, entry, parked)
+                x.provenance = None;
+                x.popped.clear();
+                let track = x.pending.iter().any(|d| d.provenance.is_some());
+                (level, entry, parked, track)
             });
             self.park(ParkPoint::BeforeEntry(NodeId(entry.node)));
             let failures = cycle_state::failures();
@@ -1422,7 +1426,11 @@ impl<C: Cells> Runtime<C> {
                             }
                             _ => Vec::new(),
                         };
-                        x.pop_vframe().map(|v| (v, !x.vstack.is_empty(), kept))
+                        let v = x.pop_vframe()?;
+                        if track {
+                            x.popped.push((v.cidx, v.node, v.generation));
+                        }
+                        Some((v, !x.vstack.is_empty(), kept))
                     } else {
                         None
                     }
@@ -2024,6 +2032,7 @@ impl<C: Cells> Runtime<C> {
                         attributed: cycle_state::failures() != failures,
                         payload,
                     },
+                    None,
                 );
             }
         });
@@ -2242,6 +2251,7 @@ impl<C: Cells> Runtime<C> {
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
             let below = x.vstack[level as usize - 1].clone();
+            let provenance = x.provenance.take();
             x.deliver_blocked(
                 &below,
                 Delivered::Unwind {
@@ -2250,6 +2260,7 @@ impl<C: Cells> Runtime<C> {
                     attributed: cycle_state::failures() != failures,
                     payload,
                 },
+                provenance,
             );
             x.levels.truncate(level as usize);
             x.trim_levels();
@@ -2576,7 +2587,9 @@ impl<C: Cells> Runtime<C> {
             });
             match (walk, what) {
                 (Some(walk), _) => walk.ran(node),
-                (None, Some(what)) if below.reading == reading => x.deliver_blocked(&below, what),
+                (None, Some(what)) if below.reading == reading => {
+                    x.deliver_blocked(&below, what, None);
+                }
                 _ => {}
             }
         });
@@ -2833,7 +2846,9 @@ impl<C: Cells> Runtime<C> {
 
 /// A copy of a panic payload of a type the engine knows: a cycle unwind's
 /// or a `panic!` message.
-fn copy_payload(payload: &(dyn std::any::Any + Send)) -> Option<Box<dyn std::any::Any + Send>> {
+pub(super) fn copy_payload(
+    payload: &(dyn std::any::Any + Send),
+) -> Option<Box<dyn std::any::Any + Send>> {
     if let Some(unwind) = payload.downcast_ref::<crate::cycle::CycleUnwind>() {
         return Some(Box::new(crate::cycle::CycleUnwind(unwind.0.clone())));
     }

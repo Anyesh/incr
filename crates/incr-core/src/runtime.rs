@@ -773,6 +773,7 @@ pub struct Runtime<C: Cells> {
     /// `INCR_TEST_ALL_REPLAYABLE`: every query not marked
     /// `NOT_REPLAYABLE` is replayable.
     pub(crate) all_replayable: bool,
+    pub(crate) provenance: provenance_impl::Table<C>,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -869,6 +870,7 @@ impl<C: Cells> Runtime<C> {
             max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
             frames_set: std::sync::atomic::AtomicBool::new(false),
             all_replayable: replay_defaults().1,
+            provenance: provenance_impl::table::<C>(),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -3054,16 +3056,7 @@ impl<C: Cells> Runtime<C> {
                     self.wait_out_deleting(id, spins);
                     continue;
                 }
-                NodeState::Failed => {
-                    // A closure that catches this panic has still read a
-                    // node with no value, so it must not land Clean over it.
-                    self.dep_stack.poison_current_frame(self.runtime_id);
-                    panic!(
-                        "incr-core: node {} read but its last compute panicked; it stays \
-                         Failed until a dependency changes (set an upstream input to retry)",
-                        id.0,
-                    );
-                }
+                NodeState::Failed => self.read_failed_node(id),
                 NodeState::Dead => {
                     // A bumped generation under Dead is a delete that has
                     // unhooked the node but not recycled the slot yet.
@@ -3501,6 +3494,9 @@ impl<C: Cells> Runtime<C> {
         // would lose recovery paths through deps the failed run had not
         // reached yet. Extra edges only cause spurious re-verification,
         // never staleness.
+        if !C::SINGLE_THREADED {
+            self.before_failed_landing(id, node.generation(), attempt.cidx, &*payload);
+        }
         self.land_failed(id, node, flags, attempt, wrote, deps, &[], bag);
         // An enclosing closure that catches the unwind has still read a
         // dep that did not land Clean.
@@ -4156,6 +4152,9 @@ mod claim_set_impl;
 
 #[path = "runtime_replay.rs"]
 mod replay_impl;
+
+#[path = "runtime_provenance.rs"]
+mod provenance_impl;
 
 #[path = "runtime_watch.rs"]
 mod watch_impl;
