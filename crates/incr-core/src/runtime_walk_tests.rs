@@ -1521,73 +1521,52 @@ fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 
     rt.get(below.unwrap())
 }
 
-/// Runs the chain on a spawned thread's default stack, which the frame
-/// budget must bound.
+/// Runs the chain on a thread with the default 2 MiB spawn stack, which
+/// the default frame budget must bound in a debug build too.
 fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
     // Frames that are never doomed overflow this stack at 1000 to 2000
     // levels.
     let n = test_size(10_000);
-    let got = thread::spawn(move || ticket_catching_chain::<C>(n, failed, custom))
+    let got = thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || ticket_catching_chain::<C>(n, failed, custom))
+        .unwrap()
         .join()
         .unwrap();
     assert_eq!(got, if failed { n as i64 } else { 0 });
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn local_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Local>(false, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn shared_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Shared>(false, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn local_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Local>(true, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn shared_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Shared>(true, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn local_uncopyable_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Local>(true, true);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn shared_uncopyable_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Shared>(true, true);
