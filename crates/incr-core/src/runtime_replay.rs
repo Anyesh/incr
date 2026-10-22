@@ -78,8 +78,7 @@ struct Below {
     node: u32,
     cidx: u32,
     ctl: *const ComputeCtl,
-    reading: u64,
-    ordinal: u32,
+    step: replay::Step,
     path: u64,
 }
 
@@ -968,16 +967,10 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
-    /// Marks the reading frame F and the frames below it that can be
-    /// doomed, makes them virtual frames, and pushes `n` one level above F.
-    fn mark(&self, n: NodeId, generation: u32, retry: Retry) {
+    /// The runtime's frames on top of the thread's stack, the reading
+    /// frame first, each with its step and its path.
+    fn frames_below(&self) -> Vec<Below> {
         let rt = self.runtime_id;
-        #[cfg(test)]
-        assert!(
-            self.virtual_position(n.0, generation).is_none(),
-            "incr-core: a doom pushed node {} that has a virtual frame",
-            n.0
-        );
         let mut frames: Vec<Below> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
@@ -987,12 +980,7 @@ impl<C: Cells> Runtime<C> {
                     node: f.node.0,
                     cidx: f.cidx,
                     ctl: f.ctl,
-                    reading: f.reading,
-                    ordinal: f
-                        .deps
-                        .iter()
-                        .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == f.reading)
-                        .count() as u32,
+                    step: f.step(),
                     path: 0,
                 })
                 .collect()
@@ -1004,11 +992,44 @@ impl<C: Cells> Runtime<C> {
                 Some((cidx, path, step)) if cidx + 1 == f.cidx => replay::extend_path(path, step),
                 _ => self.path_at(f.cidx),
             };
-            // SAFETY: the frame is on the stack, so its control block is live.
-            let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
-            let step = replay::Step::of(rt, f.node, member, f.reading, f.ordinal);
-            below = Some((f.cidx, f.path, step));
+            below = Some((f.cidx, f.path, f.step));
         }
+        frames
+    }
+
+    /// Asserts that every frame [`Self::frames_below`] returns has the
+    /// path [`Self::path_at`] gives it, and the frame above it the path
+    /// its step extends that to, returning the steps, the reading frame
+    /// first.
+    #[cfg(test)]
+    #[cfg_attr(loom, allow(dead_code))]
+    pub(super) fn assert_frame_paths_agree(&self) -> Vec<replay::Step> {
+        self.frames_below()
+            .iter()
+            .map(|f| {
+                assert_eq!(f.path, self.path_at(f.cidx), "frame at {}", f.cidx);
+                assert_eq!(
+                    replay::extend_path(f.path, f.step),
+                    self.path_at(f.cidx + 1),
+                    "frame above {}",
+                    f.cidx
+                );
+                f.step
+            })
+            .collect()
+    }
+
+    /// Marks the reading frame F and the frames below it that can be
+    /// doomed, makes them virtual frames, and pushes `n` one level above F.
+    fn mark(&self, n: NodeId, generation: u32, retry: Retry) {
+        let rt = self.runtime_id;
+        #[cfg(test)]
+        assert!(
+            self.virtual_position(n.0, generation).is_none(),
+            "incr-core: a doom pushed node {} that has a virtual frame",
+            n.0
+        );
+        let frames = self.frames_below();
         let top = frames
             .first()
             .expect("incr-core: a doom has a reading frame");
@@ -1033,7 +1054,7 @@ impl<C: Cells> Runtime<C> {
             if f.cidx < floor
                 || ctl.flags.get() & (cycle::DOOMED | cycle::NO_DOOM) != 0
                 || !self.replayable(f.node)
-                || !self.reading_has_placeholder(f.reading)
+                || !self.reading_has_placeholder(f.step.reading)
             {
                 break;
             }
@@ -1097,8 +1118,8 @@ impl<C: Cells> Runtime<C> {
                     low: ctl.lowlink.get().min(f.cidx),
                     suspect,
                     spec,
-                    reading: f.reading,
-                    ordinal: f.ordinal,
+                    reading: f.step.reading,
+                    ordinal: f.step.ordinal,
                     path: f.path,
                     maker: 0,
                     ep: if ctl.has(cycle::BUFFERED) {
@@ -1106,11 +1127,7 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         None
                     },
-                    member_of: if ctl.has(cycle::BUFFERED) {
-                        cycle_state::held_episode(rt, f.node)
-                    } else {
-                        None
-                    },
+                    member_of: f.step.episode,
                     computes: {
                         let n = if ctl.has(cycle::BUFFERED) {
                             replay::member_run_root(f.cidx).unwrap_or(f.node)
@@ -2640,12 +2657,13 @@ impl<C: Cells> Runtime<C> {
                 })
         });
         let (from, path) = base.map_or((0, 0), |(at, path)| (at + 1, path));
-        self.dep_stack.read_steps(rt, from, cidx).into_iter().fold(
-            path,
-            |path, (node, member, reading, ordinal)| {
-                replay::extend_path(path, replay::Step::of(rt, node, member, reading, ordinal))
-            },
-        )
+        self.dep_stack.with(|s| {
+            s.frames
+                .iter()
+                .filter(|f| f.rt == rt && (from..cidx).contains(&f.cidx))
+                .map(|f| f.step())
+                .fold(path, replay::extend_path)
+        })
     }
 
     /// The lowlink a popped virtual frame of `node` at `cidx`, along this
