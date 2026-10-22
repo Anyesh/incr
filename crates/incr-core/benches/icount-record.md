@@ -1463,3 +1463,38 @@ walk falls about 0.1 percent under both strategies.
 
 Gate: the Clean get, table hit, value slot and single delete are
 unchanged; a set costs 3 to 4 more instructions.
+
+## Arena lock spills
+
+- Engine: the four `spreadsheet-t10` merges from `c0fddc04` to
+  `0433749e`, each built in one detached worktree; `icount.sh` at the
+  default N, `getrandom` fixed. Intel PT line diffs through `pt-lines.sh`
+  at N = 10. No workloads added.
+
+| merge | `delete_single_shared` | `fanout_shared_4` |
+|---|---|---|
+| `c0fddc04`, `1d97b37f`, `f2e77b8b` | 1,530.24 | 23,577.1 |
+| `0433749e` (`w/T8-remove-path-take`) | 1,534.24 | 23,591.3 |
+| both with `codegen-units = 1` | 1,554.33 | 23,515.3 |
+
+- **Where:** the whole rise is in `GenericArena::reserve_with` and
+  `ErasedArena::release` under `Shared`, +2 instructions per call, at the
+  arena lock's write guard: the lock pointer and poison flag are stored
+  to the stack and `RwLockWriteGuard::drop` is called through a pointer
+  to the guard, where before they went in registers. One reserve and one
+  release per single delete, six releases and one reserve per
+  `fanout_shared_4` iteration.
+- **Why:** `0433749e` touches only replay and provenance code, and with
+  one codegen unit both trees count the same on every measured workload,
+  so the source of the arena is not the cause. `RwLockWriteGuard::drop`
+  carries no `#[inline]` in std (`MutexGuard::drop` does), so it is one
+  out-of-line instance shared by every arena type; LLVM passes its guard
+  in registers only when every caller lands in that instance's codegen
+  unit, and any change elsewhere in the crate can move a caller out.
+  `w/T8-unbuilt-value-drop-rest` alone moved the same two calls the same
+  way against `1bbf96ed`.
+
+Gate: the Clean get, table hit and value slot are unchanged. The two
+calls cost 0 or 2 instructions by partitioning, like every other
+`RwLock` write in the engine; a lock whose unlock inlines would remove
+the dependence for that lock only.
