@@ -29,8 +29,8 @@ pub(super) struct Left;
 pub(crate) struct Tickets {
     next: u64,
     held: Vec<Ticket>,
-    /// The tickets of deleted nodes, dropped by the delete's bag once it
-    /// holds no lock.
+    /// The tickets of deleted nodes, dropped by the bag of the delete or
+    /// sweep that buried them once it holds no lock.
     buried: Vec<Ticket>,
 }
 
@@ -295,6 +295,29 @@ impl<C: Cells> Runtime<C> {
         drop(buried);
     }
 
+    /// A compute's sweep released nodes: the tickets they buried join its
+    /// bag, which drops them as it drains.
+    #[inline(always)]
+    pub(super) fn defer_buried_tickets(&self, bag: &mut Deferred<C>) {
+        if self.tickets_held() {
+            self.defer_buried(bag);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn defer_buried(&self, bag: &mut Deferred<C>) {
+        let buried = {
+            let mut t = self.tickets.write();
+            let buried = std::mem::take(&mut t.buried);
+            self.sync_held(&t);
+            buried
+        };
+        if !buried.is_empty() {
+            bag.push_erased(Box::new(buried));
+        }
+    }
+
     /// Notes `nodes`, landings a read took `payload` for, just above the
     /// reading frame, so that a walk's entry below that contains the panic
     /// again holds them too.
@@ -437,6 +460,7 @@ impl<C: Cells> Runtime<C> {
     /// The contained payloads still held, for tests.
     #[cfg(all(test, not(loom)))]
     pub(crate) fn contained_payloads(&self) -> usize {
-        self.tickets.read().held.len()
+        let t = self.tickets.read();
+        t.held.len() + t.buried.len()
     }
 }
