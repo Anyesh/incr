@@ -24,6 +24,7 @@ use std::mem::ManuallyDrop;
 use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, NO_DOOM, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
+use crate::replay::Step;
 
 /// One in-flight compute: the node being computed, its runtime, the deps
 /// recorded so far on its behalf, its control block and its position on
@@ -51,6 +52,20 @@ impl Frame {
             .iter()
             .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == self.reading)
             .count() as u32
+    }
+
+    /// The frame's step in the paths of the frames above it.
+    pub(crate) fn step(&self) -> Step {
+        // SAFETY: the frame is on the stack, so its control block is live
+        // (see `Frame::ctl`).
+        let member = unsafe { &*self.ctl }.has(BUFFERED);
+        Step::of(
+            self.rt,
+            self.node.0,
+            member,
+            self.reading,
+            self.reads_of_reading(),
+        )
     }
 }
 
@@ -313,28 +328,19 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// `rt`'s active frame's node and position, the node it reads now and
+    /// how many times it has read it, this read included.
+    fn active_read(&self, rt: RuntimeId) -> Option<(NodeId, u32, u64, u32)> {
+        self.with(|s| {
+            s.active(rt)
+                .map(|top| (top.node, top.cidx, top.reading, top.reads_of_reading()))
+        })
+    }
+
     /// How many times `rt`'s active frame has read the node it reads
     /// now, this read included.
     fn reads_of_current(&self, rt: RuntimeId) -> u32 {
         self.with(|s| s.active(rt).map_or(0, |top| top.reads_of_reading()))
-    }
-
-    /// For `rt`'s frames at positions `from..to`, bottom first, each
-    /// frame's node, whether it is a member run, the node it reads now
-    /// and how many times it has read it.
-    fn read_steps(&self, rt: RuntimeId, from: u32, to: u32) -> Vec<(u32, bool, u64, u32)> {
-        self.with(|s| {
-            s.frames
-                .iter()
-                .filter(|f| f.rt == rt && (from..to).contains(&f.cidx))
-                .map(|f| {
-                    // SAFETY: a frame's control block is live while it is
-                    // on the stack.
-                    let member = unsafe { &*f.ctl }.has(BUFFERED);
-                    (f.node.0, member, f.reading, f.reads_of_reading())
-                })
-                .collect()
-        })
     }
 
     fn active_frame(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32)> {

@@ -917,6 +917,7 @@ pub struct Runtime<C: Cells> {
     /// `INCR_TEST_ALL_REPLAYABLE`: every query not marked
     /// `NOT_REPLAYABLE` is replayable.
     pub(crate) all_replayable: bool,
+    pub(crate) provenance: provenance_impl::Table<C>,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1013,6 +1014,7 @@ impl<C: Cells> Runtime<C> {
             max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
             frames_set: std::sync::atomic::AtomicBool::new(false),
             all_replayable: replay_defaults().1,
+            provenance: provenance_impl::table::<C>(),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -3317,14 +3319,8 @@ impl<C: Cells> Runtime<C> {
                     continue;
                 }
                 NodeState::Failed => {
-                    // A closure that catches this panic has still read a
-                    // node with no value, so it must not land Clean over it.
-                    self.dep_stack.poison_current_frame(self.runtime_id);
-                    panic!(
-                        "incr-core: node {} read but its last compute panicked; it stays \
-                         Failed until a dependency changes (set an upstream input to retry)",
-                        id.0,
-                    );
+                    self.read_failed_node(id);
+                    continue;
                 }
                 NodeState::Dead => {
                     // A bumped generation under Dead is a delete that has
@@ -3741,18 +3737,18 @@ impl<C: Cells> Runtime<C> {
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
         replay::unwind_past(self.runtime_id, attempt.cidx);
-        // A speculative entry's run may evaluate nodes the unbounded run
-        // never does, so a panic in it lands nothing Failed, and a cycle
-        // it raises is no read's result: the real run raises either again
-        // if it does reach the node. It goes on as a discard unwind, which
-        // a closure that catches it can't land a value over.
-        let kind = if matches!(kind, None | Some(UnwindKind::Cycle)) && replay::speculative() {
-            Some(UnwindKind::Discard)
-        } else {
-            kind
-        };
+        // A closure that catches a speculative run's discard can't land a
+        // value over it.
+        let kind = replay::run_unwind_kind(kind, replay::speculative());
         self.note_unwound_read(&*payload, kind);
-        self.release_unwound_from(attempt.cidx, id.0, kind, kind.is_some(), bag);
+        self.release_unwound_from(
+            attempt.cidx,
+            id.0,
+            kind,
+            kind.is_some(),
+            Some(&*payload),
+            bag,
+        );
         let wrote = ctl.wrote.get() != 0;
         if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
@@ -3771,7 +3767,17 @@ impl<C: Cells> Runtime<C> {
         // would lose recovery paths through deps the failed run had not
         // reached yet. Extra edges only cause spurious re-verification,
         // never staleness.
-        self.land_failed(id, node, flags, attempt, wrote, deps, &[], bag);
+        self.land_failed(
+            id,
+            node,
+            flags,
+            attempt,
+            wrote,
+            deps,
+            &[],
+            Some(&*payload),
+            bag,
+        );
         // An enclosing closure that catches the unwind has still read a
         // dep that did not land Clean.
         self.dep_stack.poison_current_frame(self.runtime_id);
@@ -3782,7 +3788,7 @@ impl<C: Cells> Runtime<C> {
     /// the old and recorded deps is published, and the node lands Failed,
     /// or Dirty or New where publication says the panic may hide a change.
     /// `co_members`, sorted, are the claims released with it, which count
-    /// as settled.
+    /// as settled. `payload` is the panic, when the caller has it.
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -3793,6 +3799,7 @@ impl<C: Cells> Runtime<C> {
         wrote: bool,
         deps: &[(NodeId, u32)],
         co_members: &[u32],
+        payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
         let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
@@ -3810,6 +3817,9 @@ impl<C: Cells> Runtime<C> {
             // mid-compute, land Dirty now so the next reader retries.
             Publish::Published => NodeState::Failed,
         };
+        if !C::SINGLE_THREADED && landing == NodeState::Failed {
+            self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
+        }
         let flagged = if landing == NodeState::New {
             NodeState::New
         } else {
@@ -4426,6 +4436,9 @@ mod claim_set_impl;
 
 #[path = "runtime_replay.rs"]
 mod replay_impl;
+
+#[path = "runtime_provenance.rs"]
+mod provenance_impl;
 
 #[path = "runtime_watch.rs"]
 mod watch_impl;

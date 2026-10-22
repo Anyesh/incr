@@ -1391,3 +1391,465 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
         "F's claim taken from New landed Dirty"
     );
 }
+
+/// What a closure does with the panic of a read below it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Panics {
+    /// Lets it out.
+    Out,
+    /// Catches it and panics with its own payload.
+    Own,
+    /// Catches it, reads the node again and lets that read's panic out.
+    Twice,
+}
+
+fn panicking_reader(rt: &Rt, read: Incr<u64>, panics: Panics, own: &'static str) -> Incr<u64> {
+    rt.create_query_with(
+        move |rt: &Rt| match panics {
+            Panics::Out => rt.get(read) + 1,
+            Panics::Own => {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(read)));
+                panic!("{own}")
+            }
+            Panics::Twice => {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(read)));
+                rt.get(read) + 1
+            }
+        },
+        replayable(),
+    )
+}
+
+/// X reads Y, which panics "y boom", and X does `x` with that panic;
+/// with `w`, W reads X and does `w` with its panic. One thread's
+/// `get(top)`, W or else X, dooms the first frame whose read is at the
+/// budget, one frame per node, so Y's entry lands Failed and its payload
+/// waits for X's virtual frame. The driver parks before the next entry
+/// while another thread reads `other_reads` (X or W), which reads Y
+/// Failed and lands what it computed Failed. Each read's outcome must be
+/// one of a serial order's, and no provenance record outlives the reads.
+fn landed_failed_over_a_delivery(
+    x: Panics,
+    w: Option<Panics>,
+    other_reads_w: bool,
+) -> (Result<u64, String>, Result<u64, String>) {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1 + u32::from(w.is_some()));
+    let gate = Gate::new();
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let xn = panicking_reader(&rt, y, x, "x own");
+    let wn = w.map(|w| panicking_reader(&rt, xn, w, "w own"));
+    let top = wn.unwrap_or(xn);
+    let other_reads = if other_reads_w { top } else { xn };
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(top)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(top)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    let other = outcome(|| rt.get(other_reads));
+    assert_eq!(rt.state_of(other_reads), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+    (first, other)
+}
+
+fn failed(r: &Result<u64, String>) -> bool {
+    r.as_ref()
+        .is_err_and(|m| m.contains("last compute panicked"))
+}
+
+/// Class A of the two-thread all-seeds scan (seed 0x172), at budget 1:
+/// the other thread's X let Y's failed read out, so only the order with
+/// this thread first is serial, and its retry of X takes the payload.
+#[test]
+fn shared_vframe_landed_failed_keeps_the_payload() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, None, false);
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()), "the payload was dropped");
+}
+
+/// X's own panic makes only the other thread's order serial.
+#[test]
+fn shared_vframe_landed_failed_by_its_own_panic() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Own, None, false);
+    assert_eq!(other, Err("x own".to_string()));
+    assert!(failed(&first), "{first:?}");
+}
+
+/// X lets out its second read of Y, not the one the payload is for: in
+/// either order both reads panic "last compute panicked".
+#[test]
+fn shared_vframe_landed_failed_by_a_later_read() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Twice, None, false);
+    assert!(failed(&other), "{other:?}");
+    assert!(failed(&first), "{first:?}");
+}
+
+/// At budget 2 X's virtual frame sits above W's, and W's retry reads X
+/// natively.
+#[test]
+fn shared_vframe_landed_failed_under_a_native_read() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Out), false);
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    let (first, other) = landed_failed_over_a_delivery(Panics::Own, Some(Panics::Out), false);
+    assert_eq!(other, Err("x own".to_string()));
+    assert!(failed(&first), "{first:?}");
+}
+
+/// The other thread lands both W and X, the frames of a chain, and only
+/// a landing of W that let the failure out allows this thread first.
+#[test]
+fn shared_vframe_chain_landed_failed() {
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Out), true);
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Own), true);
+    assert_eq!(other, Err("w own".to_string()));
+    assert!(failed(&first), "{first:?}");
+}
+
+/// X is still computing on the other thread when the retry of X claims
+/// it, so the retry waits and then reads X Failed.
+#[test]
+fn shared_vframe_landed_failed_while_the_retry_waits() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let (gate, inside, waits) = (Gate::new(), Gate::new(), Gate::new());
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = {
+        let inside = inside.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                inside.park();
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
+    hook(
+        &rt,
+        vec![
+            (ParkPoint::BeforeEntry(id(x)), gate.clone()),
+            (ParkPoint::ComputeWaits(id(x)), waits.clone()),
+        ],
+    );
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    inside.arm();
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    inside.wait_parked();
+    waits.arm();
+    gate.release();
+    waits.wait_parked();
+    inside.release();
+    let other = other.join();
+    waits.release();
+    let first = first.join();
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// The other thread's read of X dooms too, before Y lands, so its Failed
+/// read of Y is its Y entry's compute, delivered to its own retry of X,
+/// which lets it out.
+#[test]
+fn shared_vframe_landed_failed_by_a_replayed_read() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let (gate, other_entry) = (Gate::new(), Gate::new());
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    hook(
+        &rt,
+        vec![
+            (ParkPoint::BeforeEntry(id(x)), gate.clone()),
+            (ParkPoint::BeforeEntry(id(y)), other_entry.clone()),
+        ],
+    );
+    other_entry.arm();
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    other_entry.wait_parked();
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    other_entry.release();
+    let other = other.join();
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("y boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// Y reads Z, which panics "z boom", so the other thread's read of Y
+/// Failed walks to Z Failed first: that panic is still the failure of
+/// X's read of Y, which X lets out.
+#[test]
+fn shared_vframe_landed_failed_by_a_walk_into_its_dep() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let z = rt.create_query_with(|_: &Rt| -> u64 { panic!("z boom") }, replayable());
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                gate.arm();
+                rt.get(z) + 1
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    let other = outcome(|| rt.get(x));
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("z boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// The other thread's X lets Y's failed read out, a set flips X and Y
+/// Dirty, and the next run of X lands it Failed by its own panic. The retry
+/// reads that later landing, so only the order with the other threads
+/// first is serial.
+#[test]
+fn shared_vframe_relanded_failed_by_its_own_panic() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let i = rt.create_input(0_u64);
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |rt: &Rt| -> u64 {
+                if rt.get(i) == 1 {
+                    return 7;
+                }
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if rt.get(i) == 1 {
+                panic!("x own");
+            }
+            rt.get(y) + 1
+        },
+        replayable(),
+    );
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    let other = outcome(|| rt.get(x));
+    assert!(failed(&other), "{other:?}");
+    rt.set(i, 1);
+    let again = outcome(|| rt.get(x));
+    assert_eq!(again, Err("x own".to_string()));
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert!(failed(&first), "{first:?}");
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// T reads F, and F (Fallback 100), X and Y read each other in a
+/// cycle. At budget 1 Y's read of F is a virtual hit, and F's virtual
+/// frame pops as the root of an episode in which F panics "f boom", so
+/// the episode lands F Failed and delivers the payload to T's virtual
+/// frame, which holds no claim: the landing publishes a record first.
+/// The other thread's T then reads F Failed through a walk that computes
+/// X and Y, which the record's match does not cover, so only the record
+/// and the reads' end are checked here.
+#[test]
+fn shared_vframe_landed_failed_over_an_episodes_delivery() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let y = {
+        let fc = fc.clone();
+        rt.create_query_with(move |rt: &Rt| rt.get(*fc.get().unwrap()) + 1, replayable())
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let f_runs = Arc::new(AtomicU32::new(0));
+    let f = {
+        let (gate, f_runs) = (gate.clone(), f_runs.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(x) + 1;
+                // The doomed run and the stand-in come first; the episode's
+                // run panics.
+                if f_runs.fetch_add(1, SeqCst) >= 2 {
+                    gate.arm();
+                    panic!("f boom")
+                }
+                v
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fallback(Box::new(|_| 100)),
+                replay: Replay::Allowed,
+            },
+        )
+    };
+    fc.set(f).unwrap();
+    let t = rt.create_query_with(move |rt: &Rt| rt.get(f) + 1, replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(t)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    assert_eq!(
+        rt.provenance_records(),
+        1,
+        "the episode published no record"
+    );
+    let other = outcome(|| rt.get(t));
+    assert!(failed(&other), "{other:?}");
+    gate.release();
+    let first = first.join();
+    assert!(first.is_err(), "{first:?}");
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// As `keeps_the_payload`, but the other thread reads R, which reads X,
+/// and X reads R back before it reads Y, so X is a member of R's
+/// episode. X's member run reads Y Failed and lets that panic out, which
+/// aborts the episode, and X lands Failed at the release of its claim.
+/// That landing let the failure out as X's own run's does, so the retry
+/// of X takes the payload.
+#[test]
+fn shared_vframe_landed_failed_by_an_episode_member() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let in_cycle = Arc::new(AtomicU8::new(0));
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let rc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let x = {
+        let (rc, in_cycle) = (rc.clone(), in_cycle.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                // The discovery run of R's cycle, which reads R as the
+                // cycle closes, returns without reading Y; the episode's
+                // runs read it.
+                if in_cycle.load(SeqCst) > 0
+                    && rt.get(*rc.get().unwrap()) > 0
+                    && in_cycle.fetch_add(1, SeqCst) == 1
+                {
+                    return 0;
+                }
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
+    let r = rt.create_query_with(
+        move |rt: &Rt| rt.get(x) + 1,
+        QueryOpts {
+            cycle: CycleStrategy::Fallback(Box::new(|_| 100)),
+            replay: Replay::Allowed,
+        },
+    );
+    rc.set(r).unwrap();
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    in_cycle.store(1, SeqCst);
+    let other = outcome(|| rt.get(r));
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert_eq!(first, Err("y boom".to_string()), "the payload was dropped");
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}

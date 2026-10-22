@@ -146,6 +146,7 @@ jobs:
           - { model: "loom_models::replay_release_vs_reader", bound: 2 }
           - { model: "loom_models::virtual_hit_claim_race", bound: 2 }
           - { model: "loom_models::discard_under_set", bound: 2 }
+          - { model: "loom_models::vframe_failed_provenance", bound: 2 }
           - { model: "loom_models::drain_vs_set", bound: 2 }
           - { model: "loom_seed_models::seed_vs_set", bound: 2 }
           - { model: "loom_seed_models::seed_vs_dep_recompute", bound: 2 }

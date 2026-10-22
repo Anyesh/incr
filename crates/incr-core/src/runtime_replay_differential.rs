@@ -4,7 +4,8 @@
 //! result (the value, a cycle's participants, or the panic's class or
 //! payload), every delete's result, and the sets of Failed and Cyclic
 //! nodes after each operation must be the unbounded run's, while every
-//! query's state agrees with the unbounded run's before the operation.
+//! query's state agrees with the unbounded run's before the operation
+//! (with one exception on two threads, below).
 //!
 //! A case may also delete nodes and recreate them into the freed slots,
 //! keep a second runtime whose queries read and are read by the first's,
@@ -12,7 +13,14 @@
 //! a second form steps two threads through barriers: one thread makes
 //! each set, delete or recreate while the other waits, and reads overlap
 //! only reads, so each result is still the unbounded run's at its
-//! sequence point.
+//! sequence point, with either of two overlapping reads first. The Failed
+//! and Cyclic sets after two overlapping reads are history, as the states
+//! are: a walk computes from its plan, so it can land a node Failed from a
+//! dep the other thread landed Failed after the walk expanded it. Where no
+//! order gives those sets, each node the reads left settled must have a
+//! Failed or Cyclic dep or a closure that panics or cycles when re-run,
+//! each node an order settles that they left Dirty or New must still read
+//! so, and the run ends there.
 //!
 //! A speculative entry can land a node the unbounded run leaves New, and
 //! with panics the engine's outcomes depend on that history: a walk
@@ -23,16 +31,18 @@
 //! and a case without them, a third of the seeds, compares the results to
 //! the end.
 
+use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Barrier, Mutex};
 
 use proptest::prelude::*;
 
-use super::Runtime;
+use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::{ErasedIncr, Incr};
+use crate::node::NodeId;
 use crate::state::NodeState;
 use crate::Value;
 
@@ -131,6 +141,7 @@ impl Rng {
 /// laid out the same way in `specs2`; its first `lower` queries read
 /// only their own runtime, and only they and its inputs are read by the
 /// first runtime.
+#[derive(Clone)]
 struct Case {
     specs: Vec<Spec>,
     panics: bool,
@@ -512,6 +523,13 @@ impl Handle {
             Handle::Bare(h) => h.into(),
         }
     }
+
+    fn state<C: Cells>(self, rt: &Runtime<C>) -> NodeState {
+        match self {
+            Handle::Plain(h) => rt.state_of(h),
+            Handle::Bare(h) => rt.state_of(h),
+        }
+    }
 }
 
 struct RtPtr<C: Cells>(*const Runtime<C>);
@@ -594,7 +612,15 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
     }
 }
 
-fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec) -> Handle {
+/// Node `i`'s query or input on `side`, its closure counting as having
+/// run already when `rerun`, as a re-run of a node that ran does.
+fn make<C: Cells>(
+    world: &Arc<World<C>>,
+    side: usize,
+    i: usize,
+    spec: &Spec,
+    rerun: bool,
+) -> Handle {
     let rt = world.rt(side);
     match spec {
         Spec::Input(v) => Handle::Plain(rt.create_input(*v)),
@@ -609,7 +635,8 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec) -> 
             } else {
                 Replay::Native
             };
-            let (expr, world, runs) = (expr.clone(), world.clone(), AtomicU32::new(0));
+            let (expr, world) = (expr.clone(), world.clone());
+            let runs = AtomicU32::new(u32::from(rerun));
             let compute = move |rt: &Runtime<C>| {
                 let node = Node {
                     rt,
@@ -719,7 +746,7 @@ impl<C: Cells> Live<C> {
         });
         for (side, specs) in [&case.specs, &case.specs2].into_iter().enumerate() {
             for (i, spec) in specs.iter().enumerate().rev() {
-                let h = make(&world, side, i, spec);
+                let h = make(&world, side, i, spec, false);
                 world.replace(side, i, h);
             }
         }
@@ -746,7 +773,7 @@ impl<C: Cells> Live<C> {
                 if w.rt(0).is_alive(old.erased()) {
                     return Out::Done;
                 }
-                let new = make(&self.world, 0, *i, spec);
+                let new = make(&self.world, 0, *i, spec, false);
                 w.replace(0, *i, new);
                 self.retired.lock().unwrap().push(old);
                 Out::Recreated(new.erased().slot() == old.erased().slot())
@@ -793,13 +820,10 @@ impl<C: Cells> Live<C> {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
                 let h = w.handle(side, q);
-                states.push(if !rt.is_alive(h.erased()) {
-                    NodeState::Dead
+                states.push(if rt.is_alive(h.erased()) {
+                    h.state(rt)
                 } else {
-                    match h {
-                        Handle::Plain(h) => rt.state_of(h),
-                        Handle::Bare(h) => rt.state_of(h),
-                    }
+                    NodeState::Dead
                 });
             }
             for x in 0..rt.nodes.len() {
@@ -890,8 +914,8 @@ impl Phase {
 }
 
 /// Pairs consecutive reads into a read phase, in the case's order, so the
-/// unbounded single-thread run of the case gives each read's expected
-/// result at its sequence point.
+/// unbounded single-thread run of the case, with either read of each pair
+/// first, gives each read's expected result at its sequence point.
 fn phases(case: &Case, seed: u64) -> Vec<Phase> {
     let mut rng = Rng(seed ^ 0xbb67_ae85_84ca_a73b);
     let mut phases = Vec::new();
@@ -918,23 +942,54 @@ fn phases(case: &Case, seed: u64) -> Vec<Phase> {
 }
 
 /// The case's operations on two threads by `phases`, with each phase's
-/// snapshot on its operations, and which operations end a phase.
-fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> (Trace, Vec<bool>) {
+/// snapshot on its operations.
+fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> Trace {
+    run_two_until(case, phases, frames, bytes, &|_| {}, &|_, _, _| false)
+}
+
+thread_local! {
+    /// Which of a two-thread run's threads this is.
+    static TWO_THREAD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Thread 0's call at the end of each read phase with two reads, by the
+/// phase's index, with the trace up to it, while thread 1 waits: whether
+/// the run stops there.
+type AtOverlap<'a> = dyn Fn(usize, &Trace, &Live<Shared>) -> bool + Sync + 'a;
+
+/// [`run_two`], with `rig` called on the built world before the threads
+/// start, and stopping at the first phase `at_overlap` stops at, the
+/// trace ending with it.
+fn run_two_until(
+    case: &Case,
+    phases: &[Phase],
+    frames: Option<u32>,
+    bytes: usize,
+    rig: &dyn Fn(&Live<Shared>),
+    at_overlap: &AtOverlap<'_>,
+) -> Trace {
     let rts = runtimes::<Shared>(frames, bytes);
     let live = Live::new(&rts, case);
+    rig(&live);
     let n = case.ops.len();
     let outs: Mutex<Vec<Option<Out>>> = Mutex::new(vec![None; n]);
     let snaps: Mutex<Vec<Option<Snapshot>>> = Mutex::new(vec![None; phases.len()]);
     let failures: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let stop = AtomicBool::new(false);
     let barrier = Barrier::new(2);
     std::thread::scope(|s| {
         for t in 0..2 {
-            let (live, outs, snaps, failures, barrier) =
-                (&live, &outs, &snaps, &failures, &barrier);
+            let (live, outs, snaps, failures, stop, barrier) =
+                (&live, &outs, &snaps, &failures, &stop, &barrier);
             s.spawn(move || {
                 reset_thread();
+                TWO_THREAD.with(|c| c.set(Some(t)));
                 for (p, phase) in phases.iter().enumerate() {
                     barrier.wait();
+                    // Thread 0 sets it before this barrier.
+                    if stop.load(Relaxed) {
+                        break;
+                    }
                     if let Some(i) = phase.of(t) {
                         let op = &case.ops[i];
                         match catch_unwind(AssertUnwindSafe(|| live.apply(op))) {
@@ -952,7 +1007,10 @@ fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> 
                         }
                     }
                     barrier.wait();
-                    if t == 0 {
+                    if t != 0 {
+                        continue;
+                    }
+                    let invariants = || {
                         if let Err(e) = catch_unwind(AssertUnwindSafe(|| live.assert_invariants()))
                         {
                             failures
@@ -960,31 +1018,432 @@ fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> 
                                 .unwrap()
                                 .push(format!("after phase {p}: {}", class(e)));
                         }
-                        snaps.lock().unwrap()[p] = Some(live.snapshot());
+                    };
+                    invariants();
+                    snaps.lock().unwrap()[p] = Some(live.snapshot());
+                    if phase.ops().len() < 2 || !failures.lock().unwrap().is_empty() {
+                        continue;
+                    }
+                    let prefix = {
+                        let (outs, snaps) = (outs.lock().unwrap(), snaps.lock().unwrap());
+                        assemble(&phases[..=p], &outs, &snaps)
+                    };
+                    match catch_unwind(AssertUnwindSafe(|| at_overlap(p, &prefix, live))) {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            stop.store(true, Relaxed);
+                            invariants();
+                            if let Err(m) = live.check_thread() {
+                                failures
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("after phase {p}: {m}"));
+                            }
+                        }
+                        Err(e) => {
+                            stop.store(true, Relaxed);
+                            failures
+                                .lock()
+                                .unwrap()
+                                .push(format!("at the end of phase {p}: {}", class(e)));
+                        }
                     }
                 }
+                TWO_THREAD.with(|c| c.set(None));
             });
         }
     });
     let failures = failures.into_inner().unwrap();
     assert!(failures.is_empty(), "{failures:#?}");
     let (outs, snaps) = (outs.into_inner().unwrap(), snaps.into_inner().unwrap());
-    let mut trace: Vec<Option<(Out, Snapshot)>> = vec![None; n];
-    let mut settles = vec![false; n];
-    for (phase, snap) in phases.iter().zip(snaps) {
-        let snap = snap.expect("every phase snapshots");
-        let ops = phase.ops();
-        settles[*ops.last().unwrap()] = true;
-        for i in ops {
-            trace[i] = Some((outs[i].clone().expect("every operation ran"), snap.clone()));
-        }
-    }
-    (trace.into_iter().map(Option::unwrap).collect(), settles)
+    let ran = snaps.iter().take_while(|s| s.is_some()).count();
+    assemble(&phases[..ran], &outs, &snaps)
 }
 
-/// Compares `got` with the unbounded run's `want`, the states only after
-/// the operations `settles` marks.
-fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, label: &str) {
+/// The trace of `phases`, the first of the case's, each operation with its
+/// phase's snapshot.
+fn assemble(phases: &[Phase], outs: &[Option<Out>], snaps: &[Option<Snapshot>]) -> Trace {
+    let mut trace = Vec::new();
+    for (phase, snap) in phases.iter().zip(snaps) {
+        let snap = snap.as_ref().expect("every phase snapshots");
+        for i in phase.ops() {
+            debug_assert_eq!(i, trace.len(), "phases run the case in order");
+            trace.push((outs[i].clone().expect("every operation ran"), snap.clone()));
+        }
+    }
+    trace
+}
+
+/// The case's operations in their phases' order, with the two reads of
+/// each read phase whose bit `swaps` sets (bit k for the k-th phase with
+/// two) in the other order.
+struct Order {
+    case: Case,
+    /// Each operation's index in the original case.
+    of: Vec<usize>,
+    /// Each operation's phase's last operation, by index here.
+    ends: Vec<usize>,
+    /// How many phases with two reads run up to and including each
+    /// operation's.
+    pairs: Vec<u32>,
+}
+
+impl Order {
+    fn new(case: &Case, phases: &[Phase], swaps: u64) -> Self {
+        let (mut of, mut ends, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+        let mut pair = 0;
+        for phase in phases {
+            let mut ops = phase.ops();
+            if ops.len() == 2 {
+                if swaps >> pair & 1 == 1 {
+                    ops.swap(0, 1);
+                }
+                pair += 1;
+            }
+            let end = of.len() + ops.len() - 1;
+            for i in ops {
+                of.push(i);
+                ends.push(end);
+                pairs.push(pair);
+            }
+        }
+        assert!(pair < 64, "a swap mask holds 63 read phases");
+        let ops = of.iter().map(|&i| case.ops[i].clone()).collect();
+        Order {
+            case: Case {
+                ops,
+                ..case.clone()
+            },
+            of,
+            ends,
+            pairs,
+        }
+    }
+
+    /// A two-thread trace of the original case's first operations, whole
+    /// phases, in this order.
+    fn arrange(&self, got: &Trace) -> Trace {
+        self.of[..got.len()]
+            .iter()
+            .map(|&i| got[i].clone())
+            .collect()
+    }
+
+    fn settles(&self) -> Vec<bool> {
+        self.ends.iter().enumerate().map(|(j, &e)| j == e).collect()
+    }
+}
+
+/// The orders of each read phase's two reads, as swap masks, whose
+/// unbounded single-thread runs, each kept in `wants`, `got` equals up to
+/// its length (whole phases), the first only unless `all`, and the
+/// closest that differs. The Failed and Cyclic sets after `got`'s last
+/// phase count only if `settle_last`. Under Shared the unbounded run is
+/// the one with the landings this thread observes in the order it
+/// observes them (T8, the read case table), so either read of a pair may
+/// land a node both read first.
+fn orders(
+    case: &Case,
+    phases: &[Phase],
+    wants: &mut HashMap<u64, Trace>,
+    got: &Trace,
+    label: &str,
+    settle_last: bool,
+    all: bool,
+) -> (Vec<u64>, Option<(usize, u64, String)>) {
+    let mut found = Vec::new();
+    let mut swaps = 0;
+    let mut closest: Option<(usize, u64, String)> = None;
+    loop {
+        let order = Order::new(case, phases, swaps);
+        let want = wants.entry(swaps).or_insert_with(|| {
+            labelled(&format!("{label}, unbounded, swaps {swaps:#b}"), || {
+                run::<Shared>(&order.case, None, 0)
+            })
+        });
+        let mut settles = order.settles();
+        settles.truncate(got.len());
+        if !settle_last {
+            settles[got.len() - 1] = false;
+        }
+        // Every order that runs the same read first in each phase up to
+        // operation j's differs at j too, or matches there: search
+        // depth-first, the k-th phase with two reads at depth k.
+        let j = match first_diff(&order.case, want, &order.arrange(got), Some(&settles)) {
+            Some((j, what)) => {
+                if closest.as_ref().is_none_or(|c| j > c.0) {
+                    closest = Some((j, swaps, what));
+                }
+                j
+            }
+            None => {
+                found.push(swaps);
+                if !all {
+                    break;
+                }
+                got.len() - 1
+            }
+        };
+        let Some(k) = (0..order.pairs[j]).rev().find(|&k| swaps >> k & 1 == 0) else {
+            break;
+        };
+        swaps = swaps & ((1 << k) - 1) | 1 << k;
+    }
+    (found, closest)
+}
+
+/// Panics unless the two-thread trace `got` equals the unbounded
+/// single-thread run of some order of each read phase's two reads, keeping
+/// each order's run in `wants`.
+fn assert_serial(
+    case: &Case,
+    phases: &[Phase],
+    wants: &mut HashMap<u64, Trace>,
+    got: &Trace,
+    label: &str,
+) {
+    let (found, closest) = orders(case, phases, wants, got, label, true, false);
+    if !found.is_empty() {
+        return;
+    }
+    let (j, swaps, what) = closest.expect("an order was tried");
+    let i = Order::new(case, phases, swaps).of[j];
+    panic!(
+        "{label}: operation {i} ({:?}) differs from the unbounded run of every order of \
+         the overlapping reads, the closest swapping {swaps:#b}\n{what}\n{}",
+        case.ops[i],
+        describe(case)
+    );
+}
+
+/// The two-thread oracle of one case, keeping each order's unbounded run
+/// across its runs.
+struct Serial<'a> {
+    case: &'a Case,
+    phases: &'a [Phase],
+    wants: Mutex<HashMap<u64, Trace>>,
+}
+
+impl<'a> Serial<'a> {
+    fn new(case: &'a Case, phases: &'a [Phase]) -> Self {
+        Serial {
+            case,
+            phases,
+            wants: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// At the end of a read phase with two reads: `None` while an order's
+    /// unbounded run gives `prefix`, its Failed and Cyclic sets included,
+    /// or while none gives its outcomes, which [`Self::check`] reports.
+    /// Otherwise the phase's Failed and Cyclic nodes are history, as its
+    /// states are (T8, the read case table: a walk computes from its plan,
+    /// so a node can land Failed from a dep another thread landed Failed
+    /// after the walk expanded it), and each must instead be true of its
+    /// inputs, by [`consistent`], which changes the world.
+    fn at_overlap(
+        &self,
+        label: &str,
+        prefix: &Trace,
+        live: &Live<Shared>,
+    ) -> Option<Result<(), String>> {
+        let (case, phases) = (self.case, self.phases);
+        let mut wants = self.wants.lock().unwrap();
+        if !orders(case, phases, &mut wants, prefix, label, true, false)
+            .0
+            .is_empty()
+        {
+            return None;
+        }
+        let (found, _) = orders(case, phases, &mut wants, prefix, label, false, true);
+        if found.is_empty() {
+            return None;
+        }
+        let end = prefix.len() - 1;
+        let sets: Vec<_> = found.iter().map(|m| settled(&wants[m][end].1 .0)).collect();
+        drop(wants);
+        Some(consistent(case, prefix, &sets, live))
+    }
+
+    /// Panics unless the run's trace `got` is an order's unbounded run, or
+    /// `at_overlap` stopped the run with a `verdict` that holds.
+    fn check(&self, label: &str, got: &Trace, verdict: Option<Result<(), String>>) {
+        match verdict {
+            None => assert_serial(
+                self.case,
+                self.phases,
+                &mut self.wants.lock().unwrap(),
+                got,
+                label,
+            ),
+            Some(Ok(())) => {}
+            Some(Err(why)) => {
+                let i = got.len() - 1;
+                panic!(
+                    "{label}: the Failed and Cyclic nodes after operation {i} ({:?}) are no \
+                     order's and not true of their inputs\n{why}\n{}",
+                    self.case.ops[i],
+                    describe(self.case)
+                )
+            }
+        }
+    }
+
+    /// One two-thread run, `rig` as [`run_two_until`] takes it, checked.
+    fn differential(
+        &self,
+        label: &str,
+        frames: Option<u32>,
+        bytes: usize,
+        rig: &dyn Fn(&Live<Shared>),
+    ) {
+        let verdict = Mutex::new(None);
+        let got = labelled(label, || {
+            run_two_until(
+                self.case,
+                self.phases,
+                frames,
+                bytes,
+                rig,
+                &|_, prefix, live| {
+                    let v = self.at_overlap(label, prefix, live);
+                    let stop = v.is_some();
+                    *verdict.lock().unwrap() = v;
+                    stop
+                },
+            )
+        });
+        self.check(label, &got, verdict.into_inner().unwrap());
+    }
+}
+
+/// Whether the Failed and Cyclic nodes after `prefix`'s last phase are
+/// true of their inputs for one of `sets`, each the Failed and Cyclic set
+/// an order with the trace's outcomes leaves. A node the phase left
+/// settled where the order does not must have a recorded dep Failed or
+/// Cyclic, or its closure, re-run as a fresh query from the phase's end,
+/// must panic or cycle. A node the order settles that the phase left
+/// Dirty or New must still read so on a later `get`: a panic for Failed,
+/// the cycle for Cyclic. The re-runs and gets run on this thread, in that
+/// order, and change the world.
+fn consistent(
+    case: &Case,
+    prefix: &Trace,
+    sets: &[Vec<(usize, NodeState)>],
+    live: &Live<Shared>,
+) -> Result<(), String> {
+    let w = &*live.world;
+    let states = &prefix.last().expect("a phase ran").1 .0;
+    let got = settled(states);
+    let node = |x: usize| {
+        let side = usize::from(x >= live.queries[0]);
+        let q = x - side * live.queries[0];
+        (side, q, w.handle(side, q))
+    };
+    let mut extra: Vec<(usize, NodeState)> = Vec::new();
+    let mut missing: Vec<(usize, NodeState)> = Vec::new();
+    for set in sets {
+        extra.extend(got.iter().filter(|g| !set.contains(g)));
+        missing.extend(set.iter().filter(|s| !got.contains(s)));
+    }
+    extra.sort_unstable_by_key(|&(x, _)| x);
+    extra.dedup();
+    missing.sort_unstable_by_key(|&(x, _)| x);
+    missing.dedup();
+
+    let settled_dep = |x: usize| {
+        let (side, _, h) = node(x);
+        let rt = w.rt(side);
+        let mut any = false;
+        rt.nodes.get(h.erased().slot()).for_each_dep(|d| {
+            any |= matches!(
+                rt.nodes.get(d.0).state(),
+                NodeState::Failed | NodeState::Cyclic
+            );
+        });
+        any
+    };
+    let by_deps: Vec<bool> = extra.iter().map(|&(x, _)| settled_dep(x)).collect();
+    let mut why: HashMap<usize, String> = HashMap::new();
+    for (&(x, s), by_deps) in extra.iter().zip(by_deps) {
+        if by_deps {
+            continue;
+        }
+        let (side, q, _) = node(x);
+        let spec = if side == 1 {
+            case.specs2[q].clone()
+        } else {
+            prefix
+                .iter()
+                .zip(&case.ops[..prefix.len()])
+                .rev()
+                .find_map(|((out, _), op)| match (op, out) {
+                    (Op::Recreate(i, spec), Out::Recreated(_)) if *i == q => Some(spec.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| case.specs[q].clone())
+        };
+        let rerun = make(&live.world, side, q, &spec, true);
+        let out = read_out(w.rt(side), rerun, false);
+        if matches!(out, Out::Value(_)) {
+            let deps = "no recorded dep is Failed or Cyclic";
+            why.insert(
+                x,
+                format!("node {x} {s:?}: {deps}, and a re-run returned {out:?}"),
+            );
+        }
+    }
+    let mut after: HashMap<usize, Result<Out, String>> = HashMap::new();
+    for &(x, _) in &missing {
+        if after.contains_key(&x) {
+            continue;
+        }
+        let left = states[x];
+        let read = if matches!(left, NodeState::Dirty | NodeState::New) {
+            let (side, _, h) = node(x);
+            Ok(read_out(w.rt(side), h, false))
+        } else {
+            Err(format!("the phase left it {left:?}"))
+        };
+        after.insert(x, read);
+    }
+
+    let mut first = None;
+    for set in sets {
+        let mut wrong = Vec::new();
+        for g in got.iter().filter(|g| !set.contains(g)) {
+            wrong.extend(why.get(&g.0).cloned());
+        }
+        for &(x, s) in set.iter().filter(|s| !got.contains(s)) {
+            // A get of a Failed node panics and one of a Cyclic node gets
+            // the cycle; a walk that meets a Failed dep panics before the
+            // node's compute, which leaves it Dirty.
+            match (&after[&x], s) {
+                (Ok(Out::Panic(_)), NodeState::Failed) => {}
+                (Ok(Out::Panic(c)), NodeState::Cyclic) if c == "cycle" => {}
+                (Ok(out), _) => wrong.push(format!(
+                    "node {x}: an order leaves it {s:?}, but a later get returned {out:?}"
+                )),
+                (Err(m), _) => wrong.push(format!("node {x}: an order leaves it {s:?}, but {m}")),
+            }
+        }
+        if wrong.is_empty() {
+            return Ok(());
+        }
+        first.get_or_insert(wrong.join("\n"));
+    }
+    Err(first.expect("an order has the trace's outcomes"))
+}
+
+/// The first operation at which `got` differs from the unbounded run's
+/// `want`, with both sides of it, comparing the states only after the
+/// operations `settles` marks.
+fn first_diff(
+    case: &Case,
+    want: &Trace,
+    got: &Trace,
+    settles: Option<&[bool]>,
+) -> Option<(usize, String)> {
     // A closure's read of a deleted node panics as stale, so a case with
     // deletes has panics.
     let panics = case.panics || case.ops.iter().any(|op| matches!(op, Op::Delete(_)));
@@ -1037,22 +1496,36 @@ fn compare(case: &Case, want: &Trace, got: &Trace, settles: Option<&[bool]>, lab
         let compared = |out: &Out, snap: &Snapshot| {
             (out.clone(), (agree && settles).then(|| settled(&snap.0)))
         };
-        assert_eq!(
-            compared(want_out, want),
-            compared(got_out, got),
-            "{label}: operation {i} ({:?}) differs from the unbounded run\nops: {:?}\n\
-             case: {:#?}\nsecond runtime: {:#?}",
-            case.ops[i],
-            case.ops,
-            case.specs,
-            case.specs2,
-        );
+        let (w, g) = (compared(want_out, want), compared(got_out, got));
+        if w != g {
+            return Some((i, format!("want {w:?}\n got {g:?}")));
+        }
         // A dep list is history too: under a panic a read can stop the
         // closure short of the reads after it.
         if settles {
             agree &= want.0 == got.0 && want.1 == got.1;
         }
     }
+    None
+}
+
+/// Panics, naming the case, at the first operation at which `got` differs
+/// from the unbounded run's `want`.
+fn compare(case: &Case, want: &Trace, got: &Trace, label: &str) {
+    if let Some((i, what)) = first_diff(case, want, got, None) {
+        panic!(
+            "{label}: operation {i} ({:?}) differs from the unbounded run\n{what}\n{}",
+            case.ops[i],
+            describe(case)
+        );
+    }
+}
+
+fn describe(case: &Case) -> String {
+    format!(
+        "ops: {:?}\ncase: {:#?}\nsecond runtime: {:#?}",
+        case.ops, case.specs, case.specs2
+    )
 }
 
 /// Runs `f`, prefixing the message of any panic out of it with `label`.
@@ -1075,26 +1548,27 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
         for bytes in [0, 16 * 1024] {
             let label = format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes");
             let bounded = labelled(&label, || run::<C>(case, Some(frames), bytes));
-            compare(case, &unbounded, &bounded, None, &label);
+            compare(case, &unbounded, &bounded, &label);
         }
     }
 }
 
 /// The two-thread form: every phase schedule at every budget, unbounded
-/// included, against the unbounded single-thread run.
+/// included, against the unbounded single-thread run of some order of each
+/// phase's two reads, by [`Serial`].
 fn differential_two(case: &Case, seed: u64) {
     let phases = phases(case, seed);
-    let unbounded = run::<Shared>(case, None, 0);
+    let serial = Serial::new(case, &phases);
     for frames in [None, Some(1), Some(2), Some(3)] {
         for bytes in [0, 16 * 1024] {
             let label = format!(
                 "seed {seed:#x}, two threads {phases:?}, budget {frames:?} frames, {bytes} bytes"
             );
-            let (got, settles) = labelled(&label, || run_two(case, &phases, frames, bytes));
-            compare(case, &unbounded, &got, Some(&settles), &label);
+            serial.differential(&label, frames, bytes, &|_| {});
         }
     }
 }
+
 /// Seeds that once failed, each with what it caught.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -1325,6 +1799,188 @@ fn cross_two_thread_seeds() {
             }
         }
     });
+}
+
+/// The unbounded single-thread runs of 0x524 and 0x3c9 with their first
+/// read phase's reads in the other order, laid out as two-thread traces,
+/// differ from the case-order runs: 0x524's closure payload goes to the
+/// other read, and 0x3c9's cycle is entered elsewhere. The two-thread
+/// oracle takes each, and not with the read that differs given an outcome
+/// no order gives.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_takes_either_order_of_a_read_pair() {
+    for seed in [0x524, 0x3c9] {
+        let case = gen_case(seed, false, true);
+        let phases = phases(&case, seed);
+        let swapped = Order::new(&case, &phases, 1);
+        quiet(|| {
+            let serial = run::<Shared>(&swapped.case, None, 0);
+            let mut got = vec![None; case.ops.len()];
+            for (j, &i) in swapped.of.iter().enumerate() {
+                got[i] = Some((serial[j].0.clone(), serial[swapped.ends[j]].1.clone()));
+            }
+            let got: Trace = got.into_iter().map(Option::unwrap).collect();
+            let in_order = Order::new(&case, &phases, 0);
+            let unbounded = run::<Shared>(&case, None, 0);
+            let (i, _) = first_diff(&case, &unbounded, &got, Some(&in_order.settles()))
+                .unwrap_or_else(|| panic!("seed {seed:#x}: the swap changes no outcome"));
+            assert_serial(&case, &phases, &mut HashMap::new(), &got, "swapped");
+
+            let mut bad = got;
+            bad[i].0 = Out::Panic("no order's outcome".to_owned());
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                assert_serial(&case, &phases, &mut HashMap::new(), &bad, "bad");
+            }));
+            assert!(caught.is_err(), "seed {seed:#x}: a wrong outcome passed");
+        });
+    }
+}
+
+/// Two-thread seeds with panics or cycles whose overlapping reads, at most
+/// budgets, come out as the unbounded run of the other order: which read
+/// lands a node both read first decides which gets a closure's payload,
+/// or where a cycle is entered.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_swapped_order_seeds() {
+    for seed in [0x245, 0x3c9] {
+        let case = gen_case(seed, false, true);
+        quiet(|| {
+            for _ in 0..4 {
+                differential_two(&case, seed);
+            }
+        });
+    }
+}
+
+/// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
+/// cycle, and each order of them leaves {7, 10, 11, 12, 13} Failed. Here
+/// op 7's walk is held at its first compute, node 3, while op 8 lands 10
+/// to 13 Failed; the walk then computes 3 from its plan, 3's read meets 12
+/// Failed, and 3 lands Failed with 7 left Dirty. That is history (T8, the
+/// read case table), and the oracle takes it: a re-run of 3 panics, and
+/// so does a get of 7. Swap bit 1, not bit 0 (ops 5 and 6), runs op 8 first,
+/// which gets the closure's payload.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
+    struct Hold {
+        on: AtomicBool,
+        first: AtomicBool,
+        at3: AtomicBool,
+    }
+    fn until(done: impl Fn() -> bool) {
+        let start = std::time::Instant::now();
+        while !done() {
+            assert!(start.elapsed().as_secs() < 20, "the schedule stalled");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    let case = gen_case(0x934, false, true);
+    let phases = phases(&case, 0x934);
+    let at = |i| phases.iter().position(|p| p.ops().contains(&i)).unwrap();
+    let (before, overlap) = (at(6), at(7));
+    assert_eq!(phases[before].ops(), [5, 6]);
+    assert_eq!(phases[overlap].ops(), [7, 8]);
+    assert_eq!(phases[overlap].of(0), Some(8));
+    quiet(|| {
+        let swapped = Order::new(&case, &phases, 0b10);
+        let first = |i| swapped.of.iter().position(|&j| j == i).unwrap();
+        assert!(first(8) < first(7));
+        let serial = run::<Shared>(&swapped.case, None, 0);
+        assert_eq!(serial[first(8)].0, Out::Panic("boom 0:11".to_owned()));
+
+        let hold = Arc::new(Hold {
+            on: AtomicBool::new(false),
+            first: AtomicBool::new(false),
+            at3: AtomicBool::new(false),
+        });
+        // Thread 0 runs op 8: it holds at its first park until op 7's walk
+        // is at its compute of 3, which holds until op 8 has landed 13.
+        let rig = |live: &Live<Shared>| {
+            let (hold, world) = (hold.clone(), live.world.clone());
+            let three = ParkPoint::BeforeComputeOne(NodeId(world.handle(0, 3).erased().slot()));
+            let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                if !hold.on.load(SeqCst) {
+                    return;
+                }
+                match TWO_THREAD.with(std::cell::Cell::get) {
+                    Some(0) if !hold.first.swap(true, SeqCst) => until(|| hold.at3.load(SeqCst)),
+                    Some(1) if p == three && !hold.at3.swap(true, SeqCst) => {
+                        until(|| world.handle(0, 13).state(world.rt(0)) == NodeState::Failed)
+                    }
+                    _ => {}
+                }
+            });
+            assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+        };
+        let serial = Serial::new(&case, &phases);
+        let (verdict, left) = (Mutex::new(None), Mutex::new(Vec::new()));
+        let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+            if p == overlap {
+                hold.on.store(false, SeqCst);
+                *left.lock().unwrap() = settled(&prefix[8].1 .0);
+            }
+            let v = serial.at_overlap("0x934", prefix, live);
+            if p == before {
+                hold.on.store(true, SeqCst);
+            }
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+        let failed = [3, 10, 11, 12, 13].map(|x| (x, NodeState::Failed));
+        assert_eq!(*left.lock().unwrap(), failed);
+        let verdict = verdict.into_inner().unwrap();
+        assert_eq!(verdict, Some(Ok(())));
+        serial.check("0x934", &got, verdict);
+    });
+}
+
+/// After 0x934's overlapping ops 7 and 8, a trace whose Failed set holds
+/// node 1, which op 5 computed Clean, or lacks node 10, which every order
+/// leaves Failed, is still rejected: 1's deps are Clean and its re-run
+/// returns a value, and 10 was left Clean, not Dirty or New.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
+    let case = gen_case(0x934, false, true);
+    let phases = phases(&case, 0x934);
+    let overlap = phases.iter().position(|p| p.ops() == [7, 8]).unwrap();
+    for (x, to, why) in [
+        (
+            1,
+            NodeState::Failed,
+            "node 1 Failed: no recorded dep is Failed or Cyclic",
+        ),
+        (
+            10,
+            NodeState::Clean,
+            "node 10: an order leaves it Failed, but the phase left it Clean",
+        ),
+    ] {
+        quiet(|| {
+            let serial = Serial::new(&case, &phases);
+            let verdict = Mutex::new(None);
+            run_two_until(&case, &phases, None, 0, &|_| {}, &|p, prefix, live| {
+                let mut prefix = prefix.clone();
+                if p == overlap {
+                    for (_, snap) in &mut prefix[7..] {
+                        snap.0[x] = to;
+                    }
+                }
+                let v = serial.at_overlap("0x934", &prefix, live);
+                let stop = v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            match verdict.into_inner().unwrap() {
+                Some(Err(m)) => assert!(m.contains(why), "{m}"),
+                v => panic!("node {x} {to:?} passed: {v:?}"),
+            }
+        });
+    }
 }
 
 /// Seeds the scans found failing at a frame budget, each a replay fault

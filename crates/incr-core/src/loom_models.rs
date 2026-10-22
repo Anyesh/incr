@@ -1427,6 +1427,54 @@ fn discard_under_set() {
     });
 }
 
+/// A read's panic message, its panic expected.
+fn panic_message(f: impl FnOnce() -> u64) -> Result<u64, String> {
+    EXPECTING_UNWIND.with(|e| e.set(true));
+    let out = catch_unwind(AssertUnwindSafe(f)).map_err(|e| {
+        e.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()
+    });
+    EXPECTING_UNWIND.with(|e| e.set(false));
+    out
+}
+
+/// X reads Y, which panics "y boom", at budget 1, and two threads read X.
+/// A thread whose read of Y dooms X runs Y as an entry, which lands Failed
+/// with the payload held for X's retry, while the other thread may compute
+/// X, read Y Failed and land X Failed, letting that failure out. The
+/// record published before Y's landing is what the other thread's Failed
+/// read finds, so the retry takes the payload: one read gets "y boom" and
+/// the other "last compute panicked", as in either serial order.
+#[test]
+fn vframe_failed_provenance() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let y = rt.create_query_with(|_: &Rt| -> u64 { panic!("y boom") }, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || panic_message(|| rt.get(x)))
+        };
+        let mine = panic_message(|| rt.get(x));
+        let other = other.join().unwrap();
+        let boom = Err("y boom".to_string());
+        let failed = |r: &Result<u64, String>| {
+            r.as_ref()
+                .is_err_and(|m| m.contains("last compute panicked"))
+        };
+        assert!(
+            (mine == boom && failed(&other)) || (other == boom && failed(&mine)),
+            "no serial order: {mine:?} {other:?}"
+        );
+        assert_eq!(rt.provenance_records(), 0);
+        rt.assert_invariant_i();
+    });
+}
+
 /// x -> Q, both Clean, with x watched. One thread sets x while another
 /// watches Q and drains. The walk's flip and `watch`'s state load are
 /// ordered only through `inner`, with no SeqCst: whichever section comes

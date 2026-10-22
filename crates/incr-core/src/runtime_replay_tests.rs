@@ -7,8 +7,11 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Runtime, DEFAULT_MAX_FRAMES};
 use crate::cells::{Cells, Local, Shared};
-use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
+use crate::cycle::{ComputeCtl, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
+use crate::cycle_state::{with_held, Held};
+use crate::dep_stack::DepStack;
 use crate::handle::Incr;
+use crate::node::NodeId;
 use crate::state::NodeState;
 
 macro_rules! local_and_shared {
@@ -432,3 +435,54 @@ fn local_active_frame_doomed_sees_this_runtimes_frame() {
 fn shared_active_frame_doomed_sees_this_runtimes_frame() {
     active_frame_doomed_sees_this_runtimes_frame::<Shared>();
 }
+
+/// A frame's step is one rule: on a stack whose frames read a node more
+/// than once, read another generation of it, and run a member of an
+/// episode, the path `mark` chains up for each frame from the one below
+/// is the one `path_at` gives it.
+fn frame_paths_agree<C: Cells>(rt: &Runtime<C>) {
+    let id = rt.runtime_id;
+    let ctls: Vec<ComputeCtl> = (0..4).map(|_| ComputeCtl::new(0)).collect();
+    ctls[1].raise(BUFFERED);
+    let mut held = Held::new(0, 1, true, false);
+    held.ep = 7;
+    with_held(|h| h.insert((id, 11), held));
+    let s = &rt.dep_stack;
+    s.push_frame(id, NodeId(10), &ctls[0]);
+    s.record_dep(id, NodeId(20), 0);
+    s.record_read(id, NodeId(20), 0);
+    s.push_frame(id, NodeId(11), &ctls[1]);
+    s.record_read(id, NodeId(21), 1);
+    s.push_frame(id, NodeId(12), &ctls[2]);
+    s.record_dep(id, NodeId(21), 3);
+    s.record_read(id, NodeId(21), 0);
+    s.record_read(id, NodeId(21), 0);
+    s.record_read(id, NodeId(21), 0);
+    s.push_frame(id, NodeId(13), &ctls[3]);
+    s.record_read(id, NodeId(23), 0);
+
+    let steps = rt.assert_frame_paths_agree();
+
+    for _ in 0..4 {
+        s.pop_frame();
+    }
+    with_held(|h| h.remove(&(id, 11)));
+    let seen: Vec<_> = steps
+        .iter()
+        .map(|st| (st.node, st.ordinal, st.episode))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (13, 1, None),
+            (12, 3, None),
+            (11, 1, Some(7)),
+            (10, 2, None)
+        ]
+    );
+}
+local_and_shared!(
+    frame_paths_agree,
+    local_frame_paths_agree,
+    shared_frame_paths_agree
+);

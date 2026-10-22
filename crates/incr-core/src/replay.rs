@@ -13,8 +13,9 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
-use crate::cycle_state::{held_episode, Episode};
+use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::handle::RuntimeId;
 use crate::taint_memo;
 use crate::value_code;
@@ -133,6 +134,30 @@ pub(crate) struct Delivery {
     /// outcome of the same read replaces; otherwise an earlier read's.
     pub(crate) blocked: bool,
     pub(crate) what: Delivered,
+    /// For a user panic whose node landed Failed above the frame, the
+    /// record that tells which landings of the frame's node by other
+    /// threads let that failure out.
+    pub(crate) provenance: Option<Rc<dyn Provenance>>,
+    /// With a provenance record, the virtual frames below the frame's that
+    /// have popped since, contiguous and highest first, as `(cidx, node,
+    /// generation)`: a read of one of their nodes stands for its frame's
+    /// run.
+    pub(crate) below: Vec<(u32, u32, u32)>,
+}
+
+/// A delivery's hold on its runtime's provenance record, which stays
+/// live while some delivery holds it.
+pub(crate) trait Provenance {
+    fn record(&self) -> u64;
+}
+
+/// This thread's Failed read that a provenance record names: the
+/// runtime, the record and the node read.
+#[derive(Clone, Copy)]
+pub(crate) struct Carry {
+    pub(crate) rt: RuntimeId,
+    pub(crate) record: u64,
+    pub(crate) node: u32,
 }
 
 pub(crate) enum Delivered {
@@ -214,6 +239,9 @@ pub(crate) struct Context {
     /// cooperatively, by dooming every frame of the run: the driver drops
     /// it once the run comes back discarded.
     pub(crate) drop_point: Option<u32>,
+    /// The provenance record that the delivery for this read takes,
+    /// published before the frame above it landed Failed.
+    pub(crate) provenance: Option<(ReadKey, Rc<dyn Provenance>)>,
 }
 
 impl Context {
@@ -237,6 +265,7 @@ impl Context {
             lows: Vec::new(),
             drop_at: None,
             drop_point: None,
+            provenance: None,
         }
     }
 
@@ -294,9 +323,33 @@ impl Context {
         self.vstack[..above.min(self.vstack.len())].last()
     }
 
-    /// Pops the top virtual frame.
     /// Delivers `what` to the read virtual frame `below` was blocked in.
     pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) {
+        self.push_blocked(below, what, None);
+    }
+
+    /// Delivers the unwind out of the running frame at `cidx` to the
+    /// read of [`Self::unwind_target`], with the provenance record
+    /// published for that read.
+    pub(crate) fn deliver_unwind(&mut self, cidx: u32, what: Delivered) {
+        let below = self
+            .unwind_target(cidx)
+            .expect("incr-core: an unwind is delivered to a virtual frame")
+            .clone();
+        let key = ReadKey::blocked(&below);
+        let provenance = self
+            .provenance
+            .take()
+            .and_then(|(k, p)| (k == key).then_some(p));
+        self.push_blocked(&below, what, provenance);
+    }
+
+    fn push_blocked(
+        &mut self,
+        below: &VFrame,
+        what: Delivered,
+        provenance: Option<Rc<dyn Provenance>>,
+    ) {
         let key = ReadKey::blocked(below);
         self.pending.retain(|d| !(d.blocked && d.key == key));
         self.pending.push(Delivery {
@@ -305,7 +358,102 @@ impl Context {
             taken: false,
             blocked: true,
             what,
+            provenance,
+            below: Vec::new(),
         });
+    }
+
+    /// The virtual frame the driver delivers an unwind out of the frame at
+    /// `cidx` to, when that is the running frame: the running entry's, or
+    /// the one a pop finishes.
+    pub(crate) fn unwind_target(&self, cidx: u32) -> Option<&VFrame> {
+        let level = self.running?;
+        if self.boundary + level != cidx {
+            return None;
+        }
+        self.vframe_at(cidx.checked_sub(1)?)
+    }
+
+    /// The read of [`Self::unwind_target`] for a landing of `node` at
+    /// `cidx`, when that read is of `node`.
+    pub(crate) fn landing_reader(&self, node: u32, generation: u32, cidx: u32) -> Option<ReadKey> {
+        let below = self.unwind_target(cidx)?;
+        (below.reading == u64::from(node) | (u64::from(generation) << 32))
+            .then(|| ReadKey::blocked(below))
+    }
+
+    /// The virtual frame at position `cidx`.
+    pub(crate) fn vframe_at(&self, cidx: u32) -> Option<&VFrame> {
+        let v = self.vstack.get(cidx.checked_sub(self.boundary)? as usize)?;
+        (v.cidx == cidx).then_some(v)
+    }
+
+    /// The untaken user-panic deliveries with a record that a read of
+    /// `node` at position `at` stands for: those for that frame, and those
+    /// whose frame's pops reached it, as `(index, record)`.
+    pub(crate) fn landed_payloads(
+        &self,
+        at: u32,
+        node: u32,
+        generation: u32,
+    ) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.pending.iter().enumerate().filter_map(move |(i, d)| {
+            let k = d.key;
+            let p = d.provenance.as_ref()?;
+            (!d.taken
+                && matches!(d.what, Delivered::Unwind { cycle: false, .. })
+                && ((k.cidx == at && k.node == node && k.generation == generation)
+                    || d.below.contains(&(at, node, generation))))
+            .then(|| (i, p.record()))
+        })
+    }
+
+    /// Takes the payload of delivery `i` for a read at `at`, as
+    /// [`Self::take_unwind`] does. When the read is the running frame's
+    /// own compute, its unwind carries the record on to
+    /// [`Self::unwind_target`].
+    pub(crate) fn take_landed(&mut self, i: usize, at: u32) -> (bool, Box<dyn Any + Send>) {
+        if let Some(below) = self.unwind_target(at) {
+            let key = ReadKey::blocked(below);
+            self.provenance = self.pending[i].provenance.clone().map(|p| (key, p));
+        }
+        match self.take_unwind(i) {
+            Delivered::Unwind {
+                attributed,
+                payload,
+                ..
+            } => (attributed, payload),
+            _ => unreachable!("incr-core: matched as an unwind"),
+        }
+    }
+
+    /// Marks delivery `i`'s read taken, as `take_delivery` does, and
+    /// returns its unwind. The delivery stays until its maker's run ends,
+    /// for a retry doomed again; a payload that can't be copied is
+    /// delivered once.
+    pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
+        let key = self.pending[i].key;
+        for d in self.pending.iter_mut().filter(|d| d.key == key) {
+            d.taken = true;
+        }
+        let Delivered::Unwind {
+            cycle,
+            poison,
+            attributed,
+            payload,
+        } = &self.pending[i].what
+        else {
+            unreachable!("incr-core: taken as an unwind");
+        };
+        match copy_payload(&**payload) {
+            Some(copy) => Delivered::Unwind {
+                cycle: *cycle,
+                poison: *poison,
+                attributed: *attributed,
+                payload: copy,
+            },
+            None => self.pending.remove(i).what,
+        }
     }
 
     /// Keeps the walk of the read virtual frame `below` was blocked in, from
@@ -320,6 +468,8 @@ impl Context {
             taken: false,
             blocked: false,
             what: Delivered::Walk(Box::new(walk)),
+            provenance: None,
+            below: Vec::new(),
         });
     }
 
@@ -340,6 +490,8 @@ impl Context {
                 taken: false,
                 blocked: false,
                 what: Delivered::Direct,
+                provenance: None,
+                below: Vec::new(),
             });
         }
     }
@@ -410,6 +562,7 @@ thread_local! {
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
+    static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
 }
@@ -420,6 +573,7 @@ loom::thread_local! {
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
+    static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
 }
@@ -688,6 +842,19 @@ pub(crate) fn speculative() -> bool {
     SPECULATIVE.with(Cell::get) != 0
 }
 
+/// The kind an unwind of `kind` out of a run goes on as. A speculative
+/// run may evaluate nodes the unbounded run never does, so a panic in it
+/// lands nothing Failed, and a cycle it raises is no read's result: the
+/// real run raises either again if it does reach the node. Either goes on
+/// as a discard.
+pub(crate) fn run_unwind_kind(kind: Option<UnwindKind>, speculative: bool) -> Option<UnwindKind> {
+    if speculative && matches!(kind, None | Some(UnwindKind::Cycle)) {
+        Some(UnwindKind::Discard)
+    } else {
+        kind
+    }
+}
+
 /// Counts a speculative entry's run while it lives; dropping it, by an
 /// unwind included, gives the count back.
 pub(crate) struct Speculating(());
@@ -714,6 +881,30 @@ pub(crate) fn with<R>(f: impl FnOnce(&mut Vec<Context>) -> R) -> R {
         value_code::set_replay_bit(!c.is_empty());
         r
     })
+}
+
+/// The Failed read a provenance record named, until a later Failed read
+/// of the same node on this thread or the end of the outermost entry.
+pub(crate) fn carry() -> Option<Carry> {
+    CARRY.with(Cell::get)
+}
+
+pub(crate) fn set_carry(carry: Option<Carry>) {
+    CARRY.with(|c| c.set(carry));
+}
+
+/// A copy of a panic payload of a type the engine knows: a cycle unwind's
+/// or a `panic!` message.
+pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + Send>> {
+    if let Some(unwind) = payload.downcast_ref::<crate::cycle::CycleUnwind>() {
+        return Some(Box::new(crate::cycle::CycleUnwind(unwind.0.clone())));
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return Some(Box::new(message.clone()));
+    }
+    payload
+        .downcast_ref::<&'static str>()
+        .map(|message| Box::new(*message) as Box<dyn Any + Send>)
 }
 
 /// Opens a context, returning its id.
@@ -791,6 +982,7 @@ pub(crate) fn reset() {
 #[inline(never)]
 fn clear() {
     SUSPENDED.with(|s| s.borrow_mut().clear());
+    set_carry(None);
     let removed = with(std::mem::take);
     drop(removed);
 }

@@ -295,6 +295,9 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Option<Cycle> {
         replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
+        if outermost {
+            replay::set_carry(None);
+        }
         // A wound wins over any kind: whatever unwound last, this
         // thread gave up its claims to an older one, and retries.
         if outermost && cycle_state::wounded() {
@@ -632,7 +635,14 @@ impl<C: Cells> Runtime<C> {
                     ctl.lower(anchor);
                     let kind_now = cycle_state::unwind_kind();
                     let mut bag = Deferred::new();
-                    self.release_unwound_from(at + 1, slot, kind_now, kind_now.is_some(), &mut bag);
+                    self.release_unwound_from(
+                        at + 1,
+                        slot,
+                        kind_now,
+                        kind_now.is_some(),
+                        Some(&*payload),
+                        &mut bag,
+                    );
                     bag.drain(self);
                     return Some(Err(self.member_run_unwound(kind, payload)));
                 }
@@ -760,14 +770,11 @@ impl<C: Cells> Runtime<C> {
         }
         if result.is_err() {
             replay::unwind_past_since(self.runtime_id, cidx, first);
-            // A speculative run's panic or cycle is a discard, as in
-            // `compute_panicked`: callers land the run after its
-            // speculative guard has dropped.
-            if matches!(cycle_state::unwind_kind(), None | Some(UnwindKind::Cycle))
-                && replay::speculative()
-            {
-                cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
-            }
+            // Callers land the run after its speculative guard has dropped.
+            cycle_state::set_unwind_kind(replay::run_unwind_kind(
+                cycle_state::unwind_kind(),
+                replay::speculative(),
+            ));
             // A discard unwinds a run the unbounded run never makes: the
             // member keeps what its last run recorded, or its episode's
             // landing installs deps that the discard leaves New.
@@ -936,7 +943,7 @@ impl<C: Cells> Runtime<C> {
     fn abort_episode(&self, cidx: u32, payload: Payload, bag: &mut Deferred<C>) -> ! {
         let kind = cycle_state::take_unwind_kind();
         self.note_unwound_read(&*payload, kind);
-        self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), bag);
+        self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), Some(&*payload), bag);
         // The root's reader that catches the unwind has read a node that
         // did not land, as after a single node's unwind.
         self.dep_stack.poison_current_frame(self.runtime_id);
@@ -1484,32 +1491,35 @@ impl<C: Cells> Runtime<C> {
         kind: Option<UnwindKind>,
         bag: &mut Deferred<C>,
     ) {
-        self.release_held_where(cidx, discarding, kind, None, &[], bag);
+        self.release_held_where(cidx, discarding, kind, None, &[], None, bag);
     }
 
     /// [`Self::release_held_from`] for a frame at `cidx` that unwound with
     /// `kind`: the claims its subtree deferred to a root below it go too.
     /// A doom's discard keeps those, for the frame's retry to read, and so
     /// does a speculative run's unwind, which the unbounded run may never
-    /// make: another frame at the position may own them.
+    /// make: another frame at the position may own them. `payload` is the
+    /// unwind's, which a claim landing Failed lets out.
     pub(super) fn release_unwound_from(
         &self,
         cidx: u32,
         node: u32,
         kind: Option<UnwindKind>,
         discarding: bool,
+        payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, kind, subtree, &[], bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &[], payload, bag);
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
     /// the claims in `keep`.
     pub(super) fn release_held_except(&self, cidx: u32, keep: &[u32], bag: &mut Deferred<C>) {
-        self.release_held_where(cidx, true, Some(UnwindKind::Discard), None, keep, bag);
+        self.release_held_where(cidx, true, Some(UnwindKind::Discard), None, keep, None, bag);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn release_held_where(
         &self,
         cidx: u32,
@@ -1517,6 +1527,7 @@ impl<C: Cells> Runtime<C> {
         kind: Option<UnwindKind>,
         subtree: Option<u32>,
         keep: &[u32],
+        payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
         // The unwinding frame, of node `subtree`, owns the claims owned at
@@ -1571,7 +1582,9 @@ impl<C: Cells> Runtime<C> {
                     stamp_rev,
                     verify_rev,
                 };
-                self.land_failed(id, node, flags, attempt, e.wrote, &e.deps, &released, bag);
+                self.land_failed(
+                    id, node, flags, attempt, e.wrote, &e.deps, &released, payload, bag,
+                );
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
@@ -1936,7 +1949,17 @@ impl<C: Cells> Runtime<C> {
                     verify_rev,
                 };
                 let deps = std::mem::take(&mut e.deps);
-                self.land_failed(id, node, flags, attempt, false, &deps, &members, bag);
+                self.land_failed(
+                    id,
+                    node,
+                    flags,
+                    attempt,
+                    false,
+                    &deps,
+                    &members,
+                    Some(&*payload),
+                    bag,
+                );
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
