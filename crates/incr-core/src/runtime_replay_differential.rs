@@ -2125,6 +2125,23 @@ fn a_stand_in_run_contains_a_panic_as_its_walk_does() {
     }
 }
 
+/// Seed 0x6b0e30c5cf9d0858 at budget 3: op 0's Get(0) raised "last
+/// compute panicked" where the unbounded run raises "boom 0:9". As with
+/// 0xeead60a378ca2b4, a retry's rerun of a caught read landed a node
+/// Failed that the unbounded run leaves Dirty for a later read to compute
+/// again, so that read is owed the payload held for the node's frame.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failed_read_takes_the_payload_its_rerun_let_out() {
+    for seed in [0x0eea_d60a_378c_a2b4, 0x6b0e_30c5_cf9d_0858] {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
