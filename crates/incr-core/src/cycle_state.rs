@@ -187,6 +187,9 @@ pub(crate) struct Episode {
     pub(crate) cu: Vec<u32>,
     /// The iteration state since the last restart, `None` at a restart.
     pub(crate) round: Option<Round>,
+    /// The root's compute is a walk's entry, which contains the episode's
+    /// abort.
+    pub(crate) walked: bool,
 }
 
 pub(crate) struct Round {

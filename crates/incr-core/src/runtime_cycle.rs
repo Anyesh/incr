@@ -58,6 +58,9 @@ pub(super) enum PopEnd {
     /// chain cooperatively instead, its claims discarded: the reader is
     /// answered as a discarded compute's.
     Dropped,
+    /// The root's compute is a walk's entry, which contained the episode's
+    /// abort: its claims have landed, and the walk goes on.
+    Contained,
 }
 
 /// What an episode did, for tests.
@@ -876,7 +879,7 @@ impl<C: Cells> Runtime<C> {
             self.set_drop_kind();
             bag.drain_carried(Box::new(cycle::DiscardUnwind));
         }
-        self.episode(id, cidx, bag)
+        self.episode(id, cidx, ctl.has(cycle::WALKED), bag)
     }
 
     /// Every claim of this runtime held at or above `cidx`, re-anchored at
@@ -937,16 +940,37 @@ impl<C: Cells> Runtime<C> {
 
     /// Ends an episode with an unwind: every member is released, a member
     /// whose own code panicked through fix 5's panic path and the others
-    /// with the discard landing, and the unwind resumes.
+    /// with the discard landing, and the unwind resumes, or stops at the
+    /// episode's boundary if the walk's entry rooting it contains it.
     fn abort_episode(&self, cidx: u32, payload: Payload, bag: &mut Deferred<C>) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.note_unwound_read(&*payload, kind);
+        let contain = self.episode_contains(cidx, kind, &*payload);
         self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), Some(&*payload), bag);
-        // The root's reader that catches the unwind has read a node that
-        // did not land, as after a single node's unwind.
-        self.dep_stack.poison_current_frame(self.runtime_id);
-        cycle_state::set_unwind_kind(kind);
-        bag.drain_carried(payload)
+        if contain {
+            self.raise_contained(cidx, payload, bag);
+        }
+        self.leave_frame(kind, payload, bag)
+    }
+
+    /// Whether the walk's entry whose compute roots the episode at `cidx`,
+    /// if one does, contains its abort, asked before the releases as
+    /// `compute_panicked` asks. A contained abort drops the replay contexts
+    /// the root's frame opened, as that frame's unwind would; any other
+    /// tells the reading frame its read unwound.
+    fn episode_contains(
+        &self,
+        cidx: u32,
+        kind: Option<UnwindKind>,
+        payload: &(dyn Any + Send),
+    ) -> bool {
+        let contain = contain_impl::walked_episode(cidx)
+            .is_some_and(|root| self.containable(root, kind, payload));
+        if contain {
+            replay::unwind_past(self.runtime_id, cidx);
+        } else {
+            self.note_unwound_read(payload, kind);
+        }
+        contain
     }
 
     /// Drops a user value an episode no longer needs, attributing a
@@ -1009,8 +1033,14 @@ impl<C: Cells> Runtime<C> {
 
     /// The episode rooted at `root`, at conceptual-stack position `cidx`:
     /// iterate the members to a landing, defer the group to a lower root,
-    /// or dissolve it.
-    pub(super) fn episode(&self, root: NodeId, cidx: u32, bag: &mut Deferred<C>) -> PopEnd {
+    /// or dissolve it. `walked` if the root's compute is a walk's entry.
+    pub(super) fn episode(
+        &self,
+        root: NodeId,
+        cidx: u32,
+        walked: bool,
+        bag: &mut Deferred<C>,
+    ) -> PopEnd {
         #[cfg(test)]
         self.episodes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1024,6 +1054,7 @@ impl<C: Cells> Runtime<C> {
             members: self.claim_members(cidx),
             cu: Vec::new(),
             round: None,
+            walked,
         });
         #[cfg(test)]
         self.episodes_seen
@@ -1036,7 +1067,24 @@ impl<C: Cells> Runtime<C> {
     /// Runs episode `ep` on from where it stands. A member run that a doom
     /// discards suspends it in the context of that run's virtual frame,
     /// whose pop resumes it with the same member in the same iteration.
-    pub(super) fn run_episode(&self, mut ep: Box<Episode>, bag: &mut Deferred<C>) -> PopEnd {
+    ///
+    /// An episode rooted at a walk's entry is where its contained abort
+    /// stops, so that the entry's compute ends `Contained`.
+    pub(super) fn run_episode(&self, ep: Box<Episode>, bag: &mut Deferred<C>) -> PopEnd {
+        if !ep.walked {
+            return self.episode_rounds(ep, bag);
+        }
+        let _walked = contain_impl::WalkedEpisode::enter(ep.cidx, ep.root);
+        match catch_unwind(AssertUnwindSafe(|| self.episode_rounds(ep, bag))) {
+            Ok(end) => end,
+            Err(payload) => {
+                self.contain_unwind(payload, bag);
+                PopEnd::Contained
+            }
+        }
+    }
+
+    fn episode_rounds(&self, mut ep: Box<Episode>, bag: &mut Deferred<C>) -> PopEnd {
         let rt = self.runtime_id;
         let cidx = ep.cidx;
         let id = ep.id;
@@ -1577,7 +1625,7 @@ impl<C: Cells> Runtime<C> {
                     verify_rev,
                 };
                 self.land_failed(
-                    id, node, flags, attempt, e.wrote, &e.deps, &released, payload, None, bag,
+                    id, node, flags, attempt, e.wrote, &e.deps, &released, payload, bag,
                 );
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
@@ -1930,7 +1978,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.note_unwound_read(&*payload, kind);
+        let contain = self.episode_contains(cidx, kind, &*payload);
         let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {
             let id = NodeId(*m);
@@ -1952,7 +2000,6 @@ impl<C: Cells> Runtime<C> {
                     &deps,
                     &members,
                     Some(&*payload),
-                    None,
                     bag,
                 );
             } else {
@@ -1960,9 +2007,10 @@ impl<C: Cells> Runtime<C> {
             }
             bag.push_erased(Box::new((e.buf.take(), e.s.take())));
         }
-        self.dep_stack.poison_current_frame(self.runtime_id);
-        cycle_state::set_unwind_kind(kind);
-        bag.drain_carried(payload)
+        if contain {
+            self.raise_contained(cidx, payload, bag);
+        }
+        self.leave_frame(kind, payload, bag)
     }
 
     /// Claims group member `m`, Dirty to Computing, for the group verify
@@ -2031,12 +2079,13 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Group verification of the Dirty group member `x`, whose claim
-    /// `compute_one` holds at generation `g`.
+    /// `compute_one` holds at generation `g`, `walked` if as a walk's entry.
     pub(super) fn group_verify(
         &self,
         x: NodeId,
         g: u32,
         visit: Visit,
+        walked: bool,
         bag: &mut Deferred<C>,
     ) -> GroupEnd {
         let rt = self.runtime_id;
@@ -2161,7 +2210,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         });
-        match self.episode(x, cidx, bag) {
+        match self.episode(x, cidx, walked, bag) {
             PopEnd::Landed => GroupEnd::Done(Computed::Done),
             PopEnd::Deferred => GroupEnd::Done(Computed::Deferred),
             PopEnd::Dissolved => {
@@ -2170,6 +2219,7 @@ impl<C: Cells> Runtime<C> {
             }
             PopEnd::Retry => GroupEnd::Retry,
             PopEnd::Suspended | PopEnd::Dropped => GroupEnd::Done(Computed::Discarded),
+            PopEnd::Contained => GroupEnd::Done(Computed::Unsettled),
         }
     }
 }

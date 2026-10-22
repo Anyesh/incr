@@ -5,6 +5,12 @@
 //! the walk goes on; a panic's payload stays with the Failed landings it
 //! made, as a ticket, for the first read of any of them.
 //!
+//! The entry's frame decides where it ends in the unwind, before its
+//! claims are released: the closure's panic arm, or the abort of the
+//! episode the entry roots. A contained unwind lands as any other and
+//! skips what an unwind tells the reading frame; where it stops, in the
+//! panic arm or at the episode's boundary, its landings become the ticket.
+//!
 //! The landings an unwind makes above the containing entry are found
 //! through notes this thread keeps per landing, keyed by the address of
 //! the panic's box. A note lives only while that box unwinds: every point
@@ -15,7 +21,7 @@
 //! also holds the text of a `&str` or `String` payload.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, PoisonError};
@@ -38,9 +44,9 @@ pub(crate) struct Tickets {
 }
 
 /// A contained panic, held while any of `nodes`, the `(node, generation)`
-/// landings it failed, stays in that Failed landing: the entry's and each
-/// one the unwind made above the entry's frame. A node's later Failed
-/// landing, its flip to Dirty or its delete removes it.
+/// landings it failed at or above the entry's position, stays in that
+/// Failed landing. A node's later Failed landing, its flip to Dirty or its
+/// delete removes it.
 struct Ticket {
     /// Orders tickets, so that a node's flip to Dirty removes it only from
     /// tickets of landings before the flip.
@@ -69,14 +75,47 @@ struct Unwound {
     restorable: bool,
 }
 
+/// An episode's abort that the walk's entry rooting it at `cidx` contains,
+/// on its way to the episode's boundary.
+pub(super) struct Contained {
+    cidx: u32,
+    payload: Box<dyn Any + Send>,
+}
+
 #[cfg(not(loom))]
 thread_local! {
     static UNWOUND: RefCell<Vec<Unwound>> = const { RefCell::new(Vec::new()) };
+    static WALKED_EPISODE: Cell<(u32, u32)> = const { Cell::new((u32::MAX, 0)) };
 }
 
 #[cfg(loom)]
 loom::thread_local! {
     static UNWOUND: RefCell<Vec<Unwound>> = RefCell::new(Vec::new());
+    static WALKED_EPISODE: Cell<(u32, u32)> = Cell::new((u32::MAX, 0));
+}
+
+/// The position and root slot of the innermost running episode whose
+/// root is a walk's entry, while it runs.
+pub(super) struct WalkedEpisode((u32, u32));
+
+impl WalkedEpisode {
+    pub(super) fn enter(cidx: u32, root: NodeId) -> Self {
+        Self(WALKED_EPISODE.with(|w| w.replace((cidx, root.0))))
+    }
+}
+
+impl Drop for WalkedEpisode {
+    fn drop(&mut self) {
+        WALKED_EPISODE.with(|w| w.set(self.0));
+    }
+}
+
+/// The root of the episode at `cidx`, if it is a walk's entry.
+pub(super) fn walked_episode(cidx: u32) -> Option<NodeId> {
+    WALKED_EPISODE.with(|w| {
+        let (at, root) = w.get();
+        (at == cidx).then_some(NodeId(root))
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -182,11 +221,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Before `id` lands Failed at frame `cidx`, from `land_failed`: drops
-    /// `id` from the tickets of earlier landings, then holds `contained`,
-    /// the panic a walk's entry contained, for this landing and those the
-    /// unwind made above it, or notes `payload`, a panic unwinding on, for
-    /// a walk's entry below to contain. Returns the mark that orders this
-    /// landing after every ticket it removed from, or 0 with none held.
+    /// `id` from the tickets of earlier landings and notes `payload`, the
+    /// panic unwinding, for a walk's entry below to contain. Returns the
+    /// mark that orders this landing after every ticket it removed from, or
+    /// 0 with none held.
     #[cold]
     #[inline(never)]
     pub(super) fn failed_landing(
@@ -195,63 +233,115 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         cidx: u32,
         payload: Option<&(dyn Any + Send)>,
-        contained: Option<Box<dyn Any + Send>>,
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
-        let nodes = match (&contained, payload) {
-            (Some(contained), _) => {
-                let at = key(&**contained);
-                let mut nodes = vec![landing];
-                with_notes(|u| {
-                    u.retain(|w| {
-                        let above = w.cidx > cidx;
-                        if above && w.rt == rt && w.payload == at && !nodes.contains(&w.node) {
-                            nodes.push(w.node);
-                        }
-                        !above
-                    });
+        if let Some(payload) = payload {
+            // The frames at and above `cidx` belong to this unwind, so an
+            // earlier unwind's notes there are spent.
+            let at = key(payload);
+            with_notes(|u| {
+                u.retain(|w| !(w.cidx >= cidx && w.payload != at));
+                u.push(Unwound {
+                    rt,
+                    cidx,
+                    node: landing,
+                    payload: at,
+                    restorable: false,
                 });
-                nodes
-            }
-            (None, Some(payload)) => {
-                // The frames at and above `cidx` belong to this unwind, so
-                // an earlier unwind's notes there are spent.
-                let at = key(payload);
-                with_notes(|u| {
-                    u.retain(|w| !(w.cidx >= cidx && w.payload != at));
-                    u.push(Unwound {
-                        rt,
-                        cidx,
-                        node: landing,
-                        payload: at,
-                        restorable: false,
-                    });
-                });
-                Vec::new()
-            }
-            (None, None) => Vec::new(),
-        };
-        if contained.is_none() && !self.tickets_held() {
+            });
+        }
+        if !self.tickets_held() {
             return 0;
         }
         let (stale, mark) = {
             let mut t = self.tickets.write();
             let stale = release(&mut t, u64::MAX, |n| n == landing);
-            if let Some(payload) = contained {
-                let seq = t.next;
-                t.held.push(Ticket {
-                    seq,
-                    nodes,
-                    payload: Mutex::new(payload),
-                });
-            }
             t.next += 1;
             self.sync_held(&t);
             (stale, t.next)
         };
         drop(stale);
         mark
+    }
+
+    /// The episode at `cidx`, rooted at a walk's entry, aborts with
+    /// `payload`, which the entry contains: the unwind goes on, past what
+    /// it would tell the reading frame, to the episode's boundary.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn raise_contained(
+        &self,
+        cidx: u32,
+        payload: Box<dyn Any + Send>,
+        bag: &mut Deferred<C>,
+    ) -> ! {
+        bag.drain_carried(Box::new(Contained { cidx, payload }))
+    }
+
+    /// An unwind out of the rounds of an episode rooted at a walk's entry:
+    /// a [`Contained`] stops here, anything else unwinds on.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn contain_unwind(&self, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
+        let c = match payload.downcast::<Contained>() {
+            Ok(c) => c,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+        self.contain(c.cidx, c.payload, bag);
+    }
+
+    /// Stops an unwind a walk's entry at `cidx` contains: the notes at and
+    /// above `cidx` are spent, and the Failed landings `payload` made there
+    /// hold it for their first read.
+    pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
+        let (rt, at) = (self.runtime_id, key(&*payload));
+        let mut nodes = Vec::new();
+        if notes_held() {
+            with_notes(|u| {
+                u.retain(|w| {
+                    let above = w.cidx >= cidx;
+                    if above && w.rt == rt && w.payload == at && !nodes.contains(&w.node) {
+                        nodes.push(w.node);
+                    }
+                    !above
+                });
+            });
+        }
+        if let Some(payload) = self.hold(nodes, payload) {
+            bag.push_erased(payload);
+        }
+    }
+
+    /// Holds `payload` for those of `nodes` still in their Failed landing
+    /// and in no other ticket, or returns it when none is.
+    fn hold(
+        &self,
+        mut nodes: Vec<(u32, u32)>,
+        payload: Box<dyn Any + Send>,
+    ) -> Option<Box<dyn Any + Send>> {
+        if nodes.is_empty() {
+            return Some(payload);
+        }
+        let mut t = self.tickets.write();
+        nodes.retain(|&(slot, generation)| {
+            let node = self.nodes.get(slot);
+            node.generation() == generation
+                && state::load::<C>(node.state_cell()) == NodeState::Failed
+                && !t.held.iter().any(|c| c.nodes.contains(&(slot, generation)))
+        });
+        if nodes.is_empty() {
+            return Some(payload);
+        }
+        let seq = t.next;
+        t.next += 1;
+        t.held.push(Ticket {
+            seq,
+            nodes,
+            payload: Mutex::new(payload),
+        });
+        self.sync_held(&t);
+        None
     }
 
     /// Where `id` is about to leave Failed for Dirty: the mark its
@@ -448,28 +538,7 @@ impl<C: Cells> Runtime<C> {
                 !same
             });
         });
-        if nodes.is_empty() {
-            return Some(payload);
-        }
-        let mut t = self.tickets.write();
-        nodes.retain(|&(slot, generation)| {
-            let node = self.nodes.get(slot);
-            node.generation() == generation
-                && state::load::<C>(node.state_cell()) == NodeState::Failed
-                && !t.held.iter().any(|c| c.nodes.contains(&(slot, generation)))
-        });
-        if nodes.is_empty() {
-            return Some(payload);
-        }
-        let seq = t.next;
-        t.next += 1;
-        t.held.push(Ticket {
-            seq,
-            nodes,
-            payload: Mutex::new(payload),
-        });
-        self.sync_held(&t);
-        None
+        self.hold(nodes, payload)
     }
 
     /// The contained payloads still held, for tests.

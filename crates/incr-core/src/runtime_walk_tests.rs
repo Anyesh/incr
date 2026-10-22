@@ -780,6 +780,129 @@ fn shared_walked_dep_panic_reaches_the_rerun_that_reads_it() {
     walked_dep_panic_reaches_the_rerun_that_reads_it::<Shared>();
 }
 
+/// How `x`'s stale dep `a` comes to run an episode that panics.
+#[derive(Clone, Copy, PartialEq)]
+enum EpisodeShape {
+    /// `a` and `b` are a landed group, which the walk group-verifies.
+    Group,
+    /// The set of `k` closes the cycle, so `a`'s compute roots it.
+    NewCycle,
+}
+
+/// `a`, a fixpoint from 0 capped at 5, reads `b` while `k` is 1, and `b`
+/// reads `a`. `b` panics on an `a` of 3 or more while `j` is 0, which only
+/// a fixpoint iteration reaches. `x` reads `sel`, and `a` while `sel` is 0
+/// or always if `always_reads_a`. After `j` drops to 0 and `sel` moves to
+/// 1, the walk of `x` runs `a`'s episode, whose member run of `b` panics.
+/// Returns what `get(x)` gives then.
+fn episode_panic_under_walk<C: Cells>(
+    shape: EpisodeShape,
+    always_reads_a: bool,
+) -> std::thread::Result<i64> {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let k = rt.create_input(i64::from(shape == EpisodeShape::Group));
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let cell = cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                if rt.get(k) == 0 {
+                    1
+                } else {
+                    rt.get(*cell.get().unwrap()).min(5)
+                }
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a);
+        assert!(v < 3 || rt.get(j) != 0, "b boom");
+        v + 1
+    });
+    cell.set(b).unwrap();
+    let x = rt.create_query(move |rt| {
+        let s = rt.get(sel);
+        if always_reads_a || s == 0 {
+            s + rt.get(a)
+        } else {
+            100
+        }
+    });
+    let before = if shape == EpisodeShape::Group { 5 } else { 1 };
+    assert_eq!(rt.get(x), before);
+    assert_eq!(rt.get(b), before + 1);
+
+    if shape == EpisodeShape::NewCycle {
+        rt.set(k, 1);
+    }
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    rt.group_verifies.lock().unwrap().clear();
+    let episodes = rt.episodes.load(Ordering::Relaxed);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(x)));
+    assert!(rt.episodes.load(Ordering::Relaxed) > episodes);
+    assert_eq!(
+        rt.group_verifies.lock().unwrap().contains(&a.slot()),
+        shape == EpisodeShape::Group
+    );
+    if got.is_ok() {
+        // The episode's panic stays with its Failed member for a reader.
+        let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
+        assert_eq!(panic_message(err), "b boom");
+    }
+    assert_no_notes();
+    got
+}
+
+#[test]
+fn local_stale_group_dep_whose_verify_panics_is_not_read() {
+    let got = episode_panic_under_walk::<Local>(EpisodeShape::Group, false);
+    assert_eq!(got.ok(), Some(100));
+}
+
+#[test]
+fn shared_stale_group_dep_whose_verify_panics_is_not_read() {
+    let got = episode_panic_under_walk::<Shared>(EpisodeShape::Group, false);
+    assert_eq!(got.ok(), Some(100));
+}
+
+#[test]
+fn local_stale_dep_whose_episode_panics_is_not_read() {
+    let got = episode_panic_under_walk::<Local>(EpisodeShape::NewCycle, false);
+    assert_eq!(got.ok(), Some(100));
+}
+
+#[test]
+fn shared_stale_dep_whose_episode_panics_is_not_read() {
+    let got = episode_panic_under_walk::<Shared>(EpisodeShape::NewCycle, false);
+    assert_eq!(got.ok(), Some(100));
+}
+
+/// The rerun still reads `a`, so the read raises the episode's panic, as a
+/// run from scratch does.
+fn walked_episode_panic_reaches_the_rerun_that_reads_it<C: Cells>() {
+    for shape in [EpisodeShape::Group, EpisodeShape::NewCycle] {
+        let err = episode_panic_under_walk::<C>(shape, true).unwrap_err();
+        assert_eq!(panic_message(err), "b boom");
+    }
+}
+
+#[test]
+fn local_walked_episode_panic_reaches_the_rerun_that_reads_it() {
+    walked_episode_panic_reaches_the_rerun_that_reads_it::<Local>();
+}
+
+#[test]
+fn shared_walked_episode_panic_reaches_the_rerun_that_reads_it() {
+    walked_episode_panic_reaches_the_rerun_that_reads_it::<Shared>();
+}
+
 /// A running total `a_k = b + a_{k-1}` reads the changed `b` before its
 /// predecessor; the walk still cleans the chain bottom-up, so a set of `b`
 /// recomputes 100k nodes without nesting their closures.
