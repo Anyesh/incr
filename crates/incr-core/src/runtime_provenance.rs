@@ -273,13 +273,6 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         replay::with(|c| {
-            for x in c.iter_mut().filter(|x| x.rt == rt) {
-                for d in x.pending.iter_mut() {
-                    if d.key.node == id.0 && d.key.generation == generation {
-                        d.failed_here = true;
-                    }
-                }
-            }
             let Some((x, key)) = c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
                 let key = x.landing_reader(id.0, generation, cidx)?;
                 Some((x, key))
@@ -302,6 +295,26 @@ impl<C: Cells> Runtime<C> {
                 id: record,
             });
             x.provenance = Some((key, hold));
+        });
+    }
+
+    /// After this thread's landing stored `id` Failed: the deliveries held
+    /// for its frames may go to a Failed read by their path.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn after_failed_store(&self, id: NodeId, generation: u32) {
+        if value_code::thread_word() & value_code::REPLAY_BIT == 0 || replay::speculative() {
+            return;
+        }
+        let rt = self.runtime_id;
+        replay::with(|c| {
+            for x in c.iter_mut().filter(|x| x.rt == rt) {
+                for d in x.pending.iter_mut() {
+                    if d.key.node == id.0 && d.key.generation == generation {
+                        d.failed_here = true;
+                    }
+                }
+            }
         });
     }
 
