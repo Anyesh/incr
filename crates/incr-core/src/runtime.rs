@@ -3577,7 +3577,7 @@ impl<C: Cells> Runtime<C> {
         // A closure that catches a speculative run's discard can't land a
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
-        let contain = walked && self.containable(id, kind, &*payload);
+        let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
         if !contain {
             self.note_unwound_read(&*payload, kind);
         }
@@ -3636,17 +3636,19 @@ impl<C: Cells> Runtime<C> {
         bag.drain_carried(payload)
     }
 
-    /// Whether walk entry `entry` contains an unwind out of its compute,
-    /// asked before the compute's frame releases its claims: a panic, or a
-    /// cycle none of whose members this thread still holds or has a virtual
-    /// frame of, so that every member ran above the walk and the unwind
-    /// released it. The entry's own claim is not counted: the unwind
-    /// releases it too, and a virtual frame's run still holds it when this
-    /// is asked. A wounded thread must reach its outermost entry, so it
-    /// contains none.
+    /// Whether walk entry `entry`, at position `cidx`, contains an unwind
+    /// out of its compute, asked before the compute's frame releases its
+    /// claims: a panic, or a cycle none of whose members this thread will
+    /// still hold or has a virtual frame of, so that every member ran above
+    /// the walk and the unwind released it. The entry's own claim and the
+    /// claims held at or above its position are not counted: the unwind
+    /// releases them too, and a virtual frame's run still holds the entry's
+    /// when this is asked. A wounded thread must reach its outermost entry,
+    /// so it contains none.
     pub(super) fn containable(
         &self,
         entry: NodeId,
+        cidx: u32,
         kind: Option<UnwindKind>,
         payload: &(dyn std::any::Any + Send),
     ) -> bool {
@@ -3660,7 +3662,7 @@ impl<C: Cells> Runtime<C> {
                     .iter()
                     .map(|p| NodeId(p.slot()))
                     .all(|p| {
-                        (p == entry || self.own_claim_owner(p).is_none())
+                        (p == entry || self.unwind_releases(p, cidx))
                             && self.virtual_owner(p).is_none()
                     })
             }),
