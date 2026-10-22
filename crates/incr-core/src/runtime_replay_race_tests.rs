@@ -1932,6 +1932,76 @@ fn shared_vframe_failed_read_of_a_recycled_slot() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// Records whether it was dropped while its thread was unwinding, where a
+/// panicking user `Drop` aborts.
+struct DropWitness(Arc<AtomicU8>);
+
+impl Drop for DropWitness {
+    fn drop(&mut self) {
+        let at = if thread::panicking() { 2 } else { 1 };
+        self.0.store(at, SeqCst);
+    }
+}
+
+/// The retry's first attempt at X reads Z, which is deleted under it, so
+/// its publish is Stale and the attempt's bag carries an item into the
+/// next. Meanwhile the other thread's X lets Y's failure out, so the next
+/// attempt takes the payload, and the bag drains before it is raised.
+#[test]
+fn shared_vframe_owed_payload_drains_a_stale_retrys_bag_first() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let (inside, stale) = (Gate::new(), Gate::new());
+    let z = rt.create_input(1_u64);
+    let y = rt.create_query_with(|_: &Rt| -> u64 { panic!("y boom") }, replayable());
+    let runs = Arc::new(AtomicU32::new(0));
+    let x = {
+        let (inside, runs) = (inside.clone(), Arc::clone(&runs));
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if runs.fetch_add(1, SeqCst) == 1 {
+                    let v = rt.get(z);
+                    inside.park();
+                    return v;
+                }
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
+    hook(&rt, vec![(ParkPoint::StaleRetry(id(x)), stale.clone())]);
+    let dropped = Arc::new(AtomicU8::new(0));
+    let planted = Arc::clone(&dropped);
+    let installed = rt.bag_hook.set(Box::new(move |p| {
+        (p == ParkPoint::StaleRetry(id(x)))
+            .then(|| Box::new(DropWitness(Arc::clone(&planted))) as crate::deferred::ErasedDrop)
+    }));
+    assert!(installed.is_ok(), "bag hook installed twice");
+    inside.arm();
+    stale.arm();
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    inside.wait_parked();
+    rt.delete_node(z);
+    inside.release();
+    stale.wait_parked();
+    let other = outcome(|| rt.get(x));
+    assert!(failed(&other), "{other:?}");
+    stale.release();
+    let first = first.join();
+    assert_eq!(first, Err("y boom".to_string()));
+    assert_eq!(
+        dropped.load(SeqCst),
+        1,
+        "the bag dropped its item while unwinding"
+    );
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
 /// T reads F, and F (Fallback 100), X and Y read each other in a
 /// cycle. At budget 1 Y's read of F is a virtual hit, and F's virtual
 /// frame pops as the root of an episode in which F panics "f boom", so

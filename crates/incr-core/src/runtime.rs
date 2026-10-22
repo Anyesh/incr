@@ -3074,7 +3074,7 @@ impl<C: Cells> Runtime<C> {
             // failure on is seen whatever state it left the node in since.
             if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
                 if let Some(payload) = self.owed_payload(id, g0.unwrap_or(node.generation())) {
-                    self.raise_owed(payload);
+                    self.raise_owed(payload, bag);
                 }
             }
             match observed {
@@ -3210,7 +3210,7 @@ impl<C: Cells> Runtime<C> {
                         NodeState::New
                     };
                     self.land(id, node, discard, discard);
-                    self.raise_owed(payload);
+                    self.raise_owed(payload, bag);
                 }
             }
 

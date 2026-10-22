@@ -161,12 +161,13 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Raises `payload`, which [`Self::owed_payload`] took, as the read's
-    /// panic.
+    /// panic, after `bag` drains in carried mode: a Stale retry's bag can
+    /// still hold a displaced value, whose `Drop` must not run in the unwind.
     #[cold]
     #[inline(never)]
-    pub(super) fn raise_owed(&self, payload: Box<dyn Any + Send>) -> ! {
+    pub(super) fn raise_owed(&self, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) -> ! {
         self.dep_stack.poison_current_frame(self.runtime_id);
-        resume_unwind(payload)
+        bag.drain_carried(payload)
     }
 
     /// A Failed read on this thread: if it is made for the read a record
