@@ -13,6 +13,7 @@ use super::race_tests::{id, park_at, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
+use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
 use crate::deferred::{ErasedDrop, SPILL_ALLOCS};
 use crate::handle::Incr;
 use crate::reclaim_probe::{self, RetireSite};
@@ -1087,6 +1088,75 @@ fn shared_delete_drop_panic_drops_its_buried_tickets() {
             reclaim_probe::force(RetireSite::DeleteRetire);
             delete_drop_panic_drops_its_buried_tickets(&rt);
         },
+    )
+    .assert_clean();
+}
+
+/// `x`'s walk runs the episode of its stale dep `a` (a fixpoint over
+/// `Boom`), whose member `b` panics once `a` holds `Boom(3)`, so the walk
+/// contains the abort. The released `Boom(3)` panics in its `Drop`; that
+/// panic leaves the read once the landings are done, as it does for a
+/// compute the walk contains, and `a` keeps the episode's payload.
+fn contained_episode_abort_keeps_member_drop_panic<C: Cells>(rt: &Runtime<C>) {
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let k = rt.create_input(0_i64);
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let cell = cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                if rt.get(k) == 0 {
+                    Boom(1)
+                } else {
+                    Boom(rt.get(*cell.get().unwrap()).min(5))
+                }
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| Boom(0))),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a).0;
+        if v >= 3 && rt.get(j) == 0 {
+            arm(3);
+            panic!("b boom");
+        }
+        v + 1
+    });
+    cell.set(b).unwrap();
+    let x = rt.create_query(move |rt| {
+        let s = rt.get(sel);
+        if s == 0 {
+            s + rt.get(a).0
+        } else {
+            100
+        }
+    });
+    assert_eq!(rt.get(x), 1);
+    assert_eq!(rt.get(b), 2);
+    rt.set(k, 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(x)));
+    let armed = ARMED.load(SeqCst);
+    arm(i64::MIN);
+    assert_eq!(armed, i64::MIN, "Boom(3) was never dropped");
+    let err = got.expect_err("the released Boom(3)'s Drop panic must leave the read");
+    assert!(panic_message(err).contains("drop of Boom(3)"));
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
+    assert_eq!(panic_message(err), "b boom");
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_contained_episode_abort_keeps_member_drop_panic() {
+    run_in_child(
+        "runtime::drop_panic_tests::wave6_contained_episode_abort_keeps_member_drop_panic",
+        || contained_episode_abort_keeps_member_drop_panic(&Runtime::<Local>::new()),
     )
     .assert_clean();
 }
