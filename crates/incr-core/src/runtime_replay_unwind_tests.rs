@@ -420,6 +420,83 @@ local_and_shared!(
     shared_virtual_hit_then_panic_in_a_speculative_entry
 );
 
+fn deps_of<C: Cells>(rt: &Runtime<C>, h: Incr<u64>) -> Vec<u32> {
+    let mut d = Vec::new();
+    rt.nodes.get(h.slot()).for_each_dep(|n| d.push(n.0));
+    d
+}
+
+/// F = IF(A, Q, 7), Q reads P (Fallback), P reads M, M reads H, and H's
+/// first run reads P and then W, its later ones W alone. M panics when
+/// its run is speculative and H is not the placeholder. At budget 1 F's
+/// read of Q is speculative, and H's read of P is a virtual hit that
+/// claims M too, so M's run, doomed at H, is finished by a member run at
+/// its virtual frame, which panics. The unbounded run never reads Q, so M
+/// lands as a discard: neither Failed nor with the deps of a run the
+/// unbounded run never makes.
+fn panic_in_a_speculative_entrys_continuation<C: Cells>() {
+    let run = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let a_in = rt.create_input(false);
+        let a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+        let w = rt.create_query_with(|_| 5_u64, replayable());
+        let p_later = Later::default();
+        let hits = Arc::new(AtomicU32::new(1));
+        let (hh, l) = (hits.clone(), p_later.clone());
+        let h = rt.create_query_with(
+            move |rt| {
+                if hh
+                    .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    rt.get(later(&l));
+                }
+                rt.get(w)
+            },
+            replayable(),
+        );
+        let panics = Arc::new(AtomicU32::new(0));
+        let r = panics.clone();
+        let m = rt.create_query_with(
+            move |rt| {
+                let v = rt.get(h);
+                if v != 0 && crate::replay::speculative() {
+                    r.fetch_add(1, SeqCst);
+                    std::panic::panic_any(String::from("spec boom"));
+                }
+                v
+            },
+            replayable(),
+        );
+        let p = rt.create_query_with(move |rt| rt.get(m), fallback(50));
+        p_later.set(p).unwrap();
+        let q = rt.create_query_with(move |rt| rt.get(p), replayable());
+        let f = rt.create_query_with(
+            move |rt| if rt.get(a) { rt.get(q) } else { 7 },
+            replayable(),
+        );
+        let failures = cycle_state::failures();
+        assert_eq!(get(&rt, f), Out::Value(7), "frames: {frames:?}");
+        rt.assert_invariant_i();
+        let after = [q, p, m, h].map(|n| (rt.state_of(n), deps_of(&rt, n)));
+        (
+            after,
+            cycle_state::failures() - failures,
+            panics.load(SeqCst),
+        )
+    };
+    let (unbounded, unbounded_failures, _) = run(None);
+    let (bounded, bounded_failures, panics) = run(Some(1));
+    assert!(panics > 0, "M's continuation reached its panic");
+    assert_eq!(bounded, unbounded, "Q, P, M and H: state and deps");
+    assert_eq!(bounded_failures, unbounded_failures, "failures counted");
+}
+local_and_shared!(
+    panic_in_a_speculative_entrys_continuation,
+    local_panic_in_a_speculative_entrys_continuation,
+    shared_panic_in_a_speculative_entrys_continuation
+);
+
 /// A cycle value whose drop panics "drop boom" when `marked`; a clone is
 /// unmarked, so only the iterate a step marked panics.
 struct Marked {

@@ -1305,3 +1305,89 @@ fn shared_reader_of_a_discarded_member_verifies_its_group() {
     );
     assert!(kept, "the discard took X out of its group");
 }
+
+/// F (Fallback 100) reads X, X reads Y and then Z, Y reads F while input
+/// s is 0, and Z sets s to 1 on its first run. F is New with a record of
+/// the group {F, Q}, as a walk leaves a Cyclic member. At budget 1 Z's
+/// set comes before F's pop, whose episode dissolves, and the driver
+/// parks before the level-0 entry claims F again. F's claim, taken from
+/// New, lands New as if never taken, and another thread's read then gets
+/// the unbounded run's value.
+#[test]
+fn shared_dissolved_root_lands_as_before_its_claim() {
+    let run = |frames: u32, park: bool| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+        let s = rt.create_input(0_u64);
+        let gate = Gate::new();
+        let z = {
+            let gate = gate.clone();
+            let ran = Arc::new(AtomicU8::new(0));
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    if ran.swap(1, SeqCst) == 0 {
+                        if park {
+                            gate.arm();
+                        }
+                        rt.set(s, 1);
+                    }
+                    10
+                },
+                replayable(),
+            )
+        };
+        let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let y = {
+            let fc = fc.clone();
+            rt.create_query_with(
+                move |rt: &Rt| match rt.get(s) {
+                    0 => rt.get(*fc.get().unwrap()) + 1,
+                    _ => 5,
+                },
+                replayable(),
+            )
+        };
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + rt.get(z), replayable());
+        let f = rt.create_query_with(
+            move |rt: &Rt| rt.get(x),
+            QueryOpts {
+                cycle: CycleStrategy::Fallback(Box::new(|_: &Cycle| 100)),
+                replay: Replay::Allowed,
+            },
+        );
+        fc.set(f).unwrap();
+        let q = rt.create_query(|_: &Rt| 7_u64);
+        assert_eq!(rt.get(q), 7);
+        rt.force_group_for_test(&[f.erase(), q.erase()]);
+        hook(&rt, vec![(ParkPoint::BeforeClaim(id(f)), gate.clone())]);
+        let reader = {
+            let rt = rt.clone();
+            spawn(move || outcome(|| rt.get(f)))
+        };
+        let mut gap = None;
+        if park {
+            gate.wait_parked();
+            let landed = rt.state_of(f);
+            let other = {
+                let rt = rt.clone();
+                spawn(move || outcome(|| rt.get(f)))
+            };
+            gap = Some((landed, other.join()));
+            gate.release();
+        }
+        let got = reader.join();
+        rt.assert_invariant_i();
+        (got, gap)
+    };
+    let (want, _) = run(u32::MAX, false);
+    assert_eq!(want, Ok(15));
+    let (got, gap) = run(1, true);
+    let (state, other) = gap.expect("the driver parked");
+    assert_eq!((got, other), (want.clone(), want));
+    assert_eq!(
+        state,
+        NodeState::New,
+        "F's claim taken from New landed Dirty"
+    );
+}

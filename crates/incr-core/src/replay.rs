@@ -14,7 +14,7 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 
-use crate::cycle_state::Episode;
+use crate::cycle_state::{held_episode, Episode};
 use crate::handle::RuntimeId;
 use crate::taint_memo;
 use crate::value_code;
@@ -61,9 +61,9 @@ pub(crate) struct VFrame {
     pub(crate) reading: u64,
     /// Which of the frame's reads of that node it was blocked in, from 1.
     pub(crate) ordinal: u32,
-    /// The reads the frames below were in when this frame ran, as a hash
-    /// of their ordinals: a frame of the same node at the same position
-    /// under another read of a frame below is another run.
+    /// The frames below and the reads they were in when this frame ran, as
+    /// a hash of their [`Step`]s: a frame of the same node at the same
+    /// position under another frame or read below is another run.
     pub(crate) path: u64,
     /// The level of the entry whose run made it.
     pub(crate) maker: u32,
@@ -475,13 +475,56 @@ pub(crate) fn peek_id() -> u64 {
     NEXT_ID.with(Cell::get)
 }
 
-/// The path of a frame above one at `path` that is in its `ordinal`-th
-/// read of a node.
-pub(crate) fn extend_path(path: u64, (reading, ordinal): (u64, u32)) -> u64 {
-    path.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(reading)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(u64::from(ordinal) + 1)
+/// A frame as the paths of the frames above it see it: its run as well as
+/// its read, since the frame above a read is not always the read's node (a
+/// walk computes the node's deps first), and an episode's member run reads
+/// as the discovery run of its node did.
+#[derive(Clone, Copy)]
+pub(crate) struct Step {
+    pub(crate) node: u32,
+    /// The episode of the frame's member run, if it is one.
+    pub(crate) episode: Option<u64>,
+    /// The node the frame reads, `slot | generation << 32`.
+    pub(crate) reading: u64,
+    /// Which of the frame's reads of that node it is in, from 1.
+    pub(crate) ordinal: u32,
+}
+
+impl Step {
+    /// The step of `rt`'s frame of `node` on the stack, a member run if
+    /// `member`.
+    pub(crate) fn of(rt: RuntimeId, node: u32, member: bool, reading: u64, ordinal: u32) -> Self {
+        Self {
+            node,
+            episode: member.then(|| held_episode(rt, node)).flatten(),
+            reading,
+            ordinal,
+        }
+    }
+
+    /// The step of the frame `v` stands for.
+    pub(crate) fn virtual_frame(v: &VFrame) -> Self {
+        Self {
+            node: v.node,
+            episode: v.member_of,
+            reading: v.reading,
+            ordinal: v.ordinal,
+        }
+    }
+}
+
+/// The path of a frame above one at `path` that is in `step`.
+pub(crate) fn extend_path(path: u64, step: Step) -> u64 {
+    [
+        u64::from(step.node),
+        step.episode.map_or(0, |e| e + 1),
+        step.reading,
+        u64::from(step.ordinal) + 1,
+    ]
+    .into_iter()
+    .fold(path, |p, x| {
+        p.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(x)
+    })
 }
 
 /// A read that may take deliveries: when it ends, the walk directions it
