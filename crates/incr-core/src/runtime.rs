@@ -840,8 +840,12 @@ pub struct Runtime<C: Cells> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DoomGate(pub(crate) bool);
 
-/// The default frame budget.
-pub const DEFAULT_MAX_FRAMES: u32 = 256;
+/// The default frame budget: 256, or 64 when incr-core is built with
+/// debug assertions, whose frames are about 13 times larger (about
+/// 10.5 KiB a nested read against 850 B). Either way a chain of reads at
+/// the budget uses under 700 KiB of a spawned thread's 2 MiB stack, the
+/// rest left to the closures' own frames.
+pub const DEFAULT_MAX_FRAMES: u32 = if cfg!(debug_assertions) { 64 } else { 256 };
 
 /// The default frame budget and whether every query is replayable, from
 /// `INCR_MAX_DEPTH` and `INCR_TEST_ALL_REPLAYABLE`, read once.
@@ -1307,11 +1311,12 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
-    /// Sets the frame budget, 256 unless `INCR_MAX_DEPTH` says otherwise:
-    /// a read made by a replayable query's compute when this runtime's
-    /// frames on the thread number `n` or more (every runtime's, under
-    /// `Shared`) replays instead of nesting, if the read's type has a
-    /// placeholder. Replay changes where computes run, never a result.
+    /// Sets the frame budget, [`DEFAULT_MAX_FRAMES`] unless `INCR_MAX_DEPTH`
+    /// says otherwise: a read made by a replayable query's compute when
+    /// this runtime's frames on the thread number `n` or more (every
+    /// runtime's, under `Shared`) replays instead of nesting, if the read's
+    /// type has a placeholder. Replay changes where computes run, never a
+    /// result.
     ///
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
@@ -1328,7 +1333,7 @@ impl<C: Cells> Runtime<C> {
     /// bytes. Frames differ in size with the closure and the build, so
     /// the frame count alone does not bound the stack. Like
     /// [`Self::set_max_frames`], it wins over `INCR_MAX_DEPTH`: a runtime
-    /// that has not set its frame budget gets the default of 256.
+    /// that has not set its frame budget gets [`DEFAULT_MAX_FRAMES`].
     pub fn set_max_stack_bytes(&self, n: usize) {
         if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
             self.max_frames
