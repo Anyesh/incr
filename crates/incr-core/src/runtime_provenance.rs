@@ -137,9 +137,12 @@ impl<C: Cells> Runtime<C> {
         let found = {
             let records = self.provenance.read();
             // Every Failed landing updates the records before its store, so
-            // under the lock a node still Failed was landed by the latest
-            // update; one that left Failed is read again.
-            if state::load::<C>(node.state_cell()) != NodeState::Failed {
+            // under the lock a node still Failed at the same generation was
+            // landed by the latest update; one that left Failed, or whose
+            // slot was recycled, is read again.
+            if state::load::<C>(node.state_cell()) != NodeState::Failed
+                || node.generation() != generation
+            {
                 return Err(Left);
             }
             candidates.into_iter().find(|&(_, _, record)| {
@@ -276,6 +279,6 @@ impl<C: Cells> Runtime<C> {
     }
 }
 
-/// A Failed read's node left Failed before the read could tell which
-/// landing it saw.
+/// A Failed read's node left Failed, or its slot was recycled, before the
+/// read could tell which landing it saw.
 struct Left;
