@@ -295,6 +295,9 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Option<Cycle> {
         replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
+        if outermost {
+            replay::set_carry(None);
+        }
         // A wound wins over any kind: whatever unwound last, this
         // thread gave up its claims to an older one, and retries.
         if outermost && cycle_state::wounded() {
@@ -1554,7 +1557,9 @@ impl<C: Cells> Runtime<C> {
                     stamp_rev,
                     verify_rev,
                 };
-                self.land_failed(id, node, flags, attempt, e.wrote, &e.deps, &released, bag);
+                self.land_failed(
+                    id, node, flags, attempt, e.wrote, &e.deps, &released, None, bag,
+                );
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
@@ -1919,7 +1924,17 @@ impl<C: Cells> Runtime<C> {
                     verify_rev,
                 };
                 let deps = std::mem::take(&mut e.deps);
-                self.land_failed(id, node, flags, attempt, false, &deps, &members, bag);
+                self.land_failed(
+                    id,
+                    node,
+                    flags,
+                    attempt,
+                    false,
+                    &deps,
+                    &members,
+                    Some(&*payload),
+                    bag,
+                );
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }

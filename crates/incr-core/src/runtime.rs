@@ -3056,7 +3056,10 @@ impl<C: Cells> Runtime<C> {
                     self.wait_out_deleting(id, spins);
                     continue;
                 }
-                NodeState::Failed => self.read_failed_node(id),
+                NodeState::Failed => {
+                    self.read_failed_node(id);
+                    continue;
+                }
                 NodeState::Dead => {
                     // A bumped generation under Dead is a delete that has
                     // unhooked the node but not recycled the slot yet.
@@ -3494,10 +3497,17 @@ impl<C: Cells> Runtime<C> {
         // would lose recovery paths through deps the failed run had not
         // reached yet. Extra edges only cause spurious re-verification,
         // never staleness.
-        if !C::SINGLE_THREADED {
-            self.before_failed_landing(id, node.generation(), attempt.cidx, &*payload);
-        }
-        self.land_failed(id, node, flags, attempt, wrote, deps, &[], bag);
+        self.land_failed(
+            id,
+            node,
+            flags,
+            attempt,
+            wrote,
+            deps,
+            &[],
+            Some(&*payload),
+            bag,
+        );
         // An enclosing closure that catches the unwind has still read a
         // dep that did not land Clean.
         self.dep_stack.poison_current_frame(self.runtime_id);
@@ -3508,7 +3518,7 @@ impl<C: Cells> Runtime<C> {
     /// the old and recorded deps is published, and the node lands Failed,
     /// or Dirty or New where publication says the panic may hide a change.
     /// `co_members`, sorted, are the claims released with it, which count
-    /// as settled.
+    /// as settled. `payload` is the panic, when the caller has it.
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -3519,6 +3529,7 @@ impl<C: Cells> Runtime<C> {
         wrote: bool,
         deps: &[(NodeId, u32)],
         co_members: &[u32],
+        payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
         let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
@@ -3536,6 +3547,9 @@ impl<C: Cells> Runtime<C> {
             // mid-compute, land Dirty now so the next reader retries.
             Publish::Published => NodeState::Failed,
         };
+        if !C::SINGLE_THREADED && landing == NodeState::Failed {
+            self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
+        }
         let flagged = if landing == NodeState::New {
             NodeState::New
         } else {

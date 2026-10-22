@@ -1669,3 +1669,119 @@ fn shared_vframe_landed_failed_by_a_walk_into_its_dep() {
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
+
+/// The other thread's X lets Y's failed read out, a set flips X and Y
+/// Dirty, and the next run of X lands it Failed by its own panic. The retry
+/// reads that later landing, so only the order with the other threads
+/// first is serial.
+#[test]
+fn shared_vframe_relanded_failed_by_its_own_panic() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let i = rt.create_input(0_u64);
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |rt: &Rt| -> u64 {
+                if rt.get(i) == 1 {
+                    return 7;
+                }
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if rt.get(i) == 1 {
+                panic!("x own");
+            }
+            rt.get(y) + 1
+        },
+        replayable(),
+    );
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    let other = outcome(|| rt.get(x));
+    assert!(failed(&other), "{other:?}");
+    rt.set(i, 1);
+    let again = outcome(|| rt.get(x));
+    assert_eq!(again, Err("x own".to_string()));
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert!(failed(&first), "{first:?}");
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
+/// T reads F, and F (Fallback 100), X and Y read each other in a
+/// cycle. At budget 1 Y's read of F is a virtual hit, and F's virtual
+/// frame pops as the root of an episode in which F panics "f boom", so
+/// the episode lands F Failed and delivers the payload to T's virtual
+/// frame, which holds no claim: the landing publishes a record first.
+/// The other thread's T then reads F Failed through a walk that computes
+/// X and Y, which the record's match does not cover, so only the record
+/// and the reads' end are checked here.
+#[test]
+fn shared_vframe_landed_failed_over_an_episodes_delivery() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let y = {
+        let fc = fc.clone();
+        rt.create_query_with(move |rt: &Rt| rt.get(*fc.get().unwrap()) + 1, replayable())
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let f_runs = Arc::new(AtomicU32::new(0));
+    let f = {
+        let (gate, f_runs) = (gate.clone(), f_runs.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(x) + 1;
+                // The doomed run and the stand-in come first; the episode's
+                // run panics.
+                if f_runs.fetch_add(1, SeqCst) >= 2 {
+                    gate.arm();
+                    panic!("f boom")
+                }
+                v
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fallback(Box::new(|_| 100)),
+                replay: Replay::Allowed,
+            },
+        )
+    };
+    fc.set(f).unwrap();
+    let t = rt.create_query_with(move |rt: &Rt| rt.get(f) + 1, replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(t)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    assert_eq!(
+        rt.provenance_records(),
+        1,
+        "the episode published no record"
+    );
+    let other = outcome(|| rt.get(t));
+    assert!(failed(&other), "{other:?}");
+    gate.release();
+    let first = first.join();
+    assert!(first.is_err(), "{first:?}");
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}

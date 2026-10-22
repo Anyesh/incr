@@ -8,14 +8,14 @@
 //! retry reads X Failed. The record published before Y lands carries
 //! which landings did.
 
+use std::any::Any;
 use std::panic::resume_unwind;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use super::replay_impl::copy_payload;
 use super::*;
 use crate::locks::Lock;
-use crate::replay::{self, Carry, Delivered, Provenance};
+use crate::replay::{self, Carry, Provenance, ReadKey};
 
 /// The read a record is for: the virtual frame's node and generation,
 /// the node it was blocked reading and which of its reads of it that was.
@@ -27,11 +27,22 @@ struct Reader {
     ordinal: u32,
 }
 
+impl From<ReadKey> for Reader {
+    fn from(k: ReadKey) -> Self {
+        Self {
+            node: k.node,
+            generation: k.generation,
+            reading: k.reading,
+            ordinal: k.ordinal,
+        }
+    }
+}
+
 struct Record {
     id: u64,
     reader: Reader,
-    /// The landings, as `(node, generation)`, of runs on other threads
-    /// that let the record's read failure out unchanged.
+    /// The nodes, as `(node, generation)`, whose latest Failed landing on
+    /// another thread let the record's read failure out unchanged.
     propagated: Vec<(u32, u32)>,
 }
 
@@ -56,13 +67,8 @@ struct Hold<C: Cells> {
 }
 
 impl<C: Cells> Provenance for Hold<C> {
-    fn propagated(&self, node: u32, generation: u32) -> bool {
-        self.table
-            .read()
-            .live
-            .iter()
-            .find(|r| r.id == self.id)
-            .is_some_and(|r| r.propagated.contains(&(node, generation)))
+    fn record(&self) -> u64 {
+        self.id
     }
 }
 
@@ -81,20 +87,27 @@ fn failed_read_message(slot: u32) -> String {
 }
 
 impl<C: Cells> Runtime<C> {
-    /// `compute_one`'s Failed arm: the read panics "last compute
-    /// panicked", unless this thread holds a payload for the frame the
-    /// node's compute would run in and the node's landing let that
-    /// payload's read failure out, in which case the read takes the payload.
+    /// `compute_attempts`' Failed arm: the read panics "last compute
+    /// panicked", or takes a payload this thread holds for it
+    /// (`take_landed_payload`). Returns when the node has left Failed
+    /// since the read saw it, to be read again.
     #[cold]
     #[inline(never)]
-    pub(super) fn read_failed_node(&self, id: NodeId) -> ! {
+    pub(super) fn read_failed_node(&self, id: NodeId) {
+        let mut payload = None;
+        if !C::SINGLE_THREADED {
+            match self.take_landed_payload(id) {
+                Err(Left) => return,
+                Ok(taken) => payload = taken,
+            }
+        }
         // A closure that catches this panic has still read a node with no
         // value, so it must not land Clean over it.
         self.dep_stack.poison_current_frame(self.runtime_id);
+        if let Some(payload) = payload {
+            resume_unwind(payload);
+        }
         if !C::SINGLE_THREADED {
-            if let Some(payload) = self.take_landed_payload(id) {
-                resume_unwind(payload);
-            }
             self.note_failed_read(id);
         }
         panic!("{}", failed_read_message(id.0));
@@ -102,65 +115,61 @@ impl<C: Cells> Runtime<C> {
 
     /// The payload held for the frame of `id` at the position its compute
     /// would take, or for a frame above it whose pops reached `id`'s frame
-    /// there, if another thread's landing of `id` let that payload's read
-    /// failure out. Taken as `take_delivery` takes one: a copy, and the
-    /// delivery kept for a retry doomed again, if the payload can be
-    /// copied. When the read is the running entry's own compute, the
-    /// entry's unwind carries the record on to the frame below.
-    fn take_landed_payload(&self, id: NodeId) -> Option<Box<dyn std::any::Any + Send>> {
+    /// there, if the landing of `id` this read sees let that payload's
+    /// read failure out.
+    fn take_landed_payload(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
         let rt = self.runtime_id;
-        let generation = self.nodes.get(id.0).generation();
+        let node = self.nodes.get(id.0);
+        let generation = node.generation();
         let at = self.dep_stack.next_cidx();
-        let (attributed, payload) = replay::with(|c| {
-            c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
-                let i = x.pending.iter().position(|d| {
-                    let k = d.key;
-                    !d.taken
-                        && matches!(d.what, Delivered::Unwind { cycle: false, .. })
-                        && ((k.cidx == at && k.node == id.0 && k.generation == generation)
-                            || d.below.contains(&(at, id.0, generation)))
-                        && d.provenance
-                            .as_ref()
-                            .is_some_and(|p| p.propagated(id.0, generation))
-                })?;
-                let key = x.pending[i].key;
-                for d in x.pending.iter_mut().filter(|d| d.key == key) {
-                    d.taken = true;
-                }
-                if x.running.is_some_and(|level| x.boundary + level == at) {
-                    x.provenance = x.pending[i].provenance.clone();
-                }
-                let Delivered::Unwind {
-                    attributed,
-                    payload,
-                    ..
-                } = &x.pending[i].what
-                else {
-                    unreachable!("incr-core: matched as an unwind");
-                };
-                let attributed = *attributed;
-                let payload = match copy_payload(&**payload) {
-                    Some(copy) => copy,
-                    None => match x.pending.remove(i).what {
-                        Delivered::Unwind { payload, .. } => payload,
-                        _ => unreachable!("incr-core: matched as an unwind"),
-                    },
-                };
-                Some((attributed, payload))
+        let candidates: Vec<(u64, usize, u64)> = replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| {
+                    x.landed_payloads(at, id.0, generation)
+                        .map(|(i, record)| (x.id, i, record))
+                })
+                .collect()
+        });
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let found = {
+            let records = self.provenance.read();
+            // Every Failed landing updates the records before its store, so
+            // under the lock a node still Failed was landed by the latest
+            // update; one that left Failed is read again.
+            if state::load::<C>(node.state_cell()) != NodeState::Failed {
+                return Err(Left);
+            }
+            candidates.into_iter().find(|&(_, _, record)| {
+                records
+                    .live
+                    .iter()
+                    .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
             })
-        })?;
+        };
+        let Some((context, i, _)) = found else {
+            return Ok(None);
+        };
+        let (attributed, payload) = replay::with(|c| {
+            c.iter_mut()
+                .find(|x| x.id == context)
+                .expect("incr-core: the delivery's context is open")
+                .take_landed(i, at)
+        });
         if attributed {
             cycle_state::count_failure();
         }
-        Some(payload)
+        Ok(Some(payload))
     }
 
     /// A Failed read on this thread: if it is made for the read a record
     /// names, the read's panic is carried until a landing lets it out or
     /// another Failed read of the same node. That read's frame is the
     /// reading frame, or the virtual frame below when the read is a driver
-    /// entry's own compute, whose retry the panic is delivered to; the
-    /// Failed node is the read node, or a dep its walk reached first.
+    /// entry's own compute; the Failed node is the read node, or a dep its
+    /// walk reached first.
     fn note_failed_read(&self, id: NodeId) {
         let rt = self.runtime_id;
         if replay::carry().is_some_and(|c| c.rt == rt && c.node == id.0) {
@@ -175,15 +184,9 @@ impl<C: Cells> Runtime<C> {
                 ordinal,
             }),
             _ => replay::with(|c| {
-                c.iter().filter(|x| x.rt == rt).find_map(|x| {
-                    let v = x.vstack.get(below.checked_sub(x.boundary)? as usize)?;
-                    (v.cidx == below).then_some(Reader {
-                        node: v.node,
-                        generation: v.generation,
-                        reading: v.reading,
-                        ordinal: v.ordinal,
-                    })
-                })
+                c.iter()
+                    .filter(|x| x.rt == rt)
+                    .find_map(|x| x.vframe_at(below).map(|v| ReadKey::blocked(v).into()))
             }),
         };
         let Some(reader) = reader else {
@@ -205,11 +208,13 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Before `id` lands Failed from a user panic: if `id` is the running
-    /// entry's node above a virtual frame, its record is published for
-    /// the delivery the entry's unwind makes, before the landing another
-    /// thread's read can see; and if the panic is a carried Failed read's,
-    /// unchanged, this landing is recorded as letting it out.
+    /// Before `id` lands Failed, from `land_failed`, which every Failed
+    /// landing goes through. The landing replaces whatever an earlier
+    /// landing of `id` recorded, adding `id` where it lets a carried
+    /// Failed read's panic out unchanged; and when it is the running
+    /// frame's above a virtual frame blocked reading `id`, it publishes
+    /// the record for the delivery that frame's unwind makes, before
+    /// another thread can read `id` Failed.
     #[cold]
     #[inline(never)]
     pub(super) fn before_failed_landing(
@@ -217,75 +222,50 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         generation: u32,
         cidx: u32,
-        payload: &(dyn std::any::Any + Send),
+        payload: Option<&(dyn Any + Send)>,
     ) {
-        if C::SINGLE_THREADED {
-            return;
-        }
         let rt = self.runtime_id;
-        if let Some(carry) = replay::carry().filter(|c| c.rt == rt) {
-            if payload
-                .downcast_ref::<String>()
-                .is_some_and(|m| *m == failed_read_message(carry.node))
-            {
-                if let Some(r) = self
-                    .provenance
-                    .write()
-                    .live
-                    .iter_mut()
-                    .find(|r| r.id == carry.record)
-                {
+        let carried = replay::carry().filter(|c| {
+            c.rt == rt
+                && payload
+                    .and_then(|p| p.downcast_ref::<String>())
+                    .is_some_and(|m| *m == failed_read_message(c.node))
+        });
+        {
+            let mut records = self.provenance.write();
+            for r in &mut records.live {
+                r.propagated.retain(|&landed| landed != (id.0, generation));
+                if carried.is_some_and(|c| c.record == r.id) {
                     r.propagated.push((id.0, generation));
                 }
             }
         }
-        if value_code::thread_word() & value_code::REPLAY_BIT == 0 {
+        if value_code::thread_word() & value_code::REPLAY_BIT == 0 || replay::speculative() {
             return;
         }
-        let reader = replay::with(|c| {
-            c.iter().filter(|x| x.rt == rt).find_map(|x| {
-                let level = x.running?;
-                let entry = x.running_entry?;
-                let below = (level > 0
-                    && !entry.spec
-                    && entry.node == id.0
-                    && entry.generation == generation
-                    && x.boundary + level == cidx)
-                    .then(|| x.vstack.get(level as usize - 1))
-                    .flatten()?;
-                Some(Reader {
-                    node: below.node,
-                    generation: below.generation,
-                    reading: below.reading,
-                    ordinal: below.ordinal,
-                })
-            })
-        });
-        let Some(reader) = reader else {
-            return;
-        };
-        let id_of = {
-            let mut records = self.provenance.write();
-            let record = records.next;
-            records.next += 1;
-            records.live.push(Record {
-                id: record,
-                reader,
-                propagated: Vec::new(),
-            });
-            record
-        };
-        let hold: Rc<dyn Provenance> = Rc::new(Hold::<C> {
-            table: Arc::clone(&self.provenance),
-            id: id_of,
-        });
         replay::with(|c| {
-            if let Some(x) = c
-                .iter_mut()
-                .find(|x| x.rt == rt && x.running.is_some_and(|level| x.boundary + level == cidx))
-            {
-                x.provenance = Some(hold);
-            }
+            let Some((x, key)) = c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
+                let key = x.landing_reader(id.0, generation, cidx)?;
+                Some((x, key))
+            }) else {
+                return;
+            };
+            let record = {
+                let mut records = self.provenance.write();
+                let record = records.next;
+                records.next += 1;
+                records.live.push(Record {
+                    id: record,
+                    reader: key.into(),
+                    propagated: Vec::new(),
+                });
+                record
+            };
+            let hold: Rc<dyn Provenance> = Rc::new(Hold::<C> {
+                table: Arc::clone(&self.provenance),
+                id: record,
+            });
+            x.provenance = Some((key, hold));
         });
     }
 
@@ -295,3 +275,7 @@ impl<C: Cells> Runtime<C> {
         self.provenance.read().live.len()
     }
 }
+
+/// A Failed read's node left Failed before the read could tell which
+/// landing it saw.
+struct Left;
