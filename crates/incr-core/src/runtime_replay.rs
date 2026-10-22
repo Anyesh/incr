@@ -2186,7 +2186,7 @@ impl<C: Cells> Runtime<C> {
             );
         }
         if let Some(spec_buf) = spec_buf {
-            bag.push_erased(spec_buf);
+            bag.push_erased(Box::new(spec_buf));
         }
         bag.push_erased(Box::new(e.into_values()));
         payload
