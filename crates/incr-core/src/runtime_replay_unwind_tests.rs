@@ -1265,6 +1265,20 @@ local_and_shared!(
 /// doom, and the level-0 retry that takes the second delivery first runs
 /// the caught read again, which takes the first delivery.
 fn caught_member_panic_read_twice<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    caught_member_panic_rig::<C>(frames, None)
+}
+
+/// Each speculative read's message, and whether a delivery for X's frame
+/// was still untaken after it.
+type Seen = Arc<Mutex<Vec<(String, bool)>>>;
+
+/// With `seen`, A makes a second read of X that finds X Failed inside a
+/// speculative run's guard, catches it and records its message and
+/// whether a delivery for X's frame is still untaken.
+fn caught_member_panic_rig<C: Cells>(
+    frames: Option<u32>,
+    seen: Option<Seen>,
+) -> (Out, Vec<NodeState>) {
     let rt = runtime::<C>(frames);
     let a_later = Later::default();
     let al = a_later.clone();
@@ -1284,6 +1298,25 @@ fn caught_member_panic_read_twice<C: Cells>(frames: Option<u32>) -> (Out, Vec<No
             let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
             if caught % 2 == 0 {
                 3
+            } else if let Some(seen) = seen
+                .as_ref()
+                .filter(|_| rt.state_of(x) == NodeState::Failed)
+            {
+                let read = {
+                    let _speculating = crate::replay::Speculating::enter();
+                    catch_unwind(AssertUnwindSafe(|| rt.get(x)))
+                };
+                let held = crate::replay::with(|c| {
+                    c.iter().any(|ctx| {
+                        ctx.pending
+                            .iter()
+                            .any(|d| !d.taken && d.key.node == x.slot())
+                    })
+                });
+                seen.lock()
+                    .unwrap()
+                    .push((read.err().map(message).unwrap_or_default(), held));
+                7
             } else {
                 rt.get(x)
             }
@@ -1319,4 +1352,28 @@ fn local_caught_member_panic_keeps_its_payload() {
 #[test]
 fn shared_caught_member_panic_keeps_its_payload() {
     caught_member_panic_keeps_its_payload::<Shared>();
+}
+
+/// The caught-member shape at budget 2 with A's second read of X made as
+/// a speculative run's: that read must not take the delivery held for
+/// X's frame there, which a closure in the run could catch and drop.
+fn speculative_failed_read_keeps_the_delivery<C: Cells>() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let _ = caught_member_panic_rig::<C>(Some(2), Some(seen.clone()));
+    let seen = seen.lock().unwrap();
+    assert!(!seen.is_empty(), "the speculative read never ran");
+    for (msg, held) in seen.iter() {
+        assert!(msg.contains("last compute panicked"), "{msg}");
+        assert!(held, "the speculative read took the delivery");
+    }
+}
+
+#[test]
+fn local_speculative_failed_read_keeps_the_delivery() {
+    speculative_failed_read_keeps_the_delivery::<Local>();
+}
+
+#[test]
+fn shared_speculative_failed_read_keeps_the_delivery() {
+    speculative_failed_read_keeps_the_delivery::<Shared>();
 }

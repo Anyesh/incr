@@ -125,7 +125,8 @@ impl<C: Cells> Runtime<C> {
     /// also takes the payload held for that frame along the read's path
     /// once this thread landed `id` Failed (`Context::landed_payloads`): a
     /// retry's rerun of an earlier read can land it Failed where the
-    /// unbounded run leaves it Dirty for this read to compute again.
+    /// unbounded run leaves it Dirty for this read to compute again. A
+    /// speculative run's read takes none.
     #[cold]
     #[inline(never)]
     pub(super) fn owed_payload(
@@ -134,6 +135,11 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         failed: bool,
     ) -> Option<Box<dyn Any + Send>> {
+        // As `take_delivery`'s scope: a closure in a speculative run can
+        // catch and drop the payload the real run's read is owed.
+        if replay::speculative() {
+            return None;
+        }
         let rt = self.runtime_id;
         let at = self.dep_stack.next_cidx();
         let path = failed.then(|| self.path_at(at));
