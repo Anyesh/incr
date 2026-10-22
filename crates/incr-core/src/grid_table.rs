@@ -2,9 +2,12 @@
 //! keys, `(sheet, row, column)`, that finds a node by indexing instead of
 //! hashing.
 //!
-//! Each sheet has a directory of columns and each column a directory of
-//! pages of [`PAGE_ROWS`] consecutive rows, so a walk down a column reads
-//! adjacent memory and an entry costs 8 bytes in a page that is in use.
+//! Each sheet has a directory of columns. A column reaches its pages of
+//! [`PAGE_ROWS`] consecutive rows through a directory and two fixed
+//! levels of 64 entries, each indexed by six more bits of the row, so it
+//! costs memory by the pages in use rather than by its largest row. A
+//! walk down a column reads adjacent memory and an entry costs 8 bytes in
+//! a page that is in use.
 //! An entry is one word, the node's slot and generation, written under
 //! the table's miss mutex with a Release store and read with an Acquire
 //! load. Directories, pages and the column and sheet levels are never
@@ -31,11 +34,16 @@ use crate::value_code;
 /// Rows per page.
 pub const PAGE_ROWS: u32 = 64;
 const PAGE_SHIFT: u32 = PAGE_ROWS.trailing_zeros();
+/// Row bits each directory level of a column indexes.
+const LEVEL_SHIFT: u32 = 6;
+const LEVEL_MASK: u32 = (1 << LEVEL_SHIFT) - 1;
+const CHUNK_SHIFT: u32 = PAGE_SHIFT + LEVEL_SHIFT;
+const MID_SHIFT: u32 = CHUNK_SHIFT + LEVEL_SHIFT;
 
 /// The key of a [`GridTable`] entry. Each coordinate has a bound, so a
 /// stray key cannot make the table allocate gigabytes of directory: a
-/// column's directory grows with its largest row, a sheet's with its
-/// largest column.
+/// sheet's directory grows with its largest column, and a column's top
+/// level, at most 64 entries under `ROWS`, with its largest row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GridKey {
     pub sheet: u32,
@@ -130,9 +138,52 @@ impl<T: 'static, C: Cells> Drop for Owning<T, C> {
     }
 }
 
+/// A level of `1 << LEVEL_SHIFT` entries that owns them as [`Owning`]
+/// does. Fixed in size, so an index is one load with no length to check.
+struct Fixed<T: 'static, C: Cells>([C::Ptr<T>; 1 << LEVEL_SHIFT]);
+
+impl<T: 'static, C: Cells> Fixed<T, C> {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| C::Ptr::new_null()))
+    }
+
+    #[inline(always)]
+    fn get(&self, index: u32) -> Option<&T> {
+        let p = self.0[(index & LEVEL_MASK) as usize].load_acquire();
+        // SAFETY: as in `Owning::get`.
+        (!p.is_null()).then(|| unsafe { &*p })
+    }
+
+    /// As [`Owning::get_or_create`], under the table's miss mutex.
+    fn get_or_create(&self, index: u32, new: impl FnOnce() -> T) -> &T {
+        let cell = &self.0[(index & LEVEL_MASK) as usize];
+        let mut p = cell.load_relaxed();
+        if p.is_null() {
+            p = Box::into_raw(Box::new(new()));
+            cell.store_release(p);
+        }
+        // SAFETY: as in `Owning::get`.
+        unsafe { &*p }
+    }
+}
+
+impl<T: 'static, C: Cells> Drop for Fixed<T, C> {
+    fn drop(&mut self) {
+        for cell in &self.0 {
+            let p = cell.load_relaxed();
+            if !p.is_null() {
+                // SAFETY: see `Owning::get`; `&mut self` rules out readers.
+                drop(unsafe { Box::from_raw(p) });
+            }
+        }
+    }
+}
+
 struct Page<C: Cells>([C::U64; PAGE_ROWS as usize]);
 
-type Column<C> = Owning<Page<C>, C>;
+type Chunk<C> = Fixed<Page<C>, C>;
+type Mid<C> = Fixed<Chunk<C>, C>;
+type Column<C> = Owning<Mid<C>, C>;
 type Sheet<C> = Owning<Column<C>, C>;
 
 /// A map from `(sheet, row, column)` to nodes of the runtime that created
@@ -197,7 +248,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         init: impl FnOnce() -> T,
     ) -> Incr<T> {
         self.check_runtime(rt);
-        // Only `entry_or_create` makes entries, after this check, so an
+        // Only `page_or_create` makes entries, after this check, so an
         // out-of-range key never hits and is checked on the miss.
         if let Some(handle) = self.find(rt, key) {
             return handle;
@@ -266,7 +317,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
         F: Fn(&Runtime<C>) -> T + Send + Sync + 'static,
     {
         self.check_runtime(rt);
-        // Only `entry_or_create` makes entries, after this check, so an
+        // Only `page_or_create` makes entries, after this check, so an
         // out-of-range key never hits and is checked on the miss.
         if let Some(handle) = self.find(rt, key) {
             return handle;
@@ -352,9 +403,17 @@ impl<T: Value, C: Cells> GridTable<T, C> {
             }
         }
         let mut claims = Claims::<C>(Vec::with_capacity(keys.len()));
+        // A batch usually runs down a column, so most keys share the page
+        // of the key before them.
+        let mut last: Option<(GridKey, &Page<C>)> = None;
         for &key in keys {
             key.check();
-            let entry = self.entry_or_create(key);
+            let at = GridKey::new(key.sheet, key.row >> PAGE_SHIFT, key.column);
+            let page = match last {
+                Some((was, page)) if was == at => page,
+                _ => last.insert((at, self.page_or_create(key))).1,
+            };
+            let entry = &page.0[(key.row & (PAGE_ROWS - 1)) as usize];
             let word = C::u64_load_relaxed(entry);
             let refused = if word == CLAIMED {
                 Some("appears twice")
@@ -397,6 +456,8 @@ impl<T: Value, C: Cells> GridTable<T, C> {
             .sheets
             .get(key.sheet)?
             .get(key.column)?
+            .get(key.row >> MID_SHIFT)?
+            .get(key.row >> CHUNK_SHIFT)?
             .get(key.row >> PAGE_SHIFT)?;
         Some(&page.0[(key.row & (PAGE_ROWS - 1)) as usize])
     }
@@ -404,14 +465,20 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     /// [`Self::entry`], creating the levels it passes through. Under the
     /// miss mutex.
     fn entry_or_create(&self, key: GridKey) -> &C::U64 {
-        let page = self
-            .sheets
+        &self.page_or_create(key).0[(key.row & (PAGE_ROWS - 1)) as usize]
+    }
+
+    /// The page holding `key`'s entry, creating the levels it passes
+    /// through. Under the miss mutex.
+    fn page_or_create(&self, key: GridKey) -> &Page<C> {
+        self.sheets
             .get_or_create(key.sheet, || Owning::new(1))
             .get_or_create(key.column, || Owning::new(1))
+            .get_or_create(key.row >> MID_SHIFT, Fixed::new)
+            .get_or_create(key.row >> CHUNK_SHIFT, Fixed::new)
             .get_or_create(key.row >> PAGE_SHIFT, || {
                 Page(std::array::from_fn(|_| C::new_u64(0)))
-            });
-        &page.0[(key.row & (PAGE_ROWS - 1)) as usize]
+            })
     }
 
     #[inline]
