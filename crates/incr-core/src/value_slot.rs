@@ -32,7 +32,8 @@
 
 use std::cell::{RefCell, UnsafeCell};
 
-use haphazard::{AtomicPtr as HzAtomicPtr, Global, HazardPointer, Replaced};
+use haphazard::raw::Pointer;
+use haphazard::{AtomicPtr as HzAtomicPtr, Domain, Global, HazardPointer, Replaced};
 
 use crate::cells::Cells;
 use crate::value::Value;
@@ -78,6 +79,17 @@ pub trait ValueSlot<T: Value>: 'static {
     /// the free list.
     #[must_use]
     fn clear(&self) -> Option<Self::Displaced>;
+
+    /// `displaced` boxed so that a drop of the box under
+    /// [`crate::deferred::isolate`] isolates the value's own `Drop` too,
+    /// which a retire token runs only at a later reclaim.
+    #[doc(hidden)]
+    fn isolating(displaced: Self::Displaced) -> Box<dyn std::any::Any>
+    where
+        Self::Displaced: 'static,
+    {
+        Box::new(displaced)
+    }
 
     /// Panic with the contract message if the thread is inside value
     /// code, where only a strategy whose readers hold a reference into
@@ -294,6 +306,12 @@ impl<T: Value> ValueSlot<T> for SharedValueSlot<T> {
         // readers finish their clone before the free.
         unsafe { self.0.swap_ptr(std::ptr::null_mut()) }.map(RetiredValue)
     }
+
+    fn isolating(displaced: RetiredValue<T>) -> Box<dyn std::any::Any> {
+        let replaced = displaced.0;
+        std::mem::forget(displaced);
+        Box::new(IsolatingRetire(replaced))
+    }
 }
 
 impl<T: Value> Drop for SharedValueSlot<T> {
@@ -315,6 +333,59 @@ impl<T: Value> Drop for RetiredValue<T> {
         // hazard pointers defer the actual free until no reader still
         // references it.
         unsafe { self.0.retire() };
+    }
+}
+
+/// A [`RetiredValue`] whose reclaim drops the value under
+/// [`crate::deferred::isolate`].
+struct IsolatingRetire<T: Value>(Replaced<T, Global, Box<T>>);
+
+impl<T: Value> Drop for IsolatingRetire<T> {
+    fn drop(&mut self) {
+        // SAFETY: as for `RetiredValue`, whose pointer this is; the
+        // pointer came from `Box::into_raw`, as `Isolated::from_raw`
+        // requires.
+        unsafe {
+            Domain::global().retire_ptr::<T, Isolated<T>>(self.0.into_inner().as_ptr());
+        }
+    }
+}
+
+/// The box a reclaim rebuilds for an [`IsolatingRetire`]'s value.
+struct Isolated<T>(Option<Box<T>>);
+
+impl<T> std::ops::Deref for Isolated<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0
+            .as_deref()
+            .expect("incr-core: an isolated box holds its value")
+    }
+}
+
+// SAFETY: `into_raw` and `from_raw` are `Box`'s, so the pointer stays
+// valid from one to the other and `from_raw` rebuilds it only once.
+unsafe impl<T> Pointer<T> for Isolated<T> {
+    fn into_raw(mut self) -> *mut T {
+        Box::into_raw(
+            self.0
+                .take()
+                .expect("incr-core: an isolated box holds its value"),
+        )
+    }
+
+    unsafe fn from_raw(ptr: *mut T) -> Self {
+        // SAFETY: the caller passes a pointer `into_raw` returned.
+        Self(Some(unsafe { Box::from_raw(ptr) }))
+    }
+}
+
+impl<T> Drop for Isolated<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            crate::deferred::isolate(|| drop(value));
+        }
     }
 }
 

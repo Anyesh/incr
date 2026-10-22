@@ -1842,8 +1842,8 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn unwrite_speculative(&self, node: &NodeData<C>, bag: &mut Deferred<C>) {
         let arena = self.arenas.erased(node.type_tag());
-        if let Some(value) = arena.clear_value(node.arena_slot()) {
-            bag.push_erased(Box::new(Unbuilt::new(value)));
+        if let Some(value) = arena.clear_unbuilt(node.arena_slot()) {
+            bag.push_erased(Box::new(value));
         }
     }
 
