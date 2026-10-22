@@ -930,7 +930,237 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
     );
 }
 
+/// A group verify's episode panics in member b: b lands Failed, released
+/// with the Fixpoint co-member a it reads. A later set that reaches only a
+/// must still let b recompute, so with j back at
+/// 1 the cycle converges to a = 2, b = 3 as it first did.
+fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let bc = cell::<i64>();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = rt.get(*bc.get().unwrap());
+                if rt.get(j) == 0 {
+                    v
+                } else {
+                    v.min(2)
+                }
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a);
+        assert!(v < 3, "b boom");
+        v + 1
+    });
+    bc.set(b).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b), 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"b boom"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert_eq!(rt.get(a), 2);
+    rt.assert_invariant_i();
+}
+
+/// As [`wave6_failed_member_over_dirty_co_member`], with the set reaching
+/// b only through two co-members: j is read by c, c by a, a by b.
+fn failed_member_two_hops_from_the_set<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let cc = cell::<i64>();
+    let a = {
+        let cc = cc.clone();
+        rt.create_query_with(
+            move |rt| rt.get(*cc.get().unwrap()),
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a);
+        assert!(v < 3, "b boom");
+        v + 1
+    });
+    let c = rt.create_query(move |rt| {
+        let v = rt.get(b);
+        if rt.get(j) == 0 {
+            v
+        } else {
+            v.min(2)
+        }
+    });
+    cc.set(c).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b), 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"b boom"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert_eq!(rt.get(c), 2);
+    rt.assert_invariant_i();
+}
+
+/// A co-member reads k only in the episode that fails b, so k's edge is
+/// only in its run's record; setting k must still let b recompute.
+fn failed_member_cured_through_a_recorded_dep<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let k = rt.create_input(0_i64);
+    let bc = cell::<i64>();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = rt.get(*bc.get().unwrap());
+                if rt.get(j) == 0 && rt.get(k) == 0 {
+                    v
+                } else {
+                    v.min(2)
+                }
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a);
+        assert!(v < 3, "b boom");
+        v + 1
+    });
+    bc.set(b).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b), 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"b boom"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(k, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    rt.assert_invariant_i();
+}
+
+/// The cycle forms inside root x's own frame, which panics: x lands
+/// Failed through its compute's panic path, over the member y it read.
+fn failed_frame_node_over_its_released_member<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let yc = cell::<i64>();
+    let x = {
+        let yc = yc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = rt.get(*yc.get().unwrap());
+                assert!(v < 3, "x boom");
+                v + 1
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let y = rt.create_query(move |rt| if rt.get(j) == 1 { 1 } else { rt.get(x) + 5 });
+    yc.set(y).unwrap();
+    assert_eq!(rt.get(x), 2);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(x)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(x), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(x)).ok(), Some(2));
+    rt.assert_invariant_i();
+}
+
+/// An `i64` whose compare panics only between 3 and 6.
+#[derive(Clone, Debug)]
+struct EqBomb(i64);
+
+impl PartialEq for EqBomb {
+    fn eq(&self, other: &Self) -> bool {
+        assert!(
+            (self.0.min(other.0), self.0.max(other.0)) != (3, 6),
+            "EqBomb"
+        );
+        self.0 == other.0
+    }
+}
+
+/// Step 3's write of b compares b's stored 3 with its converged 6 and
+/// panics: b lands Failed, and a set reaching it through the co-members
+/// must still let it recompute.
+fn failed_compare_over_a_co_member<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let cc = cell::<i64>();
+    let a = {
+        let cc = cc.clone();
+        rt.create_query_with(
+            move |rt| rt.get(*cc.get().unwrap()),
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| EqBomb(rt.get(a) + 1));
+    let c = rt.create_query(move |rt| {
+        let v = rt.get(b).0;
+        if rt.get(j) == 0 {
+            v.min(5)
+        } else {
+            v.min(2)
+        }
+    });
+    cc.set(c).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b).0, 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"EqBomb"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok().map(|v| v.0), Some(3));
+    rt.assert_invariant_i();
+}
+
 both!(
+    wave6_failed_member_over_dirty_co_member,
+    failed_member_two_hops_from_the_set,
+    failed_member_cured_through_a_recorded_dep,
+    failed_frame_node_over_its_released_member,
+    failed_compare_over_a_co_member,
     a_panic_after_a_swallowed_cycle_lands_failed,
     member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
