@@ -29,8 +29,6 @@ struct Reader {
 
 struct Record {
     id: u64,
-    /// The node that landed Failed and its generation.
-    landed: (u32, u32),
     reader: Reader,
     /// The landings, as `(node, generation)`, of runs on other threads
     /// that let the record's read failure out unchanged.
@@ -160,12 +158,12 @@ impl<C: Cells> Runtime<C> {
         Some(payload)
     }
 
-    /// A Failed read on this thread: if a record names it, from the frame
-    /// that record's payload waits for, the read's panic is carried until
-    /// a landing lets it out or another Failed read of the node. That
-    /// frame is the reading frame, or the virtual frame below when the
-    /// read is a driver entry's own compute, whose retry the panic is
-    /// delivered to.
+    /// A Failed read on this thread: if it is made for the read a record
+    /// names, the read's panic is carried until a landing lets it out or
+    /// another Failed read of the same node. That read's frame is the
+    /// reading frame, or the virtual frame below when the read is a driver
+    /// entry's own compute, whose retry the panic is delivered to; the
+    /// Failed node is the read node, or a dep its walk reached first.
     fn note_failed_read(&self, id: NodeId) {
         let rt = self.runtime_id;
         if replay::carry().is_some_and(|c| c.rt == rt && c.node == id.0) {
@@ -194,13 +192,12 @@ impl<C: Cells> Runtime<C> {
         let Some(reader) = reader else {
             return;
         };
-        let landed = (id.0, self.nodes.get(id.0).generation());
         let record = self
             .provenance
             .read()
             .live
             .iter()
-            .find(|r| r.landed == landed && r.reader == reader)
+            .find(|r| r.reader == reader)
             .map(|r| r.id);
         if let Some(record) = record {
             replay::set_carry(Some(Carry {
@@ -276,7 +273,6 @@ impl<C: Cells> Runtime<C> {
             records.next += 1;
             records.live.push(Record {
                 id: record,
-                landed: (id.0, generation),
                 reader,
                 propagated: Vec::new(),
             });

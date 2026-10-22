@@ -1631,3 +1631,41 @@ fn shared_vframe_landed_failed_by_a_replayed_read() {
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
+
+/// Y reads Z, which panics "z boom", so the other thread's read of Y
+/// Failed walks to Z Failed first: that panic is still the failure of
+/// X's read of Y, which X lets out.
+#[test]
+fn shared_vframe_landed_failed_by_a_walk_into_its_dep() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let z = rt.create_query_with(|_: &Rt| -> u64 { panic!("z boom") }, replayable());
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                gate.arm();
+                rt.get(z) + 1
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    let other = outcome(|| rt.get(x));
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(first, Err("z boom".to_string()));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
