@@ -1442,13 +1442,12 @@ fn vframe_failed_provenance() {
 }
 
 /// As `vframe_failed_provenance`, but once s is 1 Y returns 7 and X
-/// panics "x fresh", and the other thread reads X, sets s and reads X
-/// again, so X's own panic can reland X Failed over the landing that let
-/// the held payload's failure out before this thread's retry reads X.
-/// The three outcomes must be those of a serial order of this thread's
-/// read among the other's.
+/// panics "x fresh" on it, and the other thread reads X, sets s and reads
+/// X again, so X's own panic can reland X Failed over the landing that let
+/// the held payload's failure out before this thread's retry reads X. X
+/// reads only Y, so the set's walk reaches X once. The three outcomes must
+/// be those of a serial order of this thread's read among the other's.
 #[test]
-#[ignore = "X lands from two computes after one set: (x fresh, y boom, x fresh), as at 978b407"]
 fn vframe_failed_provenance_relanded() {
     run(|| {
         let rt = Arc::new(Rt::new());
@@ -1466,10 +1465,11 @@ fn vframe_failed_provenance_relanded() {
         );
         let x = rt.create_query_with(
             move |rt: &Rt| {
-                if rt.get(s) == 1 {
+                let v = rt.get(y);
+                if v == 7 {
                     panic!("x fresh")
                 }
-                rt.get(y) + 1
+                v + 1
             },
             replayable(),
         );
