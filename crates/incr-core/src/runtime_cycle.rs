@@ -18,7 +18,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
-use crate::cycle_state::{Episode, Held, Round, Step};
+use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
 use crate::{set_stack, waits};
 
 /// What a compute attempt carries into its landings.
@@ -525,11 +525,11 @@ impl<C: Cells> Runtime<C> {
                 .find(|f| f.node.0 == slot && f.rt == rt)
                 .map(|f| f.cidx)
         });
-        let held = self.look_held(slot, replay::speculative(), |e| {
+        let held = self.look_held(slot, Look::here(), |e| {
             (
                 e.anchor(),
                 e.in_cu,
-                e.buf.is_some(),
+                e.buf().is_some(),
                 e.episode.clone(),
                 e.ep,
             )
@@ -673,14 +673,14 @@ impl<C: Cells> Runtime<C> {
 
     /// A clone of a held node's current value (`s`) or buffer.
     fn held_value<T: Value>(&self, slot: u32, current: bool) -> T {
-        cycle_state::with_held(|h| {
-            let e = &h[&(self.runtime_id, slot)];
-            let v = if current { &e.s } else { &e.buf };
+        self.look_held(slot, Look::here(), |seen| {
+            let v = if current { &seen.s } else { seen.buf() };
             let v = v
                 .as_ref()
                 .expect("incr-core: a held member has a value to read");
             value_code::run(|| downcast::<T>(v).clone())
         })
+        .expect("incr-core: a read member is held")
     }
 
     /// A strategy member's value when no episode runs: `g` of the cycle
@@ -781,20 +781,18 @@ impl<C: Cells> Runtime<C> {
                 return result.map(|_| None);
             }
         }
-        let speculative = replay::speculative();
+        let look = Look::here();
         let (replaced, spec_buf) = cycle_state::with_held(|h| {
             let e = h
                 .get_mut(&(self.runtime_id, slot))
                 .expect("incr-core: a member run's node is held");
-            let spec_buf = if speculative {
-                e.before_spec_write();
-                None
-            } else {
-                e.settle()
-            };
-            e.record_run(deps);
-            e.opened = !ctl.children.get().is_null();
-            e.poisoned |= ctl.has(cycle::POISONED);
+            let out = e.record(
+                look,
+                deps,
+                ctl.buf.take(),
+                !ctl.children.get().is_null(),
+                ctl.has(cycle::POISONED),
+            );
             // An engine unwind is no fault of the member's.
             if result.is_err()
                 && cycle_state::failures() == failures
@@ -802,7 +800,7 @@ impl<C: Cells> Runtime<C> {
             {
                 cycle_state::mark_failed(e);
             }
-            (std::mem::replace(&mut e.buf, ctl.buf.take()), spec_buf)
+            out
         });
         drop(replaced);
         drop(spec_buf);
@@ -834,10 +832,10 @@ impl<C: Cells> Runtime<C> {
         self.release_held_from(cidx + 1, true, Some(UnwindKind::Discard), &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
-                .and_then(|e| e.buf.take())
+                .and_then(Held::discard_buf)
         });
         if let Some(old) = old {
-            bag.push_erased(old);
+            bag.push_erased(Box::new(old));
         }
         replay::unwind_past_since(self.runtime_id, cidx + 1, first);
         bag.drain(self);
@@ -862,14 +860,18 @@ impl<C: Cells> Runtime<C> {
         let lowlink = ctl.lowlink.get().min(cidx);
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
-        if replay::speculative() {
-            held.before_spec_write();
-        }
-        held.buf = ctl.buf.take();
-        held.poisoned = ctl.has(cycle::POISONED);
         held.wrote = ctl.wrote.get() != 0;
-        held.opened = !ctl.children.get().is_null();
-        held.record_run(deps);
+        let (replaced, spec_buf) = held.record(
+            Look::here(),
+            deps,
+            ctl.buf.take(),
+            !ctl.children.get().is_null(),
+            ctl.has(cycle::POISONED),
+        );
+        debug_assert!(
+            replaced.is_none() && spec_buf.is_none(),
+            "incr-core: a new claim replaces nothing"
+        );
         held.own(cidx, id.0, None);
         let displaced = cycle_state::with_held(|h| h.insert((rt, id.0), held));
         debug_assert!(displaced.is_none(), "incr-core: node {} held twice", id.0);
@@ -908,12 +910,23 @@ impl<C: Cells> Runtime<C> {
     /// into `members`.
     fn member_graph(&self, members: &[u32]) -> Vec<Vec<usize>> {
         let rt = self.runtime_id;
-        cycle_state::with_held(|h| {
+        let look = Look::here();
+        let mut spec_bufs = Vec::new();
+        let graph = cycle_state::with_held(|h| {
             members
                 .iter()
                 .map(|m| {
-                    let mut out: Vec<usize> = h[&(rt, *m)]
-                        .last
+                    let (seen, spec_buf) = h
+                        .get_mut(&(rt, *m))
+                        .expect("incr-core: an episode member is held")
+                        .look(look);
+                    debug_assert!(
+                        spec_buf.is_none(),
+                        "incr-core: an episode member is settled before its graph"
+                    );
+                    spec_bufs.extend(spec_buf);
+                    let mut out: Vec<usize> = seen
+                        .last()
                         .iter()
                         .filter_map(|(d, _)| members.binary_search(&d.0).ok())
                         .collect();
@@ -922,7 +935,9 @@ impl<C: Cells> Runtime<C> {
                     out
                 })
                 .collect()
-        })
+        });
+        self.drop_spec_bufs(spec_bufs);
+        graph
     }
 
     /// Runs `f`, user code attributed to member `slot`: a panic marks the
@@ -984,13 +999,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Drops a user value an episode no longer needs, attributing a
     /// panicking `Drop` to the member it belonged to.
-    fn drop_member_value(
-        &self,
-        slot: u32,
-        cidx: u32,
-        value: Option<Erased>,
-        bag: &mut Deferred<C>,
-    ) {
+    fn drop_member_value<V>(&self, slot: u32, cidx: u32, value: Option<V>, bag: &mut Deferred<C>) {
         if let Some(value) = value {
             self.attributed(slot, cidx, bag, || drop(value));
         }
@@ -999,35 +1008,48 @@ impl<C: Cells> Runtime<C> {
     /// Whether episode member `slot` has no buffer, a speculative run's
     /// settled first.
     fn unbuffered(&self, slot: u32, cidx: u32, bag: &mut Deferred<C>) -> bool {
-        let settling = !replay::speculative();
         let (spec_buf, none) = self.take_held(slot, |e| {
-            (if settling { e.settle() } else { None }, e.buf.is_none())
+            let (seen, spec_buf) = e.look(Look::here());
+            (spec_buf, seen.buf().is_none())
         });
         self.drop_member_value(slot, cidx, spec_buf, bag);
         none
     }
 
-    /// `f` on held node `slot`, if held, as a look under speculation when
-    /// `speculative`; a look outside speculation settles the claim first.
+    /// `f` on held node `slot`'s run as `look` sees it, if held.
     pub(super) fn look_held<R>(
         &self,
         slot: u32,
-        speculative: bool,
-        f: impl FnOnce(&Held) -> R,
+        look: Look,
+        f: impl FnOnce(&Seen<&mut Held>) -> R,
     ) -> Option<R> {
-        let (seen, spec_buf) = cycle_state::with_held(|h| {
-            h.get_mut(&(self.runtime_id, slot))
-                .map_or((None, None), |e| {
-                    let spec_buf = if speculative { None } else { e.settle() };
-                    (Some(f(e)), spec_buf)
-                })
-        });
-        if let Some(spec_buf) = spec_buf {
-            let mut bag = Deferred::new();
-            bag.push_erased(spec_buf);
-            bag.drain(self);
+        let mut f = Some(f);
+        loop {
+            // What a settle took is dropped before `f` runs, which may run
+            // user code; the claim's next look settles nothing.
+            let seen = cycle_state::with_held(|h| {
+                let Some(e) = h.get_mut(&(self.runtime_id, slot)) else {
+                    return Ok(None);
+                };
+                match e.look(look) {
+                    (seen, None) => Ok(Some(f.take().expect("look_held calls f once")(&seen))),
+                    (_, Some(spec_buf)) => Err(spec_buf),
+                }
+            });
+            match seen {
+                Ok(seen) => return seen,
+                Err(spec_buf) => self.drop_spec_bufs(Some(spec_buf)),
+            }
         }
-        seen
+    }
+
+    /// Drops what settles took off claims, outside the held map.
+    fn drop_spec_bufs(&self, spec_bufs: impl IntoIterator<Item = Erased>) {
+        let mut bag = Deferred::new();
+        for spec_buf in spec_bufs {
+            bag.push_erased(spec_buf);
+        }
+        bag.drain(self);
     }
 
     fn take_held<R>(&self, slot: u32, f: impl FnOnce(&mut Held) -> R) -> R {
@@ -1156,20 +1178,20 @@ impl<C: Cells> Runtime<C> {
                     .collect();
                 // A restart clears what the members installed, which a later
                 // settle would put back.
-                let settling = !replay::speculative();
+                let look = Look::here();
                 let settled: Vec<(u32, Erased)> = cycle_state::with_held(|h| {
                     h.root_at(rt, &ep.members, cidx);
                     ep.members
                         .iter()
                         .filter_map(|m| {
-                            let e = h
+                            let (mut e, spec_buf) = h
                                 .get_mut(&(rt, *m))
-                                .expect("incr-core: an episode member is held");
-                            let spec_buf = if settling { e.settle() } else { None };
+                                .expect("incr-core: an episode member is held")
+                                .look(look);
                             e.episode = Some(cycle.clone());
                             e.ep = id;
                             e.in_cu = ep.cu.binary_search(m).is_ok();
-                            e.installed.clear();
+                            e.clear_installed();
                             spec_buf.map(|v| (*m, v))
                         })
                         .collect()
@@ -1212,7 +1234,7 @@ impl<C: Cells> Runtime<C> {
                     // 1. Clear the unseeded buffers.
                     Step::Clear => {
                         for &m in &r.unseeded {
-                            let old = self.take_held(m, |e| e.buf.take());
+                            let old = self.take_held(m, Held::discard_buf);
                             self.drop_member_value(m, cidx, old, bag);
                         }
                         r.low = cidx;
@@ -1314,7 +1336,15 @@ impl<C: Cells> Runtime<C> {
                         // 4. The strategy members' next values.
                         let mut converged = vec![true; r.strategies.len()];
                         for (i, (m, s)) in r.strategies.iter().enumerate() {
-                            let out = self.take_held(*m, |e| e.buf.take());
+                            let (out, spec_buf) = self.take_held(*m, |e| {
+                                let (mut seen, spec_buf) = e.look(Look::here());
+                                (seen.take_buf(), spec_buf)
+                            });
+                            debug_assert!(
+                                spec_buf.is_none(),
+                                "incr-core: a strategy member is settled before its step"
+                            );
+                            self.drop_member_value(*m, cidx, spec_buf, bag);
                             if s.max_iterations().is_none() {
                                 self.drop_member_value(*m, cidx, out, bag);
                                 continue;
@@ -1380,7 +1410,7 @@ impl<C: Cells> Runtime<C> {
                             .filter(|m| ep.cu.binary_search(m).is_err())
                             .collect();
                         for &m in &outside {
-                            let old = self.take_held(m, |e| e.buf.take());
+                            let old = self.take_held(m, Held::discard_buf);
                             self.drop_member_value(m, cidx, old, bag);
                         }
                         r.low = cidx;
@@ -1484,7 +1514,7 @@ impl<C: Cells> Runtime<C> {
         let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)))
             .expect("incr-core: a dissolved root is held");
         let ended = (e.first, e.wrote);
-        bag.push_erased(Box::new((e.buf, e.s)));
+        bag.push_erased(Box::new(e.into_values()));
         ended
     }
 
@@ -1571,7 +1601,7 @@ impl<C: Cells> Runtime<C> {
             let entry = cycle_state::with_held(|h| h.remove(&(rt, m)));
             if let Some(e) = entry {
                 self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
-                bag.push_erased(Box::new((e.buf, e.s)));
+                bag.push_erased(Box::new(e.into_values()));
             }
         }
     }
@@ -1668,12 +1698,11 @@ impl<C: Cells> Runtime<C> {
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
         let stamp_rev = self.current_revision();
         let verify_rev = C::walked(&self.walk, &self.revision);
-        let settling = !replay::speculative();
-        for (slot, mut e) in entries {
-            if settling {
-                if let Some(spec_buf) = e.settle() {
-                    bag.push_erased(spec_buf);
-                }
+        let look = Look::here();
+        for (slot, e) in entries {
+            let (e, spec_buf) = e.into_look(look);
+            if let Some(spec_buf) = spec_buf {
+                bag.push_erased(spec_buf);
             }
             let id = NodeId(slot);
             if e.failed && !discarding {
@@ -1685,12 +1714,20 @@ impl<C: Cells> Runtime<C> {
                     verify_rev,
                 };
                 self.land_failed(
-                    id, node, flags, attempt, e.wrote, &e.deps, &released, payload, bag,
+                    id,
+                    node,
+                    flags,
+                    attempt,
+                    e.wrote,
+                    e.deps(),
+                    &released,
+                    payload,
+                    bag,
                 );
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
-            bag.push_erased(Box::new((e.buf, e.s)));
+            bag.push_erased(Box::new(e.into_values()));
         }
     }
 
@@ -1793,13 +1830,17 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let id = NodeId(slot);
         let (node, flags) = self.nodes.get_with_flags(slot);
-        let mut e = cycle_state::with_held(|h| h.remove(&(rt, slot)))
+        let e = cycle_state::with_held(|h| h.remove(&(rt, slot)))
             .expect("incr-core: a landing claim is held");
         debug_assert!(
             !e.spec_written() || replay::speculative(),
             "incr-core: a held node lands a speculative run's buffer"
         );
-        let value = e.buf.take().expect("incr-core: a finished run has a value");
+        let (mut e, spec_buf) = e.into_look(Look::here());
+        if let Some(spec_buf) = spec_buf {
+            bag.push_erased(spec_buf);
+        }
+        let value = e.take_buf().expect("incr-core: a finished run has a value");
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
         let first = e.first;
@@ -1815,34 +1856,34 @@ impl<C: Cells> Runtime<C> {
                 changed
             }
             Err(payload) => {
-                cycle_state::with_held(|h| h.insert((rt, slot), e));
+                cycle_state::with_held(|h| h.insert((rt, slot), e.into_held()));
                 return Err(payload);
             }
         };
         if changed || first {
             node.max_changed_at(stamp_rev);
         }
-        let published = self.publish_deps(id, &e.last, None, verify_rev, bag);
+        let published = self.publish_deps(id, e.last(), None, verify_rev, bag);
         let landed = if published == Publish::Stale {
             if first && !e.wrote {
                 node.set_verified_at(0);
             }
-            self.children_landing(id, flags, ChildLanding::Discard, e.opened, bag);
+            self.children_landing(id, flags, ChildLanding::Discard, e.opened(), bag);
             // Leaving the group is safe: a New node's record is inert.
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
             false
         } else {
-            if e.poisoned {
+            if e.poisoned() {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
             }
-            let (target, children) = if published == Publish::Superseded || e.poisoned {
+            let (target, children) = if published == Publish::Superseded || e.poisoned() {
                 (NodeState::Dirty, ChildLanding::Keep)
             } else {
                 (NodeState::Clean, ChildLanding::Sweep)
             };
-            self.children_landing(id, flags, children, e.opened, bag);
+            self.children_landing(id, flags, children, e.opened(), bag);
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
             self.land_single(id, node, flags, target, NodeState::Dirty);
@@ -1854,7 +1895,7 @@ impl<C: Cells> Runtime<C> {
             );
             true
         };
-        bag.push_erased(Box::new((e.buf, e.s)));
+        bag.push_erased(Box::new(e.into_values()));
         Ok(landed)
     }
 
@@ -1872,7 +1913,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> PopEnd {
         let rt = self.runtime_id;
-        let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
+        let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             members
                 .iter()
                 .map(|&m| {
@@ -1888,11 +1929,22 @@ impl<C: Cells> Runtime<C> {
             replay::speculative() || entries.iter().all(|(_, e)| !e.spec_written()),
             "incr-core: an episode lands a speculative run's record"
         );
+        let look = Look::here();
+        let mut entries: Vec<(u32, Seen<Held>)> = entries
+            .into_iter()
+            .map(|(m, e)| {
+                let (e, spec_buf) = e.into_look(look);
+                if let Some(spec_buf) = spec_buf {
+                    bag.push_erased(spec_buf);
+                }
+                (m, e)
+            })
+            .collect();
 
         // Step 2: validate, install and record the group under one hold.
         let mut inner = self.inner.write();
         let stale = entries.iter().any(|(_, e)| {
-            e.deps.iter().any(|&(d, generation)| {
+            e.deps().iter().any(|&(d, generation)| {
                 let dep = self.nodes.get(d.0);
                 dep.generation() != generation || dep.state() == NodeState::Dead
             })
@@ -1908,7 +1960,7 @@ impl<C: Cells> Runtime<C> {
                 // Leaving the group is safe: a New member's record is inert,
                 // and the root's retry records the group again.
                 self.land_single(NodeId(m), node, flags, NodeState::New, NodeState::New);
-                bag.push_erased(Box::new((e.buf, e.s)));
+                bag.push_erased(Box::new(e.into_values()));
             }
             return PopEnd::Retry;
         }
@@ -1918,7 +1970,7 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(*m);
             let mut old: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| old.push(d));
-            let new: &[NodeId] = &e.installed;
+            let new: &[NodeId] = e.installed();
             superseded |= new.iter().any(|d| {
                 members.binary_search(&d.0).is_err()
                     && !old.contains(d)
@@ -1965,7 +2017,7 @@ impl<C: Cells> Runtime<C> {
                 entries[i].1.changed = true;
             } else {
                 let e = &mut entries[i].1;
-                let value = if e.seeded { e.s.take() } else { e.buf.take() }
+                let value = if e.seeded { e.s.take() } else { e.take_buf() }
                     .expect("incr-core: a landing member has a value");
                 let first = e.first;
                 let wrote = Cell::new(0_u8);
@@ -1989,7 +2041,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if entries[i].1.poisoned {
+            if entries[i].1.poisoned() {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
@@ -2000,7 +2052,7 @@ impl<C: Cells> Runtime<C> {
         // new dep may hide a change.
         let dirty = superseded
             || entries.iter().any(|(m, e)| {
-                e.poisoned || self.nodes.get(*m).state() == NodeState::ComputingDirty
+                e.poisoned() || self.nodes.get(*m).state() == NodeState::ComputingDirty
             });
         for (m, e) in entries {
             let node = self.nodes.get(m);
@@ -2025,9 +2077,9 @@ impl<C: Cells> Runtime<C> {
                 _ => ChildLanding::Discard,
             };
             let flags = self.nodes.get_with_flags(m).1;
-            self.children_landing(NodeId(m), flags, children, e.opened, bag);
+            self.children_landing(NodeId(m), flags, children, e.opened(), bag);
             self.land(NodeId(m), node, target, flagged);
-            bag.push_erased(Box::new((e.buf, e.s)));
+            bag.push_erased(Box::new(e.into_values()));
         }
         PopEnd::Landed
     }
@@ -2038,7 +2090,7 @@ impl<C: Cells> Runtime<C> {
     /// others take the unwind's landing ([`Self::unwound_land`]).
     fn abort_landing(
         &self,
-        entries: &mut [(u32, Held)],
+        entries: &mut [(u32, Seen<Held>)],
         stamp_rev: u64,
         verify_rev: u64,
         cidx: u32,
@@ -2058,7 +2110,7 @@ impl<C: Cells> Runtime<C> {
                     stamp_rev,
                     verify_rev,
                 };
-                let deps = std::mem::take(&mut e.deps);
+                let deps = e.take_deps();
                 self.land_failed(
                     id,
                     node,
@@ -2073,7 +2125,7 @@ impl<C: Cells> Runtime<C> {
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
-            bag.push_erased(Box::new((e.buf.take(), e.s.take())));
+            bag.push_erased(Box::new((e.take_buf(), e.s.take())));
         }
         if contain {
             self.raise_contained(cidx, payload, bag);
