@@ -1044,3 +1044,52 @@ fn local_caught_note_stays_out_of_a_reused_address_ticket() {
 fn shared_caught_note_stays_out_of_a_reused_address_ticket() {
     caught_note_stays_out_of_a_reused_address_ticket::<Shared>();
 }
+
+struct XZst;
+struct DZst;
+
+/// As [`caught_note_stays_out_of_a_reused_address_ticket`] with
+/// zero-sized payloads, whose boxes all share one dangling address and
+/// carry no text: x's note must stay out of the ticket for d's fresh
+/// payload of another type.
+fn caught_zst_note_stays_out_of_another_types_ticket<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let t = rt.create_input(0_i64);
+    let x = rt.create_query(|_: &Runtime<C>| -> i64 { std::panic::panic_any(XZst) });
+    let d = rt.create_query(move |rt| {
+        if rt.get(t) == 1 {
+            drop(catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err());
+            std::panic::panic_any(DZst);
+        }
+        0
+    });
+    let n = rt.create_query(move |rt| {
+        if rt.get(sel) == 1 {
+            rt.get(x)
+        } else {
+            rt.get(d)
+        }
+    });
+    assert_eq!(rt.get(n), 0);
+    rt.set(t, 1);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err();
+    assert!(!got.is::<DZst>(), "x's read took d's contained payload");
+    assert!(
+        panic_message(got).contains("last compute panicked"),
+        "x's read raised a payload"
+    );
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err();
+    assert!(got.is::<DZst>(), "d's read lost its payload");
+}
+
+#[test]
+fn local_caught_zst_note_stays_out_of_another_types_ticket() {
+    caught_zst_note_stays_out_of_another_types_ticket::<Local>();
+}
+
+#[test]
+fn shared_caught_zst_note_stays_out_of_another_types_ticket() {
+    caught_zst_note_stays_out_of_another_types_ticket::<Shared>();
+}
