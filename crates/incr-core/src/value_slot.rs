@@ -486,7 +486,9 @@ mod tests {
         assert_eq!(rejected, Boom(4));
     }
 
-    /// A value whose `Drop` always panics, counting its drops.
+    /// A value whose `Drop` always panics, counting its drops. The payload
+    /// is zero-sized, so the box `isolate` forgets allocates nothing for
+    /// Miri to report.
     #[derive(Clone, PartialEq, Debug)]
     struct Bang;
 
@@ -495,7 +497,7 @@ mod tests {
     impl Drop for Bang {
         fn drop(&mut self) {
             BANGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            panic!("bang");
+            std::panic::panic_any(());
         }
     }
 
