@@ -1447,3 +1447,75 @@ local_and_shared!(
     local_failed_read_takes_no_caught_delivery,
     shared_failed_read_takes_no_caught_delivery
 );
+
+/// The caught-member shape with A a walk's non-root entry: R reads A
+/// while `sel` is 0, and A reads X only once `on` is set. Setting both
+/// makes R's walk run A, whose panic the walk contains, and R reruns
+/// without A. Returns R's read, then X's and A's.
+fn walked_caught_member<C: Cells>(frames: Option<u32>) -> (Out, Out, Out) {
+    let rt = runtime::<C>(frames);
+    let on = rt.create_input(0_u64);
+    let sel = rt.create_input(0_u64);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("b boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(move |rt| rt.get(b) + 4, replayable());
+    let a = rt.create_query_with(
+        move |rt| {
+            if rt.get(on) == 0 {
+                return 1;
+            }
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let r = rt.create_query_with(
+        move |rt| if rt.get(sel) == 0 { rt.get(a) } else { 100 },
+        replayable(),
+    );
+    assert_eq!(get(&rt, r), Out::Value(1));
+    rt.set(on, 1);
+    rt.set(sel, 1);
+    let got = (get(&rt, r), get(&rt, x), get(&rt, a));
+    rt.assert_invariant_i();
+    got
+}
+
+/// At budget 2 A's second read takes "b boom" for X's frame by its path,
+/// and that read stands for X's compute, so the walk's ticket holds X's
+/// landing and X's read gets the payload, as in the unbounded run.
+fn walked_caught_member_keeps_its_ticket<C: Cells>() {
+    let unbounded = walked_caught_member::<C>(None);
+    assert_eq!(
+        (&unbounded.0, &unbounded.1),
+        (&Out::Value(100), &Out::Panic("b boom".into()))
+    );
+    for frames in 1..=5 {
+        assert_eq!(
+            walked_caught_member::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    walked_caught_member_keeps_its_ticket,
+    local_walked_caught_member_keeps_its_ticket,
+    shared_walked_caught_member_keeps_its_ticket
+);

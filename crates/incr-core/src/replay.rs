@@ -484,7 +484,11 @@ impl Context {
     /// [`Self::take_unwind`] does. When the read is the running frame's
     /// own compute, its unwind carries the record on to
     /// [`Self::unwind_target`].
-    pub(crate) fn take_landed(&mut self, i: usize, at: u32) -> (bool, Box<dyn Any + Send>) {
+    pub(crate) fn take_landed(
+        &mut self,
+        i: usize,
+        at: u32,
+    ) -> (bool, Box<dyn Any + Send>, Vec<(u32, u32)>) {
         if let Some(below) = self.unwind_target(at) {
             let key = ReadKey::blocked(below);
             self.provenance = self.pending[i].provenance.clone().map(|p| (key, p));
@@ -493,8 +497,9 @@ impl Context {
             Delivered::Unwind {
                 attributed,
                 payload,
+                nodes,
                 ..
-            } => (attributed, payload),
+            } => (attributed, payload, nodes),
             _ => unreachable!("incr-core: matched as an unwind"),
         }
     }
@@ -504,10 +509,7 @@ impl Context {
     /// for a retry doomed again; a payload that can't be copied is
     /// delivered once.
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
-        let key = self.pending[i].key;
-        for d in self.pending.iter_mut().filter(|d| d.key == key) {
-            d.taken = true;
-        }
+        self.spend(i);
         let Delivered::Unwind {
             cycle,
             poison,
@@ -527,6 +529,14 @@ impl Context {
                 nodes: nodes.clone(),
             },
             None => self.pending.remove(i).what,
+        }
+    }
+
+    /// Marks delivery `i`'s read taken, with every delivery for it.
+    pub(crate) fn spend(&mut self, i: usize) {
+        let key = self.pending[i].key;
+        for d in self.pending.iter_mut().filter(|d| d.key == key) {
+            d.taken = true;
         }
     }
 
