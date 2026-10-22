@@ -3329,3 +3329,76 @@ fn no_recreated_node_reads_the_template() {
         }
     }
 }
+
+/// Seed 0x3748's fourth phase at a budget of 3 frames: op 6 `TryGet(10)` on
+/// one thread, op 5 `Get(8)` on the other. With `TryGet(10)` first, it
+/// enters the cycle 10 -> 14 -> 16 -> 17 -> 18, whose walk computes its New
+/// dep 19 -> 20 -> 8 -> 9 -> 10. About one run in 25 the other thread's
+/// driver lands 14, 16 and 17 Failed first, so the walk reaches 19 through
+/// Failed 14 and the cycle built from this thread's frames leaves out 14
+/// and 16. In the first such run, `patch` edits op 6's participants (slots)
+/// before the oracle sees them; returns whether the oracle took the run,
+/// every run before it checked as usual.
+fn cycle_from_own_frames(patch: fn(&mut Vec<u32>)) -> bool {
+    let case = gen_case(0x3748, false, true);
+    let phases = phases(&case, 0x3748);
+    let own: Vec<u32> = vec![8, 9, 18, 19, 20];
+    let op6 = |mask: u64| {
+        let order = Order::new(&case, &phases, mask);
+        let at = order.of.iter().position(|&x| x == 6).unwrap();
+        run::<Shared>(&order.case, None, 0)[at].0.clone()
+    };
+    assert_eq!(op6(0), Out::Panic("failed".to_owned()));
+    assert!(
+        matches!(op6(4), Out::Cycle(c) if c.len() > own.len() && own.iter().all(|p| c.contains(p)))
+    );
+    let mut took = None;
+    quiet(|| {
+        for _ in 0..2000 {
+            let serial = Serial::new(&case, &phases);
+            let verdict = Mutex::new(None);
+            let hit = AtomicBool::new(false);
+            let fix = |t: &mut Trace| {
+                if let Some((Out::Cycle(c), _)) = t.get_mut(6) {
+                    if *c == own {
+                        hit.store(true, SeqCst);
+                        patch(c);
+                    }
+                }
+            };
+            let mut got = run_two_until(&case, &phases, Some(3), 0, &|_| {}, &|_, prefix, live| {
+                let mut prefix = prefix.clone();
+                fix(&mut prefix);
+                let v = serial.at_overlap("0x3748", &prefix, live);
+                let stop = v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            fix(&mut got);
+            let verdict = verdict.into_inner().unwrap();
+            if !hit.load(SeqCst) {
+                serial.check("0x3748", &got, verdict);
+                continue;
+            }
+            took = Some(
+                catch_unwind(AssertUnwindSafe(|| serial.check("0x3748", &got, verdict))).is_ok(),
+            );
+            return;
+        }
+    });
+    took.expect("no run of 0x3748 reported the cycle from its own frames")
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_takes_a_cycle_built_from_this_threads_frames() {
+    assert!(cycle_from_own_frames(|_| {}));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_rejects_a_made_up_cycle() {
+    // Node 17 (slot 11) is on the walk's way but no order's participant.
+    assert!(!cycle_from_own_frames(|c| c.push(11)));
+    assert!(!cycle_from_own_frames(|c| c.clear()));
+}
