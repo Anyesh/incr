@@ -2317,7 +2317,7 @@ fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
     };
     let held = |x: Incr<u64>| {
         crate::replay::with(|c| {
-            c.iter().flat_map(|ctx| &ctx.pending).find_map(|d| {
+            c.iter().flat_map(|ctx| ctx.pending.iter()).find_map(|d| {
                 (!d.taken && d.key.node == x.slot()).then_some((d.key.cidx, d.key.path))
             })
         })
