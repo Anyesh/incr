@@ -3105,7 +3105,7 @@ impl<C: Cells> Runtime<C> {
                 // whose rerun reads it only if it still needs it.
                 NodeState::Failed if walked => return Computed::Done,
                 NodeState::Failed => {
-                    self.read_failed_node::<MODE>(id, g0.unwrap_or(node.generation()), bag);
+                    self.read_failed_node::<MODE>(id, bag);
                     continue;
                 }
                 NodeState::Dead => {

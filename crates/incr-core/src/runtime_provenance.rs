@@ -99,23 +99,19 @@ fn failed_read_message(slot: u32) -> String {
 impl<C: Cells> Runtime<C> {
     /// `compute_attempts`' Failed arm: the read panics "last compute
     /// panicked", or takes the payload a walk contained for the landing it
-    /// sees (`take_contained`), or else the one held for `id`'s frame at
-    /// `generation` along the read's path (`path_delivery`). Returns
+    /// sees (`take_contained`), or else the one held for `id`'s frame
+    /// along the read's path (`path_delivery`). Returns
     /// when the node has left Failed since the read saw it, to be read
     /// again. A payload a record owes the read was taken after the load,
     /// by `owed_payload`.
     #[cold]
     #[inline(never)]
-    pub(super) fn read_failed_node<const MODE: u8>(
-        &self,
-        id: NodeId,
-        generation: u32,
-        bag: &mut Deferred<C>,
-    ) {
+    pub(super) fn read_failed_node<const MODE: u8>(&self, id: NodeId, bag: &mut Deferred<C>) {
         let Ok(payload) = self.take_contained(id) else {
             return;
         };
         if MODE & VIRT != 0 {
+            let generation = self.nodes.get(id.0).generation();
             if let Some((context, i)) = self.path_delivery(id, generation) {
                 // A ticket's landing is newer than the delivery's round, so
                 // the unbounded run's read gets the ticket's payload and
