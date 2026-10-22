@@ -889,12 +889,6 @@ impl<C: Cells> Runtime<C> {
                 continue;
             };
             for read in replay::take_kept_reads(rt, f.cidx, f.ctl) {
-                if vframes
-                    .iter()
-                    .any(|w| u64::from(w.node) == read.reading & 0xffff_ffff)
-                {
-                    continue;
-                }
                 let key = ReadKey {
                     reading: read.reading,
                     ordinal: read.ordinal,
