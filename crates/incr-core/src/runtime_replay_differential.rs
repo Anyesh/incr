@@ -2761,6 +2761,38 @@ fn overlap_verdict(
     verdict.into_inner().unwrap()
 }
 
+/// A node whose closure catches its Failed dep's panic lands Dirty,
+/// poisoned, in every order, so no history leaves it Failed or Cyclic.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_rejects_a_settled_reader_that_catches_its_dep() {
+    let q = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            q(Expr::Catch(Box::new(Expr::Read(1, false)))),
+            q(Expr::PanicIf(Box::new(Expr::Read(2, false)), 0)),
+            Spec::Input(7),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 3,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(1), Op::Get(0)],
+    };
+    for to in [NodeState::Failed, NodeState::Cyclic] {
+        match overlap_verdict(&case, &[0], to, false) {
+            Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+            v => panic!("node 0 {to:?} passed: {v:?}"),
+        }
+    }
+}
+
 /// A cycle with no panic anywhere converges, so no history leaves its
 /// members Failed, even though each one's recorded dep is the other.
 #[test]
