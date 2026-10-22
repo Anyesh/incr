@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, NO_DOOM, POISONED};
+use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -115,10 +115,6 @@ impl Frames {
         self.frames.last_mut().filter(|top| top.rt == rt)
     }
 
-    /// A read another runtime serves to the top frame whose outcome no
-    /// kept read can carry: that frame can no longer be doomed, because its
-    /// retry would read the other runtime again. A frame doomed already
-    /// keeps its doom.
     /// A Clean read another runtime serves to the top frame, which keeps no
     /// read: the frame's retry reads the node again. A call, not an empty
     /// arm, because with an empty arm the Clean read inlined into `get`
@@ -129,9 +125,13 @@ impl Frames {
         std::hint::black_box(&mut *self);
     }
 
+    /// A read another runtime serves to the top frame whose outcome no
+    /// kept read can carry: within its own runtime's budget, that frame can
+    /// no longer be doomed, because its retry would read the other runtime
+    /// again (see [`FOREIGN_HOLD`]). A frame doomed already keeps its doom.
     #[cold]
     #[inline(never)]
-    fn keep_top_undoomed(&mut self) {
+    fn hold_foreign_reader(&mut self) {
         let top = self
             .frames
             .last()
@@ -140,7 +140,7 @@ impl Frames {
         // (see `Frame::ctl`).
         let ctl = unsafe { &*top.ctl };
         if !ctl.has(DOOMED) {
-            ctl.raise(NO_DOOM);
+            ctl.raise(FOREIGN_HOLD);
         }
     }
 
@@ -259,9 +259,9 @@ pub trait DepStack: 'static {
         self.with(|s| s.frames.last().map(|f| (f.rt, f.node, f.ctl, f.cidx)))
     }
 
-    /// See [`Frames::keep_top_undoomed`].
-    fn keep_top_undoomed(&self) {
-        self.with(Frames::keep_top_undoomed);
+    /// See [`Frames::hold_foreign_reader`].
+    fn hold_foreign_reader(&self) {
+        self.with(Frames::hold_foreign_reader);
     }
 
     /// [`Self::record_dep`] for a nested non-Clean read, which also stores

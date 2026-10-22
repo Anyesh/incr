@@ -324,7 +324,7 @@ impl<C: Cells> Runtime<C> {
             .dep_stack
             .record_dep_or_foreign(self.runtime_id, id, gen)
         {
-            self.keep_foreign_reader_undoomed();
+            self.dep_stack.hold_foreign_reader();
         }
         self.park(ParkPoint::ObserverAfterEntryCheck(id));
         if observed != NodeState::Clean {

@@ -88,6 +88,8 @@ impl<D: DepStack> Drop for Placed<'_, D> {
 struct Below {
     node: u32,
     cidx: u32,
+    /// The stack's depth with this frame on top.
+    depth: u32,
     ctl: *const ComputeCtl,
     step: replay::Step,
     path: u64,
@@ -109,14 +111,14 @@ impl<C: Cells> Runtime<C> {
         node.generation() == (reading >> 32) as u32 && self.arenas.erased(tag).has_placeholder()
     }
 
-    /// Keeps another runtime's frame on top, whose read of this runtime no
-    /// kept read carries, from being doomed, within this runtime's budget
-    /// only: past it the stack bound wins, as for a ticket payload, and the
-    /// frame's retry reads the node again.
-    pub(super) fn keep_foreign_reader_undoomed(&self) {
-        if !self.over_budget(self.dep_stack.depth() as u32) {
-            self.dep_stack.keep_top_undoomed();
-        }
+    /// Whether the frame `depth` deep with control block `ctl` can't be
+    /// doomed: it is `NO_DOOM`, or it holds a foreign read within this
+    /// runtime's budget, past which the stack bound wins, as for a ticket
+    /// payload, and its retry reads the other runtime again.
+    fn undoomable(&self, ctl: &ComputeCtl, depth: u32) -> bool {
+        let flags = ctl.flags.get();
+        flags & cycle::NO_DOOM != 0
+            || (flags & cycle::FOREIGN_HOLD != 0 && !self.over_budget(depth))
     }
 
     /// Whether a read from a frame `depth` frames deep is at or past a
@@ -602,29 +604,36 @@ impl<C: Cells> Runtime<C> {
         // The run's frames are those from where the driver placed the entry
         // up, not those at or above its position: a member run in the run
         // sits at its anchor, which can lie below that position.
-        let frames: Vec<(bool, u32, u32, *const ComputeCtl, u64)> = self.dep_stack.with(|s| {
+        let frames: Vec<(bool, u32, u32, *const ComputeCtl, u64, u32)> = self.dep_stack.with(|s| {
+            let placed = s.placed as usize;
             s.frames
-                .get(s.placed as usize..)
+                .get(placed..)
                 .expect("incr-core: an entry above level 0 runs placed")
                 .iter()
+                .enumerate()
                 .rev()
-                .map(|f| (f.rt == rt, f.node.0, f.cidx, f.ctl, f.reading))
+                .map(|(i, f)| {
+                    let depth = (placed + i + 1) as u32;
+                    (f.rt == rt, f.node.0, f.cidx, f.ctl, f.reading, depth)
+                })
                 .collect()
         });
         if reader.is_some_and(|r| frames.first().is_none_or(|f| f.2 != r)) {
             return false;
         }
-        let doomable = frames.iter().all(|&(ours, node, _, ctl, reading)| {
+        let doomable = frames.iter().all(|&(ours, node, _, ctl, reading, depth)| {
             // SAFETY: a frame's control block is live while it is on the
             // stack.
-            ours && unsafe { &*ctl }.flags.get() & (cycle::NO_DOOM | cycle::BUFFERED) == 0
+            let ctl = unsafe { &*ctl };
+            ours && !ctl.has(cycle::BUFFERED)
+                && !self.undoomable(ctl, depth)
                 && self.replayable(node)
                 && self.reading_has_placeholder(reading)
         });
         if !doomable {
             return false;
         }
-        for &(_, _, _, ctl, _) in &frames {
+        for &(_, _, _, ctl, _, _) in &frames {
             // SAFETY: as above.
             unsafe { &*ctl }.raise(cycle::DOOMED);
         }
@@ -1119,7 +1128,7 @@ impl<C: Cells> Runtime<C> {
             Err(payload) => {
                 let copy = replay::copy_payload(&**payload);
                 if copy.is_none() {
-                    self.keep_foreign_reader_undoomed();
+                    self.dep_stack.hold_foreign_reader();
                 }
                 copy.map(|payload| Delivered::Unwind {
                     cycle: false,
@@ -1247,13 +1256,16 @@ impl<C: Cells> Runtime<C> {
     fn frames_below(&self) -> Vec<Below> {
         let rt = self.runtime_id;
         let mut frames: Vec<Below> = self.dep_stack.with(|s| {
+            let len = s.frames.len();
             s.frames
                 .iter()
                 .rev()
-                .take_while(|f| f.rt == rt)
-                .map(|f| Below {
+                .enumerate()
+                .take_while(|(_, f)| f.rt == rt)
+                .map(|(i, f)| Below {
                     node: f.node.0,
                     cidx: f.cidx,
+                    depth: (len - i) as u32,
                     ctl: f.ctl,
                     step: f.step(),
                     path: 0,
@@ -1327,7 +1339,8 @@ impl<C: Cells> Runtime<C> {
             // stack, and these frames are below the reading one.
             let ctl = unsafe { &*f.ctl };
             if f.cidx < floor
-                || ctl.flags.get() & (cycle::DOOMED | cycle::NO_DOOM) != 0
+                || ctl.has(cycle::DOOMED)
+                || self.undoomable(ctl, f.depth)
                 || !self.replayable(f.node)
                 || !self.reading_has_placeholder(f.step.reading)
             {
