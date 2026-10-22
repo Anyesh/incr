@@ -20,14 +20,14 @@
 //! fresh one at the freed address with no engine call between, so the key
 //! also holds the text of a `&str` or `String` payload.
 
-use std::any::{Any, TypeId};
+use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
+use crate::replay::{payload_key, PayloadKey};
 
 /// A Failed read's node left Failed before the read could tell which
 /// landing it saw.
@@ -70,7 +70,7 @@ struct Unwound {
     /// which every runtime on the thread shares.
     cidx: u32,
     node: (u32, u32),
-    payload: Key,
+    payload: PayloadKey,
     /// Taken from a ticket by a read: a discarded run's read was no
     /// reader's observation, so its drop holds the ticket again.
     restorable: bool,
@@ -117,29 +117,6 @@ pub(super) fn walked_episode(cidx: u32) -> Option<NodeId> {
         let (at, root) = w.get();
         (at == cidx).then_some(NodeId(root))
     })
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Key {
-    /// Every zero-sized payload's box has its type's dangling address, so
-    /// only the type tells two of them apart, the engine's own unwinds
-    /// included.
-    address: usize,
-    ty: TypeId,
-    /// A hash of the payload's text, 0 for a payload of another type.
-    text: u64,
-}
-
-fn key(payload: &(dyn Any + Send)) -> Key {
-    let text = |s: &str| BuildHasherDefault::<DefaultHasher>::default().hash_one(s);
-    Key {
-        address: std::ptr::from_ref(payload).cast::<()>() as usize,
-        ty: Any::type_id(payload),
-        text: match payload.downcast_ref::<&'static str>() {
-            Some(s) => text(s),
-            None => payload.downcast_ref::<String>().map_or(0, |s| text(s)),
-        },
-    }
 }
 
 /// Edits this thread's notes and keeps `value_code::NOTES_BIT` in step.
@@ -255,7 +232,7 @@ impl<C: Cells> Runtime<C> {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
             // frame's, whose closure may still hold the payload they follow.
-            let at = key(payload);
+            let at = payload_key(payload);
             with_notes(|u| {
                 u.retain(|w| !(w.cidx > cidx && w.payload != at));
                 u.push(Unwound {
@@ -310,7 +287,7 @@ impl<C: Cells> Runtime<C> {
     /// landings `payload` made there hold it for their first read. Another
     /// payload's notes at `cidx` are the reading frame's, as at a landing.
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
-        let (rt, at) = (self.runtime_id, key(&*payload));
+        let (rt, at) = (self.runtime_id, payload_key(&*payload));
         let mut nodes = Vec::new();
         if notes_held() {
             with_notes(|u| {
@@ -481,7 +458,11 @@ impl<C: Cells> Runtime<C> {
         if nodes.is_empty() {
             return;
         }
-        let (rt, cidx, at) = (self.runtime_id, self.dep_stack.next_cidx(), key(payload));
+        let (rt, cidx, at) = (
+            self.runtime_id,
+            self.dep_stack.next_cidx(),
+            payload_key(payload),
+        );
         with_notes(|u| {
             u.extend(nodes.into_iter().map(|node| Unwound {
                 rt,
@@ -508,7 +489,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Vec::new();
         }
-        let (rt, at) = (self.runtime_id, key(payload));
+        let (rt, at) = (self.runtime_id, payload_key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             for w in u.iter_mut().filter(|w| w.payload == at) {
@@ -527,7 +508,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Vec::new();
         }
-        let (rt, at) = (self.runtime_id, key(payload));
+        let (rt, at) = (self.runtime_id, payload_key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             u.retain(|w| {
@@ -574,7 +555,7 @@ impl<C: Cells> Runtime<C> {
         if !notes_held() {
             return Some(payload);
         }
-        let (rt, at) = (self.runtime_id, key(&*payload));
+        let (rt, at) = (self.runtime_id, payload_key(&*payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             u.retain(|w| {

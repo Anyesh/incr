@@ -1448,6 +1448,76 @@ local_and_shared!(
     shared_failed_read_takes_no_caught_delivery
 );
 
+/// The two-deliveries shape with B replaced by D, a query with no deps
+/// whose panic text is C's "c boom". X catches its read of C, and D's
+/// panic escapes X.
+fn caught_read_same_text_as_escape<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let c = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("c boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let d = rt.create_query_with(
+        |_| -> u64 { std::panic::panic_any(String::from("c boom")) },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt| {
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
+            rt.get(d) + 4
+        },
+        replayable(),
+    );
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, d, c].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+/// D's landing must not mark X's caught read of C escaped just because
+/// the two payloads share a text: A's second read finds X Failed and must
+/// raise "last compute panicked", as the unbounded run does, not "c boom".
+fn wave6_escape_match_by_text_marks_caught_read<C: Cells>() {
+    let unbounded = caught_read_same_text_as_escape::<C>(None);
+    assert!(
+        matches!(&unbounded.0, Out::Panic(m) if m.contains("last compute panicked")),
+        "{unbounded:?}"
+    );
+    for frames in 1..=4 {
+        let got = caught_read_same_text_as_escape::<C>(Some(frames));
+        assert!(
+            matches!(&got.0, Out::Panic(m) if m.contains("last compute panicked")),
+            "budget {frames}: {got:?}"
+        );
+        assert_eq!(got.1, unbounded.1, "budget {frames} states");
+    }
+}
+
+local_and_shared!(
+    wave6_escape_match_by_text_marks_caught_read,
+    local_wave6_escape_match_by_text_marks_caught_read,
+    shared_wave6_escape_match_by_text_marks_caught_read
+);
+
 /// The caught-member shape with A a walk's non-root entry: R reads A
 /// while `sel` is 0, and A reads X only once `on` is set. Setting both
 /// makes R's walk run A, whose panic the walk contains, and R reruns

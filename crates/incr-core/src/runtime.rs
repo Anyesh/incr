@@ -3733,7 +3733,7 @@ impl<C: Cells> Runtime<C> {
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
         if let Some(payload) = payload.filter(|_| landed == NodeState::Failed) {
-            self.after_failed_store(id, node.generation(), attempt.cidx, payload);
+            self.after_failed_store(id, node.generation(), attempt.cidx, deps, payload);
         }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.

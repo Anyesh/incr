@@ -10,9 +10,10 @@
 //! Every context of every runtime on the thread lives in one stack, in
 //! the order they nest; a runtime's contexts are those with its id.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
@@ -155,6 +156,8 @@ pub(crate) struct Delivery {
     /// the delivery's path may take it. A read the compute caught, or
     /// another thread's landing, marks none.
     pub(crate) escaped: bool,
+    /// The copy of the payload the latest take of it raised.
+    pub(crate) resumed: Option<PayloadKey>,
 }
 
 impl Delivery {
@@ -382,6 +385,7 @@ impl Context {
             provenance,
             below: Vec::new(),
             escaped: false,
+            resumed: None,
         });
     }
 
@@ -448,33 +452,35 @@ impl Context {
         })
     }
 
-    /// The frame of `node` at `cidx` landed Failed with `payload`: marks
-    /// [`Delivery::escaped`] the deliveries, on any path, for the read
-    /// whose taken delivery's payload that is.
+    /// The frame of `node` at `cidx` landed Failed with `payload`, and
+    /// `last`, as `(reading, ordinal)`, was its compute's last read: marks
+    /// [`Delivery::escaped`] the deliveries, on any path, for that read when
+    /// `payload` is the copy a take of one of them raised. A read after the
+    /// take means the compute caught that copy, so a payload at its freed
+    /// address with the same text is another panic.
     pub(crate) fn mark_escaped(
         &mut self,
         node: u32,
         generation: u32,
         cidx: u32,
+        last: (u64, u32),
         payload: &(dyn Any + Send),
     ) {
-        let frame = |k: &ReadKey| k.node == node && k.generation == generation && k.cidx == cidx;
-        let reads: Vec<(u64, u32)> = self
-            .pending
-            .iter()
-            .filter(|d| d.taken && frame(&d.key))
-            .filter(|d| match &d.what {
-                Delivered::Unwind {
-                    cycle: false,
-                    payload: held,
-                    ..
-                } => same_text(&**held, payload),
-                _ => false,
-            })
-            .map(|d| (d.key.reading, d.key.ordinal))
-            .collect();
-        for d in self.pending.iter_mut() {
-            if frame(&d.key) && reads.contains(&(d.key.reading, d.key.ordinal)) {
+        let read = |k: &ReadKey| {
+            k.node == node
+                && k.generation == generation
+                && k.cidx == cidx
+                && (k.reading, k.ordinal) == last
+        };
+        let unwind = Some(payload_key(payload));
+        let escaped = self.pending.iter().any(|d| {
+            d.taken
+                && read(&d.key)
+                && d.resumed == unwind
+                && matches!(d.what, Delivered::Unwind { cycle: false, .. })
+        });
+        if escaped {
+            for d in self.pending.iter_mut().filter(|d| read(&d.key)) {
                 d.escaped = true;
             }
         }
@@ -520,16 +526,20 @@ impl Context {
         else {
             unreachable!("incr-core: taken as an unwind");
         };
-        match copy_payload(&**payload) {
-            Some(copy) => Delivered::Unwind {
-                cycle: *cycle,
-                poison: *poison,
-                attributed: *attributed,
-                payload: copy,
-                nodes: nodes.clone(),
-            },
-            None => self.pending.remove(i).what,
+        let Some(copy) = copy_payload(&**payload) else {
+            return self.pending.remove(i).what;
+        };
+        let what = Delivered::Unwind {
+            cycle: *cycle,
+            poison: *poison,
+            attributed: *attributed,
+            payload: copy,
+            nodes: nodes.clone(),
+        };
+        if let Delivered::Unwind { payload, .. } = &what {
+            self.pending[i].resumed = Some(payload_key(&**payload));
         }
+        what
     }
 
     /// Marks delivery `i`'s read taken, with every delivery for it.
@@ -555,6 +565,7 @@ impl Context {
             provenance: None,
             below: Vec::new(),
             escaped: false,
+            resumed: None,
         });
     }
 
@@ -578,6 +589,7 @@ impl Context {
                 provenance: None,
                 below: Vec::new(),
                 escaped: false,
+                resumed: None,
             });
         }
     }
@@ -993,16 +1005,32 @@ pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + S
         .map(|message| Box::new(*message) as Box<dyn Any + Send>)
 }
 
-/// Both payloads are a `String` or `&str` panic with the same text: a
-/// delivery's payload and the copy of it a read raised.
-fn same_text(a: &(dyn Any + Send), b: &(dyn Any + Send)) -> bool {
-    let text = |p: &(dyn Any + Send)| {
-        p.downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| p.downcast_ref::<&'static str>().copied())
-            .map(str::to_owned)
-    };
-    text(a).is_some_and(|a| text(b).is_some_and(|b| a == b))
+/// Which unwind a panic payload is, for this thread's walk-containment
+/// notes and a delivery's [`Delivery::resumed`]: the address of its box,
+/// which stays put while the box unwinds. A closure can catch a box and
+/// raise a fresh one at the freed address with no engine call between, so
+/// the key also holds the type and the text of a `&str` or `String`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PayloadKey {
+    /// Every zero-sized payload's box has its type's dangling address, so
+    /// only the type tells two of them apart, the engine's own unwinds
+    /// included.
+    address: usize,
+    ty: TypeId,
+    /// A hash of the payload's text, 0 for a payload of another type.
+    text: u64,
+}
+
+pub(crate) fn payload_key(payload: &(dyn Any + Send)) -> PayloadKey {
+    let text = |s: &str| BuildHasherDefault::<DefaultHasher>::default().hash_one(s);
+    PayloadKey {
+        address: std::ptr::from_ref(payload).cast::<()>() as usize,
+        ty: Any::type_id(payload),
+        text: match payload.downcast_ref::<&'static str>() {
+            Some(s) => text(s),
+            None => payload.downcast_ref::<String>().map_or(0, |s| text(s)),
+        },
+    }
 }
 
 /// Opens a context, returning its id.
