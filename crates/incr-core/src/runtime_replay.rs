@@ -1220,6 +1220,7 @@ impl<C: Cells> Runtime<C> {
                         below: Vec::new(),
                         escaped: false,
                         resumed: None,
+                        landed: None,
                     });
                 }
             }

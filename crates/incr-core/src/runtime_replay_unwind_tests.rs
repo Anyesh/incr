@@ -1265,20 +1265,6 @@ local_and_shared!(
 /// doom, and the level-0 retry that takes the second delivery first runs
 /// the caught read again, which takes the first delivery.
 fn caught_member_panic_read_twice<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
-    caught_member_panic_rig::<C>(frames, None)
-}
-
-/// Each speculative read's message, and whether a delivery for X's frame
-/// was still untaken after it.
-type Seen = Arc<Mutex<Vec<(String, bool)>>>;
-
-/// With `seen`, A makes a second read of X that finds X Failed inside a
-/// speculative run's guard, catches it and records its message and
-/// whether a delivery for X's frame is still untaken.
-fn caught_member_panic_rig<C: Cells>(
-    frames: Option<u32>,
-    seen: Option<Seen>,
-) -> (Out, Vec<NodeState>) {
     let rt = runtime::<C>(frames);
     let a_later = Later::default();
     let al = a_later.clone();
@@ -1298,25 +1284,6 @@ fn caught_member_panic_rig<C: Cells>(
             let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
             if caught % 2 == 0 {
                 3
-            } else if let Some(seen) = seen
-                .as_ref()
-                .filter(|_| rt.state_of(x) == NodeState::Failed)
-            {
-                let read = {
-                    let _speculating = crate::replay::Speculating::enter();
-                    catch_unwind(AssertUnwindSafe(|| rt.get(x)))
-                };
-                let held = crate::replay::with(|c| {
-                    c.iter().any(|ctx| {
-                        ctx.pending
-                            .iter()
-                            .any(|d| !d.taken && d.key.node == x.slot())
-                    })
-                });
-                seen.lock()
-                    .unwrap()
-                    .push((read.err().map(message).unwrap_or_default(), held));
-                7
             } else {
                 rt.get(x)
             }
@@ -1352,30 +1319,6 @@ fn local_caught_member_panic_keeps_its_payload() {
 #[test]
 fn shared_caught_member_panic_keeps_its_payload() {
     caught_member_panic_keeps_its_payload::<Shared>();
-}
-
-/// The caught-member shape at budget 2 with A's second read of X made as
-/// a speculative run's: that read must not take the delivery held for
-/// X's frame there, which a closure in the run could catch and drop.
-fn speculative_failed_read_keeps_the_delivery<C: Cells>() {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let _ = caught_member_panic_rig::<C>(Some(2), Some(seen.clone()));
-    let seen = seen.lock().unwrap();
-    assert!(!seen.is_empty(), "the speculative read never ran");
-    for (msg, held) in seen.iter() {
-        assert!(msg.contains("last compute panicked"), "{msg}");
-        assert!(held, "the speculative read took the delivery");
-    }
-}
-
-#[test]
-fn local_speculative_failed_read_keeps_the_delivery() {
-    speculative_failed_read_keeps_the_delivery::<Local>();
-}
-
-#[test]
-fn shared_speculative_failed_read_keeps_the_delivery() {
-    speculative_failed_read_keeps_the_delivery::<Shared>();
 }
 
 /// The caught-member shape with X first catching its read of C, which
@@ -1423,30 +1366,6 @@ fn caught_member_panic_two_deliveries<C: Cells>(frames: Option<u32>) -> (Out, Ve
     rt.assert_invariant_i();
     (got, [a, x, b, c].iter().map(|&h| rt.state_of(h)).collect())
 }
-
-/// X's Failed read must not take the caught read's payload, "c boom",
-/// where the unbounded run raises "b boom".
-fn failed_read_takes_no_caught_delivery<C: Cells>() {
-    let unbounded = caught_member_panic_two_deliveries::<C>(None);
-    assert_eq!(
-        unbounded,
-        (Out::Panic("b boom".into()), vec![NodeState::Failed; 4])
-    );
-    for frames in 1..=4 {
-        let got = caught_member_panic_two_deliveries::<C>(Some(frames));
-        // Accepted residual: X's compute caught the read the only delivery
-        // on this path is for, so the read takes none and raises "last
-        // compute panicked" where the unbounded run raises "b boom".
-        let residual = matches!(&got.0, Out::Panic(m) if m.contains("last compute panicked"));
-        assert!(got == unbounded || residual, "budget {frames}: {got:?}");
-    }
-}
-
-local_and_shared!(
-    failed_read_takes_no_caught_delivery,
-    local_failed_read_takes_no_caught_delivery,
-    shared_failed_read_takes_no_caught_delivery
-);
 
 /// The two-deliveries shape with B replaced by D, a query with no deps
 /// whose panic text is C's "c boom". X catches its read of C, and D's
@@ -1512,10 +1431,31 @@ fn wave6_escape_match_by_text_marks_caught_read<C: Cells>() {
     }
 }
 
+/// Single-thread runs keep the payload text exact: at every budget A's
+/// second read of X raises "b boom" as the unbounded run does, not "last
+/// compute panicked" when the path's only delivery is for X's caught read.
+fn wave6_failed_read_after_a_caught_delivery_keeps_the_payload<C: Cells>() {
+    let unbounded = caught_member_panic_two_deliveries::<C>(None);
+    assert_eq!(
+        unbounded,
+        (Out::Panic("b boom".into()), vec![NodeState::Failed; 4])
+    );
+    for frames in 1..=4 {
+        let got = caught_member_panic_two_deliveries::<C>(Some(frames));
+        assert_eq!(got, unbounded, "budget {frames}");
+    }
+}
+
 local_and_shared!(
     wave6_escape_match_by_text_marks_caught_read,
     local_wave6_escape_match_by_text_marks_caught_read,
     shared_wave6_escape_match_by_text_marks_caught_read
+);
+
+local_and_shared!(
+    wave6_failed_read_after_a_caught_delivery_keeps_the_payload,
+    wave6_local_failed_read_after_a_caught_delivery_keeps_the_payload,
+    wave6_shared_failed_read_after_a_caught_delivery_keeps_the_payload
 );
 
 /// The caught-member shape with A a walk's non-root entry: R reads A

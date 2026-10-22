@@ -3666,7 +3666,9 @@ impl<C: Cells> Runtime<C> {
 
     /// Fix 5's landing of a claim whose closure panicked: the union of
     /// the old and recorded deps is published, and the node lands Failed,
-    /// or Dirty or New where publication says the panic may hide a change.
+    /// or Dirty or New where publication says the panic may hide a change,
+    /// or Dirty where a replay delivery raised the panic and its first take
+    /// landed the node Dirty (`retaken_landing`).
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
     #[allow(clippy::too_many_arguments)]
@@ -3697,6 +3699,8 @@ impl<C: Cells> Runtime<C> {
             // mid-compute, land Dirty now so the next reader retries.
             Publish::Published => NodeState::Failed,
         };
+        let landing =
+            self.retaken_landing(id, node.generation(), attempt.cidx, deps, payload, landing);
         let mut mark = 0;
         if landing == NodeState::Failed {
             if !C::SINGLE_THREADED {
