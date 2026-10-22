@@ -286,6 +286,7 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
     /// Normal mode: see the module docs.
     #[inline(always)]
     pub(crate) fn drain(mut self, rt: &Runtime<C>) {
+        rt.drop_buried_tickets();
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
             self.node.drop_parts();
             if self.dep_list.is_some() || self.members.is_some() {

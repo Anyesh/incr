@@ -13,6 +13,7 @@ use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
 use crate::test_size::test_size;
+use crate::value_code;
 
 /// Nested first computes overflow the default test thread stack somewhere
 /// between 600 and 700 levels in debug builds.
@@ -569,4 +570,250 @@ fn shared_deep_contended_chain_reader_waits_at_depth_0() {
 #[cfg_attr(miri, ignore)]
 fn shared_deep_contended_chain_reader_waits_inside_a_compute() {
     deep_contended_chain(true);
+}
+
+/// `x` reads `sel` first and `f` only while `sel` is 0. After `f`'s input
+/// makes it panic and `sel` moves to 1, `x`'s rerun reads `sel` alone, so
+/// `get(x)` is 100 whether or not `f` was read, and landed Failed, before.
+fn stale_dep_that_panics_is_not_read<C: Cells>(read_f_first: bool) {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v != 0, "f boom");
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(f) } else { 100 });
+    assert_eq!(rt.get(x), 1);
+
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    if read_f_first {
+        let err = catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err();
+        assert_eq!(panic_message(err), "f boom");
+    }
+    assert_eq!(rt.get(x), 100);
+    rt.set(sel, 0);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+    let expected = if read_f_first {
+        "last compute panicked"
+    } else {
+        "f boom"
+    };
+    assert!(panic_message(err).contains(expected));
+}
+
+#[test]
+fn local_stale_dep_that_panics_is_not_read() {
+    stale_dep_that_panics_is_not_read::<Local>(false);
+    stale_dep_that_panics_is_not_read::<Local>(true);
+}
+
+#[test]
+fn shared_stale_dep_that_panics_is_not_read() {
+    stale_dep_that_panics_is_not_read::<Shared>(false);
+    stale_dep_that_panics_is_not_read::<Shared>(true);
+}
+
+/// `x` read `a` while `sel` was 0; setting `k` closes a cycle `a -> b -> a`
+/// and setting `sel` stops `x` reading `a`. A run from scratch never meets
+/// the cycle, so `get(x)` does not raise it, though the walk may run `a`.
+fn stale_dep_in_a_cycle_is_not_read<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let cell = cell.clone();
+        rt.create_query(move |rt| {
+            if rt.get(k) == 0 {
+                1
+            } else {
+                rt.get(*cell.get().unwrap()) + 1
+            }
+        })
+    };
+    let b = rt.create_query(move |rt| rt.get(a) + 1);
+    cell.set(b).unwrap();
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(a) } else { 100 });
+    assert_eq!(rt.get(x), 1);
+    assert_eq!(rt.get(b), 2);
+
+    rt.set(k, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
+    assert!(panic_message(err).contains("cycle"));
+}
+
+#[test]
+fn local_stale_dep_in_a_cycle_is_not_read() {
+    stale_dep_in_a_cycle_is_not_read::<Local>();
+}
+
+#[test]
+fn shared_stale_dep_in_a_cycle_is_not_read() {
+    stale_dep_in_a_cycle_is_not_read::<Shared>();
+}
+
+/// The walk cleans every recorded dep before a node's rerun, so it runs
+/// `e` after `sel` has stopped `x` reading it: a cost beta.5 has too,
+/// which the result must not show.
+fn stale_dep_gives_the_rerun_result<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let u = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let e = rt.create_query(move |rt| rt.get(j) * 10);
+    let d = rt.create_query(move |rt| rt.get(j) + 1);
+    let x = rt.create_query(move |rt| {
+        if rt.get(sel) == 0 {
+            rt.get(e)
+        } else {
+            rt.get(u) + rt.get(d)
+        }
+    });
+    assert_eq!(rt.get(x), 10);
+    rt.set(j, 2);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 3);
+    rt.set(j, 5);
+    assert_eq!(rt.get(x), 6);
+}
+
+#[test]
+fn local_stale_dep_gives_the_rerun_result() {
+    stale_dep_gives_the_rerun_result::<Local>();
+}
+
+#[test]
+fn shared_stale_dep_gives_the_rerun_result() {
+    stale_dep_gives_the_rerun_result::<Shared>();
+}
+
+/// A dep the walk cleans panics, and the rerun still reads it: the rerun
+/// raises the dep's own payload, as a run from scratch does, and only a
+/// later read sees "last compute panicked". Nothing is held once the dep
+/// recovers.
+fn walked_dep_panic_reaches_the_rerun_that_reads_it<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v != 0, "f boom");
+        v
+    });
+    let x = rt.create_query(move |rt| rt.get(sel) + rt.get(f));
+    assert_eq!(rt.get(x), 1);
+
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+    assert_eq!(panic_message(err), "f boom");
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err();
+    assert!(panic_message(err).contains("last compute panicked"));
+
+    rt.set(j, 2);
+    assert_eq!(rt.get(x), 3);
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_no_notes();
+}
+
+/// No unwind is in flight, so this thread keeps no landing for one.
+fn assert_no_notes() {
+    assert_eq!(value_code::thread_word() & value_code::NOTES_BIT, 0);
+}
+
+/// A contained panic nobody reads is held only while its node stays in
+/// that Failed landing: a set that flips the node Dirty releases it, and
+/// so does a delete of the node.
+fn unread_contained_panic_is_released<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v != 0, "f boom");
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(f) } else { 100 });
+    let held = |rt: &Runtime<C>| {
+        rt.set(j, 1);
+        rt.set(sel, 0);
+        assert_eq!(rt.get(x), 1);
+        rt.set(j, 0);
+        rt.set(sel, 1);
+        assert_eq!(rt.get(x), 100);
+        assert_eq!(rt.contained_payloads(), 1);
+        assert_no_notes();
+    };
+    held(&rt);
+    rt.set(j, 3);
+    assert_eq!(rt.contained_payloads(), 0);
+
+    held(&rt);
+    rt.delete_node(x);
+    rt.delete_node(f);
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_no_notes();
+}
+
+#[test]
+fn local_unread_contained_panic_is_released() {
+    unread_contained_panic_is_released::<Local>();
+}
+
+#[test]
+fn shared_unread_contained_panic_is_released() {
+    unread_contained_panic_is_released::<Shared>();
+}
+
+#[test]
+fn local_walked_dep_panic_reaches_the_rerun_that_reads_it() {
+    walked_dep_panic_reaches_the_rerun_that_reads_it::<Local>();
+}
+
+#[test]
+fn shared_walked_dep_panic_reaches_the_rerun_that_reads_it() {
+    walked_dep_panic_reaches_the_rerun_that_reads_it::<Shared>();
+}
+
+/// A running total `a_k = b + a_{k-1}` reads the changed `b` before its
+/// predecessor; the walk still cleans the chain bottom-up, so a set of `b`
+/// recomputes 100k nodes without nesting their closures.
+fn running_total_chain<C: Cells>() -> i64 {
+    let rt = Runtime::<C>::new();
+    let b = rt.create_input(1_i64);
+    let mut prev: Option<Incr<i64>> = None;
+    for _ in 0..100_000 {
+        let p = prev;
+        let q = rt.create_query(move |rt| rt.get(b) + p.map_or(0, |p| rt.get(p)));
+        rt.get(q);
+        prev = Some(q);
+    }
+    rt.set(b, 2);
+    rt.get(prev.unwrap())
+}
+
+fn on_8_mib_stack(f: fn() -> i64) -> i64 {
+    thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_running_total_chain_recomputes_without_nesting() {
+    assert_eq!(on_8_mib_stack(running_total_chain::<Local>), 200_000);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_running_total_chain_recomputes_without_nesting() {
+    assert_eq!(on_8_mib_stack(running_total_chain::<Shared>), 200_000);
 }

@@ -27,7 +27,8 @@ use crate::arena_registry::{ArenaRegistry, ArenaTags};
 use crate::cells::Cells;
 use crate::children::ChildIndex;
 use crate::cycle::{
-    self, ComputeCtl, Cycle, CycleStrategy, ErasedOpts, ErasedStrategy, Outcome, QueryOpts,
+    self, ComputeCtl, Cycle, CycleStrategy, CycleUnwind, ErasedOpts, ErasedStrategy, Outcome,
+    QueryOpts,
 };
 use crate::cycle_state::{self, EntryDepth, UnwindKind};
 use crate::deferred::{Deferred, DeleteBag, NodeDrops};
@@ -286,6 +287,9 @@ pub(crate) enum ParkPoint {
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
+    /// In a Failed read that found a payload it may take, after it loaded
+    /// the node's generation and before the record lock.
+    FailedReadBeforeRecheck(NodeId),
     /// In `seed_query`'s `inner.write()`, before the trust check of the
     /// trusted dep `NodeId`.
     SeedBeforeTrust(NodeId),
@@ -918,6 +922,8 @@ pub struct Runtime<C: Cells> {
     /// `NOT_REPLAYABLE` is replayable.
     pub(crate) all_replayable: bool,
     pub(crate) provenance: provenance_impl::Table<C>,
+    tickets: C::Lock<contain_impl::Tickets>,
+    tickets_held: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1015,6 +1021,8 @@ impl<C: Cells> Runtime<C> {
             frames_set: std::sync::atomic::AtomicBool::new(false),
             all_replayable: replay_defaults().1,
             provenance: provenance_impl::table::<C>(),
+            tickets: contain_impl::tickets::<C>(),
+            tickets_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -2054,6 +2062,7 @@ impl<C: Cells> Runtime<C> {
         };
         self.unwatch_deleted(slot, bits);
         C::u8_store_relaxed(flags, 0);
+        self.bury_tickets(slot, node.generation());
         node.bump_generation();
         let compute = inner.compute_fns[slot as usize].take();
         let observers = inner.observers.take_slot(slot);
@@ -2874,10 +2883,28 @@ impl<C: Cells> Runtime<C> {
             loop {
                 let cur = state::load::<C>(node.state_cell());
                 match cur {
-                    NodeState::Clean | NodeState::Failed => {
+                    NodeState::Clean => {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
                             .is_ok()
                         {
+                            let inner = self.inner.read();
+                            if C::u8_load_relaxed(flags) & WATCHED != 0 {
+                                self.enqueue_watched(id, node);
+                            }
+                            inner.dependents[id.0 as usize].extend_into(&mut queue);
+                            break;
+                        }
+                        // The state moved under us (a claim or another
+                        // walk); re-examine.
+                    }
+                    NodeState::Failed => {
+                        let mark = self.ticket_mark();
+                        if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
+                            .is_ok()
+                        {
+                            if let Some(mark) = mark {
+                                self.left_failed(id, mark);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3056,7 +3083,8 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     Visit::VerifyOnly(taint)
                 };
-                let mut computed = self.compute_one::<MODE>(cur, visit, is_root.then_some(gen));
+                let mut computed =
+                    self.compute_one::<MODE>(cur, visit, is_root.then_some(gen), !is_root);
                 if computed != Computed::Done {
                     let entry = Entry { id: cur, taint };
                     match self.walk_stopped(id, entry, visit, is_root, &mut walk, computed) {
@@ -3238,7 +3266,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
-        let mut computed = self.compute_one::<MODE>(id, Visit::Direct, Some(gen));
+        let mut computed = self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false);
         if computed == Computed::Discarded {
             computed = self.walk_discarded(Visit::Direct).unwrap_or(computed);
         }
@@ -3276,9 +3304,15 @@ impl<C: Cells> Runtime<C> {
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
     #[inline(always)]
-    fn compute_one<const MODE: u8>(&self, id: NodeId, visit: Visit, gen: Option<u32>) -> Computed {
+    fn compute_one<const MODE: u8>(
+        &self,
+        id: NodeId,
+        visit: Visit,
+        gen: Option<u32>,
+        walked: bool,
+    ) -> Computed {
         let mut bag = Deferred::new();
-        let computed = self.compute_attempts::<MODE>(id, visit, gen, &mut bag);
+        let computed = self.compute_attempts::<MODE>(id, visit, gen, walked, &mut bag);
         bag.drain(self);
         computed
     }
@@ -3289,6 +3323,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         visit: Visit,
         gen: Option<u32>,
+        walked: bool,
         bag: &mut Deferred<C>,
     ) -> Computed {
         let (node, flags) = self.nodes.get_with_flags(id.0);
@@ -3297,6 +3332,13 @@ impl<C: Cells> Runtime<C> {
 
         'attempt: loop {
             let observed = state::load::<C>(node.state_cell());
+            // After the load, so a landing that passed the held payload's
+            // failure on is seen whatever state it left the node in since.
+            if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
+                if let Some(payload) = self.owed_payload(id, g0.unwrap_or(node.generation())) {
+                    self.raise_owed(payload, bag);
+                }
+            }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
                 NodeState::Computing | NodeState::ComputingDirty => {
@@ -3318,6 +3360,9 @@ impl<C: Cells> Runtime<C> {
                     self.wait_out_deleting(id, spins);
                     continue;
                 }
+                // A walk's entry leaves a Failed dep for the reading node,
+                // whose rerun reads it only if it still needs it.
+                NodeState::Failed if walked => return Computed::Done,
                 NodeState::Failed => {
                     self.read_failed_node(id);
                     continue;
@@ -3416,6 +3461,20 @@ impl<C: Cells> Runtime<C> {
                 self.land(id, node, discard, discard);
                 return Computed::Gone;
             }
+            // The claim succeeds on a Dirty that such a landing and a set
+            // made since the load, and until it is released no landing of
+            // the node can pass the failure on.
+            if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
+                if let Some(payload) = self.owed_payload(id, g) {
+                    let discard = if claimed_dirty {
+                        NodeState::Dirty
+                    } else {
+                        NodeState::New
+                    };
+                    self.land(id, node, discard, discard);
+                    self.raise_owed(payload, bag);
+                }
+            }
 
             // Capture the revisions after the claim and BEFORE verifying or
             // computing. If a set() bumps the revision mid-flight, our
@@ -3447,7 +3506,14 @@ impl<C: Cells> Runtime<C> {
                 // group verify runs no member and must not doom, because the
                 // unbounded run's verify leaves the node for its reader.
                 if MODE & ARMED != 0 && !matches!(visit, Visit::VerifyOnly(_)) {
-                    return self.doom(id, node, g, claimed_dirty, matches!(visit, Visit::Direct));
+                    return self.doom(
+                        id,
+                        node,
+                        g,
+                        claimed_dirty,
+                        matches!(visit, Visit::Direct),
+                        walked,
+                    );
                 }
                 if MODE & VIRT != 0
                     && !matches!(visit, Visit::VerifyOnly(_))
@@ -3522,7 +3588,14 @@ impl<C: Cells> Runtime<C> {
                 // clean the changed deps.
             }
             if MODE & ARMED != 0 {
-                return self.doom(id, node, g, claimed_dirty, matches!(visit, Visit::Direct));
+                return self.doom(
+                    id,
+                    node,
+                    g,
+                    claimed_dirty,
+                    matches!(visit, Visit::Direct),
+                    walked,
+                );
             }
             let is_recompute = claimed_dirty;
             let first = !claimed_dirty;
@@ -3536,7 +3609,10 @@ impl<C: Cells> Runtime<C> {
                 // runtime's, and the Failed transition plus the frame pop
                 // below restore every invariant the unwind could have
                 // interrupted; no lock is held while user code runs.
-                let ctl = ComputeCtl::new(if is_recompute { cycle::RECOMPUTE } else { 0 });
+                let ctl = ComputeCtl::new(
+                    if is_recompute { cycle::RECOMPUTE } else { 0 }
+                        | if walked { cycle::WALKED } else { 0 },
+                );
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
                 if MODE & VIRT != 0 {
@@ -3556,7 +3632,11 @@ impl<C: Cells> Runtime<C> {
                 }));
                 let deps = self.dep_stack.pop_frame();
                 let word = value_code::thread_word();
-                if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK | value_code::REPLAY_BIT)
+                if word
+                    & (value_code::MEMO_BIT
+                        | value_code::UNWIND_MASK
+                        | value_code::REPLAY_BIT
+                        | value_code::NOTES_BIT)
                     != 0
                 {
                     let attempt = Attempt {
@@ -3590,21 +3670,24 @@ impl<C: Cells> Runtime<C> {
                         };
                         return self.discard_doomed(id, attempt, &ctl, Some(payload), bag);
                     }
-                    Err(payload) => self.compute_panicked(
-                        id,
-                        node,
-                        flags,
-                        Attempt {
-                            first,
-                            cidx,
-                            stamp_rev,
-                            verify_rev,
-                        },
-                        &ctl,
-                        &deps,
-                        bag,
-                        payload,
-                    ),
+                    Err(payload) => {
+                        return self.compute_panicked(
+                            id,
+                            node,
+                            flags,
+                            Attempt {
+                                first,
+                                cidx,
+                                stamp_rev,
+                                verify_rev,
+                            },
+                            &ctl,
+                            &deps,
+                            bag,
+                            walked,
+                            payload,
+                        )
+                    }
                 };
 
                 if ctl.flags.get() & (cycle::LOW | cycle::DOOMED) != 0 {
@@ -3720,7 +3803,11 @@ impl<C: Cells> Runtime<C> {
 
     /// The `Err` arm of a compute: the closure panicked, or an engine
     /// unwind passed through it. Lands the node and every claim this
-    /// thread held above its frame, then resumes the unwind.
+    /// thread held above its frame, then resumes the unwind. A walk's entry
+    /// (`walked`) contains a panic, or a cycle whose claims all ran above
+    /// it, and returns `Unsettled`: the recorder's rerun reads the node
+    /// again if it still does, and the payload stays with the Failed node
+    /// for that read.
     #[cold]
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
@@ -3733,14 +3820,18 @@ impl<C: Cells> Runtime<C> {
         ctl: &ComputeCtl,
         deps: &[(NodeId, u32)],
         bag: &mut Deferred<C>,
+        walked: bool,
         payload: Box<dyn std::any::Any + Send>,
-    ) -> ! {
+    ) -> Computed {
         let kind = cycle_state::take_unwind_kind();
         replay::unwind_past(self.runtime_id, attempt.cidx);
         // A closure that catches a speculative run's discard can't land a
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
-        self.note_unwound_read(&*payload, kind);
+        let contain = walked && self.containable(kind, &*payload);
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
+        }
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -3754,6 +3845,10 @@ impl<C: Cells> Runtime<C> {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
             self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
+            if contain {
+                self.retire_notes_above(attempt.cidx);
+                return Computed::Unsettled;
+            }
             // A closure that catches the unwind has read a dep that did not
             // land, which its publish counts as settled if it read it before.
             self.dep_stack.poison_current_frame(self.runtime_id);
@@ -3767,6 +3862,23 @@ impl<C: Cells> Runtime<C> {
         // would lose recovery paths through deps the failed run had not
         // reached yet. Extra edges only cause spurious re-verification,
         // never staleness.
+        if contain {
+            self.land_failed(
+                id,
+                node,
+                flags,
+                attempt,
+                wrote,
+                deps,
+                &[],
+                None,
+                Some(payload),
+                bag,
+            );
+            // Spent even if the landing was not Failed, which drops the box.
+            self.retire_notes_above(attempt.cidx);
+            return Computed::Unsettled;
+        }
         self.land_failed(
             id,
             node,
@@ -3776,6 +3888,7 @@ impl<C: Cells> Runtime<C> {
             deps,
             &[],
             Some(&*payload),
+            None,
             bag,
         );
         // An enclosing closure that catches the unwind has still read a
@@ -3784,11 +3897,33 @@ impl<C: Cells> Runtime<C> {
         bag.drain_carried(payload);
     }
 
+    /// Whether a walk's entry contains an unwind out of its compute: a
+    /// panic, or a cycle none of whose members this thread still holds or
+    /// has a virtual frame of, so that every member ran above the walk and
+    /// the unwind released it. A wounded thread must reach its outermost
+    /// entry, so it contains none.
+    fn containable(&self, kind: Option<UnwindKind>, payload: &(dyn std::any::Any + Send)) -> bool {
+        if cycle_state::wounded() {
+            return false;
+        }
+        match kind {
+            None => true,
+            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_some_and(|c| {
+                c.0.participants()
+                    .iter()
+                    .map(|p| NodeId(p.slot()))
+                    .all(|p| self.own_claim_owner(p).is_none() && self.virtual_owner(p).is_none())
+            }),
+            Some(_) => false,
+        }
+    }
+
     /// Fix 5's landing of a claim whose closure panicked: the union of
     /// the old and recorded deps is published, and the node lands Failed,
     /// or Dirty or New where publication says the panic may hide a change.
     /// `co_members`, sorted, are the claims released with it, which count
-    /// as settled. `payload` is the panic, when the caller has it.
+    /// as settled. `payload` is the panic, when the caller has it, or
+    /// `contained` when a walk contained it and the node keeps it.
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -3800,8 +3935,10 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         co_members: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
+        contained: Option<Box<dyn std::any::Any + Send>>,
         bag: &mut Deferred<C>,
     ) {
+        let view = payload.or(contained.as_deref());
         let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
             // A stale dep's slot may already belong to another node, so no
             // union is published. The old deps keep their reverse edges.
@@ -3817,8 +3954,12 @@ impl<C: Cells> Runtime<C> {
             // mid-compute, land Dirty now so the next reader retries.
             Publish::Published => NodeState::Failed,
         };
-        if !C::SINGLE_THREADED && landing == NodeState::Failed {
-            self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
+        let mut mark = 0;
+        if landing == NodeState::Failed {
+            if !C::SINGLE_THREADED {
+                self.before_failed_landing(id, node.generation(), attempt.cidx, view);
+            }
+            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, contained);
         }
         let flagged = if landing == NodeState::New {
             NodeState::New
@@ -3841,7 +3982,12 @@ impl<C: Cells> Runtime<C> {
         self.children_landing(id, flags, ChildLanding::Discard, false, bag);
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
-        self.land_single(id, node, flags, landing, flagged);
+        let landed = self.land_single(id, node, flags, landing, flagged);
+        // A set flagged the compute, so it landed Dirty past the walk that
+        // would have released its ticket.
+        if mark != 0 && landed != NodeState::Failed {
+            self.left_failed(id, mark);
+        }
     }
 
     /// A frame pop found the memo, unwind or replay bit in the thread word.
@@ -3860,6 +4006,9 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         bag: &mut Deferred<C>,
     ) -> Option<Computed> {
+        if word & value_code::NOTES_BIT != 0 && result.is_ok() {
+            self.retire_notes_above(attempt.cidx);
+        }
         if self.after_pop(word, result.is_ok()) {
             *result = Err(match UnwindKind::of_word(word) {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
@@ -4439,6 +4588,9 @@ mod replay_impl;
 
 #[path = "runtime_provenance.rs"]
 mod provenance_impl;
+
+#[path = "runtime_contain.rs"]
+mod contain_impl;
 
 #[path = "runtime_watch.rs"]
 mod watch_impl;

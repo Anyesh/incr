@@ -1917,3 +1917,56 @@ Gate: no workload rises against T10. `get_clean_local` 102 to 94,
 `get_clean_shared` 196 to 192, `table_hit_local` 155.14 to 150.14,
 `table_hit_shared` 218.14 to 216.14, and `value_slot_read_*` unchanged
 at 5 and 87.
+
+## Walk containment
+
+- Engine: branch `w/T8-walk-contain-failed-dep` against its base
+  `spreadsheet-t10` at `978b407`, built in a detached worktree; one run
+  of `icount.sh` at the default N for each column. No workloads added.
+- Change: a dep that the dirty walk computes and that panics or closes
+  a cycle counts as changed for its recorder, and its payload stays with
+  the Failed node for the first reader as a ticket. The walk passes
+  `walked` to `compute_one`, which sets a `WALKED` bit in `ComputeCtl`
+  (flags widen from `u8` to `u16`). The dirty walk's Failed arm, now apart
+  from the Clean arm, drops the node's ticket; a delete buries the
+  tickets of the node it deletes and its bag drops them, each behind one
+  relaxed flag.
+- Attribution: Intel PT on line-table builds, N = 10 with 100 warm-up,
+  traced totals within 0.3 of `perf stat` per iteration, on a build that
+  still had one `Clean | Failed` arm; the arm split and the delete flag
+  were attributed by their diff, not traced.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local`, `value_slot_read_local` | 155.14, 5 | 155.14, 5 | 0 |
+| `diamond_local` | 3,921 | 3,918 | −3 |
+| `diamond_shared` | 7,811 | 7,849 | +38 |
+| `chain_local/propagate/100` | 91,406 | 91,306 | −100 |
+| `chain_shared/propagate/10` | 20,404 | 20,525 | +121 |
+| `chain_shared/propagate/100` | 186,837 | 188,038 | +1,201 |
+| `delete_single_local` / `_shared` | 706 / 1,530 | 712 / 1,534 | +6 / +4 |
+
+- **`walked` and `WALKED`:** `ComputeCtl::new` ORs the bit in and
+  `has`/`raise` test a `u16`: up to +10 per iteration on the Shared
+  chain, about 1 per walk visit.
+- **Codegen in `clean_walk`:** with `compute_one` taking another
+  parameter, the frame push and pop, the `catch_unwind` wrapper and the
+  node lookup shift: +33 (`diamond_shared`) and +110
+  (`chain_shared/propagate/10`) in the trace, which with the line above
+  accounts for the Shared rise. Local nets about +2 in the trace and
+  falls below base once the arm is split.
+- **The Failed arm:** with one `Clean | Failed` arm, a `cur == Failed`
+  test after every flip cost +9, +28 and +80 in `mark_dependents_dirty`;
+  the split arm takes it off the Clean path, which is where the Local
+  fall and most of the Shared drop between the two tip builds come from.
+- **Deletes:** two relaxed loads of the ticket flag and their branches,
+  one where the node is unhooked and one at the bag's drain: +6 Local and
+  +4 Shared per delete, and the matching share of `fanout_*` and
+  `delete_*` (+0.3 to +0.6 percent).
+- **No cost:** `NOTES_BIT` in the compute pop's mask (one mask, nets 0
+  to −20 in the trace) and the `Failed if walked` arm, which the clean
+  path never reaches.
+
+Gate: the Clean get, table hit and value slot are unchanged; the dirty
+walk falls 0.1 percent Local and rises 0.5 to 0.6 percent Shared.

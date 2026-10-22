@@ -193,7 +193,7 @@ fn in_cycles(adj: &[Vec<usize>]) -> Vec<bool> {
 }
 
 impl<C: Cells> Runtime<C> {
-    fn active_ctl_has(&self, flag: u8) -> bool {
+    fn active_ctl_has(&self, flag: u16) -> bool {
         self.dep_stack
             .active_frame(self.runtime_id)
             // SAFETY: the active frame's control block is live.
@@ -295,6 +295,9 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Option<Cycle> {
         replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
+        if outermost {
+            self.retire_notes();
+        }
         if outermost {
             replay::set_carry(None);
         }
@@ -818,7 +821,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         cycle_state::take_unwind_kind();
         let mut bag = Deferred::new();
-        if let Some(payload) = payload {
+        if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
             bag.push_erased(payload);
         }
         if let Some(value) = ctl.buf.take() {
@@ -1583,7 +1586,7 @@ impl<C: Cells> Runtime<C> {
                     verify_rev,
                 };
                 self.land_failed(
-                    id, node, flags, attempt, e.wrote, &e.deps, &released, payload, bag,
+                    id, node, flags, attempt, e.wrote, &e.deps, &released, payload, None, bag,
                 );
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
@@ -1958,6 +1961,7 @@ impl<C: Cells> Runtime<C> {
                     &deps,
                     &members,
                     Some(&*payload),
+                    None,
                     bag,
                 );
             } else {
