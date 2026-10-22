@@ -32,6 +32,9 @@ pub(crate) struct Entry {
     /// enclosing one, so the unbounded run may never evaluate it.
     pub(crate) spec: bool,
     pub(crate) retry: Retry,
+    /// It stands for a walk's entry, so its compute contains a panic as
+    /// the walk's does.
+    pub(crate) walked: bool,
 }
 
 /// How the driver runs an entry.
@@ -82,6 +85,9 @@ pub(crate) struct VFrame {
     /// The discard released them, but in the unbounded run they are still
     /// held, so a cycle closed above counts them among its participants.
     pub(crate) deferred: Vec<(u32, u32)>,
+    /// A walk computed the frame's node, so the walk contains an unwind
+    /// out of its run.
+    pub(crate) walked: bool,
 }
 
 /// The read a delivery is for.
@@ -172,6 +178,9 @@ pub(crate) enum Delivered {
         /// so a member run that takes it again is not.
         attributed: bool,
         payload: Box<dyn Any + Send>,
+        /// The landings the panic made that a walk's entry may contain
+        /// with it (`runtime_provenance`), which follow each copy taken.
+        nodes: Vec<(u32, u32)>,
     },
     /// The entry landed without a Clean value. The unbounded run's read
     /// takes the slot as the compute left it, poisoned, where a later read
@@ -441,6 +450,7 @@ impl Context {
             poison,
             attributed,
             payload,
+            nodes,
         } = &self.pending[i].what
         else {
             unreachable!("incr-core: taken as an unwind");
@@ -451,6 +461,7 @@ impl Context {
                 poison: *poison,
                 attributed: *attributed,
                 payload: copy,
+                nodes: nodes.clone(),
             },
             None => self.pending.remove(i).what,
         }
