@@ -625,7 +625,14 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> Computed {
         replay::unwind_past(self.runtime_id, attempt.cidx);
-        self.release_unwound_from(attempt.cidx, id.0, Some(UnwindKind::Discard), true, bag);
+        self.release_unwound_from(
+            attempt.cidx,
+            id.0,
+            Some(UnwindKind::Discard),
+            true,
+            None,
+            bag,
+        );
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
@@ -2056,13 +2063,13 @@ impl<C: Cells> Runtime<C> {
         // An episode's member stays held for its episode, as when the run
         // nests in its reader: only what the run left above it goes.
         if self.episode_member(slot) {
-            self.release_unwound_from(cidx, slot, kind, discarding, bag);
+            self.release_unwound_from(cidx, slot, kind, discarding, Some(payload), bag);
             return;
         }
         let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) else {
             return;
         };
-        self.release_unwound_from(cidx, slot, kind, discarding, bag);
+        self.release_unwound_from(cidx, slot, kind, discarding, Some(payload), bag);
         let id = NodeId(slot);
         let stamp_rev = self.current_revision();
         if discarding {

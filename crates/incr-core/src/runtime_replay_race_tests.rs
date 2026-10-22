@@ -1785,3 +1785,71 @@ fn shared_vframe_landed_failed_over_an_episodes_delivery() {
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
+
+/// As `keeps_the_payload`, but the other thread reads R, which reads X,
+/// and X reads R back before it reads Y, so X is a member of R's
+/// episode. X's member run reads Y Failed and lets that panic out, which
+/// aborts the episode, and X lands Failed at the release of its claim.
+/// That landing let the failure out as X's own run's does, so the retry
+/// of X takes the payload.
+#[test]
+fn shared_vframe_landed_failed_by_an_episode_member() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let in_cycle = Arc::new(AtomicU8::new(0));
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let rc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let x = {
+        let (rc, in_cycle) = (rc.clone(), in_cycle.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                // The discovery run of R's cycle, which reads R as the
+                // cycle closes, returns without reading Y; the episode's
+                // runs read it.
+                if in_cycle.load(SeqCst) > 0
+                    && rt.get(*rc.get().unwrap()) > 0
+                    && in_cycle.fetch_add(1, SeqCst) == 1
+                {
+                    return 0;
+                }
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
+    let r = rt.create_query_with(
+        move |rt: &Rt| rt.get(x) + 1,
+        QueryOpts {
+            cycle: CycleStrategy::Fallback(Box::new(|_| 100)),
+            replay: Replay::Allowed,
+        },
+    );
+    rc.set(r).unwrap();
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(y), NodeState::Failed);
+    in_cycle.store(1, SeqCst);
+    let other = outcome(|| rt.get(r));
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+    gate.release();
+    let first = first.join();
+    assert_eq!(first, Err("y boom".to_string()), "the payload was dropped");
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}

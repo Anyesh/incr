@@ -3478,7 +3478,14 @@ impl<C: Cells> Runtime<C> {
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
         self.note_unwound_read(&*payload, kind);
-        self.release_unwound_from(attempt.cidx, id.0, kind, kind.is_some(), bag);
+        self.release_unwound_from(
+            attempt.cidx,
+            id.0,
+            kind,
+            kind.is_some(),
+            Some(&*payload),
+            bag,
+        );
         let wrote = ctl.wrote.get() != 0;
         if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
