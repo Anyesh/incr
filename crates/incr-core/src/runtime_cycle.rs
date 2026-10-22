@@ -969,10 +969,10 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Ends an episode with an unwind: every member is released, a member
-    /// whose own code panicked through fix 5's panic path and the others
-    /// with the discard landing, and the unwind resumes, or stops at the
-    /// episode's boundary if the walk's entry rooting it contains it.
+    /// Ends an episode with an unwind: every member is released as
+    /// [`Self::release_held_from`] lands it, and the unwind resumes, or
+    /// stops at the episode's boundary if the walk's entry rooting it
+    /// contains it.
     fn abort_episode(&self, cidx: u32, payload: Payload, bag: &mut Deferred<C>) -> ! {
         let kind = cycle_state::take_unwind_kind();
         let contain = self.episode_contains(cidx, kind, &*payload);
@@ -1607,10 +1607,10 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Lands every claim of this runtime held at or above `cidx`: a claim
-    /// whose own code panicked in user code takes fix 5's panic path, and
-    /// every other claim, and every claim under an engine unwind or a
-    /// discard (`discarding`), the discard landing.
+    /// Lands every claim of this runtime held at or above `cidx`: with
+    /// `discarding`, each takes the discard landing; otherwise, under a
+    /// user panic, a claim whose own code panicked takes fix 5's panic
+    /// path and every other claim [`Self::land_panic_released`].
     pub(super) fn release_held_from(
         &self,
         cidx: u32,
@@ -1714,14 +1714,16 @@ impl<C: Cells> Runtime<C> {
                 bag.push_erased(Box::new(spec_buf));
             }
             let id = NodeId(slot);
-            if e.failed && !discarding {
+            let attempt = Attempt {
+                first: e.first,
+                cidx,
+                stamp_rev,
+                verify_rev,
+            };
+            if discarding {
+                self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
+            } else if e.failed {
                 let (node, flags) = self.nodes.get_with_flags(slot);
-                let attempt = Attempt {
-                    first: e.first,
-                    cidx,
-                    stamp_rev,
-                    verify_rev,
-                };
                 self.land_failed(
                     id,
                     node,
@@ -1734,7 +1736,7 @@ impl<C: Cells> Runtime<C> {
                     bag,
                 );
             } else {
-                self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
+                self.land_panic_released(id, attempt, e.wrote, e.deps(), &released, bag);
             }
             // A discarded claim's run is one the unbounded run never makes,
             // or makes again on the retry.
@@ -2117,10 +2119,13 @@ impl<C: Cells> Runtime<C> {
         PopEnd::Landed
     }
 
-    /// Step 3 ended in a panic (a `PartialEq` of a member's value): every
-    /// member whose slot was written is stamped and lands New, the member
-    /// whose compare panicked lands through fix 5's panic path, and the
-    /// others take the unwind's landing ([`Self::unwound_land`]).
+    /// Step 3 ended in a panic (a `PartialEq` of a member's value): the
+    /// member whose compare panicked lands through fix 5's panic path if
+    /// it wrote nothing, and the others through
+    /// [`Self::land_panic_released`] for a user panic,
+    /// or the unwind's landing ([`Self::unwound_land`]) for an engine
+    /// one, where a member whose slot was written is stamped and lands
+    /// New.
     fn abort_landing(
         &self,
         entries: &mut [(u32, Seen<Held>)],
@@ -2135,14 +2140,14 @@ impl<C: Cells> Runtime<C> {
         let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {
             let id = NodeId(*m);
+            let attempt = Attempt {
+                first: e.first,
+                cidx,
+                stamp_rev,
+                verify_rev,
+            };
             if e.failed && !e.wrote {
                 let (node, flags) = self.nodes.get_with_flags(*m);
-                let attempt = Attempt {
-                    first: e.first,
-                    cidx,
-                    stamp_rev,
-                    verify_rev,
-                };
                 let deps = e.take_deps();
                 self.land_failed(
                     id,
@@ -2155,6 +2160,8 @@ impl<C: Cells> Runtime<C> {
                     Some(&*payload),
                     bag,
                 );
+            } else if kind.is_none() {
+                self.land_panic_released(id, attempt, e.wrote, e.deps(), &members, bag);
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
