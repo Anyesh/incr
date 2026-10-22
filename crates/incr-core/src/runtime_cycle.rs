@@ -608,7 +608,7 @@ impl<C: Cells> Runtime<C> {
             // One position above its reader, as the driver runs a held
             // entry: nested member runs at one anchor would share it, and a
             // doom marks frames by position.
-            let mut r5 = self.member_run(slot, at + 1, true);
+            let mut r5 = self.member_run(slot, at + 1, true, false);
             // A read past the budget in the member run doomed it. If the
             // member run was the doom's bottom frame, its context runs here
             // until the member is buffered, and the loop's member run passes
@@ -709,12 +709,15 @@ impl<C: Cells> Runtime<C> {
     /// Runs held node `slot`'s closure as a member run at position
     /// `cidx`: its value is buffered in the held map, with the deps it
     /// recorded. Returns the run's lowlink, or the panic it ended in, with
-    /// the node marked failed unless the run was speculative.
+    /// the node marked failed unless the run was speculative. A `walked`
+    /// run finishes a walk's compute, so the virtual frames a doom in it
+    /// makes contain a panic as that walk does.
     pub(super) fn member_run(
         &self,
         slot: u32,
         cidx: u32,
         doomable: bool,
+        walked: bool,
     ) -> Result<Option<u32>, Payload> {
         let id = NodeId(slot);
         let compute = {
@@ -726,11 +729,13 @@ impl<C: Cells> Runtime<C> {
                 .map(std::ptr::from_ref)
                 .expect("incr-core: a held node is a query")
         };
-        let ctl = ComputeCtl::new(if doomable {
-            cycle::BUFFERED
-        } else {
-            cycle::BUFFERED | cycle::NO_DOOM
-        });
+        let ctl = ComputeCtl::new(
+            if doomable {
+                cycle::BUFFERED
+            } else {
+                cycle::BUFFERED | cycle::NO_DOOM
+            } | if walked { cycle::WALKED } else { 0 },
+        );
         ctl.lowlink.set(cidx);
         self.dep_stack
             .push_frame_at(self.runtime_id, id, &ctl, cidx);
@@ -985,7 +990,7 @@ impl<C: Cells> Runtime<C> {
                 id: replay::member_run_episode(cidx),
                 slot,
             });
-        let ran = self.member_run(slot, cidx, true);
+        let ran = self.member_run(slot, cidx, true, false);
         replay::leave_member_run();
         self.drop_deliveries(replay::run_ended(
             self.runtime_id,

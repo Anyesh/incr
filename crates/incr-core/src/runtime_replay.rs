@@ -1578,7 +1578,7 @@ impl<C: Cells> Runtime<C> {
                             self.dep_stack.place_next_at(cidx, level > 0),
                         );
                         let _speculating = entry.spec.then(replay::Speculating::enter);
-                        self.member_run(entry.node, cidx, true)
+                        self.member_run(entry.node, cidx, true, entry.walked)
                     };
                     self.drop_deliveries(replay::run_ended(
                         self.runtime_id,
@@ -1862,7 +1862,7 @@ impl<C: Cells> Runtime<C> {
             self.own_deferred(v.cidx, v.node);
             let ran = {
                 let _speculating = v.spec.then(replay::Speculating::enter);
-                self.member_run(v.node, v.cidx, true)
+                self.member_run(v.node, v.cidx, true, v.walked)
             };
             self.drop_deliveries(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
             match ran {
