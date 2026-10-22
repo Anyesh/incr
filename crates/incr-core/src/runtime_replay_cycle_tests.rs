@@ -997,7 +997,49 @@ fn speculative_chain_drops_without_unwinding<C: Cells>() {
     assert!(drops > 0, "no chain was dropped");
 }
 
+/// A walk entry whose virtual frame's run closes a cycle through itself,
+/// at budget 1. D reads E and then G, E is `try_get(F)` or 7777, F is
+/// `get(G)` or 9999 if it unwinds, and G reads D, so `try_get(D)` closes
+/// the cycle and leaves E and F Dirty over a New G. `try_get(E)`'s walk
+/// then computes G, whose read of D dooms; G's run as a virtual frame
+/// closes the cycle again at D's read of G, and the walk contains that
+/// unwind, as the unbounded run's walk does, because every claim but G's
+/// own ran above G. The unwind releases G's claim too, so counting it
+/// let the cycle out as `try_get(E)`'s `Err` (two-thread seed 0x5b0d).
+fn walk_entry_contains_a_cycle_through_itself<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let d_cell = cell::<u64>();
+        let g = {
+            let d_cell = d_cell.clone();
+            rt.create_query_with(move |rt| rt.get(*d_cell.get().unwrap()), replayable())
+        };
+        let f = rt.create_query_with(
+            move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_or(9999),
+            replayable(),
+        );
+        let e = rt.create_query_with(move |rt| rt.try_get(f).unwrap_or(7777), replayable());
+        let d = rt.create_query_with(
+            move |rt| {
+                rt.get(e);
+                rt.get(g)
+            },
+            replayable(),
+        );
+        d_cell.set(d).unwrap();
+        let first = try_get(&rt, d);
+        let second = try_get(&rt, e);
+        rt.assert_invariant_i();
+        (first, second, rt.state_of(e), rt.state_of(g))
+    };
+    let unbounded = observe(None);
+    assert!(matches!(unbounded.0, Outcome::Cycle(_)), "{unbounded:?}");
+    assert_eq!(unbounded.1, Outcome::Value(7777));
+    assert_eq!(observe(Some(1)), unbounded);
+}
+
 local_and_shared!(
+    walk_entry_contains_a_cycle_through_itself,
     speculative_chain_drops_without_unwinding,
     virtual_hit_above_an_earlier_one,
     drop_through_a_native_frame,
