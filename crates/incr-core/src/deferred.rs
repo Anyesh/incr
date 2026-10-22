@@ -418,7 +418,7 @@ impl Unbuilt {
         Self(Some(value))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn value(&self) -> &dyn Any {
         self.0
             .as_deref()
