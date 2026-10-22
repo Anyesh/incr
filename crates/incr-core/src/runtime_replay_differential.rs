@@ -17,7 +17,12 @@
 //! that a panic is one outcome kind whatever its text: which of two
 //! racing readers of a panicked node gets the closure's payload and which
 //! gets "last compute panicked" is not part of the result (the wiki
-//! decision "Shared panic payload contract"). The Failed and Cyclic sets
+//! decision "Shared panic payload contract"). A get whose thread's
+//! `try_get` got a cycle that the other read's get then landed is ordered
+//! per read: a cycle's result depends on the member a get enters at, so
+//! its run may mix both orders' outcomes, but each of its node's reads
+//! must be an order's outcome for that read and its value the closure
+//! over them. The Failed and Cyclic sets
 //! after two overlapping reads are history, as the states are: a walk
 //! computes from its plan, so it can land a node Failed from a dep the
 //! other thread landed Failed after the walk expanded it. Where no order
@@ -35,9 +40,9 @@
 //! and a case without them, a third of the seeds, compares the results to
 //! the end.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Barrier, Mutex};
 
 use proptest::prelude::*;
@@ -568,9 +573,178 @@ impl<C: Cells> World<C> {
 fn read_value<C: Cells>(rt: &Runtime<C>, h: Handle, try_: bool) -> u64 {
     match (h, try_) {
         (Handle::Plain(h), false) => rt.get(h),
-        (Handle::Plain(h), true) => rt.try_get(h).unwrap_or(7777),
         (Handle::Bare(h), false) => rt.get(h).0,
-        (Handle::Bare(h), true) => rt.try_get(h).map_or(7777, |b| b.0),
+        (h, true) => try_value(rt, h).unwrap_or(7777),
+    }
+}
+
+fn try_value<C: Cells>(rt: &Runtime<C>, h: Handle) -> Result<u64, crate::cycle::Cycle> {
+    match h {
+        Handle::Plain(h) => rt.try_get(h),
+        Handle::Bare(h) => rt.try_get(h).map(|b| b.0),
+    }
+}
+
+/// A closure's read as the recorder keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum ReadOut {
+    Value(u64),
+    /// A `try_get`'s `Err`, with the cycle's participants by slot.
+    Cycle(Vec<u32>),
+    /// The read unwound into the closure's code.
+    Unwound,
+}
+
+/// A closure's read: the target's side and index, whether by `try_get`,
+/// and its outcome.
+type Read = (usize, usize, bool, ReadOut);
+
+/// One run of a query's closure: its node's side and index, whether it
+/// was the node's first, its reads in order, its value if it returned,
+/// and when it ended, on a clock both threads share.
+#[derive(Clone, Debug)]
+struct Eval {
+    node: (usize, usize),
+    first: bool,
+    reads: Vec<Read>,
+    value: Option<u64>,
+    end: u64,
+}
+
+thread_local! {
+    /// While set, the runs of closures that end on this thread.
+    static EVALS: std::cell::RefCell<Option<Vec<Eval>>> = const { std::cell::RefCell::new(None) };
+    /// The closures running on this thread while `EVALS` is set,
+    /// innermost last.
+    static OPEN: std::cell::RefCell<Vec<Eval>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+static EVAL_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// `f`'s result with the closure runs that ended on this thread inside it.
+fn record<R>(f: impl FnOnce() -> R) -> (R, Vec<Eval>) {
+    EVALS.with(|e| *e.borrow_mut() = Some(Vec::new()));
+    let r = f();
+    let log = EVALS.with(|e| e.borrow_mut().take()).unwrap_or_default();
+    (r, log)
+}
+
+/// A closure run, open while it runs if the thread records.
+struct Running(bool);
+
+impl Running {
+    fn start(node: (usize, usize), first: bool) -> Self {
+        let on = EVALS.with(|e| e.borrow().is_some());
+        if on {
+            OPEN.with(|o| {
+                o.borrow_mut().push(Eval {
+                    node,
+                    first,
+                    reads: Vec::new(),
+                    value: None,
+                    end: 0,
+                })
+            });
+        }
+        Running(on)
+    }
+
+    fn returned(&self, v: u64) {
+        if self.0 {
+            OPEN.with(|o| o.borrow_mut().last_mut().expect("the run is open").value = Some(v));
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if !self.0 {
+            return;
+        }
+        let mut e = OPEN
+            .with(|o| o.borrow_mut().pop())
+            .expect("the run is open");
+        e.end = EVAL_CLOCK.fetch_add(1, SeqCst);
+        EVALS.with(|l| {
+            if let Some(l) = l.borrow_mut().as_mut() {
+                l.push(e);
+            }
+        });
+    }
+}
+
+/// [`read_value`], kept on the innermost open run.
+fn read_logged<C: Cells>(rt: &Runtime<C>, h: Handle, target: (usize, usize), try_: bool) -> u64 {
+    let at = OPEN.with(|o| {
+        let mut o = o.borrow_mut();
+        let depth = o.len().checked_sub(1)?;
+        let reads = &mut o[depth].reads;
+        reads.push((target.0, target.1, try_, ReadOut::Unwound));
+        Some((depth, reads.len() - 1))
+    });
+    let Some((depth, k)) = at else {
+        return read_value(rt, h, try_);
+    };
+    let (v, out) = if try_ {
+        match try_value(rt, h) {
+            Ok(v) => (v, ReadOut::Value(v)),
+            Err(c) => (
+                7777,
+                ReadOut::Cycle(c.participants().iter().map(|p| p.slot()).collect()),
+            ),
+        }
+    } else {
+        let v = read_value(rt, h, false);
+        (v, ReadOut::Value(v))
+    };
+    OPEN.with(|o| o.borrow_mut()[depth].reads[k].3 = out);
+    v
+}
+
+/// `e` as [`eval`] computes it, with each read taking the next of
+/// `reads`: `Ok` with the value, `Err(None)` if it unwinds, or
+/// `Err(Some(why))` if a read is not the one `reads` holds next.
+fn formula(
+    e: &Expr,
+    (side, at, first): (usize, usize, bool),
+    reads: &mut std::slice::Iter<'_, Read>,
+) -> Result<u64, Option<String>> {
+    let mut read = |s: usize, target: usize, try_: bool| match reads.next() {
+        Some((rs, rt, rtry, out)) if (*rs, *rt, *rtry) == (s, target, try_) => match out {
+            ReadOut::Value(v) => Ok(*v),
+            ReadOut::Cycle(_) => Ok(7777),
+            ReadOut::Unwound => Err(None),
+        },
+        next => Err(Some(format!(
+            "node {at} reads {target} on side {s}, but its run's next read is {next:?}"
+        ))),
+    };
+    let n = (side, at, first);
+    match e {
+        Expr::Const(v) => Ok(*v),
+        Expr::Read(target, try_) => read(side, *target, *try_),
+        Expr::ReadOther(target, try_) => read(1 - side, *target, *try_),
+        Expr::Add(a, b) => Ok(formula(a, n, reads)?.wrapping_add(formula(b, n, reads)?)),
+        Expr::If(c, a, b) => {
+            if formula(c, n, reads)? % 2 == 0 {
+                formula(a, n, reads)
+            } else {
+                formula(b, n, reads)
+            }
+        }
+        Expr::PanicIf(c, when) => {
+            let v = formula(c, n, reads)?;
+            if v % 7 == *when {
+                Err(None)
+            } else {
+                Ok(v)
+            }
+        }
+        Expr::Catch(inner) => match formula(inner, n, reads) {
+            Err(None) => Ok(9999),
+            other => other,
+        },
+        Expr::FirstRun(a, b) => formula(if first { a } else { b }, n, reads),
     }
 }
 
@@ -585,10 +759,20 @@ struct Node<'a, C: Cells> {
 fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
     match e {
         Expr::Const(v) => *v,
-        Expr::Read(target, try_) => read_value(n.rt, n.world.handle(n.side, *target), *try_),
+        Expr::Read(target, try_) => read_logged(
+            n.rt,
+            n.world.handle(n.side, *target),
+            (n.side, *target),
+            *try_,
+        ),
         Expr::ReadOther(target, try_) => {
             let other = 1 - n.side;
-            read_value(n.world.rt(other), n.world.handle(other, *target), *try_)
+            read_logged(
+                n.world.rt(other),
+                n.world.handle(other, *target),
+                (other, *target),
+                *try_,
+            )
         }
         Expr::Add(a, b) => eval(n, a).wrapping_add(eval(n, b)),
         Expr::If(c, a, b) => {
@@ -649,7 +833,10 @@ fn make<C: Cells>(
                     at: i,
                     first: runs.fetch_add(1, Relaxed) == 0,
                 };
-                eval(&node, &expr)
+                let running = Running::start((side, i), node.first);
+                let v = eval(&node, &expr);
+                running.returned(v);
+                v
             };
             if *bare {
                 Handle::Bare(rt.create_query_with(
@@ -733,6 +920,9 @@ struct Live<C: Cells> {
     world: Arc<World<C>>,
     retired: Mutex<Vec<Handle>>,
     queries: [usize; 2],
+    /// The closure runs each operation's thread ended, by operation, in
+    /// a two-thread run.
+    evals: Mutex<HashMap<usize, Vec<Eval>>>,
 }
 
 /// After an operation: every query's state, every node's dependencies in
@@ -758,6 +948,7 @@ impl<C: Cells> Live<C> {
             world,
             retired: Mutex::new(Vec::new()),
             queries: [case.queries, case.queries2],
+            evals: Mutex::new(HashMap::new()),
         }
     }
 
@@ -873,19 +1064,34 @@ fn reset_thread() {
 }
 
 fn run<C: Cells>(case: &Case, frames: Option<u32>, bytes: usize) -> Trace {
+    run_logged::<C>(case, frames, bytes, false).0
+}
+
+/// [`run`], with each operation's closure runs if `log`.
+fn run_logged<C: Cells>(
+    case: &Case,
+    frames: Option<u32>,
+    bytes: usize,
+    log: bool,
+) -> (Trace, Vec<Vec<Eval>>) {
     let rts = runtimes::<C>(frames, bytes);
     let live = Live::new(&rts, case);
     reset_thread();
-    let mut trace = Vec::new();
+    let (mut trace, mut evals) = (Vec::new(), Vec::new());
     for op in &case.ops {
-        let out = live.apply(op);
+        let (out, ran) = if log {
+            record(|| live.apply(op))
+        } else {
+            (live.apply(op), Vec::new())
+        };
         live.assert_invariants();
         if let Err(m) = live.check_thread() {
             panic!("operation {op:?}: {m}");
         }
         trace.push((out, live.snapshot()));
+        evals.push(ran);
     }
-    trace
+    (trace, evals)
 }
 
 /// Who runs what, between barriers: a set, delete or recreate by one
@@ -996,8 +1202,11 @@ fn run_two_until(
                     }
                     if let Some(i) = phase.of(t) {
                         let op = &case.ops[i];
-                        match catch_unwind(AssertUnwindSafe(|| live.apply(op))) {
-                            Ok(out) => outs.lock().unwrap()[i] = Some(out),
+                        match catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op)))) {
+                            Ok((out, ran)) => {
+                                outs.lock().unwrap()[i] = Some(out);
+                                live.evals.lock().unwrap().insert(i, ran);
+                            }
                             Err(p) => failures.lock().unwrap().push(format!(
                                 "thread {t}, operation {i} ({op:?}) panicked: {}",
                                 class(p)
@@ -1146,6 +1355,7 @@ impl Order {
 /// the one with the landings this thread observes in the order it
 /// observes them (T8, the read case table), so either read of a pair may
 /// land a node both read first.
+#[allow(clippy::too_many_arguments)]
 fn orders(
     case: &Case,
     phases: &[Phase],
@@ -1154,6 +1364,7 @@ fn orders(
     label: &str,
     settle_last: bool,
     all: bool,
+    per_read: &PerRead,
 ) -> (Vec<u64>, Option<(usize, u64, String)>) {
     let mut found = Vec::new();
     let mut swaps = 0;
@@ -1174,12 +1385,16 @@ fn orders(
         // operation j's differs at j too, or matches there: search
         // depth-first, the k-th phase with two reads at depth k.
         let arranged = order.arrange(got);
+        let per: PerRead = (order.of.iter().enumerate())
+            .filter_map(|(j, i)| Some((j, per_read.get(i)?.clone())))
+            .collect();
         let diff = first_diff(
             &order.case,
             want,
             &arranged,
             Some(&settles),
             PanicText::Ignored,
+            &per,
         );
         let j = match diff {
             Some((j, what)) => {
@@ -1214,7 +1429,19 @@ fn assert_serial(
     got: &Trace,
     label: &str,
 ) {
-    let (found, closest) = orders(case, phases, wants, got, label, true, false);
+    assert_serial_with(case, phases, wants, got, label, &PerRead::new());
+}
+
+/// [`assert_serial`], with the gets `per_read` orders per read.
+fn assert_serial_with(
+    case: &Case,
+    phases: &[Phase],
+    wants: &mut HashMap<u64, Trace>,
+    got: &Trace,
+    label: &str,
+    per_read: &PerRead,
+) {
+    let (found, closest) = orders(case, phases, wants, got, label, true, false, per_read);
     if !found.is_empty() {
         return;
     }
@@ -1234,6 +1461,9 @@ struct Serial<'a> {
     case: &'a Case,
     phases: &'a [Phase],
     wants: Mutex<HashMap<u64, Trace>>,
+    /// Each order's closure runs, by operation, for [`Self::per_read`].
+    logs: Mutex<HashMap<u64, Vec<Vec<Eval>>>>,
+    per_read: Mutex<PerRead>,
 }
 
 impl<'a> Serial<'a> {
@@ -1242,6 +1472,8 @@ impl<'a> Serial<'a> {
             case,
             phases,
             wants: Mutex::new(HashMap::new()),
+            logs: Mutex::new(HashMap::new()),
+            per_read: Mutex::new(PerRead::new()),
         }
     }
 
@@ -1260,14 +1492,20 @@ impl<'a> Serial<'a> {
         live: &Live<Shared>,
     ) -> Option<Result<(), String>> {
         let (case, phases) = (self.case, self.phases);
+        self.per_read(label, prefix, live);
+        let per_read = self.per_read.lock().unwrap().clone();
         let mut wants = self.wants.lock().unwrap();
-        if !orders(case, phases, &mut wants, prefix, label, true, false)
-            .0
-            .is_empty()
+        if !orders(
+            case, phases, &mut wants, prefix, label, true, false, &per_read,
+        )
+        .0
+        .is_empty()
         {
             return None;
         }
-        let (found, _) = orders(case, phases, &mut wants, prefix, label, false, true);
+        let (found, _) = orders(
+            case, phases, &mut wants, prefix, label, false, true, &per_read,
+        );
         if found.is_empty() {
             return None;
         }
@@ -1277,16 +1515,139 @@ impl<'a> Serial<'a> {
         Some(consistent(case, prefix, &sets, live))
     }
 
+    /// Orders per read each get of the read phase `prefix` ends with whose
+    /// thread's `try_get` returned a cycle that the other read's get
+    /// landed: every participant ended the phase Clean, and its last run
+    /// that returned was on the other thread. Cycle results depend on the
+    /// member a get enters at, so the get may mix outcomes of both orders.
+    /// Its value must still be
+    /// its node's closure over its last run's reads, each an outcome some
+    /// order of the phase gives that read.
+    fn per_read(&self, label: &str, prefix: &Trace, live: &Live<Shared>) {
+        let end = prefix.len() - 1;
+        let Some(p) = (self.phases.iter()).position(|ph| ph.ops().last() == Some(&end)) else {
+            return;
+        };
+        let phase = &self.phases[p];
+        let states = &prefix[end].1 .0;
+        let w = &*live.world;
+        let spec_of: HashMap<u32, usize> = (0..live.queries[0])
+            .map(|x| (w.handle(0, x).erased().slot(), x))
+            .collect();
+        let evals = live.evals.lock().unwrap().clone();
+        let none = Vec::new();
+        for t in 0..2 {
+            let (Some(i), Some(j)) = (phase.of(t), phase.of(1 - t)) else {
+                continue;
+            };
+            let (Op::Get(q) | Op::TryGet(q)) = self.case.ops[i] else {
+                continue;
+            };
+            if !matches!(self.case.ops[j], Op::Get(_) | Op::TryGet(_)) {
+                continue;
+            }
+            let (mine, theirs) = (
+                evals.get(&i).unwrap_or(&none),
+                evals.get(&j).unwrap_or(&none),
+            );
+            let landed_there = |slot: &u32| {
+                spec_of.get(slot).is_some_and(|&x| {
+                    states[x] == NodeState::Clean
+                        && (mine.iter().chain(theirs))
+                            .filter(|e| e.node == (0, x) && e.value.is_some())
+                            .max_by_key(|e| e.end)
+                            .is_some_and(|e| theirs.iter().any(|o| o.end == e.end))
+                })
+            };
+            let caught = (mine.iter().flat_map(|e| &e.reads)).any(|(side, _, try_, out)| {
+                matches!(out, ReadOut::Cycle(c) if *side == 0 && *try_ && c.iter().all(landed_there))
+            });
+            let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
+            if let (true, Some(run)) = (caught, last) {
+                let verdict = self.closure_over_reads(label, prefix, p, i, q, run);
+                self.per_read.lock().unwrap().insert(i, verdict);
+            }
+        }
+    }
+
+    /// The outcome node `q`'s closure gives over `run`'s reads, for op `i`
+    /// of phase `p`, or why a read is no order's outcome for it, an
+    /// order's outcome being that of a read in the order's last run of `q`
+    /// in op `i`: the orders are those an order of the phases before gives
+    /// `prefix` in, with either read of phase `p` first.
+    fn closure_over_reads(
+        &self,
+        label: &str,
+        prefix: &Trace,
+        p: usize,
+        i: usize,
+        q: usize,
+        run: &Eval,
+    ) -> Result<Out, String> {
+        let (case, phases) = (self.case, self.phases);
+        let start = phases[p].ops()[0];
+        let pair = phases[..p].iter().filter(|ph| ph.ops().len() == 2).count();
+        let masks = if start == 0 {
+            vec![0]
+        } else {
+            let before = prefix[..start].to_vec();
+            let per_read = self.per_read.lock().unwrap().clone();
+            let mut wants = self.wants.lock().unwrap();
+            orders(
+                case, phases, &mut wants, &before, label, true, true, &per_read,
+            )
+            .0
+        };
+        let mut allowed: HashSet<Read> = HashSet::new();
+        for m in masks.iter().flat_map(|m| [m & !(1 << pair), m | 1 << pair]) {
+            let order = Order::new(case, phases, m);
+            let at = order
+                .of
+                .iter()
+                .position(|&x| x == i)
+                .expect("every order runs it");
+            let mut logs = self.logs.lock().unwrap();
+            let log = logs.entry(m).or_insert_with(|| {
+                labelled(&format!("{label}, unbounded, swaps {m:#b}, logged"), || {
+                    run_logged::<Shared>(&order.case, None, 0, true).1
+                })
+            });
+            let last = (log[at].iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
+            allowed.extend(last.into_iter().flat_map(|e| e.reads.iter().cloned()));
+        }
+        if let Some(r) = run.reads.iter().find(|r| !allowed.contains(*r)) {
+            return Err(format!(
+                "op {i}: node {q} read {r:?}, which no order gives that read"
+            ));
+        }
+        let Spec::Query { expr, .. } = spec_at(case, prefix, 0, q) else {
+            return Err(format!("op {i}: node {q} is an input"));
+        };
+        let mut reads = run.reads.iter();
+        let out = match formula(&expr, (0, q, run.first), &mut reads) {
+            Ok(v) => Out::Value(v),
+            Err(None) => Out::Panic(String::new()),
+            Err(Some(why)) => return Err(format!("op {i}: {why}")),
+        };
+        match reads.next() {
+            None => Ok(out),
+            Some(r) => Err(format!(
+                "op {i}: node {q}'s closure stops before its read {r:?}"
+            )),
+        }
+    }
+
     /// Panics unless the run's trace `got` is an order's unbounded run, or
     /// `at_overlap` stopped the run with a `verdict` that holds.
     fn check(&self, label: &str, got: &Trace, verdict: Option<Result<(), String>>) {
         match verdict {
-            None => assert_serial(
+            None => assert_serial_with(
                 self.case,
                 self.phases,
                 &mut self.wants.lock().unwrap(),
                 got,
                 label,
+                &self.per_read.lock().unwrap(),
             ),
             Some(Ok(())) => {}
             Some(Err(why)) => {
@@ -1309,6 +1670,7 @@ impl<'a> Serial<'a> {
         bytes: usize,
         rig: &dyn Fn(&Live<Shared>),
     ) {
+        self.per_read.lock().unwrap().clear();
         let verdict = Mutex::new(None);
         let got = labelled(label, || {
             run_two_until(
@@ -1382,19 +1744,7 @@ fn consistent(
             continue;
         }
         let (side, q, _) = node(x);
-        let spec = if side == 1 {
-            case.specs2[q].clone()
-        } else {
-            prefix
-                .iter()
-                .zip(&case.ops[..prefix.len()])
-                .rev()
-                .find_map(|((out, _), op)| match (op, out) {
-                    (Op::Recreate(i, spec), Out::Recreated(_)) if *i == q => Some(spec.clone()),
-                    _ => None,
-                })
-                .unwrap_or_else(|| case.specs[q].clone())
-        };
+        let spec = spec_at(case, prefix, side, q);
         let rerun = make(&live.world, side, q, &spec, true);
         let out = read_out(w.rt(side), rerun, false);
         if matches!(out, Out::Value(_)) {
@@ -1447,6 +1797,27 @@ fn consistent(
     Err(first.expect("an order has the trace's outcomes"))
 }
 
+/// Node `q`'s spec on `side` after `prefix`: the last recreate's that
+/// took, or the case's.
+fn spec_at(case: &Case, prefix: &Trace, side: usize, q: usize) -> Spec {
+    if side == 1 {
+        return case.specs2[q].clone();
+    }
+    prefix
+        .iter()
+        .zip(&case.ops[..prefix.len()])
+        .rev()
+        .find_map(|((out, _), op)| match (op, out) {
+            (Op::Recreate(i, spec), Out::Recreated(_)) if *i == q => Some(spec.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| case.specs[q].clone())
+}
+
+/// What a get ordered per read must return, by operation: the closure
+/// over its run's reads, or why those reads are no orders' outcomes.
+type PerRead = HashMap<usize, Result<Out, String>>;
+
 /// How [`first_diff`] compares two panics.
 #[derive(Copy, Clone, Debug)]
 enum PanicText {
@@ -1475,6 +1846,7 @@ fn first_diff(
     got: &Trace,
     settles: Option<&[bool]>,
     text: PanicText,
+    per_read: &PerRead,
 ) -> Option<(usize, String)> {
     // A closure's read of a deleted node panics as stale, so a case with
     // deletes has panics.
@@ -1526,7 +1898,23 @@ fn first_diff(
         }
         let settles = settles.is_none_or(|s| s[i]);
         let sets = |snap: &Snapshot| (agree && settles).then(|| settled(&snap.0));
-        if !text.same(want_out, got_out) || sets(want) != sets(got) {
+        // A get ordered per read: its outcome is its closure's over its
+        // reads, and the rest is compared as for any other operation.
+        if let Some(by_reads) = per_read.get(&i).filter(|_| !text.same(want_out, got_out)) {
+            let wrong = match by_reads {
+                Ok(out) if text.same(out, got_out) => None,
+                Ok(out) => Some(format!("its closure over its reads gives {out:?}")),
+                Err(why) => Some(why.clone()),
+            };
+            if wrong.is_some() || sets(want) != sets(got) {
+                let (w, g) = ((want_out, sets(want)), (got_out, sets(got)));
+                let wrong = wrong.unwrap_or_default();
+                return Some((
+                    i,
+                    format!("want {w:?}\n got {g:?}\nordered per read: {wrong}"),
+                ));
+            }
+        } else if !text.same(want_out, got_out) || sets(want) != sets(got) {
             let (w, g) = ((want_out, sets(want)), (got_out, sets(got)));
             return Some((i, format!("want {w:?}\n got {g:?}")));
         }
@@ -1542,7 +1930,7 @@ fn first_diff(
 /// Panics, naming the case, at the first operation at which `got` differs
 /// from the unbounded run's `want`.
 fn compare(case: &Case, want: &Trace, got: &Trace, label: &str) {
-    if let Some((i, what)) = first_diff(case, want, got, None, PanicText::Exact) {
+    if let Some((i, what)) = first_diff(case, want, got, None, PanicText::Exact, &PerRead::new()) {
         panic!(
             "{label}: operation {i} ({:?}) differs from the unbounded run\n{what}\n{}",
             case.ops[i],
@@ -1907,8 +2295,15 @@ fn two_thread_oracle_takes_either_order_of_a_read_pair() {
             let in_order = Order::new(&case, &phases, 0);
             let unbounded = run::<Shared>(&case, None, 0);
             let settles = in_order.settles();
-            let (i, _) = first_diff(&case, &unbounded, &got, Some(&settles), PanicText::Exact)
-                .unwrap_or_else(|| panic!("seed {seed:#x}: the swap changes no outcome"));
+            let (i, _) = first_diff(
+                &case,
+                &unbounded,
+                &got,
+                Some(&settles),
+                PanicText::Exact,
+                &PerRead::new(),
+            )
+            .unwrap_or_else(|| panic!("seed {seed:#x}: the swap changes no outcome"));
             assert_serial(&case, &phases, &mut HashMap::new(), &got, "swapped");
 
             let mut bad = got;
@@ -1975,6 +2370,15 @@ fn two_thread_swapped_order_seeds() {
     }
 }
 
+/// Waits for a forced schedule's `done`, failing the test if it stalls.
+fn until(done: impl Fn() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(start.elapsed().as_secs() < 20, "the schedule stalled");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
@@ -1990,13 +2394,6 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
         on: AtomicBool,
         first: AtomicBool,
         at3: AtomicBool,
-    }
-    fn until(done: impl Fn() -> bool) {
-        let start = std::time::Instant::now();
-        while !done() {
-            assert!(start.elapsed().as_secs() < 20, "the schedule stalled");
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
     }
     let case = gen_case(0x934, false, true);
     let phases = phases(&case, 0x934);
@@ -2061,6 +2458,115 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
         let verdict = verdict.into_inner().unwrap();
         assert_eq!(verdict, None);
         serial.check("0x934", &got, verdict);
+    });
+}
+
+/// 0x1006's ops 6 (`Get(12)`) and 7 (`Get(7)`) overlap on the cold cycle
+/// 8 -> 9 -> 10 -> 11 -> 12 -> 8, whose strategy members are 11 and 12.
+/// Op 7 enters it at 8, which has none, so 7's `try_get(4)` gets the
+/// cycle (R3). Here op 7 then holds until op 6, entering at 12, has
+/// landed 8 Clean, and 7 reads 8 = 2 twice: 7777 + 2 + 2, no order's
+/// value. The oracle orders that get per read: each read is an order's
+/// outcome for it, and the value is 7's closure over them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
+    let case = gen_case(0x1006, false, true);
+    let phases = phases(&case, 0x1006);
+    let overlap = phases.iter().position(|p| p.ops() == [6, 7]).unwrap();
+    assert_eq!(phases[overlap].of(1), Some(7));
+    let (on, ready) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    // Thread 0 runs op 6: it holds at its first park until op 7 has got
+    // the cycle and is at its claim of 8, which holds until 8 is Clean.
+    let rig = |live: &Live<Shared>| {
+        let (on, ready, world) = (on.clone(), ready.clone(), live.world.clone());
+        let slot = |q| NodeId(world.handle(0, q).erased().slot());
+        let (four, eight) = (slot(4), slot(8));
+        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+            if !on.load(SeqCst) {
+                return;
+            }
+            let state = |n: NodeId| world.rt(0).nodes.get(n.0).state();
+            match TWO_THREAD.with(std::cell::Cell::get) {
+                Some(0) => until(|| ready.load(SeqCst)),
+                Some(1)
+                    if p == ParkPoint::BeforeClaim(eight)
+                        && state(four) == NodeState::New
+                        && !ready.swap(true, SeqCst) =>
+                {
+                    until(|| state(eight) == NodeState::Clean)
+                }
+                _ => {}
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    quiet(|| {
+        let serial = Serial::new(&case, &phases);
+        let (verdict, seven) = (Mutex::new(None), Mutex::new(None));
+        let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+            if p == overlap {
+                on.store(false, SeqCst);
+                let evals = live.evals.lock().unwrap();
+                let last = evals[&7]
+                    .iter()
+                    .filter(|e| e.node == (0, 7))
+                    .max_by_key(|e| e.end);
+                *seven.lock().unwrap() = Some((prefix.clone(), last.cloned().unwrap()));
+            }
+            let v = serial.at_overlap("0x1006", prefix, live);
+            if p + 1 == overlap {
+                on.store(true, SeqCst);
+            }
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+        assert_eq!(got[7].0, Out::Value(7781));
+        serial.check("0x1006", &got, verdict.into_inner().unwrap());
+        let per_read = serial.per_read.lock().unwrap().clone();
+        assert_eq!(
+            per_read.keys().collect::<Vec<_>>(),
+            [&7],
+            "op 6 stays exact"
+        );
+
+        let (prefix, mut sevens) = seven.into_inner().unwrap().unwrap();
+        let read = (sevens.reads.iter_mut())
+            .find(|r| r.3 == ReadOut::Value(2))
+            .unwrap();
+        read.3 = ReadOut::Value(3);
+        let why = serial
+            .closure_over_reads("0x1006", &prefix, overlap, 7, 7, &sevens)
+            .unwrap_err();
+        assert!(why.contains("no order gives that read"), "{why}");
+        let rejects = |bad: Trace, what: &str| {
+            let fresh = Serial::new(&case, &phases);
+            *fresh.per_read.lock().unwrap() = per_read.clone();
+            let caught = catch_unwind(AssertUnwindSafe(|| fresh.check(what, &bad, None)));
+            assert!(caught.is_err(), "{what} passed");
+        };
+        let mut off = got.clone();
+        off[7].0 = Out::Value(7780);
+        rejects(off, "a value off 7's closure over its reads");
+        let mut partner = got.clone();
+        partner[6].0 = Out::Value(u64::MAX);
+        rejects(partner, "a wrong value for op 6");
+        let mut failed = got.clone();
+        for k in [6, 7] {
+            failed[k].1 .0[5] = NodeState::Failed;
+        }
+        rejects(failed, "a Failed node no order leaves");
+        // 7 read 4 through the cycle's unwind, so it lands Dirty, where 6
+        // first leaves it Clean: the states differ past the phase and, in
+        // a case with cycles, later results are history as after any such
+        // phase.
+        let in_order = run::<Shared>(&case, None, 0);
+        assert_eq!(got[7].1 .0[7], NodeState::Dirty);
+        assert_eq!(in_order[7].1 .0[7], NodeState::Clean);
     });
 }
 
