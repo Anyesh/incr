@@ -2002,6 +2002,99 @@ fn shared_vframe_owed_payload_drains_a_stale_retrys_bag_first() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// R reads X, which reads Y only once `sel` is 1, so a set of `sel` makes
+/// R's walk compute X as a walk entry, whose read of Y dooms it at budget
+/// 1. Y's entry panics "y boom", parked before X's retry on `gate`.
+struct WalkedFrame {
+    rt: Arc<Rt>,
+    i: Incr<u64>,
+    x: Incr<u64>,
+    r: Incr<u64>,
+    gate: Gate,
+}
+
+fn walked_frame() -> WalkedFrame {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let (sel, i) = (rt.create_input(0_u64), rt.create_input(0_u64));
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |rt: &Rt| -> u64 {
+                if rt.get(i) == 1 {
+                    return 7;
+                }
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if rt.get(sel) == 0 {
+                return 1;
+            }
+            rt.get(y) + 1
+        },
+        replayable(),
+    );
+    let r = rt.create_query_with(move |rt: &Rt| rt.get(x) + 1, replayable());
+    assert_eq!(rt.get(r), 2);
+    rt.set(sel, 1);
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    WalkedFrame { rt, i, x, r, gate }
+}
+
+/// The other thread's X lets Y's failed read out before the walk's retry
+/// of X, which finds X Failed. Only the order with this thread's whole
+/// read first is serial: its walk contains "y boom" on X, R's rerun takes
+/// it, and the other thread reads X Failed.
+#[test]
+#[ignore = "a walked retry skips the owed check; T8-vframe-owed-walked-retry"]
+fn shared_walked_vframe_failed_by_a_landing_that_let_the_failure_out() {
+    let WalkedFrame { rt, x, r, gate, .. } = walked_frame();
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(r)))
+    };
+    gate.wait_parked();
+    let other = outcome(|| rt.get(x));
+    assert!(failed(&other), "{other:?}");
+    gate.release();
+    let first = first.join();
+    assert_eq!(first, Err("y boom".to_string()));
+    assert!(failed(&outcome(|| rt.get(x))));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+    assert_eq!(rt.contained_payloads(), 0);
+}
+
+/// As `failed_by_a_landing_that_let_the_failure_out`, but a set that
+/// mends Y flips X Dirty before the retry, which claims X. The serial
+/// outcome is the same, and the set leaves X Dirty for the next read.
+#[test]
+#[ignore = "a walked retry skips the owed check; T8-vframe-owed-walked-retry"]
+fn shared_walked_vframe_dirtied_after_it_let_the_failure_out() {
+    let WalkedFrame { rt, i, x, r, gate } = walked_frame();
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(r)))
+    };
+    gate.wait_parked();
+    let other = outcome(|| rt.get(x));
+    assert!(failed(&other), "{other:?}");
+    rt.set(i, 1);
+    gate.release();
+    let first = first.join();
+    assert_eq!(first, Err("y boom".to_string()));
+    assert_eq!(outcome(|| rt.get(r)), Ok(9));
+    rt.assert_invariant_i();
+    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+}
+
 /// T reads F, and F (Fallback 100), X and Y read each other in a
 /// cycle. At budget 1 Y's read of F is a virtual hit, and F's virtual
 /// frame pops as the root of an episode in which F panics "f boom", so
