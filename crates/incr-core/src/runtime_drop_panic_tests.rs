@@ -813,3 +813,36 @@ fn local_delete_of_a_node_claimed_dead_panics_instead_of_spinning() {
     )
     .assert_panicked_with("claimed by a delete on this thread");
 }
+
+/// A contained payload whose `Drop` panics, released by a set's dirty walk,
+/// must not stop that walk before it flags the input's other dependents.
+fn ticket_drop_panic_keeps_the_set_walk<C: Cells>(rt: &Runtime<C>) {
+    let i = rt.create_input(0_i64);
+    let sel = rt.create_input(0_i64);
+    let e = rt.create_query(move |rt| {
+        let v = rt.get(i);
+        if v == 1 {
+            std::panic::panic_any(Boom(7));
+        }
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(e) } else { 100 });
+    let k = rt.create_query(move |rt| rt.get(i) * 10);
+    assert_eq!(rt.get(k), 0);
+    assert_eq!(rt.get(x), 0);
+    rt.set(i, 1);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(rt.contained_payloads(), 1);
+    assert_eq!(rt.get(k), 10);
+    arm(7);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.set(i, 2)));
+    arm(i64::MIN);
+    assert_eq!(rt.get(k), 20);
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn local_ticket_drop_panic_keeps_the_set_walk() {
+    ticket_drop_panic_keeps_the_set_walk(&Runtime::<Local>::new());
+}
