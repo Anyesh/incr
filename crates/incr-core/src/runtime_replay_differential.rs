@@ -609,6 +609,9 @@ struct Eval {
     reads: Vec<Read>,
     value: Option<u64>,
     end: u64,
+    /// When each read that got a cycle returned, by its index in
+    /// `reads`, on the same clock.
+    caught: Vec<(usize, u64)>,
 }
 
 thread_local! {
@@ -643,6 +646,7 @@ impl Running {
                     reads: Vec::new(),
                     value: None,
                     end: 0,
+                    caught: Vec::new(),
                 })
             });
         }
@@ -688,10 +692,14 @@ fn read_logged<C: Cells>(rt: &Runtime<C>, h: Handle, target: (usize, usize), try
     let (v, out) = if try_ {
         match try_value(rt, h) {
             Ok(v) => (v, ReadOut::Value(v)),
-            Err(c) => (
-                7777,
-                ReadOut::Cycle(c.participants().iter().map(|p| p.slot()).collect()),
-            ),
+            Err(c) => {
+                let at = EVAL_CLOCK.fetch_add(1, SeqCst);
+                OPEN.with(|o| o.borrow_mut()[depth].caught.push((k, at)));
+                (
+                    7777,
+                    ReadOut::Cycle(c.participants().iter().map(|p| p.slot()).collect()),
+                )
+            }
         }
     } else {
         let v = read_value(rt, h, false);
@@ -1555,8 +1563,9 @@ impl<'a> Serial<'a> {
 
     /// Orders per read each get of the read phase `prefix` ends with whose
     /// thread's `try_get` returned a cycle that the other read's get
-    /// landed: every participant ended the phase Clean, and its last run
-    /// that returned was on the other thread. Cycle results depend on the
+    /// landed after it: every participant ended the phase Clean, and its
+    /// last run that returned was on the other thread and ended after the
+    /// `try_get` returned. Cycle results depend on the
     /// member a get enters at, so the get may mix outcomes of both orders.
     /// Its value must still be
     /// its node's closure over its last run's reads, each an outcome some
@@ -1588,17 +1597,20 @@ impl<'a> Serial<'a> {
                 evals.get(&i).unwrap_or(&none),
                 evals.get(&j).unwrap_or(&none),
             );
-            let landed_there = |slot: &u32| {
+            let landed_there_after = |slot: &u32, at: u64| {
                 spec_of.get(slot).is_some_and(|&x| {
                     states[x] == NodeState::Clean
                         && (mine.iter().chain(theirs))
                             .filter(|e| e.node == (0, x) && e.value.is_some())
                             .max_by_key(|e| e.end)
-                            .is_some_and(|e| theirs.iter().any(|o| o.end == e.end))
+                            .is_some_and(|e| e.end > at && theirs.iter().any(|o| o.end == e.end))
                 })
             };
-            let caught = (mine.iter().flat_map(|e| &e.reads)).any(|(side, _, try_, out)| {
-                matches!(out, ReadOut::Cycle(c) if *side == 0 && *try_ && c.iter().all(landed_there))
+            let caught = mine.iter().any(|e| {
+                e.caught.iter().any(|&(k, at)| {
+                    matches!(&e.reads[k], (0, _, true, ReadOut::Cycle(c))
+                        if c.iter().all(|slot| landed_there_after(slot, at)))
+                })
             });
             let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
             if let (true, Some(run)) = (caught, last) {
@@ -2794,6 +2806,119 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
         let in_order = run::<Shared>(&case, None, 0);
         assert_eq!(got[7].1 .0[7], NodeState::Dirty);
         assert_eq!(in_order[7].1 .0[7], NodeState::Clean);
+    });
+}
+
+/// 0x1006's phase [6, 7] run serially: op 7 holds at its first park until
+/// op 6 has landed 8..12 Clean, so no race is possible and op 7's outcome
+/// must be the 6-first order's Value(8). With a stale-catch fault spliced
+/// in (op 7 carries the racing run's reads, its `try_get(4)` = Cycle, and
+/// returns 7781), the oracle must reject the trace: the cycle was caught
+/// after the partner landed it, not before.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
+    let case = gen_case(0x1006, false, true);
+    let phases = phases(&case, 0x1006);
+    let overlap = phases.iter().position(|p| p.ops() == [6, 7]).unwrap();
+    assert_eq!(phases[overlap].of(1), Some(7));
+    let (on, ready) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let race_rig = |live: &Live<Shared>| {
+        let (on, ready, world) = (on.clone(), ready.clone(), live.world.clone());
+        let slot = |q| NodeId(world.handle(0, q).erased().slot());
+        let (four, eight) = (slot(4), slot(8));
+        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+            if !on.load(SeqCst) {
+                return;
+            }
+            let state = |n: NodeId| world.rt(0).nodes.get(n.0).state();
+            match TWO_THREAD.with(std::cell::Cell::get) {
+                Some(0) => until(|| ready.load(SeqCst)),
+                Some(1)
+                    if p == ParkPoint::BeforeClaim(eight)
+                        && state(four) == NodeState::New
+                        && !ready.swap(true, SeqCst) =>
+                {
+                    until(|| state(eight) == NodeState::Clean)
+                }
+                _ => {}
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    let serial_rig = |live: &Live<Shared>| {
+        let (on, world) = (on.clone(), live.world.clone());
+        let hook: crate::runtime::ParkHook = Box::new(move |_| {
+            if on.load(SeqCst) && TWO_THREAD.with(std::cell::Cell::get) == Some(1) {
+                let clean = |q| {
+                    world
+                        .rt(0)
+                        .nodes
+                        .get(world.handle(0, q).erased().slot())
+                        .state()
+                        == NodeState::Clean
+                };
+                until(|| (8..=12).all(clean));
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    quiet(|| {
+        let racing = Serial::new(&case, &phases);
+        let race_evals = Mutex::new(None);
+        let race_got = run_two_until(&case, &phases, None, 0, &race_rig, &|p, prefix, live| {
+            if p == overlap {
+                on.store(false, SeqCst);
+                *race_evals.lock().unwrap() = Some(live.evals.lock().unwrap()[&7].clone());
+            }
+            let v = racing.at_overlap("0x1006 race", prefix, live);
+            if p + 1 == overlap {
+                on.store(true, SeqCst);
+            }
+            v.is_some()
+        });
+        assert_eq!(race_got[7].0, Out::Value(7781), "the race was driven");
+        let race_evals = race_evals.into_inner().unwrap().unwrap();
+
+        let serial = Serial::new(&case, &phases);
+        let verdict = Mutex::new(None);
+        let got = run_two_until(&case, &phases, None, 0, &serial_rig, &|p, prefix, live| {
+            let mut prefix = prefix.clone();
+            if p == overlap {
+                on.store(false, SeqCst);
+                assert_eq!(prefix[7].0, Out::Value(8), "the schedule was serial");
+                // The fault catches the cycle after op 6 landed it, so its
+                // runs take stamps after this run's.
+                let after = EVAL_CLOCK.load(SeqCst);
+                let mut stale = race_evals.clone();
+                for e in &mut stale {
+                    e.end += after;
+                    e.caught.iter_mut().for_each(|c| c.1 += after);
+                }
+                live.evals.lock().unwrap().insert(7, stale);
+                prefix[7].0 = Out::Value(7781);
+            }
+            let v = serial.at_overlap("0x1006 serial", &prefix, live);
+            if p + 1 == overlap {
+                on.store(true, SeqCst);
+            }
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+        let mut bad = got.clone();
+        bad[7].0 = Out::Value(7781);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            serial.check("0x1006 serial", &bad, verdict.into_inner().unwrap())
+        }));
+        assert!(
+            caught.is_err(),
+            "a cycle caught after the partner landed it was ordered per read: {:?}",
+            serial.per_read.lock().unwrap().get(&7)
+        );
     });
 }
 
