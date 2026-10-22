@@ -2729,6 +2729,67 @@ fn stale_read_payload_reaches_the_root_through_replayed_frames() {
     });
 }
 
+/// A one-phase case's snapshots with nodes `xs` patched to `to`, judged
+/// by `at_overlap`; `live_too` also sets the live nodes' states.
+fn overlap_verdict(
+    case: &Case,
+    xs: &[usize],
+    to: NodeState,
+    live_too: bool,
+) -> Option<Result<(), String>> {
+    let phases = phases(case, 0);
+    let serial = Serial::new(case, &phases);
+    let verdict = Mutex::new(None);
+    quiet(|| {
+        run_two_until(case, &phases, None, 0, &|_| {}, &|_, prefix, live| {
+            let mut prefix = prefix.clone();
+            for &x in xs {
+                for (_, snap) in &mut prefix {
+                    snap.0[x] = to;
+                }
+                if live_too {
+                    let (rt, h) = (live.world.rt(0), live.world.handle(0, x));
+                    rt.nodes.get(h.erased().slot()).set_state(to as u8);
+                }
+            }
+            let v = serial.at_overlap("patched", &prefix, live);
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+    });
+    verdict.into_inner().unwrap()
+}
+
+/// A cycle with no panic anywhere converges, so no history leaves its
+/// members Failed, even though each one's recorded dep is the other.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_rejects_a_failed_set_that_justifies_itself() {
+    let q = |n| Spec::Query {
+        expr: Expr::Read(n, false),
+        replay: false,
+        bare: false,
+        strategy: Strat::Fixpoint {
+            initial: 3,
+            limit: 8,
+        },
+    };
+    let case = Case {
+        specs: vec![q(1), q(0)],
+        panics: false,
+        cycles: true,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(1)],
+    };
+    match overlap_verdict(&case, &[0, 1], NodeState::Failed, true) {
+        Some(Err(_)) => {}
+        v => panic!("a self-justified Failed set passed: {v:?}"),
+    }
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
