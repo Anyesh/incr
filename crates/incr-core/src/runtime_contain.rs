@@ -252,11 +252,12 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
         if let Some(payload) = payload {
-            // The frames at and above `cidx` belong to this unwind, so an
-            // earlier unwind's notes there are spent.
+            // The frames above `cidx` belong to this unwind, so an earlier
+            // unwind's notes there are spent. Notes at `cidx` are the reading
+            // frame's, whose closure may still hold the payload they follow.
             let at = key(payload);
             with_notes(|u| {
-                u.retain(|w| !(w.cidx >= cidx && w.payload != at));
+                u.retain(|w| !(w.cidx > cidx && w.payload != at));
                 u.push(Unwound {
                     rt,
                     cidx,
@@ -306,20 +307,21 @@ impl<C: Cells> Runtime<C> {
         self.contain(c.cidx, c.payload, bag);
     }
 
-    /// Stops an unwind a walk's entry at `cidx` contains: the notes at and
-    /// above `cidx` are spent, and the Failed landings `payload` made there
-    /// hold it for their first read.
+    /// Stops an unwind a walk's entry at `cidx` contains: the notes above
+    /// `cidx` and those of `payload` at it are spent, and the Failed
+    /// landings `payload` made there hold it for their first read. Another
+    /// payload's notes at `cidx` are the reading frame's, as at a landing.
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
         let (rt, at) = (self.runtime_id, key(&*payload));
         let mut nodes = Vec::new();
         if notes_held() {
             with_notes(|u| {
                 u.retain(|w| {
-                    let above = w.cidx >= cidx;
-                    if above && w.rt == rt && w.payload == at && !nodes.contains(&w.node) {
+                    let ours = w.cidx >= cidx && w.payload == at;
+                    if ours && w.rt == rt && !nodes.contains(&w.node) {
                         nodes.push(w.node);
                     }
-                    !above
+                    !(ours || w.cidx > cidx)
                 });
             });
         }
