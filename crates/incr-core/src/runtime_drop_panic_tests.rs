@@ -1418,3 +1418,40 @@ fn shared_wave7_kept_dirty_read_clone_drop_is_not_raised() {
         |rt| wave7_kept_dirty_read_clone_drop_is_not_raised(rt, 64),
     );
 }
+
+/// The kept clone of a poisoned Dirty read is dropped when its frame pops,
+/// and its `Drop` panic is no event of the run's: `get(f)` returns 0 and
+/// `f` is not Failed under a budget, as unbounded, where no clone is made.
+fn wave7_kept_dirty_read_clone_drops_isolated<C: Cells>(rt: &Runtime<C>, frames: u32) {
+    rt.set_max_frames(frames);
+    let q = rt.create_query(|_| -> i64 { panic!("q boom") });
+    let p = rt.create_query(move |rt| {
+        let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+        Boom(7)
+    });
+    let f = rt.create_query(move |rt| {
+        std::mem::forget(rt.get(p));
+        0_u64
+    });
+    arm(7);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_err(panic_message);
+    arm(i64::MIN);
+    assert_eq!(got, Ok(0), "frames {frames}");
+    assert_ne!(rt.state_of(f), NodeState::Failed, "frames {frames}");
+}
+
+#[test]
+fn local_wave7_kept_dirty_read_clone_drops_isolated() {
+    for frames in [u32::MAX, 64, crate::DEFAULT_MAX_FRAMES] {
+        wave7_kept_dirty_read_clone_drops_isolated(&Runtime::<Local>::new(), frames);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wave7_kept_dirty_read_clone_drops_isolated() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_wave7_kept_dirty_read_clone_drops_isolated",
+        |rt| wave7_kept_dirty_read_clone_drops_isolated(rt, 64),
+    );
+}
