@@ -1589,3 +1589,72 @@ local_and_shared!(
     local_walked_caught_member_keeps_its_ticket,
     shared_walked_caught_member_keeps_its_ticket
 );
+
+/// A reads itself, a fallback cycle, then catches its `try_get` of B. B
+/// reads C under `catch_unwind` and panics unless that read gives an even
+/// value; C's `try_get` of B meets the cycle B..C, which has no strategy,
+/// so C gives 7777 and B panics and lands Failed. Returns A's value and
+/// the states of A, B and C.
+fn caught_cycle_in_fallback_member<C: Cells>(frames: Option<u32>) -> (u64, [NodeState; 3]) {
+    let rt = runtime::<C>(frames);
+    let (a_cell, b_cell): (Later, Later) = Default::default();
+    let a = {
+        let (a_cell, b_cell) = (a_cell.clone(), b_cell.clone());
+        rt.create_query_with(
+            move |rt| {
+                if rt.get(later(&a_cell)) % 2 == 0 {
+                    0
+                } else {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        rt.try_get(later(&b_cell)).unwrap_or(7777)
+                    }))
+                    .unwrap_or(9999)
+                }
+            },
+            fallback(1),
+        )
+    };
+    a_cell.set(a).unwrap();
+    let c_cell: Later = Default::default();
+    let b = {
+        let c_cell = c_cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(later(&c_cell)))).unwrap_or(9999);
+                if v % 2 == 0 {
+                    0
+                } else {
+                    panic!("b boom")
+                }
+            },
+            replayable(),
+        )
+    };
+    b_cell.set(b).unwrap();
+    let c = rt.create_query_with(move |rt| rt.try_get(b).unwrap_or(7777), replayable());
+    c_cell.set(c).unwrap();
+    let got = rt.get(a);
+    rt.assert_invariant_i();
+    (got, [rt.state_of(a), rt.state_of(b), rt.state_of(c)])
+}
+
+/// At budget 1, B's Failed landing must survive as in the unbounded run
+/// (seed 0xa18d458163c687fe).
+fn caught_cycle_in_fallback_member_lands_failed<C: Cells>() {
+    let unbounded = caught_cycle_in_fallback_member::<C>(None);
+    assert_eq!(unbounded.0, 1);
+    assert_eq!(unbounded.1[1], NodeState::Failed);
+    for frames in 1..=4 {
+        assert_eq!(
+            caught_cycle_in_fallback_member::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    caught_cycle_in_fallback_member_lands_failed,
+    local_caught_cycle_in_fallback_member_lands_failed,
+    shared_caught_cycle_in_fallback_member_lands_failed
+);
