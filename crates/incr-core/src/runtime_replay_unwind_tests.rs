@@ -849,6 +849,88 @@ local_and_shared!(
     shared_unwind_out_of_an_entry
 );
 
+/// T reads F, F reads w and U, and once c is 1 U reads F: with `u_panics`
+/// F takes a fallback and U panics after reading it, otherwise the cycle
+/// panics at depth 0. Below budget 2 U's virtual hit claims F, Dirty from
+/// its first revision, and U's entry's unwind releases that claim with
+/// the discard landing. What every read and later set lands is the
+/// unbounded run's.
+fn user_panic_releases_a_virtual_hit_claim<C: Cells>(
+    frames: Option<u32>,
+    u_panics: bool,
+) -> Vec<(Out, [NodeState; 3])> {
+    let rt = runtime::<C>(frames);
+    let c = rt.create_input(0_u64);
+    let w = rt.create_input(5_u64);
+    let f_later = Later::default();
+    let fl = f_later.clone();
+    let u = rt.create_query_with(
+        move |rt| {
+            if rt.get(c) == 0 {
+                return 1;
+            }
+            let v = rt.get(later(&fl));
+            if u_panics {
+                std::panic::panic_any(String::from("u boom"));
+            }
+            v
+        },
+        replayable(),
+    );
+    let body = move |rt: &Runtime<C>| rt.get(w) + rt.get(u);
+    let f = if u_panics {
+        rt.create_query_with(body, fallback(100))
+    } else {
+        rt.create_query_with(body, replayable())
+    };
+    f_later.set(f).unwrap();
+    let t = rt.create_query_with(move |rt| rt.get(f) + 1, replayable());
+    let mut seen = Vec::new();
+    let mut read = |rt: &Runtime<C>| {
+        let out = get(rt, t);
+        rt.assert_invariant_i();
+        seen.push((out, [t, f, u].map(|h| rt.state_of(h))));
+    };
+    read(&rt);
+    rt.set(c, 1);
+    read(&rt);
+    rt.set(w, 6);
+    read(&rt);
+    rt.set(c, 0);
+    read(&rt);
+    seen
+}
+
+fn a_user_panic_releases_a_virtual_hit_claim<C: Cells>() {
+    for u_panics in [false, true] {
+        let unbounded = user_panic_releases_a_virtual_hit_claim::<C>(None, u_panics);
+        let Out::Panic(text) = &unbounded[1].0 else {
+            panic!("{unbounded:?}")
+        };
+        assert!(
+            text.contains(if u_panics {
+                "u boom"
+            } else {
+                "dependency cycle"
+            }),
+            "{text}"
+        );
+        assert_eq!(unbounded[3].0, Out::Value(8));
+        for frames in [1, 2, 3] {
+            assert_eq!(
+                user_panic_releases_a_virtual_hit_claim::<C>(Some(frames), u_panics),
+                unbounded,
+                "U panics: {u_panics}, budget {frames}"
+            );
+        }
+    }
+}
+local_and_shared!(
+    a_user_panic_releases_a_virtual_hit_claim,
+    local_a_user_panic_releases_a_virtual_hit_claim,
+    shared_a_user_panic_releases_a_virtual_hit_claim
+);
+
 /// P, New, reads N at budget 1, so the read dooms P. Once N is Dirty, its
 /// input changed after a compute, so its verify fails, and once it is
 /// New. The doom point finds N released, Dirty or New with
