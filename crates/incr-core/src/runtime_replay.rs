@@ -109,9 +109,10 @@ impl<C: Cells> Runtime<C> {
         node.generation() == (reading >> 32) as u32 && self.arenas.erased(tag).has_placeholder()
     }
 
-    /// Whether a read from frame `f` is at or past a budget.
-    fn over_budget(&self, f: ActiveRead) -> bool {
-        if f.depth >= self.max_frames.load(std::sync::atomic::Ordering::Relaxed) {
+    /// Whether a read from a frame `depth` frames deep is at or past a
+    /// budget.
+    fn over_budget(&self, depth: u32) -> bool {
+        if depth >= self.max_frames.load(std::sync::atomic::Ordering::Relaxed) {
             return true;
         }
         let bytes = self
@@ -226,7 +227,7 @@ impl<C: Cells> Runtime<C> {
                         return read;
                     }
                 }
-                if self.over_budget(f)
+                if self.over_budget(f.depth)
                     && !ctl.has(cycle::NO_DOOM)
                     && self.replayable(f.node.0)
                     && self.placeholder::<T>().is_some()
@@ -948,6 +949,47 @@ impl<C: Cells> Runtime<C> {
         };
         let what = Delivered::Unwind {
             cycle: kind == Some(UnwindKind::Cycle),
+            poison: true,
+            attributed: false,
+            payload: copy,
+            nodes: self.copy_notes(payload),
+        };
+        self.keep_read(ctl, cidx, reading, ordinal, what);
+    }
+
+    /// The active frame's read of `id` took `payload` from a walk's
+    /// ticket. If a budget is set, the frame may be doomed after its closure
+    /// has dropped the one-shot payload, and its retry's read must take it
+    /// again, as the unbounded run's one read did: a copy is kept for the
+    /// retry, or, for a payload no copy can stand for, the frame is not
+    /// doomed while it is within the budget. Past the budget the stack bound
+    /// wins, and the retry reads the node Failed with no payload.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn note_ticket_read(&self, id: NodeId, payload: &(dyn std::any::Any + Send)) {
+        if !self.budgeted() {
+            return;
+        }
+        let Some((ctl, cidx, reading, ordinal)) = self.dep_stack.unwound_reader(self.runtime_id)
+        else {
+            return;
+        };
+        if reading != u64::from(id.0) | (u64::from(self.nodes.get(id.0).generation()) << 32) {
+            return;
+        }
+        let Some(copy) = replay::copy_payload(payload) else {
+            if !self.over_budget(self.dep_stack.depth() as u32) {
+                // SAFETY: the reading frame is on the stack, so its control
+                // block is live.
+                let flags = unsafe { &*ctl };
+                if !flags.has(cycle::DOOMED) {
+                    flags.raise(cycle::NO_DOOM);
+                }
+            }
+            return;
+        };
+        let what = Delivered::Unwind {
+            cycle: false,
             poison: true,
             attributed: false,
             payload: copy,
