@@ -94,27 +94,16 @@ fn failed_read_message(slot: u32) -> String {
 
 impl<C: Cells> Runtime<C> {
     /// `compute_attempts`' Failed arm: the read panics "last compute
-    /// panicked", or takes a payload this thread holds for it
-    /// (`take_landed_payload`). Returns when the node has left Failed
-    /// since the read saw it, to be read again.
+    /// panicked", or takes the payload a walk contained for the landing it
+    /// sees (`take_contained`). Returns when the node has left Failed since
+    /// the read saw it, to be read again. A payload this thread holds for
+    /// the read was taken after the load, by `owed_payload`.
     #[cold]
     #[inline(never)]
     pub(super) fn read_failed_node(&self, id: NodeId) {
-        let mut payload = None;
-        if !C::SINGLE_THREADED {
-            match self.take_landed_payload(id) {
-                Err(Left) => return,
-                Ok(taken) => payload = taken,
-            }
-        }
-        // A held delivery's payload goes first: a ticket for a panic that
-        // passed the delivery's failure on is not the read's own.
-        if payload.is_none() {
-            match self.take_contained(id) {
-                Err(Left) => return,
-                Ok(taken) => payload = taken,
-            }
-        }
+        let Ok(payload) = self.take_contained(id) else {
+            return;
+        };
         // A closure that catches this panic has still read a node with no
         // value, so it must not land Clean over it.
         self.dep_stack.poison_current_frame(self.runtime_id);
@@ -125,12 +114,6 @@ impl<C: Cells> Runtime<C> {
             self.note_failed_read(id);
         }
         panic!("{}", failed_read_message(id.0));
-    }
-
-    /// The payload [`Self::owed_payload`] finds for the generation of `id`
-    /// this read sees.
-    fn take_landed_payload(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
-        Ok(self.owed_payload(id, self.nodes.get(id.0).generation()))
     }
 
     /// The payload held for the frame of `id` at `generation` at the
@@ -299,7 +282,3 @@ impl<C: Cells> Runtime<C> {
         self.provenance.read().live.len()
     }
 }
-
-/// A Failed read's node left Failed before the read could tell which
-/// landing it saw.
-pub(super) struct Left;
