@@ -314,7 +314,13 @@ impl<C: Cells> Runtime<C> {
                 cycle_state::held_keys().is_empty(),
                 "incr-core: a wounded thread waits for its winner holding claims"
             );
-            waits::await_winner(C::backoff);
+            waits::await_winner(C::backoff, |(rt, slot)| {
+                rt == self.runtime_id
+                    && !matches!(
+                        state::load::<C>(self.nodes.get(slot).state_cell()),
+                        NodeState::New | NodeState::Dirty
+                    )
+            });
             return None;
         }
         match cycle_state::take_unwind_kind() {
