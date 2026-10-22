@@ -359,26 +359,25 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Where `id` is about to leave Failed for Dirty: the mark its
-    /// `left_failed` takes, so that it keeps the ticket of a landing made
-    /// after the flip. `None` when no ticket is held.
+    /// A set's walk flips `id` from Failed to Dirty, under the tickets'
+    /// lock: a `hold` of the landing either precedes the flip, which then
+    /// releases its ticket, or sees the node Dirty and holds nothing. The
+    /// payloads it alone kept wait with the buried ones until the walk has
+    /// flagged every dependent. False if the state moved first.
     #[cold]
     #[inline(never)]
-    pub(super) fn ticket_mark(&self) -> Option<u64> {
-        self.tickets_held().then(|| self.tickets.read().next)
-    }
-
-    /// `id` left the Failed landing that ordered before `mark`, so no read
-    /// takes a payload for it any more. A set's walk flipped it: the
-    /// payloads it alone kept wait with the buried ones until the walk
-    /// has flagged every dependent.
-    #[cold]
-    #[inline(never)]
-    pub(super) fn left_failed(&self, id: NodeId, mark: u64) {
+    pub(super) fn flip_failed(&self, id: NodeId) -> bool {
+        let node = self.nodes.get(id.0);
         let mut t = self.tickets.write();
-        let stale = release(&mut t, mark, |(n, _)| n == id.0);
+        if state::try_transition::<C>(node.state_cell(), NodeState::Failed, NodeState::Dirty)
+            .is_err()
+        {
+            return false;
+        }
+        let stale = release(&mut t, u64::MAX, |(n, _)| n == id.0);
         t.buried.extend(stale);
         self.sync_held(&t);
+        true
     }
 
     /// After a set's walk: drops the tickets its flips released.
@@ -397,8 +396,9 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// [`Self::left_failed`] where `id`'s own compute landed it Dirty past
-    /// the walk: the payloads join the compute's bag.
+    /// `id`'s own compute landed it Dirty past the walk that would have
+    /// flipped it, leaving the Failed landing that ordered before `mark`:
+    /// the payloads join the compute's bag.
     #[cold]
     #[inline(never)]
     pub(super) fn left_failed_landing(&self, id: NodeId, mark: u64, bag: &mut Deferred<C>) {

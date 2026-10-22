@@ -2640,13 +2640,7 @@ impl<C: Cells> Runtime<C> {
                         // walk); re-examine.
                     }
                     NodeState::Failed => {
-                        let mark = self.ticket_mark();
-                        if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
-                            .is_ok()
-                        {
-                            if let Some(mark) = mark {
-                                self.left_failed(id, mark);
-                            }
+                        if self.flip_failed(id) {
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
