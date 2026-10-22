@@ -1017,7 +1017,7 @@ macro_rules! pairs {
 pairs!(
     cross_runtime_reentry,
     cross_runtime_read_records_nothing,
-    foreign_reader_is_never_doomed,
+    foreign_reader_is_doomed_and_retried,
     foreign_ring_read_is_not_rerun,
 );
 
@@ -1241,16 +1241,23 @@ mod flags_reload {
 }
 
 /// A replayable frame at budget 1 that reads 64 leaves runs twice, once
-/// doomed; after a read of another runtime's node it is never doomed, so
-/// its leaves nest natively and it runs once.
-fn foreign_reader_is_never_doomed<A: Cells, B: Cells>() {
+/// doomed, whether or not it first reads another runtime's input. The last
+/// leaf sets that input when it runs, which is after the read in the
+/// unbounded run and between the doomed run and its retry here, so the
+/// retry takes the doomed run's read again rather than reading the input.
+fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
     for foreign in [false, true] {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_placeholder(0_u64);
         r1.set_max_frames(1);
         let x = r2.create_input(1000_u64);
-        let leaves: Vec<Incr<u64>> = (0..64_u64).map(|i| r1.create_query(move |_| i)).collect();
+        let mut leaves: Vec<Incr<u64>> = (0..63_u64).map(|i| r1.create_query(move |_| i)).collect();
+        let r2_ = OtherRt(&*r2);
+        leaves.push(r1.create_query(move |_| {
+            r2_.set(x, 2000);
+            63
+        }));
         let runs = Arc::new(AtomicU32::new(0));
         let wide = {
             let (r2, runs) = (OtherRt(&*r2), runs.clone());
@@ -1266,9 +1273,13 @@ fn foreign_reader_is_never_doomed<A: Cells, B: Cells>() {
                 },
             )
         };
-        assert_eq!(r1.get(wide), 1000 + (0..64).sum::<u64>());
-        assert_eq!(runs.load(Ordering::Relaxed), if foreign { 1 } else { 2 });
-        assert_eq!(r1.dooms.lock().unwrap().is_empty(), foreign);
+        assert_eq!(
+            r1.get(wide),
+            1000 + (0..64).sum::<u64>(),
+            "foreign {foreign}"
+        );
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "foreign {foreign}");
+        assert!(!r1.dooms.lock().unwrap().is_empty(), "foreign {foreign}");
     }
 }
 
@@ -1313,5 +1324,78 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
     assert_eq!(run(u32::MAX), Ok(7777));
     for frames in [1, 2] {
         assert_eq!(run(frames), Ok(7777), "budget {frames}");
+    }
+}
+
+/// A replayable chain of `n` levels read top-down in runtime A, where every
+/// level reads an input of runtime B and then the next level. Run on a
+/// spawned thread's default stack, which the frame budget must bound, as
+/// it does a chain that reads only its own runtime.
+fn foreign_reading_chain_stays_within_the_stack<A: Cells, B: Cells>() {
+    let n = crate::test_size::test_size(100_000);
+    let got = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        let x = r2.create_input(1_i64);
+        let mut below: Option<Incr<i64>> = None;
+        for _ in 0..n {
+            let (r2, next) = (OtherRt(&*r2), below);
+            below = Some(r1.create_query_with(
+                move |rt| r2.get(x) + next.map_or(0, |b| rt.get(b)),
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(got, n as i64);
+}
+
+mod foreign_chain {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_local() {
+        super::foreign_reading_chain_stays_within_the_stack::<Local, Local>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared() {
+        super::foreign_reading_chain_stays_within_the_stack::<Local, Shared>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_local() {
+        super::foreign_reading_chain_stays_within_the_stack::<Shared, Local>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_shared() {
+        super::foreign_reading_chain_stays_within_the_stack::<Shared, Shared>();
     }
 }

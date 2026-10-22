@@ -81,6 +81,13 @@ pub struct ActiveRead {
     pub(crate) depth: u32,
 }
 
+impl ActiveRead {
+    /// The depth of another runtime's frame reading this runtime's node:
+    /// past every budget, so the read takes the cold path, which keeps its
+    /// outcome for that frame's retry.
+    pub(crate) const FOREIGN: u32 = u32::MAX;
+}
+
 /// A stack of frames, innermost last.
 #[doc(hidden)]
 pub struct Frames {
@@ -108,13 +115,13 @@ impl Frames {
         self.frames.last_mut().filter(|top| top.rt == rt)
     }
 
-    /// A read `rt` serves to the top frame, which is not one of `rt`'s:
-    /// that frame can no longer be doomed, because its retry would read
-    /// the other runtime again and no kept read carries what the first
-    /// read returned. A frame doomed already keeps its doom.
+    /// A read another runtime serves to the top frame whose outcome no
+    /// kept read can carry: that frame can no longer be doomed, because its
+    /// retry would read the other runtime again. A frame doomed already
+    /// keeps its doom.
     #[cold]
     #[inline(never)]
-    fn note_foreign_read(&mut self) {
+    fn keep_top_undoomed(&mut self) {
         let top = self
             .frames
             .last()
@@ -214,28 +221,47 @@ pub trait DepStack: 'static {
     /// Record `dep`, read at `generation`, as a dependency of runtime
     /// `rt`'s active frame, if it has one. The generation lets publish
     /// detect a dep that was deleted, and possibly recycled, after the
-    /// read.
+    /// read. True if the top frame is another runtime's, which records
+    /// nothing.
     #[inline(always)]
-    fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) {
+    fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> bool {
         self.with(|s| match s.frames.last_mut() {
-            Some(top) if top.rt == rt => top.deps.push((dep, generation)),
-            Some(_) => s.note_foreign_read(),
-            None => {}
+            Some(top) if top.rt == rt => {
+                top.deps.push((dep, generation));
+                false
+            }
+            Some(_) => true,
+            None => false,
         })
+    }
+
+    /// The top frame's runtime, node, control block and position.
+    fn top_frame(&self) -> Option<(RuntimeId, NodeId, *const ComputeCtl, u32)> {
+        self.with(|s| s.frames.last().map(|f| (f.rt, f.node, f.ctl, f.cidx)))
+    }
+
+    /// See [`Frames::keep_top_undoomed`].
+    fn keep_top_undoomed(&self) {
+        self.with(Frames::keep_top_undoomed);
     }
 
     /// [`Self::record_dep`] for a nested non-Clean read, which also stores
     /// the read in the frame and returns what the read needs to know of
-    /// the frame.
+    /// the frame: for another runtime's frame, at depth
+    /// [`ActiveRead::FOREIGN`], with nothing stored.
     #[inline(always)]
     fn record_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> Option<ActiveRead> {
         self.with(|s| {
             let depth = s.frames.len() as u32;
             let top = match s.frames.last_mut() {
                 Some(top) if top.rt == rt => top,
-                Some(_) => {
-                    s.note_foreign_read();
-                    return None;
+                Some(top) => {
+                    return Some(ActiveRead {
+                        node: top.node,
+                        ctl: top.ctl,
+                        cidx: top.cidx,
+                        depth: ActiveRead::FOREIGN,
+                    })
                 }
                 None => return None,
             };

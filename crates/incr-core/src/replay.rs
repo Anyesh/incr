@@ -109,6 +109,9 @@ pub(crate) struct ReadKey {
     /// the node at the position, and the runs of another episode, are other
     /// runs.
     pub(crate) episode: Option<u64>,
+    /// The runtime of the node `reading` names, when it is not the
+    /// frame's: a read of another runtime's node.
+    pub(crate) foreign: Option<RuntimeId>,
 }
 
 impl ReadKey {
@@ -122,6 +125,7 @@ impl ReadKey {
             ordinal: v.ordinal,
             path: v.path,
             episode: v.member_of,
+            foreign: None,
         }
     }
 }
@@ -266,10 +270,31 @@ pub(crate) struct Context {
     /// The provenance record that the delivery for this read takes,
     /// published before the frame above it landed Failed.
     pub(crate) provenance: Option<(ReadKey, Rc<dyn Provenance>)>,
+    pub(crate) frame_keys: FrameKeys,
 }
 
+/// The parts of a read key for a frame of a context's runtime that only
+/// that runtime can give, for a read of another runtime's node by the
+/// frame: the frame's node generation, its path and its member episode.
+#[derive(Clone, Copy)]
+pub(crate) struct FrameKeys {
+    /// The runtime that opened the context, live while the context is open.
+    pub(crate) owner: *const (),
+    /// `(owner, node, cidx, member)` to the frame's key parts.
+    pub(crate) parts: unsafe fn(*const (), u32, u32, bool) -> KeyParts,
+}
+
+/// A frame's node generation, path and member episode.
+pub(crate) type KeyParts = (u32, u64, Option<u64>);
+
 impl Context {
-    pub(crate) fn new(id: u64, rt: RuntimeId, boundary: u32, target: Entry) -> Self {
+    pub(crate) fn new(
+        id: u64,
+        rt: RuntimeId,
+        boundary: u32,
+        target: Entry,
+        frame_keys: FrameKeys,
+    ) -> Self {
         Self {
             id,
             rt,
@@ -290,6 +315,7 @@ impl Context {
             drop_at: None,
             drop_point: None,
             provenance: None,
+            frame_keys,
         }
     }
 
@@ -651,6 +677,7 @@ pub(crate) struct KeptRead {
     pub(crate) ctl: *const crate::cycle::ComputeCtl,
     pub(crate) reading: u64,
     pub(crate) ordinal: u32,
+    pub(crate) foreign: Option<RuntimeId>,
     pub(crate) what: Delivered,
 }
 
@@ -719,6 +746,37 @@ pub(crate) fn take_kept_reads(
         d.borrow_mut()
             .extract_if(.., |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl)
             .collect()
+    })
+}
+
+/// Which of its reads of `reading`, a node of runtime `foreign`, the read
+/// the frame of `ctl` at `cidx` of `rt` makes now is, from 1. `kept` says
+/// whether the frame has kept a read yet, so that reads kept for an earlier
+/// frame there are not counted.
+pub(crate) fn foreign_ordinal(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    reading: u64,
+    foreign: RuntimeId,
+    kept: bool,
+) -> u32 {
+    if !kept {
+        return 1;
+    }
+    KEPT_READS.with(|d| {
+        let earlier = d
+            .borrow()
+            .iter()
+            .filter(|e| {
+                e.rt == rt
+                    && e.cidx == cidx
+                    && e.ctl == ctl
+                    && e.reading == reading
+                    && e.foreign == Some(foreign)
+            })
+            .count();
+        earlier as u32 + 1
     })
 }
 
@@ -1034,10 +1092,48 @@ pub(crate) fn payload_key(payload: &(dyn Any + Send)) -> PayloadKey {
 }
 
 /// Opens a context, returning its id.
-pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry) -> u64 {
+pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry, frame_keys: FrameKeys) -> u64 {
     let id = next_id();
-    with(|c| c.push(Context::new(id, rt, boundary, target)));
+    with(|c| c.push(Context::new(id, rt, boundary, target, frame_keys)));
     id
+}
+
+/// The key parts of `rt`'s frames, if `rt` has a context open.
+pub(crate) fn frame_keys(rt: RuntimeId) -> Option<FrameKeys> {
+    with(|c| c.iter().find(|x| x.rt == rt).map(|x| x.frame_keys))
+}
+
+/// Takes the outcome held in `rt`'s contexts for the read `key`, marking
+/// every delivery for it taken: a landed value cloned by `clone`, or the
+/// unwind (see [`Context::take_unwind`]). Walk directions are not
+/// outcomes.
+pub(crate) fn take_pending(
+    rt: RuntimeId,
+    key: &ReadKey,
+    clone: impl Fn(&(dyn Any + Send)) -> Box<dyn Any + Send>,
+) -> Option<Delivered> {
+    with(|c| {
+        c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
+            let at = x.pending.iter().position(|d| {
+                !d.taken
+                    && !matches!(d.what, Delivered::Walk(_) | Delivered::Direct)
+                    && d.key == *key
+            })?;
+            // The read has its outcome, which ended the walk it was
+            // blocked in, so a later read under the same key in this
+            // run must not resume that walk or recompute its node.
+            for d in x.pending.iter_mut().filter(|d| d.key == *key) {
+                d.taken = true;
+            }
+            Some(match &x.pending[at].what {
+                Delivered::Landed(value) => Delivered::Landed(clone(&**value)),
+                Delivered::Walk(_) | Delivered::Direct => {
+                    unreachable!("incr-core: a walk's direction is not a value")
+                }
+                Delivered::Unwind { .. } => x.take_unwind(at),
+            })
+        })
+    })
 }
 
 /// Removes context `id`, if it is still open, returning the deliveries
