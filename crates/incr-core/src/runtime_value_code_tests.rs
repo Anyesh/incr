@@ -542,7 +542,7 @@ fn clone_that_observes_or_stabilizes<C: Cells>(rt: Rc<Runtime<C>>) {
     assert_eq!(rt.get(q), 2);
     let added = Arc::new(AtomicU32::new(0));
     type Change<C> = (&'static str, Box<dyn Fn(&Runtime<C>)>);
-    let changes: [Change<C>; 3] = [
+    let changes: [Change<C>; 4] = [
         ("observe", {
             let added = Arc::clone(&added);
             Box::new(move |rt: &Runtime<C>| {
@@ -557,6 +557,12 @@ fn clone_that_observes_or_stabilizes<C: Cells>(rt: Rc<Runtime<C>>) {
             Box::new(move |rt: &Runtime<C>| rt.unobserve(observer)),
         ),
         ("stabilize", Box::new(|rt: &Runtime<C>| rt.stabilize())),
+        (
+            "get_traced",
+            Box::new(move |rt: &Runtime<C>| {
+                rt.get_traced(q);
+            }),
+        ),
     ];
     for (name, change) in changes {
         let hooked = Rc::clone(&rt);
@@ -756,6 +762,9 @@ fn engine_paths<C: Cells>() -> Vec<Path<C>> {
         }),
         ("unobserve", |rt, f| rt.unobserve(f.observer)),
         ("stabilize", |rt, _| rt.stabilize()),
+        ("get_traced", |rt, f| {
+            rt.get_traced(f.victim);
+        }),
         ("create_collection", |rt, _| {
             rt.create_collection::<u32>();
         }),
