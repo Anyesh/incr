@@ -1219,6 +1219,7 @@ impl<C: Cells> Runtime<C> {
                         provenance: None,
                         below: Vec::new(),
                         escaped: false,
+                        resumed: None,
                     });
                 }
             }
