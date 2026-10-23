@@ -2641,24 +2641,26 @@ impl<C: Cells> Runtime<C> {
         self.drop_deliveries(ended);
     }
 
-    /// Drops the deliveries held, in any of this runtime's contexts, for
-    /// the frames of the nodes in `released`, whose claims a user panic's
-    /// release just landed: that release ended the frames' runs. A
+    /// Drops the deliveries, claim watermarks and failure counts held, in
+    /// any of this runtime's contexts, for the frames of the nodes in
+    /// `released`, whose claims a user panic's release just landed: that
+    /// release ended the frames' runs. A
     /// speculative run's release is not the unbounded run's, so it keeps
     /// them.
     #[cold]
     #[inline(never)]
-    pub(super) fn end_released_deliveries(&self, released: &[u32]) {
+    pub(super) fn end_released_runs(&self, released: &[u32]) {
         if replay::speculative() {
             return;
         }
         let rt = self.runtime_id;
         let dropped: Vec<Delivery> = replay::with(|c| {
             let mut dropped = Vec::new();
-            for x in c.iter_mut().filter(|x| x.rt == rt && !x.pending.is_empty()) {
+            for x in c.iter_mut().filter(|x| x.rt == rt) {
                 for &slot in released {
                     let generation = self.nodes.get(slot).generation();
                     dropped.extend(x.pending.extract_node(slot, generation));
+                    x.end_node_runs(slot, generation);
                 }
             }
             dropped
@@ -3219,18 +3221,6 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn take_run_failures(&self, node: NodeId, cidx: u32) -> Option<u64> {
         self.take_earliest(node, cidx, |x| &mut x.run_failures)
-    }
-
-    /// Whether a failure count is held for a member run of `slot` at any
-    /// position.
-    pub(super) fn has_run_failures(&self, slot: u32) -> bool {
-        let rt = self.runtime_id;
-        let generation = self.nodes.get(slot).generation();
-        replay::with(|c| {
-            c.iter()
-                .filter(|x| x.rt == rt)
-                .any(|x| x.run_failures.has_node(slot, generation))
-        })
     }
 
     fn take_earliest(
