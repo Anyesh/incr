@@ -587,3 +587,52 @@ fn wave7_shared_kept_dirty_read_is_released_with_its_runtime() {
     wave7_kept_dirty_read_outlives_runtime::<Shared>(false);
     wave7_kept_dirty_read_outlives_runtime::<Shared>(true);
 }
+
+/// `set_max_frames(u32::MAX)` racing `set_max_stack_bytes(0)` leaves the
+/// runtime unbudgeted and listed whichever runs first, so no race may
+/// leave it with `DEFAULT_MAX_FRAMES`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn racing_frame_and_byte_setters_end_as_a_serial_order() {
+    let rt = Runtime::<Shared>::new();
+    let go = AtomicU32::new(0);
+    let done = AtomicU32::new(0);
+    let rounds = 20_000_u32;
+    let mut bad = 0_u32;
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for round in 1..=rounds {
+                let mut spins = 0_u32;
+                while go.load(SeqCst) != round {
+                    spins += 1;
+                    if spins % 64 == 0 {
+                        std::thread::yield_now();
+                    }
+                    std::hint::spin_loop();
+                }
+                rt.set_max_stack_bytes(0);
+                done.fetch_add(1, SeqCst);
+            }
+        });
+        for round in 1..=rounds {
+            rt.frames_set.store(false, SeqCst);
+            rt.max_frames.store(DEFAULT_MAX_FRAMES, SeqCst);
+            rt.max_stack_bytes.store(0, SeqCst);
+            rt.note_budget();
+            go.store(round, SeqCst);
+            rt.set_max_frames(u32::MAX);
+            while done.load(SeqCst) != round {
+                std::thread::yield_now();
+            }
+            if rt.max_frames.load(SeqCst) != u32::MAX
+                || !super::replay_impl::unbudgeted(rt.runtime_id)
+            {
+                bad += 1;
+            }
+        }
+    });
+    assert_eq!(
+        bad, 0,
+        "{bad} of {rounds} races left a budget no serial order gives"
+    );
+}
