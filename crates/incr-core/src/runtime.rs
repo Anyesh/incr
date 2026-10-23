@@ -841,10 +841,11 @@ pub struct Runtime<C: Cells> {
 pub(crate) struct DoomGate(pub(crate) bool);
 
 /// The default frame budget: 256, or 64 when incr-core is built with
-/// debug assertions, whose frames are about 13 times larger (about
-/// 10.5 KiB a nested read against 850 B). Either way a chain of reads at
-/// the budget uses under 700 KiB of a spawned thread's 2 MiB stack, the
-/// rest left to the closures' own frames.
+/// debug assertions, whose frames are 14 to 18 times larger. A chain at
+/// the budget is deepest once replay runs it, at about 1.5 KiB a nested
+/// read (1.9 KiB under `Shared`) in release and 26.5 KiB in debug: under
+/// 480 KiB of a spawned thread's 2 MiB stack in release and 1.65 MiB in
+/// debug, which leaves each closure on the chain about 6 KiB of its own.
 pub const DEFAULT_MAX_FRAMES: u32 = if cfg!(debug_assertions) { 64 } else { 256 };
 
 /// The default frame budget and whether every query is replayable, from
