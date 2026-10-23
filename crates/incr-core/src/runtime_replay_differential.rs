@@ -2737,6 +2737,21 @@ fn a_released_claim_takes_no_delivery_of_its_ended_run() {
     });
 }
 
+/// Seeds 0x6e3, 0xd60 and 0xdeb: a user panic in a ring releases members
+/// whose doomed runs kept claim watermarks for their retries, and the
+/// members' next runs at those positions run fresh, taking none of them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_released_member_takes_no_record_of_its_ended_run() {
+    for seed in [0x6e3, 0xd60, 0xdeb] {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// Asserts every operation's outcome and node states at budgets 1 to 3
 /// are the unbounded run's, for a case whose reads of Dirty values stop
 /// `first_diff` comparing states although the runs agree.
@@ -3082,6 +3097,27 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
     quiet(|| {
         for _ in 0..8 {
             differential_two(&case, 0x5aab);
+        }
+    });
+}
+
+/// Seeds 0x41eb and 0x833e, one thread, and the two-thread seed 0x2b13
+/// they stand for: a dropped chain truncates the virtual frame of a doomed
+/// episode member run whose failure count is still held, and releases the
+/// member with the discard landing. The count goes with the frame, since
+/// the member's next run there is a new one.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_dropped_chain_takes_its_member_runs_failure_counts() {
+    quiet(|| {
+        for seed in [0x41eb, 0x833e] {
+            let case = gen_case(seed, false, false);
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        }
+        let case = gen_case(0x2b13, false, true);
+        for _ in 0..4 {
+            differential_two(&case, 0x2b13);
         }
     });
 }

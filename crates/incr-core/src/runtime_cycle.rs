@@ -1771,19 +1771,13 @@ impl<C: Cells> Runtime<C> {
             }
         }
         // A user panic's release is one the unbounded run makes too, and it
-        // ends the runs of the released nodes' frames: a delivery kept for a
-        // retry of one of them would reach the node's next, fresh run at
-        // that position. A cycle unwind's release keeps them, since the
+        // ends the runs of the released nodes' frames: a delivery, claim
+        // watermark or failure count kept for a retry of one of them would
+        // reach the node's next, fresh run at that position. A cycle unwind's release keeps them, since the
         // doomed run's retry reads the cycle from them again, as do a doom's
         // discard and a wound.
         if kind.is_none() {
-            self.end_released_deliveries(&released);
-            // As for those deliveries, a failure count kept for one of these
-            // runs would reach the node's next run there and hide its mark.
-            debug_assert!(
-                replay::speculative() || !released.iter().any(|&m| self.has_run_failures(m)),
-                "incr-core: a released member's doomed run left a failure count"
-            );
+            self.end_released_runs(&released);
         }
     }
 
