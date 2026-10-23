@@ -253,10 +253,10 @@ impl Retire {
 }
 
 /// A context's deliveries. Each keeps its index until it is removed, and
-/// is found by its read, the level whose run made it, its frame, or the
-/// provenance record it carries, without a pass over the others: a deep
-/// chain's context holds a delivery per level, and its reads look them up
-/// per level.
+/// is found by its read, the level whose run made it, its frame, its
+/// frame's node, or the provenance record it carries, without a pass over
+/// the others: a deep chain's context holds a delivery per level, and its
+/// reads look them up per level.
 #[derive(Default)]
 pub(crate) struct Pending {
     slots: Vec<Option<Delivery>>,
@@ -264,6 +264,8 @@ pub(crate) struct Pending {
     by_key: HashMap<ReadKey, Vec<usize>>,
     by_maker: HashMap<u32, Vec<usize>>,
     by_frame: HashMap<(u32, u32, u32), Vec<usize>>,
+    /// By the frame's node and generation, at any position.
+    by_node: HashMap<(u32, u32), Vec<usize>>,
     traced: Vec<usize>,
     /// The passed deliveries that carry a landing deeper than just above
     /// their frame, which a pop can retire.
@@ -290,6 +292,10 @@ impl Pending {
         self.by_key.entry(d.key).or_default().push(i);
         self.by_maker.entry(d.maker).or_default().push(i);
         self.by_frame.entry(frame_of(&d.key)).or_default().push(i);
+        self.by_node
+            .entry((d.key.node, d.key.generation))
+            .or_default()
+            .push(i);
         if d.provenance.is_some() {
             self.traced.push(i);
         }
@@ -307,6 +313,7 @@ impl Pending {
         unlist(&mut self.by_key, &d.key, i);
         unlist(&mut self.by_maker, &d.maker, i);
         unlist(&mut self.by_frame, &frame_of(&d.key), i);
+        unlist(&mut self.by_node, &(d.key.node, d.key.generation), i);
         if d.provenance.is_some() {
             self.traced.retain(|&j| j != i);
         }
@@ -428,6 +435,22 @@ impl Pending {
             .into_iter()
             .map(|i| self.remove(i))
             .collect()
+    }
+
+    /// Removes, oldest first, the deliveries for reads by the frames of
+    /// `node` at `generation`, at any position.
+    pub(crate) fn extract_node(&mut self, node: u32, generation: u32) -> Vec<Delivery> {
+        self.by_node
+            .get(&(node, generation))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|i| self.remove(i))
+            .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.live == 0
     }
 
     /// The deliveries that carry a provenance record, oldest first.
