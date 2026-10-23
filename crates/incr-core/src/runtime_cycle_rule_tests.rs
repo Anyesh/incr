@@ -1989,12 +1989,13 @@ fn shared_shared_unbudgeted_foreign_read_keeps_no_clone() {
     unbudgeted_foreign_read_keeps_no_clone::<Shared, Shared>();
 }
 
-/// X reads B's uncopyable panic, then `during` runs, then X reads its own
-/// runtime's Y, which reads Z. Returns X's value: 10 for its own payload,
-/// plus Y's 2.
+/// X reads B's uncopyable panic `held_at` KiB deep, then `during` runs,
+/// then X reads its own runtime's Y, which reads Z, `deep` KiB deep.
+/// Returns X's value: 10 for its own payload, plus Y's 2.
 fn hold_then_own_read<A: Cells, B: Cells>(
     before: fn(&Runtime<A>),
     during: fn(&Runtime<A>),
+    held_at: usize,
     deep: usize,
 ) -> i64 {
     quiet_uncopyable();
@@ -2013,7 +2014,8 @@ fn hold_then_own_read<A: Cells, B: Cells>(
         let r2 = OtherRt(&*r2);
         let x = r1.create_query_with(
             move |rt| {
-                let own = quiet(|| r2.get(bq)).is_err_and(|p| p.is::<Uncopyable>());
+                let own =
+                    deeper(held_at, || quiet(|| r2.get(bq))).is_err_and(|p| p.is::<Uncopyable>());
                 during(rt);
                 10 * i64::from(own) + deeper(deep, || rt.get(y))
             },
@@ -2047,21 +2049,24 @@ mod review_8b_held_deep_read {
     #[cfg_attr(miri, ignore)]
     fn a_held_frame_reading_deep_keeps_its_payload() {
         assert_eq!(
-            hold_then_own_read::<Local, Shared>(unbudgeted, none, 96),
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 0, 96),
             12
         );
-        assert_eq!(hold_then_own_read::<Local, Shared>(bytes_64k, none, 96), 12);
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(bytes_64k, none, 0, 96),
+            12
+        );
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn shared_a_held_frame_reading_deep_keeps_its_payload() {
         assert_eq!(
-            hold_then_own_read::<Shared, Shared>(unbudgeted, none, 96),
+            hold_then_own_read::<Shared, Shared>(unbudgeted, none, 0, 96),
             12
         );
         assert_eq!(
-            hold_then_own_read::<Shared, Shared>(bytes_64k, none, 96),
+            hold_then_own_read::<Shared, Shared>(bytes_64k, none, 0, 96),
             12
         );
     }
@@ -2087,10 +2092,58 @@ mod review_8b_mid_compute_budget {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn a_budget_set_mid_compute_keeps_the_earlier_payload() {
-        assert_eq!(hold_then_own_read::<Local, Shared>(unbudgeted, none, 0), 12);
-        assert_eq!(hold_then_own_read::<Local, Shared>(frames_2, none, 0), 12);
         assert_eq!(
-            hold_then_own_read::<Local, Shared>(unbudgeted, frames_2, 0),
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 0, 0),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(frames_2, none, 0, 0),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, frames_2, 0, 0),
+            12
+        );
+    }
+
+    fn bytes_64k<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(64 * 1024);
+    }
+
+    fn bytes_1m<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(1024 * 1024);
+    }
+
+    /// X's hold, taken 96 KiB deep where no budget or a 1 MiB one held
+    /// it, still holds X once a 64 KiB budget is set mid-compute.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_tightened_mid_compute_keeps_an_earlier_hold() {
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, bytes_64k, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(bytes_1m, bytes_64k, 96, 96),
+            12
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_a_budget_tightened_mid_compute_keeps_an_earlier_hold() {
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(bytes_1m, bytes_64k, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(unbudgeted, bytes_64k, 96, 96),
             12
         );
     }
