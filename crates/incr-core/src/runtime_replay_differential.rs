@@ -1127,9 +1127,6 @@ impl<C: Cells> Live<C> {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
                 let h = w.handle(side, q);
-                if std::env::var_os("W3MAP").is_some() {
-                    eprintln!("W3 map side {side} q {q} -> {:?}", h.erased());
-                }
                 let state = if rt.is_alive(h.erased()) {
                     h.state(rt)
                 } else {
@@ -1211,9 +1208,6 @@ fn run_logged<C: Cells>(
     reset_thread();
     let (mut trace, mut evals) = (Vec::new(), Vec::new());
     for op in &case.ops {
-        if std::env::var_os("W3T").is_some() {
-            eprintln!("W3 ----- op {op:?}");
-        }
         let (out, ran) = if log {
             record(|| live.apply(op))
         } else {
@@ -5463,4 +5457,21 @@ fn wave8_local_seed_57c24cb_failed_set() {
 #[cfg_attr(miri, ignore)]
 fn wave8_shared_seed_57c24cb_failed_set() {
     quiet(|| differential::<Shared>(&gen_case(0x57c24cb, false, false), 0x57c24cb));
+}
+
+/// Seed 0xd6e169f0079b0996 as a paired case, cut to its first four ops,
+/// at every budget: op 3's `TryGet(15)` landed slot 10 Dirty where the
+/// unbounded run's user-panic release lands it New, with slot 6 Failed for
+/// Dirty. Either of two rules keeps it green alone: a walked episode's
+/// abort counts no held member as released (478dc453), and a speculative
+/// run memoizes nothing (50e5e777).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_seed_d6e1_released_new_walked_fresh() {
+    let mut case = gen_case(0xd6e1_69f0_079b_0996, false, true);
+    case.ops.truncate(4);
+    quiet(|| {
+        differential::<Local>(&case, 0xd6e1_69f0_079b_0996);
+        differential::<Shared>(&case, 0xd6e1_69f0_079b_0996);
+    });
 }
