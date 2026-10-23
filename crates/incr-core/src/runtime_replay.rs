@@ -95,7 +95,65 @@ struct Below {
     path: u64,
 }
 
+/// The ids of runtimes without a budget, which never doom a frame, so
+/// another runtime's read from one of their frames keeps nothing for a
+/// retry. `UNBUDGETED_LEN` mirrors the list's length, so a read finds it
+/// empty without the lock.
+static UNBUDGETED: std::sync::Mutex<Vec<RuntimeId>> = std::sync::Mutex::new(Vec::new());
+static UNBUDGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A runtime's place in `UNBUDGETED`, which its drop gives up.
+pub(crate) struct BudgetEntry(RuntimeId);
+
+impl BudgetEntry {
+    pub(crate) fn new(id: RuntimeId, max_frames: u32) -> Self {
+        let entry = Self(id);
+        if max_frames == u32::MAX {
+            entry.note(true);
+        }
+        entry
+    }
+
+    /// Lists the runtime as unbudgeted, or takes it off the list.
+    fn note(&self, unbudgeted: bool) {
+        if !unbudgeted && UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return;
+        }
+        let mut list = UNBUDGETED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (list.iter().position(|&id| id == self.0), unbudgeted) {
+            (None, true) => list.push(self.0),
+            (Some(at), false) => {
+                list.swap_remove(at);
+            }
+            _ => {}
+        }
+        UNBUDGETED_LEN.store(list.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for BudgetEntry {
+    fn drop(&mut self) {
+        self.note(false);
+    }
+}
+
+/// Whether runtime `id` is listed in `UNBUDGETED`.
+pub(super) fn unbudgeted(id: RuntimeId) -> bool {
+    UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) != 0
+        && UNBUDGETED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&id)
+}
+
 impl<C: Cells> Runtime<C> {
+    /// Keeps `UNBUDGETED` in step with this runtime's budgets.
+    pub(super) fn note_budget(&self) {
+        self.budget_entry.note(!self.budgeted());
+    }
+
     /// Whether node `slot`'s compute may be doomed.
     pub(super) fn replayable(&self, slot: u32) -> bool {
         let bits = C::u8_load_relaxed(self.nodes.get_with_flags(slot).1);
@@ -1090,8 +1148,9 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the reading frame is on the stack, so its control block
         // is live.
         let flags = unsafe { &*ctl };
-        // A doomed frame's reads are not the unbounded run's.
-        if reader == self.runtime_id || flags.has(cycle::DOOMED) {
+        // A doomed frame's reads are not the unbounded run's, and an
+        // unbudgeted runtime's frame is never retried.
+        if reader == self.runtime_id || flags.has(cycle::DOOMED) || unbudgeted(reader) {
             return self.read_unframed(handle, observed, kind, word);
         }
         let rt = self.runtime_id;
