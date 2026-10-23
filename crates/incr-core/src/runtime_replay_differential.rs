@@ -5547,3 +5547,223 @@ fn wave8_seed_d6e1_released_new_walked_fresh() {
         differential::<Shared>(&case, 0xd6e1_69f0_079b_0996);
     });
 }
+
+/// Seed 0x148c's base case, shrunk. Unbounded, `Get(7)` leaves node 9 New:
+/// no run reads it. At budgets 2 and 3 a stand-in's Dirty landing,
+/// reported to its walk as `Unsettled`, must not lead the bounded run to
+/// compute node 9.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
+    use Expr::{Add, Catch, Const, If, PanicIf, Read};
+    let b = Box::new;
+    let query = |expr, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy,
+    };
+    let mut specs: Vec<Spec> = (0..18).map(|_| query(Const(0), Strat::None)).collect();
+    specs[0] = query(Read(17, false), Strat::None);
+    specs[2] = query(Read(16, false), Strat::None);
+    specs[3] = query(Read(5, false), Strat::None);
+    specs[5] = query(Read(6, false), Strat::None);
+    specs[6] = query(Read(7, false), Strat::None);
+    specs[7] = query(Read(8, true), Strat::None);
+    specs[8] = query(
+        Add(
+            b(Add(b(Read(12, true)), b(Read(18, false)))),
+            b(If(b(Read(2, false)), b(Read(9, false)), b(Const(0)))),
+        ),
+        Strat::None,
+    );
+    specs[9] = query(Add(b(Read(6, false)), b(Read(10, true))), Strat::None);
+    specs[10] = query(Catch(b(Read(11, false))), Strat::None);
+    specs[11] = query(
+        If(b(Read(9, true)), b(Read(12, false)), b(Read(12, false))),
+        Strat::None,
+    );
+    specs[12] = query(
+        Add(
+            b(Read(13, false)),
+            b(If(b(Read(17, false)), b(Read(13, false)), b(Const(0)))),
+        ),
+        Strat::None,
+    );
+    specs[13] = query(Read(18, false), Strat::None);
+    specs[14] = query(Add(b(Read(10, false)), b(Read(15, false))), Strat::None);
+    specs[15] = query(Catch(b(Read(14, false))), Strat::None);
+    specs[16] = query(Read(17, false), Strat::None);
+    specs[17] = query(
+        Add(
+            b(Read(15, false)),
+            b(PanicIf(
+                b(If(
+                    b(Read(18, false)),
+                    b(Read(18, false)),
+                    b(Read(5, false)),
+                )),
+                2,
+            )),
+        ),
+        Strat::Fixpoint {
+            initial: 0,
+            limit: 3,
+        },
+    );
+    specs.push(Spec::Input(2));
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 18,
+        specs2: vec![],
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(3), Op::Set(18, 3), Op::Get(7)],
+    };
+    let states = |t: Trace| -> Vec<(Out, Vec<NodeState>)> {
+        t.into_iter().map(|(out, snap)| (out, snap.0)).collect()
+    };
+    quiet(|| {
+        let unbounded = states(run::<Local>(&case, None, 0));
+        assert_eq!(unbounded[3].1[9], NodeState::New, "unbounded");
+        for frames in [1, 2, 3] {
+            let local = states(run::<Local>(&case, Some(frames), 0));
+            assert_eq!(local, unbounded, "Local, budget {frames}");
+            let shared = states(run::<Shared>(&case, Some(frames), 0));
+            assert_eq!(shared, unbounded, "Shared, budget {frames}");
+        }
+    });
+}
+
+/// Seed 0x9ab9's base case, shrunk. Unbounded, `TryGet(12)` reads 0. At
+/// budget 1 a speculative run of node 3 (slot 20) writes its slot and is
+/// discarded, so `discard_target` takes the value back and lands the node
+/// New where the unbounded run leaves it Dirty; the claim releases and
+/// walks that follow differ, and the bounded run reports the cycle
+/// [5, 7, 10, 11, 17]. Landing it Dirty passes at every budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "T8-speculative-landings: a discarded speculative write lands its node New"]
+fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
+    use Expr::{Add, Catch, Const, If, Read};
+    let b = Box::new;
+    let query = |expr, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy,
+    };
+    let mut specs: Vec<Spec> = (0..23).map(|_| query(Const(0), Strat::None)).collect();
+    specs[2] = query(Read(3, false), Strat::Fallback(1));
+    specs[3] = Spec::Query {
+        expr: Catch(b(If(b(Read(20, false)), b(Read(4, false)), b(Const(0))))),
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    specs[4] = query(
+        Add(
+            b(Add(b(Read(5, true)), b(Read(5, true)))),
+            b(Catch(b(Read(5, false)))),
+        ),
+        Strat::Fixpoint {
+            initial: 3,
+            limit: 2,
+        },
+    );
+    specs[5] = query(
+        Add(
+            b(Add(
+                b(Read(2, false)),
+                b(If(b(Read(6, false)), b(Read(7, false)), b(Read(6, false)))),
+            )),
+            b(Read(10, true)),
+        ),
+        Strat::None,
+    );
+    specs[6] = query(
+        If(b(Read(7, false)), b(Const(0)), b(Read(12, false))),
+        Strat::Fixpoint {
+            initial: 3,
+            limit: 3,
+        },
+    );
+    specs[7] = query(
+        If(b(Read(8, false)), b(Const(0)), b(Read(22, true))),
+        Strat::None,
+    );
+    specs[8] = query(
+        If(
+            b(Read(3, true)),
+            b(Read(9, false)),
+            b(Add(b(Read(8, false)), b(Read(9, true)))),
+        ),
+        Strat::Fallback(3),
+    );
+    specs[9] = Spec::Query {
+        expr: Read(10, false),
+        replay: true,
+        bare: true,
+        strategy: Strat::Fallback(2),
+    };
+    specs[10] = query(
+        If(b(Read(17, false)), b(Read(14, false)), b(Const(0))),
+        Strat::None,
+    );
+    specs[12] = query(Read(13, false), Strat::None);
+    specs[13] = query(Read(14, false), Strat::None);
+    specs[14] = query(Read(15, false), Strat::None);
+    specs[15] = query(
+        If(b(Read(16, false)), b(Read(16, false)), b(Const(0))),
+        Strat::None,
+    );
+    specs[16] = query(Read(22, false), Strat::None);
+    specs[17] = query(
+        Add(
+            b(Read(18, false)),
+            b(If(b(Read(14, false)), b(Read(9, false)), b(Const(0)))),
+        ),
+        Strat::None,
+    );
+    specs[18] = query(
+        If(
+            b(If(
+                b(Read(19, false)),
+                b(Read(19, false)),
+                b(Read(17, false)),
+            )),
+            b(Read(21, false)),
+            b(Const(0)),
+        ),
+        Strat::None,
+    );
+    specs[19] = query(Read(20, true), Strat::Fallback(3));
+    specs[20] = query(Read(21, false), Strat::None);
+    specs[21] = query(Read(22, false), Strat::None);
+    specs[22] = query(
+        If(b(Catch(b(Read(3, false)))), b(Const(0)), b(Const(0))),
+        Strat::Fallback(0),
+    );
+    specs.push(Spec::Input(2));
+    let case = Case {
+        specs,
+        panics: false,
+        cycles: true,
+        queries: 23,
+        specs2: vec![],
+        queries2: 0,
+        ops: vec![Op::TryGet(15), Op::Get(7), Op::TryGet(12)],
+    };
+    let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
+    quiet(|| {
+        let unbounded = outs(run::<Local>(&case, None, 0));
+        assert_eq!(unbounded[2], Out::Value(0), "unbounded");
+        for frames in [1, 2, 3] {
+            let local = outs(run::<Local>(&case, Some(frames), 0));
+            assert_eq!(local, unbounded, "Local, budget {frames}");
+            let shared = outs(run::<Shared>(&case, Some(frames), 0));
+            assert_eq!(shared, unbounded, "Shared, budget {frames}");
+        }
+    });
+}
