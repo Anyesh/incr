@@ -227,6 +227,7 @@ impl<C: Cells> Runtime<C> {
             // SAFETY: the active frame's control block is live.
             let ctl = unsafe { &*f.ctl };
             if ctl.has(cycle::DOOMED) {
+                self.park(ParkPoint::DoomedRead(NodeId(handle.slot())));
                 if let Some(value) = self.read_doomed(handle, f) {
                     return Ok(value);
                 }

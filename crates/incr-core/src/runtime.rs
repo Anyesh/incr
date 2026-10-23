@@ -187,6 +187,8 @@ pub(crate) enum ParkPoint {
     /// At a doom, after the node the read wanted was released and pushed
     /// and before the reading frame gets its placeholder.
     AfterDoom(NodeId),
+    /// In a doomed frame's read of `NodeId`, before its state is loaded.
+    DoomedRead(NodeId),
     /// In a replay driver's loop, after it took its next entry and before
     /// the virtual frames at and above that entry's level pop.
     BeforeEntry(NodeId),
