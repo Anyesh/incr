@@ -4707,3 +4707,35 @@ fn a_failed_union_dep_is_not_computed_by_a_retry_walk() {
         assert_eq!(bounded, [want.clone(), want], "budget 1, Local then Shared");
     });
 }
+
+/// Seed 0xbd77f8fdde0ce94f's op 0, `Get(0)` on a fresh runtime: 5's member
+/// run reads 19, which reads 8, whose own code panics, so unbounded 5 is
+/// marked failed and lands Failed. At a budget of 1, 8's run is a stand-in
+/// finishing its virtual frame, and its mark counts as a member failure
+/// nested in 5's run, so 5 is not marked and lands New.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_stand_ins_panic_is_not_a_failure_nested_in_its_readers_member_run() {
+    let seed = 0xbd77_f8fd_de0c_e94f;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(1);
+    assert!(matches!(case.ops[0], Op::Get(0)));
+    let failed = |t: &Trace| -> (Out, Vec<usize>) {
+        let (out, snap) = &t[0];
+        let set = (snap.0.iter().enumerate())
+            .filter(|(_, s)| **s == NodeState::Failed)
+            .map(|(x, _)| x)
+            .collect();
+        (out.clone(), set)
+    };
+    let want = (Out::Panic("boom 0:8".to_owned()), vec![5, 8, 19]);
+    quiet(|| {
+        assert_eq!(failed(&run::<Local>(&case, None, 0)), want);
+        assert_eq!(failed(&run::<Shared>(&case, None, 0)), want);
+        let bounded = [
+            failed(&run::<Local>(&case, Some(1), 0)),
+            failed(&run::<Shared>(&case, Some(1), 0)),
+        ];
+        assert_eq!(bounded, [want.clone(), want], "budget 1, Local then Shared");
+    });
+}

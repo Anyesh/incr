@@ -38,6 +38,9 @@ pub(crate) struct Entry {
     /// It stands for a walk's entry, so its compute contains a panic as
     /// the walk's does.
     pub(crate) walked: bool,
+    /// An R5 read of a member this thread holds doomed it, so its run is
+    /// that read's member run, not a stand-in for a frame's compute.
+    pub(crate) r5: bool,
 }
 
 /// How the driver runs an entry.

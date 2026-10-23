@@ -616,7 +616,7 @@ impl<C: Cells> Runtime<C> {
             // One position above its reader, as the driver runs a held
             // entry: nested member runs at one anchor would share it, and a
             // doom marks frames by position.
-            let mut r5 = self.member_run(slot, at + 1, true, false);
+            let mut r5 = self.member_run(slot, at + 1, true, false, false);
             // A read past the budget in the member run doomed it. If the
             // member run was the doom's bottom frame, its context runs here
             // until the member is buffered, and the loop's member run passes
@@ -719,15 +719,20 @@ impl<C: Cells> Runtime<C> {
     /// recorded. Returns the run's lowlink, or the panic it ended in, with
     /// the node marked failed unless the run was speculative. A `walked`
     /// run finishes a walk's compute, so the virtual frames a doom in it
-    /// makes contain a panic as that walk does. A run that finishes a
-    /// doomed one counts the failures marked since the earliest of those
-    /// runs began as nested in it.
+    /// makes contain a panic as that walk does. A `stand_in` run of a node
+    /// outside any episode finishes a frame the unbounded run computes
+    /// natively, so its panic marks the node failed as that compute's
+    /// landing does, never counted as a member's failure nested in its
+    /// readers' runs. Otherwise a run that finishes a doomed one counts the
+    /// failures marked since the earliest of those runs began as nested in
+    /// it.
     pub(super) fn member_run(
         &self,
         slot: u32,
         cidx: u32,
         doomable: bool,
         walked: bool,
+        stand_in: bool,
     ) -> Result<Option<u32>, Payload> {
         let id = NodeId(slot);
         let compute = {
@@ -817,11 +822,12 @@ impl<C: Cells> Runtime<C> {
                 ctl.has(cycle::POISONED),
             );
             // An engine unwind is no fault of the member's.
-            if result.is_err()
-                && cycle_state::failures() == failures
-                && cycle_state::unwind_kind().is_none()
-            {
-                cycle_state::mark_failed(e);
+            if result.is_err() && cycle_state::unwind_kind().is_none() {
+                if stand_in && e.episode.is_none() {
+                    e.failed = true;
+                } else if cycle_state::failures() == failures {
+                    cycle_state::mark_failed(e);
+                }
             }
             out
         });
@@ -1100,7 +1106,7 @@ impl<C: Cells> Runtime<C> {
                 id: replay::member_run_episode(cidx),
                 slot,
             });
-        let ran = self.member_run(slot, cidx, true, false);
+        let ran = self.member_run(slot, cidx, true, false, false);
         replay::leave_member_run();
         self.drop_deliveries(replay::run_ended(
             self.runtime_id,
