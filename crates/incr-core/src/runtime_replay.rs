@@ -1203,7 +1203,7 @@ impl<C: Cells> Runtime<C> {
                 .expect("incr-core: a kept cycle is a cycle unwind")
                 .0)),
             Some(Delivered::Unwind { payload, .. }) => Err(payload),
-            Some(Delivered::Walk(_) | Delivered::Direct) => {
+            Some(Delivered::Walk(..) | Delivered::Direct) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             None => catch_unwind(AssertUnwindSafe(|| {
@@ -2932,11 +2932,11 @@ impl<C: Cells> Runtime<C> {
                     x.resume = None;
                     if let Some(i) = x
                         .pending
-                        .find_keyed(&key, |d| !d.taken && matches!(d.what, Delivered::Walk(_)))
+                        .find_keyed(&key, |d| !d.taken && matches!(d.what, Delivered::Walk(..)))
                     {
                         let d = x.pending.get_mut(i);
                         d.taken = true;
-                        if let Delivered::Walk(walk) = &d.what {
+                        if let Delivered::Walk(walk, _) = &d.what {
                             let walk = (**walk).clone();
                             x.resume = Some((reading, f.cidx, walk));
                         }
@@ -2963,7 +2963,7 @@ impl<C: Cells> Runtime<C> {
                 self.dirty_reads.lock().unwrap().push(handle.slot());
                 (cycle, poison, attributed, payload, nodes)
             }
-            Delivered::Walk(_) | Delivered::Direct => {
+            Delivered::Walk(..) | Delivered::Direct => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             Delivered::Landed(value) => {
@@ -3117,14 +3117,16 @@ impl<C: Cells> Runtime<C> {
             let key = ReadKey::blocked(&below);
             let walk = x
                 .pending
-                .find_keyed(&key, |d| matches!(d.what, Delivered::Walk(_)))
+                .find_keyed(&key, |d| matches!(d.what, Delivered::Walk(..)))
                 .and_then(|i| match &mut x.pending.get_mut(i).what {
-                    Delivered::Walk(walk) => Some(walk),
+                    Delivered::Walk(walk, pushed) => Some((walk, pushed)),
                     _ => None,
                 });
             match (walk, what) {
-                (Some(walk), _) => {
-                    walk.ran(node);
+                (Some((walk, pushed)), _) => {
+                    if pushed.take() == Some(node) {
+                        walk.ran(node);
+                    }
                     if unsettled {
                         walk.unsettled(NodeId(node));
                     }
@@ -3351,7 +3353,7 @@ impl<C: Cells> Runtime<C> {
     ) -> Result<Computed, Computed> {
         let computed = match computed {
             Computed::Doomed => {
-                self.stash_walk(root, (!is_root).then_some(walk));
+                self.stash_walk(root, (!is_root).then_some(walk), None);
                 return Err(computed);
             }
             Computed::Discarded => match self.walk_discarded(visit) {
@@ -3360,7 +3362,7 @@ impl<C: Cells> Runtime<C> {
                     // The discarded compute is a frame the reading frame's
                     // retry runs again.
                     walk.push(entry);
-                    self.stash_walk(root, (!is_root).then_some(walk));
+                    self.stash_walk(root, (!is_root).then_some(walk), Some(entry.id.0));
                     return Err(computed);
                 }
             },
@@ -3382,7 +3384,7 @@ impl<C: Cells> Runtime<C> {
     /// A doom stopped the reading frame's walk of `root`: its retry
     /// resumes `walk`, the rest of it, or with none left, takes the root's
     /// landing as the read's outcome.
-    fn stash_walk(&self, root: NodeId, walk: Option<&mut Walk>) {
+    fn stash_walk(&self, root: NodeId, walk: Option<&mut Walk>, pushed: Option<u32>) {
         // A doomed frame's walk reads past placeholders, and a speculative
         // run's retry takes no delivery.
         if replay::speculative() {
@@ -3403,11 +3405,11 @@ impl<C: Cells> Runtime<C> {
                     .cloned()
                 {
                     match walk {
-                        Some(walk) => x.deliver_walk(&v, std::mem::take(walk)),
+                        Some(walk) => x.deliver_walk(&v, std::mem::take(walk), pushed),
                         None => {
                             let key = ReadKey::blocked(&v);
                             x.pending
-                                .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(_)));
+                                .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..)));
                         }
                     }
                     return;

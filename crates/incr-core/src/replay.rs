@@ -521,8 +521,11 @@ pub(crate) enum Delivered {
     Landed(Unbuilt<dyn Any + Send>),
     /// The rest of the walk of the frame's blocked read, from the compute
     /// a doom stopped it at: the retry's walk of that read resumes it, as
-    /// the unbounded run's walk goes on after that compute.
-    Walk(Box<crate::runtime::Walk>),
+    /// the unbounded run's walk goes on after that compute. With the node
+    /// of the entry the stop pushed back, which the context's run of that
+    /// compute pops: a doomed entry is not pushed back, so a pending entry
+    /// of its node on top is a repeat the walk still owes.
+    Walk(Box<crate::runtime::Walk>, Option<u32>),
     /// The read ran its node's compute, a virtual frame above the frame's,
     /// which the retry runs again as that compute: a walk would first
     /// visit deps the replay of that frame's run has left Failed or Dirty.
@@ -882,16 +885,21 @@ impl Context {
 
     /// Keeps the walk of the read virtual frame `below` was blocked in, from
     /// where a doom stopped it, for the frame's retry.
-    pub(crate) fn deliver_walk(&mut self, below: &VFrame, walk: crate::runtime::Walk) {
+    pub(crate) fn deliver_walk(
+        &mut self,
+        below: &VFrame,
+        walk: crate::runtime::Walk,
+        pushed: Option<u32>,
+    ) {
         let key = ReadKey::blocked(below);
         self.pending
-            .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(_)));
+            .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..)));
         self.pending.push(Delivery {
             key,
             maker: below.maker,
             taken: false,
             blocked: false,
-            what: Delivered::Walk(Box::new(walk)),
+            what: Delivered::Walk(Box::new(walk), pushed),
             provenance: None,
             below: Vec::new(),
             resumed: None,
@@ -1542,7 +1550,7 @@ pub(crate) fn take_pending(
     with(|c| {
         c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
             let at = x.pending.find_keyed(key, |d| {
-                !d.taken && !matches!(d.what, Delivered::Walk(_) | Delivered::Direct)
+                !d.taken && !matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
             })?;
             // The read has its outcome, which ended the walk it was
             // blocked in, so a later read under the same key in this
@@ -1550,7 +1558,7 @@ pub(crate) fn take_pending(
             x.pending.take_keyed(key);
             Some(match &x.pending.get(at).what {
                 Delivered::Landed(value) => Delivered::Landed(Unbuilt::new(clone(value.value()))),
-                Delivered::Walk(_) | Delivered::Direct => {
+                Delivered::Walk(..) | Delivered::Direct => {
                     unreachable!("incr-core: a walk's direction is not a value")
                 }
                 Delivered::Unwind { .. } => x.take_unwind(at),

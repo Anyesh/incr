@@ -1638,3 +1638,26 @@ collection workloads under 2).
 
 Gate: every hard gate and every single-thread compute case counts the
 same as the base.
+
+## Replayed entries pop only what their stop pushed
+
+- Engine: `w/T8-seed-922f-adds-failed` against its base `spreadsheet-t10`
+  at `c355284e`, the base in a detached worktree; one run of `icount.sh`
+  at the default N per column. No workloads added.
+- Change: a walk's stashed delivery carries the entry its stop pushed
+  back, and a context's run of a doomed entry no longer pops a repeat
+  of its node; replay paths only.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `diamond_local` | 3,919 | 3,919 | 0 |
+| `chain_local/propagate/100` | 91,210.02 | 91,210.01 | -0.01 |
+| `fanout_local_4` / `fanout_local_5` | 17,195.01 / 21,817 | 17,195.01 / 21,817 | 0 |
+
+Gate: every hard gate and every single-thread compute case counts the
+same as the base. The rest move by run-to-run noise in both directions
+(`delete_owned_tree_local` -1,938, `delete_owned_tree_shared` +5,132,
+`get_contended_shared` +249, the others under 15).
