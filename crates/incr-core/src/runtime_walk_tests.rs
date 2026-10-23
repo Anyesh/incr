@@ -701,6 +701,49 @@ fn wave6_shared_containable_counts_claim_anchored_at_walk_entry() {
     wave6_containable_counts_claim_anchored_at_walk_entry::<Shared>();
 }
 
+/// As `stale_dep_in_a_cycle_is_not_read`, but `a` catches the cycle unwind
+/// and then panics on its own. The walk entry must contain that panic as it
+/// contains the cycle, so `get(x)` gives 100, as from scratch, and only a
+/// direct `get(a)` raises "a own".
+fn wave7_walk_contains_own_panic_after_swallowed_cycle<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let cell = cell.clone();
+        rt.create_query(move |rt| -> i64 {
+            if rt.get(k) == 0 {
+                1
+            } else {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(*cell.get().unwrap())));
+                panic!("a own")
+            }
+        })
+    };
+    let b = rt.create_query(move |rt| rt.get(a) + 1);
+    cell.set(b).unwrap();
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(a) } else { 100 });
+    assert_eq!(rt.get(x), 1);
+
+    rt.set(k, 1);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(x)));
+    assert_eq!(got.map_err(panic_message), Ok(100));
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
+    assert_eq!(panic_message(err), "a own");
+}
+
+#[test]
+fn wave7_local_walk_contains_own_panic_after_swallowed_cycle() {
+    wave7_walk_contains_own_panic_after_swallowed_cycle::<Local>();
+}
+
+#[test]
+fn wave7_shared_walk_contains_own_panic_after_swallowed_cycle() {
+    wave7_walk_contains_own_panic_after_swallowed_cycle::<Shared>();
+}
+
 /// The walk cleans every recorded dep before a node's rerun, so it runs
 /// `e` after `sel` has stopped `x` reading it: a cost beta.5 has too,
 /// which the result must not show.

@@ -3649,8 +3649,9 @@ impl<C: Cells> Runtime<C> {
     /// the walk and the unwind released it. The entry's own claim and the
     /// claims held at or above its position are not counted: the unwind
     /// releases them too, and a virtual frame's run still holds the entry's
-    /// when this is asked. A wounded thread must reach its outermost entry,
-    /// so it contains none.
+    /// when this is asked. A closure that swallowed a cycle and then
+    /// panicked is contained as any panic. A wounded thread must reach its
+    /// outermost entry, so it contains none.
     pub(super) fn containable(
         &self,
         entry: NodeId,
@@ -3663,7 +3664,7 @@ impl<C: Cells> Runtime<C> {
         }
         match kind {
             None => true,
-            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_some_and(|c| {
+            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_none_or(|c| {
                 c.0.participants()
                     .iter()
                     .map(|p| NodeId(p.slot()))
