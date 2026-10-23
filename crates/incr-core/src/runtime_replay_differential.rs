@@ -3067,6 +3067,25 @@ fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
     });
 }
 
+/// Seed 0x5aab, two threads at a budget of 2: `Get(0)` and `Get(6)` both
+/// enter the cycle 0, 1, 2, 3, 8, whose member 0 branches on a caught cycle
+/// error. Serially whichever read runs first panics with the cycle and the
+/// other returns 9999. A doom gives 0 the discard landing mid-run, the
+/// other thread claims and computes it, and the two runs alternate inside
+/// the cycle: both reads can panic, both return 9999, or `Get(0)` returns
+/// 14, none of which an order gives.
+#[test]
+#[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
+    let case = gen_case(0x5aab, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x5aab);
+        }
+    });
+}
+
 /// Waits for a forced schedule's `done`, failing the test if it stalls.
 fn until(done: impl Fn() -> bool) {
     let start = std::time::Instant::now();
