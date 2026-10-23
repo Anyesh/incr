@@ -1323,7 +1323,8 @@ impl<C: Cells> Runtime<C> {
     /// this runtime's frames on the thread number `n` or more (every
     /// runtime's, under `Shared`) replays instead of nesting, if the read's
     /// type has a placeholder. Replay changes where computes run, never a
-    /// result.
+    /// result. A budget changed while a compute runs applies to reads made
+    /// after the change.
     ///
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
@@ -1341,7 +1342,9 @@ impl<C: Cells> Runtime<C> {
     /// bytes. Frames differ in size with the closure and the build, so
     /// the frame count alone does not bound the stack. Like
     /// [`Self::set_max_frames`], it wins over `INCR_MAX_DEPTH`: a runtime
-    /// that has not set its frame budget gets [`DEFAULT_MAX_FRAMES`].
+    /// that has not set its frame budget gets [`DEFAULT_MAX_FRAMES`]. A
+    /// budget changed while a compute runs applies to reads made after the
+    /// change.
     pub fn set_max_stack_bytes(&self, n: usize) {
         if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
             self.max_frames

@@ -68,6 +68,9 @@ enum VPop {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ended {
     Landed,
+    /// Landed not Clean: the walk that computed the node goes on as after
+    /// a compute that left it so.
+    Unsettled,
     Unwound,
     /// The walk that computed the node contained the run's unwind, so the
     /// walk goes on as after a compute that did not settle.
@@ -102,6 +105,14 @@ struct Below {
 static UNBUDGETED: std::sync::Mutex<Vec<RuntimeId>> = std::sync::Mutex::new(Vec::new());
 static UNBUDGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Run once by this thread's next `BudgetEntry::note`, after its caller
+    /// decided and before it locks `UNBUDGETED`.
+    pub(crate) static NOTE_DECIDED: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// A runtime's place in `UNBUDGETED`, which its drop gives up.
 pub(crate) struct BudgetEntry(RuntimeId);
 
@@ -109,19 +120,23 @@ impl BudgetEntry {
     pub(crate) fn new(id: RuntimeId, max_frames: u32) -> Self {
         let entry = Self(id);
         if max_frames == u32::MAX {
-            entry.note(true);
+            entry.note(|| true);
         }
         entry
     }
 
-    /// Lists the runtime as unbudgeted, or takes it off the list.
-    fn note(&self, unbudgeted: bool) {
-        if !unbudgeted && UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
+    /// Lists the runtime as unbudgeted, or takes it off the list, as
+    /// `unbudgeted` says under the list's lock: the lock orders racing
+    /// setters, so the last to take it sees every budget stored before.
+    fn note(&self, unbudgeted: impl FnOnce() -> bool) {
+        #[cfg(test)]
+        if let Some(hook) = NOTE_DECIDED.with(std::cell::Cell::take) {
+            hook();
         }
         let mut list = UNBUDGETED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unbudgeted = unbudgeted();
         match (list.iter().position(|&id| id == self.0), unbudgeted) {
             (None, true) => list.push(self.0),
             (Some(at), false) => {
@@ -135,7 +150,9 @@ impl BudgetEntry {
 
 impl Drop for BudgetEntry {
     fn drop(&mut self) {
-        self.note(false);
+        if UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            self.note(|| false);
+        }
     }
 }
 
@@ -151,7 +168,7 @@ pub(super) fn unbudgeted(id: RuntimeId) -> bool {
 impl<C: Cells> Runtime<C> {
     /// Keeps `UNBUDGETED` in step with this runtime's budgets.
     pub(super) fn note_budget(&self) {
-        self.budget_entry.note(!self.budgeted());
+        self.budget_entry.note(|| !self.budgeted());
     }
 
     /// Whether node `slot`'s compute may be doomed.
@@ -251,12 +268,21 @@ impl<C: Cells> Runtime<C> {
         }
         // A read while a cycle's unwind kind is set comes from a closure that
         // caught that unwind: the kind is stale, and a panic of the node read
-        // next would land as a cycle's discard instead of Failed.
-        if word & value_code::UNWIND_MASK != 0
-            && cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
-        {
-            cycle_state::set_unwind_kind(None);
-            word = value_code::thread_word();
+        // next would land as a cycle's discard instead of Failed. A caught
+        // discard is raised again here: left set, the next frame to pop
+        // would take it as its own swallow, and a context can absorb that
+        // frame's discard, so the catching closure's value would land.
+        if word & value_code::UNWIND_MASK != 0 {
+            match cycle_state::unwind_kind() {
+                Some(UnwindKind::Cycle) => {
+                    cycle_state::set_unwind_kind(None);
+                    word = value_code::thread_word();
+                }
+                Some(UnwindKind::Discard) if !std::thread::panicking() => {
+                    resume_unwind(Box::new(cycle::DiscardUnwind))
+                }
+                _ => {}
+            }
         }
         if foreign {
             return self.foreign_read(handle, observed, kind, word);
@@ -866,6 +892,7 @@ impl<C: Cells> Runtime<C> {
                     spec: spec || suspect,
                     retry: Retry::Walk,
                     walked: false,
+                    r5: false,
                 },
             );
         });
@@ -930,6 +957,7 @@ impl<C: Cells> Runtime<C> {
                 Retry::Compute
             },
             walked,
+            false,
         );
         self.park(ParkPoint::AfterDoom(id));
         Computed::Doomed
@@ -952,7 +980,7 @@ impl<C: Cells> Runtime<C> {
             depth: self.dep_stack.depth(),
             context: 0,
         });
-        self.mark(id, handle.generation(), Retry::Compute, false);
+        self.mark(id, handle.generation(), Retry::Compute, false, true);
         self.park(ParkPoint::AfterDoom(id));
         self.placeholder_read::<T>(Some(f))
     }
@@ -1376,7 +1404,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Marks the reading frame F and the frames below it that can be
     /// doomed, makes them virtual frames, and pushes `n` one level above F.
-    fn mark(&self, n: NodeId, generation: u32, retry: Retry, walked: bool) {
+    fn mark(&self, n: NodeId, generation: u32, retry: Retry, walked: bool, r5: bool) {
         let rt = self.runtime_id;
         #[cfg(test)]
         assert!(
@@ -1453,6 +1481,7 @@ impl<C: Cells> Runtime<C> {
                     spec,
                     retry: target_retry,
                     walked: target_walked,
+                    r5: false,
                 },
                 self.frame_keys(),
             ),
@@ -1577,6 +1606,7 @@ impl<C: Cells> Runtime<C> {
                     spec: spec || suspect,
                     retry,
                     walked,
+                    r5,
                 },
             );
         });
@@ -1943,7 +1973,7 @@ impl<C: Cells> Runtime<C> {
                             self.dep_stack.place_next_at(cidx, level > 0),
                         );
                         let _speculating = entry.spec.then(replay::Speculating::enter);
-                        self.member_run(entry.node, cidx, true, entry.walked)
+                        self.member_run(entry.node, cidx, true, entry.walked, !entry.r5)
                     };
                     self.drop_deliveries(replay::run_ended(
                         self.runtime_id,
@@ -2235,7 +2265,7 @@ impl<C: Cells> Runtime<C> {
             self.own_deferred(v.cidx, v.node);
             let ran = {
                 let _speculating = v.spec.then(replay::Speculating::enter);
-                self.member_run(v.node, v.cidx, true, v.walked)
+                self.member_run(v.node, v.cidx, true, v.walked, true)
             };
             self.drop_deliveries(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
             match ran {
@@ -2311,10 +2341,10 @@ impl<C: Cells> Runtime<C> {
                 return match self.land_alone(v.node, revs, &mut bag) {
                     Ok(landed) => {
                         bag.drain(self);
-                        if landed {
-                            VPop::Finished(v.node, Ended::Landed)
-                        } else {
-                            VPop::Next
+                        match landed {
+                            Some(NodeState::Clean) => VPop::Finished(v.node, Ended::Landed),
+                            Some(_) => VPop::Finished(v.node, Ended::Unsettled),
+                            None => VPop::Next,
                         }
                     }
                     Err(payload) => {
@@ -2619,24 +2649,26 @@ impl<C: Cells> Runtime<C> {
         self.drop_deliveries(ended);
     }
 
-    /// Drops the deliveries held, in any of this runtime's contexts, for
-    /// the frames of the nodes in `released`, whose claims a user panic's
-    /// release just landed: that release ended the frames' runs. A
+    /// Drops the deliveries, claim watermarks and failure counts held, in
+    /// any of this runtime's contexts, for the frames of the nodes in
+    /// `released`, whose claims a user panic's release just landed: that
+    /// release ended the frames' runs. A
     /// speculative run's release is not the unbounded run's, so it keeps
     /// them.
     #[cold]
     #[inline(never)]
-    pub(super) fn end_released_deliveries(&self, released: &[u32]) {
+    pub(super) fn end_released_runs(&self, released: &[u32]) {
         if replay::speculative() {
             return;
         }
         let rt = self.runtime_id;
         let dropped: Vec<Delivery> = replay::with(|c| {
             let mut dropped = Vec::new();
-            for x in c.iter_mut().filter(|x| x.rt == rt && !x.pending.is_empty()) {
+            for x in c.iter_mut().filter(|x| x.rt == rt) {
                 for &slot in released {
                     let generation = self.nodes.get(slot).generation();
                     dropped.extend(x.pending.extract_node(slot, generation));
+                    x.end_node_runs(slot, generation);
                 }
             }
             dropped
@@ -3010,7 +3042,8 @@ impl<C: Cells> Runtime<C> {
             (v.cidx - x.boundary, x.boundary)
         });
         if landed && pos > 0 {
-            self.hold_landing(id, pos, node, generation, ended == Ended::Contained);
+            let unsettled = matches!(ended, Ended::Contained | Ended::Unsettled);
+            self.hold_landing(id, pos, node, generation, unsettled);
         }
         if pos != level || entry.node != node || entry.generation != generation {
             return None;
@@ -3030,6 +3063,9 @@ impl<C: Cells> Runtime<C> {
             // compute's reader does after its landing.
             if landed {
                 self.episode_landed(self.nodes.get(node));
+            }
+            if ended == Ended::Unsettled {
+                return Some(Computed::Unsettled);
             }
             return Some(Computed::Done);
         }
@@ -3197,18 +3233,6 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn take_run_failures(&self, node: NodeId, cidx: u32) -> Option<u64> {
         self.take_earliest(node, cidx, |x| &mut x.run_failures)
-    }
-
-    /// Whether a failure count is held for a member run of `slot` at any
-    /// position.
-    pub(super) fn has_run_failures(&self, slot: u32) -> bool {
-        let rt = self.runtime_id;
-        let generation = self.nodes.get(slot).generation();
-        replay::with(|c| {
-            c.iter()
-                .filter(|x| x.rt == rt)
-                .any(|x| x.run_failures.has_node(slot, generation))
-        })
     }
 
     fn take_earliest(

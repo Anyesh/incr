@@ -1548,3 +1548,64 @@ the dependence for that lock only.
 
 Gate: every hard gate and every single-thread compute case counts the
 same as the base.
+
+## Foreign budget fixes
+
+- Engine: `w/T8-wave8-foreign-budget-fixes` (`759cf000`) against its
+  base `spreadsheet-t10` at `ba660f66`, the base in a detached worktree;
+  one run of `icount.sh` at the default N per column, the fanouts again
+  twice. Intel PT line diffs through `pt-lines.sh` at N = 10 and 1. No
+  workloads added.
+- Change: a runtime's unbudgeted listing is decided under the list's
+  lock, and a frame's second foreign hold keeps the address nearer the
+  stack's base; both are cold paths.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `diamond_local` / `_shared` | 3,919 / 7,850.9 | 3,919 / 7,850.9 | 0 |
+| `chain_local/propagate/100` | 91,210.0 | 91,210.0 | 0 |
+| `fanout_local_4` / `fanout_shared_4` | 17,195.0 / 23,590.9 | 17,195.0 / 23,590.9 | 0 |
+| `fanout_local_5` / `fanout_shared_5` | 21,817.0 / 28,957.1 | 21,839.0 / 28,979.1 | +22 / +22 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,463,747 / 4,775,102 | 3,468,745 / 4,780,100 | +4,998 / +4,998 |
+
+- **Fanouts:** the whole rise is `DependentList::remove_from_block`, +5
+  per removed dependent at its entry, exit and empty-block test: it now
+  saves four registers and aligns the stack where the base saved three,
+  in a function neither commit touches. With `codegen-units = 1`,
+  `getrandom` fixed and ASLR off, the PT trace of `fanout_local_1000`
+  counts 3,515,762 per iteration on both trees, line for line.
+  `icount.sh` on those builds moves by -40, -1,092 and +614 at N = 1, 10
+  and the default, in both directions with N, so what is left there
+  depends on the run's state, not on the change.
+- **`table_hit_*` in cycles:** three runs per tree overlap (Local 100.5
+  to 107.9 base, 106.6 to 117.8 tip; Shared 185.8 to 200.4 base, 165.7
+  to 228.0 tip), with the instruction counts equal.
+
+Gate: every hard gate and every single-thread compute case outside the
+fanouts counts the same as the base; the fanout rise is partitioning.
+
+## Unsettled stand-in landings
+
+- Engine: `w/T8-finding3-unsettled` (`88a53c99`) against its base
+  `spreadsheet-t10` at `5bd221cc`, the base in a detached worktree; one
+  run of `icount.sh` at the default N per column. No workloads added.
+- Change: a stand-in's `land_alone` returns the state it landed, and a
+  virtual frame's pop that lands its node not Clean reports it to the
+  walk as unsettled; both are replay paths no workload reaches.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `diamond_local` / `_shared` | 3,919 / 7,850.99 | 3,919 / 7,850.94 | 0 / -0.05 |
+| `chain_local/propagate/100` | 91,210.02 | 91,210.02 | 0 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,463,128.8 / 4,773,608.4 | 3,463,128.9 / 4,773,609.6 | +0.1 / +1.2 |
+
+Gate: every hard gate and every single-thread compute case counts the
+same as the base. The rest move by run-to-run noise in both directions
+(`delete_owned_tree_local` -1,490, `get_contended_shared` +249, the
+collection workloads under 2).
