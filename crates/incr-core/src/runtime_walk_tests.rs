@@ -1250,6 +1250,115 @@ fn wave7_shared_kept_read_follows_another_landing() {
     wave7_kept_read_follows_another_landing::<Shared>();
 }
 
+/// Under x's walk, the entry w (replayable with `replay_w`) catches the
+/// panic of c, which re-raises its dep r's "r boom" (r lands a frame deeper
+/// than c), then catches the cycle unwind out of y, whose replayable chain
+/// z1..z4 reads y back, and re-raises "r boom" while the unwind kind is
+/// still Cycle. Returns x, then the messages of r and c.
+fn wave8_cycle_after_caught_deep_landing<C: Cells>(
+    budget: Option<u32>,
+    replay_w: bool,
+) -> (i64, String, String) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    let sel = rt.create_input(0_i64);
+    let on = rt.create_input(0_i64);
+    let replay = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let r = rt.create_query(move |_rt: &Runtime<C>| -> i64 { panic!("r boom") });
+    let c = rt.create_query(move |rt: &Runtime<C>| rt.get(r));
+    let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let z4 = {
+        let y_cell = y_cell.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| rt.get(*y_cell.get().unwrap()) + 1,
+            replay(),
+        )
+    };
+    let z3 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(z4) + 1, replay());
+    let z2 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(z3) + 1, replay());
+    let z1 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(z2) + 1, replay());
+    let y = rt.create_query_with(move |rt: &Runtime<C>| rt.get(z1) + 1, replay());
+    y_cell.set(y).unwrap();
+    let w = rt.create_query_with(
+        move |rt: &Runtime<C>| -> i64 {
+            if rt.get(on) == 0 {
+                return 0;
+            }
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(c))).unwrap_err();
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(y)));
+            std::panic::resume_unwind(caught)
+        },
+        QueryOpts {
+            replay: if replay_w {
+                Replay::Allowed
+            } else {
+                Replay::Native
+            },
+            ..Default::default()
+        },
+    );
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(w) } else { 100 });
+    assert_eq!(rt.get(x), 0);
+    rt.set(on, 1);
+    rt.set(sel, 1);
+    if let Some(b) = budget {
+        rt.set_max_frames(b);
+    }
+    let v = rt.get(x);
+    let mr = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(r))).unwrap_err());
+    let mc = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(c))).unwrap_err());
+    (v, mr, mc)
+}
+
+/// The walk contains w's re-raised "r boom" with both landings it was noted
+/// for, r's included: y's run ends in a cycle unwind, which retires no
+/// note, so no frame pops above w with a value between the catch and the
+/// re-raise. Every budget must leave the unbounded run's ticket, though
+/// there y's doomed run pops with a value.
+fn wave8_cycle_after_caught_deep_landing_matches_unbounded<C: Cells>(replay_w: bool) {
+    let unbounded = wave8_cycle_after_caught_deep_landing::<C>(None, replay_w);
+    assert_eq!(unbounded.1, "r boom", "{unbounded:?}");
+    let differ: Vec<u32> = (1..=8)
+        .filter(|&b| wave8_cycle_after_caught_deep_landing::<C>(Some(b), replay_w) != unbounded)
+        .collect();
+    let first = differ
+        .first()
+        .map(|&b| wave8_cycle_after_caught_deep_landing::<C>(Some(b), replay_w));
+    assert!(
+        differ.is_empty(),
+        "replay_w {replay_w}: budgets {differ:?} give {first:?}, unbounded {unbounded:?}"
+    );
+}
+
+/// A doomed pop above w must not retire w's live note of r's landing.
+#[test]
+fn wave8_local_cycle_after_caught_deep_landing_matches_unbounded() {
+    wave8_cycle_after_caught_deep_landing_matches_unbounded::<Local>(false);
+}
+
+/// A doomed pop above a doomed w must not retire r's landing from the
+/// kept copy of w's read of c.
+#[test]
+fn wave8_local_cycle_after_kept_deep_landing_matches_unbounded() {
+    wave8_cycle_after_caught_deep_landing_matches_unbounded::<Local>(true);
+}
+
+/// A doomed pop above w must not retire w's live note of r's landing.
+#[test]
+fn wave8_shared_cycle_after_caught_deep_landing_matches_unbounded() {
+    wave8_cycle_after_caught_deep_landing_matches_unbounded::<Shared>(false);
+}
+
+/// A doomed pop above a doomed w must not retire r's landing from the
+/// kept copy of w's read of c.
+#[test]
+fn wave8_shared_cycle_after_kept_deep_landing_matches_unbounded() {
+    wave8_cycle_after_caught_deep_landing_matches_unbounded::<Shared>(true);
+}
+
 /// g takes a's held ticket, sets k (flipping a Dirty) and rereads a, directly
 /// or through b, so a lands Failed again with "a boom 1"; g drops that and
 /// re-raises the taken "a boom 0". No ticket may hold the superseded payload:
