@@ -345,7 +345,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 if self.over_budget(f.depth)
-                    && !ctl.has(cycle::NO_DOOM)
+                    && !self.undoomable(ctl, f.depth)
                     && self.replayable(f.node.0)
                     && self.placeholder::<T>().is_some()
                 {
