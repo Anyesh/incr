@@ -17,6 +17,7 @@ use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
+use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::state::NodeState;
 use crate::taint_memo;
@@ -489,8 +490,9 @@ pub(crate) enum Delivered {
     /// takes the slot as the compute left it, poisoned, where a later read
     /// would walk and run the node again. It is that value, cloned when
     /// the delivery is made, because a later run in the context may
-    /// compute the node again before the retry reads it.
-    Landed(Box<dyn Any + Send>),
+    /// compute the node again before the retry reads it. Until a read
+    /// takes it, it is a clone the unbounded run never builds.
+    Landed(Unbuilt<dyn Any + Send>),
     /// The rest of the walk of the frame's blocked read, from the compute
     /// a doom stopped it at: the retry's walk of that read resumes it, as
     /// the unbounded run's walk goes on after that compute.
@@ -974,15 +976,20 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
     if let Delivered::Unwind { nodes, .. } = &read.what {
         KEPT_DEPTH.with(|k| k.set(k.get().max(nodes.max_depth())));
     }
-    KEPT_READS.with(|d| {
+    let gone: Vec<KeptRead> = KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
-        d.retain(|e| {
-            e.rt != read.rt
-                || e.cidx < read.cidx
-                || e.cidx == read.cidx && e.ctl == read.ctl && !fresh
-        });
+        let gone = d
+            .extract_if(.., |e| {
+                e.rt == read.rt
+                    && e.cidx >= read.cidx
+                    && !(e.cidx == read.cidx && e.ctl == read.ctl && !fresh)
+            })
+            .collect();
         d.push(read);
+        gone
     });
+    value_code::set_kept_bit(true);
+    drop(gone);
 }
 
 fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
@@ -1004,8 +1011,7 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
 
 /// Whether a kept read or a context's delivery may hold copied landings.
 pub(crate) fn copies_held() -> bool {
-    KEPT_READS.with(|d| !d.borrow().is_empty())
-        || value_code::thread_word() & value_code::REPLAY_BIT != 0
+    value_code::thread_word() & (value_code::KEPT_BIT | value_code::REPLAY_BIT) != 0
 }
 
 /// Applies `ev`, an event that retires notes of runtime `rt`, to the
@@ -1021,7 +1027,8 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
         let mut d = d.borrow_mut();
         let deepest = KEPT_DEPTH.with(Cell::get);
         // Kept reads are pushed by the stack's top frame after those at or
-        // above it go, so the live ones run in frame order.
+        // above it go, and go when their frame pops, so they run in frame
+        // order.
         for e in d.iter_mut().rev() {
             if !all && e.cidx + 1 + deepest <= at {
                 break;
@@ -1049,18 +1056,32 @@ pub(crate) fn take_kept_reads(
     cidx: u32,
     ctl: *const crate::cycle::ComputeCtl,
 ) -> Vec<KeptRead> {
+    extract_kept(|e| e.rt == rt && e.cidx == cidx && e.ctl == ctl)
+}
+
+/// Drops the reads kept for frames of `rt` at or above `cidx`, which a
+/// frame pop at `cidx` ends: only a doom takes them, and it took them as
+/// it marked the frames.
+#[cold]
+#[inline(never)]
+pub(crate) fn drop_kept_from(rt: RuntimeId, cidx: u32) {
+    drop(extract_kept(|e| e.rt == rt && e.cidx >= cidx));
+}
+
+/// Taken out of the list before they drop, since a kept value's `Drop`
+/// runs user code.
+fn extract_kept(mut which: impl FnMut(&KeptRead) -> bool) -> Vec<KeptRead> {
     KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
-        let taken = d
-            .extract_if(.., |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl)
-            .collect();
+        let out = d.extract_if(.., |e| which(e)).collect();
+        value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() {
             KEPT_DEPTH.with(|k| k.set(0));
             if value_code::thread_word() & value_code::REPLAY_BIT == 0 {
                 COPIED.with(|c| *c.borrow_mut() = [0; 64]);
             }
         }
-        taken
+        out
     })
 }
 

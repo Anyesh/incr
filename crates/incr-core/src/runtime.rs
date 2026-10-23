@@ -3378,7 +3378,8 @@ impl<C: Cells> Runtime<C> {
                     & (value_code::MEMO_BIT
                         | value_code::UNWIND_MASK
                         | value_code::REPLAY_BIT
-                        | value_code::NOTES_BIT)
+                        | value_code::NOTES_BIT
+                        | value_code::KEPT_BIT)
                     != 0
                 {
                     let attempt = Attempt {
@@ -3791,6 +3792,9 @@ impl<C: Cells> Runtime<C> {
         if word & value_code::NOTES_BIT != 0 && result.is_ok() {
             self.retire_notes_above(attempt.cidx);
         }
+        if word & value_code::KEPT_BIT != 0 {
+            replay::drop_kept_from(self.runtime_id, attempt.cidx);
+        }
         if self.after_pop(word, result.is_ok()) {
             *result = Err(match UnwindKind::of_word(word) {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
@@ -3805,7 +3809,9 @@ impl<C: Cells> Runtime<C> {
         }
         // After the rewrites: a swallowed discard or wound is no pop of the
         // unbounded run's.
-        if result.is_ok() && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT) != 0 {
+        if result.is_ok()
+            && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT | value_code::KEPT_BIT) != 0
+        {
             self.retire_copies(&replay::Retire::Above(attempt.cidx));
         }
         None

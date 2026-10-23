@@ -910,6 +910,7 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         let value: cycle::Erased = Box::new(value_code::run(|| value.clone()));
+        let value = Unbuilt::new(value);
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
         let ordinal = self.dep_stack.reads_of_current(self.runtime_id);
         self.keep_read(f.ctl, f.cidx, reading, ordinal, Delivered::Landed(value));
@@ -2529,12 +2530,13 @@ impl<C: Cells> Runtime<C> {
                 x.pending.take_keyed(&key);
                 Some(match &x.pending.get(at).what {
                     Delivered::Landed(value) => {
-                        Delivered::Landed(Box::new(value_code::run(|| {
+                        Delivered::Landed(Unbuilt::new(Box::new(value_code::run(|| {
                             value
+                                .value()
                                 .downcast_ref::<T>()
                                 .expect("incr-core: a landed value has its node's type")
                                 .clone()
-                        })))
+                        }))))
                     }
                     Delivered::Walk(_) | Delivered::Direct => {
                         unreachable!("incr-core: a walk's direction is not a value")
@@ -2596,6 +2598,7 @@ impl<C: Cells> Runtime<C> {
                 // SAFETY: the active frame's control block is live.
                 unsafe { &*f.ctl }.raise(cycle::POISONED);
                 return Some(Ok(*value
+                    .into_inner()
                     .downcast::<T>()
                     .expect("incr-core: a landed value has its node's type")));
             }
@@ -2698,7 +2701,9 @@ impl<C: Cells> Runtime<C> {
         let state = state::load::<C>(self.nodes.get(node).state_cell());
         let reading = u64::from(node) | (u64::from(generation) << 32);
         let what = match state {
-            NodeState::Dirty => self.slot_value(node).map(Delivered::Landed),
+            NodeState::Dirty => self
+                .slot_value(node)
+                .map(|v| Delivered::Landed(Unbuilt::new(v))),
             NodeState::New | NodeState::Cyclic => {
                 self.inner
                     .read()
