@@ -456,10 +456,6 @@ impl Pending {
             .collect()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.live == 0
-    }
-
     /// The deliveries that carry a provenance record, oldest first.
     pub(crate) fn traced(&self) -> &[usize] {
         &self.traced
@@ -930,6 +926,22 @@ impl Context {
         }
     }
 
+    /// The run of the frame at `frame` along `path` is over, and a later
+    /// run of its node there is another run: the claim watermark or failure
+    /// count kept for the ended run's retry would pass the ended run's
+    /// claim or marks on to it.
+    pub(crate) fn end_frame_runs(&mut self, frame: (u32, u32, u32), path: u64) {
+        self.claim_revs.end_frame(frame, path);
+        self.run_failures.end_frame(frame, path);
+    }
+
+    /// As [`Self::end_frame_runs`], for every frame of `node` at
+    /// `generation`, whose runs a release ended.
+    pub(crate) fn end_node_runs(&mut self, node: u32, generation: u32) {
+        self.claim_revs.end_node(node, generation);
+        self.run_failures.end_node(node, generation);
+    }
+
     /// The run of the entry at `level` ended: the deliveries it made for
     /// its frames' retries are returned to be dropped, and its claim
     /// watermarks and failure counts go.
@@ -964,14 +976,7 @@ impl Context {
             let Some(v) = self.pop_vframe() else {
                 break;
             };
-            // The frame's run is over, and a later run of its node there is
-            // another run: a failure count left for it would hide its mark.
-            debug_assert!(
-                !self
-                    .run_failures
-                    .has_path((v.node, v.generation, v.cidx), v.path),
-                "incr-core: a truncated member run's frame left a failure count"
-            );
+            self.end_frame_runs((v.node, v.generation, v.cidx), v.path);
             if let Some(ep) = v.ep {
                 if let Some(at) = self.episodes.iter().position(|e| e.id == ep) {
                     abandoned.push(self.episodes.remove(at));
@@ -1664,13 +1669,28 @@ pub(crate) struct EarliestByFrame {
     /// Each frame's records, as `(path, maker, value)`.
     by_frame: HashMap<Frame, Vec<(u64, u32, u64)>>,
     by_maker: HashMap<u32, Vec<Frame>>,
+    /// The positions of each node's frames, by node and generation.
+    by_node: HashMap<(u32, u32), Vec<u32>>,
+    /// The nodes whose runs a release ended, until a doomed run of the node
+    /// notes a record again: a record taken for one meanwhile would be one
+    /// of the ended runs'.
+    #[cfg(debug_assertions)]
+    ended: std::collections::HashSet<(u32, u32)>,
 }
 
 type Frame = (u32, u32, u32);
 
 impl EarliestByFrame {
     fn note(&mut self, frame: Frame, path: u64, maker: u32, value: u64) {
+        #[cfg(debug_assertions)]
+        self.ended.remove(&(frame.0, frame.1));
         let records = self.by_frame.entry(frame).or_default();
+        if records.is_empty() {
+            self.by_node
+                .entry((frame.0, frame.1))
+                .or_default()
+                .push(frame.2);
+        }
         match records.iter_mut().find(|r| r.0 == path) {
             Some(r) => r.2 = r.2.min(value),
             None => {
@@ -1685,37 +1705,62 @@ impl EarliestByFrame {
     }
 
     pub(crate) fn take(&mut self, frame: Frame, path: u64) -> Option<u64> {
+        let value = self.remove(frame, |r| r.0 == path);
+        #[cfg(debug_assertions)]
+        assert!(
+            value.is_none() || !self.ended.contains(&(frame.0, frame.1)),
+            "incr-core: a run took a record of a run a release ended"
+        );
+        value
+    }
+
+    /// Removes the frame's records that `f` accepts, returning the value of
+    /// the last.
+    fn remove(&mut self, frame: Frame, f: impl Fn(&(u64, u32, u64)) -> bool) -> Option<u64> {
         let records = self.by_frame.get_mut(&frame)?;
-        let at = records.iter().position(|r| r.0 == path)?;
-        let value = records.swap_remove(at).2;
+        let mut value = None;
+        records.retain(|r| {
+            let gone = f(r);
+            if gone {
+                value = Some(r.2);
+            }
+            !gone
+        });
         if records.is_empty() {
             self.by_frame.remove(&frame);
+            let key = (frame.0, frame.1);
+            if let Some(at) = self.by_node.get_mut(&key) {
+                at.retain(|&c| c != frame.2);
+                if at.is_empty() {
+                    self.by_node.remove(&key);
+                }
+            }
         }
-        Some(value)
+        value
     }
 
-    fn has_path(&self, frame: Frame, path: u64) -> bool {
-        self.by_frame
-            .get(&frame)
-            .is_some_and(|r| r.iter().any(|r| r.0 == path))
+    /// The run of the frame at `frame` along `path` ended.
+    fn end_frame(&mut self, frame: Frame, path: u64) {
+        self.remove(frame, |r| r.0 == path);
     }
 
-    /// Whether a record is held for a frame of `node` at `generation`, at
-    /// any position.
-    pub(crate) fn has_node(&self, node: u32, generation: u32) -> bool {
-        self.by_frame
-            .keys()
-            .any(|f| f.0 == node && f.1 == generation)
+    /// A release ended the runs of every frame of `node` at `generation`.
+    fn end_node(&mut self, node: u32, generation: u32) {
+        #[cfg(debug_assertions)]
+        self.ended.insert((node, generation));
+        for cidx in self
+            .by_node
+            .get(&(node, generation))
+            .cloned()
+            .unwrap_or_default()
+        {
+            self.remove((node, generation, cidx), |_| true);
+        }
     }
 
     fn end_maker(&mut self, level: u32) {
         for frame in self.by_maker.remove(&level).unwrap_or_default() {
-            if let Some(records) = self.by_frame.get_mut(&frame) {
-                records.retain(|r| r.1 != level);
-                if records.is_empty() {
-                    self.by_frame.remove(&frame);
-                }
-            }
+            self.remove(frame, |r| r.1 == level);
         }
     }
 }

@@ -68,6 +68,9 @@ enum VPop {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ended {
     Landed,
+    /// Landed not Clean: the walk that computed the node goes on as after
+    /// a compute that left it so.
+    Unsettled,
     Unwound,
     /// The walk that computed the node contained the run's unwind, so the
     /// walk goes on as after a compute that did not settle.
@@ -265,12 +268,21 @@ impl<C: Cells> Runtime<C> {
         }
         // A read while a cycle's unwind kind is set comes from a closure that
         // caught that unwind: the kind is stale, and a panic of the node read
-        // next would land as a cycle's discard instead of Failed.
-        if word & value_code::UNWIND_MASK != 0
-            && cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
-        {
-            cycle_state::set_unwind_kind(None);
-            word = value_code::thread_word();
+        // next would land as a cycle's discard instead of Failed. A caught
+        // discard is raised again here: left set, the next frame to pop
+        // would take it as its own swallow, and a context can absorb that
+        // frame's discard, so the catching closure's value would land.
+        if word & value_code::UNWIND_MASK != 0 {
+            match cycle_state::unwind_kind() {
+                Some(UnwindKind::Cycle) => {
+                    cycle_state::set_unwind_kind(None);
+                    word = value_code::thread_word();
+                }
+                Some(UnwindKind::Discard) if !std::thread::panicking() => {
+                    resume_unwind(Box::new(cycle::DiscardUnwind))
+                }
+                _ => {}
+            }
         }
         if foreign {
             return self.foreign_read(handle, observed, kind, word);
@@ -2324,10 +2336,10 @@ impl<C: Cells> Runtime<C> {
                 return match self.land_alone(v.node, revs, &mut bag) {
                     Ok(landed) => {
                         bag.drain(self);
-                        if landed {
-                            VPop::Finished(v.node, Ended::Landed)
-                        } else {
-                            VPop::Next
+                        match landed {
+                            Some(NodeState::Clean) => VPop::Finished(v.node, Ended::Landed),
+                            Some(_) => VPop::Finished(v.node, Ended::Unsettled),
+                            None => VPop::Next,
                         }
                     }
                     Err(payload) => {
@@ -2632,24 +2644,26 @@ impl<C: Cells> Runtime<C> {
         self.drop_deliveries(ended);
     }
 
-    /// Drops the deliveries held, in any of this runtime's contexts, for
-    /// the frames of the nodes in `released`, whose claims a user panic's
-    /// release just landed: that release ended the frames' runs. A
+    /// Drops the deliveries, claim watermarks and failure counts held, in
+    /// any of this runtime's contexts, for the frames of the nodes in
+    /// `released`, whose claims a user panic's release just landed: that
+    /// release ended the frames' runs. A
     /// speculative run's release is not the unbounded run's, so it keeps
     /// them.
     #[cold]
     #[inline(never)]
-    pub(super) fn end_released_deliveries(&self, released: &[u32]) {
+    pub(super) fn end_released_runs(&self, released: &[u32]) {
         if replay::speculative() {
             return;
         }
         let rt = self.runtime_id;
         let dropped: Vec<Delivery> = replay::with(|c| {
             let mut dropped = Vec::new();
-            for x in c.iter_mut().filter(|x| x.rt == rt && !x.pending.is_empty()) {
+            for x in c.iter_mut().filter(|x| x.rt == rt) {
                 for &slot in released {
                     let generation = self.nodes.get(slot).generation();
                     dropped.extend(x.pending.extract_node(slot, generation));
+                    x.end_node_runs(slot, generation);
                 }
             }
             dropped
@@ -3027,7 +3041,8 @@ impl<C: Cells> Runtime<C> {
             (v.cidx - x.boundary, x.boundary)
         });
         if landed && pos > 0 {
-            self.hold_landing(id, pos, node, generation, ended == Ended::Contained);
+            let unsettled = matches!(ended, Ended::Contained | Ended::Unsettled);
+            self.hold_landing(id, pos, node, generation, unsettled);
         }
         if pos != level || entry.node != node || entry.generation != generation {
             return None;
@@ -3047,6 +3062,9 @@ impl<C: Cells> Runtime<C> {
             // compute's reader does after its landing.
             if landed {
                 self.episode_landed(self.nodes.get(node));
+            }
+            if ended == Ended::Unsettled {
+                return Some(Computed::Unsettled);
             }
             return Some(Computed::Done);
         }
@@ -3214,18 +3232,6 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn take_run_failures(&self, node: NodeId, cidx: u32) -> Option<u64> {
         self.take_earliest(node, cidx, |x| &mut x.run_failures)
-    }
-
-    /// Whether a failure count is held for a member run of `slot` at any
-    /// position.
-    pub(super) fn has_run_failures(&self, slot: u32) -> bool {
-        let rt = self.runtime_id;
-        let generation = self.nodes.get(slot).generation();
-        replay::with(|c| {
-            c.iter()
-                .filter(|x| x.rt == rt)
-                .any(|x| x.run_failures.has_node(slot, generation))
-        })
     }
 
     fn take_earliest(

@@ -1771,19 +1771,13 @@ impl<C: Cells> Runtime<C> {
             }
         }
         // A user panic's release is one the unbounded run makes too, and it
-        // ends the runs of the released nodes' frames: a delivery kept for a
-        // retry of one of them would reach the node's next, fresh run at
-        // that position. A cycle unwind's release keeps them, since the
+        // ends the runs of the released nodes' frames: a delivery, claim
+        // watermark or failure count kept for a retry of one of them would
+        // reach the node's next, fresh run at that position. A cycle unwind's release keeps them, since the
         // doomed run's retry reads the cycle from them again, as do a doom's
         // discard and a wound.
         if kind.is_none() {
-            self.end_released_deliveries(&released);
-            // As for those deliveries, a failure count kept for one of these
-            // runs would reach the node's next run there and hide its mark.
-            debug_assert!(
-                replay::speculative() || !released.iter().any(|&m| self.has_run_failures(m)),
-                "incr-core: a released member's doomed run left a failure count"
-            );
+            self.end_released_runs(&released);
         }
     }
 
@@ -1892,15 +1886,16 @@ impl<C: Cells> Runtime<C> {
     /// `compute_attempts` lands a run that popped neither LOW nor rooting a
     /// claim: a virtual hit's claim stood for its frame on the stack, and
     /// that frame turned out to be no cycle's member. `revs` are the stamp
-    /// and verify revisions taken before the run. `Ok(false)` if a dep went
-    /// stale, so that the node landed New for a retry; `Err` if writing the
-    /// value panicked, with the claim still held.
+    /// and verify revisions taken before the run. `Ok` with the state the
+    /// node landed in, or `None` if a dep went stale, so that the node
+    /// landed New for a retry; `Err` if writing the value panicked, with
+    /// the claim still held.
     pub(super) fn land_alone(
         &self,
         slot: u32,
         (stamp_rev, verify_rev): (u64, u64),
         bag: &mut Deferred<C>,
-    ) -> Result<bool, Payload> {
+    ) -> Result<Option<NodeState>, Payload> {
         let rt = self.runtime_id;
         let id = NodeId(slot);
         let (node, flags) = self.nodes.get_with_flags(slot);
@@ -1945,7 +1940,7 @@ impl<C: Cells> Runtime<C> {
             self.children_landing(id, flags, ChildLanding::Discard, e.opened(), bag);
             // Leaving the group is safe: a New node's record is inert.
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
-            false
+            None
         } else {
             if e.poisoned() {
                 node.set_verified_at(0);
@@ -1960,14 +1955,14 @@ impl<C: Cells> Runtime<C> {
             self.children_landing(id, flags, children, e.opened(), bag);
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
-            self.land_single(id, node, flags, target, NodeState::Dirty);
+            let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
             self.record_trace(
                 id,
                 crate::trace::TraceAction::Recomputed {
                     value_changed: changed,
                 },
             );
-            true
+            Some(landed)
         };
         bag.push_erased(Box::new(e.into_values()));
         Ok(landed)

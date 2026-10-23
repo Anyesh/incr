@@ -1587,6 +1587,29 @@ same as the base.
 Gate: every hard gate and every single-thread compute case outside the
 fanouts counts the same as the base; the fanout rise is partitioning.
 
+## Unsettled stand-in landings
+
+- Engine: `w/T8-finding3-unsettled` (`88a53c99`) against its base
+  `spreadsheet-t10` at `5bd221cc`, the base in a detached worktree; one
+  run of `icount.sh` at the default N per column. No workloads added.
+- Change: a stand-in's `land_alone` returns the state it landed, and a
+  virtual frame's pop that lands its node not Clean reports it to the
+  walk as unsettled; both are replay paths no workload reaches.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `diamond_local` / `_shared` | 3,919 / 7,850.99 | 3,919 / 7,850.94 | 0 / -0.05 |
+| `chain_local/propagate/100` | 91,210.02 | 91,210.02 | 0 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,463,128.8 / 4,773,608.4 | 3,463,128.9 / 4,773,609.6 | +0.1 / +1.2 |
+
+Gate: every hard gate and every single-thread compute case counts the
+same as the base. The rest move by run-to-run noise in both directions
+(`delete_owned_tree_local` -1,490, `get_contended_shared` +249, the
+collection workloads under 2).
+
 ## Member try_get of its own member
 
 - Engine: `w/T8-lead-a18d-adds-failed` (`7c14ca1e`) against its base
