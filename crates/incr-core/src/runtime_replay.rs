@@ -1134,11 +1134,11 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: as above.
         let (target, target_retry, target_walked) = if unsafe { &*bottom.ctl }.has(cycle::BUFFERED)
         {
-            (
-                replay::member_run_root(bottom.cidx).unwrap_or(bottom.node),
-                Retry::Compute,
-                false,
-            )
+            let root = replay::member_run_root(bottom.cidx).unwrap_or(bottom.node);
+            // The root's compute, run again, is a walk's entry if the
+            // episode's was, and contains an unwind as that entry did.
+            let walked = contain_impl::walked_episode(bottom.cidx) == Some(NodeId(root));
+            (root, Retry::Compute, walked)
         } else {
             // SAFETY: as above.
             let walked = unsafe { &*bottom.ctl }.has(cycle::WALKED);
