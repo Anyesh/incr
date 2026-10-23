@@ -2864,7 +2864,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         node: NodeId,
         cidx: u32,
-        records: fn(&mut replay::Context) -> &mut replay::ClaimRevs,
+        records: fn(&mut replay::Context) -> &mut replay::EarliestByFrame,
     ) -> Option<u64> {
         let rt = self.runtime_id;
         let generation = self.nodes.get(node.0).generation();

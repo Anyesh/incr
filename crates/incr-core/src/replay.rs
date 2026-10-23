@@ -551,12 +551,12 @@ pub(crate) struct Context {
     /// finishes the frame starts there or the maker's run ends: the
     /// unbounded run's frame claimed once, before any set its doomed runs
     /// made.
-    pub(crate) claim_revs: ClaimRevs,
+    pub(crate) claim_revs: EarliestByFrame,
     /// The thread's failure count when each doomed member run's earliest
     /// run began, kept as `claim_revs` is: the unbounded run's run of the
     /// member nests every failure marked since, whichever step of the
     /// replay marked it.
-    pub(crate) run_failures: ClaimRevs,
+    pub(crate) run_failures: EarliestByFrame,
     /// The level of a landed point a read's judgement met above the
     /// position it read, until the driver drops the chain above it.
     pub(crate) drop_at: Option<u32>,
@@ -588,8 +588,8 @@ impl Context {
             resume: None,
             direct: None,
             lows: Vec::new(),
-            claim_revs: ClaimRevs::default(),
-            run_failures: ClaimRevs::default(),
+            claim_revs: EarliestByFrame::default(),
+            run_failures: EarliestByFrame::default(),
             drop_at: None,
             drop_point: None,
             provenance: None,
@@ -1531,7 +1531,7 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
 /// as `(node, generation, cidx)`, and by maker: a long chain dooms and
 /// retries every frame.
 #[derive(Default)]
-pub(crate) struct ClaimRevs {
+pub(crate) struct EarliestByFrame {
     /// Each frame's records, as `(path, maker, value)`.
     by_frame: HashMap<Frame, Vec<(u64, u32, u64)>>,
     by_maker: HashMap<u32, Vec<Frame>>,
@@ -1539,13 +1539,13 @@ pub(crate) struct ClaimRevs {
 
 type Frame = (u32, u32, u32);
 
-impl ClaimRevs {
-    fn note(&mut self, frame: Frame, path: u64, maker: u32, rev: u64) {
+impl EarliestByFrame {
+    fn note(&mut self, frame: Frame, path: u64, maker: u32, value: u64) {
         let records = self.by_frame.entry(frame).or_default();
         match records.iter_mut().find(|r| r.0 == path) {
-            Some(r) => r.2 = r.2.min(rev),
+            Some(r) => r.2 = r.2.min(value),
             None => {
-                records.push((path, maker, rev));
+                records.push((path, maker, value));
                 self.by_maker.entry(maker).or_default().push(frame);
             }
         }
@@ -1558,11 +1558,11 @@ impl ClaimRevs {
     pub(crate) fn take(&mut self, frame: Frame, path: u64) -> Option<u64> {
         let records = self.by_frame.get_mut(&frame)?;
         let at = records.iter().position(|r| r.0 == path)?;
-        let rev = records.swap_remove(at).2;
+        let value = records.swap_remove(at).2;
         if records.is_empty() {
             self.by_frame.remove(&frame);
         }
-        Some(rev)
+        Some(value)
     }
 
     fn end_maker(&mut self, level: u32) {
@@ -1603,7 +1603,7 @@ fn note_earliest(
     generation: u32,
     cidx: u32,
     value: u64,
-    records: fn(&mut Context) -> &mut ClaimRevs,
+    records: fn(&mut Context) -> &mut EarliestByFrame,
 ) {
     with(|c| {
         for x in c.iter_mut().filter(|x| x.rt == rt) {
