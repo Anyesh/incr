@@ -551,7 +551,12 @@ pub(crate) struct Context {
     /// finishes the frame starts there or the maker's run ends: the
     /// unbounded run's frame claimed once, before any set its doomed runs
     /// made.
-    pub(crate) claim_revs: ClaimRevs,
+    pub(crate) claim_revs: EarliestByFrame,
+    /// The thread's failure count when each doomed member run's earliest
+    /// run began, kept as `claim_revs` is: the unbounded run's run of the
+    /// member nests every failure marked since, whichever step of the
+    /// replay marked it.
+    pub(crate) run_failures: EarliestByFrame,
     /// The level of a landed point a read's judgement met above the
     /// position it read, until the driver drops the chain above it.
     pub(crate) drop_at: Option<u32>,
@@ -583,7 +588,8 @@ impl Context {
             resume: None,
             direct: None,
             lows: Vec::new(),
-            claim_revs: ClaimRevs::default(),
+            claim_revs: EarliestByFrame::default(),
+            run_failures: EarliestByFrame::default(),
             drop_at: None,
             drop_point: None,
             provenance: None,
@@ -874,9 +880,10 @@ impl Context {
 
     /// The run of the entry at `level` ended: the deliveries it made for
     /// its frames' retries are returned to be dropped, and its claim
-    /// watermarks go.
+    /// watermarks and failure counts go.
     pub(crate) fn end_maker(&mut self, level: u32) -> Vec<Delivery> {
         self.claim_revs.end_maker(level);
+        self.run_failures.end_maker(level);
         self.pending.extract_maker(level)
     }
 
@@ -898,11 +905,21 @@ impl Context {
 
     /// Truncates `vstack` to `len` with no Tarjan pops, returning the
     /// episodes suspended at the frames removed: they are abandoned, and
-    /// their members are released with the claims held there.
+    /// their members are released with the claims held there. The removed
+    /// frames' failure counts go.
     pub(crate) fn truncate_vstack(&mut self, len: usize) -> Vec<Episode> {
         let mut abandoned = Vec::new();
         while self.vstack.len() > len {
-            if let Some(ep) = self.pop_vframe().and_then(|v| v.ep) {
+            let Some(v) = self.pop_vframe() else {
+                break;
+            };
+            // The frame's run is over, and a later run of its node there is
+            // another run: a failure count left for it would hide its mark.
+            if !self.run_failures.is_empty() {
+                self.run_failures
+                    .take((v.node, v.generation, v.cidx), v.path);
+            }
+            if let Some(ep) = v.ep {
                 if let Some(at) = self.episodes.iter().position(|e| e.id == ep) {
                     abandoned.push(self.episodes.remove(at));
                 }
@@ -1519,24 +1536,26 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
     })
 }
 
-/// See [`Context::claim_revs`], indexed by frame, as `(node, generation,
-/// cidx)`, and by maker: a long chain dooms and retries every frame.
+/// The earliest value noted for each doomed frame, as in
+/// [`Context::claim_revs`] and [`Context::run_failures`], indexed by frame,
+/// as `(node, generation, cidx)`, and by maker: a long chain dooms and
+/// retries every frame.
 #[derive(Default)]
-pub(crate) struct ClaimRevs {
-    /// Each frame's records, as `(path, maker, rev)`.
+pub(crate) struct EarliestByFrame {
+    /// Each frame's records, as `(path, maker, value)`.
     by_frame: HashMap<Frame, Vec<(u64, u32, u64)>>,
     by_maker: HashMap<u32, Vec<Frame>>,
 }
 
 type Frame = (u32, u32, u32);
 
-impl ClaimRevs {
-    fn note(&mut self, frame: Frame, path: u64, maker: u32, rev: u64) {
+impl EarliestByFrame {
+    fn note(&mut self, frame: Frame, path: u64, maker: u32, value: u64) {
         let records = self.by_frame.entry(frame).or_default();
         match records.iter_mut().find(|r| r.0 == path) {
-            Some(r) => r.2 = r.2.min(rev),
+            Some(r) => r.2 = r.2.min(value),
             None => {
-                records.push((path, maker, rev));
+                records.push((path, maker, value));
                 self.by_maker.entry(maker).or_default().push(frame);
             }
         }
@@ -1549,11 +1568,15 @@ impl ClaimRevs {
     pub(crate) fn take(&mut self, frame: Frame, path: u64) -> Option<u64> {
         let records = self.by_frame.get_mut(&frame)?;
         let at = records.iter().position(|r| r.0 == path)?;
-        let rev = records.swap_remove(at).2;
+        let value = records.swap_remove(at).2;
         if records.is_empty() {
             self.by_frame.remove(&frame);
         }
-        Some(rev)
+        Some(value)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_frame.is_empty()
     }
 
     fn end_maker(&mut self, level: u32) {
@@ -1571,6 +1594,31 @@ impl ClaimRevs {
 /// The doomed run of `node` at `cidx`, whose virtual frame is on a
 /// context's stack, claimed at walked watermark `rev`.
 pub(crate) fn note_claim_rev(rt: RuntimeId, node: u32, generation: u32, cidx: u32, rev: u64) {
+    note_earliest(rt, node, generation, cidx, rev, |x| &mut x.claim_revs);
+}
+
+/// The doomed member run of `node` at `cidx`, whose virtual frame is on a
+/// context's stack, began at thread failure count `failures`.
+pub(crate) fn note_run_failures(
+    rt: RuntimeId,
+    node: u32,
+    generation: u32,
+    cidx: u32,
+    failures: u64,
+) {
+    note_earliest(rt, node, generation, cidx, failures, |x| {
+        &mut x.run_failures
+    });
+}
+
+fn note_earliest(
+    rt: RuntimeId,
+    node: u32,
+    generation: u32,
+    cidx: u32,
+    value: u64,
+    records: fn(&mut Context) -> &mut EarliestByFrame,
+) {
     with(|c| {
         for x in c.iter_mut().filter(|x| x.rt == rt) {
             let Some(v) = cidx
@@ -1581,8 +1629,7 @@ pub(crate) fn note_claim_rev(rt: RuntimeId, node: u32, generation: u32, cidx: u3
                 continue;
             };
             let (path, maker) = (v.path, v.maker);
-            x.claim_revs
-                .note((node, generation, cidx), path, maker, rev);
+            records(x).note((node, generation, cidx), path, maker, value);
             return;
         }
     });
