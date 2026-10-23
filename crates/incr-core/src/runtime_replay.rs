@@ -2745,6 +2745,11 @@ impl<C: Cells> Runtime<C> {
                 x.levels[q as usize].pop_front();
             }
             x.trim_levels();
+            // Entries a doom handed over from the dropped frames go with
+            // them, as a frame's pop clears what it owns (owner = position
+            // + 1).
+            let from = x.boundary + q + 1;
+            x.memo.retain(|&(_, owner)| owner < from);
             (x.boundary, x.truncate_vstack(q as usize))
         });
         for ep in abandoned {
