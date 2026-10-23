@@ -864,15 +864,40 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
     }
 }
 
-/// Node `i`'s query or input on `side`, its closure counting as having
-/// run already when `rerun`, as a re-run of a node that ran does.
-fn make<C: Cells>(
-    world: &Arc<World<C>>,
-    side: usize,
-    i: usize,
-    spec: &Spec,
-    rerun: bool,
-) -> Handle {
+/// How a node's closure ran before the node is made.
+enum Ran {
+    Never,
+    /// Its last run was not its first, so any run of it is a rerun.
+    Rerun,
+    /// Its last run was its first and landed Clean over these reads. An
+    /// order verifies them and keeps that run's value, so the made
+    /// closure's first run takes `FirstRun`'s first branch again unless one
+    /// of them now reads differently.
+    First(Vec<Read>),
+}
+
+/// Whether each of `reads` gets the same kind of outcome, and the same
+/// value, read again in order.
+fn reads_alike<C: Cells>(world: &World<C>, reads: &[Read]) -> bool {
+    reads.iter().all(|&(side, d, try_, ref out)| {
+        let (rt, h) = (world.rt(side), world.handle(side, d));
+        let again = catch_unwind(AssertUnwindSafe(|| {
+            if try_ {
+                try_value(rt, h).ok()
+            } else {
+                Some(read_value(rt, h, false))
+            }
+        }));
+        match (out, again) {
+            (ReadOut::Value(v), Ok(Some(w))) => *v == w,
+            (ReadOut::Cycle(_), Ok(None)) | (ReadOut::Unwound, Err(_)) => true,
+            _ => false,
+        }
+    })
+}
+
+/// Node `i`'s query or input on `side`, its closure having run as `ran`.
+fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran: Ran) -> Handle {
     let rt = world.rt(side);
     match spec {
         Spec::Input(v) => Handle::Plain(rt.create_input(*v)),
@@ -888,14 +913,23 @@ fn make<C: Cells>(
                 Replay::Native
             };
             let (expr, world) = (expr.clone(), world.clone());
-            let runs = AtomicU32::new(u32::from(rerun));
+            let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
+            let kept = match ran {
+                Ran::First(reads) => Some(reads),
+                Ran::Never | Ran::Rerun => None,
+            };
             let compute = move |rt: &Runtime<C>| {
+                let first = match runs.fetch_add(1, Relaxed) {
+                    0 => true,
+                    1 => kept.as_ref().is_some_and(|r| reads_alike(&world, r)),
+                    _ => false,
+                };
                 let node = Node {
                     rt,
                     world: &world,
                     side,
                     at: i,
-                    first: runs.fetch_add(1, Relaxed) == 0,
+                    first,
                 };
                 let running = Running::start((side, i), node.first);
                 let v = eval(&node, &expr);
@@ -1017,7 +1051,7 @@ impl<C: Cells> Live<C> {
         });
         for (side, specs) in [&case.specs, &case.specs2].into_iter().enumerate() {
             for (i, spec) in specs.iter().enumerate().rev() {
-                let h = make(&world, side, i, spec, false);
+                let h = make(&world, side, i, spec, Ran::Never);
                 world.replace(side, i, h);
             }
         }
@@ -1045,7 +1079,7 @@ impl<C: Cells> Live<C> {
                 if w.rt(0).is_alive(old.erased()) {
                     return Out::Done;
                 }
-                let new = make(&self.world, 0, *i, spec, false);
+                let new = make(&self.world, 0, *i, spec, Ran::Never);
                 w.replace(0, *i, new);
                 self.retired.lock().unwrap().push(old);
                 Out::Recreated(new.erased().slot() == old.erased().slot())
@@ -2149,27 +2183,36 @@ fn consistent(
                 && !(clean(states[x]) && start.is_some_and(|st| clean(st[x])))
         })
         .collect();
-    // A fresh query's closure runs as a first run, `FirstRun`'s, unless the
-    // node's closure ran before the phase since its last recreate.
+    // A fresh query's closure runs as it last ran before the phase, since
+    // its last recreate (`Ran`). A first run is kept only if it landed
+    // Clean: a Failed or poisoned landing leaves nothing an order verifies.
     let first_op = phase_reads.first().copied().unwrap_or(0);
     let evals = live.evals.lock().unwrap().clone();
-    let ran_before = |side: usize, q: usize| {
+    let ran = |x: usize| {
+        let (side, q, _) = node(x);
         let made = (0..first_op).rev().find(|&i| {
             side == 0
                 && matches!((&case.ops[i], &prefix[i].0), (Op::Recreate(r, _), Out::Recreated(_)) if *r == q)
         });
-        (made.map_or(0, |i| i + 1)..first_op).any(|i| {
-            evals
-                .get(&i)
-                .is_some_and(|es| es.iter().any(|e| e.node == (side, q)))
-        })
+        let last = (made.map_or(0, |i| i + 1)..first_op)
+            .filter_map(|i| evals.get(&i).map(|es| (i, es)))
+            .flat_map(|(i, es)| es.iter().map(move |e| (i, e)))
+            .filter(|(_, e)| e.node == (side, q))
+            .max_by_key(|(_, e)| e.end);
+        match last {
+            None => Ran::Never,
+            Some((i, l)) if l.first && prefix[i].1 .0[x] == NodeState::Clean => {
+                Ran::First(l.reads.clone())
+            }
+            Some(_) => Ran::Rerun,
+        }
     };
     let replay = |reads: &[usize]| {
         let reruns: Vec<(usize, usize, Handle, Handle)> = (fresh.iter())
             .map(|&x| {
                 let (side, q, _) = node(x);
                 let spec = spec_at(case, prefix, side, q);
-                let rerun = make(&live.world, side, q, &spec, ran_before(side, q));
+                let rerun = make(&live.world, side, q, &spec, ran(x));
                 (side, q, w.replace(side, q, rerun).expect("built"), rerun)
             })
             .collect();
