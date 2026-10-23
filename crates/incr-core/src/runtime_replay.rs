@@ -175,6 +175,11 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
         mut word: u64,
     ) -> Result<T, Cycle> {
+        let foreign = word & value_code::FOREIGN_BIT != 0;
+        if foreign {
+            value_code::clear_foreign_bit();
+            word &= !value_code::FOREIGN_BIT;
+        }
         if word & value_code::COUNTER_MASK != 0 {
             return Ok(self.value_code_read(handle, self.nodes.get(handle.slot())));
         }
@@ -187,7 +192,7 @@ impl<C: Cells> Runtime<C> {
             cycle_state::set_unwind_kind(None);
             word = value_code::thread_word();
         }
-        if frame.is_some_and(|f| f.depth == ActiveRead::FOREIGN) {
+        if foreign {
             return self.foreign_read(handle, observed, kind, word);
         }
         // A delivery goes to its frame's retry in a non-speculative run: a

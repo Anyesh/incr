@@ -81,13 +81,6 @@ pub struct ActiveRead {
     pub(crate) depth: u32,
 }
 
-impl ActiveRead {
-    /// The depth of another runtime's frame reading this runtime's node:
-    /// past every budget, so the read takes the cold path, which keeps its
-    /// outcome for that frame's retry.
-    pub(crate) const FOREIGN: u32 = u32::MAX;
-}
-
 /// A stack of frames, innermost last.
 #[doc(hidden)]
 pub struct Frames {
@@ -123,6 +116,17 @@ impl Frames {
     #[inline(never)]
     fn foreign_clean_read(&mut self) {
         std::hint::black_box(&mut *self);
+    }
+
+    /// A non-Clean read another runtime serves to the top frame: it sets
+    /// `value_code::FOREIGN_BIT`, so the read takes the cold path, which
+    /// keeps its outcome for that frame's retry. The bit, not a returned
+    /// frame, because a second `Some` exit costs `get` 3 instructions per
+    /// framed read.
+    #[cold]
+    #[inline(never)]
+    fn foreign_non_clean_read(&mut self) {
+        crate::value_code::set_foreign_bit();
     }
 
     /// A read another runtime serves to the top frame whose outcome no
@@ -266,21 +270,16 @@ pub trait DepStack: 'static {
 
     /// [`Self::record_dep`] for a nested non-Clean read, which also stores
     /// the read in the frame and returns what the read needs to know of
-    /// the frame: for another runtime's frame, at depth
-    /// `ActiveRead::FOREIGN`, with nothing stored.
+    /// the frame: none for another runtime's frame, with nothing stored.
     #[inline(always)]
     fn record_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> Option<ActiveRead> {
         self.with(|s| {
             let depth = s.frames.len() as u32;
             let top = match s.frames.last_mut() {
                 Some(top) if top.rt == rt => top,
-                Some(top) => {
-                    return Some(ActiveRead {
-                        node: top.node,
-                        ctl: top.ctl,
-                        cidx: top.cidx,
-                        depth: ActiveRead::FOREIGN,
-                    })
+                Some(_) => {
+                    s.foreign_non_clean_read();
+                    return None;
                 }
                 None => return None,
             };
