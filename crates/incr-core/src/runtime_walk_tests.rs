@@ -16,8 +16,10 @@ use crate::test_size::test_size;
 use crate::value_code;
 
 /// Nested first computes overflow the default test thread stack somewhere
-/// between 600 and 700 levels in debug builds.
-const DEEP_STACK: usize = 256 << 20;
+/// between 600 and 700 levels in debug builds. The taint chain's 10,000
+/// native nested gets need 240 to 248 MiB in debug, about 25 KiB each, so
+/// this leaves them twice that.
+const DEEP_STACK: usize = 512 << 20;
 
 fn panic_message(err: Box<dyn std::any::Any + Send>) -> String {
     match err.downcast::<String>() {

@@ -1127,9 +1127,6 @@ impl<C: Cells> Live<C> {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
                 let h = w.handle(side, q);
-                if std::env::var_os("W3MAP").is_some() {
-                    eprintln!("W3 map side {side} q {q} -> {:?}", h.erased());
-                }
                 let state = if rt.is_alive(h.erased()) {
                     h.state(rt)
                 } else {
@@ -1211,9 +1208,6 @@ fn run_logged<C: Cells>(
     reset_thread();
     let (mut trace, mut evals) = (Vec::new(), Vec::new());
     for op in &case.ops {
-        if std::env::var_os("W3T").is_some() {
-            eprintln!("W3 ----- op {op:?}");
-        }
         let (out, ran) = if log {
             record(|| live.apply(op))
         } else {
@@ -2603,6 +2597,118 @@ fn seed_56cd8c2_keeps_the_failed_set() {
     });
 }
 
+/// 0x16d87, shrunk: a fresh `TryGet(18)`, which unbounded gets a cycle of
+/// six participants. At budget 1, a speculative run's walk memoized 10
+/// under the frame at position 1, so 11's later read of 10 computed it
+/// directly where the unbounded run walks it into the episode rooted at
+/// 10, and the cycle came out as three.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_16d87_takes_no_speculative_memo() {
+    use Expr::{Add, Catch, Const, If, PanicIf, Read};
+    let b = Box::new;
+    let query = |expr, replay, strategy| Spec::Query {
+        expr,
+        replay,
+        bare: false,
+        strategy,
+    };
+    let zero = |replay| query(Const(0), replay, Strat::None);
+    let mut specs: Vec<Spec> = (0..25).map(|_| zero(true)).collect();
+    specs[0] = query(Const(2), false, Strat::None);
+    specs[2] = query(
+        If(b(Read(17, false)), b(Const(0)), b(Const(0))),
+        true,
+        Strat::Fallback(0),
+    );
+    specs[4] = query(
+        Add(b(Read(5, false)), b(Read(10, false))),
+        true,
+        Strat::None,
+    );
+    specs[5] = query(Add(b(Read(8, true)), b(Read(2, false))), true, Strat::None);
+    specs[7] = query(
+        If(b(Read(8, false)), b(Const(0)), b(Read(16, false))),
+        true,
+        Strat::None,
+    );
+    specs[8] = query(Catch(b(Read(9, true))), true, Strat::None);
+    specs[9] = query(Read(12, false), true, Strat::None);
+    specs[10] = query(
+        Catch(b(If(b(Read(13, false)), b(Const(0)), b(Const(0))))),
+        true,
+        Strat::None,
+    );
+    specs[12] = query(Read(13, false), true, Strat::None);
+    specs[13] = query(Read(14, false), true, Strat::None);
+    specs[14] = query(
+        Add(b(Read(7, false)), b(Read(15, false))),
+        true,
+        Strat::None,
+    );
+    specs[15] = query(
+        If(
+            b(Add(b(Read(22, false)), b(PanicIf(b(Read(16, false)), 3)))),
+            b(Const(0)),
+            b(Const(0)),
+        ),
+        true,
+        Strat::None,
+    );
+    specs[16] = query(
+        If(
+            b(If(
+                b(If(b(Read(17, false)), b(Const(0)), b(Const(0)))),
+                b(Const(1)),
+                b(Const(1)),
+            )),
+            b(Const(0)),
+            b(Read(17, false)),
+        ),
+        true,
+        Strat::Fallback(3),
+    );
+    specs[17] = query(Read(23, false), true, Strat::None);
+    specs[18] = query(
+        If(
+            b(If(
+                b(If(b(Read(2, true)), b(Read(23, false)), b(Const(0)))),
+                b(Const(0)),
+                b(Const(0)),
+            )),
+            b(Const(0)),
+            b(Const(0)),
+        ),
+        true,
+        Strat::None,
+    );
+    specs[21] = query(Const(2), true, Strat::None);
+    specs[22] = query(Read(23, true), true, Strat::None);
+    specs[23] = query(Read(24, false), false, Strat::None);
+    specs[24] = query(
+        If(b(Read(4, false)), b(Const(0)), b(Const(0))),
+        true,
+        Strat::Fixpoint {
+            initial: 0,
+            limit: 3,
+        },
+    );
+    specs.extend([2, 4, 2].map(Spec::Input));
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 25,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(18)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x16d87);
+        differential::<Shared>(&case, 0x16d87);
+    });
+}
+
 /// 0x56cd8c2's read of held 8 goes past `cycle_read` only to resume its
 /// walk: each skip is a resume `clean_walk` then takes, so no read skips
 /// twice, and the resumed entry 9 still reads held 8 as the unbounded run
@@ -3295,6 +3401,23 @@ fn a_retry_walking_a_doomed_episodes_members_keeps_its_cycle() {
     case.ops = vec![Op::Set(24, 4), Op::Get(12)];
     quiet(|| {
         assert!(matches!(run::<Local>(&case, None, 0)[1].0, Out::Panic(_)));
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
+/// Seed 0x29bf2de20fa0e476's op 0, `Get(0)` on a fresh runtime: 1 branches
+/// on a `try_get` into the cycle of 6, 7, 8, 13 and 17. With walked
+/// episodes counting held members as released, the unbounded run panicked
+/// in 1 and budget 3 returned 2; every budget must agree.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walked_episode_in_a_try_get_cycle_answers_as_unbounded() {
+    let seed = 0x29bf_2de2_0fa0_e476;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(1);
+    assert!(matches!(case.ops[0], Op::Get(0)));
+    quiet(|| {
         differential::<Local>(&case, seed);
         differential::<Shared>(&case, seed);
     });
@@ -5331,5 +5454,40 @@ fn targets_unwind_into_the_loops_read_is_kept_for_its_retry() {
         differential::<Local>(&gen_case(seed, false, false), seed);
         differential::<Shared>(&gen_case(seed, false, false), seed);
         differential_two(&gen_case(seed, false, true), seed);
+    });
+}
+
+/// Seed 0x57c24cb at budget 1: op 5's `Get(7)` left queries 15 to 18
+/// New or Dirty where the unbounded run fails them. A speculative replay
+/// of slot 16's frame memoized slot 15 at owner 1 and was doomed; the real
+/// run's next read of 15 took that memo and computed 15 without the walk
+/// that finds the unbounded run's cycle.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_local_seed_57c24cb_failed_set() {
+    quiet(|| differential::<Local>(&gen_case(0x57c24cb, false, false), 0x57c24cb));
+}
+
+/// As [`wave8_local_seed_57c24cb_failed_set`], under `Shared`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_shared_seed_57c24cb_failed_set() {
+    quiet(|| differential::<Shared>(&gen_case(0x57c24cb, false, false), 0x57c24cb));
+}
+
+/// Seed 0xd6e169f0079b0996 as a paired case, cut to its first four ops,
+/// at every budget: op 3's `TryGet(15)` landed slot 10 Dirty where the
+/// unbounded run's user-panic release lands it New, with slot 6 Failed for
+/// Dirty. Either of two rules keeps it green alone: a walked episode's
+/// abort counts no held member as released (478dc453), and a speculative
+/// run memoizes nothing (50e5e777).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_seed_d6e1_released_new_walked_fresh() {
+    let mut case = gen_case(0xd6e1_69f0_079b_0996, false, true);
+    case.ops.truncate(4);
+    quiet(|| {
+        differential::<Local>(&case, 0xd6e1_69f0_079b_0996);
+        differential::<Shared>(&case, 0xd6e1_69f0_079b_0996);
     });
 }
