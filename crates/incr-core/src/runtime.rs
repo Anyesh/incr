@@ -3405,7 +3405,7 @@ impl<C: Cells> Runtime<C> {
                 let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     compute(self, id.0, &ctl)
                 }));
-                let deps = self.dep_stack.pop_frame();
+                let (deps, reading) = self.dep_stack.pop_frame_reading();
                 let word = value_code::thread_word();
                 if word
                     & (value_code::MEMO_BIT
@@ -3421,6 +3421,11 @@ impl<C: Cells> Runtime<C> {
                         stamp_rev,
                         verify_rev,
                     };
+                    if let Err(payload) = &result {
+                        if word & value_code::UNWIND_MASK != 0 {
+                            cycle_impl::clear_caught_cycle(&**payload, &deps, reading);
+                        }
+                    }
                     if let Some(dropped) =
                         self.after_pop_word(id, word, &mut result, attempt, &ctl, &deps, bag)
                     {

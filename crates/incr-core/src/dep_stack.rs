@@ -258,14 +258,22 @@ pub trait DepStack: 'static {
     /// generation it was read at.
     #[inline(always)]
     fn pop_frame(&self) -> Vec<(NodeId, u32)> {
-        let deps = self.with(|s| {
-            s.frames
+        self.pop_frame_reading().0
+    }
+
+    /// [`Self::pop_frame`], with the frame's last non-Clean read (see
+    /// [`Frame::reading`]).
+    #[inline(always)]
+    fn pop_frame_reading(&self) -> (Vec<(NodeId, u32)>, u64) {
+        let frame = self.with(|s| {
+            let f = s
+                .frames
                 .pop()
-                .expect("incr-core: pop_frame on an empty stack")
-                .deps
+                .expect("incr-core: pop_frame on an empty stack");
+            (f.deps, f.reading)
         });
         crate::lock_order::leave_frame();
-        deps
+        frame
     }
 
     /// Record `dep`, read at `generation`, as a dependency of runtime
