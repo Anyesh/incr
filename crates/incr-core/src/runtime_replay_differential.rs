@@ -978,7 +978,8 @@ fn set_out<C: Cells>(rt: &Runtime<C>, h: Handle, v: u64) -> Out {
     }
 }
 
-/// The caches of one [`Serial::history_cause`].
+/// The caches of one phase's history checks: reads taken by op and node,
+/// and runs taken by end and the value they were taken for.
 struct History<'a> {
     label: &'a str,
     prefix: &'a Trace,
@@ -986,7 +987,7 @@ struct History<'a> {
     live: &'a Live<Shared>,
     runs: Vec<(usize, Eval)>,
     allowed: HashMap<(usize, usize), HashSet<Read>>,
-    taken: HashMap<u64, bool>,
+    taken: HashMap<(u64, Option<u64>), bool>,
 }
 
 /// A run's two runtimes, its node tables, and the handles recreates
@@ -1098,7 +1099,7 @@ impl<C: Cells> Live<C> {
                     NodeState::Dead
                 };
                 states.push(state);
-                over_settled.push(state == NodeState::Dirty && settled_dep(rt, h, false));
+                over_settled.push(state == NodeState::Dirty && settled_dep(rt, h));
             }
             for x in 0..rt.nodes.len() {
                 let mut d = Vec::new();
@@ -1113,15 +1114,14 @@ impl<C: Cells> Live<C> {
     }
 }
 
-/// Whether a recorded dep of `h` is Cyclic, or Failed too unless `cyclic`.
-fn settled_dep<C: Cells>(rt: &Runtime<C>, h: Handle, cyclic: bool) -> bool {
+/// Whether a recorded dep of `h` is Failed or Cyclic.
+fn settled_dep<C: Cells>(rt: &Runtime<C>, h: Handle) -> bool {
     let mut any = false;
     rt.nodes.get(h.erased().slot()).for_each_dep(|d| {
-        any |= match rt.nodes.get(d.0).state() {
-            NodeState::Cyclic => true,
-            NodeState::Failed => !cyclic,
-            _ => false,
-        };
+        any |= matches!(
+            rt.nodes.get(d.0).state(),
+            NodeState::Failed | NodeState::Cyclic
+        );
     });
     any
 }
@@ -1261,6 +1261,9 @@ thread_local! {
 /// phase's index, with the trace up to it, while thread 1 waits: whether
 /// the run stops there.
 type AtOverlap<'a> = dyn Fn(usize, &Trace, &Live<Shared>) -> bool + Sync + 'a;
+
+/// The extras of a set that their history in the phase grounds.
+type Grounded<'a> = dyn Fn(&[(usize, NodeState)]) -> HashSet<usize> + 'a;
 
 /// [`run_two`], with `rig` called on the built world before the threads
 /// start, and stopping at the first phase `at_overlap` stops at, the
@@ -1628,8 +1631,17 @@ impl<'a> Serial<'a> {
         let end = prefix.len() - 1;
         let sets: Vec<_> = found.iter().map(|m| settled(&wants[m][end].1 .0)).collect();
         drop(wants);
-        let history = |x: usize| self.history_cause(label, prefix, live, x);
-        Some(consistent(case, prefix, &sets, live, &history))
+        let history =
+            |extra: &[(usize, NodeState)]| self.history_grounded(label, prefix, live, extra);
+        let reads = (phases.iter())
+            .find(|ph| ph.ops().last() == Some(&end))
+            .map_or_else(Vec::new, Phase::ops);
+        let start = (reads.first())
+            .filter(|&&i| i > 0)
+            .map(|&i| prefix[i - 1].1 .0.as_slice());
+        Some(consistent(
+            case, prefix, &sets, live, &reads, start, &history,
+        ))
     }
 
     /// Orders per read each get of the read phase `prefix` ends with whose
@@ -1840,16 +1852,16 @@ impl<'a> Serial<'a> {
         allowed
     }
 
-    /// Whether node `x`'s last run in the read phase `prefix` ends panicked
-    /// in its own closure over reads the oracle takes: each one a read an
-    /// order's last run of the node makes, the value an input holds, or the
-    /// value of an earlier run of the read node in the phase whose closure
-    /// gives it over reads the oracle takes in turn.
-    fn history_cause(&self, label: &str, prefix: &Trace, live: &Live<Shared>, x: usize) -> bool {
+    /// The runs on runtime 0 of the read phase `prefix` ends with, by op,
+    /// for [`Self::run_taken`].
+    fn history<'h>(
+        &self,
+        label: &'h str,
+        prefix: &'h Trace,
+        live: &'h Live<Shared>,
+    ) -> Option<History<'h>> {
         let end = prefix.len() - 1;
-        let Some(p) = (self.phases.iter()).position(|ph| ph.ops().last() == Some(&end)) else {
-            return false;
-        };
+        let p = (self.phases.iter()).position(|ph| ph.ops().last() == Some(&end))?;
         let evals = live.evals.lock().unwrap().clone();
         let runs: Vec<(usize, Eval)> = self.phases[p]
             .ops()
@@ -1863,14 +1875,7 @@ impl<'a> Serial<'a> {
             })
             .filter(|(_, e)| e.node.0 == 0)
             .collect();
-        let Some((i, last)) = (runs.iter())
-            .filter(|(_, e)| e.node.1 == x)
-            .max_by_key(|(_, e)| e.end)
-            .cloned()
-        else {
-            return false;
-        };
-        let mut cx = History {
+        Some(History {
             label,
             prefix,
             p,
@@ -1878,17 +1883,99 @@ impl<'a> Serial<'a> {
             runs,
             allowed: HashMap::new(),
             taken: HashMap::new(),
+        })
+    }
+
+    /// Node `x`'s last run in `cx`'s phase, with its op.
+    fn last_run(cx: &History<'_>, x: usize) -> Option<(usize, Eval)> {
+        (cx.runs.iter())
+            .filter(|(_, e)| e.node.1 == x)
+            .max_by_key(|(_, e)| e.end)
+            .cloned()
+    }
+
+    /// Whether node `x`'s last run in the read phase `prefix` ends panicked
+    /// in its own closure over reads the oracle takes: each one a read an
+    /// order's last run of the node makes, the value an input holds, or the
+    /// value of an earlier run of the read node in the phase whose closure
+    /// gives it over reads the oracle takes in turn.
+    fn history_cause(&self, label: &str, prefix: &Trace, live: &Live<Shared>, x: usize) -> bool {
+        let Some(mut cx) = self.history(label, prefix, live) else {
+            return false;
         };
-        self.run_taken(&mut cx, i, &last, None)
+        Self::last_run(&cx, x).is_some_and(|(i, last)| self.run_taken(&mut cx, i, &last, None))
+    }
+
+    /// The Failed nodes of `extra` the read phase `prefix` ends with left
+    /// Failed through its own history: one whose last run in the phase
+    /// panicked in its own closure over reads the oracle takes
+    /// ([`Self::history_cause`]), or whose last run there unwound, over such
+    /// reads before it, from a read of such a node or of a node the phase
+    /// left Failed that is not in `extra`.
+    fn history_grounded(
+        &self,
+        label: &str,
+        prefix: &Trace,
+        live: &Live<Shared>,
+        extra: &[(usize, NodeState)],
+    ) -> HashSet<usize> {
+        let mut grounded = HashSet::new();
+        let Some(mut cx) = self.history(label, prefix, live) else {
+            return grounded;
+        };
+        let failed: Vec<(usize, Eval)> = (extra.iter())
+            .filter(|&&(x, s)| s == NodeState::Failed && x < live.queries[0])
+            .filter_map(|&(x, _)| Self::last_run(&cx, x))
+            .collect();
+        for (i, run) in &failed {
+            if self.run_taken(&mut cx, *i, run, None) {
+                grounded.insert(run.node.1);
+            }
+        }
+        let states = &prefix.last().expect("a phase ran").1 .0;
+        loop {
+            let mut more = Vec::new();
+            for (i, run) in &failed {
+                let x = run.node.1;
+                let Some(&(0, y, _, ReadOut::Unwound)) = run.reads.last() else {
+                    continue;
+                };
+                let through = grounded.contains(&y)
+                    || y < live.queries[0]
+                        && states[y] == NodeState::Failed
+                        && !extra.contains(&(y, NodeState::Failed));
+                if !grounded.contains(&x) && through && self.unwound_taken(&mut cx, *i, run) {
+                    more.push(x);
+                }
+            }
+            if more.is_empty() {
+                return grounded;
+            }
+            grounded.extend(more);
+        }
+    }
+
+    /// Whether `run`, of op `i`, ends unwound by its last read, every read
+    /// before it one the oracle takes.
+    fn unwound_taken(&self, cx: &mut History<'_>, i: usize, run: &Eval) -> bool {
+        let q = run.node.1;
+        let Spec::Query { expr, .. } = spec_at(self.case, cx.prefix, 0, q) else {
+            return false;
+        };
+        let mut reads = run.reads.iter();
+        let unwinds = formula(&expr, (0, q, run.first), &mut reads) == Err(None);
+        unwinds
+            && reads.next().is_none()
+            && (0..run.reads.len() - 1).all(|k| self.read_taken(cx, i, run, k))
     }
 
     /// Whether `run`, of op `i`, gives `value` (its own panic for `None`)
     /// over reads the oracle takes, as [`Self::history_cause`] takes them.
     fn run_taken(&self, cx: &mut History<'_>, i: usize, run: &Eval, value: Option<u64>) -> bool {
-        if let Some(&t) = cx.taken.get(&run.end) {
+        if let Some(&t) = cx.taken.get(&(run.end, value)) {
             return t;
         }
-        cx.taken.insert(run.end, false);
+        cx.taken.insert((run.end, value), false);
         let q = run.node.1;
         let gives = match spec_at(self.case, cx.prefix, 0, q) {
             Spec::Query { expr, .. } => {
@@ -1904,7 +1991,7 @@ impl<'a> Serial<'a> {
             Spec::Input(_) => false,
         };
         let taken = gives && (0..run.reads.len()).all(|k| self.read_taken(cx, i, run, k));
-        cx.taken.insert(run.end, taken);
+        cx.taken.insert((run.end, value), taken);
         taken
     }
 
@@ -2004,25 +2091,25 @@ impl<'a> Serial<'a> {
 
 /// Whether the Failed and Cyclic nodes after `prefix`'s last phase are
 /// true of their inputs for one of `sets`, each the Failed and Cyclic set
-/// an order with the trace's outcomes leaves. A node the phase left
-/// Cyclic where the order does not must have a recorded dep Cyclic, or its
-/// closure, re-run as a fresh query from the phase's end, must panic or
-/// cycle. One it left Failed must have a cause none of those Failed nodes
-/// stands in for unless it has one too: the re-run panics with the
-/// closure's own payload, or through a read of a node left Failed or
-/// Cyclic that is not such a node, or of one the re-runs landed Failed
-/// that has such a cause itself, or its last run in the phase panicked in
-/// its own closure over reads the oracle takes
-/// ([`Serial::history_cause`]). A node the order settles that the phase left
-/// Dirty or New must still read so on a later `get`: a panic for Failed,
-/// the cycle for Cyclic. The re-runs and gets run on this thread, in that
-/// order, and change the world.
+/// an order with the trace's outcomes leaves, `start` being the states
+/// before the phase. Each node the phase left Failed or Cyclic where the
+/// order does not must land so again when the phase's reads replay, in one
+/// order for the whole set, over fresh queries in place of every query the
+/// phase may have changed, unless the phase's own history left it Failed
+/// (`history`, [`Serial::history_grounded`]), which it keeps. A cycle
+/// whose members follow provisional values may close over other members in
+/// the replay than in the phase. A node the order settles that the phase
+/// left Dirty or New must still read so on a later `get`: a panic for
+/// Failed, the cycle for Cyclic. The replays and gets run on this thread,
+/// in that order.
 fn consistent(
     case: &Case,
     prefix: &Trace,
     sets: &[Vec<(usize, NodeState)>],
     live: &Live<Shared>,
-    history: &dyn Fn(usize) -> bool,
+    phase_reads: &[usize],
+    start: Option<&[NodeState]>,
+    history: &Grounded<'_>,
 ) -> Result<(), String> {
     let w = &*live.world;
     let states = &prefix.last().expect("a phase ran").1 .0;
@@ -2043,122 +2130,65 @@ fn consistent(
     missing.sort_unstable_by_key(|&(x, _)| x);
     missing.dedup();
 
-    let failed_extra: HashMap<(usize, u32), usize> = extra
-        .iter()
-        .filter(|&&(_, s)| s == NodeState::Failed)
-        .map(|&(x, _)| {
-            let (side, _, h) = node(x);
-            ((side, h.erased().slot()), x)
+    // Each replay reads only inputs, nodes Clean before and after the
+    // phase, and kept nodes as the phase left them: no state under judgement.
+    let kept = history(&extra);
+    let fresh: Vec<usize> = (0..states.len())
+        .filter(|&x| {
+            let (side, q, _) = node(x);
+            let clean = |s: NodeState| s == NodeState::Clean;
+            states[x] != NodeState::Dead
+                && !kept.contains(&x)
+                && matches!(spec_at(case, prefix, side, q), Spec::Query { .. })
+                && !(clean(states[x]) && start.is_some_and(|st| clean(st[x])))
         })
         .collect();
-    // What the phase left, read before the re-runs change it.
-    let key = |x: usize| {
-        let (side, _, h) = node(x);
-        (side, h.erased().slot())
+    // A fresh query's closure runs as a first run, `FirstRun`'s, unless the
+    // node's closure ran before the phase since its last recreate.
+    let first_op = phase_reads.first().copied().unwrap_or(0);
+    let evals = live.evals.lock().unwrap().clone();
+    let ran_before = |side: usize, q: usize| {
+        let made = (0..first_op).rev().find(|&i| {
+            side == 0
+                && matches!((&case.ops[i], &prefix[i].0), (Op::Recreate(r, _), Out::Recreated(_)) if *r == q)
+        });
+        (made.map_or(0, |i| i + 1)..first_op).any(|i| {
+            evals
+                .get(&i)
+                .is_some_and(|es| es.iter().any(|e| e.node == (side, q)))
+        })
     };
-    let left: HashSet<(usize, u32)> = got.iter().map(|&(x, _)| key(x)).collect();
-    let cyclic_dep: HashSet<usize> = extra
-        .iter()
-        .filter(|&&(x, s)| {
-            let (side, _, h) = node(x);
-            s == NodeState::Cyclic && settled_dep(w.rt(side), h, true)
-        })
-        .map(|&(x, _)| x)
-        .collect();
-    let mut why: HashMap<usize, String> = HashMap::new();
-    // Failed nodes that fail only through reads: an extra one whose re-run
-    // did, or one the re-runs landed Failed, which has no node index to
-    // report.
-    struct Open {
-        x: Option<usize>,
-        key: (usize, u32),
-        read: Vec<u32>,
-    }
-    let mut through: Vec<Open> = Vec::new();
-    for &(x, s) in &extra {
-        if cyclic_dep.contains(&x) {
-            continue;
+    let replay = |reads: &[usize]| {
+        let reruns: Vec<(usize, usize, Handle, Handle)> = (fresh.iter())
+            .map(|&x| {
+                let (side, q, _) = node(x);
+                let spec = spec_at(case, prefix, side, q);
+                let rerun = make(&live.world, side, q, &spec, ran_before(side, q));
+                (side, q, w.replace(side, q, rerun).expect("built"), rerun)
+            })
+            .collect();
+        for &i in reads {
+            let _ = catch_unwind(AssertUnwindSafe(|| live.apply(&case.ops[i])));
         }
-        let (side, q, _) = node(x);
-        let spec = spec_at(case, prefix, side, q);
-        let rerun = make(&live.world, side, q, &spec, true);
-        let out = read_out(w.rt(side), rerun, false);
-        match (&out, s) {
-            (Out::Value(_), _) => {
-                let deps = if s == NodeState::Cyclic {
-                    "no recorded dep is Cyclic, and "
-                } else {
-                    ""
-                };
-                why.insert(
+        for &(side, q, h, _) in &reruns {
+            w.replace(side, q, h);
+        }
+        let mut off: HashMap<usize, String> = HashMap::new();
+        for (&x, &(side, _, _, rerun)) in fresh.iter().zip(&reruns) {
+            let landed = w.rt(side).nodes.get(rerun.erased().slot()).state();
+            if let Some(&(_, s)) = extra.iter().find(|&&(y, s)| y == x && s != landed) {
+                off.insert(
                     x,
-                    format!("node {x} {s:?}: {deps}a re-run returned {out:?}"),
+                    format!("node {x} {s:?}: a replay of the phase's reads landed it {landed:?}"),
                 );
             }
-            (Out::Panic(c), NodeState::Failed) if c == "failed" || c == "cycle" => {
-                if history(x) {
-                    continue;
-                }
-                let mut read = Vec::new();
-                w.rt(side)
-                    .nodes
-                    .get(rerun.erased().slot())
-                    .for_each_dep(|d| read.push(d.0));
-                through.push(Open {
-                    x: Some(x),
-                    key: key(x),
-                    read,
-                });
-            }
-            _ => {}
         }
-    }
-    for (x, &state) in states.iter().enumerate() {
-        let (side, slot) = key(x);
-        let n = w.rt(side).nodes.get(slot);
-        if state != NodeState::Dead
-            && !left.contains(&(side, slot))
-            && n.state() == NodeState::Failed
-        {
-            let mut read = Vec::new();
-            n.for_each_dep(|d| read.push(d.0));
-            through.push(Open {
-                x: None,
-                key: (side, slot),
-                read,
-            });
-        }
-    }
-    loop {
-        let open = through.len();
-        let stands = |side: usize, d: u32, why: &HashMap<usize, String>, through: &[Open]| {
-            matches!(
-                w.rt(side).nodes.get(d).state(),
-                NodeState::Failed | NodeState::Cyclic
-            ) && !through.iter().any(|t| t.key == (side, d))
-                && failed_extra
-                    .get(&(side, d))
-                    .is_none_or(|y| !why.contains_key(y))
-        };
-        let grounded: Vec<bool> = through
-            .iter()
-            .map(|t| t.read.iter().any(|&d| stands(t.key.0, d, &why, &through)))
-            .collect();
-        let mut grounded = grounded.into_iter();
-        through.retain(|_| !grounded.next().unwrap());
-        if through.len() == open {
-            break;
-        }
-    }
-    for x in through.into_iter().filter_map(|t| t.x) {
-        why.insert(
-            x,
-            format!(
-                "node {x} Failed: a re-run fails only through nodes the phase left Failed \
-                 that no order does and that have no other cause"
-            ),
-        );
-    }
+        off
+    };
+    let mut reads = phase_reads.to_vec();
+    let mut replays = vec![replay(&reads)];
+    reads.reverse();
+    replays.push(replay(&reads));
     let mut after: HashMap<usize, Result<Out, String>> = HashMap::new();
     for &(x, _) in &missing {
         if after.contains_key(&x) {
@@ -2176,10 +2206,14 @@ fn consistent(
 
     let mut first = None;
     for set in sets {
-        let mut wrong = Vec::new();
-        for g in got.iter().filter(|g| !set.contains(g)) {
-            wrong.extend(why.get(&g.0).cloned());
-        }
+        let mut wrong = (replays.iter())
+            .map(|off| {
+                (got.iter().filter(|g| !set.contains(g)))
+                    .filter_map(|g| off.get(&g.0).cloned())
+                    .collect::<Vec<_>>()
+            })
+            .min_by_key(Vec::len)
+            .expect("two replays");
         for &(x, s) in set.iter().filter(|s| !got.contains(s)) {
             // A get of a Failed node panics and one of a Cyclic node gets
             // the cycle; a walk that meets a Failed dep panics before the
@@ -3348,8 +3382,8 @@ fn wave6_per_read_rejects_a_cycle_caught_after_the_partner_landed_it() {
 
 /// After 0x934's overlapping ops 7 and 8, a trace whose Failed set holds
 /// node 1, which op 5 computed Clean, or lacks node 10, which every order
-/// leaves Failed, is still rejected: 1's deps are Clean and its re-run
-/// returns a value, and 10 was left Clean, not Dirty or New.
+/// leaves Failed, is still rejected: no read of the phase reaches 1, so
+/// their replay leaves it New, and 10 was left Clean, not Dirty or New.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
@@ -3360,7 +3394,7 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
         (
             1,
             NodeState::Failed,
-            "node 1 Failed: a re-run returned Value(1)",
+            "node 1 Failed: a replay of the phase's reads landed it New",
         ),
         (
             10,
@@ -3626,13 +3660,23 @@ fn overlap_verdict(
     to: NodeState,
     live_too: bool,
 ) -> Option<Result<(), String>> {
+    let patches: Vec<(usize, NodeState)> = xs.iter().map(|&x| (x, to)).collect();
+    overlap_verdict_of(case, &patches, live_too)
+}
+
+/// [`overlap_verdict`] with each node patched to its own state.
+fn overlap_verdict_of(
+    case: &Case,
+    patches: &[(usize, NodeState)],
+    live_too: bool,
+) -> Option<Result<(), String>> {
     let phases = phases(case, 0);
     let serial = Serial::new(case, &phases);
     let verdict = Mutex::new(None);
     quiet(|| {
         run_two_until(case, &phases, None, 0, &|_| {}, &|_, prefix, live| {
             let mut prefix = prefix.clone();
-            for &x in xs {
+            for &(x, to) in patches {
                 for (_, snap) in &mut prefix {
                     snap.0[x] = to;
                 }
@@ -3712,9 +3756,9 @@ fn two_thread_oracle_rejects_a_failed_set_that_justifies_itself() {
 }
 
 /// 0's first run is `Const(1)`, so no order computes 1 and none leaves
-/// anything Failed. With 0 patched Failed, its re-run reads 1, which
-/// computes, reads the patched 0 and lands Failed: a ground the check
-/// itself made, so 0 Failed has no cause and must be rejected.
+/// anything Failed. 0 patched Failed has no cause, though a later run of 0
+/// would read 1, which reads 0: a check that read 0's patched state there
+/// would make its own ground.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn wave6_two_thread_oracle_rejects_a_failed_node_grounded_by_its_own_rerun() {
@@ -3745,6 +3789,207 @@ fn wave6_two_thread_oracle_rejects_a_failed_node_grounded_by_its_own_rerun() {
     }
 }
 
+/// A Fixpoint cycle with no panic converges to 3 in every order, so no
+/// history leaves its members Cyclic, even though each one's recorded dep
+/// is the other, patched Cyclic: the oracle must reject the set.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave7_two_thread_oracle_rejects_a_cyclic_set_that_justifies_itself() {
+    let q = |n| Spec::Query {
+        expr: Expr::Read(n, false),
+        replay: false,
+        bare: false,
+        strategy: Strat::Fixpoint {
+            initial: 3,
+            limit: 8,
+        },
+    };
+    let case = Case {
+        specs: vec![q(1), q(0)],
+        panics: false,
+        cycles: true,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(1)],
+    };
+    match overlap_verdict(&case, &[0, 1], NodeState::Cyclic, true) {
+        Some(Err(_)) => {}
+        v => panic!("a self-justified Cyclic set passed: {v:?}"),
+    }
+}
+
+/// The converging pair of the test above with 0 patched Cyclic and 1
+/// Failed: each stands only on the other's patched state, across the two
+/// kinds.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave7_two_thread_oracle_rejects_a_mixed_set_that_justifies_itself() {
+    let q = |n| Spec::Query {
+        expr: Expr::Read(n, false),
+        replay: false,
+        bare: false,
+        strategy: Strat::Fixpoint {
+            initial: 3,
+            limit: 8,
+        },
+    };
+    let case = Case {
+        specs: vec![q(1), q(0)],
+        panics: false,
+        cycles: true,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(1)],
+    };
+    let patches = [(0, NodeState::Cyclic), (1, NodeState::Failed)];
+    match overlap_verdict_of(&case, &patches, true) {
+        Some(Err(_)) => {}
+        v => panic!("a self-justified mixed set passed: {v:?}"),
+    }
+}
+
+/// A `get` entering the cycle at 0, which has no strategy, panics while the
+/// cycle is discovered and leaves 0 and 1 New in every order: 0 patched
+/// Cyclic is no history's, though a `get` entering at 0 panics as a cycle
+/// would.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave7_two_thread_oracle_rejects_cyclic_on_a_discovery_panic() {
+    let q = |n, strategy| Spec::Query {
+        expr: Expr::Read(n, false),
+        replay: false,
+        bare: false,
+        strategy,
+    };
+    let case = Case {
+        specs: vec![
+            q(1, Strat::None),
+            q(
+                0,
+                Strat::Fixpoint {
+                    initial: 3,
+                    limit: 8,
+                },
+            ),
+        ],
+        panics: false,
+        cycles: true,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(0)],
+    };
+    match overlap_verdict(&case, &[0], NodeState::Cyclic, true) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("0 Cyclic on a discovery panic passed: {v:?}"),
+    }
+}
+
+/// The plain cycle 0 -> 2 -> 3 -> 0, with 1 -> 3, lands nothing but New:
+/// patched, 0 and 1 Cyclic and 2 Failed stand only on each other's states,
+/// 3 included once it reads them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave7_two_thread_oracle_rejects_a_mixed_set_over_a_plain_cycle() {
+    let read = |n| Spec::Query {
+        expr: Expr::Read(n, false),
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![read(2), read(3), read(3), read(0)],
+        panics: false,
+        cycles: true,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(1)],
+    };
+    let patches = [
+        (0, NodeState::Cyclic),
+        (1, NodeState::Cyclic),
+        (2, NodeState::Failed),
+    ];
+    match overlap_verdict_of(&case, &patches, true) {
+        Some(Err(_)) => {}
+        v => panic!("a mixed set over a plain cycle passed: {v:?}"),
+    }
+}
+
+/// 1 and 2 read each other with no strategy, and 0 reads 1 from outside
+/// the cycle: patched Cyclic, 0 is no member of any cycle, whichever of
+/// the pair the phase left Cyclic.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave7_two_thread_oracle_rejects_a_reader_of_a_cycle_left_cyclic() {
+    let read = |n| Spec::Query {
+        expr: Expr::Read(n, false),
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![read(1), read(2), read(1)],
+        panics: false,
+        cycles: true,
+        queries: 3,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(1), Op::TryGet(2)],
+    };
+    let patches = [
+        (0, NodeState::Cyclic),
+        (1, NodeState::Cyclic),
+        (2, NodeState::Cyclic),
+    ];
+    match overlap_verdict_of(&case, &patches, true) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("a reader of a cycle left Cyclic passed: {v:?}"),
+    }
+}
+
+/// Every order leaves the plain cycle 0 -> 1 -> 0 Cyclic. 2's later runs
+/// read 0 by `try_get`, which records the read, then 3, and 3 reads 2:
+/// patched Failed, 2 and 3 have no cause but each other.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave7_two_thread_oracle_rejects_a_failed_pair_over_a_caught_cyclic_read() {
+    let q = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            q(Expr::Read(1, false)),
+            q(Expr::Read(0, false)),
+            q(Expr::FirstRun(
+                Box::new(Expr::Const(1)),
+                Box::new(Expr::Add(
+                    Box::new(Expr::Read(0, true)),
+                    Box::new(Expr::Read(3, false)),
+                )),
+            )),
+            q(Expr::Read(2, false)),
+        ],
+        panics: false,
+        cycles: true,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(0), Op::Get(3)],
+    };
+    let patches = [(2, NodeState::Failed), (3, NodeState::Failed)];
+    match overlap_verdict_of(&case, &patches, true) {
+        Some(Err(_)) => {}
+        v => panic!("a Failed pair over a caught Cyclic read passed: {v:?}"),
+    }
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped
@@ -3758,6 +4003,83 @@ fn deferred_exit_seeds() {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);
         });
+    }
+}
+
+/// A run taken for the value it returned is no own panic: the history
+/// checks share one cache across a phase's nodes, so a run one node's read
+/// took for its value must not answer a later own-panic check of it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_history_takes_a_valued_run_for_its_value_only() {
+    let read = |n| Spec::Query {
+        expr: Expr::Read(n, false),
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![read(2), read(2), Spec::Input(5)],
+        panics: false,
+        cycles: false,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(1)],
+    };
+    let phases = phases(&case, 0);
+    let serial = Serial::new(&case, &phases);
+    let checked = Mutex::new(None);
+    quiet(|| {
+        run_two_until(&case, &phases, None, 0, &|_| {}, &|_, prefix, live| {
+            let mut cx = serial.history("cache", prefix, live).expect("a read phase");
+            let (i, run) = Serial::last_run(&cx, 0).expect("0 ran");
+            assert_eq!(run.value, Some(5));
+            let valued = serial.run_taken(&mut cx, i, &run, Some(5));
+            let own = serial.run_taken(&mut cx, i, &run, None);
+            *checked.lock().unwrap() = Some((valued, own));
+            true
+        });
+    });
+    assert_eq!(checked.into_inner().unwrap(), Some((true, false)));
+}
+
+/// 0 and 1 both first-run `Const(1)` then read 2, which panics on its own
+/// input. The phase runs both for the first time and their gets return 1,
+/// so patched Failed both are untrue of the inputs, and must be judged
+/// alike whichever the check takes first.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave7_two_thread_oracle_judges_symmetric_failed_extras_alike() {
+    let q = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let first_then_read2 = || {
+        q(Expr::FirstRun(
+            Box::new(Expr::Const(1)),
+            Box::new(Expr::Read(2, false)),
+        ))
+    };
+    let case = Case {
+        specs: vec![
+            first_then_read2(),
+            first_then_read2(),
+            q(Expr::PanicIf(Box::new(Expr::Read(3, false)), 0)),
+            Spec::Input(7),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(1)],
+    };
+    match overlap_verdict(&case, &[0, 1], NodeState::Failed, true) {
+        Some(Err(m)) => assert!(m.contains("node 0") && m.contains("node 1"), "{m}"),
+        v => panic!("symmetric Failed extras judged apart: {v:?}"),
     }
 }
 
