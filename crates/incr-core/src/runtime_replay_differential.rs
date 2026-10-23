@@ -4267,3 +4267,40 @@ fn two_thread_oracle_rejects_a_history_grounding_over_an_untaken_read() {
         (false, false)
     );
 }
+
+/// Seed 0x55ac771450d16c5b's op 0, `Get(0)` on a fresh runtime: node 8 lands
+/// Failed with the union of its deps, which keeps 10 from an earlier
+/// cycle-iteration run. Unbounded, 11's walk of Failed 12 memoizes 8 under
+/// 0's frame, so 7's rerun reads 8 directly. At a budget of 1 those entries
+/// are 0's virtual frame's, a doom in the driver's pop of that frame
+/// restarted the driver and dropped them, and 7's retry walked Failed 8 and
+/// computed New 10, which landed Failed too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failed_union_dep_is_not_computed_by_a_retry_walk() {
+    let seed = 0x55ac_7714_50d1_6c5b;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(1);
+    assert!(matches!(case.ops[0], Op::Get(0)));
+    let failed = |t: &Trace| -> (Out, Vec<usize>) {
+        let (out, snap) = &t[0];
+        let set = (snap.0.iter().enumerate())
+            .filter(|(_, s)| **s == NodeState::Failed)
+            .map(|(x, _)| x)
+            .collect();
+        (out.clone(), set)
+    };
+    let want = (
+        Out::Panic("boom 0:12".to_owned()),
+        vec![1, 2, 3, 6, 7, 8, 11, 12],
+    );
+    quiet(|| {
+        assert_eq!(failed(&run::<Local>(&case, None, 0)), want);
+        assert_eq!(failed(&run::<Shared>(&case, None, 0)), want);
+        let bounded = [
+            failed(&run::<Local>(&case, Some(1), 0)),
+            failed(&run::<Shared>(&case, Some(1), 0)),
+        ];
+        assert_eq!(bounded, [want.clone(), want], "budget 1, Local then Shared");
+    });
+}

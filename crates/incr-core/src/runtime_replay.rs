@@ -56,9 +56,9 @@ pub(crate) struct EntrySeen {
 /// How a virtual frame's pop left its context's driver.
 enum VPop {
     Next,
-    /// A doom or a dropped chain pushed entries: the driver picks its next
-    /// entry again.
-    Restart,
+    /// A doom (`true`) or a dropped chain pushed entries: the driver picks
+    /// its next entry again.
+    Restart(bool),
     /// The run of the frame at the popped position ended: no retry
     /// computes it again.
     Finished(u32, Ended),
@@ -1585,7 +1585,23 @@ impl<C: Cells> Runtime<C> {
                         }
                         popped_frames.push((v.clone(), false));
                     }
-                    VPop::Restart => continue 'entries,
+                    VPop::Restart(doomed) => {
+                        // A doom in the pop handed the context the entries
+                        // above it, and the frame it left unfinished keeps its
+                        // own with them, as the unbounded run's frame does.
+                        if doomed
+                            && v.ep.is_none()
+                            && !kept.is_empty()
+                            && self.vframe_unfinished(&v)
+                        {
+                            replay::with(|c| {
+                                if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+                                    x.memo.extend(kept);
+                                }
+                            });
+                        }
+                        continue 'entries;
+                    }
                     VPop::Finished(node, ended) => {
                         popped_frames.push((v.clone(), ended != Ended::Unwound));
                         if let Some(computed) =
@@ -1827,6 +1843,20 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Whether the run `v` stands for has yet to end: its node is still
+    /// New or Dirty, or a claim this thread holds.
+    fn vframe_unfinished(&self, v: &VFrame) -> bool {
+        let node = self.nodes.get(v.node);
+        node.generation() == v.generation
+            && match state::load::<C>(node.state_cell()) {
+                NodeState::New | NodeState::Dirty => true,
+                NodeState::Computing | NodeState::ComputingDirty => {
+                    cycle_state::holds(self.runtime_id, v.node)
+                }
+                _ => false,
+            }
+    }
+
     /// A virtual frame's pop, as its frame's pop would be: nothing if its
     /// node has landed or been replaced since, a lowlink below its position
     /// passed down, and at a lowlink equal to its position with claims
@@ -1836,14 +1866,8 @@ impl<C: Cells> Runtime<C> {
     fn tarjan_pop(&self, id: u64, v: &VFrame) -> VPop {
         let rt = self.runtime_id;
         let failures = cycle_state::failures();
-        let node = self.nodes.get(v.node);
-        if node.generation() != v.generation {
+        if !self.vframe_unfinished(v) {
             return VPop::Next;
-        }
-        match state::load::<C>(node.state_cell()) {
-            NodeState::New | NodeState::Dirty => {}
-            NodeState::Computing | NodeState::ComputingDirty if cycle_state::holds(rt, v.node) => {}
-            _ => return VPop::Next,
         }
         // What the pop runs sits at the frame's position: a doom in it joins
         // the context there.
@@ -1918,7 +1942,7 @@ impl<C: Cells> Runtime<C> {
                     // (`take_low`), so its own is the frame's.
                     low = l;
                 }
-                Ok(None) => return VPop::Restart,
+                Ok(None) => return VPop::Restart(true),
                 Err(payload) => {
                     self.end_deliveries(id, v.node, v.generation, v.cidx);
                     return self.vframe_unwound(id, v, v.node, true, payload, failures);
@@ -2024,7 +2048,7 @@ impl<C: Cells> Runtime<C> {
             }
             self.drop_chain(id, q, false, &mut bag);
             bag.drain(self);
-            return VPop::Restart;
+            return VPop::Restart(false);
         }
         if !cycle_state::holds(rt, v.node) {
             debug_assert!(
@@ -2073,7 +2097,7 @@ impl<C: Cells> Runtime<C> {
     /// entries its doom pushed first.
     fn episode_task_end(&self, root: NodeId, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         let pop = match end {
-            PopEnd::Suspended => VPop::Restart,
+            PopEnd::Suspended => VPop::Restart(true),
             PopEnd::Landed => VPop::Finished(root.0, Ended::Landed),
             PopEnd::Contained => VPop::Finished(root.0, Ended::Contained),
             _ => VPop::Next,
@@ -2154,7 +2178,7 @@ impl<C: Cells> Runtime<C> {
             }
             self.drop_chain(id, q, false, &mut bag);
             bag.drain(self);
-            return VPop::Restart;
+            return VPop::Restart(false);
         }
         if pos == 0 {
             // The read that ran the loop reads the target as a compute's
