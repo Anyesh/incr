@@ -4976,3 +4976,31 @@ fn wave8_local_seed_58b5909_failed_set() {
 fn wave8_shared_seed_58b5909_failed_set() {
     quiet(|| differential::<Shared>(&gen_base(0x58b5909), 0x58b5909));
 }
+
+/// Seed 0x922f4fd7cf058ec: at budget 1, a walk's entry dooms with a
+/// repeat pending entry of its node beneath it. The replayed compute must
+/// not pop that repeat from the stashed walk: unbounded, the repeat
+/// carries a taint that keeps node 8 from running, so op 11 `TryGet(10)`
+/// does not land 8 Failed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn doomed_entrys_replay_keeps_a_repeat_beneath_it() {
+    let seed = 0x0922_f4fd_7cf0_58ec;
+    quiet(|| {
+        differential::<Local>(&gen_case(seed, false, false), seed);
+        differential::<Shared>(&gen_case(seed, false, false), seed);
+    });
+}
+
+/// Seed 0x92ef8cb9, the same rule: op 6 `Get(7)` must leave the unbounded
+/// run's Failed set, on one thread and on two.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn doomed_entrys_replay_keeps_a_repeat_beneath_it_92ef8cb9() {
+    let seed = 0x92ef_8cb9;
+    quiet(|| {
+        differential::<Local>(&gen_case(seed, false, false), seed);
+        differential::<Shared>(&gen_case(seed, false, false), seed);
+        differential_two(&gen_case(seed, false, true), seed);
+    });
+}
