@@ -2485,8 +2485,7 @@ impl<C: Cells> Runtime<C> {
         });
         if kind == Some(UnwindKind::Wound) {
             bag.drain(self);
-            self.close_unwound(id, boundary, kind);
-            resume_unwind(payload);
+            self.unwind_out_of(id, boundary, kind, payload);
         }
         if v.spec || kind == Some(UnwindKind::Discard) {
             let q = replay::with(|c| {
@@ -2518,8 +2517,7 @@ impl<C: Cells> Runtime<C> {
             // unwind leaves its reader.
             self.dep_stack.poison_current_frame(self.runtime_id);
             bag.drain(self);
-            self.close_unwound(id, boundary, kind);
-            resume_unwind(payload);
+            self.unwind_out_of(id, boundary, kind, payload);
         }
         cycle_state::take_unwind_kind();
         let poison = !(continuation && self.episode_member(node));
@@ -2749,13 +2747,11 @@ impl<C: Cells> Runtime<C> {
                 return None;
             }
             if enclosing {
-                self.close_unwound(id, boundary, kind);
-                resume_unwind(payload);
+                self.unwind_out_of(id, boundary, kind, payload);
             }
         }
         if kind == Some(UnwindKind::Wound) || (!entry.spec && level == 0) {
-            self.close_unwound(id, boundary, kind);
-            resume_unwind(payload);
+            self.unwind_out_of(id, boundary, kind, payload);
         }
         if entry.spec {
             // The speculative chain the entry belongs to starts at the
@@ -2776,8 +2772,7 @@ impl<C: Cells> Runtime<C> {
                 q
             });
             if q == 0 {
-                self.close_unwound(id, boundary, kind);
-                resume_unwind(payload);
+                self.unwind_out_of(id, boundary, kind, payload);
             }
             cycle_state::take_unwind_kind();
             let mut bag = Deferred::new();
@@ -3137,6 +3132,21 @@ impl<C: Cells> Runtime<C> {
                 _ => {}
             }
         });
+    }
+
+    /// Closes context `id` and unwinds `payload` on to the read that ran
+    /// its loop, which keeps it for its frame's retry, as a compute's
+    /// unwind out to its reader is kept.
+    fn unwind_out_of(
+        &self,
+        id: u64,
+        boundary: u32,
+        kind: Option<UnwindKind>,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> ! {
+        self.close_unwound(id, boundary, kind);
+        self.note_unwound_read(&*payload, kind);
+        resume_unwind(payload)
     }
 
     /// Closes context `id` on an unwind out of its loop, which also ends
