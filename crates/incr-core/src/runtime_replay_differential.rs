@@ -2772,6 +2772,22 @@ fn two_thread_schedule_seeds() {
     }
 }
 
+/// 0x25e4, over several schedules: a read that panics in a member of a
+/// group lands that member Failed and releases the others Dirty, and a
+/// deferral of their group exits showed the other thread them still
+/// grouped beside the Failed member, so its read expanded the group into
+/// a cycle no order of the two reads has.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_group_exit_seeds() {
+    let case = gen_case(0x25e4, false, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0x25e4);
+        }
+    });
+}
+
 /// Two-thread seeds with a second runtime, each over several schedules.
 /// 0x43c2 and 0x4c08, with no cycles, compare with the unbounded run: a
 /// concurrent `Get2` panicked "dependency cycle" before a doomed frame's
@@ -3610,6 +3626,22 @@ fn wave6_two_thread_oracle_rejects_a_failed_node_grounded_by_its_own_rerun() {
     match overlap_verdict(&case, &[0], NodeState::Failed, true) {
         Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
         v => panic!("node 0 Failed with no panic anywhere passed: {v:?}"),
+    }
+}
+
+/// Shared seeds a deferral of group exits to the read's end got wrong on
+/// one thread, against Local: in 0x68d3 a verify-only visit of a member
+/// whose exit was deferred computed it, and in 0x40d8 a discard dropped
+/// the deferred exits of landings it did not undo.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn deferred_exit_seeds() {
+    for seed in [0x40d8, 0x68d3] {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
     }
 }
 
