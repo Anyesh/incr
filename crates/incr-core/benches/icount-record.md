@@ -1609,3 +1609,32 @@ Gate: every hard gate and every single-thread compute case counts the
 same as the base. The rest move by run-to-run noise in both directions
 (`delete_owned_tree_local` -1,490, `get_contended_shared` +249, the
 collection workloads under 2).
+
+## Member try_get of its own member
+
+- Engine: `w/T8-lead-a18d-adds-failed` (`7c14ca1e`) against its base
+  `spreadsheet-t10` at `ab33f929`, the base in a detached worktree; one
+  run of `icount.sh` at the default N per column, the fanouts again
+  twice. Intel PT line diff of `fanout_local_1000` through `pt-lines.sh`
+  at N = 1. No workloads added.
+- Change: a delivered cycle unwind carrying a closure's own panic stays
+  the cycle's for a member run's `try_get` of a member of its episode, a
+  test on the cold delivery path only.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 198 | 102 / 198 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 219.14 | 155.14 / 219.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 90 | 5 / 90 | 0 |
+| `fanout_local_5` | 21,817.0 | 21,817.0 | 0 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,463,128 / 4,777,611 | 3,463,742 / 4,779,099 | +614 / +1,488 |
+
+- **`fanout_*_1000`:** each build repeats its count run to run, but the
+  PT trace with `getrandom` fixed and ASLR off counts 3,505,756 per
+  iteration on both trees, line for line, and `fanout_*_5` is equal. The
+  two counts are the values `fanout_local_1000` also took on the trees of
+  **Foreign budget fixes**, so the difference is the run's state, not
+  the change.
+
+Gate: every hard gate and every single-thread compute case counts the
+same as the base.
