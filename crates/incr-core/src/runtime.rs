@@ -815,6 +815,10 @@ pub struct Runtime<C: Cells> {
     /// frame's position, whose taint-memo entries the context owns.
     #[cfg(test)]
     pub(crate) virtual_anchor_skips: std::sync::atomic::AtomicU64,
+    /// Reads of a held root that went past `cycle_read` to resume a doomed
+    /// walk, and walks of a held root resumed.
+    #[cfg(test)]
+    pub(crate) resumes_past_held: [std::sync::atomic::AtomicU64; 2],
     /// Every episode start, suspension, resumption and member run, in order.
     #[cfg(test)]
     pub(crate) episodes_seen: std::sync::Mutex<Vec<cycle_impl::EpisodeSeen>>,
@@ -914,6 +918,8 @@ impl<C: Cells> Runtime<C> {
             dirty_reads: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            resumes_past_held: Default::default(),
             #[cfg(test)]
             episodes_seen: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -2034,7 +2040,12 @@ impl<C: Cells> Runtime<C> {
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
         loop {
-            if observed == NodeState::Cyclic || is_computing(observed) {
+            // A read whose walk a doom stopped goes on with it even if its
+            // root is held by now, as the unbounded run's walk goes on past
+            // the entry that left it held.
+            if (observed == NodeState::Cyclic || is_computing(observed))
+                && !(MODE & VIRT != 0 && self.resume_pending(NodeId(slot)))
+            {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
                 if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
                     return read;

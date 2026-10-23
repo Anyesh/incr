@@ -3287,6 +3287,29 @@ impl<C: Cells> Runtime<C> {
         })
     }
 
+    /// Whether this read of `root` has a walk to resume (`take_resume`).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn resume_pending(&self, root: NodeId) -> bool {
+        let rt = self.runtime_id;
+        let Some((_, at)) = self.dep_stack.active_frame(rt) else {
+            return false;
+        };
+        let reading = u64::from(root.0) | (u64::from(self.nodes.get(root.0).generation()) << 32);
+        let pending = replay::with(|c| {
+            c.iter().filter(|x| x.rt == rt).any(|x| {
+                x.resume
+                    .as_ref()
+                    .is_some_and(|r| r.0 == reading && r.1 == at)
+            })
+        });
+        #[cfg(test)]
+        if pending {
+            self.resumes_past_held[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        pending
+    }
+
     /// The walk this read of `root` resumes: a frame's retry making the
     /// read whose walk a doom stopped goes on from where it stopped.
     #[cold]
@@ -3295,12 +3318,20 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let (_, at) = self.dep_stack.active_frame(rt)?;
         let reading = u64::from(root.0) | (u64::from(self.nodes.get(root.0).generation()) << 32);
-        replay::with(|c| {
+        let walk = replay::with(|c| {
             c.iter_mut()
                 .filter(|x| x.rt == rt)
                 .find_map(|x| x.resume.take_if(|r| r.0 == reading && r.1 == at))
                 .map(|r| r.2)
-        })
+        });
+        #[cfg(test)]
+        if walk.is_some() {
+            let observed = state::load::<C>(self.nodes.get(root.0).state_cell());
+            if observed == NodeState::Cyclic || super::is_computing(observed) {
+                self.resumes_past_held[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        walk
     }
 
     /// A walk of `root` whose compute of `entry` came back other than

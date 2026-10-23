@@ -2490,6 +2490,119 @@ fn regressions() {
     }
 }
 
+/// Wave 8a lead 0x56cd8c2, shrunk. 5 reads 6, which `try_get`s 7, a
+/// bare Fixpoint member (initial 3, limit 1) that `try_get`s 8 and reads
+/// it; 8 reads 10, which reads 5 and then 12 or `try_get`s 9, and 9
+/// panics on 8's value 0. After `Get(4)` and a set of 12, `TryGet(10)`
+/// panics "boom 0:9" in both runs, but at budget 1 the bounded run left
+/// 5 to 8 out of the Failed set the unbounded run lands: 8's compute in
+/// 7's walk of 8 was doomed, and 7's retry took the walk's rest but found
+/// 8 held, so the walk never ran 9 and 10 failed outside 7's episode.
+fn seed_56cd8c2_case() -> Case {
+    let query = |expr, strategy, bare| Spec::Query {
+        expr,
+        replay: true,
+        bare,
+        strategy,
+    };
+    let read = |n, try_| Box::new(Expr::Read(n, try_));
+    let zero = || query(Expr::Const(0), Strat::None, false);
+    Case {
+        specs: vec![
+            zero(),
+            zero(),
+            zero(),
+            zero(),
+            query(
+                Expr::Add(
+                    read(7, true),
+                    Box::new(Expr::Add(read(5, true), read(5, false))),
+                ),
+                Strat::None,
+                false,
+            ),
+            query(Expr::Read(6, false), Strat::None, false),
+            query(Expr::Read(7, true), Strat::None, false),
+            query(
+                Expr::Add(read(8, true), read(8, false)),
+                Strat::Fixpoint {
+                    initial: 3,
+                    limit: 1,
+                },
+                true,
+            ),
+            query(Expr::Read(10, false), Strat::None, false),
+            query(Expr::PanicIf(read(8, false), 0), Strat::None, false),
+            query(
+                Expr::If(read(5, false), read(12, false), read(9, true)),
+                Strat::None,
+                false,
+            ),
+            Spec::Input(4),
+            Spec::Input(2),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 11,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(4), Op::Set(12, 1), Op::TryGet(10)],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_56cd8c2_keeps_the_failed_set() {
+    let case = seed_56cd8c2_case();
+    quiet(|| {
+        differential::<Local>(&case, 0x56c_d8c2);
+        differential::<Shared>(&case, 0x56c_d8c2);
+    });
+}
+
+/// 0x56cd8c2's read of held 8 goes past `cycle_read` only to resume its
+/// walk: each skip is a resume `clean_walk` then takes, so no read skips
+/// twice, and the resumed entry 9 still reads held 8 as the unbounded run
+/// does, a cycle unwind and then the in-cycle value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn resuming_past_a_held_root_skips_no_cycle_read() {
+    fn nine<C: Cells>(frames: Option<u32>) -> (Vec<Vec<Read>>, [u64; 2]) {
+        let case = seed_56cd8c2_case();
+        let rts = runtimes::<C>(frames, 0);
+        let live = Live::new(&rts, &case);
+        reset_thread();
+        let mut reads = Vec::new();
+        for op in &case.ops {
+            let (_, ran) = record(|| live.apply(op));
+            reads = ran
+                .into_iter()
+                .filter(|e| e.node == (0, 9))
+                .map(|e| e.reads)
+                .collect();
+        }
+        drop(live);
+        let count = |i: usize| {
+            rts.iter()
+                .map(|rt| rt.resumes_past_held[i].load(SeqCst))
+                .sum()
+        };
+        (reads, [count(0), count(1)])
+    }
+    fn check<C: Cells>() {
+        let (want, none) = nine::<C>(None);
+        assert_eq!(none, [0, 0]);
+        let (got, [skipped, taken]) = nine::<C>(Some(1));
+        assert_eq!(got, want);
+        assert!(skipped > 0);
+        assert_eq!(skipped, taken);
+    }
+    quiet(|| {
+        check::<Local>();
+        check::<Shared>();
+    });
+}
+
 /// 0x1dd5_ac14_6f19_4569 at budget 2: a doomed member run's speculative
 /// R5 run of another member buffered a value read off the doom (a cycle's
 /// `Err`), and the episode's retry read that buffer where the unbounded
