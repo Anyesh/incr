@@ -1482,13 +1482,18 @@ enum FirstRead {
 }
 
 /// A replayable frame at budget 1 that reads 64 leaves runs twice, once
-/// doomed, whatever it first reads. The last leaf sets another runtime's
+/// doomed, whatever it first reads; see [`foreign_reader_is_doomed_with`]. The last leaf sets another runtime's
 /// input when it runs, which is after the first read in the unbounded run
 /// and between the doomed run and its retry here. A retry takes a non-Clean
 /// foreign read's outcome again, so it agrees with the unbounded run; a
 /// Clean foreign read keeps nothing, so the retry reads the node again and
 /// sees the set, the documented limitation.
 fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
+    foreign_reader_is_doomed_with::<A, B>(64);
+}
+
+/// [`foreign_reader_is_doomed_and_retried`] with `n` leaves.
+fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
     for first in [
         FirstRead::Own,
         FirstRead::ForeignClean,
@@ -1500,11 +1505,11 @@ fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
         r1.set_max_frames(1);
         let x = r2.create_input(1000_u64);
         let q = r2.create_query(move |rt| rt.get(x));
-        let mut leaves: Vec<Incr<u64>> = (0..63_u64).map(|i| r1.create_query(move |_| i)).collect();
+        let mut leaves: Vec<Incr<u64>> = (0..n - 1).map(|i| r1.create_query(move |_| i)).collect();
         let r2_ = OtherRt(&*r2);
         leaves.push(r1.create_query(move |_| {
             r2_.set(x, 2000);
-            63
+            n - 1
         }));
         let runs = Arc::new(AtomicU32::new(0));
         let wide = {
@@ -1529,7 +1534,7 @@ fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
             FirstRead::ForeignClean => 2000,
             FirstRead::Own | FirstRead::ForeignComputed => 1000,
         };
-        assert_eq!(r1.get(wide), base + (0..64).sum::<u64>(), "{first:?}");
+        assert_eq!(r1.get(wide), base + (0..n).sum::<u64>(), "{first:?}");
         assert_eq!(runs.load(Ordering::Relaxed), 2, "{first:?}");
         assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
     }
@@ -1677,21 +1682,40 @@ fn quiet_uncopyable() {
 /// `b_frames` is B's frame budget, if not the default: the reader is A's
 /// frame, so A's budget bounds it whatever B's is.
 fn foreign_panicking_chain_stays_within_the_stack<A: Cells, B: Cells>(b_frames: Option<u32>) {
-    quiet_uncopyable();
     let n = crate::test_size::test_size(100_000);
-    let got = std::thread::spawn(move || {
+    assert_eq!(
+        foreign_panicking_chain::<A, B>(n, None, b_frames).0,
+        n as i64
+    );
+}
+
+/// The chain of [`foreign_panicking_chain_stays_within_the_stack`], `n`
+/// levels with the given frame budgets, giving A's result and how many
+/// times each level ran, the top level first.
+fn foreign_panicking_chain<A: Cells, B: Cells>(
+    n: usize,
+    a_frames: Option<u32>,
+    b_frames: Option<u32>,
+) -> (i64, Vec<u32>) {
+    quiet_uncopyable();
+    std::thread::spawn(move || {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_placeholder(0_i64);
+        if let Some(frames) = a_frames {
+            r1.set_max_frames(frames);
+        }
         if let Some(frames) = b_frames {
             r2.set_max_frames(frames);
         }
+        let runs: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
         let mut below: Option<Incr<i64>> = None;
-        for _ in 0..n {
+        for level in (0..n).rev() {
             let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
-            let (r2, next) = (OtherRt(&*r2), below);
+            let (r2, next, runs) = (OtherRt(&*r2), below, runs.clone());
             below = Some(r1.create_query_with(
                 move |rt| {
+                    runs[level].fetch_add(1, Ordering::Relaxed);
                     let caught = quiet(|| r2.get(bq)).is_err();
                     i64::from(caught) + next.map_or(0, |b| rt.get(b))
                 },
@@ -1701,11 +1725,14 @@ fn foreign_panicking_chain_stays_within_the_stack<A: Cells, B: Cells>(b_frames: 
                 },
             ));
         }
-        r1.get(below.unwrap())
+        let got = r1.get(below.unwrap());
+        (
+            got,
+            runs.iter().map(|r| r.load(Ordering::Relaxed)).collect(),
+        )
     })
     .join()
-    .unwrap();
-    assert_eq!(got, n as i64);
+    .unwrap()
 }
 
 mod foreign_panic_chain {
@@ -1739,5 +1766,42 @@ mod foreign_panic_chain {
     #[cfg_attr(miri, ignore)]
     fn local_shared_with_b_unbudgeted() {
         super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(Some(u32::MAX));
+    }
+}
+
+/// Small foreign-read cases that run under Miri: a non-Clean foreign read
+/// kept for a doomed frame's retry, the Clean read's documented gap, and
+/// an uncopyable foreign panic holding its reader within the budget only.
+mod foreign_miri {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    fn doomed_reader_local_shared() {
+        super::foreign_reader_is_doomed_with::<Local, Shared>(4);
+    }
+
+    #[test]
+    fn doomed_reader_shared_local() {
+        super::foreign_reader_is_doomed_with::<Shared, Local>(4);
+    }
+
+    #[test]
+    fn panic_chain_past_the_budget_local_shared() {
+        panic_chain_past_the_budget::<Local, Shared>();
+    }
+
+    #[test]
+    fn panic_chain_past_the_budget_shared_shared() {
+        panic_chain_past_the_budget::<Shared, Shared>();
+    }
+
+    /// At A's budget of 4, the three levels within it took an uncopyable
+    /// foreign payload and are held, so they run once; levels past it are
+    /// doomed and retried.
+    fn panic_chain_past_the_budget<A: crate::cells::Cells, B: crate::cells::Cells>() {
+        let (got, runs) = super::foreign_panicking_chain::<A, B>(12, Some(4), None);
+        assert_eq!(got, 12);
+        assert_eq!(runs[..3], [1, 1, 1]);
+        assert!(runs[3..].contains(&2), "{runs:?}");
     }
 }
