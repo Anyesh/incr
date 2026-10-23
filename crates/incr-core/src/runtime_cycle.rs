@@ -760,6 +760,11 @@ impl<C: Cells> Runtime<C> {
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
         let deps = self.dep_stack.pop_frame();
         let word = value_code::thread_word();
+        // A member run starts after its episode root's pop, so nothing
+        // below it drops what it kept.
+        if word & value_code::KEPT_BIT != 0 {
+            replay::drop_kept_from(self.runtime_id, cidx);
+        }
         if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
             && self.after_pop(word, result.is_ok())
         {

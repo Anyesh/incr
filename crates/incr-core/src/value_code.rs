@@ -38,10 +38,14 @@ pub(crate) const REPLAY_BIT: u64 = 1 << 60;
 /// that panic retires them.
 pub(crate) const NOTES_BIT: u64 = 1 << 59;
 
+/// Set while this thread keeps reads for a retry (`replay::keep_read`), so
+/// that a frame pop drops the ones kept for frames it ends.
+pub(crate) const KEPT_BIT: u64 = 1 << 58;
+
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
 /// so a live memo, unwind kind, replay context or note never trips the
 /// contract panic.
-pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT | NOTES_BIT);
+pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT | NOTES_BIT | KEPT_BIT);
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
@@ -84,6 +88,16 @@ pub(crate) fn set_notes_bit(held: bool) {
             w.get() | NOTES_BIT
         } else {
             w.get() & !NOTES_BIT
+        })
+    });
+}
+
+pub(crate) fn set_kept_bit(kept: bool) {
+    THREAD_WORD.with(|w| {
+        w.set(if kept {
+            w.get() | KEPT_BIT
+        } else {
+            w.get() & !KEPT_BIT
         })
     });
 }
