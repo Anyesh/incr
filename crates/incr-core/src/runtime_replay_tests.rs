@@ -617,8 +617,7 @@ fn racing_frame_and_byte_setters_end_as_a_serial_order() {
         for round in 1..=rounds {
             rt.set_budget(|| {
                 rt.frames_set.store(false, SeqCst);
-                rt.max_frames.store(DEFAULT_MAX_FRAMES, SeqCst);
-                rt.max_stack_bytes.store(0, SeqCst);
+                (DEFAULT_MAX_FRAMES, 0)
             });
             go.store(round, SeqCst);
             rt.set_max_frames(u32::MAX);

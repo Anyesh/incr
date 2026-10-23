@@ -1329,8 +1329,9 @@ impl<C: Cells> Runtime<C> {
     /// this runtime's frames on the thread number `n` or more (every
     /// runtime's, under `Shared`) replays instead of nesting, if the read's
     /// type has a placeholder. Replay changes where computes run, never a
-    /// result. A budget changed while a compute runs applies to reads made
-    /// after the change.
+    /// result. A compute running on a thread when that thread first meets
+    /// a budget change is never replayed for it, since its reads before
+    /// were made under the budget before.
     ///
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
@@ -1338,8 +1339,11 @@ impl<C: Cells> Runtime<C> {
         self.set_budget(|| {
             self.frames_set
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.max_frames
-                .store(n, std::sync::atomic::Ordering::Relaxed);
+            (
+                n,
+                self.max_stack_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
         });
     }
 
@@ -1350,16 +1354,15 @@ impl<C: Cells> Runtime<C> {
     /// the frame count alone does not bound the stack. Like
     /// [`Self::set_max_frames`], it wins over `INCR_MAX_DEPTH`: a runtime
     /// that has not set its frame budget gets [`DEFAULT_MAX_FRAMES`]. A
-    /// budget changed while a compute runs applies to reads made after the
-    /// change.
+    /// change spares running computes as [`Self::set_max_frames`]'s does.
     pub fn set_max_stack_bytes(&self, n: usize) {
         self.set_budget(|| {
-            if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
-                self.max_frames
-                    .store(DEFAULT_MAX_FRAMES, std::sync::atomic::Ordering::Relaxed);
-            }
-            self.max_stack_bytes
-                .store(n, std::sync::atomic::Ordering::Relaxed);
+            let frames = if self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
+                self.max_frames.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                DEFAULT_MAX_FRAMES
+            };
+            (frames, n)
         });
     }
 

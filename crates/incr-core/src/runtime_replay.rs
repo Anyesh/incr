@@ -113,16 +113,6 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Counts budget changes across runtimes. A foreign hold notes the count
-/// when taken, since the runtime that takes it can't see the reader's
-/// budget, and the reader judges it held if its budget changed since.
-static BUDGET_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// `BUDGET_CLOCK` now, for a foreign hold taken now.
-pub(super) fn budget_clock() -> u64 {
-    BUDGET_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
-}
-
 /// A runtime's place in `UNBUDGETED`, which its drop gives up, and the
 /// `BUDGET_CLOCK` count its budget last changed at.
 pub(crate) struct BudgetEntry {
@@ -183,17 +173,49 @@ pub(super) fn unbudgeted(id: RuntimeId) -> bool {
 }
 
 impl<C: Cells> Runtime<C> {
-    /// Runs `store`, a budget change, and keeps `UNBUDGETED` in step with
-    /// it, both under the list's lock.
-    pub(super) fn set_budget(&self, store: impl FnOnce()) {
+    /// Sets the frame and byte budgets `budget` gives, and keeps
+    /// `UNBUDGETED` in step with them, both under the list's lock. A change
+    /// takes a `BUDGET_CLOCK` count, stored before the budgets so a read
+    /// that sees them sees it (`hold_running_frames`).
+    pub(super) fn set_budget(&self, budget: impl FnOnce() -> (u32, usize)) {
+        use std::sync::atomic::Ordering::Relaxed;
         self.budget_entry.note(|| {
-            let now = BUDGET_CLOCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            self.budget_entry
-                .changed
-                .store(now, std::sync::atomic::Ordering::SeqCst);
-            store();
+            let (frames, bytes) = budget();
+            if (frames, bytes)
+                != (
+                    self.max_frames.load(Relaxed),
+                    self.max_stack_bytes.load(Relaxed),
+                )
+            {
+                self.budget_entry
+                    .changed
+                    .store(cycle_state::tick_budget_clock(), Relaxed);
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                self.max_frames.store(frames, Relaxed);
+                self.max_stack_bytes.store(bytes, Relaxed);
+            }
             !self.budgeted()
         });
+    }
+
+    /// Raises `NO_DOOM` on this runtime's frames on this thread when it
+    /// first meets a budget change made since its outermost entry began,
+    /// and returns whether it did: those frames may have read under the
+    /// budget before, which kept nothing a retry under this one needs.
+    #[cold]
+    #[inline(never)]
+    fn hold_running_frames(&self) -> bool {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let changed = self
+            .budget_entry
+            .changed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !cycle_state::meet_budget_change(self.runtime_id, changed) {
+            return false;
+        }
+        self.dep_stack
+            .raise_on_undoomed(self.runtime_id, cycle::NO_DOOM);
+        true
     }
 
     /// Whether node `slot`'s compute may be doomed.
@@ -215,8 +237,8 @@ impl<C: Cells> Runtime<C> {
     /// doomed: it is `NO_DOOM`, or it took a foreign read's hold within this
     /// runtime's budget where it read, past which the stack bound wins, as
     /// for a ticket payload, and its retry reads the other runtime again.
-    /// A hold taken before this runtime's budget last changed was taken
-    /// under a budget no longer known, so it holds.
+    /// A frame running when this thread meets a budget change is
+    /// `NO_DOOM` from then on.
     fn undoomable(&self, ctl: &ComputeCtl, depth: u32) -> bool {
         let flags = ctl.flags.get();
         flags & cycle::NO_DOOM != 0
@@ -224,13 +246,8 @@ impl<C: Cells> Runtime<C> {
                 && self
                     .dep_stack
                     .hold_position(ctl)
-                    .is_some_and(|(at, clock)| {
-                        self.budget_entry
-                            .changed
-                            .load(std::sync::atomic::Ordering::SeqCst)
-                            > clock
-                            || !self.over_budget_at(depth, at)
-                    }))
+                    .is_some_and(|at| !self.over_budget_at(depth, at)))
+            || (self.hold_running_frames() && ctl.has(cycle::NO_DOOM))
     }
 
     /// Whether a read from a frame `depth` frames deep is at or past a
@@ -1210,15 +1227,9 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the reading frame is on the stack, so its control block
         // is live.
         let flags = unsafe { &*ctl };
-        // A doomed frame's reads are not the unbounded run's.
-        if reader == self.runtime_id || flags.has(cycle::DOOMED) {
-            return self.read_unframed(handle, observed, kind, word);
-        }
-        let clock = budget_clock();
-        // An unbudgeted runtime's frame is retried only under a budget set
-        // later, which its hold keeps from dooming it.
-        if unbudgeted(reader) {
-            self.dep_stack.hold_foreign_reader(clock);
+        // A doomed frame's reads are not the unbounded run's, and an
+        // unbudgeted runtime's frame is never retried.
+        if reader == self.runtime_id || flags.has(cycle::DOOMED) || unbudgeted(reader) {
             return self.read_unframed(handle, observed, kind, word);
         }
         let rt = self.runtime_id;
@@ -1263,7 +1274,7 @@ impl<C: Cells> Runtime<C> {
             Err(payload) => {
                 let copy = replay::copy_payload(&**payload);
                 if copy.is_none() {
-                    self.dep_stack.hold_foreign_reader(clock);
+                    self.dep_stack.hold_foreign_reader();
                 }
                 copy.map(|payload| Delivered::Unwind {
                     cycle: false,
