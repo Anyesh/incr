@@ -426,9 +426,9 @@ fn the_unbudgeted_list_follows_the_budgets() {
     assert!(!super::replay_impl::unbudgeted(id));
 }
 
-/// Lists `rt` as unbudgeted while giving it a byte budget: another thread
-/// sets the byte budget after `set_max_frames(u32::MAX)` decided the
-/// runtime has no budget and before it takes the list's lock.
+/// Races `set_max_frames(u32::MAX)` with a byte budget: another thread
+/// sets the byte budget after `set_max_frames` is called and before it
+/// takes the list's lock.
 pub(super) fn race_budget_setters(rt: &Runtime<Shared>, bytes: usize) {
     let at = std::ptr::from_ref(rt) as usize;
     super::replay_impl::NOTE_DECIDED.with(|h| {
@@ -615,10 +615,11 @@ fn racing_frame_and_byte_setters_end_as_a_serial_order() {
             }
         });
         for round in 1..=rounds {
-            rt.frames_set.store(false, SeqCst);
-            rt.max_frames.store(DEFAULT_MAX_FRAMES, SeqCst);
-            rt.max_stack_bytes.store(0, SeqCst);
-            rt.note_budget();
+            rt.set_budget(|| {
+                rt.frames_set.store(false, SeqCst);
+                rt.max_frames.store(DEFAULT_MAX_FRAMES, SeqCst);
+                rt.max_stack_bytes.store(0, SeqCst);
+            });
             go.store(round, SeqCst);
             rt.set_max_frames(u32::MAX);
             while done.load(SeqCst) != round {

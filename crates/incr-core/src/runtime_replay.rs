@@ -107,8 +107,8 @@ static UNBUDGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 
 #[cfg(test)]
 thread_local! {
-    /// Run once by this thread's next `BudgetEntry::note`, after its caller
-    /// decided and before it locks `UNBUDGETED`.
+    /// Run once by this thread's next `BudgetEntry::note`, before it locks
+    /// `UNBUDGETED`.
     pub(crate) static NOTE_DECIDED: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::Cell::new(None) };
 }
@@ -126,8 +126,8 @@ impl BudgetEntry {
     }
 
     /// Lists the runtime as unbudgeted, or takes it off the list, as
-    /// `unbudgeted` says under the list's lock: the lock orders racing
-    /// setters, so the last to take it sees every budget stored before.
+    /// `unbudgeted` says under the list's lock: setters store their budget
+    /// inside `unbudgeted`, so the lock orders racing setters whole.
     fn note(&self, unbudgeted: impl FnOnce() -> bool) {
         #[cfg(test)]
         if let Some(hook) = NOTE_DECIDED.with(std::cell::Cell::take) {
@@ -166,9 +166,13 @@ pub(super) fn unbudgeted(id: RuntimeId) -> bool {
 }
 
 impl<C: Cells> Runtime<C> {
-    /// Keeps `UNBUDGETED` in step with this runtime's budgets.
-    pub(super) fn note_budget(&self) {
-        self.budget_entry.note(|| !self.budgeted());
+    /// Runs `store`, a budget change, and keeps `UNBUDGETED` in step with
+    /// it, both under the list's lock.
+    pub(super) fn set_budget(&self, store: impl FnOnce()) {
+        self.budget_entry.note(|| {
+            store();
+            !self.budgeted()
+        });
     }
 
     /// Whether node `slot`'s compute may be doomed.

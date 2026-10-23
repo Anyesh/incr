@@ -1335,11 +1335,12 @@ impl<C: Cells> Runtime<C> {
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
         assert!(n > 0, "incr-core: the frame budget is at least 1");
-        self.frames_set
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.max_frames
-            .store(n, std::sync::atomic::Ordering::Relaxed);
-        self.note_budget();
+        self.set_budget(|| {
+            self.frames_set
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.max_frames
+                .store(n, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 
     /// Sets a byte budget beside the frame budget, off when `n` is 0 (the
@@ -1352,13 +1353,14 @@ impl<C: Cells> Runtime<C> {
     /// budget changed while a compute runs applies to reads made after the
     /// change.
     pub fn set_max_stack_bytes(&self, n: usize) {
-        if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
-            self.max_frames
-                .store(DEFAULT_MAX_FRAMES, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.max_stack_bytes
-            .store(n, std::sync::atomic::Ordering::Relaxed);
-        self.note_budget();
+        self.set_budget(|| {
+            if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
+                self.max_frames
+                    .store(DEFAULT_MAX_FRAMES, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.max_stack_bytes
+                .store(n, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 
     /// A clone of `T`'s placeholder, if it has one.
