@@ -904,8 +904,9 @@ impl<C: Cells> Runtime<C> {
 
     /// A read made in a doomed frame: the placeholder, after pushing the
     /// node as an entry above the frame unless this thread computes,
-    /// holds or virtually computes it. `None` for a type with no
-    /// placeholder, which the read computes natively.
+    /// holds or virtually computes it, or the frame was blocked reading
+    /// it. `None` for a type with no placeholder, which the read computes
+    /// natively.
     fn read_doomed<T: Value>(&self, handle: Incr<T>, f: ActiveRead) -> Option<T> {
         let placeholder = self.placeholder::<T>()?;
         let rt = self.runtime_id;
@@ -932,7 +933,15 @@ impl<C: Cells> Runtime<C> {
             if x.drop_point.is_some() {
                 return;
             }
-            let spec = x.vstack[(f.cidx - x.boundary) as usize].spec;
+            let frame = &x.vstack[(f.cidx - x.boundary) as usize];
+            // The retry makes the read the frame was blocked in before this
+            // one, and that read settles the node as the unbounded run's
+            // did: an entry landing it first would leave a stashed walk
+            // unresumed.
+            if frame.reading == u64::from(slot) | (u64::from(handle.generation()) << 32) {
+                return;
+            }
+            let spec = frame.spec;
             x.push_entry(
                 f.cidx + 1 - x.boundary,
                 Entry {
