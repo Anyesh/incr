@@ -864,15 +864,40 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
     }
 }
 
-/// Node `i`'s query or input on `side`, its closure counting as having
-/// run already when `rerun`, as a re-run of a node that ran does.
-fn make<C: Cells>(
-    world: &Arc<World<C>>,
-    side: usize,
-    i: usize,
-    spec: &Spec,
-    rerun: bool,
-) -> Handle {
+/// How a node's closure ran before the node is made.
+enum Ran {
+    Never,
+    /// Its last run was not its first, so any run of it is a rerun.
+    Rerun,
+    /// Its last run was its first and landed Clean over these reads. An
+    /// order verifies them and keeps that run's value, so the made
+    /// closure's first run takes `FirstRun`'s first branch again unless one
+    /// of them now reads differently.
+    First(Vec<Read>),
+}
+
+/// Whether each of `reads` gets the same kind of outcome, and the same
+/// value, read again in order.
+fn reads_alike<C: Cells>(world: &World<C>, reads: &[Read]) -> bool {
+    reads.iter().all(|&(side, d, try_, ref out)| {
+        let (rt, h) = (world.rt(side), world.handle(side, d));
+        let again = catch_unwind(AssertUnwindSafe(|| {
+            if try_ {
+                try_value(rt, h).ok()
+            } else {
+                Some(read_value(rt, h, false))
+            }
+        }));
+        match (out, again) {
+            (ReadOut::Value(v), Ok(Some(w))) => *v == w,
+            (ReadOut::Cycle(_), Ok(None)) | (ReadOut::Unwound, Err(_)) => true,
+            _ => false,
+        }
+    })
+}
+
+/// Node `i`'s query or input on `side`, its closure having run as `ran`.
+fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran: Ran) -> Handle {
     let rt = world.rt(side);
     match spec {
         Spec::Input(v) => Handle::Plain(rt.create_input(*v)),
@@ -888,14 +913,23 @@ fn make<C: Cells>(
                 Replay::Native
             };
             let (expr, world) = (expr.clone(), world.clone());
-            let runs = AtomicU32::new(u32::from(rerun));
+            let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
+            let kept = match ran {
+                Ran::First(reads) => Some(reads),
+                Ran::Never | Ran::Rerun => None,
+            };
             let compute = move |rt: &Runtime<C>| {
+                let first = match runs.fetch_add(1, Relaxed) {
+                    0 => true,
+                    1 => kept.as_ref().is_some_and(|r| reads_alike(&world, r)),
+                    _ => false,
+                };
                 let node = Node {
                     rt,
                     world: &world,
                     side,
                     at: i,
-                    first: runs.fetch_add(1, Relaxed) == 0,
+                    first,
                 };
                 let running = Running::start((side, i), node.first);
                 let v = eval(&node, &expr);
@@ -1017,7 +1051,7 @@ impl<C: Cells> Live<C> {
         });
         for (side, specs) in [&case.specs, &case.specs2].into_iter().enumerate() {
             for (i, spec) in specs.iter().enumerate().rev() {
-                let h = make(&world, side, i, spec, false);
+                let h = make(&world, side, i, spec, Ran::Never);
                 world.replace(side, i, h);
             }
         }
@@ -1045,7 +1079,7 @@ impl<C: Cells> Live<C> {
                 if w.rt(0).is_alive(old.erased()) {
                     return Out::Done;
                 }
-                let new = make(&self.world, 0, *i, spec, false);
+                let new = make(&self.world, 0, *i, spec, Ran::Never);
                 w.replace(0, *i, new);
                 self.retired.lock().unwrap().push(old);
                 Out::Recreated(new.erased().slot() == old.erased().slot())
@@ -2149,27 +2183,36 @@ fn consistent(
                 && !(clean(states[x]) && start.is_some_and(|st| clean(st[x])))
         })
         .collect();
-    // A fresh query's closure runs as a first run, `FirstRun`'s, unless the
-    // node's closure ran before the phase since its last recreate.
+    // A fresh query's closure runs as it last ran before the phase, since
+    // its last recreate (`Ran`). A first run is kept only if it landed
+    // Clean: a Failed or poisoned landing leaves nothing an order verifies.
     let first_op = phase_reads.first().copied().unwrap_or(0);
     let evals = live.evals.lock().unwrap().clone();
-    let ran_before = |side: usize, q: usize| {
+    let ran = |x: usize| {
+        let (side, q, _) = node(x);
         let made = (0..first_op).rev().find(|&i| {
             side == 0
                 && matches!((&case.ops[i], &prefix[i].0), (Op::Recreate(r, _), Out::Recreated(_)) if *r == q)
         });
-        (made.map_or(0, |i| i + 1)..first_op).any(|i| {
-            evals
-                .get(&i)
-                .is_some_and(|es| es.iter().any(|e| e.node == (side, q)))
-        })
+        let last = (made.map_or(0, |i| i + 1)..first_op)
+            .filter_map(|i| evals.get(&i).map(|es| (i, es)))
+            .flat_map(|(i, es)| es.iter().map(move |e| (i, e)))
+            .filter(|(_, e)| e.node == (side, q))
+            .max_by_key(|(_, e)| e.end);
+        match last {
+            None => Ran::Never,
+            Some((i, l)) if l.first && prefix[i].1 .0[x] == NodeState::Clean => {
+                Ran::First(l.reads.clone())
+            }
+            Some(_) => Ran::Rerun,
+        }
     };
     let replay = |reads: &[usize]| {
         let reruns: Vec<(usize, usize, Handle, Handle)> = (fresh.iter())
             .map(|&x| {
                 let (side, q, _) = node(x);
                 let spec = spec_at(case, prefix, side, q);
-                let rerun = make(&live.world, side, q, &spec, ran_before(side, q));
+                let rerun = make(&live.world, side, q, &spec, ran(x));
                 (side, q, w.replace(side, q, rerun).expect("built"), rerun)
             })
             .collect();
@@ -4434,6 +4477,144 @@ fn wave7_two_thread_oracle_judges_symmetric_failed_extras_alike() {
         Some(Err(m)) => assert!(m.contains("node 0") && m.contains("node 1"), "{m}"),
         v => panic!("symmetric Failed extras judged apart: {v:?}"),
     }
+}
+
+/// 0's first run returns 1, and any later run of its closure panics. Op 0
+/// runs it, and the read phase's `get(0)` reads it Clean in every order,
+/// so no order runs the closure again and none leaves 0 Failed. A replay
+/// that recomputes 0 as a fresh query runs the branch no order runs, so
+/// it must not make 0 patched Failed true of the phase's inputs.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_two_thread_oracle_rejects_a_failed_node_only_a_rerun_of_it_clean_gives() {
+    let case = Case {
+        specs: vec![
+            Spec::Query {
+                expr: Expr::FirstRun(
+                    Box::new(Expr::Const(1)),
+                    Box::new(Expr::PanicIf(Box::new(Expr::Const(0)), 0)),
+                ),
+                replay: false,
+                bare: false,
+                strategy: Strat::None,
+            },
+            Spec::Input(7),
+            Spec::Input(7),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 3,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(2, 5), Op::Get(0), Op::Get(1)],
+    };
+    match patched_zero_failed(&case) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("0 Failed, which no order runs its closure for, passed: {v:?}"),
+    }
+}
+
+/// As above, but 0 reads 3, which always gives 1, so the set of 2 leaves
+/// 0 Dirty: every order verifies 0 over 3's unchanged value and keeps its
+/// first run's 1, and none runs the closure again.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_two_thread_oracle_rejects_a_failed_node_an_order_verifies_clean() {
+    let query = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            query(Expr::FirstRun(
+                Box::new(Expr::Read(3, false)),
+                Box::new(Expr::PanicIf(Box::new(Expr::Const(0)), 0)),
+            )),
+            Spec::Input(7),
+            Spec::Input(7),
+            query(Expr::If(
+                Box::new(Expr::Read(2, false)),
+                Box::new(Expr::Const(1)),
+                Box::new(Expr::Const(1)),
+            )),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(2, 5), Op::Get(0), Op::Get(1)],
+    };
+    match patched_zero_failed(&case) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("0 Failed, which every order verifies Clean, passed: {v:?}"),
+    }
+}
+
+/// 0's first run panics over 3's 7, which lands it Failed with nothing an
+/// order verifies, so after the set of 2 every order reruns 0 to 5 though
+/// 3 still gives 7. A first run counts as kept only if it landed Clean.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_two_thread_oracle_rejects_a_failed_node_from_a_first_run_no_order_keeps() {
+    let query = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            query(Expr::FirstRun(
+                Box::new(Expr::PanicIf(Box::new(Expr::Read(3, false)), 0)),
+                Box::new(Expr::Const(5)),
+            )),
+            Spec::Input(7),
+            Spec::Input(7),
+            query(Expr::If(
+                Box::new(Expr::Read(2, false)),
+                Box::new(Expr::Const(7)),
+                Box::new(Expr::Const(7)),
+            )),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(2, 5), Op::Get(0), Op::Get(1)],
+    };
+    match patched_zero_failed(&case) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("0 Failed, which every order reruns to 5, passed: {v:?}"),
+    }
+}
+
+/// The two-thread oracle's verdict on `case`'s read phase of ops 2 and 3
+/// with node 0 patched Failed after it.
+fn patched_zero_failed(case: &Case) -> Option<Result<(), String>> {
+    let phases = phases(case, 0);
+    let serial = Serial::new(case, &phases);
+    let verdict = Mutex::new(None);
+    quiet(|| {
+        run_two_until(case, &phases, None, 0, &|_| {}, &|_, prefix, live| {
+            let mut prefix = prefix.clone();
+            for (_, snap) in &mut prefix[2..] {
+                snap.0[0] = NodeState::Failed;
+            }
+            let (rt, h) = (live.world.rt(0), live.world.handle(0, 0));
+            rt.nodes
+                .get(h.erased().slot())
+                .set_state(NodeState::Failed as u8);
+            let v = serial.at_overlap("patched", &prefix, live);
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+    });
+    verdict.into_inner().unwrap()
 }
 
 /// Seeds the scans found failing at a frame budget, each a replay fault
