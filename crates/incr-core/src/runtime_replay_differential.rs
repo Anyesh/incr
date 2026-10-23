@@ -2901,6 +2901,41 @@ fn two_thread_swapped_order_seeds() {
     }
 }
 
+/// The Failed set after op `i` of a trace, with the op's outcome.
+fn failed_after(t: &Trace, i: usize) -> (Out, Vec<usize>) {
+    let (out, snap) = &t[i];
+    let set = (snap.0.iter().enumerate())
+        .filter(|(_, s)| **s == NodeState::Failed)
+        .map(|(x, _)| x)
+        .collect();
+    (out.clone(), set)
+}
+
+/// Seed 0xe486019a1c945cce's op 1, `Get(4)`: member 8 of the cycle
+/// {4, 5, 7, 8} reads 9, whose walk computes 21, and 21's own code panics
+/// in the episode of {9, 21, 22, 23}, which marks it failed; 9 then passes
+/// that panic to 8. Unbounded, the mark falls inside 8's member run, so 8
+/// lands New. At a budget of 1 the driver runs that episode between doomed
+/// runs of 8, and the run finishing 8's frame counted marks from its own
+/// start only, so 8 landed Failed as well.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
+    let seed = 0xe486_019a_1c94_5cce;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        let mut fresh = case.clone();
+        fresh.ops = vec![Op::Get(4)];
+        let want = (Out::Panic("boom 0:21".to_owned()), vec![9, 21]);
+        assert_eq!(failed_after(&run::<Local>(&fresh, None, 0), 0), want);
+        assert!(matches!(case.ops[1], Op::Get(4)));
+        assert_eq!(failed_after(&run::<Local>(&case, Some(1), 0), 1), want);
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+        differential_two(&gen_case(seed, false, true), seed);
+    });
+}
+
 /// Waits for a forced schedule's `done`, failing the test if it stalls.
 fn until(done: impl Fn() -> bool) {
     let start = std::time::Instant::now();
