@@ -3437,6 +3437,55 @@ fn caught_read_of_a_virtual_frame_node_is_kept_for_the_retry() {
     });
 }
 
+/// Seed 0x69fd501b4c8fbf5c, shrunk: `Get(7)` lands the cycle
+/// 18 -> 19 -> 3 -> 17 -> 18, rooted at the Fallback 18. `Set(22, 1)` turns
+/// 17's read of 18 into a read of 19, so the cycle left is {19, 3, 17},
+/// which 17's Fixpoint converges without 18. `Get(6)`'s `try_get(7)` walks
+/// 18 as an entry, whose group verify contains the cycle it finds. At
+/// budget 1 that verify's episode is doomed, and the retry of 18 has to
+/// stay a walk entry that contains it too, or the cycle reaches 7's read.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn try_get_of_a_former_cycle_member_reads_its_value() {
+    let query = |expr, replay, strategy| Spec::Query {
+        expr,
+        replay,
+        bare: false,
+        strategy,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let mut specs: Vec<Spec> = (0..22)
+        .map(|_| query(Expr::Const(1), false, Strat::None))
+        .collect();
+    specs[3] = query(Expr::Read(17, false), false, Strat::None);
+    specs[6] = query(Expr::Read(7, true), false, Strat::None);
+    specs[7] = query(Expr::Read(18, false), false, Strat::None);
+    specs[17] = query(
+        Expr::If(read(22), read(18), read(19)),
+        false,
+        Strat::Fixpoint {
+            initial: 3,
+            limit: 2,
+        },
+    );
+    specs[18] = query(Expr::Read(19, false), true, Strat::Fallback(0));
+    specs[19] = query(Expr::Read(3, false), false, Strat::None);
+    specs.extend([4, 4, 3, 4].map(Spec::Input));
+    let case = Case {
+        specs,
+        panics: false,
+        cycles: true,
+        queries: 22,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(7), Op::Set(22, 1), Op::Get(6)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x69fd_501b_4c8f_bf5c);
+        differential::<Shared>(&case, 0x69fd_501b_4c8f_bf5c);
+    });
+}
+
 /// A one-phase case's snapshots with nodes `xs` patched to `to`, judged
 /// by `at_overlap`; `live_too` also sets the live nodes' states.
 fn overlap_verdict(
@@ -3974,74 +4023,92 @@ fn no_recreated_node_reads_the_template() {
     }
 }
 
-/// Seed 0x7f1d's first phase, unbounded: op 0 `Get(0)` on one thread, op
-/// 1 `TryGet(9)` on the other. Each order gives op 1 a cycle through 4, 7,
-/// 8 and 9: with op 0 first one closing through 15, with op 1 first one
-/// closing through 11, 12 and 13. Most two-thread runs give op 1 the cycle
-/// [4, 7, 8, 9] its own frames close, the other thread holding the rest.
-/// In the first such run, `patch` edits op 1's participants (slots) before
-/// the oracle sees them; returns whether the oracle took the run, every run
-/// before it checked as usual.
-fn cycle_from_own_frames(patch: fn(&mut Vec<u32>)) -> bool {
-    let case = gen_case(0x7f1d, false, true);
-    let phases = phases(&case, 0x7f1d);
-    let own: Vec<u32> = vec![4, 7, 8, 9];
-    let op1 = |mask: u64| {
-        let order = Order::new(&case, &phases, mask);
-        let at = order.of.iter().position(|&x| x == 1).unwrap();
-        run::<Shared>(&order.case, None, 0)[at].0.clone()
+/// The ring 0 -> 1 -> 2 -> 3 -> 0, never computed, read by `TryGet(0)` and
+/// `TryGet(2)` on the two threads at once: every order and every two-thread
+/// run gives both the cycle through all four. `patch` edits op 0's
+/// participants, as nodes, before the oracle sees them, standing in for a
+/// cycle built from one thread's frames with members another thread landed
+/// first left out; returns whether the oracle took the run. A real such
+/// cycle needs a member that branches on a cycle error, and which member
+/// computes first decides those.
+fn cycle_from_own_frames(patch: fn(&mut Vec<usize>)) -> bool {
+    let query = |expr| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy: Strat::None,
     };
-    assert_eq!(op1(0), Out::Cycle(vec![4, 7, 8, 9, 15]));
-    assert_eq!(op1(1), Out::Cycle(vec![4, 7, 8, 9, 11, 12, 13]));
-    let mut took = None;
+    let read = |n| query(Expr::Read(n, false));
+    let case = Case {
+        specs: vec![read(1), read(2), read(3), read(0), query(Expr::Const(1))],
+        panics: false,
+        cycles: true,
+        queries: 5,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(0), Op::TryGet(2)],
+    };
+    let phases = [Phase::Read([Some(0), Some(1)])];
+    let slots = Mutex::new(Vec::new());
+    let fix = |t: &mut Trace| {
+        let slot = slots.lock().unwrap();
+        let Out::Cycle(c) = &mut t[0].0 else {
+            panic!("op 0 got {:?}, not the ring's cycle", t[0].0)
+        };
+        let mut nodes: Vec<usize> = c
+            .iter()
+            .map(|p| slot.iter().position(|s| s == p).unwrap())
+            .collect();
+        nodes.sort_unstable();
+        assert_eq!(nodes, [0, 1, 2, 3]);
+        patch(&mut nodes);
+        *c = nodes.iter().map(|&x| slot[x]).collect();
+        c.sort_unstable();
+    };
+    let mut took = false;
     quiet(|| {
-        for _ in 0..2000 {
-            let serial = Serial::new(&case, &phases);
-            let verdict = Mutex::new(None);
-            let hit = AtomicBool::new(false);
-            let fix = |t: &mut Trace| {
-                if let Some((Out::Cycle(c), _)) = t.get_mut(1) {
-                    if *c == own {
-                        hit.store(true, SeqCst);
-                        patch(c);
-                    }
-                }
-            };
-            let mut got = run_two_until(&case, &phases, None, 0, &|_| {}, &|_, prefix, live| {
-                let mut prefix = prefix.clone();
-                fix(&mut prefix);
-                let v = serial.at_overlap("0x7f1d", &prefix, live);
-                let stop = v.is_some();
-                *verdict.lock().unwrap() = v;
-                stop
-            });
-            fix(&mut got);
-            let verdict = verdict.into_inner().unwrap();
-            if !hit.load(SeqCst) {
-                serial.check("0x7f1d", &got, verdict);
-                continue;
-            }
-            took = Some(
-                catch_unwind(AssertUnwindSafe(|| serial.check("0x7f1d", &got, verdict))).is_ok(),
-            );
-            return;
+        for mask in [0, 1] {
+            let order = Order::new(&case, &phases, mask);
+            let ring = run::<Shared>(&order.case, None, 0);
+            assert!(ring
+                .iter()
+                .all(|r| matches!(&r.0, Out::Cycle(c) if c.len() == 4)));
         }
+        let serial = Serial::new(&case, &phases);
+        let verdict = Mutex::new(None);
+        let mut got = run_two_until(&case, &phases, None, 0, &|_| {}, &|_, prefix, live| {
+            *slots.lock().unwrap() = (0..case.specs.len())
+                .map(|x| live.world.handle(0, x).erased().slot())
+                .collect();
+            let mut prefix = prefix.clone();
+            fix(&mut prefix);
+            let v = serial.at_overlap("own-frames ring", &prefix, live);
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+        fix(&mut got);
+        let verdict = verdict.into_inner().unwrap();
+        took = catch_unwind(AssertUnwindSafe(|| {
+            serial.check("own-frames ring", &got, verdict)
+        }))
+        .is_ok();
     });
-    took.expect("no run of 0x7f1d reported the cycle from its own frames")
+    took
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_cycle_built_from_this_threads_frames() {
-    assert!(cycle_from_own_frames(|_| {}));
+    assert!(cycle_from_own_frames(|c| c.retain(|&x| x != 3)));
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_made_up_cycle() {
-    // Slots 11 and 15 are each one order's participant, so a cycle with
-    // both is a part of neither order's.
-    assert!(!cycle_from_own_frames(|c| c.extend([11, 15])));
+    // 4 is no member of the ring, so a cycle through it is no part of an
+    // order's.
+    assert!(!cycle_from_own_frames(|c| c.push(4)));
     assert!(!cycle_from_own_frames(|c| c.clear()));
 }
 

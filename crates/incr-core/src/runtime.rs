@@ -3239,7 +3239,7 @@ impl<C: Cells> Runtime<C> {
             // walk, and a verified_at naming a revision whose walk had not
             // dirtied our deps yet would let us verify Clean past it (B6).
             let stamp_rev = self.current_revision();
-            let verify_rev = C::walked(&self.walk, &self.revision);
+            let mut verify_rev = C::walked(&self.walk, &self.revision);
 
             // The flags byte is loaded only now, after the claim and the
             // generation recheck: until the claim, another thread's
@@ -3365,6 +3365,11 @@ impl<C: Cells> Runtime<C> {
                 if MODE & VIRT != 0 {
                     if let Some(low) = self.take_low(id, cidx) {
                         ctl.lower(low);
+                    }
+                    // The unbounded run's frame claimed before the sets its
+                    // doomed runs made, so a dep they changed supersedes it.
+                    if let Some(rev) = self.take_claim_rev(id, cidx) {
+                        verify_rev = verify_rev.min(rev);
                     }
                 }
                 // SAFETY: the closure was read under the read hold at
@@ -3583,9 +3588,6 @@ impl<C: Cells> Runtime<C> {
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
         let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
-        if !contain {
-            self.note_unwound_read(&*payload, kind);
-        }
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -3619,6 +3621,10 @@ impl<C: Cells> Runtime<C> {
                 bag,
             );
         }
+        // After the landings, whose notes the kept copy carries.
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
+        }
         if contain {
             self.contain(attempt.cidx, payload, bag);
             return Computed::Unsettled;
@@ -3648,8 +3654,9 @@ impl<C: Cells> Runtime<C> {
     /// the walk and the unwind released it. The entry's own claim and the
     /// claims held at or above its position are not counted: the unwind
     /// releases them too, and a virtual frame's run still holds the entry's
-    /// when this is asked. A wounded thread must reach its outermost entry,
-    /// so it contains none.
+    /// when this is asked. A closure that swallowed a cycle and then
+    /// panicked is contained as any panic. A wounded thread must reach its
+    /// outermost entry, so it contains none.
     pub(super) fn containable(
         &self,
         entry: NodeId,
@@ -3662,7 +3669,7 @@ impl<C: Cells> Runtime<C> {
         }
         match kind {
             None => true,
-            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_some_and(|c| {
+            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_none_or(|c| {
                 c.0.participants()
                     .iter()
                     .map(|p| NodeId(p.slot()))
@@ -3810,6 +3817,13 @@ impl<C: Cells> Runtime<C> {
             }
             self.set_drop_kind();
             *result = Err(Box::new(cycle::DiscardUnwind));
+        }
+        // After the rewrites: a swallowed discard or wound is no pop of the
+        // unbounded run's.
+        if result.is_ok()
+            && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT | value_code::KEPT_BIT) != 0
+        {
+            self.retire_copies(&replay::Retire::Above(attempt.cidx));
         }
         None
     }

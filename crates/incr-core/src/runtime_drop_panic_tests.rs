@@ -5,8 +5,8 @@
 
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering::SeqCst};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 
 use super::race_tests::{id, park_at, Gate};
@@ -20,22 +20,36 @@ use crate::handle::Incr;
 use crate::reclaim_probe::{self, RetireSite};
 use crate::state::NodeState;
 
-/// A value whose `Drop` panics once, for the value `ARMED` names.
+/// A value whose `Drop` panics once for each time its value is armed.
 #[derive(Clone, PartialEq, Debug)]
 struct Boom(i64);
 
-static ARMED: AtomicI64 = AtomicI64::new(i64::MIN);
+/// The armed values. Tests run in parallel, so each arms and disarms only
+/// its own.
+static ARMED: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+fn armed_values() -> std::sync::MutexGuard<'static, Vec<i64>> {
+    ARMED.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 fn arm(value: i64) {
-    ARMED.store(value, SeqCst);
+    armed_values().push(value);
+}
+
+/// Takes one arming of `value`, returning whether there was one.
+fn disarm(value: i64) -> bool {
+    let mut armed = armed_values();
+    let at = armed.iter().position(|&v| v == value);
+    at.map(|i| armed.swap_remove(i)).is_some()
+}
+
+fn is_armed(value: i64) -> bool {
+    armed_values().contains(&value)
 }
 
 impl Drop for Boom {
     fn drop(&mut self) {
-        if ARMED
-            .compare_exchange(self.0, i64::MIN, SeqCst, SeqCst)
-            .is_ok()
-        {
+        if disarm(self.0) {
             panic!("drop of Boom({}) panicked on purpose", self.0);
         }
     }
@@ -286,7 +300,7 @@ fn shared_err_path_retire_keeps_the_original_panic() {
             let msg = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(q))).unwrap_err());
             assert!(msg.contains("user panic 4242"), "got: {msg}");
             assert!(!msg.contains("Boom"), "got: {msg}");
-            assert_eq!(ARMED.load(SeqCst), i64::MIN, "the retire did not run");
+            assert!(!is_armed(1), "the retire did not run");
 
             assert_eq!(rt.state_of(q), NodeState::Failed);
             assert!(rt.has_reverse_edge(inputs[8], q));
@@ -347,7 +361,7 @@ fn shared_swallowed_drop_panic_over_a_superseded_node_lands_dirty() {
             rt.set(switch, 1);
             rt.set(reads_q, 1);
             assert_eq!(rt.get(p), -1);
-            assert_eq!(ARMED.load(SeqCst), i64::MIN, "the retire did not run");
+            assert!(!is_armed(1), "the retire did not run");
             assert_eq!(rt.state_of(q), NodeState::Dirty);
             assert_eq!(rt.state_of(p), NodeState::Dirty);
 
@@ -506,7 +520,7 @@ fn shared_stale_path_drain_panic_under_a_swallowing_parent_lands_dirty() {
             assert_eq!(rt.get(p), -1);
             deleter.join().unwrap();
             assert_eq!(attempts.load(SeqCst), 2, "the Stale attempt must retry");
-            assert_eq!(ARMED.load(SeqCst), i64::MIN, "the retire did not run");
+            assert!(!is_armed(1), "the retire did not run");
             assert_eq!(rt.state_of(q), NodeState::Clean);
             assert_eq!(rt.state_of(p), NodeState::Dirty);
             // P's -1 came from the swallowed panic, not from Q's value,
@@ -548,7 +562,7 @@ fn shared_drain_panic_under_a_swallowing_parent_recomputes_on_the_next_read() {
             rt.set(switch, 1);
             rt.set(reads_q, 1);
             assert_eq!(rt.get(p), -1);
-            assert_eq!(ARMED.load(SeqCst), i64::MIN, "the retire did not run");
+            assert!(!is_armed(1), "the retire did not run");
             assert_eq!(rt.state_of(q), NodeState::Clean);
             assert_eq!(rt.state_of(p), NodeState::Dirty);
 
@@ -839,7 +853,7 @@ fn ticket_drop_panic_keeps_the_set_walk<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(rt.get(k), 10);
     arm(7);
     let err = catch_unwind(AssertUnwindSafe(|| rt.set(i, 2))).unwrap_err();
-    arm(i64::MIN);
+    disarm(7);
     assert!(panic_message(err).contains("drop of Boom(7)"));
     assert_eq!(rt.get(k), 20);
     rt.assert_invariant_i();
@@ -893,7 +907,7 @@ fn ticket_drop_panic_keeps_the_delete<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(rt.contained_payloads(), 1);
     arm(8);
     let err = catch_unwind(AssertUnwindSafe(|| rt.delete_node(e))).unwrap_err();
-    arm(i64::MIN);
+    disarm(8);
     assert!(panic_message(err).contains("drop of Boom(8)"));
     assert_eq!(
         Arc::strong_count(&probe),
@@ -951,7 +965,7 @@ fn ticket_drop_panic_keeps_a_flagged_landing<C: Cells>(rt: &Runtime<C>) {
     rt.set(sel, 1);
     arm(9);
     let err = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
-    arm(i64::MIN);
+    disarm(9);
     assert!(panic_message(err).contains("drop of Boom(9)"));
     rt.assert_invariant_i();
     assert_eq!(rt.contained_payloads(), 0);
@@ -1015,7 +1029,7 @@ fn ticket_drop_panic_keeps_a_walk_holding_two<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(rt.get(k), 10);
     arm(10);
     let err = catch_unwind(AssertUnwindSafe(|| rt.set(i, 2))).unwrap_err();
-    arm(i64::MIN);
+    disarm(10);
     assert!(panic_message(err).contains("drop of Boom(10)"));
     assert_eq!(rt.contained_payloads(), 0);
     assert_eq!(rt.get(k), 20);
@@ -1062,7 +1076,7 @@ fn delete_drop_panic_drops_its_buried_tickets<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(rt.contained_payloads(), 1);
     arm(21);
     let err = catch_unwind(AssertUnwindSafe(|| rt.delete_node(e))).unwrap_err();
-    arm(i64::MIN);
+    disarm(21);
     assert!(panic_message(err).contains("drop of Boom(21)"));
     assert_eq!(rt.contained_payloads(), 0);
     rt.assert_invariant_i();
@@ -1175,9 +1189,7 @@ fn contained_episode_abort_keeps_member_drop_panic<C: Cells>(
     rt.set(j, 0);
     rt.set(sel, 1);
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(x)));
-    let armed = ARMED.load(SeqCst);
-    arm(i64::MIN);
-    assert_eq!(armed, i64::MIN, "Boom(3) was never dropped");
+    assert!(!disarm(3), "Boom(3) was never dropped");
     let err = got.expect_err("the released Boom(3)'s Drop panic must leave the read");
     assert!(panic_message(err).contains("drop of Boom(3)"));
     assert!(
@@ -1366,15 +1378,15 @@ fn shared_unwritten_speculative_value_drop_is_not_raised() {
 }
 
 /// Under a frame budget that is never reached, f's read of a poisoned
-/// (Dirty) p keeps a clone of Boom(7) the unbounded run never makes. A
+/// (Dirty) p keeps a clone of Boom(31) the unbounded run never makes. A
 /// later top-level g that reads another Dirty node must still return 1
-/// and leave Boom(7) undropped, as the unbounded run does.
+/// and leave Boom(31) undropped, as the unbounded run does.
 fn wave7_kept_dirty_read_clone_drop_is_not_raised<C: Cells>(rt: &Runtime<C>, frames: u32) {
     rt.set_max_frames(frames);
     let q = rt.create_query(|_| -> i64 { panic!("q boom") });
     let p = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
-        Boom(7)
+        Boom(31)
     });
     let f = rt.create_query(move |rt| {
         std::mem::forget(rt.get(p));
@@ -1383,7 +1395,7 @@ fn wave7_kept_dirty_read_clone_drop_is_not_raised<C: Cells>(rt: &Runtime<C>, fra
     let q2 = rt.create_query(|_| -> i64 { panic!("q2 boom") });
     let p2 = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q2)));
-        Boom(8)
+        Boom(32)
     });
     let g = rt.create_query(move |rt| {
         std::mem::forget(rt.get(p2));
@@ -1391,14 +1403,13 @@ fn wave7_kept_dirty_read_clone_drop_is_not_raised<C: Cells>(rt: &Runtime<C>, fra
     });
     assert_eq!(rt.get(f), 0);
     assert_eq!(rt.state_of(p), NodeState::Dirty, "p was poisoned");
-    arm(7);
+    arm(31);
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(g))).map_err(panic_message);
-    let still_armed = ARMED.load(SeqCst) == 7;
-    arm(i64::MIN);
+    let still_armed = disarm(31);
     assert_eq!(got, Ok(1), "frames {frames}");
     assert!(
         still_armed,
-        "no Boom(7) dropped during get(g), frames {frames}"
+        "no Boom(31) dropped during get(g), frames {frames}"
     );
     assert_ne!(rt.state_of(g), NodeState::Failed, "frames {frames}");
 }
@@ -1427,15 +1438,15 @@ fn wave7_kept_dirty_read_clone_drops_isolated<C: Cells>(rt: &Runtime<C>, frames:
     let q = rt.create_query(|_| -> i64 { panic!("q boom") });
     let p = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
-        Boom(7)
+        Boom(33)
     });
     let f = rt.create_query(move |rt| {
         std::mem::forget(rt.get(p));
         0_u64
     });
-    arm(7);
+    arm(33);
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_err(panic_message);
-    arm(i64::MIN);
+    disarm(33);
     assert_eq!(got, Ok(0), "frames {frames}");
     assert_ne!(rt.state_of(f), NodeState::Failed, "frames {frames}");
 }
