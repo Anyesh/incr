@@ -855,6 +855,81 @@ fn loom_wound_keeps_a_member_computed_alone_in_its_group() {
     });
 }
 
+/// The landed group {r, x, y} after k is set to 1: r reads x, x
+/// (Fallback) reads y, and y reads x, so r is out of the cycle. A's
+/// group verify of r runs an episode that releases x and y; until A's
+/// read ends unwounded the other thread still sees them in the group, so
+/// B's read of y verifies the group, or waits for A, as a single-thread
+/// order does. Seeing them out, B computes y alone and enters the cycle
+/// at the unseeded y: a cycle error neither single-thread order raises.
+fn released_group(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
+    let k = rt.create_input(0_u64);
+    let yc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let x = {
+        let yc = yc.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Rt| match rt.get(k) {
+                0 => 0,
+                _ => rt.get(*yc.get().unwrap()) + 1,
+            },
+            |_c: &crate::cycle::Cycle| 10,
+        )
+    };
+    let y = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(x) + 100,
+    });
+    let r = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 1,
+        _ => rt.get(x) + 1000,
+    });
+    yc.set(y).unwrap();
+    assert_eq!((rt.get(r), rt.get(x), rt.get(y)), (1, 0, 0));
+    rt.force_group_for_test(&[r.erase(), x.erase(), y.erase()]);
+    rt.set(k, 1);
+    (r, y)
+}
+
+#[test]
+#[ignore = "T8-44e3-clean-landing-variant"]
+fn loom_released_group_members_stay_grouped_until_the_read_ends() {
+    run(|| {
+        let orders: Vec<(
+            Result<u64, crate::cycle::Cycle>,
+            Result<u64, crate::cycle::Cycle>,
+        )> = [true, false]
+            .into_iter()
+            .map(|r_first| {
+                let rt = Rt::new();
+                let (r, y) = released_group(&rt);
+                if r_first {
+                    let a = rt.try_get(r);
+                    (a, rt.try_get(y))
+                } else {
+                    let b = rt.try_get(y);
+                    (rt.try_get(r), b)
+                }
+            })
+            .collect();
+        let rt = Arc::new(Rt::new());
+        let (r, y) = released_group(&rt);
+        let reads_r = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(r))
+        };
+        let reads_y = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(y))
+        };
+        let got = (reads_r.join().unwrap(), reads_y.join().unwrap());
+        assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
 /// A (Fallback) reads B while s is 0, and B reads A. A reader enters the
 /// cycle while a setter breaks it: the final values are the acyclic ones.
 #[test]

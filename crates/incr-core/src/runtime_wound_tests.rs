@@ -4,7 +4,7 @@
 //! and because the wound counter is process-wide.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -847,6 +847,198 @@ fn shared_tainted_group_verify_release_keeps_the_group() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_tainted_group_verify_release_keeps_the_group",
         || released_member_keeps_its_group(Release::Tainted),
+    )
+    .assert_clean();
+}
+
+/// Once `k` is 1, `r` (Fixpoint) reads `z`, and `y` when `z` is not 0;
+/// `z` (Fixpoint) reads `w`, and `y` when `w` is 0; `y` (unseeded) reads
+/// `w`, then `z` when `w` is 0 and `r` otherwise; `w` (Fixpoint) is 7.
+/// All four keep a record of one group. In an episode's first iteration
+/// the seeds are 0, so `r` reaches no other member: A's episode at `r`
+/// dissolves and releases `z`, `y` and `w` ungrouped, while B's at `y`
+/// keeps {y, z} and lets `r` join. B waits on A's claim of `y` first, so
+/// B is older; A parks in `z` after the dissolve until B, which took `y`,
+/// waits on `r`, and A's read of `y` closes the waits-for cycle. With
+/// `first_reads_y`, `z`'s run after the dissolve reads `y` first, so A is
+/// wounded before it lands a released member.
+struct Dissolve {
+    rt: Arc<Runtime<Shared>>,
+    r: Incr<i64>,
+    z: Incr<i64>,
+    y: Incr<i64>,
+    w: Incr<i64>,
+    /// Parks `z`'s run in A's episode, with every member claimed.
+    early: Gate,
+    /// Parks `z`'s run after the dissolve, A holding only `r` and `z`.
+    late: Gate,
+    first_reads_y: Arc<AtomicBool>,
+}
+
+impl Dissolve {
+    fn new() -> Self {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let k = rt.create_input(0_i64);
+        let z_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let w_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let fixpoint = || QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).max_iterations(20)),
+            ..QueryOpts::default()
+        };
+        let r = {
+            let (z_cell, y_cell) = (z_cell.clone(), y_cell.clone());
+            rt.create_query_with(
+                move |rt| match rt.get(k) {
+                    0 => 1,
+                    _ if rt.get(*z_cell.get().unwrap()) == 0 => 1,
+                    _ => (rt.get(*y_cell.get().unwrap()) + 1).min(50),
+                },
+                fixpoint(),
+            )
+        };
+        let (early, late) = (Gate::new(), Gate::new());
+        let first_reads_y = Arc::new(AtomicBool::new(false));
+        let z = {
+            let (y_cell, w_cell) = (y_cell.clone(), w_cell.clone());
+            let (early, late) = (early.clone(), late.clone());
+            let first_reads_y = first_reads_y.clone();
+            rt.create_query_with(
+                move |rt| {
+                    if rt.get(k) == 0 {
+                        return 0;
+                    }
+                    late.park();
+                    // B holds `y`, so this read wounds A and never returns.
+                    if first_reads_y.load(Ordering::SeqCst) {
+                        rt.get(*y_cell.get().unwrap());
+                    }
+                    early.park();
+                    match rt.get(*w_cell.get().unwrap()) {
+                        0 => rt.get(*y_cell.get().unwrap()),
+                        _ => 3,
+                    }
+                },
+                fixpoint(),
+            )
+        };
+        let y = {
+            let w_cell = w_cell.clone();
+            rt.create_query(move |rt| match rt.get(k) {
+                0 => 0,
+                _ if rt.get(*w_cell.get().unwrap()) == 0 => rt.get(z) + 10,
+                _ => rt.get(r) + 10,
+            })
+        };
+        let w = rt.create_query_with(move |rt| 7 * rt.get(k), fixpoint());
+        z_cell.set(z).unwrap();
+        y_cell.set(y).unwrap();
+        w_cell.set(w).unwrap();
+        assert!(r.slot() < z.slot() && z.slot() < y.slot() && y.slot() < w.slot());
+        assert_eq!((rt.get(r), rt.get(z), rt.get(y), rt.get(w)), (1, 0, 0, 0));
+        rt.force_group_for_test(&[r.erase(), z.erase(), y.erase(), w.erase()]);
+        rt.set(k, 1);
+        Dissolve {
+            rt,
+            r,
+            z,
+            y,
+            w,
+            early,
+            late,
+            first_reads_y,
+        }
+    }
+
+    fn read(&self, node: Incr<i64>) -> Result<i64, String> {
+        catch_unwind(AssertUnwindSafe(|| self.rt.get(node))).map_err(panic_message)
+    }
+
+    /// A's read of `r`, B's of `y`, then a read of every node.
+    fn outcome(&self, a: Result<i64, String>, b: Result<i64, String>) -> Vec<Result<i64, String>> {
+        vec![
+            a,
+            b,
+            self.read(self.r),
+            self.read(self.z),
+            self.read(self.y),
+            self.read(self.w),
+        ]
+    }
+
+    fn single_thread(a_first: bool) -> Vec<Result<i64, String>> {
+        let g = Dissolve::new();
+        if a_first {
+            let a = g.read(g.r);
+            g.outcome(a, g.read(g.y))
+        } else {
+            let b = g.read(g.y);
+            g.outcome(g.read(g.r), b)
+        }
+    }
+
+    fn concurrent(first_reads_y: bool) -> Vec<Result<i64, String>> {
+        let g = Dissolve::new();
+        let wounds = waits::WOUNDS.load(Ordering::Relaxed);
+        g.early.arm();
+        let (a, b) = thread::scope(|s| {
+            let g = &g;
+            let a = s.spawn(move || g.read(g.r));
+            g.early.wait_parked();
+            let b = s.spawn(move || g.read(g.y));
+            g.late.arm();
+            g.early.release();
+            g.late.wait_parked();
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !waits::waited_on((g.rt.runtime_id, g.r.slot())) {
+                assert!(Instant::now() < deadline, "B never waited on r");
+                thread::sleep(Duration::from_millis(1));
+            }
+            g.first_reads_y.store(first_reads_y, Ordering::SeqCst);
+            g.late.release();
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        assert!(waits::WOUNDS.load(Ordering::Relaxed) > wounds, "no wound");
+        let outcome = g.outcome(a, b);
+        g.rt.assert_invariant_i();
+        outcome
+    }
+}
+
+fn dissolve_keeps_the_released_members_grouped(first_reads_y: bool) {
+    let a_first = Dissolve::single_thread(true);
+    let b_first = Dissolve::single_thread(false);
+    for round in 0..20 {
+        let got = Dissolve::concurrent(first_reads_y);
+        assert!(
+            got == a_first || got == b_first,
+            "round {round}: {got:?}, single-thread {a_first:?} or {b_first:?}"
+        );
+    }
+}
+
+/// The members a dissolve released before A's wound keep their group, so
+/// B verifies it as a single thread would. Released alone, B computes
+/// `y` outside it, and `r`'s read of `y` meets the unseeded `y` on B's
+/// stack: a cycle error that no single-thread order raises.
+#[test]
+#[ignore = "T8-44e3-clean-landing-variant"]
+fn shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped",
+        || dissolve_keeps_the_released_members_grouped(true),
+    )
+    .assert_clean();
+}
+
+/// As above, with A landing `w` and `z` Clean outside the group before its
+/// wound: B's group verify fails on the Clean `z` and computes `y` alone.
+#[test]
+#[ignore = "T8-44e3-clean-landing-variant: a wounded read's Clean landings of released members"]
+fn shared_wound_after_clean_landings_of_released_members_keeps_their_group() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_wound_after_clean_landings_of_released_members_keeps_their_group",
+        || dissolve_keeps_the_released_members_grouped(false),
     )
     .assert_clean();
 }
