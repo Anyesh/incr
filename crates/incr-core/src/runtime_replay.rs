@@ -102,6 +102,14 @@ struct Below {
 static UNBUDGETED: std::sync::Mutex<Vec<RuntimeId>> = std::sync::Mutex::new(Vec::new());
 static UNBUDGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Run once by this thread's next `BudgetEntry::note`, after its caller
+    /// decided and before it locks `UNBUDGETED`.
+    pub(crate) static NOTE_DECIDED: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// A runtime's place in `UNBUDGETED`, which its drop gives up.
 pub(crate) struct BudgetEntry(RuntimeId);
 
@@ -109,19 +117,23 @@ impl BudgetEntry {
     pub(crate) fn new(id: RuntimeId, max_frames: u32) -> Self {
         let entry = Self(id);
         if max_frames == u32::MAX {
-            entry.note(true);
+            entry.note(|| true);
         }
         entry
     }
 
-    /// Lists the runtime as unbudgeted, or takes it off the list.
-    fn note(&self, unbudgeted: bool) {
-        if !unbudgeted && UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
+    /// Lists the runtime as unbudgeted, or takes it off the list, as
+    /// `unbudgeted` says under the list's lock: the lock orders racing
+    /// setters, so the last to take it sees every budget stored before.
+    fn note(&self, unbudgeted: impl FnOnce() -> bool) {
+        #[cfg(test)]
+        if let Some(hook) = NOTE_DECIDED.with(std::cell::Cell::take) {
+            hook();
         }
         let mut list = UNBUDGETED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unbudgeted = unbudgeted();
         match (list.iter().position(|&id| id == self.0), unbudgeted) {
             (None, true) => list.push(self.0),
             (Some(at), false) => {
@@ -135,7 +147,9 @@ impl BudgetEntry {
 
 impl Drop for BudgetEntry {
     fn drop(&mut self) {
-        self.note(false);
+        if UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            self.note(|| false);
+        }
     }
 }
 
@@ -151,7 +165,7 @@ pub(super) fn unbudgeted(id: RuntimeId) -> bool {
 impl<C: Cells> Runtime<C> {
     /// Keeps `UNBUDGETED` in step with this runtime's budgets.
     pub(super) fn note_budget(&self) {
-        self.budget_entry.note(!self.budgeted());
+        self.budget_entry.note(|| !self.budgeted());
     }
 
     /// Whether node `slot`'s compute may be doomed.

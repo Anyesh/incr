@@ -1812,14 +1812,13 @@ mod foreign_miri {
 /// at the bottom of the stack, within any budget, so its foreign read's
 /// hold keeps it undoomed and it sees its own payload; a retry would read
 /// B's node again and see the Failed node's.
-fn outermost_foreign_reader_keeps_its_payload<A: Cells, B: Cells>(frames: u32, bytes: usize) {
+fn outermost_foreign_reader_keeps_its_payload<A: Cells, B: Cells>(budget: fn(&Runtime<A>)) {
     quiet_uncopyable();
     let outer = std::thread::spawn(move || {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_placeholder(0_i64);
-        r1.set_max_frames(frames);
-        r1.set_max_stack_bytes(bytes);
+        budget(&r1);
         let mut below: Option<Incr<i64>> = None;
         for level in 0..200 {
             let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
@@ -1843,19 +1842,93 @@ fn outermost_foreign_reader_keeps_its_payload<A: Cells, B: Cells>(frames: u32, b
     assert_eq!(outer, 1, "the outermost reader saw a retry's payload");
 }
 
+/// Runs `read` with about `kib` KiB more of this thread's stack in use.
+#[inline(never)]
+fn deeper<R>(kib: usize, read: impl FnOnce() -> R) -> R {
+    if kib == 0 {
+        return read();
+    }
+    let pad = std::hint::black_box([0_u8; 1024]);
+    let out = deeper(kib - 1, read);
+    std::hint::black_box(&pad);
+    out
+}
+
+/// The outermost reader takes its first uncopyable foreign read within
+/// the byte budget, then a second one from deep in its own closure's
+/// stack, past it. The first read still holds the frame, which is within
+/// the budget, so the outermost reader sees its own payload.
+fn a_later_deep_hold_keeps_the_first<A: Cells, B: Cells>() {
+    quiet_uncopyable();
+    let outer = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        r1.set_max_frames(u32::MAX);
+        r1.set_max_stack_bytes(64 * 1024);
+        let mut below: Option<Incr<i64>> = None;
+        for level in 0..200 {
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let deep = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let (r2, next) = (OtherRt(&*r2), below);
+            let outermost = level == 199;
+            below = Some(r1.create_query_with(
+                move |rt| {
+                    if !outermost {
+                        return next.map_or(0, |b| rt.get(b));
+                    }
+                    let own = quiet(|| r2.get(bq)).is_err_and(|p| p.is::<Uncopyable>());
+                    let _ = deeper(96, || quiet(|| r2.get(deep)));
+                    i64::from(own) + next.map_or(0, |b| rt.get(b))
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(outer, 1, "the outermost reader saw a retry's payload");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_shared_a_later_deep_hold_keeps_the_first() {
+    a_later_deep_hold_keeps_the_first::<Local, Shared>();
+}
+
 mod foreign_hold_within_budget {
     use crate::cells::{Local, Shared};
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn frame_budget() {
-        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(8, 0);
+        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(|r| {
+            r.set_max_frames(8);
+            r.set_max_stack_bytes(0);
+        });
     }
 
     #[test]
     #[cfg_attr(miri, ignore)]
     fn byte_budget() {
-        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(u32::MAX, 64 * 1024);
+        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(|r| {
+            r.set_max_frames(u32::MAX);
+            r.set_max_stack_bytes(64 * 1024);
+        });
+    }
+
+    /// The byte budget set by another thread while `set_max_frames` lists
+    /// the runtime.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn byte_budget_set_by_a_racing_thread() {
+        super::outermost_foreign_reader_keeps_its_payload::<Shared, Shared>(|r| {
+            crate::runtime::replay_tests::race_budget_setters(r, 64 * 1024);
+        });
     }
 }
 
