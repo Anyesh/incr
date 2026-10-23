@@ -117,23 +117,23 @@ impl BudgetEntry {
     pub(crate) fn new(id: RuntimeId, max_frames: u32) -> Self {
         let entry = Self(id);
         if max_frames == u32::MAX {
-            entry.note(true);
+            entry.note(|| true);
         }
         entry
     }
 
-    /// Lists the runtime as unbudgeted, or takes it off the list.
-    fn note(&self, unbudgeted: bool) {
+    /// Lists the runtime as unbudgeted, or takes it off the list, as
+    /// `unbudgeted` says under the list's lock: the lock orders racing
+    /// setters, so the last to take it sees every budget stored before.
+    fn note(&self, unbudgeted: impl FnOnce() -> bool) {
         #[cfg(test)]
         if let Some(hook) = NOTE_DECIDED.with(std::cell::Cell::take) {
             hook();
         }
-        if !unbudgeted && UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            return;
-        }
         let mut list = UNBUDGETED
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unbudgeted = unbudgeted();
         match (list.iter().position(|&id| id == self.0), unbudgeted) {
             (None, true) => list.push(self.0),
             (Some(at), false) => {
@@ -147,7 +147,9 @@ impl BudgetEntry {
 
 impl Drop for BudgetEntry {
     fn drop(&mut self) {
-        self.note(false);
+        if UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            self.note(|| false);
+        }
     }
 }
 
@@ -163,7 +165,7 @@ pub(super) fn unbudgeted(id: RuntimeId) -> bool {
 impl<C: Cells> Runtime<C> {
     /// Keeps `UNBUDGETED` in step with this runtime's budgets.
     pub(super) fn note_budget(&self) {
-        self.budget_entry.note(!self.budgeted());
+        self.budget_entry.note(|| !self.budgeted());
     }
 
     /// Whether node `slot`'s compute may be doomed.

@@ -154,6 +154,18 @@ impl Frames {
             let here = 0_u8;
             let here = std::hint::black_box(std::ptr::from_ref(&here)) as usize;
             let keep = self.holds.partition_point(|&(i, _, _)| i < index);
+            // A frame's earlier hold nearer the stack's base still holds it.
+            let base = crate::cycle_state::stack_base();
+            let here = match self.holds.get(keep) {
+                Some(&(i, c, at)) if i == index && c == top.ctl => {
+                    if at.abs_diff(base) < here.abs_diff(base) {
+                        at
+                    } else {
+                        here
+                    }
+                }
+                _ => here,
+            };
             self.holds.truncate(keep);
             self.holds.push((index, top.ctl, here));
         }
