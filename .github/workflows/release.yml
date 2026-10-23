@@ -15,6 +15,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - run: bash scripts/check-release-versions.sh
       - run: cargo test --release -p incr-core -p incr-compute -p incr-concurrent -p incr-kube -p incr-persist --features incr-persist/sqlite
 
   publish-crates:
