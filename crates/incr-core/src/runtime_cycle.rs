@@ -1886,15 +1886,16 @@ impl<C: Cells> Runtime<C> {
     /// `compute_attempts` lands a run that popped neither LOW nor rooting a
     /// claim: a virtual hit's claim stood for its frame on the stack, and
     /// that frame turned out to be no cycle's member. `revs` are the stamp
-    /// and verify revisions taken before the run. `Ok(false)` if a dep went
-    /// stale, so that the node landed New for a retry; `Err` if writing the
-    /// value panicked, with the claim still held.
+    /// and verify revisions taken before the run. `Ok` with the state the
+    /// node landed in, or `None` if a dep went stale, so that the node
+    /// landed New for a retry; `Err` if writing the value panicked, with
+    /// the claim still held.
     pub(super) fn land_alone(
         &self,
         slot: u32,
         (stamp_rev, verify_rev): (u64, u64),
         bag: &mut Deferred<C>,
-    ) -> Result<bool, Payload> {
+    ) -> Result<Option<NodeState>, Payload> {
         let rt = self.runtime_id;
         let id = NodeId(slot);
         let (node, flags) = self.nodes.get_with_flags(slot);
@@ -1939,7 +1940,7 @@ impl<C: Cells> Runtime<C> {
             self.children_landing(id, flags, ChildLanding::Discard, e.opened(), bag);
             // Leaving the group is safe: a New node's record is inert.
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
-            false
+            None
         } else {
             if e.poisoned() {
                 node.set_verified_at(0);
@@ -1954,14 +1955,14 @@ impl<C: Cells> Runtime<C> {
             self.children_landing(id, flags, children, e.opened(), bag);
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
-            self.land_single(id, node, flags, target, NodeState::Dirty);
+            let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
             self.record_trace(
                 id,
                 crate::trace::TraceAction::Recomputed {
                     value_changed: changed,
                 },
             );
-            true
+            Some(landed)
         };
         bag.push_erased(Box::new(e.into_values()));
         Ok(landed)

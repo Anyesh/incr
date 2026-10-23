@@ -931,6 +931,123 @@ local_and_shared!(
     shared_a_user_panic_releases_a_virtual_hit_claim
 );
 
+/// Seed 0x88f7, shrunk: a cycle n4 -> n6 -> n7 -> n8 -> n9 -> n10 -> n11
+/// -> n12 -> n4 (n4 and the native n12 with fallbacks, n6 catching, n10
+/// and n5 with `try_get`), where n12 panics once its value is 3 mod 7.
+/// After `get(n4)` panics and `sel` is set to 0, the walk of `get(n9)`
+/// runs n12 first, whose panic releases the cycle's other claims New
+/// (e9eea59d). Returns each read's outcome and the node states after it.
+fn wave8_released_new_cycle_run<C: Cells>(frames: Option<u32>) -> Vec<(Out, Vec<NodeState>)> {
+    let rt = runtime::<C>(frames);
+    let two = rt.create_input(2_u64);
+    let sel = rt.create_input(3_u64);
+    let n4_later = Later::default();
+    let n10_later = Later::default();
+    let even = |v: u64| v % 2 == 0;
+    let (l10, l4) = (n10_later.clone(), n4_later.clone());
+    let n15 = rt.create_query_with(
+        move |rt| {
+            let v = if even(rt.get(later(&l10))) {
+                0
+            } else {
+                rt.try_get(two).unwrap_or(7777)
+            };
+            v + 1
+        },
+        replayable(),
+    );
+    let n13 = rt.create_query_with(|_| 3_u64, replayable());
+    let n12 = rt.create_query_with(
+        move |rt| {
+            let v = if even(rt.get(later(&l4))) {
+                if even(rt.get(sel)) {
+                    rt.get(n15)
+                } else {
+                    rt.get(n13)
+                }
+            } else {
+                0
+            };
+            if v % 7 == 3 {
+                std::panic::panic_any(String::from("boom 12"));
+            }
+            v
+        },
+        QueryOpts {
+            replay: Replay::Native,
+            cycle: CycleStrategy::fallback(|_| 1_u64),
+        },
+    );
+    let n11 = rt.create_query_with(
+        move |rt| {
+            rt.get(n12);
+            1
+        },
+        replayable(),
+    );
+    let n10 = rt.create_query_with(move |rt| rt.try_get(n11).unwrap_or(7777), replayable());
+    n10_later.set(n10).unwrap();
+    let n9 = rt.create_query_with(move |rt| u64::from(!even(rt.get(n10))), replayable());
+    let n8 = rt.create_query_with(move |rt| rt.get(n9), replayable());
+    let n7 = rt.create_query_with(move |rt| rt.get(n8), replayable());
+    let n6 = rt.create_query_with(
+        move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(n7))).unwrap_or(9999),
+        replayable(),
+    );
+    let l4 = n4_later.clone();
+    let n5 = rt.create_query_with(
+        move |rt| rt.try_get(later(&l4)).unwrap_or(7777),
+        replayable(),
+    );
+    let n4 = rt.create_query_with(
+        move |rt| {
+            if even(rt.get(n6)) {
+                0
+            } else {
+                rt.try_get(n11).unwrap_or(7777) + rt.get(n5)
+            }
+        },
+        fallback(0),
+    );
+    n4_later.set(n4).unwrap();
+    let nodes = [n4, n5, n6, n7, n8, n9, n10, n11, n12, n15];
+    let mut seen = Vec::new();
+    let mut read = |rt: &Runtime<C>, h: Incr<u64>| {
+        eprintln!("W3 ----- read {:?}", h);
+        let out = get(rt, h);
+        eprintln!(
+            "W3 ----- out {:?} {:?}",
+            out,
+            nodes.iter().map(|&n| rt.state_of(n)).collect::<Vec<_>>()
+        );
+        rt.assert_invariant_i();
+        seen.push((out, nodes.iter().map(|&n| rt.state_of(n)).collect()));
+    };
+    read(&rt, n4);
+    rt.set(sel, 0);
+    read(&rt, n9);
+    seen
+}
+
+/// The unbounded run's walk contains n12's panic in the entries n8 and n7,
+/// so n9 lands Failed inside n8 and `get(n9)` reports its last compute
+/// panicked, with n7 and n8 Failed. Every budget must give that.
+fn wave8_released_new_cycle_replays_as_unbounded<C: Cells>() {
+    let unbounded = wave8_released_new_cycle_run::<C>(None);
+    for frames in [1, 2, 3] {
+        assert_eq!(
+            wave8_released_new_cycle_run::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+local_and_shared!(
+    wave8_released_new_cycle_replays_as_unbounded,
+    wave8_local_released_new_cycle_replays_as_unbounded,
+    wave8_shared_released_new_cycle_replays_as_unbounded
+);
+
 /// P, New, reads N at budget 1, so the read dooms P. Once N is Dirty, its
 /// input changed after a compute, so its verify fails, and once it is
 /// New. The doom point finds N released, Dirty or New with
