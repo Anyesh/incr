@@ -2027,6 +2027,35 @@ fn hold_then_own_read<A: Cells, B: Cells>(
     .unwrap()
 }
 
+/// [`hold_then_own_read`] with X's first read of its own runtime's A,
+/// which panics with a message, in place of B's uncopyable panic.
+fn own_panic_then_own_read<A: Cells>(before: fn(&Runtime<A>), during: fn(&Runtime<A>)) -> i64 {
+    std::thread::spawn(move || {
+        let r1 = Runtime::<A>::new();
+        r1.set_placeholder(0_i64);
+        before(&r1);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let a = r1.create_query(|_| -> i64 { std::panic::panic_any("own") });
+        let z = r1.create_query_with(|_| 1_i64, opts());
+        let y = r1.create_query_with(move |rt| rt.get(z) + 1, opts());
+        let x = r1.create_query_with(
+            move |rt| {
+                let own =
+                    quiet(|| rt.get(a)).is_err_and(|p| p.downcast_ref::<&str>() == Some(&"own"));
+                during(rt);
+                10 * i64::from(own) + rt.get(y)
+            },
+            opts(),
+        );
+        r1.get(x)
+    })
+    .join()
+    .unwrap()
+}
+
 mod review_8b_held_deep_read {
     use super::{hold_then_own_read, Runtime};
     use crate::cells::{Cells, Local, Shared};
@@ -2073,7 +2102,7 @@ mod review_8b_held_deep_read {
 }
 
 mod review_8b_mid_compute_budget {
-    use super::{hold_then_own_read, Runtime};
+    use super::{hold_then_own_read, own_panic_then_own_read, Runtime};
     use crate::cells::{Cells, Local, Shared};
 
     fn none<C: Cells>(_: &Runtime<C>) {}
@@ -2146,5 +2175,16 @@ mod review_8b_mid_compute_budget {
             hold_then_own_read::<Shared, Shared>(unbudgeted, bytes_64k, 96, 96),
             12
         );
+    }
+
+    /// A frame budget set while X runs keeps X's earlier read of its own
+    /// runtime's panic, which nothing kept while X's runtime had no budget.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_set_mid_compute_keeps_an_earlier_own_panic() {
+        assert_eq!(own_panic_then_own_read::<Local>(unbudgeted, none), 12);
+        assert_eq!(own_panic_then_own_read::<Local>(frames_2, none), 12);
+        assert_eq!(own_panic_then_own_read::<Local>(unbudgeted, frames_2), 12);
+        assert_eq!(own_panic_then_own_read::<Shared>(unbudgeted, frames_2), 12);
     }
 }
