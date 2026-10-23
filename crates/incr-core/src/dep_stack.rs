@@ -149,15 +149,18 @@ impl Frames {
         // (see `Frame::ctl`).
         let ctl = unsafe { &*top.ctl };
         if !ctl.has(DOOMED) {
+            let held = ctl.has(FOREIGN_HOLD);
             ctl.raise(FOREIGN_HOLD);
             let index = (self.frames.len() - 1) as u32;
             let here = 0_u8;
             let here = std::hint::black_box(std::ptr::from_ref(&here)) as usize;
             let keep = self.holds.partition_point(|&(i, _, _)| i < index);
             // A frame's earlier hold nearer the stack's base still holds it.
+            // An entry left by a popped frame at this place may share its
+            // control block's address, so only a frame already held has one.
             let base = crate::cycle_state::stack_base();
             let here = match self.holds.get(keep) {
-                Some(&(i, c, at)) if i == index && c == top.ctl => {
+                Some(&(i, c, at)) if held && i == index && c == top.ctl => {
                     if at.abs_diff(base) < here.abs_diff(base) {
                         at
                     } else {
@@ -305,6 +308,20 @@ pub trait DepStack: 'static {
     /// The top frame's runtime, node, control block and position.
     fn top_frame(&self) -> Option<(RuntimeId, NodeId, *const ComputeCtl, u32)> {
         self.with(|s| s.frames.last().map(|f| (f.rt, f.node, f.ctl, f.cidx)))
+    }
+
+    /// Raises `flag` on each of `rt`'s frames that is not doomed.
+    fn raise_on_undoomed(&self, rt: RuntimeId, flag: u16) {
+        self.with(|s| {
+            for f in s.frames.iter().filter(|f| f.rt == rt) {
+                // SAFETY: a frame's control block is live while it is on
+                // the stack (see `Frame::ctl`).
+                let ctl = unsafe { &*f.ctl };
+                if !ctl.has(DOOMED) {
+                    ctl.raise(flag);
+                }
+            }
+        });
     }
 
     /// See `Frames::hold_foreign_reader`.
