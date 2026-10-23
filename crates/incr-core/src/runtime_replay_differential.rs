@@ -3445,6 +3445,24 @@ fn a_walked_episode_in_a_try_get_cycle_answers_as_unbounded() {
     });
 }
 
+/// Seed 0x52's op 9, `Get(12)` at budget 1: 12 reads 13 twice, and the
+/// first read's walk of 13 is doomed with 7's rerun still in it. The
+/// doomed run's second read of 13 pushed a speculative entry that landed
+/// 13 before 12's retry, so the retry never resumed the walk and 7 stayed
+/// Dirty where the unbounded run leaves it Clean.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
+    let seed = 0x52;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(10);
+    assert!(matches!(case.ops[9], Op::Get(12)));
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// Seeds 0x833e (and 0x41eb, in [`strict_dirty_for_clean_seeds`]), one thread, and the two-thread seed 0x2b13
 /// they stand for: a dropped chain truncates the virtual frame of a doomed
 /// episode member run whose failure count is still held, and releases the
