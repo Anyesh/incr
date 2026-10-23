@@ -1309,6 +1309,13 @@ impl<C: Cells> Runtime<C> {
         payload: Option<Box<dyn std::any::Any + Send>>,
         bag: &mut Deferred<C>,
     ) -> Computed {
+        replay::note_claim_rev(
+            self.runtime_id,
+            id.0,
+            self.nodes.get(id.0).generation(),
+            attempt.cidx,
+            attempt.verify_rev,
+        );
         let mut keep = Vec::new();
         let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
         self.release_held_except(attempt.cidx, &keep, bag);
@@ -1768,7 +1775,7 @@ impl<C: Cells> Runtime<C> {
                 let unread: Vec<Delivery> = replay::with(|c| {
                     c.iter_mut()
                         .find(|x| x.id == id)
-                        .map(|x| x.pending.extract_maker(level))
+                        .map(|x| x.end_maker(level))
                         .unwrap_or_default()
                 });
                 self.drop_deliveries(unread);
@@ -2827,6 +2834,30 @@ impl<C: Cells> Runtime<C> {
                 .filter(|f| f.rt == rt && (from..cidx).contains(&f.cidx))
                 .map(|f| f.step())
                 .fold(path, replay::extend_path)
+        })
+    }
+
+    /// The walked watermark the earliest doomed run of the frame of `node`
+    /// at `cidx`, along this frame's path, claimed at, for the run that
+    /// finishes it.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn take_claim_rev(&self, node: NodeId, cidx: u32) -> Option<u64> {
+        let rt = self.runtime_id;
+        let generation = self.nodes.get(node.0).generation();
+        let frame = (node.0, generation, cidx);
+        if !replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .any(|x| x.claim_revs.has(frame))
+        }) {
+            return None;
+        }
+        let path = self.path_at(cidx);
+        replay::with(|c| {
+            c.iter_mut()
+                .filter(|x| x.rt == rt)
+                .find_map(|x| x.claim_revs.take(frame, path))
         })
     }
 

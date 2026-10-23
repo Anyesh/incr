@@ -3234,7 +3234,7 @@ impl<C: Cells> Runtime<C> {
             // walk, and a verified_at naming a revision whose walk had not
             // dirtied our deps yet would let us verify Clean past it (B6).
             let stamp_rev = self.current_revision();
-            let verify_rev = C::walked(&self.walk, &self.revision);
+            let mut verify_rev = C::walked(&self.walk, &self.revision);
 
             // The flags byte is loaded only now, after the claim and the
             // generation recheck: until the claim, another thread's
@@ -3360,6 +3360,11 @@ impl<C: Cells> Runtime<C> {
                 if MODE & VIRT != 0 {
                     if let Some(low) = self.take_low(id, cidx) {
                         ctl.lower(low);
+                    }
+                    // The unbounded run's frame claimed before the sets its
+                    // doomed runs made, so a dep they changed supersedes it.
+                    if let Some(rev) = self.take_claim_rev(id, cidx) {
+                        verify_rev = verify_rev.min(rev);
                     }
                 }
                 // SAFETY: the closure was read under the read hold at

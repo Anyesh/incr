@@ -1106,13 +1106,11 @@ fn wave7_shared_kept_read_drops_a_relanded_node() {
 }
 
 #[test]
-#[ignore = "T8-rerun-takes-earlier-runs-delivery: the walk's rerun of g takes its first run's delivery"]
 fn wave7_local_rerun_reads_a_relanded_node_afresh() {
     wave7_kept_read_drops_a_relanded_node::<Local>(true);
 }
 
 #[test]
-#[ignore = "T8-rerun-takes-earlier-runs-delivery: the walk's rerun of g takes its first run's delivery"]
 fn wave7_shared_rerun_reads_a_relanded_node_afresh() {
     wave7_kept_read_drops_a_relanded_node::<Shared>(true);
 }
