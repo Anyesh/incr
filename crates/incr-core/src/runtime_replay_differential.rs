@@ -2651,6 +2651,87 @@ fn a_try_get_passes_on_a_swallowing_closures_panic() {
     });
 }
 
+/// Seed 0xd3713dd8cf68c605, shrunk. 4 reads the ring 5, 6, 7, 8, 9, 10,
+/// where 10, a Fallback(0) member, reads the input and 5, and 7 panics on
+/// 8's value. At budget 2 the first pass delivered 9's cycle to 8's read
+/// at its position, and the doomed entry's retry re-armed it. 7's panic
+/// then released 8 and 9, which ends their runs as it does unbounded, but
+/// 8's next run at that position took the old cycle where the unbounded
+/// run reads 9 Failed: 8 stayed Dirty instead of Failed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_released_claim_takes_no_delivery_of_its_ended_run() {
+    let query = |expr, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let case = Case {
+        specs: vec![
+            query(Expr::Read(1, false), Strat::None),
+            query(
+                Expr::If(
+                    read(2),
+                    Box::new(Expr::Const(0)),
+                    Box::new(Expr::Read(2, true)),
+                ),
+                Strat::None,
+            ),
+            query(Expr::Catch(read(3)), Strat::None),
+            query(Expr::Read(10, false), Strat::None),
+            query(Expr::Read(5, false), Strat::None),
+            query(Expr::Read(6, false), Strat::None),
+            query(Expr::Read(7, false), Strat::None),
+            query(Expr::PanicIf(read(8), 0), Strat::None),
+            query(Expr::Read(9, false), Strat::None),
+            query(Expr::Read(10, false), Strat::None),
+            query(Expr::Add(read(11), read(5)), Strat::Fallback(0)),
+            Spec::Input(4),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 11,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(11, 0), Op::Get(4)],
+    };
+    quiet(|| {
+        exact_states::<Local>(&case);
+        exact_states::<Shared>(&case);
+    });
+}
+
+/// Asserts every operation's outcome and node states at budgets 1 to 3
+/// are the unbounded run's, for a case whose reads of Dirty values stop
+/// `first_diff` comparing states although the runs agree.
+fn exact_states<C: Cells>(case: &Case) {
+    let states = |t: Trace| -> Vec<(Out, Vec<NodeState>)> {
+        t.into_iter().map(|(out, snap)| (out, snap.0)).collect()
+    };
+    let unbounded = states(run::<C>(case, None, 0));
+    for frames in [1, 2, 3] {
+        assert_eq!(
+            states(run::<C>(case, Some(frames), 0)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+/// Seed 0xd3713dd8cf68c605 unshrunk, the case above's source.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_d371_released_claim_takes_no_old_delivery() {
+    let seed = 0xd371_3dd8_cf68_c605;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
