@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Runtime;
@@ -2054,6 +2054,56 @@ fn own_panic_then_own_read<A: Cells>(before: fn(&Runtime<A>), during: fn(&Runtim
     })
     .join()
     .unwrap()
+}
+
+/// X reads Y1 and then Y2, siblings that each take an uncopyable foreign
+/// read `held_at` KiB deep and then read their own runtime 96 KiB deep,
+/// under a 64 KiB byte budget. Returns how many times each ran.
+fn sibling_holds<A: Cells, B: Cells>(held_at: [usize; 2]) -> [usize; 2] {
+    quiet_uncopyable();
+    std::thread::spawn(move || {
+        let runs: &'static [AtomicUsize; 2] = Box::leak(Box::default());
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        r1.set_max_frames(u32::MAX);
+        r1.set_max_stack_bytes(64 * 1024);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let ys = [0, 1].map(|i| {
+            let z = r1.create_query_with(|_| 1_i64, opts());
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with(
+                move |rt| {
+                    runs[i].fetch_add(1, Ordering::SeqCst);
+                    let _ = deeper(held_at[i], || quiet(|| r2.get(bq)));
+                    deeper(96, || rt.get(z))
+                },
+                opts(),
+            )
+        });
+        let x = r1.create_query_with(move |rt| rt.get(ys[0]) + rt.get(ys[1]), opts());
+        r1.get(x);
+        runs.each_ref().map(|n| n.load(Ordering::SeqCst))
+    })
+    .join()
+    .unwrap()
+}
+
+/// A hold Y1 took and gave up with its frame does not hold Y2, a later
+/// frame at the same place: Y2's own hold, past the budget, leaves it
+/// doomed and run again when it reads past the budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_popped_siblings_hold_does_not_hold_the_next_frame() {
+    let (both, second) = (
+        sibling_holds::<Local, Shared>([96, 96]),
+        sibling_holds::<Local, Shared>([0, 96]),
+    );
+    assert!(both[1] > 1 && second[1] > 1, "{both:?} {second:?}");
 }
 
 mod review_8b_held_deep_read {
