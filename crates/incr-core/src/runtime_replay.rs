@@ -1121,7 +1121,7 @@ impl<C: Cells> Runtime<C> {
                 poison: false,
                 attributed: false,
                 payload: Box::new(cycle::CycleUnwind(c.clone())),
-                nodes: Vec::new(),
+                nodes: replay::Landings::default(),
             }),
             // An engine unwind, a wound, leaves the reader's run too.
             Err(_) if cycle_state::unwind_kind().is_some() => None,
@@ -1135,7 +1135,7 @@ impl<C: Cells> Runtime<C> {
                     poison: false,
                     attributed: false,
                     payload,
-                    nodes: Vec::new(),
+                    nodes: replay::Landings::default(),
                 })
             }
         };
