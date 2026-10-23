@@ -3387,6 +3387,23 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
     });
 }
 
+/// Seed 0xe4aa8b2e, two threads at a budget of 1 or 2: both threads read
+/// node 0, whose cycle branches on a caught panic, and `Get(0)` returns
+/// 9999 where every order panics. Each thread's doom discard-lands a node
+/// the other thread then claims, down the chain from node 26, as in 0x5aab.
+/// It fails in about one debug `differential_two` run in five.
+#[test]
+#[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_frame_keeps_its_node_from_the_other_thread_e4aa8b2e() {
+    let case = gen_case(0xe4aa_8b2e, false, true);
+    quiet(|| {
+        for _ in 0..16 {
+            differential_two(&case, 0xe4aa_8b2e);
+        }
+    });
+}
+
 /// Seed 0x57c2661 cut to `Get(12)` on a fresh runtime with 24 at 4: a
 /// cycle reaches the read unbounded, aborting 13's episode, which is no
 /// walk's. At budgets 1 to 3 a doom discards a member run of that episode
