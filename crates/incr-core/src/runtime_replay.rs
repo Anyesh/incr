@@ -2911,6 +2911,18 @@ impl<C: Cells> Runtime<C> {
         self.take_earliest(node, cidx, |x| &mut x.run_failures)
     }
 
+    /// Whether a failure count is held for a member run of `slot` at any
+    /// position.
+    pub(super) fn has_run_failures(&self, slot: u32) -> bool {
+        let rt = self.runtime_id;
+        let generation = self.nodes.get(slot).generation();
+        replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .any(|x| x.run_failures.has_node(slot, generation))
+        })
+    }
+
     fn take_earliest(
         &self,
         node: NodeId,

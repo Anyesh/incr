@@ -928,8 +928,7 @@ impl Context {
 
     /// Truncates `vstack` to `len` with no Tarjan pops, returning the
     /// episodes suspended at the frames removed: they are abandoned, and
-    /// their members are released with the claims held there. The removed
-    /// frames' failure counts go.
+    /// their members are released with the claims held there.
     pub(crate) fn truncate_vstack(&mut self, len: usize) -> Vec<Episode> {
         let mut abandoned = Vec::new();
         while self.vstack.len() > len {
@@ -938,10 +937,12 @@ impl Context {
             };
             // The frame's run is over, and a later run of its node there is
             // another run: a failure count left for it would hide its mark.
-            if !self.run_failures.is_empty() {
-                self.run_failures
-                    .take((v.node, v.generation, v.cidx), v.path);
-            }
+            debug_assert!(
+                !self
+                    .run_failures
+                    .has_path((v.node, v.generation, v.cidx), v.path),
+                "incr-core: a truncated member run's frame left a failure count"
+            );
             if let Some(ep) = v.ep {
                 if let Some(at) = self.episodes.iter().position(|e| e.id == ep) {
                     abandoned.push(self.episodes.remove(at));
@@ -1598,8 +1599,18 @@ impl EarliestByFrame {
         Some(value)
     }
 
-    fn is_empty(&self) -> bool {
-        self.by_frame.is_empty()
+    fn has_path(&self, frame: Frame, path: u64) -> bool {
+        self.by_frame
+            .get(&frame)
+            .is_some_and(|r| r.iter().any(|r| r.0 == path))
+    }
+
+    /// Whether a record is held for a frame of `node` at `generation`, at
+    /// any position.
+    pub(crate) fn has_node(&self, node: u32, generation: u32) -> bool {
+        self.by_frame
+            .keys()
+            .any(|f| f.0 == node && f.1 == generation)
     }
 
     fn end_maker(&mut self, level: u32) {

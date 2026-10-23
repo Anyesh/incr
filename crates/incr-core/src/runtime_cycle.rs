@@ -1772,6 +1772,12 @@ impl<C: Cells> Runtime<C> {
         // discard and a wound.
         if kind.is_none() {
             self.end_released_deliveries(&released);
+            // As for those deliveries, a failure count kept for one of these
+            // runs would reach the node's next run there and hide its mark.
+            debug_assert!(
+                replay::speculative() || !released.iter().any(|&m| self.has_run_failures(m)),
+                "incr-core: a released member's doomed run left a failure count"
+            );
         }
     }
 
