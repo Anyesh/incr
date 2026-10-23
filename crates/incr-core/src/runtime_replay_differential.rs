@@ -5497,6 +5497,22 @@ fn doomed_entrys_replay_keeps_a_repeat_beneath_it_92ef8cb9() {
     });
 }
 
+/// Seed 0x3da5e79115b09817: at budget 1, the context's target n4 ends in
+/// a user panic that the native reader catches before it is doomed. Its
+/// retry must read n4 as that read did, not walk it again after the
+/// context has landed it Failed: op 0 `Get(0)` must not add node 8 to
+/// the Failed set.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn targets_unwind_into_the_loops_read_is_kept_for_its_retry() {
+    let seed = 0x3da5_e791_15b0_9817;
+    quiet(|| {
+        differential::<Local>(&gen_case(seed, false, false), seed);
+        differential::<Shared>(&gen_case(seed, false, false), seed);
+        differential_two(&gen_case(seed, false, true), seed);
+    });
+}
+
 /// Seed 0x57c24cb at budget 1: op 5's `Get(7)` left queries 15 to 18
 /// New or Dirty where the unbounded run fails them. A speculative replay
 /// of slot 16's frame memoized slot 15 at owner 1 and was doomed; the real

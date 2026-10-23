@@ -1662,6 +1662,29 @@ same as the base. The rest move by run-to-run noise in both directions
 (`delete_owned_tree_local` -1,938, `delete_owned_tree_shared` +5,132,
 `get_contended_shared` +249, the others under 15).
 
+## Kept unwinds out of replay loops
+
+- Engine: `w/T8-seed-3da5-extra-failed` against its base
+  `spreadsheet-t10` at `1b77f852`, the base in a detached worktree; one
+  run of `icount.sh` at the default N per column. No workloads added.
+- Change: a context closing on an unwind, and an R5 member run's unwind,
+  keep the read they unwind into for its frame's retry; replay paths
+  only.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `diamond_local` | 3,919 | 3,919 | 0 |
+| `chain_local/propagate/100` | 91,210.01 | 91,210.01 | 0 |
+| `fanout_local_4` | 17,195 | 17,195 | 0 |
+
+Gate: every hard gate and every single-thread compute case counts the
+same as the base. The rest move by run-to-run noise in both directions
+(`delete_owned_tree_*` +244 / -349, `fanout_shared_1000` +9, the others
+under 9).
+
 ## A caught cycle's kind ends at the catching frame's pop
 
 - Engine: `w/T8-seed-b5e0053b30` against its base `spreadsheet-t10` at

@@ -675,6 +675,7 @@ impl<C: Cells> Runtime<C> {
                 return unwind.0.clone();
             }
         }
+        self.note_unwound_read(&*payload, cycle_state::unwind_kind());
         resume_unwind(payload)
     }
 
