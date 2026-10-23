@@ -88,6 +88,8 @@ impl<D: DepStack> Drop for Placed<'_, D> {
 struct Below {
     node: u32,
     cidx: u32,
+    /// The stack's depth with this frame on top.
+    depth: u32,
     ctl: *const ComputeCtl,
     step: replay::Step,
     path: u64,
@@ -107,6 +109,16 @@ impl<C: Cells> Runtime<C> {
         let tag = node.type_tag();
         C::fence_acquire();
         node.generation() == (reading >> 32) as u32 && self.arenas.erased(tag).has_placeholder()
+    }
+
+    /// Whether the frame `depth` deep with control block `ctl` can't be
+    /// doomed: it is `NO_DOOM`, or it holds a foreign read within this
+    /// runtime's budget, past which the stack bound wins, as for a ticket
+    /// payload, and its retry reads the other runtime again.
+    fn undoomable(&self, ctl: &ComputeCtl, depth: u32) -> bool {
+        let flags = ctl.flags.get();
+        flags & cycle::NO_DOOM != 0
+            || (flags & cycle::FOREIGN_HOLD != 0 && !self.over_budget(depth))
     }
 
     /// Whether a read from a frame `depth` frames deep is at or past a
@@ -163,6 +175,11 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
         mut word: u64,
     ) -> Result<T, Cycle> {
+        let foreign = word & value_code::FOREIGN_BIT != 0;
+        if foreign {
+            value_code::clear_foreign_bit();
+            word &= !value_code::FOREIGN_BIT;
+        }
         if word & value_code::COUNTER_MASK != 0 {
             return Ok(self.value_code_read(handle, self.nodes.get(handle.slot())));
         }
@@ -174,6 +191,9 @@ impl<C: Cells> Runtime<C> {
         {
             cycle_state::set_unwind_kind(None);
             word = value_code::thread_word();
+        }
+        if foreign {
+            return self.foreign_read(handle, observed, kind, word);
         }
         // A delivery goes to its frame's retry in a non-speculative run: a
         // speculative run that computes the same node is on another path,
@@ -589,29 +609,36 @@ impl<C: Cells> Runtime<C> {
         // The run's frames are those from where the driver placed the entry
         // up, not those at or above its position: a member run in the run
         // sits at its anchor, which can lie below that position.
-        let frames: Vec<(bool, u32, u32, *const ComputeCtl, u64)> = self.dep_stack.with(|s| {
+        let frames: Vec<(bool, u32, u32, *const ComputeCtl, u64, u32)> = self.dep_stack.with(|s| {
+            let placed = s.placed as usize;
             s.frames
-                .get(s.placed as usize..)
+                .get(placed..)
                 .expect("incr-core: an entry above level 0 runs placed")
                 .iter()
+                .enumerate()
                 .rev()
-                .map(|f| (f.rt == rt, f.node.0, f.cidx, f.ctl, f.reading))
+                .map(|(i, f)| {
+                    let depth = (placed + i + 1) as u32;
+                    (f.rt == rt, f.node.0, f.cidx, f.ctl, f.reading, depth)
+                })
                 .collect()
         });
         if reader.is_some_and(|r| frames.first().is_none_or(|f| f.2 != r)) {
             return false;
         }
-        let doomable = frames.iter().all(|&(ours, node, _, ctl, reading)| {
+        let doomable = frames.iter().all(|&(ours, node, _, ctl, reading, depth)| {
             // SAFETY: a frame's control block is live while it is on the
             // stack.
-            ours && unsafe { &*ctl }.flags.get() & (cycle::NO_DOOM | cycle::BUFFERED) == 0
+            let ctl = unsafe { &*ctl };
+            ours && !ctl.has(cycle::BUFFERED)
+                && !self.undoomable(ctl, depth)
                 && self.replayable(node)
                 && self.reading_has_placeholder(reading)
         });
         if !doomable {
             return false;
         }
-        for &(_, _, _, ctl, _) in &frames {
+        for &(_, _, _, ctl, _, _) in &frames {
             // SAFETY: as above.
             unsafe { &*ctl }.raise(cycle::DOOMED);
         }
@@ -892,6 +919,7 @@ impl<C: Cells> Runtime<C> {
                 let key = ReadKey {
                     reading: read.reading,
                     ordinal: read.ordinal,
+                    foreign: read.foreign,
                     ..ReadKey::blocked(v)
                 };
                 out.push((key, read.what));
@@ -993,6 +1021,202 @@ impl<C: Cells> Runtime<C> {
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
 
+    /// The key parts a read by this runtime's frame of `node` at `cidx`
+    /// gets from this runtime: the node's generation, the frame's path and,
+    /// for a member run, its episode.
+    fn key_parts(&self, node: u32, cidx: u32, member: bool) -> replay::KeyParts {
+        let episode = member
+            .then(|| cycle_state::held_episode(self.runtime_id, node))
+            .flatten();
+        (
+            self.nodes.get(node).generation(),
+            self.path_at(cidx),
+            episode,
+        )
+    }
+
+    fn frame_keys(&self) -> replay::FrameKeys {
+        replay::FrameKeys {
+            owner: std::ptr::from_ref(self).cast(),
+            parts: Self::foreign_key_parts,
+        }
+    }
+
+    /// [`Self::key_parts`] for a read another runtime makes from one of
+    /// this runtime's frames.
+    ///
+    /// # Safety
+    ///
+    /// `owner` is a context's [`replay::FrameKeys::owner`], this runtime,
+    /// and the context is open.
+    unsafe fn foreign_key_parts(
+        owner: *const (),
+        node: u32,
+        cidx: u32,
+        member: bool,
+    ) -> replay::KeyParts {
+        // SAFETY: the caller's contract; the driver that opened the context
+        // holds the runtime until it closes it.
+        let rt = unsafe { &*owner.cast::<Self>() };
+        rt.key_parts(node, cidx, member)
+    }
+
+    /// A read of `handle` by another runtime's frame, which may be doomed
+    /// and retried. A second read of this runtime need not return what the
+    /// first did (a cycle's outcome depends on where a walk enters it), so
+    /// the retry takes the first read's outcome again, kept in the reader's
+    /// runtime. A panic no copy can stand for keeps the reader from being
+    /// doomed instead.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn foreign_read<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        kind: ReadKind,
+        word: u64,
+    ) -> Result<T, Cycle> {
+        let Some((reader, node, ctl, cidx)) = self.dep_stack.top_frame() else {
+            return self.read_unframed(handle, observed, kind, word);
+        };
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live.
+        let flags = unsafe { &*ctl };
+        // A doomed frame's reads are not the unbounded run's.
+        if reader == self.runtime_id || flags.has(cycle::DOOMED) {
+            return self.read_unframed(handle, observed, kind, word);
+        }
+        let rt = self.runtime_id;
+        let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
+        let kept = flags.has(cycle::KEPT_READ);
+        let ordinal = replay::foreign_ordinal(reader, cidx, ctl, reading, rt, kept);
+        let taken = self
+            .foreign_key(word, (reader, node, flags, cidx), reading, ordinal)
+            .and_then(|key| replay::take_pending(reader, &key, clone_landed::<T>));
+        let outcome = match taken {
+            Some(Delivered::Landed(value)) => Ok(Ok(*value
+                .into_inner()
+                .downcast::<T>()
+                .expect("incr-core: a landed value has its node's type"))),
+            Some(Delivered::Unwind {
+                cycle: true,
+                payload,
+                ..
+            }) => Ok(Err(payload
+                .downcast::<cycle::CycleUnwind>()
+                .expect("incr-core: a kept cycle is a cycle unwind")
+                .0)),
+            Some(Delivered::Unwind { payload, .. }) => Err(payload),
+            Some(Delivered::Walk(_) | Delivered::Direct) => {
+                unreachable!("incr-core: a walk's direction is not a value")
+            }
+            None => catch_unwind(AssertUnwindSafe(|| {
+                self.read_unframed(handle, observed, kind, word)
+            })),
+        };
+        let what = match &outcome {
+            Ok(Ok(value)) => Some(Delivered::Landed(Unbuilt::new(clone_landed::<T>(value)))),
+            Ok(Err(c)) => Some(Delivered::Unwind {
+                cycle: true,
+                poison: false,
+                attributed: false,
+                payload: Box::new(cycle::CycleUnwind(c.clone())),
+                nodes: replay::Landings::default(),
+            }),
+            // An engine unwind, a wound, leaves the reader's run too.
+            Err(_) if cycle_state::unwind_kind().is_some() => None,
+            Err(payload) => {
+                let copy = replay::copy_payload(&**payload);
+                if copy.is_none() {
+                    self.dep_stack.hold_foreign_reader();
+                }
+                copy.map(|payload| Delivered::Unwind {
+                    cycle: false,
+                    poison: false,
+                    attributed: false,
+                    payload,
+                    nodes: replay::Landings::default(),
+                })
+            }
+        };
+        if let Some(what) = what {
+            flags.raise(cycle::KEPT_READ);
+            replay::keep_read(
+                replay::KeptRead {
+                    rt: reader,
+                    cidx,
+                    ctl,
+                    reading,
+                    ordinal,
+                    foreign: Some(rt),
+                    what,
+                },
+                !kept,
+            );
+        }
+        match outcome {
+            Ok(read) => read,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    /// The key of the read of this runtime's node `reading` that `frame`,
+    /// another runtime's, makes for the `ordinal`th time, when the read is
+    /// a retry's in an open context of that runtime.
+    fn foreign_key(
+        &self,
+        word: u64,
+        frame: (RuntimeId, NodeId, &cycle::ComputeCtl, u32),
+        reading: u64,
+        ordinal: u32,
+    ) -> Option<ReadKey> {
+        let (reader, node, flags, cidx) = frame;
+        if word & value_code::REPLAY_BIT == 0 || replay::speculative() {
+            return None;
+        }
+        let keys = replay::frame_keys(reader)?;
+        let member = flags.has(cycle::BUFFERED);
+        // SAFETY: the keys come from an open context of `reader`.
+        let (generation, path, episode) = unsafe { (keys.parts)(keys.owner, node.0, cidx, member) };
+        Some(ReadKey {
+            node: node.0,
+            generation,
+            cidx,
+            reading,
+            ordinal,
+            path,
+            episode,
+            foreign: Some(self.runtime_id),
+        })
+    }
+
+    /// A read of `handle` that records nothing in the frame on top of the
+    /// stack: `read_slow` with no frame of this runtime's.
+    fn read_unframed<T: Value>(
+        &self,
+        handle: Incr<T>,
+        mut observed: NodeState,
+        kind: ReadKind,
+        word: u64,
+    ) -> Result<T, Cycle> {
+        let node = self.nodes.get(handle.slot());
+        if observed == NodeState::Clean {
+            let (type_tag, arena_slot) = self.fields_under(handle, node);
+            if let Some(value) = self.try_read_slot(handle, node, type_tag, arena_slot) {
+                return Ok(value);
+            }
+            match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                Ok(value) => return Ok(value),
+                Err(now) => observed = now,
+            }
+        }
+        if word & (value_code::COUNTER_MASK | value_code::REPLAY_BIT | value_code::UNWIND_MASK) != 0
+        {
+            return self.read_cold(handle, observed, kind, None, word);
+        }
+        self.read_walk::<T, 0>(handle, node, observed, kind, word, None)
+    }
+
     fn budgeted(&self) -> bool {
         self.max_frames.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX
             || self
@@ -1020,6 +1244,7 @@ impl<C: Cells> Runtime<C> {
                 ctl,
                 reading,
                 ordinal,
+                foreign: None,
                 what,
             },
             fresh,
@@ -1031,13 +1256,16 @@ impl<C: Cells> Runtime<C> {
     fn frames_below(&self) -> Vec<Below> {
         let rt = self.runtime_id;
         let mut frames: Vec<Below> = self.dep_stack.with(|s| {
+            let len = s.frames.len();
             s.frames
                 .iter()
                 .rev()
-                .take_while(|f| f.rt == rt)
-                .map(|f| Below {
+                .enumerate()
+                .take_while(|(_, f)| f.rt == rt)
+                .map(|(i, f)| Below {
                     node: f.node.0,
                     cidx: f.cidx,
+                    depth: (len - i) as u32,
                     ctl: f.ctl,
                     step: f.step(),
                     path: 0,
@@ -1111,7 +1339,8 @@ impl<C: Cells> Runtime<C> {
             // stack, and these frames are below the reading one.
             let ctl = unsafe { &*f.ctl };
             if f.cidx < floor
-                || ctl.flags.get() & (cycle::DOOMED | cycle::NO_DOOM) != 0
+                || ctl.has(cycle::DOOMED)
+                || self.undoomable(ctl, f.depth)
                 || !self.replayable(f.node)
                 || !self.reading_has_placeholder(f.step.reading)
             {
@@ -1157,6 +1386,7 @@ impl<C: Cells> Runtime<C> {
                     retry: target_retry,
                     walked: target_walked,
                 },
+                self.frame_keys(),
             ),
         };
         #[cfg(test)]
@@ -2539,7 +2769,7 @@ impl<C: Cells> Runtime<C> {
         // no delivery can intercept, so the read's outcome may not be the
         // unbounded run's.
         #[cfg(test)]
-        for d in ended.iter().filter(|d| !d.taken) {
+        for d in ended.iter().filter(|d| !d.taken && d.key.foreign.is_none()) {
             let slot = d.key.reading as u32;
             if state::load::<C>(self.nodes.get(slot).state_cell()) == NodeState::Clean {
                 self.dirty_reads.lock().unwrap().push(slot);
@@ -2558,7 +2788,6 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
     ) -> Option<Result<T, Cycle>> {
         let rt = self.runtime_id;
-        let generation = self.nodes.get(f.node.0).generation();
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
         // A delivery stays until its maker's run ends, because a retry
         // doomed again after the read comes back to it as an entry and must
@@ -2566,43 +2795,18 @@ impl<C: Cells> Runtime<C> {
         // delivered once.
         // SAFETY: the active frame's control block is live.
         let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
+        let (generation, path, episode) = self.key_parts(f.node.0, f.cidx, member);
         let key = ReadKey {
             node: f.node.0,
             generation,
             cidx: f.cidx,
             reading,
             ordinal: self.dep_stack.reads_of_current(rt),
-            path: self.path_at(f.cidx),
-            episode: member
-                .then(|| cycle_state::held_episode(rt, f.node.0))
-                .flatten(),
+            path,
+            episode,
+            foreign: None,
         };
-        let what = replay::with(|c| {
-            c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
-                let at = x.pending.find_keyed(&key, |d| {
-                    !d.taken && !matches!(d.what, Delivered::Walk(_) | Delivered::Direct)
-                })?;
-                // The read has its outcome, which ended the walk it was
-                // blocked in, so a later read under the same key in this
-                // run must not resume that walk or recompute its node.
-                x.pending.take_keyed(&key);
-                Some(match &x.pending.get(at).what {
-                    Delivered::Landed(value) => {
-                        Delivered::Landed(Unbuilt::new(Box::new(value_code::run(|| {
-                            value
-                                .value()
-                                .downcast_ref::<T>()
-                                .expect("incr-core: a landed value has its node's type")
-                                .clone()
-                        }))))
-                    }
-                    Delivered::Walk(_) | Delivered::Direct => {
-                        unreachable!("incr-core: a walk's direction is not a value")
-                    }
-                    Delivered::Unwind { .. } => x.take_unwind(at),
-                })
-            })
-        });
+        let what = replay::take_pending(rt, &key, clone_landed::<T>);
         let Some(what) = what else {
             let slot = handle.slot();
             replay::with(|c| {
@@ -3103,4 +3307,14 @@ impl<C: Cells> Runtime<C> {
                 .any(|x| x.vstack.iter().any(|v| v.cidx == cidx))
         })
     }
+}
+
+/// A clone of a landed value of type `T`, as a delivery holds it.
+fn clone_landed<T: Value>(value: &(dyn std::any::Any + Send)) -> cycle::Erased {
+    Box::new(value_code::run(|| {
+        value
+            .downcast_ref::<T>()
+            .expect("incr-core: a landed value has its node's type")
+            .clone()
+    }))
 }

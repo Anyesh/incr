@@ -318,7 +318,14 @@ impl<C: Cells> Runtime<C> {
             C::fence_acquire();
             (state::load::<C>(node.state_cell()), stamp)
         };
-        self.dep_stack.record_dep(self.runtime_id, id, gen);
+        // No kept read carries an observer's read to a retry of another
+        // runtime's frame.
+        if self
+            .dep_stack
+            .record_dep_or_foreign(self.runtime_id, id, gen)
+        {
+            self.dep_stack.hold_foreign_reader();
+        }
         self.park(ParkPoint::ObserverAfterEntryCheck(id));
         if observed != NodeState::Clean {
             self.observer_walk(handle, observed, entry_stamp)?;

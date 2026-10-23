@@ -1247,7 +1247,7 @@ macro_rules! pairs {
 pairs!(
     cross_runtime_reentry,
     cross_runtime_read_records_nothing,
-    foreign_reader_is_never_doomed,
+    foreign_reader_is_doomed_and_retried,
     foreign_ring_read_is_not_rerun,
 );
 
@@ -1470,24 +1470,53 @@ mod flags_reload {
     }
 }
 
+/// What a replayable frame reads first in [`foreign_reader_is_doomed_and_retried`].
+#[derive(Clone, Copy, Debug)]
+enum FirstRead {
+    Own,
+    /// Another runtime's input, Clean when read.
+    ForeignClean,
+    /// Another runtime's query over that input, New when read, so the
+    /// read computes it.
+    ForeignComputed,
+}
+
 /// A replayable frame at budget 1 that reads 64 leaves runs twice, once
-/// doomed; after a read of another runtime's node it is never doomed, so
-/// its leaves nest natively and it runs once.
-fn foreign_reader_is_never_doomed<A: Cells, B: Cells>() {
-    for foreign in [false, true] {
+/// doomed, whatever it first reads. The last leaf sets another runtime's
+/// input when it runs, which is after the first read in the unbounded run
+/// and between the doomed run and its retry here. A retry takes a non-Clean
+/// foreign read's outcome again, so it agrees with the unbounded run; a
+/// Clean foreign read keeps nothing, so the retry reads the node again and
+/// sees the set, the documented limitation.
+fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
+    for first in [
+        FirstRead::Own,
+        FirstRead::ForeignClean,
+        FirstRead::ForeignComputed,
+    ] {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_placeholder(0_u64);
         r1.set_max_frames(1);
         let x = r2.create_input(1000_u64);
-        let leaves: Vec<Incr<u64>> = (0..64_u64).map(|i| r1.create_query(move |_| i)).collect();
+        let q = r2.create_query(move |rt| rt.get(x));
+        let mut leaves: Vec<Incr<u64>> = (0..63_u64).map(|i| r1.create_query(move |_| i)).collect();
+        let r2_ = OtherRt(&*r2);
+        leaves.push(r1.create_query(move |_| {
+            r2_.set(x, 2000);
+            63
+        }));
         let runs = Arc::new(AtomicU32::new(0));
         let wide = {
             let (r2, runs) = (OtherRt(&*r2), runs.clone());
             r1.create_query_with(
                 move |rt| {
                     runs.fetch_add(1, Ordering::Relaxed);
-                    let base = if foreign { r2.get(x) } else { 1000 };
+                    let base = match first {
+                        FirstRead::Own => 1000,
+                        FirstRead::ForeignClean => r2.get(x),
+                        FirstRead::ForeignComputed => r2.get(q),
+                    };
                     base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
                 },
                 QueryOpts {
@@ -1496,9 +1525,13 @@ fn foreign_reader_is_never_doomed<A: Cells, B: Cells>() {
                 },
             )
         };
-        assert_eq!(r1.get(wide), 1000 + (0..64).sum::<u64>());
-        assert_eq!(runs.load(Ordering::Relaxed), if foreign { 1 } else { 2 });
-        assert_eq!(r1.dooms.lock().unwrap().is_empty(), foreign);
+        let base = match first {
+            FirstRead::ForeignClean => 2000,
+            FirstRead::Own | FirstRead::ForeignComputed => 1000,
+        };
+        assert_eq!(r1.get(wide), base + (0..64).sum::<u64>(), "{first:?}");
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "{first:?}");
+        assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
     }
 }
 
@@ -1543,5 +1576,168 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
     assert_eq!(run(u32::MAX), Ok(7777));
     for frames in [1, 2] {
         assert_eq!(run(frames), Ok(7777), "budget {frames}");
+    }
+}
+
+/// A replayable chain of `n` levels read top-down in runtime A, where every
+/// level reads an input of runtime B and then the next level. Run on a
+/// spawned thread's default stack, which the frame budget must bound, as
+/// it does a chain that reads only its own runtime.
+fn foreign_reading_chain_stays_within_the_stack<A: Cells, B: Cells>() {
+    let n = crate::test_size::test_size(100_000);
+    let got = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        let x = r2.create_input(1_i64);
+        let mut below: Option<Incr<i64>> = None;
+        for _ in 0..n {
+            let (r2, next) = (OtherRt(&*r2), below);
+            below = Some(r1.create_query_with(
+                move |rt| r2.get(x) + next.map_or(0, |b| rt.get(b)),
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(got, n as i64);
+}
+
+mod foreign_chain {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_local() {
+        super::foreign_reading_chain_stays_within_the_stack::<Local, Local>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared() {
+        super::foreign_reading_chain_stays_within_the_stack::<Local, Shared>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_local() {
+        super::foreign_reading_chain_stays_within_the_stack::<Shared, Local>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_shared() {
+        super::foreign_reading_chain_stays_within_the_stack::<Shared, Shared>();
+    }
+}
+
+/// A panic payload no copy can stand for.
+struct Uncopyable;
+
+/// Silences the panics of [`Uncopyable`] payloads, one per level of
+/// `foreign_panicking_chain_stays_within_the_stack`, and leaves every
+/// other panic to the default hook.
+fn quiet_uncopyable() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.payload().is::<Uncopyable>() {
+                default(info);
+            }
+        }));
+    });
+}
+
+/// As [`foreign_reading_chain_stays_within_the_stack`], with every level
+/// catching the panic of its own node of runtime B, whose payload no kept
+/// read can carry. Such a reader stays undoomed only within the budget, so
+/// the chain is bounded as one with a ticket payload is.
+/// `b_frames` is B's frame budget, if not the default: the reader is A's
+/// frame, so A's budget bounds it whatever B's is.
+fn foreign_panicking_chain_stays_within_the_stack<A: Cells, B: Cells>(b_frames: Option<u32>) {
+    quiet_uncopyable();
+    let n = crate::test_size::test_size(100_000);
+    let got = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        if let Some(frames) = b_frames {
+            r2.set_max_frames(frames);
+        }
+        let mut below: Option<Incr<i64>> = None;
+        for _ in 0..n {
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let (r2, next) = (OtherRt(&*r2), below);
+            below = Some(r1.create_query_with(
+                move |rt| {
+                    let caught = quiet(|| r2.get(bq)).is_err();
+                    i64::from(caught) + next.map_or(0, |b| rt.get(b))
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(got, n as i64);
+}
+
+mod foreign_panic_chain {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(None);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_shared() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>(None);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared_with_b_unbudgeted() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(Some(u32::MAX));
     }
 }

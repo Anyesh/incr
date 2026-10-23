@@ -1981,7 +1981,12 @@ impl<C: Cells> Runtime<C> {
             .record_read(self.runtime_id, NodeId(slot), handle.generation());
 
         let word = value_code::thread_word();
-        if word & (value_code::COUNTER_MASK | value_code::REPLAY_BIT | value_code::UNWIND_MASK) != 0
+        if word
+            & (value_code::COUNTER_MASK
+                | value_code::REPLAY_BIT
+                | value_code::UNWIND_MASK
+                | value_code::FOREIGN_BIT)
+            != 0
             || frame.is_some_and(|f| self.doomed_or_past_budget(f))
         {
             return self.read_cold(handle, observed, kind, frame, word);

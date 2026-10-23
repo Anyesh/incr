@@ -1498,3 +1498,53 @@ Gate: the Clean get, table hit and value slot are unchanged. The two
 calls cost 0 or 2 instructions by partitioning, like every other
 `RwLock` write in the engine; a lock whose unlock inlines would remove
 the dependence for that lock only.
+
+## Foreign reads
+
+- Engine: `w/T8-foreign-read-stack-overflow` (`16a6164f`) against its
+  base `spreadsheet-t10` at `98d7c337`, the base in a detached worktree;
+  one run of `icount.sh` at the default N per column, and the deletes
+  again with `getrandom` fixed by `fixed_getrandom.so`. Intel PT line
+  diffs through `pt-lines.sh` at N = 10. No workloads added.
+- Change: a non-Clean read that another runtime's frame makes takes the
+  cold path, which keeps its outcome for that frame's retry; a Clean one
+  keeps nothing; an uncopyable outcome holds the reader undoomable within
+  its own runtime's budget (`FOREIGN_HOLD`).
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `diamond_local` / `_shared` | 3,919 / 7,850.9 | 3,919 / 7,850.0 | 0 / -1 |
+| `chain_local/propagate/100` | 91,210.0 | 91,210.0 | 0 |
+| `fanout_local_4` / `fanout_shared_4` | 17,195.0 / 23,591.1 | 17,195.0 / 23,591.1 | 0 |
+| `delete_owned_tree_local` / `_shared` (fixed seed) | 601,628 / 981,243 | 601,638 / 981,053 | +10 / -190 |
+| `children_churn_local` / `_shared` | 16,528.7 / 19,434.1 | 16,498.7 / 19,402.4 | -30 / -32 |
+
+- **The foreign arm of `record_read`:** returning the other runtime's
+  frame as a second `Some` exit cost +3 per framed non-Clean read under
+  Local (+7 on `fanout_local_4`, +9 on `fanout_shared_4`): LLVM merged
+  the RefCell release of both exits, which spilled two registers in
+  `get_slow`. Building that frame out of line, or returning the whole
+  `Option` from a cold call, cost +4 to +5. The arm now returns `None`
+  like the base and its cold call sets `value_code::FOREIGN_BIT`, which
+  joins the mask `read_slow` already tests, so the own-runtime path is
+  the base's instruction for instruction.
+- **The Clean arm of `record_dep`:** an empty arm spilled two more
+  registers in the inlined Clean `get`, 2 to 10 instructions per read; a
+  cold out-of-line call in the arm keeps the base's code.
+- **Deletes:** `icount.sh` does not fix `getrandom`, and its
+  `delete_owned_tree_*` columns moved +1,318 / +608 between runs of the
+  same trees. With the seed fixed the Local rise is +10, all in drop glue
+  this branch does not touch (`drop_in_place`, `DeleteBag`), and Shared
+  falls by 190.
+- **`children_churn_*`:** `HashMap::insert` is now inlined into
+  `children::IndexState::insert` (-82 for the call, +52 inlined).
+- **Partitioning:** with `codegen-units = 1` and the seed fixed, both
+  trees count the same on `delete_owned_tree_local` (610,684.3),
+  `children_churn_local` (16,410.4) and `diamond_local` (3,986.0), so
+  the delete rise and the churn fall are where codegen units split.
+
+Gate: every hard gate and every single-thread compute case counts the
+same as the base.

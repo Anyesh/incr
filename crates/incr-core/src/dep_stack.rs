@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, NO_DOOM, POISONED};
+use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -108,13 +108,34 @@ impl Frames {
         self.frames.last_mut().filter(|top| top.rt == rt)
     }
 
-    /// A read `rt` serves to the top frame, which is not one of `rt`'s:
-    /// that frame can no longer be doomed, because its retry would read
-    /// the other runtime again and no kept read carries what the first
-    /// read returned. A frame doomed already keeps its doom.
+    /// A Clean read another runtime serves to the top frame, which keeps no
+    /// read: the frame's retry reads the node again. A call, not an empty
+    /// arm, because with an empty arm the Clean read inlined into `get`
+    /// spills two more registers, 2 to 10 instructions per read.
     #[cold]
     #[inline(never)]
-    fn note_foreign_read(&mut self) {
+    fn foreign_clean_read(&mut self) {
+        std::hint::black_box(&mut *self);
+    }
+
+    /// A non-Clean read another runtime serves to the top frame: it sets
+    /// `value_code::FOREIGN_BIT`, so the read takes the cold path, which
+    /// keeps its outcome for that frame's retry. The bit, not a returned
+    /// frame, because a second `Some` exit costs `get` 3 instructions per
+    /// framed read.
+    #[cold]
+    #[inline(never)]
+    fn foreign_non_clean_read(&mut self) {
+        crate::value_code::set_foreign_bit();
+    }
+
+    /// A read another runtime serves to the top frame whose outcome no
+    /// kept read can carry: within its own runtime's budget, that frame can
+    /// no longer be doomed, because its retry would read the other runtime
+    /// again (see [`FOREIGN_HOLD`]). A frame doomed already keeps its doom.
+    #[cold]
+    #[inline(never)]
+    fn hold_foreign_reader(&mut self) {
         let top = self
             .frames
             .last()
@@ -123,7 +144,7 @@ impl Frames {
         // (see `Frame::ctl`).
         let ctl = unsafe { &*top.ctl };
         if !ctl.has(DOOMED) {
-            ctl.raise(NO_DOOM);
+            ctl.raise(FOREIGN_HOLD);
         }
     }
 
@@ -214,19 +235,42 @@ pub trait DepStack: 'static {
     /// Record `dep`, read at `generation`, as a dependency of runtime
     /// `rt`'s active frame, if it has one. The generation lets publish
     /// detect a dep that was deleted, and possibly recycled, after the
-    /// read.
+    /// read. A top frame of another runtime's records nothing.
     #[inline(always)]
     fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) {
         self.with(|s| match s.frames.last_mut() {
             Some(top) if top.rt == rt => top.deps.push((dep, generation)),
-            Some(_) => s.note_foreign_read(),
+            Some(_) => s.foreign_clean_read(),
             None => {}
         })
     }
 
+    /// [`Self::record_dep`], true if the top frame is another runtime's.
+    #[inline(always)]
+    fn record_dep_or_foreign(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> bool {
+        self.with(|s| match s.frames.last_mut() {
+            Some(top) if top.rt == rt => {
+                top.deps.push((dep, generation));
+                false
+            }
+            Some(_) => true,
+            None => false,
+        })
+    }
+
+    /// The top frame's runtime, node, control block and position.
+    fn top_frame(&self) -> Option<(RuntimeId, NodeId, *const ComputeCtl, u32)> {
+        self.with(|s| s.frames.last().map(|f| (f.rt, f.node, f.ctl, f.cidx)))
+    }
+
+    /// See `Frames::hold_foreign_reader`.
+    fn hold_foreign_reader(&self) {
+        self.with(Frames::hold_foreign_reader);
+    }
+
     /// [`Self::record_dep`] for a nested non-Clean read, which also stores
     /// the read in the frame and returns what the read needs to know of
-    /// the frame.
+    /// the frame: none for another runtime's frame, with nothing stored.
     #[inline(always)]
     fn record_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> Option<ActiveRead> {
         self.with(|s| {
@@ -234,7 +278,7 @@ pub trait DepStack: 'static {
             let top = match s.frames.last_mut() {
                 Some(top) if top.rt == rt => top,
                 Some(_) => {
-                    s.note_foreign_read();
+                    s.foreign_non_clean_read();
                     return None;
                 }
                 None => return None,
