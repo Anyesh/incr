@@ -113,12 +113,29 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// A runtime's place in `UNBUDGETED`, which its drop gives up.
-pub(crate) struct BudgetEntry(RuntimeId);
+/// Counts budget changes across runtimes. A foreign hold notes the count
+/// when taken, since the runtime that takes it can't see the reader's
+/// budget, and the reader judges it held if its budget changed since.
+static BUDGET_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `BUDGET_CLOCK` now, for a foreign hold taken now.
+pub(super) fn budget_clock() -> u64 {
+    BUDGET_CLOCK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A runtime's place in `UNBUDGETED`, which its drop gives up, and the
+/// `BUDGET_CLOCK` count its budget last changed at.
+pub(crate) struct BudgetEntry {
+    id: RuntimeId,
+    changed: std::sync::atomic::AtomicU64,
+}
 
 impl BudgetEntry {
     pub(crate) fn new(id: RuntimeId, max_frames: u32) -> Self {
-        let entry = Self(id);
+        let entry = Self {
+            id,
+            changed: std::sync::atomic::AtomicU64::new(0),
+        };
         if max_frames == u32::MAX {
             entry.note(|| true);
         }
@@ -137,8 +154,8 @@ impl BudgetEntry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let unbudgeted = unbudgeted();
-        match (list.iter().position(|&id| id == self.0), unbudgeted) {
-            (None, true) => list.push(self.0),
+        match (list.iter().position(|&id| id == self.id), unbudgeted) {
+            (None, true) => list.push(self.id),
             (Some(at), false) => {
                 list.swap_remove(at);
             }
@@ -170,6 +187,10 @@ impl<C: Cells> Runtime<C> {
     /// it, both under the list's lock.
     pub(super) fn set_budget(&self, store: impl FnOnce()) {
         self.budget_entry.note(|| {
+            let now = BUDGET_CLOCK.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            self.budget_entry
+                .changed
+                .store(now, std::sync::atomic::Ordering::SeqCst);
             store();
             !self.budgeted()
         });
@@ -194,6 +215,8 @@ impl<C: Cells> Runtime<C> {
     /// doomed: it is `NO_DOOM`, or it took a foreign read's hold within this
     /// runtime's budget where it read, past which the stack bound wins, as
     /// for a ticket payload, and its retry reads the other runtime again.
+    /// A hold taken before this runtime's budget last changed was taken
+    /// under a budget no longer known, so it holds.
     fn undoomable(&self, ctl: &ComputeCtl, depth: u32) -> bool {
         let flags = ctl.flags.get();
         flags & cycle::NO_DOOM != 0
@@ -201,7 +224,13 @@ impl<C: Cells> Runtime<C> {
                 && self
                     .dep_stack
                     .hold_position(ctl)
-                    .is_some_and(|at| !self.over_budget_at(depth, at)))
+                    .is_some_and(|(at, clock)| {
+                        self.budget_entry
+                            .changed
+                            .load(std::sync::atomic::Ordering::SeqCst)
+                            > clock
+                            || !self.over_budget_at(depth, at)
+                    }))
     }
 
     /// Whether a read from a frame `depth` frames deep is at or past a
@@ -1181,9 +1210,15 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the reading frame is on the stack, so its control block
         // is live.
         let flags = unsafe { &*ctl };
-        // A doomed frame's reads are not the unbounded run's, and an
-        // unbudgeted runtime's frame is never retried.
-        if reader == self.runtime_id || flags.has(cycle::DOOMED) || unbudgeted(reader) {
+        // A doomed frame's reads are not the unbounded run's.
+        if reader == self.runtime_id || flags.has(cycle::DOOMED) {
+            return self.read_unframed(handle, observed, kind, word);
+        }
+        let clock = budget_clock();
+        // An unbudgeted runtime's frame is retried only under a budget set
+        // later, which its hold keeps from dooming it.
+        if unbudgeted(reader) {
+            self.dep_stack.hold_foreign_reader(clock);
             return self.read_unframed(handle, observed, kind, word);
         }
         let rt = self.runtime_id;
@@ -1228,7 +1263,7 @@ impl<C: Cells> Runtime<C> {
             Err(payload) => {
                 let copy = replay::copy_payload(&**payload);
                 if copy.is_none() {
-                    self.dep_stack.hold_foreign_reader();
+                    self.dep_stack.hold_foreign_reader(clock);
                 }
                 copy.map(|payload| Delivered::Unwind {
                     cycle: false,

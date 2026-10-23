@@ -93,10 +93,11 @@ pub struct Frames {
     /// the frame below it is not its reader.
     pub(crate) placed: u32,
     /// Each frame holding `FOREIGN_HOLD`, by index and control block, with
-    /// the stack address its hold was taken at: its runtime judges the hold
-    /// against its byte budget there, since at a doom the stack is past it.
+    /// the stack address its hold was taken at and the budget clock then:
+    /// its runtime judges the hold against its byte budget there, since at
+    /// a doom the stack is past it, unless its budget changed since.
     /// Indexes increase, and a hold drops the entries at or above its own.
-    holds: Vec<(u32, *const ComputeCtl, usize)>,
+    holds: Vec<(u32, *const ComputeCtl, usize, u64)>,
 }
 
 /// A placement [`DepStack::place_next_at`] replaced, to restore.
@@ -140,7 +141,7 @@ impl Frames {
     /// again (see [`FOREIGN_HOLD`]). A frame doomed already keeps its doom.
     #[cold]
     #[inline(never)]
-    fn hold_foreign_reader(&mut self) {
+    fn hold_foreign_reader(&mut self, clock: u64) {
         let top = self
             .frames
             .last()
@@ -153,34 +154,36 @@ impl Frames {
             let index = (self.frames.len() - 1) as u32;
             let here = 0_u8;
             let here = std::hint::black_box(std::ptr::from_ref(&here)) as usize;
-            let keep = self.holds.partition_point(|&(i, _, _)| i < index);
-            // A frame's earlier hold nearer the stack's base still holds it.
+            let keep = self.holds.partition_point(|&(i, _, _, _)| i < index);
+            // A frame's earlier hold nearer the stack's base, or under a
+            // budget since changed, still holds it.
             let base = crate::cycle_state::stack_base();
-            let here = match self.holds.get(keep) {
-                Some(&(i, c, at)) if i == index && c == top.ctl => {
+            let (here, clock) = match self.holds.get(keep) {
+                Some(&(i, c, at, then)) if i == index && c == top.ctl => (
                     if at.abs_diff(base) < here.abs_diff(base) {
                         at
                     } else {
                         here
-                    }
-                }
-                _ => here,
+                    },
+                    then.min(clock),
+                ),
+                _ => (here, clock),
             };
             self.holds.truncate(keep);
-            self.holds.push((index, top.ctl, here));
+            self.holds.push((index, top.ctl, here, clock));
         }
     }
 
     /// The stack address at which the frame whose control block is `ctl`
-    /// took its `FOREIGN_HOLD`.
-    fn hold_position(&self, ctl: *const ComputeCtl) -> Option<usize> {
+    /// took its `FOREIGN_HOLD`, and the budget clock then.
+    fn hold_position(&self, ctl: *const ComputeCtl) -> Option<(usize, u64)> {
         self.holds
             .iter()
             .rev()
-            .find(|&&(i, c, _)| {
+            .find(|&&(i, c, _, _)| {
                 c == ctl && self.frames.get(i as usize).is_some_and(|f| f.ctl == ctl)
             })
-            .map(|&(_, _, at)| at)
+            .map(|&(_, _, at, clock)| (at, clock))
     }
 
     /// The active frame as the reader of what the compute that popped
@@ -308,12 +311,12 @@ pub trait DepStack: 'static {
     }
 
     /// See `Frames::hold_foreign_reader`.
-    fn hold_foreign_reader(&self) {
-        self.with(Frames::hold_foreign_reader);
+    fn hold_foreign_reader(&self, clock: u64) {
+        self.with(|s| s.hold_foreign_reader(clock));
     }
 
     /// See `Frames::hold_position`.
-    fn hold_position(&self, ctl: *const ComputeCtl) -> Option<usize> {
+    fn hold_position(&self, ctl: *const ComputeCtl) -> Option<(usize, u64)> {
         self.with(|s| s.hold_position(ctl))
     }
 

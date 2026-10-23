@@ -324,7 +324,8 @@ impl<C: Cells> Runtime<C> {
             .dep_stack
             .record_dep_or_foreign(self.runtime_id, id, gen)
         {
-            self.dep_stack.hold_foreign_reader();
+            self.dep_stack
+                .hold_foreign_reader(replay_impl::budget_clock());
         }
         self.park(ParkPoint::ObserverAfterEntryCheck(id));
         if observed != NodeState::Clean {
