@@ -268,12 +268,21 @@ impl<C: Cells> Runtime<C> {
         }
         // A read while a cycle's unwind kind is set comes from a closure that
         // caught that unwind: the kind is stale, and a panic of the node read
-        // next would land as a cycle's discard instead of Failed.
-        if word & value_code::UNWIND_MASK != 0
-            && cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
-        {
-            cycle_state::set_unwind_kind(None);
-            word = value_code::thread_word();
+        // next would land as a cycle's discard instead of Failed. A caught
+        // discard is raised again here: left set, the next frame to pop
+        // would take it as its own swallow, and a context can absorb that
+        // frame's discard, so the catching closure's value would land.
+        if word & value_code::UNWIND_MASK != 0 {
+            match cycle_state::unwind_kind() {
+                Some(UnwindKind::Cycle) => {
+                    cycle_state::set_unwind_kind(None);
+                    word = value_code::thread_word();
+                }
+                Some(UnwindKind::Discard) if !std::thread::panicking() => {
+                    resume_unwind(Box::new(cycle::DiscardUnwind))
+                }
+                _ => {}
+            }
         }
         if foreign {
             return self.foreign_read(handle, observed, kind, word);
