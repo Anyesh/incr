@@ -1839,3 +1839,75 @@ local_and_shared!(
     local_wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload,
     shared_wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload
 );
+
+/// P reads A, A reads B, B reads M under `catch_unwind` and panics if that
+/// read failed, and M's `try_get` of A meets the cycle A..M, which has no
+/// strategy. M is created first, so the episode A roots runs M's member
+/// run first, and M's `try_get` of A, a held member without a buffer, runs
+/// A nested in it. B's panic rides out of that run as the cycle's unwind,
+/// which reaches M as the cycle's, so M is not the member that failed and
+/// the episode's abort leaves every node New. Returns P's outcome and the
+/// states of P, A, B and M.
+fn member_try_get_in_caught_cycle<C: Cells>(frames: Option<u32>) -> (String, [NodeState; 4]) {
+    let rt = runtime::<C>(frames);
+    let (a_cell, m_cell): (Later, Later) = Default::default();
+    let m = {
+        let a_cell = a_cell.clone();
+        rt.create_query_with(
+            move |rt| rt.try_get(later(&a_cell)).unwrap_or(7777),
+            replayable(),
+        )
+    };
+    m_cell.set(m).unwrap();
+    let b = {
+        let m_cell = m_cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(later(&m_cell)))).unwrap_or(9999);
+                if v == 9999 {
+                    panic!("b boom")
+                }
+                v
+            },
+            replayable(),
+        )
+    };
+    let a = rt.create_query_with(move |rt| rt.get(b), replayable());
+    a_cell.set(a).unwrap();
+    let mut p = a;
+    for _ in 0..3 {
+        let below = p;
+        p = rt.create_query_with(move |rt| rt.get(below), replayable());
+    }
+    let got = match catch_unwind(AssertUnwindSafe(|| rt.get(p))) {
+        Ok(v) => format!("value {v}"),
+        Err(e) => e
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_default(),
+    };
+    rt.assert_invariant_i();
+    (got, [p, a, b, m].map(|q| rt.state_of(q)))
+}
+
+/// At every budget the member's `try_get` leaves it New as in the
+/// unbounded run (seeds 0x58b6599 and 0x58b6d24).
+fn member_try_get_in_caught_cycle_stays_new<C: Cells>() {
+    let unbounded = member_try_get_in_caught_cycle::<C>(None);
+    assert_eq!(unbounded.0, "b boom");
+    assert_eq!(unbounded.1, [NodeState::New; 4]);
+    for frames in 1..=4 {
+        assert_eq!(
+            member_try_get_in_caught_cycle::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    member_try_get_in_caught_cycle_stays_new,
+    local_member_try_get_in_caught_cycle_stays_new,
+    shared_member_try_get_in_caught_cycle_stays_new
+);

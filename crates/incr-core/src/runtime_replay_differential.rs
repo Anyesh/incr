@@ -2685,6 +2685,24 @@ fn a_try_get_passes_on_a_swallowing_closures_panic() {
     });
 }
 
+/// Base seeds 0x58b6599 at budget 3 and 0x58b6d24 at budget 1: a bounded
+/// run landed a member Failed where the unbounded run leaves it New. Its
+/// member run's `try_get` of another member of its episode took that
+/// member's unwind, a closure's own panic after it swallowed the cycle, as
+/// an ordinary panic, where the unbounded run's R5 read passes it on as
+/// the cycle's.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_member_try_get_keeps_a_swallowing_closures_cycle() {
+    for seed in [0x58b_6599, 0x58b_6d24] {
+        let case = gen_base(seed);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// Seed 0xd3713dd8cf68c605, shrunk. 4 reads the ring 5, 6, 7, 8, 9, 10,
 /// where 10, a Fallback(0) member, reads the input and 5, and 7 panics on
 /// 8's value. At budget 2 the first pass delivered 9's cycle to 8's read
