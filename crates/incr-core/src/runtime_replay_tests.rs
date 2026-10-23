@@ -605,7 +605,7 @@ fn racing_frame_and_byte_setters_end_as_a_serial_order() {
                 let mut spins = 0_u32;
                 while go.load(SeqCst) != round {
                     spins += 1;
-                    if spins % 64 == 0 {
+                    if spins.is_multiple_of(64) {
                         std::thread::yield_now();
                     }
                     std::hint::spin_loop();
