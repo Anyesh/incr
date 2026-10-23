@@ -3437,6 +3437,55 @@ fn caught_read_of_a_virtual_frame_node_is_kept_for_the_retry() {
     });
 }
 
+/// Seed 0x69fd501b4c8fbf5c, shrunk: `Get(7)` lands the cycle
+/// 18 -> 19 -> 3 -> 17 -> 18, rooted at the Fallback 18. `Set(22, 1)` turns
+/// 17's read of 18 into a read of 19, so the cycle left is {19, 3, 17},
+/// which 17's Fixpoint converges without 18. `Get(6)`'s `try_get(7)` walks
+/// 18 as an entry, whose group verify contains the cycle it finds. At
+/// budget 1 that verify's episode is doomed, and the retry of 18 has to
+/// stay a walk entry that contains it too, or the cycle reaches 7's read.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn try_get_of_a_former_cycle_member_reads_its_value() {
+    let query = |expr, replay, strategy| Spec::Query {
+        expr,
+        replay,
+        bare: false,
+        strategy,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let mut specs: Vec<Spec> = (0..22)
+        .map(|_| query(Expr::Const(1), false, Strat::None))
+        .collect();
+    specs[3] = query(Expr::Read(17, false), false, Strat::None);
+    specs[6] = query(Expr::Read(7, true), false, Strat::None);
+    specs[7] = query(Expr::Read(18, false), false, Strat::None);
+    specs[17] = query(
+        Expr::If(read(22), read(18), read(19)),
+        false,
+        Strat::Fixpoint {
+            initial: 3,
+            limit: 2,
+        },
+    );
+    specs[18] = query(Expr::Read(19, false), true, Strat::Fallback(0));
+    specs[19] = query(Expr::Read(3, false), false, Strat::None);
+    specs.extend([4, 4, 3, 4].map(Spec::Input));
+    let case = Case {
+        specs,
+        panics: false,
+        cycles: true,
+        queries: 22,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(7), Op::Set(22, 1), Op::Get(6)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x69fd_501b_4c8f_bf5c);
+        differential::<Shared>(&case, 0x69fd_501b_4c8f_bf5c);
+    });
+}
+
 /// A one-phase case's snapshots with nodes `xs` patched to `to`, judged
 /// by `at_overlap`; `live_too` also sets the live nodes' states.
 fn overlap_verdict(
