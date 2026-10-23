@@ -3809,7 +3809,10 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         bag: &mut Deferred<C>,
     ) -> Option<Computed> {
-        if word & value_code::NOTES_BIT != 0 && result.is_ok() {
+        // A doomed run's pop is discarded and its retry pops in its place,
+        // so it retires nothing the unbounded run keeps.
+        let doomed = ctl.has(cycle::DOOMED);
+        if word & value_code::NOTES_BIT != 0 && result.is_ok() && !doomed {
             self.retire_notes_above(attempt.cidx);
         }
         if word & value_code::KEPT_BIT != 0 {
@@ -3830,6 +3833,7 @@ impl<C: Cells> Runtime<C> {
         // After the rewrites: a swallowed discard or wound is no pop of the
         // unbounded run's.
         if result.is_ok()
+            && !doomed
             && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT | value_code::KEPT_BIT) != 0
         {
             self.retire_copies(&replay::Retire::Above(attempt.cidx));
