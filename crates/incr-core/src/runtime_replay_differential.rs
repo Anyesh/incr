@@ -2325,8 +2325,9 @@ impl PanicText {
 }
 
 /// The first operation at which `got` differs from the unbounded run's
-/// `want`, with both sides of it, comparing the states only after the
-/// operations `settles` marks.
+/// `want`, with both sides of it: in its outcome, or, after the operations
+/// `settles` marks, in any node's state or recorded deps. An exemption
+/// excuses one operation's outcome and nothing after it.
 fn first_diff(
     case: &Case,
     want: &Trace,
@@ -2336,58 +2337,22 @@ fn first_diff(
     per_read: &PerRead,
     cycles: &CycleReads,
 ) -> Option<(usize, String)> {
-    // A closure's read of a deleted node panics as stale, so a case with
-    // deletes has panics.
-    let panics = case.panics || case.ops.iter().any(|op| matches!(op, Op::Delete(_)));
-    let mut agree = true;
     for (i, ((want_out, want), (got_out, got))) in want.iter().zip(got).enumerate() {
-        // Once a speculative landing or a delivery has left the states
-        // apart, a panic or a cycle may come out otherwise: a walk of a
-        // Dirty node computes its deps before its closure, so it enters a
-        // cycle, and so picks its root and strategy, where a compute of
-        // the node New would not.
-        if !agree && (panics || case.cycles) {
-            break;
-        }
-        // A read of the other runtime records no edge (T5 Scoping), so a
-        // set of the second runtime leaves the first's readers of it on
-        // what they read when they last ran. Once the states differ, the
-        // runs ran those readers at different times.
-        if !agree && matches!(case.ops[i], Op::Set2(..)) {
-            break;
-        }
-        // A read that lands its target Dirty returns a value computed
-        // against a read that a later landing in the same revision
-        // changed. A replayed frame reads after that landing when the read
-        // is a Clean `get`, which no delivery can intercept, so the
-        // bounded run may return the later value.
         let target = match case.ops[i] {
             Op::Get(q) | Op::TryGet(q) => Some(q),
             Op::Get2(q, _) => Some(case.queries + q),
             _ => None,
         };
-        // A target Dirty over a dep it read Failed or Cyclic was poisoned by
-        // that read, which leaves no value to come out later.
-        if target.is_some_and(|q| want.0[q] == NodeState::Dirty && !want.3[q]) {
-            agree = false;
-            continue;
-        }
-        // So may a frame that read a node's Dirty value, or took its
-        // unwind or a delivery for its read, which a later landing made
-        // Clean: its next retry reads it with a Clean `get`.
-        if want.2 || got.2 {
-            agree = false;
-            continue;
-        }
-        // A delete's dependents are history too: a speculative entry can
-        // land a reader of the node Clean, with its edge, where the
-        // unbounded run left the reader New. Past a delete that came out
-        // otherwise the two runs hold different graphs.
-        if !agree && matches!(case.ops[i], Op::Delete(_)) && want_out != got_out {
-            break;
-        }
-        let settles = settles.is_none_or(|s| s[i]);
-        let sets = |snap: &Snapshot| (agree && settles).then(|| settled(&snap.0));
+        // A read that lands its target Dirty returns a value computed
+        // against a read that a later landing in the same revision changed,
+        // and a replayed frame reads after that landing with a Clean `get`,
+        // so the bounded run may return the later value. A target poisoned
+        // by a Failed or Cyclic dep it read has no later value.
+        let dirty_target = target.is_some_and(|q| want.0[q] == NodeState::Dirty && !want.3[q]);
+        // So may a frame that read a node's Dirty value, or took its unwind
+        // or a delivery for its read, which a later landing made Clean: its
+        // next retry reads it with a Clean `get`.
+        let stale_read = want.2 || got.2;
         // Under two threads the cycle a read reports is built from this
         // thread's frames, so members another thread landed first are left
         // out of it: a verified part of an order's participants matches.
@@ -2399,37 +2364,54 @@ fn first_diff(
                         if !g.is_empty() && g.iter().all(|p| w.contains(p))
                 )
         };
-        // A get ordered per read: its outcome is its closure's over its
-        // reads, and the rest is compared as for any other operation.
-        if let Some(by_reads) = per_read.get(&i).filter(|_| !same(want_out, got_out)) {
-            let wrong = match by_reads {
-                Ok(out) if same(out, got_out) => None,
-                Ok(out) => Some(format!("its closure over its reads gives {out:?}")),
-                Err(why) => Some(why.clone()),
-            };
-            if wrong.is_some() || sets(want) != sets(got) {
-                let (w, g) = ((want_out, sets(want)), (got_out, sets(got)));
-                let wrong = wrong.unwrap_or_default();
-                return Some((
-                    i,
-                    format!("want {w:?}\n got {g:?}\nordered per read: {wrong}"),
-                ));
+        let wrong_out = if same(want_out, got_out) || dirty_target || stale_read {
+            None
+        } else {
+            // A get ordered per read: its outcome is its closure's over its
+            // reads.
+            match per_read.get(&i) {
+                Some(Ok(out)) if same(out, got_out) => None,
+                Some(Ok(out)) => Some(format!(
+                    "\nordered per read: its closure over its reads gives {out:?}"
+                )),
+                Some(Err(why)) => Some(format!("\nordered per read: {why}")),
+                None => Some(match cycles.get(&i) {
+                    Some(Err(why)) => format!("\n{why}"),
+                    _ => String::new(),
+                }),
             }
-        } else if !same(want_out, got_out) || sets(want) != sets(got) {
-            let (w, g) = ((want_out, sets(want)), (got_out, sets(got)));
-            let why = match cycles.get(&i) {
-                Some(Err(why)) => format!("\n{why}"),
-                _ => String::new(),
-            };
-            return Some((i, format!("want {w:?}\n got {g:?}{why}")));
-        }
-        // A dep list is history too: under a panic a read can stop the
-        // closure short of the reads after it.
-        if settles {
-            agree &= want.0 == got.0 && want.1 == got.1;
+        };
+        let wrong_states = settles
+            .is_none_or(|s| s[i])
+            .then(|| states_diff(want, got))
+            .flatten();
+        if wrong_out.is_some() || wrong_states.is_some() {
+            let (w, g) = ((want_out, settled(&want.0)), (got_out, settled(&got.0)));
+            let states = wrong_states.map_or(String::new(), |d| format!("\n{d}"));
+            let why = wrong_out.unwrap_or_default();
+            return Some((i, format!("want {w:?}\n got {g:?}{states}{why}")));
         }
     }
     None
+}
+
+/// The nodes whose state or recorded deps differ between two snapshots.
+fn states_diff(want: &Snapshot, got: &Snapshot) -> Option<String> {
+    let states: Vec<String> = (want.0.iter().zip(&got.0).enumerate())
+        .filter(|(_, (w, g))| w != g)
+        .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
+        .collect();
+    let deps: Vec<String> = (want.1.iter().zip(&got.1).enumerate())
+        .filter(|(_, (w, g))| w != g)
+        .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
+        .collect();
+    (!states.is_empty() || !deps.is_empty()).then(|| {
+        format!(
+            "states differ [{}], deps differ [{}]",
+            states.join(", "),
+            deps.join(", ")
+        )
+    })
 }
 
 /// Panics, naming the case, at the first operation at which `got` differs
@@ -5125,8 +5107,11 @@ fn scan(seeds: impl Iterator<Item = u64>, all: bool, check: impl Fn(u64)) {
             if let Some(payload) = failed {
                 if all {
                     let message = class(payload);
-                    let first = message.lines().next().unwrap_or_default();
-                    eprintln!("FAIL {seed:x}: {first}");
+                    let head: Vec<&str> = message
+                        .lines()
+                        .take_while(|l| !l.starts_with("ops:"))
+                        .collect();
+                    eprintln!("FAIL {seed:x}: {}", head.join(" | "));
                 }
                 failing.push(seed);
                 if best.is_none_or(|(w, _)| weight < w) {
