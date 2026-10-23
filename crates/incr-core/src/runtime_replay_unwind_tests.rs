@@ -943,7 +943,7 @@ fn wave8_released_new_cycle_run<C: Cells>(frames: Option<u32>) -> Vec<(Out, Vec<
     let sel = rt.create_input(3_u64);
     let n4_later = Later::default();
     let n10_later = Later::default();
-    let even = |v: u64| v % 2 == 0;
+    let even = |v: u64| v.is_multiple_of(2);
     let (l10, l4) = (n10_later.clone(), n4_later.clone());
     let n15 = rt.create_query_with(
         move |rt| {
