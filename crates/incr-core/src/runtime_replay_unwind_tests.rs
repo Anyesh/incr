@@ -1013,13 +1013,7 @@ fn wave8_released_new_cycle_run<C: Cells>(frames: Option<u32>) -> Vec<(Out, Vec<
     let nodes = [n4, n5, n6, n7, n8, n9, n10, n11, n12, n15];
     let mut seen = Vec::new();
     let mut read = |rt: &Runtime<C>, h: Incr<u64>| {
-        eprintln!("W3 ----- read {:?}", h);
         let out = get(rt, h);
-        eprintln!(
-            "W3 ----- out {:?} {:?}",
-            out,
-            nodes.iter().map(|&n| rt.state_of(n)).collect::<Vec<_>>()
-        );
         rt.assert_invariant_i();
         seen.push((out, nodes.iter().map(|&n| rt.state_of(n)).collect()));
     };

@@ -1127,9 +1127,6 @@ impl<C: Cells> Live<C> {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
                 let h = w.handle(side, q);
-                if std::env::var_os("W3MAP").is_some() {
-                    eprintln!("W3 map side {side} q {q} -> {:?}", h.erased());
-                }
                 let state = if rt.is_alive(h.erased()) {
                     h.state(rt)
                 } else {
@@ -1211,9 +1208,6 @@ fn run_logged<C: Cells>(
     reset_thread();
     let (mut trace, mut evals) = (Vec::new(), Vec::new());
     for op in &case.ops {
-        if std::env::var_os("W3T").is_some() {
-            eprintln!("W3 ----- op {op:?}");
-        }
         let (out, ran) = if log {
             record(|| live.apply(op))
         } else {
