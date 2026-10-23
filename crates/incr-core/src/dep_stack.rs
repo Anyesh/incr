@@ -259,7 +259,7 @@ pub trait DepStack: 'static {
         self.with(|s| s.frames.last().map(|f| (f.rt, f.node, f.ctl, f.cidx)))
     }
 
-    /// See [`Frames::hold_foreign_reader`].
+    /// See `Frames::hold_foreign_reader`.
     fn hold_foreign_reader(&self) {
         self.with(Frames::hold_foreign_reader);
     }
@@ -267,7 +267,7 @@ pub trait DepStack: 'static {
     /// [`Self::record_dep`] for a nested non-Clean read, which also stores
     /// the read in the frame and returns what the read needs to know of
     /// the frame: for another runtime's frame, at depth
-    /// [`ActiveRead::FOREIGN`], with nothing stored.
+    /// `ActiveRead::FOREIGN`, with nothing stored.
     #[inline(always)]
     fn record_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> Option<ActiveRead> {
         self.with(|s| {
