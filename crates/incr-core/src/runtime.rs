@@ -3983,9 +3983,14 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Memoize a node verify-only left non-Clean under the frame at depth
-    /// `owner`, whose pop clears the entry.
+    /// `owner`, whose pop clears the entry. A speculative run memoizes
+    /// nothing: the unbounded run has no such run, and an entry it left
+    /// under an owner below it would send a later real read of the node
+    /// straight to its compute.
     fn memoize(&self, id: NodeId, owner: u32) {
-        taint_memo::memoize(self.runtime_id, id, owner);
+        if !replay::speculative() {
+            taint_memo::memoize(self.runtime_id, id, owner);
+        }
     }
 
     /// Leave this thread's `Computing` claim for `target`, or for `flagged`
