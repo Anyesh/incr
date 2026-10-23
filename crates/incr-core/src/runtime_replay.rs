@@ -68,6 +68,9 @@ enum VPop {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Ended {
     Landed,
+    /// Landed not Clean: the walk that computed the node goes on as after
+    /// a compute that left it so.
+    Unsettled,
     Unwound,
     /// The walk that computed the node contained the run's unwind, so the
     /// walk goes on as after a compute that did not settle.
@@ -2324,10 +2327,10 @@ impl<C: Cells> Runtime<C> {
                 return match self.land_alone(v.node, revs, &mut bag) {
                     Ok(landed) => {
                         bag.drain(self);
-                        if landed {
-                            VPop::Finished(v.node, Ended::Landed)
-                        } else {
-                            VPop::Next
+                        match landed {
+                            Some(NodeState::Clean) => VPop::Finished(v.node, Ended::Landed),
+                            Some(_) => VPop::Finished(v.node, Ended::Unsettled),
+                            None => VPop::Next,
                         }
                     }
                     Err(payload) => {
@@ -3025,7 +3028,8 @@ impl<C: Cells> Runtime<C> {
             (v.cidx - x.boundary, x.boundary)
         });
         if landed && pos > 0 {
-            self.hold_landing(id, pos, node, generation, ended == Ended::Contained);
+            let unsettled = matches!(ended, Ended::Contained | Ended::Unsettled);
+            self.hold_landing(id, pos, node, generation, unsettled);
         }
         if pos != level || entry.node != node || entry.generation != generation {
             return None;
@@ -3045,6 +3049,9 @@ impl<C: Cells> Runtime<C> {
             // compute's reader does after its landing.
             if landed {
                 self.episode_landed(self.nodes.get(node));
+            }
+            if ended == Ended::Unsettled {
+                return Some(Computed::Unsettled);
             }
             return Some(Computed::Done);
         }

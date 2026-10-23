@@ -1093,6 +1093,9 @@ impl<C: Cells> Live<C> {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
                 let h = w.handle(side, q);
+                if std::env::var_os("W3MAP").is_some() {
+                    eprintln!("W3 map side {side} q {q} -> {:?}", h.erased());
+                }
                 let state = if rt.is_alive(h.erased()) {
                     h.state(rt)
                 } else {
@@ -1174,6 +1177,9 @@ fn run_logged<C: Cells>(
     reset_thread();
     let (mut trace, mut evals) = (Vec::new(), Vec::new());
     for op in &case.ops {
+        if std::env::var_os("W3T").is_some() {
+            eprintln!("W3 ----- op {op:?}");
+        }
         let (out, ran) = if log {
             record(|| live.apply(op))
         } else {
@@ -3707,6 +3713,98 @@ fn try_get_of_a_former_cycle_member_reads_its_value() {
     });
 }
 
+/// Seed 0x88f7, shrunk, with a second runtime: a user panic in a cycle
+/// releases the other claims, which e9eea59d lands New, and the same read
+/// then computes them again. After `Get(4)` and `Set(19, 0)`, `Get(9)`'s
+/// walk runs 12, which panics; unbounded, the walk's entries 8 and 7
+/// contain the panic and 9 reads as "last compute panicked". Every budget
+/// must give the unbounded run's outcomes and states, on `Local` and
+/// `Shared`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_seed_88f7_released_claims_replay_as_unbounded() {
+    use Expr::{Add, Catch, Const, If, PanicIf, Read};
+    let b = Box::new;
+    let query = |expr, replay, strategy| Spec::Query {
+        expr,
+        replay,
+        bare: false,
+        strategy,
+    };
+    let zero = |replay| query(Const(0), replay, Strat::None);
+
+    let mut specs: Vec<Spec> = (0..19).map(|_| zero(true)).collect();
+    specs[4] = query(
+        If(
+            b(Read(6, false)),
+            b(Const(0)),
+            b(Add(b(Read(11, true)), b(Read(5, false)))),
+        ),
+        true,
+        Strat::Fallback(0),
+    );
+    specs[5] = query(Read(4, true), true, Strat::None);
+    specs[6] = query(Catch(b(Read(7, false))), true, Strat::None);
+    specs[7] = query(Read(8, false), true, Strat::None);
+    specs[8] = query(Read(9, false), true, Strat::None);
+    specs[9] = query(
+        If(b(Read(10, false)), b(Const(0)), b(Const(1))),
+        true,
+        Strat::None,
+    );
+    specs[10] = query(Read(11, true), true, Strat::None);
+    specs[11] = query(
+        Add(
+            b(If(b(Read(12, false)), b(Const(0)), b(Const(0)))),
+            b(Const(1)),
+        ),
+        true,
+        Strat::None,
+    );
+    specs[12] = query(
+        PanicIf(
+            b(If(
+                b(Read(4, false)),
+                b(If(
+                    b(Read(19, false)),
+                    b(Read(15, false)),
+                    b(Read(13, false)),
+                )),
+                b(Const(0)),
+            )),
+            3,
+        ),
+        false,
+        Strat::Fallback(1),
+    );
+    specs[13] = query(Const(3), true, Strat::None);
+    specs[14] = zero(false);
+    specs[15] = query(
+        Add(
+            b(If(b(Read(10, false)), b(Const(0)), b(Read(22, true)))),
+            b(Const(1)),
+        ),
+        true,
+        Strat::None,
+    );
+    specs[16] = zero(false);
+    specs.extend([3, 0, 0, 2].map(Spec::Input));
+    let walked = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 19,
+        specs2: vec![zero(true), zero(true), zero(false), Spec::Input(1)],
+        queries2: 3,
+        ops: vec![Op::Get(4), Op::Set(19, 0), Op::Get(9)],
+    };
+
+    quiet(|| {
+        differential::<Local>(&walked, 0x88f7);
+        differential::<Shared>(&walked, 0x88f7);
+    });
+}
+
 /// A one-phase case's snapshots with nodes `xs` patched to `to`, judged
 /// by `at_overlap`; `live_too` also sets the live nodes' states.
 fn overlap_verdict(
@@ -4793,4 +4891,20 @@ fn a_stand_ins_panic_is_not_a_failure_nested_in_its_readers_member_run() {
         ];
         assert_eq!(bounded, [want.clone(), want], "budget 1, Local then Shared");
     });
+}
+
+/// Seed 0x58b5909's base case: at budget 3, op 4 Get(4) must leave the
+/// unbounded run's Failed set (bisected: passes on 7df62769, fails from
+/// e9eea59d on, where the bounded run lands node 9 Failed too).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_local_seed_58b5909_failed_set() {
+    quiet(|| differential::<Local>(&gen_base(0x58b5909), 0x58b5909));
+}
+
+/// As [`wave8_local_seed_58b5909_failed_set`], under `Shared`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_shared_seed_58b5909_failed_set() {
+    quiet(|| differential::<Shared>(&gen_base(0x58b5909), 0x58b5909));
 }
