@@ -3300,6 +3300,23 @@ fn a_retry_walking_a_doomed_episodes_members_keeps_its_cycle() {
     });
 }
 
+/// Seed 0x29bf2de20fa0e476's op 0, `Get(0)` on a fresh runtime: 1 branches
+/// on a `try_get` into the cycle of 6, 7, 8, 13 and 17. With walked
+/// episodes counting held members as released, the unbounded run panicked
+/// in 1 and budget 3 returned 2; every budget must agree.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walked_episode_in_a_try_get_cycle_answers_as_unbounded() {
+    let seed = 0x29bf_2de2_0fa0_e476;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(1);
+    assert!(matches!(case.ops[0], Op::Get(0)));
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// Seeds 0x41eb and 0x833e, one thread, and the two-thread seed 0x2b13
 /// they stand for: a dropped chain truncates the virtual frame of a doomed
 /// episode member run whose failure count is still held, and releases the
