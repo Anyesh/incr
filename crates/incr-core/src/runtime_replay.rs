@@ -2848,13 +2848,31 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn take_claim_rev(&self, node: NodeId, cidx: u32) -> Option<u64> {
+        self.take_earliest(node, cidx, |x| &mut x.claim_revs)
+    }
+
+    /// The thread's failure count when the earliest doomed run of the
+    /// member run of `node` at `cidx`, along this frame's path, began, for
+    /// the run that finishes it.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn take_run_failures(&self, node: NodeId, cidx: u32) -> Option<u64> {
+        self.take_earliest(node, cidx, |x| &mut x.run_failures)
+    }
+
+    fn take_earliest(
+        &self,
+        node: NodeId,
+        cidx: u32,
+        records: fn(&mut replay::Context) -> &mut replay::ClaimRevs,
+    ) -> Option<u64> {
         let rt = self.runtime_id;
         let generation = self.nodes.get(node.0).generation();
         let frame = (node.0, generation, cidx);
         if !replay::with(|c| {
-            c.iter()
+            c.iter_mut()
                 .filter(|x| x.rt == rt)
-                .any(|x| x.claim_revs.has(frame))
+                .any(|x| records(x).has(frame))
         }) {
             return None;
         }
@@ -2862,7 +2880,7 @@ impl<C: Cells> Runtime<C> {
         replay::with(|c| {
             c.iter_mut()
                 .filter(|x| x.rt == rt)
-                .find_map(|x| x.claim_revs.take(frame, path))
+                .find_map(|x| records(x).take(frame, path))
         })
     }
 

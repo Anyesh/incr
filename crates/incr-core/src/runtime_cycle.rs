@@ -719,7 +719,9 @@ impl<C: Cells> Runtime<C> {
     /// recorded. Returns the run's lowlink, or the panic it ended in, with
     /// the node marked failed unless the run was speculative. A `walked`
     /// run finishes a walk's compute, so the virtual frames a doom in it
-    /// makes contain a panic as that walk does.
+    /// makes contain a panic as that walk does. A run that finishes a
+    /// doomed one counts the failures marked since the earliest of those
+    /// runs began as nested in it.
     pub(super) fn member_run(
         &self,
         slot: u32,
@@ -747,15 +749,17 @@ impl<C: Cells> Runtime<C> {
         ctl.lowlink.set(cidx);
         self.dep_stack
             .push_frame_at(self.runtime_id, id, &ctl, cidx);
+        let mut began = None;
         if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
             if let Some(low) = self.take_low(id, cidx) {
                 ctl.lower(low);
             }
+            began = self.take_run_failures(id, cidx);
         }
         // SAFETY: this thread holds the node's claim, so its closure is
         // not freed (see `compute_attempts`).
         let compute = unsafe { &*compute };
-        let failures = cycle_state::failures();
+        let failures = began.unwrap_or_else(cycle_state::failures);
         let first = replay::peek_id();
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
         let deps = self.dep_stack.pop_frame();
@@ -776,6 +780,13 @@ impl<C: Cells> Runtime<C> {
         if ctl.has(cycle::DOOMED)
             && (result.is_ok() || !matches!(cycle_state::unwind_kind(), Some(UnwindKind::Wound)))
         {
+            replay::note_run_failures(
+                self.runtime_id,
+                slot,
+                self.nodes.get(slot).generation(),
+                cidx,
+                failures,
+            );
             self.member_run_doomed(slot, cidx, first, &ctl, result.err());
             return Ok(None);
         }
