@@ -1015,7 +1015,7 @@ impl<C: Cells> Runtime<C> {
         payload: &(dyn Any + Send),
     ) -> bool {
         let contain = contain_impl::walked_episode(cidx)
-            .is_some_and(|root| self.containable(root, cidx, kind, payload));
+            .is_some_and(|root| self.containable(root, None, kind, payload));
         if contain {
             replay::unwind_past(self.runtime_id, cidx);
         }
