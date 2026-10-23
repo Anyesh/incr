@@ -426,6 +426,36 @@ fn the_unbudgeted_list_follows_the_budgets() {
     assert!(!super::replay_impl::unbudgeted(id));
 }
 
+/// Lists `rt` as unbudgeted while giving it a byte budget: another thread
+/// sets the byte budget after `set_max_frames(u32::MAX)` decided the
+/// runtime has no budget and before it takes the list's lock.
+pub(super) fn race_budget_setters(rt: &Runtime<Shared>, bytes: usize) {
+    let at = std::ptr::from_ref(rt) as usize;
+    super::replay_impl::NOTE_DECIDED.with(|h| {
+        h.set(Some(Box::new(move || {
+            // SAFETY: `rt` outlives `set_max_frames`, whose `note` runs this.
+            let rt = unsafe { &*(at as *const Runtime<Shared>) };
+            std::thread::scope(|s| {
+                s.spawn(|| rt.set_max_stack_bytes(bytes));
+            });
+        })));
+    });
+    rt.set_max_frames(u32::MAX);
+}
+
+/// Two threads setting one runtime's budgets leave it listed exactly when
+/// it has neither.
+#[test]
+fn racing_budget_setters_leave_a_byte_budget_unlisted() {
+    let rt = Runtime::<Shared>::new();
+    race_budget_setters(&rt, 1 << 20);
+    assert_eq!(rt.max_stack_bytes.load(Relaxed), 1 << 20);
+    assert!(
+        !super::replay_impl::unbudgeted(rt.runtime_id),
+        "listed unbudgeted while it has a byte budget"
+    );
+}
+
 /// `INCR_MAX_DEPTH` changes only the default frame budget: a byte budget
 /// set explicitly runs at `DEFAULT_MAX_FRAMES`, and an explicit frame
 /// budget stays.

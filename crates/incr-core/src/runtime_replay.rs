@@ -102,6 +102,14 @@ struct Below {
 static UNBUDGETED: std::sync::Mutex<Vec<RuntimeId>> = std::sync::Mutex::new(Vec::new());
 static UNBUDGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Run once by this thread's next `BudgetEntry::note`, after its caller
+    /// decided and before it locks `UNBUDGETED`.
+    pub(crate) static NOTE_DECIDED: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// A runtime's place in `UNBUDGETED`, which its drop gives up.
 pub(crate) struct BudgetEntry(RuntimeId);
 
@@ -116,6 +124,10 @@ impl BudgetEntry {
 
     /// Lists the runtime as unbudgeted, or takes it off the list.
     fn note(&self, unbudgeted: bool) {
+        #[cfg(test)]
+        if let Some(hook) = NOTE_DECIDED.with(std::cell::Cell::take) {
+            hook();
+        }
         if !unbudgeted && UNBUDGETED_LEN.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return;
         }
