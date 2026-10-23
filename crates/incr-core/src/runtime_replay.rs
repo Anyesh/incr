@@ -285,6 +285,7 @@ impl<C: Cells> Runtime<C> {
             // SAFETY: the active frame's control block is live.
             let ctl = unsafe { &*f.ctl };
             if ctl.has(cycle::DOOMED) {
+                self.park(ParkPoint::DoomedRead(NodeId(handle.slot())));
                 if let Some(value) = self.read_doomed(handle, f) {
                     return Ok(value);
                 }
@@ -2803,6 +2804,11 @@ impl<C: Cells> Runtime<C> {
                 x.levels[q as usize].pop_front();
             }
             x.trim_levels();
+            // Entries a doom handed over from the dropped frames go with
+            // them, as a frame's pop clears what it owns (owner = position
+            // + 1).
+            let from = x.boundary + q + 1;
+            x.memo.retain(|&(_, owner)| owner < from);
             (x.boundary, x.truncate_vstack(q as usize))
         });
         for ep in abandoned {
