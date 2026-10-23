@@ -407,6 +407,25 @@ fn shared_caught_delivery_after_its_node_lands_reads_it_clean() {
     );
 }
 
+/// A runtime is listed as unbudgeted exactly while it has neither budget,
+/// and leaves the list when it is dropped.
+#[test]
+fn the_unbudgeted_list_follows_the_budgets() {
+    let rt = Runtime::<Local>::new();
+    let id = rt.runtime_id;
+    rt.set_max_frames(u32::MAX);
+    assert!(super::replay_impl::unbudgeted(id));
+    rt.set_max_stack_bytes(1 << 20);
+    assert!(!super::replay_impl::unbudgeted(id));
+    rt.set_max_stack_bytes(0);
+    assert!(super::replay_impl::unbudgeted(id));
+    rt.set_max_frames(8);
+    assert!(!super::replay_impl::unbudgeted(id));
+    rt.set_max_frames(u32::MAX);
+    drop(rt);
+    assert!(!super::replay_impl::unbudgeted(id));
+}
+
 /// `INCR_MAX_DEPTH` changes only the default frame budget: a byte budget
 /// set explicitly runs at `DEFAULT_MAX_FRAMES`, and an explicit frame
 /// budget stays.

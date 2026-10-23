@@ -1858,3 +1858,60 @@ mod foreign_hold_within_budget {
         super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(u32::MAX, 64 * 1024);
     }
 }
+
+thread_local! {
+    static CLONES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A value that counts its clones on this thread.
+#[derive(PartialEq)]
+struct Counted(i64);
+
+impl Clone for Counted {
+    fn clone(&self) -> Self {
+        CLONES.with(|c| c.set(c.get() + 1));
+        Counted(self.0)
+    }
+}
+
+fn clones_of(read: impl FnOnce()) -> u32 {
+    CLONES.with(|c| c.set(0));
+    read();
+    CLONES.with(Cell::get)
+}
+
+/// With no budget no read is retried, so a foreign read keeps no copy:
+/// a frame's read of another runtime's New node clones its value as often
+/// as a read from outside any frame does.
+fn unbudgeted_foreign_read_keeps_no_clone<A: Cells, B: Cells>() {
+    let direct = {
+        let r2 = Runtime::<B>::new();
+        let bq = r2.create_query(|_| Counted(7));
+        clones_of(|| {
+            r2.get(bq);
+        })
+    };
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_max_frames(u32::MAX);
+    let bq = r2.create_query(|_| Counted(7));
+    let other = OtherRt(&*r2);
+    let q = r1.create_query(move |_| other.get(bq).0);
+    let framed = clones_of(|| {
+        r1.get(q);
+    });
+    assert_eq!(
+        framed, direct,
+        "clones of a framed foreign read, unbudgeted"
+    );
+}
+
+#[test]
+fn local_shared_unbudgeted_foreign_read_keeps_no_clone() {
+    unbudgeted_foreign_read_keeps_no_clone::<Local, Shared>();
+}
+
+#[test]
+fn shared_shared_unbudgeted_foreign_read_keeps_no_clone() {
+    unbudgeted_foreign_read_keeps_no_clone::<Shared, Shared>();
+}

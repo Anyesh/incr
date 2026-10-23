@@ -778,6 +778,7 @@ pub struct Runtime<C: Cells> {
     /// `set_max_frames` has been called, so a byte budget set later keeps
     /// its frame budget instead of taking the default's place.
     frames_set: std::sync::atomic::AtomicBool,
+    budget_entry: replay_impl::BudgetEntry,
     /// `INCR_TEST_ALL_REPLAYABLE`: every query not marked
     /// `NOT_REPLAYABLE` is replayable.
     pub(crate) all_replayable: bool,
@@ -872,6 +873,7 @@ impl<C: Cells> Default for Runtime<C> {
 
 impl<C: Cells> Runtime<C> {
     pub fn new() -> Self {
+        let runtime_id = RuntimeId::allocate();
         Self {
             nodes: SegmentedNodes::new(),
             arenas: ArenaRegistry::new(),
@@ -880,11 +882,12 @@ impl<C: Cells> Runtime<C> {
             revision: C::new_u64(2),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
-            runtime_id: RuntimeId::allocate(),
+            runtime_id,
             tracing_armed: C::new_u8(0),
             max_frames: std::sync::atomic::AtomicU32::new(replay_defaults().0),
             max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
             frames_set: std::sync::atomic::AtomicBool::new(false),
+            budget_entry: replay_impl::BudgetEntry::new(runtime_id, replay_defaults().0),
             all_replayable: replay_defaults().1,
             provenance: provenance_impl::table::<C>(),
             tickets: contain_impl::tickets::<C>(),
@@ -1327,6 +1330,7 @@ impl<C: Cells> Runtime<C> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.max_frames
             .store(n, std::sync::atomic::Ordering::Relaxed);
+        self.note_budget();
     }
 
     /// Sets a byte budget beside the frame budget, off when `n` is 0 (the
@@ -1343,6 +1347,7 @@ impl<C: Cells> Runtime<C> {
         }
         self.max_stack_bytes
             .store(n, std::sync::atomic::Ordering::Relaxed);
+        self.note_budget();
     }
 
     /// A clone of `T`'s placeholder, if it has one.
