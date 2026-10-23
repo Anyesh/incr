@@ -4009,6 +4009,56 @@ fn wave7_two_thread_oracle_rejects_a_failed_pair_over_a_caught_cyclic_read() {
     }
 }
 
+/// A closure that catches a discard and reads again: at budget 1, 1's
+/// speculative run reads bare 2, whose doomed frame opens a context whose
+/// every entry is speculative, so the panic of 5, read only off 2's
+/// placeholder for 4, unwinds into 1's first read as a discard. 1 catches
+/// it, and its second read's compute of 2 popped in its place, so 1 landed
+/// 9999 + 4 where the unbounded run never runs 5. 0x58b56de (a base seed)
+/// is the same.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn caught_discard_then_read() {
+    let read = |n| Box::new(Expr::Read(n, false));
+    let case = Case {
+        specs: vec![
+            replayable(Expr::Add(read(3), read(1)), Strat::None),
+            replayable(
+                Expr::Add(
+                    Box::new(Expr::Catch(Box::new(Expr::Read(2, true)))),
+                    Box::new(Expr::Catch(read(2))),
+                ),
+                Strat::None,
+            ),
+            Spec::Query {
+                expr: Expr::If(read(4), read(5), read(6)),
+                replay: true,
+                bare: true,
+                strategy: Strat::None,
+            },
+            replayable(Expr::Read(7, false), Strat::None),
+            replayable(Expr::Read(8, false), Strat::None),
+            replayable(Expr::PanicIf(Box::new(Expr::Const(0)), 0), Strat::None),
+            replayable(Expr::Const(4), Strat::None),
+            Spec::Input(2),
+            Spec::Input(3),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 7,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0);
+        differential::<Shared>(&case, 0);
+        let seed = gen_base(0x58b_56de);
+        differential::<Local>(&seed, 0x58b_56de);
+        differential::<Shared>(&seed, 0x58b_56de);
+    });
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped
