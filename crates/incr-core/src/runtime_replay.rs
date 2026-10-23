@@ -2316,6 +2316,33 @@ impl<C: Cells> Runtime<C> {
         self.drop_deliveries(ended);
     }
 
+    /// Drops the deliveries held, in any of this runtime's contexts, for
+    /// the frames of the nodes in `released`, whose claims a user panic's
+    /// release just landed: that release ended the frames' runs. A
+    /// speculative run's release is not the unbounded run's, so it keeps
+    /// them.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn end_released_deliveries(&self, released: &[u32]) {
+        if replay::speculative() {
+            return;
+        }
+        let rt = self.runtime_id;
+        let dropped: Vec<Delivery> = replay::with(|c| {
+            let mut dropped = Vec::new();
+            for x in c.iter_mut().filter(|x| x.rt == rt && !x.pending.is_empty()) {
+                for &slot in released {
+                    let generation = self.nodes.get(slot).generation();
+                    dropped.extend(x.pending.extract_node(slot, generation));
+                }
+            }
+            dropped
+        });
+        // No retry reads these frames again, so their unread reads are not
+        // marked as [`Self::drop_deliveries`] marks a retry's.
+        drop(dropped);
+    }
+
     /// Releases, with the discard landing, the claims virtual hits took
     /// for the entries of context `id` at or above `level` that are still
     /// held. Each is the node of a virtual frame below `level`, which that

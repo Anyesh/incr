@@ -1764,6 +1764,15 @@ impl<C: Cells> Runtime<C> {
                 bag.push_erased(Box::new(e.into_values()));
             }
         }
+        // A user panic's release is one the unbounded run makes too, and it
+        // ends the runs of the released nodes' frames: a delivery kept for a
+        // retry of one of them would reach the node's next, fresh run at
+        // that position. A cycle unwind's release keeps them, since the
+        // doomed run's retry reads the cycle from them again, as do a doom's
+        // discard and a wound.
+        if kind.is_none() {
+            self.end_released_deliveries(&released);
+        }
     }
 
     /// The discard landing of a claim this thread holds: the node lands as
