@@ -3086,6 +3086,24 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
     });
 }
 
+/// Seed 0x57c2661 cut to `Get(12)` on a fresh runtime with 24 at 4: a
+/// cycle reaches the read unbounded. At a budget of 1 a doom discards a
+/// member run of 13's episode, which is no walk's, and the retry reaches
+/// 13 through a walk of its deps, whose episodes contain the cycle, so
+/// the read returns 15564.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_episode_is_not_walked_on_its_retry() {
+    let seed = 0x57c2661;
+    let mut case = gen_case(seed, false, false);
+    case.ops = vec![Op::Set(24, 4), Op::Get(12)];
+    quiet(|| {
+        assert!(matches!(run::<Local>(&case, None, 0)[1].0, Out::Panic(_)));
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// Waits for a forced schedule's `done`, failing the test if it stalls.
 fn until(done: impl Fn() -> bool) {
     let start = std::time::Instant::now();
