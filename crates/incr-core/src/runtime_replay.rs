@@ -2711,7 +2711,7 @@ impl<C: Cells> Runtime<C> {
                         // left New, and not of one left Cyclic.
                         poison: state == NodeState::New,
                         payload: Box::new(cycle::CycleUnwind(g.cycle.clone())),
-                        nodes: Vec::new(),
+                        nodes: replay::Landings::default(),
                     })
             }
             _ => None,

@@ -3791,9 +3791,6 @@ impl<C: Cells> Runtime<C> {
         if word & value_code::NOTES_BIT != 0 && result.is_ok() {
             self.retire_notes_above(attempt.cidx);
         }
-        if word & value_code::REPLAY_BIT != 0 && result.is_ok() && !replay::speculative() {
-            replay::retire_delivered_above(self.runtime_id, attempt.cidx);
-        }
         if self.after_pop(word, result.is_ok()) {
             *result = Err(match UnwindKind::of_word(word) {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
@@ -3805,6 +3802,11 @@ impl<C: Cells> Runtime<C> {
             }
             self.set_drop_kind();
             *result = Err(Box::new(cycle::DiscardUnwind));
+        }
+        // After the rewrites: a swallowed discard or wound is no pop of the
+        // unbounded run's.
+        if result.is_ok() && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT) != 0 {
+            self.retire_copies(&replay::Retire::Above(attempt.cidx));
         }
         None
     }
@@ -4416,7 +4418,6 @@ mod observer_read_tests;
 mod stabilize_tests;
 
 pub(crate) use children_impl::ChildLanding;
-pub(crate) use contain_impl::Noted;
 pub(crate) use observe_impl::ObserverEntry;
 use observe_impl::Observers;
 
