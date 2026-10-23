@@ -92,6 +92,11 @@ pub struct Frames {
     /// The index the frame a driver placed sits at, while it is placed:
     /// the frame below it is not its reader.
     pub(crate) placed: u32,
+    /// Each frame holding `FOREIGN_HOLD`, by index and control block, with
+    /// the stack address its hold was taken at: its runtime judges the hold
+    /// against its byte budget there, since at a doom the stack is past it.
+    /// Indexes increase, and a hold drops the entries at or above its own.
+    holds: Vec<(u32, *const ComputeCtl, usize)>,
 }
 
 /// A placement [`DepStack::place_next_at`] replaced, to restore.
@@ -145,7 +150,25 @@ impl Frames {
         let ctl = unsafe { &*top.ctl };
         if !ctl.has(DOOMED) {
             ctl.raise(FOREIGN_HOLD);
+            let index = (self.frames.len() - 1) as u32;
+            let here = 0_u8;
+            let here = std::hint::black_box(std::ptr::from_ref(&here)) as usize;
+            let keep = self.holds.partition_point(|&(i, _, _)| i < index);
+            self.holds.truncate(keep);
+            self.holds.push((index, top.ctl, here));
         }
+    }
+
+    /// The stack address at which the frame whose control block is `ctl`
+    /// took its `FOREIGN_HOLD`.
+    fn hold_position(&self, ctl: *const ComputeCtl) -> Option<usize> {
+        self.holds
+            .iter()
+            .rev()
+            .find(|&&(i, c, _)| {
+                c == ctl && self.frames.get(i as usize).is_some_and(|f| f.ctl == ctl)
+            })
+            .map(|&(_, _, at)| at)
     }
 
     /// The active frame as the reader of what the compute that popped
@@ -164,6 +187,7 @@ impl Frames {
             frames: Vec::new(),
             bias: 0,
             placed: u32::MAX,
+            holds: Vec::new(),
         }
     }
 
@@ -266,6 +290,11 @@ pub trait DepStack: 'static {
     /// See `Frames::hold_foreign_reader`.
     fn hold_foreign_reader(&self) {
         self.with(Frames::hold_foreign_reader);
+    }
+
+    /// See `Frames::hold_position`.
+    fn hold_position(&self, ctl: *const ComputeCtl) -> Option<usize> {
+        self.with(|s| s.hold_position(ctl))
     }
 
     /// [`Self::record_dep`] for a nested non-Clean read, which also stores

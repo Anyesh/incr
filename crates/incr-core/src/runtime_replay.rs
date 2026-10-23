@@ -112,30 +112,38 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether the frame `depth` deep with control block `ctl` can't be
-    /// doomed: it is `NO_DOOM`, or it holds a foreign read within this
-    /// runtime's budget, past which the stack bound wins, as for a ticket
-    /// payload, and its retry reads the other runtime again.
+    /// doomed: it is `NO_DOOM`, or it took a foreign read's hold within this
+    /// runtime's budget where it read, past which the stack bound wins, as
+    /// for a ticket payload, and its retry reads the other runtime again.
     fn undoomable(&self, ctl: &ComputeCtl, depth: u32) -> bool {
         let flags = ctl.flags.get();
         flags & cycle::NO_DOOM != 0
-            || (flags & cycle::FOREIGN_HOLD != 0 && !self.over_budget(depth))
+            || (flags & cycle::FOREIGN_HOLD != 0
+                && self
+                    .dep_stack
+                    .hold_position(ctl)
+                    .is_some_and(|at| !self.over_budget_at(depth, at)))
     }
 
     /// Whether a read from a frame `depth` frames deep is at or past a
     /// budget.
     fn over_budget(&self, depth: u32) -> bool {
+        let here = 0_u8;
+        self.over_budget_at(
+            depth,
+            std::hint::black_box(std::ptr::from_ref(&here)) as usize,
+        )
+    }
+
+    /// [`Self::over_budget`] for a read made at stack address `here`.
+    fn over_budget_at(&self, depth: u32, here: usize) -> bool {
         if depth >= self.max_frames.load(std::sync::atomic::Ordering::Relaxed) {
             return true;
         }
         let bytes = self
             .max_stack_bytes
             .load(std::sync::atomic::Ordering::Relaxed);
-        if bytes == 0 {
-            return false;
-        }
-        let here = 0_u8;
-        let here = std::hint::black_box(std::ptr::from_ref(&here)) as usize;
-        here.abs_diff(cycle_state::stack_base()) > bytes
+        bytes != 0 && here.abs_diff(cycle_state::stack_base()) > bytes
     }
 
     /// A speculative entry's run lands only Clean values: a node it would
