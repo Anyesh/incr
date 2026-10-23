@@ -1684,3 +1684,33 @@ Gate: every hard gate and every single-thread compute case counts the
 same as the base. The rest move by run-to-run noise in both directions
 (`delete_owned_tree_*` +244 / -349, `fanout_shared_1000` +9, the others
 under 9).
+
+## A caught cycle's kind ends at the catching frame's pop
+
+- Engine: `w/T8-seed-b5e0053b30` against its base `spreadsheet-t10` at
+  `fb94958a`, the base in a detached worktree; one run of `icount.sh` at
+  the default N per column. No workloads added.
+- Change: the native and member-run pops take the frame's last non-Clean
+  read with its deps (`pop_frame_reading`), and a cold check on an unwind
+  clears a caught cycle's kind there. An earlier form checked the kind on
+  the Clean `get` path and cost +4 on `get_clean_local` / `_shared` (106 /
+  200), so it was dropped.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/100` | 91,210.01 | 91,210.01 | 0 |
+| `chain_shared/propagate/4` / `10` / `100` | 9,427.22 / 20,526.80 / 188,039.13 | 9,431.20 / 20,536.83 / 188,139.13 | +3.98 / +10.03 / +100.00 |
+| `fanout_shared_1000` | 4,773,614.68 | 4,774,617.17 | +1,002.49 |
+| `delete_cascade_shared` | 4,556,773.02 | 4,557,767.46 | +994.44 |
+
+Gate: every hard gate counts the same as the base, and so does every
+`Local` compute case. `Shared` compute pops cost one instruction more:
+the frame's `reading` comes out of `SharedDepStack::with` beside its deps,
+one per node computed (+1.00 per chain node, +1 per fanout reader).
+`delete_cascade_shared` goes up by the same amount: each iteration
+computes the chains it then deletes, one pop per node.
+The rest move by noise in both directions (`delete_owned_tree_shared`
+-801, `get_contended_shared` +28, the others under 7).

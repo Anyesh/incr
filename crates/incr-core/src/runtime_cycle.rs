@@ -768,12 +768,17 @@ impl<C: Cells> Runtime<C> {
         let failures = began.unwrap_or_else(cycle_state::failures);
         let first = replay::peek_id();
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
-        let deps = self.dep_stack.pop_frame();
+        let (deps, reading) = self.dep_stack.pop_frame_reading();
         let word = value_code::thread_word();
         // A member run starts after its episode root's pop, so nothing
         // below it drops what it kept.
         if word & value_code::KEPT_BIT != 0 {
             replay::drop_kept_from(self.runtime_id, cidx);
+        }
+        if let Err(payload) = &result {
+            if word & value_code::UNWIND_MASK != 0 {
+                clear_caught_cycle(&**payload, &deps, reading);
+            }
         }
         if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
             && self.after_pop(word, result.is_ok())
@@ -2436,4 +2441,22 @@ fn cycle_panic(cycle: Cycle) -> ! {
 /// episode suspended over it, or one it waits for, keeps it.
 fn released_at(rt: RuntimeId, e: &Held, cidx: u32) -> bool {
     !replay::is_suspended(e.ep) && !replay::waits_for_suspended(rt, e.anchor(), cidx)
+}
+
+/// A run that unwinds with a cycle's kind and its own payload, having read
+/// past the read the cycle came in through: its closure caught the cycle,
+/// so the kind is stale and the panic is the closure's, as `read_cold`
+/// makes it at a non-Clean read. A Clean read leaves the kind alone, so the
+/// pop clears it here.
+#[cold]
+#[inline(never)]
+pub(super) fn clear_caught_cycle(payload: &(dyn Any + Send), deps: &[(NodeId, u32)], reading: u64) {
+    if cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
+        && !payload.is::<CycleUnwind>()
+        && deps
+            .last()
+            .is_some_and(|&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) != reading)
+    {
+        cycle_state::set_unwind_kind(None);
+    }
 }

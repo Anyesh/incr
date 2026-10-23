@@ -4509,6 +4509,62 @@ fn caught_discard_then_read() {
     });
 }
 
+/// 0 catches the cycle of its read of 1, reads 2 and panics on its own:
+/// it lands the same whether 2 is Clean or still to compute. A Clean read
+/// kept the caught cycle's kind, so 0's panic went on as the cycle and 0
+/// landed as a cycle member does. In 0xb5e0053b30 at budget 1 the driver
+/// had computed the read node, so 0 landed New where the unbounded run,
+/// computing it inline, landed 0 Failed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn caught_cycle_then_clean_read() {
+    let read = |n| Box::new(Expr::Read(n, false));
+    let case = |ops| Case {
+        specs: vec![
+            replayable(
+                Expr::Add(
+                    Box::new(Expr::Catch(read(1))),
+                    Box::new(Expr::Add(
+                        read(2),
+                        Box::new(Expr::PanicIf(Box::new(Expr::Const(0)), 0)),
+                    )),
+                ),
+                Strat::None,
+            ),
+            replayable(Expr::Read(0, false), Strat::None),
+            replayable(Expr::Const(5), Strat::None),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 3,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    };
+    let last = |t: Trace| {
+        let (out, snap) = t.last().expect("an op ran").clone();
+        (out, snap.0[0])
+    };
+    quiet(|| {
+        let (fresh, warm) = (case(vec![Op::Get(0)]), case(vec![Op::Get(2), Op::Get(0)]));
+        assert_eq!(
+            last(run::<Local>(&warm, None, 0)),
+            last(run::<Local>(&fresh, None, 0))
+        );
+        assert_eq!(
+            last(run::<Shared>(&warm, None, 0)),
+            last(run::<Shared>(&fresh, None, 0))
+        );
+        for c in [&fresh, &warm] {
+            differential::<Local>(c, 0);
+            differential::<Shared>(c, 0);
+        }
+        let seed = gen_case(0xb5_e005_3b30, false, false);
+        differential::<Local>(&seed, 0xb5_e005_3b30);
+        differential::<Shared>(&seed, 0xb5_e005_3b30);
+    });
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped
