@@ -2636,12 +2636,18 @@ impl<C: Cells> Runtime<C> {
         }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
-        // passes on as an ordinary panic, as `entered` does.
+        // passes on as an ordinary panic, as `entered` does. It carries the
+        // landings noted for it before the catch, as the native box does.
         let payload = match payload.downcast::<crate::cycle::CycleUnwind>() {
             Ok(unwind) if kind == ReadKind::TryGet => return Some(Err(unwind.0)),
             Ok(unwind) => unwind,
-            Err(payload) if kind == ReadKind::TryGet => resume_unwind(payload),
-            Err(payload) => payload,
+            Err(payload) => {
+                self.note_delivered(nodes, &*payload);
+                if kind == ReadKind::TryGet {
+                    resume_unwind(payload);
+                }
+                payload
+            }
         };
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(payload)
