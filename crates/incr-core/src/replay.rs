@@ -905,11 +905,21 @@ impl Context {
 
     /// Truncates `vstack` to `len` with no Tarjan pops, returning the
     /// episodes suspended at the frames removed: they are abandoned, and
-    /// their members are released with the claims held there.
+    /// their members are released with the claims held there. The removed
+    /// frames' failure counts go.
     pub(crate) fn truncate_vstack(&mut self, len: usize) -> Vec<Episode> {
         let mut abandoned = Vec::new();
         while self.vstack.len() > len {
-            if let Some(ep) = self.pop_vframe().and_then(|v| v.ep) {
+            let Some(v) = self.pop_vframe() else {
+                break;
+            };
+            // The frame's run is over, and a later run of its node there is
+            // another run: a failure count left for it would hide its mark.
+            if !self.run_failures.is_empty() {
+                self.run_failures
+                    .take((v.node, v.generation, v.cidx), v.path);
+            }
+            if let Some(ep) = v.ep {
                 if let Some(at) = self.episodes.iter().position(|e| e.id == ep) {
                     abandoned.push(self.episodes.remove(at));
                 }
@@ -1563,6 +1573,10 @@ impl EarliestByFrame {
             self.by_frame.remove(&frame);
         }
         Some(value)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_frame.is_empty()
     }
 
     fn end_maker(&mut self, level: u32) {
