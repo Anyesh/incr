@@ -894,6 +894,85 @@ fn wave6_shared_doomed_run_keeps_the_ticket_it_took() {
     wave6_doomed_run_keeps_the_ticket_it_took::<Shared>();
 }
 
+/// g takes a's held ticket, sets k (flipping a Dirty) and rereads a, directly
+/// or through b, so a lands Failed again with "a boom 1"; g drops that and
+/// re-raises the taken "a boom 0". No ticket may hold the superseded payload:
+/// get(a) reports "last compute panicked".
+fn wave7_relanded_node_drops_its_taken_ticket_note<C: Cells>(via_b: bool) {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let k = rt.create_input(0_i64);
+    let a = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        let v = rt.get(j);
+        let kk = rt.get(k);
+        if v == 0 {
+            panic!("a boom {kk}")
+        }
+        v
+    });
+    let b = rt.create_query(move |rt: &Runtime<C>| rt.get(a));
+    let g = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        match catch_unwind(AssertUnwindSafe(|| rt.get(a))) {
+            Ok(v) => v,
+            Err(p) => {
+                rt.set(k, 1);
+                let _ = catch_unwind(AssertUnwindSafe(
+                    || {
+                        if via_b {
+                            rt.get(b)
+                        } else {
+                            rt.get(a)
+                        }
+                    },
+                ));
+                std::panic::resume_unwind(p)
+            }
+        }
+    });
+    let w = rt.create_query(move |rt: &Runtime<C>| rt.get(g));
+    let x = rt.create_query(move |rt: &Runtime<C>| if rt.get(sel) == 0 { rt.get(w) } else { 100 });
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_no_notes();
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err());
+    assert!(
+        got.contains("last compute panicked"),
+        "via_b={via_b}: a raised {got:?}, a superseded landing's payload"
+    );
+    // w's walk reran g after its flagged Dirty landing, and that run
+    // re-raised what its read of a raised.
+    let got = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
+    assert!(
+        got.contains("last compute panicked"),
+        "via_b={via_b}: g raised {got:?}"
+    );
+    assert_eq!(rt.contained_payloads(), 0, "via_b={via_b}");
+    assert_no_notes();
+}
+
+#[test]
+fn wave7_local_relanded_node_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Local>(false);
+}
+
+#[test]
+fn wave7_shared_relanded_node_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Shared>(false);
+}
+
+#[test]
+fn wave7_local_relanded_node_via_dependent_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Local>(true);
+}
+
+#[test]
+fn wave7_shared_relanded_node_via_dependent_drops_its_taken_ticket_note() {
+    wave7_relanded_node_drops_its_taken_ticket_note::<Shared>(true);
+}
+
 #[test]
 fn local_walked_dep_panic_reaches_the_rerun_that_reads_it() {
     walked_dep_panic_reaches_the_rerun_that_reads_it::<Local>();
@@ -1521,74 +1600,135 @@ fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 
     rt.get(below.unwrap())
 }
 
-/// Runs the chain on a spawned thread's default stack, which the frame
-/// budget must bound.
+/// Runs the chain on a thread with the default 2 MiB spawn stack, which
+/// the default frame budget must bound in a debug build too.
 fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
     // Frames that are never doomed overflow this stack at 1000 to 2000
     // levels.
     let n = test_size(100_000);
-    let got = thread::spawn(move || ticket_catching_chain::<C>(n, failed, custom))
+    let got = thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || ticket_catching_chain::<C>(n, failed, custom))
+        .unwrap()
         .join()
         .unwrap();
     assert_eq!(got, if failed { n as i64 } else { 0 });
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn local_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Local>(false, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn shared_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Shared>(false, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn local_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Local>(true, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn shared_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Shared>(true, false);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn local_uncopyable_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Local>(true, true);
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
-)]
 #[cfg_attr(miri, ignore)]
 fn shared_uncopyable_ticket_catching_chain_stays_within_the_stack() {
     ticket_catching_chain_on_a_thread::<Shared>(true, true);
+}
+
+/// Fixpoint `a` reads unseeded `b` with `try_get` and panics on its `Err`;
+/// once `k` is 1, `b` reads `a`. A fresh `get(r)` enters the cycle at `a`,
+/// so `b`'s read of `a` gets `a`'s initial value and the episode converges.
+/// The walk computes `b` as a walk entry first instead, which puts `b`
+/// below `a`, so `a`'s read of `b` is R3's `Err` and `a` panics. A cycle
+/// whose member branches on a cycle error depends on which member computes
+/// first, and an incremental read enters it where its walk does (CHANGELOG,
+/// Known limitations).
+fn walk_cycle_entry<C: Cells>(k0: i64) -> (Runtime<C>, Incr<i64>, Incr<i64>) {
+    let rt = Runtime::<C>::new();
+    let k = rt.create_input(k0);
+    let a_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let b = {
+        let a_cell = a_cell.clone();
+        rt.create_query(move |rt| {
+            if rt.get(k) == 0 {
+                0
+            } else {
+                rt.get(*a_cell.get().unwrap()) + 1
+            }
+        })
+    };
+    let a = rt.create_query_with(
+        move |rt| match rt.try_get(b) {
+            Ok(v) => (v + 1).min(5),
+            Err(_) => panic!("boom"),
+        },
+        QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).max_iterations(20)),
+            ..QueryOpts::default()
+        },
+    );
+    a_cell.set(a).unwrap();
+    let r = rt.create_query(move |rt| rt.get(a) * 10);
+    (rt, k, r)
+}
+
+fn walk_enters_a_cycle_where_a_fresh_read_does<C: Cells>() {
+    let (fresh, _, fresh_r) = walk_cycle_entry::<C>(1);
+    let expected = fresh.get(fresh_r);
+    assert_eq!(expected, 50);
+
+    let (rt, k, r) = walk_cycle_entry::<C>(0);
+    assert_eq!(rt.get(r), 10);
+    rt.set(k, 1);
+    assert_eq!(rt.try_get(r), Ok(expected));
+}
+
+#[test]
+#[ignore = "a walk enters a cycle where it recomputes first, not where a fresh read does"]
+fn local_walk_enters_a_cycle_where_a_fresh_read_does() {
+    walk_enters_a_cycle_where_a_fresh_read_does::<Local>();
+}
+
+#[test]
+#[ignore = "a walk enters a cycle where it recomputes first, not where a fresh read does"]
+fn shared_walk_enters_a_cycle_where_a_fresh_read_does() {
+    walk_enters_a_cycle_where_a_fresh_read_does::<Shared>();
+}
+
+fn walk_enters_a_cycle_at_its_first_recomputed_member<C: Cells>() {
+    let (rt, k, r) = walk_cycle_entry::<C>(0);
+    assert_eq!(rt.get(r), 10);
+    rt.set(k, 1);
+    let read = catch_unwind(AssertUnwindSafe(|| rt.try_get(r)));
+    assert_eq!(
+        read.map_err(panic_message),
+        Err("boom".to_string()),
+        "the walk's cycle entry changed; check the ignored fresh-order test"
+    );
+}
+
+#[test]
+fn local_walk_enters_a_cycle_at_its_first_recomputed_member() {
+    walk_enters_a_cycle_at_its_first_recomputed_member::<Local>();
+}
+
+#[test]
+fn shared_walk_enters_a_cycle_at_its_first_recomputed_member() {
+    walk_enters_a_cycle_at_its_first_recomputed_member::<Shared>();
 }

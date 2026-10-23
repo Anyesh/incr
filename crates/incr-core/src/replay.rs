@@ -17,6 +17,7 @@ use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
+use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::state::NodeState;
 use crate::taint_memo;
@@ -310,7 +311,7 @@ impl Pending {
         self.slots.into_iter().flatten().collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &Delivery> {
         self.slots.iter().flatten()
     }
@@ -357,8 +358,9 @@ pub(crate) enum Delivered {
     /// takes the slot as the compute left it, poisoned, where a later read
     /// would walk and run the node again. It is that value, cloned when
     /// the delivery is made, because a later run in the context may
-    /// compute the node again before the retry reads it.
-    Landed(Box<dyn Any + Send>),
+    /// compute the node again before the retry reads it. Until a read
+    /// takes it, it is a clone the unbounded run never builds.
+    Landed(Unbuilt<dyn Any + Send>),
     /// The rest of the walk of the frame's blocked read, from the compute
     /// a doom stopped it at: the retry's walk of that read resumes it, as
     /// the unbounded run's walk goes on after that compute.
@@ -854,15 +856,20 @@ pub(crate) fn vindexes_empty() -> bool {
 /// every frame at or above the reading one's position, but the reading
 /// one, which is a run of its own if this is its first such read.
 pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
-    KEPT_READS.with(|d| {
+    let gone: Vec<KeptRead> = KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
-        d.retain(|e| {
-            e.rt != read.rt
-                || e.cidx < read.cidx
-                || e.cidx == read.cidx && e.ctl == read.ctl && !fresh
-        });
+        let gone = d
+            .extract_if(.., |e| {
+                e.rt == read.rt
+                    && e.cidx >= read.cidx
+                    && !(e.cidx == read.cidx && e.ctl == read.ctl && !fresh)
+            })
+            .collect();
         d.push(read);
+        gone
     });
+    value_code::set_kept_bit(true);
+    drop(gone);
 }
 
 /// The reads kept for the run of control block `ctl` at `cidx`.
@@ -871,10 +878,26 @@ pub(crate) fn take_kept_reads(
     cidx: u32,
     ctl: *const crate::cycle::ComputeCtl,
 ) -> Vec<KeptRead> {
+    extract_kept(|e| e.rt == rt && e.cidx == cidx && e.ctl == ctl)
+}
+
+/// Drops the reads kept for frames of `rt` at or above `cidx`, which a
+/// frame pop at `cidx` ends: only a doom takes them, and it took them as
+/// it marked the frames.
+#[cold]
+#[inline(never)]
+pub(crate) fn drop_kept_from(rt: RuntimeId, cidx: u32) {
+    drop(extract_kept(|e| e.rt == rt && e.cidx >= cidx));
+}
+
+/// Taken out of the list before they drop, since a kept value's `Drop`
+/// runs user code.
+fn extract_kept(mut which: impl FnMut(&KeptRead) -> bool) -> Vec<KeptRead> {
     KEPT_READS.with(|d| {
-        d.borrow_mut()
-            .extract_if(.., |e| e.rt == rt && e.cidx == cidx && e.ctl == ctl)
-            .collect()
+        let mut d = d.borrow_mut();
+        let out = d.extract_if(.., |e| which(e)).collect();
+        value_code::set_kept_bit(!d.is_empty());
+        out
     })
 }
 
@@ -1251,7 +1274,7 @@ pub(crate) fn take_pending(
             // run must not resume that walk or recompute its node.
             x.pending.take_keyed(key);
             Some(match &x.pending.get(at).what {
-                Delivered::Landed(value) => Delivered::Landed(clone(&**value)),
+                Delivered::Landed(value) => Delivered::Landed(Unbuilt::new(clone(value.value()))),
                 Delivered::Walk(_) | Delivered::Direct => {
                     unreachable!("incr-core: a walk's direction is not a value")
                 }

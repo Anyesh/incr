@@ -174,7 +174,7 @@ impl<C: Cells> NodeData<C> {
 
     /// Construct a new input node. Input nodes start `Clean` because their
     /// value is provided at creation. `revision` seeds `verified_at`, and
-    /// `changed_at` gets its [`Self::input_stamp`].
+    /// `changed_at` gets `revision - 1`.
     pub fn new_input(type_tag: u16, arena_slot: u32, revision: u64) -> Self {
         Self {
             verified_at: C::new_u64(revision),

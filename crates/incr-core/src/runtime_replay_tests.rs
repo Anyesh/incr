@@ -13,6 +13,7 @@ use crate::dep_stack::DepStack;
 use crate::handle::Incr;
 use crate::node::NodeId;
 use crate::state::NodeState;
+use crate::test_size::test_size;
 
 macro_rules! local_and_shared {
     ($body:ident, $local:ident, $shared:ident) => {
@@ -116,19 +117,17 @@ local_and_shared!(
     shared_chain_at_budget_1
 );
 
-/// A first compute of a 100k chain at budget `frames`, or at the default
-/// budget (256 unless `INCR_MAX_DEPTH` says otherwise) when `None`: native
-/// depth stays within the budget, so a 1 MiB thread holds it, and every
-/// node runs at most twice, every doom returning to one context.
-#[cfg(not(debug_assertions))]
-fn chain_100k<C: Cells>(rt: &Runtime<C>, frames: Option<u32>) {
+/// A first compute of an `n`-level chain at budget `frames`, or at the
+/// default budget when `None`: native depth stays within the budget, and
+/// every node runs at most twice, every doom returning to one context.
+fn deep_chain<C: Cells>(rt: &Runtime<C>, n: usize, frames: Option<u32>) {
     rt.set_placeholder(0_u64);
     if let Some(frames) = frames {
         rt.set_max_frames(frames);
     }
     let budget = rt.max_frames.load(Relaxed) as usize;
-    let c = chain(rt, 100_000);
-    assert_eq!(rt.get(c.nodes[0]), 100_000);
+    let c = chain(rt, n);
+    assert_eq!(rt.get(c.nodes[0]), n as u64);
     assert!(c.max_runs() <= 2, "a node ran {} times", c.max_runs());
     let dooms = rt.dooms.lock().unwrap();
     assert!(!dooms.is_empty());
@@ -145,25 +144,50 @@ fn chain_100k<C: Cells>(rt: &Runtime<C>, frames: Option<u32>) {
 #[cfg(not(debug_assertions))]
 #[test]
 fn local_chain_100k_on_a_1_mib_thread() {
-    on_stack(1 << 20, || chain_100k(&Runtime::<Local>::new(), None));
+    on_stack(1 << 20, || {
+        deep_chain(&Runtime::<Local>::new(), 100_000, None)
+    });
 }
 
 #[cfg(not(debug_assertions))]
 #[test]
 fn shared_chain_100k_on_a_1_mib_thread() {
-    on_stack(1 << 20, || chain_100k(&Runtime::<Shared>::new(), None));
+    on_stack(1 << 20, || {
+        deep_chain(&Runtime::<Shared>::new(), 100_000, None)
+    });
 }
 
 #[cfg(not(debug_assertions))]
 #[test]
 fn local_chain_100k_at_budget_1_on_a_1_mib_thread() {
-    on_stack(1 << 20, || chain_100k(&Runtime::<Local>::new(), Some(1)));
+    on_stack(1 << 20, || {
+        deep_chain(&Runtime::<Local>::new(), 100_000, Some(1))
+    });
 }
 
 #[cfg(not(debug_assertions))]
 #[test]
 fn shared_chain_100k_at_budget_1_on_a_1_mib_thread() {
-    on_stack(1 << 20, || chain_100k(&Runtime::<Shared>::new(), Some(1)));
+    on_stack(1 << 20, || {
+        deep_chain(&Runtime::<Shared>::new(), 100_000, Some(1))
+    });
+}
+
+// A debug build's frames are about 13 times a release build's.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_chain_10k_at_the_default_budget_on_a_2_mib_thread() {
+    on_stack(2 << 20, || {
+        deep_chain(&Runtime::<Local>::new(), test_size(10_000), None);
+    });
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_chain_10k_at_the_default_budget_on_a_2_mib_thread() {
+    on_stack(2 << 20, || {
+        deep_chain(&Runtime::<Shared>::new(), test_size(10_000), None);
+    });
 }
 
 /// A doomed first compute lands New, and the driver computes it again.
@@ -384,7 +408,7 @@ fn shared_caught_delivery_after_its_node_lands_reads_it_clean() {
 }
 
 /// `INCR_MAX_DEPTH` changes only the default frame budget: a byte budget
-/// set explicitly runs at the default 256 frames, and an explicit frame
+/// set explicitly runs at `DEFAULT_MAX_FRAMES`, and an explicit frame
 /// budget stays.
 fn explicit_budgets_win<C: Cells>() {
     let rt = Runtime::<C>::new();
@@ -456,3 +480,61 @@ local_and_shared!(
     local_frame_paths_agree,
     shared_frame_paths_agree
 );
+
+/// Each round builds a runtime with a frame budget it never reaches, where
+/// f reads p and p caught q's panic, so f's read of p is Dirty. Once the
+/// round's runtime is dropped, no clone of p's value may survive it: the
+/// probe's strong count is back to 1 after every round. With `member`, the
+/// read is an episode member run's: f is in a cycle with a Fallback `a`.
+fn wave7_kept_dirty_read_outlives_runtime<C: Cells>(member: bool) {
+    std::thread::spawn(move || {
+        let probe = Arc::new(());
+        for round in 1..=3_usize {
+            let rt = Runtime::<C>::new();
+            rt.set_max_frames(64);
+            let q = rt.create_query(|_rt| -> u64 { panic!("q boom") });
+            let pr = probe.clone();
+            let p = rt.create_query(move |rt| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+                pr.clone()
+            });
+            let a_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+            let f = {
+                let a_cell = a_cell.clone();
+                rt.create_query(move |rt| {
+                    let _ = rt.get(p);
+                    a_cell.get().map_or(0, |&a| rt.get(a))
+                })
+            };
+            if member {
+                a_cell
+                    .set(rt.create_query_with_fallback(move |rt| rt.get(f), |_| 0_u64))
+                    .unwrap();
+                assert_eq!(rt.get(*a_cell.get().unwrap()), 0);
+            } else {
+                assert_eq!(rt.get(f), 0);
+            }
+            drop(rt);
+            haphazard::Domain::global().eager_reclaim();
+            assert_eq!(
+                Arc::strong_count(&probe),
+                1,
+                "round {round}: a kept read outlived its runtime"
+            );
+        }
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn wave7_local_kept_dirty_read_is_released_with_its_runtime() {
+    wave7_kept_dirty_read_outlives_runtime::<Local>(false);
+    wave7_kept_dirty_read_outlives_runtime::<Local>(true);
+}
+
+#[test]
+fn wave7_shared_kept_dirty_read_is_released_with_its_runtime() {
+    wave7_kept_dirty_read_outlives_runtime::<Shared>(false);
+    wave7_kept_dirty_read_outlives_runtime::<Shared>(true);
+}

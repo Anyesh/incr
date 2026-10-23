@@ -272,7 +272,9 @@ impl Held {
         self.installed = r.installed;
         self.opened = r.opened;
         self.poisoned = r.poisoned;
-        self.buf.take().map(|buf| Unbuilt::new(buf))
+        self.buf
+            .take()
+            .map(|buf| Unbuilt::<dyn std::any::Any>::new(buf))
     }
 }
 

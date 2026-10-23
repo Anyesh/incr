@@ -840,8 +840,12 @@ pub struct Runtime<C: Cells> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DoomGate(pub(crate) bool);
 
-/// The default frame budget.
-pub const DEFAULT_MAX_FRAMES: u32 = 256;
+/// The default frame budget: 256, or 64 when incr-core is built with
+/// debug assertions, whose frames are about 13 times larger (about
+/// 10.5 KiB a nested read against 850 B). Either way a chain of reads at
+/// the budget uses under 700 KiB of a spawned thread's 2 MiB stack, the
+/// rest left to the closures' own frames.
+pub const DEFAULT_MAX_FRAMES: u32 = if cfg!(debug_assertions) { 64 } else { 256 };
 
 /// The default frame budget and whether every query is replayable, from
 /// `INCR_MAX_DEPTH` and `INCR_TEST_ALL_REPLAYABLE`, read once.
@@ -1307,11 +1311,12 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
-    /// Sets the frame budget, 256 unless `INCR_MAX_DEPTH` says otherwise:
-    /// a read made by a replayable query's compute when this runtime's
-    /// frames on the thread number `n` or more (every runtime's, under
-    /// `Shared`) replays instead of nesting, if the read's type has a
-    /// placeholder. Replay changes where computes run, never a result.
+    /// Sets the frame budget, [`DEFAULT_MAX_FRAMES`] unless `INCR_MAX_DEPTH`
+    /// says otherwise: a read made by a replayable query's compute when
+    /// this runtime's frames on the thread number `n` or more (every
+    /// runtime's, under `Shared`) replays instead of nesting, if the read's
+    /// type has a placeholder. Replay changes where computes run, never a
+    /// result.
     ///
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
@@ -1328,7 +1333,7 @@ impl<C: Cells> Runtime<C> {
     /// bytes. Frames differ in size with the closure and the build, so
     /// the frame count alone does not bound the stack. Like
     /// [`Self::set_max_frames`], it wins over `INCR_MAX_DEPTH`: a runtime
-    /// that has not set its frame budget gets the default of 256.
+    /// that has not set its frame budget gets [`DEFAULT_MAX_FRAMES`].
     pub fn set_max_stack_bytes(&self, n: usize) {
         if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
             self.max_frames
@@ -3373,7 +3378,8 @@ impl<C: Cells> Runtime<C> {
                     & (value_code::MEMO_BIT
                         | value_code::UNWIND_MASK
                         | value_code::REPLAY_BIT
-                        | value_code::NOTES_BIT)
+                        | value_code::NOTES_BIT
+                        | value_code::KEPT_BIT)
                     != 0
                 {
                     let attempt = Attempt {
@@ -3737,6 +3743,35 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// The landing of a claim a user panic released without failing it.
+    /// A node that lands Failed, now or as the unwind goes on, read it,
+    /// directly or through other released claims, so a set that would cure
+    /// the failure may reach that node only through this one: the union of
+    /// its old and recorded deps is published, as [`Self::land_failed`]
+    /// publishes them, and it lands New, which a set's walk passes through
+    /// where Dirty stops it.
+    /// `co_members`, sorted, are the claims released with it.
+    fn land_panic_released(
+        &self,
+        id: NodeId,
+        attempt: Attempt,
+        wrote: bool,
+        deps: &[(NodeId, u32)],
+        co_members: &[u32],
+        bag: &mut Deferred<C>,
+    ) {
+        let (node, flags) = self.nodes.get_with_flags(id.0);
+        // Any outcome lands New, which recomputes.
+        self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag);
+        if wrote {
+            node.max_changed_at(attempt.stamp_rev);
+        } else if attempt.first {
+            node.set_verified_at(0);
+        }
+        self.children_landing(id, flags, ChildLanding::Discard, false, bag);
+        self.land_single(id, node, flags, NodeState::New, NodeState::New);
+    }
+
     /// A frame pop found the memo, unwind or replay bit in the thread word.
     /// A wound or discard rewrites `result` into its unwind; `Some` is a
     /// speculative run dropped in place.
@@ -3755,6 +3790,9 @@ impl<C: Cells> Runtime<C> {
     ) -> Option<Computed> {
         if word & value_code::NOTES_BIT != 0 && result.is_ok() {
             self.retire_notes_above(attempt.cidx);
+        }
+        if word & value_code::KEPT_BIT != 0 {
+            replay::drop_kept_from(self.runtime_id, attempt.cidx);
         }
         if self.after_pop(word, result.is_ok()) {
             *result = Err(match UnwindKind::of_word(word) {

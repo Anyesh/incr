@@ -411,22 +411,28 @@ fn retire_dep_list<C: Cells>(token: RetiredDeps<C>) {
 /// A value only a speculative or discarded run made, which the unbounded
 /// run never builds, or builds again on the retry: its `Drop` is no event
 /// of that run's, so it drops under [`isolate`] wherever it drops.
-pub(crate) struct Unbuilt(Option<Box<dyn Any>>);
+pub(crate) struct Unbuilt<V: ?Sized = dyn Any>(Option<Box<V>>);
 
-impl Unbuilt {
-    pub(crate) fn new(value: Box<dyn Any>) -> Self {
+impl<V: ?Sized> Unbuilt<V> {
+    pub(crate) fn new(value: Box<V>) -> Self {
         Self(Some(value))
     }
 
-    #[cfg(all(test, not(loom)))]
-    pub(crate) fn value(&self) -> &dyn Any {
+    pub(crate) fn value(&self) -> &V {
         self.0
             .as_deref()
             .expect("an unbuilt value is held until it drops")
     }
+
+    /// The value, for a read that delivers it: from then on it is built.
+    pub(crate) fn into_inner(mut self) -> Box<V> {
+        self.0
+            .take()
+            .expect("an unbuilt value is held until it drops")
+    }
 }
 
-impl Drop for Unbuilt {
+impl<V: ?Sized> Drop for Unbuilt<V> {
     fn drop(&mut self) {
         if let Some(value) = self.0.take() {
             isolate(|| drop(value));
