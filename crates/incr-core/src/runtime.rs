@@ -843,7 +843,7 @@ pub(crate) struct DoomGate(pub(crate) bool);
 /// The default frame budget: 256, or 32 when incr-core is built with
 /// debug assertions, whose frames are 14 to 18 times larger. A chain at
 /// the budget is deepest once replay runs it, at about 1.5 KiB a nested
-/// read (1.9 KiB under `Shared`) in release and 26.5 KiB in debug: under
+/// read (1.86 KiB under `Shared`) in release and 26 KiB in debug: under
 /// 480 KiB of a spawned thread's 2 MiB stack in release, leaving each
 /// closure on the chain about 6 KiB of its own, and under 840 KiB in
 /// debug, leaving about 38 KiB, room for a debug closure's local buffers.
