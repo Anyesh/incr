@@ -1805,3 +1805,56 @@ mod foreign_miri {
         assert!(runs[3..].contains(&2), "{runs:?}");
     }
 }
+
+/// A chain of readers of runtime A, each catching the panic of its own
+/// node of runtime B, whose payload no kept read can carry, under A's
+/// frame budget `frames` and byte budget `bytes`. The outermost reader is
+/// at the bottom of the stack, within any budget, so its foreign read's
+/// hold keeps it undoomed and it sees its own payload; a retry would read
+/// B's node again and see the Failed node's.
+fn outermost_foreign_reader_keeps_its_payload<A: Cells, B: Cells>(frames: u32, bytes: usize) {
+    quiet_uncopyable();
+    let outer = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        r1.set_max_frames(frames);
+        r1.set_max_stack_bytes(bytes);
+        let mut below: Option<Incr<i64>> = None;
+        for level in 0..200 {
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let (r2, next) = (OtherRt(&*r2), below);
+            let weight = if level == 199 { 1_000_000 } else { 1 };
+            below = Some(r1.create_query_with(
+                move |rt| {
+                    let own = quiet(|| r2.get(bq)).is_err_and(|p| p.is::<Uncopyable>());
+                    i64::from(own) * weight + next.map_or(0, |b| rt.get(b))
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap()) / 1_000_000
+    })
+    .join()
+    .unwrap();
+    assert_eq!(outer, 1, "the outermost reader saw a retry's payload");
+}
+
+mod foreign_hold_within_budget {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn frame_budget() {
+        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(8, 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn byte_budget() {
+        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(u32::MAX, 64 * 1024);
+    }
+}
