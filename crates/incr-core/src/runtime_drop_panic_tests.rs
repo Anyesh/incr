@@ -1466,3 +1466,42 @@ fn shared_wave7_kept_dirty_read_clone_drops_isolated() {
         |rt| wave7_kept_dirty_read_clone_drops_isolated(rt, 64),
     );
 }
+
+/// Counts its drops; with `again`, its `Drop` panics too.
+struct CountedPayload {
+    drops: Arc<AtomicU32>,
+    again: bool,
+}
+
+impl Drop for CountedPayload {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, SeqCst);
+        if self.again {
+            panic!("payload drop");
+        }
+    }
+}
+
+/// `isolate` drops the payload of a step's panic instead of leaking it.
+#[test]
+fn isolate_drops_the_steps_payload() {
+    let drops = Arc::new(AtomicU32::new(0));
+    let payload = CountedPayload {
+        drops: drops.clone(),
+        again: false,
+    };
+    crate::deferred::isolate(move || std::panic::panic_any(payload));
+    assert_eq!(drops.load(SeqCst), 1);
+}
+
+/// A payload whose own `Drop` panics stays inside `isolate`.
+#[test]
+fn isolate_contains_a_payload_whose_drop_panics() {
+    let drops = Arc::new(AtomicU32::new(0));
+    let payload = CountedPayload {
+        drops: drops.clone(),
+        again: true,
+    };
+    crate::deferred::isolate(move || std::panic::panic_any(payload));
+    assert_eq!(drops.load(SeqCst), 1);
+}

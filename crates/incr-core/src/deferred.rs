@@ -442,8 +442,9 @@ impl<V: ?Sized> Drop for Unbuilt<V> {
 
 /// Runs one cleanup step and swallows its panic, so an exit that already
 /// carries a payload delivers that payload unchanged. The secondary
-/// payload is forgotten, not dropped, because its own `Drop` could
-/// panic again.
+/// payload is dropped under its own catch. If that drop panics too, its
+/// payload is dropped when it is a message and forgotten otherwise, since
+/// its own `Drop` could panic again.
 ///
 /// The thread's engine unwind kind is saved before the step and
 /// restored after it here, discarding whatever the step set, so a wound
@@ -452,7 +453,13 @@ impl<V: ?Sized> Drop for Unbuilt<V> {
 pub(crate) fn isolate(step: impl FnOnce()) {
     let kind = cycle_state::unwind_kind();
     if let Err(payload) = catch_unwind(AssertUnwindSafe(step)) {
-        std::mem::forget(payload);
+        if let Err(again) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            if again.is::<&'static str>() || again.is::<String>() {
+                drop(again);
+            } else {
+                std::mem::forget(again);
+            }
+        }
     }
     cycle_state::set_unwind_kind(kind);
 }

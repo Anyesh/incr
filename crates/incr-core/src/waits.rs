@@ -232,6 +232,7 @@ mod tests {
     /// on is taken, not after a fixed number of backoffs, each of which can
     /// give up a time slice on a loaded box.
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn head_start_ends_once_the_winners_claim_is_taken() {
         crate::child_test::run_in_child(
             "waits::tests::head_start_ends_once_the_winners_claim_is_taken",
