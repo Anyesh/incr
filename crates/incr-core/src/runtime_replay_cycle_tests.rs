@@ -1095,7 +1095,13 @@ fn handed_over_graph<C: Cells>(
     let mut nodes = vec![m, r];
     for _ in 1..depth {
         let below = p;
-        p = rt.create_query_with(move |rt| rt.get(t_in) * 0 + rt.get(below), replayable());
+        p = rt.create_query_with(
+            move |rt| {
+                let _ = rt.get(t_in);
+                rt.get(below)
+            },
+            replayable(),
+        );
         nodes.push(p);
     }
     let x = {
@@ -1275,7 +1281,13 @@ fn landed_f_graph<C: Cells>(rt: &Runtime<C>, depth: u32, grouped: bool) -> Lande
     let mut nodes = vec![m, w, r];
     for _ in 1..depth {
         let below = p;
-        p = rt.create_query_with(move |rt| rt.get(t_in) * 0 + rt.get(below), replayable());
+        p = rt.create_query_with(
+            move |rt| {
+                let _ = rt.get(t_in);
+                rt.get(below)
+            },
+            replayable(),
+        );
         nodes.push(p);
     }
     let x = {
