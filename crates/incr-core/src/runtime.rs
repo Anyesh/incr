@@ -3578,9 +3578,6 @@ impl<C: Cells> Runtime<C> {
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
         let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
-        if !contain {
-            self.note_unwound_read(&*payload, kind);
-        }
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -3613,6 +3610,10 @@ impl<C: Cells> Runtime<C> {
                 Some(&*payload),
                 bag,
             );
+        }
+        // After the landings, whose notes the kept copy carries.
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
         }
         if contain {
             self.contain(attempt.cidx, payload, bag);
@@ -3805,6 +3806,13 @@ impl<C: Cells> Runtime<C> {
             }
             self.set_drop_kind();
             *result = Err(Box::new(cycle::DiscardUnwind));
+        }
+        // After the rewrites: a swallowed discard or wound is no pop of the
+        // unbounded run's.
+        if result.is_ok()
+            && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT | value_code::KEPT_BIT) != 0
+        {
+            self.retire_copies(&replay::Retire::Above(attempt.cidx));
         }
         None
     }

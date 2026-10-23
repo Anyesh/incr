@@ -3,7 +3,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -892,6 +892,321 @@ fn wave6_local_doomed_run_keeps_the_ticket_it_took() {
 #[test]
 fn wave6_shared_doomed_run_keeps_the_ticket_it_took() {
     wave6_doomed_run_keeps_the_ticket_it_took::<Shared>();
+}
+
+/// Under x's walk, a replayable g catches the panic of a never-read r, reads
+/// the replayable chain dd1..dd4 and re-raises, at frame budget `budget` (or
+/// the default), holding the caught box across a doom so the retry's copy
+/// cannot reuse its address. With `deep`, r re-raises the panic of its dep d,
+/// whose landing sits a frame deeper. Returns x, then the messages of d (empty
+/// without `deep`), r and g.
+fn wave7_kept_read_after_fresh_failed_read<C: Cells>(
+    budget: Option<u32>,
+    deep: bool,
+) -> (i64, String, String, String) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    let sel = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let d = rt.create_query(move |_rt: &Runtime<C>| -> i64 { panic!("r boom") });
+    let r = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        if deep {
+            rt.get(d)
+        } else {
+            panic!("r boom")
+        }
+    });
+    let replay = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let dd4 = rt.create_query_with(move |_rt: &Runtime<C>| 1_i64, replay());
+    let dd3 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd4) + 1, replay());
+    let dd2 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd3) + 1, replay());
+    let dd1 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd2) + 1, replay());
+    let held: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> = Arc::new(Mutex::new(None));
+    let g = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            if rt.get(k) == 0 {
+                return 0;
+            }
+            let c = catch_unwind(AssertUnwindSafe(|| rt.get(r))).map_err(|p| {
+                *held.lock().unwrap() = Some(p);
+            });
+            let v = rt.get(dd1);
+            match c {
+                Ok(n) => n + v,
+                Err(()) => {
+                    let p = held.lock().unwrap().take().unwrap();
+                    std::panic::resume_unwind(p)
+                }
+            }
+        },
+        replay(),
+    );
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(g) } else { 100 });
+    assert_eq!(rt.get(x), 0);
+    rt.set(k, 1);
+    rt.set(sel, 1);
+    if let Some(b) = budget {
+        rt.set_max_frames(b);
+    }
+    let v = rt.get(x);
+    let md = if deep {
+        panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err())
+    } else {
+        String::new()
+    };
+    let mr = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(r))).unwrap_err());
+    let mg = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
+    assert_no_notes();
+    (v, md, mr, mg)
+}
+
+/// The walk contains g's re-raised panic with r's own Failed landing, so r
+/// raises "r boom" and g reports its last compute panicked. With `deep`, g's
+/// read of dd1 retired d's deeper landing first, so d reports its last
+/// compute panicked. A doomed run's retry of g must leave the same ticket at
+/// every budget.
+fn wave7_kept_read_keeps_the_read_nodes_landing<C: Cells>(deep: bool) {
+    let unbounded = wave7_kept_read_after_fresh_failed_read::<C>(None, deep);
+    assert_eq!(unbounded.0, 100);
+    assert_eq!(
+        unbounded.1.contains("last compute panicked"),
+        deep,
+        "{}",
+        unbounded.1
+    );
+    assert_eq!(unbounded.2, "r boom");
+    assert!(
+        unbounded.3.contains("last compute panicked"),
+        "{}",
+        unbounded.3
+    );
+    for b in 1..=8 {
+        assert_eq!(
+            wave7_kept_read_after_fresh_failed_read::<C>(Some(b), deep),
+            unbounded,
+            "budget {b}, deep {deep}"
+        );
+    }
+}
+
+#[test]
+fn wave7_local_kept_read_keeps_the_read_nodes_landing() {
+    wave7_kept_read_keeps_the_read_nodes_landing::<Local>(false);
+}
+
+#[test]
+fn wave7_shared_kept_read_keeps_the_read_nodes_landing() {
+    wave7_kept_read_keeps_the_read_nodes_landing::<Shared>(false);
+}
+
+#[test]
+fn wave7_local_kept_read_keeps_the_read_nodes_deeper_landing_retired() {
+    wave7_kept_read_keeps_the_read_nodes_landing::<Local>(true);
+}
+
+#[test]
+fn wave7_shared_kept_read_keeps_the_read_nodes_deeper_landing_retired() {
+    wave7_kept_read_keeps_the_read_nodes_landing::<Shared>(true);
+}
+
+/// Under x's walk, a replayable g catches the panic of a never-read a, sets
+/// k and catches a's second panic through b, which lands a Failed again,
+/// then reads the replayable chain dd1..dd4 and re-raises a's first panic,
+/// at frame budget `budget` (or the default). Returns x, then the messages
+/// of a and g.
+fn wave7_kept_read_after_relanded_read<C: Cells>(budget: Option<u32>) -> (i64, String, String) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    let sel = rt.create_input(0_i64);
+    let on = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let a = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        let kk = rt.get(k);
+        panic!("a boom {kk}")
+    });
+    let b = rt.create_query(move |rt: &Runtime<C>| rt.get(a));
+    let replay = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let dd4 = rt.create_query_with(move |_rt: &Runtime<C>| 1_i64, replay());
+    let dd3 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd4) + 1, replay());
+    let dd2 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd3) + 1, replay());
+    let dd1 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd2) + 1, replay());
+    let held: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> = Arc::new(Mutex::new(None));
+    let g = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            if rt.get(on) == 0 {
+                return 0;
+            }
+            let c = catch_unwind(AssertUnwindSafe(|| rt.get(a))).map_err(|p| {
+                *held.lock().unwrap() = Some(p);
+            });
+            if c.is_err() {
+                rt.set(k, 1);
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(b)));
+            }
+            let v = rt.get(dd1);
+            match c {
+                Ok(n) => n + v,
+                Err(()) => {
+                    let p = held.lock().unwrap().take().unwrap();
+                    std::panic::resume_unwind(p)
+                }
+            }
+        },
+        replay(),
+    );
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(g) } else { 100 });
+    assert_eq!(rt.get(x), 0);
+    rt.set(on, 1);
+    rt.set(sel, 1);
+    if let Some(b) = budget {
+        rt.set_max_frames(b);
+    }
+    let v = rt.get(x);
+    let ma = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err());
+    let mg = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
+    assert_no_notes();
+    (v, ma, mg)
+}
+
+/// a's second Failed landing replaces its first, so no ticket holds the
+/// payload g re-raises for a, at any budget: a kept copy of g's read must
+/// lose a as the live note does. With `rerun`, g's message is compared
+/// too: x's walk reruns g after its flagged Dirty landing, and that run
+/// must read a afresh.
+fn wave7_kept_read_drops_a_relanded_node<C: Cells>(rerun: bool) {
+    let unbounded = wave7_kept_read_after_relanded_read::<C>(None);
+    assert!(
+        unbounded.1.contains("last compute panicked"),
+        "{unbounded:?}"
+    );
+    for b in 1..=8 {
+        let got = wave7_kept_read_after_relanded_read::<C>(Some(b));
+        if rerun {
+            assert_eq!(got, unbounded, "budget {b}");
+        } else {
+            assert_eq!((got.0, &got.1), (unbounded.0, &unbounded.1), "budget {b}");
+        }
+    }
+}
+
+#[test]
+fn wave7_local_kept_read_drops_a_relanded_node() {
+    wave7_kept_read_drops_a_relanded_node::<Local>(false);
+}
+
+#[test]
+fn wave7_shared_kept_read_drops_a_relanded_node() {
+    wave7_kept_read_drops_a_relanded_node::<Shared>(false);
+}
+
+#[test]
+#[ignore = "T8-rerun-takes-earlier-runs-delivery: the walk's rerun of g takes its first run's delivery"]
+fn wave7_local_rerun_reads_a_relanded_node_afresh() {
+    wave7_kept_read_drops_a_relanded_node::<Local>(true);
+}
+
+#[test]
+#[ignore = "T8-rerun-takes-earlier-runs-delivery: the walk's rerun of g takes its first run's delivery"]
+fn wave7_shared_rerun_reads_a_relanded_node_afresh() {
+    wave7_kept_read_drops_a_relanded_node::<Shared>(true);
+}
+
+/// Under x's walk, a replayable g catches the panic of a never-read r, which
+/// re-raises its dep s's, then reads the replayable chain dd1..dd4, where
+/// dd1 panics after reading dd2; g catches that and re-raises r's panic, at
+/// frame budget `budget` (or the default). Returns x, then the messages of
+/// s, r and g.
+fn wave7_kept_read_after_another_landing<C: Cells>(
+    budget: Option<u32>,
+) -> (i64, String, String, String) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    let sel = rt.create_input(0_i64);
+    let on = rt.create_input(0_i64);
+    let s = rt.create_query(move |_rt: &Runtime<C>| -> i64 { panic!("s boom") });
+    let r = rt.create_query(move |rt: &Runtime<C>| rt.get(s));
+    let replay = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let dd4 = rt.create_query_with(move |_rt: &Runtime<C>| 1_i64, replay());
+    let dd3 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd4) + 1, replay());
+    let dd2 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd3) + 1, replay());
+    let dd1 = rt.create_query_with(
+        move |rt: &Runtime<C>| -> i64 {
+            let v = rt.get(dd2);
+            panic!("dd boom {v}")
+        },
+        replay(),
+    );
+    let held: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>> = Arc::new(Mutex::new(None));
+    let g = rt.create_query_with(
+        move |rt: &Runtime<C>| {
+            if rt.get(on) == 0 {
+                return 0;
+            }
+            let c = catch_unwind(AssertUnwindSafe(|| rt.get(r))).map_err(|p| {
+                *held.lock().unwrap() = Some(p);
+            });
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(dd1))).unwrap_or(7);
+            match c {
+                Ok(n) => n + v,
+                Err(()) => {
+                    let p = held.lock().unwrap().take().unwrap();
+                    std::panic::resume_unwind(p)
+                }
+            }
+        },
+        replay(),
+    );
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(g) } else { 100 });
+    assert_eq!(rt.get(x), 0);
+    rt.set(on, 1);
+    rt.set(sel, 1);
+    if let Some(b) = budget {
+        rt.set_max_frames(b);
+    }
+    let v = rt.get(x);
+    let ms = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(s))).unwrap_err());
+    let mr = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(r))).unwrap_err());
+    let mg = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
+    assert_no_notes();
+    (v, ms, mr, mg)
+}
+
+/// dd1's Failed landing with its own panic, just above g, retires s's
+/// deeper note: the walk contains g's panic with r and g only, at every
+/// budget.
+fn wave7_kept_read_follows_another_landing<C: Cells>() {
+    let unbounded = wave7_kept_read_after_another_landing::<C>(None);
+    assert!(
+        unbounded.1.contains("last compute panicked"),
+        "{unbounded:?}"
+    );
+    assert_eq!(unbounded.2, "s boom");
+    for b in 1..=8 {
+        assert_eq!(
+            wave7_kept_read_after_another_landing::<C>(Some(b)),
+            unbounded,
+            "budget {b}"
+        );
+    }
+}
+
+#[test]
+fn wave7_local_kept_read_follows_another_landing() {
+    wave7_kept_read_follows_another_landing::<Local>();
+}
+
+#[test]
+fn wave7_shared_kept_read_follows_another_landing() {
+    wave7_kept_read_follows_another_landing::<Shared>();
 }
 
 /// g takes a's held ticket, sets k (flipping a Dirty) and rereads a, directly

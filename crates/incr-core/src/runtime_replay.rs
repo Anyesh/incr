@@ -947,7 +947,7 @@ impl<C: Cells> Runtime<C> {
             poison: true,
             attributed: false,
             payload: copy,
-            nodes: self.copy_notes(payload),
+            nodes: self.copy_notes(payload, cidx + 1),
         };
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
@@ -988,7 +988,7 @@ impl<C: Cells> Runtime<C> {
             poison: true,
             attributed: false,
             payload: copy,
-            nodes: self.copy_notes(payload),
+            nodes: self.copy_notes(payload, cidx + 1),
         };
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
@@ -1260,6 +1260,7 @@ impl<C: Cells> Runtime<C> {
                         below: Vec::new(),
                         resumed: None,
                         landed: None,
+                        passed: true,
                     });
                 }
             }
@@ -2166,7 +2167,7 @@ impl<C: Cells> Runtime<C> {
                         cycle: kind == Some(UnwindKind::Cycle),
                         poison,
                         attributed: cycle_state::failures() != failures,
-                        nodes: self.take_notes(&*payload),
+                        nodes: self.take_notes(&*payload, v.cidx),
                         payload,
                     },
                 );
@@ -2409,7 +2410,7 @@ impl<C: Cells> Runtime<C> {
                     cycle: kind == Some(UnwindKind::Cycle),
                     poison,
                     attributed: cycle_state::failures() != failures,
-                    nodes: self.take_notes(&*payload),
+                    nodes: self.take_notes(&*payload, boundary + level),
                     payload,
                 },
             );
@@ -2715,7 +2716,7 @@ impl<C: Cells> Runtime<C> {
                         // left New, and not of one left Cyclic.
                         poison: state == NodeState::New,
                         payload: Box::new(cycle::CycleUnwind(g.cycle.clone())),
-                        nodes: Vec::new(),
+                        nodes: replay::Landings::default(),
                     })
             }
             _ => None,

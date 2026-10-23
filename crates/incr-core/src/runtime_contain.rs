@@ -29,7 +29,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
-use crate::replay::{payload_key, PayloadKey};
+use crate::replay::{payload_key, Landings, PayloadKey, Retire};
 
 /// A Failed read's node left Failed before the read could tell which
 /// landing it saw.
@@ -121,6 +121,17 @@ pub(super) fn walked_episode(cidx: u32) -> Option<NodeId> {
         let (at, root) = w.get();
         (at == cidx).then_some(NodeId(root))
     })
+}
+
+/// Adds note `w`'s landing to `nodes` at its depth above `base`, keeping
+/// the shallowest depth of a landing noted twice. A note below `base`
+/// counts as just above it.
+fn add_noted(nodes: &mut Vec<((u32, u32), u32)>, w: &Unwound, base: u32) {
+    let depth = w.cidx.saturating_sub(base);
+    match nodes.iter_mut().find(|(n, _)| *n == w.node) {
+        Some((_, d)) => *d = (*d).min(depth),
+        None => nodes.push((w.node, depth)),
+    }
 }
 
 /// Edits this thread's notes and keeps `value_code::NOTES_BIT` in step.
@@ -269,6 +280,11 @@ impl<C: Cells> Runtime<C> {
         } else if notes_held() {
             with_notes(|u| u.retain(|w| !replaced(w)));
         }
+        self.retire_copies(&Retire::Landing {
+            cidx,
+            payload: payload.map(payload_key),
+            node: landing,
+        });
         if !self.tickets_held() {
             return 0;
         }
@@ -313,6 +329,7 @@ impl<C: Cells> Runtime<C> {
     /// payload's notes at `cidx` are the reading frame's, as at a landing.
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
+        self.retire_copies(&Retire::Contained { cidx, payload: at });
         let mut nodes = Vec::new();
         if notes_held() {
             with_notes(|u| {
@@ -485,18 +502,29 @@ impl<C: Cells> Runtime<C> {
     /// reading frame, so that a walk's entry below that contains the panic
     /// again holds them too.
     fn note_read(&self, nodes: Vec<(u32, u32)>, payload: &(dyn Any + Send), restorable: bool) {
-        if nodes.is_empty() {
-            return;
-        }
-        let (rt, cidx, at) = (
+        self.note_above(nodes.into_iter().map(|n| (n, 0)), payload, restorable);
+    }
+
+    /// Notes each of `nodes` at its depth above the reading frame.
+    fn note_above(
+        &self,
+        nodes: impl IntoIterator<Item = ((u32, u32), u32)>,
+        payload: &(dyn Any + Send),
+        restorable: bool,
+    ) {
+        let (rt, base, at) = (
             self.runtime_id,
             self.dep_stack.next_cidx(),
             payload_key(payload),
         );
+        let mut nodes = nodes.into_iter().peekable();
+        if nodes.peek().is_none() {
+            return;
+        }
         with_notes(|u| {
-            u.extend(nodes.into_iter().map(|node| Unwound {
+            u.extend(nodes.map(|(node, depth)| Unwound {
                 rt,
-                cidx,
+                cidx: base + depth,
                 node,
                 payload: at,
                 restorable,
@@ -505,51 +533,75 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A delivered unwind a retry's read raises: its landings follow the
-    /// copy the read takes.
-    pub(super) fn note_delivered(&self, nodes: Vec<(u32, u32)>, payload: &(dyn Any + Send)) {
-        self.note_read(nodes, payload, false);
+    /// copy the read takes, each as deep above the read as it landed, so
+    /// the retry's later pops retire the deeper ones as the unbounded
+    /// run's do.
+    pub(super) fn note_delivered(&self, nodes: Landings, payload: &(dyn Any + Send)) {
+        self.note_above(nodes.nodes, payload, false);
     }
 
     /// A delivery keeps a copy of `payload` for a frame's retry while
-    /// `payload` unwinds on: the copy carries the landings noted for it.
-    /// The retry's read stands for the frame's read in the unbounded run,
-    /// so a discard of the run the payload unwinds through no longer holds
-    /// their ticket again.
-    pub(super) fn copy_notes(&self, payload: &(dyn Any + Send)) -> Vec<(u32, u32)> {
+    /// `payload` unwinds on: the copy carries the landings noted for it,
+    /// with their depths above `base`, the position just above the
+    /// reading frame. The retry's read stands for the frame's read in the
+    /// unbounded run, so a discard of the run the payload unwinds through
+    /// no longer holds their ticket again.
+    pub(super) fn copy_notes(&self, payload: &(dyn Any + Send), base: u32) -> Landings {
         if !notes_held() {
-            return Vec::new();
+            return Landings::default();
         }
         let (rt, at) = (self.runtime_id, payload_key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             for w in u.iter_mut().filter(|w| w.payload == at) {
                 w.restorable = false;
-                if w.rt == rt && !nodes.contains(&w.node) {
-                    nodes.push(w.node);
+                if w.rt == rt {
+                    add_noted(&mut nodes, w, base);
                 }
             }
         });
-        nodes
+        self.copied(at, nodes)
+    }
+
+    fn copied(&self, at: PayloadKey, nodes: Vec<((u32, u32), u32)>) -> Landings {
+        let landings = Landings {
+            source: Some(at),
+            nodes,
+        };
+        replay::mark_copied(self.runtime_id, &landings);
+        landings
     }
 
     /// A delivery takes `payload` itself for a frame's retry, so its
-    /// unwind ends here and the delivery carries its landings.
-    pub(super) fn take_notes(&self, payload: &(dyn Any + Send)) -> Vec<(u32, u32)> {
+    /// unwind ends here and the delivery carries its landings, with their
+    /// depths above `base` as [`Self::copy_notes`] gives them.
+    pub(super) fn take_notes(&self, payload: &(dyn Any + Send), base: u32) -> Landings {
         if !notes_held() {
-            return Vec::new();
+            return Landings::default();
         }
         let (rt, at) = (self.runtime_id, payload_key(payload));
         let mut nodes = Vec::new();
         with_notes(|u| {
             u.retain(|w| {
                 let same = w.payload == at;
-                if same && w.rt == rt && !nodes.contains(&w.node) {
-                    nodes.push(w.node);
+                if same && w.rt == rt {
+                    add_noted(&mut nodes, w, base);
                 }
                 !same
             });
         });
-        nodes
+        self.copied(at, nodes)
+    }
+
+    /// Applies `ev` to the copies of this runtime's notes that kept reads
+    /// and passed deliveries hold, as it applies to the notes: a frame's
+    /// retry re-notes them, and the unbounded run's frame would find
+    /// only those still noted. A speculative run is no event of the
+    /// unbounded run's.
+    pub(super) fn retire_copies(&self, ev: &Retire) {
+        if !replay::speculative() && replay::copies_held() {
+            replay::retire_copies(self.runtime_id, ev);
+        }
     }
 
     /// An unwind stopped at frame `cidx`: a closure there caught it, or a

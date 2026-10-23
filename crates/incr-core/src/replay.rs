@@ -168,6 +168,88 @@ pub(crate) struct Delivery {
     /// doomed again, lands it so again: the deps it finds may have landed
     /// since in ways the unbounded run's frame never saw.
     pub(crate) landed: Option<NodeState>,
+    /// A run of the frame has read past it: the landings it carries stood
+    /// as notes in the unbounded run from then on, so a later pop above
+    /// the frame retires them as it retires notes.
+    pub(crate) passed: bool,
+}
+
+/// The Failed landings noted for a payload that a copy of it carries, each
+/// with its depth above the reading frame, and the payload they were noted
+/// for.
+#[derive(Clone, Default)]
+pub(crate) struct Landings {
+    pub(crate) source: Option<PayloadKey>,
+    pub(crate) nodes: Vec<((u32, u32), u32)>,
+}
+
+impl Landings {
+    fn is_deep(&self) -> bool {
+        self.nodes.iter().any(|&(_, depth)| depth > 0)
+    }
+
+    fn max_depth(&self) -> u32 {
+        self.nodes
+            .iter()
+            .map(|&(_, depth)| depth)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Applies `ev` to the landings of a read by the frame at `cidx`, as it
+    /// applies to the notes they stand for; `resumed` is the copy the
+    /// frame's latest take raised, which counts as the source.
+    fn retire(&mut self, cidx: u32, ev: &Retire, resumed: Option<PayloadKey>) {
+        let ours = |p: PayloadKey| self.source == Some(p) || resumed == Some(p);
+        let gone: Box<dyn Fn((u32, u32), u32) -> bool> = match *ev {
+            Retire::Above(at) => Box::new(move |_, pos| pos > at),
+            Retire::Contained { cidx: at, payload } => {
+                let same = ours(payload);
+                Box::new(move |_, pos| pos > at || pos == at && same)
+            }
+            Retire::Landing {
+                cidx: at,
+                payload,
+                node,
+            } => {
+                let other = payload.is_some_and(|p| !ours(p));
+                Box::new(move |n, pos| n == node || pos > at && other)
+            }
+        };
+        self.nodes.retain(|&(n, depth)| !gone(n, cidx + 1 + depth));
+    }
+}
+
+/// An event that retires notes (`runtime_contain`), applied to the copies
+/// of them that kept reads and passed deliveries hold.
+pub(crate) enum Retire {
+    /// A frame at this position popped with a value.
+    Above(u32),
+    /// A walk's entry at `cidx` contained `payload`.
+    Contained { cidx: u32, payload: PayloadKey },
+    /// `node` landed Failed at `cidx`, unwinding `payload` if known.
+    Landing {
+        cidx: u32,
+        payload: Option<PayloadKey>,
+        node: (u32, u32),
+    },
+}
+
+impl Retire {
+    fn cidx(&self) -> u32 {
+        match *self {
+            Retire::Above(at)
+            | Retire::Contained { cidx: at, .. }
+            | Retire::Landing { cidx: at, .. } => at,
+        }
+    }
+
+    fn node(&self) -> Option<(u32, u32)> {
+        match *self {
+            Retire::Landing { node, .. } => Some(node),
+            _ => None,
+        }
+    }
 }
 
 /// A context's deliveries. Each keeps its index until it is removed, and
@@ -183,6 +265,9 @@ pub(crate) struct Pending {
     by_maker: HashMap<u32, Vec<usize>>,
     by_frame: HashMap<(u32, u32, u32), Vec<usize>>,
     traced: Vec<usize>,
+    /// The passed deliveries that carry a landing deeper than just above
+    /// their frame, which a pop can retire.
+    deep: Vec<usize>,
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -208,6 +293,9 @@ impl Pending {
         if d.provenance.is_some() {
             self.traced.push(i);
         }
+        if d.passed && d.is_deep() {
+            self.deep.push(i);
+        }
         self.slots.push(Some(d));
         self.live += 1;
     }
@@ -221,6 +309,9 @@ impl Pending {
         unlist(&mut self.by_frame, &frame_of(&d.key), i);
         if d.provenance.is_some() {
             self.traced.retain(|&j| j != i);
+        }
+        if d.passed {
+            self.deep.retain(|&j| j != i);
         }
         self.live -= 1;
         // No index is held across a point where none is live.
@@ -240,6 +331,47 @@ impl Pending {
         self.slots[i]
             .as_mut()
             .expect("incr-core: a delivery's index is live")
+    }
+
+    /// Delivery `i`'s frame has read past it.
+    pub(crate) fn pass(&mut self, i: usize) {
+        let d = self.get_mut(i);
+        if !d.passed {
+            d.passed = true;
+            if d.is_deep() {
+                self.deep.push(i);
+            }
+        }
+    }
+
+    /// Applies `ev` to the landings the passed deliveries carry: those of
+    /// every passed delivery for a node's landing that a copy may hold,
+    /// else only the deeper ones, since an event at or below a frame
+    /// ends that frame's run.
+    fn retire(&mut self, ev: &Retire, all: bool) {
+        let slots = &mut self.slots;
+        let apply = |d: &mut Delivery| {
+            if d.key.cidx < ev.cidx() || all {
+                let resumed = d.resumed;
+                if let Delivered::Unwind { nodes, .. } = &mut d.what {
+                    nodes.retire(d.key.cidx, ev, resumed);
+                }
+            }
+        };
+        if all {
+            for d in slots.iter_mut().flatten().filter(|d| d.passed) {
+                apply(d);
+            }
+        }
+        self.deep.retain(|&i| {
+            let d = slots[i]
+                .as_mut()
+                .expect("incr-core: a delivery's index is live");
+            if !all {
+                apply(d);
+            }
+            d.is_deep()
+        });
     }
 
     /// The deliveries for read `key`, oldest first.
@@ -314,6 +446,10 @@ impl Pending {
 }
 
 impl Delivery {
+    fn is_deep(&self) -> bool {
+        matches!(&self.what, Delivered::Unwind { nodes, .. } if nodes.is_deep())
+    }
+
     fn is_untaken_panic(&self) -> bool {
         !self.taken && matches!(self.what, Delivered::Unwind { cycle: false, .. })
     }
@@ -348,7 +484,7 @@ pub(crate) enum Delivered {
         payload: Box<dyn Any + Send>,
         /// The landings the panic made that a walk's entry may contain
         /// with it (`runtime_provenance`), which follow each copy taken.
-        nodes: Vec<(u32, u32)>,
+        nodes: Landings,
     },
     /// The entry landed without a Clean value. The unbounded run's read
     /// takes the slot as the compute left it, poisoned, where a later read
@@ -540,6 +676,7 @@ impl Context {
             below: Vec::new(),
             resumed: None,
             landed: None,
+            passed: false,
         });
     }
 
@@ -655,6 +792,7 @@ impl Context {
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
         let key = self.pending.get(i).key;
         self.pending.take_keyed(&key);
+        self.pending.pass(i);
         let Delivered::Unwind {
             cycle,
             poison,
@@ -697,6 +835,7 @@ impl Context {
             below: Vec::new(),
             resumed: None,
             landed: None,
+            passed: false,
         });
     }
 
@@ -721,6 +860,7 @@ impl Context {
                 below: Vec::new(),
                 resumed: None,
                 landed: None,
+                passed: false,
             });
         }
     }
@@ -788,6 +928,8 @@ pub(crate) struct KeptRead {
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<KeptRead>> = const { RefCell::new(Vec::new()) };
+    static KEPT_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static COPIED: RefCell<[u64; 64]> = const { RefCell::new([0; 64]) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
@@ -799,6 +941,8 @@ thread_local! {
 #[cfg(loom)]
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<KeptRead>> = RefCell::new(Vec::new());
+    static KEPT_DEPTH: Cell<u32> = Cell::new(0);
+    static COPIED: RefCell<[u64; 64]> = RefCell::new([0; 64]);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
@@ -829,6 +973,9 @@ pub(crate) fn vindexes_empty() -> bool {
 /// every frame at or above the reading one's position, but the reading
 /// one, which is a run of its own if this is its first such read.
 pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
+    if let Delivered::Unwind { nodes, .. } = &read.what {
+        KEPT_DEPTH.with(|k| k.set(k.get().max(nodes.max_depth())));
+    }
     let gone: Vec<KeptRead> = KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
         let gone = d
@@ -843,6 +990,64 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
     });
     value_code::set_kept_bit(true);
     drop(gone);
+}
+
+fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
+    let h = BuildHasherDefault::<DefaultHasher>::default().hash_one((rt, node)) as usize;
+    ((h >> 6) & 63, 1 << (h & 63))
+}
+
+/// Marks `nodes` as landings a copy may hold, so that a later landing of
+/// one of them finds the copies to drop it from.
+pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
+    COPIED.with(|c| {
+        let mut c = c.borrow_mut();
+        for &(n, _) in &nodes.nodes {
+            let (w, b) = copied_bit(rt, n);
+            c[w] |= b;
+        }
+    });
+}
+
+/// Whether a kept read or a context's delivery may hold copied landings.
+pub(crate) fn copies_held() -> bool {
+    value_code::thread_word() & (value_code::KEPT_BIT | value_code::REPLAY_BIT) != 0
+}
+
+/// Applies `ev`, an event that retires notes of runtime `rt`, to the
+/// copies of them kept reads and the contexts' passed deliveries hold,
+/// outside a speculative run.
+pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
+    let all = ev.node().is_some_and(|n| {
+        let (w, b) = copied_bit(rt, n);
+        COPIED.with(|c| c.borrow()[w] & b != 0)
+    });
+    let at = ev.cidx();
+    KEPT_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        let deepest = KEPT_DEPTH.with(Cell::get);
+        // Kept reads are pushed by the stack's top frame after those at or
+        // above it go, and go when their frame pops, so they run in frame
+        // order.
+        for e in d.iter_mut().rev() {
+            if !all && e.cidx + 1 + deepest <= at {
+                break;
+            }
+            if e.rt == rt && (e.cidx < at || all) {
+                if let Delivered::Unwind { nodes, .. } = &mut e.what {
+                    nodes.retire(e.cidx, ev, None);
+                }
+            }
+        }
+        if d.is_empty() {
+            KEPT_DEPTH.with(|k| k.set(0));
+        }
+    });
+    with(|c| {
+        for x in c.iter_mut().filter(|x| x.rt == rt) {
+            x.pending.retire(ev, all);
+        }
+    });
 }
 
 /// The reads kept for the run of control block `ctl` at `cidx`.
@@ -870,6 +1075,12 @@ fn extract_kept(mut which: impl FnMut(&KeptRead) -> bool) -> Vec<KeptRead> {
         let mut d = d.borrow_mut();
         let out = d.extract_if(.., |e| which(e)).collect();
         value_code::set_kept_bit(!d.is_empty());
+        if d.is_empty() {
+            KEPT_DEPTH.with(|k| k.set(0));
+            if value_code::thread_word() & value_code::REPLAY_BIT == 0 {
+                COPIED.with(|c| *c.borrow_mut() = [0; 64]);
+            }
+        }
         out
     })
 }
