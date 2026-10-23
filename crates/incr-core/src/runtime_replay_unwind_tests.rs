@@ -1679,3 +1679,75 @@ local_and_shared!(
     local_caught_cycle_in_fallback_member_lands_failed,
     shared_caught_cycle_in_fallback_member_lands_failed
 );
+
+/// After a set, R's rerun computes X, which catches B's panic, swallows
+/// Y's self-cycle and re-raises B's payload; R's `try_get` passes it on as
+/// an ordinary panic. At every budget `get(top)` must panic "b boom" as in
+/// the unbounded run. Returns top's read and the states of B, X and R.
+fn wave7_rethrown_panic_after_swallowed_cycle<C: Cells>(
+    frames: Option<u32>,
+) -> (Out, [NodeState; 3]) {
+    let rt = runtime::<C>(frames);
+    let k = rt.create_input(0_u64);
+    let b = rt.create_query_with(|_rt| -> u64 { panic!("b boom") }, replayable());
+    let y_cell: Later = Default::default();
+    let y = {
+        let y_cell = y_cell.clone();
+        rt.create_query_with(move |rt| rt.get(later(&y_cell)), replayable())
+    };
+    y_cell.set(y).unwrap();
+    let x = rt.create_query_with(
+        move |rt| {
+            let r = catch_unwind(AssertUnwindSafe(|| rt.get(b)));
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(y)));
+            match r {
+                Ok(v) => v,
+                Err(p) => std::panic::resume_unwind(p),
+            }
+        },
+        replayable(),
+    );
+    let r = rt.create_query_with(
+        move |rt| {
+            if rt.get(k) == 0 {
+                return 1;
+            }
+            rt.try_get(x).unwrap_or(7777)
+        },
+        replayable(),
+    );
+    let top = rt.create_query_with(
+        move |rt| {
+            let v = rt.get(r);
+            if rt.get(k) == 0 {
+                v
+            } else {
+                0
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(top), 1);
+    rt.set(k, 1);
+    let got = get(&rt, top);
+    rt.assert_invariant_i();
+    (got, [rt.state_of(b), rt.state_of(x), rt.state_of(r)])
+}
+
+fn wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload<C: Cells>() {
+    let unbounded = wave7_rethrown_panic_after_swallowed_cycle::<C>(None);
+    assert_eq!(unbounded.0, Out::Panic("b boom".to_owned()));
+    for frames in 1..=4 {
+        assert_eq!(
+            wave7_rethrown_panic_after_swallowed_cycle::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload,
+    local_wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload,
+    shared_wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload
+);
