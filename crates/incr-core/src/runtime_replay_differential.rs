@@ -4304,6 +4304,144 @@ fn wave7_two_thread_oracle_judges_symmetric_failed_extras_alike() {
     }
 }
 
+/// 0's first run returns 1, and any later run of its closure panics. Op 0
+/// runs it, and the read phase's `get(0)` reads it Clean in every order,
+/// so no order runs the closure again and none leaves 0 Failed. A replay
+/// that recomputes 0 as a fresh query runs the branch no order runs, so
+/// it must not make 0 patched Failed true of the phase's inputs.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_two_thread_oracle_rejects_a_failed_node_only_a_rerun_of_it_clean_gives() {
+    let case = Case {
+        specs: vec![
+            Spec::Query {
+                expr: Expr::FirstRun(
+                    Box::new(Expr::Const(1)),
+                    Box::new(Expr::PanicIf(Box::new(Expr::Const(0)), 0)),
+                ),
+                replay: false,
+                bare: false,
+                strategy: Strat::None,
+            },
+            Spec::Input(7),
+            Spec::Input(7),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 3,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(2, 5), Op::Get(0), Op::Get(1)],
+    };
+    match patched_zero_failed(&case) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("0 Failed, which no order runs its closure for, passed: {v:?}"),
+    }
+}
+
+/// As above, but 0 reads 3, which always gives 1, so the set of 2 leaves
+/// 0 Dirty: every order verifies 0 over 3's unchanged value and keeps its
+/// first run's 1, and none runs the closure again.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_two_thread_oracle_rejects_a_failed_node_an_order_verifies_clean() {
+    let query = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            query(Expr::FirstRun(
+                Box::new(Expr::Read(3, false)),
+                Box::new(Expr::PanicIf(Box::new(Expr::Const(0)), 0)),
+            )),
+            Spec::Input(7),
+            Spec::Input(7),
+            query(Expr::If(
+                Box::new(Expr::Read(2, false)),
+                Box::new(Expr::Const(1)),
+                Box::new(Expr::Const(1)),
+            )),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(2, 5), Op::Get(0), Op::Get(1)],
+    };
+    match patched_zero_failed(&case) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("0 Failed, which every order verifies Clean, passed: {v:?}"),
+    }
+}
+
+/// 0's first run panics over 3's 7, which lands it Failed with nothing an
+/// order verifies, so after the set of 2 every order reruns 0 to 5 though
+/// 3 still gives 7. A first run counts as kept only if it landed Clean.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn wave8_two_thread_oracle_rejects_a_failed_node_from_a_first_run_no_order_keeps() {
+    let query = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            query(Expr::FirstRun(
+                Box::new(Expr::PanicIf(Box::new(Expr::Read(3, false)), 0)),
+                Box::new(Expr::Const(5)),
+            )),
+            Spec::Input(7),
+            Spec::Input(7),
+            query(Expr::If(
+                Box::new(Expr::Read(2, false)),
+                Box::new(Expr::Const(7)),
+                Box::new(Expr::Const(7)),
+            )),
+        ],
+        panics: true,
+        cycles: false,
+        queries: 4,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(2, 5), Op::Get(0), Op::Get(1)],
+    };
+    match patched_zero_failed(&case) {
+        Some(Err(m)) => assert!(m.contains("node 0"), "{m}"),
+        v => panic!("0 Failed, which every order reruns to 5, passed: {v:?}"),
+    }
+}
+
+/// The two-thread oracle's verdict on `case`'s read phase of ops 2 and 3
+/// with node 0 patched Failed after it.
+fn patched_zero_failed(case: &Case) -> Option<Result<(), String>> {
+    let phases = phases(case, 0);
+    let serial = Serial::new(case, &phases);
+    let verdict = Mutex::new(None);
+    quiet(|| {
+        run_two_until(case, &phases, None, 0, &|_| {}, &|_, prefix, live| {
+            let mut prefix = prefix.clone();
+            for (_, snap) in &mut prefix[2..] {
+                snap.0[0] = NodeState::Failed;
+            }
+            let (rt, h) = (live.world.rt(0), live.world.handle(0, 0));
+            rt.nodes
+                .get(h.erased().slot())
+                .set_state(NodeState::Failed as u8);
+            let v = serial.at_overlap("patched", &prefix, live);
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+    });
+    verdict.into_inner().unwrap()
+}
+
 /// Seeds the scans found failing at a frame budget, each a replay fault
 /// since fixed.
 #[test]
