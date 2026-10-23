@@ -880,6 +880,7 @@ impl<C: Cells> Runtime<C> {
                     spec: spec || suspect,
                     retry: Retry::Walk,
                     walked: false,
+                    r5: false,
                 },
             );
         });
@@ -944,6 +945,7 @@ impl<C: Cells> Runtime<C> {
                 Retry::Compute
             },
             walked,
+            false,
         );
         self.park(ParkPoint::AfterDoom(id));
         Computed::Doomed
@@ -966,7 +968,7 @@ impl<C: Cells> Runtime<C> {
             depth: self.dep_stack.depth(),
             context: 0,
         });
-        self.mark(id, handle.generation(), Retry::Compute, false);
+        self.mark(id, handle.generation(), Retry::Compute, false, true);
         self.park(ParkPoint::AfterDoom(id));
         self.placeholder_read::<T>(Some(f))
     }
@@ -1390,7 +1392,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Marks the reading frame F and the frames below it that can be
     /// doomed, makes them virtual frames, and pushes `n` one level above F.
-    fn mark(&self, n: NodeId, generation: u32, retry: Retry, walked: bool) {
+    fn mark(&self, n: NodeId, generation: u32, retry: Retry, walked: bool, r5: bool) {
         let rt = self.runtime_id;
         #[cfg(test)]
         assert!(
@@ -1467,6 +1469,7 @@ impl<C: Cells> Runtime<C> {
                     spec,
                     retry: target_retry,
                     walked: target_walked,
+                    r5: false,
                 },
                 self.frame_keys(),
             ),
@@ -1591,6 +1594,7 @@ impl<C: Cells> Runtime<C> {
                     spec: spec || suspect,
                     retry,
                     walked,
+                    r5,
                 },
             );
         });
@@ -1957,7 +1961,7 @@ impl<C: Cells> Runtime<C> {
                             self.dep_stack.place_next_at(cidx, level > 0),
                         );
                         let _speculating = entry.spec.then(replay::Speculating::enter);
-                        self.member_run(entry.node, cidx, true, entry.walked)
+                        self.member_run(entry.node, cidx, true, entry.walked, !entry.r5)
                     };
                     self.drop_deliveries(replay::run_ended(
                         self.runtime_id,
@@ -2244,7 +2248,7 @@ impl<C: Cells> Runtime<C> {
             self.own_deferred(v.cidx, v.node);
             let ran = {
                 let _speculating = v.spec.then(replay::Speculating::enter);
-                self.member_run(v.node, v.cidx, true, v.walked)
+                self.member_run(v.node, v.cidx, true, v.walked, true)
             };
             self.drop_deliveries(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
             match ran {
