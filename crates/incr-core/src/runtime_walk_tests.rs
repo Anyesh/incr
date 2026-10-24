@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::race_tests::{id, park_at, Gate};
-use super::{ParkPoint, Runtime, Walk, EXACT_MODE_AT};
+use super::{ParkPoint, Runtime, Walk, EXACT_MODE_AT, NO_TAINT_NEW};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
@@ -2292,4 +2292,20 @@ fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
     assert!(walk.is_visited(p));
     assert!(!walk.is_visited(x));
     assert!(walk.first_new_expansion(x));
+}
+
+#[test]
+fn an_untainted_entry_merged_into_its_parent_keeps_the_new_mark() {
+    let (r, p, x) = (NodeId(1), NodeId(2), NodeId(3));
+    let mut walk = Walk::new(r, NodeState::Dirty);
+    walk.work.clear();
+    walk.visit(p, true);
+    walk.visit(p, false);
+    walk.drop_repeats(walk.work.len());
+    assert_eq!(walk.work.len(), 1);
+    assert_eq!(walk.work[0].taint, NO_TAINT_NEW);
+    walk.visit(x, false);
+    walk.unsettled(x);
+    assert_eq!(walk.work.len(), 1);
+    assert_eq!(walk.work[0].taint, NO_TAINT_NEW);
 }

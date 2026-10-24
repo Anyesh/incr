@@ -502,7 +502,7 @@ const VISIT_COMPUTING: u32 = u32::MAX - 1;
 const NO_TAINT: u32 = u32::MAX - 3;
 
 /// `NO_TAINT` of a node the walk's visit found New. Above `NO_TAINT`, so
-/// a taint merged into it only drops the mark.
+/// a taint merged into it drops the mark; merging `NO_TAINT` is skipped.
 const NO_TAINT_NEW: u32 = u32::MAX - 2;
 
 /// What a walk that hands `compute_one` an untainted entry planned of it.
@@ -522,7 +522,8 @@ struct Entry {
     id: NodeId,
     /// `VISIT` or `VISIT_COMPUTING`, or on a pending entry the lowest
     /// frame depth among the Computing deps this thread holds that were
-    /// skipped under it, or `NO_TAINT`. A tainted node is reachable only through edges that
+    /// skipped under it, or `NO_TAINT` (`NO_TAINT_NEW` if its visit found
+    /// it New). A tainted node is reachable only through edges that
     /// may be stale, so the walk must not run its closure: the parent's
     /// closure decides whether it is still read. The kind shares the
     /// field so that an entry stays 8 bytes.
@@ -670,8 +671,10 @@ impl Walk {
             .map(|e| e.taint)
             .min()
             .unwrap_or(NO_TAINT);
-        if let Some(parent) = self.work[..cut].iter_mut().rev().find(|e| e.is_pending()) {
-            parent.taint = parent.taint.min(taint);
+        if taint < NO_TAINT {
+            if let Some(parent) = self.work[..cut].iter_mut().rev().find(|e| e.is_pending()) {
+                parent.taint = parent.taint.min(taint);
+            }
         }
         self.work.drain(cut..top);
     }
@@ -693,8 +696,11 @@ impl Walk {
             let entry = self.work[at];
             if entry.is_pending() && entry.id == id {
                 self.work.remove(at);
-                if let Some(parent) = self.work[..at].iter_mut().rev().find(|e| e.is_pending()) {
-                    parent.taint = parent.taint.min(entry.taint);
+                if entry.taint < NO_TAINT {
+                    if let Some(parent) = self.work[..at].iter_mut().rev().find(|e| e.is_pending())
+                    {
+                        parent.taint = parent.taint.min(entry.taint);
+                    }
                 }
             }
         }
@@ -2978,7 +2984,8 @@ impl<C: Cells> Runtime<C> {
                     Visit::VerifyOnly(taint)
                 };
                 // A tainted entry never runs its closure, so it verifies in
-                // place whatever another thread landed.
+                // place whatever another thread landed; a tainted root runs
+                // it, but its taint has replaced the New mark.
                 #[cfg(test)]
                 let forced = *FORCE_REVISIT && !revisited.contains(&cur);
                 #[cfg(not(test))]
