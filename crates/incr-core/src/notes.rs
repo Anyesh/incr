@@ -7,16 +7,79 @@
 //! payload's notes are a log per runtime that the copies share, so a copy
 //! costs nothing per note, and the positions each payload has notes at are
 //! indexed, so retiring notes above a frame visits only the payloads it
-//! retires.
+//! retires. A read that takes a ticket notes it as one note, which a
+//! walk's entry that contains the payload again holds as the same ticket.
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::replay::{note_work, Landings, PayloadKey};
+
+/// Removals of notes and of a ticket's landings, on every thread: a copy
+/// taken at `EPOCH` sees what a later removal takes.
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The number a removal marks what it takes with.
+pub(crate) fn removal() -> u64 {
+    EPOCH.fetch_add(1, SeqCst)
+}
+
+/// The number a copy taken now sees removals from.
+pub(crate) fn epoch() -> u64 {
+    EPOCH.load(SeqCst)
+}
+
+/// A ticket's landings in the order they joined it, shared by the note a
+/// read that takes the ticket leaves and by the copies taken of the note.
+pub(crate) struct Members {
+    /// The ticket's id.
+    pub(crate) id: u64,
+    joined: Mutex<Joined>,
+    /// The read's note went without holding the ticket again.
+    dropped: AtomicBool,
+}
+
+#[derive(Default)]
+pub(crate) struct Joined {
+    pub(crate) members: Vec<Member>,
+    /// As `Log::marked`.
+    pub(crate) marked: (u64, usize),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Member {
+    pub(crate) node: (u32, u32),
+    /// As `Noted::gone`.
+    pub(crate) gone: u64,
+}
+
+impl Members {
+    pub(crate) fn new(id: u64) -> Self {
+        Self {
+            id,
+            joined: Mutex::default(),
+            dropped: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Joined> {
+        self.joined.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn dropped(&self) -> bool {
+        self.dropped.load(SeqCst)
+    }
+
+    fn drop_note(&self) {
+        self.dropped.store(true, SeqCst);
+    }
+}
 
 /// One runtime's notes of one payload, in the order noted. A note leaves
 /// by the number of the removal that took it, not from the log, so that a
@@ -29,9 +92,12 @@ pub(crate) struct Log {
     pub(crate) marked: (u64, usize),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct Noted {
     pub(crate) node: (u32, u32),
+    /// A ticket a read took, whose first members the note stands for in
+    /// place of `node`.
+    pub(crate) lent: Option<(Arc<Members>, usize)>,
     pub(crate) cidx: u32,
     /// Taken from a ticket by a read: a discarded run's read was no
     /// reader's observation, so its drop holds the ticket again.
@@ -49,16 +115,28 @@ impl Log {
         note_work(len);
         let mut nodes: Vec<((u32, u32), u32)> = Vec::new();
         let mut at: HashMap<(u32, u32), usize, FxBuildHasher> = HashMap::default();
+        let mut add = |node: (u32, u32), depth: u32| match at.entry(node) {
+            Entry::Occupied(i) => {
+                let d = &mut nodes[*i.get()].1;
+                *d = (*d).min(depth);
+            }
+            Entry::Vacant(v) => {
+                v.insert(nodes.len());
+                nodes.push((node, depth));
+            }
+        };
         for e in self.entries[..len].iter().filter(|e| e.gone >= epoch) {
             let depth = e.cidx.saturating_sub(base);
-            match at.entry(e.node) {
-                Entry::Occupied(i) => {
-                    let d = &mut nodes[*i.get()].1;
-                    *d = (*d).min(depth);
-                }
-                Entry::Vacant(v) => {
-                    v.insert(nodes.len());
-                    nodes.push((e.node, depth));
+            match &e.lent {
+                None => add(e.node, depth),
+                Some((members, len)) => {
+                    note_work(*len);
+                    for m in members.lock().members[..*len]
+                        .iter()
+                        .filter(|m| m.gone >= epoch)
+                    {
+                        add(m.node, depth);
+                    }
                 }
             }
         }
@@ -104,14 +182,14 @@ impl Group {
         self.logs.iter().find(|l| l.rt == rt)
     }
 
-    /// Takes note `idx` of log `log` out at removal `epoch`, returning its
-    /// landing if it was still noted.
-    fn take(&self, log: u32, idx: u32, epoch: u64) -> Option<(u32, u32)> {
+    /// Takes note `idx` of log `log` out at removal `at`, returning it if
+    /// it was still noted.
+    fn take(&self, log: u32, idx: u32, at: u64) -> Option<Noted> {
         let mut l = self.logs[log as usize].log.borrow_mut();
         let e = &mut l.entries[idx as usize];
         (e.gone == u64::MAX).then(|| {
-            e.gone = epoch;
-            e.node
+            e.gone = at;
+            e.clone()
         })
     }
 }
@@ -123,8 +201,6 @@ pub(crate) struct Notes {
     /// Where each landing was noted. A place may have been taken since, or
     /// hold another note after its payload's notes all went.
     by_node: BTreeMap<(RuntimeId, (u32, u32)), Vec<At>>,
-    /// The removals so far.
-    epoch: u64,
     live: usize,
 }
 
@@ -134,7 +210,6 @@ impl Notes {
             groups: BTreeMap::new(),
             tops: BTreeSet::new(),
             by_node: BTreeMap::new(),
-            epoch: 0,
             live: 0,
         }
     }
@@ -151,7 +226,33 @@ impl Notes {
         node: (u32, u32),
         restorable: bool,
     ) {
+        self.push_noted(rt, key, cidx, node, None, restorable);
+    }
+
+    /// Notes the ticket `members` stands for, which a read took with the
+    /// payload of `key`, as its members so far.
+    pub(crate) fn push_lent(
+        &mut self,
+        rt: RuntimeId,
+        key: PayloadKey,
+        cidx: u32,
+        members: Arc<Members>,
+    ) {
+        let len = members.lock().members.len();
+        self.push_noted(rt, key, cidx, (u32::MAX, 0), Some((members, len)), true);
+    }
+
+    fn push_noted(
+        &mut self,
+        rt: RuntimeId,
+        key: PayloadKey,
+        cidx: u32,
+        node: (u32, u32),
+        lent: Option<(Arc<Members>, usize)>,
+        restorable: bool,
+    ) {
         note_work(1);
+        let indexed = lent.is_none();
         let g = self.groups.entry(key).or_insert_with(|| Group {
             logs: Vec::new(),
             levels: BTreeMap::new(),
@@ -172,6 +273,7 @@ impl Notes {
             let mut l = g.logs[log].log.borrow_mut();
             l.entries.push(Noted {
                 node,
+                lent,
                 cidx,
                 restorable,
                 gone: u64::MAX,
@@ -184,10 +286,12 @@ impl Notes {
         level.at.push((log, idx));
         let new = g.top();
         self.retop(key, old, new);
-        self.by_node
-            .entry((rt, node))
-            .or_default()
-            .push(At { key, log, idx });
+        if indexed {
+            self.by_node
+                .entry((rt, node))
+                .or_default()
+                .push(At { key, log, idx });
+        }
         self.live += 1;
     }
 
@@ -202,10 +306,7 @@ impl Notes {
         }
     }
 
-    /// Ends a removal: the notes it took stay visible to the copies taken
-    /// before it.
     fn removed(&mut self) {
-        self.epoch += 1;
         if self.live == 0 {
             self.by_node.clear();
         }
@@ -217,6 +318,7 @@ impl Notes {
             return;
         };
         note_work(places.len());
+        let removal = removal();
         for at in places {
             let Some(g) = self.groups.get_mut(&at.key) else {
                 continue;
@@ -228,7 +330,7 @@ impl Notes {
                 Some(e) if e.node == node && e.gone == u64::MAX => e.cidx,
                 _ => continue,
             };
-            g.take(at.log, at.idx, self.epoch);
+            g.take(at.log, at.idx, removal);
             let old = g.top();
             let level = g
                 .levels
@@ -266,28 +368,28 @@ impl Notes {
     }
 
     /// Removes `key`'s notes at `from` and above, returning those of `rt`
-    /// as (entry, landing).
-    fn forget_levels(
-        &mut self,
-        key: PayloadKey,
-        from: u32,
-        rt: Option<RuntimeId>,
-    ) -> Vec<(u32, (u32, u32))> {
+    /// as (entry, landing), and the tickets its reads took.
+    fn forget_levels(&mut self, key: PayloadKey, from: u32, rt: Option<RuntimeId>) -> Taken {
+        let mut out = Taken::default();
         let Some(g) = self.groups.get_mut(&key) else {
-            return Vec::new();
+            return out;
         };
         let old = g.top();
         let gone = g.levels.split_off(&from);
         let mine = rt.and_then(|rt| g.logs.iter().position(|l| l.rt == rt));
-        let mut out = Vec::new();
+        let removal = removal();
         for (_, level) in gone {
             note_work(level.at.len());
             self.live -= level.live as usize;
             for (log, idx) in level.at {
-                if let Some(node) = g.take(log, idx, self.epoch) {
-                    if mine == Some(log as usize) {
-                        out.push((idx, node));
-                    }
+                let Some(e) = g.take(log, idx, removal) else {
+                    continue;
+                };
+                match (e.lent, mine == Some(log as usize)) {
+                    (None, true) => out.nodes.push((idx, e.node)),
+                    (None, false) => {}
+                    (Some((members, _)), true) => out.lent.push(members),
+                    (Some((members, _)), false) => members.drop_note(),
                 }
             }
         }
@@ -301,19 +403,27 @@ impl Notes {
 
     /// A walk's entry at `cidx` contains `key`'s payload: the notes above
     /// `cidx` go, and `key`'s at it. Returns `rt`'s landings of `key` that
-    /// went, in the order noted.
-    pub(crate) fn contain(&mut self, rt: RuntimeId, cidx: u32, key: PayloadKey) -> Vec<(u32, u32)> {
+    /// went, in the order noted, and the tickets its reads took.
+    pub(crate) fn contain(
+        &mut self,
+        rt: RuntimeId,
+        cidx: u32,
+        key: PayloadKey,
+    ) -> (Vec<(u32, u32)>, Vec<Arc<Members>>) {
         let mut ours = self.forget_levels(key, cidx, Some(rt));
         if let Some(above) = cidx.checked_add(1) {
             self.forget_from(above, None);
         } else {
             self.removed();
         }
-        ours.sort_unstable_by_key(|&(idx, _)| idx);
+        ours.nodes.sort_unstable_by_key(|&(idx, _)| idx);
         let mut seen = BTreeSet::new();
-        ours.into_iter()
+        let nodes = ours
+            .nodes
+            .into_iter()
             .filter_map(|(_, node)| seen.insert(node).then_some(node))
-            .collect()
+            .collect();
+        (nodes, ours.lent)
     }
 
     /// A copy of `rt`'s notes of `key`, at their depths above `base`. The
@@ -328,7 +438,7 @@ impl Notes {
         }
         let top = g.top().expect("incr-core: a group holds a note");
         match g.log(rt) {
-            Some(l) => Landings::shared(Some(key), l.log.clone(), self.epoch, base, top),
+            Some(l) => Landings::shared(Some(key), l.log.clone(), epoch(), base, top),
             None => Landings::owned(Some(key), Vec::new()),
         }
     }
@@ -346,35 +456,86 @@ impl Notes {
     /// Takes `key`'s notes, returning `rt`'s landings of them at their
     /// depths above `base`.
     pub(crate) fn take(&mut self, rt: RuntimeId, key: PayloadKey, base: u32) -> Landings {
-        let epoch = self.epoch;
-        let nodes = self
-            .remove_group(key)
-            .and_then(|g| {
-                g.log(rt).map(|l| {
-                    let l = l.log.borrow();
-                    l.landings(l.entries.len(), epoch, base)
-                })
+        let epoch = epoch();
+        let Some(g) = self.remove_group(key) else {
+            return Landings::owned(Some(key), Vec::new());
+        };
+        let nodes = g
+            .log(rt)
+            .map(|l| {
+                let l = l.log.borrow();
+                l.landings(l.entries.len(), epoch, base)
             })
             .unwrap_or_default();
+        drop_lent(&g, |_, _| false);
         Landings::owned(Some(key), nodes)
     }
 
-    /// Takes `key`'s notes, returning `rt`'s restorable landings.
-    pub(crate) fn restore(&mut self, rt: RuntimeId, key: PayloadKey) -> Vec<(u32, u32)> {
+    /// Takes `key`'s notes, returning `rt`'s restorable landings and the
+    /// tickets its reads took that no copy took.
+    pub(crate) fn restore(
+        &mut self,
+        rt: RuntimeId,
+        key: PayloadKey,
+    ) -> (Vec<(u32, u32)>, Vec<Arc<Members>>) {
         let Some(g) = self.remove_group(key) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
-        let Some(l) = g.log(rt) else {
-            return Vec::new();
+        let mine = g.logs.iter().position(|l| l.rt == rt);
+        let restorable = |log: usize, i: usize, e: &Noted| {
+            Some(log) == mine && e.gone == u64::MAX && e.restorable && i >= g.logs[log].copied
+        };
+        let mut lent = Vec::new();
+        drop_lent(&g, |log, i| {
+            let l = g.logs[log].log.borrow();
+            let e = &l.entries[i];
+            let keep = restorable(log, i, e);
+            if keep {
+                lent.extend(e.lent.as_ref().map(|(m, _)| m.clone()));
+            }
+            keep
+        });
+        let Some(l) = mine.map(|i| &g.logs[i]) else {
+            return (Vec::new(), lent);
         };
         let log = l.log.borrow();
         note_work(log.entries.len());
         let mut seen = BTreeSet::new();
-        log.entries
+        let nodes = log
+            .entries
             .iter()
             .enumerate()
-            .filter(|&(i, e)| e.gone == u64::MAX && e.restorable && i >= l.copied)
+            .filter(|&(i, e)| e.lent.is_none() && restorable(mine.unwrap(), i, e))
             .filter_map(|(_, e)| seen.insert(e.node).then_some(e.node))
-            .collect()
+            .collect();
+        (nodes, lent)
+    }
+}
+
+/// What a removal took of a payload's notes.
+#[derive(Default)]
+struct Taken {
+    nodes: Vec<(u32, (u32, u32))>,
+    lent: Vec<Arc<Members>>,
+}
+
+/// Drops the notes of the tickets reads took in `g`, which went with
+/// their payload's notes, but those `keep` says a hold takes again.
+fn drop_lent(g: &Group, mut keep: impl FnMut(usize, usize) -> bool) {
+    for (log, l) in g.logs.iter().enumerate() {
+        let lent: Vec<(usize, Arc<Members>)> = l
+            .log
+            .borrow()
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.gone == u64::MAX)
+            .filter_map(|(i, e)| e.lent.as_ref().map(|(m, _)| (i, m.clone())))
+            .collect();
+        for (i, members) in lent {
+            if !keep(log, i) {
+                members.drop_note();
+            }
+        }
     }
 }

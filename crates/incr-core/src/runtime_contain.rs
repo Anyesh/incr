@@ -25,11 +25,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
-use crate::notes::Notes;
+use crate::notes::{removal, Members, Notes};
 use crate::replay::{note_work, payload_key, Landings, Retire};
 
 /// A Failed read's node left Failed before the read could tell which
@@ -40,27 +40,88 @@ pub(super) struct Left;
 #[derive(Default)]
 pub(crate) struct Tickets {
     next: u64,
-    /// By the order they were held in, so that a node's flip to Dirty
-    /// removes it only from tickets of landings before the flip.
+    /// By id. A ticket keeps its id while reads take it and walks' entries
+    /// hold it again, so that its landings move with it.
     held: BTreeMap<u64, Ticket>,
-    /// The ticket of each landing a held ticket keeps, which is one at
-    /// most: a landing joins a ticket only if it is in none.
-    landings: BTreeMap<(u32, u32), u64>,
+    /// The tickets reads took, with their payloads, until a walk's entry
+    /// holds one again or the read's note goes.
+    lent: BTreeMap<u64, Ticket>,
+    /// The ticket of each landing a held or lent ticket keeps, which is one
+    /// at most, with the landing's place among its members and the order it
+    /// joined in, so that a node's flip to Dirty removes it only from a
+    /// ticket it joined before the flip. A landing whose ticket went is in
+    /// none.
+    landings: BTreeMap<(u32, u32), Joined>,
     /// The tickets of deleted nodes and of nodes a set's walk flipped,
     /// dropped once the delete, sweep or walk that released them holds no
     /// lock and has finished.
     buried: Vec<Ticket>,
 }
 
-/// A contained panic, held while any of `nodes`, the `(node, generation)`
-/// landings it failed at or above the entry's position, stays in that
-/// Failed landing. A node's later Failed landing, its flip to Dirty or its
-/// delete removes it.
+#[derive(Clone, Copy)]
+struct Joined {
+    ticket: u64,
+    member: u32,
+    seq: u64,
+}
+
+/// A contained panic, held while any of its members, the `(node,
+/// generation)` landings it failed at or above the entry's position, stays
+/// in that Failed landing. A node's later Failed landing, its flip to Dirty
+/// or its delete removes it.
 struct Ticket {
-    nodes: Vec<(u32, u32)>,
+    members: Arc<Members>,
+    live: u32,
     /// The mutex only makes the table `Sync`: the payload moves in and out
-    /// under the write lock.
-    payload: Mutex<Box<dyn Any + Send>>,
+    /// under the write lock. None while a read has it.
+    payload: Option<Mutex<Box<dyn Any + Send>>>,
+}
+
+impl Tickets {
+    /// The ticket landing `n` is in, if any, and whether it is held.
+    fn of(&self, n: (u32, u32)) -> Option<(Joined, bool)> {
+        let j = *self.landings.get(&n)?;
+        if self.held.contains_key(&j.ticket) {
+            Some((j, true))
+        } else {
+            self.lent.contains_key(&j.ticket).then_some((j, false))
+        }
+    }
+
+    /// Takes `j`'s landing out of its ticket's members at removal `at`.
+    fn leave(&mut self, j: Joined, at: u64) -> Option<&mut Ticket> {
+        let c = match self.held.get_mut(&j.ticket) {
+            Some(c) => c,
+            None => self.lent.get_mut(&j.ticket)?,
+        };
+        c.members.lock().members[j.member as usize].gone = at;
+        c.live -= 1;
+        Some(c)
+    }
+
+    /// Lets the tickets go whose read's note went without holding them
+    /// again, with their landings.
+    fn prune(&mut self) {
+        let dropped: Vec<u64> = self
+            .lent
+            .iter()
+            .filter(|(_, c)| c.members.dropped())
+            .map(|(&id, _)| id)
+            .collect();
+        for id in dropped {
+            let c = self
+                .lent
+                .remove(&id)
+                .expect("incr-core: a lent ticket is listed");
+            let members = c.members.lock();
+            note_work(members.members.len());
+            for m in &members.members {
+                if self.landings.get(&m.node).is_some_and(|j| j.ticket == id) {
+                    self.landings.remove(&m.node);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn tickets<C: Cells>() -> C::Lock<Tickets> {
@@ -132,24 +193,22 @@ fn notes_held() -> bool {
 /// of them for `u64::MAX`), returning the payloads left with no landing,
 /// which the caller drops outside the lock: a drop is user code.
 fn release(t: &mut Tickets, mark: u64, landings: RangeInclusive<(u32, u32)>) -> Vec<Ticket> {
-    let found: Vec<((u32, u32), u64)> = t
+    let found: Vec<((u32, u32), Joined)> = t
         .landings
         .range(landings)
-        .filter(|&(_, &seq)| seq < mark)
-        .map(|(&landing, &seq)| (landing, seq))
+        .filter(|&(_, j)| j.seq < mark)
+        .map(|(&landing, &j)| (landing, j))
         .collect();
     let mut stale = Vec::new();
     note_work(found.len());
-    for (landing, seq) in found {
+    let at = removal();
+    for (landing, j) in found {
         t.landings.remove(&landing);
-        let c = t
-            .held
-            .get_mut(&seq)
-            .expect("incr-core: an indexed landing's ticket is held");
-        note_work(c.nodes.len());
-        c.nodes.retain(|&n| n != landing);
-        if c.nodes.is_empty() {
-            stale.extend(t.held.remove(&seq));
+        // A lent ticket keeps its payload's read waiting to hold it again.
+        if t.leave(j, at)
+            .is_some_and(|c| c.live == 0 && c.payload.is_some())
+        {
+            stale.extend(t.held.remove(&j.ticket));
         }
     }
     stale
@@ -177,17 +236,19 @@ impl<C: Cells> Runtime<C> {
 
     /// Before a write guard on the tickets drops.
     fn sync_held(&self, t: &Tickets) {
-        self.tickets_held
-            .store(!t.held.is_empty() || !t.buried.is_empty(), Relaxed);
+        self.tickets_held.store(
+            !t.held.is_empty() || !t.lent.is_empty() || !t.buried.is_empty(),
+            Relaxed,
+        );
     }
 
     /// The payload a walk contained for `id`'s current Failed landing, taken
     /// by the first read of any node it failed.
     ///
-    /// The ticket's nodes are noted against the payload just above the
-    /// reading frame: a read from a compute whose panic a walk's entry
-    /// below contains again is no reader's observation, so that entry
-    /// holds them too. A speculative run's read takes none: a closure in
+    /// The ticket is noted against the payload just above the reading
+    /// frame: a read from a compute whose panic a walk's entry below
+    /// contains again is no reader's observation, so that entry holds the
+    /// ticket again. A speculative run's read takes none: a closure in
     /// the run can catch and drop the payload before the run's discard
     /// would hold it again, and the real run's read is owed it.
     pub(super) fn take_contained(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
@@ -203,21 +264,29 @@ impl<C: Cells> Runtime<C> {
         if state::load::<C>(node.state_cell()) != NodeState::Failed {
             return Err(Left);
         }
-        let Some(seq) = t.landings.get(&landing).copied() else {
+        t.prune();
+        let Some((j, true)) = t.of(landing) else {
             return Ok(None);
         };
-        let Ticket { nodes, payload } = t
+        let mut c = t
             .held
-            .remove(&seq)
-            .expect("incr-core: an indexed landing's ticket is held");
-        note_work(nodes.len());
-        for n in &nodes {
-            t.landings.remove(n);
-        }
+            .remove(&j.ticket)
+            .expect("incr-core: a held ticket is listed");
+        let payload = c
+            .payload
+            .take()
+            .expect("incr-core: a held ticket has its payload");
+        let members = c.members.clone();
+        t.lent.insert(j.ticket, c);
         self.sync_held(&t);
         drop(t);
         let payload = payload.into_inner().unwrap_or_else(PoisonError::into_inner);
-        self.note_read(nodes, &*payload, true);
+        let (rt, at, base) = (
+            self.runtime_id,
+            payload_key(&*payload),
+            self.dep_stack.next_cidx(),
+        );
+        with_notes(|n| n.push_lent(rt, at, base, members));
         Ok(Some(payload))
     }
 
@@ -303,51 +372,119 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
         self.retire_copies(&Retire::Contained { cidx, payload: at });
-        let nodes = if notes_held() {
+        let (nodes, lent) = if notes_held() {
             with_notes(|n| n.contain(rt, cidx, at))
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        if let Some(payload) = self.hold(nodes, payload) {
+        if let Some(payload) = self.hold(nodes, lent, payload) {
             bag.push_erased(payload);
         }
     }
 
-    /// Holds `payload` for those of `nodes` still in their Failed landing
-    /// and in no other ticket, or returns it when none is.
+    /// Holds `payload` for the tickets in `lent` that reads took with it,
+    /// as one, and for those of `nodes` still in their Failed landing and
+    /// in no held ticket, or returns it when none is. A node in a ticket a
+    /// read took leaves that ticket.
     fn hold(
         &self,
         mut nodes: Vec<(u32, u32)>,
+        lent: Vec<Arc<Members>>,
         payload: Box<dyn Any + Send>,
     ) -> Option<Box<dyn Any + Send>> {
-        if nodes.is_empty() {
+        if nodes.is_empty() && lent.is_empty() {
             return Some(payload);
         }
         let mut t = self.tickets.write();
-        note_work(nodes.len());
+        t.prune();
+        let mut taken: Vec<(u64, Ticket)> = lent
+            .iter()
+            .filter_map(|m| t.lent.remove(&m.id).map(|c| (m.id, c)))
+            .collect();
+        note_work(nodes.len() + taken.len());
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
                 && state::load::<C>(node.state_cell()) == NodeState::Failed
-                && !t.landings.contains_key(&(slot, generation))
+                && t.of((slot, generation))
+                    .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
         });
-        if nodes.is_empty() {
-            return Some(payload);
-        }
         let seq = t.next;
         t.next += 1;
-        for &n in &nodes {
-            t.landings.insert(n, seq);
+        let (id, mut ticket) = taken.pop().unwrap_or_else(|| {
+            (
+                seq,
+                Ticket {
+                    members: Arc::new(Members::new(seq)),
+                    live: 0,
+                    payload: None,
+                },
+            )
+        });
+        let at = removal();
+        // Tickets reads took with the same payload go into one.
+        for (other, c) in taken {
+            let members = c.members.lock();
+            note_work(members.members.len());
+            for m in members.members.iter().filter(|m| m.gone == u64::MAX) {
+                let j = t.landings[&m.node];
+                debug_assert_eq!(j.ticket, other);
+                nodes.push(m.node);
+                t.landings.remove(&m.node);
+            }
         }
-        t.held.insert(
-            seq,
-            Ticket {
-                nodes,
-                payload: Mutex::new(payload),
-            },
-        );
+        for n in nodes {
+            if let Some((j, _)) = t.of(n) {
+                t.leave(j, at);
+            }
+            let member = {
+                let mut joined = ticket.members.lock();
+                joined.members.push(crate::notes::Member {
+                    node: n,
+                    gone: u64::MAX,
+                });
+                joined.members.len() as u32 - 1
+            };
+            t.landings.insert(
+                n,
+                Joined {
+                    ticket: id,
+                    member,
+                    seq,
+                },
+            );
+            ticket.live += 1;
+        }
+        if cfg!(test) {
+            self.check_members(&t, id, &ticket);
+        }
+        if ticket.live == 0 {
+            self.sync_held(&t);
+            return Some(payload);
+        }
+        ticket.payload = Some(Mutex::new(payload));
+        t.held.insert(id, ticket);
         self.sync_held(&t);
         None
+    }
+
+    /// Every landing a ticket keeps is Failed and indexed to it: every
+    /// change from that landing releases it.
+    fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {
+        let members = ticket.members.lock();
+        let live = members.members.iter().filter(|m| m.gone == u64::MAX);
+        let mut n = 0;
+        for m in live {
+            n += 1;
+            let node = self.nodes.get(m.node.0);
+            assert!(
+                node.generation() == m.node.1
+                    && state::load::<C>(node.state_cell()) == NodeState::Failed
+                    && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
+                "incr-core: a ticket keeps only Failed landings it indexes"
+            );
+        }
+        assert_eq!(n, ticket.live, "incr-core: a ticket counts its landings");
     }
 
     /// A set's walk flips `id` from Failed to Dirty, under the tickets'
@@ -465,13 +602,6 @@ impl<C: Cells> Runtime<C> {
         defer(buried, bag);
     }
 
-    /// Notes `nodes`, landings a read took `payload` for, just above the
-    /// reading frame, so that a walk's entry below that contains the panic
-    /// again holds them too.
-    fn note_read(&self, nodes: Vec<(u32, u32)>, payload: &(dyn Any + Send), restorable: bool) {
-        self.note_above(nodes.into_iter().map(|n| (n, 0)), payload, restorable);
-    }
-
     /// Notes each of `nodes` at its depth above the reading frame.
     fn note_above(
         &self,
@@ -577,8 +707,8 @@ impl<C: Cells> Runtime<C> {
             return Some(payload);
         }
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
-        let nodes = with_notes(|n| n.restore(rt, at));
-        self.hold(nodes, payload)
+        let (nodes, lent) = with_notes(|n| n.restore(rt, at));
+        self.hold(nodes, lent, payload)
     }
 
     /// The contained payloads still held, for tests.
