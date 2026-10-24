@@ -2231,3 +2231,45 @@ Gate: the hard gates are exact (101/193, 218.14/87). `rc-sweep`
 against `34412289` changes no value and flags no run count, and the
 strict scan lists the same seeds as `34412289`'s. Replay scale timing
 and `scale-icount` run on the train that lands this branch.
+
+## Released claims' walk rule and the per-node released mark
+
+`w/T10-ub-f2ad3443-wrong-values` (tip `4a29dee5`, on `89d83e76`) keeps
+a read's walk to the deps a released claim's last finished run read
+(`Inner::released_deps`), and marks a node holding such an entry in bit
+0x40 of `NodeData::dep_count`, so the same-deps publish and the walk
+test the node instead of a runtime-wide count. Base `89d83e76`, same box,
+`icount.sh` defaults; "branch" is `c044a098`, the rule without the mark.
+
+| workload | base | branch | tip | delta |
+|---|---|---|---|---|
+| `get_clean_local` | 102 | | 102 | 0 |
+| `get_clean_shared` | 196 | | 196 | 0 |
+| `table_hit_shared` | 218.14 | | 218.14 | 0 |
+| `value_slot_read_shared` | 87 | | 87 | 0 |
+| `chain_local/propagate/4` | 4633 | 4697 | 4709 | +76 |
+| `chain_shared/propagate/4` | 9555.20 | 9611.20 | 9599.20 | +44 |
+| `fanout_local_4` | 17187.01 | 17330 | 17362 | +174.99 |
+| `delete_single_local` | 711 | 714 | 716 | +5 |
+
+- The rule costs 64 per `chain_local/propagate/4` iteration (Intel PT,
+  base against branch): the walk's kept-count expansion 28, the
+  same-deps publish's entry check 12, extra dep scans 20; the rest is
+  `compute_attempts` code moving between inlined sites, netting 0.
+- The mark adds 12 more under Local: `count_of` now masks the count
+  under both strategies (released entries exist under Local), about one
+  instruction per dep scan. Shared already masked for the unrun mark, and
+  its rows fall by up to 12.
+- A first version called `set_released` out of line and looked the node
+  up again by slot on every publish of new deps and every delete:
+  `delete_single_local` +4.8%, `fanout_local_4` +3.0%. Testing the mark
+  inline at the caller, with the node it holds, brought those to +0.7%
+  and +1.0%.
+- `released_hot` (Shared set+get on a static-dep node, one never-read
+  released entry present against none): +4.5% to +5.4% instructions per
+  op at 1, 4 and 8 threads with the runtime-wide count, +0.00% to +0.17%
+  with the mark.
+
+Gate: the hard gates are exact (102, 196, 218.14, 87). Replay scale by
+`strict-scan.sh`'s `scale-icount` on `8d006e54` against `89d83e76`: every ratio within
+0.4%.
