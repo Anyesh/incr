@@ -1300,6 +1300,8 @@ fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> 
 thread_local! {
     /// Which of a two-thread run's threads this is.
     static TWO_THREAD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The phase a two-thread run's thread is in.
+    static TWO_PHASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Thread 0's call at the end of each read phase with two reads, by the
@@ -1344,6 +1346,7 @@ fn run_two_until(
                         break;
                     }
                     if let Some(i) = phase.of(t) {
+                        TWO_PHASE.with(|c| c.set(p));
                         let op = &case.ops[i];
                         match catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op)))) {
                             Ok((out, ran)) => {
@@ -5874,5 +5877,120 @@ fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
             let shared = outs(run::<Shared>(&case, Some(frames), 0));
             assert_eq!(shared, unbounded, "Shared, budget {frames}");
         }
+    });
+}
+
+/// Runs `case`'s phase of ops `pair` on two threads with thread 0's
+/// walk held before its compute of query `held`, until thread 1's read
+/// has settled `settled` and left `left` as they are (by query), then
+/// checks the run against the orders.
+fn hold_planned_walk(
+    case: &Case,
+    seed: u64,
+    pair: [usize; 2],
+    held: usize,
+    settled: &'static [(usize, NodeState)],
+) -> Trace {
+    let phases = phases(case, seed);
+    let overlap = phases.iter().position(|p| p.ops() == pair).unwrap();
+    assert_eq!(phases[overlap].of(0), Some(pair[0]));
+    let ready = Arc::new(AtomicBool::new(false));
+    let rig = |live: &Live<Shared>| {
+        let (ready, world) = (ready.clone(), live.world.clone());
+        let slot = move |q| world.handle(0, q).erased().slot();
+        let world = live.world.clone();
+        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+            if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                return;
+            }
+            let state = |q| world.rt(0).nodes.get(slot(q)).state();
+            match TWO_THREAD.with(std::cell::Cell::get) {
+                Some(0)
+                    if p == ParkPoint::BeforeComputeOne(NodeId(slot(held)))
+                        && !ready.swap(true, SeqCst) =>
+                {
+                    until(|| settled.iter().all(|&(q, s)| state(q) == s));
+                }
+                Some(1) => until(|| ready.load(SeqCst)),
+                _ => {}
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    let serial = Serial::new(case, &phases);
+    let verdict = Mutex::new(None);
+    let got = run_two_until(case, &phases, None, 0, &rig, &|p, prefix, live| {
+        if p == overlap {
+            assert!(
+                ready.load(SeqCst),
+                "thread 0's walk reached the held compute"
+            );
+            assert!(
+                live.world.rt(0).unrun_unclaims.load(SeqCst) > 0,
+                "thread 0's walk re-planned"
+            );
+        }
+        let v = serial.at_overlap("held walk", prefix, live);
+        let stop = v.is_some();
+        *verdict.lock().unwrap() = v;
+        stop
+    });
+    serial.check("held walk", &got, verdict.into_inner().unwrap());
+    got
+}
+
+/// 0x7c3a12bcc's ops 8 (`Get(7)`, thread 0) and 9 (`Get(9)`, thread 1)
+/// enter one cycle at different members. Thread 0's walk of 7 plans down
+/// to 22 and is held there while thread 1 resolves the cycle alone: it
+/// lands 7 Clean by 7's fallback, leaves 22 and 23 New, and panics with
+/// the cycle, as `Get(9)` does first in a single thread. The order with
+/// `Get(9)` first then reads 7 Clean; a walk that goes on with its plan
+/// computes 22 again and panics too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_replans_after_another_thread_lands_its_root_by_a_cycle() {
+    let seed = 0x7c3a12bcc;
+    let case = gen_case(seed, false, true);
+    use NodeState::{Clean, Dirty, New};
+    quiet(|| {
+        let got = hold_planned_walk(
+            &case,
+            seed,
+            [8, 9],
+            22,
+            &[(7, Clean), (22, New), (23, New), (21, Dirty)],
+        );
+        assert_eq!(got[9].0, Out::Panic("cycle".into()));
+        assert_eq!(got[8].0, Out::Value(2));
+    });
+}
+
+/// As above with thread 0 reading 18, rewritten to read 7, so the node
+/// thread 1 lands Clean is an intermediate of thread 0's plan, not its
+/// root, and 18 stays Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_replans_after_another_thread_lands_an_intermediate_by_a_cycle() {
+    let seed = 0x7c3a12bcc;
+    let mut case = gen_case(seed, false, true);
+    case.specs[18] = Spec::Query {
+        expr: Expr::Read(7, false),
+        replay: true,
+        bare: false,
+        strategy: Strat::None,
+    };
+    case.ops[0] = Op::Get(18);
+    case.ops[8] = Op::Get(18);
+    use NodeState::{Clean, Dirty, New};
+    quiet(|| {
+        let got = hold_planned_walk(
+            &case,
+            seed,
+            [8, 9],
+            22,
+            &[(7, Clean), (22, New), (23, New), (21, Dirty), (18, Dirty)],
+        );
+        assert_eq!(got[9].0, Out::Panic("cycle".into()));
+        assert!(matches!(got[8].0, Out::Value(_)), "{:?}", got[8].0);
     });
 }

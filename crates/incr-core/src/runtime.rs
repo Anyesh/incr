@@ -135,6 +135,9 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// In `compute_one`, after a walk entry's claim and before the check
+    /// for episodes other threads landed since the walk planned.
+    AfterWalkClaim(NodeId),
     /// In red/green verification, after the dep scan found no change and
     /// before the landing CAS.
     VerifyAfterScan(NodeId),
@@ -405,6 +408,25 @@ enum Visit {
     Direct,
 }
 
+/// What a walk under `Shared` planned under, as `Runtime::planned`.
+#[derive(Copy, Clone)]
+struct Planned {
+    all: u64,
+    own: u64,
+}
+
+/// Test toggle: with `INCR_FORCE_REPLAN` set, every walk entry's check
+/// finds another thread's episode.
+#[cfg(test)]
+static FORCE_REPLAN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("INCR_FORCE_REPLAN").is_some());
+
+#[cfg(test)]
+thread_local! {
+    /// `FORCE_REPLAN` for this thread alone.
+    pub(crate) static FORCE_REPLAN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How `compute_one` left the node it was handed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Computed {
@@ -429,6 +451,9 @@ enum Computed {
     /// The node's run was doomed and discarded: it is a virtual frame,
     /// and a replay driver runs it again.
     Discarded,
+    /// Another thread landed an episode since the walk planned: the node
+    /// was left unrun and unclaimed, and the walk prunes its plan.
+    Replan,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
     /// walk skips it and taints the path under this memo owner.
@@ -657,6 +682,33 @@ impl Walk {
         self.visited = Some(visited);
     }
 
+    /// Drops the plan above `work[keep - 1]`, and with it the visits and
+    /// expansions of the nodes it left no pending entry, so that a later
+    /// visit of one plans it as a walk that never met it would.
+    fn prune(&mut self, keep: usize) {
+        let mut gone: HashSet<NodeId> = self
+            .work
+            .drain(keep..)
+            .filter(|e| e.is_pending())
+            .map(|e| e.id)
+            .collect();
+        for e in self.work.iter().filter(|e| e.is_pending()) {
+            gone.remove(&e.id);
+        }
+        if gone.is_empty() {
+            return;
+        }
+        if let Some(visited) = &mut self.visited {
+            visited.retain(|id| !gone.contains(id));
+        }
+        if let Some(expanded) = &mut self.expanded {
+            expanded.new.retain(|id| !gone.contains(id));
+            expanded
+                .groups
+                .retain(|g| !g.members.iter().any(|&(m, _)| gone.contains(&NodeId(m))));
+        }
+    }
+
     #[inline]
     fn expand(&mut self, dep: NodeId, dep_state: NodeState) {
         self.push(Entry {
@@ -766,6 +818,10 @@ pub struct Runtime<C: Cells> {
     /// Taken only inside an `inner` section or with no lock held.
     pub(crate) watch_queue: OrderedLock<watch_impl::WatchQueue, C>,
     pub(crate) revision: <C as Cells>::U64,
+    /// Episodes landed on this runtime, by every thread: an episode can
+    /// land a member Clean over nodes it leaves New or Dirty, which a
+    /// walk another thread planned earlier would go on to compute.
+    pub(crate) episodes_landed: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
@@ -831,6 +887,9 @@ pub struct Runtime<C: Cells> {
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
+    /// Walk entry claims released unrun after the episode check.
+    #[cfg(test)]
+    pub(crate) unrun_unclaims: std::sync::atomic::AtomicU32,
     /// Every entry a driver ran, as it found its context.
     #[cfg(test)]
     pub(crate) entries: std::sync::Mutex<Vec<replay_impl::EntrySeen>>,
@@ -886,6 +945,7 @@ impl<C: Cells> Runtime<C> {
             inner: OrderedLock::new(LockKind::Inner, Inner::new()),
             watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
+            episodes_landed: C::new_u64(0),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id,
@@ -928,6 +988,8 @@ impl<C: Cells> Runtime<C> {
             drop_unwinds: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            unrun_unclaims: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -2075,7 +2137,9 @@ impl<C: Cells> Runtime<C> {
                 Computed::Doomed | Computed::Discarded => {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
-                Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
+                Computed::Skipped(_) | Computed::Replan => {
+                    unreachable!("incr-core: a walk's root is never skipped or replanned")
+                }
             }
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
@@ -2845,8 +2909,17 @@ impl<C: Cells> Runtime<C> {
             }
             return self.compute_direct::<MODE>(id, gen);
         }
+        // A resumed walk was planned before its doom, at a count no longer
+        // known, so it checks against none: it re-plans if any other
+        // thread has landed an episode.
+        let mut planned = if resume.is_some() {
+            Planned { all: 0, own: 0 }
+        } else {
+            self.planned()
+        };
         let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
         let mut root = Computed::Done;
+        let mut unchecked = None;
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
@@ -2857,8 +2930,22 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     Visit::VerifyOnly(taint)
                 };
-                let mut computed =
-                    self.compute_one::<MODE>(cur, visit, is_root.then_some(gen), !is_root);
+                let mut computed = self.compute_one::<MODE>(
+                    cur,
+                    visit,
+                    is_root.then_some(gen),
+                    !is_root,
+                    (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
+                        .then_some(planned),
+                );
+                if !C::SINGLE_THREADED && computed == Computed::Replan {
+                    planned = self.planned();
+                    if !self.prune_settled(&mut walk) {
+                        walk.push(Entry { id: cur, taint });
+                        unchecked = Some(cur);
+                    }
+                    continue;
+                }
                 if computed != Computed::Done {
                     let entry = Entry { id: cur, taint };
                     match self.walk_stopped(id, entry, visit, is_root, &mut walk, computed) {
@@ -2986,6 +3073,87 @@ impl<C: Cells> Runtime<C> {
         root
     }
 
+    /// What a walk under `Shared` plans under: the runtime's episode
+    /// count and this thread's share of it.
+    #[inline(always)]
+    fn planned(&self) -> Planned {
+        if C::SINGLE_THREADED {
+            return Planned { all: 0, own: 0 };
+        }
+        let all = C::u64_load_acquire(&self.episodes_landed);
+        // This thread's share is at most the count.
+        let own = if all == 0 {
+            0
+        } else {
+            cycle_state::own_episodes(self.runtime_id)
+        };
+        Planned { all, own }
+    }
+
+    /// Whether another thread has landed an episode on this runtime since
+    /// `planned`.
+    #[inline(always)]
+    fn replan(&self, planned: Planned) -> bool {
+        #[cfg(test)]
+        if *FORCE_REPLAN || FORCE_REPLAN_HERE.with(std::cell::Cell::get) {
+            return true;
+        }
+        let all = C::u64_load_acquire(&self.episodes_landed);
+        all != planned.all && self.others_landed(planned, all)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn others_landed(&self, planned: Planned, all: u64) -> bool {
+        let own = cycle_state::own_episodes(self.runtime_id);
+        all.wrapping_sub(planned.all) != own.wrapping_sub(planned.own)
+    }
+
+    /// Releases a claim taken from New or Dirty (`dirty`) before anything
+    /// ran, as no landing: watchers see nothing. A set's flag changes
+    /// nothing, since its walk already passed through to the dependents and
+    /// leaves a New node New.
+    #[cold]
+    #[inline(never)]
+    fn unclaim_unrun(&self, node: &NodeData<C>, dirty: bool) {
+        #[cfg(test)]
+        self.unrun_unclaims
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let back = if dirty {
+            NodeState::Dirty
+        } else {
+            NodeState::New
+        };
+        if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
+            let unflagged =
+                state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
+            debug_assert!(unflagged.is_ok(), "incr-core: an unrun claim is held");
+        }
+    }
+
+    /// Drops the part of `walk`'s plan under its lowest pending node that
+    /// is Clean or Cyclic now, as a walk planned now would not expand it,
+    /// and keeps the rest with what the walk has learned. False if no
+    /// pending node has settled.
+    #[cold]
+    #[inline(never)]
+    fn prune_settled(&self, walk: &mut Walk) -> bool {
+        let settled = walk.work.iter().position(|e| {
+            e.is_pending()
+                && matches!(
+                    state::load::<C>(self.nodes.get(e.id.0).state_cell()),
+                    NodeState::Clean | NodeState::Cyclic
+                )
+        });
+        match settled {
+            Some(at) => {
+                walk.prune(at + 1);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The first time a walk reaches a Dirty member of a landed group, it
     /// expands the whole group: a pending entry for the member, whose
     /// compute verifies the group, and every member's deps outside the
@@ -3040,7 +3208,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
-        let mut computed = self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false);
+        let mut computed = self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false, None);
         if computed == Computed::Discarded {
             computed = self.walk_discarded(Visit::Direct).unwrap_or(computed);
         }
@@ -3077,6 +3245,8 @@ impl<C: Cells> Runtime<C> {
     /// nothing included (`Gone`, the input arm, a retry that found the
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
+    ///
+    /// `planned` is what a walk entry under `Shared` was planned under.
     #[inline(always)]
     fn compute_one<const MODE: u8>(
         &self,
@@ -3084,9 +3254,10 @@ impl<C: Cells> Runtime<C> {
         visit: Visit,
         gen: Option<u32>,
         walked: bool,
+        planned: Option<Planned>,
     ) -> Computed {
         let mut bag = Deferred::new();
-        let computed = self.compute_attempts::<MODE>(id, visit, gen, walked, &mut bag);
+        let computed = self.compute_attempts::<MODE>(id, visit, gen, walked, planned, &mut bag);
         bag.drain(self);
         computed
     }
@@ -3098,6 +3269,7 @@ impl<C: Cells> Runtime<C> {
         visit: Visit,
         gen: Option<u32>,
         walked: bool,
+        planned: Option<Planned>,
         bag: &mut Deferred<C>,
     ) -> Computed {
         let (node, flags) = self.nodes.get_with_flags(id.0);
@@ -3247,6 +3419,18 @@ impl<C: Cells> Runtime<C> {
                     };
                     self.land(id, node, discard, discard);
                     self.raise_owed(payload, bag);
+                }
+            }
+            // When the claim reads from another thread's episode, which left
+            // this node New or Dirty, it reads the count that episode
+            // bumped first: the episode may have landed Clean a node this
+            // plan reaches the node through, which a walk planned now
+            // skips. A claim not ordered after an episode may run before it.
+            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
+                self.park(ParkPoint::AfterWalkClaim(id));
+                if self.replan(p) {
+                    self.unclaim_unrun(node, claimed_dirty);
+                    return Computed::Replan;
                 }
             }
 
