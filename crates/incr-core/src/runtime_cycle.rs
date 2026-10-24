@@ -2225,6 +2225,16 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
+        // Step 3 sets memos before the compare that panicked. With no
+        // engine kind every member lands New, or through `land_failed`,
+        // whose `changed_at` raise clears the memo.
+        debug_assert!(
+            kind.is_none()
+                || entries
+                    .iter()
+                    .all(|(m, _)| !self.nodes.get(*m).memo_at(|| verify_rev)),
+            "incr-core: an engine unwind aborted an episode landing over a member's memo (T8-memo-on-aborted-episode)"
+        );
         let contain = self.episode_contains(cidx, kind, &*payload);
         let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {
