@@ -7198,3 +7198,178 @@ fn a_dissolved_roots_rerun_at_the_bottom_walks_its_reads_again() {
         differential::<Shared>(&case, 0x189fb);
     });
 }
+
+/// Seed 0x381 with `FirstRun` on its Native queries, shrunk by
+/// `replay_shrink`: at budget 3, query 0 stayed New where the unbounded run
+/// computes it, because 18's Clean read of 19 skipped the walk a doom had
+/// stopped there.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_381_first_run_state() {
+    let specs: Vec<Spec> = vec![
+        Spec::Query {
+            expr: Expr::Catch(Box::new(Expr::Read(19, false))),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: false,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(3),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: false,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(1),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(3),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Read(18, false),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Read(19, false),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::If(
+                Box::new(Expr::Read(21, true)),
+                Box::new(Expr::Const(0)),
+                Box::new(Expr::Catch(Box::new(Expr::Read(0, false)))),
+            ),
+            replay: false,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Const(3),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Read(22, false),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::FirstRun(Box::new(Expr::Read(23, false)), Box::new(Expr::Const(0))),
+            replay: false,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Query {
+            expr: Expr::Read(24, false),
+            replay: true,
+            bare: false,
+            strategy: Strat::None,
+        },
+        Spec::Input(3),
+        Spec::Input(2),
+        Spec::Input(0),
+    ];
+    let case = Case {
+        specs,
+        panics: false,
+        cycles: true,
+        queries: 24,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(24, 1), Op::TryGet(17)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x381);
+        differential::<Shared>(&case, 0x381);
+    });
+}
