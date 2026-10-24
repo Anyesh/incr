@@ -1775,7 +1775,7 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: as above.
         let top_ctl = unsafe { &*top.ctl };
         let suspect = top_ctl.has(cycle::PH_SEEN);
-        replay::with(|c| {
+        let unkept = replay::with(|c| {
             let x = c
                 .iter_mut()
                 .find(|x| x.id == id)
@@ -1803,6 +1803,7 @@ impl<C: Cells> Runtime<C> {
                 v.maker = maker;
                 x.push_vframe(v);
             }
+            let mut unkept = Vec::new();
             for (key, what) in kept {
                 // A frame marked again keeps the delivery its first mark, or
                 // the entry it was blocked on, made for the read.
@@ -1810,8 +1811,10 @@ impl<C: Cells> Runtime<C> {
                     .find_keyed(&key, |d| {
                         matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
                     })
-                    .is_none()
+                    .is_some()
                 {
+                    unkept.push(what);
+                } else {
                     let mut d = Delivery::new(key, maker, what);
                     d.passed = true;
                     x.pending.push(d);
@@ -1835,7 +1838,9 @@ impl<C: Cells> Runtime<C> {
                     r5,
                 },
             );
+            unkept
         });
+        drop(unkept);
         for f in marked {
             // SAFETY: as above.
             unsafe { &*f.ctl }.raise(cycle::DOOMED);
@@ -2833,20 +2838,23 @@ impl<C: Cells> Runtime<C> {
         }
         cycle_state::take_unwind_kind();
         let poison = !(continuation && self.episode_member(node));
-        replay::with(|c| {
-            if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                x.deliver_unwind(
-                    v.cidx,
-                    Delivered::Unwind {
-                        cycle: kind == Some(UnwindKind::Cycle),
-                        poison,
-                        attributed: cycle_state::failures() != failures,
-                        nodes: self.take_notes(&*payload, v.cidx),
-                        payload,
-                    },
-                );
+        let replaced = replay::with(|c| match c.iter_mut().find(|x| x.id == id) {
+            Some(x) => x.deliver_unwind(
+                v.cidx,
+                Delivered::Unwind {
+                    cycle: kind == Some(UnwindKind::Cycle),
+                    poison,
+                    attributed: cycle_state::failures() != failures,
+                    nodes: self.take_notes(&*payload, v.cidx),
+                    payload,
+                },
+            ),
+            None => {
+                bag.push_erased(payload);
+                Vec::new()
             }
         });
+        drop(replaced);
         bag.drain(self);
         VPop::Finished(node, Ended::Unwound)
     }
@@ -3188,12 +3196,12 @@ impl<C: Cells> Runtime<C> {
         // An R5 member run's unwind leaves its reader unpoisoned, as the
         // member stays held for its episode.
         let poison = !self.episode_member(entry.node);
-        let abandoned = replay::with(|c| {
+        let (replaced, abandoned) = replay::with(|c| {
             let x = c
                 .iter_mut()
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
-            x.deliver_unwind(
+            let replaced = x.deliver_unwind(
                 boundary + level,
                 Delivered::Unwind {
                     cycle: kind == Some(UnwindKind::Cycle),
@@ -3205,8 +3213,9 @@ impl<C: Cells> Runtime<C> {
             );
             x.levels.truncate(level as usize);
             x.trim_levels();
-            x.truncate_vstack(level as usize)
+            (replaced, x.truncate_vstack(level as usize))
         });
+        drop(replaced);
         let mut bag = Deferred::new();
         for ep in abandoned {
             bag.push_erased(Box::new(ep));
@@ -3503,9 +3512,11 @@ impl<C: Cells> Runtime<C> {
             }
             _ => None,
         };
-        replay::with(|c| {
+        // What the contexts don't keep drops after their borrow: a landed
+        // value is the user's.
+        let unkept = replay::with(|c| {
             let Some(x) = c.iter_mut().find(|x| x.id == id) else {
-                return;
+                return (what, Vec::new());
             };
             let below = x.vstack[level as usize - 1].clone();
             // A walk the doom stopped short of its root goes on in the
@@ -3519,20 +3530,22 @@ impl<C: Cells> Runtime<C> {
                     _ => None,
                 });
             match (walk, what) {
-                (Some((walk, pushed)), _) => {
+                (Some((walk, pushed)), what) => {
                     if pushed.take() == Some(node) {
                         walk.ran(node);
                     }
                     if unsettled {
                         walk.unsettled(NodeId(node));
                     }
+                    (what, Vec::new())
                 }
                 (None, Some(what)) if below.reading == reading => {
-                    x.deliver_blocked(&below, what);
+                    (None, x.deliver_blocked(&below, what))
                 }
-                _ => {}
+                (None, what) => (what, Vec::new()),
             }
         });
+        drop(unkept);
     }
 
     /// Closes context `id` and unwinds `payload` on to the read that ran
@@ -3837,8 +3850,10 @@ impl<C: Cells> Runtime<C> {
                         }
                         None => {
                             let key = ReadKey::blocked(&v);
-                            c[i].pending
-                                .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..)));
+                            drop(
+                                c[i].pending
+                                    .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..))),
+                            );
                         }
                     }
                     return;

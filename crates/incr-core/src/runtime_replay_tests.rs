@@ -878,11 +878,13 @@ fn a_replaced_blocked_landing_drops_outside_the_contexts<C: Cells>(rt: &Runtime<
         crate::replay::Delivered::Landed(crate::deferred::Unbuilt::new(v))
     };
     let first = landed(Box::new(ReadsOnDrop(rt as *const Runtime<C>, q)));
-    crate::replay::with(|c| {
+    let replaced = crate::replay::with(|c| {
         let x = c.iter_mut().find(|x| x.id == id).unwrap();
-        x.deliver_blocked(&below, first);
-        x.deliver_blocked(&below, landed(Box::new(0_u64)));
+        assert!(x.deliver_blocked(&below, first).is_empty());
+        x.deliver_blocked(&below, landed(Box::new(0_u64)))
     });
+    assert_eq!(READ.with(std::cell::Cell::get), 0);
+    drop(replaced);
     drop(crate::replay::close(id));
     assert_eq!(READ.with(std::cell::Cell::get), 3);
 }
