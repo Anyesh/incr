@@ -3,6 +3,7 @@
 //! marks the frames below it, the discard of a doomed frame, and the
 //! driver that runs a context's entries until its target lands.
 
+use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
@@ -221,15 +222,18 @@ impl<C: Cells> Runtime<C> {
         bytes != 0 && here.abs_diff(cycle_state::stack_base()) > bytes
     }
 
-    /// A speculative entry's run lands only Clean values: a node it would
-    /// land Dirty, poisoned or over a dep that is not Clean, has a history
-    /// the unbounded run may never give it, and a later walk of its deps
-    /// would differ from a first run of its closure. Such a pop drops the
-    /// chain. A doomed frame's pop lands nothing anyway.
+    /// A speculative entry's run stashes only Clean values: a node it would
+    /// land Dirty, poisoned, over a dep that is neither Clean nor stashed, or
+    /// over a read of a value a later landing changed (`KEPT_READ`), has a
+    /// history the unbounded run may never give it, and a later walk
+    /// of its deps would differ from a first run of its closure. A creator's
+    /// run touched or made children an adoption could not account for. Such
+    /// a pop drops the chain. A doomed frame's pop lands nothing anyway.
     #[cold]
     #[inline(never)]
     pub(super) fn speculative_lands_dirty(
         &self,
+        id: NodeId,
         word: u64,
         ctl: &ComputeCtl,
         deps: &[(NodeId, u32)],
@@ -237,13 +241,411 @@ impl<C: Cells> Runtime<C> {
         word & value_code::REPLAY_BIT != 0
             && replay::speculative()
             && !ctl.has(cycle::DOOMED)
-            && (ctl.has(cycle::POISONED)
-                || deps.iter().any(|&(d, _)| {
+            && (ctl.flags.get() & (cycle::POISONED | cycle::KEPT_READ) != 0
+                || !ctl.children.get().is_null()
+                || C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_INDEX != 0
+                || deps.iter().any(|&(d, generation)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
                         NodeState::Clean | NodeState::Cyclic
-                    )
+                    ) && !self.stashed(d.0, generation, false)
                 }))
+    }
+
+    /// A speculative run's pop that would land `id` Clean: the run's value
+    /// and deps are stashed for later speculative reads, and the node lands
+    /// back in the state it was claimed from, with no deps, stamp or value
+    /// the unbounded run never gave it.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn stash_speculative(
+        &self,
+        id: NodeId,
+        generation: u32,
+        attempt: Attempt,
+        ctl: &ComputeCtl,
+        deps: Vec<(NodeId, u32)>,
+    ) -> Computed {
+        let value = ctl
+            .buf
+            .take()
+            .expect("incr-core: a speculative run buffers its value");
+        self.stash(
+            id.0,
+            generation,
+            Stash {
+                outcome: Outcome::Value(Unbuilt::new(value)),
+                deps,
+                verify_rev: attempt.verify_rev,
+            },
+        );
+        let node = self.nodes.get(id.0);
+        let target = if attempt.first {
+            NodeState::New
+        } else {
+            NodeState::Dirty
+        };
+        self.land(id, node, target, target);
+        Computed::Done
+    }
+
+    /// A speculative run that unwound or was dropped after its closure
+    /// returned: the value it buffered is one the unbounded run never built,
+    /// so it drops under `isolate`.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn unbuild_speculative(&self, ctl: &ComputeCtl, bag: &mut Deferred<C>) {
+        if let Some(value) = ctl.buf.take() {
+            bag.push_erased(Box::new(Unbuilt::new(value)));
+        }
+    }
+
+    /// A real claim of `id` at `generation`, from Dirty if `claimed_dirty`,
+    /// finds the node stashed: the stash stands in for the run the unbounded
+    /// run makes here, so the closure runs once. Its stashed deps are adopted
+    /// first, depth first with an explicit stack, in the order that run
+    /// lands them. Any dep that is neither Clean at or below the stash's
+    /// verify revision nor adoptable fails the nodes above it, which keep
+    /// their claims' source states and compute; the root keeps its claim.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn adopt_stash(
+        &self,
+        id: NodeId,
+        generation: u32,
+        claimed_dirty: bool,
+        bag: &mut Deferred<C>,
+    ) -> Adopted {
+        let rt = self.runtime_id;
+        if replay::speculative() || replay::frame_records(rt, id.0, generation) {
+            return Adopted::No;
+        }
+        let Some(stash) = self.take_stash(id.0, generation) else {
+            return Adopted::No;
+        };
+        let mut stack = vec![Adopting {
+            id,
+            claimed_dirty,
+            stash,
+            next: 0,
+        }];
+        let mut failed = false;
+        loop {
+            let top = stack.last_mut().expect("incr-core: adoption has a root");
+            if !failed && top.next < top.stash.deps.len() {
+                let (d, dg) = top.stash.deps[top.next];
+                top.next += 1;
+                if self.nodes.get(d.0).generation() != dg {
+                    failed = true;
+                } else if !self.observed_clean(d, top.stash.verify_rev) {
+                    match self.claim_stashed(d, dg) {
+                        Some(dep) => stack.push(dep),
+                        None => failed = true,
+                    }
+                }
+                continue;
+            }
+            let a = stack.pop().expect("incr-core: adoption has a root");
+            let root = stack.is_empty();
+            if !failed && root {
+                if let Outcome::Panic(payload) = a.stash.outcome {
+                    return Adopted::Panicked(AdoptedPanic {
+                        payload: payload.into_inner(),
+                        deps: a.stash.deps,
+                    });
+                }
+            }
+            failed |= !matches!(a.stash.outcome, Outcome::Value(_));
+            if failed {
+                bag.push_erased(Box::new(a.stash.outcome));
+                if root {
+                    return Adopted::No;
+                }
+                let target = if a.claimed_dirty {
+                    NodeState::Dirty
+                } else {
+                    NodeState::New
+                };
+                self.land(a.id, self.nodes.get(a.id.0), target, target);
+                continue;
+            }
+            match self.land_adopted(a, bag) {
+                Some(NodeState::Clean) if root => return Adopted::Landed(Computed::Done),
+                Some(NodeState::Clean) => {}
+                Some(_) if root => {
+                    self.dep_stack.poison_current_frame(rt);
+                    return Adopted::Landed(Computed::Unsettled);
+                }
+                None if root => return Adopted::Stale,
+                Some(_) | None => failed = true,
+            }
+        }
+    }
+
+    /// Claims stashed node `id` at `generation` for adoption, from New or
+    /// Dirty, with its stash.
+    fn claim_stashed(&self, id: NodeId, generation: u32) -> Option<Adopting> {
+        let rt = self.runtime_id;
+        if replay::frame_records(rt, id.0, generation) || !self.stashed(id.0, generation, false) {
+            return None;
+        }
+        let node = self.nodes.get(id.0);
+        let claimed_dirty =
+            state::try_claim_compute::<C>(node.state_cell()).ok()? == NodeState::Dirty;
+        let source = if claimed_dirty {
+            NodeState::Dirty
+        } else {
+            NodeState::New
+        };
+        let stash = (node.generation() == generation)
+            .then(|| self.take_stash(id.0, generation))
+            .flatten();
+        let Some(stash) = stash else {
+            self.land(id, node, source, source);
+            return None;
+        };
+        Some(Adopting {
+            id,
+            claimed_dirty,
+            stash,
+            next: 0,
+        })
+    }
+
+    /// Lands claimed node `a.id` from its stash, as `compute_attempts`
+    /// lands a run: the state it landed in, or `None` if a dep went stale
+    /// or the write panicked, with the node landed back New or as claimed.
+    fn land_adopted(&self, a: Adopting, bag: &mut Deferred<C>) -> Option<NodeState> {
+        let (node, flags) = self.nodes.get_with_flags(a.id.0);
+        let first = !a.claimed_dirty;
+        let stamp_rev = self.current_revision();
+        let verify_rev = a
+            .stash
+            .verify_rev
+            .min(C::walked(&self.walk, &self.revision));
+        let arena = self.arenas.erased(node.type_tag());
+        let wrote = std::cell::Cell::new(0_u8);
+        let Outcome::Value(value) = a.stash.outcome else {
+            unreachable!("incr-core: a panic's stash lands only through its raise")
+        };
+        let value = value.into_inner();
+        let changed = match catch_unwind(AssertUnwindSafe(|| {
+            arena.write_erased(node.arena_slot(), value, first, &wrote)
+        })) {
+            Ok((changed, displaced)) => {
+                if let Some(d) = displaced {
+                    bag.push_erased(d);
+                }
+                changed
+            }
+            Err(payload) => {
+                bag.push_erased(Box::new(Unbuilt::new(payload)));
+                let target = self.discard_target(
+                    a.id,
+                    first,
+                    wrote.get() != 0,
+                    stamp_rev,
+                    ChildLanding::Keep,
+                    bag,
+                );
+                self.land(a.id, node, target, target);
+                return None;
+            }
+        };
+        if changed || first {
+            node.max_changed_at(stamp_rev);
+        }
+        let published = self.publish_deps(a.id, &a.stash.deps, None, verify_rev, bag);
+        if published == Publish::Stale {
+            if first && wrote.get() == 0 {
+                node.set_verified_at(0);
+            }
+            self.land_single(a.id, node, flags, NodeState::New, NodeState::New);
+            return None;
+        }
+        node.max_verified_at(verify_rev);
+        let target = if published == Publish::Superseded {
+            NodeState::Dirty
+        } else {
+            NodeState::Clean
+        };
+        let landed = self.land_single(a.id, node, flags, target, NodeState::Dirty);
+        self.record_trace(
+            a.id,
+            crate::trace::TraceAction::Recomputed {
+                value_changed: changed,
+            },
+        );
+        Some(landed)
+    }
+
+    /// Whether a speculative run's compute of `id` at `generation` finds it
+    /// stashed, so that it is not computed again: the stash is what the
+    /// run's reads of it return.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn stashed_claim(&self, id: NodeId, generation: u32) -> bool {
+        replay::speculative() && self.stashed(id.0, generation, true)
+    }
+
+    /// A speculative read's value of `handle` from its stash.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn stashed_read<T: Value>(&self, handle: Incr<T>) -> Option<T> {
+        if !replay::speculative() {
+            return None;
+        }
+        if C::u32_load_relaxed(&self.stash_count) == 0 {
+            return None;
+        }
+        let revision = self.current_revision();
+        let mut s = self.stashes.write();
+        if s.revision != revision {
+            return None;
+        }
+        let stash = s.map.get_mut(&(handle.slot(), handle.generation()))?;
+        let read = match &stash.get_mut().outcome {
+            Outcome::Value(value) => Ok(value.value().downcast_ref::<T>().cloned()),
+            Outcome::Panic(_) | Outcome::Tried => Err(()),
+        };
+        drop(s);
+        // A run that read a panic would unwind with it, which a speculative
+        // run's discard stands in for. A node tried in this revision is not
+        // run again, so its reader is discarded too.
+        read.unwrap_or_else(|()| self.drop_unwind())
+    }
+
+    /// A speculative run's closure panicked, over a frame that read only
+    /// settled values: the panic is stashed for the real claim to raise, and
+    /// the run unwinds with a discard in its place.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn stash_panic(
+        &self,
+        id: NodeId,
+        ctl: &ComputeCtl,
+        deps: &[(NodeId, u32)],
+        verify_rev: u64,
+        payload: Box<dyn Any + Send>,
+    ) -> Box<dyn Any + Send> {
+        if ctl.flags.get() & (cycle::DOOMED | cycle::POISONED | cycle::KEPT_READ) != 0
+            || !replay::speculative()
+        {
+            return payload;
+        }
+        self.stash(
+            id.0,
+            self.nodes.get(id.0).generation(),
+            Stash {
+                outcome: Outcome::Panic(Unbuilt::new(payload)),
+                deps: deps.to_vec(),
+                verify_rev,
+            },
+        );
+        Box::new(cycle::DiscardUnwind)
+    }
+
+    /// The payload of an adopted panic, with its deps recorded in the frame
+    /// it is raised in, as the closure's reads before the panic recorded
+    /// them.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn raise_adopted(&self, raised: AdoptedPanic) -> Box<dyn Any + Send> {
+        for &(d, generation) in &raised.deps {
+            self.dep_stack.record_dep(self.runtime_id, d, generation);
+        }
+        raised.payload
+    }
+
+    /// Marks a speculative run of `id` at `generation` as tried, so that no
+    /// later speculative run computes it again in this revision whether or
+    /// not this one kept a stash.
+    #[cold]
+    #[inline(never)]
+    fn mark_tried(&self, id: NodeId, generation: u32) {
+        self.stash(
+            id.0,
+            generation,
+            Stash {
+                outcome: Outcome::Tried,
+                deps: Vec::new(),
+                verify_rev: 0,
+            },
+        );
+    }
+
+    /// Keeps `stash` for node `slot` at `generation`, for this revision. A
+    /// node already stashed keeps its first stash, which speculative reads
+    /// may have returned; a run's stash replaces its own tried mark.
+    fn stash(&self, slot: u32, generation: u32, stash: Stash) {
+        let revision = self.current_revision();
+        let (displaced, ended) = {
+            let mut s = self.stashes.write();
+            let ended = (s.revision != revision).then(|| std::mem::take(&mut s.map));
+            s.revision = revision;
+            let displaced = match s.map.entry((slot, generation)) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let kept = o.get_mut().get_mut();
+                    if matches!(kept.outcome, Outcome::Tried) {
+                        Some(std::mem::replace(kept, stash))
+                    } else {
+                        Some(stash)
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    v.insert(Exclusive(stash));
+                    None
+                }
+            };
+            C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
+            (displaced, ended)
+        };
+        drop((displaced, ended));
+    }
+
+    /// Whether node `slot` at `generation` has a stash this revision, a
+    /// tried mark included if `tried`.
+    pub(super) fn stashed(&self, slot: u32, generation: u32, tried: bool) -> bool {
+        if C::u32_load_relaxed(&self.stash_count) == 0 {
+            return false;
+        }
+        let revision = self.current_revision();
+        let mut s = self.stashes.write();
+        s.revision == revision
+            && (s.map.get_mut(&(slot, generation)))
+                .is_some_and(|e| tried || !matches!(e.get_mut().outcome, Outcome::Tried))
+    }
+
+    /// Takes the stash of node `slot` at `generation` for a real run that
+    /// adopts it. A tried mark stays for the revision.
+    fn take_stash(&self, slot: u32, generation: u32) -> Option<Stash> {
+        if C::u32_load_relaxed(&self.stash_count) == 0 {
+            return None;
+        }
+        let revision = self.current_revision();
+        let mut s = self.stashes.write();
+        if s.revision != revision
+            || (s.map.get_mut(&(slot, generation)))
+                .is_none_or(|e| matches!(e.get_mut().outcome, Outcome::Tried))
+        {
+            return None;
+        }
+        let stash = s.map.remove(&(slot, generation))?;
+        C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
+        Some(stash.0)
+    }
+
+    /// Drops every stash: a revision began, and a stash holds only for the
+    /// revision its run read in.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn drop_stashes(&self) {
+        let ended = {
+            let mut s = self.stashes.write();
+            C::u32_store_relaxed(&self.stash_count, 0);
+            std::mem::take(&mut s.map)
+        };
+        drop(ended);
     }
 
     /// A slow read that value code, a doomed or budgeted frame, or an open
@@ -354,8 +756,12 @@ impl<C: Cells> Runtime<C> {
             // makes, as a doomed frame's own native read is.
             _speculating = Some(replay::Speculating::enter());
         }
+        // A speculative run of a runtime with no context, read from another
+        // runtime's doomed frame, runs in VIRT mode too, so that its
+        // landings are withheld.
         if word & value_code::REPLAY_BIT != 0
-            && replay::with(|c| replay::innermost(c, self.runtime_id).is_some())
+            && (replay::speculative()
+                || replay::with(|c| replay::innermost(c, self.runtime_id).is_some()))
         {
             mode |= VIRT;
         }
@@ -765,7 +1171,9 @@ impl<C: Cells> Runtime<C> {
             None,
             bag,
         );
-        if let Some(value) = ctl.buf.take() {
+        if ctl.has(cycle::SPECULATIVE) {
+            self.unbuild_speculative(ctl, bag);
+        } else if let Some(value) = ctl.buf.take() {
             bag.push_erased(value);
         }
         let wrote = ctl.wrote.get() != 0;
@@ -3478,4 +3886,93 @@ fn clone_landed<T: Value>(value: &(dyn std::any::Any + Send)) -> cycle::Erased {
             .expect("incr-core: a landed value has its node's type")
             .clone()
     }))
+}
+
+/// What [`Runtime::adopt_stash`] did with a claimed node.
+pub(super) enum Adopted {
+    /// No stash stands in for the run: the claim computes.
+    No,
+    /// The node landed from its stash.
+    Landed(Computed),
+    /// A dep went stale under the stash: the node landed New for a retry.
+    Stale,
+    /// The stash is a panic, which the claim's run raises in place of its
+    /// closure.
+    Panicked(AdoptedPanic),
+}
+
+/// A stashed panic a real claim adopts: its payload and the deps its run
+/// read before it.
+pub(super) struct AdoptedPanic {
+    payload: Box<dyn Any + Send>,
+    deps: Vec<(NodeId, u32)>,
+}
+
+/// A node claimed for adoption, with its stash and the next dep to check.
+struct Adopting {
+    id: NodeId,
+    claimed_dirty: bool,
+    stash: Stash,
+    next: usize,
+}
+
+/// A speculative run's landing withheld: the node landed back in the state
+/// it was claimed from, and its run's value and deps wait here for
+/// speculative reads of the node and for the real claim that adopts them.
+pub(super) struct Stash {
+    outcome: Outcome,
+    deps: Vec<(NodeId, u32)>,
+    verify_rev: u64,
+}
+
+/// Marks its speculative attempt's Native node tried when the attempt
+/// ends, by return or unwind: a mark while the run is open would turn away
+/// a reader that should wait for it or find the cycle through it. A
+/// replayable node is not marked, since its closure may run again.
+pub(super) struct TriedOnExit<'a, C: Cells> {
+    rt: &'a Runtime<C>,
+    id: NodeId,
+    generation: u32,
+}
+
+impl<'a, C: Cells> TriedOnExit<'a, C> {
+    pub(super) fn new(rt: &'a Runtime<C>, id: NodeId, generation: u32) -> Self {
+        Self { rt, id, generation }
+    }
+}
+
+impl<C: Cells> Drop for TriedOnExit<'_, C> {
+    fn drop(&mut self) {
+        self.rt.mark_tried(self.id, self.generation);
+    }
+}
+
+enum Outcome {
+    Value(Unbuilt<dyn Any + Send>),
+    /// The payload of the run's panic.
+    Panic(Unbuilt<dyn Any + Send>),
+    /// A run still going, or one that kept nothing.
+    Tried,
+}
+
+/// A runtime's stashes, all of one revision, by node and generation.
+#[derive(Default)]
+pub(crate) struct Stashes {
+    revision: u64,
+    map: HashMap<(u32, u32), Exclusive<Stash>>,
+}
+
+/// A value reached only through `&mut`, so sharing `&Exclusive` across
+/// threads shares nothing: the stash's value and payload are `Send` only.
+struct Exclusive<T>(T);
+
+// SAFETY: no method takes `&self`, so a shared reference gives no access
+// to the inner value; access needs `&mut`, which the stash lock's write
+// guard alone provides.
+unsafe impl<T: Send> Sync for Exclusive<T> {}
+
+impl<T> Exclusive<T> {
+    fn get_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
 }

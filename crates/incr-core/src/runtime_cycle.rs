@@ -1848,7 +1848,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Lands the discarded attempt's children as `children` and stamps the
     /// node for its discard landing, which lands it in the state returned.
-    fn discard_target(
+    pub(super) fn discard_target(
         &self,
         id: NodeId,
         first: bool,

@@ -349,6 +349,9 @@ impl<C: Cells> SetClaim<'_, C> {
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         self.rt.drop_released_tickets();
+        if C::u32_load_relaxed(&self.rt.stash_count) != 0 {
+            self.rt.drop_stashes();
+        }
         std::mem::forget(self);
         stamp
     }
@@ -729,9 +732,10 @@ fn reached_under_own_set(id: NodeId) -> ! {
 ///
 /// A replayed run can be speculative: after a read returned a
 /// placeholder, the run may evaluate queries the run without a budget
-/// would never evaluate. A panic there is swallowed and lands nothing
-/// `Failed`, so a query that the real run does evaluate raises its own
-/// panic then.
+/// would never evaluate, each at most once per revision. Such a run
+/// lands nothing: its value or panic is kept for the revision, and a
+/// later read of that query takes it unless something the run read has
+/// changed.
 ///
 /// # Panics in user code
 ///
@@ -828,6 +832,10 @@ pub struct Runtime<C: Cells> {
     /// Drop unwinds raised.
     #[cfg(test)]
     pub(crate) drop_unwinds: std::sync::atomic::AtomicU32,
+    /// Speculative runs' withheld landings of this revision.
+    pub(crate) stashes: OrderedLock<replay_impl::Stashes, C>,
+    /// How many stashes `stashes` holds, so a claim can skip its lock.
+    pub(crate) stash_count: C::U32,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -926,6 +934,8 @@ impl<C: Cells> Runtime<C> {
             deliveries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             drop_unwinds: std::sync::atomic::AtomicU32::new(0),
+            stashes: OrderedLock::new(LockKind::Stashes, replay_impl::Stashes::default()),
+            stash_count: C::new_u32(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -1152,7 +1162,11 @@ impl<C: Cells> Runtime<C> {
                     let new_value = f(rt);
                     let node = rt.nodes.get(slot);
                     let outcome = match ctl.flags.get()
-                        & (cycle::RECOMPUTE | cycle::BUFFERED | cycle::LOW | cycle::DOOMED)
+                        & (cycle::RECOMPUTE
+                            | cycle::BUFFERED
+                            | cycle::LOW
+                            | cycle::DOOMED
+                            | cycle::SPECULATIVE)
                     {
                         0 => {
                             ctl.wrote.set(1);
@@ -2040,6 +2054,11 @@ impl<C: Cells> Runtime<C> {
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
         loop {
+            if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
+                if let Some(value) = self.stashed_read(handle) {
+                    return Ok(value);
+                }
+            }
             // A read whose walk a doom stopped goes on with it even if its
             // root is held by now, as the unbounded run's walk goes on past
             // the entry that left it held.
@@ -2055,7 +2074,13 @@ impl<C: Cells> Runtime<C> {
             let walk =
                 || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
             match self.entered(kind, walk)? {
-                Computed::Done | Computed::Unsettled => {}
+                Computed::Done | Computed::Unsettled => {
+                    if MODE & VIRT != 0 {
+                        if let Some(value) = self.stashed_read(handle) {
+                            return Ok(value);
+                        }
+                    }
+                }
                 Computed::Gone => self.stale_handle(handle),
                 Computed::Deferred => {
                     return self
@@ -3193,6 +3218,9 @@ impl<C: Cells> Runtime<C> {
                 }
             };
 
+            if MODE & VIRT != 0 && self.stashed_claim(id, g) {
+                return Computed::Done;
+            }
             self.park(ParkPoint::BeforeClaim(id));
 
             // Verification claims the node too, so a walk that arrives
@@ -3263,6 +3291,23 @@ impl<C: Cells> Runtime<C> {
             // dirtied our deps yet would let us verify Clean past it (B6).
             let stamp_rev = self.current_revision();
             let mut verify_rev = C::walked(&self.walk, &self.revision);
+
+            let mut adopted_panic = None;
+            if C::u32_load_relaxed(&self.stash_count) != 0 && !matches!(visit, Visit::VerifyOnly(_))
+            {
+                match self.adopt_stash(id, g, claimed_dirty, bag) {
+                    replay_impl::Adopted::No => {}
+                    replay_impl::Adopted::Panicked(raised) => {
+                        verifying = false;
+                        adopted_panic = Some(raised);
+                    }
+                    replay_impl::Adopted::Landed(computed) => return computed,
+                    replay_impl::Adopted::Stale => {
+                        self.park_with_bag(ParkPoint::StaleRetry(id), bag);
+                        continue 'attempt;
+                    }
+                }
+            }
 
             // The flags byte is loaded only now, after the claim and the
             // generation recheck: until the claim, another thread's
@@ -3357,7 +3402,7 @@ impl<C: Cells> Runtime<C> {
                 // Keep the claim and recompute; the closure's nested reads
                 // clean the changed deps.
             }
-            if MODE & ARMED != 0 {
+            if MODE & ARMED != 0 && adopted_panic.is_none() {
                 return self.doom(
                     id,
                     node,
@@ -3367,6 +3412,9 @@ impl<C: Cells> Runtime<C> {
                     walked,
                 );
             }
+            let speculative = MODE & VIRT != 0 && replay::speculative();
+            let _tried = (speculative && !self.replayable(id.0))
+                .then(|| replay_impl::TriedOnExit::new(self, id, g));
             let is_recompute = claimed_dirty;
             let first = !claimed_dirty;
 
@@ -3381,7 +3429,8 @@ impl<C: Cells> Runtime<C> {
                 // interrupted; no lock is held while user code runs.
                 let ctl = ComputeCtl::new(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
-                        | if walked { cycle::WALKED } else { 0 },
+                        | if walked { cycle::WALKED } else { 0 }
+                        | if speculative { cycle::SPECULATIVE } else { 0 },
                 );
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
@@ -3402,9 +3451,12 @@ impl<C: Cells> Runtime<C> {
                 // succeed while this node is Computing. `SlotVec` never moves
                 // its entries, so the `Box` still points where it was read.
                 let compute = unsafe { &*compute };
-                let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    compute(self, id.0, &ctl)
-                }));
+                let mut result = match adopted_panic.take() {
+                    Some(raised) => Err(self.raise_adopted(raised)),
+                    None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        compute(self, id.0, &ctl)
+                    })),
+                };
                 let (deps, reading) = self.dep_stack.pop_frame_reading();
                 let word = value_code::thread_word();
                 if word
@@ -3433,6 +3485,9 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
 
+                if result.is_err() && ctl.has(cycle::SPECULATIVE) {
+                    self.unbuild_speculative(&ctl, bag);
+                }
                 let outcome = match result {
                     Ok(outcome) => outcome,
                     // A doomed run reads placeholders, so a cycle it raises
@@ -3471,15 +3526,18 @@ impl<C: Cells> Runtime<C> {
                     }
                 };
 
-                if ctl.flags.get() & (cycle::LOW | cycle::DOOMED) != 0 {
+                if ctl.flags.get() & (cycle::LOW | cycle::DOOMED | cycle::SPECULATIVE) != 0 {
+                    let attempt = Attempt {
+                        first,
+                        cidx,
+                        stamp_rev,
+                        verify_rev,
+                    };
                     if ctl.has(cycle::DOOMED) {
-                        let attempt = Attempt {
-                            first,
-                            cidx,
-                            stamp_rev,
-                            verify_rev,
-                        };
                         return self.discard_doomed(id, attempt, &ctl, None, bag);
+                    }
+                    if !ctl.has(cycle::LOW) {
+                        return self.stash_speculative(id, g, attempt, &ctl, deps);
                     }
                     match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
                         PopEnd::Deferred => return Computed::Deferred,
@@ -3611,6 +3669,11 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Computed {
         let kind = cycle_state::take_unwind_kind();
+        let payload = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
+            self.stash_panic(id, ctl, deps, attempt.verify_rev, payload)
+        } else {
+            payload
+        };
         replay::unwind_past(self.runtime_id, attempt.cidx);
         // A closure that catches a speculative run's discard can't land a
         // value over it.
@@ -3850,7 +3913,7 @@ impl<C: Cells> Runtime<C> {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
                 _ => Box::new(cycle::WoundUnwind),
             });
-        } else if result.is_ok() && self.speculative_lands_dirty(word, ctl, deps) {
+        } else if result.is_ok() && self.speculative_lands_dirty(id, word, ctl, deps) {
             if self.drop_cooperatively(None) {
                 return Some(self.discard_dropped(id, attempt, ctl, bag));
             }
@@ -4358,6 +4421,26 @@ impl<C: Cells> Runtime<C> {
 
 #[cfg(test)]
 impl<C: Cells> Runtime<C> {
+    #[cfg(not(loom))]
+    fn computing_flags(&self) -> u16 {
+        let (ctl, _) = (self.dep_stack.active_frame(self.runtime_id)).expect("a compute is active");
+        // SAFETY: an active frame's control block is live while the frame
+        // is on the stack (see `Frame::ctl`).
+        unsafe { (*ctl).flags.get() }
+    }
+
+    #[cfg(not(loom))]
+    /// Whether this runtime's active compute claimed its node New, so the
+    /// node has landed nothing since it was made.
+    pub(crate) fn computing_first(&self) -> bool {
+        self.computing_flags() & cycle::RECOMPUTE == 0
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn computing_speculative(&self) -> bool {
+        self.computing_flags() & cycle::SPECULATIVE != 0
+    }
+
     #[cfg(not(loom))]
     /// Give `member` installed edges to `extra` on top of its own, with
     /// the reverse edges, as an episode leaves a cycle's members.

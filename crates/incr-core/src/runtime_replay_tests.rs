@@ -587,3 +587,467 @@ fn wave7_shared_kept_dirty_read_is_released_with_its_runtime() {
     wave7_kept_dirty_read_outlives_runtime::<Shared>(false);
     wave7_kept_dirty_read_outlives_runtime::<Shared>(true);
 }
+
+/// A replayable `r` that reads `b` (5) at budget 1, so its doomed run reads
+/// the placeholder 0 and takes the branch to `c`, which the unbounded run
+/// never reads. `c` reads `input` (1) plus 10 and counts its runs, and is
+/// replayable when `replay` is set.
+struct SideRead {
+    r: Incr<u64>,
+    c: Incr<u64>,
+    input: Incr<u64>,
+    runs: Arc<AtomicU32>,
+}
+
+fn side_read<C: Cells>(rt: &Runtime<C>, replay: bool) -> SideRead {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let b = rt.create_query(|_| 5_u64);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let c = rt.create_query_with(
+        move |rt| {
+            counted.fetch_add(1, SeqCst);
+            rt.get(input) + 10
+        },
+        QueryOpts {
+            replay: if replay {
+                Replay::Allowed
+            } else {
+                Replay::Native
+            },
+            ..Default::default()
+        },
+    );
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    SideRead { r, c, input, runs }
+}
+
+/// The speculative run's compute of `c` lands nothing: `c` stays New with
+/// no edge, so `input` deletes as in the unbounded run.
+fn speculative_compute_leaves_new<C: Cells>(replay: bool) {
+    let rt = Runtime::<C>::new();
+    let s = side_read(&rt, replay);
+    assert_eq!(rt.get(s.r), 5);
+    assert_eq!(rt.state_of(s.c), NodeState::New);
+    assert_eq!(rt.try_delete_node(s.input), Ok(()));
+}
+
+#[test]
+fn local_speculative_compute_leaves_new() {
+    speculative_compute_leaves_new::<Local>(false);
+    speculative_compute_leaves_new::<Local>(true);
+}
+
+#[test]
+fn shared_speculative_compute_leaves_new() {
+    speculative_compute_leaves_new::<Shared>(false);
+    speculative_compute_leaves_new::<Shared>(true);
+}
+
+/// A Native `c` that a speculative run computed runs at most once in the
+/// revision: a later `get` adopts the stash, and after a set the stash is
+/// gone and `c` computes for the new revision.
+fn speculative_native_runs_once_per_revision<C: Cells>(rt: &Runtime<C>) {
+    let s = side_read(rt, false);
+    assert_eq!(rt.get(s.r), 5);
+    assert_eq!(s.runs.load(SeqCst), 1);
+    assert_eq!(rt.get(s.c), 11);
+    assert_eq!(s.runs.load(SeqCst), 1, "c ran twice in one revision");
+    rt.set(s.input, 2);
+    assert_eq!(rt.get(s.c), 12);
+    assert_eq!(s.runs.load(SeqCst), 2);
+}
+
+local_and_shared!(
+    speculative_native_runs_once_per_revision,
+    local_speculative_native_runs_once_per_revision,
+    shared_speculative_native_runs_once_per_revision
+);
+
+/// `c` is Clean at 11 under `d`, and a set makes it Dirty. The speculative
+/// recompute of `c` (12) leaves it Dirty with its slot at 11, so `d`'s
+/// verify sees `c` change rather than cut off against the speculative 12.
+fn speculative_recompute_leaves_dirty<C: Cells>(rt: &Runtime<C>) {
+    let s = side_read(rt, true);
+    let c = s.c;
+    let d = rt.create_query(move |rt| rt.get(c) * 2);
+    assert_eq!(rt.get(d), 22);
+    rt.set(s.input, 2);
+    assert_eq!(rt.get(s.r), 5);
+    assert_eq!(rt.state_of(c), NodeState::Dirty);
+    assert_eq!(rt.get(d), 24);
+}
+
+local_and_shared!(
+    speculative_recompute_leaves_dirty,
+    local_speculative_recompute_leaves_dirty,
+    shared_speculative_recompute_leaves_dirty
+);
+
+/// Replayable links over Native leaves, each counting its runs: link 0
+/// reads `fan` leaves and each later link the one before it and up to four
+/// more. Every leaf reads `input`. At `budget` the links doom and retry,
+/// and their doomed runs read leaves ahead of need, yet each leaf's closure
+/// runs once per revision.
+fn native_leaves_run_once_per_revision<C: Cells>(len: usize, fan: u64, budget: u32) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(budget);
+    let input = rt.create_input(0_u64);
+    let width = |i: usize| if i == 0 { fan } else { fan.min(4) };
+    let mut runs = Vec::new();
+    let mut top: Option<Incr<u64>> = None;
+    for i in 0..len {
+        let leaves: Vec<Incr<u64>> = (0..width(i))
+            .map(|j| {
+                let count = Arc::new(AtomicU32::new(0));
+                runs.push(count.clone());
+                rt.create_query(move |rt| {
+                    count.fetch_add(1, SeqCst);
+                    rt.get(input) + j
+                })
+            })
+            .collect();
+        let below = top;
+        top = Some(rt.create_query_with(
+            move |rt| {
+                below.map_or(0, |b| rt.get(b)) + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
+            },
+            replayable(),
+        ));
+    }
+    let top = top.unwrap();
+    let want = |v: u64| -> u64 {
+        (0..len)
+            .map(|i| width(i) * v + width(i) * (width(i) - 1) / 2)
+            .sum()
+    };
+    for (revision, v) in [(1, 0), (2, 1)] {
+        rt.set(input, v);
+        assert_eq!(rt.get(top), want(v));
+        let ran: Vec<u32> = runs.iter().map(|r| r.load(SeqCst)).collect();
+        assert!(
+            ran.iter().all(|&n| n == revision),
+            "len {len} fan {fan} budget {budget}: leaf runs {:?} in revision {revision}",
+            ran.iter().filter(|&&n| n != revision).collect::<Vec<_>>()
+        );
+    }
+}
+
+fn native_leaves_at_every_budget<C: Cells>() {
+    on_stack(1 << 30, || {
+        for (len, fan) in [(1, 10_000), (200, 10_000), (5000, 1)] {
+            for budget in [1, 8, 32] {
+                native_leaves_run_once_per_revision::<C>(len, fan, budget);
+            }
+        }
+    });
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_native_leaves_run_once_per_revision() {
+    native_leaves_at_every_budget::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_native_leaves_run_once_per_revision() {
+    native_leaves_at_every_budget::<Shared>();
+}
+
+/// The `side_read` shape with every query Native: nothing replays, so no
+/// run is speculative at budget 1, `c` never runs and nothing is stashed.
+fn native_graph_never_speculates<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let b = rt.create_query(|rt| {
+        assert!(!rt.computing_speculative());
+        5_u64
+    });
+    let c = rt.create_query(move |rt| {
+        assert!(!rt.computing_speculative());
+        counted.fetch_add(1, SeqCst);
+        11_u64
+    });
+    let mut top = rt.create_query(move |rt| {
+        assert!(!rt.computing_speculative());
+        let x = rt.get(b);
+        if x == 0 {
+            rt.get(c)
+        } else {
+            x
+        }
+    });
+    for _ in 0..50 {
+        let below = top;
+        top = rt.create_query(move |rt| {
+            assert!(!rt.computing_speculative());
+            rt.get(below) + 1
+        });
+    }
+    assert_eq!(rt.get(top), 55);
+    assert_eq!(runs.load(SeqCst), 0);
+    assert_eq!(C::u32_load_relaxed(&rt.stash_count), 0);
+    assert!(rt.dooms.lock().unwrap().is_empty());
+}
+
+local_and_shared!(
+    native_graph_never_speculates,
+    local_native_graph_never_speculates,
+    shared_native_graph_never_speculates
+);
+
+/// `c` and `e` are a cycle with no strategy, reached only by the
+/// speculative runs of `r` and of `r2`, its copy. The cycle stashes nothing
+/// and lands neither node, and when `c` is Native `r2`'s run does not
+/// compute it again in the revision; the later `get` of `c` computes it and
+/// meets the cycle as the unbounded run does.
+fn speculative_cycle_is_recomputed<C: Cells>(replay: bool) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let opts = || QueryOpts {
+        replay: if replay {
+            Replay::Allowed
+        } else {
+            Replay::Native
+        },
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let e_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let e_of_c = e_cell.clone();
+    let c = rt.create_query_with(
+        move |rt| {
+            counted.fetch_add(1, SeqCst);
+            rt.get(*e_of_c.get().unwrap()) + 1
+        },
+        opts(),
+    );
+    e_cell
+        .set(rt.create_query_with(move |rt| rt.get(c) + 1, opts()))
+        .unwrap();
+    let reader = || {
+        let b = rt.create_query(|_| 5_u64);
+        rt.create_query_with(
+            move |rt| {
+                let x = rt.get(b);
+                if x == 0 {
+                    rt.get(c)
+                } else {
+                    x
+                }
+            },
+            replayable(),
+        )
+    };
+    let (r, r2) = (reader(), reader());
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(rt.state_of(c), NodeState::New);
+    assert_eq!(rt.state_of(*e_cell.get().unwrap()), NodeState::New);
+    let before = runs.load(SeqCst);
+    assert!(before <= 1);
+    assert_eq!(rt.get(r2), 5);
+    if !replay {
+        assert_eq!(runs.load(SeqCst), before, "replay {replay}: c ran twice");
+    }
+    let payload = catch_unwind(AssertUnwindSafe(|| rt.get(c))).expect_err("c cycles");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(message.contains("dependency cycle"), "{message}");
+    assert!(runs.load(SeqCst) > before, "the real claim recomputes c");
+}
+
+#[test]
+fn local_speculative_cycle_is_recomputed() {
+    speculative_cycle_is_recomputed::<Local>(false);
+    speculative_cycle_is_recomputed::<Local>(true);
+}
+
+#[test]
+fn shared_speculative_cycle_is_recomputed() {
+    speculative_cycle_is_recomputed::<Shared>(false);
+    speculative_cycle_is_recomputed::<Shared>(true);
+}
+
+/// A speculative run's panic in `c` is stashed, not landed, and the later
+/// real `get` raises that payload with no second run, landing `c` Failed.
+fn speculative_panic_is_raised_once<C: Cells>(replay: bool) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let b = rt.create_query(|_| 5_u64);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let c = rt.create_query_with(
+        move |_| -> u64 {
+            counted.fetch_add(1, SeqCst);
+            panic!("c boom")
+        },
+        QueryOpts {
+            replay: if replay {
+                Replay::Allowed
+            } else {
+                Replay::Native
+            },
+            ..Default::default()
+        },
+    );
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(runs.load(SeqCst), 1);
+    assert_eq!(rt.state_of(c), NodeState::New);
+    let payload = catch_unwind(AssertUnwindSafe(|| rt.get(c))).expect_err("c panics");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"c boom"));
+    assert_eq!(runs.load(SeqCst), 1, "c ran twice in one revision");
+    assert_eq!(rt.state_of(c), NodeState::Failed);
+}
+
+#[test]
+fn local_speculative_panic_is_raised_once() {
+    speculative_panic_is_raised_once::<Local>(false);
+    speculative_panic_is_raised_once::<Local>(true);
+}
+
+#[test]
+fn shared_speculative_panic_is_raised_once() {
+    speculative_panic_is_raised_once::<Shared>(false);
+    speculative_panic_is_raised_once::<Shared>(true);
+}
+
+/// Counts its drops.
+#[derive(Clone)]
+struct Dropped(Arc<AtomicU32>);
+
+impl PartialEq for Dropped {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, SeqCst);
+    }
+}
+
+/// A stash no real claim adopts is freed when a set ends its revision, and
+/// when the runtime drops.
+fn unadopted_stash_is_freed<C: Cells>(set: bool) {
+    let drops = Arc::new(AtomicU32::new(0));
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_placeholder(Dropped(Arc::new(AtomicU32::new(0))));
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let b = rt.create_query(|_| 5_u64);
+    let made = drops.clone();
+    let c = rt.create_query(move |rt| {
+        rt.get(input);
+        Dropped(made.clone())
+    });
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                drop(rt.get(c));
+            }
+            x
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(rt.state_of(c), NodeState::New);
+    assert_eq!(C::u32_load_relaxed(&rt.stash_count), 1);
+    let before = drops.load(SeqCst);
+    if set {
+        rt.set(input, 2);
+        assert_eq!(C::u32_load_relaxed(&rt.stash_count), 0);
+    } else {
+        drop(rt);
+    }
+    assert_eq!(
+        drops.load(SeqCst),
+        before + 1,
+        "the stashed value was freed"
+    );
+}
+
+#[test]
+fn local_unadopted_stash_is_freed() {
+    unadopted_stash_is_freed::<Local>(true);
+    unadopted_stash_is_freed::<Local>(false);
+}
+
+#[test]
+fn shared_unadopted_stash_is_freed() {
+    unadopted_stash_is_freed::<Shared>(true);
+    unadopted_stash_is_freed::<Shared>(false);
+}
+
+/// `r`'s read of `q` dooms at budget 1, so its doomed run reads `q`'s
+/// placeholder 0 and goes on to `c`, a Native node that panics if it sees
+/// `q` as 0. A frame that reads a placeholder is doomed and stashes
+/// nothing, so `c`'s speculative run reads `q`'s real 7: it neither panics
+/// nor runs again when a later `get` adopts it.
+fn speculative_run_never_sees_a_placeholder<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let q = rt.create_query_with(|_| 7_u64, replayable());
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let c = rt.create_query(move |rt| {
+        counted.fetch_add(1, SeqCst);
+        let v = rt.get(q);
+        assert_ne!(v, 0, "c read a placeholder");
+        v + 1
+    });
+    let r = rt.create_query_with(
+        move |rt| {
+            if rt.get(q) == 0 {
+                rt.get(c)
+            } else {
+                1
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 1);
+    assert!(runs.load(SeqCst) <= 1);
+    assert_eq!(rt.get(c), 8);
+    assert_eq!(runs.load(SeqCst), 1, "c ran twice in one revision");
+}
+
+local_and_shared!(
+    speculative_run_never_sees_a_placeholder,
+    local_speculative_run_never_sees_a_placeholder,
+    shared_speculative_run_never_sees_a_placeholder
+);

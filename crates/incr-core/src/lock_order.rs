@@ -40,6 +40,8 @@ pub enum LockKind {
     Directory,
     /// T9's watch queue.
     WatchQueue,
+    /// A runtime's stashes of speculative runs; nothing is taken under it.
+    Stashes,
 }
 
 impl LockKind {
@@ -59,6 +61,7 @@ impl LockKind {
             LockKind::Arena => 65,
             LockKind::Directory => 66,
             LockKind::WatchQueue => 70,
+            LockKind::Stashes => 75,
         }
     }
 }

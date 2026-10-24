@@ -501,7 +501,9 @@ fn shared_walk_skips_a_vframe_computing_on_another_thread() {
     entry.release();
     target.wait_parked();
     assert_eq!(s.rt.state_of(s.p), NodeState::Computing);
-    assert_eq!(s.rt.state_of(s.c0), NodeState::Clean);
+    // c0's entry follows the placeholder P read for `a`, so it is
+    // speculative: its walk ran, and its landing waits in a stash.
+    assert_eq!(s.rt.state_of(s.c0), NodeState::Dirty);
     s.gate.release();
     let unbounded = {
         let u = taint_shape();
@@ -578,7 +580,9 @@ fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
     first.release();
     target.wait_parked();
     assert_eq!(s.rt.state_of(s.p), NodeState::Computing);
-    assert_eq!(s.rt.state_of(s.c0), NodeState::Clean);
+    // c0's entry follows the placeholder P read for `a`, so it is
+    // speculative: its walk ran, and its landing waits in a stash.
+    assert_eq!(s.rt.state_of(s.c0), NodeState::Dirty);
     held.arm();
     s.late.release();
     held.wait_parked();
