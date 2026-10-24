@@ -1876,17 +1876,17 @@ Gate: the hard gates hold (198, 219.14, 90). Replay scale by
 
 ## A handled read keeps a memo for the revision
 
-- Base: spreadsheet-t10 adf57986. Tip: w/T8-caught-failed-read-lands 0296a252, the base in a detached worktree; one run of `icount.sh` at the default N per column, and `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_local/propagate/4` and `chain_shared/propagate/4` at 03794a1a. No workloads added.
-- Change: a compute's landing classifies its frame's `POISONED` and `HANDLED` flags (`ComputeCtl::poison`) and records a memo for `HANDLED` alone (`memo_landing`); a walk tests each Dirty node it plans for a memo, the root's compute tests once more, and `max_verified_at` clears a memo bit (a store under `Local`, a load and a cold CAS under `Shared`).
+- Base: spreadsheet-t10 adf57986. Tip: w/T8-caught-failed-read-lands 03794a1a (the engine b2e71d8e merges), the base in a detached worktree; one run of `icount.sh` at the default N per column, and `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_local/propagate/4` and `chain_shared/propagate/4`. No workloads added.
+- Change: a compute's landing classifies its frame's `POISONED` and `HANDLED` flags (`ComputeCtl::poison`) and records a memo for `HANDLED` alone (`memo_landing`); a walk tests each Dirty node it plans for a memo, the node's compute tests again, and `max_verified_at` clears a memo bit (a store under `Local`, a load and a cold CAS under `Shared`).
 
 | workload | base | tip | delta |
 |---|---|---|---|
 | `get_clean_local` / `get_clean_shared` | 102 / 198 | 102 / 198 | 0 |
 | `table_hit_local` / `_shared` | 155.14 / 219.14 | 155.14 / 219.14 | 0 |
 | `value_slot_read_local` / `_shared` | 5 / 90 | 5 / 90 | 0 |
-| `chain_local/propagate/4` / `10` / `100` | 4,633 / 10,015 / 91,504.01 | 4,714 / 10,210 / 93,409.03 | +81 / +195 / +1,905.02 |
-| `chain_shared/propagate/4` / `10` / `100` | 9,624.22 / 21,029.81 / 193,132.12 | 9,664.22 / 21,123.81 / 194,036.18 | +40 / +94 / +904.06 |
-| `fanout_local_1000` / `fanout_shared_1000` | 3,461,212.14 / 4,804,755.33 | 3,478,229.37 / 4,807,760.25 | +17,017.23 / +3,004.92 |
-| `delete_cascade_local` / `_shared` | 3,246,569.46 / 4,585,757.55 | 3,263,569.91 / 4,588,760.01 | +17,000.45 / +3,002.46 |
+| `chain_local/propagate/4` / `10` / `100` | 4,633 / 10,015 / 91,504.01 | 4,729 / 10,255 / 93,904.01 | +96 / +240 / +2,400 |
+| `chain_shared/propagate/4` / `10` / `100` | 9,624.22 / 21,029.81 / 193,132.12 | 9,676.21 / 21,159.83 / 194,432.19 | +51.99 / +130.02 / +1,300.07 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,461,212.14 / 4,804,755.33 | 3,478,230.93 / 4,807,755.70 | +17,018.79 / +3,000.37 |
+| `delete_cascade_local` / `_shared` | 3,246,569.46 / 4,585,757.55 | 3,263,569.81 / 4,588,760.97 | +17,000.35 / +3,003.42 |
 
-Gate: every hard gate counts the same as the base. Each propagating compute costs about 19 more under `Local` and 9 under `Shared`. Intel PT at 03794a1a, before the entry test moved to the root only (which took 15 / 12 off `chain_*/propagate/4`), puts per compute: the memo test's load and bit test (`node.rs:422` +7 Local, +6 Shared, plus +1 at each guard), the stamp's memo clear (`node.rs:316` +3 Local; `node.rs:317` +3 and the atomics +7 Shared), the landing's flag mask and memo test (`cycle.rs:440`, `runtime.rs:4103`, +2), and code layout in `compute_attempts` (`Publish`'s compare out of line +3, `segmented_nodes.rs:191` +3, the landing target +4/-4). Fan-out and delete workloads compute one leaf per step. The rest move by noise (`delete_owned_tree_*` -2,280 / +1,164, the others under 5).
+Gate: every hard gate counts the same as the base. Each propagating compute costs 24 more under `Local` and 13 under `Shared`. Intel PT puts per compute: the two memo tests' load and bit test (`node.rs:422` +7 Local, +6 Shared, and +1 at each guard), the stamp's memo clear (`node.rs:316` +3 Local; `node.rs:317` +3 and the atomics +7 Shared), the landing's flag mask and memo test (`cycle.rs:440`, `runtime.rs:4103`, +2), and code layout in `compute_attempts` (`Publish`'s compare out of line +3, `segmented_nodes.rs:191` +3, the landing target +4/-4). Testing only the root's compute for a memo would save 4 / 3 per compute, but a walk entry whose memo landed after the walk planned it then reruns and can compute another value (0x66a's Local op 2). Fan-out and delete workloads compute one leaf per step. The rest move by noise (`delete_owned_tree_*` +3,884 / -2,708, the others under 5).
