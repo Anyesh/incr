@@ -1019,19 +1019,34 @@ impl<C: Cells> Runtime<C> {
     /// `compute_panicked` asks. A contained abort drops the replay contexts
     /// the root's frame opened, as that frame's unwind would; the caller
     /// tells the reading frame of any other that its read unwound, after
-    /// the landings it keeps a copy of.
+    /// the landings it keeps a copy of. A cycle of the episode's own held
+    /// members escapes, as a direct episode's does: containing it lets a
+    /// retry that reaches those members as walk entries answer otherwise
+    /// than the unbounded run. A cycle a member run met through nodes the
+    /// episode does not hold is that run's unwind, and is contained as one.
     fn episode_contains(
         &self,
         cidx: u32,
         kind: Option<UnwindKind>,
         payload: &(dyn Any + Send),
     ) -> bool {
-        let contain = contain_impl::walked_episode(cidx)
-            .is_some_and(|root| self.containable(root, None, kind, payload));
+        let contain = contain_impl::walked_episode(cidx).is_some_and(|root| {
+            !self.own_members_cycle(root, payload) && self.containable(root, cidx, kind, payload)
+        });
         if contain {
             replay::unwind_past(self.runtime_id, cidx);
         }
         contain
+    }
+
+    /// Whether `payload` is a cycle whose participants, `root` aside, are
+    /// all claims this thread holds.
+    fn own_members_cycle(&self, root: NodeId, payload: &(dyn Any + Send)) -> bool {
+        payload.downcast_ref::<CycleUnwind>().is_some_and(|c| {
+            c.0.participants()
+                .iter()
+                .all(|p| p.slot() == root.0 || cycle_state::holds(self.runtime_id, p.slot()))
+        })
     }
 
     /// Drops a user value an episode no longer needs, attributing a
@@ -1987,6 +2002,12 @@ impl<C: Cells> Runtime<C> {
         cidx: u32,
         bag: &mut Deferred<C>,
     ) -> PopEnd {
+        if !C::SINGLE_THREADED {
+            // Before the members land, so that a read of one of their
+            // landings also reads the count.
+            cycle_state::own_episode(self.runtime_id);
+            C::u64_fetch_add(&self.episodes_landed, 1);
+        }
         let rt = self.runtime_id;
         let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             members

@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Runtime;
@@ -1987,4 +1987,254 @@ fn local_shared_unbudgeted_foreign_read_keeps_no_clone() {
 #[test]
 fn shared_shared_unbudgeted_foreign_read_keeps_no_clone() {
     unbudgeted_foreign_read_keeps_no_clone::<Shared, Shared>();
+}
+
+/// X reads B's uncopyable panic `held_at` KiB deep, then `during` runs,
+/// then X reads its own runtime's Y, which reads Z, `deep` KiB deep.
+/// Returns X's value: 10 for its own payload, plus Y's 2.
+fn hold_then_own_read<A: Cells, B: Cells>(
+    before: fn(&Runtime<A>),
+    during: fn(&Runtime<A>),
+    held_at: usize,
+    deep: usize,
+) -> i64 {
+    quiet_uncopyable();
+    std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        before(&r1);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+        let z = r1.create_query_with(|_| 1_i64, opts());
+        let y = r1.create_query_with(move |rt| rt.get(z) + 1, opts());
+        let r2 = OtherRt(&*r2);
+        let x = r1.create_query_with(
+            move |rt| {
+                let own =
+                    deeper(held_at, || quiet(|| r2.get(bq))).is_err_and(|p| p.is::<Uncopyable>());
+                during(rt);
+                10 * i64::from(own) + deeper(deep, || rt.get(y))
+            },
+            opts(),
+        );
+        r1.get(x)
+    })
+    .join()
+    .unwrap()
+}
+
+/// [`hold_then_own_read`] with X's first read of its own runtime's A,
+/// which panics with a message, in place of B's uncopyable panic.
+fn own_panic_then_own_read<A: Cells>(before: fn(&Runtime<A>), during: fn(&Runtime<A>)) -> i64 {
+    std::thread::spawn(move || {
+        let r1 = Runtime::<A>::new();
+        r1.set_placeholder(0_i64);
+        before(&r1);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let a = r1.create_query(|_| -> i64 { std::panic::panic_any("own") });
+        let z = r1.create_query_with(|_| 1_i64, opts());
+        let y = r1.create_query_with(move |rt| rt.get(z) + 1, opts());
+        let x = r1.create_query_with(
+            move |rt| {
+                let own =
+                    quiet(|| rt.get(a)).is_err_and(|p| p.downcast_ref::<&str>() == Some(&"own"));
+                during(rt);
+                10 * i64::from(own) + rt.get(y)
+            },
+            opts(),
+        );
+        r1.get(x)
+    })
+    .join()
+    .unwrap()
+}
+
+/// X reads Y1 and then Y2, siblings that each take an uncopyable foreign
+/// read `held_at` KiB deep and then read their own runtime 96 KiB deep,
+/// under a 64 KiB byte budget. Returns how many times each ran.
+fn sibling_holds<A: Cells, B: Cells>(held_at: [usize; 2]) -> [usize; 2] {
+    quiet_uncopyable();
+    std::thread::spawn(move || {
+        let runs: &'static [AtomicUsize; 2] = Box::leak(Box::default());
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        r1.set_max_frames(u32::MAX);
+        r1.set_max_stack_bytes(64 * 1024);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let ys = [0, 1].map(|i| {
+            let z = r1.create_query_with(|_| 1_i64, opts());
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with(
+                move |rt| {
+                    runs[i].fetch_add(1, Ordering::SeqCst);
+                    let _ = deeper(held_at[i], || quiet(|| r2.get(bq)));
+                    deeper(96, || rt.get(z))
+                },
+                opts(),
+            )
+        });
+        let x = r1.create_query_with(move |rt| rt.get(ys[0]) + rt.get(ys[1]), opts());
+        r1.get(x);
+        runs.each_ref().map(|n| n.load(Ordering::SeqCst))
+    })
+    .join()
+    .unwrap()
+}
+
+/// A hold Y1 took and gave up with its frame does not hold Y2, a later
+/// frame at the same place: Y2's own hold, past the budget, leaves it
+/// doomed and run again when it reads past the budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_popped_siblings_hold_does_not_hold_the_next_frame() {
+    let (both, second) = (
+        sibling_holds::<Local, Shared>([96, 96]),
+        sibling_holds::<Local, Shared>([0, 96]),
+    );
+    assert!(both[1] > 1 && second[1] > 1, "{both:?} {second:?}");
+}
+
+mod review_8b_held_deep_read {
+    use super::{hold_then_own_read, Runtime};
+    use crate::cells::{Cells, Local, Shared};
+
+    fn none<C: Cells>(_: &Runtime<C>) {}
+
+    fn unbudgeted<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+    }
+
+    fn bytes_64k<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(64 * 1024);
+    }
+
+    /// X's hold, taken within the byte budget, keeps X undoomed as
+    /// `NO_DOOM` would when X's own later read is past the budget, so X
+    /// sees its own payload as the unbudgeted run does.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_held_frame_reading_deep_keeps_its_payload() {
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 0, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(bytes_64k, none, 0, 96),
+            12
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_a_held_frame_reading_deep_keeps_its_payload() {
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(unbudgeted, none, 0, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(bytes_64k, none, 0, 96),
+            12
+        );
+    }
+}
+
+mod review_8b_mid_compute_budget {
+    use super::{hold_then_own_read, own_panic_then_own_read, Runtime};
+    use crate::cells::{Cells, Local, Shared};
+
+    fn none<C: Cells>(_: &Runtime<C>) {}
+
+    fn unbudgeted<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+    }
+
+    fn frames_2<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(2);
+    }
+
+    /// A frame budget set while X runs applies to reads made after it, so
+    /// X's foreign read made before it is not retried: X sees its own
+    /// payload, as with no budget and with the budget set beforehand.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_set_mid_compute_keeps_the_earlier_payload() {
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 0, 0),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(frames_2, none, 0, 0),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, frames_2, 0, 0),
+            12
+        );
+    }
+
+    fn bytes_64k<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(64 * 1024);
+    }
+
+    fn bytes_1m<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(1024 * 1024);
+    }
+
+    /// X's hold, taken 96 KiB deep where no budget or a 1 MiB one held
+    /// it, still holds X once a 64 KiB budget is set mid-compute.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_tightened_mid_compute_keeps_an_earlier_hold() {
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, bytes_64k, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(bytes_1m, bytes_64k, 96, 96),
+            12
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_a_budget_tightened_mid_compute_keeps_an_earlier_hold() {
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(bytes_1m, bytes_64k, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(unbudgeted, bytes_64k, 96, 96),
+            12
+        );
+    }
+
+    /// A frame budget set while X runs keeps X's earlier read of its own
+    /// runtime's panic, which nothing kept while X's runtime had no budget.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_set_mid_compute_keeps_an_earlier_own_panic() {
+        assert_eq!(own_panic_then_own_read::<Local>(unbudgeted, none), 12);
+        assert_eq!(own_panic_then_own_read::<Local>(frames_2, none), 12);
+        assert_eq!(own_panic_then_own_read::<Local>(unbudgeted, frames_2), 12);
+        assert_eq!(own_panic_then_own_read::<Shared>(unbudgeted, frames_2), 12);
+    }
 }

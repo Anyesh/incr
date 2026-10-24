@@ -392,7 +392,9 @@ impl<C: Cells> Runtime<C> {
             Computed::Deferred => Err(ObsErr::Cycle(stamp)),
             // The reading run is thrown away and its retry reads again.
             Computed::Doomed | Computed::Discarded => Err(ObsErr::Gone),
-            Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
+            Computed::Skipped(_) | Computed::Replan => {
+                unreachable!("incr-core: a walk's root is never skipped or replanned")
+            }
         }
     }
 

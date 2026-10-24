@@ -1323,6 +1323,8 @@ fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> 
 thread_local! {
     /// Which of a two-thread run's threads this is.
     static TWO_THREAD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The phase a two-thread run's thread is in.
+    static TWO_PHASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Thread 0's call at the end of each read phase with two reads, by the
@@ -1367,6 +1369,7 @@ fn run_two_until(
                         break;
                     }
                     if let Some(i) = phase.of(t) {
+                        TWO_PHASE.with(|c| c.set(p));
                         let op = &case.ops[i];
                         match catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op)))) {
                             Ok((out, ran)) => {
@@ -3036,6 +3039,70 @@ fn a_member_try_get_keeps_a_swallowing_closures_cycle() {
     }
 }
 
+/// Member 5 (created first) try_gets 1, and then 4 on discovery's `Err`
+/// but 3 once 1 has a buffer, so 3 joins the episode only in 5's member
+/// run, where it computes natively. 3's `try_get` of 4, a held member
+/// without a buffer, is R5 in the unbounded run: 4 swallows the cycle on 5
+/// and panics, and that unwind stays the cycle's, so the episode's abort
+/// leaves 3 New. A bounded run delivers 4's unwind to 3's retry, which is
+/// not a member run, so `take_delivery` passes it on as an ordinary panic
+/// and 3 lands Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_native_try_get_of_a_held_member_keeps_a_swallowing_closures_cycle() {
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let case = Case {
+        specs: vec![
+            replayable(Expr::Read(1, false), Strat::None),
+            replayable(
+                Expr::Add(r(2, false), Box::new(Expr::Const(1))),
+                Strat::None,
+            ),
+            replayable(Expr::Read(5, true), Strat::None),
+            replayable(Expr::Read(4, true), Strat::None),
+            replayable(
+                Expr::If(
+                    Box::new(Expr::Catch(r(1, false))),
+                    Box::new(Expr::PanicIf(Box::new(Expr::Catch(r(5, false))), 3)),
+                    Box::new(Expr::Const(0)),
+                ),
+                Strat::None,
+            ),
+            replayable(Expr::If(r(1, true), r(3, true), r(4, true)), Strat::None),
+            Spec::Input(1),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 6,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0)],
+    };
+    fn outcomes<C: Cells>(case: &Case, frames: Option<u32>) -> Vec<(Out, Vec<NodeState>)> {
+        run::<C>(case, frames, 0)
+            .into_iter()
+            .map(|(out, snap)| (out, snap.0))
+            .collect()
+    }
+    quiet(|| {
+        let unbounded = outcomes::<Local>(&case, None);
+        assert_eq!(unbounded[0].1[3], NodeState::New);
+        assert_eq!(outcomes::<Shared>(&case, None), unbounded);
+        for frames in 1..=3 {
+            assert_eq!(
+                outcomes::<Local>(&case, Some(frames)),
+                unbounded,
+                "Local, budget {frames}"
+            );
+            assert_eq!(
+                outcomes::<Shared>(&case, Some(frames)),
+                unbounded,
+                "Shared, budget {frames}"
+            );
+        }
+    });
+}
+
 /// Seed 0xd3713dd8cf68c605, shrunk. 4 reads the ring 5, 6, 7, 8, 9, 10,
 /// where 10, a Fallback(0) member, reads the input and 5, and 7 panics on
 /// 8's value. At budget 2 the first pass delivered 9's cycle to 8's read
@@ -3452,6 +3519,23 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
     });
 }
 
+/// Seed 0xe4aa8b2e, two threads at a budget of 1 or 2: both threads read
+/// node 0, whose cycle branches on a caught panic, and `Get(0)` returns
+/// 9999 where every order panics. Each thread's doom discard-lands a node
+/// the other thread then claims, down the chain from node 26, as in 0x5aab.
+/// It fails in about one debug `differential_two` run in five.
+#[test]
+#[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_frame_keeps_its_node_from_the_other_thread_e4aa8b2e() {
+    let case = gen_case(0xe4aa_8b2e, false, true);
+    quiet(|| {
+        for _ in 0..16 {
+            differential_two(&case, 0xe4aa_8b2e);
+        }
+    });
+}
+
 /// Seed 0x57c2661 cut to `Get(12)` on a fresh runtime with 24 at 4: a
 /// cycle reaches the read unbounded, aborting 13's episode, which is no
 /// walk's. At budgets 1 to 3 a doom discards a member run of that episode
@@ -3486,6 +3570,46 @@ fn a_walked_episode_in_a_try_get_cycle_answers_as_unbounded() {
         differential::<Local>(&case, seed);
         differential::<Shared>(&case, seed);
     });
+}
+
+/// Seed 0x52's op 9, `Get(12)` at budget 1: 12 reads 13 twice, and the
+/// first read's walk of 13 is doomed with 7's rerun still in it. The
+/// doomed run's second read of 13 pushed a speculative entry that landed
+/// 13 before 12's retry, so the retry never resumed the walk and 7 stayed
+/// Dirty where the unbounded run leaves it Clean.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
+    let seed = 0x52;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(10);
+    assert!(matches!(case.ops[9], Op::Get(12)));
+    quiet(|| {
+        // A forced prune leaves the unread node 8 Dirty where the doomed
+        // walk's retry computes it: walk scope, not a result.
+        if *super::FORCE_REPLAN {
+            outcomes_alike::<Local>(&case, seed);
+            outcomes_alike::<Shared>(&case, seed);
+        } else {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        }
+    });
+}
+
+/// [`differential`]'s runs, compared by their operations' outcomes alone.
+fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
+    let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
+    let unbounded = outcomes(run::<C>(case, None, 0));
+    for frames in [1, 2, 3] {
+        for bytes in [0, 16 * 1024] {
+            let bounded = outcomes(run::<C>(case, Some(frames), bytes));
+            assert_eq!(
+                bounded, unbounded,
+                "seed {seed:#x}, budget {frames} frames, {bytes} bytes"
+            );
+        }
+    }
 }
 
 /// Seeds 0x833e and 0x41eb, one thread, and the two-thread seed 0x2b13
@@ -5978,5 +6102,169 @@ fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
             let shared = outs(run::<Shared>(&case, Some(frames), 0));
             assert_eq!(shared, unbounded, "Shared, budget {frames}");
         }
+    });
+}
+
+/// `seed`'s operations with every `Get` read four more times with no set
+/// between, and the first get whose repeats differ from it, any panic
+/// counting as the same outcome: a Failed node's later reads raise
+/// "last compute panicked" in place of the first read's payload.
+fn first_changed_get<C: Cells>(seed: u64) -> Option<(usize, Vec<Out>)> {
+    let mut case = gen_case(seed, false, false);
+    case.ops = case
+        .ops
+        .drain(..)
+        .flat_map(|op| {
+            let n = if matches!(op, Op::Get(_)) { 5 } else { 1 };
+            std::iter::repeat_n(op, n)
+        })
+        .collect();
+    let mut trace = Vec::new();
+    quiet(|| trace = run::<C>(&case, None, 0));
+    let outcome = |i: usize| match &trace[i].0 {
+        Out::Panic(_) => Out::Panic(String::new()),
+        o => o.clone(),
+    };
+    let mut i = 0;
+    while i < case.ops.len() {
+        if !matches!(case.ops[i], Op::Get(_)) {
+            i += 1;
+            continue;
+        }
+        if (i + 1..i + 5).any(|j| outcome(j) != outcome(i)) {
+            return Some((i, trace[i..i + 5].iter().map(|(o, _)| o.clone()).collect()));
+        }
+        i += 5;
+    }
+    None
+}
+
+/// 0x1a7: q7 catches a co-member's cycle panic and sits in two
+/// overlapping episodes, so each episode lands Dirty through real poison
+/// and the next get plans the other cycle: 9999, 8, 9999, ... 0x4ea
+/// alternates the same way, and 0x701 reads 9999, 4, 9999. Keeping a
+/// Dirty landing's outcome for its revision (T8-get-alternates-without-set,
+/// rule (b)) is beta.7 work.
+#[test]
+#[ignore = "beta.7: T8-get-alternates-without-set rule (b)"]
+fn a_member_catching_a_co_members_cycle_panic_repeats_its_get() {
+    for seed in [0x1a7, 0x4ea, 0x701] {
+        assert_eq!(first_changed_get::<Local>(seed), None, "{seed:#x}");
+        assert_eq!(first_changed_get::<Shared>(seed), None, "{seed:#x}");
+    }
+}
+
+/// Runs `case`'s phase of ops `pair` on two threads with thread 0's
+/// walk held before its compute of query `held`, until thread 1's read
+/// has settled `settled` and left `left` as they are (by query), then
+/// checks the run against the orders.
+fn hold_planned_walk(
+    case: &Case,
+    seed: u64,
+    pair: [usize; 2],
+    held: usize,
+    settled: &'static [(usize, NodeState)],
+) -> Trace {
+    let phases = phases(case, seed);
+    let overlap = phases.iter().position(|p| p.ops() == pair).unwrap();
+    assert_eq!(phases[overlap].of(0), Some(pair[0]));
+    let ready = Arc::new(AtomicBool::new(false));
+    let rig = |live: &Live<Shared>| {
+        let (ready, world) = (ready.clone(), live.world.clone());
+        let slot = move |q| world.handle(0, q).erased().slot();
+        let world = live.world.clone();
+        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+            if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                return;
+            }
+            let state = |q| world.rt(0).nodes.get(slot(q)).state();
+            match TWO_THREAD.with(std::cell::Cell::get) {
+                Some(0)
+                    if p == ParkPoint::BeforeComputeOne(NodeId(slot(held)))
+                        && !ready.swap(true, SeqCst) =>
+                {
+                    until(|| settled.iter().all(|&(q, s)| state(q) == s));
+                }
+                Some(1) => until(|| ready.load(SeqCst)),
+                _ => {}
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    let serial = Serial::new(case, &phases);
+    let verdict = Mutex::new(None);
+    let got = run_two_until(case, &phases, None, 0, &rig, &|p, prefix, live| {
+        if p == overlap {
+            assert!(
+                ready.load(SeqCst),
+                "thread 0's walk reached the held compute"
+            );
+            assert!(
+                live.world.rt(0).unrun_unclaims.load(SeqCst) > 0,
+                "thread 0's walk re-planned"
+            );
+        }
+        let v = serial.at_overlap("held walk", prefix, live);
+        let stop = v.is_some();
+        *verdict.lock().unwrap() = v;
+        stop
+    });
+    serial.check("held walk", &got, verdict.into_inner().unwrap());
+    got
+}
+
+/// 0x7c3a12bcc's ops 8 (`Get(7)`, thread 0) and 9 (`Get(9)`, thread 1)
+/// enter one cycle at different members. Thread 0's walk of 7 plans down
+/// to 22 and is held there while thread 1 resolves the cycle alone: it
+/// lands 7 Clean by 7's fallback, leaves 22 and 23 New, and panics with
+/// the cycle, as `Get(9)` does first in a single thread. The order with
+/// `Get(9)` first then reads 7 Clean; a walk that goes on with its plan
+/// computes 22 again and panics too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_replans_after_another_thread_lands_its_root_by_a_cycle() {
+    let seed = 0x7c3a12bcc;
+    let case = gen_case(seed, false, true);
+    use NodeState::{Clean, Dirty, New};
+    quiet(|| {
+        let got = hold_planned_walk(
+            &case,
+            seed,
+            [8, 9],
+            22,
+            &[(7, Clean), (22, New), (23, New), (21, Dirty)],
+        );
+        assert_eq!(got[9].0, Out::Panic("cycle".into()));
+        assert_eq!(got[8].0, Out::Value(2));
+    });
+}
+
+/// As above with thread 0 reading 18, rewritten to read 7, so the node
+/// thread 1 lands Clean is an intermediate of thread 0's plan, not its
+/// root, and 18 stays Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_replans_after_another_thread_lands_an_intermediate_by_a_cycle() {
+    let seed = 0x7c3a12bcc;
+    let mut case = gen_case(seed, false, true);
+    case.specs[18] = Spec::Query {
+        expr: Expr::Read(7, false),
+        replay: true,
+        bare: false,
+        strategy: Strat::None,
+    };
+    case.ops[0] = Op::Get(18);
+    case.ops[8] = Op::Get(18);
+    use NodeState::{Clean, Dirty, New};
+    quiet(|| {
+        let got = hold_planned_walk(
+            &case,
+            seed,
+            [8, 9],
+            22,
+            &[(7, Clean), (22, New), (23, New), (21, Dirty), (18, Dirty)],
+        );
+        assert_eq!(got[9].0, Out::Panic("cycle".into()));
+        assert!(matches!(got[8].0, Out::Value(_)), "{:?}", got[8].0);
     });
 }
