@@ -281,6 +281,81 @@ fn shared_vframe_node_read_failed_read_above() {
     vframe_node_read(FAILED, true);
 }
 
+/// The landed-VFrame shape at budget 1 with the other thread's read of X
+/// parked between its claim CAS and its reservation check, so X is
+/// Computing on that thread when the driver pops X's virtual frame. The
+/// pop must wait for the claim to be given back and retry X, not take a
+/// node Computing elsewhere as finished: the dooming thread never waits
+/// on the other read's claim, and both reads are the unbounded run's in
+/// which T's came first.
+#[test]
+fn shared_vframe_pop_waits_out_a_claim_before_its_reservation_check() {
+    let s = landed_shape(Rt::new(), false);
+    s.rt.set_max_frames(1);
+    let (entry, check) = (Gate::new(), Gate::new());
+    let reader_id: Arc<OnceLock<ThreadId>> = Arc::default();
+    let reader_waits = Arc::new(AtomicU32::new(0));
+    {
+        let (x, y) = (id(s.x), id(s.y));
+        let (entry, check) = (entry.clone(), check.clone());
+        let (reader_id, reader_waits) = (reader_id.clone(), reader_waits.clone());
+        let installed = s.rt.park_hook.set(Box::new(move |p| {
+            if p == ParkPoint::BeforeEntry(y) {
+                entry.park();
+            } else if p == ParkPoint::BeforeReservationCheck(x) {
+                check.park();
+            } else if p == ParkPoint::ComputeWaits(x)
+                && reader_id.get() == Some(&thread::current().id())
+            {
+                reader_waits.fetch_add(1, SeqCst);
+            }
+        }));
+        assert!(installed.is_ok(), "park hook installed twice");
+    }
+    entry.arm();
+    let reader = {
+        let (rt, t, reader_id) = (s.rt.clone(), s.t, reader_id.clone());
+        spawn(move || {
+            reader_id.set(thread::current().id()).unwrap();
+            outcome(|| rt.get(t))
+        })
+    };
+    entry.wait_parked();
+    s.mode.store(CLEAN, SeqCst);
+    check.arm();
+    let other = {
+        let (rt, x) = (s.rt.clone(), s.x);
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    check.wait_parked();
+    assert_eq!(s.rt.state_of(s.x), NodeState::Computing);
+    entry.release();
+    // A right pop waits until the release; a wrong one reaches X's claim
+    // well inside the window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while reader_waits.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
+        thread::yield_now();
+    }
+    check.release();
+    let (t, x) = (reader.join(), other.join());
+
+    let (want_t, want_x, want_later) = t_first(CLEAN, false);
+    assert_eq!((t, x), (want_t, want_x));
+    assert_eq!(
+        s.x_runs.load(SeqCst),
+        alone_switched_runs(CLEAN, false),
+        "the other thread's read ran X"
+    );
+    assert_eq!(s.rt.state_of(s.x), NodeState::Clean);
+    assert_eq!(outcome(|| s.rt.get(s.t)), want_later, "a later read agrees");
+    s.rt.assert_invariant_i();
+    assert_eq!(
+        reader_waits.load(SeqCst),
+        0,
+        "the pop took X, Computing on the other thread, as finished"
+    );
+}
+
 /// The landed-VFrame shape with X's closure switched to park inside its
 /// run while another thread's read of X waits for X's reservation: the
 /// retry of X claims it and parks there, X Computing on the dooming
