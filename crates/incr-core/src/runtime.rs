@@ -841,9 +841,12 @@ fn reached_under_own_set(id: NodeId) -> ! {
 /// A replayed run can be speculative: after a read returned a
 /// placeholder, the run may evaluate queries the run without a budget
 /// would never evaluate. Such a run lands nothing: the value or panic it
-/// ends with is kept for the revision, and a later read of that query
-/// takes it if nothing the run read has changed, and otherwise runs the
-/// closure again, as it does when the run met a cycle. A
+/// ends with, and the children it created, are kept for the revision, and
+/// a later read of that query takes them if nothing the run read has
+/// changed, and otherwise runs the closure again. So does a later read of a
+/// query whose run kept nothing: it read a dep that did not land Clean or
+/// a panic that another speculative run kept, it read through a run that
+/// kept nothing, or it met a cycle. A
 /// [`Replay::Native`](crate::Replay::Native) query runs speculatively at
 /// most once per revision.
 ///

@@ -1167,6 +1167,94 @@ fn shared_native_creator_runs_once_as_unbounded() {
     native_creator_runs_once_as_unbounded::<Shared>();
 }
 
+/// How the speculative run of `c` in [`native_rerun_exception`] reads
+/// `p`, a query that panics.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum RerunShape {
+    /// `c` catches the panic of `p`, which a real read left Failed: its run
+    /// read a dep that did not land Clean.
+    Poisoned,
+    /// `c` catches the panic of `p`, whose own speculative run stashed it:
+    /// the run unwinds with a discard where it would catch the panic.
+    StashedPanic,
+    /// `c` reads replayable `e` past the budget: its run dooms, and the
+    /// run that retries it is stashed, so `c` runs as often as unbounded.
+    Doomed,
+    /// `c` reads Native `d`, which catches the panic of Failed `p`: `d`'s
+    /// run keeps nothing, so the chain above it drops.
+    DroppedChain,
+}
+
+/// A Native `c` reached first by a speculative run of `r` whose run keeps
+/// nothing to adopt: the real `get(c)` runs its closure again, one run more
+/// than the unbounded run, with the unbounded run's value. Returns `c`'s
+/// value and runs.
+fn native_rerun_exception<C: Cells>(frames: u32, shape: RerunShape) -> (u64, u32) {
+    let rt = native_runtime::<C>();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let b = rt.create_query(|_| 5_u64);
+    let p = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("p fails") });
+    let caught = move |rt: &Runtime<C>| catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_or(9);
+    let d = rt.create_query(caught);
+    let f = rt.create_query_with(|_| 3_u64, replayable());
+    let e = rt.create_query_with(move |rt| rt.get(f) + 1, replayable());
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let c = rt.create_query(move |rt: &Runtime<C>| {
+        counted.fetch_add(1, SeqCst);
+        match shape {
+            RerunShape::Poisoned | RerunShape::StashedPanic => caught(rt) + 1,
+            RerunShape::Doomed => rt.get(e) + 1,
+            RerunShape::DroppedChain => rt.get(d) + 1,
+        }
+    });
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    if shape != RerunShape::StashedPanic {
+        assert!(catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err());
+    }
+    assert_eq!(rt.get(r), 5);
+    let v = rt.get(c);
+    (v, runs.load(SeqCst))
+}
+
+fn native_rerun_exceptions<C: Cells>() {
+    for shape in [
+        RerunShape::Poisoned,
+        RerunShape::StashedPanic,
+        RerunShape::Doomed,
+        RerunShape::DroppedChain,
+    ] {
+        let (v, runs) = native_rerun_exception::<C>(u32::MAX, shape);
+        let rerun = u32::from(shape != RerunShape::Doomed);
+        assert_eq!(
+            native_rerun_exception::<C>(1, shape),
+            (v, runs + rerun),
+            "{shape:?}: (c, c's runs) at budget 1 vs unbounded"
+        );
+    }
+}
+
+#[test]
+fn local_native_rerun_exceptions() {
+    native_rerun_exceptions::<Local>();
+}
+
+#[test]
+fn shared_native_rerun_exceptions() {
+    native_rerun_exceptions::<Shared>();
+}
+
 /// A stash no real claim adopts is freed when a set ends its revision, and
 /// when the runtime drops.
 fn unadopted_stash_is_freed<C: Cells>(set: bool) {
