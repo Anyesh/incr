@@ -1629,3 +1629,50 @@ fn a_get_waiting_on_a_compute_checks_the_locks_it_holds() {
         "got: {msg}"
     );
 }
+
+/// A walk entry's claim released unrun after the episode check: a reader
+/// waiting on that claim goes on, and reads the node once it lands.
+#[test]
+fn a_claim_released_unrun_ends_its_waiters_wait() {
+    let rt = Arc::new(Rt::new());
+    let (x, q, d) = chain(&rt);
+    rt.set(x, 2);
+    let (claimed, waiting) = (Gate::new(), Gate::new());
+    // The walker passes the reader's park point before its claim, so the
+    // reader's gate is armed only once the walker holds the claim.
+    let points = [
+        (ParkPoint::AfterWalkClaim(id(q)), claimed.clone()),
+        (ParkPoint::BeforeComputeOne(id(q)), waiting.clone()),
+    ];
+    claimed.arm();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        for (point, gate) in &points {
+            if *point == p {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let walker = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            super::FORCE_REPLAN_HERE.with(|f| f.set(true));
+            rt.get(d)
+        })
+    };
+    claimed.wait_parked();
+    waiting.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(q))
+    };
+    waiting.wait_parked();
+    waiting.release();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::Computing);
+    claimed.release();
+    assert_eq!(reader.join().unwrap(), 1);
+    assert_eq!(walker.join().unwrap(), 101);
+    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    rt.assert_invariant_i();
+}

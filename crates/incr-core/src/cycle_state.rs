@@ -818,6 +818,7 @@ thread_local! {
             stack_base: Cell::new(0),
         }
     };
+    static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
     static OUTER: RefCell<Outer> = const {
         RefCell::new(Outer {
             dissolved: Vec::new(),
@@ -838,6 +839,7 @@ loom::thread_local! {
         held_any: Cell::new(false),
         stack_base: Cell::new(0),
     };
+    static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         last_cycle: None,
@@ -1007,6 +1009,27 @@ pub(crate) fn stack_base() -> usize {
 /// The thread's engine entry depth: 0 outside every engine entry.
 pub(crate) fn depth() -> u32 {
     ENTRY.with(|e| e.depth.get())
+}
+
+/// Counts an episode this thread lands on `rt`.
+pub(crate) fn own_episode(rt: RuntimeId) {
+    OWN_EPISODES.with(|o| {
+        let mut o = o.borrow_mut();
+        match o.iter_mut().find(|(r, _)| *r == rt) {
+            Some((_, n)) => *n = n.wrapping_add(1),
+            None => o.push((rt, 1)),
+        }
+    });
+}
+
+/// The episodes this thread has landed on `rt`.
+pub(crate) fn own_episodes(rt: RuntimeId) -> u64 {
+    OWN_EPISODES.with(|o| {
+        o.borrow()
+            .iter()
+            .find(|(r, _)| *r == rt)
+            .map_or(0, |&(_, n)| n)
+    })
 }
 
 /// This thread's wound-wait ticket, taken from `next` at its first
