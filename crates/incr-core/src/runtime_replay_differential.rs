@@ -2650,6 +2650,100 @@ fn seed_56cd8c2_keeps_the_failed_set() {
     });
 }
 
+/// 0xe126d92b8f, shrunk. 9 (Fallback) reads 4, which `try_get`s 5, and 5
+/// reaches 9 again through 6. In `Get(9)` the walk of Fixpoint member 2's
+/// run computes 9 twice at the same position and path, and at budget 3
+/// each run's read of 4 dooms it. Both reads have one key, so the second
+/// doom's delivery replaced the first, the member's restart gave it to
+/// the first run, and the second run doomed 4 again, forever.
+fn seed_e126d92b8f_case() -> Case {
+    let q = |expr, replay, bare, strategy| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy,
+    };
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let c = |v| Box::new(Expr::Const(v));
+    Case {
+        specs: vec![
+            q(Expr::Read(1, false), true, false, Strat::None),
+            q(Expr::Read(2, false), true, false, Strat::None),
+            q(
+                Expr::If(r(8, false), r(1, true), c(0)),
+                true,
+                false,
+                Strat::Fixpoint {
+                    initial: 2,
+                    limit: 3,
+                },
+            ),
+            q(Expr::Const(3), false, false, Strat::None),
+            q(Expr::Read(5, true), false, false, Strat::None),
+            q(
+                Expr::If(
+                    Box::new(Expr::Add(r(10, false), c(1))),
+                    Box::new(Expr::If(r(6, false), c(0), r(7, false))),
+                    c(0),
+                ),
+                true,
+                true,
+                Strat::None,
+            ),
+            q(Expr::Read(9, false), true, false, Strat::None),
+            q(
+                Expr::If(r(2, false), r(8, true), c(0)),
+                false,
+                false,
+                Strat::None,
+            ),
+            q(Expr::Read(9, true), true, false, Strat::None),
+            q(
+                Expr::Add(c(1), r(4, false)),
+                true,
+                false,
+                Strat::Fallback(1),
+            ),
+            q(
+                Expr::If(r(11, false), r(10, true), c(1)),
+                true,
+                false,
+                Strat::None,
+            ),
+            q(Expr::Read(12, false), true, true, Strat::None),
+            Spec::Input(1),
+            Spec::Input(0),
+            Spec::Input(3),
+        ],
+        panics: false,
+        cycles: true,
+        queries: 12,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(1), Op::Set(12, 2), Op::Get(0), Op::Get(9)],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_e126d92b8f_repeated_runs_keep_their_deliveries() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let case = seed_e126d92b8f_case();
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            quiet(|| {
+                differential::<Local>(&case, 0xe1_26d9_2b8f);
+                differential::<Shared>(&case, 0xe1_26d9_2b8f);
+            });
+        }));
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(r) => r.unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        Err(_) => panic!("seed 0xe126d92b8f: a bounded run never returned"),
+    }
+}
+
 /// 0x16d87, shrunk: a fresh `TryGet(18)`, which unbounded gets a cycle of
 /// six participants. At budget 1, a speculative run's walk memoized 10
 /// under the frame at position 1, so 11's later read of 10 computed it
