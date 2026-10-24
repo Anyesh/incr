@@ -95,9 +95,10 @@ pub(crate) struct Inner<C: Cells> {
     /// `IN_GROUP`.
     pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
     /// Each query a user panic released New over a union of deps
-    /// ([`Runtime::land_panic_released`]), with the generation it landed
-    /// under and how many of those deps, from the front, its last finished
-    /// run read. Any other publish of its deps drops it.
+    /// ([`Runtime::land_panic_released`]): that union's length, and how
+    /// many of its deps, from the front, its last finished run read. A
+    /// Failed landing's union, which keeps the old deps as its prefix,
+    /// carries it; any other publish of its deps drops it.
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
@@ -418,6 +419,12 @@ impl<'a> PanicUnion<'a> {
             Self::Failed(m) | Self::Released(m) => m,
         }
     }
+}
+
+fn dep_len<C: Cells>(node: &NodeData<C>) -> u32 {
+    let mut n = 0;
+    node.for_each_dep(|_| n += 1);
+    n
 }
 
 /// What `publish_deps` found when it validated a compute's recorded deps.
@@ -4460,19 +4467,22 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// A finished run published the deps it already had.
+    /// A finished run published the deps it already had. The read hold
+    /// keeps a runtime with any entry left from writing on every publish.
     #[cold]
     #[inline(never)]
     fn drop_released_entry(&self, id: NodeId) {
-        self.set_released(&mut self.inner.write(), id.0, None);
+        if self.inner.read().released_deps.contains_key(&id.0) {
+            self.set_released(&mut self.inner.write(), id.0, None);
+        }
     }
 
     #[cold]
     #[inline(never)]
     fn released_entry(&self, id: NodeId, node: &NodeData<C>) -> Option<u32> {
         let inner = self.inner.read();
-        let &(generation, kept) = inner.released_deps.get(&id.0)?;
-        (generation == node.generation()).then_some(kept)
+        let &(len, kept) = inner.released_deps.get(&id.0)?;
+        (len == dep_len(node)).then_some(kept)
     }
 
     /// A frame pop found the memo, unwind or replay bit in the thread word.
@@ -4883,14 +4893,17 @@ impl<C: Cells> Runtime<C> {
             bag.push_dep_list(displaced);
         }
         // The union keeps the old deps as its prefix.
-        let entry = matches!(panic, Some(PanicUnion::Released(_))).then(|| {
-            let kept = inner
-                .released_deps
-                .get(&id.0)
-                .filter(|&&(generation, _)| generation == node.generation())
-                .map_or(diff.old.len() as u32, |&(_, kept)| kept);
-            (node.generation(), kept)
-        });
+        let kept = inner
+            .released_deps
+            .get(&id.0)
+            .filter(|&&(len, _)| len as usize == diff.old.len())
+            .map(|&(_, kept)| kept);
+        let len = diff.new.len() as u32;
+        let entry = match panic {
+            Some(PanicUnion::Released(_)) => Some((len, kept.unwrap_or(diff.old.len() as u32))),
+            Some(PanicUnion::Failed(_)) => kept.map(|kept| (len, kept)),
+            None => None,
+        };
         self.set_released(&mut inner, id.0, entry);
 
         for old_dep in diff.old {
@@ -4941,23 +4954,29 @@ impl<C: Cells> Runtime<C> {
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl<C: Cells> Runtime<C> {
-    /// Invariant (I) of the shared-protocol plan, checked at quiescence:
-    /// every installed dep S of a `Clean` node X is alive, has X in
-    /// `dependents[S]`, and is itself `Clean`. Also checks that no freed
-    /// slot still carries reverse edges.
-    /// A finished run's publish drops its node's released entry, so a Clean
-    /// node keeps none.
-    pub(crate) fn assert_released_entries_unsettled(&self) {
+    /// Every released entry counts its node's current deps, as each publish
+    /// that replaces them sets or drops it, and no Clean node keeps one: a
+    /// finished run's publish drops it.
+    pub(crate) fn assert_released_entries_match_deps(&self) {
         let inner = self.inner.read();
-        for &slot in inner.released_deps.keys() {
-            let state = self.nodes.get(slot).state();
+        for (&slot, &(len, kept)) in &inner.released_deps {
+            let node = self.nodes.get(slot);
+            let deps = dep_len(node);
             assert!(
-                state != NodeState::Clean,
+                len == deps && kept < len,
+                "node {slot} has {deps} deps under a released entry ({len}, {kept})"
+            );
+            assert!(
+                node.state() != NodeState::Clean,
                 "node {slot} is Clean with a released entry"
             );
         }
     }
 
+    /// Invariant (I) of the shared-protocol plan, checked at quiescence:
+    /// every installed dep S of a `Clean` node X is alive, has X in
+    /// `dependents[S]`, and is itself `Clean`. Also checks that no freed
+    /// slot still carries reverse edges.
     pub(crate) fn assert_invariant_i(&self) {
         let inner = self.inner.read();
         for x in 0..self.nodes.len() {

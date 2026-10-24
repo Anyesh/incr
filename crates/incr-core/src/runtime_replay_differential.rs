@@ -1397,8 +1397,8 @@ impl<C: Cells> Live<C> {
     fn assert_invariants(&self) {
         self.world.rt(0).assert_invariant_i();
         self.world.rt(1).assert_invariant_i();
-        self.world.rt(0).assert_released_entries_unsettled();
-        self.world.rt(1).assert_released_entries_unsettled();
+        self.world.rt(0).assert_released_entries_match_deps();
+        self.world.rt(1).assert_released_entries_match_deps();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -4211,7 +4211,7 @@ fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
 /// Seed 0x66a, unbounded: a released claim's later finished run published
 /// deps without dropping its released entry, so its kept count outlived
 /// the list it counted. [`Live::assert_invariants`] finds the Clean node
-/// still holding one.
+/// still holding it.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_finished_run_drops_its_released_entry() {
@@ -7637,8 +7637,14 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
             .filter(|&n| unbounded[3].1[n] == NodeState::New)
             .collect();
         assert_eq!(new, [1, 2, 3, 4, 14, 16], "unbounded");
+        let holds = || super::replay_impl::UNSETTLED_HOLDS.with(|n| n.replace(0));
         for frames in [1, 2, 3] {
+            holds();
             let local = states(run::<Local>(&case, Some(frames), 0));
+            assert!(
+                frames < 2 || holds() > 0,
+                "budget {frames}: no Unsettled landing"
+            );
             assert_eq!(local, unbounded, "Local, budget {frames}");
             let shared = states(run::<Shared>(&case, Some(frames), 0));
             assert_eq!(shared, unbounded, "Shared, budget {frames}");
