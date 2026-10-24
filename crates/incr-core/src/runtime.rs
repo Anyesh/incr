@@ -415,6 +415,12 @@ struct Planned {
     own: u64,
 }
 
+/// Test toggle: with `INCR_FORCE_REVISIT` set, every untainted walk
+/// entry under `Shared` that claims a Dirty node is visited again once.
+#[cfg(test)]
+static FORCE_REVISIT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("INCR_FORCE_REVISIT").is_some());
+
 /// Test toggle: with `INCR_FORCE_REPLAN` set, every walk entry's check
 /// finds another thread's episode.
 #[cfg(test)]
@@ -454,6 +460,12 @@ enum Computed {
     /// Another thread landed an episode since the walk planned: the node
     /// was left unrun and unclaimed, and the walk prunes its plan.
     Replan,
+    /// Another thread landed the node Dirty since the walk planned it: a
+    /// claim wait ended with it Dirty, or a claim from Dirty followed a
+    /// load of New. The node was left unrun and unclaimed, and the walk
+    /// visits it again, as a read that came after that landing expands
+    /// its deps before claiming it.
+    Revisit,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
     /// walk skips it and taints the path under this memo owner.
@@ -695,17 +707,29 @@ impl Walk {
         for e in self.work.iter().filter(|e| e.is_pending()) {
             gone.remove(&e.id);
         }
-        if gone.is_empty() {
-            return;
+        if !gone.is_empty() {
+            self.forget(|id| gone.contains(id));
         }
+    }
+
+    /// Visits `id` again as a walk that never met it would, past a first
+    /// visit that expanded it (or the group it is now a member of).
+    #[cold]
+    #[inline(never)]
+    fn revisit(&mut self, id: NodeId) {
+        self.forget(|&n| n == id);
+        self.push(Entry { id, taint: VISIT });
+    }
+
+    fn forget(&mut self, gone: impl Fn(&NodeId) -> bool) {
         if let Some(visited) = &mut self.visited {
-            visited.retain(|id| !gone.contains(id));
+            visited.retain(|id| !gone(id));
         }
         if let Some(expanded) = &mut self.expanded {
-            expanded.new.retain(|id| !gone.contains(id));
+            expanded.new.retain(|id| !gone(id));
             expanded
                 .groups
-                .retain(|g| !g.members.iter().any(|&(m, _)| gone.contains(&NodeId(m))));
+                .retain(|g| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
         }
     }
 
@@ -752,6 +776,14 @@ impl Walk {
             parent.taint = parent.taint.min(owner);
         }
     }
+}
+
+#[inline(always)]
+fn forced_revisit() -> bool {
+    #[cfg(test)]
+    return *FORCE_REVISIT;
+    #[cfg(not(test))]
+    false
 }
 
 #[inline(always)]
@@ -2137,7 +2169,7 @@ impl<C: Cells> Runtime<C> {
                 Computed::Doomed | Computed::Discarded => {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
-                Computed::Skipped(_) | Computed::Replan => {
+                Computed::Skipped(_) | Computed::Replan | Computed::Revisit => {
                     unreachable!("incr-core: a walk's root is never skipped or replanned")
                 }
             }
@@ -2920,6 +2952,8 @@ impl<C: Cells> Runtime<C> {
         let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
         let mut root = Computed::Done;
         let mut unchecked = None;
+        #[cfg(test)]
+        let mut revisited: Vec<NodeId> = Vec::new();
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
@@ -2930,6 +2964,15 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     Visit::VerifyOnly(taint)
                 };
+                // A tainted entry never runs its closure, so it verifies in
+                // place whatever another thread landed.
+                let revisit = !C::SINGLE_THREADED && taint >= NO_TAINT && {
+                    #[cfg(test)]
+                    let forced_once = *FORCE_REVISIT && revisited.contains(&cur);
+                    #[cfg(not(test))]
+                    let forced_once = false;
+                    !forced_once
+                };
                 let mut computed = self.compute_one::<MODE>(
                     cur,
                     visit,
@@ -2937,7 +2980,14 @@ impl<C: Cells> Runtime<C> {
                     !is_root,
                     (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
                         .then_some(planned),
+                    revisit,
                 );
+                if !C::SINGLE_THREADED && computed == Computed::Revisit {
+                    #[cfg(test)]
+                    revisited.push(cur);
+                    walk.revisit(cur);
+                    continue;
+                }
                 if !C::SINGLE_THREADED && computed == Computed::Replan {
                     planned = self.planned();
                     if !self.prune_settled(&mut walk) {
@@ -3208,7 +3258,8 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
-        let mut computed = self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false, None);
+        let mut computed =
+            self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false, None, false);
         if computed == Computed::Discarded {
             computed = self.walk_discarded(Visit::Direct).unwrap_or(computed);
         }
@@ -3255,9 +3306,11 @@ impl<C: Cells> Runtime<C> {
         gen: Option<u32>,
         walked: bool,
         planned: Option<Planned>,
+        revisit: bool,
     ) -> Computed {
         let mut bag = Deferred::new();
-        let computed = self.compute_attempts::<MODE>(id, visit, gen, walked, planned, &mut bag);
+        let computed =
+            self.compute_attempts::<MODE>(id, visit, gen, walked, planned, revisit, &mut bag);
         bag.drain(self);
         computed
     }
@@ -3270,6 +3323,7 @@ impl<C: Cells> Runtime<C> {
         gen: Option<u32>,
         walked: bool,
         planned: Option<Planned>,
+        revisit: bool,
         bag: &mut Deferred<C>,
     ) -> Computed {
         let (node, flags) = self.nodes.get_with_flags(id.0);
@@ -3334,6 +3388,7 @@ impl<C: Cells> Runtime<C> {
                         return Computed::Done;
                     }
                 }
+                NodeState::Dirty if revisit && spins != 0 => return Computed::Revisit,
                 NodeState::Dirty => {}
             }
             if MODE & VIRT != 0 && spins != 0 && gen.is_none() {
@@ -3420,6 +3475,10 @@ impl<C: Cells> Runtime<C> {
                     self.land(id, node, discard, discard);
                     self.raise_owed(payload, bag);
                 }
+            }
+            if revisit && claimed_dirty && (observed == NodeState::New || forced_revisit()) {
+                self.unclaim_unrun(node, claimed_dirty);
+                return Computed::Revisit;
             }
             // When the claim reads from another thread's episode, which left
             // this node New or Dirty, it reads the count that episode

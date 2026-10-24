@@ -2144,6 +2144,7 @@ impl<C: Cells> Runtime<C> {
                             Some(entry.generation),
                             entry.walked,
                             None,
+                            false,
                         )
                     } else {
                         let (id, generation) = (NodeId(entry.node), Some(entry.generation));
@@ -2155,6 +2156,7 @@ impl<C: Cells> Runtime<C> {
                                 generation,
                                 entry.walked,
                                 None,
+                                false,
                             ),
                             Retry::Direct => self.compute_one::<VIRT>(
                                 id,
@@ -2162,6 +2164,7 @@ impl<C: Cells> Runtime<C> {
                                 generation,
                                 entry.walked,
                                 None,
+                                false,
                             ),
                         }
                     }
