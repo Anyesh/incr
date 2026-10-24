@@ -416,7 +416,8 @@ struct Planned {
 }
 
 /// Test toggle: with `INCR_FORCE_REVISIT` set, every untainted walk
-/// entry under `Shared` that claims a Dirty node is visited again once.
+/// entry under `Shared` counts once as planned New, so a claim of it from
+/// Dirty visits it again.
 #[cfg(test)]
 static FORCE_REVISIT: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| std::env::var_os("INCR_FORCE_REVISIT").is_some());
@@ -461,10 +462,10 @@ enum Computed {
     /// was left unrun and unclaimed, and the walk prunes its plan.
     Replan,
     /// Another thread landed the node Dirty since the walk planned it: a
-    /// claim wait ended with it Dirty, or a claim from Dirty followed a
-    /// load of New. The node was left unrun and unclaimed, and the walk
-    /// visits it again, as a read that came after that landing expands
-    /// its deps before claiming it.
+    /// claim wait ended with it Dirty, or the walk planned it New and
+    /// claimed it from Dirty. The node was left unrun and unclaimed, and
+    /// the walk visits it again, as a read that came after that landing
+    /// expands its deps before claiming it.
     Revisit,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
@@ -498,7 +499,20 @@ const VISIT: u32 = u32::MAX;
 const VISIT_COMPUTING: u32 = u32::MAX - 1;
 
 /// `Entry::taint` of a pending entry no skipped dep has reached.
-const NO_TAINT: u32 = u32::MAX - 2;
+const NO_TAINT: u32 = u32::MAX - 3;
+
+/// `NO_TAINT` of a node the walk's visit found New. Above `NO_TAINT`, so
+/// a taint merged into it only drops the mark.
+const NO_TAINT_NEW: u32 = u32::MAX - 2;
+
+/// What a walk that hands `compute_one` an untainted entry planned of it.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Seen {
+    /// No walk that can visit the node again.
+    Unwalked,
+    Dirty,
+    New,
+}
 
 /// One entry of `ensure_clean`'s walk. A visit (`taint >= VISIT_COMPUTING`)
 /// expands `x`'s non-Clean deps; the pending entry is pushed on the first
@@ -605,10 +619,10 @@ impl Walk {
     }
 
     #[inline]
-    fn visit(&mut self, id: NodeId) {
+    fn visit(&mut self, id: NodeId, new: bool) {
         self.push(Entry {
             id,
-            taint: NO_TAINT,
+            taint: if new { NO_TAINT_NEW } else { NO_TAINT },
         });
         self.first_visits += 1;
         if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
@@ -776,14 +790,6 @@ impl Walk {
             parent.taint = parent.taint.min(owner);
         }
     }
-}
-
-#[inline(always)]
-fn forced_revisit() -> bool {
-    #[cfg(test)]
-    return *FORCE_REVISIT;
-    #[cfg(not(test))]
-    false
 }
 
 #[inline(always)]
@@ -2170,7 +2176,9 @@ impl<C: Cells> Runtime<C> {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
                 Computed::Skipped(_) | Computed::Replan | Computed::Revisit => {
-                    unreachable!("incr-core: a walk's root is never skipped or replanned")
+                    unreachable!(
+                        "incr-core: a walk's root is never skipped, replanned or revisited"
+                    )
                 }
             }
             let (type_tag, arena_slot) = self.fields_under(handle, node);
@@ -2959,19 +2967,23 @@ impl<C: Cells> Runtime<C> {
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
                 self.park(ParkPoint::BeforeComputeOne(cur));
-                let visit = if is_root || taint == NO_TAINT {
+                let visit = if is_root || taint >= NO_TAINT {
                     Visit::Full
                 } else {
                     Visit::VerifyOnly(taint)
                 };
                 // A tainted entry never runs its closure, so it verifies in
                 // place whatever another thread landed.
-                let revisit = !C::SINGLE_THREADED && taint >= NO_TAINT && {
-                    #[cfg(test)]
-                    let forced_once = *FORCE_REVISIT && revisited.contains(&cur);
-                    #[cfg(not(test))]
-                    let forced_once = false;
-                    !forced_once
+                #[cfg(test)]
+                let forced = *FORCE_REVISIT && !revisited.contains(&cur);
+                #[cfg(not(test))]
+                let forced = false;
+                let seen = if C::SINGLE_THREADED || taint < NO_TAINT {
+                    Seen::Unwalked
+                } else if taint == NO_TAINT_NEW || forced {
+                    Seen::New
+                } else {
+                    Seen::Dirty
                 };
                 let mut computed = self.compute_one::<MODE>(
                     cur,
@@ -2980,7 +2992,7 @@ impl<C: Cells> Runtime<C> {
                     !is_root,
                     (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
                         .then_some(planned),
-                    revisit,
+                    seen,
                 );
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
@@ -3005,7 +3017,7 @@ impl<C: Cells> Runtime<C> {
                 }
                 if is_root {
                     root = computed;
-                } else if taint != NO_TAINT {
+                } else if taint < NO_TAINT {
                     walk.taint(taint);
                 }
                 continue;
@@ -3103,7 +3115,7 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    walk.visit(cur);
+                    walk.visit(cur, observed == NodeState::New);
                     node.for_each_dep(|dep| {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
@@ -3233,7 +3245,7 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        walk.visit(cur);
+        walk.visit(cur, false);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group
@@ -3259,7 +3271,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
         let mut computed =
-            self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false, None, false);
+            self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false, None, Seen::Unwalked);
         if computed == Computed::Discarded {
             computed = self.walk_discarded(Visit::Direct).unwrap_or(computed);
         }
@@ -3306,11 +3318,11 @@ impl<C: Cells> Runtime<C> {
         gen: Option<u32>,
         walked: bool,
         planned: Option<Planned>,
-        revisit: bool,
+        seen: Seen,
     ) -> Computed {
         let mut bag = Deferred::new();
         let computed =
-            self.compute_attempts::<MODE>(id, visit, gen, walked, planned, revisit, &mut bag);
+            self.compute_attempts::<MODE>(id, visit, gen, walked, planned, seen, &mut bag);
         bag.drain(self);
         computed
     }
@@ -3323,7 +3335,7 @@ impl<C: Cells> Runtime<C> {
         gen: Option<u32>,
         walked: bool,
         planned: Option<Planned>,
-        revisit: bool,
+        seen: Seen,
         bag: &mut Deferred<C>,
     ) -> Computed {
         let (node, flags) = self.nodes.get_with_flags(id.0);
@@ -3388,7 +3400,14 @@ impl<C: Cells> Runtime<C> {
                         return Computed::Done;
                     }
                 }
-                NodeState::Dirty if revisit && spins != 0 => return Computed::Revisit,
+                // The generation check below would end a recycled root.
+                NodeState::Dirty
+                    if seen != Seen::Unwalked
+                        && spins != 0
+                        && g0.is_none_or(|g| g == node.generation()) =>
+                {
+                    return Computed::Revisit
+                }
                 NodeState::Dirty => {}
             }
             if MODE & VIRT != 0 && spins != 0 && gen.is_none() {
@@ -3476,7 +3495,7 @@ impl<C: Cells> Runtime<C> {
                     self.raise_owed(payload, bag);
                 }
             }
-            if revisit && claimed_dirty && (observed == NodeState::New || forced_revisit()) {
+            if claimed_dirty && seen == Seen::New {
                 self.unclaim_unrun(node, claimed_dirty);
                 return Computed::Revisit;
             }

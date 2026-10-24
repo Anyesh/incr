@@ -1788,18 +1788,17 @@ fn a_walk_that_waited_out_a_dirty_landing_plans_the_node_again() {
     assert_eq!(first.join().unwrap().ok(), Some(3));
 }
 
-/// Thread A loads `a` New, and B's read lands it Dirty before A claims
-/// it. A's claim from Dirty after a load of New plans `a` again, so it
-/// gets 3, as a serial second read does.
-#[test]
-fn a_walk_that_planned_a_node_new_plans_it_again_after_a_dirty_landing() {
+/// Thread A's walk plans `a` New and parks at `at`; another read lands
+/// `a` Dirty meanwhile. A's claim from Dirty plans `a` again, so it gets
+/// 3, as a serial second read does.
+fn planned_new_then_landed_dirty(at: fn(NodeId) -> ParkPoint) {
     let rt = Arc::new(Rt::new());
     let (a, _) = caught_cycle_under_a_fallback(&rt);
-    let loaded = Gate::new();
-    loaded.arm();
-    let parks = loaded.clone();
+    let planned = Gate::new();
+    planned.arm();
+    let parks = planned.clone();
     let installed = rt.park_hook.set(Box::new(move |p| {
-        if p == ParkPoint::BeforeClaim(id(a)) && thread::current().name() == Some("A") {
+        if p == at(id(a)) && thread::current().name() == Some("A") {
             parks.park();
         }
     }));
@@ -1811,9 +1810,19 @@ fn a_walk_that_planned_a_node_new_plans_it_again_after_a_dirty_landing() {
             .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(a))))
             .unwrap()
     };
-    loaded.wait_parked();
+    planned.wait_parked();
     assert_eq!(rt.try_get(a), Ok(7777));
     assert_eq!(rt.state_of(a), NodeState::Dirty);
-    loaded.release();
+    planned.release();
     assert_eq!(first.join().unwrap().ok(), Some(3));
+}
+
+#[test]
+fn a_claim_from_dirty_after_a_load_of_new_plans_the_node_again() {
+    planned_new_then_landed_dirty(ParkPoint::BeforeClaim);
+}
+
+#[test]
+fn a_dirty_landing_before_the_walks_first_load_plans_the_node_again() {
+    planned_new_then_landed_dirty(ParkPoint::BeforeComputeOne);
 }

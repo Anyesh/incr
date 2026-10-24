@@ -2284,8 +2284,8 @@ fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
     walk.visited = Some(Default::default());
     // R's deps Q and P, P's dep X, a New node with installed deps.
     walk.expand(q, NodeState::Dirty);
-    walk.visit(p);
-    walk.visit(x);
+    walk.visit(p, false);
+    walk.visit(x, true);
     assert!(walk.first_new_expansion(x));
     walk.prune(3);
     assert_eq!(walk.work.len(), 3);
