@@ -630,9 +630,10 @@ impl Pending {
             .collect()
     }
 
-    /// Whether a frame of `node` at `generation`, at any position, still
-    /// has an outcome to take for one of its own runtime's reads: its retry
-    /// is to land the node as the unbounded run's frame did.
+    /// Whether a frame of `node` at `generation`, at any position, has an
+    /// outcome for one of its own runtime's reads still untaken. Its retry
+    /// may be yet to land the node as the unbounded run's frame did; a
+    /// reset of its maker's deliveries also leaves one after it has.
     pub(crate) fn owes_outcome(&self, node: u32, generation: u32) -> bool {
         self.by_node.get(&(node, generation)).is_some_and(|list| {
             list.as_slice().iter().any(|&i| {
