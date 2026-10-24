@@ -2118,9 +2118,11 @@ impl<C: Cells> Runtime<C> {
         drop(inner);
 
         // A member's handled outcome holds for the revision, and every
-        // member's value is built on it, so all of them keep a memo.
+        // member's value is built on it, so all of them keep a memo. Not
+        // with CU left: a CU member run again alone may skip the reads
+        // that put it in CU and read the memos as values.
         let poison = entries.iter().fold(0, |p, (_, e)| p | e.poison());
-        let memo = self.memo_landing(poison, verify_rev);
+        let memo = cu.is_empty() && self.memo_landing(poison, verify_rev);
 
         // Step 3: write the values and stamp.
         for i in 0..entries.len() {
@@ -2160,7 +2162,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if memo && cu.binary_search(&m).is_err() {
+            if memo {
                 node.set_memo(verify_rev);
             } else if entries[i].1.poison() != 0 {
                 node.set_verified_at(0);

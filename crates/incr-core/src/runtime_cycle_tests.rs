@@ -886,7 +886,43 @@ fn poison_reaches_the_landing_through_step<C: Cells>() {
     assert_eq!(rt.state_of(f), NodeState::Dirty);
 }
 
+/// S (seeded) catches a Failed dep's panic and reads A; A reads B only
+/// while S is 0, so A and B join CU in the first round and A stays in it
+/// after S converges. A's cycle error holds for the revision: a second
+/// read of A must not run it alone against S's value.
+fn cu_member_keeps_its_error_over_a_handled_episode<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (ac, bc) = (cell::<u64>(), cell::<u64>());
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let s = {
+        let ac = ac.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                rt.try_get(*ac.get().unwrap()).unwrap_or(0) + 1
+            },
+            fixpoint(Fixpoint::new(|| 0_u64)),
+        )
+    };
+    let a = {
+        let bc = bc.clone();
+        rt.create_query(move |rt: &Runtime<C>| match rt.try_get(s) {
+            Ok(0) => rt.try_get(*bc.get().unwrap()).unwrap_or(50),
+            Ok(v) => v,
+            Err(_) => 77,
+        })
+    };
+    let b = rt.create_query(move |rt: &Runtime<C>| rt.try_get(a).unwrap_or(60));
+    ac.set(a).unwrap();
+    bc.set(b).unwrap();
+    let first = rt.try_get(a).map_err(|c| slots(&c));
+    let second = rt.try_get(a).map_err(|c| slots(&c));
+    assert_eq!(first.is_ok(), second.is_ok(), "{first:?} then {second:?}");
+    rt.assert_invariant_i();
+}
+
 both!(
+    cu_member_keeps_its_error_over_a_handled_episode,
     self_cycle_fallback,
     self_cycle_fixpoint,
     self_cycle_unseeded,
