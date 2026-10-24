@@ -3608,7 +3608,7 @@ impl<C: Cells> Runtime<C> {
                         adopted_panic = Some(raised);
                     }
                     replay_impl::Adopted::Landed(computed) => {
-                        self.adopted_pop();
+                        self.adopted_pop(id);
                         return computed;
                     }
                     replay_impl::Adopted::Stale => {

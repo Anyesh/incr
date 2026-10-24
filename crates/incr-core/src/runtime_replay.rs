@@ -540,13 +540,17 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// An adopted stash landed the claimed node in place of the run the
+    /// An adopted stash landed the claimed node `id` in place of the run the
     /// unbounded run makes here, at the next frame position: that run's pop
-    /// retires the notes, and their copies, above it.
-    pub(super) fn adopted_pop(&self) {
+    /// retires the notes, and their copies, above it, and ends its run. No
+    /// run started, so the run's path is the position's.
+    pub(super) fn adopted_pop(&self, id: NodeId) {
         let cidx = self.dep_stack.next_cidx();
         self.retire_notes_above(cidx);
         self.retire_copies(&replay::Retire::Above(cidx));
+        if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+            self.end_run_along(id, cidx, |_| self.path_at(cidx));
+        }
     }
 
     /// Claims stashed node `id` at `generation` for adoption, from New or
@@ -3361,6 +3365,13 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn end_run(&self, id: NodeId, cidx: u32) {
+        self.end_run_along(id, cidx, |generation| {
+            self.run_path(id.0, generation, cidx).0
+        });
+    }
+
+    /// [`Self::end_run`], with the run's path given its node's generation.
+    fn end_run_along(&self, id: NodeId, cidx: u32, path: impl FnOnce(u32) -> u64) {
         let rt = self.runtime_id;
         let Some(below) = cidx.checked_sub(1) else {
             return;
@@ -3369,8 +3380,7 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         let generation = self.nodes.get(id.0).generation();
-        let (path, _) = self.run_path(id.0, generation, cidx);
-        replay::end_run(rt, (id.0, generation, cidx), path);
+        replay::end_run(rt, (id.0, generation, cidx), path(generation));
     }
 
     /// A run of `node` that finishes its virtual frame's frame starts: the
