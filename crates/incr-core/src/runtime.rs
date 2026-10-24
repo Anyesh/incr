@@ -682,6 +682,33 @@ impl Walk {
         self.visited = Some(visited);
     }
 
+    /// Drops the plan above `work[keep - 1]`, and with it the visits and
+    /// expansions of the nodes it left no pending entry, so that a later
+    /// visit of one plans it as a walk that never met it would.
+    fn prune(&mut self, keep: usize) {
+        let mut gone: HashSet<NodeId> = self
+            .work
+            .drain(keep..)
+            .filter(|e| e.is_pending())
+            .map(|e| e.id)
+            .collect();
+        for e in self.work.iter().filter(|e| e.is_pending()) {
+            gone.remove(&e.id);
+        }
+        if gone.is_empty() {
+            return;
+        }
+        if let Some(visited) = &mut self.visited {
+            visited.retain(|id| !gone.contains(id));
+        }
+        if let Some(expanded) = &mut self.expanded {
+            expanded.new.retain(|id| !gone.contains(id));
+            expanded
+                .groups
+                .retain(|g| !g.members.iter().any(|&(m, _)| gone.contains(&NodeId(m))));
+        }
+    }
+
     #[inline]
     fn expand(&mut self, dep: NodeId, dep_state: NodeState) {
         self.push(Entry {
@@ -3108,7 +3135,7 @@ impl<C: Cells> Runtime<C> {
         });
         match settled {
             Some(at) => {
-                walk.work.truncate(at + 1);
+                walk.prune(at + 1);
                 true
             }
             None => false,
