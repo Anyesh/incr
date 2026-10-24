@@ -5363,6 +5363,63 @@ fn speculative_landings_verified_later_seeds() {
     }
 }
 
+/// Paired cases (`REPLAY_PAIRED`) whose speculative runs landed nodes the
+/// unbounded run leaves New or Dirty, by a compute or a walk's verify.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_landings_paired_seeds() {
+    for seed in [
+        0x16c,
+        0x1b1,
+        0x1d8,
+        0x1e6,
+        0x268,
+        0x2c2,
+        0x2e4,
+        0x349,
+        0x3a3,
+        0x52b,
+        0x565,
+        0x57a,
+        0x5ef,
+        0x784,
+        0x7bd,
+        0x7dd,
+        0x833,
+        0x837,
+        0x9dd,
+        0xb77,
+        0x3661_47ff,
+        0x3661_487d,
+        0x3661_490b,
+        0x3661_490e,
+        0x3661_4a16,
+        0x3661_4a3d,
+        0x3661_4a69,
+        0x3661_4a78,
+        0x3661_4b0b,
+        0x3661_4b3b,
+        0x3661_4b5a,
+        0x3661_4d27,
+        0x3661_4da1,
+        0x3661_4e1d,
+        0x3661_4e63,
+        0x3661_4f23,
+        0x3661_502f,
+        0x3661_50eb,
+        0x3661_511e,
+        0x3661_5142,
+        0x3661_52a5,
+        0x3661_52af,
+    ] {
+        let case = gen_case(seed, false, true);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// 0xa02 (see [`cross_seeds`]): a speculative landing read the second
 /// runtime's input before a set of it, and a later read returns the old
 /// value.
