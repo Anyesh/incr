@@ -995,7 +995,7 @@ pub(crate) fn note_dissolved_group(rt: RuntimeId, root: u32, group: Arc<GroupInf
 
 /// Whether `group` is the record whose episode at `root` dissolved in
 /// this outermost entry.
-pub(crate) fn dissolved_group(rt: RuntimeId, root: u32, group: &Arc<GroupInfo>) -> bool {
+pub(crate) fn is_dissolved_group(rt: RuntimeId, root: u32, group: &Arc<GroupInfo>) -> bool {
     OUTER.with(|o| {
         o.borrow()
             .dissolved_groups
