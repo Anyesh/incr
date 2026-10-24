@@ -287,12 +287,16 @@ impl<C: Cells> Runtime<C> {
     /// A speculative entry's run lands only Clean values: a node it would
     /// land Dirty, poisoned or over a dep that is not Clean, has a history
     /// the unbounded run may never give it, and a later walk of its deps
-    /// would differ from a first run of its closure. Such a pop drops the
-    /// chain. A doomed frame's pop lands nothing anyway.
+    /// would differ from a first run of its closure. Nor does it land a
+    /// node whose marked frame still owes its retry an outcome: the
+    /// unbounded run's frame lands the node first, and its readers read
+    /// that landing. Such a pop drops the chain. A doomed frame's pop lands
+    /// nothing anyway.
     #[cold]
     #[inline(never)]
     pub(super) fn speculative_lands_dirty(
         &self,
+        id: NodeId,
         word: u64,
         ctl: &ComputeCtl,
         deps: &[(NodeId, u32)],
@@ -306,7 +310,18 @@ impl<C: Cells> Runtime<C> {
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
                         NodeState::Clean | NodeState::Cyclic
                     )
-                }))
+                })
+                || self.frame_owes_outcome(id))
+    }
+
+    fn frame_owes_outcome(&self, id: NodeId) -> bool {
+        let rt = self.runtime_id;
+        let generation = self.nodes.get(id.0).generation();
+        replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .any(|x| x.pending.owes_outcome(id.0, generation))
+        })
     }
 
     /// Diverts the Clean reads of the frame just pushed for `node` at

@@ -630,6 +630,20 @@ impl Pending {
             .collect()
     }
 
+    /// Whether a frame of `node` at `generation`, at any position, still
+    /// has an outcome to take for one of its own runtime's reads: its retry
+    /// is to land the node as the unbounded run's frame did.
+    pub(crate) fn owes_outcome(&self, node: u32, generation: u32) -> bool {
+        self.by_node.get(&(node, generation)).is_some_and(|list| {
+            list.as_slice().iter().any(|&i| {
+                let d = self.get(i);
+                !d.taken
+                    && d.key.foreign.is_none()
+                    && matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
+            })
+        })
+    }
+
     /// Removes, oldest first, the deliveries for reads by the frames of
     /// `node` at `generation`, at any position.
     pub(crate) fn extract_node(&mut self, node: u32, generation: u32) -> Vec<Delivery> {
