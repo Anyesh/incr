@@ -3059,8 +3059,9 @@ impl<C: Cells> Runtime<C> {
     /// `gen` is the caller's handle generation for the root; each walk
     /// entry carries its node's generation from when the walk met it. An
     /// entry whose node is deleted under the walk is dropped, because only
-    /// a dep its parent no longer reads can be deleted. A root found
-    /// recycled is reported as `Gone` for the caller's stale panic.
+    /// a dep its parent no longer reads, or one deleted with it in one
+    /// owned set, can be deleted. A root found recycled is reported as
+    /// `Gone` for the caller's stale panic.
     #[inline]
     fn ensure_clean(&self, id: NodeId, gen: u32) -> Computed {
         // The check precedes the fast path because a Clean read still
@@ -3210,15 +3211,16 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Computing
             };
             // Expanding a recycled slot would run the new node's deps for
-            // a stale read: the root's ends the read, a dep's was no longer
-            // read by the recompute that let its delete through.
+            // a stale read: the root's ends the read, and a dep's was
+            // deleted unread or with its reader in one owned set.
             if node.generation() != generation {
                 if cur == id {
                     return Computed::Gone;
                 }
                 continue;
             }
-            // As a recycled dep's, before the delete bumps the generation.
+            // Skipped as a recycled dep is: its delete has not bumped the
+            // generation yet.
             if observed == NodeState::Dead && !is_root {
                 continue;
             }
@@ -3589,8 +3591,8 @@ impl<C: Cells> Runtime<C> {
                     self.read_failed_node(id, g0);
                     continue;
                 }
-                // Only a dep nothing reads can be deleted: the parent that
-                // recorded it no longer does.
+                // Only a dep its parent no longer reads, or one deleted with
+                // it in one owned set, can be deleted.
                 NodeState::Dead if walked => return Computed::Gone,
                 NodeState::Dead => {
                     // An observer's read of a node whose delete has not
