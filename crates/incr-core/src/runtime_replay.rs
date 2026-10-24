@@ -539,6 +539,15 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// An adopted stash landed the claimed node in place of the run the
+    /// unbounded run makes here, at the next frame position: that run's pop
+    /// retires the notes, and their copies, above it.
+    pub(super) fn adopted_pop(&self) {
+        let cidx = self.dep_stack.next_cidx();
+        self.retire_notes_above(cidx);
+        self.retire_copies(&replay::Retire::Above(cidx));
+    }
+
     /// Claims stashed node `id` at `generation` for adoption, from New or
     /// Dirty, with its stash.
     fn claim_stashed(&self, id: NodeId, generation: u32) -> Option<Adopting> {

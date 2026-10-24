@@ -1018,28 +1018,36 @@ fn wave6_shared_doomed_run_keeps_the_ticket_it_took() {
 /// the replayable chain dd1..dd4 and re-raises, at frame budget `budget` (or
 /// none), holding the caught box across a doom so the retry's copy
 /// cannot reuse its address. With `deep`, r re-raises the panic of its dep d,
-/// whose landing sits a frame deeper. Returns x, then the messages of d (empty
-/// without `deep`), r and g.
+/// whose landing sits a frame deeper. With `replay_r`, r is replayable too.
+/// Returns x, then the messages of d (empty without `deep`), r and g.
 fn wave7_kept_read_after_fresh_failed_read<C: Cells>(
     budget: Option<u32>,
     deep: bool,
+    replay_r: bool,
 ) -> (i64, String, String, String) {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
     let sel = rt.create_input(0_i64);
     let k = rt.create_input(0_i64);
-    let d = rt.create_query(move |_rt: &Runtime<C>| -> i64 { panic!("r boom") });
-    let r = rt.create_query(move |rt: &Runtime<C>| -> i64 {
-        if deep {
-            rt.get(d)
-        } else {
-            panic!("r boom")
-        }
-    });
     let replay = || QueryOpts {
         replay: Replay::Allowed,
         ..Default::default()
     };
+    let d = rt.create_query(move |_rt: &Runtime<C>| -> i64 { panic!("r boom") });
+    let r = rt.create_query_with(
+        move |rt: &Runtime<C>| -> i64 {
+            if deep {
+                rt.get(d)
+            } else {
+                panic!("r boom")
+            }
+        },
+        if replay_r {
+            replay()
+        } else {
+            QueryOpts::default()
+        },
+    );
     let dd4 = rt.create_query_with(move |_rt: &Runtime<C>| 1_i64, replay());
     let dd3 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd4) + 1, replay());
     let dd2 = rt.create_query_with(move |rt: &Runtime<C>| rt.get(dd3) + 1, replay());
@@ -1084,10 +1092,10 @@ fn wave7_kept_read_after_fresh_failed_read<C: Cells>(
 /// The walk contains g's re-raised panic with r's own Failed landing, so r
 /// raises "r boom" and g reports its last compute panicked. With `deep`, g's
 /// read of dd1 retired d's deeper landing first, so d reports its last
-/// compute panicked. A doomed run's retry of g must leave the same ticket at
-/// every budget.
+/// compute panicked. A doomed run's retry of g, or of a replayable r, must
+/// leave the same ticket at every budget.
 fn wave7_kept_read_keeps_the_read_nodes_landing<C: Cells>(deep: bool) {
-    let unbounded = wave7_kept_read_after_fresh_failed_read::<C>(None, deep);
+    let unbounded = wave7_kept_read_after_fresh_failed_read::<C>(None, deep, false);
     assert_eq!(unbounded.0, 100);
     assert_eq!(
         unbounded.1.contains("last compute panicked"),
@@ -1101,12 +1109,14 @@ fn wave7_kept_read_keeps_the_read_nodes_landing<C: Cells>(deep: bool) {
         "{}",
         unbounded.3
     );
-    for b in 1..=8 {
-        assert_eq!(
-            wave7_kept_read_after_fresh_failed_read::<C>(Some(b), deep),
-            unbounded,
-            "budget {b}, deep {deep}"
-        );
+    for replay_r in [false, true] {
+        for b in 1..=8 {
+            assert_eq!(
+                wave7_kept_read_after_fresh_failed_read::<C>(Some(b), deep, replay_r),
+                unbounded,
+                "budget {b}, deep {deep}, replay_r {replay_r}"
+            );
+        }
     }
 }
 

@@ -3603,7 +3603,10 @@ impl<C: Cells> Runtime<C> {
                         verifying = false;
                         adopted_panic = Some(raised);
                     }
-                    replay_impl::Adopted::Landed(computed) => return computed,
+                    replay_impl::Adopted::Landed(computed) => {
+                        self.adopted_pop();
+                        return computed;
+                    }
                     replay_impl::Adopted::Stale => {
                         self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                         continue 'attempt;
