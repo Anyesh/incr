@@ -979,32 +979,61 @@ fn shared_delete_and_recycle_between_scan_and_claim() {
 }
 
 /// The recycling shape with X1 switched to catch a Failed dep and read by
-/// another thread before Y's scan of T, or between the scan and the
-/// claim: X1 lands Dirty with a memo for the revision, which stands for
-/// a landing, so the read drops the chain at X1's level and never runs
-/// X1, as in the unbounded run with the read of X1 first.
+/// another thread between Y's scan of T and its claim: X1 lands Dirty
+/// with a memo for the revision, which stands for a landing, so the claim
+/// is released, the read drops the chain at X1's level and never runs X1,
+/// as in the unbounded run with the read of X1 first. Before the scan X1
+/// is reserved for the doomed context's retry, so the other thread's read
+/// waits, the retry lands X1's memo, and that read takes it without a run.
 fn memo_landing_during_replay(when: Recycle) {
-    let s = below_shape(Rt::new());
-    s.rt.set_max_frames(1);
-    let gate = Gate::new();
-    let point = match when {
-        Recycle::BeforeScan => ParkPoint::BeforeEntry(id(s.y)),
-        Recycle::BeforeClaim => ParkPoint::BeforeVirtualClaim(id(s.t)),
+    // X1's runs and T's outcome, with the other thread's read of X1 or,
+    // for the reference, without it.
+    let run = |other_reads: bool| {
+        let s = below_shape(Rt::new());
+        s.rt.set_max_frames(1);
+        let gate = Gate::new();
+        let point = match when {
+            Recycle::BeforeScan => ParkPoint::BeforeEntry(id(s.y)),
+            Recycle::BeforeClaim => ParkPoint::BeforeVirtualClaim(id(s.t)),
+        };
+        hook(&s.rt, vec![(point, gate.clone())]);
+        gate.arm();
+        let reader = {
+            let (rt, t) = (s.rt.clone(), s.t);
+            spawn(move || outcome(|| rt.get(t)))
+        };
+        gate.wait_parked();
+        s.caught.store(true, SeqCst);
+        let other = match (other_reads, when) {
+            (false, _) => None,
+            (true, Recycle::BeforeClaim) => {
+                assert_eq!(s.rt.get(s.x1), 7);
+                assert!(s.rt.has_memo_of(s.x1));
+                assert_eq!(s.x1_caught.swap(0, SeqCst), 2, "X1's own runs at budget 1");
+                None
+            }
+            (true, Recycle::BeforeScan) => {
+                let waits = s.rt.reservation_waits.load(SeqCst);
+                let other = {
+                    let (rt, x1) = (s.rt.clone(), s.x1);
+                    spawn(move || outcome(|| rt.get(x1)))
+                };
+                await_reservation_wait(&s.rt, waits);
+                Some(other)
+            }
+        };
+        gate.release();
+        let got = reader.join();
+        if let Some(other) = other {
+            assert_eq!(other.join(), Ok(7));
+        }
+        if other_reads {
+            assert!(s.rt.has_memo_of(s.x1));
+        }
+        s.rt.assert_invariant_i();
+        (got, s.x1_caught.load(SeqCst))
     };
-    hook(&s.rt, vec![(point, gate.clone())]);
-    gate.arm();
-    let reader = {
-        let (rt, t) = (s.rt.clone(), s.t);
-        spawn(move || outcome(|| rt.get(t)))
-    };
-    gate.wait_parked();
-    s.caught.store(true, SeqCst);
-    assert_eq!(s.rt.get(s.x1), 7);
-    assert!(s.rt.has_memo_of(s.x1));
-    let landed_runs = s.x1_caught.load(SeqCst);
-    gate.release();
-    let got = reader.join();
-
+    let (got, runs) = run(true);
     let unbounded = below_shape(Rt::new());
     unbounded.rt.set_max_frames(u32::MAX);
     unbounded.caught.store(true, SeqCst);
@@ -1012,12 +1041,13 @@ fn memo_landing_during_replay(when: Recycle) {
     let want = outcome(|| unbounded.rt.get(unbounded.t));
     assert_eq!(want, Ok(8));
     assert_eq!(got, want);
-    assert_eq!(
-        s.x1_caught.load(SeqCst),
-        landed_runs,
-        "X1 ran again over its memo"
-    );
-    s.rt.assert_invariant_i();
+    let reference = match when {
+        // The read never runs X1 over the memo the other thread landed.
+        Recycle::BeforeClaim => 0,
+        // The waiting read takes the memo the reader's retry landed.
+        Recycle::BeforeScan => run(false).1,
+    };
+    assert_eq!(runs, reference, "X1 ran again over its memo");
 }
 
 #[test]
