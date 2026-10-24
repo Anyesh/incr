@@ -1527,8 +1527,9 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
 
 /// The same shape with F, X and Y a landed group and Z's set behind input
 /// t: F's claim, taken from Dirty, lands as before it, still a verified
-/// member of its group, so the other thread's read verifies the group as
-/// in the order where it reads first.
+/// member of its group, and reserved for the context's retry, so the other
+/// thread's read waits and reads as in the order where the driver reads
+/// first.
 #[test]
 fn shared_dissolved_member_root_stays_in_its_group() {
     let run = |frames: u32, park: bool| {
@@ -1606,14 +1607,17 @@ fn shared_dissolved_member_root_stays_in_its_group() {
                 rt.cycle_of(f).is_some(),
                 rt.verified_at_of(f) == verified,
             );
+            let waits = rt.reservation_waits.load(SeqCst);
             let other = {
                 let rt = rt.clone();
                 spawn(move || outcome(|| rt.get(f)))
             };
-            gap = Some((landed, other.join()));
+            await_reservation_wait(&rt, waits);
             gate.release();
+            gap = Some((landed, other));
         }
         let got = reader.join();
+        let gap = gap.map(|(landed, other)| (landed, other.join()));
         rt.assert_invariant_i();
         (got, gap)
     };
