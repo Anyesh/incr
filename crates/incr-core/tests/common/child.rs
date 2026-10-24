@@ -62,7 +62,13 @@ pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -
     }
 
     let mut child = Command::new(env::current_exe().unwrap())
-        .args([test, "--exact", "--test-threads=1", "--nocapture"])
+        .args([
+            test,
+            "--exact",
+            "--include-ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
         .env(CHILD, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -94,7 +100,15 @@ pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -
     let output = format!("{}{}", stdout.join().unwrap(), stderr.join().unwrap());
     match status {
         None => Outcome::Killed,
-        Some(status) if status.success() => Outcome::Clean,
+        Some(status) if status.success() => {
+            // The body exits before libtest's summary, so a summary means
+            // the body never ran: `test` named no test.
+            assert!(
+                !output.contains("test result:"),
+                "the child never ran a test named {test}: {output}"
+            );
+            Outcome::Clean
+        }
         Some(_) => Outcome::Panicked { output },
     }
 }
