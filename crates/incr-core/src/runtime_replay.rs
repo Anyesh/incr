@@ -2138,19 +2138,25 @@ impl<C: Cells> Runtime<C> {
                             visit,
                             Some(entry.generation),
                             entry.walked,
+                            None,
                         )
                     } else {
                         let (id, generation) = (NodeId(entry.node), Some(entry.generation));
                         match entry.retry {
                             Retry::Walk => self.ensure_clean_virt(id, entry.generation),
-                            Retry::Compute => {
-                                self.compute_one::<VIRT>(id, Visit::Full, generation, entry.walked)
-                            }
+                            Retry::Compute => self.compute_one::<VIRT>(
+                                id,
+                                Visit::Full,
+                                generation,
+                                entry.walked,
+                                None,
+                            ),
                             Retry::Direct => self.compute_one::<VIRT>(
                                 id,
                                 Visit::Direct,
                                 generation,
                                 entry.walked,
+                                None,
                             ),
                         }
                     }

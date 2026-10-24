@@ -2002,6 +2002,12 @@ impl<C: Cells> Runtime<C> {
         cidx: u32,
         bag: &mut Deferred<C>,
     ) -> PopEnd {
+        if !C::SINGLE_THREADED {
+            // Before the members land, so that a read of one of their
+            // landings also reads the count.
+            cycle_state::own_episode(self.runtime_id);
+            C::u64_fetch_add(&self.episodes_landed, 1);
+        }
         let rt = self.runtime_id;
         let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             members
