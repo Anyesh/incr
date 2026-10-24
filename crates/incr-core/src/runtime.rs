@@ -141,6 +141,8 @@ pub(crate) enum ParkPoint {
     /// In `compute_attempts`, after the claim CAS and before the check for
     /// another thread's doom reservation.
     BeforeReservationCheck(NodeId),
+    /// In `clean_walk`, before a visit of a non-root entry loads its state.
+    BeforeVisit(NodeId),
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
@@ -3199,6 +3201,9 @@ impl<C: Cells> Runtime<C> {
             }
 
             let (node, flags) = self.nodes.get_with_flags(cur.0);
+            if !is_root {
+                self.park(ParkPoint::BeforeVisit(cur));
+            }
             let observed = if taint == VISIT {
                 state::load::<C>(node.state_cell())
             } else {

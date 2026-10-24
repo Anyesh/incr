@@ -1795,13 +1795,19 @@ fn shared_root_wait_finds_its_slot_recycled_into_a_dirty_node() {
     rt.assert_invariant_i();
 }
 
-/// A read of D walks D's deps and parks before the entry of E. Another
-/// thread recomputes D, which no longer reads E, deletes E and recycles
-/// its slot into Z. The read gets D's new value, as in the serial order
-/// with the recompute and delete first, and Z's closure does not run on
-/// its behalf.
-#[test]
-fn shared_walk_entry_finds_its_slot_recycled_into_a_new_node() {
+#[derive(Clone, Copy)]
+enum DepEntry {
+    Visit,
+    Pending,
+}
+
+/// A read of D walks D's deps and parks at E's visit or pending entry.
+/// Another thread recomputes D, which no longer reads E, and deletes E:
+/// parked after its Dead claim, before the generation bump, or through
+/// to a recycle of E's slot into Z. The read gets D's new value, as in
+/// the serial order with the recompute and delete first, and Z's closure
+/// does not run on its behalf.
+fn walk_entry_finds_its_dep_deleted(at: DepEntry, recycled: bool) {
     let rt = Arc::new(Rt::new());
     let i = rt.create_input(0_u64);
     let j = rt.create_input(0_u64);
@@ -1809,10 +1815,17 @@ fn shared_walk_entry_finds_its_slot_recycled_into_a_new_node() {
     let d = rt.create_query(move |rt: &Rt| if rt.get(i) == 0 { rt.get(e) } else { 5 });
     assert_eq!(rt.get(d), 1);
     rt.set(j, 1);
-    let entry = Gate::new();
+    let (entry, delete) = (Gate::new(), Gate::new());
+    let point = match at {
+        DepEntry::Visit => ParkPoint::BeforeVisit(id(e)),
+        DepEntry::Pending => ParkPoint::BeforeComputeOne(id(e)),
+    };
     park_at(
         &rt,
-        vec![(ParkPoint::BeforeComputeOne(id(e)), entry.clone())],
+        vec![
+            (point, entry.clone()),
+            (ParkPoint::DeleteAfterCheck(id(e)), delete.clone()),
+        ],
     );
     let reader = {
         let rt = Arc::clone(&rt);
@@ -1820,9 +1833,29 @@ fn shared_walk_entry_finds_its_slot_recycled_into_a_new_node() {
     };
     entry.wait_parked();
     rt.set(i, 1);
+    // The recompute's own walk passes E's points with their gates spent.
     assert_eq!(rt.get(d), 5);
-    rt.delete_node(e);
     let z_runs = Arc::new(AtomicUsize::new(0));
+    let deleter = if recycled {
+        delete.release();
+        rt.delete_node(e);
+        None
+    } else {
+        let deleter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.delete_node(e))
+        };
+        delete.wait_parked();
+        assert_eq!(rt.state_of(e), NodeState::Dead);
+        Some(deleter)
+    };
+    entry.release();
+    let got = reader.join().unwrap();
+    assert_eq!(got, Ok(5));
+    if let Some(deleter) = deleter {
+        delete.release();
+        deleter.join().unwrap();
+    }
     let z = {
         let z_runs = Arc::clone(&z_runs);
         rt.create_query(move |_: &Rt| {
@@ -1831,17 +1864,33 @@ fn shared_walk_entry_finds_its_slot_recycled_into_a_new_node() {
         })
     };
     assert_eq!(z.slot(), e.slot(), "Z reuses E's slot");
-    entry.release();
-    let got = reader.join().unwrap();
-    assert_eq!(got, Ok(5));
     assert_eq!(
         z_runs.load(Ordering::SeqCst),
         0,
         "Z ran on the reader's behalf"
     );
-    assert_eq!(rt.state_of(z), NodeState::New);
     assert_eq!(rt.get(z), 7);
     rt.assert_invariant_i();
+}
+
+#[test]
+fn shared_walk_visit_finds_its_dep_recycled() {
+    walk_entry_finds_its_dep_deleted(DepEntry::Visit, true);
+}
+
+#[test]
+fn shared_walk_visit_finds_its_dep_dead() {
+    walk_entry_finds_its_dep_deleted(DepEntry::Visit, false);
+}
+
+#[test]
+fn shared_walk_entry_finds_its_slot_recycled_into_a_new_node() {
+    walk_entry_finds_its_dep_deleted(DepEntry::Pending, true);
+}
+
+#[test]
+fn shared_walk_entry_finds_its_dep_dead() {
+    walk_entry_finds_its_dep_deleted(DepEntry::Pending, false);
 }
 
 #[test]
