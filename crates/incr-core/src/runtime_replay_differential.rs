@@ -2496,16 +2496,34 @@ fn labelled<T>(label: &str, f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// The budgets a single-thread differential compares with the unbounded
+/// run: each frame budget with and without a byte budget, and the byte
+/// budget alone.
+const BUDGETS: [(Option<u32>, usize); 7] = [
+    (Some(1), 0),
+    (Some(1), 16 * 1024),
+    (Some(2), 0),
+    (Some(2), 16 * 1024),
+    (Some(3), 0),
+    (Some(3), 16 * 1024),
+    (None, 16 * 1024),
+];
+
+fn budget_label(seed: u64, frames: Option<u32>, bytes: usize) -> String {
+    match frames {
+        Some(frames) => format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes"),
+        None => format!("seed {seed:#x}, budget None frames, {bytes} bytes"),
+    }
+}
+
 fn differential<C: Cells>(case: &Case, seed: u64) {
     let unbounded = labelled(&format!("seed {seed:#x}, unbounded"), || {
         run::<C>(case, None, 0)
     });
-    for frames in [1, 2, 3] {
-        for bytes in [0, 16 * 1024] {
-            let label = format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes");
-            let bounded = labelled(&label, || run::<C>(case, Some(frames), bytes));
-            compare(case, &unbounded, &bounded, &label);
-        }
+    for (frames, bytes) in BUDGETS {
+        let label = budget_label(seed, frames, bytes);
+        let bounded = labelled(&label, || run::<C>(case, frames, bytes));
+        compare(case, &unbounded, &bounded, &label);
     }
 }
 
@@ -3558,14 +3576,9 @@ fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
 fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
     let unbounded = outcomes(run::<C>(case, None, 0));
-    for frames in [1, 2, 3] {
-        for bytes in [0, 16 * 1024] {
-            let bounded = outcomes(run::<C>(case, Some(frames), bytes));
-            assert_eq!(
-                bounded, unbounded,
-                "seed {seed:#x}, budget {frames} frames, {bytes} bytes"
-            );
-        }
+    for (frames, bytes) in BUDGETS {
+        let bounded = outcomes(run::<C>(case, frames, bytes));
+        assert_eq!(bounded, unbounded, "{}", budget_label(seed, frames, bytes));
     }
 }
 
