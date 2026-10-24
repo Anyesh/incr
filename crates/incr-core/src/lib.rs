@@ -29,6 +29,7 @@ mod dep_set;
 pub mod dep_stack;
 mod dependent_list;
 mod directory;
+mod few;
 pub mod fx;
 pub mod generic_arena;
 pub mod handle;
