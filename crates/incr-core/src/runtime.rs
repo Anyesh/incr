@@ -136,6 +136,9 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// In `compute_attempts`, after the claim CAS and before the check for
+    /// another thread's doom reservation.
+    BeforeReservationCheck(NodeId),
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
@@ -3572,6 +3575,7 @@ impl<C: Cells> Runtime<C> {
                 self.land_unrun(id, node, discard);
                 return Computed::Gone;
             }
+            self.park(ParkPoint::BeforeReservationCheck(id));
             if self.reserved_elsewhere(id, g) {
                 self.unclaim_unrun(node, claimed_dirty);
                 self.wait_out_reservation(id, g, None, &mut spins);
