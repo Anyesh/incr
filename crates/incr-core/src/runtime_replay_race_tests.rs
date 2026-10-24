@@ -2869,14 +2869,23 @@ impl Clone for Slow {
 
 /// A speculative read clones a stashed value with the stash lock released,
 /// so a user `Clone` that waits on another thread cannot hold up that
-/// thread's stash bookkeeping.
+/// thread's stash bookkeeping, and a real claim that adopts the value
+/// meanwhile lands a clone of it rather than running the closure again.
 #[test]
 fn a_stashed_value_is_cloned_outside_the_stash_lock() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
     let input = rt.create_input(7_u64);
-    let x = rt.create_query_with(move |rt: &Rt| Slow(rt.get(input)), replayable());
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            counted.fetch_add(1, SeqCst);
+            Slow(rt.get(input))
+        },
+        replayable(),
+    );
     let reader = || {
         let b = rt.create_query(|_: &Rt| 5_u64);
         rt.create_query_with(
@@ -2908,6 +2917,7 @@ fn a_stashed_value_is_cloned_outside_the_stash_lock() {
         thread::spawn(move || tx.send(rt.stashed(id(x).0, x.generation(), false)).unwrap())
     };
     let looked = rx.recv_timeout(Duration::from_secs(2));
+    assert_eq!(rt.get(x), Slow(7));
     SLOW_RELEASED.store(true, SeqCst);
     assert_eq!(cloning.join().unwrap(), 5);
     looking.join().unwrap();
@@ -2915,5 +2925,10 @@ fn a_stashed_value_is_cloned_outside_the_stash_lock() {
         looked,
         Ok(true),
         "the stash lock is held across a user Clone"
+    );
+    assert_eq!(
+        runs.load(SeqCst),
+        1,
+        "x ran again while its stash was shared"
     );
 }

@@ -630,22 +630,17 @@ impl<C: Cells> Runtime<C> {
         let Outcome::Value { value, .. } = a.stash.outcome else {
             unreachable!("incr-core: a panic's stash lands only through its raise")
         };
-        // A speculative read still cloning the value shares it: the node
-        // computes instead.
-        let value = match std::sync::Arc::try_unwrap(value) {
-            Ok(value) => value.0.into_inner(),
-            Err(shared) => {
-                drop(shared);
-                let target = if first {
-                    NodeState::New
-                } else {
-                    NodeState::Dirty
-                };
-                self.land(a.id, node, target, target);
-                return None;
-            }
-        };
         let changed = match catch_unwind(AssertUnwindSafe(|| {
+            // A speculative read still cloning the value shares it, so the
+            // node lands a clone.
+            let value = match std::sync::Arc::try_unwrap(value) {
+                Ok(value) => value.0.into_inner(),
+                Err(shared) => {
+                    let value = arena.clone_erased(shared.0.value());
+                    bag.push_erased(Box::new(shared));
+                    value
+                }
+            };
             arena.write_erased(node.arena_slot(), value, first, &wrote)
         })) {
             Ok((changed, displaced)) => {
