@@ -1603,6 +1603,9 @@ impl<C: Cells> Runtime<C> {
         }
         match state::load::<C>(node.state_cell()) {
             NodeState::Clean => Ok(self.read_slot(handle, node, type_tag, arena_slot)),
+            // The state of the node a delete recycled the slot into is not
+            // the handle's to act on.
+            _ if node.generation() != handle.generation() => self.stale_handle(handle),
             now => Err(now),
         }
     }
@@ -2357,6 +2360,9 @@ impl<C: Cells> Runtime<C> {
         node: &NodeData<C>,
     ) -> Result<Cycle, NodeState> {
         let state = state::load::<C>(node.state_cell());
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
         if matches!(state, NodeState::Cyclic | NodeState::New) {
             if let Some(cycle) = self.cycle_of(handle) {
                 return Ok(cycle);
@@ -2399,17 +2405,16 @@ impl<C: Cells> Runtime<C> {
                 },
             }
         }
+        // The state may be the node's a delete recycled the slot into.
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
         match state {
             // A concurrent delete is no contract breach, so the read gets
             // the panic any reader of a node being deleted gets. Under
             // Local only this thread can be mid-delete, so the value code
             // was called from inside the delete.
-            NodeState::Dead if !C::SINGLE_THREADED => {
-                if node.generation() != handle.generation() {
-                    self.stale_handle(handle);
-                }
-                deleted_while_reading(id)
-            }
+            NodeState::Dead if !C::SINGLE_THREADED => deleted_while_reading(id),
             _ => value_code::contract_panic(),
         }
     }
@@ -3129,7 +3134,7 @@ impl<C: Cells> Runtime<C> {
                 let mut computed = self.compute_one::<MODE>(
                     cur,
                     visit,
-                    is_root.then_some(gen),
+                    (is_root || cur == id).then_some(gen),
                     !is_root,
                     (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
                         .then_some(planned),
@@ -3176,6 +3181,12 @@ impl<C: Cells> Runtime<C> {
             } else {
                 NodeState::Computing
             };
+            // The walk's handle is on the root alone: a dep with a reader
+            // cannot be deleted. Expanding a recycled root would run the
+            // new node's deps for a stale read.
+            if cur == id && node.generation() != gen {
+                return Computed::Gone;
+            }
             // A node with a virtual frame stands for a frame on the stack,
             // so the walk skips it as it skips a real one.
             if MODE & VIRT != 0
@@ -3499,8 +3510,10 @@ impl<C: Cells> Runtime<C> {
 
         'attempt: loop {
             let observed = state::load::<C>(node.state_cell());
-            // A wait can outlast the node, whose slot then holds another.
-            if spins != 0 && g0.is_some_and(|g| g != node.generation()) {
+            // A reader of a known generation must not act on the state of
+            // the node a delete recycled the slot into; generation loads
+            // after the state, as a recycle bumps it first.
+            if g0.is_some_and(|g| g != node.generation()) {
                 return Computed::Gone;
             }
             // After the load, so a landing that passed the held payload's
@@ -3535,15 +3548,10 @@ impl<C: Cells> Runtime<C> {
                 // whose rerun reads it only if it still needs it.
                 NodeState::Failed if walked => return Computed::Done,
                 NodeState::Failed => {
-                    self.read_failed_node(id);
+                    self.read_failed_node(id, g0);
                     continue;
                 }
                 NodeState::Dead => {
-                    // A bumped generation under Dead is a delete that has
-                    // unhooked the node but not recycled the slot yet.
-                    if g0.is_some_and(|g| g != node.generation()) {
-                        return Computed::Gone;
-                    }
                     // An observer's read of a node whose delete has not
                     // bumped its generation yet: the observer goes with it.
                     if observe_impl::is_observed(self.runtime_id, id.0) {
