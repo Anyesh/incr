@@ -2573,3 +2573,50 @@ fn a_claim_after_another_threads_speculative_run_does_not_run_it_again() {
     assert_eq!(rt.get(n), 11);
     assert_eq!(runs.load(SeqCst), 1);
 }
+
+/// A speculative verify of `mid` scans its deps, then a set ends the
+/// revision before it stashes: the stash must not hold for the set's
+/// revision, where a speculative read would take `mid` as unchanged.
+#[test]
+fn a_speculative_verify_across_a_set_keeps_no_stash() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let leaf = rt.create_query_with(move |rt: &Rt| rt.get(input) / 10, replayable());
+    let mid = rt.create_query_with(move |rt: &Rt| rt.get(leaf), replayable());
+    let top = rt.create_query_with(move |rt: &Rt| rt.get(mid) + 1, replayable());
+    assert_eq!(rt.get(top), 1);
+    rt.set(input, 2);
+    let b = rt.create_query(|_: &Rt| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(top)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    let gate = Gate::new();
+    gate.arm();
+    hook(
+        &rt,
+        vec![(ParkPoint::VerifyAfterScan(id(mid)), gate.clone())],
+    );
+    let parked = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(reader))
+    };
+    gate.wait_parked();
+    rt.set(input, 13);
+    gate.release();
+    assert_eq!(parked.join().unwrap(), 5);
+    assert!(
+        !rt.stashed_verify(id(mid).0, mid.generation()),
+        "a verify from before the set is stashed for its revision"
+    );
+    assert_eq!(rt.get(top), 2);
+}

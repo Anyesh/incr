@@ -130,7 +130,7 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
         let value = value
             .downcast_ref::<T>()
             .expect("incr-core: a stashed value has its node's type");
-        crate::value_code::run(|| self.try_read(slot).is_some_and(|v| v == *value))
+        crate::value_code::run(|| self.eq_current(slot, value))
     }
 }
 

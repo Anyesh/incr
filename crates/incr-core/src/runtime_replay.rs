@@ -345,6 +345,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 verify_rev: attempt.verify_rev,
             },
+            attempt.stamp_rev,
         );
         let target = if attempt.first {
             NodeState::New
@@ -368,18 +369,18 @@ impl<C: Cells> Runtime<C> {
         node: &NodeData<C>,
         generation: u32,
         since: u64,
+        stamp_rev: u64,
         verify_rev: u64,
     ) -> Computed {
-        let mut deps = Vec::new();
-        node.for_each_dep(|d| deps.push((d, self.nodes.get(d.0).generation())));
         self.stash(
             id.0,
             generation,
             Stash {
                 outcome: Outcome::Verified { since },
-                deps,
+                deps: self.current_deps(node),
                 verify_rev,
             },
+            stamp_rev,
         );
         self.land(id, node, NodeState::Dirty, NodeState::Dirty);
         Computed::Done
@@ -397,16 +398,29 @@ impl<C: Cells> Runtime<C> {
         let revision = self.current_revision();
         let mut s = self.stashes.write();
         s.revision == revision
-            && (s.map.get_mut(&(slot, generation))).is_some_and(|e| {
-                matches!(
-                    e.get_mut().outcome,
-                    Outcome::Verified { .. }
-                        | Outcome::Value {
-                            unchanged: true,
-                            ..
-                        }
-                )
+            && (s.map.get_mut(&(slot, generation))).is_some_and(|e| match e.get_mut().outcome {
+                Outcome::Verified { since } => self.nodes.get(slot).verified_at() == since,
+                Outcome::Value { unchanged, .. } => unchanged,
+                Outcome::Panic(_) | Outcome::Tried => false,
             })
+    }
+
+    /// Whether node `slot` at `generation` has a stashed verify this
+    /// revision.
+    #[cfg(test)]
+    pub(super) fn stashed_verify(&self, slot: u32, generation: u32) -> bool {
+        let revision = self.current_revision();
+        let mut s = self.stashes.write();
+        s.revision == revision
+            && (s.map.get_mut(&(slot, generation)))
+                .is_some_and(|e| matches!(e.get_mut().outcome, Outcome::Verified { .. }))
+    }
+
+    /// Node `node`'s deps, each at its current generation.
+    fn current_deps(&self, node: &NodeData<C>) -> Vec<(NodeId, u32)> {
+        let mut deps = Vec::new();
+        node.for_each_dep(|d| deps.push((d, self.nodes.get(d.0).generation())));
+        deps
     }
 
     /// A speculative run that unwound or was dropped after its closure
@@ -498,9 +512,18 @@ impl<C: Cells> Runtime<C> {
                 self.land(a.id, self.nodes.get(a.id.0), target, target);
                 continue;
             }
+            let adopted = a.id;
             match self.land_adopted(a, bag) {
                 Some(NodeState::Clean) if root => return Adopted::Landed(Computed::Done),
-                Some(NodeState::Clean) => {}
+                // A verify's dep must still be unchanged since the verify
+                // once it lands from its own stash.
+                Some(NodeState::Clean) => {
+                    if let Some(Outcome::Verified { since }) =
+                        stack.last().map(|t| &t.stash.outcome)
+                    {
+                        failed = !self.observed_clean(adopted, *since);
+                    }
+                }
                 Some(_) if root => {
                     self.dep_stack.poison_current_frame(rt);
                     return Adopted::Landed(Computed::Unsettled);
@@ -546,7 +569,12 @@ impl<C: Cells> Runtime<C> {
     /// or the write panicked, with the node landed back New or as claimed.
     fn land_adopted(&self, a: Adopting, bag: &mut Deferred<C>) -> Option<NodeState> {
         let (node, flags) = self.nodes.get_with_flags(a.id.0);
-        if let Outcome::Verified { .. } = a.stash.outcome {
+        if let Outcome::Verified { since } = a.stash.outcome {
+            // A real landing since the speculative verify supersedes it.
+            if node.verified_at() != since || self.current_deps(node) != a.stash.deps {
+                self.land(a.id, node, NodeState::Dirty, NodeState::Dirty);
+                return None;
+            }
             node.max_verified_at(
                 a.stash
                     .verify_rev
@@ -671,7 +699,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         ctl: &ComputeCtl,
         deps: &[(NodeId, u32)],
-        verify_rev: u64,
+        attempt: &Attempt,
         payload: Box<dyn Any + Send>,
     ) -> Box<dyn Any + Send> {
         if ctl.flags.get() & (cycle::DOOMED | cycle::POISONED | cycle::KEPT_READ) != 0
@@ -685,8 +713,9 @@ impl<C: Cells> Runtime<C> {
             Stash {
                 outcome: Outcome::Panic(Unbuilt::new(payload)),
                 deps: deps.to_vec(),
-                verify_rev,
+                verify_rev: attempt.verify_rev,
             },
+            attempt.stamp_rev,
         );
         Box::new(cycle::DiscardUnwind)
     }
@@ -719,17 +748,23 @@ impl<C: Cells> Runtime<C> {
                 deps: Vec::new(),
                 verify_rev: 0,
             },
+            self.current_revision(),
         )
     }
 
-    /// Keeps `stash` for node `slot` at `generation`, for this revision, and
-    /// says whether the node had no entry. A node already stashed keeps its
-    /// first stash, which speculative reads may have returned; a run's stash
-    /// replaces its own tried mark.
-    fn stash(&self, slot: u32, generation: u32, stash: Stash) -> bool {
-        let revision = self.current_revision();
+    /// Keeps `stash` for node `slot` at `generation`, for `revision`, the
+    /// one its run claimed in, and says whether the node had no entry. A
+    /// node already stashed keeps its first stash, which speculative reads
+    /// may have returned; a run's stash replaces its own tried mark. A
+    /// stash whose revision a set has ended is dropped.
+    fn stash(&self, slot: u32, generation: u32, stash: Stash, revision: u64) -> bool {
         let (displaced, ended) = {
             let mut s = self.stashes.write();
+            if self.current_revision() != revision {
+                drop(s);
+                drop(stash);
+                return true;
+            }
             let ended = (s.revision != revision).then(|| std::mem::take(&mut s.map));
             s.revision = revision;
             let displaced = match s.map.entry((slot, generation)) {

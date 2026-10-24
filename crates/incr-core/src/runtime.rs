@@ -3673,10 +3673,10 @@ impl<C: Cells> Runtime<C> {
                     }
                 });
                 if !any_changed {
-                    if MODE & VIRT != 0 && replay::speculative() {
-                        return self.stash_verify(id, node, g, my_verified, verify_rev);
-                    }
                     self.park(ParkPoint::VerifyAfterScan(id));
+                    if MODE & VIRT != 0 && replay::speculative() {
+                        return self.stash_verify(id, node, g, my_verified, stamp_rev, verify_rev);
+                    }
                     node.max_verified_at(verify_rev);
                     if self.land_single(id, node, flags, NodeState::Clean, NodeState::Dirty)
                         == NodeState::Clean
@@ -3981,7 +3981,7 @@ impl<C: Cells> Runtime<C> {
     ) -> Computed {
         let kind = cycle_state::take_unwind_kind();
         let payload = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
-            self.stash_panic(id, ctl, deps, attempt.verify_rev, payload)
+            self.stash_panic(id, ctl, deps, &attempt, payload)
         } else {
             payload
         };
