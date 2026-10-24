@@ -6374,6 +6374,10 @@ fn a_speculative_recompute_to_the_same_value_keeps_its_reader_verified() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn native_cycle_members_rerun_under_replay() {
+    // INCR_TEST_ALL_REPLAYABLE replays Native specs, so no run is Native.
+    if super::replay_defaults().1 {
+        return;
+    }
     for seed in [0x0001_2b74, 0x597] {
         let case = gen_base(seed);
         let mut counts = NativeCounts::new();
