@@ -962,8 +962,6 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             bare,
             strategy,
         } => {
-            // `INCR_TEST_ALL_REPLAYABLE` replays `Replay::Native` queries too.
-            let native = !*replay && !rt.all_replayable;
             let made = world.made.fetch_add(1, Relaxed);
             let by_landing = lands_first(expr);
             let replay = if *replay {
@@ -971,6 +969,13 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             } else {
                 Replay::Native
             };
+            // A `FirstRun` closure reads differently once it has run, so
+            // its Native query stays Native under `INCR_TEST_ALL_REPLAYABLE`,
+            // as a collection operator's does: a doomed first run would make
+            // the retry take the other branch.
+            let pinned = replay == Replay::Native && has_first_run(expr);
+            // `INCR_TEST_ALL_REPLAYABLE` replays the other Native queries.
+            let native = replay == Replay::Native && (pinned || !rt.all_replayable);
             let (expr, world) = (expr.clone(), world.clone());
             let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
             let compute = move |rt: &Runtime<C>| {
@@ -1014,20 +1019,26 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                 v
             };
             if *bare {
-                Handle::Bare(rt.create_query_with(
+                Handle::Bare(rt.create_query_erased::<true, _, _>(
                     move |rt| Bare::made(compute(rt)),
-                    QueryOpts {
-                        cycle: strategy.build(|v| Bare(v, false)),
-                        replay,
-                    },
+                    erased(
+                        pinned,
+                        QueryOpts {
+                            cycle: strategy.build(|v| Bare(v, false)),
+                            replay,
+                        },
+                    ),
                 ))
             } else {
-                Handle::Plain(rt.create_query_with(
+                Handle::Plain(rt.create_query_erased::<true, _, _>(
                     compute,
-                    QueryOpts {
-                        cycle: strategy.build(|v| v),
-                        replay,
-                    },
+                    erased(
+                        pinned,
+                        QueryOpts {
+                            cycle: strategy.build(|v| v),
+                            replay,
+                        },
+                    ),
                 ))
             }
         }
@@ -5855,6 +5866,32 @@ fn seed_783_at_budget_3() {
     });
 }
 
+/// A query whose run read the node being deleted keeps that dependency,
+/// so the delete is refused at every budget. In 0x2343 node 15's run
+/// completes with the read; in 0xc17 node 7's claim, released by another
+/// node's user panic, lands New over the deps its run read.
+#[test]
+fn delete_of_a_node_a_query_read_is_refused() {
+    for (seed, op) in [(0x2343, 9), (0xc17, 5)] {
+        let mut case = gen_case(seed, false, false);
+        assert!(matches!(case.ops[op], Op::Delete(_)));
+        case.ops.truncate(op + 1);
+        quiet(|| {
+            for (frames, bytes) in std::iter::once((None, 0)).chain(BUDGETS) {
+                let local = run::<Local>(&case, frames, bytes);
+                let shared = run::<Shared>(&case, frames, bytes);
+                for trace in [&local, &shared] {
+                    assert_eq!(
+                        trace[op].0,
+                        Out::Deleted(Err("HasDependents".into())),
+                        "seed {seed:#x} at {frames:?}/{bytes}"
+                    );
+                }
+            }
+        });
+    }
+}
+
 /// A diverted frame's Clean read with nothing to take is a fast read: with
 /// every retry's frame diverted, each case's bounded runs give the
 /// outcomes, states and deps they give with only the frames a delivery
@@ -6138,6 +6175,26 @@ fn one<C: Cells>() {
             differential_two(&case, seed);
         }
     });
+}
+
+fn erased<T: Value>(pinned: bool, opts: QueryOpts<T>) -> crate::cycle::ErasedOpts {
+    let mut opts = crate::cycle::erase_opts(opts);
+    if pinned {
+        opts.flags |= crate::segmented_nodes::NOT_REPLAYABLE;
+    }
+    opts
+}
+
+fn has_first_run(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => false,
+        Expr::FirstRun(..) => true,
+        // A run that lands nothing leaves `FirstLanded` on its first branch,
+        // so a doomed run's retry reads as it did.
+        Expr::Add(a, b) | Expr::FirstLanded(a, b) => has_first_run(a) || has_first_run(b),
+        Expr::If(a, b, c) => has_first_run(a) || has_first_run(b) || has_first_run(c),
+        Expr::PanicIf(a, _) | Expr::Catch(a) => has_first_run(a),
+    }
 }
 
 fn size(e: &Expr) -> usize {
@@ -7768,13 +7825,6 @@ fn a_dissolved_roots_rerun_at_the_bottom_walks_its_reads_again() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn seed_381_first_run_state() {
-    if super::replay_defaults().1 {
-        eprintln!(
-            "skipped under INCR_TEST_ALL_REPLAYABLE until T10-381-all-replayable-cycle-value: \
-             budget 1 lands 0 and 19 Clean where the unbounded run leaves them Cyclic"
-        );
-        return;
-    }
     let specs: Vec<Spec> = vec![
         Spec::Query {
             expr: Expr::Catch(Box::new(Expr::Read(19, false))),

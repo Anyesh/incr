@@ -2202,13 +2202,63 @@ fn shared_vframe_reader_waits_then_dirties_it() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// With no budget, a set that lands after X claimed and before it reads
+/// `i` supersedes X's deps, so X's own panic lands it Dirty and the next
+/// read runs it again.
+#[test]
+fn shared_set_during_xs_compute_lands_x_dirty() {
+    let rt = Arc::new(Rt::new());
+    let i = rt.create_input(0_u64);
+    let y = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            if rt.get(i) == 1 {
+                return 7;
+            }
+            panic!("y boom")
+        },
+        replayable(),
+    );
+    let x_runs = Arc::new(AtomicU32::new(0));
+    let (claimed, wait_claimed) = mpsc::channel::<()>();
+    let (go, wait_go) = mpsc::channel::<()>();
+    let x = {
+        let x_runs = x_runs.clone();
+        let (claimed, wait_go) = (Mutex::new(claimed), Mutex::new(wait_go));
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if x_runs.fetch_add(1, SeqCst) == 0 {
+                    claimed.lock().unwrap().send(()).unwrap();
+                    wait_go.lock().unwrap().recv().unwrap();
+                }
+                if rt.get(i) == 1 {
+                    panic!("x own");
+                }
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    wait_claimed.recv().unwrap();
+    rt.set(i, 1);
+    go.send(()).unwrap();
+    assert_eq!(first.join(), Err("x own".to_string()));
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    assert_eq!(outcome(|| rt.get(x)), Err("x own".to_string()));
+    assert_eq!(x_runs.load(SeqCst), 2);
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+}
+
 /// The retry loads X New and parks before its claim while the other
 /// thread's read of X waits for the reservation, and a set flips Y Dirty
-/// and makes X panic "x own". The retry claims X from New and runs it at
-/// the new revision, as the serial order with the set and then this
-/// thread's read first does, and the other thread reads X Failed.
+/// and makes X panic "x own". The doomed run claimed X before the set, so
+/// the set overlaps X's frame as it does in
+/// [`shared_set_during_xs_compute_lands_x_dirty`]: the retry's panic lands
+/// X Dirty, and the waiting read runs X again and lands it Failed.
 #[test]
-#[ignore = "the retry's own panic after a set lands X Dirty, not Failed; T8-set-before-retry-claim-lands-dirty"]
 fn shared_vframe_set_before_the_retrys_claim_under_a_waiting_reader() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
@@ -2268,8 +2318,12 @@ fn shared_vframe_set_before_the_retrys_claim_under_a_waiting_reader() {
     claim.release();
     let (first, other) = (first.join(), other.join());
     assert_eq!(first, Err("x own".to_string()));
-    assert!(failed(&other), "{other:?}");
-    assert_eq!(x_runs.load(SeqCst), 2, "X ran doomed and as the retry");
+    assert_eq!(other, Err("x own".to_string()));
+    assert_eq!(
+        x_runs.load(SeqCst),
+        3,
+        "X ran doomed, as the retry and for the waiting read"
+    );
     assert_eq!(rt.state_of(x), NodeState::Failed);
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
