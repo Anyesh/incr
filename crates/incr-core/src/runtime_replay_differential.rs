@@ -6740,3 +6740,116 @@ fn a_failed_ring_member_lands_failed_at_every_budget() {
         differential::<Shared>(&case, 0x675a);
     });
 }
+
+/// Seed 0x189fb's op 2, `TryGet(20)`, shrunk: 20 roots an episode whose
+/// cycle passes through 6, and at a budget of 2 a doom replays it, so the
+/// pop of 20's virtual frame at position 0 runs the episode. It dissolves
+/// to 20 alone, which then reruns as a new run, and that run's read of 6,
+/// released Dirty, walks again as the unbounded run's does. Taking the
+/// `Direct` delivery made for the first run's read instead gave `Value(2)`
+/// where the unbounded run panics out of 11.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_dissolved_roots_rerun_at_the_bottom_walks_its_reads_again() {
+    let specs = vec![
+        replayable(Expr::Const(0), Strat::None),
+        replayable(Expr::Const(0), Strat::None),
+        replayable(Expr::Const(0), Strat::None),
+        replayable(Expr::Const(0), Strat::None),
+        replayable(
+            Expr::Read(5, false),
+            Strat::Fixpoint {
+                initial: 3,
+                limit: 3,
+            },
+        ),
+        replayable(Expr::Read(6, false), Strat::None),
+        replayable(Expr::Read(7, true), Strat::Fallback(2)),
+        replayable(Expr::Read(13, false), Strat::None),
+        replayable(Expr::Const(0), Strat::None),
+        replayable(
+            Expr::If(
+                Box::new(Expr::Read(4, true)),
+                Box::new(Expr::Read(10, true)),
+                Box::new(Expr::Const(0)),
+            ),
+            Strat::None,
+        ),
+        replayable(Expr::Read(20, false), Strat::None),
+        replayable(
+            Expr::PanicIf(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Read(12, true)),
+                    Box::new(Expr::If(
+                        Box::new(Expr::Read(12, false)),
+                        Box::new(Expr::Read(9, false)),
+                        Box::new(Expr::Const(0)),
+                    )),
+                )),
+                0,
+            ),
+            Strat::None,
+        ),
+        replayable(Expr::Read(13, false), Strat::None),
+        Spec::Query {
+            expr: Expr::If(
+                Box::new(Expr::Read(11, false)),
+                Box::new(Expr::Const(0)),
+                Box::new(Expr::Const(0)),
+            ),
+            replay: false,
+            bare: false,
+            strategy: Strat::Fixpoint {
+                initial: 4,
+                limit: 2,
+            },
+        },
+        replayable(Expr::Const(1), Strat::None),
+        replayable(Expr::Const(4), Strat::None),
+        replayable(Expr::Const(0), Strat::None),
+        Spec::Query {
+            expr: Expr::Const(0),
+            replay: false,
+            bare: false,
+            strategy: Strat::None,
+        },
+        replayable(Expr::Const(0), Strat::None),
+        replayable(Expr::Read(24, true), Strat::None),
+        replayable(
+            Expr::If(
+                Box::new(Expr::Read(19, false)),
+                Box::new(Expr::Const(1)),
+                Box::new(Expr::Read(6, false)),
+            ),
+            Strat::Fixpoint {
+                initial: 1,
+                limit: 1,
+            },
+        ),
+        Spec::Query {
+            expr: Expr::Const(3),
+            replay: false,
+            bare: true,
+            strategy: Strat::None,
+        },
+        replayable(Expr::Const(0), Strat::None),
+        replayable(Expr::Const(0), Strat::None),
+        Spec::Input(4),
+        Spec::Input(2),
+        Spec::Input(3),
+        Spec::Input(2),
+    ];
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 24,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(4), Op::Set(24, 3), Op::TryGet(20)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x189fb);
+        differential::<Shared>(&case, 0x189fb);
+    });
+}
