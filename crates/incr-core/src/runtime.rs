@@ -3390,14 +3390,7 @@ impl<C: Cells> Runtime<C> {
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
                 NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
-                    // A walk entry's memo reaches the reader only through
-                    // the reading node's own run.
-                    if walked {
-                        return Computed::Done;
-                    }
-                    self.dep_stack
-                        .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
-                    return Computed::Unsettled;
+                    return self.read_memo(walked);
                 }
                 NodeState::Computing | NodeState::ComputingDirty => {
                     // A walk's deps-first computes can defer the walk's own
@@ -3550,6 +3543,12 @@ impl<C: Cells> Runtime<C> {
             if claimed_dirty && seen == Seen::New {
                 self.unclaim_unrun(id, node, claimed_dirty);
                 return Computed::Revisit;
+            }
+            // Another thread's memo landing since the load leaves a Dirty
+            // the claim succeeds on, and the memo stands for this run.
+            if claimed_dirty && node.memo_at(|| self.current_revision()) {
+                self.unclaim_unrun(id, node, claimed_dirty);
+                return self.read_memo(walked);
             }
             // When the claim reads from another thread's episode, which left
             // this node New or Dirty, it reads the count that episode
@@ -4101,6 +4100,18 @@ impl<C: Cells> Runtime<C> {
     /// the check guards against.
     pub(super) fn memo_landing(&self, poison: u16, verify_rev: u64) -> bool {
         poison == cycle::HANDLED && self.current_revision() == verify_rev
+    }
+
+    /// A read of a node holding a memo for this revision: it takes the
+    /// node's value, and a walk entry's memo reaches the reader only
+    /// through the reading node's own run.
+    fn read_memo(&self, walked: bool) -> Computed {
+        if walked {
+            return Computed::Done;
+        }
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
+        Computed::Unsettled
     }
 
     /// The flag a read of `node`, left Dirty by a landing, raises on its

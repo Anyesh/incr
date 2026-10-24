@@ -493,6 +493,35 @@ fn caught_failed_dep_flipped_during_a_recompute_keeps_no_memo() {
     assert_eq!(rt.get(d), 11);
 }
 
+/// A read loads `d` Dirty with no memo for the revision, another thread
+/// lands `d` with one, and the read claims `d` after: it takes the memo
+/// instead of running `d` again in the revision.
+#[test]
+fn claim_after_another_threads_memo_takes_the_memo() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (_, y, _, d) = caught_failed_dep(&rt, &gate);
+    assert_eq!(rt.get(d), 7);
+    rt.set(y, 1);
+    let unclaims = rt.unrun_unclaims.load(Ordering::Relaxed);
+    let before_claim = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::BeforeClaim(id(d)), before_claim.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    before_claim.wait_parked();
+    assert_eq!(rt.get(d), 8);
+    assert!(rt.has_memo_of(d));
+    before_claim.release();
+    assert_eq!(reader.join().unwrap(), 8);
+    assert!(rt.has_memo_of(d));
+    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), unclaims + 1);
+}
+
 #[test]
 fn b1_publish_lands_between_delete_check_and_claim() {
     let rt = Arc::new(Rt::new());
