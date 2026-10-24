@@ -3207,9 +3207,10 @@ impl<C: Cells> Runtime<C> {
                 return Some(Computed::Unsettled);
             }
             // The read that ran the loop reads the target as the native
-            // compute's reader does after its landing.
+            // compute's reader does after its landing, which a walk entry's
+            // landing leaves unpoisoned.
             if landed {
-                self.episode_landed(self.nodes.get(node));
+                self.episode_landed(self.nodes.get(node), entry.walked);
             }
             if ended == Ended::Unsettled {
                 return Some(Computed::Unsettled);

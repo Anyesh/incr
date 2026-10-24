@@ -3587,7 +3587,7 @@ impl<C: Cells> Runtime<C> {
                     // compute to read again, which poisons where needed.
                     GroupEnd::Done(Computed::Done) if !matches!(visit, Visit::VerifyOnly(_)) => {
                         self.park(ParkPoint::EpisodeLanded(id));
-                        return self.episode_landed(node);
+                        return self.episode_landed(node, walked);
                     }
                     GroupEnd::Done(computed) => return computed,
                     GroupEnd::Retry => {
@@ -3632,7 +3632,7 @@ impl<C: Cells> Runtime<C> {
                     {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                     } else {
-                        self.dep_stack.poison_current_frame(self.runtime_id);
+                        self.poison_reader(walked);
                     }
                     return Computed::Done;
                 }
@@ -3777,7 +3777,7 @@ impl<C: Cells> Runtime<C> {
                         PopEnd::Deferred => return Computed::Deferred,
                         PopEnd::Landed => {
                             self.park(ParkPoint::EpisodeLanded(id));
-                            return self.episode_landed(node);
+                            return self.episode_landed(node, walked);
                         }
                         PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
                         PopEnd::Contained => return Computed::Unsettled,
@@ -3860,10 +3860,7 @@ impl<C: Cells> Runtime<C> {
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
-                    // The enclosing compute read this node through a non-Clean
-                    // landing. Its own publish may take the fast path, where
-                    // nothing else would catch that.
-                    self.dep_stack.poison_current_frame(self.runtime_id);
+                    self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
@@ -3879,11 +3876,22 @@ impl<C: Cells> Runtime<C> {
     /// root as soon as it lands, so any state but Clean or Cyclic poisons:
     /// a Clean root leaves Clean only through a walk, which flags the
     /// reader too.
-    fn episode_landed(&self, node: &NodeData<C>) -> Computed {
+    fn episode_landed(&self, node: &NodeData<C>, walked: bool) -> Computed {
         if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
-            self.dep_stack.poison_current_frame(self.runtime_id);
+            self.poison_reader(walked);
         }
         Computed::Done
+    }
+
+    /// After a non-Clean landing: the enclosing compute read this node, and
+    /// its own publish may take the fast path, where nothing else would
+    /// catch that. A walk entry (`walked`) is no such read: a dependent's
+    /// rerun reads it again through a nested get if it still needs it, and
+    /// that read poisons the dependent.
+    fn poison_reader(&self, walked: bool) {
+        if !walked {
+            self.dep_stack.poison_current_frame(self.runtime_id);
+        }
     }
 
     /// The `Err` arm of a compute: the closure panicked, or an engine

@@ -783,6 +783,81 @@ fn shared_stale_dep_gives_the_rerun_result() {
     stale_dep_gives_the_rerun_result::<Shared>();
 }
 
+/// `y` read `e` while `sel` was 0; setting `k` makes `e` catch a cycle and
+/// land Dirty, and `sel` is set to `sel_after`. `z`'s first run reads `y`,
+/// whose walk cleans `e` first. Returns `z`'s and `e`'s states after it.
+fn walk_entry_reader<C: Cells>(frames: Option<u32>, sel_after: i64) -> (NodeState, NodeState) {
+    let rt = Runtime::<C>::new();
+    if let Some(frames) = frames {
+        rt.set_max_frames(frames);
+    }
+    let sel = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let c1 = {
+        let cell = cell.clone();
+        rt.create_query(move |rt| rt.get(*cell.get().unwrap()) + 1)
+    };
+    let c2 = rt.create_query(move |rt| rt.get(c1) + 1);
+    cell.set(c2).unwrap();
+    let e = rt.create_query(move |rt| {
+        if rt.get(k) == 0 {
+            1
+        } else {
+            catch_unwind(AssertUnwindSafe(|| rt.get(c1))).unwrap_or(7)
+        }
+    });
+    let y = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(e) } else { 5 });
+    assert_eq!(rt.get(y), 1);
+
+    rt.set(k, 1);
+    rt.set(sel, sel_after);
+    let z = rt.create_query(move |rt| rt.get(y) + 1);
+    assert_eq!(rt.get(z), if sel_after == 0 { 8 } else { 6 });
+    (rt.state_of(z), rt.state_of(e))
+}
+
+/// When `y`'s rerun no longer reads `e`, `z` read nothing that did not land
+/// Clean and lands Clean, as from scratch, at every frame budget (seed
+/// 0x77d).
+fn unread_walk_entry_leaves_the_reader_clean<C: Cells>() {
+    for frames in [None, Some(1), Some(2), Some(3)] {
+        let (z, e) = walk_entry_reader::<C>(frames, 1);
+        assert_ne!(e, NodeState::Clean, "frames {frames:?}");
+        assert_eq!(z, NodeState::Clean, "frames {frames:?}");
+    }
+}
+
+#[test]
+fn local_unread_walk_entry_leaves_the_reader_clean() {
+    unread_walk_entry_leaves_the_reader_clean::<Local>();
+}
+
+#[test]
+fn shared_unread_walk_entry_leaves_the_reader_clean() {
+    unread_walk_entry_leaves_the_reader_clean::<Shared>();
+}
+
+/// When `y`'s rerun still reads `e`, `z` read a value built on `e`'s Dirty
+/// landing and lands Dirty, at every frame budget.
+fn read_walk_entry_leaves_the_reader_dirty<C: Cells>() {
+    for frames in [None, Some(1), Some(2), Some(3)] {
+        let (z, e) = walk_entry_reader::<C>(frames, 0);
+        assert_ne!(e, NodeState::Clean, "frames {frames:?}");
+        assert_eq!(z, NodeState::Dirty, "frames {frames:?}");
+    }
+}
+
+#[test]
+fn local_read_walk_entry_leaves_the_reader_dirty() {
+    read_walk_entry_leaves_the_reader_dirty::<Local>();
+}
+
+#[test]
+fn shared_read_walk_entry_leaves_the_reader_dirty() {
+    read_walk_entry_leaves_the_reader_dirty::<Shared>();
+}
+
 /// A dep the walk cleans panics, and the rerun still reads it: the rerun
 /// raises the dep's own payload, as a run from scratch does, and only a
 /// later read sees "last compute panicked". Nothing is held once the dep
