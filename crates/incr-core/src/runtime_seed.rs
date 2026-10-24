@@ -37,6 +37,12 @@ impl<C: Cells> Runtime<C> {
         {
             return Err((SeedError::NotFresh, value));
         }
+        // Another thread's doom keeps the node as its unbounded run's frame
+        // does, claimed.
+        if self.reserved_elsewhere(id, q.generation()) {
+            self.unclaim_unrun(node, false);
+            return Err((SeedError::NotFresh, value));
+        }
         let installed = {
             let mut inner = self.inner.write();
             self.install_seed(&mut inner, id, q.generation(), deps, reuse)

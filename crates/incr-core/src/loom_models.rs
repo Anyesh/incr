@@ -1436,6 +1436,82 @@ fn virtual_hit_claim_race() {
     });
 }
 
+/// A Fallback cycle F -> X -> ... -> F of `len` nodes at budget
+/// `frames`, entered at F on one thread and at X on the other: each
+/// thread's chain dooms on nodes the other's entries need, and its
+/// replay keeps every node the doom released reserved until its outermost
+/// context is removed. Each thread can wait on the other's reservation while
+/// holding its own, across its context's retries; wound-wait resolves
+/// any such wait, nothing stays reserved, and the pair of reads is one
+/// serial order's.
+fn doom_reservations_cross(len: usize, frames: u32) {
+    fn shape(len: usize, frames: u32) -> (Arc<Rt>, Incr<u64>, Incr<u64>) {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+        let fc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let mut next = {
+            let fc = fc.clone();
+            rt.create_query_with(move |rt: &Rt| rt.get(*fc.get().unwrap()) + 1, replayable())
+        };
+        for _ in 2..len {
+            let n = next;
+            next = rt.create_query_with(move |rt: &Rt| rt.get(n) + 1, replayable());
+        }
+        let x = next;
+        let f = rt.create_query_with(
+            move |rt: &Rt| rt.get(x) + 1,
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::Fallback(Box::new(|_| 100)),
+                replay: crate::cycle::Replay::Allowed,
+            },
+        );
+        fc.set(f).unwrap();
+        (rt, f, x)
+    }
+    run(move || {
+        let serial = |f_first: bool| {
+            let (rt, f, x) = shape(len, frames);
+            if f_first {
+                let vf = panic_message(|| rt.get(f));
+                (vf, panic_message(|| rt.get(x)))
+            } else {
+                let vx = panic_message(|| rt.get(x));
+                (panic_message(|| rt.get(f)), vx)
+            }
+        };
+        let orders = [serial(true), serial(false)];
+        let (rt, f, x) = shape(len, frames);
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || panic_message(|| rt.get(x)))
+        };
+        let vf = panic_message(|| rt.get(f));
+        let got = (vf, other.join().unwrap());
+        assert!(orders.contains(&got), "{got:?} not in {orders:?}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+    });
+}
+
+/// [`doom_reservations_cross`] on F <-> X at budget 1: each read dooms on
+/// the other thread's entry node.
+#[test]
+fn doom_reservations_cross_direct() {
+    doom_reservations_cross(2, 1);
+}
+
+/// [`doom_reservations_cross`] on a cycle of three at budget 2: each doom
+/// discards the frame below it, whose node stays reserved while the
+/// context's entries run.
+#[test]
+fn doom_reservations_cross_held() {
+    doom_reservations_cross(3, 2);
+}
+
 /// F, Clean at s = 0, reads a New query N once s is set, so at budget 1
 /// its run claimed from Dirty dooms on N and is discarded, while another
 /// thread sets s again. The discard landing keeps that set's dirtying:

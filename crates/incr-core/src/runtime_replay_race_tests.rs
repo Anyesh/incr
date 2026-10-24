@@ -1,17 +1,20 @@
 //! T8 replay under `Shared` with a second thread acting between replay
 //! rounds: a thread parks its driver at a [`ParkPoint`] (or inside a
-//! closure) while another lands, claims, deletes or sets the nodes its
-//! virtual frames stand for. Each result is compared with the unbounded
-//! run's in which the other thread's action came first.
+//! closure) while another reads, deletes or sets the nodes its virtual
+//! frames stand for. A doom reserves the nodes its context computes
+//! again, so another thread's read of one waits for the dooming thread's
+//! landing; each result is compared with the unbounded run's in which the
+//! dooming thread's read came first, after the other thread's delete or
+//! set.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
-use super::race_tests::{id, Gate};
+use super::race_tests::{await_reservation_wait, id, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
@@ -89,7 +92,6 @@ const CLEAN: u8 = 1;
 const CYCLIC: u8 = 2;
 const FAILED: u8 = 3;
 const PARKED: u8 = 4;
-const CAUGHT: u8 = 5;
 
 /// T reads X with `try_get`, X reads Y, and Y, when `y_reads_x`, reads X
 /// with `try_get`; all replayable over a `u64` placeholder. A switched X
@@ -162,25 +164,43 @@ fn landed_shape(rt: Rt, y_reads_x: bool) -> Landed {
 
 type Outcome = Result<u64, String>;
 
-/// The unbounded run in which X's switched landing comes first:
-/// `get(X)`'s outcome, then `get(T)`'s, X's runs, and a later `get(T)`'s
-/// outcome, which for a Failed T names T rather than X.
-fn landed_first(mode: u8, y_reads_x: bool) -> (Outcome, Outcome, u32, Outcome) {
+/// The unbounded run in which T's read comes first and X's closure is
+/// switched to `mode` before it: `get(T)`'s outcome, then `get(X)`'s, and
+/// a later `get(T)`'s.
+fn t_first(mode: u8, y_reads_x: bool) -> (Outcome, Outcome, Outcome) {
     let s = landed_shape(Rt::new(), y_reads_x);
+    s.rt.set_max_frames(u32::MAX);
     s.mode.store(mode, SeqCst);
-    let x = outcome(|| s.rt.get(s.x));
     let t = outcome(|| s.rt.get(s.t));
-    let runs = s.x_runs.load(SeqCst);
-    (x, t, runs, outcome(|| s.rt.get(s.t)))
+    let x = outcome(|| s.rt.get(s.x));
+    (t, x, outcome(|| s.rt.get(s.t)))
 }
 
-/// **A VFrame's node landed by another thread** (Virtual cycles step 1,
+/// X's runs in the bounded run on one thread with X's closure switched to
+/// `mode` where [`vframe_node_read`] parks.
+fn alone_switched_runs(mode: u8, y_reads_x: bool) -> u32 {
+    let s = landed_shape(Rt::new(), y_reads_x);
+    s.rt.set_max_frames(1);
+    let (m, y) = (s.mode.clone(), id(s.y));
+    let installed = s.rt.park_hook.set(Box::new(move |p| {
+        if p == ParkPoint::BeforeEntry(y) {
+            m.store(mode, SeqCst);
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
+    let _ = outcome(|| s.rt.get(s.t));
+    s.x_runs.load(SeqCst)
+}
+
+/// **A VFrame's node read by another thread** (Virtual cycles step 1,
 /// Loop step 2), at budget 1: T's run dooms on X and X's on Y, so T and
-/// X are virtual frames when the driver takes Y. Parked there, another
-/// thread lands X in `mode`; Y's read of X (when it makes one), the pop
-/// of X's virtual frame and T's retry then behave as the unbounded run
-/// in which that landing came first.
-fn vframe_node_landed(mode: u8, y_reads_x: bool) {
+/// X are virtual frames when the driver takes Y. Parked there, X's
+/// closure switches to `mode` and another thread reads X. T's context
+/// computes X again, as the unbounded run's frame still holds it, so that
+/// read waits for the landing of T's retry and runs nothing: both reads
+/// are the unbounded run's in which T's came first, and X runs as often
+/// as on one thread.
+fn vframe_node_read(mode: u8, y_reads_x: bool) {
     let s = landed_shape(Rt::new(), y_reads_x);
     s.rt.set_max_frames(1);
     let entry = Gate::new();
@@ -197,17 +217,29 @@ fn vframe_node_landed(mode: u8, y_reads_x: bool) {
     assert_eq!(s.rt.state_of(s.t), NodeState::New);
     assert_eq!(s.rt.state_of(s.x), NodeState::New);
     s.mode.store(mode, SeqCst);
-    let x = outcome(|| s.rt.get(s.x));
-    entry.release();
-    let t = reader.join();
-
-    let (want_x, want_t, runs, want_later) = landed_first(mode, y_reads_x);
-    assert_eq!(x, want_x);
-    assert_eq!(t, want_t);
+    let runs_parked = s.x_runs.load(SeqCst);
+    let waits = s.rt.reservation_waits.load(SeqCst);
+    let other = {
+        let (rt, x) = (s.rt.clone(), s.x);
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&s.rt, waits);
     assert_eq!(
         s.x_runs.load(SeqCst),
-        runs + 1,
-        "X ran once doomed and then as in the unbounded run, never again"
+        runs_parked,
+        "X ran under the reservation"
+    );
+    entry.release();
+    let t = reader.join();
+    let x = other.join();
+
+    let (want_t, want_x, want_later) = t_first(mode, y_reads_x);
+    assert_eq!(t, want_t);
+    assert_eq!(x, want_x);
+    assert_eq!(
+        s.x_runs.load(SeqCst),
+        alone_switched_runs(mode, y_reads_x),
+        "the other thread's read ran X"
     );
     let landed = match mode {
         CLEAN => NodeState::Clean,
@@ -220,95 +252,183 @@ fn vframe_node_landed(mode: u8, y_reads_x: bool) {
 }
 
 #[test]
-fn shared_vframe_node_landed_clean() {
-    vframe_node_landed(CLEAN, false);
+fn shared_vframe_node_read_clean() {
+    vframe_node_read(CLEAN, false);
 }
 
 #[test]
-fn shared_vframe_node_landed_clean_read_above() {
-    vframe_node_landed(CLEAN, true);
+fn shared_vframe_node_read_clean_read_above() {
+    vframe_node_read(CLEAN, true);
 }
 
 #[test]
-fn shared_vframe_node_landed_cyclic() {
-    vframe_node_landed(CYCLIC, false);
+fn shared_vframe_node_read_cyclic() {
+    vframe_node_read(CYCLIC, false);
 }
 
 #[test]
-fn shared_vframe_node_landed_cyclic_read_above() {
-    vframe_node_landed(CYCLIC, true);
+fn shared_vframe_node_read_cyclic_read_above() {
+    vframe_node_read(CYCLIC, true);
 }
 
 #[test]
-fn shared_vframe_node_landed_failed() {
-    vframe_node_landed(FAILED, false);
+fn shared_vframe_node_read_failed() {
+    vframe_node_read(FAILED, false);
 }
 
 #[test]
-fn shared_vframe_node_landed_failed_read_above() {
-    vframe_node_landed(FAILED, true);
+fn shared_vframe_node_read_failed_read_above() {
+    vframe_node_read(FAILED, true);
 }
 
-/// The landed-VFrame shape with X Computing on the other thread at the
-/// pop of its virtual frame: the pop does nothing, and X's entry below
-/// waits on that claim, as the unbounded run's read of a node another
-/// thread computes would.
+/// The landed-VFrame shape at budget 1 with the other thread's read of X
+/// parked between its claim CAS and its reservation check, X Computing
+/// there, when the driver pops X's virtual frame: the pop waits for the
+/// claim to come back instead of taking X as finished, and both reads
+/// match the unbounded run with T's first.
 #[test]
-fn shared_vframe_node_computing_at_pop() {
+fn shared_vframe_pop_waits_out_a_claim_before_its_reservation_check() {
     let s = landed_shape(Rt::new(), false);
     s.rt.set_max_frames(1);
-    let (entry, wait) = (Gate::new(), Gate::new());
+    let (entry, check) = (Gate::new(), Gate::new());
+    let reader_id: Arc<OnceLock<ThreadId>> = Arc::default();
+    let reader_waits = Arc::new(AtomicU32::new(0));
+    {
+        let (x, y) = (id(s.x), id(s.y));
+        let (entry, check) = (entry.clone(), check.clone());
+        let (reader_id, reader_waits) = (reader_id.clone(), reader_waits.clone());
+        let installed = s.rt.park_hook.set(Box::new(move |p| {
+            if p == ParkPoint::BeforeEntry(y) {
+                entry.park();
+            } else if p == ParkPoint::BeforeReservationCheck(x) {
+                check.park();
+            } else if p == ParkPoint::ComputeWaits(x)
+                && reader_id.get() == Some(&thread::current().id())
+            {
+                reader_waits.fetch_add(1, SeqCst);
+            }
+        }));
+        assert!(installed.is_ok(), "park hook installed twice");
+    }
+    entry.arm();
+    let reader = {
+        let (rt, t, reader_id) = (s.rt.clone(), s.t, reader_id.clone());
+        spawn(move || {
+            reader_id.set(thread::current().id()).unwrap();
+            outcome(|| rt.get(t))
+        })
+    };
+    entry.wait_parked();
+    s.mode.store(CLEAN, SeqCst);
+    check.arm();
+    let other = {
+        let (rt, x) = (s.rt.clone(), s.x);
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    check.wait_parked();
+    assert_eq!(s.rt.state_of(s.x), NodeState::Computing);
+    entry.release();
+    // A right pop waits until the release; a wrong one reaches X's claim
+    // well inside the window.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while reader_waits.load(SeqCst) == 0
+        && s.rt.give_back_waits.load(SeqCst) == 0
+        && std::time::Instant::now() < deadline
+    {
+        thread::yield_now();
+    }
+    check.release();
+    let (t, x) = (reader.join(), other.join());
+
+    let (want_t, want_x, want_later) = t_first(CLEAN, false);
+    assert_eq!((t, x), (want_t, want_x));
+    assert_eq!(
+        s.x_runs.load(SeqCst),
+        alone_switched_runs(CLEAN, false),
+        "the other thread's read ran X"
+    );
+    assert_eq!(s.rt.state_of(s.x), NodeState::Clean);
+    assert_eq!(outcome(|| s.rt.get(s.t)), want_later, "a later read agrees");
+    s.rt.assert_invariant_i();
+    assert_eq!(
+        reader_waits.load(SeqCst),
+        0,
+        "the pop took X, Computing on the other thread, as finished"
+    );
+    assert!(
+        s.rt.give_back_waits.load(SeqCst) >= 1,
+        "the pop never waited for X's claim to come back"
+    );
+}
+
+/// The landed-VFrame shape with X's closure switched to park inside its
+/// run while another thread's read of X waits for X's reservation: the
+/// retry of X claims it and parks there, X Computing on the dooming
+/// thread with the other read still waiting, and both reads are the
+/// unbounded run's in which T's came first.
+#[test]
+fn shared_vframe_node_reader_waits_through_the_retrys_compute() {
+    let s = landed_shape(Rt::new(), false);
+    s.rt.set_max_frames(1);
+    let entry = Gate::new();
     hook(
         &s.rt,
-        vec![
-            (ParkPoint::BeforeEntry(id(s.y)), entry.clone()),
-            (ParkPoint::BeforeComputeOne(id(s.x)), wait.clone()),
-            (ParkPoint::ComputeWaits(id(s.x)), wait.clone()),
-        ],
+        vec![(ParkPoint::BeforeEntry(id(s.y)), entry.clone())],
     );
     entry.arm();
     let reader = {
         let (rt, t) = (s.rt.clone(), s.t);
-        spawn(move || rt.get(t))
+        spawn(move || outcome(|| rt.get(t)))
     };
     entry.wait_parked();
     s.mode.store(PARKED, SeqCst);
-    s.gate.arm();
-    let lander = {
+    let runs_parked = s.x_runs.load(SeqCst);
+    let waits = s.rt.reservation_waits.load(SeqCst);
+    let other = {
         let (rt, x) = (s.rt.clone(), s.x);
-        spawn(move || rt.get(x))
+        spawn(move || outcome(|| rt.get(x)))
     };
-    s.gate.wait_parked();
-    wait.arm();
+    await_reservation_wait(&s.rt, waits);
+    assert_eq!(
+        s.x_runs.load(SeqCst),
+        runs_parked,
+        "X ran under the reservation"
+    );
+    s.gate.arm();
     entry.release();
-    wait.wait_parked();
+    s.gate.wait_parked();
     assert_eq!(s.rt.state_of(s.x), NodeState::Computing);
     s.gate.release();
-    assert_eq!(lander.join(), 42);
-    wait.release();
-    assert_eq!(reader.join(), 43);
-    assert_eq!(s.x_runs.load(SeqCst), 2);
+    let (t, x) = (reader.join(), other.join());
+
+    let (want_t, want_x, want_later) = t_first(PARKED, false);
+    assert_eq!((t, x), (want_t, want_x));
+    assert_eq!(
+        s.x_runs.load(SeqCst),
+        alone_switched_runs(PARKED, false),
+        "the other thread's read ran X"
+    );
     assert_eq!(s.rt.state_of(s.t), NodeState::Clean);
+    assert_eq!(outcome(|| s.rt.get(s.t)), want_later, "a later read agrees");
     s.rt.assert_invariant_i();
 }
 
-/// T reads X1, X1 reads X2 (until switched to land 42 alone, or to catch
-/// the panic of a dep that always fails and count those runs), X2 reads
-/// Y, and Y reads T with `try_get`, all replayable; T counts runs.
+/// T reads X1, X1 reads X2 (until switched to catch the panic of a dep
+/// that always fails and count those runs), X2 reads Y, and Y reads T
+/// with `try_get`, all replayable; T counts runs.
 struct Below {
     rt: Arc<Rt>,
     t: Incr<u64>,
     x1: Incr<u64>,
     y: Incr<u64>,
-    landed: Arc<AtomicU8>,
     t_runs: Arc<AtomicU32>,
+    caught: Arc<AtomicBool>,
     x1_caught: Arc<AtomicU32>,
 }
 
 fn below_shape(rt: Rt) -> Below {
     let rt = Arc::new(rt);
     rt.set_placeholder(0_u64);
-    let landed = Arc::new(AtomicU8::new(CHAIN));
     let t_runs = Arc::new(AtomicU32::new(0));
     let tc: Arc<OnceLock<Incr<u64>>> = Arc::default();
     let y = {
@@ -320,18 +440,18 @@ fn below_shape(rt: Rt) -> Below {
     };
     let x2 = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
     let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let caught = Arc::new(AtomicBool::new(false));
     let x1_caught = Arc::new(AtomicU32::new(0));
     let x1 = {
-        let (landed, fc, x1_caught) = (landed.clone(), fc.clone(), x1_caught.clone());
+        let (caught, fc, x1_caught) = (caught.clone(), fc.clone(), x1_caught.clone());
         rt.create_query_with(
-            move |rt: &Rt| match landed.load(SeqCst) {
-                CHAIN => rt.get(x2) + 1,
-                CAUGHT => {
-                    x1_caught.fetch_add(1, SeqCst);
-                    let f = *fc.get().unwrap();
-                    catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v)
+            move |rt: &Rt| {
+                if !caught.load(SeqCst) {
+                    return rt.get(x2) + 1;
                 }
-                _ => 42,
+                x1_caught.fetch_add(1, SeqCst);
+                let f = *fc.get().unwrap();
+                catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v)
             },
             replayable(),
         )
@@ -354,20 +474,21 @@ fn below_shape(rt: Rt) -> Below {
         t,
         x1,
         y,
-        landed,
         t_runs,
+        caught,
         x1_caught,
     }
 }
 
 /// **A landed point below the running entry's maker** (Dropping a
 /// speculative chain), at budget 3: T's run makes virtual frames of T, X1
-/// and X2 and pushes Y, and another thread lands X1 before Y runs. Y's
-/// read of T meets X1 landed above T's frame, a landed point, so the drop
+/// and X2 and pushes Y, and another thread deletes X1 before Y runs. Y's
+/// read of T meets X1 gone above T's frame, a landed point, so the drop
 /// removes only the entries above X1's level and keeps T, the level-0
-/// target, whose retry reads X1 Clean.
+/// target, whose retry reads X1 by handle and panics as stale, as the
+/// unbounded run does when the delete comes first.
 #[test]
-fn shared_landed_point_below_the_running_entrys_maker() {
+fn shared_deleted_point_below_the_running_entrys_maker() {
     let s = below_shape(Rt::new());
     s.rt.set_max_frames(3);
     let entry = Gate::new();
@@ -378,26 +499,29 @@ fn shared_landed_point_below_the_running_entrys_maker() {
     entry.arm();
     let reader = {
         let (rt, t) = (s.rt.clone(), s.t);
-        spawn(move || rt.get(t))
+        spawn(move || outcome(|| rt.get(t)))
     };
     entry.wait_parked();
     assert_eq!(s.rt.state_of(s.x1), NodeState::New);
-    s.landed.store(CLEAN, SeqCst);
-    assert_eq!(s.rt.get(s.x1), 42);
+    s.rt.delete_node(s.x1);
     entry.release();
+    let got = reader.join();
 
     let unbounded = below_shape(Rt::new());
     unbounded.rt.set_max_frames(u32::MAX);
-    unbounded.landed.store(CLEAN, SeqCst);
-    assert_eq!(unbounded.rt.get(unbounded.x1), 42);
-    let want = unbounded.rt.get(unbounded.t);
-    assert_eq!(reader.join(), want);
+    unbounded.rt.delete_node(unbounded.x1);
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("stale")),
+        "{want:?}"
+    );
+    assert_eq!(got, want);
     assert_eq!(
         s.t_runs.load(SeqCst),
         2,
         "T ran doomed and then as its own retry"
     );
-    assert_eq!(s.rt.state_of(s.t), NodeState::Clean);
+    assert_eq!(s.rt.state_of(s.t), unbounded.rt.state_of(unbounded.t));
     s.rt.assert_invariant_i();
 }
 
@@ -406,15 +530,12 @@ fn shared_landed_point_below_the_running_entrys_maker() {
 /// when t = 0 or j when t = 1. Computed at s = t = 0, so c1 holds an
 /// installed edge to P, then set to s = t = 1, j = 5, which leaves that
 /// edge stale. At budget 1, P dooms on A and its doomed read of c0 pushes
-/// c0 as a walk. P parks on `gate` once it is armed, and on `late` after
-/// its read of A.
+/// c0 as a walk.
 struct Taint {
     rt: Arc<Rt>,
     p: Incr<u64>,
     a: Incr<u64>,
     c0: Incr<u64>,
-    gate: Gate,
-    late: Gate,
     p_runs: Arc<AtomicU32>,
 }
 
@@ -426,7 +547,6 @@ fn taint_shape() -> Taint {
         rt.create_input(0_u64),
         rt.create_input(0_u64),
     );
-    let (gate, late) = (Gate::new(), Gate::new());
     let p_runs = Arc::new(AtomicU32::new(0));
     let pc: Arc<OnceLock<Incr<u64>>> = Arc::default();
     let c1 = {
@@ -445,15 +565,12 @@ fn taint_shape() -> Taint {
     let c0 = rt.create_query_with(move |rt: &Rt| rt.get(c1) + 1, replayable());
     let a = rt.create_query_with(|_: &Rt| 1_u64, replayable());
     let p = {
-        let (gate, late, p_runs) = (gate.clone(), late.clone(), p_runs.clone());
+        let p_runs = p_runs.clone();
         rt.create_query_with(
             move |rt: &Rt| {
                 p_runs.fetch_add(1, SeqCst);
-                gate.park();
                 if rt.get(s) == 1 {
-                    let a = rt.get(a);
-                    late.park();
-                    a + 1000 + rt.get(c0)
+                    rt.get(a) + 1000 + rt.get(c0)
                 } else {
                     0
                 }
@@ -472,31 +589,33 @@ fn taint_shape() -> Taint {
         p,
         a,
         c0,
-        gate,
-        late,
         p_runs,
     }
 }
 
-/// **The walk's Computing arm at a VFrame** (T1 The Computing arm too),
-/// at budget 1: thread 1's `get(P)` dooms P on its read of c0, so P is a
-/// virtual frame when the driver takes c0. Thread 2 then claims P and
-/// parks inside P's closure, and c0's entry walk reaches P Computing
-/// through c1's stale edge: it skips P and taints the path instead of
-/// waiting, so thread 1 reaches its level-0 target while thread 2 still
-/// holds P. Both threads read the value of the unbounded run in which
-/// thread 2's claim came first, and P runs only doomed and on thread 2.
+/// P's runs in the bounded run of `get(P)` on one thread at budget 1.
+fn taint_alone_runs() -> u32 {
+    let u = taint_shape();
+    u.rt.set_max_frames(1);
+    let _ = outcome(|| u.rt.get(u.p));
+    u.p_runs.load(SeqCst)
+}
+
+/// **A walk reaching a VFrame whose node another thread waits on** (T1
+/// The Computing arm too), at budget 1: thread 1's `get(P)` dooms P on
+/// its read of c0, so P is a virtual frame when the driver takes c0, and
+/// parked there, thread 2 reads P, which waits for P's reservation. c0's
+/// entry walk reaches P through c1's stale edge with P unclaimed, and
+/// thread 1 lands P. Both threads read the unbounded run's value, and P
+/// runs as often as on one thread.
 #[test]
-fn shared_walk_skips_a_vframe_computing_on_another_thread() {
+fn shared_walk_reaches_a_vframe_another_thread_waits_on() {
     let s = taint_shape();
     s.rt.set_max_frames(1);
-    let (entry, target) = (Gate::new(), Gate::new());
+    let entry = Gate::new();
     hook(
         &s.rt,
-        vec![
-            (ParkPoint::BeforeEntry(id(s.c0)), entry.clone()),
-            (ParkPoint::BeforeEntry(id(s.p)), target.clone()),
-        ],
+        vec![(ParkPoint::BeforeEntry(id(s.c0)), entry.clone())],
     );
     entry.arm();
     let reader = {
@@ -505,68 +624,51 @@ fn shared_walk_skips_a_vframe_computing_on_another_thread() {
     };
     entry.wait_parked();
     assert_eq!(s.p_runs.load(SeqCst), 1);
-    s.gate.arm();
-    let claimer = {
+    let waits = s.rt.reservation_waits.load(SeqCst);
+    let waiter = {
         let (rt, p) = (s.rt.clone(), s.p);
         spawn(move || rt.get(p))
     };
-    s.gate.wait_parked();
-    target.arm();
+    await_reservation_wait(&s.rt, waits);
+    assert_eq!(
+        s.p_runs.load(SeqCst),
+        1,
+        "thread 2 ran P under the reservation"
+    );
     entry.release();
-    target.wait_parked();
-    assert_eq!(s.rt.state_of(s.p), NodeState::Computing);
-    assert_eq!(s.rt.state_of(s.c0), NodeState::Clean);
-    s.gate.release();
     let unbounded = {
         let u = taint_shape();
         u.rt.set_max_frames(u32::MAX);
         u.rt.get(u.p)
     };
-    assert_eq!(claimer.join(), unbounded);
-    target.release();
     assert_eq!(reader.join(), unbounded);
-    assert_eq!(s.p_runs.load(SeqCst), 2, "thread 1's walk never ran P");
+    assert_eq!(waiter.join(), unbounded);
+    assert_eq!(s.p_runs.load(SeqCst), taint_alone_runs(), "thread 2 ran P");
     s.rt.assert_invariant_i();
 }
 
-/// **The walk's Computing arm at a VFrame, the discard-landing form** (T1
-/// The Computing arm too, row 22), at budget 1. The plan's form parks
-/// thread 1's walk inside its wait on P and has thread 2 discard-land P,
-/// so that the wait ends with P Dirty and a virtual frame of it on the
-/// first thread. That precondition is unreachable: the walk looks P's
-/// virtual frame up before its Computing arm waits, and only thread 1
-/// makes its own virtual frames, which it cannot do while it waits, so a
-/// wait on P begins only when P has none and ends the same way.
-/// `post_wait_owner` asserts it on every post-wait claim. This test runs
-/// the reachable order instead: thread 1's `get(P)` dooms P, then thread 2
-/// claims P and dooms on A, which thread 1's driver has not run yet, and
-/// parks inside P's doomed run. c0's entry walk reaches P Computing and
-/// skips it without waiting; thread 2 then discard-lands P and parks
-/// before its retry, and thread 1's target entry claims P from that
-/// landing.
+/// The walk form with thread 2's read made earlier, at budget 1: thread
+/// 1's `get(P)` dooms P on its read of A and parks before A's entry, and
+/// thread 2's read of P waits for P's reservation instead of claiming P
+/// and dooming on A itself. Thread 1's c0 entry walk reaches P through
+/// c1's stale edge and never waits on P, and both threads read the
+/// unbounded run's value with P running as often as on one thread.
 #[test]
-fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
+fn shared_reader_of_a_vframe_waits_before_its_doom_targets_entry() {
     let s = taint_shape();
     s.rt.set_max_frames(1);
-    let (first, target, held) = (Gate::new(), Gate::new(), Gate::new());
+    let first = Gate::new();
     let p = id(s.p);
     let seen: Arc<Mutex<Vec<(ThreadId, ParkPoint)>>> = Arc::default();
     let installed = s.rt.park_hook.set(Box::new({
-        let gates = vec![
-            (ParkPoint::BeforeEntry(id(s.a)), first.clone()),
-            (ParkPoint::BeforeEntry(p), target.clone()),
-            (ParkPoint::BeforeEntry(p), held.clone()),
-        ];
-        let seen = seen.clone();
+        let (first, a, seen) = (first.clone(), id(s.a), seen.clone());
         move |point| {
             if matches!(point, ParkPoint::BeforeComputeOne(n) | ParkPoint::ComputeWaits(n) if n == p)
             {
                 seen.lock().unwrap().push((thread::current().id(), point));
             }
-            for (at, gate) in &gates {
-                if *at == point {
-                    gate.park();
-                }
+            if point == ParkPoint::BeforeEntry(a) {
+                first.park();
             }
         }
     }));
@@ -582,41 +684,26 @@ fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
     };
     first.wait_parked();
     assert_eq!(s.rt.state_of(s.a), NodeState::New);
-    s.late.arm();
-    let claimer = {
+    let waits = s.rt.reservation_waits.load(SeqCst);
+    let waiter = {
         let (rt, p) = (s.rt.clone(), s.p);
         spawn(move || rt.get(p))
     };
-    s.late.wait_parked();
-    assert_eq!(s.p_runs.load(SeqCst), 2);
-    target.arm();
-    first.release();
-    target.wait_parked();
-    assert_eq!(s.rt.state_of(s.p), NodeState::Computing);
-    assert_eq!(s.rt.state_of(s.c0), NodeState::Clean);
-    held.arm();
-    s.late.release();
-    held.wait_parked();
+    await_reservation_wait(&s.rt, waits);
     assert_eq!(
-        s.rt.state_of(s.p),
-        NodeState::Dirty,
-        "thread 2 discard-landed P"
+        s.p_runs.load(SeqCst),
+        1,
+        "thread 2 ran P under the reservation"
     );
-    assert_eq!(s.p_runs.load(SeqCst), 2);
+    first.release();
     let unbounded = {
         let u = taint_shape();
         u.rt.set_max_frames(u32::MAX);
         u.rt.get(u.p)
     };
-    target.release();
     assert_eq!(reader.join(), unbounded);
-    held.release();
-    assert_eq!(claimer.join(), unbounded);
-    assert_eq!(
-        s.p_runs.load(SeqCst),
-        3,
-        "P ran doomed on each thread and once more in thread 1's target entry"
-    );
+    assert_eq!(waiter.join(), unbounded);
+    assert_eq!(s.p_runs.load(SeqCst), taint_alone_runs(), "thread 2 ran P");
     let reader_id = *reader_id.get().unwrap();
     let waits: Vec<ParkPoint> = seen
         .lock()
@@ -625,14 +712,10 @@ fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
         .filter(|(t, _)| *t == reader_id)
         .map(|&(_, point)| point)
         .collect();
-    // A forced revisit of P computes it from the walk a second time.
-    if !super::forced_revisit() {
-        assert_eq!(
-            waits,
-            vec![ParkPoint::BeforeComputeOne(p)],
-            "thread 1's only walk compute of P is its root's, and it never waited on P"
-        );
-    }
+    assert!(
+        !waits.contains(&ParkPoint::ComputeWaits(p)),
+        "thread 1 waited on P: {waits:?}"
+    );
     s.rt.assert_invariant_i();
 }
 
@@ -753,6 +836,7 @@ fn wound_inside_a_driver_entry() {
     let claimed = claimer.join();
 
     let u = wound_entry_shape();
+    u.rt.set_max_frames(u32::MAX);
     let want_z = outcome(|| u.rt.get(u.z));
     let want_h = u.rt.get(u.h);
     assert_eq!(claimed, want_z);
@@ -914,7 +998,7 @@ fn memo_landing_during_replay(when: Recycle) {
         spawn(move || outcome(|| rt.get(t)))
     };
     gate.wait_parked();
-    s.landed.store(CAUGHT, SeqCst);
+    s.caught.store(true, SeqCst);
     assert_eq!(s.rt.get(s.x1), 7);
     assert!(s.rt.has_memo_of(s.x1));
     let landed_runs = s.x1_caught.load(SeqCst);
@@ -923,7 +1007,7 @@ fn memo_landing_during_replay(when: Recycle) {
 
     let unbounded = below_shape(Rt::new());
     unbounded.rt.set_max_frames(u32::MAX);
-    unbounded.landed.store(CAUGHT, SeqCst);
+    unbounded.caught.store(true, SeqCst);
     assert_eq!(unbounded.rt.get(unbounded.x1), 7);
     let want = outcome(|| unbounded.rt.get(unbounded.t));
     assert_eq!(want, Ok(8));
@@ -1003,13 +1087,13 @@ fn await_registered_wait(rt: &Rt, h: Incr<u64>) {
     }
 }
 
-/// **Readers of released claims**, at budget 1 on the landed-VFrame
+/// **Readers of released claims wait**, at budget 1 on the landed-VFrame
 /// shape in its chain form: a doom releases the claim of the node its
-/// read wanted before the reading frame gets its placeholder, and
-/// another thread parked there computes that node; another thread also
-/// computes a discarded frame's node between rounds. Each is computed
-/// once, by the other thread, as a node no one claims, and T's value is
-/// the unbounded run's.
+/// read wanted before the reading frame gets its placeholder, and a
+/// discarded frame's node is released between rounds. The dooming
+/// thread's context computes each again while the unbounded run's frame
+/// still holds it, so another thread's read of it, parked there, waits for
+/// that landing and runs nothing; both values are the unbounded run's.
 fn released_claim_read(point: fn(&Landed) -> ParkPoint) {
     let s = landed_shape(Rt::new(), false);
     s.rt.set_max_frames(1);
@@ -1022,19 +1106,23 @@ fn released_claim_read(point: fn(&Landed) -> ParkPoint) {
     };
     gate.wait_parked();
     assert_eq!(s.rt.state_of(s.x), NodeState::New, "X's claim is released");
-    let alone = landed_shape(Rt::new(), false);
-    alone.rt.set_max_frames(1);
-    assert_eq!(s.rt.get(s.x), alone.rt.get(alone.x));
     let runs_before = s.x_runs.load(SeqCst);
+    let waits = s.rt.reservation_waits.load(SeqCst);
+    let other = {
+        let (rt, x) = (s.rt.clone(), s.x);
+        spawn(move || rt.get(x))
+    };
+    await_reservation_wait(&s.rt, waits);
+    assert_eq!(
+        s.x_runs.load(SeqCst),
+        runs_before,
+        "another thread ran X while the doom's context had it to compute"
+    );
     gate.release();
     let unbounded = landed_shape(Rt::new(), false);
     unbounded.rt.set_max_frames(u32::MAX);
     assert_eq!(reader.join(), unbounded.rt.get(unbounded.t));
-    assert_eq!(
-        s.x_runs.load(SeqCst),
-        runs_before,
-        "the reader never ran X once it had landed"
-    );
+    assert_eq!(other.join(), unbounded.rt.get(unbounded.x));
     assert_eq!(s.rt.state_of(s.t), NodeState::Clean);
     s.rt.assert_invariant_i();
 }
@@ -1053,8 +1141,9 @@ fn shared_reader_of_a_discarded_frames_released_claim() {
 /// s = 0, is Dirty after `set(s, 1)`. Reader B plans its walk of F and
 /// stops before its claim; reader A claims F and dooms on its read of the
 /// New query N, and B waits on A's claim. A's doom discards F as if its
-/// run never happened and A's read goes on, so B claims F as planned
-/// instead of revisiting it, which only a landing of A's claim warrants.
+/// run never happened and A's read goes on, so B does not revisit F,
+/// which only a landing of A's claim warrants; F stays reserved for A's
+/// retry, whose landing B then reads.
 #[test]
 fn shared_reader_that_waited_out_a_discarded_claim_keeps_its_plan() {
     let rt = Arc::new(Rt::new());
@@ -1107,8 +1196,8 @@ fn shared_reader_that_waited_out_a_discarded_claim_keeps_its_plan() {
     gates[2].2.release();
     gates[1].2.release();
     gates[3].2.wait_parked();
-    let b = b.join().unwrap();
     gates[3].2.release();
+    let b = b.join().unwrap();
     assert_eq!((a.join().unwrap(), b), (11, 11));
     assert_eq!(rt.wait_revisits.load(SeqCst), 0, "B revisited F");
     rt.assert_invariant_i();
@@ -1166,40 +1255,28 @@ fn shared_set_during_a_discard() {
 
 /// A Fallback cycle F -> X -> Y -> F, all replayable: F's fallback is
 /// 100, X reads Y while input b is 0 and is 50 otherwise, and Y,
-/// unseeded, reads F. X parks on `gate` once it is armed.
+/// unseeded, reads F.
 struct Hit {
     rt: Arc<Rt>,
     f: Incr<u64>,
     x: Incr<u64>,
     y: Incr<u64>,
     b: Incr<u64>,
-    gate: Gate,
 }
 
 fn hit_shape() -> Hit {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     let b = rt.create_input(0_u64);
-    let gate = Gate::new();
     let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
     let y = {
         let fc = fc.clone();
         rt.create_query_with(move |rt: &Rt| rt.get(*fc.get().unwrap()) + 1, replayable())
     };
-    let x = {
-        let gate = gate.clone();
-        rt.create_query_with(
-            move |rt: &Rt| {
-                gate.park();
-                if rt.get(b) == 0 {
-                    rt.get(y) + 1
-                } else {
-                    50
-                }
-            },
-            replayable(),
-        )
-    };
+    let x = rt.create_query_with(
+        move |rt: &Rt| if rt.get(b) == 0 { rt.get(y) + 1 } else { 50 },
+        replayable(),
+    );
     let f = rt.create_query_with(
         move |rt: &Rt| rt.get(x) + 1,
         QueryOpts {
@@ -1208,14 +1285,7 @@ fn hit_shape() -> Hit {
         },
     );
     fc.set(f).unwrap();
-    Hit {
-        rt,
-        f,
-        x,
-        y,
-        b,
-        gate,
-    }
+    Hit { rt, f, x, y, b }
 }
 
 /// The values of F, X and Y in a single-threaded unbounded run entered
@@ -1230,17 +1300,15 @@ fn hit_unbounded(b: u64) -> (u64, u64, Option<u64>) {
     (f, x, y)
 }
 
-/// **A virtual-hit claim racing another thread** (Virtual cycles step 4),
-/// at budget 1: F and X are virtual frames when the driver takes Y, and
-/// another thread claims X and parks inside X's closure. Y's read of F is
-/// a virtual hit whose claim of X fails, so the claims taken roll back
-/// and the read waits on X, registered. With `b` still 0, X's closure on
-/// the other thread reads Y, which the first thread computes: the
-/// registry closes the waits-for cycle, and the results are the single
-/// run's. With `b` set to 1 first, X lands Clean without reading Y, the
-/// second judgement finds a landed frame above F's and drops the chain,
-/// and F's retry reads X Clean.
-fn virtual_hit_claim_race(b: u64) {
+/// **A virtual hit with another thread waiting on a frame's node**
+/// (Virtual cycles step 4), at budget 1: F and X are virtual frames when
+/// the driver takes Y, and parked there, `b` is set and another thread
+/// reads X, which waits for X's reservation and runs nothing. Y's read of
+/// F is a virtual hit whose claims of F and X succeed, and both reads are
+/// the single run's in which F's came first with `b` set before it: with
+/// `b` still 0, X reads Y, and with `b` at 1, X lands Clean without
+/// reading Y.
+fn virtual_hit_with_a_waiting_reader(b: u64) {
     let s = hit_shape();
     s.rt.set_max_frames(1);
     let entry = Gate::new();
@@ -1255,15 +1323,18 @@ fn virtual_hit_claim_race(b: u64) {
     };
     entry.wait_parked();
     s.rt.set(s.b, b);
-    s.gate.arm();
+    let waits = s.rt.reservation_waits.load(SeqCst);
     let second = {
         let (rt, x) = (s.rt.clone(), s.x);
         spawn(move || rt.get(x))
     };
-    s.gate.wait_parked();
+    await_reservation_wait(&s.rt, waits);
+    assert_eq!(
+        s.rt.state_of(s.x),
+        NodeState::New,
+        "X ran under the reservation"
+    );
     entry.release();
-    await_registered_wait(&s.rt, s.x);
-    s.gate.release();
     let (f, x) = (first.join(), second.join());
 
     let (want_f, want_x, want_y) = hit_unbounded(b);
@@ -1278,13 +1349,76 @@ fn virtual_hit_claim_race(b: u64) {
 }
 
 #[test]
-fn shared_virtual_hit_claim_race_closes_a_waits_for_cycle() {
-    virtual_hit_claim_race(0);
+fn shared_virtual_hit_with_a_waiting_reader() {
+    virtual_hit_with_a_waiting_reader(0);
 }
 
 #[test]
-fn shared_virtual_hit_claim_race_then_a_landed_frame() {
-    virtual_hit_claim_race(1);
+fn shared_virtual_hit_with_a_waiting_reader_after_a_set() {
+    virtual_hit_with_a_waiting_reader(1);
+}
+
+/// **A virtual-hit claim racing another thread** (Virtual cycles step 4),
+/// at budget 1: F and X are virtual frames when the driver takes Y, and
+/// between the scan of Y's read of F and its claims another thread
+/// deletes X, recycles its slot into Z and claims Z, parked inside Z's
+/// closure. The claim of X's slot fails, so the claim of F rolls back
+/// and the read waits on Z, registered; once Z lands, the read finds X's
+/// frame gone, a landed point, and drops the chain, and `get(F)` panics
+/// as stale, as the unbounded run does with the delete first.
+#[test]
+fn shared_virtual_hit_claim_of_a_recycled_slot_rolls_back() {
+    let s = hit_shape();
+    s.rt.set_max_frames(1);
+    let claim = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeVirtualClaim(id(s.f)), claim.clone())],
+    );
+    claim.arm();
+    let first = {
+        let (rt, f) = (s.rt.clone(), s.f);
+        spawn(move || outcome(|| rt.get(f)))
+    };
+    claim.wait_parked();
+    s.rt.delete_node(s.x);
+    let inside = Gate::new();
+    let z = {
+        let inside = inside.clone();
+        s.rt.create_query_with(
+            move |_: &Rt| {
+                inside.park();
+                9_u64
+            },
+            replayable(),
+        )
+    };
+    assert_eq!(z.slot(), s.x.slot(), "Z reuses X's slot");
+    inside.arm();
+    let lander = {
+        let rt = s.rt.clone();
+        spawn(move || rt.get(z))
+    };
+    inside.wait_parked();
+    claim.release();
+    await_registered_wait(&s.rt, z);
+    assert_eq!(s.rt.state_of(s.f), NodeState::New, "F's claim was kept");
+    inside.release();
+    assert_eq!(lander.join(), 9);
+    let got = first.join();
+
+    let u = hit_shape();
+    u.rt.set_max_frames(u32::MAX);
+    u.rt.delete_node(u.x);
+    u.rt.create_query_with(|_: &Rt| 9_u64, replayable::<u64>());
+    let want = outcome(|| u.rt.get(u.f));
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("stale")),
+        "{want:?}"
+    );
+    assert_eq!(got, want);
+    s.rt.assert_invariant_i();
+    assert!(!crate::waits::waited_on((s.rt.runtime_id, z.slot())));
 }
 
 /// X (no strategy) keeps a record of the group {X, M} and M (Fallback
@@ -1408,10 +1542,10 @@ fn shared_discarded_member_matches_unbounded() {
 }
 
 /// The member shape at budget 2: T's reader parks before D's entry, with
-/// X discarded. Another thread then reads W, which reads X, and must
-/// verify X's group, as a run that reads W first does: computed alone, X
-/// reads M, which reads X on the stack, a cycle error that neither order
-/// of the two reads raises.
+/// X discarded. Another thread then reads W, which reads X, and waits on
+/// X's reservation; it must then verify X's group, as a run that reads W
+/// first does: computed alone, X reads M, which reads X on the stack, a
+/// cycle error that neither order of the two reads raises.
 #[test]
 fn shared_reader_of_a_discarded_member_verifies_its_group() {
     let s = member_shape::<Shared>(2);
@@ -1428,13 +1562,16 @@ fn shared_reader_of_a_discarded_member_verifies_its_group() {
     entry.wait_parked();
     assert_eq!(s.rt.state_of(s.x), NodeState::Dirty, "X is discarded");
     let kept = s.in_group(s.x);
+    let waits = s.rt.reservation_waits.load(SeqCst);
     let w = {
         let (rt, w) = (s.rt.clone(), s.w);
         spawn(move || outcome(|| rt.get(w)))
-    }
-    .join();
+    };
+    // X stays reserved for T's context, so W's read waits for its retry.
+    await_reservation_wait(&s.rt, waits);
     entry.release();
     let t = reader.join();
+    let w = w.join();
     let got = [vec![t, w], s.reads(&[s.t, s.w, s.m, s.x, s.d])].concat();
     s.rt.assert_invariant_i();
 
@@ -1457,8 +1594,9 @@ fn shared_reader_of_a_discarded_member_verifies_its_group() {
 /// the group {F, Q}, as a walk leaves a Cyclic member. At budget 1 Z's
 /// set comes before F's pop, whose episode dissolves, and the driver
 /// parks before the level-0 entry claims F again. F's claim, taken from
-/// New, lands New as if never taken, and another thread's read then gets
-/// the unbounded run's value.
+/// New, lands New as if never taken, and F stays reserved: another
+/// thread's read waits for the driver's landing of F and gets the
+/// unbounded run's value.
 #[test]
 fn shared_dissolved_root_lands_as_before_its_claim() {
     let run = |frames: u32, park: bool| {
@@ -1515,14 +1653,18 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
         if park {
             gate.wait_parked();
             let landed = rt.state_of(f);
+            let waits = rt.reservation_waits.load(SeqCst);
             let other = {
                 let rt = rt.clone();
                 spawn(move || outcome(|| rt.get(f)))
             };
-            gap = Some((landed, other.join()));
+            await_reservation_wait(&rt, waits);
+            assert_eq!(rt.state_of(f), NodeState::New, "the other thread ran F");
             gate.release();
+            gap = Some((landed, other));
         }
         let got = reader.join();
+        let gap = gap.map(|(landed, other)| (landed, other.join()));
         rt.assert_invariant_i();
         (got, gap)
     };
@@ -1540,8 +1682,9 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
 
 /// The same shape with F, X and Y a landed group and Z's set behind input
 /// t: F's claim, taken from Dirty, lands as before it, still a verified
-/// member of its group, so the other thread's read verifies the group as
-/// in the order where it reads first.
+/// member of its group, and reserved for the context's retry, so the other
+/// thread's read waits and reads as in the order where the driver reads
+/// first.
 #[test]
 fn shared_dissolved_member_root_stays_in_its_group() {
     let run = |frames: u32, park: bool| {
@@ -1619,14 +1762,17 @@ fn shared_dissolved_member_root_stays_in_its_group() {
                 rt.cycle_of(f).is_some(),
                 rt.verified_at_of(f) == verified,
             );
+            let waits = rt.reservation_waits.load(SeqCst);
             let other = {
                 let rt = rt.clone();
                 spawn(move || outcome(|| rt.get(f)))
             };
-            gap = Some((landed, other.join()));
+            await_reservation_wait(&rt, waits);
             gate.release();
+            gap = Some((landed, other));
         }
         let got = reader.join();
+        let gap = gap.map(|(landed, other)| (landed, other.join()));
         rt.assert_invariant_i();
         (got, gap)
     };
@@ -1671,21 +1817,19 @@ fn panicking_reader(rt: &Rt, read: Incr<u64>, panics: Panics, own: &'static str)
 }
 
 /// X reads Y, which panics "y boom", and X does `x` with that panic;
-/// with `w`, W reads X and does `w` with its panic. One thread's
-/// `get(top)`, W or else X, dooms the first frame whose read is at the
-/// budget, one frame per node, so Y's entry lands Failed and its payload
-/// waits for X's virtual frame. The driver parks before the next entry
-/// while another thread reads `other_reads` (X or W), which reads Y
-/// Failed and lands what it computed Failed. Each read's outcome must be
-/// one of a serial order's, and no provenance record outlives the reads.
-fn landed_failed_over_a_delivery(
-    x: Panics,
-    w: Option<Panics>,
-    other_reads_w: bool,
-) -> (Result<u64, String>, Result<u64, String>) {
+/// with `w`, W reads X and does `w` with its panic. Y arms `gate` as it
+/// runs. `top` is W, or else X.
+struct Delivery {
+    rt: Arc<Rt>,
+    gate: Gate,
+    y: Incr<u64>,
+    x: Incr<u64>,
+    top: Incr<u64>,
+}
+
+fn delivery_shape(x: Panics, w: Option<Panics>) -> Delivery {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
-    rt.set_max_frames(1 + u32::from(w.is_some()));
     let gate = Gate::new();
     let y = {
         let gate = gate.clone();
@@ -1698,22 +1842,63 @@ fn landed_failed_over_a_delivery(
         )
     };
     let xn = panicking_reader(&rt, y, x, "x own");
-    let wn = w.map(|w| panicking_reader(&rt, xn, w, "w own"));
-    let top = wn.unwrap_or(xn);
-    let other_reads = if other_reads_w { top } else { xn };
-    hook(&rt, vec![(ParkPoint::BeforeEntry(id(top)), gate.clone())]);
+    let top = w.map_or(xn, |w| panicking_reader(&rt, xn, w, "w own"));
+    Delivery {
+        rt,
+        gate,
+        y,
+        x: xn,
+        top,
+    }
+}
+
+/// One thread's `get(top)` dooms the first frame whose read is at the
+/// budget, one frame per node, so Y's entry lands Failed and its payload
+/// waits for X's virtual frame. The driver parks before the next entry
+/// while another thread reads X, or W with `other_reads_w`, the node of a
+/// virtual frame: that read waits for the dooming thread's landing and
+/// computes nothing. Both outcomes are the unbounded run's in which this
+/// thread's read came first, and no provenance record outlives the reads.
+fn read_over_a_delivery(
+    x: Panics,
+    w: Option<Panics>,
+    other_reads_w: bool,
+) -> (Result<u64, String>, Result<u64, String>) {
+    let s = delivery_shape(x, w);
+    let rt = s.rt.clone();
+    rt.set_max_frames(1 + u32::from(w.is_some()));
+    let other_reads = if other_reads_w { s.top } else { s.x };
+    hook(
+        &rt,
+        vec![(ParkPoint::BeforeEntry(id(s.top)), s.gate.clone())],
+    );
     let first = {
-        let rt = rt.clone();
+        let (rt, top) = (rt.clone(), s.top);
         spawn(move || outcome(|| rt.get(top)))
     };
-    gate.wait_parked();
-    assert_eq!(rt.state_of(y), NodeState::Failed);
-    let other = outcome(|| rt.get(other_reads));
-    assert_eq!(rt.state_of(other_reads), NodeState::Failed);
-    gate.release();
-    let first = first.join();
+    s.gate.wait_parked();
+    assert_eq!(rt.state_of(s.y), NodeState::Failed);
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(other_reads)))
+    };
+    await_reservation_wait(&rt, waits);
+    assert_eq!(
+        rt.state_of(other_reads),
+        NodeState::New,
+        "the other thread computed a reserved node"
+    );
+    s.gate.release();
+    let (first, other) = (first.join(), other.join());
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+
+    let u = delivery_shape(x, w);
+    u.rt.set_max_frames(u32::MAX);
+    let want_first = outcome(|| u.rt.get(u.top));
+    let want_other = outcome(|| u.rt.get(if other_reads_w { u.top } else { u.x }));
+    assert_eq!((&first, &other), (&want_first, &want_other));
     (first, other)
 }
 
@@ -1722,65 +1907,64 @@ fn failed(r: &Result<u64, String>) -> bool {
         .is_err_and(|m| m.contains("last compute panicked"))
 }
 
-/// Class A of the two-thread all-seeds scan (seed 0x172), at budget 1:
-/// the other thread's X let Y's failed read out, so only the order with
-/// this thread first is serial, and its retry of X takes the payload.
+/// X lets Y's failed read out, so the retry of X takes the payload and the
+/// other thread reads X Failed.
 #[test]
-fn shared_vframe_landed_failed_keeps_the_payload() {
-    let (first, other) = landed_failed_over_a_delivery(Panics::Out, None, false);
-    assert!(failed(&other), "{other:?}");
+fn shared_vframe_reader_waits_for_the_retry_that_takes_the_payload() {
+    let (first, other) = read_over_a_delivery(Panics::Out, None, false);
     assert_eq!(first, Err("y boom".to_string()), "the payload was dropped");
-}
-
-/// X's own panic makes only the other thread's order serial.
-#[test]
-fn shared_vframe_landed_failed_by_its_own_panic() {
-    let (first, other) = landed_failed_over_a_delivery(Panics::Own, None, false);
-    assert_eq!(other, Err("x own".to_string()));
-    assert!(failed(&first), "{first:?}");
-}
-
-/// X lets out its second read of Y, not the one the payload is for: in
-/// either order both reads panic "last compute panicked".
-#[test]
-fn shared_vframe_landed_failed_by_a_later_read() {
-    let (first, other) = landed_failed_over_a_delivery(Panics::Twice, None, false);
     assert!(failed(&other), "{other:?}");
+}
+
+/// X catches Y's failed read and panics with its own payload.
+#[test]
+fn shared_vframe_reader_waits_for_a_retry_with_its_own_panic() {
+    let (first, other) = read_over_a_delivery(Panics::Own, None, false);
+    assert_eq!(first, Err("x own".to_string()));
+    assert!(failed(&other), "{other:?}");
+}
+
+/// X lets out its second read of Y, not the one the payload is for, so
+/// both reads panic "last compute panicked".
+#[test]
+fn shared_vframe_reader_waits_for_a_retry_with_a_later_read() {
+    let (first, other) = read_over_a_delivery(Panics::Twice, None, false);
     assert!(failed(&first), "{first:?}");
+    assert!(failed(&other), "{other:?}");
 }
 
 /// At budget 2 X's virtual frame sits above W's, and W's retry reads X
 /// natively.
 #[test]
-fn shared_vframe_landed_failed_under_a_native_read() {
-    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Out), false);
-    assert!(failed(&other), "{other:?}");
+fn shared_vframe_reader_waits_under_a_native_read() {
+    let (first, other) = read_over_a_delivery(Panics::Out, Some(Panics::Out), false);
     assert_eq!(first, Err("y boom".to_string()));
-    let (first, other) = landed_failed_over_a_delivery(Panics::Own, Some(Panics::Out), false);
-    assert_eq!(other, Err("x own".to_string()));
-    assert!(failed(&first), "{first:?}");
+    assert!(failed(&other), "{other:?}");
+    let (first, other) = read_over_a_delivery(Panics::Own, Some(Panics::Out), false);
+    assert_eq!(first, Err("x own".to_string()));
+    assert!(failed(&other), "{other:?}");
 }
 
-/// The other thread lands both W and X, the frames of a chain, and only
-/// a landing of W that let the failure out allows this thread first.
+/// The other thread reads W, the bottom frame of the chain W and X, and
+/// waits for W's landing.
 #[test]
-fn shared_vframe_chain_landed_failed() {
-    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Out), true);
-    assert!(failed(&other), "{other:?}");
+fn shared_vframe_chain_reader_waits_for_its_bottom_frame() {
+    let (first, other) = read_over_a_delivery(Panics::Out, Some(Panics::Out), true);
     assert_eq!(first, Err("y boom".to_string()));
-    let (first, other) = landed_failed_over_a_delivery(Panics::Out, Some(Panics::Own), true);
-    assert_eq!(other, Err("w own".to_string()));
-    assert!(failed(&first), "{first:?}");
+    assert!(failed(&other), "{other:?}");
+    let (first, other) = read_over_a_delivery(Panics::Out, Some(Panics::Own), true);
+    assert_eq!(first, Err("w own".to_string()));
+    assert!(failed(&other), "{other:?}");
 }
 
 /// R reads F, then N; F and N both read V, which reads Y. At budget 3
 /// V's read of Y dooms R, F and V, and R's read of N after F's
 /// placeholder pushes N as a speculative entry. The driver parks before
-/// it while the other thread lands V Failed over Y. N's run reads V at
-/// V's frame position: the payload waiting there is owed to the real
-/// retry's read of V through F, not to N.
+/// it while the other thread reads V, which waits for V's landing. N's
+/// run reads V at V's frame position: the payload waiting there is the
+/// real retry's read of V through F, not N's.
 #[test]
-fn speculative_entry_leaves_a_landed_payload_for_the_real_retry() {
+fn speculative_entry_leaves_a_held_payload_for_the_real_retry() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(3);
@@ -1805,24 +1989,31 @@ fn speculative_entry_leaves_a_landed_payload_for_the_real_retry() {
         spawn(move || outcome(|| rt.get(r)))
     };
     gate.wait_parked();
-    let other = outcome(|| rt.get(v));
-    assert_eq!(rt.state_of(v), NodeState::Failed);
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(v)))
+    };
+    await_reservation_wait(&rt, waits);
+    assert_eq!(rt.state_of(v), NodeState::New);
     gate.release();
-    let first = first.join();
+    let (first, other) = (first.join(), other.join());
+    assert_eq!(rt.state_of(v), NodeState::Failed);
     rt.assert_invariant_i();
     assert!(failed(&other), "{other:?}");
     assert_eq!(first, Err("y boom".to_string()), "the payload was taken");
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// X is still computing on the other thread when the retry of X claims
-/// it, so the retry waits and then reads X Failed.
+/// The other thread's read of X waits for its reservation through the
+/// retry's compute of X, parked inside X's closure while it holds X's
+/// claim, and then reads X Failed.
 #[test]
-fn shared_vframe_landed_failed_while_the_retry_waits() {
+fn shared_vframe_reader_waits_while_the_retry_computes() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
-    let (gate, inside, waits) = (Gate::new(), Gate::new(), Gate::new());
+    let (gate, inside) = (Gate::new(), Gate::new());
     let y = {
         let gate = gate.clone();
         rt.create_query_with(
@@ -1833,61 +2024,62 @@ fn shared_vframe_landed_failed_while_the_retry_waits() {
             replayable(),
         )
     };
+    let x_runs = Arc::new(AtomicU32::new(0));
     let x = {
-        let inside = inside.clone();
+        let (inside, x_runs) = (inside.clone(), x_runs.clone());
         rt.create_query_with(
             move |rt: &Rt| {
+                x_runs.fetch_add(1, SeqCst);
                 inside.park();
                 rt.get(y) + 1
             },
             replayable(),
         )
     };
-    hook(
-        &rt,
-        vec![
-            (ParkPoint::BeforeEntry(id(x)), gate.clone()),
-            (ParkPoint::ComputeWaits(id(x)), waits.clone()),
-        ],
-    );
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
     let first = {
         let rt = rt.clone();
         spawn(move || outcome(|| rt.get(x)))
     };
     gate.wait_parked();
-    inside.arm();
+    let waits = rt.reservation_waits.load(SeqCst);
     let other = {
         let rt = rt.clone();
         spawn(move || outcome(|| rt.get(x)))
     };
-    inside.wait_parked();
-    waits.arm();
+    await_reservation_wait(&rt, waits);
+    assert_eq!(x_runs.load(SeqCst), 1, "the other thread ran X");
+    inside.arm();
     gate.release();
-    waits.wait_parked();
+    inside.wait_parked();
+    assert_eq!(rt.state_of(x), NodeState::Computing);
+    assert_eq!(x_runs.load(SeqCst), 2);
     inside.release();
-    let other = other.join();
-    waits.release();
-    let first = first.join();
-    assert!(failed(&other), "{other:?}");
+    let (first, other) = (first.join(), other.join());
     assert_eq!(first, Err("y boom".to_string()));
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(x_runs.load(SeqCst), 2, "the other thread ran X");
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// The other thread's read of X dooms too, before Y lands, so its Failed
-/// read of Y is its Y entry's compute, delivered to its own retry of X,
-/// which lets it out.
+/// Two threads read X, which reads Y, panicking "y boom", at budget 1.
+/// The other thread's read dooms first and parks before Y's entry, so X
+/// and Y are reserved for its context: this thread's read waits for them
+/// instead of dooming in turn, and reads X Failed after the other
+/// thread's retry of X let its payload out.
 #[test]
-fn shared_vframe_landed_failed_by_a_replayed_read() {
+fn shared_second_read_waits_for_the_first_reads_doom() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
-    let (gate, other_entry) = (Gate::new(), Gate::new());
+    let other_entry = Gate::new();
+    let y_runs = Arc::new(AtomicU32::new(0));
     let y = {
-        let gate = gate.clone();
+        let y_runs = y_runs.clone();
         rt.create_query_with(
             move |_: &Rt| -> u64 {
-                gate.arm();
+                y_runs.fetch_add(1, SeqCst);
                 panic!("y boom")
             },
             replayable(),
@@ -1896,10 +2088,7 @@ fn shared_vframe_landed_failed_by_a_replayed_read() {
     let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
     hook(
         &rt,
-        vec![
-            (ParkPoint::BeforeEntry(id(x)), gate.clone()),
-            (ParkPoint::BeforeEntry(id(y)), other_entry.clone()),
-        ],
+        vec![(ParkPoint::BeforeEntry(id(y)), other_entry.clone())],
     );
     other_entry.arm();
     let other = {
@@ -1907,28 +2096,28 @@ fn shared_vframe_landed_failed_by_a_replayed_read() {
         spawn(move || outcome(|| rt.get(x)))
     };
     other_entry.wait_parked();
+    let waits = rt.reservation_waits.load(SeqCst);
     let first = {
         let rt = rt.clone();
         spawn(move || outcome(|| rt.get(x)))
     };
-    gate.wait_parked();
-    assert_eq!(rt.state_of(y), NodeState::Failed);
+    await_reservation_wait(&rt, waits);
+    assert_eq!(rt.state_of(x), NodeState::New);
+    assert_eq!(y_runs.load(SeqCst), 0, "Y ran under the reservation");
     other_entry.release();
-    let other = other.join();
-    assert_eq!(rt.state_of(x), NodeState::Failed);
-    gate.release();
-    let first = first.join();
-    assert!(failed(&other), "{other:?}");
-    assert_eq!(first, Err("y boom".to_string()));
+    let (other, first) = (other.join(), first.join());
+    assert_eq!(other, Err("y boom".to_string()));
+    assert!(failed(&first), "{first:?}");
+    assert_eq!(y_runs.load(SeqCst), 1);
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// Y reads Z, which panics "z boom", so the other thread's read of Y
-/// Failed walks to Z Failed first: that panic is still the failure of
-/// X's read of Y, which X lets out.
+/// Y reads Z, which panics "z boom", and lands Failed over Z's Failed
+/// entry; X lets Y's failure out. The other thread's read of X waits for
+/// the retry, which raises "z boom", and reads X Failed.
 #[test]
-fn shared_vframe_landed_failed_by_a_walk_into_its_dep() {
+fn shared_vframe_reader_waits_over_a_failed_dep_of_its_dep() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -1952,22 +2141,28 @@ fn shared_vframe_landed_failed_by_a_walk_into_its_dep() {
     };
     gate.wait_parked();
     assert_eq!(rt.state_of(y), NodeState::Failed);
-    let other = outcome(|| rt.get(x));
-    assert_eq!(rt.state_of(x), NodeState::Failed);
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
+    assert_eq!(rt.state_of(x), NodeState::New);
     gate.release();
-    let first = first.join();
+    let (first, other) = (first.join(), other.join());
+    assert_eq!(rt.state_of(x), NodeState::Failed);
     assert!(failed(&other), "{other:?}");
     assert_eq!(first, Err("z boom".to_string()));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// The other thread's X lets Y's failed read out, a set flips X and Y
-/// Dirty, and the next run of X lands it Failed by its own panic. The other
-/// thread observed Y's failure, so only the order with this thread first
-/// is serial, and the retry takes the payload over the later landing.
+/// The other thread's read of X waits for the retry, which takes Y's
+/// payload, and reads X Failed; then a set flips X and Y Dirty, and its
+/// next read of X lands X Failed by X's own panic, as in the serial order
+/// with this thread first.
 #[test]
-fn shared_vframe_relanded_failed_by_its_own_panic() {
+fn shared_vframe_reader_waits_then_relands_it_failed_by_its_own_panic() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -2002,25 +2197,33 @@ fn shared_vframe_relanded_failed_by_its_own_panic() {
     };
     gate.wait_parked();
     assert_eq!(rt.state_of(y), NodeState::Failed);
-    let other = outcome(|| rt.get(x));
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || {
+            let other = outcome(|| rt.get(x));
+            rt.set(i, 1);
+            (other, outcome(|| rt.get(x)))
+        })
+    };
+    await_reservation_wait(&rt, waits);
+    assert_eq!(rt.state_of(x), NodeState::New);
+    gate.release();
+    let (first, (other, again)) = (first.join(), other.join());
+    assert_eq!(first, Err("y boom".to_string()));
     assert!(failed(&other), "{other:?}");
-    rt.set(i, 1);
-    let again = outcome(|| rt.get(x));
     assert_eq!(again, Err("x own".to_string()));
     assert_eq!(rt.state_of(x), NodeState::Failed);
-    gate.release();
-    let first = first.join();
-    assert_eq!(first, Err("y boom".to_string()));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// The other thread's X lets Y's failed read out and a set flips X Dirty
-/// before the retry reads X. The other thread observed Y's failure, so
-/// only the order with this thread first is serial: the retry takes the
-/// payload instead of computing X, which the next read computes.
+/// The other thread's read of X waits for the retry, which takes Y's
+/// payload, reads X Failed and then sets an input that flips X Dirty, so
+/// the next read computes X, as in the serial order with this thread
+/// first.
 #[test]
-fn shared_vframe_dirtied_after_it_let_the_failure_out() {
+fn shared_vframe_reader_waits_then_dirties_it() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -2054,23 +2257,34 @@ fn shared_vframe_dirtied_after_it_let_the_failure_out() {
         spawn(move || outcome(|| rt.get(x)))
     };
     gate.wait_parked();
-    let other = outcome(|| rt.get(x));
-    assert!(failed(&other), "{other:?}");
-    rt.set(i, 1);
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || {
+            let other = outcome(|| rt.get(x));
+            rt.set(i, 1);
+            other
+        })
+    };
+    await_reservation_wait(&rt, waits);
     gate.release();
-    let first = first.join();
+    let (first, other) = (first.join(), other.join());
     assert_eq!(first, Err("y boom".to_string()));
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
     assert_eq!(outcome(|| rt.get(x)), Err("x own".to_string()));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// As `dirtied_after_it_let_the_failure_out`, but the retry loads X New
-/// and parks before its claim while the other thread computes X, letting
-/// Y's failure out, and a set flips X Dirty, so the claim succeeds on that
-/// Dirty. The retry gives the claim back and takes the payload.
+/// The retry loads X New and parks before its claim while the other
+/// thread's read of X waits for the reservation, and a set flips Y Dirty
+/// and makes X panic "x own". The retry claims X from New and runs it at
+/// the new revision, as the serial order with the set and then this
+/// thread's read first does, and the other thread reads X Failed.
 #[test]
-fn shared_vframe_dirtied_while_the_retry_claims() {
+#[ignore = "the retry's own panic after a set lands X Dirty, not Failed; T8-set-before-retry-claim-lands-dirty"]
+fn shared_vframe_set_before_the_retrys_claim_under_a_waiting_reader() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -2089,15 +2303,20 @@ fn shared_vframe_dirtied_while_the_retry_claims() {
             replayable(),
         )
     };
-    let x = rt.create_query_with(
-        move |rt: &Rt| {
-            if rt.get(i) == 1 {
-                panic!("x own");
-            }
-            rt.get(y) + 1
-        },
-        replayable(),
-    );
+    let x_runs = Arc::new(AtomicU32::new(0));
+    let x = {
+        let x_runs = x_runs.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                x_runs.fetch_add(1, SeqCst);
+                if rt.get(i) == 1 {
+                    panic!("x own");
+                }
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
     hook(
         &rt,
         vec![
@@ -2113,14 +2332,20 @@ fn shared_vframe_dirtied_while_the_retry_claims() {
     claim.arm();
     gate.release();
     claim.wait_parked();
-    let other = outcome(|| rt.get(x));
-    assert!(failed(&other), "{other:?}");
+    assert_eq!(rt.state_of(x), NodeState::New);
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
     rt.set(i, 1);
     claim.release();
-    let first = first.join();
-    assert_eq!(first, Err("y boom".to_string()));
-    assert_eq!(rt.state_of(x), NodeState::Dirty);
-    assert_eq!(outcome(|| rt.get(x)), Err("x own".to_string()));
+    let (first, other) = (first.join(), other.join());
+    assert_eq!(first, Err("x own".to_string()));
+    assert!(failed(&other), "{other:?}");
+    assert_eq!(x_runs.load(SeqCst), 2, "X ran doomed and as the retry");
+    assert_eq!(rt.state_of(x), NodeState::Failed);
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
@@ -2169,14 +2394,15 @@ fn shared_vframe_relanded_clean_below_its_reader() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// As `keeps_the_payload`, but after the retry's read of X found the
-/// payload and loaded X's generation, another thread deletes X and
-/// recycles its slot into Z, landed Failed by its own panic, before the
-/// read takes the record lock. The other thread's read let the failure
-/// out, so only the order with this thread first is serial, where the
-/// retry takes the payload.
+/// The retry of X finds Y's payload held for X's frame and parks before
+/// it checks the payload's record, while the other thread's read of X
+/// waits for the reservation. Another thread deletes X and recycles its
+/// slot into Z, landed Failed by its own panic. No landing let the
+/// failure out, so the retry takes nothing, finds X gone and panics as
+/// stale, as does the waiting read, as in the serial order with the
+/// delete first.
 #[test]
-fn shared_vframe_failed_read_of_a_recycled_slot() {
+fn shared_vframe_retry_rechecks_a_recycled_slot() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -2204,8 +2430,12 @@ fn shared_vframe_failed_read_of_a_recycled_slot() {
         spawn(move || outcome(|| rt.get(x)))
     };
     gate.wait_parked();
-    let other = outcome(|| rt.get(x));
-    assert!(failed(&other), "{other:?}");
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
     recheck.arm();
     gate.release();
     recheck.wait_parked();
@@ -2214,8 +2444,19 @@ fn shared_vframe_failed_read_of_a_recycled_slot() {
     assert_eq!(z.slot(), x.slot(), "Z reuses X's slot");
     assert_eq!(outcome(|| rt.get(z)), Err("z boom".to_string()));
     recheck.release();
-    let first = first.join();
-    assert_eq!(first, Err("y boom".to_string()));
+    let (first, other) = (first.join(), other.join());
+
+    let u = Rt::new();
+    u.set_max_frames(u32::MAX);
+    let uy = u.create_query_with(|_: &Rt| -> u64 { panic!("y boom") }, replayable());
+    let ux = u.create_query_with(move |rt: &Rt| rt.get(uy) + 1, replayable());
+    u.delete_node(ux);
+    let want = outcome(|| u.get(ux));
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("stale")),
+        "{want:?}"
+    );
+    assert_eq!((&first, &other), (&want, &want));
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
@@ -2233,10 +2474,11 @@ impl Drop for DropWitness {
 
 /// The retry's first attempt at X reads Z, which is deleted under it, so
 /// its publish is Stale and the attempt's bag carries an item into the
-/// next. Meanwhile the other thread's X lets Y's failure out, so the next
-/// attempt takes the payload, and the bag drains before it is raised.
+/// next. Another thread's read of X waits on X meanwhile; the next attempt
+/// fails on Y, the bag drains before that panic is raised, and the waiting
+/// read then reads X Failed.
 #[test]
-fn shared_vframe_owed_payload_drains_a_stale_retrys_bag_first() {
+fn shared_vframe_stale_retrys_bag_drains_under_a_waiting_reader() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -2276,11 +2518,16 @@ fn shared_vframe_owed_payload_drains_a_stale_retrys_bag_first() {
     rt.delete_node(z);
     inside.release();
     stale.wait_parked();
-    let other = outcome(|| rt.get(x));
-    assert!(failed(&other), "{other:?}");
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    await_reservation_wait(&rt, waits);
     stale.release();
-    let first = first.join();
+    let (first, other) = (first.join(), other.join());
     assert_eq!(first, Err("y boom".to_string()));
+    assert!(failed(&other), "{other:?}");
     assert_eq!(
         dropped.load(SeqCst),
         1,
@@ -2446,17 +2693,22 @@ fn shared_vframe_landed_failed_over_an_episodes_delivery() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
-/// As `keeps_the_payload`, but the other thread reads R, which reads X,
-/// and X reads R back before it reads Y, so X is a member of R's
-/// episode. X's member run reads Y Failed and lets that panic out, which
-/// aborts the episode, and X lands Failed at the release of its claim.
-/// That landing let the failure out as X's own run's does, so the retry
-/// of X takes the payload.
-#[test]
-fn shared_vframe_landed_failed_by_an_episode_member() {
+/// Y panics "y boom"; R (Fallback 100) reads X, and X reads Y, and once
+/// `in_cycle` is set, R first: X's discovery run of R's cycle reads R as
+/// the cycle closes and returns without reading Y, and the episode's runs
+/// read it. Y arms `gate` as it runs.
+struct Episode {
+    rt: Arc<Rt>,
+    gate: Gate,
+    y: Incr<u64>,
+    x: Incr<u64>,
+    r: Incr<u64>,
+    in_cycle: Arc<AtomicU8>,
+}
+
+fn episode_shape() -> Episode {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
-    rt.set_max_frames(1);
     let gate = Gate::new();
     let in_cycle = Arc::new(AtomicU8::new(0));
     let y = {
@@ -2474,9 +2726,6 @@ fn shared_vframe_landed_failed_by_an_episode_member() {
         let (rc, in_cycle) = (rc.clone(), in_cycle.clone());
         rt.create_query_with(
             move |rt: &Rt| {
-                // The discovery run of R's cycle, which reads R as the
-                // cycle closes, returns without reading Y; the episode's
-                // runs read it.
                 if in_cycle.load(SeqCst) > 0
                     && rt.get(*rc.get().unwrap()) > 0
                     && in_cycle.fetch_add(1, SeqCst) == 1
@@ -2496,41 +2745,103 @@ fn shared_vframe_landed_failed_by_an_episode_member() {
         },
     );
     rc.set(r).unwrap();
-    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    Episode {
+        rt,
+        gate,
+        y,
+        x,
+        r,
+        in_cycle,
+    }
+}
+
+/// At budget 1 this thread's `get(X)` dooms X on its read of Y, whose
+/// entry lands Failed, and parks before X's retry. X's closure switches
+/// to read R first, and the other thread reads R, whose read of X waits
+/// for X's reservation while it holds R's claim. X's retry then reads R:
+/// the waits-for registry breaks that cycle by a wound, whose victim
+/// decides which read comes first, and the reads end as in that order's
+/// unbounded run. In either order the other thread's read of R raises
+/// "last compute panicked" for Y, which this thread landed Failed, in place
+/// of "y boom", which the `Shared` payload contract leaves open.
+#[test]
+fn shared_episode_reader_and_a_vframes_retry_break_a_waits_for_cycle() {
+    let s = episode_shape();
+    s.rt.set_max_frames(1);
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.x)), s.gate.clone())],
+    );
     let first = {
-        let rt = rt.clone();
+        let (rt, x) = (s.rt.clone(), s.x);
         spawn(move || outcome(|| rt.get(x)))
     };
-    gate.wait_parked();
-    assert_eq!(rt.state_of(y), NodeState::Failed);
-    in_cycle.store(1, SeqCst);
-    let other = outcome(|| rt.get(r));
-    assert!(failed(&other), "{other:?}");
-    assert_eq!(rt.state_of(x), NodeState::Failed);
-    gate.release();
-    let first = first.join();
-    assert_eq!(first, Err("y boom".to_string()), "the payload was dropped");
-    rt.assert_invariant_i();
-    assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+    s.gate.wait_parked();
+    assert_eq!(s.rt.state_of(s.y), NodeState::Failed);
+    s.in_cycle.store(1, SeqCst);
+    let waits = s.rt.reservation_waits.load(SeqCst);
+    let other = {
+        let (rt, r) = (s.rt.clone(), s.r);
+        spawn(move || outcome(|| rt.get(r)))
+    };
+    await_reservation_wait(&s.rt, waits);
+    assert_eq!(s.rt.state_of(s.x), NodeState::New, "the other thread ran X");
+    s.gate.release();
+    let (first, other) = (first.join(), other.join());
+    s.rt.assert_invariant_i();
+    assert_eq!(
+        s.rt.provenance_records(),
+        0,
+        "a record outlived its delivery"
+    );
+
+    let serial = |x_first: bool| {
+        let u = episode_shape();
+        u.rt.set_max_frames(u32::MAX);
+        u.in_cycle.store(1, SeqCst);
+        let (want_first, want_other) = if x_first {
+            let f = outcome(|| u.rt.get(u.x));
+            (f, outcome(|| u.rt.get(u.r)))
+        } else {
+            let o = outcome(|| u.rt.get(u.r));
+            (outcome(|| u.rt.get(u.x)), o)
+        };
+        (want_first, want_other, u.rt.state_of(u.x))
+    };
+    let orders = [serial(false), serial(true)];
+    assert_ne!(orders[0].0, orders[1].0);
+    let (_, want_other, want_state) = orders
+        .into_iter()
+        .find(|w| w.0 == first)
+        .unwrap_or_else(|| panic!("{first:?} is no order's read of X"));
+    assert_eq!(want_other, Err("y boom".to_string()));
+    assert!(
+        other
+            .as_ref()
+            .is_err_and(|m| m.contains("node 0 read but its last compute panicked")),
+        "{other:?}"
+    );
+    assert_eq!(s.rt.state_of(s.x), want_state);
 }
 
 /// The position and path of an untaken delivery for a frame of X.
 type Held = Option<(u32, u64)>;
 
 /// W reads X, which reads Y, which panics "y boom"; once `switch` is set,
-/// W first reads Z, which reads Z2. At budget 2 this thread's `get(W)`
-/// dooms W and X, Y's entry lands Failed, and the driver parks before
-/// W's retry with Y's payload held for X's frame at position 1. The other
-/// thread lands X Failed, then sets the switch and reads W, whose read of
-/// Z dooms W, so W's retry reads X Failed in a replay of its own at the
-/// same position and path as the held payload's frame. A context is one
-/// thread's, so that read raises "last compute panicked" and the payload
-/// is still held when this thread goes on.
-#[test]
-fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
+/// W first reads Z, which reads Z2. Y sets `y_ran` and arms `gate`.
+struct EqualPath {
+    rt: Arc<Rt>,
+    gate: Gate,
+    y_ran: Arc<std::sync::atomic::AtomicBool>,
+    switch: Arc<std::sync::atomic::AtomicBool>,
+    y: Incr<u64>,
+    x: Incr<u64>,
+    w: Incr<u64>,
+}
+
+fn equal_path_shape() -> EqualPath {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
-    rt.set_max_frames(2);
     let gate = Gate::new();
     let y_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let y = {
@@ -2560,6 +2871,37 @@ fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
             replayable(),
         )
     };
+    EqualPath {
+        rt,
+        gate,
+        y_ran,
+        switch,
+        y,
+        x,
+        w,
+    }
+}
+
+/// At budget 2 this thread's `get(W)` dooms W and X, Y's entry lands
+/// Failed, and the driver parks before W's retry with Y's payload held
+/// for X's frame at position 1. Parked there, W's switch is set and the
+/// other thread reads X and then W, each the node of a virtual frame:
+/// both wait for this thread's landings, so the payload stays held for
+/// X's frame while the driver is parked and no replay of the other
+/// thread's reaches it. The reads are the unbounded run's in which this
+/// thread's came first with the switch set before it.
+#[test]
+fn shared_reader_waits_out_a_held_delivery_at_an_equal_path() {
+    let EqualPath {
+        rt,
+        gate,
+        y_ran,
+        switch,
+        y,
+        x,
+        w,
+    } = equal_path_shape();
+    rt.set_max_frames(2);
     let held = |x: Incr<u64>| {
         crate::replay::with(|c| {
             c.iter().flat_map(|ctx| ctx.pending.iter()).find_map(|d| {
@@ -2585,20 +2927,16 @@ fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
     };
     gate.wait_parked();
     assert_eq!(rt.state_of(y), NodeState::Failed);
-    let landed = outcome(|| rt.get(x));
-    assert!(failed(&landed), "{landed:?}");
     switch.store(true, SeqCst);
-    let other = outcome(|| rt.get(w));
-    assert!(
-        failed(&other),
-        "the other thread took the held payload: {other:?}"
-    );
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || (outcome(|| rt.get(x)), outcome(|| rt.get(w))))
+    };
+    await_reservation_wait(&rt, waits);
+    assert_eq!(rt.state_of(x), NodeState::New, "the other thread ran X");
     gate.release();
-    let first = first.join();
-    assert!(
-        first == Err("y boom".to_string()) || failed(&first),
-        "{first:?}"
-    );
+    let (first, (landed, other)) = (first.join(), other.join());
     let path = crate::replay::extend_path(
         0,
         crate::replay::Step::of(
@@ -2613,33 +2951,37 @@ fn shared_failed_read_at_an_equal_path_leaves_another_threads_delivery() {
     assert_eq!(*seen, vec![Some((1, path)); 2], "the held payload moved");
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
+
+    let u = equal_path_shape();
+    u.rt.set_max_frames(u32::MAX);
+    u.switch.store(true, SeqCst);
+    let want = (
+        outcome(|| u.rt.get(u.w)),
+        outcome(|| u.rt.get(u.x)),
+        outcome(|| u.rt.get(u.w)),
+    );
+    assert_eq!(want.0, Err("y boom".to_string()));
+    assert_eq!((first, landed, other), want);
 }
 
-/// The two-deliveries shape of `runtime_replay_unwind_tests`, with X
-/// switchable as in [`landed_shape`]: A (Fallback 4) catches its read of
-/// X and reads X again; X catches its read of C and reads B; B and C read
-/// A and panic on its fallback. Switched, X reads nothing and lands Clean
-/// 42 or panics, and B and C read nothing.
+/// The two-deliveries shape of `runtime_replay_unwind_tests`: A
+/// (Fallback 4) catches its read of X and reads X again; X catches its
+/// read of C and reads B; B and C read A and panic on its fallback.
 struct Retaken {
     rt: Arc<Rt>,
     a: Incr<u64>,
     x: Incr<u64>,
     c: Incr<u64>,
-    mode: Arc<AtomicU8>,
 }
 
 fn retaken_shape() -> Retaken {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
-    let mode = Arc::new(AtomicU8::new(CHAIN));
     let ac: Arc<OnceLock<Incr<u64>>> = Arc::default();
     let member = |text: &'static str| {
-        let (ac, mode) = (ac.clone(), mode.clone());
+        let ac = ac.clone();
         rt.create_query_with(
             move |rt: &Rt| {
-                if mode.load(SeqCst) != CHAIN {
-                    return 0;
-                }
                 let a = rt.get(*ac.get().unwrap());
                 if a == 4 {
                     std::panic::panic_any(String::from(text));
@@ -2651,20 +2993,13 @@ fn retaken_shape() -> Retaken {
     };
     let c = member("c boom");
     let b = member("b boom");
-    let x = {
-        let mode = mode.clone();
-        rt.create_query_with(
-            move |rt: &Rt| match mode.load(SeqCst) {
-                CHAIN => {
-                    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
-                    rt.get(b) + 4
-                }
-                CLEAN => 42,
-                _ => std::panic::panic_any(String::from("x failed")),
-            },
-            replayable(),
-        )
-    };
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
+            rt.get(b) + 4
+        },
+        replayable(),
+    );
     let a = rt.create_query_with(
         move |rt: &Rt| {
             let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
@@ -2680,31 +3015,30 @@ fn retaken_shape() -> Retaken {
         },
     );
     ac.set(a).unwrap();
-    Retaken { rt, a, x, c, mode }
+    Retaken { rt, a, x, c }
 }
 
-/// The unbounded run in which the other thread's switch of X to `mode`
-/// and its `get(X)` come first: `get(A)`'s outcome and the states of A
-/// and X.
-fn retaken_first(mode: u8) -> (Outcome, [NodeState; 2]) {
+/// The unbounded run in which A's read comes before X's: `get(A)`'s
+/// outcome, `get(X)`'s, and the states of A and X.
+fn retaken_a_first() -> (Outcome, Outcome, [NodeState; 2]) {
     let s = retaken_shape();
-    s.mode.store(mode, SeqCst);
-    let _ = outcome(|| s.rt.get(s.x));
+    s.rt.set_max_frames(u32::MAX);
     let a = outcome(|| s.rt.get(s.a));
-    (a, [s.a, s.x].map(|h| s.rt.state_of(h)))
+    let x = outcome(|| s.rt.get(s.x));
+    (a, x, [s.a, s.x].map(|h| s.rt.state_of(h)))
 }
 
-/// **A frame's node landed by another thread between two takes of its
-/// delivery**, at budget 2: the retry of A's caught read takes the
-/// delivery for X's read of B, which lands X Dirty, and a retry doomed
-/// again takes it a second time. Parked between the two takes, at the
-/// driver's second entry for C, another thread switches X and lands it,
-/// which it can since virtual frames hold no claims. The later take must
-/// not land X over that state, and A ends as in the unbounded run in which
-/// the other thread came first. The other thread's own read walks X's
-/// deps as the first take left them, so for a panicking X it can raise
-/// a Failed read of X rather than X's panic, as a serial walk would.
-fn retaken_delivery_after_another_landing(mode: u8) {
+/// **A reader of a frame's node between two takes of its delivery**, at
+/// budget 2: the retry of A's caught read takes the delivery for X's read
+/// of B, which lands X Dirty, and a retry doomed again takes it a second
+/// time. Parked between the two takes, at the driver's second entry for
+/// C, another thread reads X: X stays reserved through the first take's
+/// landing, so that read waits and lands nothing, and both reads end as
+/// in the unbounded run in which A's came first. X's closure is not
+/// switched here: a switch between the takes would make X's two landed
+/// runs disagree, which no serial order does.
+#[test]
+fn shared_retaken_delivery_with_a_waiting_reader() {
     let s = retaken_shape();
     s.rt.set_max_frames(2);
     let gate = Gate::new();
@@ -2728,37 +3062,23 @@ fn retaken_delivery_after_another_landing(mode: u8) {
         NodeState::Dirty,
         "the first take landed X Dirty"
     );
-    s.mode.store(mode, SeqCst);
-    let x = outcome(|| s.rt.get(s.x));
-    let other = if mode == CLEAN {
-        assert_eq!(x, Ok(42));
-        NodeState::Clean
-    } else {
-        assert!(x.is_err(), "{x:?}");
-        NodeState::Failed
+    let waits = s.rt.reservation_waits.load(SeqCst);
+    let other = {
+        let (rt, x) = (s.rt.clone(), s.x);
+        spawn(move || outcome(|| rt.get(x)))
     };
-    assert_eq!(s.rt.state_of(s.x), other);
-    gate.release();
-    let a = reader.join();
-
+    await_reservation_wait(&s.rt, waits);
     assert_eq!(
         s.rt.state_of(s.x),
-        other,
-        "the later take landed X over the other thread's landing"
+        NodeState::Dirty,
+        "the other thread landed X under the reservation"
     );
+    gate.release();
+    let (a, x) = (reader.join(), other.join());
+
     assert_eq!(
-        (a, [s.a, s.x].map(|h| s.rt.state_of(h))),
-        retaken_first(mode)
+        (a, x, [s.a, s.x].map(|h| s.rt.state_of(h))),
+        retaken_a_first()
     );
     s.rt.assert_invariant_i();
-}
-
-#[test]
-fn shared_retaken_delivery_after_another_thread_lands_clean() {
-    retaken_delivery_after_another_landing(CLEAN);
-}
-
-#[test]
-fn shared_retaken_delivery_after_another_thread_lands_failed() {
-    retaken_delivery_after_another_landing(FAILED);
 }

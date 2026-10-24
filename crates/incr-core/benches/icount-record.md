@@ -1959,6 +1959,16 @@ each segment, which put Local and Shared over the memory ceiling at
 owner writes both and its release publishes both. Base `ca94bbad`, tip
 `52987c56`, same box, `icount.sh` defaults.
 
+## Doom reservations
+
+`f98fc424` (on `ac199763`) keeps a node a doom released for its
+context's retry from other threads until that context ends. Each Shared
+claim reads one global count after its CAS, an unrun landing notes the
+node when a reservation scope is open, and every outermost Shared entry
+checks on exit that its thread holds none. Base `78d070d4` (`ac199763`
+adds only a comment), tip `12f67a7d` (the later commits change only the
+wound path and loom builds), same box, `icount.sh` defaults.
+
 | workload | base | tip | delta |
 |---|---|---|---|
 | `get_clean_shared` | 196 | 196 | 0 |
@@ -2076,6 +2086,41 @@ because `diverted_clean_read` looks across contexts to end the divert
 on every read that takes nothing; T8-divert-per-read-undivert-cost ends
 it only after a take, a removal or a doom instead. The release replay
 scale tests finish in 24.94 s at the tip against 28.39 s at the base.
+
+| `delete_single_shared` | 1533.25 | 1563.36 | +30.11 |
+| `early_cutoff_shared` | 3683.85 | 3739.84 | +55.99 |
+| `fanout_shared_4` | 23724.09 | 24031.99 | +307.90 |
+| `fanout_shared_1000` | 4800753.40 | 4851229.31 | +50475.91 |
+| `delete_cascade_shared` | 4581755.89 | 4663009.77 | +81253.88 |
+| `simple_count/shared/1000` | 4130.81 | 4176.09 | +45.28 |
+| `collection_insert_then_read/shared_incremental/1000` | 7524.88 | 7596.24 | +71.36 |
+
+- About 30 instructions per outermost Shared entry are the exit guard's
+  drop (`OutermostExit`, `reserve::none_held`: a thread-local access, a
+  `RefCell` borrow and a larger `catch_unwind` closure). Intel PT on
+  `delete_single_shared` (10 iterations, +32 per iteration in that run)
+  puts 30 there.
+- In `fanout_shared_4`'s PT diff (+308 per iteration) the thread-local,
+  `Cell`, closure, drop and `Vec` lines of the entry path add about +210,
+  the generation check at the top of `compute_attempts`' loop +45 and the
+  claim-path branch at `runtime.rs:3554` +15; the -85/+70 swings between
+  `segmented_nodes.rs:192` and `state.rs:66` net to about zero and are
+  code moving between partitions.
+- Local rows move by 0.0 to 0.9% though reservations compile out under
+  `SINGLE_THREADED`: layout, as in earlier sections.
+
+Gate: the hard gates hold (102/196, 155.14/218.14, 5/87). Replay scale
+by `strict-scan.sh`'s `scale-icount` against `78d070d4`: Local ratios are
+in 0.9978..1.0024; Shared rise up to 1.18
+(`shared_taint_100k_at_budget_1_on_a_1_mib_thread`; 1.12 at budget 256,
+1.10 `shared_byte_budget_before_frame_budget`, 1.03 to 1.08 for the
+cycle, fixpoint, ring and stabilize rows), and `replay_scale_tests` take
+18.3 s against 16.9 s. In the profile of the worst row the new symbols
+are `reserve::elsewhere` (3.8% of instructions), `BTreeMap::remove`
+(2.9%) and `reserve::unlist` (2.8%): the thread's own reservations keep
+`LIVE` non-zero, so each of its re-claims takes the table lock and a
+lookup, and each context end removes its entries from the shared map.
+B7-reservation-table-cost tracks a per-node reservation word instead.
 
 ## A handled read keeps a memo for the revision
 

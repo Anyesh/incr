@@ -1208,13 +1208,11 @@ fn doom_handed_memo_meets_no_chain_drop<C: Cells>() {
 /// [`handed_over_graph`] with F = IF(A, k, X + W) a `u64` over an input
 /// k, and a root G = F + W, where W is M, or with `grouped` a Fallback
 /// member N = M + 1 of a 2-cycle with M = X + N. R reads W while s = 0.
-/// F reaches neither W nor X once A is true, so another thread can land F
-/// while X's run holds X.
+/// F reaches neither W nor X once A is true.
 struct LandedF {
     g: Incr<u64>,
     f: Incr<u64>,
     m: Incr<u64>,
-    w: Incr<u64>,
     x: Incr<u64>,
     r: Incr<u64>,
     s_in: Incr<u64>,
@@ -1352,7 +1350,6 @@ fn landed_f_graph<C: Cells>(rt: &Runtime<C>, depth: u32, grouped: bool) -> Lande
         g,
         f,
         m,
-        w,
         x,
         r,
         s_in,
@@ -1363,17 +1360,15 @@ fn landed_f_graph<C: Cells>(rt: &Runtime<C>, depth: u32, grouped: bool) -> Lande
     }
 }
 
-/// **A dropped chain leaves a doom's handed-over memo entry** (Shared):
-/// under G's read of F, X's entry walks R -> W into X's frame, memoizing
-/// W under X, and R's compute dooms X, handing W's entry to the context.
-/// Parked at X's doomed read of F, which has a virtual frame, another
-/// thread lands F Clean, so the read takes no placeholder and drops X's
-/// chain cooperatively; parked again before the entry of W that F's
-/// doomed run pushed, it lands X Clean. W's entry must then verify W
-/// Clean (group-verify it when `grouped`), as the unbounded run with the
-/// same landings first does, not run W's closure from an entry left by
-/// the dropped chain.
-fn dropped_chain_handed_memo(grouped: bool) {
+/// **A reserved VFrame node keeps a doom's handed-over memo entry**
+/// (Shared): under G's read of F, X's entry walks R -> W into X's frame,
+/// memoizing W under X, and R's compute dooms X, handing W's entry to the
+/// context. Parked at X's doomed read of F, which has a virtual frame,
+/// another thread reads F and waits on its reservation instead of landing
+/// it. W's entry must then verify W Clean (group-verify it when
+/// `grouped`), and the reads of G, F and X are the unbounded run's in
+/// that order.
+fn reserved_vframe_handed_memo(grouped: bool) {
     for frames in 1..=4 {
         let depth = frames;
         let observe = |frames: Option<u32>| {
@@ -1393,37 +1388,39 @@ fn dropped_chain_handed_memo(grouped: bool) {
             let before = [HF, HX, HM, HR, HG, HN].map(|i| g.runs.of(i));
             let (root, f, x) = match frames {
                 None => {
+                    let root = get(&rt, g.g);
                     let f = get(&rt, g.f);
-                    let x = get(&rt, g.x);
-                    (get(&rt, g.g), f, x)
+                    (root, f, get(&rt, g.x))
                 }
                 Some(_) => {
-                    let (doomed_read, w_entry) = (Gate::new(), Gate::new());
-                    let points = [
-                        (ParkPoint::DoomedRead(id(g.f)), doomed_read.clone()),
-                        (ParkPoint::BeforeEntry(id(g.w)), w_entry.clone()),
-                    ];
-                    let installed = rt.park_hook.set(Box::new(move |p| {
-                        for (point, gate) in &points {
-                            if *point == p {
+                    let doomed_read = Gate::new();
+                    let point = ParkPoint::DoomedRead(id(g.f));
+                    let installed = rt.park_hook.set(Box::new({
+                        let gate = doomed_read.clone();
+                        move |p| {
+                            if p == point {
                                 gate.park();
                             }
                         }
                     }));
                     assert!(installed.is_ok(), "park hook installed twice");
                     doomed_read.arm();
-                    std::thread::scope(|s| {
+                    let (root, f) = std::thread::scope(|s| {
                         let reader = s.spawn(|| get(&rt, g.g));
                         doomed_read.wait_parked();
                         assert_ne!(rt.state_of(g.f), NodeState::Clean, "frames {frames:?}");
-                        let f = get(&rt, g.f);
-                        w_entry.arm();
+                        let waits = rt.reservation_waits.load(SeqCst);
+                        let other = s.spawn(|| get(&rt, g.f));
+                        super::race_tests::await_reservation_wait(&rt, waits);
+                        assert_ne!(
+                            rt.state_of(g.f),
+                            NodeState::Clean,
+                            "frames {frames:?}: F landed under the reservation"
+                        );
                         doomed_read.release();
-                        w_entry.wait_parked();
-                        let x = get(&rt, g.x);
-                        w_entry.release();
-                        (reader.join().unwrap(), f, x)
-                    })
+                        (reader.join().unwrap(), other.join().unwrap())
+                    });
+                    (root, f, get(&rt, g.x))
                 }
             };
             rt.assert_invariant_i();
@@ -1465,13 +1462,13 @@ fn dropped_chain_handed_memo(grouped: bool) {
 }
 
 #[test]
-fn shared_dropped_chain_handed_memo() {
-    dropped_chain_handed_memo(false);
+fn shared_reserved_vframe_keeps_handed_memo() {
+    reserved_vframe_handed_memo(false);
 }
 
 #[test]
-fn shared_dropped_chain_handed_memo_in_group() {
-    dropped_chain_handed_memo(true);
+fn shared_reserved_vframe_keeps_handed_memo_in_group() {
+    reserved_vframe_handed_memo(true);
 }
 
 local_and_shared!(
