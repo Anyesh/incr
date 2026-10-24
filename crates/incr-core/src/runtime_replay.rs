@@ -59,6 +59,12 @@ enum VPop {
     /// A doom (`true`) or a dropped chain pushed entries: the driver picks
     /// its next entry again.
     Restart(bool),
+    /// The episode rooted at the node dissolved, which ended the run of the
+    /// root's frame: the retry that computes the root alone is another run,
+    /// as the unbounded run's frame runs the closure again. A resumed
+    /// episode pops at a member run's frame, at the root's position, so the
+    /// root is named.
+    Dissolved(u32),
     /// The run of the frame at the popped position ended: no retry
     /// computes it again.
     Finished(u32, Ended),
@@ -1902,6 +1908,7 @@ impl<C: Cells> Runtime<C> {
             // The virtual frames at and above the entry's level pop, highest
             // first, each as the frame it stands for would.
             let mut popped_frames: Vec<(VFrame, bool)> = Vec::new();
+            let mut dissolved: Vec<u32> = Vec::new();
             loop {
                 let popped = replay::with(|c| {
                     let x = c
@@ -1994,6 +2001,13 @@ impl<C: Cells> Runtime<C> {
                     VPop::Next => {
                         if retried && !kept.is_empty() {
                             taint_memo::restore(kept);
+                        }
+                        popped_frames.push((v.clone(), false));
+                    }
+                    VPop::Dissolved(root) => {
+                        let generation = self.nodes.get(root).generation();
+                        if self.end_dissolved_reads(NodeId(root), generation, v.cidx) {
+                            dissolved.push(v.cidx);
                         }
                         popped_frames.push((v.clone(), false));
                     }
@@ -2133,10 +2147,9 @@ impl<C: Cells> Runtime<C> {
                 .filter(|&(v, landed)| !landed && v.cidx > at)
             {
                 let read = v.computes;
-                if let Some((w, _)) = popped_frames
-                    .iter()
-                    .find(|(w, _)| w.cidx + 1 == v.cidx && w.reading == read)
-                {
+                if let Some((w, _)) = popped_frames.iter().find(|(w, _)| {
+                    w.cidx + 1 == v.cidx && w.reading == read && !dissolved.contains(&w.cidx)
+                }) {
                     replay::with(|c| {
                         let runs = replay::run_snapshot(c, self.runtime_id, w);
                         if let Some(x) = c.iter_mut().find(|x| x.id == id) {
@@ -2533,6 +2546,7 @@ impl<C: Cells> Runtime<C> {
             PopEnd::Suspended => VPop::Restart(true),
             PopEnd::Landed => VPop::Finished(root.0, Ended::Landed),
             PopEnd::Contained => VPop::Finished(root.0, Ended::Contained),
+            PopEnd::Dissolved => VPop::Dissolved(root.0),
             _ => VPop::Next,
         };
         if let PopEnd::Dissolved = end {
@@ -2847,6 +2861,31 @@ impl<C: Cells> Runtime<C> {
         // No retry reads these frames again, so their unread reads are not
         // marked as [`Self::drop_deliveries`] marks a retry's.
         drop(dropped);
+    }
+
+    /// Drops the deliveries held, in any of this runtime's contexts, for
+    /// reads by the frame of `root` at `cidx`, whose episode just
+    /// dissolved: the unbounded run's frame runs the closure again, and the
+    /// new run's reads are not the ended run's. A speculative run's dissolve
+    /// is not the unbounded run's, so it keeps them; returns whether they
+    /// were dropped.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn end_dissolved_reads(&self, root: NodeId, generation: u32, cidx: u32) -> bool {
+        if replay::speculative() {
+            return false;
+        }
+        let rt = self.runtime_id;
+        let ended: Vec<Delivery> = replay::with(|c| {
+            c.iter_mut()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| x.pending.extract_frame(root.0, generation, cidx))
+                .collect()
+        });
+        // No retry reads the ended run's frame again, so its unread reads
+        // are not marked as [`Self::drop_deliveries`] marks a retry's.
+        drop(ended);
+        true
     }
 
     /// Releases, with the discard landing, the claims virtual hits took
