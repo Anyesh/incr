@@ -2525,7 +2525,7 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
         let mut bounded = labelled(&label, || run::<C>(case, frames, bytes));
         // A forced revisit re-walks its entry, and a bounded run's retried
         // walks force it again at their own points, so only the outputs
-        // are results.
+        // and whether a read was replaced are results.
         if super::forced_revisit() && !C::SINGLE_THREADED {
             for ((_, got), (_, want)) in bounded.iter_mut().zip(&unbounded) {
                 let replaced = got.2;
