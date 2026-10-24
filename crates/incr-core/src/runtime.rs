@@ -4937,6 +4937,10 @@ mod replay_scale_tests;
 mod replay_race_tests;
 
 #[cfg(all(test, not(loom)))]
+#[path = "runtime_reserve_tests.rs"]
+mod reserve_tests;
+
+#[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_differential.rs"]
 mod replay_differential;
 
