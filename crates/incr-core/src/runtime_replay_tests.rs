@@ -1850,3 +1850,97 @@ local_and_shared!(
     local_a_replaced_blocked_landing_drops_outside_the_contexts,
     shared_a_replaced_blocked_landing_drops_outside_the_contexts
 );
+
+#[derive(Debug)]
+struct CustomPayload(u64);
+
+/// What `r` saw when it caught `d`'s panic: 1 for `d`'s `CustomPayload`
+/// (its number added), 2 for any other payload, 3 for a value; plus a deep
+/// read `chain` replayable hops long. `d` sits `mid` replayable hops below
+/// `r`, and is replayable if `d_replayable`.
+fn custom_payload_shape<C: Cells>(
+    frames: u32,
+    chain: u32,
+    mid: u32,
+    d_replayable: bool,
+    outer: u32,
+) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let i = rt.create_input(1_u64);
+    let d = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let v = rt.get(i);
+            std::panic::panic_any(CustomPayload(40 + v))
+        },
+        if d_replayable {
+            replayable()
+        } else {
+            QueryOpts::default()
+        },
+    );
+    let mut top = d;
+    for _ in 0..mid {
+        let v = top;
+        top = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let v = deep;
+        deep = rt.create_query_with(move |rt| rt.get(v) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(top))) {
+                Err(p) => match p.downcast_ref::<CustomPayload>() {
+                    Some(c) => 1 + c.0,
+                    None => 2,
+                },
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut top_r = r;
+    for _ in 0..outer {
+        let v = top_r;
+        top_r = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    rt.try_get(top_r).unwrap_or(7777)
+}
+
+/// A reader that catches a dep's custom panic payload, which the engine
+/// cannot copy for a retry, branches on it as the unbounded run does under
+/// every budget that leaves the reader below the budget itself.
+#[test]
+fn a_caught_custom_payload_survives_the_readers_retries() {
+    for d_replayable in [true, false] {
+        for outer in [0, 1, 4] {
+            for mid in [0, 1, 3] {
+                for chain in [0, 2, 6] {
+                    let shape = |frames, local: bool| {
+                        if local {
+                            custom_payload_shape::<Local>(frames, chain, mid, d_replayable, outer)
+                        } else {
+                            custom_payload_shape::<Shared>(frames, chain, mid, d_replayable, outer)
+                        }
+                    };
+                    for local in [true, false] {
+                        let want = shape(u32::MAX, local);
+                        // At the budget itself, see `hold_uncopied`.
+                        for frames in (2..9).filter(|&f| f != outer + 1) {
+                            assert_eq!(
+                                shape(frames, local),
+                                want,
+                                "local={local} d_replayable={d_replayable} outer={outer} \
+                                 mid={mid} chain={chain} frames={frames}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
