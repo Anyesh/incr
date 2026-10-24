@@ -3416,10 +3416,11 @@ impl<C: Cells> Runtime<C> {
                     self.raise_owed(payload, bag);
                 }
             }
-            // The claim reads from the landing that left the node New or
-            // Dirty, so it reads any episode another thread landed before
-            // that: the episode may have landed Clean a node this plan
-            // reaches the node through, which a walk planned now skips.
+            // When the claim reads from another thread's episode, which left
+            // this node New or Dirty, it reads the count that episode
+            // bumped first: the episode may have landed Clean a node this
+            // plan reaches the node through, which a walk planned now
+            // skips. A claim not ordered after an episode may run before it.
             if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
