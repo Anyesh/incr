@@ -5244,6 +5244,50 @@ fn a_discarded_stash_leaves_the_next_run_first() {
     });
 }
 
+/// The set of 11 leaves 4..=8 Dirty and the `Get(8)` settles 8 with its
+/// old value, so 4..=7 verify. At budget 1 0's read of 1 dooms, and 1's
+/// doomed run reads the placeholder for 10 and takes the branch to 2,
+/// which only that speculative run reads: its walk verifies 7..=4, which
+/// the unbounded run never reads and leaves Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_speculative_walk_verify_lands_nothing() {
+    let query = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let zero = || Box::new(Expr::Const(0));
+    let case = Case {
+        specs: vec![
+            query(Expr::Read(1, false), true, false),
+            query(Expr::If(read(10), read(2), zero()), true, false),
+            query(Expr::Read(3, false), true, false),
+            query(Expr::Read(4, false), true, false),
+            query(Expr::Read(5, false), false, false),
+            query(Expr::Read(6, false), true, false),
+            query(Expr::Read(7, true), true, true),
+            query(Expr::Read(8, false), false, false),
+            query(Expr::If(read(9), zero(), zero()), true, false),
+            query(Expr::Read(11, true), true, true),
+            query(Expr::Const(1), true, false),
+            Spec::Input(2),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 11,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(4), Op::Set(11, 3), Op::Get(8), Op::Get(0)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0);
+        differential::<Shared>(&case, 0);
+    });
+}
+
 /// Seeds whose Native closures run more often in a revision under replay
 /// than unbounded, by retries rather than speculative runs, run with
 /// [`compare_native`]'s full count; the base seeds are from

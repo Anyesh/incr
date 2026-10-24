@@ -2172,7 +2172,9 @@ impl<C: Cells> Runtime<C> {
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
                     if let Some(f) = frame {
-                        if state::load::<C>(node.state_cell()) == NodeState::Dirty {
+                        if state::load::<C>(node.state_cell()) == NodeState::Dirty
+                            && !self.verified_stash(handle.slot(), handle.generation())
+                        {
                             #[cfg(test)]
                             self.dirty_reads.lock().unwrap().push(handle.slot());
                             self.note_dirty_read(f, handle, &value);
@@ -3570,6 +3572,9 @@ impl<C: Cells> Runtime<C> {
                     }
                 });
                 if !any_changed {
+                    if MODE & VIRT != 0 && replay::speculative() {
+                        return self.stash_verify(id, node, g, my_verified, verify_rev);
+                    }
                     self.park(ParkPoint::VerifyAfterScan(id));
                     node.max_verified_at(verify_rev);
                     if self.land_single(id, node, flags, NodeState::Clean, NodeState::Dirty)
@@ -4454,7 +4459,10 @@ impl<C: Cells> Runtime<C> {
     /// first could pair an old stamp with a newer `Clean`.
     fn observed_clean(&self, dep: NodeId, rev: u64) -> bool {
         let node = self.nodes.get(dep.0);
-        node.state().is_settled() && node.changed_at() <= rev
+        let state = node.state();
+        (state.is_settled()
+            || state == NodeState::Dirty && self.verified_stash(dep.0, node.generation()))
+            && node.changed_at() <= rev
     }
 
     #[cfg(test)]

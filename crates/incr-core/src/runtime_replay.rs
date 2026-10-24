@@ -339,6 +339,51 @@ impl<C: Cells> Runtime<C> {
         Computed::Done
     }
 
+    /// A speculative verify that would land `id` Clean, against the
+    /// `since` it was verified at: the node lands back Dirty, and its stash
+    /// stands for the verify, so a speculative read takes the node's value
+    /// and a dependent's verify counts it Clean, and the real claim adopts
+    /// it as the unbounded run's verify.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn stash_verify(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        generation: u32,
+        since: u64,
+        verify_rev: u64,
+    ) -> Computed {
+        let mut deps = Vec::new();
+        node.for_each_dep(|d| deps.push((d, self.nodes.get(d.0).generation())));
+        self.stash(
+            id.0,
+            generation,
+            Stash {
+                outcome: Outcome::Verified { since },
+                deps,
+                verify_rev,
+            },
+        );
+        self.land(id, node, NodeState::Dirty, NodeState::Dirty);
+        Computed::Done
+    }
+
+    /// Whether a speculative run's verify of node `slot` at `generation`
+    /// is stashed, in a speculative run.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn verified_stash(&self, slot: u32, generation: u32) -> bool {
+        if !replay::speculative() || C::u32_load_relaxed(&self.stash_count) == 0 {
+            return false;
+        }
+        let revision = self.current_revision();
+        let mut s = self.stashes.write();
+        s.revision == revision
+            && (s.map.get_mut(&(slot, generation)))
+                .is_some_and(|e| matches!(e.get_mut().outcome, Outcome::Verified { .. }))
+    }
+
     /// A speculative run that unwound or was dropped after its closure
     /// returned: the value it buffered is one the unbounded run never built,
     /// so it drops under `isolate`.
@@ -370,7 +415,9 @@ impl<C: Cells> Runtime<C> {
         if replay::speculative() || replay::frame_records(rt, id.0, generation) {
             return Adopted::No;
         }
-        let Some(stash) = self.take_stash(id.0, generation) else {
+        // A root's verify is its claim's own, after the walk settled its
+        // deps; a taint memo's claim runs the closure, as unbounded.
+        let Some(stash) = self.take_stash(id.0, generation, false) else {
             return Adopted::No;
         };
         let mut stack = vec![Adopting {
@@ -385,9 +432,13 @@ impl<C: Cells> Runtime<C> {
             if !failed && top.next < top.stash.deps.len() {
                 let (d, dg) = top.stash.deps[top.next];
                 top.next += 1;
+                let rev = match top.stash.outcome {
+                    Outcome::Verified { since } => since,
+                    _ => top.stash.verify_rev,
+                };
                 if self.nodes.get(d.0).generation() != dg {
                     failed = true;
-                } else if !self.observed_clean(d, top.stash.verify_rev) {
+                } else if !self.observed_clean(d, rev) {
                     match self.claim_stashed(d, dg) {
                         Some(dep) => stack.push(dep),
                         None => failed = true,
@@ -405,7 +456,10 @@ impl<C: Cells> Runtime<C> {
                     });
                 }
             }
-            failed |= !matches!(a.stash.outcome, Outcome::Value(_));
+            failed |= !matches!(
+                a.stash.outcome,
+                Outcome::Value(_) | Outcome::Verified { .. }
+            );
             if failed {
                 bag.push_erased(Box::new(a.stash.outcome));
                 if root {
@@ -448,7 +502,7 @@ impl<C: Cells> Runtime<C> {
             NodeState::New
         };
         let stash = (node.generation() == generation)
-            .then(|| self.take_stash(id.0, generation))
+            .then(|| self.take_stash(id.0, generation, true))
             .flatten();
         let Some(stash) = stash else {
             self.land(id, node, source, source);
@@ -467,6 +521,18 @@ impl<C: Cells> Runtime<C> {
     /// or the write panicked, with the node landed back New or as claimed.
     fn land_adopted(&self, a: Adopting, bag: &mut Deferred<C>) -> Option<NodeState> {
         let (node, flags) = self.nodes.get_with_flags(a.id.0);
+        if let Outcome::Verified { .. } = a.stash.outcome {
+            node.max_verified_at(
+                a.stash
+                    .verify_rev
+                    .min(C::walked(&self.walk, &self.revision)),
+            );
+            let landed = self.land_single(a.id, node, flags, NodeState::Clean, NodeState::Dirty);
+            if landed == NodeState::Clean {
+                self.record_trace(a.id, crate::trace::TraceAction::VerifiedClean);
+            }
+            return Some(landed);
+        }
         let first = !a.claimed_dirty;
         let stamp_rev = self.current_revision();
         let verify_rev = a
@@ -560,6 +626,7 @@ impl<C: Cells> Runtime<C> {
             Outcome::Value(value) => Ok(value_code::run(|| {
                 value.value().downcast_ref::<T>().cloned()
             })),
+            Outcome::Verified { .. } => Ok(None),
             Outcome::Panic(_) | Outcome::Tried => Err(()),
         };
         drop(s);
@@ -676,9 +743,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Takes the stash of node `slot` at `generation` for a real run that
-    /// adopts it. A Native node keeps a tried mark in its place for the
-    /// revision, whether or not the adoption lands it.
-    fn take_stash(&self, slot: u32, generation: u32) -> Option<Stash> {
+    /// adopts it, a verify's only if `verified`. A Native node's run keeps a
+    /// tried mark in its place for the revision, whether or not the
+    /// adoption lands it.
+    fn take_stash(&self, slot: u32, generation: u32, verified: bool) -> Option<Stash> {
         if C::u32_load_relaxed(&self.stash_count) == 0 {
             return None;
         }
@@ -689,10 +757,11 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let entry = s.map.get_mut(&(slot, generation))?.get_mut();
-        if matches!(entry.outcome, Outcome::Tried) {
+        let verify = matches!(entry.outcome, Outcome::Verified { .. });
+        if matches!(entry.outcome, Outcome::Tried) || verify && !verified {
             return None;
         }
-        if native {
+        if native && !verify {
             let tried = Stash {
                 outcome: Outcome::Tried,
                 deps: Vec::new(),
@@ -4009,6 +4078,11 @@ enum Outcome {
     Value(Unbuilt<dyn Any + Send>),
     /// The payload of the run's panic.
     Panic(Unbuilt<dyn Any + Send>),
+    /// A verify that found every dep unchanged since `since`, the node's
+    /// `verified_at`.
+    Verified {
+        since: u64,
+    },
     /// A run still going, or one that kept nothing.
     Tried,
 }
