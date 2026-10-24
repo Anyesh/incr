@@ -3882,9 +3882,9 @@ impl<C: Cells> Runtime<C> {
         Computed::Done
     }
 
-    /// After a non-Clean landing: the enclosing compute read this node
-    /// through it, and its own publish may take the fast path, where nothing
-    /// else would catch that. A walk entry (`walked`) is no such read: the
+    /// After a non-Clean landing: the enclosing compute read this node, and
+    /// its own publish may take the fast path, where nothing else would
+    /// catch that. A walk entry (`walked`) is no such read: the
     /// root's rerun reads it again through a nested get if it still needs
     /// it, and that read poisons the root.
     fn poison_reader(&self, walked: bool) {
