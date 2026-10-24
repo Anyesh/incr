@@ -3389,12 +3389,10 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
-                NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
-                    // A walk entry's memo reaches the reader only through
-                    // the reading node's own run.
-                    if walked {
-                        return Computed::Done;
-                    }
+                // A walk skips an entry's memo when it plans, so only a
+                // root tests for one; an entry's memo landed since runs it
+                // again.
+                NodeState::Dirty if !walked && node.memo_at(|| self.current_revision()) => {
                     self.dep_stack
                         .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
                     return Computed::Unsettled;
