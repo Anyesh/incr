@@ -462,8 +462,8 @@ enum Computed {
     /// was left unrun and unclaimed, and the walk prunes its plan.
     Replan,
     /// Another thread landed the node Dirty since the walk planned it: a
-    /// claim wait ended with it Dirty, or the walk planned it New and
-    /// claimed it from Dirty. The node was left unrun and unclaimed, and
+    /// claim wait ended with it Dirty, not released unrun, or the walk
+    /// planned it New and claimed it from Dirty. The node was left unrun and unclaimed, and
     /// the walk visits it again, as a read that came after that landing
     /// expands its deps before claiming it.
     Revisit,
@@ -3194,7 +3194,7 @@ impl<C: Cells> Runtime<C> {
     /// leaves a New node New.
     #[cold]
     #[inline(never)]
-    fn unclaim_unrun(&self, node: &NodeData<C>, dirty: bool) {
+    fn unclaim_unrun(&self, id: NodeId, node: &NodeData<C>, dirty: bool) {
         #[cfg(test)]
         self.unrun_unclaims
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3203,6 +3203,9 @@ impl<C: Cells> Runtime<C> {
         } else {
             NodeState::New
         };
+        if !C::SINGLE_THREADED {
+            C::u8_store_relaxed(self.nodes.unrun(id.0), 1);
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
                 state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
@@ -3423,7 +3426,10 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty
                     if seen != Seen::Unwalked
                         && spins != 0
-                        && g0.is_none_or(|g| g == node.generation()) =>
+                        && g0.is_none_or(|g| g == node.generation())
+                        // A claim released unrun leaves its thread's read
+                        // going on, which may still come after this one.
+                        && C::u8_load_relaxed(self.nodes.unrun(id.0)) == 0 =>
                 {
                     #[cfg(test)]
                     self.wait_revisits
@@ -3500,7 +3506,7 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     NodeState::New
                 };
-                self.land(id, node, discard, discard);
+                self.land_unrun(id, node, discard);
                 return Computed::Gone;
             }
             // The claim succeeds on a Dirty that such a landing and a set
@@ -3513,12 +3519,12 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         NodeState::New
                     };
-                    self.land(id, node, discard, discard);
+                    self.land_unrun(id, node, discard);
                     self.raise_owed(payload, bag);
                 }
             }
             if claimed_dirty && seen == Seen::New {
-                self.unclaim_unrun(node, claimed_dirty);
+                self.unclaim_unrun(id, node, claimed_dirty);
                 return Computed::Revisit;
             }
             // When the claim reads from another thread's episode, which left
@@ -3529,7 +3535,7 @@ impl<C: Cells> Runtime<C> {
             if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
-                    self.unclaim_unrun(node, claimed_dirty);
+                    self.unclaim_unrun(id, node, claimed_dirty);
                     return Computed::Replan;
                 }
             }
@@ -3584,7 +3590,7 @@ impl<C: Cells> Runtime<C> {
                 // release or re-landing would outlive the run's discard.
                 if let Visit::VerifyOnly(owner) = visit {
                     if MODE & VIRT != 0 && replay::speculative() {
-                        self.land(id, node, NodeState::Dirty, NodeState::Dirty);
+                        self.land_unrun(id, node, NodeState::Dirty);
                         self.memoize(id, owner);
                         return Computed::Done;
                     }
@@ -4202,10 +4208,23 @@ impl<C: Cells> Runtime<C> {
         target: NodeState,
         flagged: NodeState,
     ) -> NodeState {
+        self.land_single_as(id, node, flags, target, flagged, false)
+    }
+
+    #[inline(always)]
+    pub(crate) fn land_single_as(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
         if C::u8_load_relaxed(flags) & IN_GROUP != 0 {
             self.leave_group(id, node, flags, target);
         }
-        self.land(id, node, target, flagged)
+        self.land_as(id, node, target, flagged, unrun)
     }
 
     /// The landing of a run of `id` in `compute_one`: a creator's
@@ -4325,6 +4344,29 @@ impl<C: Cells> Runtime<C> {
         target: NodeState,
         flagged: NodeState,
     ) -> NodeState {
+        self.land_as(id, node, target, flagged, false)
+    }
+
+    /// [`Self::land`] of a claim released as if its run never happened, so
+    /// that a thread that waited it out does not take it for a landing
+    /// that a read ordered before its own made.
+    pub(crate) fn land_unrun(&self, id: NodeId, node: &NodeData<C>, target: NodeState) {
+        self.land_as(id, node, target, target, true);
+    }
+
+    #[inline(always)]
+    fn land_as(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
+        if !C::SINGLE_THREADED {
+            // Before the release, which publishes it with the state.
+            C::u8_store_relaxed(self.nodes.unrun(id.0), u8::from(unrun));
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
                 self.report_landing(id);

@@ -1827,7 +1827,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        self.land_single(id, node, flags, target, target);
+        self.land_single_as(id, node, flags, target, target, true);
     }
 
     /// [`Self::discard_land`] of a claim released by an unwind of `kind`.
@@ -1865,7 +1865,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, children, bag);
-        self.land(id, self.nodes.get(id.0), target, target);
+        self.land_unrun(id, self.nodes.get(id.0), target);
     }
 
     /// Lands the discarded attempt's children as `children` and stamps the

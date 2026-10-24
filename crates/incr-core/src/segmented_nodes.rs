@@ -95,6 +95,9 @@ pub(crate) const WATCHED: u8 = 128;
 struct Segment<C: Cells> {
     slots: [UnsafeCell<MaybeUninit<NodeData<C>>>; SEGMENT_SIZE],
     flags: [C::U8; SEGMENT_SIZE],
+    /// Per node, whether its claim was last released unrun: stored by the
+    /// claim's owner before the release, which publishes it.
+    unrun: [C::U8; SEGMENT_SIZE],
 }
 
 /// Strategy-parameterized segmented node store.
@@ -152,11 +155,13 @@ impl<C: Cells> SegmentedNodes<C> {
         self.segments.grow_to(seg_idx);
         let mut segment = Box::<Segment<C>>::new_uninit();
         let p = segment.as_mut_ptr();
-        // SAFETY: every flags byte is written before `assume_init`; the
-        // slots are `MaybeUninit` and need no initialization.
+        // SAFETY: every flags and unrun byte is written before
+        // `assume_init`; the slots are `MaybeUninit` and need no
+        // initialization.
         let segment = unsafe {
             for i in 0..SEGMENT_SIZE {
                 std::ptr::addr_of_mut!((*p).flags[i]).write(C::new_u8(0));
+                std::ptr::addr_of_mut!((*p).unrun[i]).write(C::new_u8(0));
             }
             segment.assume_init()
         };
@@ -179,6 +184,30 @@ impl<C: Cells> SegmentedNodes<C> {
     /// The node at `slot` and its flags byte, through one directory walk.
     #[inline(always)]
     pub(crate) fn get_with_flags(&self, slot: u32) -> (&NodeData<C>, &C::U8) {
+        let (seg, within) = self.locate(slot);
+        // SAFETY: as `locate`'s.
+        unsafe {
+            (
+                (*(*seg).slots[within].get()).assume_init_ref(),
+                &(*seg).flags[within],
+            )
+        }
+    }
+
+    /// The unrun byte of the node at `slot`.
+    #[inline(always)]
+    pub(crate) fn unrun(&self, slot: u32) -> &C::U8 {
+        let (seg, within) = self.locate(slot);
+        // SAFETY: as `locate`'s.
+        unsafe { &(*seg).unrun[within] }
+    }
+
+    /// The live segment holding `slot`, and `slot`'s index in it.
+    /// Dereferencing it is sound because the caller reached `slot` through
+    /// a happens-before chain from its push (module doc), so the slot is
+    /// initialized and the non-null segment is live until drop.
+    #[inline(always)]
+    fn locate(&self, slot: u32) -> (*const Segment<C>, usize) {
         debug_assert!(
             slot < C::u32_load_relaxed(&self.len),
             "SegmentedNodes::get slot {} out of range (len {})",
@@ -194,17 +223,7 @@ impl<C: Cells> SegmentedNodes<C> {
         if seg_ptr.is_null() {
             segment_not_visible(seg_idx);
         }
-
-        // SAFETY: the caller reached `slot` through a happens-before
-        // chain from its push (module doc), so the slot is initialized
-        // and the non-null segment is live until drop.
-        unsafe {
-            let within = (slot & SEGMENT_MASK) as usize;
-            (
-                (*(*seg_ptr).slots[within].get()).assume_init_ref(),
-                &(*seg_ptr).flags[within],
-            )
-        }
+        (seg_ptr.cast_const(), (slot & SEGMENT_MASK) as usize)
     }
 
     /// Number of initialized slots.
