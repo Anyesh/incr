@@ -1929,6 +1929,7 @@ fn a_caught_custom_payload_survives_the_readers_retries() {
                     };
                     for local in [true, false] {
                         let want = shape(u32::MAX, local);
+                        assert_eq!(want, 42_000 + 1 + u64::from(chain));
                         // At the budget itself, see `hold_uncopied`.
                         for frames in (2..9).filter(|&f| f != outer + 1) {
                             assert_eq!(
