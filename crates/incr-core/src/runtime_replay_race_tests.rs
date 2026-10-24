@@ -5,7 +5,7 @@
 //! run's in which the other thread's action came first.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering::SeqCst};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, ThreadId};
@@ -2740,4 +2740,76 @@ fn a_speculative_verify_before_a_sets_walk_keeps_no_stash() {
         "a verify over a dep the pending walk dirties is stashed"
     );
     assert_eq!(rt.get(top), 2);
+}
+
+static SLOW_ARMED: AtomicBool = AtomicBool::new(false);
+static SLOW_IN_CLONE: AtomicBool = AtomicBool::new(false);
+static SLOW_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// A value whose next `Clone` after [`SLOW_ARMED`] is set waits for
+/// [`SLOW_RELEASED`].
+#[derive(Debug, PartialEq)]
+struct Slow(u64);
+
+impl Clone for Slow {
+    fn clone(&self) -> Self {
+        if SLOW_ARMED.swap(false, SeqCst) {
+            SLOW_IN_CLONE.store(true, SeqCst);
+            while !SLOW_RELEASED.load(SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Slow(self.0)
+    }
+}
+
+/// A speculative read clones a stashed value with the stash lock released,
+/// so a user `Clone` that waits on another thread cannot hold up that
+/// thread's stash bookkeeping.
+#[test]
+fn a_stashed_value_is_cloned_outside_the_stash_lock() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(7_u64);
+    let x = rt.create_query_with(move |rt: &Rt| Slow(rt.get(input)), replayable());
+    let reader = || {
+        let b = rt.create_query(|_: &Rt| 5_u64);
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(b);
+                if v == 0 {
+                    rt.get(x).0
+                } else {
+                    v
+                }
+            },
+            replayable(),
+        )
+    };
+    let (r1, r2) = (reader(), reader());
+    assert_eq!(rt.get(r1), 5);
+    assert!(rt.stashed(id(x).0, x.generation(), false), "x is stashed");
+    SLOW_ARMED.store(true, SeqCst);
+    let cloning = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(r2))
+    };
+    while !SLOW_IN_CLONE.load(SeqCst) {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (tx, rx) = mpsc::channel();
+    let looking = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || tx.send(rt.stashed(id(x).0, x.generation(), false)).unwrap())
+    };
+    let looked = rx.recv_timeout(Duration::from_secs(2));
+    SLOW_RELEASED.store(true, SeqCst);
+    assert_eq!(cloning.join().unwrap(), 5);
+    looking.join().unwrap();
+    assert_eq!(
+        looked,
+        Ok(true),
+        "the stash lock is held across a user Clone"
+    );
 }

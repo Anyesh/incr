@@ -340,7 +340,7 @@ impl<C: Cells> Runtime<C> {
             generation,
             Stash {
                 outcome: Outcome::Value {
-                    value: Unbuilt::new(value),
+                    value: std::sync::Arc::new(StashedValue(Unbuilt::new(value))),
                     unchanged,
                 },
                 deps,
@@ -619,7 +619,21 @@ impl<C: Cells> Runtime<C> {
         let Outcome::Value { value, .. } = a.stash.outcome else {
             unreachable!("incr-core: a panic's stash lands only through its raise")
         };
-        let value = value.into_inner();
+        // A speculative read still cloning the value shares it: the node
+        // computes instead.
+        let value = match std::sync::Arc::try_unwrap(value) {
+            Ok(value) => value.0.into_inner(),
+            Err(shared) => {
+                drop(shared);
+                let target = if first {
+                    NodeState::New
+                } else {
+                    NodeState::Dirty
+                };
+                self.land(a.id, node, target, target);
+                return None;
+            }
+        };
         let changed = match catch_unwind(AssertUnwindSafe(|| {
             arena.write_erased(node.arena_slot(), value, first, &wrote)
         })) {
@@ -695,12 +709,8 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let stash = s.map.get_mut(&(handle.slot(), handle.generation()))?;
-        // Value code may read Clean nodes, which takes no lock, so the clone
-        // can run under the stash lock.
         let read = match &stash.get_mut().outcome {
-            Outcome::Value { value, .. } => Ok(value_code::run(|| {
-                value.value().downcast_ref::<T>().cloned()
-            })),
+            Outcome::Value { value, .. } => Ok(Some(std::sync::Arc::clone(value))),
             Outcome::Verified { .. } => Ok(None),
             Outcome::Panic(_) | Outcome::Tried => Err(()),
         };
@@ -708,7 +718,8 @@ impl<C: Cells> Runtime<C> {
         // A run that read a panic would unwind with it, which a speculative
         // run's discard stands in for. A node tried in this revision is not
         // run again, so its reader is discarded too.
-        read.unwrap_or_else(|()| self.drop_unwind())
+        let value = read.unwrap_or_else(|()| self.drop_unwind())?;
+        value_code::run(|| value.0.value().downcast_ref::<T>().cloned())
     }
 
     /// A speculative run's closure panicked, over a frame that read only
@@ -4292,7 +4303,7 @@ pub(super) struct Stash {
 enum Outcome {
     /// A run's value, and whether it equals the value the node holds.
     Value {
-        value: Unbuilt<dyn Any + Send>,
+        value: std::sync::Arc<StashedValue>,
         unchanged: bool,
     },
     /// The payload of the run's panic.
@@ -4303,6 +4314,14 @@ enum Outcome {
     /// A run still going, or one that kept nothing.
     Tried,
 }
+
+/// A stashed run's value, which speculative reads clone with the stash
+/// lock released.
+struct StashedValue(Unbuilt<dyn Any + Send>);
+
+// SAFETY: a stash holds only a query's buffered value, whose type is a
+// `Value`, which is `Sync`.
+unsafe impl Sync for StashedValue {}
 
 /// A runtime's stashes, all of one revision, by node and generation.
 #[derive(Default)]
