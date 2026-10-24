@@ -3,6 +3,10 @@
 //! entry, the byte budget beating the frame budget, and dooms under
 //! `stabilize`.
 
+#[cfg(not(debug_assertions))]
+use std::panic::{catch_unwind, AssertUnwindSafe};
+#[cfg(not(debug_assertions))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -575,4 +579,60 @@ fn local_doom_under_stabilize() {
 #[test]
 fn shared_doom_under_stabilize() {
     doom_under_stabilize::<Shared>();
+}
+
+/// A retry diverted for the unwind of a read reads 100k Clean nodes first:
+/// each diverted read finds no delivery for its node without counting the
+/// frame's earlier reads, so the retry stays linear. The shape is
+/// `caught_delivery_after_its_node_lands`, whose T reads the nodes first.
+#[cfg(not(debug_assertions))]
+fn wide_diverted_retry<C: Cells>() {
+    let n = 100_000;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let leaves: Arc<Vec<Incr<u64>>> =
+        Arc::new((0..n as u64).map(|i| rt.create_query(move |_| i)).collect());
+    for &leaf in leaves.iter() {
+        rt.get(leaf);
+    }
+    let s_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let s_for_p = s_cell.clone();
+    let p = rt.create_query_with(
+        move |rt| rt.get(*s_for_p.get().unwrap()),
+        QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 3).max_iterations(1)),
+            replay: crate::cycle::Replay::Allowed,
+        },
+    );
+    let s = rt.create_query_with(move |rt| rt.get(p), replayable());
+    s_cell.set(s).unwrap();
+    let diverted = Arc::new(AtomicBool::new(false));
+    let seen = diverted.clone();
+    let t = rt.create_query_with(
+        move |rt| {
+            if rt.dep_stack.diverts_clean_reads(rt.runtime_id) {
+                seen.store(true, SeqCst);
+            }
+            let sum = leaves.iter().map(|&leaf| rt.get(leaf)).sum::<u64>();
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(s)));
+            let _ = rt.get(p);
+            sum
+        },
+        replayable(),
+    );
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(t)));
+    assert!(diverted.load(SeqCst), "the retry was not diverted");
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_wide_diverted_retry() {
+    wide_diverted_retry::<Local>();
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_wide_diverted_retry() {
+    wide_diverted_retry::<Shared>();
 }

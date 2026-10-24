@@ -763,6 +763,7 @@ impl<C: Cells> Runtime<C> {
                 ctl.lower(low);
             }
             began = self.take_run_failures(id, cidx);
+            self.divert_for_deliveries(id, cidx);
         }
         // SAFETY: this thread holds the node's claim, so its closure is
         // not freed (see `compute_attempts`).
@@ -1136,7 +1137,7 @@ impl<C: Cells> Runtime<C> {
             });
         let ran = self.member_run(slot, cidx, true, false, false);
         replay::leave_member_run();
-        self.drop_deliveries(replay::run_ended(
+        drop(replay::run_ended(
             self.runtime_id,
             cidx,
             matches!(ran, Ok(None)),
