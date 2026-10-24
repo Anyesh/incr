@@ -55,6 +55,18 @@ pub fn run_in_child(test: &str, body: impl FnOnce()) -> Outcome {
     run_in_child_within(test, HANG_TIMEOUT, body)
 }
 
+/// Runs `body` with no other test thread in the process: in a child, or
+/// directly under Miri, whose test runs are single-threaded. For a body
+/// that asserts what one reclaim of haphazard's global domain drops, which
+/// a reclaim pass or a hazard on another test thread can hold back.
+pub fn run_alone(test: &str, body: impl FnOnce()) {
+    if cfg!(miri) {
+        body();
+    } else {
+        run_in_child(test, body).assert_clean();
+    }
+}
+
 pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -> Outcome {
     if env::var_os(CHILD).is_some() {
         body();
