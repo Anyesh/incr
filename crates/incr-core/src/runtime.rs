@@ -3540,8 +3540,9 @@ impl<C: Cells> Runtime<C> {
                     continue 'attempt;
                 }
 
-                let poisoned = ctl.has(cycle::POISONED);
-                if poisoned || ctl.has(cycle::FAILED_READ) {
+                let poison = ctl.poison();
+                let poisoned = poison & cycle::POISONED != 0;
+                if poison != 0 {
                     // The value may be built on a result the closure
                     // swallowed from a dep that did not land Clean or whose
                     // cleanup failed, and that dep's stamps need not have
@@ -4234,7 +4235,7 @@ impl<C: Cells> Runtime<C> {
     /// the one the compute read, and a later flip's walk finds the edge
     /// this publish installs. The state is loaded first, so that a flip
     /// and a relanding Failed since the read come with their set's bump.
-    fn failed_unmoved(&self, dep: NodeId, rev: u64) -> bool {
+    pub(super) fn failed_unmoved(&self, dep: NodeId, rev: u64) -> bool {
         self.nodes.get(dep.0).state() == NodeState::Failed && self.current_revision() == rev
     }
 

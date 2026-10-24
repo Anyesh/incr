@@ -2065,6 +2065,7 @@ impl<C: Cells> Runtime<C> {
                 members.binary_search(&d.0).is_err()
                     && !old.contains(d)
                     && !self.observed_clean(*d, verify_rev)
+                    && !self.failed_unmoved(*d, verify_rev)
             });
             if old != new {
                 if let Some(displaced) = node.install_deps(new) {

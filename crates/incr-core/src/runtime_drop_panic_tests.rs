@@ -1442,6 +1442,46 @@ fn shared_wave7_kept_dirty_read_clone_drop_is_not_raised() {
     );
 }
 
+/// A caught Failed read lands p Clean, so f's read keeps no clone: no
+/// Boom(34) is dropped during get(f) at any budget, as unbounded.
+fn caught_failed_read_keeps_no_clone<C: Cells>(rt: &Runtime<C>, frames: u32) {
+    rt.set_max_frames(frames);
+    let q = rt.create_query(|_| -> i64 { panic!("q boom") });
+    let p = rt.create_query(move |rt| {
+        let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
+        Boom(34)
+    });
+    let f = rt.create_query(move |rt| {
+        std::mem::forget(rt.get(p));
+        0_u64
+    });
+    arm(34);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_err(panic_message);
+    let still_armed = disarm(34);
+    assert_eq!(got, Ok(0), "frames {frames}");
+    assert!(
+        still_armed,
+        "no Boom(34) dropped during get(f), frames {frames}"
+    );
+    assert_eq!(rt.state_of(p), NodeState::Clean, "frames {frames}");
+}
+
+#[test]
+fn local_caught_failed_read_keeps_no_clone() {
+    for frames in [u32::MAX, 64, crate::DEFAULT_MAX_FRAMES] {
+        caught_failed_read_keeps_no_clone(&Runtime::<Local>::new(), frames);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_caught_failed_read_keeps_no_clone() {
+    in_shared_child(
+        "runtime::drop_panic_tests::shared_caught_failed_read_keeps_no_clone",
+        |rt| caught_failed_read_keeps_no_clone(rt, 64),
+    );
+}
+
 /// The kept clone of a poisoned Dirty read is dropped when its frame pops,
 /// and its `Drop` panic is no event of the run's: `get(f)` returns 0 and
 /// `f` is not Failed under a budget, as unbounded, where no clone is made.

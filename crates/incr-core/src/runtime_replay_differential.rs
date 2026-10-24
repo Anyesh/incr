@@ -2654,6 +2654,14 @@ fn seed_56cd8c2_keeps_the_failed_set() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn seed_16d87_takes_no_speculative_memo() {
+    let case = seed_16d87_case();
+    quiet(|| {
+        same_outcomes::<Local>(&case, 0x16d87);
+        same_outcomes::<Shared>(&case, 0x16d87);
+    });
+}
+
+fn seed_16d87_case() -> Case {
     use Expr::{Add, Catch, Const, If, PanicIf, Read};
     let b = Box::new;
     let query = |expr, replay, strategy| Spec::Query {
@@ -2743,7 +2751,7 @@ fn seed_16d87_takes_no_speculative_memo() {
         },
     );
     specs.extend([2, 4, 2].map(Spec::Input));
-    let case = Case {
+    Case {
         specs,
         panics: true,
         cycles: true,
@@ -2751,11 +2759,7 @@ fn seed_16d87_takes_no_speculative_memo() {
         specs2: Vec::new(),
         queries2: 0,
         ops: vec![Op::TryGet(18)],
-    };
-    quiet(|| {
-        same_outcomes::<Local>(&case, 0x16d87);
-        same_outcomes::<Shared>(&case, 0x16d87);
-    });
+    }
 }
 
 /// 0x56cd8c2's read of held 8 goes past `cycle_read` only to resume its
@@ -3031,6 +3035,15 @@ fn a_member_try_get_keeps_a_swallowing_closures_cycle() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_claim_takes_no_delivery_of_its_ended_run() {
+    let case = released_claim_case();
+    let nodes: Vec<usize> = (2..11).collect();
+    quiet(|| {
+        exact_states::<Local>(&case, &nodes);
+        exact_states::<Shared>(&case, &nodes);
+    });
+}
+
+fn released_claim_case() -> Case {
     let query = |expr, strategy| Spec::Query {
         expr,
         replay: true,
@@ -3038,7 +3051,7 @@ fn a_released_claim_takes_no_delivery_of_its_ended_run() {
         strategy,
     };
     let read = |n| Box::new(Expr::Read(n, false));
-    let case = Case {
+    Case {
         specs: vec![
             query(Expr::Read(1, false), Strat::None),
             query(
@@ -3066,12 +3079,7 @@ fn a_released_claim_takes_no_delivery_of_its_ended_run() {
         specs2: Vec::new(),
         queries2: 0,
         ops: vec![Op::Get(0), Op::Set(11, 0), Op::Get(4)],
-    };
-    let nodes: Vec<usize> = (2..11).collect();
-    quiet(|| {
-        exact_states::<Local>(&case, &nodes);
-        exact_states::<Shared>(&case, &nodes);
-    });
+    }
 }
 
 /// Seeds 0x6e3 and 0xdeb (and 0xd60, in [`strict_dirty_for_clean_seeds`]): a user panic in a ring releases members
@@ -4654,6 +4662,32 @@ fn caught_cycle_then_clean_read() {
 
 /// n_i = n_{i+1} + n_{i+1} for i < k - 1, n_{k-1} catches the panic of its
 /// read of n_k, and n_k panics on the input it reads.
+/// [`caught_failed_chain`] with the catching node in a cycle: n_{k-1}
+/// catches n_{k+1}'s panic and reads n_k, which reads n_{k-1} back, both
+/// with a fallback.
+fn caught_failed_cycle_chain(k: usize, ops: Vec<Op>) -> Case {
+    let read = |t| Box::new(Expr::Read(t, false));
+    let mut specs: Vec<Spec> = (0..k - 1)
+        .map(|i| replayable(Expr::Add(read(i + 1), read(i + 1)), Strat::None))
+        .collect();
+    specs.push(replayable(
+        Expr::Add(Box::new(Expr::Catch(read(k + 1))), read(k)),
+        Strat::Fallback(1),
+    ));
+    specs.push(replayable(Expr::Read(k - 1, false), Strat::Fallback(2)));
+    specs.push(replayable(Expr::PanicIf(read(k + 2), 0), Strat::None));
+    specs.push(Spec::Input(0));
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: k + 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    }
+}
+
 fn caught_failed_chain(k: usize, ops: Vec<Op>) -> Case {
     let read = |t| Box::new(Expr::Read(t, false));
     let mut specs: Vec<Spec> = (0..k - 1)
@@ -4677,6 +4711,31 @@ fn caught_failed_chain(k: usize, ops: Vec<Op>) -> Case {
 /// value for the revision: a later read reuses it, as every read of a
 /// Clean node does. It landed Dirty, so each read in the revision ran it
 /// again: the chain above it ran 2^k computes.
+/// As below, with the catching node a member of a cycle the episode lands:
+/// the chain above it runs each node once.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_episode_over_a_caught_failed_read_lands_its_value_for_the_revision() {
+    let k = 20;
+    let case = caught_failed_cycle_chain(k, vec![Op::Get(0), Op::Get(0)]);
+    quiet(|| {
+        for (trace, runs) in [
+            run_logged::<Local>(&case, None, 0, true),
+            run_logged::<Shared>(&case, None, 0, true),
+        ] {
+            assert_eq!(trace[1].0, trace[0].0);
+            for n in 0..k - 1 {
+                let ran = runs[0].iter().filter(|e| e.node == (0, n)).count();
+                assert_eq!(ran, 1, "node {n} ran {ran} times");
+            }
+            assert!(runs[1].is_empty(), "the second get ran {:?}", runs[1]);
+        }
+        let short = caught_failed_cycle_chain(6, vec![Op::Get(0), Op::Get(0)]);
+        differential::<Local>(&short, 0);
+        differential::<Shared>(&short, 0);
+    });
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn caught_failed_read_lands_its_value_for_the_revision() {
@@ -5052,9 +5111,11 @@ fn replay_seeds() {
 
 /// Seeds that differ under the strict comparator where the unbounded run
 /// leaves a node Dirty and the bounded run lands it Clean; 0xa5b and 0x1359
-/// return other outcomes too. 0xdeb, 0x575, 0x670 and 0x29bf2de20fa0e476
-/// show it once a caught Failed read lands Clean: before, the later landing
-/// that the bounded run reads was Dirty too.
+/// return other outcomes too. 0xdeb, 0x575, 0x670, 0x29bf2de20fa0e476 and
+/// the cases of [`seed_16d87_takes_no_speculative_memo`] and
+/// [`a_released_claim_takes_no_delivery_of_its_ended_run`] show it once a
+/// caught Failed read lands Clean: before, the later landing that the
+/// bounded run reads was Dirty too.
 #[test]
 #[cfg_attr(miri, ignore)]
 #[ignore = "T8-strict-group-c-dirty-for-clean"]
@@ -5065,7 +5126,11 @@ fn strict_dirty_for_clean_seeds() {
         .chain(
             [0xa5b, 0x1359, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d]
                 .map(|seed| (seed, gen_base(seed))),
-        );
+        )
+        .chain([
+            (0x16d87, seed_16d87_case()),
+            (0xd371, released_claim_case()),
+        ]);
     for (seed, case) in cases {
         quiet(|| {
             differential::<Local>(&case, seed);

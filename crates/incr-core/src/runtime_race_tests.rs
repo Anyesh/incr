@@ -1557,11 +1557,17 @@ fn read_of_cycle_member_vs_claim_after_landing() {
     rt.assert_invariant_i();
 }
 
-/// a <-> b, a cycle `a`'s fallback resolves, with `b` catching a
-/// panicking read so that every episode lands its members Dirty, and
-/// `x` reading `a`. Returns `x`, `a` and the gate in `a`'s closure.
+/// a <-> b, a cycle `a`'s fallback resolves, with `b` catching the cycle
+/// of a node that reads itself so that every episode lands its members
+/// Dirty, and `x` reading `a`. Returns `x`, `a` and the gate in `a`'s
+/// closure.
 fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate) {
-    let failed = rt.create_query(|_: &Rt| -> u64 { panic!("boom") });
+    let self_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
+    let failed = {
+        let self_cell = Arc::clone(&self_cell);
+        rt.create_query(move |rt: &Rt| rt.get(*self_cell.get().unwrap()))
+    };
+    self_cell.set(failed).unwrap();
     let in_a = Gate::new();
     let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
     let a = {
