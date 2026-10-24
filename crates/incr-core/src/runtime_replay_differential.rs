@@ -5397,6 +5397,54 @@ fn a_speculative_walk_verify_lands_nothing() {
     });
 }
 
+/// After the sets 5 is back at 2, so the `Get(0)` recomputes 4 to its
+/// old value and the Native 3 verifies, as the unbounded run's walk does.
+/// At budget 1 0's try-read of 1 dooms, and the speculative run's
+/// recompute of 4 is stashed rather than landed: 3's verify must still
+/// count it unchanged, or 3's closure runs where the unbounded run's
+/// never does.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_speculative_recompute_to_the_same_value_keeps_its_reader_verified() {
+    let query = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            query(
+                Expr::Add(
+                    Box::new(Expr::Read(2, false)),
+                    Box::new(Expr::Read(1, true)),
+                ),
+                true,
+                false,
+            ),
+            query(Expr::Read(3, false), false, false),
+            query(Expr::Const(0), true, false),
+            query(
+                Expr::FirstLanded(Box::new(Expr::Read(4, true)), Box::new(Expr::Const(0))),
+                false,
+                false,
+            ),
+            query(Expr::Read(5, false), true, true),
+            Spec::Input(2),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 5,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(1), Op::Set(5, 1), Op::Set(5, 2), Op::Get(0)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0);
+        differential::<Shared>(&case, 0);
+    });
+}
+
 /// Seeds whose Native closures run more often in a revision under replay
 /// than unbounded, by retries rather than speculative runs, run with
 /// [`compare_native`]'s full count; the base seeds are from

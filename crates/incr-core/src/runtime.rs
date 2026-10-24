@@ -2224,7 +2224,7 @@ impl<C: Cells> Runtime<C> {
                 Some(value) => {
                     if let Some(f) = frame {
                         if state::load::<C>(node.state_cell()) == NodeState::Dirty
-                            && !self.verified_stash(handle.slot(), handle.generation())
+                            && !self.unchanged_stash(handle.slot(), handle.generation())
                         {
                             #[cfg(test)]
                             self.dirty_reads.lock().unwrap().push(handle.slot());
@@ -3842,7 +3842,7 @@ impl<C: Cells> Runtime<C> {
                         return self.discard_doomed(id, attempt, &ctl, None, bag);
                     }
                     if !ctl.has(cycle::LOW) {
-                        return self.stash_speculative(id, g, attempt, &ctl, deps);
+                        return self.stash_speculative(id, g, attempt, &ctl, deps, bag);
                     }
                     match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
                         PopEnd::Deferred => return Computed::Deferred,
@@ -4578,7 +4578,7 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(dep.0);
         let state = node.state();
         (state.is_settled()
-            || state == NodeState::Dirty && self.verified_stash(dep.0, node.generation()))
+            || state == NodeState::Dirty && self.unchanged_stash(dep.0, node.generation()))
             && node.changed_at() <= rev
     }
 

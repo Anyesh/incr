@@ -315,21 +315,37 @@ impl<C: Cells> Runtime<C> {
         attempt: Attempt,
         ctl: &ComputeCtl,
         deps: Vec<(NodeId, u32)>,
+        bag: &mut Deferred<C>,
     ) -> Computed {
         let value = ctl
             .buf
             .take()
             .expect("incr-core: a speculative run buffers its value");
+        let node = self.nodes.get(id.0);
+        let unchanged = !attempt.first
+            && match catch_unwind(AssertUnwindSafe(|| {
+                self.arenas
+                    .erased(node.type_tag())
+                    .equals_erased(node.arena_slot(), &*value)
+            })) {
+                Ok(equal) => equal,
+                Err(payload) => {
+                    bag.push_erased(Box::new(Unbuilt::new(payload)));
+                    false
+                }
+            };
         self.stash(
             id.0,
             generation,
             Stash {
-                outcome: Outcome::Value(Unbuilt::new(value)),
+                outcome: Outcome::Value {
+                    value: Unbuilt::new(value),
+                    unchanged,
+                },
                 deps,
                 verify_rev: attempt.verify_rev,
             },
         );
-        let node = self.nodes.get(id.0);
         let target = if attempt.first {
             NodeState::New
         } else {
@@ -369,19 +385,28 @@ impl<C: Cells> Runtime<C> {
         Computed::Done
     }
 
-    /// Whether a speculative run's verify of node `slot` at `generation`
-    /// is stashed, in a speculative run.
+    /// Whether, in a speculative run, node `slot` at `generation` has a
+    /// stashed verify or a stashed recompute to the value it holds, which
+    /// the unbounded run lands without a new `changed_at`.
     #[cold]
     #[inline(never)]
-    pub(super) fn verified_stash(&self, slot: u32, generation: u32) -> bool {
+    pub(super) fn unchanged_stash(&self, slot: u32, generation: u32) -> bool {
         if !replay::speculative() || C::u32_load_relaxed(&self.stash_count) == 0 {
             return false;
         }
         let revision = self.current_revision();
         let mut s = self.stashes.write();
         s.revision == revision
-            && (s.map.get_mut(&(slot, generation)))
-                .is_some_and(|e| matches!(e.get_mut().outcome, Outcome::Verified { .. }))
+            && (s.map.get_mut(&(slot, generation))).is_some_and(|e| {
+                matches!(
+                    e.get_mut().outcome,
+                    Outcome::Verified { .. }
+                        | Outcome::Value {
+                            unchanged: true,
+                            ..
+                        }
+                )
+            })
     }
 
     /// A speculative run that unwound or was dropped after its closure
@@ -458,7 +483,7 @@ impl<C: Cells> Runtime<C> {
             }
             failed |= !matches!(
                 a.stash.outcome,
-                Outcome::Value(_) | Outcome::Verified { .. }
+                Outcome::Value { .. } | Outcome::Verified { .. }
             );
             if failed {
                 bag.push_erased(Box::new(a.stash.outcome));
@@ -541,7 +566,7 @@ impl<C: Cells> Runtime<C> {
             .min(C::walked(&self.walk, &self.revision));
         let arena = self.arenas.erased(node.type_tag());
         let wrote = std::cell::Cell::new(0_u8);
-        let Outcome::Value(value) = a.stash.outcome else {
+        let Outcome::Value { value, .. } = a.stash.outcome else {
             unreachable!("incr-core: a panic's stash lands only through its raise")
         };
         let value = value.into_inner();
@@ -623,7 +648,7 @@ impl<C: Cells> Runtime<C> {
         // Value code may read Clean nodes, which takes no lock, so the clone
         // can run under the stash lock.
         let read = match &stash.get_mut().outcome {
-            Outcome::Value(value) => Ok(value_code::run(|| {
+            Outcome::Value { value, .. } => Ok(value_code::run(|| {
                 value.value().downcast_ref::<T>().cloned()
             })),
             Outcome::Verified { .. } => Ok(None),
@@ -4170,14 +4195,16 @@ pub(super) struct Stash {
 }
 
 enum Outcome {
-    Value(Unbuilt<dyn Any + Send>),
+    /// A run's value, and whether it equals the value the node holds.
+    Value {
+        value: Unbuilt<dyn Any + Send>,
+        unchanged: bool,
+    },
     /// The payload of the run's panic.
     Panic(Unbuilt<dyn Any + Send>),
     /// A verify that found every dep unchanged since `since`, the node's
     /// `verified_at`.
-    Verified {
-        since: u64,
-    },
+    Verified { since: u64 },
     /// A run still going, or one that kept nothing.
     Tried,
 }
