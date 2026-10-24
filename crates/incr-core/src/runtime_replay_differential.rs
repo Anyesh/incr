@@ -2509,17 +2509,35 @@ fn labelled<T>(label: &str, f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// The budgets a single-thread differential compares with the unbounded
+/// run: each frame budget with and without a byte budget, and the byte
+/// budget alone.
+const BUDGETS: [(Option<u32>, usize); 7] = [
+    (Some(1), 0),
+    (Some(1), 16 * 1024),
+    (Some(2), 0),
+    (Some(2), 16 * 1024),
+    (Some(3), 0),
+    (Some(3), 16 * 1024),
+    (None, 16 * 1024),
+];
+
+fn budget_label(seed: u64, frames: Option<u32>, bytes: usize) -> String {
+    match frames {
+        Some(frames) => format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes"),
+        None => format!("seed {seed:#x}, budget None frames, {bytes} bytes"),
+    }
+}
+
 fn differential<C: Cells>(case: &Case, seed: u64) {
     let (unbounded, native) = labelled(&format!("seed {seed:#x}, unbounded"), || {
         run_counted::<C>(case, None, 0)
     });
-    for frames in [1, 2, 3] {
-        for bytes in [0, 16 * 1024] {
-            let label = format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes");
-            let (bounded, runs) = labelled(&label, || run_counted::<C>(case, Some(frames), bytes));
-            compare(case, &unbounded, &bounded, &label);
-            compare_native(&native, &runs, &label);
-        }
+    for (frames, bytes) in BUDGETS {
+        let label = budget_label(seed, frames, bytes);
+        let (bounded, runs) = labelled(&label, || run_counted::<C>(case, frames, bytes));
+        compare(case, &unbounded, &bounded, &label);
+        compare_native(&native, &runs, &label);
     }
 }
 
@@ -3623,14 +3641,9 @@ fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
 fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
     let unbounded = outcomes(run::<C>(case, None, 0));
-    for frames in [1, 2, 3] {
-        for bytes in [0, 16 * 1024] {
-            let bounded = outcomes(run::<C>(case, Some(frames), bytes));
-            assert_eq!(
-                bounded, unbounded,
-                "seed {seed:#x}, budget {frames} frames, {bytes} bytes"
-            );
-        }
+    for (frames, bytes) in BUDGETS {
+        let bounded = outcomes(run::<C>(case, frames, bytes));
+        assert_eq!(bounded, unbounded, "{}", budget_label(seed, frames, bytes));
     }
 }
 
@@ -6289,4 +6302,232 @@ fn a_walk_replans_after_another_thread_lands_an_intermediate_by_a_cycle() {
         assert_eq!(got[9].0, Out::Panic("cycle".into()));
         assert!(matches!(got[8].0, Out::Value(_)), "{:?}", got[8].0);
     });
+}
+
+/// A differential panic's message from its budget on, joined to one line
+/// up to the trace.
+fn failure_message(p: Box<dyn std::any::Any + Send>) -> String {
+    let m = p
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    let m: Vec<&str> = m.lines().take_while(|l| !l.starts_with("ops:")).collect();
+    let m = m.join(" | ");
+    let at = m.find("budget ").unwrap_or(0);
+    m[at..].to_string()
+}
+
+/// Each expression `e` can become by replacing one of its subexpressions
+/// with a constant or with one of that subexpression's operands.
+fn shrink_expr(e: &Expr) -> Vec<Expr> {
+    let mut out = vec![Expr::Const(0), Expr::Const(1)];
+    let b = |e: &Expr| Box::new(e.clone());
+    match e {
+        Expr::Const(_) => out.clear(),
+        Expr::Read(n, true) => out.push(Expr::Read(*n, false)),
+        Expr::ReadOther(n, true) => out.push(Expr::ReadOther(*n, false)),
+        Expr::Read(..) | Expr::ReadOther(..) => {}
+        Expr::Add(x, y) => {
+            out.extend([(**x).clone(), (**y).clone()]);
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::Add(Box::new(x), b(y))),
+            );
+            out.extend(
+                shrink_expr(y)
+                    .into_iter()
+                    .map(|y| Expr::Add(b(x), Box::new(y))),
+            );
+        }
+        Expr::If(c, t, f) => {
+            out.extend([(**c).clone(), (**t).clone(), (**f).clone()]);
+            out.extend(
+                shrink_expr(c)
+                    .into_iter()
+                    .map(|c| Expr::If(Box::new(c), b(t), b(f))),
+            );
+            out.extend(
+                shrink_expr(t)
+                    .into_iter()
+                    .map(|t| Expr::If(b(c), Box::new(t), b(f))),
+            );
+            out.extend(
+                shrink_expr(f)
+                    .into_iter()
+                    .map(|f| Expr::If(b(c), b(t), Box::new(f))),
+            );
+        }
+        Expr::PanicIf(x, k) => {
+            out.push((**x).clone());
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::PanicIf(Box::new(x), *k)),
+            );
+        }
+        Expr::Catch(x) => {
+            out.push((**x).clone());
+            out.extend(shrink_expr(x).into_iter().map(|x| Expr::Catch(Box::new(x))));
+        }
+        Expr::FirstRun(x, y) => {
+            out.extend([(**x).clone(), (**y).clone()]);
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::FirstRun(Box::new(x), b(y))),
+            );
+            out.extend(
+                shrink_expr(y)
+                    .into_iter()
+                    .map(|y| Expr::FirstRun(b(x), Box::new(y))),
+            );
+        }
+    }
+    out
+}
+
+/// Each case `c` can become by one step: dropping an op, simplifying one
+/// query's expression, or clearing its strategy, `bare` or `replay`.
+fn shrink_case(c: &Case) -> Vec<Case> {
+    let mut out = Vec::new();
+    for i in 0..c.ops.len() {
+        let mut d = c.clone();
+        d.ops.remove(i);
+        out.push(d);
+    }
+    for (i, s) in c.specs.iter().enumerate() {
+        let Spec::Query {
+            expr,
+            replay,
+            bare,
+            strategy,
+        } = s
+        else {
+            continue;
+        };
+        let with = |expr: Expr, replay: bool, bare: bool, strategy: Strat| {
+            let mut d = c.clone();
+            d.specs[i] = Spec::Query {
+                expr,
+                replay,
+                bare,
+                strategy,
+            };
+            d
+        };
+        if !matches!(strategy, Strat::None) {
+            out.push(with(expr.clone(), *replay, *bare, Strat::None));
+        }
+        if *bare {
+            out.push(with(expr.clone(), *replay, false, *strategy));
+        }
+        if *replay {
+            out.push(with(expr.clone(), false, *bare, *strategy));
+        }
+        for e in shrink_expr(expr) {
+            out.push(with(e, *replay, *bare, *strategy));
+        }
+    }
+    out
+}
+
+/// Shrinks the single-thread case of `REPLAY_SEED` (`REPLAY_BASE` for the
+/// base generator, `REPLAY_TWO` for its paired case) while its run at
+/// budget `REPLAY_FRAMES` (0 for none) frames, `REPLAY_BYTES` bytes, under
+/// Shared if `REPLAY_SHARED`, still fails with a message containing
+/// `SHRINK_NEEDLE`, and prints the case it ends at. Candidates whose runs
+/// panic with another message are counted, not kept.
+#[test]
+#[ignore = "a diagnostic that shrinks one seed's case"]
+fn replay_shrink() {
+    let seed = u64::from_str_radix(&std::env::var("REPLAY_SEED").expect("REPLAY_SEED"), 16)
+        .expect("a hex seed");
+    let frames: u32 = std::env::var("REPLAY_FRAMES").map_or(1, |v| v.parse().expect("frames"));
+    let frames = (frames > 0).then_some(frames);
+    let bytes: usize = std::env::var("REPLAY_BYTES").map_or(0, |v| v.parse().expect("bytes"));
+    let needle = std::env::var("SHRINK_NEEDLE").unwrap_or_else(|_| "differs".into());
+    let mut case = if std::env::var_os("REPLAY_BASE").is_some() {
+        gen_base(seed)
+    } else {
+        gen_case(seed, false, std::env::var_os("REPLAY_TWO").is_some())
+    };
+    let fails = |c: &Case| -> Option<bool> {
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let label = budget_label(seed, frames, bytes);
+            if shared() {
+                let u = run::<Shared>(c, None, 0);
+                compare(c, &u, &run::<Shared>(c, frames, bytes), &label);
+            } else {
+                let u = run::<Local>(c, None, 0);
+                compare(c, &u, &run::<Local>(c, frames, bytes), &label);
+            }
+        }));
+        match r {
+            Ok(()) => Some(false),
+            Err(p) => {
+                let m = failure_message(p);
+                if m.contains(&needle) {
+                    Some(true)
+                } else if m.contains("differs") {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    let size = |c: &Case| format!("{:?}{:?}", c.specs, c.ops).len();
+    let (mut tried, mut other) = (0, 0);
+    quiet(|| {
+        assert_eq!(
+            fails(&case),
+            Some(true),
+            "seed {seed:#x} does not fail as asked"
+        );
+        loop {
+            let before = size(&case);
+            let next = shrink_case(&case).into_iter().find(|d| {
+                if size(d) >= before {
+                    return false;
+                }
+                tried += 1;
+                match fails(d) {
+                    Some(f) => f,
+                    None => {
+                        other += 1;
+                        false
+                    }
+                }
+            });
+            match next {
+                Some(d) => case = d,
+                None => break,
+            }
+        }
+    });
+    eprintln!(
+        "SHRUNK seed {seed:#x}: {tried} candidates run, {other} panicked otherwise, size {}",
+        size(&case)
+    );
+    for (i, s) in case.specs.iter().enumerate() {
+        eprintln!("{i}: {s:?}");
+    }
+    eprintln!("ops: {:?}", case.ops);
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let u = run::<Local>(&case, None, 0);
+        compare(
+            &case,
+            &u,
+            &run::<Local>(&case, frames, bytes),
+            &budget_label(seed, frames, bytes),
+        );
+    }));
+    eprintln!(
+        "SHRUNK failure: {}",
+        r.err()
+            .map(failure_message)
+            .unwrap_or_else(|| "none under Local".into())
+    );
 }
