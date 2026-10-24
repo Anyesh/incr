@@ -3209,7 +3209,7 @@ impl<C: Cells> Runtime<C> {
             // The read that ran the loop reads the target as the native
             // compute's reader does after its landing.
             if landed {
-                self.episode_landed(self.nodes.get(node));
+                self.episode_landed(self.nodes.get(node), false);
             }
             if ended == Ended::Unsettled {
                 return Some(Computed::Unsettled);

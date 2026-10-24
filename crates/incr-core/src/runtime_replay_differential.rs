@@ -5698,6 +5698,22 @@ fn wave8_shared_seed_58b5909_failed_set() {
     quiet(|| differential::<Shared>(&gen_base(0x58b5909), 0x58b5909));
 }
 
+/// Op 6 Get(11): 11's read of 14 walks 3, a dep 14's rerun no longer reads,
+/// which catches a cycle and lands Dirty. The unbounded run landed 11 Dirty
+/// for it, the bounded run's retry Clean; 11 never reads 3.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_seed_77d_unread_walk_entry() {
+    quiet(|| differential::<Local>(&gen_case(0x77d, false, true), 0x77d));
+}
+
+/// As [`local_seed_77d_unread_walk_entry`], under `Shared`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_seed_77d_unread_walk_entry() {
+    quiet(|| differential::<Shared>(&gen_case(0x77d, false, true), 0x77d));
+}
+
 /// Seed 0x922f4fd7cf058ec: at budget 1, a walk's entry dooms with a
 /// repeat pending entry of its node beneath it. The replayed compute must
 /// not pop that repeat from the stashed walk: unbounded, the repeat

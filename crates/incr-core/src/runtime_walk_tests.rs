@@ -783,6 +783,49 @@ fn shared_stale_dep_gives_the_rerun_result() {
     stale_dep_gives_the_rerun_result::<Shared>();
 }
 
+/// `y` read `e` while `sel` was 0; setting `k` makes `e` catch a cycle and
+/// land Dirty, and setting `sel` stops `y` reading `e`. `z`'s first run reads
+/// `y`, whose walk cleans `e` though `y`'s rerun no longer reads it, so `z`
+/// read nothing that did not land Clean and lands Clean, as from scratch
+/// (seed 0x77d).
+fn unread_walk_entry_leaves_the_reader_clean<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let c1 = {
+        let cell = cell.clone();
+        rt.create_query(move |rt| rt.get(*cell.get().unwrap()) + 1)
+    };
+    let c2 = rt.create_query(move |rt| rt.get(c1) + 1);
+    cell.set(c2).unwrap();
+    let e = rt.create_query(move |rt| {
+        if rt.get(k) == 0 {
+            1
+        } else {
+            catch_unwind(AssertUnwindSafe(|| rt.get(c1))).unwrap_or(7)
+        }
+    });
+    let y = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(e) } else { 5 });
+    assert_eq!(rt.get(y), 1);
+
+    rt.set(k, 1);
+    rt.set(sel, 1);
+    let z = rt.create_query(move |rt| rt.get(y) + 1);
+    assert_eq!(rt.get(z), 6);
+    assert_eq!(rt.state_of(z), NodeState::Clean);
+}
+
+#[test]
+fn local_unread_walk_entry_leaves_the_reader_clean() {
+    unread_walk_entry_leaves_the_reader_clean::<Local>();
+}
+
+#[test]
+fn shared_unread_walk_entry_leaves_the_reader_clean() {
+    unread_walk_entry_leaves_the_reader_clean::<Shared>();
+}
+
 /// A dep the walk cleans panics, and the rerun still reads it: the rerun
 /// raises the dep's own payload, as a run from scratch does, and only a
 /// later read sees "last compute panicked". Nothing is held once the dep
