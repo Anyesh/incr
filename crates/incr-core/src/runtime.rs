@@ -2268,7 +2268,8 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
-        let _root = reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
+        let arm = || reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
+        let mut root = Some(arm());
         loop {
             if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
                 if let Some(value) = self.stashed_read(handle) {
@@ -2319,12 +2320,18 @@ impl<C: Cells> Runtime<C> {
             }
             self.park(ParkPoint::AfterWalk(NodeId(slot)));
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            match self.try_read_slot(handle, node, type_tag, arena_slot) {
+            let mut dirty = false;
+            // The value is pinned before the clone, which is user code and
+            // may wait on a thread that reads this node, so the read's
+            // reservation of its own node ends there.
+            let read = self.try_read_slot_then(handle, node, type_tag, arena_slot, || {
+                dirty = frame.is_some() && state::load::<C>(node.state_cell()) == NodeState::Dirty;
+                drop(root.take());
+            });
+            match read {
                 Some(value) => {
-                    if let Some(f) = frame {
-                        if state::load::<C>(node.state_cell()) == NodeState::Dirty
-                            && !self.unchanged_stash(handle.slot(), handle.generation())
-                        {
+                    if let Some(f) = frame.filter(|_| dirty) {
+                        if !self.unchanged_stash(handle.slot(), handle.generation()) {
                             self.note_dirty_read(f, handle, &value);
                         }
                     }
@@ -2335,7 +2342,10 @@ impl<C: Cells> Runtime<C> {
                     Err(NodeState::Clean) => {
                         return Ok(self.read_slot(handle, node, type_tag, arena_slot));
                     }
-                    Err(now) => observed = now,
+                    Err(now) => {
+                        observed = now;
+                        root = Some(arm());
+                    }
                 },
             }
         }
@@ -2446,6 +2456,33 @@ impl<C: Cells> Runtime<C> {
             Some(value) => value,
             None => self.read_failed(handle),
         }
+    }
+
+    /// [`Self::try_read_slot`], with `loaded` run once the value is pinned
+    /// and before it is cloned.
+    #[inline(always)]
+    fn try_read_slot_then<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+        loaded: impl FnOnce(),
+    ) -> Option<T> {
+        self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
+        let arena = self.arenas.tagged_arena::<T>(type_tag);
+        let value = value_code::run(|| match arena {
+            Some(arena) => arena.try_read_then(arena_slot, loaded),
+            None => {
+                loaded();
+                None
+            }
+        });
+        C::fence_acquire();
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
+        value
     }
 
     /// [`Self::read_slot`], with `None` for an empty slot.
