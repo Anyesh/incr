@@ -1361,6 +1361,8 @@ thread_local! {
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
+    // In step with KEPT_READS: every push and removal there goes through
+    // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
@@ -1378,6 +1380,8 @@ loom::thread_local! {
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
+    // In step with KEPT_READS: every push and removal there goes through
+    // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
@@ -1451,6 +1455,9 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
                 e.rt == read.rt && e.cidx >= read.cidx && (fresh || !ours(e))
             })
             .collect();
+        for (e, _) in &gone {
+            count_foreign(e, false);
+        }
         // Most replay coverage runs in release, and the scans of kept reads
         // rely on this.
         if cfg!(any(test, debug_assertions)) {
@@ -1458,9 +1465,6 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
                 d.last().is_none_or(|(e, _)| e.cidx <= read.cidx),
                 "incr-core: kept reads run in frame order"
             );
-        }
-        for (e, _) in &gone {
-            count_foreign(e, false);
         }
         count_foreign(&read, true);
         d.push((read, seen));
@@ -1658,7 +1662,7 @@ pub(crate) fn foreign_ordinal(
             .count();
         assert_eq!(
             scanned, earlier as usize,
-            "incr-core: a frame's foreign read count"
+            "incr-core: a frame's counted and scanned foreign reads differ"
         );
     });
     earlier + 1
