@@ -1574,3 +1574,50 @@ fn racing_frame_and_byte_setters_end_as_a_serial_order() {
         "{bad} of {rounds} races left a budget no serial order gives"
     );
 }
+
+/// Seed 0x381's shape: `q18`'s read of `q19` walks into `q0`, whose read of
+/// `q19` dooms at budget 3, so the driver lands `q19` Clean as an entry.
+/// `q18`'s retry reads `q19` Clean and must still resume its stopped walk,
+/// as the unbounded run's walk goes on to compute `q0`. Returns the last
+/// read's value and the states of `q0` and `q19`.
+fn stopped_walk_shape<C: Cells>(frames: u32) -> (u64, NodeState, NodeState) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let i24 = rt.create_input(3_u64);
+    let q23 = rt.create_query_with(move |rt| rt.get(i24), replayable());
+    let q22 = rt.create_query(move |rt| rt.get(q23));
+    let q21 = rt.create_query_with(move |rt| rt.get(q22), replayable());
+    let c0: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let q19 = {
+        let c0 = c0.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            if rt.try_get(q21).unwrap_or(7777).is_multiple_of(2) {
+                0
+            } else {
+                let q0 = *c0.get().unwrap();
+                catch_unwind(AssertUnwindSafe(|| rt.get(q0))).unwrap_or(9999)
+            }
+        })
+    };
+    let q0 = rt.create_query_with(
+        move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(q19))).unwrap_or(9999),
+        replayable(),
+    );
+    c0.set(q0).unwrap();
+    let q18 = rt.create_query_with(move |rt| rt.get(q19), replayable());
+    let q17 = rt.create_query_with(move |rt| rt.get(q18), replayable());
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q0)));
+    rt.set(i24, 0);
+    let v = rt.try_get(q17).unwrap_or(7777);
+    (v, rt.state_of(q0), rt.state_of(q19))
+}
+
+#[test]
+fn a_walk_stopped_below_an_entry_that_lands_its_root_clean_goes_on() {
+    let want = (0, NodeState::Clean, NodeState::Clean);
+    assert_eq!(stopped_walk_shape::<Local>(u32::MAX), want);
+    assert_eq!(stopped_walk_shape::<Local>(3), want);
+    assert_eq!(stopped_walk_shape::<Shared>(u32::MAX), want);
+    assert_eq!(stopped_walk_shape::<Shared>(3), want);
+}

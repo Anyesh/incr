@@ -43,6 +43,7 @@ use crate::locks::OrderedLock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
+use crate::reserve;
 use crate::segmented_nodes::{
     SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED, WATCHED,
 };
@@ -135,6 +136,9 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// In `compute_attempts`, after the claim CAS and before the check for
+    /// another thread's doom reservation.
+    BeforeReservationCheck(NodeId),
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
@@ -958,6 +962,13 @@ pub struct Runtime<C: Cells> {
     /// Walk entry claims released unrun after the episode check.
     #[cfg(test)]
     pub(crate) unrun_unclaims: std::sync::atomic::AtomicU32,
+    /// Waits on another thread's doom reservation, for tests.
+    #[cfg(test)]
+    pub(crate) reservation_waits: std::sync::atomic::AtomicU32,
+    /// Pops that waited for another thread's claim of a node this thread
+    /// reserves to come back, for tests.
+    #[cfg(test)]
+    pub(crate) give_back_waits: std::sync::atomic::AtomicU32,
     /// Every entry a driver ran, as it found its context.
     #[cfg(test)]
     pub(crate) entries: std::sync::Mutex<Vec<replay_impl::EntrySeen>>,
@@ -1060,6 +1071,10 @@ impl<C: Cells> Runtime<C> {
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             unrun_unclaims: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            reservation_waits: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            give_back_waits: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -3269,6 +3284,16 @@ impl<C: Cells> Runtime<C> {
         all.wrapping_sub(planned.all) != own.wrapping_sub(planned.own)
     }
 
+    /// After a claim CAS of `id` at `generation` succeeded: whether another
+    /// thread's doom reserved the node, so the claim must be given back
+    /// unrun and the reservation waited out.
+    #[inline(always)]
+    fn reserved_elsewhere(&self, id: NodeId, generation: u32) -> bool {
+        !C::SINGLE_THREADED
+            && reserve::any()
+            && reserve::elsewhere((self.runtime_id, id.0), generation)
+    }
+
     /// Releases a claim taken from New or Dirty (`dirty`) before anything
     /// ran, as no landing: watchers see nothing. A set's flag changes
     /// nothing, since its walk already passed through to the dependents and
@@ -3446,6 +3471,10 @@ impl<C: Cells> Runtime<C> {
 
         'attempt: loop {
             let observed = state::load::<C>(node.state_cell());
+            // A wait can outlast the node, whose slot then holds another.
+            if spins != 0 && g0.is_some_and(|g| g != node.generation()) {
+                return Computed::Gone;
+            }
             // After the load, so a landing that passed the held payload's
             // failure on is seen whatever state it left the node in since.
             if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
@@ -3591,6 +3620,12 @@ impl<C: Cells> Runtime<C> {
                 };
                 self.land_unrun(id, node, discard);
                 return Computed::Gone;
+            }
+            self.park(ParkPoint::BeforeReservationCheck(id));
+            if self.reserved_elsewhere(id, g) {
+                self.unclaim_unrun(node, claimed_dirty);
+                self.wait_out_reservation(id, g, None, &mut spins);
+                continue;
             }
             // The claim succeeds on a Dirty that such a landing and a set
             // made since the load, and until it is released no landing of
@@ -4522,6 +4557,9 @@ impl<C: Cells> Runtime<C> {
         unrun: bool,
     ) -> NodeState {
         node.set_unrun(unrun);
+        if !C::SINGLE_THREADED && unrun {
+            reserve::note((self.runtime_id, id.0), node.generation());
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
                 self.report_landing(id);
@@ -5033,6 +5071,10 @@ mod replay_scale_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_race_tests.rs"]
 mod replay_race_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_reserve_tests.rs"]
+mod reserve_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_differential.rs"]

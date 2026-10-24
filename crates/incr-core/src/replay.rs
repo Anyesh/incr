@@ -809,6 +809,8 @@ pub(crate) struct Context {
     /// published before the frame above it landed Failed.
     pub(crate) provenance: Option<(ReadKey, Rc<dyn Provenance>)>,
     pub(crate) frame_keys: FrameKeys,
+    /// Ends the reservations of this context's dooms when it is removed.
+    _reserved: crate::reserve::Ends,
 }
 
 /// The parts of a read key for a frame of a context's runtime that only
@@ -858,6 +860,7 @@ impl Context {
             drop_point: None,
             provenance: None,
             frame_keys,
+            _reserved: crate::reserve::Ends(id),
         }
     }
 
@@ -1879,6 +1882,7 @@ fn clear() {
     set_carry(None);
     let removed = with(std::mem::take);
     drop(removed);
+    crate::reserve::end_all();
 }
 
 /// The innermost context of `rt` whose boundary is at or below `cidx`,
