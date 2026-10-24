@@ -3825,6 +3825,39 @@ fn two_thread_schedule_seeds() {
     }
 }
 
+/// 0x7c3a135a4 at frame budget 2: landing the claims a user panic released
+/// New let the other thread's `Get(16)` return 1 where every order of the
+/// two reads panics, in about 1 run in 1000 with no budget and 2 in 5 at
+/// this one. Every run's outcomes must be some order's.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn released_claims_leave_two_threads_a_serial_outcome() {
+    let seed = 0x7c3a135a4;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
+    quiet(|| {
+        let orders: Vec<Vec<Out>> = (0..1u64 << pairs)
+            .map(|swaps| {
+                let order = Order::new(&case, &phases, swaps);
+                let t = run::<Shared>(&order.case, None, 0);
+                let mut at = vec![0; t.len()];
+                for (j, &i) in order.of.iter().enumerate() {
+                    at[i] = j;
+                }
+                at.iter().map(|&j| t[j].0.clone()).collect()
+            })
+            .collect();
+        for _ in 0..60 {
+            let got: Vec<Out> = run_two(&case, &phases, Some(2), 16 * 1024)
+                .into_iter()
+                .map(|(out, _)| out)
+                .collect();
+            assert!(orders.contains(&got), "{got:?} is no order's");
+        }
+    });
+}
+
 /// Two-thread seeds where, under a budget, the other thread computed a node
 /// a doom released for its context's retry: each run's outcomes must be
 /// some read order's unbounded outcomes.
