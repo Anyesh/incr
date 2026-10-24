@@ -559,6 +559,16 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Drops the stash of node `id` at `generation`, which its claim will
+    /// not adopt.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn drop_stash(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) {
+        if let Some(stash) = self.take_stash(id.0, generation, false) {
+            bag.push_erased(Box::new(stash.outcome));
+        }
+    }
+
     /// Claims stashed node `id` at `generation` for adoption, from New or
     /// Dirty, with its stash.
     fn claim_stashed(&self, id: NodeId, generation: u32) -> Option<Adopting> {

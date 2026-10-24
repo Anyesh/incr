@@ -3595,25 +3595,32 @@ impl<C: Cells> Runtime<C> {
             let mut verify_rev = C::walked(&self.walk, &self.revision);
 
             let mut adopted_panic = None;
-            // A group member's verify is its group's, which no stash stands for.
-            if C::u32_load_relaxed(&self.stash_count) != 0
-                && !matches!(visit, Visit::VerifyOnly(_))
-                && !(verifying
-                    && C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0)
+            if C::u32_load_relaxed(&self.stash_count) != 0 && !matches!(visit, Visit::VerifyOnly(_))
             {
-                match self.adopt_stash(id, g, claimed_dirty, walked, bag) {
-                    replay_impl::Adopted::No => {}
-                    replay_impl::Adopted::Panicked(raised) => {
-                        verifying = false;
-                        adopted_panic = Some(raised);
-                    }
-                    replay_impl::Adopted::Landed(computed) => {
-                        self.adopted_pop(id);
-                        return computed;
-                    }
-                    replay_impl::Adopted::Stale => {
-                        self.park_with_bag(ParkPoint::StaleRetry(id), bag);
-                        continue 'attempt;
+                // A group member's verify is its group's, which no stash
+                // stands for.
+                if verifying
+                    && C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0
+                {
+                    self.drop_stash(id, g, bag);
+                } else {
+                    match self.adopt_stash(id, g, claimed_dirty, walked, bag) {
+                        replay_impl::Adopted::No => {}
+                        replay_impl::Adopted::Panicked(raised) => {
+                            verifying = false;
+                            adopted_panic = Some(raised);
+                        }
+                        replay_impl::Adopted::Landed(computed) => {
+                            self.adopted_pop(id);
+                            return computed;
+                        }
+                        // The stashed run ended, as its pop does, before its
+                        // landing found a dep gone; the retry is the next run.
+                        replay_impl::Adopted::Stale => {
+                            self.adopted_pop(id);
+                            self.park_with_bag(ParkPoint::StaleRetry(id), bag);
+                            continue 'attempt;
+                        }
                     }
                 }
             }
