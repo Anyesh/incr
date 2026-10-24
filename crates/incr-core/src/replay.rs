@@ -12,12 +12,14 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry as MapEntry;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::deferred::Unbuilt;
+use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::state::NodeState;
@@ -360,11 +362,11 @@ impl Retire {
 pub(crate) struct Pending {
     slots: Vec<Option<Delivery>>,
     live: usize,
-    by_key: HashMap<ReadKey, Vec<usize>, FxBuildHasher>,
-    by_maker: HashMap<u32, Vec<usize>, FxBuildHasher>,
-    by_frame: HashMap<(u32, u32, u32), Vec<usize>, FxBuildHasher>,
+    by_key: Index<ReadKey, usize>,
+    by_maker: Index<u32, usize>,
+    by_frame: Index<(u32, u32, u32), usize>,
     /// By the frame's node and generation, at any position.
-    by_node: HashMap<(u32, u32), Vec<usize>, FxBuildHasher>,
+    by_node: Index<(u32, u32), usize>,
     traced: Vec<usize>,
     /// The passed deliveries that carry a landing deeper than just above
     /// their frame, which a pop can retire.
@@ -375,30 +377,35 @@ fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
     (key.node, key.generation, key.cidx)
 }
 
-/// Drops index `i` from the list `map` holds under `at`.
-fn unlist<K: std::hash::Hash + Eq>(
-    map: &mut HashMap<K, Vec<usize>, FxBuildHasher>,
-    at: &K,
-    i: usize,
-) {
-    if let Some(list) = map.get_mut(at) {
-        list.retain(|&j| j != i);
-        if list.is_empty() {
-            map.remove(at);
+type Index<K, T> = HashMap<K, Few<T>, FxBuildHasher>;
+
+fn list<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: K, x: T) {
+    match map.entry(at) {
+        MapEntry::Occupied(mut e) => e.get_mut().push(x),
+        MapEntry::Vacant(e) => {
+            e.insert(Few::One(x));
         }
     }
+}
+
+/// Drops the items `gone` accepts from the list `map` holds under `at`.
+fn unlist<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: &K, gone: impl Fn(&T) -> bool) {
+    if map.get_mut(at).is_some_and(|l| l.retain(|x| !gone(x))) {
+        map.remove(at);
+    }
+}
+
+fn listed<K: std::hash::Hash + Eq, T: Copy>(map: &Index<K, T>, at: &K) -> Vec<T> {
+    map.get(at).map_or_else(Vec::new, |l| l.as_slice().to_vec())
 }
 
 impl Pending {
     pub(crate) fn push(&mut self, d: Delivery) {
         let i = self.slots.len();
-        self.by_key.entry(d.key).or_default().push(i);
-        self.by_maker.entry(d.maker).or_default().push(i);
-        self.by_frame.entry(frame_of(&d.key)).or_default().push(i);
-        self.by_node
-            .entry((d.key.node, d.key.generation))
-            .or_default()
-            .push(i);
+        list(&mut self.by_key, d.key, i);
+        list(&mut self.by_maker, d.maker, i);
+        list(&mut self.by_frame, frame_of(&d.key), i);
+        list(&mut self.by_node, (d.key.node, d.key.generation), i);
         if d.provenance.is_some() {
             self.traced.push(i);
         }
@@ -413,10 +420,12 @@ impl Pending {
         let d = self.slots[i]
             .take()
             .expect("incr-core: a delivery is removed once");
-        unlist(&mut self.by_key, &d.key, i);
-        unlist(&mut self.by_maker, &d.maker, i);
-        unlist(&mut self.by_frame, &frame_of(&d.key), i);
-        unlist(&mut self.by_node, &(d.key.node, d.key.generation), i);
+        unlist(&mut self.by_key, &d.key, |&j| j == i);
+        unlist(&mut self.by_maker, &d.maker, |&j| j == i);
+        unlist(&mut self.by_frame, &frame_of(&d.key), |&j| j == i);
+        unlist(&mut self.by_node, &(d.key.node, d.key.generation), |&j| {
+            j == i
+        });
         if d.provenance.is_some() {
             self.traced.retain(|&j| j != i);
         }
@@ -486,7 +495,7 @@ impl Pending {
 
     /// The deliveries for read `key`, oldest first.
     pub(crate) fn keyed(&self, key: &ReadKey) -> &[usize] {
-        self.by_key.get(key).map_or(&[], Vec::as_slice)
+        self.by_key.get(key).map_or(&[], Few::as_slice)
     }
 
     /// The oldest delivery for read `key` that `f` accepts.
@@ -512,7 +521,7 @@ impl Pending {
 
     /// The deliveries the run at `level` made, oldest first.
     pub(crate) fn of_maker(&self, level: u32) -> Vec<usize> {
-        self.by_maker.get(&level).cloned().unwrap_or_default()
+        listed(&self.by_maker, &level)
     }
 
     /// Removes the deliveries the run at `level` made, oldest first.
@@ -526,10 +535,7 @@ impl Pending {
     /// The deliveries for reads by the frame of `node` at `generation` and
     /// `cidx`, oldest first.
     pub(crate) fn of_frame(&self, node: u32, generation: u32, cidx: u32) -> Vec<usize> {
-        self.by_frame
-            .get(&(node, generation, cidx))
-            .cloned()
-            .unwrap_or_default()
+        listed(&self.by_frame, &(node, generation, cidx))
     }
 
     /// Removes the deliveries for reads by that frame, oldest first.
@@ -543,10 +549,7 @@ impl Pending {
     /// Removes, oldest first, the deliveries for reads by the frames of
     /// `node` at `generation`, at any position.
     pub(crate) fn extract_node(&mut self, node: u32, generation: u32) -> Vec<Delivery> {
-        self.by_node
-            .get(&(node, generation))
-            .cloned()
-            .unwrap_or_default()
+        listed(&self.by_node, &(node, generation))
             .into_iter()
             .map(|i| self.remove(i))
             .collect()
@@ -2073,10 +2076,10 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
 #[derive(Default)]
 pub(crate) struct EarliestByFrame {
     /// Each frame's records, as `(path, maker, value)`.
-    by_frame: HashMap<Frame, Vec<(u64, u32, u64)>, FxBuildHasher>,
-    by_maker: HashMap<u32, Vec<Frame>, FxBuildHasher>,
+    by_frame: Index<Frame, (u64, u32, u64)>,
+    by_maker: Index<u32, Frame>,
     /// The positions of each node's frames, by node and generation.
-    by_node: HashMap<(u32, u32), Vec<u32>, FxBuildHasher>,
+    by_node: Index<(u32, u32), u32>,
     /// The nodes whose runs a release ended, until a doomed run of the node
     /// notes a record again: a record taken for one meanwhile would be one
     /// of the ended runs'.
@@ -2091,20 +2094,23 @@ impl EarliestByFrame {
     fn note(&mut self, frame: Frame, path: u64, maker: u32, value: u64) {
         #[cfg(debug_assertions)]
         self.ended.remove(&(frame.0, frame.1));
-        let records = self.by_frame.entry(frame).or_default();
-        if records.is_empty() {
-            self.by_node
-                .entry((frame.0, frame.1))
-                .or_default()
-                .push(frame.2);
-        }
-        match records.iter_mut().find(|r| r.0 == path) {
-            Some(r) => r.2 = r.2.min(value),
-            None => {
-                records.push((path, maker, value));
-                self.by_maker.entry(maker).or_default().push(frame);
+        match self.by_frame.entry(frame) {
+            MapEntry::Vacant(e) => {
+                e.insert(Few::One((path, maker, value)));
+                list(&mut self.by_node, (frame.0, frame.1), frame.2);
+            }
+            MapEntry::Occupied(mut e) => {
+                let records = e.get_mut();
+                match records.as_mut_slice().iter_mut().find(|r| r.0 == path) {
+                    Some(r) => {
+                        r.2 = r.2.min(value);
+                        return;
+                    }
+                    None => records.push((path, maker, value)),
+                }
             }
         }
+        list(&mut self.by_maker, maker, frame);
     }
 
     pub(crate) fn has(&self, frame: Frame) -> bool {
@@ -2126,22 +2132,16 @@ impl EarliestByFrame {
     fn remove(&mut self, frame: Frame, f: impl Fn(&(u64, u32, u64)) -> bool) -> Option<u64> {
         let records = self.by_frame.get_mut(&frame)?;
         let mut value = None;
-        records.retain(|r| {
+        let empty = records.retain(|r| {
             let gone = f(r);
             if gone {
                 value = Some(r.2);
             }
             !gone
         });
-        if records.is_empty() {
+        if empty {
             self.by_frame.remove(&frame);
-            let key = (frame.0, frame.1);
-            if let Some(at) = self.by_node.get_mut(&key) {
-                at.retain(|&c| c != frame.2);
-                if at.is_empty() {
-                    self.by_node.remove(&key);
-                }
-            }
+            unlist(&mut self.by_node, &(frame.0, frame.1), |&c| c == frame.2);
         }
         value
     }
@@ -2155,18 +2155,14 @@ impl EarliestByFrame {
     fn end_node(&mut self, node: u32, generation: u32) {
         #[cfg(debug_assertions)]
         self.ended.insert((node, generation));
-        for cidx in self
-            .by_node
-            .get(&(node, generation))
-            .cloned()
-            .unwrap_or_default()
-        {
+        for cidx in listed(&self.by_node, &(node, generation)) {
             self.remove((node, generation, cidx), |_| true);
         }
     }
 
     fn end_maker(&mut self, level: u32) {
-        for frame in self.by_maker.remove(&level).unwrap_or_default() {
+        let frames = self.by_maker.remove(&level);
+        for &frame in frames.as_ref().map_or(&[][..], Few::as_slice) {
             self.remove(frame, |r| r.1 == level);
         }
     }
