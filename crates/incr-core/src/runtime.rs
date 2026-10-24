@@ -3246,6 +3246,7 @@ impl<C: Cells> Runtime<C> {
             .members
             .iter()
             .any(|&(m, g)| m == cur.0 && g == generation)
+            || cycle_state::dissolved_group(self.runtime_id, cur.0, &group)
         {
             return false;
         }

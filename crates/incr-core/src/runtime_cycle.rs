@@ -1566,6 +1566,11 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn end_dissolved(&self, root: NodeId, bag: &mut Deferred<C>) -> (bool, bool) {
         let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)))
             .expect("incr-core: a dissolved root is held");
+        if C::u8_load_relaxed(self.nodes.get_with_flags(root.0).1) & IN_GROUP != 0 {
+            if let Some(group) = self.inner.read().member_recs.get(&root.0).cloned() {
+                cycle_state::note_dissolved_group(self.runtime_id, root.0, group);
+            }
+        }
         let ended = (e.first, e.wrote);
         bag.push_erased(Box::new(e.into_values()));
         ended
@@ -2337,6 +2342,12 @@ impl<C: Cells> Runtime<C> {
             return GroupEnd::Ordinary;
         };
         if !group.members.iter().any(|&(m, gen)| m == x.0 && gen == g) {
+            return GroupEnd::Ordinary;
+        }
+        // The root keeps the group it dissolved until it lands, for other
+        // threads, whose orders verify the group; this entry's retry of the
+        // root computes it alone, as the unbounded run's frame does.
+        if cycle_state::dissolved_group(rt, x.0, &group) {
             return GroupEnd::Ordinary;
         }
         // The members' runs sit where `x`'s frame would.
