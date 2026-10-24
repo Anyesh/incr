@@ -207,10 +207,17 @@ struct OutermostExit;
 impl Drop for OutermostExit {
     fn drop(&mut self) {
         if !reserve::none_held() {
-            replay::reset();
-            reserve::end_all();
+            end_replay();
         }
     }
+}
+
+/// Removes this thread's contexts and ends its reservations, those a doom
+/// noted before `mark` opened their context included: `reset` alone
+/// misses them when no context is open.
+fn end_replay() {
+    replay::reset();
+    reserve::end_all();
 }
 
 impl<C: Cells> Runtime<C> {
@@ -335,7 +342,7 @@ impl<C: Cells> Runtime<C> {
             );
             // Another runtime's contexts, which `drop_from` keeps, would keep
             // their reservations while the winner waits on one of them.
-            replay::reset();
+            end_replay();
             debug_assert!(
                 reserve::none_held(),
                 "incr-core: a wounded thread waits for its winner holding reservations"
