@@ -2729,7 +2729,32 @@ impl<C: Cells> Runtime<C> {
         }
         let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
         let depth = self.dep_stack.depth() as u32;
-        replay::start_run(rt, ctl, depth, frame, self.path_at(cidx));
+        let path = self
+            .path_above_run(cidx, depth)
+            .unwrap_or_else(|| self.path_at(cidx));
+        debug_assert_eq!(path, self.path_at(cidx), "the path at {cidx}");
+        replay::start_run(rt, ctl, depth, frame, path);
+    }
+
+    /// [`Self::path_at`] for a frame at `cidx`, `depth`, from the run of
+    /// the frame below it, when that frame is this runtime's at `cidx - 1`
+    /// and no virtual frame stands there: its path extended by its step.
+    fn path_above_run(&self, cidx: u32, depth: u32) -> Option<u64> {
+        let rt = self.runtime_id;
+        let below = depth.checked_sub(1)?;
+        let (ctl, mut step) = self.dep_stack.with(|s| {
+            let f = s.frames.get(below.checked_sub(1)? as usize)?;
+            (f.rt == rt && f.cidx + 1 == cidx).then(|| (f.ctl, f.step()))
+        })?;
+        let (seq, path) = replay::run_at(rt, ctl, below)?;
+        let virtual_below = replay::with(|c| {
+            (c.iter().filter(|x| x.rt == rt)).any(|x| x.vframe_at(cidx - 1).is_some())
+        });
+        if virtual_below {
+            return None;
+        }
+        step.seq = seq;
+        Some(replay::extend_path(path, step))
     }
 
     /// The root of an episode at `cidx` that dissolved or went stale
