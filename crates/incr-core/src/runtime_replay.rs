@@ -1929,7 +1929,7 @@ impl<C: Cells> Runtime<C> {
                         None
                     }
                 });
-                let Some((v, virtual_below, kept)) = popped else {
+                let Some((v, virtual_below, mut kept)) = popped else {
                     // The frame left on top was blocked reading the compute
                     // popped last, which the same doomed run made, so no
                     // entry stands for it: the run of a later entry that
@@ -1988,7 +1988,7 @@ impl<C: Cells> Runtime<C> {
                         &self.dep_stack,
                         self.dep_stack.place_next_at(v.cidx, virtual_below),
                     );
-                    self.tarjan_pop(id, &v)
+                    self.tarjan_pop(id, &v, &mut kept)
                 };
                 match popped {
                     VPop::Next => {
@@ -2285,7 +2285,7 @@ impl<C: Cells> Runtime<C> {
     /// anchored there, the episode it roots, run here as a task. A
     /// speculative frame never runs one: its chain is dropped instead, and
     /// the driver picks its next entry again (`true`).
-    fn tarjan_pop(&self, id: u64, v: &VFrame) -> VPop {
+    fn tarjan_pop(&self, id: u64, v: &VFrame, kept: &mut taint_memo::Parked) -> VPop {
         let rt = self.runtime_id;
         let failures = cycle_state::failures();
         if !self.vframe_unfinished(v) {
@@ -2350,8 +2350,14 @@ impl<C: Cells> Runtime<C> {
             ));
             self.retry_deliveries(id, v.node, v.generation, v.cidx);
             // The run finishes the frame's doomed run, so it owns what that
-            // run deferred.
+            // run deferred, and its reads see the frame's own memo entries,
+            // which the unbounded run's frame keeps until it pops.
             self.own_deferred(v.cidx, v.node);
+            let (own, above) = std::mem::take(kept)
+                .into_iter()
+                .partition(|&(_, owner)| owner == v.cidx + 1);
+            *kept = above;
+            taint_memo::restore(own);
             let ran = {
                 let _speculating = v.spec.then(replay::Speculating::enter);
                 self.member_run(v.node, v.cidx, true, v.walked, true)
