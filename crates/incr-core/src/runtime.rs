@@ -3192,6 +3192,10 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => continue,
+                // A Failed entry's compute does nothing and a Failed root's
+                // raises, so neither needs its deps cleaned first.
+                NodeState::Failed if !is_root => continue,
+                NodeState::Failed => walk.visit(cur, false),
                 // A memo stands for the node's run in this revision, so its
                 // deps are not expanded; the root's compute reads it.
                 NodeState::Dirty if node.memo_at(|| self.current_revision()) => {

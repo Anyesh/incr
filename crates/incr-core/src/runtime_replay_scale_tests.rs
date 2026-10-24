@@ -636,6 +636,79 @@ fn shared_wide_diverted_retry() {
     wide_diverted_retry::<Shared>();
 }
 
+/// A chain of `n` queries over a Failed node, rerun after a set below the
+/// chain: each rerun's read of the Failed node below it walks only that
+/// node, as a walk entry Failed computes to nothing and a Failed root
+/// raises, so the reruns stay linear.
+fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
+    let n = if cfg!(miri) { 8 } else { 4000 };
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let runs = counters(1);
+    let mut below = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs[0].fetch_add(1, SeqCst);
+                rt.get(input) + rt.get(failed)
+            },
+            opts(),
+        )
+    };
+    for _ in 1..n {
+        let (runs, dep) = (runs.clone(), below);
+        below = rt.create_query_with(
+            move |rt| {
+                runs[0].fetch_add(1, SeqCst);
+                rt.get(dep) + 1
+            },
+            opts(),
+        );
+    }
+    let top = below;
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    rt.set(input, 1);
+    runs[0].store(0, SeqCst);
+    let pops = rt.walk_pops.load(SeqCst);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let pops = rt.walk_pops.load(SeqCst) - pops;
+    println!(
+        "failed_entry_chain {frames:?}: runs {} pops {pops}",
+        runs[0].load(SeqCst)
+    );
+    assert_eq!(runs[0].load(SeqCst), n as u32);
+    assert!(pops <= 3 * n as u64, "{pops} walk pops for a {n}-chain");
+}
+
+#[test]
+fn local_failed_entry_chain() {
+    on_stack(1 << 28, || failed_entry_chain::<Local>(None));
+}
+
+#[test]
+fn shared_failed_entry_chain() {
+    on_stack(1 << 28, || failed_entry_chain::<Shared>(None));
+}
+
+#[test]
+fn local_failed_entry_chain_at_budget_1() {
+    on_stack(1 << 28, || failed_entry_chain::<Local>(Some(1)));
+}
+
+#[test]
+fn shared_failed_entry_chain_at_budget_1() {
+    on_stack(1 << 28, || failed_entry_chain::<Shared>(Some(1)));
+}
+
 #[derive(Copy, Clone, Debug)]
 enum Caught {
     /// Each query panics with the same text.
