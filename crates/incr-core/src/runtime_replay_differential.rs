@@ -5507,12 +5507,14 @@ fn native_reruns_under_replay_seeds() {
 /// the unbounded run does not. In 0x5ef, `Get(4)`'s speculative entry ran
 /// 13, 14 and 17 to 20; after `Set(22, 3)`, `Get(14)` verified the landed
 /// 14 and recomputed 17 to 21, landing 21 Clean over four reads of its
-/// inputs where the unbounded run leaves it Dirty over five.
+/// inputs where the unbounded run leaves it Dirty over five. In 0xc94 a
+/// doomed run's speculative walk computes 6 and 5 and must not land them.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn speculative_landings_verified_later_seeds() {
     for seed in [
         0x5ef,
+        0xc94,
         0x0092_b175_7f47,
         0x0092_b175_7fd1,
         0x0092_b175_809c,
