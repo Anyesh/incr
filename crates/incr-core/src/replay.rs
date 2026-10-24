@@ -1760,6 +1760,7 @@ struct Run {
     ctl: usize,
     frame: Frame,
     seq: u32,
+    path: u64,
     /// When it started, among the thread's runs.
     order: u64,
 }
@@ -1833,6 +1834,7 @@ pub(crate) fn start_run(
             ctl: ctl as usize,
             frame,
             seq,
+            path,
             order: r.next,
         }));
     });
@@ -1869,19 +1871,37 @@ pub(crate) fn seq_of(rt: RuntimeId, ctl: *const crate::cycle::ComputeCtl, depth:
     with_seqs(|s| s.of(rt, ctl, depth))
 }
 
-/// The seq of the latest run of `rt`'s `frame`, live or ended: for a run
-/// that may have left the stack, as a member's that lands at its episode's
-/// end. A frame on the stack has its seq from [`seq_of`].
-pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> u32 {
+/// The seq and path of the run of the frame at `depth` whose control block
+/// is `ctl`, if it started one.
+pub(crate) fn run_at(
+    rt: RuntimeId,
+    ctl: *const crate::cycle::ComputeCtl,
+    depth: u32,
+) -> Option<(u32, u64)> {
+    RUNS.with(|r| {
+        let at = depth.checked_sub(1)? as usize;
+        (r.borrow().live.get(at).copied().flatten())
+            .filter(|x| x.rt == rt && x.ctl == ctl as usize)
+            .map(|x| (x.seq, x.path))
+    })
+}
+
+/// The seq of the latest run of `rt`'s `frame`, live or ended, and the
+/// path it started along, which no frame or virtual frame below it changes
+/// while it runs: for a run that may have left the stack, as a member's
+/// that lands at its episode's end. A frame on the stack has them from
+/// [`run_at`]. No run gives seq 0 and no path.
+pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
     RUNS.with(|r| {
         let r = r.borrow();
         let live = (r.live.iter().rev().flatten()).find(|x| x.rt == rt && x.frame == frame);
         let ended = r.ended.get(&(rt, frame));
         match (live, ended) {
-            (Some(l), Some(e)) => if l.order > e.order { l } else { e }.seq,
-            (Some(x), None) | (None, Some(x)) => x.seq,
-            (None, None) => 0,
+            (Some(l), Some(e)) => Some(if l.order > e.order { l } else { e }),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
         }
+        .map_or((0, None), |x| (x.seq, Some(x.path)))
     })
 }
 

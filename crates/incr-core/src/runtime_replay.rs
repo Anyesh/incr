@@ -1186,12 +1186,14 @@ impl<C: Cells> Runtime<C> {
         let episode = member
             .then(|| cycle_state::held_episode(rt, node))
             .flatten();
-        (
-            self.nodes.get(node).generation(),
-            self.path_at(f.cidx),
-            episode,
-            replay::seq_of(rt, f.ctl, f.depth),
-        )
+        let (seq, path) = match replay::run_at(rt, f.ctl, f.depth) {
+            Some((seq, path)) => {
+                debug_assert_eq!(path, self.path_at(f.cidx), "the run's path at {}", f.cidx);
+                (seq, path)
+            }
+            None => (0, self.path_at(f.cidx)),
+        };
+        (self.nodes.get(node).generation(), path, episode, seq)
     }
 
     fn frame_keys(&self) -> replay::FrameKeys {
@@ -2750,8 +2752,9 @@ impl<C: Cells> Runtime<C> {
         if !replay::with(|c| replay::covering(c, rt, below).is_some()) {
             return;
         }
-        let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
-        replay::end_run(rt, frame, self.path_at(cidx));
+        let generation = self.nodes.get(id.0).generation();
+        let (path, _) = self.run_path(id.0, generation, cidx);
+        replay::end_run(rt, (id.0, generation, cidx), path);
     }
 
     /// A run of `node` that finishes its virtual frame's frame starts: the
@@ -3356,6 +3359,15 @@ impl<C: Cells> Runtime<C> {
         }
         let rt = self.runtime_id;
         cycle_state::with_held(|h| h.any_virtually_owned_from(rt, cidx)).then(|| self.path_at(cidx))
+    }
+
+    /// The path and seq of the frame of `node` at `cidx`: its run's, when
+    /// one started, and [`Self::path_at`] otherwise.
+    pub(super) fn run_path(&self, node: u32, generation: u32, cidx: u32) -> (u64, u32) {
+        let (seq, path) = replay::run_seq(self.runtime_id, (node, generation, cidx));
+        let path = path.unwrap_or_else(|| self.path_at(cidx));
+        debug_assert_eq!(path, self.path_at(cidx), "the run's path at {cidx}");
+        (path, seq)
     }
 
     /// The path of a frame at position `cidx`: the highest virtual frame
