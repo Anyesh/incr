@@ -312,7 +312,9 @@ impl<C: Cells> NodeData<C> {
     #[inline(always)]
     pub fn max_verified_at(&self, v: u64) {
         let cur = C::u64_load_relaxed(&self.verified_at);
-        if cur & Self::MEMO != 0 {
+        if C::SINGLE_THREADED {
+            C::u64_store_relaxed(&self.verified_at, (cur & !Self::MEMO).max(v));
+        } else if cur & Self::MEMO != 0 {
             self.stamp_over_memo(cur, v);
         } else {
             C::u64_fetch_max(&self.verified_at, v);
