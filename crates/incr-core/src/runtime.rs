@@ -97,9 +97,7 @@ pub(crate) struct Inner<C: Cells> {
     /// Each query a user panic released New over a union of deps
     /// ([`Runtime::land_panic_released`]), with the generation it landed
     /// under and how many of those deps, from the front, its last finished
-    /// run read. Dropped when its deps are next replaced. A finished run
-    /// that records the very same list leaves it, and a later walk of the
-    /// node while New then skips deps that run read.
+    /// run read. Any other publish of its deps drops it.
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
@@ -400,6 +398,24 @@ impl<C: Cells> Drop for SetClaim<'_, C> {
         if self.held {
             self.node.release_set_claim(self.base, self.base);
             set_stack::pop(self.rt.runtime_id, self.id.0);
+        }
+    }
+}
+
+/// A panicked run's landing, which publishes the union of its old and
+/// recorded deps, with the claims released alongside it.
+#[derive(Copy, Clone)]
+enum PanicUnion<'a> {
+    Failed(&'a [u32]),
+    /// A claim the panic released New: a read's walk keeps to the old deps
+    /// ([`Inner::released_deps`]).
+    Released(&'a [u32]),
+}
+
+impl<'a> PanicUnion<'a> {
+    fn co_members(self) -> &'a [u32] {
+        match self {
+            Self::Failed(m) | Self::Released(m) => m,
         }
     }
 }
@@ -924,7 +940,8 @@ pub struct Runtime<C: Cells> {
     pub(crate) episodes_landed: <C as Cells>::U64,
     /// `Inner::released_deps.len()`, stored under the write hold, so that a
     /// walk reaching a New node skips the lock while the map is empty. The
-    /// entry is stored before the node lands New, which the walk loaded.
+    /// entry is stored before the release's state CAS lands the node New,
+    /// and the walk loads that state with acquire.
     released_count: <C as Cells>::U32,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
@@ -2110,9 +2127,7 @@ impl<C: Cells> Runtime<C> {
         if bits & IN_GROUP != 0 {
             inner.member_recs.remove(&slot);
         }
-        if inner.released_deps.remove(&slot).is_some() {
-            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
-        }
+        self.set_released(inner, slot, None);
         let children = if bits & HAS_INDEX != 0 {
             inner.children.remove(&slot)
         } else {
@@ -3279,14 +3294,14 @@ impl<C: Cells> Runtime<C> {
                     // after a cycle breaks, so each is expanded at most
                     // once per walk. A never-run node has no deps and
                     // never touches the set.
-                    let mut kept = u32::MAX;
+                    let mut kept = None;
                     if observed == NodeState::New && node.dep_count() != 0 {
                         if !walk.first_new_expansion(cur) {
                             continue;
                         }
                         // Running a released claim's recorded deps first
                         // would enter its cycle where its own run does not.
-                        kept = self.released_kept(cur, node).unwrap_or(u32::MAX);
+                        kept = self.released_kept(cur, node);
                     }
                     #[cfg(test)]
                     self.expansions
@@ -3299,9 +3314,7 @@ impl<C: Cells> Runtime<C> {
                             walk.expand(dep, dep_state);
                         }
                     };
-                    if kept == u32::MAX {
-                        node.for_each_dep(&mut expand);
-                    } else {
+                    if let Some(kept) = kept {
                         let mut n = 0;
                         node.for_each_dep(|dep| {
                             n += 1;
@@ -3309,6 +3322,8 @@ impl<C: Cells> Runtime<C> {
                                 expand(dep);
                             }
                         });
+                    } else {
+                        node.for_each_dep(&mut expand);
                     }
                 }
             }
@@ -4321,7 +4336,13 @@ impl<C: Cells> Runtime<C> {
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
-        let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
+        let landing = match self.publish_deps(
+            id,
+            deps,
+            Some(PanicUnion::Failed(co_members)),
+            attempt.verify_rev,
+            bag,
+        ) {
             // A stale dep's slot may already belong to another node, so no
             // union is published. The old deps keep their reverse edges.
             Publish::Stale => NodeState::New,
@@ -4394,24 +4415,14 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        let kept = self.released_kept(id, node).unwrap_or_else(|| {
-            let mut n = 0;
-            node.for_each_dep(|_| n += 1);
-            n
-        });
         // Any outcome lands New, which recomputes.
-        self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag);
-        let mut kept_all = true;
-        let mut n = 0;
-        node.for_each_dep(|_| {
-            n += 1;
-            kept_all &= n <= kept;
-        });
-        if !kept_all {
-            let mut inner = self.inner.write();
-            inner.released_deps.insert(id.0, (node.generation(), kept));
-            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
-        }
+        self.publish_deps(
+            id,
+            deps,
+            Some(PanicUnion::Released(co_members)),
+            attempt.verify_rev,
+            bag,
+        );
         if wrote {
             node.max_changed_at(attempt.stamp_rev);
         } else if attempt.first {
@@ -4429,6 +4440,31 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         self.released_entry(id, node)
+    }
+
+    /// Sets or drops `id`'s [`Inner::released_deps`] entry, under the hold
+    /// that publishes its deps.
+    fn set_released(&self, inner: &mut Inner<C>, id: u32, entry: Option<(u32, u32)>) {
+        let changed = match entry {
+            Some(e) => {
+                inner.released_deps.insert(id, e);
+                true
+            }
+            None => {
+                C::u32_load_relaxed(&self.released_count) != 0
+                    && inner.released_deps.remove(&id).is_some()
+            }
+        };
+        if changed {
+            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
+        }
+    }
+
+    /// A finished run published the deps it already had.
+    #[cold]
+    #[inline(never)]
+    fn drop_released_entry(&self, id: NodeId) {
+        self.set_released(&mut self.inner.write(), id.0, None);
     }
 
     #[cold]
@@ -4725,7 +4761,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         id: NodeId,
         recorded: &[(NodeId, u32)],
-        panic: Option<&[u32]>,
+        panic: Option<PanicUnion<'_>>,
         verify_rev: u64,
         bag: &mut Deferred<C>,
     ) -> Publish {
@@ -4743,6 +4779,11 @@ impl<C: Cells> Runtime<C> {
                 seen += 1;
             });
             if same && seen == recorded.len() {
+                // This run's claim followed the release's landing, so a
+                // relaxed load sees its entry's count.
+                if C::u32_load_relaxed(&self.released_count) != 0 {
+                    self.drop_released_entry(id);
+                }
                 return Publish::Published;
             }
         }
@@ -4783,7 +4824,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         node: &NodeData<C>,
         recorded: &[(NodeId, u32)],
-        panic: Option<&[u32]>,
+        panic: Option<PanicUnion<'_>>,
         verify_rev: u64,
         bag: &mut Deferred<C>,
         old_deps: &[NodeId],
@@ -4808,7 +4849,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         node: &NodeData<C>,
         recorded: &[(NodeId, u32)],
-        panic: Option<&[u32]>,
+        panic: Option<PanicUnion<'_>>,
         verify_rev: u64,
         bag: &mut Deferred<C>,
         diff: DepDiff<'_, S>,
@@ -4828,9 +4869,9 @@ impl<C: Cells> Runtime<C> {
         let settled = |d: &NodeId| {
             diff.old_set.has(*d)
                 || self.observed_clean(*d, verify_rev)
-                || panic.is_some_and(|members| {
+                || panic.is_some_and(|p| {
                     self.nodes.get(d.0).state() == NodeState::Failed
-                        || members.binary_search(&d.0).is_ok()
+                        || p.co_members().binary_search(&d.0).is_ok()
                 })
         };
         let superseded = !diff.new.iter().all(settled);
@@ -4841,9 +4882,16 @@ impl<C: Cells> Runtime<C> {
         if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
         }
-        if inner.released_deps.remove(&id.0).is_some() {
-            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
-        }
+        // The union keeps the old deps as its prefix.
+        let entry = matches!(panic, Some(PanicUnion::Released(_))).then(|| {
+            let kept = inner
+                .released_deps
+                .get(&id.0)
+                .filter(|&&(generation, _)| generation == node.generation())
+                .map_or(diff.old.len() as u32, |&(_, kept)| kept);
+            (node.generation(), kept)
+        });
+        self.set_released(&mut inner, id.0, entry);
 
         for old_dep in diff.old {
             if !diff.new_set.has(*old_dep) {
@@ -4897,6 +4945,19 @@ impl<C: Cells> Runtime<C> {
     /// every installed dep S of a `Clean` node X is alive, has X in
     /// `dependents[S]`, and is itself `Clean`. Also checks that no freed
     /// slot still carries reverse edges.
+    /// A finished run's publish drops its node's released entry, so a Clean
+    /// node keeps none.
+    pub(crate) fn assert_released_entries_unsettled(&self) {
+        let inner = self.inner.read();
+        for &slot in inner.released_deps.keys() {
+            let state = self.nodes.get(slot).state();
+            assert!(
+                state != NodeState::Clean,
+                "node {slot} is Clean with a released entry"
+            );
+        }
+    }
+
     pub(crate) fn assert_invariant_i(&self) {
         let inner = self.inner.read();
         for x in 0..self.nodes.len() {

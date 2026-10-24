@@ -2170,6 +2170,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
+            self.set_released(&mut inner, *m, None);
         }
         let group = Arc::new(GroupInfo {
             members: entries.iter().map(|(m, e)| (*m, e.generation)).collect(),

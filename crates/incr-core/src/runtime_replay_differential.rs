@@ -1397,6 +1397,8 @@ impl<C: Cells> Live<C> {
     fn assert_invariants(&self) {
         self.world.rt(0).assert_invariant_i();
         self.world.rt(1).assert_invariant_i();
+        self.world.rt(0).assert_released_entries_unsettled();
+        self.world.rt(1).assert_released_entries_unsettled();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -4187,6 +4189,20 @@ fn a_walk_leaves_a_new_nodes_deps_to_its_run() {
         for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
             assert!(matches!(trace[1].0, Out::Value(7777)), "{:?}", trace[1].0);
         }
+    });
+}
+
+/// Seed 0x66a, unbounded: a released claim's later finished run published
+/// deps without dropping its released entry, so its kept count outlived
+/// the list it counted. [`Live::assert_invariants`] finds the Clean node
+/// still holding one.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_finished_run_drops_its_released_entry() {
+    let case = gen_case(0x66a, false, false);
+    quiet(|| {
+        run::<Local>(&case, None, 0);
+        run::<Shared>(&case, None, 0);
     });
 }
 
