@@ -3692,6 +3692,23 @@ fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
     });
 }
 
+/// Seed 0x2897c4266833877, unbounded: op 3's `Get(18)` verifies 18's
+/// group with a tainted walk entry, which releases the group's claims. A
+/// released member that stayed in its group was verified as one again
+/// and gave 7793, where a fresh run raises the cycle.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_tainted_group_release_leaves_its_members_out_of_the_group() {
+    let mut case = gen_case(0x2897_c426_6833_877, false, false);
+    case.ops.truncate(4);
+    assert!(matches!(case.ops[3], Op::Get(18)));
+    quiet(|| {
+        for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
+            assert_eq!(trace[3].0, Out::Panic("cycle".to_owned()));
+        }
+    });
+}
+
 /// [`differential`]'s runs, compared by their operations' outcomes alone.
 fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
