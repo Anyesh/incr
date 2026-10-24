@@ -4022,10 +4022,10 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Computed {
         let kind = cycle_state::take_unwind_kind();
-        let payload = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
+        let (payload, children_stashed) = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
             self.stash_panic(id, ctl, deps, &attempt, payload)
         } else {
-            payload
+            (payload, false)
         };
         replay::unwind_past(self.runtime_id, attempt.cidx);
         // A closure that catches a speculative run's discard can't land a
@@ -4041,7 +4041,11 @@ impl<C: Cells> Runtime<C> {
             bag,
         );
         let wrote = ctl.wrote.get() != 0;
-        if kind.is_some() {
+        if children_stashed {
+            let first = attempt.first;
+            let stashed = ChildLanding::Stashed;
+            self.discard_land_in_group(id, first, wrote, attempt.stamp_rev, stashed, bag);
+        } else if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
             self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
@@ -4258,7 +4262,7 @@ impl<C: Cells> Runtime<C> {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
                 _ => Box::new(cycle::WoundUnwind),
             });
-        } else if result.is_ok() && self.speculative_lands_dirty(id, word, ctl, deps) {
+        } else if result.is_ok() && self.speculative_lands_dirty(word, ctl, deps) {
             if self.drop_cooperatively(None) {
                 return Some(self.discard_dropped(id, attempt, ctl, bag));
             }

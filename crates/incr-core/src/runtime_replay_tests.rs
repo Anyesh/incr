@@ -2,7 +2,7 @@
 //! the bounds on runs and walks the plan's T8 tests set.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
 use super::{Runtime, DEFAULT_MAX_FRAMES};
@@ -1008,6 +1008,163 @@ impl Drop for Dropped {
     fn drop(&mut self) {
         self.0.fetch_add(1, SeqCst);
     }
+}
+
+/// A value whose `PartialEq` panics once `boom` is set.
+#[derive(Clone, Debug)]
+struct EqBoom {
+    v: u64,
+    boom: Arc<AtomicBool>,
+}
+
+impl PartialEq for EqBoom {
+    fn eq(&self, other: &Self) -> bool {
+        assert!(!self.boom.load(SeqCst), "eq boom");
+        self.v == other.v
+    }
+}
+
+/// `x`'s recompute is stashed by a speculative run; when the real claim
+/// adopts it, the write's compare panics. The unbounded run's write panics
+/// after its one run too, so `x` lands Failed with that payload and its
+/// closure does not run again.
+fn adopted_write_panic_lands_failed<C: Cells>(replay: bool) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let b = rt.create_query(|_| 5_u64);
+    let boom = Arc::new(AtomicBool::new(false));
+    let runs = Arc::new(AtomicU32::new(0));
+    let (counted, armed) = (runs.clone(), boom.clone());
+    let x = rt.create_query_with(
+        move |rt| {
+            counted.fetch_add(1, SeqCst);
+            EqBoom {
+                v: rt.get(input),
+                boom: armed.clone(),
+            }
+        },
+        QueryOpts {
+            replay: if replay {
+                Replay::Allowed
+            } else {
+                Replay::Native
+            },
+            ..Default::default()
+        },
+    );
+    let r = rt.create_query_with(
+        move |rt| {
+            let v = rt.get(b);
+            if v == 0 {
+                rt.get(x).v
+            } else {
+                v
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(x).v, 1);
+    rt.set(input, 2);
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(runs.load(SeqCst), 2);
+    boom.store(true, SeqCst);
+    let payload = catch_unwind(AssertUnwindSafe(|| rt.get(x))).expect_err("x panics");
+    assert_eq!(payload.downcast_ref::<&str>(), Some(&"eq boom"));
+    assert_eq!(
+        runs.load(SeqCst),
+        2,
+        "x ran again after its adoption's write panicked"
+    );
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+}
+
+#[test]
+fn local_adopted_write_panic_lands_failed() {
+    adopted_write_panic_lands_failed::<Local>(false);
+    adopted_write_panic_lands_failed::<Local>(true);
+}
+
+#[test]
+fn shared_adopted_write_panic_lands_failed() {
+    adopted_write_panic_lands_failed::<Shared>(false);
+    adopted_write_panic_lands_failed::<Shared>(true);
+}
+
+/// A Native creator `c` that only a speculative run of `r` reaches first:
+/// its run, a value or a panic, is stashed with the child it made, so the
+/// real `get(c)` adopts it and `c` runs once in the revision, with the
+/// unbounded run's nodes. With `adopt` off, a set ends the revision before
+/// any real read, and the stash's child goes with it. Returns `c`'s value
+/// (`None` for a panic or no read), its runs and the node count.
+fn native_creator_runs_once<C: Cells>(
+    frames: u32,
+    adopt: bool,
+    panics: bool,
+) -> (Option<u64>, u32, usize) {
+    let rt = native_runtime::<C>();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let input = rt.create_input(1_u64);
+    let b = rt.create_query(|_| 5_u64);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let c = rt.create_query(move |rt: &Runtime<C>| {
+        counted.fetch_add(1, SeqCst);
+        let k = rt.child_input(1_u32, || 7_u64);
+        assert!(!panics || rt.get(k) != 7, "creator panic");
+        rt.get(k) + rt.get(input)
+    });
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    if adopt {
+        let v = catch_unwind(AssertUnwindSafe(|| rt.get(c))).ok();
+        return (v, runs.load(SeqCst), rt.node_count());
+    }
+    rt.set(input, 2);
+    (None, runs.load(SeqCst), rt.node_count())
+}
+
+fn native_creator_runs_once_as_unbounded<C: Cells>() {
+    for panics in [false, true] {
+        let (v, runs, nodes) = native_creator_runs_once::<C>(1, true, panics);
+        assert_eq!(
+            (v, runs, nodes),
+            native_creator_runs_once::<C>(u32::MAX, true, panics),
+            "(c, c's runs, node count) at budget 1 vs unbounded, panics {panics}"
+        );
+        // The unbounded run never reaches `c`; one run ahead of need is
+        // the bound.
+        let (v, runs, nodes) = native_creator_runs_once::<C>(1, false, panics);
+        let (_, unbounded_runs, unbounded_nodes) =
+            native_creator_runs_once::<C>(u32::MAX, false, panics);
+        assert_eq!(
+            (v, runs, nodes),
+            (None, unbounded_runs + 1, unbounded_nodes),
+            "(c, c's runs, node count) at budget 1, no adoption, panics {panics}"
+        );
+    }
+}
+
+#[test]
+fn local_native_creator_runs_once_as_unbounded() {
+    native_creator_runs_once_as_unbounded::<Local>();
+}
+
+#[test]
+fn shared_native_creator_runs_once_as_unbounded() {
+    native_creator_runs_once_as_unbounded::<Shared>();
 }
 
 /// A stash no real claim adopts is freed when a set ends its revision, and
