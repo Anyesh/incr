@@ -3604,8 +3604,14 @@ impl<C: Cells> Runtime<C> {
                 );
             }
             let speculative = MODE & VIRT != 0 && replay::speculative();
-            if speculative && !self.replayable(id.0) {
-                self.mark_tried(id, g);
+            if speculative && !self.replayable(id.0) && !self.mark_tried(id, g) {
+                let target = if claimed_dirty {
+                    NodeState::Dirty
+                } else {
+                    NodeState::New
+                };
+                self.land(id, node, target, target);
+                return Computed::Done;
             }
             let is_recompute = claimed_dirty;
             let first = !claimed_dirty;

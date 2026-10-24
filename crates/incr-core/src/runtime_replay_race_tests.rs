@@ -2521,3 +2521,52 @@ fn shared_retaken_delivery_after_another_thread_lands_clean() {
 fn shared_retaken_delivery_after_another_thread_lands_failed() {
     retaken_delivery_after_another_landing(FAILED);
 }
+
+/// Two replayable readers each doom at budget 1 and go on to the Native
+/// `n`. Thread 1's speculative read of `n` passes the tried check and
+/// parks before its claim; the main thread's speculative run then computes
+/// `n`, stashes it and lands it back New. Thread 1's claim then succeeds
+/// on New, and must not run `n` a second time in the revision.
+#[test]
+fn a_claim_after_another_threads_speculative_run_does_not_run_it_again() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let n = rt.create_query(move |rt: &Rt| {
+        counted.fetch_add(1, SeqCst);
+        rt.get(input) + 10
+    });
+    let reader = || {
+        let b = rt.create_query(|_: &Rt| 5_u64);
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let x = rt.get(b);
+                if x == 0 {
+                    rt.get(n)
+                } else {
+                    x
+                }
+            },
+            replayable(),
+        )
+    };
+    let (r1, r2) = (reader(), reader());
+    let gate = Gate::new();
+    gate.arm();
+    hook(&rt, vec![(ParkPoint::BeforeClaim(id(n)), gate.clone())]);
+    let parked = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(r1))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.get(r2), 5);
+    assert_eq!(runs.load(SeqCst), 1);
+    gate.release();
+    assert_eq!(parked.join().unwrap(), 5);
+    assert_eq!(runs.load(SeqCst), 1, "n ran speculatively twice");
+    assert_eq!(rt.get(n), 11);
+    assert_eq!(runs.load(SeqCst), 1);
+}

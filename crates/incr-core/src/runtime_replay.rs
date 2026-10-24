@@ -614,10 +614,11 @@ impl<C: Cells> Runtime<C> {
     /// Marks a speculative run of Native node `id` at `generation` as tried
     /// before its closure runs, so that no other speculative run computes it
     /// in this revision whether or not this one keeps a stash. A replayable
-    /// node is not marked, since its closure may run again.
+    /// node is not marked, since its closure may run again. False if another
+    /// speculative run marked it after this claim's check.
     #[cold]
     #[inline(never)]
-    pub(super) fn mark_tried(&self, id: NodeId, generation: u32) {
+    pub(super) fn mark_tried(&self, id: NodeId, generation: u32) -> bool {
         self.stash(
             id.0,
             generation,
@@ -626,13 +627,14 @@ impl<C: Cells> Runtime<C> {
                 deps: Vec::new(),
                 verify_rev: 0,
             },
-        );
+        )
     }
 
-    /// Keeps `stash` for node `slot` at `generation`, for this revision. A
-    /// node already stashed keeps its first stash, which speculative reads
-    /// may have returned; a run's stash replaces its own tried mark.
-    fn stash(&self, slot: u32, generation: u32, stash: Stash) {
+    /// Keeps `stash` for node `slot` at `generation`, for this revision, and
+    /// says whether the node had no entry. A node already stashed keeps its
+    /// first stash, which speculative reads may have returned; a run's stash
+    /// replaces its own tried mark.
+    fn stash(&self, slot: u32, generation: u32, stash: Stash) -> bool {
         let revision = self.current_revision();
         let (displaced, ended) = {
             let mut s = self.stashes.write();
@@ -655,7 +657,9 @@ impl<C: Cells> Runtime<C> {
             C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
             (displaced, ended)
         };
+        let vacant = displaced.is_none();
         drop((displaced, ended));
+        vacant
     }
 
     /// Whether node `slot` at `generation` has a stash this revision, a
