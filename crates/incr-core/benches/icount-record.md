@@ -2098,9 +2098,12 @@ scale tests finish in 24.94 s at the tip against 28.39 s at the base.
 - About 30 instructions per outermost Shared entry are the exit guard's
   drop (`OutermostExit`, `reserve::none_held`: a thread-local access, a
   `RefCell` borrow and a larger `catch_unwind` closure). Intel PT on
-  `delete_single_shared` puts 30 of its +32 there.
-- `fanout_shared_4` adds the guard plus the generation check at the top
-  of `compute_attempts`' loop (+45); the -85/+70 swings between
+  `delete_single_shared` (10 iterations, +32 per iteration in that run)
+  puts 30 there.
+- In `fanout_shared_4`'s PT diff (+308 per iteration) the thread-local,
+  `Cell`, closure, drop and `Vec` lines of the entry path add about +210,
+  the generation check at the top of `compute_attempts`' loop +45 and the
+  claim-path branch at `runtime.rs:3554` +15; the -85/+70 swings between
   `segmented_nodes.rs:192` and `state.rs:66` net to about zero and are
   code moving between partitions.
 - Local rows move by 0.0 to 0.9% though reservations compile out under
