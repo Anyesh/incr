@@ -2904,9 +2904,16 @@ impl<C: Cells> Runtime<C> {
             }
             return self.compute_direct::<MODE>(id, gen);
         }
+        // A resumed walk was planned before its doom, at a count no longer
+        // known, so it checks against none: it re-plans if any other
+        // thread has landed an episode.
+        let mut planned = if resume.is_some() {
+            Planned { all: 0, own: 0 }
+        } else {
+            self.planned()
+        };
         let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
         let mut root = Computed::Done;
-        let mut planned = self.planned();
         let mut unchecked = None;
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
