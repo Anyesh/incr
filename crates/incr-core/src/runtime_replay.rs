@@ -2006,7 +2006,8 @@ impl<C: Cells> Runtime<C> {
     /// may be doomed and retried, and the retry's read must take the
     /// unwind again: the unbounded run's frame read the node once, and a
     /// fresh read would run what the unwind left New, Dirty or Failed
-    /// again, or panic as Failed with another payload.
+    /// again, or panic as Failed with another payload. A payload no copy
+    /// can stand for holds the frame instead (`hold_uncopied`).
     #[cold]
     #[inline(never)]
     pub(super) fn note_unwound_read(
@@ -2025,6 +2026,7 @@ impl<C: Cells> Runtime<C> {
             return;
         };
         let Some(copy) = replay::copy_payload(payload) else {
+            self.hold_uncopied(ctl);
             return;
         };
         let what = Delivered::Unwind {
@@ -2041,9 +2043,8 @@ impl<C: Cells> Runtime<C> {
     /// ticket. If a budget is set, the frame may be doomed after its closure
     /// has dropped the one-shot payload, and its retry's read must take it
     /// again, as the unbounded run's one read did: a copy is kept for the
-    /// retry, or, for a payload no copy can stand for, the frame is not
-    /// doomed while it is within the budget. Past the budget the stack bound
-    /// wins, and the retry reads the node Failed with no payload.
+    /// retry, or a payload no copy can stand for holds the frame
+    /// (`hold_uncopied`).
     #[cold]
     #[inline(never)]
     pub(super) fn note_ticket_read(&self, id: NodeId, payload: &(dyn std::any::Any + Send)) {
@@ -2058,14 +2059,7 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         let Some(copy) = replay::copy_payload(payload) else {
-            if !self.over_budget(self.dep_stack.depth() as u32) {
-                // SAFETY: the reading frame is on the stack, so its control
-                // block is live.
-                let flags = unsafe { &*ctl };
-                if !flags.has(cycle::DOOMED) {
-                    flags.raise(cycle::NO_DOOM);
-                }
-            }
+            self.hold_uncopied(ctl);
             return;
         };
         let what = Delivered::Unwind {
@@ -2076,6 +2070,23 @@ impl<C: Cells> Runtime<C> {
             nodes: self.copy_notes(payload, cidx + 1),
         };
         self.keep_read(ctl, cidx, reading, ordinal, what);
+    }
+
+    /// The reading frame with control block `ctl` took a payload no copy
+    /// can stand for, which its closure may drop: it is not doomed while it
+    /// is within the budget, so its one read is the unbounded run's. Past
+    /// the budget the stack bound wins, and a retry reads the node Failed
+    /// with no payload.
+    fn hold_uncopied(&self, ctl: *const cycle::ComputeCtl) {
+        if self.over_budget(self.dep_stack.depth() as u32) {
+            return;
+        }
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live.
+        let flags = unsafe { &*ctl };
+        if !flags.has(cycle::DOOMED) {
+            flags.raise(cycle::NO_DOOM);
+        }
     }
 
     /// The key parts a read by this runtime's frame `f` gets from this
@@ -4149,6 +4160,10 @@ impl<C: Cells> Runtime<C> {
         if poison {
             // SAFETY: the active frame's control block is live.
             unsafe { &*f.ctl }.raise(cycle::POISONED);
+        }
+        // A payload no copy can stand for was delivered once.
+        if !replay::copyable(&*payload) {
+            self.hold_uncopied(f.ctl);
         }
         if !cycle {
             // The member marked for the panic was marked in the run it came

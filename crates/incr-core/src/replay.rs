@@ -2028,6 +2028,13 @@ pub(crate) fn set_carry(carry: Option<Carry>) {
     CARRY.with(|c| c.set(carry));
 }
 
+/// Whether [`copy_payload`] can copy `payload`.
+pub(crate) fn copyable(payload: &(dyn Any + Send)) -> bool {
+    payload.is::<crate::cycle::CycleUnwind>()
+        || payload.is::<String>()
+        || payload.is::<&'static str>()
+}
+
 /// A copy of a panic payload of a type the engine knows: a cycle unwind's
 /// or a `panic!` message.
 pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + Send>> {
