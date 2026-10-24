@@ -287,10 +287,11 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
     );
 }
 
-/// What a store that never declared "raw" reports for it on catching up
+/// What a store that does not declare "raw" reports for it on catching up
 /// across a compaction, after first loading an earlier snapshot, with the
-/// writer's collection built by inserting `order`.
-fn undeclared_catch_up(order: impl IntoIterator<Item = u32>) -> Vec<Record> {
+/// writer's collection built by inserting `order`. With `undeclared`, the
+/// store declares the key after loading and undeclares it again.
+fn undeclared_catch_up(order: impl IntoIterator<Item = u32>, undeclared: bool) -> Vec<Record> {
     let log = MemoryBackend::new();
     let writer = open::<Local, _>(log.clone());
     let raw = writer.collection::<u32>("raw").unwrap();
@@ -299,6 +300,10 @@ fn undeclared_catch_up(order: impl IntoIterator<Item = u32>) -> Vec<Record> {
     }
     writer.checkpoint().unwrap();
     let reader = open::<Local, _>(log.read_only());
+    if undeclared {
+        let r_raw = reader.collection::<u32>("raw").unwrap();
+        reader.undeclare(&r_raw).unwrap();
+    }
     let seen = subscribe(&reader);
     raw.delete(&writer, &63).unwrap();
     raw.insert(&writer, 64).unwrap();
@@ -308,8 +313,8 @@ fn undeclared_catch_up(order: impl IntoIterator<Item = u32>) -> Vec<Record> {
     for_key(&seen, "raw")
 }
 
-// Each writer's collection hashes with its own seed, so the two snapshots
-// would list the same 64 elements in the same order only by chance.
+// Each collection hashes with its own seed, so two of them would list the
+// same 64 elements in the same order only by chance.
 #[test]
 fn an_undeclared_catch_up_reports_the_same_changes_however_the_writer_hashes() {
     let expected = [
@@ -322,8 +327,10 @@ fn an_undeclared_catch_up_reports_the_same_changes_however_the_writer_hashes() {
             element: enc(&64u32),
         },
     ];
-    assert_eq!(undeclared_catch_up(0..64), expected);
-    assert_eq!(undeclared_catch_up((0..64).rev()), expected);
+    for undeclared in [false, true] {
+        assert_eq!(undeclared_catch_up(0..64, undeclared), expected);
+        assert_eq!(undeclared_catch_up((0..64).rev(), undeclared), expected);
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]

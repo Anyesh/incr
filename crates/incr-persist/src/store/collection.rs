@@ -374,6 +374,22 @@ impl<T: Value + Hash + Eq + Serialize, C: Cells> CollectionBinding<T, C> {
         drop(spent);
     }
 
+    /// The elements encoded, in byte order. A store that does not declare
+    /// the key diffs its catch-up by bytes in the order its elements were
+    /// listed, so hash order, which differs per process, would make what it
+    /// reports differ too. The runtime stores one value per class of equal
+    /// elements, so no order of them changes the state.
+    fn encoded_values(&self, rt: &Runtime<C>) -> Result<Vec<Vec<u8>>> {
+        let mut encoded = self
+            .collection
+            .values(rt)
+            .iter()
+            .map(encode)
+            .collect::<Result<Vec<_>>>()?;
+        encoded.sort_unstable();
+        Ok(encoded)
+    }
+
     /// Brings the collection to exactly `target`, stored values included,
     /// by applying only the multiplicity differences, removes first, so
     /// queries over it see one change per differing occurrence rather than
@@ -507,13 +523,7 @@ where
         if !rt.is_alive(self.node()) {
             return Err(Error::UnknownHandle);
         }
-        let encoded = self
-            .collection
-            .values(rt)
-            .iter()
-            .map(encode)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Some(Elements::from_encoded(encoded)))
+        Ok(Some(Elements::from_encoded(self.encoded_values(rt)?)))
     }
 
     fn mapped_stamp(&self) -> Option<u64> {
@@ -580,22 +590,11 @@ where
     }
 
     fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {
-        let mut elements = self
-            .collection
-            .values(rt)
-            .iter()
-            .map(encode)
-            .collect::<Result<Vec<_>>>()?;
+        let elements = self.encoded_values(rt)?;
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
         if elements.is_empty() && !has_value {
             return Ok(Vec::new());
         }
-        // A store that never declared this key diffs its catch-up by bytes in
-        // snapshot order, so listing elements in hash order, which differs
-        // per process, would make what it reports differ too. The runtime
-        // stores one value per class of equal elements, so no order of them
-        // changes the state.
-        elements.sort_unstable();
         let mut out = logged.map_or_else(Vec::new, |logged| logged.records(&self.key));
         out.extend(elements.into_iter().map(|element| Record::Insert {
             key: self.key.clone(),
