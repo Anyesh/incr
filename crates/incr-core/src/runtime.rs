@@ -3595,9 +3595,13 @@ impl<C: Cells> Runtime<C> {
             let mut verify_rev = C::walked(&self.walk, &self.revision);
 
             let mut adopted_panic = None;
-            if C::u32_load_relaxed(&self.stash_count) != 0 && !matches!(visit, Visit::VerifyOnly(_))
+            // A group member's verify is its group's, which no stash stands for.
+            if C::u32_load_relaxed(&self.stash_count) != 0
+                && !matches!(visit, Visit::VerifyOnly(_))
+                && !(verifying
+                    && C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0)
             {
-                match self.adopt_stash(id, g, claimed_dirty, bag) {
+                match self.adopt_stash(id, g, claimed_dirty, walked, bag) {
                     replay_impl::Adopted::No => {}
                     replay_impl::Adopted::Panicked(raised) => {
                         verifying = false;

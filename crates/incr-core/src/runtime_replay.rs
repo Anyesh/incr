@@ -453,6 +453,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         generation: u32,
         claimed_dirty: bool,
+        walked: bool,
         bag: &mut Deferred<C>,
     ) -> Adopted {
         let rt = self.runtime_id;
@@ -530,7 +531,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 Some(_) if root => {
-                    self.dep_stack.poison_current_frame(rt);
+                    self.poison_reader(walked);
                     return Adopted::Landed(Computed::Unsettled);
                 }
                 None if root => return Adopted::Stale,
