@@ -7088,6 +7088,89 @@ fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
     });
 }
 
+/// Seed 0xd27d, shrunk by `replay_shrink`. 13 and 19 are fixpoints on a
+/// ring through 14, 15, 16, 17 and 18, which 15's read of 3 joins to the
+/// ring 4, 5, 6. Unbounded, `Get(19)` after `Get(15)` lands 17 and 18
+/// Failed and gives 9999; at a budget of 1 the bounded run leaves them
+/// Dirty and gives 0.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_caught_ring_panic_lands_failed_at_every_budget() {
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let c = |v| Box::new(Expr::Const(v));
+    let q = |expr, replay, bare, strategy| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy,
+    };
+    let zero = |replay, bare| q(Expr::Const(0), replay, bare, Strat::None);
+    let specs = vec![
+        zero(true, true),
+        zero(false, false),
+        zero(true, false),
+        replayable(Expr::Read(4, false), Strat::None),
+        replayable(
+            Expr::Read(5, true),
+            Strat::Fixpoint {
+                initial: 3,
+                limit: 1,
+            },
+        ),
+        replayable(Expr::If(r(6, false), c(0), r(5, false)), Strat::None),
+        q(Expr::If(r(13, true), c(1), c(0)), true, true, Strat::None),
+        zero(true, false),
+        zero(true, false),
+        zero(true, false),
+        zero(false, false),
+        zero(true, false),
+        zero(false, false),
+        replayable(
+            Expr::Read(14, false),
+            Strat::Fixpoint {
+                initial: 4,
+                limit: 2,
+            },
+        ),
+        q(Expr::Read(15, true), true, true, Strat::None),
+        replayable(
+            Expr::If(r(3, false), r(16, false), r(16, false)),
+            Strat::None,
+        ),
+        q(
+            Expr::Catch(Box::new(Expr::If(r(17, false), c(0), c(0)))),
+            false,
+            false,
+            Strat::None,
+        ),
+        replayable(Expr::Read(18, true), Strat::None),
+        replayable(Expr::PanicIf(r(19, false), 0), Strat::Fallback(1)),
+        replayable(
+            Expr::Read(13, false),
+            Strat::Fixpoint {
+                initial: 4,
+                limit: 2,
+            },
+        ),
+        zero(true, false),
+        zero(true, false),
+        Spec::Input(2),
+    ];
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 22,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(15), Op::Get(19)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0xd27d);
+        differential::<Shared>(&case, 0xd27d);
+    });
+}
+
 /// Base seed 0x675a, shrunk by `replay_shrink`. 4 and 10 form a ring that
 /// 4's read of 5 and 5's of 6 join; 6 reads 7, which panics on 8, and 8
 /// reaches 10 through 9. Unbounded, `Get(10)` after `TryGet(4)` lands 7
