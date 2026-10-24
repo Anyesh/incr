@@ -1836,10 +1836,21 @@ fn walk_entry_finds_its_dep_deleted(at: DepEntry, recycled: bool) {
     // The recompute's own walk passes E's points with their gates spent.
     assert_eq!(rt.get(d), 5);
     let z_runs = Arc::new(AtomicUsize::new(0));
-    let deleter = if recycled {
+    let new_z = || {
+        let z_runs = Arc::clone(&z_runs);
+        let z = rt.create_query(move |_: &Rt| {
+            z_runs.fetch_add(1, Ordering::SeqCst);
+            7_u64
+        });
+        assert_eq!(z.slot(), e.slot(), "Z reuses E's slot");
+        z
+    };
+    let (deleter, z) = if recycled {
         delete.release();
         rt.delete_node(e);
-        None
+        let z = new_z();
+        assert_eq!(rt.state_of(z), NodeState::New);
+        (None, Some(z))
     } else {
         let deleter = {
             let rt = Arc::clone(&rt);
@@ -1847,7 +1858,7 @@ fn walk_entry_finds_its_dep_deleted(at: DepEntry, recycled: bool) {
         };
         delete.wait_parked();
         assert_eq!(rt.state_of(e), NodeState::Dead);
-        Some(deleter)
+        (Some(deleter), None)
     };
     entry.release();
     let got = reader.join().unwrap();
@@ -1856,14 +1867,7 @@ fn walk_entry_finds_its_dep_deleted(at: DepEntry, recycled: bool) {
         delete.release();
         deleter.join().unwrap();
     }
-    let z = {
-        let z_runs = Arc::clone(&z_runs);
-        rt.create_query(move |_: &Rt| {
-            z_runs.fetch_add(1, Ordering::SeqCst);
-            7_u64
-        })
-    };
-    assert_eq!(z.slot(), e.slot(), "Z reuses E's slot");
+    let z = z.unwrap_or_else(new_z);
     assert_eq!(
         z_runs.load(Ordering::SeqCst),
         0,
