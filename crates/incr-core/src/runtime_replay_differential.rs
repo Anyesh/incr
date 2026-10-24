@@ -5420,10 +5420,10 @@ fn seed_2165_in_every_order() {
 
 /// 0x783 at budget 3: in the unbounded run 19 reads 18 before the episode
 /// of 16 to 18 forms, lands Dirty over its superseded landing and poisons
-/// 14, whose read of 19 the bounded run's retry makes only after 19 lands
-/// Clean, so 14 and 15 land Clean.
+/// 14, which reads 19 before 19's later Clean run. In the bounded run a
+/// speculative entry reaches 19 while 19's marked frame still holds the
+/// Dirty landing for its retry, so that entry must not land 19 Clean.
 #[test]
-#[ignore = "T8-first-landing-before-episode-783"]
 fn seed_783_at_budget_3() {
     let case = gen_case(0x783, false, false);
     quiet(|| {
