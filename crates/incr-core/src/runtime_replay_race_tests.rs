@@ -2597,7 +2597,9 @@ fn shared_retaken_delivery_after_another_thread_lands_failed() {
 /// on New, and must not run `n` a second time in the revision.
 #[test]
 fn a_claim_after_another_threads_speculative_run_does_not_run_it_again() {
-    let rt = Arc::new(Rt::new());
+    let mut rt = Rt::new();
+    rt.all_replayable = false;
+    let rt = Arc::new(rt);
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
     let input = rt.create_input(1_u64);

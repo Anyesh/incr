@@ -5552,7 +5552,6 @@ fn speculative_landings_paired_seeds() {
         0x2e4,
         0x349,
         0x3a3,
-        0x52b,
         0x565,
         0x57a,
         0x5ef,

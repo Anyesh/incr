@@ -29,6 +29,14 @@ macro_rules! local_and_shared {
     };
 }
 
+/// A runtime whose `Replay::Native` queries stay native under
+/// `INCR_TEST_ALL_REPLAYABLE`, for tests of what only native queries do.
+fn native_runtime<C: Cells>() -> Runtime<C> {
+    let mut rt = Runtime::new();
+    rt.all_replayable = false;
+    rt
+}
+
 pub(super) fn replayable<T>() -> QueryOpts<T> {
     QueryOpts {
         replay: Replay::Allowed,
@@ -702,7 +710,7 @@ local_and_shared!(
 /// and their doomed runs read leaves ahead of need, yet each leaf's closure
 /// runs once per revision.
 fn native_leaves_run_once_per_revision<C: Cells>(len: usize, fan: u64, budget: u32) {
-    let rt = Runtime::<C>::new();
+    let rt = native_runtime::<C>();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(budget);
     let input = rt.create_input(0_u64);
@@ -806,11 +814,15 @@ fn native_graph_never_speculates<C: Cells>(rt: &Runtime<C>) {
     assert!(rt.dooms.lock().unwrap().is_empty());
 }
 
-local_and_shared!(
-    native_graph_never_speculates,
-    local_native_graph_never_speculates,
-    shared_native_graph_never_speculates
-);
+#[test]
+fn local_native_graph_never_speculates() {
+    native_graph_never_speculates(&native_runtime::<Local>());
+}
+
+#[test]
+fn shared_native_graph_never_speculates() {
+    native_graph_never_speculates(&native_runtime::<Shared>());
+}
 
 /// `c` and `e` are a cycle with no strategy, reached only by the
 /// speculative runs of `r` and of `r2`, its copy. The cycle stashes nothing
@@ -818,7 +830,7 @@ local_and_shared!(
 /// compute it again in the revision; the later `get` of `c` computes it and
 /// meets the cycle as the unbounded run does.
 fn speculative_cycle_is_recomputed<C: Cells>(replay: bool) {
-    let rt = Runtime::<C>::new();
+    let rt = native_runtime::<C>();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
     let opts = || QueryOpts {
@@ -917,11 +929,15 @@ fn failed_nested_adoption_keeps_the_tried_mark<C: Cells>(rt: &Runtime<C>) {
     assert_eq!(C::u32_load_relaxed(&rt.stash_count), 1, "n lost its mark");
 }
 
-local_and_shared!(
-    failed_nested_adoption_keeps_the_tried_mark,
-    local_failed_nested_adoption_keeps_the_tried_mark,
-    shared_failed_nested_adoption_keeps_the_tried_mark
-);
+#[test]
+fn local_failed_nested_adoption_keeps_the_tried_mark() {
+    failed_nested_adoption_keeps_the_tried_mark(&native_runtime::<Local>());
+}
+
+#[test]
+fn shared_failed_nested_adoption_keeps_the_tried_mark() {
+    failed_nested_adoption_keeps_the_tried_mark(&native_runtime::<Shared>());
+}
 
 /// A speculative run's panic in `c` is stashed, not landed, and the later
 /// real `get` raises that payload with no second run, landing `c` Failed.
