@@ -795,6 +795,10 @@ struct EntryState {
     /// The address of a local of the outermost entry, from which a read
     /// measures the stack it has used against a byte budget.
     stack_base: Cell<usize>,
+    /// `BUDGET_CLOCK` when the outermost entry began: a runtime whose
+    /// budget changed later may have frames on the stack that read under
+    /// the budget before.
+    budget_clock: Cell<u64>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -802,6 +806,9 @@ struct EntryState {
 struct Outer {
     dissolved: Vec<(RuntimeId, u32)>,
     last_cycle: Option<Cycle>,
+    /// Each runtime whose budget change this thread has met, with the
+    /// `BUDGET_CLOCK` count of the change.
+    budgets_met: Vec<(RuntimeId, u64)>,
 }
 
 #[cfg(not(loom))]
@@ -816,6 +823,7 @@ thread_local! {
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
             stack_base: Cell::new(0),
+            budget_clock: Cell::new(0),
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
@@ -823,6 +831,7 @@ thread_local! {
         RefCell::new(Outer {
             dissolved: Vec::new(),
             last_cycle: None,
+            budgets_met: Vec::new(),
         })
     };
 }
@@ -838,11 +847,13 @@ loom::thread_local! {
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
         stack_base: Cell::new(0),
+        budget_clock: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         last_cycle: None,
+        budgets_met: Vec::new(),
     });
 }
 
@@ -1001,6 +1012,33 @@ pub(crate) fn outermost_entries() -> u64 {
     OUTERMOST_ENTRIES.with(Cell::get)
 }
 
+/// Counts budget changes across runtimes, so an outermost entry and a
+/// runtime's last change can be ordered.
+static BUDGET_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A new `BUDGET_CLOCK` count, for a budget change.
+pub(crate) fn tick_budget_clock() -> u64 {
+    BUDGET_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Whether runtime `rt`'s budget change at `changed` is one this thread
+/// meets for the first time inside its outermost entry, which notes it.
+pub(crate) fn meet_budget_change(rt: RuntimeId, changed: u64) -> bool {
+    if changed <= ENTRY.with(|e| e.budget_clock.get()) {
+        return false;
+    }
+    OUTER.with(|o| {
+        let met = &mut o.borrow_mut().budgets_met;
+        match met.iter_mut().find(|(r, _)| *r == rt) {
+            Some((_, at)) if *at >= changed => return false,
+            Some((_, at)) => *at = changed,
+            None => met.push((rt, changed)),
+        }
+        ENTRY.with(|e| e.outer_set.set(true));
+        true
+    })
+}
+
 /// The stack address the outermost engine entry recorded.
 pub(crate) fn stack_base() -> usize {
     ENTRY.with(|e| e.stack_base.get())
@@ -1077,6 +1115,8 @@ impl EntryDepth {
             e.depth.set(depth + 1);
             if depth == 0 {
                 e.stack_base.set(base);
+                e.budget_clock
+                    .set(BUDGET_CLOCK.load(std::sync::atomic::Ordering::Relaxed));
                 #[cfg(all(test, not(loom)))]
                 OUTERMOST_ENTRIES.with(|n| n.set(n.get() + 1));
             }
@@ -1114,6 +1154,7 @@ pub(crate) fn reset_outermost() {
             let mut o = o.borrow_mut();
             o.dissolved.clear();
             o.last_cycle = None;
+            o.budgets_met.clear();
         });
     }
 }

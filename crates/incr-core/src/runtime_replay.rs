@@ -107,18 +107,25 @@ static UNBUDGETED_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomi
 
 #[cfg(test)]
 thread_local! {
-    /// Run once by this thread's next `BudgetEntry::note`, after its caller
-    /// decided and before it locks `UNBUDGETED`.
+    /// Run once by this thread's next `BudgetEntry::note`, before it locks
+    /// `UNBUDGETED`.
     pub(crate) static NOTE_DECIDED: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::Cell::new(None) };
 }
 
-/// A runtime's place in `UNBUDGETED`, which its drop gives up.
-pub(crate) struct BudgetEntry(RuntimeId);
+/// A runtime's place in `UNBUDGETED`, which its drop gives up, and the
+/// `BUDGET_CLOCK` count its budget last changed at.
+pub(crate) struct BudgetEntry {
+    id: RuntimeId,
+    changed: std::sync::atomic::AtomicU64,
+}
 
 impl BudgetEntry {
     pub(crate) fn new(id: RuntimeId, max_frames: u32) -> Self {
-        let entry = Self(id);
+        let entry = Self {
+            id,
+            changed: std::sync::atomic::AtomicU64::new(0),
+        };
         if max_frames == u32::MAX {
             entry.note(|| true);
         }
@@ -126,8 +133,8 @@ impl BudgetEntry {
     }
 
     /// Lists the runtime as unbudgeted, or takes it off the list, as
-    /// `unbudgeted` says under the list's lock: the lock orders racing
-    /// setters, so the last to take it sees every budget stored before.
+    /// `unbudgeted` says under the list's lock: setters store their budget
+    /// inside `unbudgeted`, so the lock orders racing setters whole.
     fn note(&self, unbudgeted: impl FnOnce() -> bool) {
         #[cfg(test)]
         if let Some(hook) = NOTE_DECIDED.with(std::cell::Cell::take) {
@@ -137,8 +144,8 @@ impl BudgetEntry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let unbudgeted = unbudgeted();
-        match (list.iter().position(|&id| id == self.0), unbudgeted) {
-            (None, true) => list.push(self.0),
+        match (list.iter().position(|&id| id == self.id), unbudgeted) {
+            (None, true) => list.push(self.id),
             (Some(at), false) => {
                 list.swap_remove(at);
             }
@@ -166,9 +173,49 @@ pub(super) fn unbudgeted(id: RuntimeId) -> bool {
 }
 
 impl<C: Cells> Runtime<C> {
-    /// Keeps `UNBUDGETED` in step with this runtime's budgets.
-    pub(super) fn note_budget(&self) {
-        self.budget_entry.note(|| !self.budgeted());
+    /// Sets the frame and byte budgets `budget` gives, and keeps
+    /// `UNBUDGETED` in step with them, both under the list's lock. A change
+    /// takes a `BUDGET_CLOCK` count, stored before the budgets so a read
+    /// that sees them sees it (`hold_running_frames`).
+    pub(super) fn set_budget(&self, budget: impl FnOnce() -> (u32, usize)) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.budget_entry.note(|| {
+            let (frames, bytes) = budget();
+            if (frames, bytes)
+                != (
+                    self.max_frames.load(Relaxed),
+                    self.max_stack_bytes.load(Relaxed),
+                )
+            {
+                self.budget_entry
+                    .changed
+                    .store(cycle_state::tick_budget_clock(), Relaxed);
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                self.max_frames.store(frames, Relaxed);
+                self.max_stack_bytes.store(bytes, Relaxed);
+            }
+            !self.budgeted()
+        });
+    }
+
+    /// Raises `NO_DOOM` on this runtime's frames on this thread when it
+    /// first meets a budget change made since its outermost entry began,
+    /// and returns whether it did: those frames may have read under the
+    /// budget before, which kept nothing a retry under this one needs.
+    #[cold]
+    #[inline(never)]
+    fn hold_running_frames(&self) -> bool {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        let changed = self
+            .budget_entry
+            .changed
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !cycle_state::meet_budget_change(self.runtime_id, changed) {
+            return false;
+        }
+        self.dep_stack
+            .raise_on_undoomed(self.runtime_id, cycle::NO_DOOM);
+        true
     }
 
     /// Whether node `slot`'s compute may be doomed.
@@ -190,6 +237,8 @@ impl<C: Cells> Runtime<C> {
     /// doomed: it is `NO_DOOM`, or it took a foreign read's hold within this
     /// runtime's budget where it read, past which the stack bound wins, as
     /// for a ticket payload, and its retry reads the other runtime again.
+    /// A frame running when this thread meets a budget change is
+    /// `NO_DOOM` from then on.
     fn undoomable(&self, ctl: &ComputeCtl, depth: u32) -> bool {
         let flags = ctl.flags.get();
         flags & cycle::NO_DOOM != 0
@@ -198,6 +247,7 @@ impl<C: Cells> Runtime<C> {
                     .dep_stack
                     .hold_position(ctl)
                     .is_some_and(|at| !self.over_budget_at(depth, at)))
+            || (self.hold_running_frames() && ctl.has(cycle::NO_DOOM))
     }
 
     /// Whether a read from a frame `depth` frames deep is at or past a
@@ -341,7 +391,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 if self.over_budget(f.depth)
-                    && !ctl.has(cycle::NO_DOOM)
+                    && !self.undoomable(ctl, f.depth)
                     && self.replayable(f.node.0)
                     && self.placeholder::<T>().is_some()
                 {
@@ -854,8 +904,9 @@ impl<C: Cells> Runtime<C> {
 
     /// A read made in a doomed frame: the placeholder, after pushing the
     /// node as an entry above the frame unless this thread computes,
-    /// holds or virtually computes it. `None` for a type with no
-    /// placeholder, which the read computes natively.
+    /// holds or virtually computes it, or the frame was blocked reading
+    /// it. `None` for a type with no placeholder, which the read computes
+    /// natively.
     fn read_doomed<T: Value>(&self, handle: Incr<T>, f: ActiveRead) -> Option<T> {
         let placeholder = self.placeholder::<T>()?;
         let rt = self.runtime_id;
@@ -882,7 +933,15 @@ impl<C: Cells> Runtime<C> {
             if x.drop_point.is_some() {
                 return;
             }
-            let spec = x.vstack[(f.cidx - x.boundary) as usize].spec;
+            let frame = &x.vstack[(f.cidx - x.boundary) as usize];
+            // The retry makes the read the frame was blocked in before this
+            // one, and that read settles the node as the unbounded run's
+            // did: an entry landing it first would leave a stashed walk
+            // unresumed.
+            if frame.reading == u64::from(slot) | (u64::from(handle.generation()) << 32) {
+                return;
+            }
+            let spec = frame.spec;
             x.push_entry(
                 f.cidx + 1 - x.boundary,
                 Entry {
@@ -1993,12 +2052,7 @@ impl<C: Cells> Runtime<C> {
                             let kind = cycle_state::unwind_kind();
                             let contain = entry.walked
                                 && !self.episode_member(entry.node)
-                                && self.containable(
-                                    NodeId(entry.node),
-                                    Some(cidx),
-                                    kind,
-                                    &*payload,
-                                );
+                                && self.containable(NodeId(entry.node), cidx, kind, &*payload);
                             let mut bag = Deferred::new();
                             let payload =
                                 self.continuation_unwound(entry.node, cidx, payload, &mut bag);
@@ -2473,7 +2527,7 @@ impl<C: Cells> Runtime<C> {
         if continuation {
             let contain = v.walked
                 && !self.episode_member(v.node)
-                && self.containable(NodeId(v.node), Some(v.cidx), kind, &*payload);
+                && self.containable(NodeId(v.node), v.cidx, kind, &*payload);
             payload = self.continuation_unwound(v.node, v.cidx, payload, &mut bag);
             if contain {
                 cycle_state::take_unwind_kind();
@@ -3002,17 +3056,17 @@ impl<C: Cells> Runtime<C> {
         }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
-        // passes on as an ordinary panic, as `entered` does, unless a member
-        // run read a member of its own episode: that read is R5's, whose
-        // unwind stays the cycle's (`member_run_unwound`). It carries the
-        // landings noted for it before the catch, as the native box does.
+        // passes on as an ordinary panic, as `entered` does, unless the read
+        // was of a member this thread holds: that read is R5's, from any
+        // frame, whose unwind stays the cycle's (`member_run_unwound`). It
+        // carries the landings noted for it before the catch, as the native
+        // box does.
         let payload = match payload.downcast::<crate::cycle::CycleUnwind>() {
             Ok(unwind) if kind == ReadKind::TryGet => return Some(Err(unwind.0)),
             Ok(unwind) => unwind,
             Err(payload) => {
                 self.note_delivered(nodes, &*payload);
-                let r5 =
-                    episode.is_some() && cycle_state::held_episode(rt, handle.slot()) == episode;
+                let r5 = cycle_state::held_episode(rt, handle.slot()).is_some();
                 if kind == ReadKind::TryGet && !r5 {
                     resume_unwind(payload);
                 }

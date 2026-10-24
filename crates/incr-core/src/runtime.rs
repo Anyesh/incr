@@ -1391,17 +1391,22 @@ impl<C: Cells> Runtime<C> {
     /// this runtime's frames on the thread number `n` or more (every
     /// runtime's, under `Shared`) replays instead of nesting, if the read's
     /// type has a placeholder. Replay changes where computes run, never a
-    /// result. A budget changed while a compute runs applies to reads made
-    /// after the change.
+    /// result. A compute running on a thread when that thread first meets
+    /// a budget change is never replayed for it, since its reads before
+    /// were made under the budget before.
     ///
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
         assert!(n > 0, "incr-core: the frame budget is at least 1");
-        self.frames_set
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.max_frames
-            .store(n, std::sync::atomic::Ordering::Relaxed);
-        self.note_budget();
+        self.set_budget(|| {
+            self.frames_set
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            (
+                n,
+                self.max_stack_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
     }
 
     /// Sets a byte budget beside the frame budget, off when `n` is 0 (the
@@ -1411,16 +1416,16 @@ impl<C: Cells> Runtime<C> {
     /// the frame count alone does not bound the stack. Like
     /// [`Self::set_max_frames`], it wins over `INCR_MAX_DEPTH`: a runtime
     /// that has not set its frame budget gets [`DEFAULT_MAX_FRAMES`]. A
-    /// budget changed while a compute runs applies to reads made after the
-    /// change.
+    /// change spares running computes as [`Self::set_max_frames`]'s does.
     pub fn set_max_stack_bytes(&self, n: usize) {
-        if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
-            self.max_frames
-                .store(DEFAULT_MAX_FRAMES, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.max_stack_bytes
-            .store(n, std::sync::atomic::Ordering::Relaxed);
-        self.note_budget();
+        self.set_budget(|| {
+            let frames = if self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
+                self.max_frames.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                DEFAULT_MAX_FRAMES
+            };
+            (frames, n)
+        });
     }
 
     /// A clone of `T`'s placeholder, if it has one.
@@ -3799,7 +3804,7 @@ impl<C: Cells> Runtime<C> {
         // A closure that catches a speculative run's discard can't land a
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
-        let contain = walked && self.containable(id, Some(attempt.cidx), kind, &*payload);
+        let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -3859,24 +3864,20 @@ impl<C: Cells> Runtime<C> {
         bag.drain_carried(payload)
     }
 
-    /// Whether walk entry `entry` contains an unwind out of its compute,
-    /// asked before the compute's frame releases its claims: a panic, or a
-    /// cycle none of whose members this thread will still hold or has a
-    /// virtual frame of, so that every member ran above the walk and the
-    /// unwind released it. The entry's own claim is not counted: the
-    /// unwind releases it too, and a virtual frame's run still holds it
-    /// when this is asked. When the unwind is the compute's own, `own` is
-    /// its position, and the claims held at or above it are not counted
-    /// either. An episode's abort passes `None`: its held members keep it,
-    /// as they keep a direct episode's, because a retry can reach as walk
-    /// entries the members the unbounded run's direct episode aborts in.
-    /// A closure that swallowed a cycle and then panicked is contained as
-    /// any panic. A wounded thread must reach its outermost entry, so it
-    /// contains none.
+    /// Whether walk entry `entry`, at position `cidx`, contains an unwind
+    /// out of its compute, asked before the compute's frame releases its
+    /// claims: a panic, or a cycle none of whose members this thread will
+    /// still hold or has a virtual frame of, so that every member ran above
+    /// the walk and the unwind released it. The entry's own claim and the
+    /// claims held at or above its position are not counted: the unwind
+    /// releases them too, and a virtual frame's run still holds the entry's
+    /// when this is asked. A closure that swallowed a cycle and then
+    /// panicked is contained as any panic. A wounded thread must reach its
+    /// outermost entry, so it contains none.
     pub(super) fn containable(
         &self,
         entry: NodeId,
-        own: Option<u32>,
+        cidx: u32,
         kind: Option<UnwindKind>,
         payload: &(dyn std::any::Any + Send),
     ) -> bool {
@@ -3890,11 +3891,7 @@ impl<C: Cells> Runtime<C> {
                     .iter()
                     .map(|p| NodeId(p.slot()))
                     .all(|p| {
-                        (p == entry
-                            || own.map_or_else(
-                                || self.own_claim_owner(p).is_none(),
-                                |cidx| self.unwind_releases(p, cidx),
-                            ))
+                        (p == entry || self.unwind_releases(p, cidx))
                             && self.virtual_owner(p).is_none()
                     })
             }),
