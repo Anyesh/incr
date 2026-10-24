@@ -395,7 +395,7 @@ pub trait DepStack: 'static {
     }
 
     /// [`Self::poison_current_frame`] with `flag`, `POISONED` or
-    /// `FAILED_READ`.
+    /// `HANDLED`.
     fn poison_current_frame_with(&self, rt: RuntimeId, flag: u16) {
         self.with(|s| {
             if let Some(top) = s.reader(rt) {

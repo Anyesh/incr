@@ -377,6 +377,28 @@ impl<C: Cells> NodeData<C> {
         C::u64_fetch_max(&self.changed_at, v);
     }
 
+    /// A query's `verified_at` while it holds a memo: below every
+    /// revision, so verification treats it as never verified, and any
+    /// later stamp's max replaces it.
+    pub const MEMO: u64 = 1;
+
+    /// Keep a Dirty query's value for the rest of revision `rev`: reads in
+    /// `rev` take it without a run, and the first read after a set runs
+    /// the closure. Raising `changed_at` to `rev` only makes the node
+    /// newer to its readers' verification. Before the landing's store, so
+    /// a reader that loads the Dirty state sees the memo.
+    #[inline(always)]
+    pub(crate) fn set_memo(&self, rev: u64) {
+        self.set_verified_at(Self::MEMO);
+        self.max_changed_at(rev);
+    }
+
+    /// Whether the query, loaded Dirty, holds a memo for revision `rev`.
+    #[inline(always)]
+    pub(crate) fn memo_at(&self, rev: u64) -> bool {
+        self.verified_at() == Self::MEMO && self.changed_at() == rev
+    }
+
     /// Sentinel meaning "a set() is in flight on this input". Any
     /// verifier comparing `changed_at > my_verified` sees the marker as
     /// infinitely new and recomputes instead of verifying clean. Without

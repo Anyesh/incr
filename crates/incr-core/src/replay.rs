@@ -558,12 +558,14 @@ pub(crate) enum Delivered {
         nodes: Landings,
     },
     /// The entry landed without a Clean value. The unbounded run's read
-    /// takes the slot as the compute left it, poisoned, where a later read
-    /// would walk and run the node again. It is that value, cloned when
-    /// the delivery is made, because a later run in the context may
-    /// compute the node again before the retry reads it. Until a read
-    /// takes it, it is a clone the unbounded run never builds.
-    Landed(Unbuilt<dyn Any + Send>),
+    /// takes the slot as the compute left it, raising the flag beside it
+    /// on the reader (`Runtime::dirty_read_poison`), where a later read
+    /// would walk and run the node again unless it holds a memo. It is
+    /// that value, cloned when the delivery is made, because a later run
+    /// in the context may compute the node again before the retry reads
+    /// it. Until a read takes it, it is a clone the unbounded run never
+    /// builds.
+    Landed(Unbuilt<dyn Any + Send>, u16),
     /// The rest of the walk of the frame's blocked read, from the compute
     /// a doom stopped it at: the retry's walk of that read resumes it, as
     /// the unbounded run's walk goes on after that compute. With the node
@@ -1636,7 +1638,9 @@ pub(crate) fn take_pending(
             // run must not resume that walk or recompute its node.
             x.pending.take_keyed(key);
             Some(match &x.pending.get(at).what {
-                Delivered::Landed(value) => Delivered::Landed(Unbuilt::new(clone(value.value()))),
+                Delivered::Landed(value, poison) => {
+                    Delivered::Landed(Unbuilt::new(clone(value.value())), *poison)
+                }
                 Delivered::Walk(..) | Delivered::Direct => {
                     unreachable!("incr-core: a walk's direction is not a value")
                 }

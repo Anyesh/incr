@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 
 use std::sync::Arc;
 
-use crate::cycle::{self, Cycle, Erased, ErasedStrategy};
+use crate::cycle::{Cycle, Erased, ErasedStrategy};
 use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
@@ -114,7 +114,7 @@ pub(crate) struct Held {
     opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    /// The `POISONED` and `FAILED_READ` flags of the runs' frames.
+    /// The `POISONED` and `HANDLED` flags of the runs' frames.
     poison: u16,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
@@ -170,7 +170,7 @@ impl Held {
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
-    /// child index and its frame's `POISONED` and `FAILED_READ` flags
+    /// child index and its frame's `POISONED` and `HANDLED` flags
     /// (`poison`). Under speculation it first
     /// keeps the record it replaces; outside, it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
@@ -349,16 +349,9 @@ impl<H: Borrow<Held>> Seen<H> {
         self.0.borrow().opened
     }
 
-    /// A run read a dep that did not land Clean, other than one landed
-    /// Failed, so the landing is Dirty.
-    pub(crate) fn poisoned(&self) -> bool {
-        self.0.borrow().poison & cycle::POISONED != 0
-    }
-
-    /// A run read a dep that did not land Clean, so the landing is
-    /// unverified (`verified_at` 0).
-    pub(crate) fn unverified(&self) -> bool {
-        self.0.borrow().poison != 0
+    /// The runs' `POISONED` and `HANDLED` flags: either lands Dirty.
+    pub(crate) fn poison(&self) -> u16 {
+        self.0.borrow().poison
     }
 }
 

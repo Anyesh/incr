@@ -37,7 +37,7 @@ fn a_real_look_settles_what_a_speculative_run_wrote() {
         assert!(settled.is_none());
         assert_eq!(read(seen.buf()), Some(7777));
         assert_eq!(seen.last(), &[(NodeId(3), 0)]);
-        assert!(seen.opened() && seen.poisoned());
+        assert!(seen.opened() && seen.poison() != 0);
     }
     assert!(e.spec_written());
     let (seen, settled) = e.look(Look::REAL);
@@ -46,7 +46,7 @@ fn a_real_look_settles_what_a_speculative_run_wrote() {
     assert_eq!(seen.deps(), &[(NodeId(2), 0)]);
     assert_eq!(seen.last(), &[(NodeId(2), 0)]);
     assert_eq!(seen.installed(), &[NodeId(2)]);
-    assert!(!seen.opened() && !seen.poisoned());
+    assert!(!seen.opened() && seen.poison() == 0);
     assert!(!seen.spec_written());
 }
 
@@ -76,7 +76,7 @@ fn a_real_write_settles_before_it_records() {
     assert_eq!(seen.deps(), &[(NodeId(2), 0), (NodeId(4), 0)]);
     assert_eq!(seen.last(), &[(NodeId(4), 0)]);
     assert_eq!(seen.installed(), &[NodeId(2), NodeId(4)]);
-    assert!(seen.opened() && seen.poisoned());
+    assert!(seen.opened() && seen.poison() != 0);
 }
 
 #[test]
@@ -115,7 +115,7 @@ fn a_settle_restores_the_record_from_before_the_first_speculative_run() {
     assert_eq!(seen.deps(), &[(NodeId(2), 0)]);
     assert_eq!(seen.last(), &[(NodeId(2), 0)]);
     assert_eq!(seen.installed(), &[NodeId(2)]);
-    assert!(!seen.opened() && !seen.poisoned());
+    assert!(!seen.opened() && seen.poison() == 0);
 }
 
 #[test]

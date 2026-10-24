@@ -1377,25 +1377,13 @@ fn shared_unwritten_speculative_value_drop_is_not_raised() {
     );
 }
 
-/// A node that reads itself, with no strategy: a closure that catches
-/// its cycle lands Dirty.
-fn self_cycle<C: Cells>(rt: &Runtime<C>) -> Incr<i64> {
-    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
-    let q = {
-        let cell = cell.clone();
-        rt.create_query(move |rt| rt.get(*cell.get().unwrap()))
-    };
-    cell.set(q).unwrap();
-    q
-}
-
 /// Under a frame budget that is never reached, f's read of a poisoned
 /// (Dirty) p keeps a clone of Boom(31) the unbounded run never makes. A
 /// later top-level g that reads another Dirty node must still return 1
 /// and leave Boom(31) undropped, as the unbounded run does.
 fn wave7_kept_dirty_read_clone_drop_is_not_raised<C: Cells>(rt: &Runtime<C>, frames: u32) {
     rt.set_max_frames(frames);
-    let q = self_cycle(rt);
+    let q = rt.create_query(|_| -> i64 { panic!("q boom") });
     let p = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
         Boom(31)
@@ -1404,7 +1392,7 @@ fn wave7_kept_dirty_read_clone_drop_is_not_raised<C: Cells>(rt: &Runtime<C>, fra
         std::mem::forget(rt.get(p));
         0_u64
     });
-    let q2 = self_cycle(rt);
+    let q2 = rt.create_query(|_| -> i64 { panic!("q2 boom") });
     let p2 = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q2)));
         Boom(32)
@@ -1442,52 +1430,12 @@ fn shared_wave7_kept_dirty_read_clone_drop_is_not_raised() {
     );
 }
 
-/// A caught Failed read lands p Clean, so f's read keeps no clone: no
-/// Boom(34) is dropped during get(f) at any budget, as unbounded.
-fn caught_failed_read_keeps_no_clone<C: Cells>(rt: &Runtime<C>, frames: u32) {
-    rt.set_max_frames(frames);
-    let q = rt.create_query(|_| -> i64 { panic!("q boom") });
-    let p = rt.create_query(move |rt| {
-        let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
-        Boom(34)
-    });
-    let f = rt.create_query(move |rt| {
-        std::mem::forget(rt.get(p));
-        0_u64
-    });
-    arm(34);
-    let got = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_err(panic_message);
-    let still_armed = disarm(34);
-    assert_eq!(got, Ok(0), "frames {frames}");
-    assert!(
-        still_armed,
-        "no Boom(34) dropped during get(f), frames {frames}"
-    );
-    assert_eq!(rt.state_of(p), NodeState::Clean, "frames {frames}");
-}
-
-#[test]
-fn local_caught_failed_read_keeps_no_clone() {
-    for frames in [u32::MAX, 64, crate::DEFAULT_MAX_FRAMES] {
-        caught_failed_read_keeps_no_clone(&Runtime::<Local>::new(), frames);
-    }
-}
-
-#[test]
-#[cfg_attr(miri, ignore)]
-fn shared_caught_failed_read_keeps_no_clone() {
-    in_shared_child(
-        "runtime::drop_panic_tests::shared_caught_failed_read_keeps_no_clone",
-        |rt| caught_failed_read_keeps_no_clone(rt, 64),
-    );
-}
-
 /// The kept clone of a poisoned Dirty read is dropped when its frame pops,
 /// and its `Drop` panic is no event of the run's: `get(f)` returns 0 and
 /// `f` is not Failed under a budget, as unbounded, where no clone is made.
 fn wave7_kept_dirty_read_clone_drops_isolated<C: Cells>(rt: &Runtime<C>, frames: u32) {
     rt.set_max_frames(frames);
-    let q = self_cycle(rt);
+    let q = rt.create_query(|_| -> i64 { panic!("q boom") });
     let p = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
         Boom(33)
@@ -1500,7 +1448,6 @@ fn wave7_kept_dirty_read_clone_drops_isolated<C: Cells>(rt: &Runtime<C>, frames:
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_err(panic_message);
     disarm(33);
     assert_eq!(got, Ok(0), "frames {frames}");
-    assert_eq!(rt.state_of(p), NodeState::Dirty, "p was poisoned");
     assert_ne!(rt.state_of(f), NodeState::Failed, "frames {frames}");
 }
 

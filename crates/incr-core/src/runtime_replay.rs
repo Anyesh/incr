@@ -287,7 +287,7 @@ impl<C: Cells> Runtime<C> {
         word & value_code::REPLAY_BIT != 0
             && replay::speculative()
             && !ctl.has(cycle::DOOMED)
-            && (ctl.has(cycle::POISONED | cycle::FAILED_READ)
+            && (ctl.has(cycle::POISONED | cycle::HANDLED)
                 || deps.iter().any(|&(d, _)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
@@ -1095,7 +1095,14 @@ impl<C: Cells> Runtime<C> {
         let value = Unbuilt::new(value);
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
         let ordinal = self.dep_stack.reads_of_current(self.runtime_id);
-        self.keep_read(f.ctl, f.cidx, reading, ordinal, Delivered::Landed(value));
+        let poison = self.dirty_read_poison(self.nodes.get(handle.slot()));
+        self.keep_read(
+            f.ctl,
+            f.cidx,
+            reading,
+            ordinal,
+            Delivered::Landed(value, poison),
+        );
     }
 
     /// The active frame's read took `payload`, a user panic or a cycle
@@ -1167,7 +1174,7 @@ impl<C: Cells> Runtime<C> {
         };
         let what = Delivered::Unwind {
             cycle: false,
-            poison: cycle::FAILED_READ,
+            poison: cycle::HANDLED,
             attributed: false,
             payload: copy,
             nodes: self.copy_notes(payload, cidx + 1),
@@ -1266,7 +1273,7 @@ impl<C: Cells> Runtime<C> {
             .foreign_key(word, (reader, node, flags, cidx), reading, ordinal)
             .and_then(|key| replay::take_pending(reader, &key, clone_landed::<T>));
         let outcome = match taken {
-            Some(Delivered::Landed(value)) => Ok(Ok(*value
+            Some(Delivered::Landed(value, _)) => Ok(Ok(*value
                 .into_inner()
                 .downcast::<T>()
                 .expect("incr-core: a landed value has its node's type"))),
@@ -1287,7 +1294,10 @@ impl<C: Cells> Runtime<C> {
             })),
         };
         let what = match &outcome {
-            Ok(Ok(value)) => Some(Delivered::Landed(Unbuilt::new(clone_landed::<T>(value)))),
+            Ok(Ok(value)) => Some(Delivered::Landed(
+                Unbuilt::new(clone_landed::<T>(value)),
+                cycle::POISONED,
+            )),
             Ok(Err(c)) => Some(Delivered::Unwind {
                 cycle: true,
                 poison: 0,
@@ -1653,7 +1663,7 @@ impl<C: Cells> Runtime<C> {
                 // the entry it was blocked on, made for the read.
                 if x.pending
                     .find_keyed(&key, |d| {
-                        matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
+                        matches!(d.what, Delivered::Landed(..) | Delivered::Unwind { .. })
                     })
                     .is_none()
                 {
@@ -2495,7 +2505,7 @@ impl<C: Cells> Runtime<C> {
     /// popping frame's own flag.
     fn alone_lands_dirty(&self, slot: u32, spec: bool) -> bool {
         self.look_held(slot, Look::here_or(spec), |e| {
-            e.poisoned()
+            e.poison() != 0
                 || e.last().iter().any(|&(d, _)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
@@ -3115,9 +3125,9 @@ impl<C: Cells> Runtime<C> {
             Delivered::Walk(..) | Delivered::Direct => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
-            Delivered::Landed(value) => {
+            Delivered::Landed(value, poison) => {
                 // SAFETY: the active frame's control block is live.
-                unsafe { &*f.ctl }.raise(cycle::POISONED);
+                unsafe { &*f.ctl }.raise(poison);
                 return Some(Ok(*value
                     .into_inner()
                     .downcast::<T>()
@@ -3236,9 +3246,12 @@ impl<C: Cells> Runtime<C> {
         let state = state::load::<C>(self.nodes.get(node).state_cell());
         let reading = u64::from(node) | (u64::from(generation) << 32);
         let what = match state {
-            NodeState::Dirty => self
-                .slot_value(node)
-                .map(|v| Delivered::Landed(Unbuilt::new(v))),
+            NodeState::Dirty => self.slot_value(node).map(|v| {
+                Delivered::Landed(
+                    Unbuilt::new(v),
+                    self.dirty_read_poison(self.nodes.get(node)),
+                )
+            }),
             NodeState::New | NodeState::Cyclic => {
                 self.inner
                     .read()

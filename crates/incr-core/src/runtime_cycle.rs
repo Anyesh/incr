@@ -1970,12 +1970,15 @@ impl<C: Cells> Runtime<C> {
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
             None
         } else {
-            if e.unverified() {
+            let poison = e.poison();
+            if self.memo_landing(poison, verify_rev) {
+                node.set_memo(verify_rev);
+            } else if poison != 0 {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
             }
-            let (target, children) = if published == Publish::Superseded || e.poisoned() {
+            let (target, children) = if published == Publish::Superseded || poison != 0 {
                 (NodeState::Dirty, ChildLanding::Keep)
             } else {
                 (NodeState::Clean, ChildLanding::Sweep)
@@ -2078,7 +2081,6 @@ impl<C: Cells> Runtime<C> {
                 members.binary_search(&d.0).is_err()
                     && !old.contains(d)
                     && !self.observed_clean(*d, verify_rev)
-                    && !self.failed_unmoved(*d, verify_rev)
             });
             if old != new {
                 if let Some(displaced) = node.install_deps(new) {
@@ -2106,6 +2108,11 @@ impl<C: Cells> Runtime<C> {
             C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
         }
         drop(inner);
+
+        // A member's handled outcome holds for the revision, and every
+        // member's value is built on it, so all of them keep a memo.
+        let poison = entries.iter().fold(0, |p, (_, e)| p | e.poison());
+        let memo = self.memo_landing(poison, verify_rev);
 
         // Step 3: write the values and stamp.
         for i in 0..entries.len() {
@@ -2145,7 +2152,9 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if entries[i].1.unverified() {
+            if memo && cu.binary_search(&m).is_err() {
+                node.set_memo(verify_rev);
+            } else if entries[i].1.poison() != 0 {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
@@ -2155,9 +2164,10 @@ impl<C: Cells> Runtime<C> {
         // Steps 4 and 5: land, all Dirty if any member was flagged or a
         // new dep may hide a change.
         let dirty = superseded
-            || entries.iter().any(|(m, e)| {
-                e.poisoned() || self.nodes.get(*m).state() == NodeState::ComputingDirty
-            });
+            || poison != 0
+            || entries
+                .iter()
+                .any(|(m, _)| self.nodes.get(*m).state() == NodeState::ComputingDirty);
         for (m, e) in entries {
             let node = self.nodes.get(m);
             self.record_trace(
@@ -2374,7 +2384,7 @@ impl<C: Cells> Runtime<C> {
         for &(m, _) in &group.members {
             let node = self.nodes.get(m);
             let verified = node.verified_at();
-            if verified == 0 {
+            if verified <= NodeData::<C>::MEMO {
                 #[cfg(test)]
                 self.group_zero_fails
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

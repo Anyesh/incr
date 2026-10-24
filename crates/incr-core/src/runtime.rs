@@ -2992,6 +2992,17 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => continue,
+                // A memo stands for the node's run in this revision, so its
+                // deps are not expanded; the root's compute reads it.
+                NodeState::Dirty if node.memo_at(self.current_revision()) => {
+                    if is_root {
+                        walk.push(Entry {
+                            id: cur,
+                            taint: NO_TAINT,
+                        });
+                    }
+                    continue;
+                }
                 NodeState::Dirty
                     if C::u8_load_relaxed(flags) & IN_GROUP != 0
                         && self.expand_group(cur, &mut walk) =>
@@ -3287,6 +3298,16 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
+                NodeState::Dirty if node.memo_at(self.current_revision()) => {
+                    // A walk entry's memo reaches the reader only through
+                    // the reading node's own run.
+                    if walked {
+                        return Computed::Done;
+                    }
+                    self.dep_stack
+                        .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
+                    return Computed::Unsettled;
+                }
                 NodeState::Computing | NodeState::ComputingDirty => {
                     // A walk's deps-first computes can defer the walk's own
                     // root into this thread's held map: its reader reads it
@@ -3522,10 +3543,10 @@ impl<C: Cells> Runtime<C> {
             // as changed, which catches a walk that passed this node before
             // the claim, and a dep that landed Dirty without a new stamp.
             // A `verified_at` of 0 means never verified, and an empty slot
-            // may sit behind it, so it always fails.
+            // may sit behind it, so it always fails, as does a memo's.
             if verifying {
                 let my_verified = node.verified_at();
-                let mut any_changed = my_verified == 0;
+                let mut any_changed = my_verified <= NodeData::<C>::MEMO;
                 node.for_each_dep(|dep| {
                     if !any_changed && !self.observed_clean(dep, my_verified) {
                         any_changed = true;
@@ -3741,8 +3762,10 @@ impl<C: Cells> Runtime<C> {
                 }
 
                 let poison = ctl.poison();
-                let poisoned = poison & cycle::POISONED != 0;
-                if poison != 0 {
+                let memo = self.memo_landing(poison, verify_rev);
+                if memo {
+                    node.set_memo(verify_rev);
+                } else if poison != 0 {
                     // The value may be built on a result the closure
                     // swallowed from a dep that did not land Clean or whose
                     // cleanup failed, and that dep's stamps need not have
@@ -3756,10 +3779,9 @@ impl<C: Cells> Runtime<C> {
 
                 // Finish. Land Dirty instead of Clean if a set() flagged us
                 // ComputingDirty mid-compute, if a new dep changed after we
-                // read it, or if a dep we read did not itself land Clean or
-                // Failed, so the next reader recomputes against the newer
-                // input.
-                let target = if published == Publish::Superseded || poisoned {
+                // read it, or if a dep we read did not itself land Clean, so
+                // the next reader recomputes against the newer input.
+                let target = if published == Publish::Superseded || poison != 0 {
                     NodeState::Dirty
                 } else {
                     NodeState::Clean
@@ -3772,7 +3794,14 @@ impl<C: Cells> Runtime<C> {
                     // The enclosing compute read this node through a non-Clean
                     // landing. Its own publish may take the fast path, where
                     // nothing else would catch that.
-                    self.dep_stack.poison_current_frame(self.runtime_id);
+                    self.dep_stack.poison_current_frame_with(
+                        self.runtime_id,
+                        if memo {
+                            cycle::HANDLED
+                        } else {
+                            cycle::POISONED
+                        },
+                    );
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
@@ -3789,8 +3818,12 @@ impl<C: Cells> Runtime<C> {
     /// a Clean root leaves Clean only through a walk, which flags the
     /// reader too.
     fn episode_landed(&self, node: &NodeData<C>) -> Computed {
-        if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
-            self.dep_stack.poison_current_frame(self.runtime_id);
+        match node.state() {
+            NodeState::Clean | NodeState::Cyclic => {}
+            NodeState::Dirty => self
+                .dep_stack
+                .poison_current_frame_with(self.runtime_id, self.dirty_read_poison(node)),
+            _ => self.dep_stack.poison_current_frame(self.runtime_id),
         }
         Computed::Done
     }
@@ -3919,7 +3952,7 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The flag the reader of an unwind with `kind` out of the compute
-    /// above it raises: `FAILED_READ` for a user panic of a node that
+    /// above it raises: `HANDLED` for a user panic of a node that
     /// landed Failed, `POISONED` otherwise.
     pub(super) fn unwound_poison(&self, kind: Option<UnwindKind>) -> u16 {
         let reading = self.dep_stack.unwound_reader(self.runtime_id);
@@ -3936,7 +3969,28 @@ impl<C: Cells> Runtime<C> {
     /// [`Self::unwound_poison`] for an unwind out of node `slot`.
     pub(super) fn failed_poison(&self, kind: Option<UnwindKind>, slot: u32) -> u16 {
         if kind.is_none() && self.nodes.get(slot).state() == NodeState::Failed {
-            cycle::FAILED_READ
+            cycle::HANDLED
+        } else {
+            cycle::POISONED
+        }
+    }
+
+    /// Whether a run that raised `poison` at `verify_rev` lands with a
+    /// memo: it handled an outcome that holds until the next set, read
+    /// nothing else unsettled, and, after its publish, no set has moved
+    /// the revision since its claim. A dep its publish found unsettled is
+    /// then one of the handled reads, so a Superseded publish still lands
+    /// a memo: its Dirty landing and the memo's revision cover the set
+    /// the check guards against.
+    pub(super) fn memo_landing(&self, poison: u16, verify_rev: u64) -> bool {
+        poison == cycle::HANDLED && self.current_revision() == verify_rev
+    }
+
+    /// The flag a read of `node`, left Dirty by a landing, raises on its
+    /// reader: `HANDLED` if the node holds a memo for this revision.
+    pub(super) fn dirty_read_poison(&self, node: &NodeData<C>) -> u16 {
+        if node.memo_at(self.current_revision()) {
+            cycle::HANDLED
         } else {
             cycle::POISONED
         }
@@ -4394,7 +4448,6 @@ impl<C: Cells> Runtime<C> {
         let settled = |d: &NodeId| {
             diff.old_set.has(*d)
                 || self.observed_clean(*d, verify_rev)
-                || self.failed_unmoved(*d, verify_rev)
                 || panic.is_some_and(|members| {
                     self.nodes.get(d.0).state() == NodeState::Failed
                         || members.binary_search(&d.0).is_ok()
@@ -4438,16 +4491,6 @@ impl<C: Cells> Runtime<C> {
         node.state().is_settled() && node.changed_at() <= rev
     }
 
-    /// True iff `dep` is `Failed` and no set has bumped the revision past
-    /// `rev`, the walked watermark at the claim. A set flips a Failed node
-    /// before it walks the node's dependents, so the state loaded here is
-    /// the one the compute read, and a later flip's walk finds the edge
-    /// this publish installs. The state is loaded first, so that a flip
-    /// and a relanding Failed since the read come with their set's bump.
-    pub(super) fn failed_unmoved(&self, dep: NodeId, rev: u64) -> bool {
-        self.nodes.get(dep.0).state() == NodeState::Failed && self.current_revision() == rev
-    }
-
     #[cfg(test)]
     pub(crate) fn arena<T: Value>(&self) -> &GenericArena<T, C> {
         let tag = self.inner.read().arena_tags.tag::<T>();
@@ -4487,11 +4530,8 @@ impl<C: Cells> Runtime<C> {
                     "(I) violated: Clean node {x} is missing from dependents[{}]",
                     s.0
                 );
-                // A closure that caught a Failed dep's panic lands Clean
-                // over it, unverified.
                 assert!(
-                    dep.state().is_settled()
-                        || dep.state() == NodeState::Failed && node.verified_at() == 0,
+                    dep.state().is_settled(),
                     "(I) violated: Clean node {x} has dep {} {:?}",
                     s.0,
                     dep.state()

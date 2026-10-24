@@ -124,7 +124,7 @@ impl<C: Cells> Runtime<C> {
         // A closure that catches this panic has read a node with no value,
         // which stays so until a set flips it.
         self.dep_stack
-            .poison_current_frame_with(self.runtime_id, cycle::FAILED_READ);
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
         if let Some(payload) = payload {
             self.note_ticket_read(id, &*payload);
             resume_unwind(payload);
@@ -192,7 +192,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn raise_owed(&self, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) -> ! {
         self.dep_stack
-            .poison_current_frame_with(self.runtime_id, cycle::FAILED_READ);
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
         bag.drain_carried(payload)
     }
 

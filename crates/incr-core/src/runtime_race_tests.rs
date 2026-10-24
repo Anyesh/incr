@@ -409,9 +409,10 @@ fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, 
 }
 
 /// A set moves `d`'s Failed dep `f` between `d`'s first read and its
-/// publish, before `d`'s edge exists, so the walk can't reach `d`.
+/// publish, before `d`'s edge exists, so the walk can't reach `d`: it
+/// lands Dirty with no memo.
 #[test]
-fn caught_failed_dep_flipped_before_the_first_publish_supersedes() {
+fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
     let rt = Arc::new(Rt::new());
     let gate = Gate::new();
     let (x, _, f, d) = caught_failed_dep(&rt, &gate);
@@ -427,6 +428,10 @@ fn caught_failed_dep_flipped_before_the_first_publish_supersedes() {
     assert_eq!(reader.join().unwrap(), 7);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert_ne!(
+        rt.verified_at_of(d),
+        crate::node::NodeData::<crate::cells::Shared>::MEMO
+    );
     assert!(rt.has_reverse_edge(f, d));
     rt.assert_invariant_i();
     assert_eq!(rt.get(d), 10);
@@ -435,7 +440,7 @@ fn caught_failed_dep_flipped_before_the_first_publish_supersedes() {
 /// As above, and `f` lands Failed again for the set before `d` publishes,
 /// so the Failed state `d` finds is not the one it read.
 #[test]
-fn caught_failed_dep_relanded_failed_before_the_first_publish_supersedes() {
+fn caught_failed_dep_relanded_failed_before_the_first_publish_keeps_no_memo() {
     let rt = Arc::new(Rt::new());
     let gate = Gate::new();
     let (x, _, f, d) = caught_failed_dep(&rt, &gate);
@@ -456,18 +461,27 @@ fn caught_failed_dep_relanded_failed_before_the_first_publish_supersedes() {
     assert_eq!(reader.join().unwrap(), 7);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert_ne!(
+        rt.verified_at_of(d),
+        crate::node::NodeData::<crate::cells::Shared>::MEMO
+    );
     rt.assert_invariant_i();
 }
 
-/// `d` lands Clean over Failed `f`; a recompute for `y` reads `f` Failed
-/// again, and a set that moves `f` mid-compute reaches `d` by its edge.
+/// `d` lands Dirty with a memo over Failed `f`; a recompute for `y` reads
+/// `f` Failed again, and a set that moves `f` mid-compute leaves it no
+/// memo.
 #[test]
-fn caught_failed_dep_flipped_during_a_recompute_dirties_it() {
+fn caught_failed_dep_flipped_during_a_recompute_keeps_no_memo() {
     let rt = Arc::new(Rt::new());
     let gate = Gate::new();
     let (x, y, f, d) = caught_failed_dep(&rt, &gate);
     assert_eq!(rt.get(d), 7);
-    assert_eq!(rt.state_of(d), NodeState::Clean);
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert_eq!(
+        rt.verified_at_of(d),
+        crate::node::NodeData::<crate::cells::Shared>::MEMO
+    );
     assert_eq!(rt.state_of(f), NodeState::Failed);
     rt.assert_invariant_i();
 
@@ -483,6 +497,10 @@ fn caught_failed_dep_flipped_during_a_recompute_dirties_it() {
     assert_eq!(reader.join().unwrap(), 8);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert_ne!(
+        rt.verified_at_of(d),
+        crate::node::NodeData::<crate::cells::Shared>::MEMO
+    );
     rt.assert_invariant_i();
     assert_eq!(rt.get(d), 11);
 }

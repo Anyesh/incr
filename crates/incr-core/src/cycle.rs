@@ -395,10 +395,11 @@ pub(crate) const WALKED: u16 = 256;
 /// outcome no kept read carries. Its own runtime treats it as `NO_DOOM`
 /// within that runtime's budget only, which the other runtime can't see.
 pub(crate) const FOREIGN_HOLD: u16 = 512;
-/// `ComputeCtl::flags`: a read in the frame raised the panic of a node
-/// that landed Failed, which stays Failed until a set flips it. Without
-/// `POISONED` the frame's value lands Clean for the revision, unverified.
-pub(crate) const FAILED_READ: u16 = 1024;
+/// `ComputeCtl::flags`: a read in the frame gave an outcome that holds
+/// until the next set (the panic of a node that landed Failed, or a
+/// memo's value). Without `POISONED` the frame lands Dirty with a memo
+/// for the revision (`NodeData::set_memo`).
+pub(crate) const HANDLED: u16 = 1024;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -434,9 +435,9 @@ impl ComputeCtl {
         self.flags.get() & flag != 0
     }
 
-    /// The frame's `POISONED` and `FAILED_READ` flags.
+    /// The frame's `POISONED` and `HANDLED` flags.
     pub(crate) fn poison(&self) -> u16 {
-        self.flags.get() & (POISONED | FAILED_READ)
+        self.flags.get() & (POISONED | HANDLED)
     }
 
     #[inline(always)]
