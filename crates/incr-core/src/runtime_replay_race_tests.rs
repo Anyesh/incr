@@ -1019,6 +1019,7 @@ fn memo_landing_during_replay(when: Recycle) {
                     spawn(move || outcome(|| rt.get(x1)))
                 };
                 await_reservation_wait(&s.rt, waits);
+                assert_eq!(s.x1_caught.load(SeqCst), 0, "the waiting read ran X1");
                 Some(other)
             }
         };
