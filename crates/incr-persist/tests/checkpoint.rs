@@ -30,8 +30,8 @@ fn records_after(backend: &impl Backend, after: Position) -> Vec<Record> {
     out.into_iter().map(|(_, record)| record).collect()
 }
 
-/// The snapshot's records grouped by key, each group in a canonical order
-/// so that element order, which follows hash iteration, does not matter.
+/// The snapshot's records grouped by key, each group sorted so that only
+/// its contents are compared.
 fn snapshot_by_key(backend: &impl Backend) -> (Position, BTreeMap<String, Vec<Vec<u8>>>) {
     let (at, records) = backend.load_snapshot().unwrap().expect("a snapshot");
     let mut keys: BTreeMap<String, Vec<Vec<u8>>> = BTreeMap::new();

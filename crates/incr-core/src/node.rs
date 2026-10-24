@@ -22,7 +22,7 @@
 //!   52     4     arena_slot    u32
 //!   56     2     type_tag      u16
 //!   58     1     state         Cells::State
-//!   59     1     dep_count     Cells::U8
+//!   59     1     dep_count     Cells::U8    (high bit: the unrun mark)
 //!   60     4     generation    Cells::U32
 //! ```
 //!
@@ -158,7 +158,7 @@ pub struct NodeData<C: Cells> {
     pub(crate) arena_slot: C::U32,
     pub(crate) type_tag: C::U16,
     pub(crate) state: C::State,
-    pub(crate) dep_count: C::U8,
+    dep_count: C::U8,
     pub(crate) generation: C::U32,
 }
 
@@ -472,12 +472,58 @@ impl<C: Cells> NodeData<C> {
         }
     }
 
-    /// Raw dep-count cell value: exact count for 0..=7 (inline storage),
+    /// Dep-count cell value: exact count for 0..=7 (inline storage),
     /// [`Self::OVERFLOW_MARKER`] when deps live in the overflow list
     /// (whose length is authoritative).
     #[inline(always)]
     pub fn dep_count(&self) -> u8 {
-        C::u8_load_relaxed(&self.dep_count)
+        Self::count_of(C::u8_load_relaxed(&self.dep_count))
+    }
+
+    /// The count in a `dep_count` cell value, without the unrun bit.
+    #[inline(always)]
+    fn count_of(raw: u8) -> u8 {
+        if C::SINGLE_THREADED {
+            raw
+        } else {
+            raw & !Self::UNRUN
+        }
+    }
+
+    #[inline(always)]
+    fn unrun_bit(&self) -> u8 {
+        if C::SINGLE_THREADED {
+            0
+        } else {
+            C::u8_load_relaxed(&self.dep_count) & Self::UNRUN
+        }
+    }
+
+    /// Whether the node's claim was last released unrun. Always false
+    /// under a single-threaded strategy, where no other thread waits.
+    #[inline(always)]
+    pub(crate) fn unrun(&self) -> bool {
+        self.unrun_bit() != 0
+    }
+
+    /// Records whether the node's claim is being released unrun. Only the
+    /// claim's owner calls it, before the release that publishes it.
+    #[inline(always)]
+    pub(crate) fn set_unrun(&self, unrun: bool) {
+        if C::SINGLE_THREADED {
+            return;
+        }
+        let raw = C::u8_load_relaxed(&self.dep_count);
+        let marked = if unrun {
+            raw | Self::UNRUN
+        } else {
+            raw & !Self::UNRUN
+        };
+        if marked != raw {
+            // Release like install_deps's, so a scan that reads this
+            // value still sees the deps installed before it.
+            C::u8_store_release(&self.dep_count, marked);
+        }
     }
 
     #[inline(always)]
@@ -521,7 +567,7 @@ impl<C: Cells> NodeData<C> {
             // overflow marker before this store finds the null and
             // retries on the count stored next.
             let displaced = self.overflow_deps.replace(None);
-            C::u8_store_release(&self.dep_count, count as u8);
+            C::u8_store_release(&self.dep_count, count as u8 | self.unrun_bit());
             displaced
         } else {
             let list = Box::new(DepList {
@@ -532,7 +578,7 @@ impl<C: Cells> NodeData<C> {
             // marker and the DepList length is authoritative. This is
             // what lifts the old 255-dep ceiling: a query may read any
             // number of inputs.
-            C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER);
+            C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER | self.unrun_bit());
             displaced
         }
     }
@@ -540,6 +586,10 @@ impl<C: Cells> NodeData<C> {
     /// Sentinel stored in `dep_count` when the dep list lives in
     /// `overflow_deps`. Any value above 7 would do; 8 is the smallest.
     pub const OVERFLOW_MARKER: u8 = 8;
+
+    /// `dep_count` bit for [`Self::unrun`], kept there because the
+    /// claim's owner writes both and its release publishes both.
+    const UNRUN: u8 = 0x80;
 
     /// Iterate over the node's recorded dependencies. A scan may race an
     /// `install_deps` on another thread (the dirty walk scans without a
@@ -565,7 +615,7 @@ impl<C: Cells> NodeData<C> {
         // inline entries (or the overflow pointer) written before it.
         // Relaxed here could yield a count ahead of the entries and index
         // sentinel garbage.
-        let count = C::u8_load_acquire(&self.dep_count);
+        let count = Self::count_of(C::u8_load_acquire(&self.dep_count));
         if count <= 7 {
             self.for_each_inline_dep(count, &mut f);
         } else {
@@ -603,7 +653,7 @@ impl<C: Cells> NodeData<C> {
             }
             C::backoff(spins);
             spins += 1;
-            let count = C::u8_load_acquire(&self.dep_count);
+            let count = Self::count_of(C::u8_load_acquire(&self.dep_count));
             if count <= 7 {
                 self.for_each_inline_dep(count, f);
                 return;
@@ -804,5 +854,31 @@ mod tests {
         drop(n.install_deps(&small));
         assert_eq!(collect_deps(&n), small);
         assert_eq!(n.dep_count(), 3);
+    }
+
+    #[test]
+    fn the_unrun_mark_leaves_the_deps_alone() {
+        for len in [3, 20] {
+            let n: NodeData<Shared> = NodeData::new_query(0, 0);
+            let deps: Vec<NodeId> = (0..len).map(NodeId).collect();
+            drop(n.install_deps(&deps));
+            let count = n.dep_count();
+            n.set_unrun(true);
+            assert!(n.unrun());
+            assert_eq!(n.dep_count(), count);
+            assert_eq!(collect_deps(&n), deps);
+            let fewer: Vec<NodeId> = (0..2).map(NodeId).collect();
+            drop(n.install_deps(&fewer));
+            assert!(n.unrun(), "an install keeps the mark");
+            assert_eq!(collect_deps(&n), fewer);
+            n.set_unrun(false);
+            assert!(!n.unrun());
+            assert_eq!(n.dep_count(), 2);
+        }
+        let n: NodeData<Local> = NodeData::new_query(0, 0);
+        drop(n.install_deps(&[NodeId(1), NodeId(2)]));
+        n.set_unrun(true);
+        assert!(!n.unrun(), "a single-threaded node keeps no mark");
+        assert_eq!(n.dep_count(), 2);
     }
 }
