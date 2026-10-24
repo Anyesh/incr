@@ -1120,8 +1120,8 @@ fn live_specs(case: &Case, i: usize, trace: &Trace) -> Vec<Spec> {
 /// values, recreated nodes from their new specs, deleted nodes deleted
 /// again), once with every `FirstRun` on its first operand and once on its
 /// second. `None` for a read no fresh runtime can make: a read of a
-/// replaced handle or of a second runtime, or one whose deletes the fresh
-/// runtime refuses.
+/// replaced handle, any read in a case with a second runtime, or one whose
+/// deletes the fresh runtime refuses.
 fn fresh_read(case: &Case, i: usize, trace: &Trace) -> Option<[Out; 2]> {
     from_scratch(case, i, trace, false)
 }
@@ -1130,7 +1130,10 @@ fn fresh_read(case: &Case, i: usize, trace: &Trace) -> Option<[Out; 2]> {
 /// on the fresh runtime: a cycle is then entered at the member the live
 /// run's reads entered first, where a lone fresh read enters it at the read
 /// node. It judges only what incremental reuse changes, since the same
-/// engine makes both reads.
+/// engine makes both reads. The earlier reads run at the inputs and specs
+/// live before read `i`, so after a set, delete or recreate they can take
+/// other branches, and enter a cycle at another member, than the live
+/// reads did; reads of deleted nodes and `ReadOld`s are left out.
 fn history_read(case: &Case, i: usize, trace: &Trace) -> Option<[Out; 2]> {
     from_scratch(case, i, trace, true)
 }
@@ -1187,8 +1190,8 @@ fn from_scratch(case: &Case, i: usize, trace: &Trace, history: bool) -> Option<[
 
 /// Whether node `n` of `specs` reaches a cycle through its expressions'
 /// reads, either operand of a `FirstRun` or `FirstLanded` included. A
-/// cycle's outcome depends on which member a run enters first, so a
-/// from-scratch read cannot judge such a read.
+/// cycle's outcome depends on which member a run enters first, so
+/// [`fresh_read`] cannot judge such a read.
 fn reaches_cycle(specs: &[Spec], n: usize) -> bool {
     fn reads(e: &Expr, out: &mut Vec<usize>) {
         match e {
@@ -6521,6 +6524,61 @@ fn a_history_read_enters_a_cycle_where_the_live_run_did() {
     });
 }
 
+/// Both oracles redo a delete before the read and build a recreated node
+/// from its new spec, and [`history_read`] leaves out an earlier read of a
+/// node that is deleted by then.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn the_oracles_redo_deletes_and_recreates() {
+    let query = |expr| Spec::Query {
+        expr,
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            query(Expr::Add(
+                Box::new(Expr::Read(3, false)),
+                Box::new(Expr::Const(1)),
+            )),
+            query(Expr::Const(3)),
+            query(Expr::Const(4)),
+            Spec::Input(5),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 3,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![
+            Op::Get(1),
+            Op::Delete(1),
+            Op::Get(2),
+            Op::Delete(2),
+            Op::Recreate(2, query(Expr::Const(9))),
+            Op::Get(0),
+            Op::Get(2),
+        ],
+    };
+    quiet(|| {
+        let trace = run::<Shared>(&case, None, 0);
+        assert_eq!(trace[1].0, Out::Deleted(Ok(())));
+        assert_eq!(trace[5].0, Out::Value(6));
+        assert_eq!(trace[6].0, Out::Value(9));
+        for oracle in [fresh_read, history_read] {
+            assert_eq!(
+                oracle(&case, 5, &trace),
+                Some([Out::Value(6), Out::Value(6)])
+            );
+            assert_eq!(
+                oracle(&case, 6, &trace),
+                Some([Out::Value(9), Out::Value(9)])
+            );
+        }
+    });
+}
+
 /// Each serial order of the two-thread cases of seeds
 /// `REPLAY_FROM..REPLAY_SCAN` (or the hex seeds in `SEEDS_FILE`), run
 /// unbounded, against [`fresh_read`]: the two-thread differential takes
@@ -6529,7 +6587,9 @@ fn a_history_read_enters_a_cycle_where_the_live_run_did() {
 /// marked `after-break` when a delete, recreate or replaced-handle read
 /// came before it, where from scratch is a weaker oracle; with
 /// `FRESH_ALL`, every read checked as well. With `HISTORY`, each read is
-/// checked against [`history_read`] instead.
+/// checked against [`history_read`] instead, and a set before it marks it
+/// `after-break` too. A panic in the oracle's own run prints a
+/// `FRESH-ORACLE-PANIC` line.
 #[test]
 #[ignore = "a diagnostic that scans seeds"]
 fn two_thread_serial_fresh_scan() {
@@ -6549,11 +6609,9 @@ fn two_thread_serial_fresh_scan() {
         }
     };
     let all = std::env::var_os("FRESH_ALL").is_some();
-    let oracle = match std::env::var_os("HISTORY") {
-        Some(_) => history_read,
-        None => fresh_read,
-    };
-    let (mut reads, mut skipped, mut wrong, mut panicked) = (0, 0, 0, 0);
+    let history = std::env::var_os("HISTORY").is_some();
+    let oracle = if history { history_read } else { fresh_read };
+    let (mut reads, mut skipped, mut wrong, mut panicked, mut oracle_panicked) = (0, 0, 0, 0, 0);
     quiet(|| {
         for &seed in &seeds {
             let case = gen_case(seed, false, true);
@@ -6572,18 +6630,29 @@ fn two_thread_serial_fresh_scan() {
                     if !order.case.ops[j].is_read() {
                         continue;
                     }
-                    let Ok(Some(fresh)) =
-                        catch_unwind(AssertUnwindSafe(|| oracle(&order.case, j, &trace)))
-                    else {
-                        skipped += 1;
-                        continue;
-                    };
+                    let fresh =
+                        match catch_unwind(AssertUnwindSafe(|| oracle(&order.case, j, &trace))) {
+                            Ok(Some(fresh)) => fresh,
+                            Ok(None) => {
+                                skipped += 1;
+                                continue;
+                            }
+                            Err(_) => {
+                                oracle_panicked += 1;
+                                eprintln!(
+                                    "FRESH-ORACLE-PANIC {seed:#x} order {:?} op {}",
+                                    order.of, order.of[j]
+                                );
+                                continue;
+                            }
+                        };
                     reads += 1;
                     let agrees = fresh_agrees(live, &fresh);
                     wrong += usize::from(!agrees);
                     if !agrees || all {
                         let after = order.case.ops[..j].iter().any(|o| {
                             matches!(o, Op::Delete(_) | Op::Recreate(..) | Op::ReadOld(..))
+                                || history && matches!(o, Op::Set(..))
                         });
                         let cyclic = match order.case.ops[j] {
                             Op::Get(n) | Op::TryGet(n) => {
@@ -6608,7 +6677,7 @@ fn two_thread_serial_fresh_scan() {
         }
     });
     eprintln!(
-        "FRESH-END {} seeds: {reads} reads checked, {wrong} wrong, {skipped} skipped, {panicked} orders panicked",
+        "FRESH-END {} seeds: {reads} reads checked, {wrong} wrong, {skipped} skipped, {panicked} orders panicked, {oracle_panicked} oracle runs panicked",
         seeds.len()
     );
 }
