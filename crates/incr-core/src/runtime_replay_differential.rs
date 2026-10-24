@@ -3930,18 +3930,19 @@ fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     }
 }
 
-/// Seeds 0x833e (and 0x41eb, in [`strict_dirty_for_clean_seeds`]), one
-/// thread: a dropped chain truncates the virtual frame of a doomed episode
-/// member run whose failure count is still held, and releases the member
-/// with the discard landing. The count goes with the frame, since the
-/// member's next run there is a new one.
+/// Seeds 0x833e and 0x41eb, one thread: a dropped chain truncates the
+/// virtual frame of a doomed episode member run whose failure count is
+/// still held, and releases the member with the discard landing. The count
+/// goes with the frame, since the member's next run there is a new one.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_dropped_chain_takes_its_member_runs_failure_counts() {
     quiet(|| {
-        let case = gen_case(0x833e, false, false);
-        differential::<Local>(&case, 0x833e);
-        differential::<Shared>(&case, 0x833e);
+        for seed in [0x833e, 0x41eb] {
+            let case = gen_case(seed, false, false);
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        }
     });
 }
 
