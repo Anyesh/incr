@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
 use crate::deferred::Unbuilt;
+use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay;
@@ -462,9 +463,9 @@ pub(crate) enum UnwindKind {
 /// claim its subtree deferred to its parent merges groups instead of
 /// moving each claim.
 pub(crate) struct HeldMap {
-    claims: HashMap<(RuntimeId, u32), Held>,
+    claims: HashMap<(RuntimeId, u32), Held, FxBuildHasher>,
     by_anchor: BTreeSet<(RuntimeId, u32, u32)>,
-    groups: HashMap<u64, Group>,
+    groups: HashMap<u64, Group, FxBuildHasher>,
     /// `(rt, owner position, group)` of every group.
     by_owner: BTreeSet<(RuntimeId, u32, u64)>,
     /// The groups a virtual frame owns.
@@ -489,9 +490,9 @@ impl std::ops::Index<&(RuntimeId, u32)> for HeldMap {
 impl HeldMap {
     fn new() -> Self {
         Self {
-            claims: HashMap::new(),
+            claims: HashMap::default(),
             by_anchor: BTreeSet::new(),
-            groups: HashMap::new(),
+            groups: HashMap::default(),
             by_owner: BTreeSet::new(),
             by_virtual_owner: BTreeSet::new(),
             next_group: 1,

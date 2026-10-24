@@ -6783,3 +6783,72 @@ fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
         );
     });
 }
+
+/// Base seed 0x675a, shrunk by `replay_shrink`. 4 and 10 form a ring that
+/// 4's read of 5 and 5's of 6 join; 6 reads 7, which panics on 8, and 8
+/// reaches 10 through 9. Unbounded, `Get(10)` after `TryGet(4)` lands 7
+/// Failed with the others; at budget 3 the bounded run leaves 7 Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failed_ring_member_lands_failed_at_every_budget() {
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let c = |v| Box::new(Expr::Const(v));
+    let mut specs: Vec<Spec> = (0..4)
+        .map(|_| replayable(Expr::Const(0), Strat::None))
+        .collect();
+    specs.extend([
+        replayable(
+            Expr::If(r(10, false), c(0), r(5, false)),
+            Strat::Fallback(2),
+        ),
+        replayable(
+            Expr::PanicIf(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Add(r(6, true), c(1))),
+                    Box::new(Expr::If(r(5, false), c(0), r(6, false))),
+                )),
+                3,
+            ),
+            Strat::Fallback(1),
+        ),
+        replayable(Expr::If(r(4, false), r(7, false), c(0)), Strat::Fallback(1)),
+        Spec::Query {
+            expr: Expr::If(
+                Box::new(Expr::If(r(8, true), c(0), r(6, false))),
+                Box::new(Expr::PanicIf(r(8, false), 2)),
+                r(8, false),
+            ),
+            replay: true,
+            bare: true,
+            strategy: Strat::None,
+        },
+        replayable(Expr::Add(c(1), r(9, false)), Strat::None),
+        replayable(Expr::Read(10, true), Strat::None),
+        Spec::Query {
+            expr: Expr::Read(4, false),
+            replay: false,
+            bare: false,
+            strategy: Strat::Fixpoint {
+                initial: 1,
+                limit: 2,
+            },
+        },
+        Spec::Input(4),
+        Spec::Input(3),
+        Spec::Input(0),
+        Spec::Input(3),
+    ]);
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 11,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(4), Op::Get(10)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x675a);
+        differential::<Shared>(&case, 0x675a);
+    });
+}

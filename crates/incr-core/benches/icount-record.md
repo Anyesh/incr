@@ -1874,6 +1874,83 @@ Gate: the hard gates hold (198, 219.14, 90). Replay scale by
 `strict-scan.sh`'s `scale-icount` against `7c94b201`: every ratio is in
 0.9974..1.0037.
 
+## Replay scale instructions against main
+
+- Engine: `w/T10-replay-scale-instruction-rise` at `2c992bc1` against
+  `spreadsheet-t10` at `adf57986` and main at `b9f0d0bf`, each built in its
+  own target dir; `scale-icount.sh` (user-space instructions per test) at
+  the tests' 100k. `icount.sh` hard gates against `adf57986` are exact:
+  get 102 / 198, `table_hit` 155.14 / 219.14, `value_slot_read` 5 / 90.
+- Changes: the replay, held-claim and taint-memo maps hash with
+  `FxBuildHasher` instead of SipHash; a run records its path when it
+  starts, from the run below it (that run's path extended by its step)
+  rather than a `path_at` fold over the stack, and its reads, its end and
+  its claim and failure records reuse it, with a debug assertion against
+  `path_at`; run slots are indexed by position instead of a `BTreeMap` of
+  100k entries; the delivery and earliest-record indexes, run counts and
+  per-position slots keep one entry inline (`Few`) instead of a `Vec` each.
+
+| test (Local / Shared) | main | t10 | tip | t10 / main | tip / main |
+|---|---|---|---|---|---|
+| `fallback_cycle_100k_at_budget_256` | 8.75G / 8.88G | 22.74G / 22.92G | 7.03G / 7.21G | 2.60 / 2.58 | 0.80 / 0.81 |
+| `taint_100k_at_budget_256` | 7.69G / 7.85G | 18.79G / 19.19G | 4.16G / 4.59G | 2.44 / 2.45 | 0.54 / 0.58 |
+| `fixpoint_cycle_100k_at_budget_256` | 10.13G / 10.27G | 15.61G / 15.85G | 8.89G / 9.15G | 1.54 / 1.54 | 0.88 / 0.89 |
+| `fixpoint_cycle_100k_at_budget_1` | 9.50G / 9.64G | 13.03G / 13.36G | 8.89G / 9.19G | 1.37 / 1.39 | 0.94 / 0.95 |
+| `fallback_cycle_100k_at_budget_1` | 7.29G / 7.41G | 10.06G / 10.28G | 6.80G / 7.01G | 1.38 / 1.39 | 0.93 / 0.95 |
+| `ring_member_runs_within_budget` | 0.31G / 0.32G | 0.43G / 0.44G | 0.29G / 0.30G | 1.38 / 1.39 | 0.93 / 0.95 |
+| `short_cycles_at_budget_1` | 0.17G / 0.18G | 0.21G / 0.22G | 0.16G / 0.16G | 1.23 / 1.24 | 0.91 / 0.92 |
+| `taint_100k_at_budget_1` | 2.78G / 3.02G | 5.21G / 5.71G | 3.41G / 3.91G | 1.88 / 1.89 | 1.23 / 1.30 |
+| `byte_budget_before_frame_budget` | 24.9M / 27.1M | 63.5M / 67.2M | 35.4M / 39.8M | 2.55 / 2.48 | 1.42 / 1.47 |
+| `doom_under_stabilize` | 4.06M / 4.22M | 6.33M / 6.70M | 4.95M / 5.40M | 1.56 / 1.59 | 1.22 / 1.28 |
+| `if_abc_at_budget_1` | 1.26M / 1.28M | 1.44M / 1.47M | 1.44M / 1.46M | 1.14 / 1.15 | 1.14 / 1.14 |
+
+The four tests still above 1.1x of main, by attribution
+(`perf record` summed over many runs, per symbol and per inlined source
+line, and a `malloc` call-site count by preloaded backtrace):
+
+- `if_abc_at_budget_1`: about 150k of its 172k added instructions are the
+  test binary's start, not the engine: a test that does nothing runs
+  1.18M instructions in main's binary and 1.33M in this one, which holds
+  1144 tests to main's 796 (dynamic relocation and test filtering). The
+  engine's part is about 20k on a three-node graph.
+- `doom_under_stabilize`: about a third of the rise is the same start
+  cost; the rest is per doom (200 here, one per frame at budget 1).
+- `byte_budget_before_frame_budget` and `taint_100k_at_budget_1` doom at
+  every frame too; their rise is the per-doom state of rules main lacks:
+  the claim and failure records each doomed frame notes and its retry
+  takes (`EarliestByFrame`, **T8** claim revisions and run failures), the
+  run seq a retry must share and a later run must not (`start_run`, run
+  slots; 0x56cdd78, 0xe126d92b8f), and the delivery indexes by maker,
+  frame and node that a doom's cleanup extracts by. Of what remains,
+  thread-local access (`replay::with` and the runs table, about a third
+  of the rise) and allocation (about a sixth) are the bookkeeping part;
+  the rest is that state's hashing and copying. None of it grows with N:
+  each ratio holds from 10k to 100k.
+
+## A stand-in run sees its frame's taint memo entries
+
+`1d332082` (on `43bb197e`) restores a virtual frame's own taint-memo
+entries for the stand-in run that finishes it, inside `tarjan_pop`, which
+only replay pops reach. Base `43bb197e`, tip `1d332082`, same box,
+`icount.sh` defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_shared` | 198 | 196 | -2 |
+| `table_hit_shared` | 219.14 | 218.14 | -1 |
+| `value_slot_read_shared` | 90 | 87 | -3 |
+| `chain_shared/propagate/100` | 193132.07 | 192627.03 | -505.04 |
+| `fanout_shared_1000` | 4804758.18 | 4799504.84 | -5253.34 |
+| `delete_cascade_shared` | 4585764.71 | 4581892.43 | -3872.28 |
+
+- No workload runs a replay pop, so nothing here executes the change. The
+  Shared rows fall by about 5 instructions per landing and the hard-gate
+  rows by 1 to 3, the code-partitioning shift seen before; every Local row
+  is unchanged within 0.1%.
+
+Gate: no rise. Replay scale by `strict-scan.sh`'s `scale-icount` against
+`43bb197e`: every ratio is in 0.9987..1.0031.
+
 ## A handled read keeps a memo for the revision
 
 - Base: spreadsheet-t10 adf57986. Tip: w/T8-caught-failed-read-lands 03794a1a (the engine b2e71d8e merges), the base in a detached worktree; one run of `icount.sh` at the default N per column, and `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_local/propagate/4` and `chain_shared/propagate/4`. No workloads added.
