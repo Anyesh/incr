@@ -292,8 +292,11 @@ impl<C: Cells> ArenaRegistry<C> {
     #[inline(never)]
     fn add<T: Value>(&self, tags: &mut ArenaTags) -> u16 {
         let type_id = TypeId::of::<T>();
+        // `DIVERTED_TAG` marks a diverted read, so no arena has it.
         let tag = u16::try_from(tags.tags.len())
-            .expect("incr-core: more than 65536 distinct value types in one runtime");
+            .ok()
+            .filter(|&tag| tag != crate::dep_stack::DIVERTED_TAG)
+            .expect("incr-core: more than 65535 distinct value types in one runtime");
         self.entries.grow_to(tag as usize);
         let entry = Box::new(ArenaEntry {
             type_id,

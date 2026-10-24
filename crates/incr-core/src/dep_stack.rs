@@ -33,6 +33,11 @@ use crate::replay::Step;
 pub struct Frame {
     pub(crate) node: NodeId,
     pub(crate) rt: RuntimeId,
+    /// The runtime whose Clean reads [`DepStack::record_dep`] records in
+    /// this frame: `rt`, or [`RuntimeId::SENTINEL`] while a replay
+    /// context holds a delivery for one of the frame's reads, so that its
+    /// Clean reads take the slow path, which takes the delivery.
+    pub(crate) read_rt: RuntimeId,
     pub(crate) deps: Vec<(NodeId, u32)>,
     /// Valid while the frame is on the stack: the code that pushed it
     /// owns the control block and pops the frame before it returns.
@@ -45,6 +50,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Whether the frame diverts its Clean reads (see [`Frame::read_rt`]).
+    fn diverts(&self) -> bool {
+        self.read_rt != self.rt
+    }
+
     /// How many times the frame has read the node it reads now, this read
     /// included.
     fn reads_of_reading(&self) -> u32 {
@@ -113,14 +123,18 @@ impl Frames {
         self.frames.last_mut().filter(|top| top.rt == rt)
     }
 
-    /// A Clean read another runtime serves to the top frame, which keeps no
-    /// read: the frame's retry reads the node again. A call, not an empty
-    /// arm, because with an empty arm the Clean read inlined into `get`
-    /// spills two more registers, 2 to 10 instructions per read.
+    /// For a Clean read the top frame does not record as `rt`'s own:
+    /// whether the frame diverts its Clean reads, leaving the read to
+    /// [`DepStack::diverted_read`]. Another runtime's frame keeps no read
+    /// (its retry reads the node again), nor does a callback's barrier,
+    /// whose `read_rt` is its `rt`, the sentinel. A call without arguments, not an
+    /// empty arm, because with an empty arm or more registers to pass the
+    /// Clean read inlined into `get` spills more, 2 to 10 instructions per
+    /// read.
     #[cold]
     #[inline(never)]
-    fn foreign_clean_read(&mut self) {
-        std::hint::black_box(&mut *self);
+    fn top_diverts_clean_reads(&mut self) -> bool {
+        self.frames.last().is_some_and(Frame::diverts)
     }
 
     /// A non-Clean read another runtime serves to the top frame: it sets
@@ -219,6 +233,7 @@ impl Frames {
         Frame {
             node,
             rt,
+            read_rt: rt,
             deps: Vec::with_capacity(4),
             ctl,
             cidx,
@@ -226,6 +241,10 @@ impl Frames {
         }
     }
 }
+
+/// The arena tag [`DepStack::record_dep`] hands back for a diverted
+/// frame's Clean read; no registry hands it out.
+pub(crate) const DIVERTED_TAG: u16 = u16::MAX;
 
 /// Strategy-parameterized dep tracker used by the runtime during compute.
 pub trait DepStack: 'static {
@@ -282,13 +301,94 @@ pub trait DepStack: 'static {
     /// Record `dep`, read at `generation`, as a dependency of runtime
     /// `rt`'s active frame, if it has one. The generation lets publish
     /// detect a dep that was deleted, and possibly recycled, after the
-    /// read. A top frame of another runtime's records nothing.
+    /// read. A top frame of another runtime's records nothing. Returns
+    /// `type_tag`, the node's arena tag, or [`DIVERTED_TAG`] when the top
+    /// frame diverts its Clean reads (see [`Frame::read_rt`]): nothing is
+    /// recorded, and the read finds no arena, so it leaves through the
+    /// empty-slot branch it already has, where the frame's own runtime
+    /// records it.
     #[inline(always)]
-    fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32) {
+    fn record_dep(&self, rt: RuntimeId, dep: NodeId, generation: u32, type_tag: u16) -> u16 {
         self.with(|s| match s.frames.last_mut() {
-            Some(top) if top.rt == rt => top.deps.push((dep, generation)),
-            Some(_) => s.foreign_clean_read(),
-            None => {}
+            Some(top) if top.read_rt == rt => {
+                top.deps.push((dep, generation));
+                type_tag
+            }
+            Some(_) => {
+                if s.top_diverts_clean_reads() {
+                    DIVERTED_TAG
+                } else {
+                    type_tag
+                }
+            }
+            None => type_tag,
+        })
+    }
+
+    /// Sends the top frame's Clean reads to the slow path (see
+    /// [`Frame::read_rt`]).
+    fn divert_clean_reads(&self) {
+        self.with(|s| {
+            if let Some(top) = s.frames.last_mut() {
+                top.read_rt = RuntimeId::SENTINEL;
+            }
+        });
+    }
+
+    /// Ends [`Self::divert_clean_reads`] for `rt`'s top frame.
+    fn end_diverted_reads(&self, rt: RuntimeId) {
+        self.with(|s| {
+            if let Some(top) = s.frames.last_mut().filter(|top| top.rt == rt) {
+                top.read_rt = rt;
+            }
+        });
+    }
+
+    /// For a Clean read [`Self::record_dep`] diverted: `rt`'s top frame,
+    /// if it is that runtime's and diverts its Clean reads. Nothing is
+    /// recorded.
+    fn diverted_read(&self, rt: RuntimeId) -> Option<ActiveRead> {
+        self.with(|s| {
+            let depth = s.frames.len() as u32;
+            let top = s
+                .frames
+                .last()
+                .filter(|top| top.rt == rt && top.diverts())?;
+            Some(ActiveRead {
+                node: top.node,
+                ctl: top.ctl,
+                cidx: top.cidx,
+                depth,
+            })
+        })
+    }
+
+    /// How many reads of `dep` at `generation` `rt`'s active frame has
+    /// recorded: a read's ordinal less one.
+    fn reads_of(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> u32 {
+        self.with(|s| {
+            s.active(rt).map_or(0, |top| {
+                top.deps.iter().filter(|&&d| d == (dep, generation)).count() as u32
+            })
+        })
+    }
+
+    /// Records `dep` in `rt`'s top frame, for a diverted Clean read that
+    /// takes no delivery.
+    fn record_diverted_read(&self, rt: RuntimeId, dep: NodeId, generation: u32) {
+        self.with(|s| {
+            if let Some(top) = s.active(rt) {
+                top.deps.push((dep, generation));
+            }
+        });
+    }
+
+    /// Whether `rt`'s top frame diverts its Clean reads.
+    fn diverts_clean_reads(&self, rt: RuntimeId) -> bool {
+        self.with(|s| {
+            s.frames
+                .last()
+                .is_some_and(|top| top.rt == rt && top.diverts())
         })
     }
 
@@ -612,9 +712,9 @@ mod tests {
         assert!(!s.current_frame_active(rt(1)));
         assert_eq!(s.push_frame(rt(1), NodeId(100), &ctl), 0);
         assert!(s.current_frame_active(rt(1)));
-        s.record_dep(rt(1), NodeId(0), 0);
-        s.record_dep(rt(1), NodeId(1), 0);
-        s.record_dep(rt(1), NodeId(2), 0);
+        s.record_dep(rt(1), NodeId(0), 0, 0);
+        s.record_dep(rt(1), NodeId(1), 0, 0);
+        s.record_dep(rt(1), NodeId(2), 0, 0);
         let frame = s.pop_frame();
         assert_eq!(frame, vec![(NodeId(0), 0), (NodeId(1), 0), (NodeId(2), 0)]);
         assert!(!s.current_frame_active(rt(1)));
@@ -625,10 +725,10 @@ mod tests {
         let s = SharedDepStack::new();
         let (a, b) = (ComputeCtl::new(0), ComputeCtl::new(0));
         s.push_frame(rt(1), NodeId(100), &a);
-        s.record_dep(rt(1), NodeId(1), 0);
+        s.record_dep(rt(1), NodeId(1), 0, 0);
         assert_eq!(s.push_frame(rt(1), NodeId(101), &b), 1);
-        s.record_dep(rt(1), NodeId(2), 0);
-        s.record_dep(rt(1), NodeId(3), 0);
+        s.record_dep(rt(1), NodeId(2), 0, 0);
+        s.record_dep(rt(1), NodeId(3), 0, 0);
         assert_eq!(s.pop_frame(), vec![(NodeId(2), 0), (NodeId(3), 0)]);
         assert_eq!(s.pop_frame(), vec![(NodeId(1), 0)]);
     }
@@ -661,10 +761,55 @@ mod tests {
         s.pop_frame();
     }
 
+    /// The diverted frame's own Clean read records nothing and is handed
+    /// to its reader with the frame, while another
+    /// runtime's Clean read into it stays a foreign Clean read: no record,
+    /// foreign bit or hold. A callback's barrier is not diverted.
+    #[test]
+    fn a_diverted_frames_clean_read_is_its_own_runtimes_only() {
+        let s = SharedDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        s.record_read(rt(1), NodeId(5), 2);
+        s.divert_clean_reads();
+        assert_eq!(s.record_dep(rt(2), NodeId(7), 0, 4), DIVERTED_TAG);
+        assert!(s.diverted_read(rt(2)).is_none());
+        assert_eq!(
+            crate::value_code::thread_word() & crate::value_code::FOREIGN_BIT,
+            0
+        );
+        assert_eq!(s.hold_position(&ctl), None);
+        assert_eq!(s.record_dep(rt(1), NodeId(5), 2, 4), DIVERTED_TAG);
+        let f = s.diverted_read(rt(1)).unwrap();
+        let reads = s.reads_of(rt(1), NodeId(5), 2);
+        assert_eq!((f.node, f.cidx, reads), (NodeId(100), 0, 1));
+        let barrier = ComputeCtl::new(0);
+        s.push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &barrier, u32::MAX);
+        assert_eq!(s.record_dep(rt(1), NodeId(5), 2, 4), 4);
+        s.pop_frame();
+        assert_eq!(s.pop_frame_reading(), (vec![(NodeId(5), 2)], 5 | 2 << 32));
+    }
+
+    /// A frame that ends its diversion records Clean reads in place again.
+    #[test]
+    fn an_undiverted_frame_records_clean_reads() {
+        let s = SharedDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        s.divert_clean_reads();
+        assert!(s.diverts_clean_reads(rt(1)));
+        s.record_diverted_read(rt(1), NodeId(6), 0);
+        s.end_diverted_reads(rt(1));
+        assert!(!s.diverts_clean_reads(rt(1)));
+        assert!(s.diverted_read(rt(1)).is_none());
+        assert_eq!(s.record_dep(rt(1), NodeId(7), 0, 4), 4);
+        assert_eq!(s.pop_frame(), vec![(NodeId(6), 0), (NodeId(7), 0)]);
+    }
+
     #[test]
     fn record_outside_frame_is_noop() {
         let s = SharedDepStack::new();
-        s.record_dep(rt(1), NodeId(42), 0);
+        s.record_dep(rt(1), NodeId(42), 0, 0);
         assert!(!s.current_frame_active(rt(1)));
     }
 
@@ -692,7 +837,7 @@ mod tests {
         s.push_frame(rt(1), NodeId(5), &a);
         s.push_frame(rt(2), NodeId(5), &b);
         assert!(!s.current_frame_active(rt(1)));
-        s.record_dep(rt(1), NodeId(9), 0);
+        s.record_dep(rt(1), NodeId(9), 0, 0);
         s.poison_current_frame(rt(1));
         assert!(!b.has(POISONED));
         assert_eq!(s.frame_depth(rt(1), NodeId(5)), Some(0));
@@ -726,7 +871,7 @@ mod tests {
         s1.push_frame(rt(1), NodeId(5), &a);
         assert_eq!(s2.push_frame(rt(2), NodeId(6), &b), 1);
         assert!(!s1.current_frame_active(rt(1)));
-        s1.record_dep(rt(1), NodeId(9), 0);
+        s1.record_dep(rt(1), NodeId(9), 0, 0);
         s1.poison_current_frame(rt(1));
         assert!(!a.has(POISONED));
         assert!(!s1.other_top_doomed(rt(1)));
@@ -735,7 +880,7 @@ mod tests {
         assert!(!s2.other_top_doomed(rt(2)));
         assert!(s2.pop_frame().is_empty());
         assert!(s1.current_frame_active(rt(1)));
-        s1.record_dep(rt(1), NodeId(10), 0);
+        s1.record_dep(rt(1), NodeId(10), 0, 0);
         assert_eq!(s1.pop_frame(), vec![(NodeId(10), 0)]);
     }
 

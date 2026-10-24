@@ -13,6 +13,12 @@ use crate::dep_stack::Placement;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
 
+#[cfg(test)]
+thread_local! {
+    /// Diverts every frame `divert_for_deliveries` sees, delivery or not.
+    pub(crate) static DIVERT_EVERY_RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What the doom point saw, for tests.
 #[cfg(test)]
 #[derive(Clone, Debug)]
@@ -860,7 +866,8 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn raise_adopted(&self, raised: AdoptedPanic) -> Box<dyn Any + Send> {
         for &(d, generation) in &raised.deps {
-            self.dep_stack.record_dep(self.runtime_id, d, generation);
+            self.dep_stack
+                .record_dep_or_foreign(self.runtime_id, d, generation);
         }
         raised.payload
     }
@@ -1045,6 +1052,115 @@ impl<C: Cells> Runtime<C> {
         self.land_unrun(id, node, source);
     }
 
+    /// Diverts the Clean reads of the frame just pushed for `node` at
+    /// `cidx` while a replay context holds a delivery for one of its reads
+    /// (see `Frame::read_rt`): the unbounded run's frame made that read
+    /// before the node landed Clean, and its retry must take what the
+    /// context kept for it, not the Clean value.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn divert_for_deliveries(&self, node: NodeId, cidx: u32) {
+        if value_code::thread_word() & value_code::REPLAY_BIT == 0 || replay::speculative() {
+            return;
+        }
+        #[cfg(test)]
+        if DIVERT_EVERY_RETRY.with(std::cell::Cell::get) {
+            self.dep_stack.divert_clean_reads();
+            return;
+        }
+        if self.frame_awaits_deliveries(node.0, cidx) {
+            self.dep_stack.divert_clean_reads();
+        }
+    }
+
+    /// Whether a context holds a delivery that the frame of `node` at
+    /// `cidx` can still take with its own runtime's reads.
+    fn frame_awaits_deliveries(&self, node: u32, cidx: u32) -> bool {
+        let rt = self.runtime_id;
+        let frame = (node, self.nodes.get(node).generation(), cidx);
+        replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .any(|x| x.pending.frame_awaits(frame))
+        })
+    }
+
+    /// Whether a context holds a delivery for the frame `f`'s next read of
+    /// `reading`, under its path, episode and run seq now. A frame's path
+    /// can change while it runs, as the virtual frames below it do, so
+    /// only a read's own lookup matches it. The read's ordinal and key
+    /// parts are found only once a delivery for its node is listed, since
+    /// they scan the frame's reads and the stack.
+    fn read_awaits_delivery(&self, f: ActiveRead, reading: u64) -> bool {
+        let rt = self.runtime_id;
+        let frame = (f.node.0, self.nodes.get(f.node.0).generation(), f.cidx);
+        let listed = |ordinal, parts| {
+            replay::with(|c| {
+                c.iter()
+                    .filter(|x| x.rt == rt)
+                    .any(|x| x.pending.read_awaits(frame, reading, ordinal, parts))
+            })
+        };
+        if !listed(None, None) {
+            return false;
+        }
+        let ordinal =
+            1 + self
+                .dep_stack
+                .reads_of(rt, NodeId(reading as u32), (reading >> 32) as u32);
+        // SAFETY: the frame's control block is live while it is on the stack.
+        let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
+        let (_, path, episode, seq) = self.key_parts(f, member);
+        listed(Some(ordinal), Some((path, episode, seq)))
+    }
+
+    /// Whether the frame `f`'s read under the thread word `word` takes a
+    /// delivery: a replayed read outside value code and the contexts'
+    /// borrow, in a run that is not speculative, by a frame that is not
+    /// doomed.
+    fn takes_deliveries(word: u64, f: ActiveRead) -> bool {
+        word & value_code::REPLAY_BIT != 0
+            && word & value_code::COUNTER_MASK == 0
+            && !replay::held()
+            && !replay::speculative()
+            // SAFETY: the active frame's control block is live.
+            && !unsafe { &*f.ctl }.has(cycle::DOOMED)
+    }
+
+    /// Whether a replay context holds a delivery for this read of
+    /// `handle` by the frame `f` under `word`, which the read takes (see
+    /// [`Self::takes_deliveries`]).
+    pub(super) fn delivery_waits<T: Value>(
+        &self,
+        f: ActiveRead,
+        handle: Incr<T>,
+        word: u64,
+    ) -> bool {
+        if !Self::takes_deliveries(word, f) {
+            return false;
+        }
+        let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
+        self.read_awaits_delivery(f, reading)
+    }
+
+    /// Ends the diversion of the frame `f`, `rt`'s top frame, once no
+    /// context holds a delivery its reads can take, or once it is doomed,
+    /// since a doomed run takes none.
+    pub(super) fn undivert_when_taken(&self, f: ActiveRead) {
+        #[cfg(test)]
+        if DIVERT_EVERY_RETRY.with(std::cell::Cell::get) {
+            return;
+        }
+        let rt = self.runtime_id;
+        // SAFETY: the active frame's control block is live.
+        let doomed = unsafe { &*f.ctl }.has(cycle::DOOMED);
+        if self.dep_stack.diverts_clean_reads(rt)
+            && (doomed || !self.frame_awaits_deliveries(f.node.0, f.cidx))
+        {
+            self.dep_stack.end_diverted_reads(rt);
+        }
+    }
+
     /// A slow read that value code, a doomed or budgeted frame, or an open
     /// replay context sends off the hot path.
     #[cold]
@@ -1089,20 +1205,17 @@ impl<C: Cells> Runtime<C> {
         // A delivery goes to its frame's retry in a non-speculative run: a
         // speculative run that computes the same node is on another path,
         // and a doomed frame is the run before the retry.
-        let scope = (word & value_code::REPLAY_BIT != 0 && !replay::speculative()).then(|| {
+        let _scope = (word & value_code::REPLAY_BIT != 0 && !replay::speculative()).then(|| {
             replay::ReadScope {
                 rt: self.runtime_id,
                 reading: u64::from(handle.slot()) | (u64::from(handle.generation()) << 32),
             }
         });
-        if scope.is_some() {
-            if let Some(read) = frame
-                // SAFETY: the active frame's control block is live.
-                .filter(|f| !unsafe { &*f.ctl }.has(cycle::DOOMED))
-                .and_then(|f| self.take_delivery(f, handle, kind))
-            {
-                return read;
-            }
+        if let Some(read) = frame
+            .filter(|&f| Self::takes_deliveries(word, f))
+            .and_then(|f| self.take_delivery(f, handle, kind))
+        {
+            return read;
         }
         let mut mode = 0;
         let mut _speculating = None;
@@ -2414,19 +2527,9 @@ impl<C: Cells> Runtime<C> {
                     })
                     .is_none()
                 {
-                    x.pending.push(Delivery {
-                        key,
-                        maker,
-                        taken: false,
-                        blocked: false,
-                        what,
-                        provenance: None,
-                        below: Vec::new(),
-                        resumed: None,
-                        landed: None,
-                        passed: true,
-                        runs: replay::RunSlot::default(),
-                    });
+                    let mut d = Delivery::new(key, maker, what);
+                    d.passed = true;
+                    x.pending.push(d);
                 }
             }
             #[cfg(test)]
@@ -2823,7 +2926,7 @@ impl<C: Cells> Runtime<C> {
                         let _speculating = entry.spec.then(replay::Speculating::enter);
                         self.member_run(entry.node, cidx, true, entry.walked, !entry.r5)
                     };
-                    self.drop_deliveries(replay::run_ended(
+                    drop(replay::run_ended(
                         self.runtime_id,
                         cidx,
                         matches!(ran, Ok(None)),
@@ -2969,7 +3072,7 @@ impl<C: Cells> Runtime<C> {
                 replay::with(|c| {
                     if let Some(x) = c.iter_mut().find(|x| x.id == id) {
                         for i in x.pending.of_maker(level) {
-                            x.pending.get_mut(i).taken = false;
+                            x.pending.set_taken(i, false);
                         }
                     }
                 });
@@ -2980,7 +3083,7 @@ impl<C: Cells> Runtime<C> {
                         .map(|x| x.end_maker(level))
                         .unwrap_or_default()
                 });
-                self.drop_deliveries(unread);
+                drop(unread);
             }
             let computed = match ran {
                 Ok(computed) => computed,
@@ -3125,7 +3228,7 @@ impl<C: Cells> Runtime<C> {
                 let _speculating = v.spec.then(replay::Speculating::enter);
                 self.member_run(v.node, v.cidx, true, v.walked, true)
             };
-            self.drop_deliveries(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
+            drop(replay::run_ended(rt, v.cidx, matches!(ran, Ok(None))));
             match ran {
                 Ok(Some(l)) => {
                     self.end_deliveries(id, v.node, v.generation, v.cidx);
@@ -3573,7 +3676,7 @@ impl<C: Cells> Runtime<C> {
         replay::with(|c| {
             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
                 for i in x.pending.of_frame(node, generation, cidx) {
-                    x.pending.get_mut(i).taken = false;
+                    x.pending.set_taken(i, false);
                 }
             }
         });
@@ -3587,7 +3690,7 @@ impl<C: Cells> Runtime<C> {
                 .map(|x| x.pending.extract_frame(node, generation, cidx))
                 .unwrap_or_default()
         });
-        self.drop_deliveries(ended);
+        drop(ended);
     }
 
     /// Drops the deliveries, claim watermarks and failure counts held, in
@@ -3614,8 +3717,6 @@ impl<C: Cells> Runtime<C> {
             }
             dropped
         });
-        // No retry reads these frames again, so their unread reads are not
-        // marked as [`Self::drop_deliveries`] marks a retry's.
         drop(dropped);
     }
 
@@ -3836,21 +3937,6 @@ impl<C: Cells> Runtime<C> {
         self.close_context(id, boundary);
     }
 
-    /// Drops the deliveries of a run that ended.
-    pub(super) fn drop_deliveries(&self, ended: Vec<Delivery>) {
-        // A retry reads a node that landed Clean with a Clean `get`, which
-        // no delivery can intercept, so the read's outcome may not be the
-        // unbounded run's.
-        #[cfg(test)]
-        for d in ended.iter().filter(|d| !d.taken && d.key.foreign.is_none()) {
-            let slot = d.key.reading as u32;
-            if state::load::<C>(self.nodes.get(slot).state_cell()) == NodeState::Clean {
-                self.dirty_reads.lock().unwrap().push(slot);
-            }
-        }
-        drop(ended);
-    }
-
     /// The unwind held for frame `f`'s read of `handle`, if this is the
     /// read it was held for: a cycle a `try_get` returns, or the unwind
     /// raised again.
@@ -3899,20 +3985,18 @@ impl<C: Cells> Runtime<C> {
                     x.direct = None;
                     if let Some(i) = x
                         .pending
-                        .find_keyed(&key, |d| !d.taken && matches!(d.what, Delivered::Direct))
+                        .find_keyed(&key, |d| !d.taken() && matches!(d.what, Delivered::Direct))
                     {
-                        let d = x.pending.get_mut(i);
-                        d.taken = true;
-                        resumed = Some(d.runs.clone());
+                        x.pending.set_taken(i, true);
+                        resumed = Some(x.pending.get(i).runs.clone());
                         x.direct = Some((slot, handle.generation(), f.cidx));
                     }
                     x.resume = None;
-                    if let Some(i) = x
-                        .pending
-                        .find_keyed(&key, |d| !d.taken && matches!(d.what, Delivered::Walk(..)))
-                    {
-                        let d = x.pending.get_mut(i);
-                        d.taken = true;
+                    if let Some(i) = x.pending.find_keyed(&key, |d| {
+                        !d.taken() && matches!(d.what, Delivered::Walk(..))
+                    }) {
+                        x.pending.set_taken(i, true);
+                        let d = x.pending.get(i);
                         resumed = Some(d.runs.clone());
                         if let Delivered::Walk(walk, _) = &d.what {
                             let walk = (**walk).clone();
@@ -3923,9 +4007,11 @@ impl<C: Cells> Runtime<C> {
                 resumed
             });
             replay::start_read(rt, f.cidx, f.depth, above, resumed);
+            self.undivert_when_taken(f);
             return None;
         };
         replay::start_read(rt, f.cidx, f.depth, above, None);
+        self.undivert_when_taken(f);
         // A read of a held node lowers its reader to the node's anchor,
         // whatever the read returns, as the read rules do.
         if let Some(anchor) = cycle_state::held_anchor(rt, handle.slot()) {
@@ -3939,11 +4025,7 @@ impl<C: Cells> Runtime<C> {
                 attributed,
                 payload,
                 nodes,
-            } => {
-                #[cfg(test)]
-                self.dirty_reads.lock().unwrap().push(handle.slot());
-                (cycle, poison, attributed, payload, nodes)
-            }
+            } => (cycle, poison, attributed, payload, nodes),
             Delivered::Walk(..) | Delivered::Direct => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
@@ -4157,7 +4239,7 @@ impl<C: Cells> Runtime<C> {
         if value_code::thread_word() & value_code::MEMO_BIT != 0 {
             taint_memo::clear_from(boundary + 1);
         }
-        self.drop_deliveries(replay::close(id));
+        drop(replay::close(id));
     }
 
     /// [`Self::ensure_clean`] for a driver entry, whose walk skips nodes
