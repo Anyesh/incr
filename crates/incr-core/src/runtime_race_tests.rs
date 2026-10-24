@@ -1490,6 +1490,11 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate) {
 /// two threads, budget None).
 #[test]
 fn reader_of_group_episode_root_claimed_after_landing() {
+    // A forced revisit adds landings of `a`, so the hook's count parks a
+    // thread the schedule never releases.
+    if super::forced_revisit() {
+        return;
+    }
     let rt = Arc::new(Rt::new());
     let (x, a, in_a) = poisoned_episode(&rt);
     rt.get(x);
@@ -1673,7 +1678,10 @@ fn a_claim_released_unrun_ends_its_waiters_wait() {
     claimed.release();
     assert_eq!(reader.join().unwrap(), 1);
     assert_eq!(walker.join().unwrap(), 101);
-    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    // A forced revisit releases claims unrun too.
+    if !super::forced_revisit() {
+        assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    }
     rt.assert_invariant_i();
 }
 
@@ -1715,7 +1723,10 @@ fn a_claim_from_new_released_unrun_after_a_set_stays_new() {
     assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::New);
     rerun.release();
     assert_eq!(walker.join().unwrap(), 102);
-    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    // A forced revisit releases claims unrun too.
+    if !super::forced_revisit() {
+        assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    }
     rt.assert_invariant_i();
 }
 

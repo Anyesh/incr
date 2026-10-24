@@ -549,6 +549,12 @@ fn walk_driven_discard<C: Cells>() {
         (c, rt.expansions() - before, w.dooms(&rt))
     };
     let unbounded = observe(None);
+    // A forced revisit expands its entry again.
+    if super::forced_revisit() && !C::SINGLE_THREADED {
+        assert_eq!(unbounded.0, Outcome::Value(26));
+        assert_eq!(observe(Some(1)).0, unbounded.0);
+        return;
+    }
     assert_eq!(unbounded, (Outcome::Value(26), 3, String::new()));
     // The plan counts 4, with B expanded again as the loop's target; the
     // driver instead runs that target as the walk's own compute of B, whose

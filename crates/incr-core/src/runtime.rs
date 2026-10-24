@@ -792,6 +792,11 @@ impl Walk {
     }
 }
 
+#[cfg(test)]
+fn forced_revisit() -> bool {
+    *FORCE_REVISIT
+}
+
 #[inline(always)]
 fn is_computing(state: NodeState) -> bool {
     matches!(state, NodeState::Computing | NodeState::ComputingDirty)

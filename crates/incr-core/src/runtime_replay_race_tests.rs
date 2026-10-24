@@ -609,11 +609,14 @@ fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
         .filter(|(t, _)| *t == reader_id)
         .map(|&(_, point)| point)
         .collect();
-    assert_eq!(
-        waits,
-        vec![ParkPoint::BeforeComputeOne(p)],
-        "thread 1's only walk compute of P is its root's, and it never waited on P"
-    );
+    // A forced revisit of P computes it from the walk a second time.
+    if !super::forced_revisit() {
+        assert_eq!(
+            waits,
+            vec![ParkPoint::BeforeComputeOne(p)],
+            "thread 1's only walk compute of P is its root's, and it never waited on P"
+        );
+    }
     s.rt.assert_invariant_i();
 }
 
