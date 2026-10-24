@@ -387,6 +387,106 @@ fn b3_dep_recomputed_for_an_unwalked_set_supersedes_new_dependent() {
     assert_eq!(rt.get(d), 60);
 }
 
+/// `f` panics while `x` is even; `d` catches that panic as 7 and reads
+/// `y`, parking on `gate` once its reads are done.
+fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let x = rt.create_input(0_u64);
+    let y = rt.create_input(0_u64);
+    let f = rt.create_query(move |rt: &Rt| {
+        let v = rt.get(x);
+        assert!(v % 2 == 1, "even");
+        v
+    });
+    let d = {
+        let gate = gate.clone();
+        rt.create_query(move |rt: &Rt| {
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10) + rt.get(y);
+            gate.park();
+            v
+        })
+    };
+    (x, y, f, d)
+}
+
+/// A set moves `d`'s Failed dep `f` between `d`'s first read and its
+/// publish, before `d`'s edge exists, so the walk can't reach `d`.
+#[test]
+fn caught_failed_dep_flipped_before_the_first_publish_supersedes() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (x, _, f, d) = caught_failed_dep(&rt, &gate);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    rt.set(x, 1);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 7);
+
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert!(rt.has_reverse_edge(f, d));
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 10);
+}
+
+/// As above, and `f` lands Failed again for the set before `d` publishes,
+/// so the Failed state `d` finds is not the one it read.
+#[test]
+fn caught_failed_dep_relanded_failed_before_the_first_publish_supersedes() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (x, _, f, d) = caught_failed_dep(&rt, &gate);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    gate.wait_parked();
+    rt.set(x, 2);
+    let refail = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err())
+    };
+    assert!(refail.join().unwrap());
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 7);
+
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    rt.assert_invariant_i();
+}
+
+/// `d` lands Clean over Failed `f`; a recompute for `y` reads `f` Failed
+/// again, and a set that moves `f` mid-compute reaches `d` by its edge.
+#[test]
+fn caught_failed_dep_flipped_during_a_recompute_dirties_it() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (x, y, f, d) = caught_failed_dep(&rt, &gate);
+    assert_eq!(rt.get(d), 7);
+    assert_eq!(rt.state_of(d), NodeState::Clean);
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    rt.assert_invariant_i();
+
+    rt.set(y, 1);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    gate.wait_parked();
+    rt.set(x, 1);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 8);
+
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 11);
+}
+
 #[test]
 fn b1_publish_lands_between_delete_check_and_claim() {
     let rt = Arc::new(Rt::new());

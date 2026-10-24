@@ -11,7 +11,7 @@ use std::ops::{Deref, DerefMut};
 
 use std::sync::Arc;
 
-use crate::cycle::{Cycle, Erased, ErasedStrategy};
+use crate::cycle::{self, Cycle, Erased, ErasedStrategy};
 use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
@@ -114,7 +114,8 @@ pub(crate) struct Held {
     opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    poisoned: bool,
+    /// The `POISONED` and `FAILED_READ` flags of the runs' frames.
+    poison: u16,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
@@ -159,7 +160,7 @@ impl Held {
             wrote: false,
             opened: false,
             changed: false,
-            poisoned: false,
+            poison: 0,
             failed: false,
             episode: None,
             ep: 0,
@@ -169,7 +170,8 @@ impl Held {
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
-    /// child index and whether it was poisoned. Under speculation it first
+    /// child index and its frame's `POISONED` and `FAILED_READ` flags
+    /// (`poison`). Under speculation it first
     /// keeps the record it replaces; outside, it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
     /// caller to drop outside the held map.
@@ -179,7 +181,7 @@ impl Held {
         deps: Vec<(NodeId, u32)>,
         buf: Option<Erased>,
         opened: bool,
-        poisoned: bool,
+        poison: u16,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
             self.keep_record();
@@ -197,7 +199,7 @@ impl Held {
         }
         self.last = deps;
         self.opened = opened;
-        self.poisoned |= poisoned;
+        self.poison |= poison;
         (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
 
@@ -250,7 +252,7 @@ impl Held {
                 last: self.last.clone(),
                 installed: self.installed.clone(),
                 opened: self.opened,
-                poisoned: self.poisoned,
+                poison: self.poison,
             }));
         }
     }
@@ -271,7 +273,7 @@ impl Held {
         self.last = r.last;
         self.installed = r.installed;
         self.opened = r.opened;
-        self.poisoned = r.poisoned;
+        self.poison = r.poison;
         self.buf
             .take()
             .map(|buf| Unbuilt::<dyn std::any::Any>::new(buf))
@@ -347,8 +349,16 @@ impl<H: Borrow<Held>> Seen<H> {
         self.0.borrow().opened
     }
 
+    /// A run read a dep that did not land Clean, other than one landed
+    /// Failed, so the landing is Dirty.
     pub(crate) fn poisoned(&self) -> bool {
-        self.0.borrow().poisoned
+        self.0.borrow().poison & cycle::POISONED != 0
+    }
+
+    /// A run read a dep that did not land Clean, so the landing is
+    /// unverified (`verified_at` 0).
+    pub(crate) fn unverified(&self) -> bool {
+        self.0.borrow().poison != 0
     }
 }
 
@@ -387,7 +397,7 @@ struct RunRecord {
     last: Vec<(NodeId, u32)>,
     installed: Vec<NodeId>,
     opened: bool,
-    poisoned: bool,
+    poison: u16,
 }
 
 /// An episode between member runs. A doom that discards a member run

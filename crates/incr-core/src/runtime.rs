@@ -3541,7 +3541,7 @@ impl<C: Cells> Runtime<C> {
                 }
 
                 let poisoned = ctl.has(cycle::POISONED);
-                if poisoned {
+                if poisoned || ctl.has(cycle::FAILED_READ) {
                     // The value may be built on a result the closure
                     // swallowed from a dep that did not land Clean or whose
                     // cleanup failed, and that dep's stamps need not have
@@ -3555,8 +3555,9 @@ impl<C: Cells> Runtime<C> {
 
                 // Finish. Land Dirty instead of Clean if a set() flagged us
                 // ComputingDirty mid-compute, if a new dep changed after we
-                // read it, or if a dep we read did not itself land Clean, so
-                // the next reader recomputes against the newer input.
+                // read it, or if a dep we read did not itself land Clean or
+                // Failed, so the next reader recomputes against the newer
+                // input.
                 let target = if published == Publish::Superseded || poisoned {
                     NodeState::Dirty
                 } else {
@@ -3675,7 +3676,8 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
         bag: &mut Deferred<C>,
     ) -> ! {
-        self.dep_stack.poison_current_frame(self.runtime_id);
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, self.unwound_poison(kind));
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
@@ -3720,6 +3722,30 @@ impl<C: Cells> Runtime<C> {
                     })
             }),
             Some(_) => false,
+        }
+    }
+
+    /// The flag the reader of an unwind with `kind` out of the compute
+    /// above it raises: `FAILED_READ` for a user panic of a node that
+    /// landed Failed, `POISONED` otherwise.
+    pub(super) fn unwound_poison(&self, kind: Option<UnwindKind>) -> u16 {
+        let reading = self.dep_stack.unwound_reader(self.runtime_id);
+        match reading {
+            Some((_, _, reading, _))
+                if self.nodes.get(reading as u32).generation() == (reading >> 32) as u32 =>
+            {
+                self.failed_poison(kind, reading as u32)
+            }
+            _ => cycle::POISONED,
+        }
+    }
+
+    /// [`Self::unwound_poison`] for an unwind out of node `slot`.
+    pub(super) fn failed_poison(&self, kind: Option<UnwindKind>, slot: u32) -> u16 {
+        if kind.is_none() && self.nodes.get(slot).state() == NodeState::Failed {
+            cycle::FAILED_READ
+        } else {
+            cycle::POISONED
         }
     }
 
@@ -4166,6 +4192,7 @@ impl<C: Cells> Runtime<C> {
         let settled = |d: &NodeId| {
             diff.old_set.has(*d)
                 || self.observed_clean(*d, verify_rev)
+                || self.failed_unmoved(*d, verify_rev)
                 || panic.is_some_and(|members| {
                     self.nodes.get(d.0).state() == NodeState::Failed
                         || members.binary_search(&d.0).is_ok()
@@ -4209,6 +4236,16 @@ impl<C: Cells> Runtime<C> {
         node.state().is_settled() && node.changed_at() <= rev
     }
 
+    /// True iff `dep` is `Failed` and no set has bumped the revision past
+    /// `rev`, the walked watermark at the claim. A set flips a Failed node
+    /// before it walks the node's dependents, so the state loaded here is
+    /// the one the compute read, and a later flip's walk finds the edge
+    /// this publish installs. The state is loaded first, so that a flip
+    /// and a relanding Failed since the read come with their set's bump.
+    fn failed_unmoved(&self, dep: NodeId, rev: u64) -> bool {
+        self.nodes.get(dep.0).state() == NodeState::Failed && self.current_revision() == rev
+    }
+
     #[cfg(test)]
     pub(crate) fn arena<T: Value>(&self) -> &GenericArena<T, C> {
         let tag = self.inner.read().arena_tags.tag::<T>();
@@ -4248,8 +4285,11 @@ impl<C: Cells> Runtime<C> {
                     "(I) violated: Clean node {x} is missing from dependents[{}]",
                     s.0
                 );
+                // A closure that caught a Failed dep's panic lands Clean
+                // over it, unverified.
                 assert!(
-                    dep.state().is_settled(),
+                    dep.state().is_settled()
+                        || dep.state() == NodeState::Failed && node.verified_at() == 0,
                     "(I) violated: Clean node {x} has dep {} {:?}",
                     s.0,
                     dep.state()

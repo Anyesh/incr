@@ -825,7 +825,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 ctl.buf.take(),
                 !ctl.children.get().is_null(),
-                ctl.has(cycle::POISONED),
+                ctl.poison(),
             );
             // An engine unwind is no fault of the member's.
             if result.is_err() && cycle_state::unwind_kind().is_none() {
@@ -901,7 +901,7 @@ impl<C: Cells> Runtime<C> {
             deps,
             ctl.buf.take(),
             !ctl.children.get().is_null(),
-            ctl.has(cycle::POISONED),
+            ctl.poison(),
         );
         debug_assert!(
             replaced.is_none() && spec_buf.is_none(),
@@ -1948,7 +1948,7 @@ impl<C: Cells> Runtime<C> {
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
             None
         } else {
-            if e.poisoned() {
+            if e.unverified() {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
@@ -2116,7 +2116,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if entries[i].1.poisoned() {
+            if entries[i].1.unverified() {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);

@@ -287,7 +287,7 @@ impl<C: Cells> Runtime<C> {
         word & value_code::REPLAY_BIT != 0
             && replay::speculative()
             && !ctl.has(cycle::DOOMED)
-            && (ctl.has(cycle::POISONED)
+            && (ctl.has(cycle::POISONED | cycle::FAILED_READ)
                 || deps.iter().any(|&(d, _)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
@@ -1117,7 +1117,7 @@ impl<C: Cells> Runtime<C> {
         };
         let what = Delivered::Unwind {
             cycle: kind == Some(UnwindKind::Cycle),
-            poison: true,
+            poison: self.unwound_poison(kind),
             attributed: false,
             payload: copy,
             nodes: self.copy_notes(payload, cidx + 1),
@@ -1158,7 +1158,7 @@ impl<C: Cells> Runtime<C> {
         };
         let what = Delivered::Unwind {
             cycle: false,
-            poison: true,
+            poison: cycle::FAILED_READ,
             attributed: false,
             payload: copy,
             nodes: self.copy_notes(payload, cidx + 1),
@@ -1264,7 +1264,7 @@ impl<C: Cells> Runtime<C> {
             Ok(Ok(value)) => Some(Delivered::Landed(Unbuilt::new(clone_landed::<T>(value)))),
             Ok(Err(c)) => Some(Delivered::Unwind {
                 cycle: true,
-                poison: false,
+                poison: 0,
                 attributed: false,
                 payload: Box::new(cycle::CycleUnwind(c.clone())),
                 nodes: replay::Landings::default(),
@@ -1278,7 +1278,7 @@ impl<C: Cells> Runtime<C> {
                 }
                 copy.map(|payload| Delivered::Unwind {
                     cycle: false,
-                    poison: false,
+                    poison: 0,
                     attributed: false,
                     payload,
                     nodes: replay::Landings::default(),
@@ -2565,12 +2565,17 @@ impl<C: Cells> Runtime<C> {
         if pos == 0 {
             // The read that ran the loop reads the target as a compute's
             // unwind leaves its reader.
-            self.dep_stack.poison_current_frame(self.runtime_id);
+            self.dep_stack
+                .poison_current_frame_with(self.runtime_id, self.unwound_poison(kind));
             bag.drain(self);
             self.unwind_out_of(id, boundary, kind, payload);
         }
         cycle_state::take_unwind_kind();
-        let poison = !(continuation && self.episode_member(node));
+        let poison = if continuation && self.episode_member(node) {
+            0
+        } else {
+            self.failed_poison(kind, v.node)
+        };
         replay::with(|c| {
             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
                 x.deliver_unwind(
@@ -2836,7 +2841,11 @@ impl<C: Cells> Runtime<C> {
         cycle_state::take_unwind_kind();
         // An R5 member run's unwind leaves its reader unpoisoned, as the
         // member stays held for its episode.
-        let poison = !self.episode_member(entry.node);
+        let poison = if self.episode_member(entry.node) {
+            0
+        } else {
+            self.failed_poison(kind, entry.node)
+        };
         let abandoned = replay::with(|c| {
             let x = c
                 .iter_mut()
@@ -3031,9 +3040,9 @@ impl<C: Cells> Runtime<C> {
         // unwind, or a `try_get` that returns it, has still read a dep that
         // did not land. The native walk computes a Dirty reader's deps
         // before its closure, so that reader never lands Clean over them.
-        if poison {
+        if poison != 0 {
             // SAFETY: the active frame's control block is live.
-            unsafe { &*f.ctl }.raise(cycle::POISONED);
+            unsafe { &*f.ctl }.raise(poison);
         }
         if !cycle {
             // The member marked for the panic was marked in the run it came
@@ -3145,7 +3154,11 @@ impl<C: Cells> Runtime<C> {
                         attributed: false,
                         // As `episode_landed` poisons a reader of a node
                         // left New, and not of one left Cyclic.
-                        poison: state == NodeState::New,
+                        poison: if state == NodeState::New {
+                            cycle::POISONED
+                        } else {
+                            0
+                        },
                         payload: Box::new(cycle::CycleUnwind(g.cycle.clone())),
                         nodes: replay::Landings::default(),
                     })

@@ -2506,6 +2506,32 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
     }
 }
 
+/// [`differential`] on every operation's outcome alone, for a case whose
+/// states wait in [`strict_dirty_for_clean_seeds`] or
+/// [`strict_recomputed_after_landing_seeds`].
+fn same_outcomes<C: Cells>(case: &Case, seed: u64) {
+    let unbounded = run::<C>(case, None, 0);
+    let no_states = vec![false; case.ops.len()];
+    for frames in [1, 2, 3] {
+        let bounded = run::<C>(case, Some(frames), 0);
+        let diff = first_diff(
+            case,
+            &unbounded,
+            &bounded,
+            Some(&no_states),
+            PanicText::Exact,
+            &PerRead::new(),
+            &CycleReads::new(),
+        );
+        if let Some((i, what)) = diff {
+            panic!(
+                "seed {seed:#x}, budget {frames}: operation {i} ({:?}) differs from the unbounded run\n{what}",
+                case.ops[i]
+            );
+        }
+    }
+}
+
 /// The two-thread form: every phase schedule at every budget, unbounded
 /// included, against the unbounded single-thread run of some order of each
 /// phase's two reads, by [`Serial`].
@@ -2623,7 +2649,8 @@ fn seed_56cd8c2_keeps_the_failed_set() {
 /// six participants. At budget 1, a speculative run's walk memoized 10
 /// under the frame at position 1, so 11's later read of 10 computed it
 /// directly where the unbounded run walks it into the episode rooted at
-/// 10, and the cycle came out as three.
+/// 10, and the cycle came out as three. Its states are
+/// T8-strict-group-c-dirty-for-clean's.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn seed_16d87_takes_no_speculative_memo() {
@@ -2726,8 +2753,8 @@ fn seed_16d87_takes_no_speculative_memo() {
         ops: vec![Op::TryGet(18)],
     };
     quiet(|| {
-        differential::<Local>(&case, 0x16d87);
-        differential::<Shared>(&case, 0x16d87);
+        same_outcomes::<Local>(&case, 0x16d87);
+        same_outcomes::<Shared>(&case, 0x16d87);
     });
 }
 
@@ -2999,7 +3026,8 @@ fn a_member_try_get_keeps_a_swallowing_closures_cycle() {
 /// at its position, and the doomed entry's retry re-armed it. 7's panic
 /// then released 8 and 9, which ends their runs as it does unbounded, but
 /// 8's next run at that position took the old cycle where the unbounded
-/// run reads 9 Failed: 8 stayed Dirty instead of Failed.
+/// run reads 9 Failed: 8 stayed Dirty instead of Failed. 0 and 1, which
+/// read 2's caught Failed read, are T8-strict-group-c-dirty-for-clean's.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_claim_takes_no_delivery_of_its_ended_run() {
@@ -3039,9 +3067,10 @@ fn a_released_claim_takes_no_delivery_of_its_ended_run() {
         queries2: 0,
         ops: vec![Op::Get(0), Op::Set(11, 0), Op::Get(4)],
     };
+    let nodes: Vec<usize> = (2..11).collect();
     quiet(|| {
-        exact_states::<Local>(&case);
-        exact_states::<Shared>(&case);
+        exact_states::<Local>(&case, &nodes);
+        exact_states::<Shared>(&case, &nodes);
     });
 }
 
@@ -3051,21 +3080,24 @@ fn a_released_claim_takes_no_delivery_of_its_ended_run() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_member_takes_no_record_of_its_ended_run() {
-    for seed in [0x6e3, 0xdeb] {
-        let case = gen_case(seed, false, false);
-        quiet(|| {
-            differential::<Local>(&case, seed);
-            differential::<Shared>(&case, seed);
-        });
-    }
+    let case = gen_case(0x6e3, false, false);
+    let deb = gen_case(0xdeb, false, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x6e3);
+        differential::<Shared>(&case, 0x6e3);
+        same_outcomes::<Local>(&deb, 0xdeb);
+        same_outcomes::<Shared>(&deb, 0xdeb);
+    });
 }
 
-/// Asserts every operation's outcome and node states at budgets 1 to 3
-/// are the unbounded run's, for a case whose reads of Dirty values stop
-/// `first_diff` comparing states although the runs agree.
-fn exact_states<C: Cells>(case: &Case) {
+/// Asserts every operation's outcome and the states of `nodes` at
+/// budgets 1 to 3 are the unbounded run's, for a case whose reads of Dirty
+/// values stop `first_diff` comparing states although the runs agree.
+fn exact_states<C: Cells>(case: &Case, nodes: &[usize]) {
     let states = |t: Trace| -> Vec<(Out, Vec<NodeState>)> {
-        t.into_iter().map(|(out, snap)| (out, snap.0)).collect()
+        t.into_iter()
+            .map(|(out, snap)| (out, nodes.iter().map(|&x| snap.0[x]).collect()))
+            .collect()
     };
     let unbounded = states(run::<C>(case, None, 0));
     for frames in [1, 2, 3] {
@@ -3457,8 +3489,8 @@ fn a_walked_episode_in_a_try_get_cycle_answers_as_unbounded() {
     case.ops.truncate(1);
     assert!(matches!(case.ops[0], Op::Get(0)));
     quiet(|| {
-        differential::<Local>(&case, seed);
-        differential::<Shared>(&case, seed);
+        same_outcomes::<Local>(&case, seed);
+        same_outcomes::<Shared>(&case, seed);
     });
 }
 
@@ -4602,6 +4634,75 @@ fn caught_cycle_then_clean_read() {
     });
 }
 
+/// n_i = n_{i+1} + n_{i+1} for i < k - 1, n_{k-1} catches the panic of its
+/// read of n_k, and n_k panics on the input it reads.
+fn caught_failed_chain(k: usize, ops: Vec<Op>) -> Case {
+    let read = |t| Box::new(Expr::Read(t, false));
+    let mut specs: Vec<Spec> = (0..k - 1)
+        .map(|i| replayable(Expr::Add(read(i + 1), read(i + 1)), Strat::None))
+        .collect();
+    specs.push(replayable(Expr::Catch(read(k)), Strat::None));
+    specs.push(replayable(Expr::PanicIf(read(k + 1), 0), Strat::None));
+    specs.push(Spec::Input(0));
+    Case {
+        specs,
+        panics: true,
+        cycles: false,
+        queries: k + 1,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    }
+}
+
+/// A closure that catches the panic of a dep that landed Failed lands its
+/// value for the revision: a later read reuses it, as every read of a
+/// Clean node does. It landed Dirty, so each read in the revision ran it
+/// again: the chain above it ran 2^k computes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn caught_failed_read_lands_its_value_for_the_revision() {
+    let k = 10;
+    let value = Out::Value(9999 << (k - 1));
+    quiet(|| {
+        let fresh = caught_failed_chain(k, vec![Op::Get(0)]);
+        let twice = caught_failed_chain(k, vec![Op::Get(k - 1), Op::Get(k - 1)]);
+        for shared in [false, true] {
+            let run_of = |case: &Case| {
+                if shared {
+                    run_logged::<Shared>(case, None, 0, true)
+                } else {
+                    run_logged::<Local>(case, None, 0, true)
+                }
+            };
+            let (trace, runs) = run_of(&fresh);
+            assert_eq!(trace[0].0, value, "shared {shared}");
+            assert_eq!(runs[0].len(), k + 1, "shared {shared}: one run per node");
+            let (trace, runs) = run_of(&twice);
+            assert_eq!(trace[0].0, trace[1].0, "shared {shared}");
+            assert!(
+                runs[1].is_empty(),
+                "shared {shared}: the second get ran {:?}",
+                runs[1]
+            );
+        }
+        for case in [&fresh, &twice] {
+            differential::<Local>(case, 0);
+            differential::<Shared>(case, 0);
+        }
+        let deep = caught_failed_chain(20, vec![Op::Get(0), Op::Get(0)]);
+        for (trace, runs) in [
+            run_logged::<Local>(&deep, None, 0, true),
+            run_logged::<Shared>(&deep, None, 0, true),
+        ] {
+            assert_eq!(trace[0].0, Out::Value(9999 << 19));
+            assert_eq!(trace[1].0, trace[0].0);
+            assert_eq!(runs[0].len(), 21, "one run per node");
+            assert!(runs[1].is_empty(), "the second get ran {:?}", runs[1]);
+        }
+    });
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped
@@ -4881,7 +4982,6 @@ fn replay_seeds() {
         0x1c12,
         0x1ce4,
         0x1d02,
-        0x1e89,
         0x21b9,
         0x2224,
         0x22ef,
@@ -4925,16 +5025,23 @@ fn replay_seeds() {
             differential::<Shared>(&case, seed);
         });
     }
+    let case = gen_base(0x1e89);
+    quiet(|| {
+        same_outcomes::<Local>(&case, 0x1e89);
+        same_outcomes::<Shared>(&case, 0x1e89);
+    });
 }
 
 /// Seeds that differ under the strict comparator where the unbounded run
 /// leaves a node Dirty and the bounded run lands it Clean; 0xa5b and 0x1359
-/// return other outcomes too.
+/// return other outcomes too. 0xdeb, 0x575, 0x670 and 0x29bf2de20fa0e476
+/// show it once a caught Failed read lands Clean: before, the later landing
+/// that the bounded run reads was Dirty too.
 #[test]
 #[cfg_attr(miri, ignore)]
 #[ignore = "T8-strict-group-c-dirty-for-clean"]
 fn strict_dirty_for_clean_seeds() {
-    let cases = [0x41eb, 0xd60]
+    let cases = [0x41eb, 0xd60, 0xdeb, 0x575, 0x670, 0x29bf_2de2_0fa0_e476]
         .map(|seed| (seed, gen_case(seed, false, false)))
         .into_iter()
         .chain(
@@ -4957,6 +5064,26 @@ fn strict_dirty_for_clean_seeds() {
 fn strict_computed_left_new_seeds() {
     for seed in [0x2997, 0xd4f2] {
         let case = gen_base(seed);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
+/// Seeds where the unbounded run computes a node again after a landing
+/// that left it Dirty or New, and the bounded run leaves it so. They show
+/// once a caught Failed read lands Clean, which the unbounded compute now
+/// does where it landed Dirty before.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "T8-seed-65e-clean-vs-new"]
+fn strict_recomputed_after_landing_seeds() {
+    let cases = [
+        (0x65e, gen_case(0x65e, false, false)),
+        (0x1e89, gen_base(0x1e89)),
+    ];
+    for (seed, case) in cases {
         quiet(|| {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);

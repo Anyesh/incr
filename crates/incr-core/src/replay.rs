@@ -498,12 +498,13 @@ pub(crate) struct Carry {
 
 pub(crate) enum Delivered {
     /// An unwind out of a non-speculative entry: a cycle unwind, whose
-    /// payload is the `CycleUnwind`, or a user panic. It poisons the
-    /// reader unless it is the cycle of a node that landed `Cyclic`, which
-    /// a read of the node raises with the node landed.
+    /// payload is the `CycleUnwind`, or a user panic. `poison` is the flag
+    /// it raises on the reader (`Runtime::unwound_poison`), 0 for the
+    /// cycle of a node that landed `Cyclic`, which a read of the node
+    /// raises with the node landed.
     Unwind {
         cycle: bool,
-        poison: bool,
+        poison: u16,
         /// A member was marked failed in the run the panic came out of,
         /// so a member run that takes it again is not.
         attributed: bool,

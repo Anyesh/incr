@@ -1377,13 +1377,25 @@ fn shared_unwritten_speculative_value_drop_is_not_raised() {
     );
 }
 
+/// A node that reads itself, with no strategy: a closure that catches
+/// its cycle lands Dirty.
+fn self_cycle<C: Cells>(rt: &Runtime<C>) -> Incr<i64> {
+    let cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let q = {
+        let cell = cell.clone();
+        rt.create_query(move |rt| rt.get(*cell.get().unwrap()))
+    };
+    cell.set(q).unwrap();
+    q
+}
+
 /// Under a frame budget that is never reached, f's read of a poisoned
 /// (Dirty) p keeps a clone of Boom(31) the unbounded run never makes. A
 /// later top-level g that reads another Dirty node must still return 1
 /// and leave Boom(31) undropped, as the unbounded run does.
 fn wave7_kept_dirty_read_clone_drop_is_not_raised<C: Cells>(rt: &Runtime<C>, frames: u32) {
     rt.set_max_frames(frames);
-    let q = rt.create_query(|_| -> i64 { panic!("q boom") });
+    let q = self_cycle(rt);
     let p = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
         Boom(31)
@@ -1392,7 +1404,7 @@ fn wave7_kept_dirty_read_clone_drop_is_not_raised<C: Cells>(rt: &Runtime<C>, fra
         std::mem::forget(rt.get(p));
         0_u64
     });
-    let q2 = rt.create_query(|_| -> i64 { panic!("q2 boom") });
+    let q2 = self_cycle(rt);
     let p2 = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q2)));
         Boom(32)
@@ -1435,7 +1447,7 @@ fn shared_wave7_kept_dirty_read_clone_drop_is_not_raised() {
 /// `f` is not Failed under a budget, as unbounded, where no clone is made.
 fn wave7_kept_dirty_read_clone_drops_isolated<C: Cells>(rt: &Runtime<C>, frames: u32) {
     rt.set_max_frames(frames);
-    let q = rt.create_query(|_| -> i64 { panic!("q boom") });
+    let q = self_cycle(rt);
     let p = rt.create_query(move |rt| {
         let _ = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
         Boom(33)
@@ -1448,6 +1460,7 @@ fn wave7_kept_dirty_read_clone_drops_isolated<C: Cells>(rt: &Runtime<C>, frames:
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_err(panic_message);
     disarm(33);
     assert_eq!(got, Ok(0), "frames {frames}");
+    assert_eq!(rt.state_of(p), NodeState::Dirty, "p was poisoned");
     assert_ne!(rt.state_of(f), NodeState::Failed, "frames {frames}");
 }
 

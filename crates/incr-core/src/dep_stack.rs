@@ -391,11 +391,17 @@ pub trait DepStack: 'static {
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
+        self.poison_current_frame_with(rt, POISONED);
+    }
+
+    /// [`Self::poison_current_frame`] with `flag`, `POISONED` or
+    /// `FAILED_READ`.
+    fn poison_current_frame_with(&self, rt: RuntimeId, flag: u16) {
         self.with(|s| {
             if let Some(top) = s.reader(rt) {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
-                unsafe { (*top.ctl).raise(POISONED) };
+                unsafe { (*top.ctl).raise(flag) };
             }
         })
     }
