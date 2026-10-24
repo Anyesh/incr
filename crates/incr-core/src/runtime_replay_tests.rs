@@ -3,12 +3,13 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Runtime, DEFAULT_MAX_FRAMES};
 use crate::cells::{Cells, Local, Shared};
+use crate::child_test::run_alone;
 use crate::cycle::{ComputeCtl, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
-use crate::cycle_state::{with_held, Held};
+use crate::cycle_state::{set_unwind_kind, unwind_kind, with_held, Held, UnwindKind};
 use crate::dep_stack::DepStack;
 use crate::handle::Incr;
 use crate::node::NodeId;
@@ -346,18 +347,23 @@ fn operator_sources_create_every_query_not_replayable() {
     }
 }
 
+/// Whether `get(t)` returned, with the states of T, P and S.
+type CaughtOutcome = (bool, [NodeState; 3]);
+
 /// T reads S with `get` inside `catch_unwind`, then P, then itself with
 /// `try_get`, then S again; P (Fixpoint) and S (unseeded) read each other.
 /// Unbounded, S's read closes the cycle at S, T catches the unwind and is
 /// poisoned, and its `get` panics with T left New. At budget 1 the unwind
 /// is delivered to T's retry, whose read of P dooms it; P's episode then
-/// lands S Clean, so the next retry reads S with a Clean `get`, which no
-/// delivery can intercept (departure 7). The result is the unbounded
-/// run's when P's episode has landed S before T runs (`warm`).
-fn caught_delivery_after_its_node_lands<C: Cells>(
-    frames: u32,
-    warm: bool,
-) -> (bool, [NodeState; 3]) {
+/// lands S Clean, and the next retry's Clean `get` of S still takes the
+/// unwind its context holds, so the result is the unbounded run's.
+fn caught_delivery_after_its_node_lands<C: Cells>(frames: u32) -> CaughtOutcome {
+    caught_delivery_run::<C>(frames).0
+}
+
+/// [`caught_delivery_after_its_node_lands`], with whether each of T's runs
+/// that reached its end began diverted and ended diverted.
+fn caught_delivery_run<C: Cells>(frames: u32) -> (CaughtOutcome, Vec<(bool, bool)>) {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
@@ -374,36 +380,59 @@ fn caught_delivery_after_its_node_lands<C: Cells>(
     let s = rt.create_query_with(move |rt| rt.get(p), replayable());
     s_cell.set(s).unwrap();
     let t_for_t = t_cell.clone();
+    let diverted = Arc::new(Mutex::new(Vec::new()));
+    let seen = diverted.clone();
     let t = rt.create_query_with(
         move |rt| {
+            let at_start = rt.dep_stack.diverts_clean_reads(rt.runtime_id);
             let _ = catch_unwind(AssertUnwindSafe(|| rt.get(s)));
             let _ = rt.get(p);
             let _ = rt.try_get(*t_for_t.get().unwrap());
-            rt.try_get(s).unwrap_or(7777)
+            let out = rt.try_get(s).unwrap_or(7777);
+            let at_end = rt.dep_stack.diverts_clean_reads(rt.runtime_id);
+            seen.lock().unwrap().push((at_start, at_end));
+            out
         },
         replayable(),
     );
     t_cell.set(t).unwrap();
-    if warm {
-        let _ = rt.try_get(p);
-    }
     let ok = catch_unwind(AssertUnwindSafe(|| rt.get(t))).is_ok();
-    (ok, [rt.state_of(t), rt.state_of(p), rt.state_of(s)])
+    let out = (ok, [rt.state_of(t), rt.state_of(p), rt.state_of(s)]);
+    let diverted = diverted.lock().unwrap().clone();
+    (out, diverted)
+}
+
+/// T's retry starts diverted, with deliveries to take, and its reads take
+/// them all, so it ends reading fast.
+fn a_retry_ends_its_divert_with_its_last_delivery<C: Cells>() {
+    let runs = caught_delivery_run::<C>(1).1;
+    assert!(runs.iter().any(|&(start, _)| start), "{runs:?}");
+    assert!(runs.iter().all(|&(_, end)| !end), "{runs:?}");
 }
 
 #[test]
-fn local_caught_delivery_after_its_node_lands_reads_it_clean() {
+fn local_a_retry_ends_its_divert_with_its_last_delivery() {
+    a_retry_ends_its_divert_with_its_last_delivery::<Local>();
+}
+
+#[test]
+fn shared_a_retry_ends_its_divert_with_its_last_delivery() {
+    a_retry_ends_its_divert_with_its_last_delivery::<Shared>();
+}
+
+#[test]
+fn local_caught_delivery_after_its_node_lands_is_taken() {
     assert_eq!(
-        caught_delivery_after_its_node_lands::<Local>(1, false),
-        caught_delivery_after_its_node_lands::<Local>(u32::MAX, true)
+        caught_delivery_after_its_node_lands::<Local>(1),
+        caught_delivery_after_its_node_lands::<Local>(u32::MAX)
     );
 }
 
 #[test]
-fn shared_caught_delivery_after_its_node_lands_reads_it_clean() {
+fn shared_caught_delivery_after_its_node_lands_is_taken() {
     assert_eq!(
-        caught_delivery_after_its_node_lands::<Shared>(1, false),
-        caught_delivery_after_its_node_lands::<Shared>(u32::MAX, true)
+        caught_delivery_after_its_node_lands::<Shared>(1),
+        caught_delivery_after_its_node_lands::<Shared>(u32::MAX)
     );
 }
 
@@ -492,12 +521,12 @@ fn frame_paths_agree<C: Cells>(rt: &Runtime<C>) {
     with_held(|h| h.insert((id, 11), held));
     let s = &rt.dep_stack;
     s.push_frame(id, NodeId(10), &ctls[0]);
-    s.record_dep(id, NodeId(20), 0);
+    s.record_dep(id, NodeId(20), 0, 0);
     s.record_read(id, NodeId(20), 0);
     s.push_frame(id, NodeId(11), &ctls[1]);
     s.record_read(id, NodeId(21), 1);
     s.push_frame(id, NodeId(12), &ctls[2]);
-    s.record_dep(id, NodeId(21), 3);
+    s.record_dep(id, NodeId(21), 3, 0);
     s.record_read(id, NodeId(21), 0);
     s.record_read(id, NodeId(21), 0);
     s.record_read(id, NodeId(21), 0);
@@ -528,6 +557,103 @@ local_and_shared!(
     frame_paths_agree,
     local_frame_paths_agree,
     shared_frame_paths_agree
+);
+
+/// A diverted frame's Clean read with no delivery to take leaves the
+/// frame as the fast read does: the same value, one dep, the `reading` of
+/// the frame's last non-Clean read, which a doom names, and the unwind
+/// kind a closure that caught a cycle's unwind left set.
+fn diverted_clean_read_is_a_fast_read<C: Cells>(rt: &Runtime<C>) {
+    let id = rt.runtime_id;
+    let c = chain(rt, 2);
+    assert_eq!(rt.get(c.nodes[0]), 2);
+    let s = &rt.dep_stack;
+    let read = |divert: bool| {
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(id, NodeId(c.nodes[0].slot()), &ctl);
+        s.record_read(id, NodeId(c.input.slot()), c.input.generation());
+        if divert {
+            s.divert_clean_reads();
+            crate::value_code::set_replay_bit(true);
+            assert!(s.diverts_clean_reads(id));
+        }
+        set_unwind_kind(Some(UnwindKind::Cycle));
+        let value = rt.get(c.nodes[1]);
+        let kind = unwind_kind();
+        set_unwind_kind(None);
+        let still_diverted = s.diverts_clean_reads(id);
+        crate::value_code::set_replay_bit(false);
+        (value, kind, still_diverted, s.pop_frame_reading())
+    };
+    let fast = read(false);
+    assert_eq!(read(true), fast);
+    assert!(
+        !fast.2,
+        "with nothing left to take the frame reads fast again"
+    );
+    assert_eq!(
+        fast.3 .0,
+        vec![
+            (NodeId(c.input.slot()), c.input.generation()),
+            (NodeId(c.nodes[1].slot()), c.nodes[1].generation()),
+        ]
+    );
+}
+local_and_shared!(
+    diverted_clean_read_is_a_fast_read,
+    local_diverted_clean_read_is_a_fast_read,
+    shared_diverted_clean_read_is_a_fast_read
+);
+
+/// Value code, such as a landed value's clone, can run inside a replay
+/// context's borrow: its Clean read of a diverted frame's dep reads the
+/// slot and leaves the contexts and the divert alone.
+fn value_code_reads_past_a_diverted_frame<C: Cells>(rt: &Runtime<C>) {
+    let id = rt.runtime_id;
+    let c = chain(rt, 2);
+    let want = rt.get(c.nodes[1]);
+    let s = &rt.dep_stack;
+    let ctl = ComputeCtl::new(0);
+    s.push_frame(id, NodeId(c.nodes[0].slot()), &ctl);
+    s.divert_clean_reads();
+    crate::value_code::set_replay_bit(true);
+    let got = crate::replay::with(|_| {
+        let _code = crate::value_code::enter();
+        rt.get(c.nodes[1])
+    });
+    crate::value_code::set_replay_bit(false);
+    assert_eq!(got, want);
+    assert!(s.diverts_clean_reads(id));
+    s.pop_frame();
+}
+local_and_shared!(
+    value_code_reads_past_a_diverted_frame,
+    local_value_code_reads_past_a_diverted_frame,
+    shared_value_code_reads_past_a_diverted_frame
+);
+
+/// A user `Drop` of a value a context held, such as a replaced landing's,
+/// runs inside the contexts' borrow outside value code: its Clean read of
+/// a diverted frame's dep reads the slot as value code's does.
+fn a_drop_inside_a_replay_borrow_reads_past_a_diverted_frame<C: Cells>(rt: &Runtime<C>) {
+    let id = rt.runtime_id;
+    let c = chain(rt, 2);
+    let want = rt.get(c.nodes[1]);
+    let s = &rt.dep_stack;
+    let ctl = ComputeCtl::new(0);
+    s.push_frame(id, NodeId(c.nodes[0].slot()), &ctl);
+    s.divert_clean_reads();
+    crate::value_code::set_replay_bit(true);
+    let got = crate::replay::with(|_| rt.get(c.nodes[1]));
+    crate::value_code::set_replay_bit(false);
+    assert_eq!(got, want);
+    assert!(s.diverts_clean_reads(id));
+    s.pop_frame();
+}
+local_and_shared!(
+    a_drop_inside_a_replay_borrow_reads_past_a_diverted_frame,
+    local_a_drop_inside_a_replay_borrow_reads_past_a_diverted_frame,
+    shared_a_drop_inside_a_replay_borrow_reads_past_a_diverted_frame
 );
 
 /// Each round builds a runtime with a frame budget it never reaches, where
@@ -584,8 +710,13 @@ fn wave7_local_kept_dirty_read_is_released_with_its_runtime() {
 
 #[test]
 fn wave7_shared_kept_dirty_read_is_released_with_its_runtime() {
-    wave7_kept_dirty_read_outlives_runtime::<Shared>(false);
-    wave7_kept_dirty_read_outlives_runtime::<Shared>(true);
+    run_alone(
+        "runtime::replay_tests::wave7_shared_kept_dirty_read_is_released_with_its_runtime",
+        || {
+            wave7_kept_dirty_read_outlives_runtime::<Shared>(false);
+            wave7_kept_dirty_read_outlives_runtime::<Shared>(true);
+        },
+    );
 }
 
 /// `set_max_frames(u32::MAX)` racing `set_max_stack_bytes(0)` leaves the

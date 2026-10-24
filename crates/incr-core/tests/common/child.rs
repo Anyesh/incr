@@ -55,6 +55,18 @@ pub fn run_in_child(test: &str, body: impl FnOnce()) -> Outcome {
     run_in_child_within(test, HANG_TIMEOUT, body)
 }
 
+/// Runs `body` with no other test thread in the process: in a child, or
+/// directly under Miri, whose test runs are single-threaded. For a body
+/// that asserts what one reclaim of haphazard's global domain drops, which
+/// a reclaim pass or a hazard on another test thread can hold back.
+pub fn run_alone(test: &str, body: impl FnOnce()) {
+    if cfg!(miri) {
+        body();
+    } else {
+        run_in_child(test, body).assert_clean();
+    }
+}
+
 pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -> Outcome {
     if env::var_os(CHILD).is_some() {
         body();
@@ -62,7 +74,13 @@ pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -
     }
 
     let mut child = Command::new(env::current_exe().unwrap())
-        .args([test, "--exact", "--test-threads=1", "--nocapture"])
+        .args([
+            test,
+            "--exact",
+            "--include-ignored",
+            "--test-threads=1",
+            "--nocapture",
+        ])
         .env(CHILD, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -94,7 +112,15 @@ pub fn run_in_child_within(test: &str, timeout: Duration, body: impl FnOnce()) -
     let output = format!("{}{}", stdout.join().unwrap(), stderr.join().unwrap());
     match status {
         None => Outcome::Killed,
-        Some(status) if status.success() => Outcome::Clean,
+        Some(status) if status.success() => {
+            // The body exits before libtest's summary, so a summary means
+            // the body never ran: `test` named no test.
+            assert!(
+                !output.contains("test result:"),
+                "the child never ran a test named {test}: {output}"
+            );
+            Outcome::Clean
+        }
         Some(_) => Outcome::Panicked { output },
     }
 }

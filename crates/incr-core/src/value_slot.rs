@@ -505,26 +505,31 @@ mod tests {
     /// strategies, under `Shared` at the reclaim its retire defers it to.
     #[test]
     fn isolating_displaced_value_drops_under_isolation() {
-        let local: LocalValueSlot<Bang> = ValueSlot::new_with(Bang);
-        let old = local.clear().expect("the slot held a value");
-        drop(crate::deferred::Unbuilt::new(LocalValueSlot::isolating(
-            old,
-        )));
-        assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 1);
+        crate::child_test::run_alone(
+            "value_slot::tests::isolating_displaced_value_drops_under_isolation",
+            || {
+                let local: LocalValueSlot<Bang> = ValueSlot::new_with(Bang);
+                let old = local.clear().expect("the slot held a value");
+                drop(crate::deferred::Unbuilt::new(LocalValueSlot::isolating(
+                    old,
+                )));
+                assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-        // A hazard on the value keeps the retire itself from reclaiming it.
-        let shared: SharedValueSlot<Bang> = ValueSlot::new_with(Bang);
-        let mut hp = HazardPointer::new();
-        // SAFETY: see `SharedValueSlot::read`.
-        assert!(unsafe { shared.0.load(&mut hp) }.is_some());
-        let old = shared.clear().expect("the slot held a value");
-        drop(crate::deferred::Unbuilt::new(SharedValueSlot::isolating(
-            old,
-        )));
-        assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 1);
-        drop(hp);
-        haphazard::Domain::global().eager_reclaim();
-        assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 2);
+                // A hazard on the value keeps the retire itself from reclaiming it.
+                let shared: SharedValueSlot<Bang> = ValueSlot::new_with(Bang);
+                let mut hp = HazardPointer::new();
+                // SAFETY: see `SharedValueSlot::read`.
+                assert!(unsafe { shared.0.load(&mut hp) }.is_some());
+                let old = shared.clear().expect("the slot held a value");
+                drop(crate::deferred::Unbuilt::new(SharedValueSlot::isolating(
+                    old,
+                )));
+                assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 1);
+                drop(hp);
+                haphazard::Domain::global().eager_reclaim();
+                assert_eq!(BANGS.load(std::sync::atomic::Ordering::SeqCst), 2);
+            },
+        );
     }
 
     #[test]
