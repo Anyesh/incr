@@ -1299,6 +1299,147 @@ fn shared_native_creator_runs_once_as_unbounded() {
     native_creator_runs_once_as_unbounded::<Shared>();
 }
 
+/// Builds (constructions and clones) and drops of `Tracked` values; a drop
+/// panics while `panics` is set.
+#[derive(Default)]
+struct Tally {
+    built: AtomicU32,
+    dropped: AtomicU32,
+    panics: AtomicBool,
+}
+
+struct Tracked(u64, Arc<Tally>);
+
+impl Tracked {
+    fn new(v: u64, tally: &Arc<Tally>) -> Self {
+        tally.built.fetch_add(1, SeqCst);
+        Self(v, tally.clone())
+    }
+}
+
+impl Clone for Tracked {
+    fn clone(&self) -> Self {
+        Self::new(self.0, &self.1)
+    }
+}
+
+impl PartialEq for Tracked {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.1.dropped.fetch_add(1, SeqCst);
+        if self.1.panics.load(SeqCst) && !std::thread::panicking() {
+            panic!("Tracked drop");
+        }
+    }
+}
+
+/// A Native `c` whose value only a speculative run of `r` builds, and,
+/// with `adopt`, a real `get(c)` reads; `r` keeps the clone its read
+/// returns if `keep`, else drops it. Every drop of a `Tracked` panics from
+/// `r`'s first read on. Returns (builds, drops) once `input`'s set has
+/// ended the revision, and whether any read or the set panicked.
+fn speculative_value_drops<C: Cells>(frames: u32, adopt: bool, keep: bool) -> (u32, u32, bool) {
+    let tally = Arc::new(Tally::default());
+    let rt = native_runtime::<C>();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let input = rt.create_input(1_u64);
+    let b = rt.create_query(|_| 5_u64);
+    let made = tally.clone();
+    let c = rt.create_query(move |rt: &Runtime<C>| Tracked::new(rt.get(input), &made));
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                let v = rt.get(c);
+                if keep {
+                    std::mem::forget(v);
+                }
+                0
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    tally.panics.store(true, SeqCst);
+    let mut panicked = catch_unwind(AssertUnwindSafe(|| assert_eq!(rt.get(r), 5))).is_err();
+    if adopt {
+        panicked |= catch_unwind(AssertUnwindSafe(|| std::mem::forget(rt.get(c)))).is_err();
+    }
+    panicked |= catch_unwind(AssertUnwindSafe(|| rt.set(input, 2))).is_err();
+    tally.panics.store(false, SeqCst);
+    (
+        tally.built.load(SeqCst),
+        tally.dropped.load(SeqCst),
+        panicked,
+    )
+}
+
+/// A replayable `q` whose run at a budget dooms on `b` and still returns
+/// a `Tracked`, built from `b`'s placeholder, that its retry replaces.
+/// Every drop of a `Tracked` panics during the read.
+fn doomed_value_drops<C: Cells>(frames: u32) -> (u32, u32, bool) {
+    let tally = Arc::new(Tally::default());
+    let rt = native_runtime::<C>();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let b = rt.create_query_with(|_| 5_u64, replayable());
+    let made = tally.clone();
+    let q = rt.create_query_with(
+        move |rt: &Runtime<C>| Tracked::new(rt.get(b), &made),
+        replayable(),
+    );
+    tally.panics.store(true, SeqCst);
+    let panicked = catch_unwind(AssertUnwindSafe(|| std::mem::forget(rt.get(q)))).is_err();
+    tally.panics.store(false, SeqCst);
+    (
+        tally.built.load(SeqCst),
+        tally.dropped.load(SeqCst),
+        panicked,
+    )
+}
+
+/// What a budget builds and drops beyond the unbounded run: a doomed run's
+/// value, the clone a speculative read hands its closure, and the value of
+/// a speculative run no real read adopts, one each. Every such drop is
+/// isolated or happens in a run that is discarded, so a panicking `Drop`
+/// reaches no read.
+fn replay_builds_and_drops<C: Cells>() {
+    assert_eq!(doomed_value_drops::<C>(u32::MAX), (2, 0, false));
+    assert_eq!(doomed_value_drops::<C>(1), (3, 1, false));
+    for adopt in [false, true] {
+        for keep in [true, false] {
+            let (built, dropped, panicked) = speculative_value_drops::<C>(u32::MAX, adopt, keep);
+            assert!(!panicked);
+            assert_eq!(
+                speculative_value_drops::<C>(1, adopt, keep),
+                (
+                    built + 1 + u32::from(!adopt),
+                    dropped + u32::from(!keep) + u32::from(!adopt),
+                    false
+                ),
+                "adopt {adopt}, keep {keep}"
+            );
+        }
+    }
+}
+
+#[test]
+fn local_replay_builds_and_drops() {
+    replay_builds_and_drops::<Local>();
+}
+
+#[test]
+fn shared_replay_builds_and_drops() {
+    replay_builds_and_drops::<Shared>();
+}
+
 /// A creator's stash that its node's own claim drops unadopted, as a group
 /// member's verify does, takes the child its run made with it.
 fn dropped_creator_stash_discards_its_child<C: Cells>() {
