@@ -1784,8 +1784,8 @@ it deletes, one entry per node. The rest move by noise
 
 ## Replay run identity
 
-- Engine: `w/T8-lead-c224-cycle-vs-value` at `c38204ad` against its base
-  `spreadsheet-t10` at `5277165a`, the base in a detached worktree; one
+- Engine: `w/T8-lead-c224-cycle-vs-value` at `0c87877b` against its base
+  `spreadsheet-t10` at `f50dcdc4`, the base in a detached worktree; one
   run of `icount.sh` at the default N per column. No workloads added.
 - Change: replay deliveries are keyed by the run they were made for, with
   each run's seq fixed at its start; the new work sits behind const
@@ -1796,15 +1796,15 @@ it deletes, one entry per node. The rest move by noise
 | `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 198 | 0 / +2 |
 | `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 219.14 | 0 / +1 |
 | `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 90 | 0 / +3 |
-| `diamond_local` / `diamond_shared` | 3,919 / 7,850.93 | 3,920 / 7,876.93 | +1 / +26 |
-| `chain_local/propagate/100` | 91,210 | 91,211.01 | +1.01 |
-| `fanout_local_4` / `fanout_local_5` | 17,195 / 21,817 | 17,202 / 21,825 | +7 / +8 |
+| `diamond_local` / `diamond_shared` | 3,926 / 7,919.92 | 3,927 / 7,942.94 | +1 / +23.02 |
+| `chain_local/propagate/100` | 91,217.03 | 91,218.03 | +1 |
+| `fanout_local_4` / `fanout_local_5` | 17,246.01 / 21,877.01 | 17,253 / 21,885 | +6.99 / +7.99 |
 
-- Attribution: Intel PT per symbol and per line on line-table builds of
-  both trees. Clean get's +2 is all in `SharedValueSlot::try_read`
-  (78 to 80) and `table_hit_shared`'s +1 in `with_pooled_hazard`, on the
-  hazard-pool lines, whose source is unchanged: a spill and a rotated
-  pool loop. The Local +1 per top-level non-Clean get is
+- Attribution (Intel PT per symbol and per line on line-table builds,
+  taken at `c38204ad` on `5277165a`, whose hard-gate deltas these match):
+  Clean get's +2 is all in `SharedValueSlot::try_read` (78 to 80) and
+  `table_hit_shared`'s +1 in `with_pooled_hazard`, on the hazard-pool
+  lines, whose source is unchanged: a spill and a rotated pool loop. The Local +1 per top-level non-Clean get is
   `reset_outermost`'s `outer_set.replace(false)` compiling to one more
   instruction in `get_slow`; Shared computes add the same `try_read` and
   `write_if_changed` pool lines plus register shuffles in `clean_walk`.
@@ -1838,5 +1838,5 @@ Replay scale, by `scale-icount.sh` (user-space instructions per test) on
   The cost of `path_at` itself is part of
   **T10-replay-scale-instruction-rise**.
 - An earlier revision kept the count slots in a `Vec` scanned on every
-  run event: 2.79 s against 477.66 s on the fixpoint case. Slots are now
-  indexed by position and path.
+  run event, which took 477.66 s on the fixpoint case where the indexed
+  slots take 2.79 s.
