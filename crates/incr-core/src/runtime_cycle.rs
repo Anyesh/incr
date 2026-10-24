@@ -20,7 +20,7 @@ use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
-use crate::{set_stack, waits};
+use crate::{reserve, set_stack, waits};
 
 /// What a compute attempt carries into its landings.
 #[derive(Copy, Clone)]
@@ -197,6 +197,22 @@ fn in_cycles(adj: &[Vec<usize>]) -> Vec<bool> {
         .collect()
 }
 
+/// Ends what an outermost engine entry leaves of its replay, whichever
+/// way it exits: contexts of another runtime that its unwinds kept, or a
+/// doom's PENDING reservations from a `mark` that unwound. A reservation
+/// left behind would keep another thread waiting until this one enters
+/// the engine again.
+struct OutermostExit;
+
+impl Drop for OutermostExit {
+    fn drop(&mut self) {
+        if !reserve::none_held() {
+            replay::reset();
+            reserve::end_all();
+        }
+    }
+}
+
 impl<C: Cells> Runtime<C> {
     fn active_ctl_has(&self, flag: u16) -> bool {
         self.dep_stack
@@ -273,6 +289,7 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         f: &mut impl FnMut() -> R,
     ) -> Result<R, Cycle> {
+        let _exit = (outermost && !C::SINGLE_THREADED).then(|| OutermostExit);
         loop {
             if outermost {
                 cycle_state::reset_outermost();
@@ -315,6 +332,13 @@ impl<C: Cells> Runtime<C> {
             debug_assert!(
                 cycle_state::held_keys().is_empty(),
                 "incr-core: a wounded thread waits for its winner holding claims"
+            );
+            // Another runtime's contexts, which `drop_from` keeps, would keep
+            // their reservations while the winner waits on one of them.
+            replay::reset();
+            debug_assert!(
+                reserve::none_held(),
+                "incr-core: a wounded thread waits for its winner holding reservations"
             );
             waits::await_winner(C::backoff, |(rt, slot)| {
                 rt == self.runtime_id
@@ -395,6 +419,11 @@ impl<C: Cells> Runtime<C> {
         holds.extend(also.map(|x| (self.runtime_id, x.0)));
         holds.extend(cycle_state::held_keys());
         holds.extend(set_stack::claims());
+        holds.extend(
+            reserve::held()
+                .into_iter()
+                .filter(|&c| c != (self.runtime_id, on.0)),
+        );
         // A thread that holds nothing is no one's owner, so no waits-for
         // cycle can pass through it and it never needs a registration.
         if holds.is_empty() {
@@ -452,6 +481,30 @@ impl<C: Cells> Runtime<C> {
         } else {
             C::backoff(*spins);
         }
+    }
+
+    /// Waits, as a claim wait on `id`, until no other thread reserves it
+    /// at `generation`, holding `also`'s claim outside its frames. Leaves
+    /// `spins` non-zero, so the claim retried after it is a waited one.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn wait_out_reservation(
+        &self,
+        id: NodeId,
+        generation: u32,
+        also: Option<NodeId>,
+        spins: &mut u32,
+    ) {
+        let claim = (self.runtime_id, id.0);
+        #[cfg(test)]
+        if reserve::elsewhere(claim, generation) {
+            self.reservation_waits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        while reserve::elsewhere(claim, generation) {
+            self.spin_holding(id, also, spins, || !reserve::elsewhere(claim, generation));
+        }
+        *spins = (*spins).max(1);
     }
 
     /// Runs a cycle callback with no lock held, as value code, under a
@@ -2268,6 +2321,16 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty,
                 NodeState::Computing,
             ) {
+                Ok(()) if self.reserved_elsewhere(NodeId(m), node.generation()) => {
+                    let generation = node.generation();
+                    self.unclaim_unrun(node, true);
+                    let waited = catch_unwind(AssertUnwindSafe(|| {
+                        self.wait_out_reservation(NodeId(m), generation, Some(x), &mut spins)
+                    }));
+                    if let Err(payload) = waited {
+                        self.unclaim_group(x, claimed, bag, payload);
+                    }
+                }
                 Ok(()) => return true,
                 Err(s)
                     if !C::SINGLE_THREADED && is_computing(s) && !self.holds_claim(NodeId(m)) =>

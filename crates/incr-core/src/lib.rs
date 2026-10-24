@@ -47,6 +47,7 @@ pub mod node;
 pub mod persist_hooks;
 mod reclaim_probe;
 mod replay;
+mod reserve;
 pub mod runtime;
 pub mod segmented_nodes;
 mod set_stack;
