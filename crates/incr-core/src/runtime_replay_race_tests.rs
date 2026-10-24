@@ -374,6 +374,7 @@ fn shared_landed_point_below_the_running_entrys_maker() {
     entry.release();
 
     let unbounded = below_shape(Rt::new());
+    unbounded.rt.set_max_frames(u32::MAX);
     unbounded.landed.store(CLEAN, SeqCst);
     assert_eq!(unbounded.rt.get(unbounded.x1), 42);
     let want = unbounded.rt.get(unbounded.t);
@@ -505,6 +506,7 @@ fn shared_walk_skips_a_vframe_computing_on_another_thread() {
     s.gate.release();
     let unbounded = {
         let u = taint_shape();
+        u.rt.set_max_frames(u32::MAX);
         u.rt.get(u.p)
     };
     assert_eq!(claimer.join(), unbounded);
@@ -590,6 +592,7 @@ fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
     assert_eq!(s.p_runs.load(SeqCst), 2);
     let unbounded = {
         let u = taint_shape();
+        u.rt.set_max_frames(u32::MAX);
         u.rt.get(u.p)
     };
     target.release();
@@ -794,6 +797,7 @@ fn shared_delete_of_a_vframes_node_between_rounds() {
     let got = reader.join();
 
     let unbounded = landed_shape(Rt::new(), false);
+    unbounded.rt.set_max_frames(u32::MAX);
     unbounded.rt.delete_node(unbounded.x);
     let want = outcome(|| unbounded.rt.get(unbounded.t));
     assert!(
@@ -851,6 +855,7 @@ fn delete_and_recycle_during_replay(when: Recycle) {
     let got = reader.join();
 
     let unbounded = below_shape(Rt::new());
+    unbounded.rt.set_max_frames(u32::MAX);
     unbounded.rt.delete_node(unbounded.x1);
     unbounded
         .rt
@@ -958,6 +963,7 @@ fn released_claim_read(point: fn(&Landed) -> ParkPoint) {
     let runs_before = s.x_runs.load(SeqCst);
     gate.release();
     let unbounded = landed_shape(Rt::new(), false);
+    unbounded.rt.set_max_frames(u32::MAX);
     assert_eq!(reader.join(), unbounded.rt.get(unbounded.t));
     assert_eq!(
         s.x_runs.load(SeqCst),
@@ -1085,6 +1091,7 @@ fn shared_set_during_a_discard() {
     rt.assert_invariant_i();
 
     let unbounded = Arc::new(Rt::new());
+    unbounded.set_max_frames(u32::MAX);
     let (us, _, uf) = shape(&unbounded);
     unbounded.set(us, 2);
     assert_eq!(rt.get(f), unbounded.get(uf));
@@ -1150,6 +1157,7 @@ fn hit_shape() -> Hit {
 /// at F, with b set first.
 fn hit_unbounded(b: u64) -> (u64, u64, Option<u64>) {
     let u = hit_shape();
+    u.rt.set_max_frames(u32::MAX);
     u.rt.set(u.b, b);
     let f = u.rt.get(u.f);
     let x = u.rt.get(u.x);
