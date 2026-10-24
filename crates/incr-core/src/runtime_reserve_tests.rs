@@ -474,3 +474,117 @@ fn second_shared_entry_under_a_local_entry_starts_with_no_context() {
     assert_eq!(bounded, unbounded);
     assert!(crate::reserve::none_held());
 }
+
+/// `get(t)` on a helper thread, or `None` if it has not returned in 10 s.
+fn within_10s(rt: &Arc<Rt>, t: Incr<u64>) -> Option<Outcome> {
+    let (tx, rx) = mpsc::channel();
+    let rt = rt.clone();
+    thread::spawn(move || {
+        let _ = tx.send(outcome(|| rt.get(t)));
+    });
+    rx.recv_timeout(Duration::from_secs(10)).ok()
+}
+
+/// T reads X, which reads Y, then joins a scoped thread that reads X;
+/// U reads X, then joins, rayon-style, a read of the input on its own
+/// thread with a scoped thread's read of Z, which reads X. Over budget,
+/// each doomed run goes on past its placeholder for X into the join,
+/// while X waits for the retry under the doom's reservation: the child
+/// must compute what it reads, as it would on a runtime without
+/// reservations, rather than wait on the thread that joins it. The
+/// unbounded runs give main's values.
+#[test]
+fn a_doomed_runs_joined_child_reads_a_node_the_doom_released() {
+    for frames in [u32::MAX, 1, 2] {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let z = rt.create_query_with(move |rt: &Rt| rt.get(x) + 1000, replayable());
+        let t = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(x);
+                let child = thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap());
+                v + child
+            },
+            replayable(),
+        );
+        let u = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(x);
+                let (a, b) = thread::scope(|s| {
+                    let b = s.spawn(|| rt.get(z));
+                    (rt.get(i), b.join().unwrap())
+                });
+                v + a + b
+            },
+            replayable(),
+        );
+        rt.set_max_frames(frames);
+        assert_eq!(within_10s(&rt, t), Some(Ok(28)), "budget {frames}");
+        rt.set(i, 4);
+        assert_eq!(
+            within_10s(&rt, u),
+            Some(Ok(15 + 4 + 1015)),
+            "budget {frames}"
+        );
+        rt.assert_invariant_i();
+    }
+}
+
+static JOIN_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static JOIN_TARGET: OnceLock<(Arc<Rt>, Incr<JoinV>)> = OnceLock::new();
+static JOIN_CHILD: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
+
+/// A value whose clone, once armed, joins a scoped thread that reads the
+/// node [`JOIN_TARGET`] names.
+#[derive(PartialEq, Debug)]
+struct JoinV(u64);
+
+impl Clone for JoinV {
+    fn clone(&self) -> Self {
+        if JOIN_ARMED.swap(false, SeqCst) {
+            let (rt, r) = JOIN_TARGET.get().unwrap();
+            let got = thread::scope(|s| {
+                s.spawn(|| catch_unwind(AssertUnwindSafe(|| rt.get(*r).0)).ok())
+                    .join()
+                    .unwrap()
+            });
+            *JOIN_CHILD.lock().unwrap() = Some(got);
+        }
+        JoinV(self.0)
+    }
+}
+
+/// R, over a dependency cycle it catches, lands Dirty with its run count,
+/// and the read's clone of R's value joins a thread that reads R. The
+/// child must rerun R, as a second read does, rather than wait on the
+/// read's reservation of its own node, and the read keeps its own value.
+#[test]
+fn a_reads_clone_joins_a_child_reading_the_node_it_landed_dirty() {
+    let rt = Arc::new(Rt::new());
+    let cc: Arc<OnceLock<Incr<JoinV>>> = Arc::default();
+    let c = {
+        let cc = cc.clone();
+        rt.create_query(move |rt: &Rt| rt.get(*cc.get().unwrap()))
+    };
+    cc.set(c).unwrap();
+    let runs = Arc::new(AtomicU32::new(0));
+    let r = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Rt| {
+            let n = u64::from(runs.fetch_add(1, SeqCst)) + 1;
+            JoinV(rt.try_get(c).map_or(n * 100, |v| v.0 + n))
+        })
+    };
+    assert!(JOIN_TARGET.set((rt.clone(), r)).is_ok());
+    JOIN_ARMED.store(true, SeqCst);
+    let (tx, rx) = mpsc::channel();
+    let reader = rt.clone();
+    thread::spawn(move || {
+        let _ = tx.send(outcome(|| reader.get(r).0));
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(10)).ok(), Some(Ok(100)));
+    assert_eq!(*JOIN_CHILD.lock().unwrap(), Some(Some(200)));
+}
