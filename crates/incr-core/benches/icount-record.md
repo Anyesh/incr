@@ -1745,3 +1745,30 @@ a slice access -2, `segmented_nodes.rs` +1 net) with no added work, so
 entry per leaf get or per delete step, hence their per-entry multiples.
 The rest move by noise (`get_contended_shared` -17,746,
 `delete_owned_tree_*` -1,169 / -2,147, the others under 11).
+
+## A caught Failed read lands Clean
+
+- Base: spreadsheet-t10 14bb4ad0. Tip: w/T8-caught-failed-read-lands 2413b901.
+- Change: a compute's landing reads `POISONED` and the new `FAILED_READ`
+  together (`ComputeCtl::poison`) and zeroes `verified_at` for either, but
+  lands Dirty only for `POISONED`; publish accepts an unmoved Failed dep
+  (`failed_unmoved`), reached only when `observed_clean` is false.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/4` / `10` / `100` | 4,634.00 / 9,998.00 / 91,217.02 | 4,642.00 / 10,018.00 / 91,417.02 | +8.00 / +20.00 / +200.00 |
+| `chain_shared/propagate/4` / `10` / `100` | 9,435.20 / 20,540.80 / 188,143.27 | 9,447.22 / 20,570.82 / 188,443.66 | +12.02 / +30.02 / +300.39 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,472,148.63 / 4,779,634.29 | 3,474,151.50 / 4,782,631.07 | +2,002.87 / +2,996.78 |
+| `delete_cascade_local` / `_shared` | 3,256,576.21 / 4,565,790.38 | 3,258,577.62 / 4,568,786.81 | +2,001.41 / +2,996.43 |
+
+Gate: every hard gate counts the same as the base. Each landed compute
+costs 2 more under `Local` and 3 under `Shared` (Intel PT on
+`chain_*/propagate/4`, 4 computes per iteration: `runtime.rs:3543-3545`
++5 per compute for the mask and the second test, against -2 for the
+two `has` calls they replace and -1 from `mem::replace` code layout;
+`Shared` adds +1 at the `Publish` compare, `runtime.rs:367`). Fan-out
+and delete workloads land one compute per leaf. The rest move by noise
+(`delete_owned_tree_*` +699 / -1,793, `get_contended_shared` -158).
