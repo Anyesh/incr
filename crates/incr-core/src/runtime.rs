@@ -3056,10 +3056,10 @@ impl<C: Cells> Runtime<C> {
     /// exempt because its caller reads its slot as soon as the walk
     /// returns.
     ///
-    /// `gen` is the caller's handle generation for the root. A walk entry
-    /// carries none (installed deps are ids only); one whose slot is
-    /// recycled under the walk is dropped, because the parent that
-    /// recorded it sees the dead dep at its publish. A root found
+    /// `gen` is the caller's handle generation for the root; each walk
+    /// entry carries its node's generation from when the walk met it. An
+    /// entry whose node is deleted under the walk is dropped, because only
+    /// a dep its parent no longer reads can be deleted. A root found
     /// recycled is reported as `Gone` for the caller's stale panic.
     #[inline]
     fn ensure_clean(&self, id: NodeId, gen: u32) -> Computed {
@@ -3216,6 +3216,10 @@ impl<C: Cells> Runtime<C> {
                 if cur == id {
                     return Computed::Gone;
                 }
+                continue;
+            }
+            // As a recycled dep's, before the delete bumps the generation.
+            if observed == NodeState::Dead && !is_root {
                 continue;
             }
             // A node with a virtual frame stands for a frame on the stack,
@@ -3585,6 +3589,9 @@ impl<C: Cells> Runtime<C> {
                     self.read_failed_node(id, g0);
                     continue;
                 }
+                // Only a dep nothing reads can be deleted: the parent that
+                // recorded it no longer does.
+                NodeState::Dead if walked => return Computed::Gone,
                 NodeState::Dead => {
                     // An observer's read of a node whose delete has not
                     // bumped its generation yet: the observer goes with it.
