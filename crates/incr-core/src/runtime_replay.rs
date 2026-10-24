@@ -3397,8 +3397,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     fn close_context(&self, id: u64, boundary: u32) {
+        // The frame below the boundary outlives the context, and so do the
+        // entries it owns.
         if value_code::thread_word() & value_code::MEMO_BIT != 0 {
-            taint_memo::clear_from(boundary);
+            taint_memo::clear_from(boundary + 1);
         }
         self.drop_deliveries(replay::close(id));
     }
