@@ -914,6 +914,11 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             } else {
                 Replay::Native
             };
+            // A `FirstRun` closure reads differently once it has run, so
+            // its Native query stays Native under `INCR_TEST_ALL_REPLAYABLE`,
+            // as a collection operator's does: a doomed first run would make
+            // the retry take the other branch.
+            let pinned = replay == Replay::Native && has_first_run(expr);
             let (expr, world) = (expr.clone(), world.clone());
             let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
             let kept = match ran {
@@ -939,20 +944,26 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                 v
             };
             if *bare {
-                Handle::Bare(rt.create_query_with(
+                Handle::Bare(rt.create_query_erased::<true, _, _>(
                     move |rt| Bare::made(compute(rt)),
-                    QueryOpts {
-                        cycle: strategy.build(|v| Bare(v, false)),
-                        replay,
-                    },
+                    erased(
+                        pinned,
+                        QueryOpts {
+                            cycle: strategy.build(|v| Bare(v, false)),
+                            replay,
+                        },
+                    ),
                 ))
             } else {
-                Handle::Plain(rt.create_query_with(
+                Handle::Plain(rt.create_query_erased::<true, _, _>(
                     compute,
-                    QueryOpts {
-                        cycle: strategy.build(|v| v),
-                        replay,
-                    },
+                    erased(
+                        pinned,
+                        QueryOpts {
+                            cycle: strategy.build(|v| v),
+                            replay,
+                        },
+                    ),
                 ))
             }
         }
@@ -5751,6 +5762,24 @@ fn one<C: Cells>() {
     });
 }
 
+fn erased<T: Value>(pinned: bool, opts: QueryOpts<T>) -> crate::cycle::ErasedOpts {
+    let mut opts = crate::cycle::erase_opts(opts);
+    if pinned {
+        opts.flags |= crate::segmented_nodes::NOT_REPLAYABLE;
+    }
+    opts
+}
+
+fn has_first_run(e: &Expr) -> bool {
+    match e {
+        Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => false,
+        Expr::FirstRun(..) => true,
+        Expr::Add(a, b) => has_first_run(a) || has_first_run(b),
+        Expr::If(a, b, c) => has_first_run(a) || has_first_run(b) || has_first_run(c),
+        Expr::PanicIf(a, _) | Expr::Catch(a) => has_first_run(a),
+    }
+}
+
 fn size(e: &Expr) -> usize {
     match e {
         Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => 1,
@@ -7286,13 +7315,6 @@ fn a_dissolved_roots_rerun_at_the_bottom_walks_its_reads_again() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn seed_381_first_run_state() {
-    if super::replay_defaults().1 {
-        eprintln!(
-            "skipped under INCR_TEST_ALL_REPLAYABLE until T10-381-all-replayable-cycle-value: \
-             budget 1 lands 0 and 19 Clean where the unbounded run leaves them Cyclic"
-        );
-        return;
-    }
     let specs: Vec<Spec> = vec![
         Spec::Query {
             expr: Expr::Catch(Box::new(Expr::Read(19, false))),
