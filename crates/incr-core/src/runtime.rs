@@ -97,8 +97,9 @@ pub(crate) struct Inner<C: Cells> {
     /// Each query whose deps a panicked run's union replaced (a user panic
     /// releasing it New, [`Runtime::land_panic_released`], or failing it):
     /// that union's length, and how many of its deps, from the front, its
-    /// last finished run read. A finished run's publish drops it. A read's
-    /// walk uses it only for a released New node.
+    /// last finished run read. Any other publish of its deps drops it, as
+    /// does its delete; a Stale publish, which installs nothing, keeps it.
+    /// A read's walk uses it only for a released New node.
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
@@ -4913,15 +4914,18 @@ impl<C: Cells> Runtime<C> {
 #[cfg(any(test, feature = "test-hooks"))]
 impl<C: Cells> Runtime<C> {
     /// Gives `h`, whose run read at least two deps, a released entry that
-    /// no read uses, as the `released_hot` bench needs.
+    /// no read uses, as the `released_hot` bench needs. No other thread may
+    /// run on `h`.
     pub fn hold_released_entry<T>(&self, h: Incr<T>) {
         let len = dep_len(self.nodes.get(h.slot()));
         assert!(len >= 2);
         self.set_released(&mut self.inner.write(), h.slot(), Some((len, len - 1)));
     }
 
-    /// Every released entry counts its node's current deps, as each publish
-    /// that replaces them sets or drops it.
+    /// At quiescence, every released entry counts its node's current deps,
+    /// as each publish that replaces them sets or drops it, and only nodes
+    /// with an entry carry the released mark.
+    #[cfg(test)]
     pub(crate) fn assert_released_entries_match_deps(&self) {
         let inner = self.inner.read();
         for (&slot, &(len, kept)) in &inner.released_deps {
