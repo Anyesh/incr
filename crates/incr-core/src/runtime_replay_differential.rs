@@ -4037,9 +4037,9 @@ fn failed_after(t: &Trace, i: usize) -> (Out, Vec<usize>) {
 /// Seed 0xe486019a1c945cce's op 1, `Get(4)`: member 8 of the cycle
 /// {4, 5, 7, 8} reads 9, whose walk computes 21, and 21's own code panics
 /// in the episode of {9, 21, 22, 23}, which marks it failed; 9 then passes
-/// that panic to 8, and a fresh run leaves 8, 9, 21, 22 and 23 Failed. At a
-/// budget of 1 the driver runs that episode between doomed runs of 8, and
-/// the run finishing 8's frame must count the marks made before it.
+/// that panic to 8, and a fresh run leaves 8, 9, 21, 22 and 23 Failed, as
+/// do the unbounded run and a budget of 1. The mark count it was pinned
+/// for is now [`a_member_frame_counts_the_marks_of_its_earlier_runs`]'s.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
@@ -4189,6 +4189,22 @@ fn a_walk_leaves_a_new_nodes_deps_to_its_run() {
         for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
             assert!(matches!(trace[1].0, Out::Value(7777)), "{:?}", trace[1].0);
         }
+    });
+}
+
+/// Seed 0x36618028's op 4, `Get(15)`, at a budget of 1: the run finishing
+/// a doomed member's frame counts the failure marks made since the
+/// frame's first run, or 15 and 16 land New where the unbounded run lands
+/// them Failed. 0xe486 no longer reaches that count.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
+    let mut case = gen_case(0x3661_8028, false, false);
+    case.ops.truncate(5);
+    assert!(matches!(case.ops[4], Op::Get(15)));
+    quiet(|| {
+        differential::<Local>(&case, 0x3661_8028);
+        differential::<Shared>(&case, 0x3661_8028);
     });
 }
 
@@ -7541,7 +7557,8 @@ fn wave8_seed_d6e1_released_new_walked_fresh() {
 
 /// Seed 0x148c's base case, shrunk. At budgets 2 and 3 a stand-in's Dirty
 /// landing is reported to its walk as `Unsettled`, which must not lead the
-/// bounded run to compute a node the unbounded run leaves New.
+/// bounded run to compute a node the unbounded run leaves New: after
+/// `Get(7)`, nodes 1 to 4, 14 and 16.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
@@ -7616,6 +7633,10 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
     };
     quiet(|| {
         let unbounded = states(run::<Local>(&case, None, 0));
+        let new: Vec<usize> = (0..unbounded[3].1.len())
+            .filter(|&n| unbounded[3].1[n] == NodeState::New)
+            .collect();
+        assert_eq!(new, [1, 2, 3, 4, 14, 16], "unbounded");
         for frames in [1, 2, 3] {
             let local = states(run::<Local>(&case, Some(frames), 0));
             assert_eq!(local, unbounded, "Local, budget {frames}");
