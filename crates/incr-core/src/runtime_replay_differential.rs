@@ -5907,6 +5907,10 @@ fn hold_planned_walk(
                 ready.load(SeqCst),
                 "thread 0's walk reached the held compute"
             );
+            assert!(
+                live.world.rt(0).unrun_unclaims.load(SeqCst) > 0,
+                "thread 0's walk re-planned"
+            );
         }
         let v = serial.at_overlap("held walk", prefix, live);
         let stop = v.is_some();
