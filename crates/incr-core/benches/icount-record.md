@@ -1950,3 +1950,39 @@ only replay pops reach. Base `43bb197e`, tip `1d332082`, same box,
 
 Gate: no rise. Replay scale by `strict-scan.sh`'s `scale-icount` against
 `43bb197e`: every ratio is in 0.9987..1.0031.
+
+## The unrun mark lives in `dep_count`'s high bit
+
+`52987c56` (on `ca94bbad`) moves the unrun mark from a byte per node in
+each segment, which put Local and Shared over the memory ceiling at
+252.09 B per pair, into bit 0x80 of `NodeData::dep_count`: the claim's
+owner writes both and its release publishes both. Base `ca94bbad`, tip
+`52987c56`, same box, `icount.sh` defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_shared` | 196 | 196 | 0 |
+| `table_hit_shared` | 218.14 | 218.14 | 0 |
+| `value_slot_read_shared` | 87 | 87 | 0 |
+| `chain_shared/propagate/4` | 9599.23 | 9555.20 | -44.03 |
+| `chain_shared/propagate/10` | 20974.82 | 20864.83 | -109.99 |
+| `chain_shared/propagate/100` | 192627.44 | 191527.08 | -1100.36 |
+| `diamond_shared` | 7976.93 | 7943.93 | -33.00 |
+| `early_cutoff_shared` | 3683.87 | 3667.85 | -16.02 |
+| `fanout_shared_1000` | 4799493.36 | 4795649.12 | -3844.24 |
+| `delete_cascade_shared` | 4581869.74 | 4576779.49 | -5090.25 |
+
+- Each Shared landing gets 11 instructions cheaper:
+  `chain_shared/propagate/N` falls by 11 N. `land_as` no longer walks
+  the directory to the node's segment for a separate byte, and reads the
+  mark from the node it already holds. The mark now costs 4 instructions
+  per landing over `283694ff`, against 15 in the section above.
+- Local compiles the mark out, as before, and its rows are unchanged
+  within 0.05% except `table_hit_sip_local` (+1.39, 0.46%), whose path
+  does not touch nodes.
+- `memory_ceiling.rs` gives 250.09 B per pair for both Local and Shared
+  in the four CI configs, the figure before `600db608`.
+
+Gate: the hard gates are exact (196, 218.14, 87). Replay scale by
+`strict-scan.sh`'s `scale-icount` against `ca94bbad`: every ratio is in
+0.9972..1.0000.
