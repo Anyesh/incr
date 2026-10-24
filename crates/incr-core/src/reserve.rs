@@ -13,8 +13,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+#[cfg(not(loom))]
 use std::hash::{Hash, Hasher};
 
+#[cfg(not(loom))]
 use crate::fx::FxHasher;
 use crate::waits::Claim;
 
@@ -26,11 +28,12 @@ use std::sync::{
 
 #[cfg(loom)]
 use loom::sync::{
-    atomic::{AtomicU32, AtomicUsize, Ordering},
+    atomic::{AtomicUsize, Ordering},
     Mutex,
 };
 
 /// Slots of [`BUCKETS`]; a power of two.
+#[cfg(not(loom))]
 const BUCKETS_LEN: usize = 1024;
 
 /// A reservation's node generation and its owner's token.
@@ -51,7 +54,6 @@ static TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
 #[cfg(loom)]
 loom::lazy_static! {
     static ref LIVE: AtomicUsize = AtomicUsize::new(0);
-    static ref BUCKETS: Vec<AtomicU32> = (0..BUCKETS_LEN).map(|_| AtomicU32::new(0)).collect();
     static ref TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
 }
 
@@ -107,10 +109,26 @@ fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, Entry>> {
     }
 }
 
+#[cfg(not(loom))]
 fn bucket(claim: Claim) -> &'static AtomicU32 {
     let mut h = FxHasher::default();
     claim.hash(&mut h);
     &BUCKETS[h.finish() as usize & (BUCKETS_LEN - 1)]
+}
+
+/// Whether `claim`'s bucket counts any reservation.
+#[cfg(not(loom))]
+fn bucket_hit(claim: Claim) -> bool {
+    bucket(claim).load(Ordering::Relaxed) != 0
+}
+
+/// Loom builds keep no bucket counts: loom's modification-order check
+/// (`assert_ne!(mo_i, mo_j)` in rt/atomic.rs, marked "sometimes fails")
+/// trips on them. [`LIVE`], stored and read the same way, still gates the
+/// table lock.
+#[cfg(loom)]
+fn bucket_hit(_: Claim) -> bool {
+    true
 }
 
 /// While it lives, every claim this thread releases unrun is reserved for
@@ -144,6 +162,7 @@ pub(crate) fn note(claim: Claim, generation: u32) {
                 Some(prev) if prev == (generation, token) => return,
                 Some(_) => {}
                 None => {
+                    #[cfg(not(loom))]
                     bucket(claim).fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -171,7 +190,7 @@ pub(crate) fn any() -> bool {
 #[cold]
 #[inline(never)]
 pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
-    if !any() || bucket(claim).load(Ordering::Relaxed) == 0 {
+    if !any() || !bucket_hit(claim) {
         return false;
     }
     let token = MINE.with(Listed::token);
@@ -185,6 +204,7 @@ fn unlist(claims: &[(Claim, u32)], token: usize) {
     for &(claim, generation) in claims {
         if t.get(&claim) == Some(&(generation, token)) {
             t.remove(&claim);
+            #[cfg(not(loom))]
             bucket(claim).fetch_sub(1, Ordering::Relaxed);
         }
     }
