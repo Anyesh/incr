@@ -262,3 +262,63 @@ fn shared_reservation_ends_when_its_owners_retry_panics() {
     assert_eq!((t_read, x_read), want);
     rt.assert_invariant_i();
 }
+
+fn reserved_elsewhere(claim: crate::waits::Claim) -> bool {
+    thread::spawn(move || crate::reserve::elsewhere(claim, 1))
+        .join()
+        .unwrap()
+}
+
+/// A read's reservation of its own node and a context's reservation of
+/// the same node each keep it until both have ended, whichever ends first.
+#[test]
+fn a_read_and_a_context_both_reserving_a_node_keep_it_until_both_end() {
+    use crate::reserve::{end_context, end_contexts, note, note_root, Root, Scope};
+    let rt = Rt::new();
+    let claim = (rt.runtime_id, 7);
+
+    {
+        let _scope = Scope::new(Some(5));
+        note(claim, 1);
+    }
+    let root = Root::arm(true, claim);
+    note_root(claim, 1);
+    end_contexts();
+    assert!(
+        reserved_elsewhere(claim),
+        "the context's end ended the read's"
+    );
+    drop(root);
+    assert!(!reserved_elsewhere(claim));
+
+    let root = Root::arm(true, claim);
+    note_root(claim, 1);
+    {
+        let _scope = Scope::new(Some(6));
+        note(claim, 1);
+    }
+    drop(root);
+    assert!(
+        reserved_elsewhere(claim),
+        "the read's end ended the context's"
+    );
+    end_context(6);
+    assert!(!reserved_elsewhere(claim));
+}
+
+/// A read nested in a read of the same node, whose walk lands the node
+/// Dirty, leaves the reservation to the enclosing read, which takes the
+/// value after it.
+#[test]
+fn a_nested_read_of_the_same_node_leaves_its_reservation_to_the_enclosing_read() {
+    use crate::reserve::{note_root, Root};
+    let rt = Rt::new();
+    let claim = (rt.runtime_id, 7);
+    let outer = Root::arm(true, claim);
+    let inner = Root::arm(true, claim);
+    note_root(claim, 1);
+    drop(inner);
+    assert!(reserved_elsewhere(claim), "the nested read ended it");
+    drop(outer);
+    assert!(!reserved_elsewhere(claim));
+}

@@ -10,6 +10,10 @@
 //! before the release that publishes it, so a claim that reads the release
 //! sees it. A node generation has at most one reservation: reserving it
 //! needs its claim, and a claim waits out another thread's reservation.
+//!
+//! A read's walk that lands the read's own node Dirty reserves it the same
+//! way until the read has taken the value: another thread's rerun of the
+//! Dirty node would replace it with a value no serial order gives the read.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -78,7 +82,7 @@ impl Drop for Listed {
     fn drop(&mut self) {
         let token = self.token();
         for g in std::mem::take(self.0.get_mut()) {
-            unlist(&g.claims, token);
+            unlist(&g.claims, token, false);
         }
     }
 }
@@ -87,16 +91,26 @@ impl Drop for Listed {
 thread_local! {
     static MINE: Listed = const { Listed(RefCell::new(Vec::new())) };
     static SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
+    /// The [`root_key`] of the innermost read's node, 0 outside reads.
+    static ROOT: Cell<u64> = const { Cell::new(0) };
+    /// Claims the read-root group lists, so a read's end skips it empty.
+    static ROOTS: Cell<u32> = const { Cell::new(0) };
 }
 
 #[cfg(loom)]
 loom::thread_local! {
     static MINE: Listed = Listed(RefCell::new(Vec::new()));
     static SCOPE: Cell<Option<u64>> = Cell::new(None);
+    static ROOT: Cell<u64> = Cell::new(0);
+    static ROOTS: Cell<u32> = Cell::new(0);
 }
 
 /// The context of a doom's reservations until the doom has marked one.
 pub(crate) const PENDING: u64 = 0;
+
+/// The context of a read's reservation of its own node, which no replay
+/// context's end ends.
+const ROOT_READ: u64 = u64::MAX;
 
 fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, Entry>> {
     #[cfg(not(loom))]
@@ -148,18 +162,124 @@ impl Drop for Scope {
 }
 
 /// Reserves `claim` at `generation` for the scope's context, if a
-/// [`Scope`] is open and this thread does not reserve it already. Called
-/// before the release.
+/// [`Scope`] is open and no context of this thread reserves it already.
+/// Called before the release.
 pub(crate) fn note(claim: Claim, generation: u32) {
     let Some(context) = SCOPE.with(Cell::get) else {
         return;
     };
+    // Only the read-root group may list it besides this one; a context
+    // that reserves it already keeps it, as without a read.
+    let again = ROOTS.with(Cell::get) != 0
+        && MINE.with(|m| {
+            let groups = m.0.borrow();
+            let by = |root: bool| {
+                groups.iter().any(|g| {
+                    (g.context == ROOT_READ) == root && g.claims.contains(&(claim, generation))
+                })
+            };
+            by(true) && !by(false)
+        });
+    list(context, claim, generation, again);
+}
+
+/// `claim` as [`ROOT`] holds it. Runtime ids are allocated from 1 and
+/// stay far below 2^32, so distinct claims never share a key, and no
+/// claim's key is 0.
+#[inline(always)]
+fn root_key((rt, slot): Claim) -> u64 {
+    (rt.get() << 32) | u64::from(slot)
+}
+
+/// While it lives, this thread's read of `claim` is walking or taking the
+/// value its walk left: a Dirty landing of `claim` reserves it until the
+/// guard drops.
+pub(crate) struct Root {
+    key: u64,
+    outer: u64,
+}
+
+impl Root {
+    /// `on` is false under `Local`, where the guard does nothing.
+    #[inline(always)]
+    pub(crate) fn arm(on: bool, claim: Claim) -> Self {
+        if !on {
+            return Self { key: 0, outer: 0 };
+        }
+        let key = root_key(claim);
+        let outer = ROOT.with(|r| r.replace(key));
+        Self { key, outer }
+    }
+}
+
+impl Drop for Root {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // An enclosing read of the same node, or none under `Local`, takes
+        // the value after this one, so the reservation passes to it.
+        if self.outer != self.key {
+            ROOT.with(|r| r.set(self.outer));
+            if ROOTS.with(Cell::get) != 0 {
+                end_root(self.key);
+            }
+        }
+    }
+}
+
+/// Reserves `claim`, landing Dirty, for the read whose node it is, if
+/// this thread's innermost read is that read. Called before the release.
+#[cold]
+#[inline(never)]
+pub(crate) fn note_root(claim: Claim, generation: u32) {
+    if ROOT.with(Cell::get) != root_key(claim) || listed(ROOT_READ, claim, generation) {
+        return;
+    }
+    // Listed even if a context of this thread reserves it already, so it
+    // stays reserved until both have ended.
+    list(ROOT_READ, claim, generation, true);
+    ROOTS.with(|n| n.set(n.get() + 1));
+}
+
+/// Whether this thread's group of `context` lists `claim`.
+fn listed(context: u64, claim: Claim, generation: u32) -> bool {
+    MINE.with(|m| {
+        m.0.borrow()
+            .iter()
+            .any(|g| g.context == context && g.claims.contains(&(claim, generation)))
+    })
+}
+
+#[cold]
+#[inline(never)]
+fn end_root(key: u64) {
+    let gone = MINE
+        .try_with(|m| {
+            let mut groups = m.0.borrow_mut();
+            let g = groups.iter_mut().find(|g| g.context == ROOT_READ)?;
+            let ended: Vec<_> = g
+                .claims
+                .extract_if(.., |&mut (c, _)| root_key(c) == key)
+                .collect();
+            ROOTS.with(|n| n.set(n.get() - ended.len() as u32));
+            if g.claims.is_empty() {
+                groups.retain(|g| g.context != ROOT_READ);
+            }
+            Some((ended, m.token()))
+        })
+        .ok()
+        .flatten();
+    if let Some((ended, token)) = gone {
+        unlist(&ended, token, true);
+    }
+}
+
+fn list(context: u64, claim: Claim, generation: u32, again: bool) {
     MINE.with(|m| {
         let token = m.token();
         {
             let mut t = table();
             match t.insert(claim, (generation, token)) {
-                Some(prev) if prev == (generation, token) => return,
+                Some(prev) if prev == (generation, token) && !again => return,
                 Some(_) => {}
                 None => {
                     #[cfg(not(loom))]
@@ -213,16 +333,39 @@ pub(crate) fn mine(claim: Claim, generation: u32) -> bool {
     reserved(claim, generation) == Some(true)
 }
 
-fn unlist(claims: &[(Claim, u32)], token: usize) {
+/// Ends `claims`, already out of their group. `shared` says another
+/// group may list them too, which only a read's reservation of its own
+/// node makes possible.
+fn unlist(claims: &[(Claim, u32)], token: usize, shared: bool) {
     let mut t = table();
     for &(claim, generation) in claims {
-        if t.get(&claim) == Some(&(generation, token)) {
+        if t.get(&claim) == Some(&(generation, token))
+            && !(shared && still_listed(claim, generation))
+        {
             t.remove(&claim);
             #[cfg(not(loom))]
             bucket(claim).fetch_sub(1, Ordering::Relaxed);
         }
     }
     LIVE.store(t.len(), Ordering::Relaxed);
+}
+
+/// Whether this thread's read-root group may list anything; true once
+/// the count is being destroyed.
+fn roots_listed() -> bool {
+    ROOTS.try_with(Cell::get).ok().is_none_or(|n| n != 0)
+}
+
+/// Whether a group of this thread still lists `claim`, as a read of its
+/// own node and a context can both. False once the thread's reservations
+/// are being destroyed.
+fn still_listed(claim: Claim, generation: u32) -> bool {
+    MINE.try_with(|m| {
+        m.0.borrow()
+            .iter()
+            .any(|g| g.claims.contains(&(claim, generation)))
+    })
+    .unwrap_or(false)
 }
 
 /// Gives the reservations of a doom that marked no context to `context`.
@@ -267,16 +410,33 @@ pub(crate) fn end_context(context: u64) {
     if let Some((g, token)) = gone {
         #[cfg(all(test, not(loom)))]
         CONTEXT_ENDS.with(|n| n.set(n.get() + g.claims.len() as u32));
-        unlist(&g.claims, token);
+        unlist(&g.claims, token, roots_listed());
     }
 }
 
-/// Ends every reservation of this thread, PENDING ones included: none of
-/// its contexts outlives this.
+/// Ends every reservation of this thread, PENDING ones and a read's of
+/// its own node included: none of its contexts outlives this.
 pub(crate) fn end_all() {
+    ROOTS.with(|n| n.set(0));
     let (groups, token) = MINE.with(|m| (std::mem::take(&mut *m.0.borrow_mut()), m.token()));
     for g in groups {
-        unlist(&g.claims, token);
+        unlist(&g.claims, token, false);
+    }
+}
+
+/// [`end_all`], except a read's reservation of its own node, which the
+/// read ends once it has taken the value: a context's removal, even at the
+/// outermost entry's exit, comes before that.
+pub(crate) fn end_contexts() {
+    let (groups, token) = MINE.with(|m| {
+        let mut groups = m.0.borrow_mut();
+        let ended = groups
+            .extract_if(.., |g| g.context != ROOT_READ)
+            .collect::<Vec<_>>();
+        (ended, m.token())
+    });
+    for g in groups {
+        unlist(&g.claims, token, roots_listed());
     }
 }
 

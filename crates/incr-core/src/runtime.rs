@@ -2223,6 +2223,7 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
+        let _root = reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
         loop {
             // A read whose walk a doom stopped goes on with it even if its
             // root is held by now, as the unbounded run's walk goes on past
@@ -4459,6 +4460,9 @@ impl<C: Cells> Runtime<C> {
         node.set_unrun(unrun);
         if !C::SINGLE_THREADED && unrun {
             reserve::note((self.runtime_id, id.0), node.generation());
+        }
+        if !C::SINGLE_THREADED && !unrun && target == NodeState::Dirty {
+            reserve::note_root((self.runtime_id, id.0), node.generation());
         }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {

@@ -207,7 +207,8 @@ struct OutermostExit;
 impl Drop for OutermostExit {
     fn drop(&mut self) {
         if !reserve::none_held() {
-            end_replay();
+            replay::reset();
+            reserve::end_contexts();
         }
     }
 }
