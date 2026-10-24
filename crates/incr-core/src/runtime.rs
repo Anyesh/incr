@@ -927,11 +927,6 @@ pub struct Runtime<C: Cells> {
     /// land a member Clean over nodes it leaves New or Dirty, which a
     /// walk another thread planned earlier would go on to compute.
     pub(crate) episodes_landed: <C as Cells>::U64,
-    /// `Inner::released_deps.len()`, stored under the write hold, so that a
-    /// walk reaching a New node skips the lock while the map is empty. The
-    /// entry is stored before the release's state CAS lands the node New,
-    /// and the walk loads that state with acquire.
-    released_count: <C as Cells>::U32,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
@@ -1069,7 +1064,6 @@ impl<C: Cells> Runtime<C> {
             watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
             episodes_landed: C::new_u64(0),
-            released_count: C::new_u32(0),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id,
@@ -4410,10 +4404,12 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// How many of `id`'s deps, from the front, its last finished run read,
-    /// if a user panic released it New over more.
+    /// if a user panic released it New over more. The mark is stored before
+    /// the release's state CAS lands the node New, and the walk loads that
+    /// state with acquire.
     #[inline]
     fn released_kept(&self, id: NodeId, node: &NodeData<C>) -> Option<u32> {
-        if C::u32_load_relaxed(&self.released_count) == 0 {
+        if !node.released_mark() {
             return None;
         }
         self.released_entry(id, node)
@@ -4422,29 +4418,26 @@ impl<C: Cells> Runtime<C> {
     /// Sets or drops `id`'s [`Inner::released_deps`] entry, under the hold
     /// that publishes its deps.
     fn set_released(&self, inner: &mut Inner<C>, id: u32, entry: Option<(u32, u32)>) {
-        let changed = match entry {
+        let node = self.nodes.get(id);
+        match entry {
             Some(e) => {
                 inner.released_deps.insert(id, e);
-                true
+                node.set_released_mark(true);
             }
             None => {
-                C::u32_load_relaxed(&self.released_count) != 0
-                    && inner.released_deps.remove(&id).is_some()
+                if node.released_mark() {
+                    inner.released_deps.remove(&id);
+                    node.set_released_mark(false);
+                }
             }
-        };
-        if changed {
-            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
         }
     }
 
-    /// A finished run published the deps it already had. The read hold
-    /// keeps a runtime with any entry left from writing on every publish.
+    /// A finished run published the deps it already had.
     #[cold]
     #[inline(never)]
     fn drop_released_entry(&self, id: NodeId) {
-        if self.inner.read().released_deps.contains_key(&id.0) {
-            self.set_released(&mut self.inner.write(), id.0, None);
-        }
+        self.set_released(&mut self.inner.write(), id.0, None);
     }
 
     #[cold]
@@ -4759,9 +4752,8 @@ impl<C: Cells> Runtime<C> {
                 seen += 1;
             });
             if same && seen == recorded.len() {
-                // This run's claim followed the release's landing, so a
-                // relaxed load sees its entry's count.
-                if C::u32_load_relaxed(&self.released_count) != 0 {
+                // Only this claim's owner writes the mark.
+                if node.released_mark() {
                     self.drop_released_entry(id);
                 }
                 return Publish::Published;
@@ -4929,6 +4921,13 @@ impl<C: Cells> Runtime<C> {
             assert!(
                 len == deps && kept < len,
                 "node {slot} has {deps} deps under a released entry ({len}, {kept})"
+            );
+        }
+        for slot in 0..self.nodes.len() {
+            assert_eq!(
+                self.nodes.get(slot).released_mark(),
+                inner.released_deps.contains_key(&slot),
+                "node {slot}'s released mark disagrees with its entry"
             );
         }
     }
@@ -5108,6 +5107,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(displaced) = node.install_deps(&deps) {
             drop(displaced);
         }
+        self.set_released(&mut inner, id.0, None);
     }
 
     #[cfg(not(loom))]
