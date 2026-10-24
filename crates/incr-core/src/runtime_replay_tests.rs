@@ -1342,7 +1342,8 @@ impl Drop for Tracked {
 /// with `adopt`, a real `get(c)` reads; `r` keeps the clone its read
 /// returns if `keep`, else drops it. Every drop of a `Tracked` panics from
 /// `r`'s first read on. Returns (builds, drops) once `input`'s set has
-/// ended the revision, and whether any read or the set panicked.
+/// ended the revision, and whether any read or the set panicked; kept
+/// values drop after the count.
 fn speculative_value_drops<C: Cells>(frames: u32, adopt: bool, keep: bool) -> (u32, u32, bool) {
     let tally = Arc::new(Tally::default());
     let rt = native_runtime::<C>();
@@ -1352,13 +1353,15 @@ fn speculative_value_drops<C: Cells>(frames: u32, adopt: bool, keep: bool) -> (u
     let b = rt.create_query(|_| 5_u64);
     let made = tally.clone();
     let c = rt.create_query(move |rt: &Runtime<C>| Tracked::new(rt.get(input), &made));
+    let held: Arc<Mutex<Vec<Tracked>>> = Arc::default();
+    let holds = held.clone();
     let r = rt.create_query_with(
         move |rt| {
             let x = rt.get(b);
             if x == 0 {
                 let v = rt.get(c);
                 if keep {
-                    std::mem::forget(v);
+                    holds.lock().unwrap().push(v);
                 }
                 0
             } else {
@@ -1370,20 +1373,24 @@ fn speculative_value_drops<C: Cells>(frames: u32, adopt: bool, keep: bool) -> (u
     tally.panics.store(true, SeqCst);
     let mut panicked = catch_unwind(AssertUnwindSafe(|| assert_eq!(rt.get(r), 5))).is_err();
     if adopt {
-        panicked |= catch_unwind(AssertUnwindSafe(|| std::mem::forget(rt.get(c)))).is_err();
+        panicked |=
+            catch_unwind(AssertUnwindSafe(|| held.lock().unwrap().push(rt.get(c)))).is_err();
     }
     panicked |= catch_unwind(AssertUnwindSafe(|| rt.set(input, 2))).is_err();
     tally.panics.store(false, SeqCst);
-    (
+    let counts = (
         tally.built.load(SeqCst),
         tally.dropped.load(SeqCst),
         panicked,
-    )
+    );
+    drop(held);
+    counts
 }
 
 /// A replayable `q` whose run at a budget dooms on `b` and still returns
 /// a `Tracked`, built from `b`'s placeholder, that its retry replaces.
-/// Every drop of a `Tracked` panics during the read.
+/// Every drop of a `Tracked` panics during the read; the value read drops
+/// after the count.
 fn doomed_value_drops<C: Cells>(frames: u32) -> (u32, u32, bool) {
     let tally = Arc::new(Tally::default());
     let rt = native_runtime::<C>();
@@ -1396,13 +1403,15 @@ fn doomed_value_drops<C: Cells>(frames: u32) -> (u32, u32, bool) {
         replayable(),
     );
     tally.panics.store(true, SeqCst);
-    let panicked = catch_unwind(AssertUnwindSafe(|| std::mem::forget(rt.get(q)))).is_err();
+    let read = catch_unwind(AssertUnwindSafe(|| rt.get(q)));
     tally.panics.store(false, SeqCst);
-    (
+    let counts = (
         tally.built.load(SeqCst),
         tally.dropped.load(SeqCst),
-        panicked,
-    )
+        read.is_err(),
+    );
+    drop(read);
+    counts
 }
 
 /// What a budget builds and drops beyond the unbounded run: a doomed run's
