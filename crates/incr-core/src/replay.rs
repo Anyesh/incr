@@ -1439,20 +1439,24 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
         let ours = |e: &KeptRead| e.rt == read.rt && e.cidx == read.cidx && e.ctl == read.ctl;
         // The frame's latest kept read went in under this same rule, so
         // nothing before it goes now.
-        let latest = (!fresh)
-            .then(|| d.iter().rposition(|(e, _)| ours(e)))
-            .flatten();
-        let from = latest.map_or_else(|| from_frame(&d, read.cidx), |i| i + 1);
+        let from = d
+            .iter()
+            .rposition(|(e, _)| e.cidx < read.cidx || !fresh && ours(e))
+            .map_or(0, |i| i + 1);
         note_work(d.len() - from);
         let gone = d
             .extract_if(from.., |(e, _)| {
                 e.rt == read.rt && e.cidx >= read.cidx && (fresh || !ours(e))
             })
             .collect();
-        debug_assert!(
-            d.last().is_none_or(|(e, _)| e.cidx <= read.cidx),
-            "incr-core: kept reads run in frame order"
-        );
+        // Most replay coverage runs in release, and the scans of kept reads
+        // rely on this.
+        if cfg!(any(test, debug_assertions)) {
+            assert!(
+                d.last().is_none_or(|(e, _)| e.cidx <= read.cidx),
+                "incr-core: kept reads run in frame order"
+            );
+        }
         d.push((read, seen));
         gone
     });
