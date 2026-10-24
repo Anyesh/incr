@@ -1494,10 +1494,17 @@ fn get_before_read_vs_delete_recycle() {
 fn read_of_cycle_member_vs_claim_after_landing() {
     let rt = Arc::new(Rt::new());
     let inp = rt.create_input(0_u64);
-    let failed = rt.create_query(move |rt: &Rt| match rt.get(inp) {
-        0 => panic!("boom"),
-        v => v,
-    });
+    // While inp is 0, `failed` reads itself, and a closure that catches
+    // its cycle lands poisoned.
+    let self_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
+    let failed = {
+        let self_cell = Arc::clone(&self_cell);
+        rt.create_query(move |rt: &Rt| match rt.get(inp) {
+            0 => rt.get(*self_cell.get().unwrap()),
+            v => v,
+        })
+    };
+    self_cell.set(failed).unwrap();
     let in_a = Gate::new();
     let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
     let a = {
@@ -1508,7 +1515,7 @@ fn read_of_cycle_member_vs_claim_after_landing() {
             catch_unwind(AssertUnwindSafe(|| rt.try_get(b).unwrap_or(7777))).unwrap_or(9999)
         })
     };
-    // b catches the panic of a read, so the episode lands Dirty and its
+    // b catches the cycle of a read, so the episode lands Dirty and its
     // members New, with their group.
     let b = rt.create_query(move |rt: &Rt| {
         let v = catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1);
