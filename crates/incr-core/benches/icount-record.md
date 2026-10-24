@@ -2106,4 +2106,15 @@ scale tests finish in 24.94 s at the tip against 28.39 s at the base.
 - Local rows move by 0.0 to 0.9% though reservations compile out under
   `SINGLE_THREADED`: layout, as in earlier sections.
 
-Gate: the hard gates hold (102/196, 155.14/218.14, 5/87).
+Gate: the hard gates hold (102/196, 155.14/218.14, 5/87). Replay scale
+by `strict-scan.sh`'s `scale-icount` against `78d070d4`: Local ratios are
+in 0.9978..1.0024; Shared rise up to 1.18
+(`shared_taint_100k_at_budget_1_on_a_1_mib_thread`; 1.12 at budget 256,
+1.10 `shared_byte_budget_before_frame_budget`, 1.03 to 1.08 for the
+cycle, fixpoint, ring and stabilize rows), and `replay_scale_tests` take
+18.3 s against 16.9 s. In the profile of the worst row the new symbols
+are `reserve::elsewhere` (3.8% of instructions), `BTreeMap::remove`
+(2.9%) and `reserve::unlist` (2.8%): the thread's own reservations keep
+`LIVE` non-zero, so each of its re-claims takes the table lock and a
+lookup, and each context end removes its entries from the shared map.
+B7-reservation-table-cost tracks a per-node reservation word instead.
