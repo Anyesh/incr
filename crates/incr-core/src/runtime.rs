@@ -868,6 +868,13 @@ fn reached_under_own_set(id: NodeId) -> ! {
 /// while the thread is already unwinding aborts the process, exactly as a
 /// panicking `Drop` inside a `Vec` does.
 ///
+/// Under a budget, replay also builds values that the run without one
+/// never builds: a doomed run's value, the value of a speculative run that
+/// no later read takes, and the clones a speculative run's reads return.
+/// They are dropped and their `Drop` runs, but a panic in it reaches no
+/// read: the runtime drops them with the panic swallowed, or in a run it
+/// discards.
+///
 /// Under `Shared`, displaced values are reclaimed through hazard
 /// pointers, so a value's `Drop` may run inside a later, unrelated
 /// retire on any thread. When such a `Drop` panics, the rest of that
