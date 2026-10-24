@@ -285,10 +285,12 @@ pub(crate) struct Landings {
 
 impl Landings {
     fn is_deep(&self) -> bool {
+        note_work(self.nodes.len());
         self.nodes.iter().any(|&(_, depth)| depth > 0)
     }
 
     fn max_depth(&self) -> u32 {
+        note_work(self.nodes.len());
         self.nodes
             .iter()
             .map(|&(_, depth)| depth)
@@ -316,6 +318,7 @@ impl Landings {
                 Box::new(move |n, pos| n == node || pos > at && other)
             }
         };
+        note_work(self.nodes.len());
         self.nodes.retain(|&(n, depth)| !gone(n, cidx + 1 + depth));
     }
 }
@@ -491,6 +494,7 @@ impl Pending {
     fn retire(&mut self, ev: &Retire, all: bool) {
         let slots = &mut self.slots;
         let apply = |d: &mut Delivery| {
+            note_work(1);
             if d.key.cidx < ev.cidx() || all {
                 let resumed = d.resumed;
                 if let Delivered::Unwind { nodes, .. } = &mut d.what {
@@ -1282,6 +1286,23 @@ loom::thread_local! {
 #[cfg(all(test, not(loom)))]
 thread_local! {
     static VINDEX_REPUSHES: Cell<u64> = const { Cell::new(0) };
+    static NOTE_WORK: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Counts `units` elements a pass over this thread's notes, their copies
+/// or its kept reads looked at.
+#[inline(always)]
+pub(crate) fn note_work(units: usize) {
+    #[cfg(all(test, not(loom)))]
+    NOTE_WORK.with(|n| n.set(n.get() + units as u64));
+    #[cfg(not(all(test, not(loom))))]
+    let _ = units;
+}
+
+/// The units [`note_work`] counted on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_note_work() -> u64 {
+    NOTE_WORK.with(|n| n.replace(0))
 }
 
 /// Virtual frames pushed on this thread for a node that already had one
@@ -1306,6 +1327,7 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
     }
     let gone: Vec<KeptRead> = KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
+        note_work(d.len());
         let gone = d
             .extract_if(.., |e| {
                 e.rt == read.rt
@@ -1330,6 +1352,7 @@ fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
 pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
     COPIED.with(|c| {
         let mut c = c.borrow_mut();
+        note_work(nodes.nodes.len());
         for &(n, _) in &nodes.nodes {
             let (w, b) = copied_bit(rt, n);
             c[w] |= b;
@@ -1358,6 +1381,7 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
         // above it go, and go when their frame pops, so they run in frame
         // order.
         for e in d.iter_mut().rev() {
+            note_work(1);
             if !all && e.cidx + 1 + deepest <= at {
                 break;
             }

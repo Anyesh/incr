@@ -3,7 +3,6 @@
 //! entry, the byte budget beating the frame budget, and dooms under
 //! `stabilize`.
 
-#[cfg(not(debug_assertions))]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(not(debug_assertions))]
 use std::sync::atomic::AtomicBool;
@@ -635,4 +634,48 @@ fn local_wide_diverted_retry() {
 #[test]
 fn shared_wide_diverted_retry() {
     wide_diverted_retry::<Shared>();
+
+/// `n` replayable queries that panic, each read and caught by one
+/// replayable reader at budget 1. With no placeholder the reads take the
+/// native path. Each caught panic's landing stays noted while the reader
+/// runs, and each payload reuses the last one's address and text, so the
+/// copy a read keeps matches every earlier note: the work on notes, their
+/// copies and the kept reads stays linear only if copies share the notes.
+fn many_caught_unwinds<C: Cells>() {
+    let n = 2000;
+    let rt = Runtime::<C>::new();
+    rt.set_max_frames(1);
+    let failing: Arc<Vec<Incr<u64>>> = Arc::new(
+        (0..n)
+            .map(|_| rt.create_query_with(|_| -> u64 { panic!("boom") }, replayable()))
+            .collect(),
+    );
+    let reader = rt.create_query_with(
+        move |rt| {
+            failing
+                .iter()
+                .filter(|&&x| catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err())
+                .count() as u64
+        },
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n as u64);
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 16 * n as u64,
+        "{work} units of note work for {n} caught unwinds"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_many_caught_unwinds_stay_linear() {
+    many_caught_unwinds::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_many_caught_unwinds_stay_linear() {
+    many_caught_unwinds::<Shared>();
 }

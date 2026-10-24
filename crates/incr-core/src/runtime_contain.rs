@@ -29,7 +29,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
-use crate::replay::{payload_key, Landings, PayloadKey, Retire};
+use crate::replay::{note_work, payload_key, Landings, PayloadKey, Retire};
 
 /// A Failed read's node left Failed before the read could tell which
 /// landing it saw.
@@ -128,6 +128,7 @@ pub(super) fn walked_episode(cidx: u32) -> Option<NodeId> {
 /// counts as just above it.
 fn add_noted(nodes: &mut Vec<((u32, u32), u32)>, w: &Unwound, base: u32) {
     let depth = w.cidx.saturating_sub(base);
+    note_work(nodes.len());
     match nodes.iter_mut().find(|(n, _)| *n == w.node) {
         Some((_, d)) => *d = (*d).min(depth),
         None => nodes.push((w.node, depth)),
@@ -138,6 +139,7 @@ fn add_noted(nodes: &mut Vec<((u32, u32), u32)>, w: &Unwound, base: u32) {
 fn with_notes<R>(f: impl FnOnce(&mut Vec<Unwound>) -> R) -> R {
     UNWOUND.with(|u| {
         let mut u = u.borrow_mut();
+        note_work(u.len());
         let held = !u.is_empty();
         let r = f(&mut u);
         let holds = !u.is_empty();
