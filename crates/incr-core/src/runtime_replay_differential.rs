@@ -5966,6 +5966,55 @@ fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
     });
 }
 
+/// `seed`'s operations with every `Get` read four more times with no set
+/// between, and the first get whose repeats differ from it, any panic
+/// counting as the same outcome: a Failed node's later reads raise
+/// "last compute panicked" in place of the first read's payload.
+fn first_changed_get<C: Cells>(seed: u64) -> Option<(usize, Vec<Out>)> {
+    let mut case = gen_case(seed, false, false);
+    case.ops = case
+        .ops
+        .drain(..)
+        .flat_map(|op| {
+            let n = if matches!(op, Op::Get(_)) { 5 } else { 1 };
+            std::iter::repeat_n(op, n)
+        })
+        .collect();
+    let mut trace = Vec::new();
+    quiet(|| trace = run::<C>(&case, None, 0));
+    let outcome = |i: usize| match &trace[i].0 {
+        Out::Panic(_) => Out::Panic(String::new()),
+        o => o.clone(),
+    };
+    let mut i = 0;
+    while i < case.ops.len() {
+        if !matches!(case.ops[i], Op::Get(_)) {
+            i += 1;
+            continue;
+        }
+        if (i + 1..i + 5).any(|j| outcome(j) != outcome(i)) {
+            return Some((i, trace[i..i + 5].iter().map(|(o, _)| o.clone()).collect()));
+        }
+        i += 5;
+    }
+    None
+}
+
+/// 0x1a7: q7 catches a co-member's cycle panic and sits in two
+/// overlapping episodes, so each episode lands Dirty through real poison
+/// and the next get plans the other cycle: 9999, 8, 9999, ... 0x4ea
+/// alternates the same way, and 0x701 reads 9999, 4, 9999. Keeping a
+/// Dirty landing's outcome for its revision (T8-get-alternates-without-set,
+/// rule (b)) is beta.7 work.
+#[test]
+#[ignore = "beta.7: T8-get-alternates-without-set rule (b)"]
+fn a_member_catching_a_co_members_cycle_panic_repeats_its_get() {
+    for seed in [0x1a7, 0x4ea, 0x701] {
+        assert_eq!(first_changed_get::<Local>(seed), None, "{seed:#x}");
+        assert_eq!(first_changed_get::<Shared>(seed), None, "{seed:#x}");
+    }
+}
+
 /// Runs `case`'s phase of ops `pair` on two threads with thread 0's
 /// walk held before its compute of query `held`, until thread 1's read
 /// has settled `settled` and left `left` as they are (by query), then
