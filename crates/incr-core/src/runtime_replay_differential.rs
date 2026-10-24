@@ -41,7 +41,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Barrier, Mutex};
 
 use proptest::prelude::*;
@@ -623,6 +623,8 @@ unsafe impl<C: Cells> Sync for RtPtr<C> {}
 struct World<C: Cells> {
     rts: [RtPtr<C>; 2],
     tables: [Vec<Mutex<Option<Handle>>>; 2],
+    /// Queries made so far.
+    made: AtomicUsize,
 }
 
 impl<C: Cells> World<C> {
@@ -696,9 +698,10 @@ thread_local! {
     static NATIVE: std::cell::RefCell<Option<Vec<NativeRun>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// A Native closure's run: its node by side and index, the revision, and
-/// whether the run is speculative.
-type NativeRun = (usize, usize, u64, bool);
+/// A Native closure's run: its node by side, index and the order it was
+/// made in (a recreated node is a new one), the revision, and whether the
+/// run is speculative.
+type NativeRun = (usize, usize, usize, u64, bool);
 
 static EVAL_CLOCK: AtomicU64 = AtomicU64::new(0);
 
@@ -938,6 +941,7 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             strategy,
         } => {
             let native = !*replay;
+            let made = world.made.fetch_add(1, Relaxed);
             let replay = if *replay {
                 Replay::Allowed
             } else {
@@ -948,7 +952,13 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                 if native {
                     NATIVE.with(|n| {
                         if let Some(runs) = &mut *n.borrow_mut() {
-                            runs.push((side, i, rt.current_revision(), rt.computing_speculative()));
+                            runs.push((
+                                side,
+                                i,
+                                made,
+                                rt.current_revision(),
+                                rt.computing_speculative(),
+                            ));
                         }
                     });
                 }
@@ -1082,6 +1092,7 @@ impl<C: Cells> Live<C> {
         let world = Arc::new(World {
             rts: [RtPtr(&*rts[0]), RtPtr(&*rts[1])],
             tables: [table(case.specs.len()), table(case.specs2.len())],
+            made: AtomicUsize::new(0),
         });
         for (side, specs) in [&case.specs, &case.specs2].into_iter().enumerate() {
             for (i, spec) in specs.iter().enumerate().rev() {
@@ -2215,8 +2226,10 @@ fn consistent(
         })
         .collect();
     // A fresh query's closure runs as it last ran before the phase, since
-    // its last recreate (`Ran`). A first run is kept only if it landed
-    // Clean: a Failed or poisoned landing leaves nothing an order verifies.
+    // its last recreate (`Ran`). A first run is kept only if its first
+    // landing, at its own operation or at a later one that adopted its
+    // stash, was Clean: a Failed or poisoned landing leaves nothing an
+    // order verifies.
     let first_op = phase_reads.first().copied().unwrap_or(0);
     let evals = live.evals.lock().unwrap().clone();
     let ran = |x: usize| {
@@ -2230,10 +2243,15 @@ fn consistent(
             .flat_map(|(i, es)| es.iter().map(move |e| (i, e)))
             .filter(|(_, e)| e.node == (side, q))
             .max_by_key(|(_, e)| e.end);
+        let landed = |i: usize| {
+            (i..first_op)
+                .map(|j| prefix[j].1 .0[x])
+                .find(|&s| s != NodeState::New)
+        };
         match last {
             None => Ran::Never,
-            Some((i, _)) if prefix[i].1 .0[x] == NodeState::New => Ran::Never,
-            Some((i, l)) if l.first && prefix[i].1 .0[x] == NodeState::Clean => {
+            Some((i, _)) if landed(i).is_none() => Ran::Never,
+            Some((i, l)) if l.first && landed(i) == Some(NodeState::Clean) => {
                 Ran::First(l.reads.clone())
             }
             Some(_) => Ran::Rerun,
@@ -2525,6 +2543,10 @@ thread_local! {
     static NATIVE_COUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Native runs by side, made order, revision and node: unbounded, bounded,
+/// and bounded speculative.
+type NativeCounts = HashMap<(usize, usize, u64, usize), (u32, u32, u32)>;
+
 /// Fails if a Native node runs speculatively more than once in a revision.
 /// With `REPLAY_NATIVE_COUNT` set, or [`NATIVE_COUNT`], also unless each
 /// runs in each revision as often as the unbounded run has it run, or once
@@ -2533,12 +2555,12 @@ thread_local! {
 fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
     let full = NATIVE_COUNT.with(std::cell::Cell::get)
         || std::env::var_os("REPLAY_NATIVE_COUNT").is_some();
-    let mut counts: HashMap<(usize, usize, u64), (u32, u32, u32)> = HashMap::new();
-    for &(side, i, rev, _) in want {
-        counts.entry((side, i, rev)).or_default().0 += 1;
+    let mut counts: NativeCounts = HashMap::new();
+    for &(side, i, made, rev, _) in want {
+        counts.entry((side, made, rev, i)).or_default().0 += 1;
     }
-    for &(side, i, rev, speculative) in got {
-        let c = counts.entry((side, i, rev)).or_default();
+    for &(side, i, made, rev, speculative) in got {
+        let c = counts.entry((side, made, rev, i)).or_default();
         c.1 += 1;
         c.2 += u32::from(speculative);
     }
@@ -2548,7 +2570,7 @@ fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
     off.sort_unstable();
     assert!(
         off.is_empty(),
-        "{label}: Native runs (side, node, revision): (unbounded, bounded, speculative) {off:?}"
+        "{label}: Native runs (side, made, revision, node): (unbounded, bounded, speculative) {off:?}"
     );
 }
 
