@@ -1361,6 +1361,7 @@ thread_local! {
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
+    static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
@@ -1377,6 +1378,7 @@ loom::thread_local! {
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
+    static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
@@ -1444,7 +1446,7 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
             .rposition(|(e, _)| e.cidx < read.cidx || !fresh && ours(e))
             .map_or(0, |i| i + 1);
         note_work(d.len() - from);
-        let gone = d
+        let gone: Vec<(KeptRead, usize)> = d
             .extract_if(from.., |(e, _)| {
                 e.rt == read.rt && e.cidx >= read.cidx && (fresh || !ours(e))
             })
@@ -1457,6 +1459,10 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
                 "incr-core: kept reads run in frame order"
             );
         }
+        for (e, _) in &gone {
+            count_foreign(e, false);
+        }
+        count_foreign(&read, true);
         d.push((read, seen));
         gone
     });
@@ -1602,7 +1608,14 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
     KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
         let from = from_frame(&d, cidx);
-        let out = d.extract_if(from.., |(e, _)| which(e)).collect();
+        let out: Vec<(KeptRead, usize)> = d.extract_if(from.., |(e, _)| which(e)).collect();
+        for (e, _) in &out {
+            count_foreign(e, false);
+        }
+        debug_assert!(
+            !d.is_empty() || FOREIGN_KEPT.with(|m| m.borrow().is_empty()),
+            "incr-core: a foreign read's count outlived its kept read"
+        );
         value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
             COPIED.with(|c| *c.borrow_mut() = [0; 64]);
@@ -1633,21 +1646,57 @@ pub(crate) fn foreign_ordinal(
     if !kept {
         return 1;
     }
+    note_work(1);
+    let key = (rt, cidx, ctl as usize, reading, foreign);
+    let earlier = FOREIGN_KEPT.with(|m| m.borrow().get(&key).copied().unwrap_or(0));
+    #[cfg(debug_assertions)]
     KEPT_READS.with(|d| {
-        note_work(d.borrow().len());
-        let earlier = d
+        let scanned = d
             .borrow()
             .iter()
-            .filter(|(e, _)| {
-                e.rt == rt
-                    && e.cidx == cidx
-                    && e.ctl == ctl
-                    && e.reading == reading
-                    && e.foreign == Some(foreign)
-            })
+            .filter(|(e, _)| foreign_key(e) == Some(key))
             .count();
-        earlier as u32 + 1
-    })
+        assert_eq!(
+            scanned, earlier as usize,
+            "incr-core: a frame's foreign read count"
+        );
+    });
+    earlier + 1
+}
+
+/// A kept foreign read's frame (runtime, position and control block), the
+/// node it read and that node's runtime.
+type ForeignKey = (RuntimeId, u32, usize, u64, RuntimeId);
+
+fn foreign_key(e: &KeptRead) -> Option<ForeignKey> {
+    e.foreign
+        .map(|foreign| (e.rt, e.cidx, e.ctl as usize, e.reading, foreign))
+}
+
+/// Counts `e` in or out of `FOREIGN_KEPT`, which holds, for each
+/// [`ForeignKey`], how many of the kept reads are under it.
+fn count_foreign(e: &KeptRead, kept: bool) {
+    let Some(key) = foreign_key(e) else {
+        return;
+    };
+    FOREIGN_KEPT.with(|m| {
+        let mut m = m.borrow_mut();
+        match m.entry(key) {
+            MapEntry::Occupied(mut o) if !kept => {
+                *o.get_mut() -= 1;
+                if *o.get() == 0 {
+                    o.remove();
+                }
+            }
+            MapEntry::Occupied(mut o) => *o.get_mut() += 1,
+            MapEntry::Vacant(v) if kept => {
+                v.insert(1);
+            }
+            MapEntry::Vacant(_) => {
+                unreachable!("incr-core: a foreign read left the kept reads uncounted")
+            }
+        }
+    });
 }
 
 /// The id the next context or episode gets.
