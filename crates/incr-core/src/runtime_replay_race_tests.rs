@@ -1525,10 +1525,10 @@ fn shared_dissolved_member_root_stays_in_its_group() {
             if p == ParkPoint::BeforeEntry(id(f)) && zran.load(SeqCst) == 1 {
                 entered.store(1, SeqCst);
             }
-            let settled = weak
+            let dirty = weak
                 .upgrade()
                 .is_some_and(|rt| rt.state_of(f) == NodeState::Dirty);
-            if p == ParkPoint::BeforeClaim(id(f)) && entered.load(SeqCst) == 1 && settled {
+            if p == ParkPoint::BeforeClaim(id(f)) && entered.load(SeqCst) == 1 && dirty {
                 parked.park();
             }
         }));
@@ -1558,6 +1558,7 @@ fn shared_dissolved_member_root_stays_in_its_group() {
         (got, gap)
     };
     let (want, _) = run(u32::MAX, false);
+    assert_eq!(want, Ok(15));
     let (got, gap) = run(1, true);
     let (landed, other) = gap.expect("the driver parked");
     assert_eq!(
@@ -1565,11 +1566,7 @@ fn shared_dissolved_member_root_stays_in_its_group() {
         (NodeState::Dirty, true, true),
         "F's discard landing: (state, in its group, verification kept)"
     );
-    assert_eq!(got, want);
-    assert!(
-        other == want || other == Ok(115),
-        "other thread read {other:?}"
-    );
+    assert_eq!((got, other), (want.clone(), want));
 }
 
 /// What a closure does with the panic of a read below it.
