@@ -205,21 +205,18 @@ pub(crate) struct Delivery {
 pub(crate) struct RunSlot {
     pub(crate) path: u64,
     pub(crate) owner: u32,
-    pub(crate) counts: Vec<(u32, u32, u32)>,
+    pub(crate) counts: Few<(u32, u32, u32)>,
 }
 
 impl RunSlot {
     fn count(&self, node: u32, generation: u32) -> u32 {
-        self.counts
-            .iter()
+        (self.counts.as_slice().iter())
             .find(|&&(n, g, _)| (n, g) == (node, generation))
             .map_or(0, |&(_, _, k)| k)
     }
 
     fn bump(&mut self, node: u32, generation: u32) {
-        match self
-            .counts
-            .iter_mut()
+        match (self.counts.as_mut_slice().iter_mut())
             .find(|(n, g, _)| (*n, *g) == (node, generation))
         {
             Some((_, _, k)) => *k += 1,
@@ -231,16 +228,16 @@ impl RunSlot {
 /// A context's run slots by position, the first at its `boundary + 1`; a
 /// position holds a slot per path its reads were made along.
 #[derive(Default)]
-pub(crate) struct RunSlots(Vec<Vec<RunSlot>>);
+pub(crate) struct RunSlots(Vec<Few<RunSlot>>);
 
 impl RunSlots {
     fn at(&self, i: usize) -> &[RunSlot] {
-        self.0.get(i).map_or(&[], Vec::as_slice)
+        self.0.get(i).map_or(&[], Few::as_slice)
     }
 
-    fn at_mut(&mut self, i: usize) -> &mut Vec<RunSlot> {
+    fn at_mut(&mut self, i: usize) -> &mut Few<RunSlot> {
         if self.0.len() <= i {
-            self.0.resize_with(i + 1, Vec::new);
+            self.0.resize_with(i + 1, Few::default);
         }
         &mut self.0[i]
     }
@@ -251,18 +248,18 @@ impl RunSlots {
 
     fn entry(&mut self, i: usize, path: u64) -> &mut RunSlot {
         let slots = self.at_mut(i);
-        let j = match slots.iter().position(|s| s.path == path) {
+        let j = match slots.as_slice().iter().position(|s| s.path == path) {
             Some(j) => j,
             None => {
                 slots.push(RunSlot {
                     path,
                     owner: 0,
-                    counts: Vec::new(),
+                    counts: Few::None,
                 });
-                slots.len() - 1
+                slots.as_slice().len() - 1
             }
         };
-        &mut slots[j]
+        &mut slots.as_mut_slice()[j]
     }
 
     /// The slots from index `i` on, which this keeps no longer.
@@ -1987,7 +1984,7 @@ pub(crate) fn run_snapshot(c: &[Context], rt: RuntimeId, below: &VFrame) -> RunS
         .unwrap_or(RunSlot {
             path,
             owner: 0,
-            counts: Vec::new(),
+            counts: Few::None,
         })
 }
 
@@ -2017,7 +2014,7 @@ pub(crate) fn start_read(rt: RuntimeId, cidx: u32, depth: u32, path: u64, from: 
         slot.owner = depth;
         match from.filter(|f| f.path == path) {
             Some(f) => slot.counts = f.counts,
-            None => slot.counts.clear(),
+            None => slot.counts = Few::None,
         }
     });
 }
