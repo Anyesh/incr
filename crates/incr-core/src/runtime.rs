@@ -97,8 +97,9 @@ pub(crate) struct Inner<C: Cells> {
     /// Each query a user panic released New over a union of deps
     /// ([`Runtime::land_panic_released`]), with the generation it landed
     /// under and how many of those deps, from the front, its last finished
-    /// run read. Dropped when its deps are next replaced; a later run that
-    /// records the very same list keeps it.
+    /// run read. Dropped when its deps are next replaced. A finished run
+    /// that records the very same list leaves it, and a later walk of the
+    /// node while New then skips deps that run read.
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
@@ -921,6 +922,10 @@ pub struct Runtime<C: Cells> {
     /// land a member Clean over nodes it leaves New or Dirty, which a
     /// walk another thread planned earlier would go on to compute.
     pub(crate) episodes_landed: <C as Cells>::U64,
+    /// `Inner::released_deps.len()`, stored under the write hold, so that a
+    /// walk reaching a New node skips the lock while the map is empty. The
+    /// entry is stored before the node lands New, which the walk loaded.
+    released_count: <C as Cells>::U32,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
@@ -1058,6 +1063,7 @@ impl<C: Cells> Runtime<C> {
             watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
             episodes_landed: C::new_u64(0),
+            released_count: C::new_u32(0),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id,
@@ -2104,8 +2110,8 @@ impl<C: Cells> Runtime<C> {
         if bits & IN_GROUP != 0 {
             inner.member_recs.remove(&slot);
         }
-        if !inner.released_deps.is_empty() {
-            inner.released_deps.remove(&slot);
+        if inner.released_deps.remove(&slot).is_some() {
+            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
         }
         let children = if bits & HAS_INDEX != 0 {
             inner.children.remove(&slot)
@@ -4402,10 +4408,9 @@ impl<C: Cells> Runtime<C> {
             kept_all &= n <= kept;
         });
         if !kept_all {
-            self.inner
-                .write()
-                .released_deps
-                .insert(id.0, (node.generation(), kept));
+            let mut inner = self.inner.write();
+            inner.released_deps.insert(id.0, (node.generation(), kept));
+            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
         }
         if wrote {
             node.max_changed_at(attempt.stamp_rev);
@@ -4418,9 +4423,17 @@ impl<C: Cells> Runtime<C> {
 
     /// How many of `id`'s deps, from the front, its last finished run read,
     /// if a user panic released it New over more.
+    #[inline]
+    fn released_kept(&self, id: NodeId, node: &NodeData<C>) -> Option<u32> {
+        if C::u32_load_relaxed(&self.released_count) == 0 {
+            return None;
+        }
+        self.released_entry(id, node)
+    }
+
     #[cold]
     #[inline(never)]
-    fn released_kept(&self, id: NodeId, node: &NodeData<C>) -> Option<u32> {
+    fn released_entry(&self, id: NodeId, node: &NodeData<C>) -> Option<u32> {
         let inner = self.inner.read();
         let &(generation, kept) = inner.released_deps.get(&id.0)?;
         (generation == node.generation()).then_some(kept)
@@ -4828,8 +4841,8 @@ impl<C: Cells> Runtime<C> {
         if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
         }
-        if !inner.released_deps.is_empty() {
-            inner.released_deps.remove(&id.0);
+        if inner.released_deps.remove(&id.0).is_some() {
+            C::u32_store_relaxed(&self.released_count, inner.released_deps.len() as u32);
         }
 
         for old_dep in diff.old {
