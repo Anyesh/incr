@@ -6287,6 +6287,64 @@ fn a_walk_replans_after_another_thread_lands_an_intermediate_by_a_cycle() {
     });
 }
 
+/// 0x7c3a1173e's ops 2 (`Get(4)`, thread 0) and 3 (`Get(11)`, thread 1)
+/// enter the cycle 4, 5, 6, 7, 8, 9, 11, 12 at different members. Thread
+/// 0 plans its read while 4 is New and is held at its claim until thread
+/// 1's read has claimed 4, so it waits that claim out, and thread 1
+/// leaves 4 Dirty. The order with `Get(11)` first then reads 4 Dirty and
+/// walks its deps before it, landing 6, 7 and 8 Failed, so op 10
+/// (`Get(8)`) panics. Computing 4 from the plan made before the wait
+/// enters the cycle at 4 instead and leaves them Dirty, and `Get(8)`
+/// returned 10006.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_read_replans_after_waiting_out_another_threads_claim_of_its_root() {
+    let seed = 0x7c3a1173e;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let overlap = phases.iter().position(|p| p.ops() == [2, 3]).unwrap();
+    assert_eq!(phases[overlap].of(0), Some(2));
+    quiet(|| {
+        for _ in 0..8 {
+            let ready = Arc::new(AtomicBool::new(false));
+            let rig = |live: &Live<Shared>| {
+                let ready = ready.clone();
+                let world = live.world.clone();
+                let slot = move |q| world.handle(0, q).erased().slot();
+                let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                    if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                        return;
+                    }
+                    match TWO_THREAD.with(std::cell::Cell::get) {
+                        Some(0) if p == ParkPoint::BeforeClaim(NodeId(slot(4))) => {
+                            until(|| ready.load(SeqCst));
+                        }
+                        Some(1)
+                            if p == ParkPoint::BeforeClaim(NodeId(slot(5)))
+                                && !ready.swap(true, SeqCst) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(30));
+                        }
+                        _ => {}
+                    }
+                });
+                assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+            };
+            let serial = Serial::new(&case, &phases);
+            let verdict = Mutex::new(None);
+            let got = run_two_until(&case, &phases, None, 0, &rig, &|_, prefix, live| {
+                let v = serial.at_overlap("held claim", prefix, live);
+                let stop = v.is_some();
+                *verdict.lock().unwrap() = v;
+                stop
+            });
+            assert!(ready.load(SeqCst), "thread 1's read claimed 4");
+            serial.check("held claim", &got, verdict.into_inner().unwrap());
+            assert_eq!(got[10].0, Out::Panic("failed".into()));
+        }
+    });
+}
+
 /// A differential panic's message from its budget on, joined to one line
 /// up to the trace.
 fn failure_message(p: Box<dyn std::any::Any + Send>) -> String {

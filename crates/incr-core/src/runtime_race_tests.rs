@@ -1799,6 +1799,62 @@ fn a_walk_that_waited_out_a_dirty_landing_plans_the_node_again() {
     assert_eq!(first.join().unwrap().ok(), Some(3));
 }
 
+/// Group verify releases the members it claimed unrun when a later member
+/// fails its claim: A's verify of `p` in the group {p, x, q} claims `x`,
+/// and `q`, which left the group Clean, fails. B planned its read of `x`
+/// before A's claim and waited it out, so it finds `x` Dirty as it planned
+/// it and claims it instead of revisiting it.
+#[test]
+fn a_walk_that_waited_out_a_released_group_claim_keeps_its_plan() {
+    let rt = Arc::new(Rt::new());
+    let k = rt.create_input(0_i64);
+    let p = rt.create_query(move |rt| rt.get(k) + 1);
+    let x = rt.create_query(move |rt| rt.get(k) * 10);
+    let q = rt.create_query(|_| 5_i64);
+    assert_eq!((rt.get(p), rt.get(x), rt.get(q)), (1, 0, 5));
+    assert!(p.slot() < x.slot() && x.slot() < q.slot());
+    rt.force_group_for_test(&[p.erase(), x.erase(), q.erase()]);
+    let (node, flags) = rt.nodes.get_with_flags(q.slot());
+    rt.leave_group(id(q), node, flags, NodeState::Clean);
+    rt.set(k, 1);
+    let (planned, claimed, waits) = (Gate::new(), Gate::new(), Gate::new());
+    let points = [
+        (ParkPoint::BeforeClaim(id(x)), "B", planned.clone()),
+        (ParkPoint::GroupMemberClaimed(id(x)), "A", claimed.clone()),
+        (ParkPoint::ComputeWaits(id(x)), "B", waits.clone()),
+    ];
+    for (_, _, gate) in &points {
+        gate.arm();
+    }
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        let name = thread::current().name().map(str::to_owned);
+        for (at, who, gate) in &points {
+            if *at == point && name.as_deref() == Some(*who) {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let read = |name: &str, h: Incr<i64>| {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || rt.get(h))
+            .unwrap()
+    };
+    let b = read("B", x);
+    planned.wait_parked();
+    let a = read("A", p);
+    claimed.wait_parked();
+    planned.release();
+    waits.wait_parked();
+    waits.release();
+    claimed.release();
+    assert_eq!((a.join().unwrap(), b.join().unwrap()), (2, 10));
+    assert_eq!(rt.wait_revisits.load(Ordering::SeqCst), 0, "B revisited x");
+    rt.assert_invariant_i();
+}
+
 /// Thread A's walk plans `a` New and parks at `at`; another read lands
 /// `a` Dirty meanwhile. A's claim from Dirty plans `a` again, so it gets
 /// 3, as a serial second read does.

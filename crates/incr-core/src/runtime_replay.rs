@@ -699,7 +699,7 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
             NodeState::New
         };
-        self.land(id, node, target, target);
+        self.land_unrun(id, node, target);
         if self.drop_cooperatively(None) {
             return Computed::Discarded;
         }
@@ -860,7 +860,7 @@ impl<C: Cells> Runtime<C> {
             let first = match claimed {
                 Ok(src) if node.generation() == generation => src == NodeState::New,
                 Ok(src) => {
-                    self.land(NodeId(slot), node, src, src);
+                    self.land_unrun(NodeId(slot), node, src);
                     self.roll_back_hit(&taken);
                     return Err(NodeId(slot));
                 }
@@ -998,7 +998,7 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
             NodeState::New
         };
-        self.land(id, node, target, target);
+        self.land_unrun(id, node, target);
         #[cfg(test)]
         self.dooms.lock().unwrap().push(DoomSeen {
             node: id.0,

@@ -1835,7 +1835,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        self.land_single(id, node, flags, target, target);
+        self.land_single_as(id, node, flags, target, target, true);
     }
 
     /// [`Self::discard_land`] of a claim released by an unwind of `kind`.
@@ -1873,7 +1873,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, children, bag);
-        self.land(id, self.nodes.get(id.0), target, target);
+        self.land_unrun(id, self.nodes.get(id.0), target);
     }
 
     /// Lands the discarded attempt's children as `children` and stamps the
@@ -2308,12 +2308,7 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
-            self.land(
-                NodeId(c),
-                self.nodes.get(c),
-                NodeState::Dirty,
-                NodeState::Dirty,
-            );
+            self.land_unrun(NodeId(c), self.nodes.get(c), NodeState::Dirty);
         }
     }
 
@@ -2368,7 +2363,7 @@ impl<C: Cells> Runtime<C> {
                 && self.virtual_position(m, generation).is_some();
             let mut ok = !virtual_member && self.claim_member(x, m, &claimed, bag);
             if ok && node.generation() != generation {
-                self.land(NodeId(m), node, NodeState::Dirty, NodeState::Dirty);
+                self.land_unrun(NodeId(m), node, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
@@ -2379,6 +2374,7 @@ impl<C: Cells> Runtime<C> {
                 h.insert((rt, m), Held::new(generation, cidx, false, false))
             });
             claimed.push(m);
+            self.park(ParkPoint::GroupMemberClaimed(NodeId(m)));
         }
 
         // 2. Did anything any member read change since it was verified?
