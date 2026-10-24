@@ -3196,7 +3196,7 @@ impl<C: Cells> Runtime<C> {
     /// leaves a New node New.
     #[cold]
     #[inline(never)]
-    fn unclaim_unrun(&self, id: NodeId, node: &NodeData<C>, dirty: bool) {
+    fn unclaim_unrun(&self, node: &NodeData<C>, dirty: bool) {
         #[cfg(test)]
         self.unrun_unclaims
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3525,7 +3525,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             if claimed_dirty && seen == Seen::New {
-                self.unclaim_unrun(id, node, claimed_dirty);
+                self.unclaim_unrun(node, claimed_dirty);
                 return Computed::Revisit;
             }
             // When the claim reads from another thread's episode, which left
@@ -3536,7 +3536,7 @@ impl<C: Cells> Runtime<C> {
             if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
-                    self.unclaim_unrun(id, node, claimed_dirty);
+                    self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Replan;
                 }
             }
