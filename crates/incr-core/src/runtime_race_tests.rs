@@ -1490,6 +1490,11 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate) {
 /// two threads, budget None).
 #[test]
 fn reader_of_group_episode_root_claimed_after_landing() {
+    // A forced revisit adds landings of `a`, so the hook's count parks a
+    // thread the schedule never releases.
+    if super::forced_revisit() {
+        return;
+    }
     let rt = Arc::new(Rt::new());
     let (x, a, in_a) = poisoned_episode(&rt);
     rt.get(x);
@@ -1673,7 +1678,10 @@ fn a_claim_released_unrun_ends_its_waiters_wait() {
     claimed.release();
     assert_eq!(reader.join().unwrap(), 1);
     assert_eq!(walker.join().unwrap(), 101);
-    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    // A forced revisit releases claims unrun too.
+    if !super::forced_revisit() {
+        assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    }
     rt.assert_invariant_i();
 }
 
@@ -1715,6 +1723,117 @@ fn a_claim_from_new_released_unrun_after_a_set_stays_new() {
     assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::New);
     rerun.release();
     assert_eq!(walker.join().unwrap(), 102);
-    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    // A forced revisit releases claims unrun too.
+    if !super::forced_revisit() {
+        assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    }
     rt.assert_invariant_i();
+}
+
+/// a = get(b); b = try_get(c), or 7777 on a cycle; c = get(a) with a
+/// Fallback of 3. A read of `a` from New meets the cycle at `a` and gets
+/// 7777, leaving `a` Dirty; a read after that walks to `c` first and gets 3.
+fn caught_cycle_under_a_fallback(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
+    let cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let b_reads = cell.clone();
+    let b = rt.create_query(move |rt| rt.try_get(*b_reads.get().unwrap()).unwrap_or(7777));
+    let a = rt.create_query(move |rt| rt.get(b));
+    let c = rt.create_query_with_fallback(move |rt| rt.get(a), |_| 3_u64);
+    cell.set(c).unwrap();
+    (a, b)
+}
+
+/// Reads of `a` one after the other give 7777 and then 3.
+#[test]
+fn a_caught_cycle_under_a_fallback_answers_a_second_read_from_its_walk() {
+    let rt = Rt::new();
+    let (a, _) = caught_cycle_under_a_fallback(&rt);
+    assert_eq!(rt.get(a), 7777);
+    assert_eq!(rt.get(a), 3);
+}
+
+/// Thread A loads `a` New, then B claims and lands it Dirty while A waits
+/// on the claim. A's read comes after B's, so it gets 3, as a serial
+/// second read does: its walk plans `a` again and expands its deps first,
+/// where verifying `a` under its own claim met the cycle at `a`.
+#[test]
+fn a_walk_that_waited_out_a_dirty_landing_plans_the_node_again() {
+    let rt = Arc::new(Rt::new());
+    let (a, b) = caught_cycle_under_a_fallback(&rt);
+    let (loaded, holding) = (Gate::new(), Gate::new());
+    let points = [
+        (ParkPoint::BeforeClaim(id(a)), "A", loaded.clone()),
+        (ParkPoint::BeforeComputeOne(id(b)), "B", holding.clone()),
+    ];
+    loaded.arm();
+    holding.arm();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        let name = thread::current().name().map(str::to_owned);
+        for (point, who, gate) in &points {
+            if *point == p && name.as_deref() == Some(*who) {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let first = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("A".into())
+            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(a))))
+            .unwrap()
+    };
+    loaded.wait_parked();
+    let second = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("B".into())
+            .spawn(move || rt.try_get(a))
+            .unwrap()
+    };
+    holding.wait_parked();
+    loaded.release();
+    thread::sleep(Duration::from_millis(20));
+    holding.release();
+    assert_eq!(second.join().unwrap(), Ok(7777));
+    assert_eq!(first.join().unwrap().ok(), Some(3));
+}
+
+/// Thread A's walk plans `a` New and parks at `at`; another read lands
+/// `a` Dirty meanwhile. A's claim from Dirty plans `a` again, so it gets
+/// 3, as a serial second read does.
+fn planned_new_then_landed_dirty(at: fn(NodeId) -> ParkPoint) {
+    let rt = Arc::new(Rt::new());
+    let (a, _) = caught_cycle_under_a_fallback(&rt);
+    let planned = Gate::new();
+    planned.arm();
+    let parks = planned.clone();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        if p == at(id(a)) && thread::current().name() == Some("A") {
+            parks.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let first = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("A".into())
+            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(a))))
+            .unwrap()
+    };
+    planned.wait_parked();
+    assert_eq!(rt.try_get(a), Ok(7777));
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    planned.release();
+    assert_eq!(first.join().unwrap().ok(), Some(3));
+}
+
+#[test]
+fn a_claim_from_dirty_after_a_load_of_new_plans_the_node_again() {
+    planned_new_then_landed_dirty(ParkPoint::BeforeClaim);
+}
+
+#[test]
+fn a_dirty_landing_before_the_walks_first_load_plans_the_node_again() {
+    planned_new_then_landed_dirty(ParkPoint::BeforeComputeOne);
 }
