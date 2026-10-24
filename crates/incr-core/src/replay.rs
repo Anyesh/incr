@@ -2036,7 +2036,7 @@ pub(crate) fn copyable(payload: &(dyn Any + Send)) -> bool {
 }
 
 /// A copy of a panic payload of a type the engine knows: a cycle unwind's
-/// or a `panic!` message.
+/// or a `panic!` message. A type added here is added to [`copyable`] too.
 pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + Send>> {
     if let Some(unwind) = payload.downcast_ref::<crate::cycle::CycleUnwind>() {
         return Some(Box::new(crate::cycle::CycleUnwind(unwind.0.clone())));
