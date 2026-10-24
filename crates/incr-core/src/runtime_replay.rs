@@ -553,7 +553,10 @@ impl<C: Cells> Runtime<C> {
         let top = f.cidx.max(self.dep_stack.next_cidx().wrapping_sub(1));
         let mut spins = 0;
         loop {
-            match state::load::<C>(self.nodes.get(slot).state_cell()) {
+            let node = self.nodes.get(slot);
+            match state::load::<C>(node.state_cell()) {
+                // Another thread's memo landing: the read takes the memo.
+                NodeState::Dirty if node.memo_at(|| self.current_revision()) => return None,
                 NodeState::New
                 | NodeState::Dirty
                 | NodeState::Computing
@@ -619,8 +622,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The lowest virtual frame above position `p`, up to `top`, whose
-    /// node another thread has landed, deleted or recycled since the
-    /// frame was made: a landed point.
+    /// node another thread has landed (a memo counts), deleted or recycled
+    /// since the frame was made: a landed point.
     fn landed_above(&self, p: u32, top: u32) -> Option<u32> {
         let rt = self.runtime_id;
         replay::with(|c| {
@@ -631,13 +634,14 @@ impl<C: Cells> Runtime<C> {
                 .filter(|v| {
                     let node = self.nodes.get(v.node);
                     node.generation() != v.generation
-                        || matches!(
-                            state::load::<C>(node.state_cell()),
+                        || match state::load::<C>(node.state_cell()) {
                             NodeState::Clean
-                                | NodeState::Cyclic
-                                | NodeState::Failed
-                                | NodeState::Dead
-                        )
+                            | NodeState::Cyclic
+                            | NodeState::Failed
+                            | NodeState::Dead => true,
+                            NodeState::Dirty => node.memo_at(|| self.current_revision()),
+                            _ => false,
+                        }
                 })
                 .map(|v| v.cidx)
                 .min()
@@ -858,6 +862,15 @@ impl<C: Cells> Runtime<C> {
             let (node, flags) = self.nodes.get_with_flags(slot);
             let claimed = state::try_claim_compute::<C>(node.state_cell());
             let first = match claimed {
+                // Another thread's memo landing since the scan.
+                Ok(NodeState::Dirty)
+                    if node.generation() == generation
+                        && node.memo_at(|| self.current_revision()) =>
+                {
+                    self.unclaim_unrun(NodeId(slot), node, true);
+                    self.roll_back_hit(&taken);
+                    return Err(NodeId(slot));
+                }
                 Ok(src) if node.generation() == generation => src == NodeState::New,
                 Ok(src) => {
                     self.land_unrun(NodeId(slot), node, src);

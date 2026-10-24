@@ -89,6 +89,7 @@ const CLEAN: u8 = 1;
 const CYCLIC: u8 = 2;
 const FAILED: u8 = 3;
 const PARKED: u8 = 4;
+const CAUGHT: u8 = 5;
 
 /// T reads X with `try_get`, X reads Y, and Y, when `y_reads_x`, reads X
 /// with `try_get`; all replayable over a `u64` placeholder. A switched X
@@ -291,8 +292,9 @@ fn shared_vframe_node_computing_at_pop() {
     s.rt.assert_invariant_i();
 }
 
-/// T reads X1, X1 reads X2 (until switched to land 42 alone), X2 reads Y,
-/// and Y reads T with `try_get`, all replayable; T and X1 count runs.
+/// T reads X1, X1 reads X2 (until switched to land 42 alone, or to catch
+/// the panic of a dep that always fails and count those runs), X2 reads
+/// Y, and Y reads T with `try_get`, all replayable; T counts runs.
 struct Below {
     rt: Arc<Rt>,
     t: Incr<u64>,
@@ -300,6 +302,7 @@ struct Below {
     y: Incr<u64>,
     landed: Arc<AtomicU8>,
     t_runs: Arc<AtomicU32>,
+    x1_caught: Arc<AtomicU32>,
 }
 
 fn below_shape(rt: Rt) -> Below {
@@ -316,11 +319,18 @@ fn below_shape(rt: Rt) -> Below {
         )
     };
     let x2 = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let x1_caught = Arc::new(AtomicU32::new(0));
     let x1 = {
-        let landed = landed.clone();
+        let (landed, fc, x1_caught) = (landed.clone(), fc.clone(), x1_caught.clone());
         rt.create_query_with(
             move |rt: &Rt| match landed.load(SeqCst) {
                 CHAIN => rt.get(x2) + 1,
+                CAUGHT => {
+                    x1_caught.fetch_add(1, SeqCst);
+                    let f = *fc.get().unwrap();
+                    catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v)
+                }
                 _ => 42,
             },
             replayable(),
@@ -337,6 +347,8 @@ fn below_shape(rt: Rt) -> Below {
         )
     };
     tc.set(t).unwrap();
+    fc.set(rt.create_query(|_: &Rt| -> u64 { panic!("fails") }))
+        .unwrap();
     Below {
         rt,
         t,
@@ -344,6 +356,7 @@ fn below_shape(rt: Rt) -> Below {
         y,
         landed,
         t_runs,
+        x1_caught,
     }
 }
 
@@ -879,6 +892,58 @@ fn shared_delete_and_recycle_before_the_scan() {
 #[test]
 fn shared_delete_and_recycle_between_scan_and_claim() {
     delete_and_recycle_during_replay(Recycle::BeforeClaim);
+}
+
+/// The recycling shape with X1 switched to catch a Failed dep and read by
+/// another thread before Y's scan of T, or between the scan and the
+/// claim: X1 lands Dirty with a memo for the revision, which stands for
+/// a landing, so the read drops the chain at X1's level and never runs
+/// X1, as in the unbounded run with the read of X1 first.
+fn memo_landing_during_replay(when: Recycle) {
+    let s = below_shape(Rt::new());
+    s.rt.set_max_frames(1);
+    let gate = Gate::new();
+    let point = match when {
+        Recycle::BeforeScan => ParkPoint::BeforeEntry(id(s.y)),
+        Recycle::BeforeClaim => ParkPoint::BeforeVirtualClaim(id(s.t)),
+    };
+    hook(&s.rt, vec![(point, gate.clone())]);
+    gate.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    gate.wait_parked();
+    s.landed.store(CAUGHT, SeqCst);
+    assert_eq!(s.rt.get(s.x1), 7);
+    assert!(s.rt.has_memo_of(s.x1));
+    let landed_runs = s.x1_caught.load(SeqCst);
+    gate.release();
+    let got = reader.join();
+
+    let unbounded = below_shape(Rt::new());
+    unbounded.rt.set_max_frames(u32::MAX);
+    unbounded.landed.store(CAUGHT, SeqCst);
+    assert_eq!(unbounded.rt.get(unbounded.x1), 7);
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert_eq!(want, Ok(8));
+    assert_eq!(got, want);
+    assert_eq!(
+        s.x1_caught.load(SeqCst),
+        landed_runs,
+        "X1 ran again over its memo"
+    );
+    s.rt.assert_invariant_i();
+}
+
+#[test]
+fn shared_memo_landing_before_the_scan() {
+    memo_landing_during_replay(Recycle::BeforeScan);
+}
+
+#[test]
+fn shared_memo_landing_between_scan_and_claim() {
+    memo_landing_during_replay(Recycle::BeforeClaim);
 }
 
 /// The Local form of a delete during replay: Y's closure deletes X, whose
