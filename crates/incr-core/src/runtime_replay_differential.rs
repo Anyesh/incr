@@ -4843,6 +4843,33 @@ fn an_episode_over_a_caught_failed_read_keeps_its_value_for_the_revision() {
     });
 }
 
+/// 0x3cb3: op 2's `Get(15)` lands 14 Failed inside the cycle 15 -> ... ->
+/// 11 -> 12 -> 13 -> 14 -> 15, and op 3's `Get(11)`, in the same revision,
+/// reads 12 -> 13 = `Catch(Read(14))` over that failure. The value is the
+/// one a fresh `Get(11)` gives with 14 held failing; a fresh read that
+/// recomputes 14 closes the cycle instead, which is not the revision's
+/// history.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_3cb3_reads_a_failed_dep_as_the_revision_left_it() {
+    let case = gen_case(0x3cb3, false, false);
+    assert!(matches!(case.ops[3], Op::Get(11)));
+    let mut held = case.clone();
+    let Spec::Query { expr, .. } = &mut held.specs[14] else {
+        panic!("14 is a query");
+    };
+    *expr = Expr::PanicIf(Box::new(Expr::Const(4)), 4);
+    held.specs[23] = Spec::Input(3);
+    held.ops = vec![Op::Get(11)];
+    quiet(|| {
+        let want = run::<Local>(&held, None, 0)[0].0.clone();
+        assert_eq!(want, Out::Value(20004));
+        assert_eq!(run::<Shared>(&held, None, 0)[0].0, want);
+        assert_eq!(run::<Local>(&case, None, 0)[3].0, want);
+        assert_eq!(run::<Shared>(&case, None, 0)[3].0, want);
+    });
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped
