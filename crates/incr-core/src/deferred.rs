@@ -435,6 +435,8 @@ impl<V: ?Sized> Unbuilt<V> {
 impl<V: ?Sized> Drop for Unbuilt<V> {
     fn drop(&mut self) {
         if let Some(value) = self.0.take() {
+            #[cfg(all(test, not(loom)))]
+            crate::replay::note_drop();
             isolate(|| drop(value));
         }
     }
