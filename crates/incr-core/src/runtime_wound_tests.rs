@@ -848,7 +848,6 @@ fn shared_group_verify_step_1_release_keeps_the_group() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "B7-tainted-group-release-two-thread: the tainted release leaves the group, as main's does"]
 fn shared_tainted_group_verify_release_keeps_the_group() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_tainted_group_verify_release_keeps_the_group",
