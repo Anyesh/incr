@@ -4912,6 +4912,14 @@ impl<C: Cells> Runtime<C> {
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl<C: Cells> Runtime<C> {
+    /// Gives `h`, whose run read at least two deps, a released entry that
+    /// no read uses, as the `released_hot` bench needs.
+    pub fn hold_released_entry<T>(&self, h: Incr<T>) {
+        let len = dep_len(self.nodes.get(h.slot()));
+        assert!(len >= 2);
+        self.set_released(&mut self.inner.write(), h.slot(), Some((len, len - 1)));
+    }
+
     /// Every released entry counts its node's current deps, as each publish
     /// that replaces them sets or drops it.
     pub(crate) fn assert_released_entries_match_deps(&self) {
