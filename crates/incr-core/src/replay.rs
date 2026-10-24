@@ -312,11 +312,11 @@ impl Retire {
 pub(crate) struct Pending {
     slots: Vec<Option<Delivery>>,
     live: usize,
-    by_key: HashMap<ReadKey, Vec<usize>>,
-    by_maker: HashMap<u32, Vec<usize>>,
-    by_frame: HashMap<(u32, u32, u32), Vec<usize>>,
+    by_key: HashMap<ReadKey, Vec<usize>, FxBuildHasher>,
+    by_maker: HashMap<u32, Vec<usize>, FxBuildHasher>,
+    by_frame: HashMap<(u32, u32, u32), Vec<usize>, FxBuildHasher>,
     /// By the frame's node and generation, at any position.
-    by_node: HashMap<(u32, u32), Vec<usize>>,
+    by_node: HashMap<(u32, u32), Vec<usize>, FxBuildHasher>,
     traced: Vec<usize>,
     /// The passed deliveries that carry a landing deeper than just above
     /// their frame, which a pop can retire.
@@ -328,7 +328,11 @@ fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
 }
 
 /// Drops index `i` from the list `map` holds under `at`.
-fn unlist<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Vec<usize>>, at: &K, i: usize) {
+fn unlist<K: std::hash::Hash + Eq>(
+    map: &mut HashMap<K, Vec<usize>, FxBuildHasher>,
+    at: &K,
+    i: usize,
+) {
     if let Some(list) = map.get_mut(at) {
         list.retain(|&j| j != i);
         if list.is_empty() {
@@ -585,7 +589,7 @@ pub(crate) struct Context {
     pub(crate) vstack: Vec<VFrame>,
     /// Each node's `vstack` positions, lowest first, with the generation
     /// its virtual frame recorded.
-    pub(crate) vindex: HashMap<u32, Vec<(u32, u32)>>,
+    pub(crate) vindex: HashMap<u32, Vec<(u32, u32)>, FxBuildHasher>,
     /// The level of the entry the driver is running, or `None` until the
     /// loop starts.
     pub(crate) running: Option<u32>,
@@ -680,7 +684,7 @@ impl Context {
             boundary,
             levels: vec![VecDeque::from([target])],
             vstack: Vec::new(),
-            vindex: HashMap::new(),
+            vindex: HashMap::default(),
             running: None,
             running_entry: None,
             pending: Pending::default(),
@@ -1095,7 +1099,7 @@ thread_local! {
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
-    static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
+    static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
@@ -1109,7 +1113,7 @@ loom::thread_local! {
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
-    static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
+    static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
@@ -1155,8 +1159,9 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
 }
 
 fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
-    let h = BuildHasherDefault::<DefaultHasher>::default().hash_one((rt, node)) as usize;
-    ((h >> 6) & 63, 1 << (h & 63))
+    // Fx mixes into the high bits; its low bits follow the key's.
+    let h = FxBuildHasher.hash_one((rt, node));
+    ((h >> 52 & 63) as usize, 1 << (h >> 58))
 }
 
 /// Marks `nodes` as landings a copy may hold, so that a later landing of
@@ -2006,15 +2011,15 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
 #[derive(Default)]
 pub(crate) struct EarliestByFrame {
     /// Each frame's records, as `(path, maker, value)`.
-    by_frame: HashMap<Frame, Vec<(u64, u32, u64)>>,
-    by_maker: HashMap<u32, Vec<Frame>>,
+    by_frame: HashMap<Frame, Vec<(u64, u32, u64)>, FxBuildHasher>,
+    by_maker: HashMap<u32, Vec<Frame>, FxBuildHasher>,
     /// The positions of each node's frames, by node and generation.
-    by_node: HashMap<(u32, u32), Vec<u32>>,
+    by_node: HashMap<(u32, u32), Vec<u32>, FxBuildHasher>,
     /// The nodes whose runs a release ended, until a doomed run of the node
     /// notes a record again: a record taken for one meanwhile would be one
     /// of the ended runs'.
     #[cfg(debug_assertions)]
-    ended: std::collections::HashSet<(u32, u32)>,
+    ended: std::collections::HashSet<(u32, u32), FxBuildHasher>,
 }
 
 /// A frame's node, generation and position.
