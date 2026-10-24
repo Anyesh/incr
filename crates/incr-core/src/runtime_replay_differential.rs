@@ -3278,6 +3278,22 @@ fn seed_d371_released_claim_takes_no_old_delivery() {
     });
 }
 
+/// Seed 0x92b175856b: at budget 3, op 7, root 0's episode dissolves and
+/// the budget dooms 0's run alone after it. Its discard keeps 0's record of
+/// the dissolved group for other threads, and the retry group-verified 0 from
+/// it and landed all seven nodes as members, where the unbounded run computes
+/// 0 alone.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_92b175856b_dissolved_root_retry_computes_alone() {
+    let seed = 0x92_b175_856b;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
