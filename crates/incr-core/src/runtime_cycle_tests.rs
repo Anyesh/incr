@@ -996,7 +996,7 @@ fn aborted_episode_landing_keeps_no_memo<C: Cells>() {
     assert!(outer.is_err());
     let (panicking, msg) = seen.lock().unwrap().take().expect("the drop ran");
     assert!(panicking);
-    assert!(!msg.contains("T8-memo-on-aborted-episode"), "{msg}");
+    assert!(msg.contains("eq boom"), "{msg}");
     assert!(!rt.has_memo_of(s), "s {:?}", rt.state_of(s));
 }
 
