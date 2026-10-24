@@ -1524,7 +1524,9 @@ impl<C: Cells> Runtime<C> {
     /// member, which clears the slot, between the load and the read. A
     /// Clean reload is read again, so only a Clean node with an empty slot
     /// is the invariant panic; `Err` hands back any other state, which the
-    /// read goes on from as if it had loaded it first.
+    /// read goes on from as if it had loaded it first. A diverted read's
+    /// `type_tag` is `DIVERTED_TAG`, and [`Self::diverted_clean_read`]
+    /// answers it, with `Err(Clean)` for a read that goes on as a slow one.
     #[cold]
     #[inline(never)]
     fn reload_after_empty_slot<T: Value>(
@@ -1534,12 +1536,50 @@ impl<C: Cells> Runtime<C> {
         type_tag: u16,
         arena_slot: u32,
     ) -> Result<T, NodeState> {
+        if type_tag == crate::dep_stack::DIVERTED_TAG {
+            return self.diverted_clean_read(handle, node);
+        }
         if C::SINGLE_THREADED {
             self.read_failed(handle);
         }
         match state::load::<C>(node.state_cell()) {
             NodeState::Clean => Ok(self.read_slot(handle, node, type_tag, arena_slot)),
             now => Err(now),
+        }
+    }
+
+    /// A Clean read the top frame diverted (see `Frame::read_rt`). The
+    /// frame's own read that a replay context holds a delivery for goes on
+    /// as the slow read the unbounded run made before the node landed
+    /// Clean, which takes the delivery; any other is the fast read.
+    #[cold]
+    #[inline(never)]
+    fn diverted_clean_read<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+    ) -> Result<T, NodeState> {
+        let rt = self.runtime_id;
+        let (dep, generation) = (NodeId(handle.slot()), handle.generation());
+        if let Some(f) = self.dep_stack.diverted_read(rt) {
+            let word = value_code::thread_word();
+            if self.delivery_waits(f, handle, word) {
+                return Err(NodeState::Clean);
+            }
+            self.dep_stack.record_diverted_read(rt, dep, generation);
+            if word & value_code::REPLAY_BIT == 0 {
+                self.dep_stack.end_diverted_reads(rt);
+            } else if word & value_code::COUNTER_MASK == 0 && !replay::held() {
+                // Value code, a landed value's clone among it, and a dropped
+                // value's `Drop` can run inside the contexts' borrow, so only
+                // other reads look there.
+                self.undivert_when_taken(f);
+            }
+        }
+        let (type_tag, arena_slot) = self.fields_under(handle, node);
+        match self.try_read_slot(handle, node, type_tag, arena_slot) {
+            Some(value) => Ok(value),
+            None => self.reload_after_empty_slot(handle, node, type_tag, arena_slot),
         }
     }
 
@@ -2028,8 +2068,12 @@ impl<C: Cells> Runtime<C> {
         let raw = C::state_load_acquire(node.state_cell());
         if raw == state::CLEAN_BYTE {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            self.dep_stack
-                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+            let type_tag = self.dep_stack.record_dep(
+                self.runtime_id,
+                NodeId(slot),
+                handle.generation(),
+                type_tag,
+            );
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => value,
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
@@ -2066,8 +2110,12 @@ impl<C: Cells> Runtime<C> {
         let raw = C::state_load_acquire(node.state_cell());
         if raw == state::CLEAN_BYTE {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            self.dep_stack
-                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
+            let type_tag = self.dep_stack.record_dep(
+                self.runtime_id,
+                NodeId(slot),
+                handle.generation(),
+                type_tag,
+            );
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => Ok(value),
                 None => match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
@@ -3702,6 +3750,7 @@ impl<C: Cells> Runtime<C> {
                     if let Some(rev) = self.take_claim_rev(id, cidx) {
                         verify_rev = verify_rev.min(rev);
                     }
+                    self.divert_for_deliveries(id, cidx);
                 }
                 // SAFETY: the closure was read under the read hold at
                 // generation `g`, and the claim above was rechecked against `g`.

@@ -763,6 +763,7 @@ impl<C: Cells> Runtime<C> {
                 ctl.lower(low);
             }
             began = self.take_run_failures(id, cidx);
+            self.divert_for_deliveries(id, cidx);
         }
         // SAFETY: this thread holds the node's claim, so its closure is
         // not freed (see `compute_attempts`).

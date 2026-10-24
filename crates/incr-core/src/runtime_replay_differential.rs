@@ -2899,6 +2899,94 @@ fn resuming_past_a_held_root_skips_no_cycle_read() {
     });
 }
 
+/// 0x2638, shrunk: the Clean form of 0x56cd8c2. After the set of 19
+/// flips 17 even, `Get(2)` has 3 walk its old dep 4, whose old deps 7 and
+/// 5 go first; 7 now reads 8 = 6 (`Fallback(3)`) and panics on 3, so the
+/// unbounded run lands 7 and then 5 Failed, and 4 Clean without reading 5.
+/// At a budget a doom stops 3's walk of 4 at 7's compute with 5 still
+/// owed, and by 3's retry 4 has landed Clean. The retry's read of 4 must
+/// still take the walk's rest, or 5 and 7 stay Dirty.
+fn seed_2638_case() -> Case {
+    let q = |expr, replay, strategy| Spec::Query {
+        expr,
+        replay,
+        bare: false,
+        strategy,
+    };
+    let r = |n| Box::new(Expr::Read(n, false));
+    let zero = || q(Expr::Const(0), true, Strat::None);
+    Case {
+        specs: vec![
+            zero(),
+            q(Expr::Read(9, false), true, Strat::None),
+            q(Expr::Read(3, false), true, Strat::None),
+            q(Expr::Add(r(4), r(9)), true, Strat::None),
+            q(
+                Expr::If(r(17), Box::new(Expr::Const(0)), r(5)),
+                false,
+                Strat::None,
+            ),
+            q(Expr::Read(7, false), true, Strat::None),
+            q(Expr::Read(15, false), true, Strat::Fallback(3)),
+            q(
+                Expr::If(
+                    r(17),
+                    Box::new(Expr::PanicIf(r(8), 3)),
+                    Box::new(Expr::Const(0)),
+                ),
+                true,
+                Strat::None,
+            ),
+            q(Expr::Read(6, false), true, Strat::None),
+            q(Expr::Read(10, false), true, Strat::None),
+            q(Expr::Read(11, false), true, Strat::None),
+            q(Expr::Read(4, false), false, Strat::None),
+            q(Expr::Const(0), false, Strat::None),
+            zero(),
+            zero(),
+            q(Expr::Read(16, false), true, Strat::None),
+            q(Expr::Read(3, true), true, Strat::None),
+            q(Expr::Add(r(18), r(20)), true, Strat::None),
+            q(Expr::Read(19, false), true, Strat::None),
+            Spec::Input(2),
+            Spec::Input(1),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 19,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(1), Op::Set(19, 1), Op::Get(2)],
+    }
+}
+
+/// Every operation's outcome and every node's state at budgets 1 to 3
+/// are the unbounded run's: the walk 0x2638's doom stops owes 5 and 7
+/// their Failed landings whatever state its root is in by the retry.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_retry_resumes_its_walk_past_a_root_landed_clean() {
+    fn check<C: Cells>() {
+        let case = seed_2638_case();
+        let want = run::<C>(&case, None, 0);
+        for frames in [1, 2, 3] {
+            let got = run::<C>(&case, Some(frames), 0);
+            for (i, ((w, ws), (g, gs))) in want.iter().zip(&got).enumerate() {
+                assert_eq!(
+                    (w, &ws.0),
+                    (g, &gs.0),
+                    "budget {frames}, operation {i} ({:?})",
+                    case.ops[i]
+                );
+            }
+        }
+    }
+    quiet(|| {
+        check::<Local>();
+        check::<Shared>();
+    });
+}
+
 /// 0x1dd5_ac14_6f19_4569 at budget 2: a doomed member run's speculative
 /// R5 run of another member buffered a value read off the doom (a cycle's
 /// `Err`), and the episode's retry read that buffer where the unbounded
@@ -5241,6 +5329,77 @@ fn strict_dirty_for_clean_seeds() {
 fn strict_computed_left_new_seeds() {
     for seed in [0x2997, 0xd4f2] {
         let case = gen_base(seed);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
+/// A diverted frame's Clean read with nothing to take is a fast read: with
+/// every retry's frame diverted, each case's bounded runs give the
+/// outcomes, states and deps they give with only the frames a delivery
+/// waits for diverted, `FirstRun` closures included.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_diverted_read_with_no_delivery_is_a_fast_read() {
+    fn runs<C: Cells>(case: &Case, frames: u32) {
+        let run = || {
+            catch_unwind(AssertUnwindSafe(|| run::<C>(case, Some(frames), 0))).map_err(|p| {
+                p.downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            })
+        };
+        let normal = run();
+        crate::runtime::replay_impl::DIVERT_EVERY_RETRY.with(|d| d.set(true));
+        let every = run();
+        crate::runtime::replay_impl::DIVERT_EVERY_RETRY.with(|d| d.set(false));
+        assert_eq!(normal, every, "budget {frames}");
+    }
+    quiet(|| {
+        for seed in 0..u64::from(cases() / 2) {
+            let case = gen_case(seed, false, false);
+            for frames in [1, 2, 3] {
+                runs::<Local>(&case, frames);
+                runs::<Shared>(&case, frames);
+            }
+        }
+    });
+}
+
+/// Seeds whose retry reads a node after it landed Clean, where the
+/// unbounded frame read it before: 0xa5b's read of q7, kept with the
+/// poisoned value q7 landed Dirty with, and 0xbe's doomed read of n12,
+/// whose outcome was Dirty at 8. The retry must take what the context
+/// holds for the read, not the Clean value, so `Get(0)` is 7781 and
+/// `Get(9)` 16 as in the unbounded run. 0x41b1 is the same read, whose
+/// `Get(4)` returned `Panic("cycle")` for `Value(3)`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_retrys_clean_read_takes_its_delivery_seeds() {
+    for seed in [0xa5b, 0xbe, 0x41b1] {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
+/// High-range strict scan seeds (from 630042492734) that landed Dirty
+/// for Clean before a retry's Clean read took its delivery; 0x92b175829f
+/// is a stashed walk rest resumed past a root that had landed Clean.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn high_range_clean_read_delivery_seeds() {
+    for seed in [
+        0x92_b175_80fc,
+        0x92_b175_83ef,
+        0x92_b175_829f,
+        0x92_b175_8479,
+    ] {
+        let case = gen_case(seed, false, false);
         quiet(|| {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);

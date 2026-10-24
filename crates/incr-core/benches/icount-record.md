@@ -2010,3 +2010,58 @@ Gate: the hard gates are exact (196, 218.14, 87). Replay scale by
 Gate: every hard gate is at or under the base. The chains and the fanout
 save 2 per Clean `get` they make: one per chain node (-2.00 per node) and
 two per fanout reader.
+
+## A retry's diverted Clean reads
+
+- Engine: `w/T8-strict-group-c-dirty-for-clean` at its tip, the
+  raw-byte compare above and the divert together, against
+  spreadsheet-t10 `adf57986` in a detached worktree; one run of
+  `icount.sh` at the default N per column. No workloads added.
+- Change: `DepStack::record_dep` returns the arena tag it is given, or
+  `DIVERTED_TAG` when the top frame diverts its Clean reads, and the
+  Clean get passes that tag to its slot read, so a diverted read leaves
+  through the empty-slot branch. A frame records `read_rt` beside `rt`.
+- Rejected: marking a pending delivery's node in its state cell kept the
+  framed `record_dep` as it was but made every state load map the mark
+  to Clean: `table_hit` +8 and `chain_local/propagate/100` +31 per node.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 198 | 101 / 193 | -1 / -5 |
+| `table_hit_shared` | 219.14 | 218.14 | -1.00 |
+| `value_slot_read_shared` | 90 | 87 | -3 |
+| `chain_local/propagate/100` | 91,504.03 | 92,004.01 | +499.98 |
+| `chain_shared/propagate/100` | 193,132.25 | 193,231.56 | +99.31 |
+| `fanout_local_1000` | 3,461,211.68 | 3,467,217.35 | +6,005.67 |
+| `fanout_shared_1000` | 4,804,762.56 | 4,809,452.84 | +4,690.28 |
+| `delete_cascade_local` / `_shared` | 3,246,570.05 / 4,585,761.98 | 3,252,570.57 / 4,588,286.60 | +6,000.52 / +2,524.62 |
+| `delete_owned_tree_local` / `_shared` | 603,139.54 / 980,968.07 | 605,240.04 / 980,921.66 | +2,100.50 / -46.41 |
+| `get_contended_shared` | 7,872,065.54 | 7,671,808.71 | -200,256.83 |
+
+Gate: every hard gate is at or under the base. Per-function Intel PT
+totals (`pt-lines.sh`, base against tip, measured on `14bb4ad0` with the
+same hot-path code) attribute the rises:
+
+- `get`: +3 Local and +4 Shared per framed Clean read (the tag through
+  `record_dep` and the compare with `read_rt`), after the raw compare's
+  -2. `chain_local/propagate/10` +30 and `chain_shared/propagate/10` +40
+  over 10 reads, `fanout_shared_4` +16 over 4, `delete_cascade_local`
+  +3,000 over the 1,000 reads of its rebuilt chains.
+- The compute path inlined into `clean_walk`: +1 to +3 per frame, for
+  `read_rt` in the pushed frame (`chain_local/propagate/10` and
+  `chain_shared/propagate/10` +20, `fanout_shared_4` +15 over 5 frames).
+- `delete_erased`: +1 per deleted node in `delete_cascade_local`
+  (+1,001, traced on an earlier build of this commit), from code layout;
+  no delete code changed. With +3 per read and +2 per frame over its
+  1,000 rebuilt nodes, that makes its +6,001.
+
+Against `adf57986` the Shared chain rises +1 per node and
+`delete_owned_tree_local` +2,100.50 where `14bb4ad0` gave -1,179.07; no
+code on either path changed between the two measures, so they move by
+layout, untraced. Scale-icount (`scale-icount.sh`, 22 replay scale
+tests): +1.25% in total against `adf57986`, `byte_budget_before_frame_budget`
+the most at +3.46% Local. Ending the divert when the last delivery is
+taken costs its lookups: a whole-retry form that never ends it is 0.36%
+under the narrow one in total (-1.24% on `byte_budget_before_frame_budget`),
+and the narrow form is kept, since a retry's Clean reads after its last
+take go through the cold path in the whole one.
