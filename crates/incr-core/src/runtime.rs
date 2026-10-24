@@ -136,6 +136,8 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// In a read's walk loop, after the walk and before the slot read.
+    AfterWalk(NodeId),
     /// In `compute_attempts`, after the claim CAS and before the check for
     /// another thread's doom reservation.
     BeforeReservationCheck(NodeId),
@@ -2252,6 +2254,7 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
+        let _root = reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
         loop {
             if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
                 if let Some(value) = self.stashed_read(handle) {
@@ -2300,6 +2303,7 @@ impl<C: Cells> Runtime<C> {
                     )
                 }
             }
+            self.park(ParkPoint::AfterWalk(NodeId(slot)));
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
@@ -4566,6 +4570,9 @@ impl<C: Cells> Runtime<C> {
         node.set_unrun(unrun);
         if !C::SINGLE_THREADED && unrun {
             reserve::note((self.runtime_id, id.0), node.generation());
+        }
+        if !C::SINGLE_THREADED && !unrun && target == NodeState::Dirty {
+            reserve::note_root((self.runtime_id, id.0), node.generation());
         }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {

@@ -1938,7 +1938,7 @@ fn clear() {
     set_carry(None);
     let removed = with(std::mem::take);
     drop(removed);
-    crate::reserve::end_all();
+    crate::reserve::end_contexts();
 }
 
 /// The innermost context of `rt` whose boundary is at or below `cidx`,
