@@ -3321,7 +3321,8 @@ impl<C: Cells> Runtime<C> {
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
     ///
-    /// `planned` is what a walk entry under `Shared` was planned under.
+    /// `planned` is what a walk entry under `Shared` was planned under, and
+    /// `seen` what the walk's visit found of an untainted entry.
     #[inline(always)]
     fn compute_one<const MODE: u8>(
         &self,
@@ -3339,6 +3340,7 @@ impl<C: Cells> Runtime<C> {
         computed
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn compute_attempts<const MODE: u8>(
         &self,
