@@ -5283,6 +5283,42 @@ fn native_reruns_under_replay_seeds() {
     assert!(failed.is_empty(), "{failed:x?}");
 }
 
+/// Seeds whose speculative continuations landed nodes Clean that the
+/// unbounded run leaves New, so a later read verified a node the unbounded
+/// run computes fresh and left it or its readers Dirty, Clean or New where
+/// the unbounded run does not. In 0x5ef, `Get(4)`'s speculative entry ran
+/// 13, 14 and 17 to 20; after `Set(22, 3)`, `Get(14)` verified the landed
+/// 14 and recomputed 17 to 21, landing 21 Clean over four reads of its
+/// inputs where the unbounded run leaves it Dirty over five.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_landings_verified_later_seeds() {
+    for seed in [
+        0x5ef,
+        0x0092_b175_7f47,
+        0x0092_b175_7fd1,
+        0x0092_b175_809c,
+        0x0092_b175_80bf,
+        0x0092_b175_8185,
+        0x0092_b175_8232,
+        0x0092_b175_83b5,
+        0x0092_b175_8415,
+        0x0092_b175_846e,
+        0x0092_b175_86ba,
+        0x0092_b175_86bf,
+        0x0092_b175_86d9,
+        0x0092_b175_8821,
+        0x0092_b175_8ad1,
+        0x0092_b175_8ad2,
+    ] {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// 0xa02 (see [`cross_seeds`]): a speculative landing read the second
 /// runtime's input before a set of it, and a later read returns the old
 /// value.
