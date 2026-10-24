@@ -9,10 +9,11 @@ use super::{Runtime, DEFAULT_MAX_FRAMES};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{ComputeCtl, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
 use crate::cycle_state::{with_held, Held};
+use crate::deferred::Deferred;
 use crate::dep_stack::DepStack;
 use crate::handle::Incr;
 use crate::node::NodeId;
-use crate::state::NodeState;
+use crate::state::{self, NodeState};
 use crate::test_size::test_size;
 
 macro_rules! local_and_shared {
@@ -1165,6 +1166,52 @@ fn local_native_creator_runs_once_as_unbounded() {
 #[test]
 fn shared_native_creator_runs_once_as_unbounded() {
     native_creator_runs_once_as_unbounded::<Shared>();
+}
+
+/// A creator's stash that its node's own claim drops unadopted, as a group
+/// member's verify does, takes the child its run made with it.
+fn dropped_creator_stash_discards_its_child<C: Cells>() {
+    let rt = native_runtime::<C>();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let b = rt.create_query(|_| 5_u64);
+    let c = rt.create_query(|rt: &Runtime<C>| rt.get(rt.child_input(1_u32, || 7_u64)));
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    let before = rt.node_count();
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(
+        rt.node_count(),
+        before + 1,
+        "c's speculative run made its child"
+    );
+    let id = NodeId(c.slot());
+    let node = rt.nodes.get(c.slot());
+    let source = state::try_claim_compute::<C>(node.state_cell()).expect("c lands back unclaimed");
+    let mut bag = Deferred::new();
+    rt.drop_stash(id, c.generation(), &mut bag);
+    rt.land_unrun(id, node, source);
+    bag.drain(&rt);
+    assert_eq!(rt.node_count(), before, "the dropped stash's child is left");
+}
+
+#[test]
+fn local_dropped_creator_stash_discards_its_child() {
+    dropped_creator_stash_discards_its_child::<Local>();
+}
+
+#[test]
+fn shared_dropped_creator_stash_discards_its_child() {
+    dropped_creator_stash_discards_its_child::<Shared>();
 }
 
 /// How the speculative run of `c` in [`native_rerun_exception`] reads

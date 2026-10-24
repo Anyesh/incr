@@ -568,7 +568,7 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Drops the stash of node `id` at `generation`, which its claim will
-    /// not adopt.
+    /// not adopt, with the children a creator's stashed run made.
     #[cold]
     #[inline(never)]
     pub(super) fn drop_stash(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) {
@@ -576,6 +576,7 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         if let Some(stash) = self.take_stash(id.0, generation, false) {
+            self.discard_stashed_children(id, stash.index, bag);
             bag.push_erased(Box::new(stash.outcome));
         }
     }
