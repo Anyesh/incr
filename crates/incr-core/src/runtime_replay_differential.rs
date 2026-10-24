@@ -36,12 +36,14 @@
 //! closure may run speculatively twice in a revision (`REPLAY_NATIVE_COUNT`
 //! also compares its run counts with the unbounded run's). `REPLAY_FIRST`
 //! scans cases
-//! whose Native closures take `FirstRun`, so a run of one that the
+//! whose Native closures take `FirstLanded`, so a run of one that the
 //! engine does not treat as the node's first shows in its value.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{
+    AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst,
+};
 use std::sync::{Arc, Barrier, Mutex};
 
 use proptest::prelude::*;
@@ -120,9 +122,13 @@ enum Expr {
     PanicIf(Box<Expr>, u64),
     /// The operand, or 9999 if it unwinds.
     Catch(Box<Expr>),
-    /// The first operand while the node has landed nothing since it was
-    /// made, else the second.
+    /// The first operand on the closure's first run in its runtime, a
+    /// doomed run included, else the second.
     FirstRun(Box<Expr>, Box<Expr>),
+    /// The first operand while the node has landed nothing since it was
+    /// made, else the second. A node's expression takes `FirstRun` or this,
+    /// not both.
+    FirstLanded(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -329,7 +335,7 @@ fn gen_case(seed: u64, cross: bool, paired: bool) -> Case {
 }
 
 /// [`gen_case`] with most Native queries of the first runtime under
-/// `FirstRun`, whose second branch adds one, so a Native closure's run
+/// `FirstLanded`, whose second branch adds one, so a Native closure's run
 /// that takes the wrong branch changes its value. Its own generator, so
 /// [`gen_case`]'s seeds keep naming the cases they did.
 fn gen_first_runs(seed: u64, cross: bool, paired: bool) -> Case {
@@ -344,7 +350,7 @@ fn gen_first_runs(seed: u64, cross: bool, paired: bool) -> Case {
         {
             if rng.chance(70) {
                 let again = Expr::Add(Box::new(expr.clone()), Box::new(Expr::Const(1)));
-                *expr = Expr::FirstRun(Box::new(expr.clone()), Box::new(again));
+                *expr = Expr::FirstLanded(Box::new(expr.clone()), Box::new(again));
             }
         }
     }
@@ -366,6 +372,7 @@ fn shift(e: Expr, by: usize) -> Expr {
         Expr::PanicIf(a, when) => Expr::PanicIf(s(a), when),
         Expr::Catch(a) => Expr::Catch(s(a)),
         Expr::FirstRun(a, b) => Expr::FirstRun(s(a), s(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(s(a), s(b)),
         leaf => leaf,
     }
 }
@@ -381,6 +388,7 @@ fn past_template(e: Expr, skip: usize, nodes: usize) -> Expr {
         Expr::PanicIf(a, when) => Expr::PanicIf(p(a), when),
         Expr::Catch(a) => Expr::Catch(p(a)),
         Expr::FirstRun(a, b) => Expr::FirstRun(p(a), p(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(p(a), p(b)),
         leaf => leaf,
     }
 }
@@ -585,6 +593,7 @@ fn without_panics(e: Expr) -> Expr {
         Expr::If(c, a, b) => Expr::If(w(c), w(a), w(b)),
         Expr::Catch(inner) => Expr::Catch(w(inner)),
         Expr::FirstRun(a, b) => Expr::FirstRun(w(a), w(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(w(a), w(b)),
         leaf => leaf,
     }
 }
@@ -839,7 +848,9 @@ fn formula(
             Err(None) => Ok(9999),
             other => other,
         },
-        Expr::FirstRun(a, b) => formula(if first { a } else { b }, n, reads),
+        Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
+            formula(if first { a } else { b }, n, reads)
+        }
     }
 }
 
@@ -885,7 +896,7 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
             v
         }
         Expr::Catch(inner) => catch_unwind(AssertUnwindSafe(|| eval(n, inner))).unwrap_or(9999),
-        Expr::FirstRun(a, b) => {
+        Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
             if n.first {
                 eval(n, a)
             } else {
@@ -897,10 +908,9 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
 
 /// How a node's closure ran before the node is made.
 enum Ran {
-    /// It has landed nothing.
+    /// It has not run, or for `FirstLanded`, has landed nothing.
     Never,
-    /// It has landed something other than a first run's Clean value, so
-    /// any run of it is a rerun.
+    /// Its last run was not its first, so any run of it is a rerun.
     Rerun,
     /// Its last run was its first and landed Clean over these reads. An
     /// order verifies them and keeps that run's value, so the made
@@ -911,6 +921,18 @@ enum Ran {
 
 /// Whether each of `reads` gets the same kind of outcome, and the same
 /// value, read again in order.
+/// Whether `e` takes `FirstLanded`, so its node's first run is the one
+/// that finds it landed nothing.
+fn lands_first(e: &Expr) -> bool {
+    match e {
+        Expr::FirstLanded(..) => true,
+        Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => false,
+        Expr::Add(a, b) | Expr::FirstRun(a, b) => lands_first(a) || lands_first(b),
+        Expr::If(c, a, b) => lands_first(c) || lands_first(a) || lands_first(b),
+        Expr::PanicIf(a, _) | Expr::Catch(a) => lands_first(a),
+    }
+}
+
 fn reads_alike<C: Cells>(world: &World<C>, reads: &[Read]) -> bool {
     reads.iter().all(|&(side, d, try_, ref out)| {
         let (rt, h) = (world.rt(side), world.handle(side, d));
@@ -942,12 +964,14 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
         } => {
             let native = !*replay;
             let made = world.made.fetch_add(1, Relaxed);
+            let by_landing = lands_first(expr);
             let replay = if *replay {
                 Replay::Allowed
             } else {
                 Replay::Native
             };
             let (expr, world) = (expr.clone(), world.clone());
+            let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
             let compute = move |rt: &Runtime<C>| {
                 if native {
                     NATIVE.with(|n| {
@@ -962,12 +986,20 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                         }
                     });
                 }
-                let first = rt.computing_first()
-                    && match &ran {
-                        Ran::Never => true,
-                        Ran::Rerun => false,
-                        Ran::First(reads) => reads_alike(&world, reads),
-                    };
+                let first = if by_landing {
+                    rt.computing_first()
+                        && match &ran {
+                            Ran::Never => true,
+                            Ran::Rerun => false,
+                            Ran::First(reads) => reads_alike(&world, reads),
+                        }
+                } else {
+                    match runs.fetch_add(1, Relaxed) {
+                        0 => true,
+                        1 => matches!(&ran, Ran::First(reads) if reads_alike(&world, reads)),
+                        _ => false,
+                    }
+                };
                 let node = Node {
                     rt,
                     world: &world,
@@ -2248,10 +2280,17 @@ fn consistent(
                 .map(|j| prefix[j].1 .0[x])
                 .find(|&s| s != NodeState::New)
         };
+        let by_landing = matches!(
+            spec_at(case, prefix, side, q),
+            Spec::Query { expr, .. } if lands_first(&expr)
+        );
         match last {
             None => Ran::Never,
-            Some((i, _)) if landed(i).is_none() => Ran::Never,
-            Some((i, l)) if l.first && landed(i) == Some(NodeState::Clean) => {
+            Some((i, _)) if by_landing && landed(i).is_none() => Ran::Never,
+            Some((i, l)) if by_landing && l.first && landed(i) == Some(NodeState::Clean) => {
+                Ran::First(l.reads.clone())
+            }
+            Some((i, l)) if !by_landing && l.first && prefix[i].1 .0[x] == NodeState::Clean => {
                 Ran::First(l.reads.clone())
             }
             Some(_) => Ran::Rerun,
@@ -5162,7 +5201,7 @@ fn strict_cycle_outcome_state_seed() {
 /// placeholder's branch to the Native 2, which only that speculative run
 /// computes, over input 3. 3 is deleted and recreated, so the `Get(2)`
 /// discards the stash for its old generation and runs 2 again: 2 has
-/// landed nothing, so that run takes `FirstRun`'s first branch, as 2's
+/// landed nothing, so that run takes `FirstLanded`'s first branch, as 2's
 /// only unbounded run does.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -5179,7 +5218,7 @@ fn a_discarded_stash_leaves_the_next_run_first() {
             query(Expr::If(read(1), read(2), Box::new(Expr::Const(3))), true),
             query(Expr::Const(5), false),
             query(
-                Expr::FirstRun(
+                Expr::FirstLanded(
                     read(3),
                     Box::new(Expr::Add(read(3), Box::new(Expr::Const(1)))),
                 ),
@@ -5356,7 +5395,7 @@ fn two_threads() -> bool {
 }
 
 /// The case for `seed`, the base one if `REPLAY_BASE` is set, else with
-/// Native `FirstRun` nodes if `REPLAY_FIRST` is, and with a second
+/// Native `FirstLanded` nodes if `REPLAY_FIRST` is, and with a second
 /// runtime if `REPLAY_CROSS` is.
 fn case_of(seed: u64) -> Case {
     if std::env::var_os("REPLAY_BASE").is_some() {
@@ -5443,7 +5482,7 @@ fn one<C: Cells>() {
 fn size(e: &Expr) -> usize {
     match e {
         Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => 1,
-        Expr::Add(a, b) | Expr::FirstRun(a, b) => 1 + size(a) + size(b),
+        Expr::Add(a, b) | Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => 1 + size(a) + size(b),
         Expr::If(a, b, c) => 1 + size(a) + size(b) + size(c),
         Expr::PanicIf(a, _) | Expr::Catch(a) => 1 + size(a),
     }
@@ -5545,7 +5584,9 @@ fn reads_any(e: &Expr, hit: &impl Fn(usize) -> bool) -> bool {
     match e {
         Expr::Const(_) | Expr::ReadOther(..) => false,
         Expr::Read(target, _) => hit(*target),
-        Expr::Add(a, b) | Expr::FirstRun(a, b) => reads_any(a, hit) || reads_any(b, hit),
+        Expr::Add(a, b) | Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
+            reads_any(a, hit) || reads_any(b, hit)
+        }
         Expr::If(c, a, b) => reads_any(c, hit) || reads_any(a, hit) || reads_any(b, hit),
         Expr::PanicIf(inner, _) | Expr::Catch(inner) => reads_any(inner, hit),
     }
@@ -6382,6 +6423,19 @@ fn shrink_expr(e: &Expr) -> Vec<Expr> {
                 shrink_expr(y)
                     .into_iter()
                     .map(|y| Expr::FirstRun(b(x), Box::new(y))),
+            );
+        }
+        Expr::FirstLanded(x, y) => {
+            out.extend([(**x).clone(), (**y).clone()]);
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::FirstLanded(Box::new(x), b(y))),
+            );
+            out.extend(
+                shrink_expr(y)
+                    .into_iter()
+                    .map(|y| Expr::FirstLanded(b(x), Box::new(y))),
             );
         }
     }
