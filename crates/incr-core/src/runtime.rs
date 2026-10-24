@@ -947,6 +947,10 @@ pub struct Runtime<C: Cells> {
     /// Waits on another thread's doom reservation, for tests.
     #[cfg(test)]
     pub(crate) reservation_waits: std::sync::atomic::AtomicU32,
+    /// Pops that waited for another thread's claim of a node this thread
+    /// reserves to come back, for tests.
+    #[cfg(test)]
+    pub(crate) give_back_waits: std::sync::atomic::AtomicU32,
     /// Every entry a driver ran, as it found its context.
     #[cfg(test)]
     pub(crate) entries: std::sync::Mutex<Vec<replay_impl::EntrySeen>>,
@@ -1049,6 +1053,8 @@ impl<C: Cells> Runtime<C> {
             unrun_unclaims: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             reservation_waits: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            give_back_waits: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]

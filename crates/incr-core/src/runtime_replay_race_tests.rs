@@ -282,12 +282,10 @@ fn shared_vframe_node_read_failed_read_above() {
 }
 
 /// The landed-VFrame shape at budget 1 with the other thread's read of X
-/// parked between its claim CAS and its reservation check, so X is
-/// Computing on that thread when the driver pops X's virtual frame. The
-/// pop must wait for the claim to be given back and retry X, not take a
-/// node Computing elsewhere as finished: the dooming thread never waits
-/// on the other read's claim, and both reads are the unbounded run's in
-/// which T's came first.
+/// parked between its claim CAS and its reservation check, X Computing
+/// there, when the driver pops X's virtual frame: the pop waits for the
+/// claim to come back instead of taking X as finished, and both reads
+/// match the unbounded run with T's first.
 #[test]
 fn shared_vframe_pop_waits_out_a_claim_before_its_reservation_check() {
     let s = landed_shape(Rt::new(), false);
@@ -333,7 +331,10 @@ fn shared_vframe_pop_waits_out_a_claim_before_its_reservation_check() {
     // A right pop waits until the release; a wrong one reaches X's claim
     // well inside the window.
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
-    while reader_waits.load(SeqCst) == 0 && std::time::Instant::now() < deadline {
+    while reader_waits.load(SeqCst) == 0
+        && s.rt.give_back_waits.load(SeqCst) == 0
+        && std::time::Instant::now() < deadline
+    {
         thread::yield_now();
     }
     check.release();
@@ -353,6 +354,10 @@ fn shared_vframe_pop_waits_out_a_claim_before_its_reservation_check() {
         reader_waits.load(SeqCst),
         0,
         "the pop took X, Computing on the other thread, as finished"
+    );
+    assert!(
+        s.rt.give_back_waits.load(SeqCst) >= 1,
+        "the pop never waited for X's claim to come back"
     );
 }
 

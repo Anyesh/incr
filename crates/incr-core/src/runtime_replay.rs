@@ -2419,17 +2419,50 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether the run `v` stands for has yet to end: its node is still
-    /// New or Dirty, or a claim this thread holds.
+    /// New or Dirty, a claim this thread holds, or another thread's claim
+    /// of a node this thread reserves, which comes back unrun.
     fn vframe_unfinished(&self, v: &VFrame) -> bool {
         let node = self.nodes.get(v.node);
-        node.generation() == v.generation
-            && match state::load::<C>(node.state_cell()) {
-                NodeState::New | NodeState::Dirty => true,
-                NodeState::Computing | NodeState::ComputingDirty => {
-                    cycle_state::holds(self.runtime_id, v.node)
-                }
-                _ => false,
+        if node.generation() != v.generation {
+            return false;
+        }
+        match state::load::<C>(node.state_cell()) {
+            NodeState::New | NodeState::Dirty => true,
+            NodeState::Computing | NodeState::ComputingDirty => {
+                cycle_state::holds(self.runtime_id, v.node) || self.given_back(v)
             }
+            _ => false,
+        }
+    }
+
+    /// Whether another thread's claim of `v`'s node, which this thread
+    /// reserves, came back unrun.
+    #[cold]
+    #[inline(never)]
+    fn given_back(&self, v: &VFrame) -> bool {
+        if C::SINGLE_THREADED || !reserve::mine((self.runtime_id, v.node), v.generation) {
+            return false;
+        }
+        #[cfg(test)]
+        self.give_back_waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let node = self.nodes.get(v.node);
+        let mut spins = 0;
+        loop {
+            let observed = state::load::<C>(node.state_cell());
+            // After the load: a recycled slot's occupant is no claim of
+            // the reserved node.
+            if node.generation() != v.generation {
+                return false;
+            }
+            match observed {
+                NodeState::New | NodeState::Dirty => return true,
+                NodeState::Computing | NodeState::ComputingDirty => {}
+                _ => return false,
+            }
+            spins += 1;
+            C::backoff(spins);
+        }
     }
 
     /// A virtual frame's pop, as its frame's pop would be: nothing if its

@@ -186,17 +186,31 @@ pub(crate) fn any() -> bool {
     LIVE.load(Ordering::Relaxed) != 0
 }
 
-/// Whether another thread reserved `claim` at `generation`.
-#[cold]
-#[inline(never)]
-pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
+/// Whether `claim` is reserved at `generation`, and if so whether by this
+/// thread.
+fn reserved(claim: Claim, generation: u32) -> Option<bool> {
     if !any() || !bucket_hit(claim) {
-        return false;
+        return None;
     }
     let token = MINE.with(Listed::token);
     table()
         .get(&claim)
-        .is_some_and(|&(g, owner)| g == generation && owner != token)
+        .filter(|&&(g, _)| g == generation)
+        .map(|&(_, owner)| owner == token)
+}
+
+/// Whether another thread reserved `claim` at `generation`.
+#[cold]
+#[inline(never)]
+pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
+    reserved(claim, generation) == Some(false)
+}
+
+/// Whether this thread reserved `claim` at `generation`.
+#[cold]
+#[inline(never)]
+pub(crate) fn mine(claim: Claim, generation: u32) -> bool {
+    reserved(claim, generation) == Some(true)
 }
 
 fn unlist(claims: &[(Claim, u32)], token: usize) {
