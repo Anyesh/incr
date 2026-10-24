@@ -860,7 +860,7 @@ impl<C: Cells> Runtime<C> {
             let first = match claimed {
                 Ok(src) if node.generation() == generation => src == NodeState::New,
                 Ok(src) => {
-                    self.land(NodeId(slot), node, src, src);
+                    self.land_unrun(NodeId(slot), node, src);
                     self.roll_back_hit(&taken);
                     return Err(NodeId(slot));
                 }

@@ -2300,12 +2300,7 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
-            self.land(
-                NodeId(c),
-                self.nodes.get(c),
-                NodeState::Dirty,
-                NodeState::Dirty,
-            );
+            self.land_unrun(NodeId(c), self.nodes.get(c), NodeState::Dirty);
         }
     }
 
@@ -2354,7 +2349,7 @@ impl<C: Cells> Runtime<C> {
                 && self.virtual_position(m, generation).is_some();
             let mut ok = !virtual_member && self.claim_member(x, m, &claimed, bag);
             if ok && node.generation() != generation {
-                self.land(NodeId(m), node, NodeState::Dirty, NodeState::Dirty);
+                self.land_unrun(NodeId(m), node, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
@@ -2365,6 +2360,7 @@ impl<C: Cells> Runtime<C> {
                 h.insert((rt, m), Held::new(generation, cidx, false, false))
             });
             claimed.push(m);
+            self.park(ParkPoint::GroupMemberClaimed(NodeId(m)));
         }
 
         // 2. Did anything any member read change since it was verified?

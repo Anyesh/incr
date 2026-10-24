@@ -198,6 +198,8 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, on finding the node claimed by another thread,
     /// before its first wait on that claim.
     ComputeWaits(NodeId),
+    /// In group verify's step 1, after it claimed member `NodeId`.
+    GroupMemberClaimed(NodeId),
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
@@ -463,9 +465,9 @@ enum Computed {
     Replan,
     /// Another thread landed the node Dirty since the walk planned it: a
     /// claim wait ended with it Dirty, not released unrun, or the walk
-    /// planned it New and claimed it from Dirty. The node was left unrun and unclaimed, and
-    /// the walk visits it again, as a read that came after that landing
-    /// expands its deps before claiming it.
+    /// planned it New and claimed it from Dirty. The node was left unrun
+    /// and unclaimed, and the walk visits it again, as a read that came
+    /// after that landing expands its deps before claiming it.
     Revisit,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
@@ -3654,7 +3656,7 @@ impl<C: Cells> Runtime<C> {
                     // nested get if it still needs it, and that read
                     // poisons where needed; a poison here would cost the
                     // root a Clean landing for an edge it may have dropped.
-                    self.land_single(id, node, flags, NodeState::Dirty, NodeState::Dirty);
+                    self.land_single_as(id, node, flags, NodeState::Dirty, NodeState::Dirty, true);
                     self.memoize(id, owner);
                     return Computed::Done;
                 }
@@ -4364,8 +4366,12 @@ impl<C: Cells> Runtime<C> {
         unrun: bool,
     ) -> NodeState {
         if !C::SINGLE_THREADED {
-            // Before the release, which publishes it with the state.
-            C::u8_store_relaxed(self.nodes.unrun(id.0), u8::from(unrun));
+            // Before the release, which publishes it with the state. Only
+            // the claim's owner writes it, so an equal byte needs no store.
+            let mark = self.nodes.unrun(id.0);
+            if C::u8_load_relaxed(mark) != u8::from(unrun) {
+                C::u8_store_relaxed(mark, u8::from(unrun));
+            }
         }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
