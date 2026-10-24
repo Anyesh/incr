@@ -412,7 +412,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Whether node `slot` at `generation` has a stashed verify this
     /// revision.
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(super) fn stashed_verify(&self, slot: u32, generation: u32) -> bool {
         let revision = self.current_revision();
         let mut s = self.stashes.write();
