@@ -158,7 +158,7 @@ pub struct NodeData<C: Cells> {
     pub(crate) arena_slot: C::U32,
     pub(crate) type_tag: C::U16,
     pub(crate) state: C::State,
-    pub(crate) dep_count: C::U8,
+    dep_count: C::U8,
     pub(crate) generation: C::U32,
 }
 
@@ -792,5 +792,10 @@ mod tests {
             assert!(!n.unrun());
             assert_eq!(n.dep_count(), 2);
         }
+        let n: NodeData<Local> = NodeData::new_query(0, 0);
+        drop(n.install_deps(&[NodeId(1), NodeId(2)]));
+        n.set_unrun(true);
+        assert!(!n.unrun(), "a single-threaded node keeps no mark");
+        assert_eq!(n.dep_count(), 2);
     }
 }

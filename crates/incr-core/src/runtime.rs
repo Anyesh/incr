@@ -4717,7 +4717,8 @@ impl<C: Cells> Runtime<C> {
 impl<C: Cells> Runtime<C> {
     #[cfg(not(loom))]
     /// Give `member` installed edges to `extra` on top of its own, with
-    /// the reverse edges, as an episode leaves a cycle's members.
+    /// the reverse edges, as an episode leaves a cycle's members. It
+    /// installs without the member's claim, so no other thread may run.
     pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
         let mut inner = self.inner.write();
         let id = NodeId(member.slot());
