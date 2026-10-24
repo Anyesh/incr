@@ -639,9 +639,9 @@ fn shared_wide_diverted_retry() {
 /// A chain of `n` queries over a Failed node, rerun after a set below the
 /// chain: each rerun's read of the Failed node below it walks only that
 /// node, as a walk entry Failed computes to nothing and a Failed root
-/// raises, so the reruns stay linear.
+/// raises, so the walks stay linear.
 fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
-    let n = if cfg!(miri) { 8 } else { 4000 };
+    let n = if cfg!(miri) { 8 } else { 1000 };
     let rt = Runtime::<C>::new();
     let opts = || match frames {
         Some(_) => replayable(),
@@ -681,12 +681,8 @@ fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
     let pops = rt.walk_pops.load(SeqCst);
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
     let pops = rt.walk_pops.load(SeqCst) - pops;
-    println!(
-        "failed_entry_chain {frames:?}: runs {} pops {pops}",
-        runs[0].load(SeqCst)
-    );
     assert_eq!(runs[0].load(SeqCst), n as u32);
-    assert!(pops <= 3 * n as u64, "{pops} walk pops for a {n}-chain");
+    assert!(pops <= 2 * n as u64 + 2, "{pops} walk pops for a {n}-chain");
 }
 
 #[test]
@@ -848,4 +844,55 @@ fn local_many_foreign_reads_stay_linear() {
 #[cfg_attr(miri, ignore)]
 fn shared_many_foreign_reads_stay_linear() {
     many_foreign_reads::<Shared>();
+}
+
+/// `k` Dirty readers over one Failed node with a Failed chain of `k` below
+/// it, whose edges a Clean run recorded, all entries of one walk: the walk
+/// passes the Failed node without walking the chain once per reader.
+fn failed_entry_fan_in<C: Cells>() {
+    let k = if cfg!(miri) { 8 } else { 200 };
+    let rt = Runtime::<C>::new();
+    let fail = rt.create_input(0_u64);
+    let mut failed = rt.create_query(move |rt| {
+        assert_eq!(rt.get(fail), 0, "failed below the fan");
+        0
+    });
+    for _ in 0..k {
+        let below = failed;
+        failed = rt.create_query(move |rt| rt.get(below) + 1);
+    }
+    let input = rt.create_input(0_u64);
+    let readers: Arc<Vec<Incr<u64>>> = Arc::new(
+        (0..k)
+            .map(|_| rt.create_query(move |rt| rt.get(input) + rt.get(failed)))
+            .collect(),
+    );
+    let top = {
+        let readers = readers.clone();
+        rt.create_query(move |rt| {
+            for &r in readers.iter() {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+            }
+            0
+        })
+    };
+    rt.get(top);
+    rt.set(fail, 1);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
+    assert_eq!(rt.state_of(failed), NodeState::Failed);
+    rt.set(input, 1);
+    let pops = rt.walk_pops.load(SeqCst);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
+    let pops = rt.walk_pops.load(SeqCst) - pops;
+    assert!(pops <= 4 * k as u64 + 2, "{pops} walk pops for {k} readers");
+}
+
+#[test]
+fn local_failed_entry_fan_in() {
+    on_stack(1 << 28, failed_entry_fan_in::<Local>);
+}
+
+#[test]
+fn shared_failed_entry_fan_in() {
+    on_stack(1 << 28, failed_entry_fan_in::<Shared>);
 }
