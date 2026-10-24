@@ -1123,6 +1123,19 @@ fn live_specs(case: &Case, i: usize, trace: &Trace) -> Vec<Spec> {
 /// replaced handle or of a second runtime, or one whose deletes the fresh
 /// runtime refuses.
 fn fresh_read(case: &Case, i: usize, trace: &Trace) -> Option<[Out; 2]> {
+    from_scratch(case, i, trace, false)
+}
+
+/// [`fresh_read`], with every earlier read of `case` made first, in order,
+/// on the fresh runtime: a cycle is then entered at the member the live
+/// run's reads entered first, where a lone fresh read enters it at the read
+/// node. It judges only what incremental reuse changes, since the same
+/// engine makes both reads.
+fn history_read(case: &Case, i: usize, trace: &Trace) -> Option<[Out; 2]> {
+    from_scratch(case, i, trace, true)
+}
+
+fn from_scratch(case: &Case, i: usize, trace: &Trace, history: bool) -> Option<[Out; 2]> {
     if !matches!(case.ops[i], Op::Get(_) | Op::TryGet(_)) || !case.specs2.is_empty() {
         return None;
     }
@@ -1133,6 +1146,14 @@ fn fresh_read(case: &Case, i: usize, trace: &Trace) -> Option<[Out; 2]> {
             .map(Op::Delete)
             .collect();
         let deletes = ops.len();
+        if history {
+            ops.extend(
+                (case.ops[..i].iter())
+                    .filter(|o| matches!(o, Op::Get(n) | Op::TryGet(n) if !dead[*n]))
+                    .cloned(),
+            );
+        }
+        let read = ops.len();
         ops.push(case.ops[i].clone());
         let fresh = Case {
             specs: specs
@@ -1159,7 +1180,7 @@ fn fresh_read(case: &Case, i: usize, trace: &Trace) -> Option<[Out; 2]> {
         t[..deletes]
             .iter()
             .all(|(o, _)| matches!(o, Out::Deleted(Ok(()))))
-            .then(|| t[deletes].0.clone())
+            .then(|| t[read].0.clone())
     };
     Some([fresh(true)?, fresh(false)?])
 }
@@ -6455,6 +6476,51 @@ fn a_from_scratch_read_judges_a_serial_reads_outcome() {
     );
 }
 
+/// A Fixpoint member entered first lands both members of a two-node cycle,
+/// so a later read of the bare member returns its memo: a lone fresh read
+/// enters the cycle at the bare member and reports it, and
+/// [`history_read`], making the first read again, does not.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_history_read_enters_a_cycle_where_the_live_run_did() {
+    let case = Case {
+        specs: vec![
+            Spec::Query {
+                expr: Expr::Read(1, false),
+                replay: true,
+                bare: false,
+                strategy: Strat::Fixpoint {
+                    initial: 0,
+                    limit: 2,
+                },
+            },
+            Spec::Query {
+                expr: Expr::Read(0, false),
+                replay: true,
+                bare: true,
+                strategy: Strat::None,
+            },
+        ],
+        panics: false,
+        cycles: true,
+        queries: 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(0), Op::TryGet(1)],
+    };
+    quiet(|| {
+        let trace = run::<Shared>(&case, None, 0);
+        assert_eq!(trace[1].0, Out::Value(0));
+        let fresh = fresh_read(&case, 1, &trace).expect("a plain read");
+        assert!(
+            fresh.iter().all(|o| matches!(o, Out::Cycle(_))),
+            "{fresh:?}"
+        );
+        let history = history_read(&case, 1, &trace).expect("a plain read");
+        assert_eq!(history, [Out::Value(0), Out::Value(0)]);
+    });
+}
+
 /// Each serial order of the two-thread cases of seeds
 /// `REPLAY_FROM..REPLAY_SCAN` (or the hex seeds in `SEEDS_FILE`), run
 /// unbounded, against [`fresh_read`]: the two-thread differential takes
@@ -6462,7 +6528,8 @@ fn a_from_scratch_read_judges_a_serial_reads_outcome() {
 /// Prints a `FRESH` line per read that matches neither from-scratch read,
 /// marked `after-break` when a delete, recreate or replaced-handle read
 /// came before it, where from scratch is a weaker oracle; with
-/// `FRESH_ALL`, every read checked as well.
+/// `FRESH_ALL`, every read checked as well. With `HISTORY`, each read is
+/// checked against [`history_read`] instead.
 #[test]
 #[ignore = "a diagnostic that scans seeds"]
 fn two_thread_serial_fresh_scan() {
@@ -6482,6 +6549,10 @@ fn two_thread_serial_fresh_scan() {
         }
     };
     let all = std::env::var_os("FRESH_ALL").is_some();
+    let oracle = match std::env::var_os("HISTORY") {
+        Some(_) => history_read,
+        None => fresh_read,
+    };
     let (mut reads, mut skipped, mut wrong, mut panicked) = (0, 0, 0, 0);
     quiet(|| {
         for &seed in &seeds {
@@ -6502,7 +6573,7 @@ fn two_thread_serial_fresh_scan() {
                         continue;
                     }
                     let Ok(Some(fresh)) =
-                        catch_unwind(AssertUnwindSafe(|| fresh_read(&order.case, j, &trace)))
+                        catch_unwind(AssertUnwindSafe(|| oracle(&order.case, j, &trace)))
                     else {
                         skipped += 1;
                         continue;
