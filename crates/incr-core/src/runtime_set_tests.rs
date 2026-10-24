@@ -406,14 +406,14 @@ fn set_returning_displaced_returns_the_current_stamp_on_an_equal_value() {
     assert_eq!(stamp, before);
 }
 
-/// One input read by 50k queries, half of which then drop it, and a
-/// quarter of the rest are deleted. Each unhook from the input's
-/// dependent list must not scan or shift the whole list.
+/// One input read by 50k queries (5k under `INCR_TEST_REDUCED`), half of
+/// which then drop it, and a quarter of the rest are deleted. Each unhook
+/// from the input's dependent list must not scan or shift the whole list.
 fn wide_input_rewires_in_sublinear_time<C: Cells>(rt: &Runtime<C>) {
-    const N: usize = 50_000;
+    let n = crate::test_size::test_size(50_000);
     let x = rt.create_input(1_i64);
     let drop_x = rt.create_input(false);
-    let queries: Vec<_> = (0..N)
+    let queries: Vec<_> = (0..n)
         .map(|i| {
             rt.create_query(move |rt| {
                 if i % 2 == 0 && rt.get(drop_x) {
@@ -438,12 +438,12 @@ fn wide_input_rewires_in_sublinear_time<C: Cells>(rt: &Runtime<C>) {
     let took = start.elapsed();
     assert_eq!(
         rt.inner.read().dependents[x.slot() as usize].iter().count(),
-        N / 4
+        n / 4
     );
     assert!(
         took < Duration::from_secs(5),
         "unhooking {} dependents took {took:?}",
-        N / 2 + N / 8
+        n / 2 + n / 8
     );
 }
 
