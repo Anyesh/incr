@@ -188,7 +188,9 @@ impl<C: Cells> Runtime<C> {
     /// holds them too. A speculative run's read takes none: a closure in
     /// the run can catch and drop the payload before the run's discard
     /// would hold it again, and the real run's read is owed it.
-    /// `Left` too when the slot no longer holds `generation`'s node.
+    /// With tickets held, `Left` too when the slot no longer holds
+    /// `generation`'s node; with none, the read's panic is the one it would
+    /// have made before the delete.
     pub(super) fn take_contained(
         &self,
         id: NodeId,
