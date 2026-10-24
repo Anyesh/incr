@@ -838,6 +838,54 @@ fn group_c_x_a<C: Cells>() {
     rt.assert_invariant_i();
 }
 
+/// A Fixpoint member that catches a failing query's panic in the runs
+/// `catching` picks from its run count and the value it read of itself,
+/// with `step` adding each output to the previous value when `adds`.
+fn caught_in_some_runs<C: Cells>(
+    catching: impl Fn(u32, i64) -> bool + Send + Sync + 'static,
+    adds: bool,
+) -> (Runtime<C>, Incr<i64>) {
+    let rt = Runtime::<C>::new();
+    let failing = rt.create_query(|_: &Runtime<C>| -> i64 { panic!("boom") });
+    let me = cell::<i64>();
+    let runs = Arc::new(AtomicU32::new(0));
+    let f = {
+        let me = me.clone();
+        rt.create_query_with(
+            move |rt| {
+                let prev = rt.get(*me.get().unwrap());
+                if catching(runs.fetch_add(1, Ordering::Relaxed), prev) {
+                    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(failing))).is_err());
+                }
+                1
+            },
+            fixpoint(if adds {
+                Fixpoint::new(|| 0_i64).step(|prev: &i64, out, _| (prev + out).min(3))
+            } else {
+                Fixpoint::new(|| 0_i64)
+            }),
+        )
+    };
+    me.set(f).unwrap();
+    (rt, f)
+}
+
+/// Iteration 1 catches and iteration 2 does not, but reads the value
+/// iteration 1 built: the landing keeps the poison through that read.
+fn poison_reaches_the_landing_through_a_member_read<C: Cells>() {
+    let (rt, f) = caught_in_some_runs::<C>(|_, prev| prev == 0, false);
+    assert_eq!(rt.get(f), 1);
+    assert_eq!(rt.state_of(f), NodeState::Dirty);
+}
+
+/// Only the discovery run and iteration 1 catch, and the last run reads
+/// nothing poisoned, but `step` builds every later value on iteration 1's.
+fn poison_reaches_the_landing_through_step<C: Cells>() {
+    let (rt, f) = caught_in_some_runs::<C>(|run, _| run < 2, true);
+    assert_eq!(rt.get(f), 3);
+    assert_eq!(rt.state_of(f), NodeState::Dirty);
+}
+
 both!(
     self_cycle_fallback,
     self_cycle_fixpoint,
@@ -862,6 +910,8 @@ both!(
     validation_shrinks_group,
     released_member_reruns_off_its_group_value,
     two_disjoint_cycles_on_one_stack,
+    poison_reaches_the_landing_through_a_member_read,
+    poison_reaches_the_landing_through_step,
 );
 
 #[test]
