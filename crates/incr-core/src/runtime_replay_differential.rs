@@ -5577,6 +5577,20 @@ fn speculative_landings_paired_seeds() {
     }
 }
 
+/// [`gen_first_runs`] cases whose speculative recomputes to a node's own
+/// value made a Native reader run where the unbounded run verifies it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_recompute_first_landed_seeds() {
+    for seed in [0xacb, 0x3661_48a8, 0x3661_491a] {
+        let case = gen_first_runs(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// 0xa02 (see [`cross_seeds`]): a speculative landing read the second
 /// runtime's input before a set of it, and a later read returns the old
 /// value.
