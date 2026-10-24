@@ -1098,7 +1098,8 @@ impl<C: Cells> Live<C> {
     }
 
     /// This thread's checks after its operation: no engine panic outside
-    /// the documented ones, and no virtual frame left or pushed twice.
+    /// the documented ones, no virtual frame left or pushed twice, and no
+    /// unbuilt value dropped inside the replay contexts' borrow.
     fn check_thread(&self) -> Result<(), String> {
         if let Some(internal) = INTERNAL.with(|i| i.borrow_mut().take()) {
             return Err(format!("an engine panic: {internal}"));
@@ -1109,6 +1110,12 @@ impl<C: Cells> Live<C> {
         }
         if !crate::replay::vindexes_empty() {
             return Err("a virtual frame is left indexed".to_owned());
+        }
+        let held = crate::replay::take_held_drops();
+        if held != 0 {
+            return Err(format!(
+                "{held} held values dropped inside the replay contexts' borrow"
+            ));
         }
         Ok(())
     }
@@ -1189,6 +1196,7 @@ fn reset_thread() {
     hook();
     INTERNAL.with(|i| i.borrow_mut().take());
     crate::replay::take_vindex_repushes();
+    crate::replay::take_held_drops();
 }
 
 fn run<C: Cells>(case: &Case, frames: Option<u32>, bytes: usize) -> Trace {

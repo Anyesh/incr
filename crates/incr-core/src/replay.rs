@@ -594,7 +594,12 @@ impl Pending {
         }
     }
 
-    /// Removes the deliveries for read `key` that `f` accepts.
+    /// Removes the walk directions for `key`, which hold no user value
+    /// and so may drop inside the contexts' borrow.
+    pub(crate) fn remove_walks(&mut self, key: &ReadKey) {
+        drop(self.remove_keyed(key, |d| matches!(d.what, Delivered::Walk(..))));
+    }
+
     /// Removes the deliveries for `key` that `f` picks and returns them:
     /// one may hold a user value, whose `Drop` may read and so must run
     /// outside the contexts' borrow.
@@ -1132,10 +1137,7 @@ impl Context {
         runs: RunSlot,
     ) {
         let key = ReadKey::blocked(below);
-        drop(
-            self.pending
-                .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..))),
-        );
+        self.pending.remove_walks(&key);
         let mut d = Delivery::new(key, below.maker, Delivered::Walk(Box::new(walk), pushed));
         d.runs = runs;
         self.pending.push(d);
@@ -1704,10 +1706,34 @@ pub(crate) fn peek<R>(f: impl FnOnce(&[Context]) -> R) -> R {
     CONTEXTS.with(|c| f(&c.borrow()))
 }
 
-/// Whether the thread's contexts are borrowed: a user `Drop` of a value
-/// one held, such as a replaced landing's, runs inside [`with`].
+/// Whether the thread's contexts are borrowed: value code runs inside
+/// [`with`], and so would a user `Drop` of a value the contexts held if
+/// an unwind out of a closure dropped it there.
 pub(crate) fn held() -> bool {
     CONTEXTS.with(|c| c.try_borrow_mut().is_err())
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static HELD_DROPS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Counts an unbuilt value dropped inside the contexts' borrow, which
+/// only an unwind out of a [`with`] closure may do. The contexts' own
+/// drop at thread exit, when they can't be reached, counts nothing.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn note_drop() {
+    if CONTEXTS
+        .try_with(|c| c.try_borrow_mut().is_err())
+        .unwrap_or(false)
+    {
+        HELD_DROPS.with(|n| n.set(n.get() + 1));
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_held_drops() -> u32 {
+    HELD_DROPS.with(|n| n.replace(0))
 }
 
 /// Runs `f` on the thread's contexts. `f` must not call user code or the

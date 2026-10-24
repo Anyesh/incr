@@ -3850,10 +3850,7 @@ impl<C: Cells> Runtime<C> {
                         }
                         None => {
                             let key = ReadKey::blocked(&v);
-                            drop(
-                                c[i].pending
-                                    .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..))),
-                            );
+                            c[i].pending.remove_walks(&key);
                         }
                     }
                     return;
