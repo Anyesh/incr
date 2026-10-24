@@ -3399,6 +3399,24 @@ fn seed_92b175856b_dissolved_root_retry_computes_alone() {
     });
 }
 
+/// Seed 0x59a582f: at budgets 2 and 3, op 3 `TryGet(1)` gave 0 for 26.
+/// Root 2's episode dissolved at its virtual frame's pop, and the driver's
+/// retry of 2 was sent straight to 10's compute, as 2's run before the
+/// dissolve had read it, where the unbounded run's new run of 2 walks 10;
+/// 2's episode then formed again. The case stops before op 15, whose
+/// superseded landing of 3 is T8-strict-group-c-dirty-for-clean's.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_59a582f_dissolved_root_reads_afresh() {
+    let seed = 0x59a_582f;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(15);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
@@ -7049,5 +7067,74 @@ fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
             [&want, &want],
             "budget 3, Local then Shared"
         );
+    });
+}
+
+/// Base seed 0x675a, shrunk by `replay_shrink`. 4 and 10 form a ring that
+/// 4's read of 5 and 5's of 6 join; 6 reads 7, which panics on 8, and 8
+/// reaches 10 through 9. Unbounded, `Get(10)` after `TryGet(4)` lands 7
+/// Failed with the others; at budget 3 the bounded run leaves 7 Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failed_ring_member_lands_failed_at_every_budget() {
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let c = |v| Box::new(Expr::Const(v));
+    let mut specs: Vec<Spec> = (0..4)
+        .map(|_| replayable(Expr::Const(0), Strat::None))
+        .collect();
+    specs.extend([
+        replayable(
+            Expr::If(r(10, false), c(0), r(5, false)),
+            Strat::Fallback(2),
+        ),
+        replayable(
+            Expr::PanicIf(
+                Box::new(Expr::Add(
+                    Box::new(Expr::Add(r(6, true), c(1))),
+                    Box::new(Expr::If(r(5, false), c(0), r(6, false))),
+                )),
+                3,
+            ),
+            Strat::Fallback(1),
+        ),
+        replayable(Expr::If(r(4, false), r(7, false), c(0)), Strat::Fallback(1)),
+        Spec::Query {
+            expr: Expr::If(
+                Box::new(Expr::If(r(8, true), c(0), r(6, false))),
+                Box::new(Expr::PanicIf(r(8, false), 2)),
+                r(8, false),
+            ),
+            replay: true,
+            bare: true,
+            strategy: Strat::None,
+        },
+        replayable(Expr::Add(c(1), r(9, false)), Strat::None),
+        replayable(Expr::Read(10, true), Strat::None),
+        Spec::Query {
+            expr: Expr::Read(4, false),
+            replay: false,
+            bare: false,
+            strategy: Strat::Fixpoint {
+                initial: 1,
+                limit: 2,
+            },
+        },
+        Spec::Input(4),
+        Spec::Input(3),
+        Spec::Input(0),
+        Spec::Input(3),
+    ]);
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 11,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(4), Op::Get(10)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x675a);
+        differential::<Shared>(&case, 0x675a);
     });
 }

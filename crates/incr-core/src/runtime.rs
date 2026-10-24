@@ -3881,6 +3881,9 @@ impl<C: Cells> Runtime<C> {
                                 self.rerun_root(id, cidx);
                             }
                             self.end_dissolved(id, bag);
+                            if MODE & VIRT != 0 {
+                                self.end_dissolved_reads(id, g, cidx);
+                            }
                             continue 'run;
                         }
                         PopEnd::Retry => {

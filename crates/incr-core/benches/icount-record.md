@@ -1926,3 +1926,27 @@ line, and a `malloc` call-site count by preloaded backtrace):
   of the rise) and allocation (about a sixth) are the bookkeeping part;
   the rest is that state's hashing and copying. None of it grows with N:
   each ratio holds from 10k to 100k.
+
+## A stand-in run sees its frame's taint memo entries
+
+`1d332082` (on `43bb197e`) restores a virtual frame's own taint-memo
+entries for the stand-in run that finishes it, inside `tarjan_pop`, which
+only replay pops reach. Base `43bb197e`, tip `1d332082`, same box,
+`icount.sh` defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_shared` | 198 | 196 | -2 |
+| `table_hit_shared` | 219.14 | 218.14 | -1 |
+| `value_slot_read_shared` | 90 | 87 | -3 |
+| `chain_shared/propagate/100` | 193132.07 | 192627.03 | -505.04 |
+| `fanout_shared_1000` | 4804758.18 | 4799504.84 | -5253.34 |
+| `delete_cascade_shared` | 4585764.71 | 4581892.43 | -3872.28 |
+
+- No workload runs a replay pop, so nothing here executes the change. The
+  Shared rows fall by about 5 instructions per landing and the hard-gate
+  rows by 1 to 3, the code-partitioning shift seen before; every Local row
+  is unchanged within 0.1%.
+
+Gate: no rise. Replay scale by `strict-scan.sh`'s `scale-icount` against
+`43bb197e`: every ratio is in 0.9987..1.0031.

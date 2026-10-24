@@ -60,6 +60,12 @@ enum VPop {
     /// A doom (`true`) or a dropped chain pushed entries: the driver picks
     /// its next entry again.
     Restart(bool),
+    /// The episode rooted at the node dissolved, which ended the run of the
+    /// root's frame: the retry that computes the root alone is another run,
+    /// as the unbounded run's frame runs the closure again. A resumed
+    /// episode pops at a member run's frame, at the root's position, so the
+    /// root is named.
+    Dissolved(u32),
     /// The run of the frame at the popped position ended: no retry
     /// computes it again.
     Finished(u32, Ended),
@@ -2497,6 +2503,7 @@ impl<C: Cells> Runtime<C> {
             // The virtual frames at and above the entry's level pop, highest
             // first, each as the frame it stands for would.
             let mut popped_frames: Vec<(VFrame, bool)> = Vec::new();
+            let mut dissolved: Vec<u32> = Vec::new();
             loop {
                 let popped = replay::with(|c| {
                     let x = c
@@ -2524,7 +2531,7 @@ impl<C: Cells> Runtime<C> {
                         None
                     }
                 });
-                let Some((v, virtual_below, kept)) = popped else {
+                let Some((v, virtual_below, mut kept)) = popped else {
                     // The frame left on top was blocked reading the compute
                     // popped last, which the same doomed run made, so no
                     // entry stands for it: the run of a later entry that
@@ -2553,8 +2560,9 @@ impl<C: Cells> Runtime<C> {
                 // A frame still New or Dirty that its pop does not finish is
                 // retried as the frame the unbounded run never popped, so it
                 // keeps its memo entries: a read of the retry that takes a
-                // delivery skips the walk that made them. Nothing the pop
-                // runs sees them.
+                // delivery skips the walk that made them. Its pop runs nothing
+                // that reads them, since only a held frame, never New or
+                // Dirty, gets a stand-in run with its own entries.
                 let node = self.nodes.get(v.node);
                 let retried = v.ep.is_none()
                     && node.generation() == v.generation
@@ -2583,12 +2591,19 @@ impl<C: Cells> Runtime<C> {
                         &self.dep_stack,
                         self.dep_stack.place_next_at(v.cidx, virtual_below),
                     );
-                    self.tarjan_pop(id, &v)
+                    self.tarjan_pop(id, &v, &mut kept)
                 };
                 match popped {
                     VPop::Next => {
                         if retried && !kept.is_empty() {
                             taint_memo::restore(kept);
+                        }
+                        popped_frames.push((v.clone(), false));
+                    }
+                    VPop::Dissolved(root) => {
+                        let generation = self.nodes.get(root).generation();
+                        if self.end_dissolved_reads(NodeId(root), generation, v.cidx) {
+                            dissolved.push(v.cidx);
                         }
                         popped_frames.push((v.clone(), false));
                     }
@@ -2728,10 +2743,9 @@ impl<C: Cells> Runtime<C> {
                 .filter(|&(v, landed)| !landed && v.cidx > at)
             {
                 let read = v.computes;
-                if let Some((w, _)) = popped_frames
-                    .iter()
-                    .find(|(w, _)| w.cidx + 1 == v.cidx && w.reading == read)
-                {
+                if let Some((w, _)) = popped_frames.iter().find(|(w, _)| {
+                    w.cidx + 1 == v.cidx && w.reading == read && !dissolved.contains(&w.cidx)
+                }) {
                     replay::with(|c| {
                         let runs = replay::run_snapshot(c, self.runtime_id, w);
                         if let Some(x) = c.iter_mut().find(|x| x.id == id) {
@@ -2880,7 +2894,7 @@ impl<C: Cells> Runtime<C> {
     /// anchored there, the episode it roots, run here as a task. A
     /// speculative frame never runs one: its chain is dropped instead, and
     /// the driver picks its next entry again (`true`).
-    fn tarjan_pop(&self, id: u64, v: &VFrame) -> VPop {
+    fn tarjan_pop(&self, id: u64, v: &VFrame, kept: &mut taint_memo::Parked) -> VPop {
         let rt = self.runtime_id;
         let failures = cycle_state::failures();
         if !self.vframe_unfinished(v) {
@@ -2945,8 +2959,14 @@ impl<C: Cells> Runtime<C> {
             ));
             self.retry_deliveries(id, v.node, v.generation, v.cidx);
             // The run finishes the frame's doomed run, so it owns what that
-            // run deferred.
+            // run deferred, and its reads see the frame's own memo entries,
+            // which the unbounded run's frame keeps until it pops.
             self.own_deferred(v.cidx, v.node);
+            let (own, above) = std::mem::take(kept)
+                .into_iter()
+                .partition(|&(_, owner)| owner == v.cidx + 1);
+            *kept = above;
+            taint_memo::restore(own);
             let ran = {
                 let _speculating = v.spec.then(replay::Speculating::enter);
                 self.member_run(v.node, v.cidx, true, v.walked, true)
@@ -3108,10 +3128,12 @@ impl<C: Cells> Runtime<C> {
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
     /// claim lands as if its run never happened, since no frame computes it
-    /// here: the entry below does. It leaves the root's group, as the
-    /// unbounded run's frame goes on to compute the root alone and leaves
-    /// it there. A suspended episode restarts the driver, which runs the
-    /// entries its doom pushed first.
+    /// here: the entry below does. It keeps the root in its group, where the
+    /// unbounded run's frame holds it until its alone landing, so another
+    /// thread verifies the group as in the order where it reads first; this
+    /// entry's retry computes the root alone (`end_dissolved`). A suspended
+    /// episode restarts the driver, which runs the entries its doom pushed
+    /// first.
     fn episode_task_end(&self, root: NodeId, cidx: u32, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         if matches!(end, PopEnd::Dissolved | PopEnd::Retry) {
             self.rerun_root(root, cidx);
@@ -3120,12 +3142,20 @@ impl<C: Cells> Runtime<C> {
             PopEnd::Suspended => VPop::Restart(true),
             PopEnd::Landed => VPop::Finished(root.0, Ended::Landed),
             PopEnd::Contained => VPop::Finished(root.0, Ended::Contained),
+            PopEnd::Dissolved => VPop::Dissolved(root.0),
             _ => VPop::Next,
         };
         if let PopEnd::Dissolved = end {
             let (first, wrote) = self.end_dissolved(root, &mut bag);
             let stamp_rev = self.current_revision();
-            self.discard_land(root, first, wrote, stamp_rev, &mut bag);
+            self.discard_land_in_group(
+                root,
+                first,
+                wrote,
+                stamp_rev,
+                ChildLanding::Discard,
+                &mut bag,
+            );
         }
         bag.drain(self);
         pop
@@ -3433,6 +3463,31 @@ impl<C: Cells> Runtime<C> {
         // No retry reads these frames again, so their unread reads are not
         // marked as [`Self::drop_deliveries`] marks a retry's.
         drop(dropped);
+    }
+
+    /// Drops the deliveries held, in any of this runtime's contexts, for
+    /// reads by the frame of `root` at `cidx`, whose episode just
+    /// dissolved: the unbounded run's frame runs the closure again, and the
+    /// new run's reads are not the ended run's. A speculative run's dissolve
+    /// is not the unbounded run's, so it keeps them; returns whether they
+    /// were dropped.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn end_dissolved_reads(&self, root: NodeId, generation: u32, cidx: u32) -> bool {
+        if replay::speculative() {
+            return false;
+        }
+        let rt = self.runtime_id;
+        let ended: Vec<Delivery> = replay::with(|c| {
+            c.iter_mut()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| x.pending.extract_frame(root.0, generation, cidx))
+                .collect()
+        });
+        // No retry reads the ended run's frame again, so its unread reads
+        // are not marked as [`Self::drop_deliveries`] marks a retry's.
+        drop(ended);
+        true
     }
 
     /// Releases, with the discard landing, the claims virtual hits took
