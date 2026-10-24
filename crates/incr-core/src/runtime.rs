@@ -94,6 +94,12 @@ pub(crate) struct Inner<C: Cells> {
     /// The group each landed cycle member belongs to, flagged by
     /// `IN_GROUP`.
     pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
+    /// Each query a user panic released New over a union of deps
+    /// ([`Runtime::land_panic_released`]), with the generation it landed
+    /// under and how many of those deps, from the front, its last finished
+    /// run read. Dropped when its deps are next replaced; a later run that
+    /// records the very same list keeps it.
+    pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
 /// A landed cycle group: its members with the generations they landed
@@ -118,6 +124,7 @@ impl<C: Cells> Inner<C> {
             children: HashMap::default(),
             cycle_strategies: HashMap::new(),
             member_recs: HashMap::new(),
+            released_deps: HashMap::new(),
         }
     }
 }
@@ -2097,6 +2104,9 @@ impl<C: Cells> Runtime<C> {
         if bits & IN_GROUP != 0 {
             inner.member_recs.remove(&slot);
         }
+        if !inner.released_deps.is_empty() {
+            inner.released_deps.remove(&slot);
+        }
         let children = if bits & HAS_INDEX != 0 {
             inner.children.remove(&slot)
         } else {
@@ -3263,23 +3273,37 @@ impl<C: Cells> Runtime<C> {
                     // after a cycle breaks, so each is expanded at most
                     // once per walk. A never-run node has no deps and
                     // never touches the set.
-                    if observed == NodeState::New
-                        && node.dep_count() != 0
-                        && !walk.first_new_expansion(cur)
-                    {
-                        continue;
+                    let mut kept = u32::MAX;
+                    if observed == NodeState::New && node.dep_count() != 0 {
+                        if !walk.first_new_expansion(cur) {
+                            continue;
+                        }
+                        // Running a released claim's recorded deps first
+                        // would enter its cycle where its own run does not.
+                        kept = self.released_kept(cur, node).unwrap_or(u32::MAX);
                     }
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     walk.visit(cur, observed == NodeState::New);
-                    node.for_each_dep(|dep| {
+                    let mut expand = |dep: NodeId| {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
                         if !dep_state.is_settled() {
                             walk.expand(dep, dep_state);
                         }
-                    });
+                    };
+                    if kept == u32::MAX {
+                        node.for_each_dep(&mut expand);
+                    } else {
+                        let mut n = 0;
+                        node.for_each_dep(|dep| {
+                            n += 1;
+                            if n <= kept {
+                                expand(dep);
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -4350,7 +4374,9 @@ impl<C: Cells> Runtime<C> {
     /// the failure may reach that node only through this one: the union of
     /// its old and recorded deps is published, as [`Self::land_failed`]
     /// publishes them, and it lands New, which a set's walk passes through
-    /// where Dirty stops it.
+    /// where Dirty stops it. A read's walk expands only the old deps
+    /// (`Inner::released_deps`), as the recorded ones can lead back into
+    /// the cycle the claim was part of.
     /// `co_members`, sorted, are the claims released with it.
     fn land_panic_released(
         &self,
@@ -4362,8 +4388,25 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
+        let kept = self.released_kept(id, node).unwrap_or_else(|| {
+            let mut n = 0;
+            node.for_each_dep(|_| n += 1);
+            n
+        });
         // Any outcome lands New, which recomputes.
         self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag);
+        let mut kept_all = true;
+        let mut n = 0;
+        node.for_each_dep(|_| {
+            n += 1;
+            kept_all &= n <= kept;
+        });
+        if !kept_all {
+            self.inner
+                .write()
+                .released_deps
+                .insert(id.0, (node.generation(), kept));
+        }
         if wrote {
             node.max_changed_at(attempt.stamp_rev);
         } else if attempt.first {
@@ -4371,6 +4414,16 @@ impl<C: Cells> Runtime<C> {
         }
         self.children_landing(id, flags, ChildLanding::Discard, false, bag);
         self.land_single(id, node, flags, NodeState::New, NodeState::New);
+    }
+
+    /// How many of `id`'s deps, from the front, its last finished run read,
+    /// if a user panic released it New over more.
+    #[cold]
+    #[inline(never)]
+    fn released_kept(&self, id: NodeId, node: &NodeData<C>) -> Option<u32> {
+        let inner = self.inner.read();
+        let &(generation, kept) = inner.released_deps.get(&id.0)?;
+        (generation == node.generation()).then_some(kept)
     }
 
     /// A frame pop found the memo, unwind or replay bit in the thread word.
@@ -4774,6 +4827,9 @@ impl<C: Cells> Runtime<C> {
         // `Drop` under this hold otherwise.
         if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
+        }
+        if !inner.released_deps.is_empty() {
+            inner.released_deps.remove(&id.0);
         }
 
         for old_dep in diff.old {

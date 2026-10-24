@@ -4173,6 +4173,24 @@ fn a_tainted_group_release_gives_a_clean_entry_orders_value() {
     });
 }
 
+/// Seed 0x39e2, unbounded: op 0's panic releases the claims of 0's reads,
+/// and they land New over the deps their runs recorded. Op 1's `Get(4)`
+/// walk expanded those deps and ran 3 first, so the cycle through 4 was
+/// entered at 3 and panicked "boom 0:3", where a fresh run of 4 enters it
+/// at 4 and gets 7777.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_leaves_a_new_nodes_deps_to_its_run() {
+    let mut case = gen_case(0x39e2, false, false);
+    case.ops.truncate(2);
+    assert!(matches!(case.ops[1], Op::Get(4)));
+    quiet(|| {
+        for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
+            assert!(matches!(trace[1].0, Out::Value(7777)), "{:?}", trace[1].0);
+        }
+    });
+}
+
 /// [`differential`]'s runs, compared by their operations' outcomes alone.
 fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
