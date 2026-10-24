@@ -118,6 +118,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn read_failed_node(&self, id: NodeId) {
+        self.park(ParkPoint::FailedReadBeforeTake(id));
         let Ok(payload) = self.take_contained(id) else {
             return;
         };

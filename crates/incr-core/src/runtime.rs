@@ -215,6 +215,9 @@ pub(crate) enum ParkPoint {
     /// In a Failed read that found a payload it may take, after it loaded
     /// the node's generation and before the record lock.
     FailedReadBeforeRecheck(NodeId),
+    /// In `read_failed_node`, before `take_contained` loads the slot's
+    /// generation.
+    FailedReadBeforeTake(NodeId),
     /// In `seed_query`'s `inner.write()`, before the trust check of the
     /// trusted dep `NodeId`.
     SeedBeforeTrust(NodeId),

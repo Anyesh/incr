@@ -1732,6 +1732,69 @@ fn a_claim_released_unrun_ends_its_waiters_wait() {
     rt.assert_invariant_i();
 }
 
+/// A read of X finds it Computing on another thread and parks before its
+/// walk waits on the root. X lands, is deleted, and its slot is recycled
+/// into Z, which reads D and is left Dirty by a set under D. The read
+/// panics as stale, as in the serial order with the delete first, and D's
+/// closure does not run on its behalf.
+#[test]
+fn shared_root_wait_finds_its_slot_recycled_into_a_dirty_node() {
+    let rt = Arc::new(Rt::new());
+    let i = rt.create_input(1_u64);
+    let d_runs = Arc::new(AtomicUsize::new(0));
+    let d = {
+        let d_runs = Arc::clone(&d_runs);
+        rt.create_query(move |rt: &Rt| {
+            d_runs.fetch_add(1, Ordering::SeqCst);
+            rt.get(i) * 10
+        })
+    };
+    let computing = Gate::new();
+    let x = {
+        let computing = computing.clone();
+        rt.create_query(move |_: &Rt| {
+            computing.park();
+            5_u64
+        })
+    };
+    computing.arm();
+    let computer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(x))
+    };
+    computing.wait_parked();
+    // The computer passed its own `BeforeComputeOne(x)` before parking.
+    let waiting = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::BeforeComputeOne(id(x)), waiting.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).map_err(panic_message))
+    };
+    waiting.wait_parked();
+    computing.release();
+    assert_eq!(computer.join().unwrap(), 5);
+    rt.delete_node(x);
+    let z = rt.create_query(move |rt: &Rt| rt.get(d) + 1);
+    assert_eq!(z.slot(), x.slot(), "Z reuses X's slot");
+    assert_eq!(rt.get(z), 11);
+    rt.set(i, 2);
+    assert_eq!(rt.state_of(z), NodeState::Dirty);
+    assert_eq!(d_runs.load(Ordering::SeqCst), 1);
+    waiting.release();
+    let got = reader.join().unwrap();
+    assert!(got.as_ref().is_err_and(|m| m.contains("stale")), "{got:?}");
+    assert_eq!(
+        d_runs.load(Ordering::SeqCst),
+        1,
+        "D ran on the reader's behalf"
+    );
+    assert_eq!(rt.get(z), 21, "Z kept its own landing");
+    rt.assert_invariant_i();
+}
+
 #[test]
 fn a_claim_from_new_released_unrun_after_a_set_stays_new() {
     let rt = Arc::new(Rt::new());

@@ -955,6 +955,58 @@ fn shared_delete_and_recycle_between_scan_and_claim() {
     delete_and_recycle_during_replay(Recycle::BeforeClaim);
 }
 
+/// As `between_scan_and_claim`, but the other thread deletes T itself,
+/// the node Y's read judges, and recycles its slot into a New query Z.
+/// `get(T)` panics as stale, as the unbounded run does with the delete
+/// first, and Z's closure never runs and Z stays New.
+#[test]
+fn shared_virtual_claim_of_a_target_recycled_into_a_new_node() {
+    let s = below_shape(Rt::new());
+    s.rt.set_max_frames(1);
+    let gate = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeVirtualClaim(id(s.t)), gate.clone())],
+    );
+    gate.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    gate.wait_parked();
+    s.rt.delete_node(s.t);
+    let z_runs = Arc::new(AtomicU32::new(0));
+    let z = {
+        let z_runs = z_runs.clone();
+        s.rt.create_query_with(
+            move |_: &Rt| {
+                z_runs.fetch_add(1, SeqCst);
+                9_u64
+            },
+            replayable(),
+        )
+    };
+    assert_eq!(z.slot(), s.t.slot(), "Z reuses T's slot");
+    gate.release();
+    let got = reader.join();
+
+    let unbounded = below_shape(Rt::new());
+    unbounded.rt.set_max_frames(u32::MAX);
+    unbounded.rt.delete_node(unbounded.t);
+    unbounded
+        .rt
+        .create_query_with(|_: &Rt| 9_u64, replayable::<u64>());
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("stale")),
+        "{want:?}"
+    );
+    assert_eq!(got, want);
+    assert_eq!(z_runs.load(SeqCst), 0, "Z ran on the reader's behalf");
+    assert_eq!(s.rt.state_of(z), NodeState::New);
+    s.rt.assert_invariant_i();
+}
+
 /// The Local form of a delete during replay: Y's closure deletes X, whose
 /// virtual frame stands for a frame on the stack below Y, and panics as
 /// a delete from inside the node's own compute, as the unbounded run's
@@ -2512,6 +2564,55 @@ fn shared_entry_finds_its_slot_recycled_into_a_failed_node() {
 #[test]
 fn shared_entry_finds_its_slot_recycled_into_a_clean_node() {
     entry_finds_its_slot_recycled(false);
+}
+
+/// X landed Failed by its own panic. A read of X parks in the Failed arm
+/// before it looks for a contained payload; another thread deletes X and
+/// recycles its slot into Z, which a walk of W lands Failed with a held
+/// "z boom" ticket. The read panics as stale, as in the serial order with
+/// the delete first, and Z keeps its ticket for Z's own reader.
+#[test]
+fn shared_failed_read_finds_its_slot_recycled_into_a_contained_failure() {
+    let rt = Arc::new(Rt::new());
+    let sel = rt.create_input(0_u64);
+    let j = rt.create_input(1_u64);
+    let x = rt.create_query(|_: &Rt| -> u64 { panic!("x boom") });
+    assert_eq!(outcome(|| rt.get(x)), Err("x boom".to_string()));
+    let gate = Gate::new();
+    hook(
+        &rt,
+        vec![(ParkPoint::FailedReadBeforeTake(id(x)), gate.clone())],
+    );
+    gate.arm();
+    let reader = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    rt.delete_node(x);
+    let z = rt.create_query(move |rt: &Rt| {
+        let v = rt.get(j);
+        assert!(v != 0, "z boom");
+        v
+    });
+    assert_eq!(z.slot(), x.slot(), "Z reuses X's slot");
+    let w = rt.create_query(move |rt: &Rt| if rt.get(sel) == 0 { rt.get(z) } else { 100 });
+    assert_eq!(rt.get(w), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(w), 100);
+    assert_eq!(rt.state_of(z), NodeState::Failed);
+    assert_eq!(rt.contained_payloads(), 1);
+    gate.release();
+    let got = reader.join();
+    assert!(got.as_ref().is_err_and(|m| m.contains("stale")), "{got:?}");
+    assert_eq!(rt.contained_payloads(), 1, "the read took Z's ticket");
+    assert_eq!(
+        outcome(|| rt.get(z)),
+        Err("z boom".to_string()),
+        "Z kept its own landing"
+    );
+    rt.assert_invariant_i();
 }
 
 /// Records whether it was dropped while its thread was unwinding, where a
