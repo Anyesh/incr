@@ -36,6 +36,10 @@ All notable changes to this project are documented here. Format roughly follows 
 - Under `Local`, a `Drop` of the value a `set` displaced that panicked left the slot holding the dropped value; the slot now holds the new value before the old one is dropped.
 - A `PersistedCollection` reopened, declared late or caught up across a compaction could store a different one of two equal elements that encode differently (`0.0` and `-0.0`, say) than the process that wrote them, because the log's elements were folded in hash order and removed by bytes. The fold now keeps insertion order and keeps element records raw from the first remove whose result depends on the element type's `Eq`, so every process stores the first inserted of equal elements, as the runtime does.
 
+### Known limitations
+
+- A repeated `get` of a node in a cycle can return a different result with no `set` in between. Usually only the first `get` differs: it lands the node Dirty, or panics with the cycle on entering it at a query with no cycle strategy, and later `get`s agree with each other. It alternates between two values when a cycle member's closure catches another member's cycle panic and the node sits in two overlapping cycles.
+
 ## [0.2.0-beta.5] - unreleased
 
 ### Added

@@ -1175,17 +1175,22 @@ impl<C: Cells> Runtime<C> {
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
 
-    /// The key parts a read by this runtime's frame of `node` at `cidx`
-    /// gets from this runtime: the node's generation, the frame's path and,
-    /// for a member run, its episode.
-    fn key_parts(&self, node: u32, cidx: u32, member: bool) -> replay::KeyParts {
+    /// The key parts a read by this runtime's frame `f` gets from this
+    /// runtime: the node's generation, the frame's path, for a member run
+    /// its episode, and its run's seq, looked up as [`Self::path_at`] and
+    /// the virtual frames look it up, so a retry's key matches the
+    /// deliveries made for it.
+    fn key_parts(&self, f: ActiveRead, member: bool) -> replay::KeyParts {
+        let rt = self.runtime_id;
+        let node = f.node.0;
         let episode = member
-            .then(|| cycle_state::held_episode(self.runtime_id, node))
+            .then(|| cycle_state::held_episode(rt, node))
             .flatten();
         (
             self.nodes.get(node).generation(),
-            self.path_at(cidx),
+            self.path_at(f.cidx),
             episode,
+            replay::seq_of(rt, f.ctl, f.depth),
         )
     }
 
@@ -1212,7 +1217,19 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the caller's contract; the driver that opened the context
         // holds the runtime until it closes it.
         let rt = unsafe { &*owner.cast::<Self>() };
-        rt.key_parts(node, cidx, member)
+        let top = rt.dep_stack.top_frame();
+        debug_assert!(top.is_some_and(|(r, n, _, c)| (r, n.0, c) == (rt.runtime_id, node, cidx)));
+        let (_, node, ctl, cidx) = top.expect("incr-core: the reading frame is on the stack");
+        let depth = rt.dep_stack.depth() as u32;
+        rt.key_parts(
+            ActiveRead {
+                node,
+                ctl,
+                cidx,
+                depth,
+            },
+            member,
+        )
     }
 
     /// A read of `handle` by another runtime's frame, which may be doomed
@@ -1332,7 +1349,8 @@ impl<C: Cells> Runtime<C> {
         let keys = replay::frame_keys(reader)?;
         let member = flags.has(cycle::BUFFERED);
         // SAFETY: the keys come from an open context of `reader`.
-        let (generation, path, episode) = unsafe { (keys.parts)(keys.owner, node.0, cidx, member) };
+        let (generation, path, episode, seq) =
+            unsafe { (keys.parts)(keys.owner, node.0, cidx, member) };
         Some(ReadKey {
             node: node.0,
             generation,
@@ -1340,6 +1358,7 @@ impl<C: Cells> Runtime<C> {
             reading,
             ordinal,
             path,
+            seq,
             episode,
             foreign: Some(self.runtime_id),
         })
@@ -1434,6 +1453,7 @@ impl<C: Cells> Runtime<C> {
                 Some((cidx, path, step)) if cidx + 1 == f.cidx => replay::extend_path(path, step),
                 _ => self.path_at(f.cidx),
             };
+            f.step.seq = replay::seq_of(rt, f.ctl, f.depth);
             below = Some((f.cidx, f.path, f.step));
         }
         frames
@@ -1571,6 +1591,7 @@ impl<C: Cells> Runtime<C> {
                     reading: f.step.reading,
                     ordinal: f.step.ordinal,
                     path: f.path,
+                    seq: f.step.seq,
                     maker: 0,
                     ep: if ctl.has(cycle::BUFFERED) {
                         replay::member_run_episode(f.cidx)
@@ -1647,6 +1668,7 @@ impl<C: Cells> Runtime<C> {
                         resumed: None,
                         landed: None,
                         passed: true,
+                        runs: replay::RunSlot::default(),
                     });
                 }
             }
@@ -1913,19 +1935,19 @@ impl<C: Cells> Runtime<C> {
                     if let Some((u, false)) = popped_frames.last() {
                         let read = u.computes;
                         replay::with(|c| {
-                            if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                                if let Some(w) = x
-                                    .vstack
-                                    .last()
-                                    .filter(|w| {
-                                        w.cidx + 1 == u.cidx
-                                            && w.reading == read
-                                            && w.maker == u.maker
-                                    })
-                                    .cloned()
-                                {
-                                    x.deliver_direct(&w);
-                                }
+                            let Some(at) = c.iter().position(|x| x.id == id) else {
+                                return;
+                            };
+                            if let Some(w) = c[at]
+                                .vstack
+                                .last()
+                                .filter(|w| {
+                                    w.cidx + 1 == u.cidx && w.reading == read && w.maker == u.maker
+                                })
+                                .cloned()
+                            {
+                                let runs = replay::run_snapshot(c, self.runtime_id, &w);
+                                c[at].deliver_direct(&w, runs);
                             }
                         });
                     }
@@ -1952,8 +1974,9 @@ impl<C: Cells> Runtime<C> {
                     let read = u.computes;
                     if u.cidx == v.cidx + 1 && v.reading == read {
                         replay::with(|c| {
+                            let runs = replay::run_snapshot(c, self.runtime_id, &v);
                             if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                                x.deliver_direct(&v);
+                                x.deliver_direct(&v, runs);
                             }
                         });
                     }
@@ -2113,8 +2136,9 @@ impl<C: Cells> Runtime<C> {
                     .find(|(w, _)| w.cidx + 1 == v.cidx && w.reading == read)
                 {
                     replay::with(|c| {
+                        let runs = replay::run_snapshot(c, self.runtime_id, w);
                         if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                            x.deliver_direct(w);
+                            x.deliver_direct(w, runs);
                         }
                     });
                 }
@@ -2138,19 +2162,25 @@ impl<C: Cells> Runtime<C> {
                             visit,
                             Some(entry.generation),
                             entry.walked,
+                            None,
                         )
                     } else {
                         let (id, generation) = (NodeId(entry.node), Some(entry.generation));
                         match entry.retry {
                             Retry::Walk => self.ensure_clean_virt(id, entry.generation),
-                            Retry::Compute => {
-                                self.compute_one::<VIRT>(id, Visit::Full, generation, entry.walked)
-                            }
+                            Retry::Compute => self.compute_one::<VIRT>(
+                                id,
+                                Visit::Full,
+                                generation,
+                                entry.walked,
+                                None,
+                            ),
                             Retry::Direct => self.compute_one::<VIRT>(
                                 id,
                                 Visit::Direct,
                                 generation,
                                 entry.walked,
+                                None,
                             ),
                         }
                     }
@@ -2294,11 +2324,11 @@ impl<C: Cells> Runtime<C> {
                     .unwrap()
                     .push(cycle_impl::EpisodeSeen::of(&ep, Some(queued_above)));
             }
-            let root = ep.root;
+            let (root, cidx) = (ep.root, ep.cidx);
             let mut bag = Deferred::new();
             let end = catch_unwind(AssertUnwindSafe(|| self.run_episode(ep, &mut bag)));
             return match end {
-                Ok(end) => self.episode_task_end(root, end, bag),
+                Ok(end) => self.episode_task_end(root, cidx, end, bag),
                 Err(payload) => self.vframe_unwound(id, v, root.0, false, payload, failures),
             };
         }
@@ -2455,7 +2485,7 @@ impl<C: Cells> Runtime<C> {
             self.episode(NodeId(v.node), v.cidx, v.walked, &mut bag)
         }));
         match end {
-            Ok(end) => self.episode_task_end(NodeId(v.node), end, bag),
+            Ok(end) => self.episode_task_end(NodeId(v.node), v.cidx, end, bag),
             Err(payload) => self.vframe_unwound(id, v, v.node, false, payload, failures),
         }
     }
@@ -2482,7 +2512,10 @@ impl<C: Cells> Runtime<C> {
     /// unbounded run's frame goes on to compute the root alone and leaves
     /// it there. A suspended episode restarts the driver, which runs the
     /// entries its doom pushed first.
-    fn episode_task_end(&self, root: NodeId, end: PopEnd, mut bag: Deferred<C>) -> VPop {
+    fn episode_task_end(&self, root: NodeId, cidx: u32, end: PopEnd, mut bag: Deferred<C>) -> VPop {
+        if matches!(end, PopEnd::Dissolved | PopEnd::Retry) {
+            self.rerun_root(root, cidx);
+        }
         let pop = match end {
             PopEnd::Suspended => VPop::Restart(true),
             PopEnd::Landed => VPop::Finished(root.0, Ended::Landed),
@@ -2681,6 +2714,46 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         });
+    }
+
+    /// The run of `id` at `cidx`, whose control block is `ctl`, starts
+    /// (see [`replay::start_run`]). Both a compute and a member run call it
+    /// with the replay bit set; it gives a seq only under a context of this
+    /// runtime.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn start_run(&self, id: NodeId, cidx: u32, ctl: &ComputeCtl) {
+        let rt = self.runtime_id;
+        if !replay::with(|c| replay::innermost(c, rt).is_some()) {
+            return;
+        }
+        let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
+        let depth = self.dep_stack.depth() as u32;
+        replay::start_run(rt, ctl, depth, frame, self.path_at(cidx));
+    }
+
+    /// The root of an episode at `cidx` that dissolved or went stale
+    /// computes again, as the unbounded run's does: another run, whose
+    /// reads walk afresh instead of taking what this run's reads were
+    /// given. Callers gate it on replay, so no other path pays for it.
+    pub(super) fn rerun_root(&self, root: NodeId, cidx: u32) {
+        self.end_run(root, cidx);
+    }
+
+    /// The run of `id` at `cidx` ended, not doomed: a later run of the
+    /// frame there is another run (see [`replay::end_run`]).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn end_run(&self, id: NodeId, cidx: u32) {
+        let rt = self.runtime_id;
+        let Some(below) = cidx.checked_sub(1) else {
+            return;
+        };
+        if !replay::with(|c| replay::covering(c, rt, below).is_some()) {
+            return;
+        }
+        let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
+        replay::end_run(rt, frame, self.path_at(cidx));
     }
 
     /// A run of `node` that finishes its virtual frame's frame starts: the
@@ -2963,7 +3036,7 @@ impl<C: Cells> Runtime<C> {
         // delivered once.
         // SAFETY: the active frame's control block is live.
         let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
-        let (generation, path, episode) = self.key_parts(f.node.0, f.cidx, member);
+        let (generation, path, episode, seq) = self.key_parts(f, member);
         let key = ReadKey {
             node: f.node.0,
             generation,
@@ -2971,20 +3044,34 @@ impl<C: Cells> Runtime<C> {
             reading,
             ordinal: self.dep_stack.reads_of_current(rt),
             path,
+            seq,
             episode,
             foreign: None,
         };
+        let above = replay::extend_path(
+            path,
+            replay::Step {
+                node: f.node.0,
+                episode,
+                reading,
+                ordinal: key.ordinal,
+                seq,
+            },
+        );
         let what = replay::take_pending(rt, &key, clone_landed::<T>);
         let Some(what) = what else {
             let slot = handle.slot();
-            replay::with(|c| {
+            let resumed = replay::with(|c| {
+                let mut resumed = None;
                 for x in c.iter_mut().filter(|x| x.rt == rt) {
                     x.direct = None;
                     if let Some(i) = x
                         .pending
                         .find_keyed(&key, |d| !d.taken && matches!(d.what, Delivered::Direct))
                     {
-                        x.pending.get_mut(i).taken = true;
+                        let d = x.pending.get_mut(i);
+                        d.taken = true;
+                        resumed = Some(d.runs.clone());
                         x.direct = Some((slot, handle.generation(), f.cidx));
                     }
                     x.resume = None;
@@ -2994,15 +3081,19 @@ impl<C: Cells> Runtime<C> {
                     {
                         let d = x.pending.get_mut(i);
                         d.taken = true;
+                        resumed = Some(d.runs.clone());
                         if let Delivered::Walk(walk, _) = &d.what {
                             let walk = (**walk).clone();
                             x.resume = Some((reading, f.cidx, walk));
                         }
                     }
                 }
+                resumed
             });
+            replay::start_read(rt, f.cidx, f.depth, above, resumed);
             return None;
         };
+        replay::start_read(rt, f.cidx, f.depth, above, None);
         // A read of a held node lowers its reader to the node's anchor,
         // whatever the read returns, as the read rules do.
         if let Some(anchor) = cycle_state::held_anchor(rt, handle.slot()) {
@@ -3059,17 +3150,17 @@ impl<C: Cells> Runtime<C> {
         }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
-        // passes on as an ordinary panic, as `entered` does, unless a member
-        // run read a member of its own episode: that read is R5's, whose
-        // unwind stays the cycle's (`member_run_unwound`). It carries the
-        // landings noted for it before the catch, as the native box does.
+        // passes on as an ordinary panic, as `entered` does, unless the read
+        // was of a member this thread holds: that read is R5's, from any
+        // frame, whose unwind stays the cycle's (`member_run_unwound`). It
+        // carries the landings noted for it before the catch, as the native
+        // box does.
         let payload = match payload.downcast::<crate::cycle::CycleUnwind>() {
             Ok(unwind) if kind == ReadKind::TryGet => return Some(Err(unwind.0)),
             Ok(unwind) => unwind,
             Err(payload) => {
                 self.note_delivered(nodes, &*payload);
-                let r5 =
-                    episode.is_some() && cycle_state::held_episode(rt, handle.slot()) == episode;
+                let r5 = cycle_state::held_episode(rt, handle.slot()).is_some();
                 if kind == ReadKind::TryGet && !r5 {
                     resume_unwind(payload);
                 }
@@ -3291,12 +3382,16 @@ impl<C: Cells> Runtime<C> {
                 })
         });
         let (from, path) = base.map_or((0, 0), |(at, path)| (at + 1, path));
-        self.dep_stack.with(|s| {
-            s.frames
-                .iter()
-                .filter(|f| f.rt == rt && (from..cidx).contains(&f.cidx))
-                .map(|f| f.step())
-                .fold(path, replay::extend_path)
+        replay::with_seqs(|seqs| {
+            self.dep_stack.with(|s| {
+                (s.frames.iter().zip(1..))
+                    .filter(|(f, _)| f.rt == rt && (from..cidx).contains(&f.cidx))
+                    .fold(path, |path, (f, depth)| {
+                        let mut step = f.step();
+                        step.seq = seqs.of(rt, f.ctl, depth);
+                        replay::extend_path(path, step)
+                    })
+            })
         })
     }
 
@@ -3473,8 +3568,8 @@ impl<C: Cells> Runtime<C> {
         };
         let reading = u64::from(root.0) | (u64::from(self.nodes.get(root.0).generation()) << 32);
         replay::with(|c| {
-            for x in c.iter_mut().filter(|x| x.rt == rt).rev() {
-                if let Some(v) = x
+            for i in (0..c.len()).rev().filter(|&i| c[i].rt == rt) {
+                if let Some(v) = c[i]
                     .vstack
                     .iter()
                     .rev()
@@ -3482,10 +3577,13 @@ impl<C: Cells> Runtime<C> {
                     .cloned()
                 {
                     match walk {
-                        Some(walk) => x.deliver_walk(&v, std::mem::take(walk), pushed),
+                        Some(walk) => {
+                            let runs = replay::run_snapshot(c, rt, &v);
+                            c[i].deliver_walk(&v, std::mem::take(walk), pushed, runs);
+                        }
                         None => {
                             let key = ReadKey::blocked(&v);
-                            x.pending
+                            c[i].pending
                                 .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..)));
                         }
                     }

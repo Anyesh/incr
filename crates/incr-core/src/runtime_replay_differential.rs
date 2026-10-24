@@ -1300,6 +1300,8 @@ fn run_two(case: &Case, phases: &[Phase], frames: Option<u32>, bytes: usize) -> 
 thread_local! {
     /// Which of a two-thread run's threads this is.
     static TWO_THREAD: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The phase a two-thread run's thread is in.
+    static TWO_PHASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Thread 0's call at the end of each read phase with two reads, by the
@@ -1344,6 +1346,7 @@ fn run_two_until(
                         break;
                     }
                     if let Some(i) = phase.of(t) {
+                        TWO_PHASE.with(|c| c.set(p));
                         let op = &case.ops[i];
                         match catch_unwind(AssertUnwindSafe(|| record(|| live.apply(op)))) {
                             Ok((out, ran)) => {
@@ -2493,16 +2496,34 @@ fn labelled<T>(label: &str, f: impl FnOnce() -> T) -> T {
     })
 }
 
+/// The budgets a single-thread differential compares with the unbounded
+/// run: each frame budget with and without a byte budget, and the byte
+/// budget alone.
+const BUDGETS: [(Option<u32>, usize); 7] = [
+    (Some(1), 0),
+    (Some(1), 16 * 1024),
+    (Some(2), 0),
+    (Some(2), 16 * 1024),
+    (Some(3), 0),
+    (Some(3), 16 * 1024),
+    (None, 16 * 1024),
+];
+
+fn budget_label(seed: u64, frames: Option<u32>, bytes: usize) -> String {
+    match frames {
+        Some(frames) => format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes"),
+        None => format!("seed {seed:#x}, budget None frames, {bytes} bytes"),
+    }
+}
+
 fn differential<C: Cells>(case: &Case, seed: u64) {
     let unbounded = labelled(&format!("seed {seed:#x}, unbounded"), || {
         run::<C>(case, None, 0)
     });
-    for frames in [1, 2, 3] {
-        for bytes in [0, 16 * 1024] {
-            let label = format!("seed {seed:#x}, budget {frames} frames, {bytes} bytes");
-            let bounded = labelled(&label, || run::<C>(case, Some(frames), bytes));
-            compare(case, &unbounded, &bounded, &label);
-        }
+    for (frames, bytes) in BUDGETS {
+        let label = budget_label(seed, frames, bytes);
+        let bounded = labelled(&label, || run::<C>(case, frames, bytes));
+        compare(case, &unbounded, &bounded, &label);
     }
 }
 
@@ -3024,6 +3045,70 @@ fn a_member_try_get_keeps_a_swallowing_closures_cycle() {
     }
 }
 
+/// Member 5 (created first) try_gets 1, and then 4 on discovery's `Err`
+/// but 3 once 1 has a buffer, so 3 joins the episode only in 5's member
+/// run, where it computes natively. 3's `try_get` of 4, a held member
+/// without a buffer, is R5 in the unbounded run: 4 swallows the cycle on 5
+/// and panics, and that unwind stays the cycle's, so the episode's abort
+/// leaves 3 New. A bounded run delivers 4's unwind to 3's retry, which is
+/// not a member run, so `take_delivery` passes it on as an ordinary panic
+/// and 3 lands Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_native_try_get_of_a_held_member_keeps_a_swallowing_closures_cycle() {
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let case = Case {
+        specs: vec![
+            replayable(Expr::Read(1, false), Strat::None),
+            replayable(
+                Expr::Add(r(2, false), Box::new(Expr::Const(1))),
+                Strat::None,
+            ),
+            replayable(Expr::Read(5, true), Strat::None),
+            replayable(Expr::Read(4, true), Strat::None),
+            replayable(
+                Expr::If(
+                    Box::new(Expr::Catch(r(1, false))),
+                    Box::new(Expr::PanicIf(Box::new(Expr::Catch(r(5, false))), 3)),
+                    Box::new(Expr::Const(0)),
+                ),
+                Strat::None,
+            ),
+            replayable(Expr::If(r(1, true), r(3, true), r(4, true)), Strat::None),
+            Spec::Input(1),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 6,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0)],
+    };
+    fn outcomes<C: Cells>(case: &Case, frames: Option<u32>) -> Vec<(Out, Vec<NodeState>)> {
+        run::<C>(case, frames, 0)
+            .into_iter()
+            .map(|(out, snap)| (out, snap.0))
+            .collect()
+    }
+    quiet(|| {
+        let unbounded = outcomes::<Local>(&case, None);
+        assert_eq!(unbounded[0].1[3], NodeState::New);
+        assert_eq!(outcomes::<Shared>(&case, None), unbounded);
+        for frames in 1..=3 {
+            assert_eq!(
+                outcomes::<Local>(&case, Some(frames)),
+                unbounded,
+                "Local, budget {frames}"
+            );
+            assert_eq!(
+                outcomes::<Shared>(&case, Some(frames)),
+                unbounded,
+                "Shared, budget {frames}"
+            );
+        }
+    });
+}
+
 /// Seed 0xd3713dd8cf68c605, shrunk. 4 reads the ring 5, 6, 7, 8, 9, 10,
 /// where 10, a Fallback(0) member, reads the input and 5, and 7 panics on
 /// 8's value. At budget 2 the first pass delivered 9's cycle to 8's read
@@ -3515,9 +3600,26 @@ fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
     case.ops.truncate(10);
     assert!(matches!(case.ops[9], Op::Get(12)));
     quiet(|| {
-        differential::<Local>(&case, seed);
-        differential::<Shared>(&case, seed);
+        // A forced prune leaves the unread node 8 Dirty where the doomed
+        // walk's retry computes it: walk scope, not a result.
+        if *super::FORCE_REPLAN {
+            outcomes_alike::<Local>(&case, seed);
+            outcomes_alike::<Shared>(&case, seed);
+        } else {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        }
     });
+}
+
+/// [`differential`]'s runs, compared by their operations' outcomes alone.
+fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
+    let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
+    let unbounded = outcomes(run::<C>(case, None, 0));
+    for (frames, bytes) in BUDGETS {
+        let bounded = outcomes(run::<C>(case, frames, bytes));
+        assert_eq!(bounded, unbounded, "{}", budget_label(seed, frames, bytes));
+    }
 }
 
 /// Seeds 0x833e (and 0x41eb, in [`strict_dirty_for_clean_seeds`]), one thread, and the two-thread seed 0x2b13
@@ -5297,7 +5399,9 @@ fn two_threads() -> bool {
 }
 
 /// The case for `seed`, the base one if `REPLAY_BASE` is set, with a
-/// second runtime if `REPLAY_CROSS` is.
+/// second runtime if `REPLAY_CROSS` is, and the two-thread form of the
+/// case if `REPLAY_TWO` or `REPLAY_PAIRED` is: `REPLAY_PAIRED` alone runs
+/// that case through the single-thread differential.
 fn case_of(seed: u64) -> Case {
     if std::env::var_os("REPLAY_BASE").is_some() {
         gen_base(seed)
@@ -5305,7 +5409,7 @@ fn case_of(seed: u64) -> Case {
         gen_case(
             seed,
             std::env::var_os("REPLAY_CROSS").is_some(),
-            two_threads(),
+            two_threads() || std::env::var_os("REPLAY_PAIRED").is_some(),
         )
     }
 }
@@ -5385,7 +5489,8 @@ fn size(e: &Expr) -> usize {
 
 /// The smallest failing case among seeds `0..REPLAY_SCAN`, by total
 /// expression size and operation count, under Shared if `REPLAY_SHARED`
-/// is set and on two threads if `REPLAY_TWO` is.
+/// is set, on two threads if `REPLAY_TWO` is, and over the two-thread
+/// cases on one thread if `REPLAY_PAIRED` is.
 #[test]
 #[ignore = "a diagnostic that scans seeds"]
 fn replay_scan() {
@@ -6076,5 +6181,460 @@ fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
             let shared = outs(run::<Shared>(&case, Some(frames), 0));
             assert_eq!(shared, unbounded, "Shared, budget {frames}");
         }
+    });
+}
+
+/// `seed`'s operations with every `Get` read four more times with no set
+/// between, and the first get whose repeats differ from it, any panic
+/// counting as the same outcome: a Failed node's later reads raise
+/// "last compute panicked" in place of the first read's payload.
+fn first_changed_get<C: Cells>(seed: u64) -> Option<(usize, Vec<Out>)> {
+    let mut case = gen_case(seed, false, false);
+    case.ops = case
+        .ops
+        .drain(..)
+        .flat_map(|op| {
+            let n = if matches!(op, Op::Get(_)) { 5 } else { 1 };
+            std::iter::repeat_n(op, n)
+        })
+        .collect();
+    let mut trace = Vec::new();
+    quiet(|| trace = run::<C>(&case, None, 0));
+    let outcome = |i: usize| match &trace[i].0 {
+        Out::Panic(_) => Out::Panic(String::new()),
+        o => o.clone(),
+    };
+    let mut i = 0;
+    while i < case.ops.len() {
+        if !matches!(case.ops[i], Op::Get(_)) {
+            i += 1;
+            continue;
+        }
+        if (i + 1..i + 5).any(|j| outcome(j) != outcome(i)) {
+            return Some((i, trace[i..i + 5].iter().map(|(o, _)| o.clone()).collect()));
+        }
+        i += 5;
+    }
+    None
+}
+
+/// 0x1a7: q7 catches a co-member's cycle panic and sits in two
+/// overlapping episodes, so each episode lands Dirty through real poison
+/// and the next get plans the other cycle: 9999, 8, 9999, ... 0x4ea
+/// alternates the same way, and 0x701 reads 9999, 4, 9999. Keeping a
+/// Dirty landing's outcome for its revision (T8-get-alternates-without-set,
+/// rule (b)) is beta.7 work.
+#[test]
+#[ignore = "beta.7: T8-get-alternates-without-set rule (b)"]
+fn a_member_catching_a_co_members_cycle_panic_repeats_its_get() {
+    for seed in [0x1a7, 0x4ea, 0x701] {
+        assert_eq!(first_changed_get::<Local>(seed), None, "{seed:#x}");
+        assert_eq!(first_changed_get::<Shared>(seed), None, "{seed:#x}");
+    }
+}
+
+/// Runs `case`'s phase of ops `pair` on two threads with thread 0's
+/// walk held before its compute of query `held`, until thread 1's read
+/// has settled `settled` and left `left` as they are (by query), then
+/// checks the run against the orders.
+fn hold_planned_walk(
+    case: &Case,
+    seed: u64,
+    pair: [usize; 2],
+    held: usize,
+    settled: &'static [(usize, NodeState)],
+) -> Trace {
+    let phases = phases(case, seed);
+    let overlap = phases.iter().position(|p| p.ops() == pair).unwrap();
+    assert_eq!(phases[overlap].of(0), Some(pair[0]));
+    let ready = Arc::new(AtomicBool::new(false));
+    let rig = |live: &Live<Shared>| {
+        let (ready, world) = (ready.clone(), live.world.clone());
+        let slot = move |q| world.handle(0, q).erased().slot();
+        let world = live.world.clone();
+        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+            if TWO_PHASE.with(std::cell::Cell::get) != overlap {
+                return;
+            }
+            let state = |q| world.rt(0).nodes.get(slot(q)).state();
+            match TWO_THREAD.with(std::cell::Cell::get) {
+                Some(0)
+                    if p == ParkPoint::BeforeComputeOne(NodeId(slot(held)))
+                        && !ready.swap(true, SeqCst) =>
+                {
+                    until(|| settled.iter().all(|&(q, s)| state(q) == s));
+                }
+                Some(1) => until(|| ready.load(SeqCst)),
+                _ => {}
+            }
+        });
+        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+    };
+    let serial = Serial::new(case, &phases);
+    let verdict = Mutex::new(None);
+    let got = run_two_until(case, &phases, None, 0, &rig, &|p, prefix, live| {
+        if p == overlap {
+            assert!(
+                ready.load(SeqCst),
+                "thread 0's walk reached the held compute"
+            );
+            assert!(
+                live.world.rt(0).unrun_unclaims.load(SeqCst) > 0,
+                "thread 0's walk re-planned"
+            );
+        }
+        let v = serial.at_overlap("held walk", prefix, live);
+        let stop = v.is_some();
+        *verdict.lock().unwrap() = v;
+        stop
+    });
+    serial.check("held walk", &got, verdict.into_inner().unwrap());
+    got
+}
+
+/// 0x7c3a12bcc's ops 8 (`Get(7)`, thread 0) and 9 (`Get(9)`, thread 1)
+/// enter one cycle at different members. Thread 0's walk of 7 plans down
+/// to 22 and is held there while thread 1 resolves the cycle alone: it
+/// lands 7 Clean by 7's fallback, leaves 22 and 23 New, and panics with
+/// the cycle, as `Get(9)` does first in a single thread. The order with
+/// `Get(9)` first then reads 7 Clean; a walk that goes on with its plan
+/// computes 22 again and panics too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_replans_after_another_thread_lands_its_root_by_a_cycle() {
+    let seed = 0x7c3a12bcc;
+    let case = gen_case(seed, false, true);
+    use NodeState::{Clean, Dirty, New};
+    quiet(|| {
+        let got = hold_planned_walk(
+            &case,
+            seed,
+            [8, 9],
+            22,
+            &[(7, Clean), (22, New), (23, New), (21, Dirty)],
+        );
+        assert_eq!(got[9].0, Out::Panic("cycle".into()));
+        assert_eq!(got[8].0, Out::Value(2));
+    });
+}
+
+/// As above with thread 0 reading 18, rewritten to read 7, so the node
+/// thread 1 lands Clean is an intermediate of thread 0's plan, not its
+/// root, and 18 stays Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_replans_after_another_thread_lands_an_intermediate_by_a_cycle() {
+    let seed = 0x7c3a12bcc;
+    let mut case = gen_case(seed, false, true);
+    case.specs[18] = Spec::Query {
+        expr: Expr::Read(7, false),
+        replay: true,
+        bare: false,
+        strategy: Strat::None,
+    };
+    case.ops[0] = Op::Get(18);
+    case.ops[8] = Op::Get(18);
+    use NodeState::{Clean, Dirty, New};
+    quiet(|| {
+        let got = hold_planned_walk(
+            &case,
+            seed,
+            [8, 9],
+            22,
+            &[(7, Clean), (22, New), (23, New), (21, Dirty), (18, Dirty)],
+        );
+        assert_eq!(got[9].0, Out::Panic("cycle".into()));
+        assert!(matches!(got[8].0, Out::Value(_)), "{:?}", got[8].0);
+    });
+}
+
+/// A differential panic's message from its budget on, joined to one line
+/// up to the trace.
+fn failure_message(p: Box<dyn std::any::Any + Send>) -> String {
+    let m = p
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    let m: Vec<&str> = m.lines().take_while(|l| !l.starts_with("ops:")).collect();
+    let m = m.join(" | ");
+    let at = m.find("budget ").unwrap_or(0);
+    m[at..].to_string()
+}
+
+/// Each expression `e` can become by replacing one of its subexpressions
+/// with a constant or with one of that subexpression's operands.
+fn shrink_expr(e: &Expr) -> Vec<Expr> {
+    let mut out = vec![Expr::Const(0), Expr::Const(1)];
+    let b = |e: &Expr| Box::new(e.clone());
+    match e {
+        Expr::Const(_) => out.clear(),
+        Expr::Read(n, true) => out.push(Expr::Read(*n, false)),
+        Expr::ReadOther(n, true) => out.push(Expr::ReadOther(*n, false)),
+        Expr::Read(..) | Expr::ReadOther(..) => {}
+        Expr::Add(x, y) => {
+            out.extend([(**x).clone(), (**y).clone()]);
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::Add(Box::new(x), b(y))),
+            );
+            out.extend(
+                shrink_expr(y)
+                    .into_iter()
+                    .map(|y| Expr::Add(b(x), Box::new(y))),
+            );
+        }
+        Expr::If(c, t, f) => {
+            out.extend([(**c).clone(), (**t).clone(), (**f).clone()]);
+            out.extend(
+                shrink_expr(c)
+                    .into_iter()
+                    .map(|c| Expr::If(Box::new(c), b(t), b(f))),
+            );
+            out.extend(
+                shrink_expr(t)
+                    .into_iter()
+                    .map(|t| Expr::If(b(c), Box::new(t), b(f))),
+            );
+            out.extend(
+                shrink_expr(f)
+                    .into_iter()
+                    .map(|f| Expr::If(b(c), b(t), Box::new(f))),
+            );
+        }
+        Expr::PanicIf(x, k) => {
+            out.push((**x).clone());
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::PanicIf(Box::new(x), *k)),
+            );
+        }
+        Expr::Catch(x) => {
+            out.push((**x).clone());
+            out.extend(shrink_expr(x).into_iter().map(|x| Expr::Catch(Box::new(x))));
+        }
+        Expr::FirstRun(x, y) => {
+            out.extend([(**x).clone(), (**y).clone()]);
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::FirstRun(Box::new(x), b(y))),
+            );
+            out.extend(
+                shrink_expr(y)
+                    .into_iter()
+                    .map(|y| Expr::FirstRun(b(x), Box::new(y))),
+            );
+        }
+    }
+    out
+}
+
+/// Each case `c` can become by one step: dropping an op, simplifying one
+/// query's expression, or clearing its strategy, `bare` or `replay`.
+fn shrink_case(c: &Case) -> Vec<Case> {
+    let mut out = Vec::new();
+    for i in 0..c.ops.len() {
+        let mut d = c.clone();
+        d.ops.remove(i);
+        out.push(d);
+    }
+    for (i, s) in c.specs.iter().enumerate() {
+        let Spec::Query {
+            expr,
+            replay,
+            bare,
+            strategy,
+        } = s
+        else {
+            continue;
+        };
+        let with = |expr: Expr, replay: bool, bare: bool, strategy: Strat| {
+            let mut d = c.clone();
+            d.specs[i] = Spec::Query {
+                expr,
+                replay,
+                bare,
+                strategy,
+            };
+            d
+        };
+        if !matches!(strategy, Strat::None) {
+            out.push(with(expr.clone(), *replay, *bare, Strat::None));
+        }
+        if *bare {
+            out.push(with(expr.clone(), *replay, false, *strategy));
+        }
+        if *replay {
+            out.push(with(expr.clone(), false, *bare, *strategy));
+        }
+        for e in shrink_expr(expr) {
+            out.push(with(e, *replay, *bare, *strategy));
+        }
+    }
+    out
+}
+
+/// Shrinks the single-thread run of `REPLAY_SEED`'s case (chosen as
+/// `replay_scan` chooses it) while its run at
+/// budget `REPLAY_FRAMES` (0 for none) frames, `REPLAY_BYTES` bytes, under
+/// Shared if `REPLAY_SHARED`, still fails with a message containing
+/// `SHRINK_NEEDLE`, and prints the case it ends at. Candidates whose runs
+/// panic with another message are counted, not kept.
+#[test]
+#[ignore = "a diagnostic that shrinks one seed's case"]
+fn replay_shrink() {
+    let seed = u64::from_str_radix(&std::env::var("REPLAY_SEED").expect("REPLAY_SEED"), 16)
+        .expect("a hex seed");
+    let frames: u32 = std::env::var("REPLAY_FRAMES").map_or(1, |v| v.parse().expect("frames"));
+    let frames = (frames > 0).then_some(frames);
+    let bytes: usize = std::env::var("REPLAY_BYTES").map_or(0, |v| v.parse().expect("bytes"));
+    let needle = std::env::var("SHRINK_NEEDLE").unwrap_or_else(|_| "differs".into());
+    let mut case = case_of(seed);
+    let fails = |c: &Case| -> Option<bool> {
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let label = budget_label(seed, frames, bytes);
+            if shared() {
+                let u = run::<Shared>(c, None, 0);
+                compare(c, &u, &run::<Shared>(c, frames, bytes), &label);
+            } else {
+                let u = run::<Local>(c, None, 0);
+                compare(c, &u, &run::<Local>(c, frames, bytes), &label);
+            }
+        }));
+        match r {
+            Ok(()) => Some(false),
+            Err(p) => {
+                let m = failure_message(p);
+                if m.contains(&needle) {
+                    Some(true)
+                } else if m.contains("differs") {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    let size = |c: &Case| format!("{:?}{:?}", c.specs, c.ops).len();
+    let (mut tried, mut other) = (0, 0);
+    quiet(|| {
+        assert_eq!(
+            fails(&case),
+            Some(true),
+            "seed {seed:#x} does not fail as asked"
+        );
+        loop {
+            let before = size(&case);
+            let next = shrink_case(&case).into_iter().find(|d| {
+                if size(d) >= before {
+                    return false;
+                }
+                tried += 1;
+                match fails(d) {
+                    Some(f) => f,
+                    None => {
+                        other += 1;
+                        false
+                    }
+                }
+            });
+            match next {
+                Some(d) => case = d,
+                None => break,
+            }
+        }
+    });
+    eprintln!(
+        "SHRUNK seed {seed:#x}: {tried} candidates run, {other} panicked otherwise, size {}",
+        size(&case)
+    );
+    for (i, s) in case.specs.iter().enumerate() {
+        eprintln!("{i}: {s:?}");
+    }
+    eprintln!("ops: {:?}", case.ops);
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let u = run::<Local>(&case, None, 0);
+        compare(
+            &case,
+            &u,
+            &run::<Local>(&case, frames, bytes),
+            &budget_label(seed, frames, bytes),
+        );
+    }));
+    eprintln!(
+        "SHRUNK failure: {}",
+        r.err()
+            .map(failure_message)
+            .unwrap_or_else(|| "none under Local".into())
+    );
+}
+
+/// Op 9 of `seed` truncated after it, as `(output, Failed set)`, for the
+/// unbounded run and for budget 3, under `C`.
+fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(10);
+    let at9 = |t: &Trace| -> (Out, Vec<usize>) {
+        let (out, snap) = &t[9];
+        let set = (snap.0.iter().enumerate())
+            .filter(|(_, s)| **s == NodeState::Failed)
+            .map(|(x, _)| x)
+            .collect();
+        (out.clone(), set)
+    };
+    [
+        at9(&run::<C>(&case, None, 0)),
+        at9(&run::<C>(&case, Some(3), 0)),
+    ]
+}
+
+/// Seed 0x56cdd78's op 9, `Get(8)`: its read of 4 runs 4's cycle episode,
+/// which releases 4, 8, 9 and 10 Dirty with no value, so the read walks 4
+/// again and the walk contains the cycle at its entries until 10's
+/// strategy closes it, reading 0. At a budget of 3 a doom stops the first
+/// walk; after the release, the frame reading 4 must walk again rather
+/// than take the `Direct` delivery made for the first walk.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
+    let seed = 0x56c_dd78;
+    assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(8)));
+    let want = (Out::Value(0), Vec::new());
+    quiet(|| {
+        let local = op9_at_budget_3::<Local>(seed);
+        let shared = op9_at_budget_3::<Shared>(seed);
+        assert_eq!([&local[0], &shared[0]], [&want, &want], "unbounded");
+        assert_eq!(
+            [&local[1], &shared[1]],
+            [&want, &want],
+            "budget 3, Local then Shared"
+        );
+    });
+}
+
+/// Seed 0x59afe69's op 9, `Get(12)`: the walk of 11 in 12's read runs 11
+/// at position 2 twice, first as a walked entry that catches a cycle out
+/// of 10, then, past 10's contained failed read, as the walk's root, which
+/// reads 10 Failed and fails 11, 12 and 13. At a budget of 3 a later doom
+/// of the first run's maker re-arms the cycle delivered for that run's
+/// read of 10, which the root run, a later run of 11 there, must not take.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
+    let seed = 0x59a_fe69;
+    assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(12)));
+    let want = (Out::Panic("failed".to_owned()), (12..=18).collect());
+    quiet(|| {
+        let local = op9_at_budget_3::<Local>(seed);
+        let shared = op9_at_budget_3::<Shared>(seed);
+        assert_eq!([&local[0], &shared[0]], [&want, &want], "unbounded");
+        assert_eq!(
+            [&local[1], &shared[1]],
+            [&want, &want],
+            "budget 3, Local then Shared"
+        );
     });
 }

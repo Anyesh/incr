@@ -1746,6 +1746,102 @@ entry per leaf get or per delete step, hence their per-entry multiples.
 The rest move by noise (`get_contended_shared` -17,746,
 `delete_owned_tree_*` -1,169 / -2,147, the others under 11).
 
+## A Shared walk checks for other threads' episodes after each claim
+
+- Engine: `w/T8-seed-7c3a12bcc-two-thread-nobudget` at `750144d9` against
+  its base `spreadsheet-t10` at `b123aaec`, the base in a detached
+  worktree; one run of `icount.sh` at the default N per column, and
+  `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_shared/propagate/10` and
+  `simple_count/shared/1000` for the per-line split. No workloads added.
+- Change: `clean_walk` passes each non-root entry's compute an
+  `Option<Planned>` (the runtime's landed-episode count when the walk
+  planned, and this thread's share), and `compute_attempts` compares it
+  with the count after its claim. Under `Local` both are compiled out.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/100` / `diamond_local` | 91,210.03 / 3,919 | 91,210.03 / 3,919 | 0 |
+| `chain_shared/propagate/4` / `10` / `100` | 9,431.24 / 20,536.89 / 188,139.27 | 9,516.21 / 20,759.82 / 190,432.25 | +84.97 / +222.93 / +2,292.98 |
+| `diamond_shared` / `early_cutoff_shared` | 7,853.94 / 3,609.85 | 7,915.93 / 3,643.85 | +61.99 / +34.00 |
+| `fanout_shared_4` / `5` / `1000` | 23,596.15 / 28,963.15 / 4,774,618.30 | 23,671.15 / 29,053.14 / 4,789,629.65 | +75.00 / +89.99 / +15,011.35 |
+| `delete_cascade_shared` | 4,557,778.18 | 4,572,774.02 | +14,995.84 |
+| `collection_insert_then_read/shared_incremental/*` | 7,405.73 / 7,380.05 / 7,385.40 | 7,463.74 / 7,437.98 / 7,443.47 | +58 each |
+| `simple_count/shared/*`, `children_*_shared` | | | +16 each |
+
+Gate: every hard gate and every `Local` workload counts the same as the
+base. `Shared` walks pay per computed entry: 15 on a fanout reader, 22 on
+a chain node. In `chain_shared/propagate/10` (+22.3 per node) PT puts
++9.2 on building the argument and the `unchecked` compare
+(`runtime.rs:2933`), +1.8 on the count load and compare in `replan`, and
+the rest on `compute_attempts` code moved by the extra parameter: the
+`IN_GROUP` test and the `group_verify` match +4 each, the publish +2,
+the `VerifyOnly` branch -6. `delete_cascade_shared` recomputes the chains
+it deletes, one entry per node. The rest move by noise
+(`get_contended_shared` -78, the others under 2).
+
+## Replay run identity
+
+- Engine: `w/T8-lead-c224-cycle-vs-value` at `0c87877b` against its base
+  `spreadsheet-t10` at `f50dcdc4`, the base in a detached worktree; one
+  run of `icount.sh` at the default N per column. No workloads added.
+- Change: replay deliveries are keyed by the run they were made for, with
+  each run's seq fixed at its start; the new work sits behind const
+  `MODE & VIRT`, a `REPLAY_BIT` test, or the `#[cold]` `after_pop_word`.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 198 | 0 / +2 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 219.14 | 0 / +1 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 90 | 0 / +3 |
+| `diamond_local` / `diamond_shared` | 3,926 / 7,919.92 | 3,927 / 7,942.94 | +1 / +23.02 |
+| `chain_local/propagate/100` | 91,217.03 | 91,218.03 | +1 |
+| `fanout_local_4` / `fanout_local_5` | 17,246.01 / 21,877.01 | 17,253 / 21,885 | +6.99 / +7.99 |
+
+- Attribution (Intel PT per symbol and per line on line-table builds,
+  taken at `c38204ad` on `5277165a`, whose hard-gate deltas these match):
+  Clean get's +2 is all in `SharedValueSlot::try_read` (78 to 80) and
+  `table_hit_shared`'s +1 in `with_pooled_hazard`, on the hazard-pool
+  lines, whose source is unchanged: a spill and a rotated pool loop. The Local +1 per top-level non-Clean get is
+  `reset_outermost`'s `outer_set.replace(false)` compiling to one more
+  instruction in `get_slow`; Shared computes add the same `try_read` and
+  `write_if_changed` pool lines plus register shuffles in `clean_walk`.
+- Partitioning, not work: with `CARGO_PROFILE_BENCH_CODEGEN_UNITS=1` both
+  trees count the same (get 193 / 193, `table_hit_shared` 213.14,
+  `value_slot_read_shared` 82, `diamond_shared` and `fanout_shared_4`
+  equal, Local lower on the tip), and reverting every hunk in
+  `runtime.rs` and `runtime_cycle.rs` keeps 198 / 219.14 / 90. These are
+  the two states **T7**'s bench build and **Member try_get of its own
+  member** recorded.
+
+Gate: no hard gate counts new work; the hard-gate moves are the recorded
+196/198, 218.14/219.14 and 87/90 partitioning states.
+
+Replay scale, by `scale-icount.sh` (user-space instructions per test) on
+`5277165a` and `e11fef20`, at the tests' 100k and with `n` set to 10k:
+
+| test | 100k base / tip | ratio | 10k ratio |
+|---|---|---|---|
+| `local_fixpoint_cycle_100k_at_budget_1` | 10.83G / 13.04G | 1.20 | 1.20 |
+| `local_fixpoint_cycle_100k_at_budget_256` | 11.90G / 15.64G | 1.31 | 1.31 |
+| `local_fallback_cycle_100k_at_budget_256` | 14.63G / 22.83G | 1.56 | 1.56 |
+| `local_taint_100k_at_budget_256_on_a_1_mib_thread` | 9.74G / 18.81G | 1.93 | 1.90 |
+| `shared_fallback_cycle_100k_at_budget_256` | 14.78G / 23.00G | 1.56 | 1.55 |
+| `shared_taint_100k_at_budget_256_on_a_1_mib_thread` | 10.14G / 19.19G | 1.89 | 1.86 |
+
+- The rise is linear (each ratio holds from 10k to 100k) and replay-only.
+  Perf on the taint case puts half of its profile in `path_at`, which
+  walks the whole dep stack and which the change now also calls at each
+  replay run's start and end; the rest is the run table and count slots.
+  The cost of `path_at` itself is part of
+  **T10-replay-scale-instruction-rise**.
+- An earlier revision kept the count slots in a `Vec` scanned on every
+  run event, which took 477.66 s on the fixpoint case where the indexed
+  slots take 2.79 s.
+
+
 ## A caught Failed read lands Clean
 
 - Base: spreadsheet-t10 14bb4ad0. Tip: w/T8-caught-failed-read-lands 2413b901.

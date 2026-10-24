@@ -1,6 +1,7 @@
-use super::{Held, Look};
+use super::{own_episode, own_episodes, Held, Look, OWN_EPISODES};
 use crate::cycle::{self, Erased};
 use crate::deferred::Unbuilt;
+use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay;
 
@@ -140,4 +141,16 @@ fn a_look_here_follows_the_thread_speculation() {
     let _speculating = replay::Speculating::enter();
     assert_eq!(Look::here(), Look::SPECULATIVE);
     assert_eq!(Look::here_or(false), Look::SPECULATIVE);
+}
+
+#[test]
+fn a_thread_counts_episodes_on_a_bounded_set_of_runtimes() {
+    let rts: Vec<RuntimeId> = (0..20).map(|_| RuntimeId::allocate()).collect();
+    for &rt in &rts {
+        own_episode(rt);
+    }
+    own_episode(rts[19]);
+    assert_eq!(own_episodes(rts[19]), 2);
+    assert_eq!(own_episodes(rts[0]), 0);
+    assert!(OWN_EPISODES.with(|o| o.borrow().len()) < rts.len());
 }
