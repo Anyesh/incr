@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 use super::{Runtime, DEFAULT_MAX_FRAMES};
 use crate::cells::{Cells, Local, Shared};
+use crate::child_test::run_alone;
 use crate::cycle::{ComputeCtl, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
 use crate::cycle_state::{with_held, Held};
 use crate::dep_stack::DepStack;
@@ -584,8 +585,13 @@ fn wave7_local_kept_dirty_read_is_released_with_its_runtime() {
 
 #[test]
 fn wave7_shared_kept_dirty_read_is_released_with_its_runtime() {
-    wave7_kept_dirty_read_outlives_runtime::<Shared>(false);
-    wave7_kept_dirty_read_outlives_runtime::<Shared>(true);
+    run_alone(
+        "runtime::replay_tests::wave7_shared_kept_dirty_read_is_released_with_its_runtime",
+        || {
+            wave7_kept_dirty_read_outlives_runtime::<Shared>(false);
+            wave7_kept_dirty_read_outlives_runtime::<Shared>(true);
+        },
+    );
 }
 
 /// `set_max_frames(u32::MAX)` racing `set_max_stack_bytes(0)` leaves the
