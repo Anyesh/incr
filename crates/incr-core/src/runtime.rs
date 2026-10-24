@@ -924,6 +924,9 @@ pub struct Runtime<C: Cells> {
     /// walk, and walks of a held root resumed.
     #[cfg(test)]
     pub(crate) resumes_past_held: [std::sync::atomic::AtomicU64; 2],
+    /// Walk entries revisited because a claim wait ended with them Dirty.
+    #[cfg(test)]
+    pub(crate) wait_revisits: std::sync::atomic::AtomicU64,
     /// Every episode start, suspension, resumption and member run, in order.
     #[cfg(test)]
     pub(crate) episodes_seen: std::sync::Mutex<Vec<cycle_impl::EpisodeSeen>>,
@@ -1029,6 +1032,8 @@ impl<C: Cells> Runtime<C> {
             virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             resumes_past_held: Default::default(),
+            #[cfg(test)]
+            wait_revisits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             episodes_seen: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -3420,7 +3425,10 @@ impl<C: Cells> Runtime<C> {
                         && spins != 0
                         && g0.is_none_or(|g| g == node.generation()) =>
                 {
-                    return Computed::Revisit
+                    #[cfg(test)]
+                    self.wait_revisits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Computed::Revisit;
                 }
                 NodeState::Dirty => {}
             }
