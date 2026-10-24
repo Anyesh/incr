@@ -3884,9 +3884,9 @@ impl<C: Cells> Runtime<C> {
 
     /// After a non-Clean landing: the enclosing compute read this node, and
     /// its own publish may take the fast path, where nothing else would
-    /// catch that. A walk entry (`walked`) is no such read: the
-    /// root's rerun reads it again through a nested get if it still needs
-    /// it, and that read poisons the root.
+    /// catch that. A walk entry (`walked`) is no such read: a dependent's
+    /// rerun reads it again through a nested get if it still needs it, and
+    /// that read poisons the dependent.
     fn poison_reader(&self, walked: bool) {
         if !walked {
             self.dep_stack.poison_current_frame(self.runtime_id);

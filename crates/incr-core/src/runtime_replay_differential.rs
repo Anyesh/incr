@@ -5699,8 +5699,8 @@ fn wave8_shared_seed_58b5909_failed_set() {
 }
 
 /// Op 6 Get(11): 11's read of 14 walks 3, a dep 14's rerun no longer reads,
-/// which catches a cycle and lands Dirty. The unbounded run landed 11 Dirty
-/// for it, the bounded run's retry Clean; 11 never reads 3.
+/// which catches a cycle and lands Dirty; 11 never reads 3, so it lands
+/// Clean.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn local_seed_77d_unread_walk_entry() {
