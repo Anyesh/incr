@@ -962,7 +962,8 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             bare,
             strategy,
         } => {
-            let native = !*replay;
+            // `INCR_TEST_ALL_REPLAYABLE` replays `Replay::Native` queries too.
+            let native = !*replay && !rt.all_replayable;
             let made = world.made.fetch_add(1, Relaxed);
             let by_landing = lands_first(expr);
             let replay = if *replay {
