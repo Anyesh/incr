@@ -3233,7 +3233,7 @@ impl<C: Cells> Runtime<C> {
     /// leaves a New node New.
     #[cold]
     #[inline(never)]
-    fn unclaim_unrun(&self, id: NodeId, node: &NodeData<C>, dirty: bool) {
+    fn unclaim_unrun(&self, node: &NodeData<C>, dirty: bool) {
         #[cfg(test)]
         self.unrun_unclaims
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3242,9 +3242,7 @@ impl<C: Cells> Runtime<C> {
         } else {
             NodeState::New
         };
-        if !C::SINGLE_THREADED {
-            C::u8_store_relaxed(self.nodes.unrun(id.0), 1);
-        }
+        node.set_unrun(true);
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
                 state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
@@ -3469,7 +3467,7 @@ impl<C: Cells> Runtime<C> {
                         && g0.is_none_or(|g| g == node.generation())
                         // A claim released unrun leaves its thread's read
                         // going on, which may still come after this one.
-                        && C::u8_load_relaxed(self.nodes.unrun(id.0)) == 0 =>
+                        && !node.unrun() =>
                 {
                     #[cfg(test)]
                     self.wait_revisits
@@ -3567,7 +3565,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             if claimed_dirty && seen == Seen::New {
-                self.unclaim_unrun(id, node, claimed_dirty);
+                self.unclaim_unrun(node, claimed_dirty);
                 return Computed::Revisit;
             }
             // When the claim reads from another thread's episode, which left
@@ -3578,7 +3576,7 @@ impl<C: Cells> Runtime<C> {
             if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
-                    self.unclaim_unrun(id, node, claimed_dirty);
+                    self.unclaim_unrun(node, claimed_dirty);
                     return Computed::Replan;
                 }
             }
@@ -4480,14 +4478,7 @@ impl<C: Cells> Runtime<C> {
         flagged: NodeState,
         unrun: bool,
     ) -> NodeState {
-        if !C::SINGLE_THREADED {
-            // Before the release, which publishes it with the state. Only
-            // the claim's owner writes it, so an equal byte needs no store.
-            let mark = self.nodes.unrun(id.0);
-            if C::u8_load_relaxed(mark) != u8::from(unrun) {
-                C::u8_store_relaxed(mark, u8::from(unrun));
-            }
-        }
+        node.set_unrun(unrun);
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
                 self.report_landing(id);
@@ -4852,7 +4843,8 @@ impl<C: Cells> Runtime<C> {
 
     #[cfg(not(loom))]
     /// Give `member` installed edges to `extra` on top of its own, with
-    /// the reverse edges, as an episode leaves a cycle's members.
+    /// the reverse edges, as an episode leaves a cycle's members. It
+    /// installs without the member's claim, so no other thread may run.
     pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
         let mut inner = self.inner.write();
         let id = NodeId(member.slot());
