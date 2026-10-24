@@ -1756,12 +1756,14 @@ impl<C: Cells> Runtime<C> {
         let episode = member
             .then(|| cycle_state::held_episode(rt, node))
             .flatten();
-        (
-            self.nodes.get(node).generation(),
-            self.path_at(f.cidx),
-            episode,
-            replay::seq_of(rt, f.ctl, f.depth),
-        )
+        let (seq, path) = match replay::run_at(rt, f.ctl, f.depth) {
+            Some((seq, path)) => {
+                debug_assert_eq!(path, self.path_at(f.cidx), "the run's path at {}", f.cidx);
+                (seq, path)
+            }
+            None => (0, self.path_at(f.cidx)),
+        };
+        (self.nodes.get(node).generation(), path, episode, seq)
     }
 
     fn frame_keys(&self) -> replay::FrameKeys {
@@ -3292,12 +3294,37 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn start_run(&self, id: NodeId, cidx: u32, ctl: &ComputeCtl) {
         let rt = self.runtime_id;
-        if !replay::with(|c| replay::innermost(c, rt).is_some()) {
+        if !replay::peek(|c| replay::innermost(c, rt).is_some()) {
             return;
         }
         let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
         let depth = self.dep_stack.depth() as u32;
-        replay::start_run(rt, ctl, depth, frame, self.path_at(cidx));
+        let path = self
+            .path_above_run(cidx, depth)
+            .unwrap_or_else(|| self.path_at(cidx));
+        debug_assert_eq!(path, self.path_at(cidx), "the path at {cidx}");
+        replay::start_run(rt, ctl, depth, frame, path);
+    }
+
+    /// [`Self::path_at`] for a frame at `cidx`, `depth`, from the run of
+    /// the frame below it, when that frame is this runtime's at `cidx - 1`
+    /// and no virtual frame stands there: its path extended by its step.
+    fn path_above_run(&self, cidx: u32, depth: u32) -> Option<u64> {
+        let rt = self.runtime_id;
+        let below = depth.checked_sub(1)?;
+        let (ctl, mut step) = self.dep_stack.with(|s| {
+            let f = s.frames.get(below.checked_sub(1)? as usize)?;
+            (f.rt == rt && f.cidx + 1 == cidx).then(|| (f.ctl, f.step()))
+        })?;
+        let (seq, path) = replay::run_at(rt, ctl, below)?;
+        let virtual_below = replay::peek(|c| {
+            (c.iter().filter(|x| x.rt == rt)).any(|x| x.vframe_at(cidx - 1).is_some())
+        });
+        if virtual_below {
+            return None;
+        }
+        step.seq = seq;
+        Some(replay::extend_path(path, step))
     }
 
     /// The root of an episode at `cidx` that dissolved or went stale
@@ -3320,8 +3347,9 @@ impl<C: Cells> Runtime<C> {
         if !replay::with(|c| replay::covering(c, rt, below).is_some()) {
             return;
         }
-        let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
-        replay::end_run(rt, frame, self.path_at(cidx));
+        let generation = self.nodes.get(id.0).generation();
+        let (path, _) = self.run_path(id.0, generation, cidx);
+        replay::end_run(rt, (id.0, generation, cidx), path);
     }
 
     /// A run of `node` that finishes its virtual frame's frame starts: the
@@ -3928,11 +3956,20 @@ impl<C: Cells> Runtime<C> {
         cycle_state::with_held(|h| h.any_virtually_owned_from(rt, cidx)).then(|| self.path_at(cidx))
     }
 
+    /// The path and seq of the frame of `node` at `cidx`: its run's, when
+    /// one started, and [`Self::path_at`] otherwise.
+    pub(super) fn run_path(&self, node: u32, generation: u32, cidx: u32) -> (u64, u32) {
+        let (seq, path) = replay::run_seq(self.runtime_id, (node, generation, cidx));
+        let path = path.unwrap_or_else(|| self.path_at(cidx));
+        debug_assert_eq!(path, self.path_at(cidx), "the run's path at {cidx}");
+        (path, seq)
+    }
+
     /// The path of a frame at position `cidx`: the highest virtual frame
     /// below it extended by the frames on the stack between them.
     pub(super) fn path_at(&self, cidx: u32) -> u64 {
         let rt = self.runtime_id;
-        let base = replay::with(|c| {
+        let base = replay::peek(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
                 .filter_map(|x| x.vframe_below(cidx))
@@ -3990,7 +4027,7 @@ impl<C: Cells> Runtime<C> {
         }) {
             return None;
         }
-        let path = self.path_at(cidx);
+        let (path, _) = self.run_path(node.0, generation, cidx);
         replay::with(|c| {
             c.iter_mut()
                 .filter(|x| x.rt == rt)
@@ -4006,14 +4043,14 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let generation = self.nodes.get(node.0).generation();
         let key = |l: &(u32, u32, u32, u64, u32)| l.0 == node.0 && l.1 == generation && l.2 == cidx;
-        if !replay::with(|c| {
+        if !replay::peek(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
                 .any(|x| x.lows.iter().any(key))
         }) {
             return None;
         }
-        let path = self.path_at(cidx);
+        let (path, _) = self.run_path(node.0, generation, cidx);
         replay::with(|c| {
             c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
                 let at = x.lows.iter().position(|l| key(l) && l.3 == path)?;

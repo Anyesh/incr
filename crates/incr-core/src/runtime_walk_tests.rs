@@ -942,7 +942,7 @@ struct NotClone(i64);
 /// Builds the held "f boom" ticket of `unread_contained_panic_is_released`
 /// (a `NotClone(6)` payload if `custom`), then has a replayable h catch f's
 /// panic, fold its text length or number into its value and read a New g,
-/// at frame budget `budget` (or the default).
+/// at frame budget `budget` (or none).
 fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>, custom: bool) -> i64 {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_i64);
@@ -979,9 +979,7 @@ fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>, custom:
             ..Default::default()
         },
     );
-    if let Some(b) = budget {
-        rt.set_max_frames(b);
-    }
+    rt.set_max_frames(budget.unwrap_or(u32::MAX));
     rt.get(h)
 }
 
@@ -1018,7 +1016,7 @@ fn wave6_shared_doomed_run_keeps_the_ticket_it_took() {
 
 /// Under x's walk, a replayable g catches the panic of a never-read r, reads
 /// the replayable chain dd1..dd4 and re-raises, at frame budget `budget` (or
-/// the default), holding the caught box across a doom so the retry's copy
+/// none), holding the caught box across a doom so the retry's copy
 /// cannot reuse its address. With `deep`, r re-raises the panic of its dep d,
 /// whose landing sits a frame deeper. Returns x, then the messages of d (empty
 /// without `deep`), r and g.
@@ -1070,9 +1068,7 @@ fn wave7_kept_read_after_fresh_failed_read<C: Cells>(
     assert_eq!(rt.get(x), 0);
     rt.set(k, 1);
     rt.set(sel, 1);
-    if let Some(b) = budget {
-        rt.set_max_frames(b);
-    }
+    rt.set_max_frames(budget.unwrap_or(u32::MAX));
     let v = rt.get(x);
     let md = if deep {
         panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err())
@@ -1137,7 +1133,7 @@ fn wave7_shared_kept_read_keeps_the_read_nodes_deeper_landing_retired() {
 /// Under x's walk, a replayable g catches the panic of a never-read a, sets
 /// k and catches a's second panic through b, which lands a Failed again,
 /// then reads the replayable chain dd1..dd4 and re-raises a's first panic,
-/// at frame budget `budget` (or the default). Returns x, then the messages
+/// at frame budget `budget` (or none). Returns x, then the messages
 /// of a and g.
 fn wave7_kept_read_after_relanded_read<C: Cells>(budget: Option<u32>) -> (i64, String, String) {
     let rt = Runtime::<C>::new();
@@ -1186,9 +1182,7 @@ fn wave7_kept_read_after_relanded_read<C: Cells>(budget: Option<u32>) -> (i64, S
     assert_eq!(rt.get(x), 0);
     rt.set(on, 1);
     rt.set(sel, 1);
-    if let Some(b) = budget {
-        rt.set_max_frames(b);
-    }
+    rt.set_max_frames(budget.unwrap_or(u32::MAX));
     let v = rt.get(x);
     let ma = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err());
     let mg = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
@@ -1240,7 +1234,7 @@ fn wave7_shared_rerun_reads_a_relanded_node_afresh() {
 /// Under x's walk, a replayable g catches the panic of a never-read r, which
 /// re-raises its dep s's, then reads the replayable chain dd1..dd4, where
 /// dd1 panics after reading dd2; g catches that and re-raises r's panic, at
-/// frame budget `budget` (or the default). Returns x, then the messages of
+/// frame budget `budget` (or none). Returns x, then the messages of
 /// s, r and g.
 fn wave7_kept_read_after_another_landing<C: Cells>(
     budget: Option<u32>,
@@ -1289,9 +1283,7 @@ fn wave7_kept_read_after_another_landing<C: Cells>(
     assert_eq!(rt.get(x), 0);
     rt.set(on, 1);
     rt.set(sel, 1);
-    if let Some(b) = budget {
-        rt.set_max_frames(b);
-    }
+    rt.set_max_frames(budget.unwrap_or(u32::MAX));
     let v = rt.get(x);
     let ms = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(s))).unwrap_err());
     let mr = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(r))).unwrap_err());
@@ -1383,9 +1375,7 @@ fn wave8_cycle_after_caught_deep_landing<C: Cells>(
     assert_eq!(rt.get(x), 0);
     rt.set(on, 1);
     rt.set(sel, 1);
-    if let Some(b) = budget {
-        rt.set_max_frames(b);
-    }
+    rt.set_max_frames(budget.unwrap_or(u32::MAX));
     let v = rt.get(x);
     let mr = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(r))).unwrap_err());
     let mc = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(c))).unwrap_err());
