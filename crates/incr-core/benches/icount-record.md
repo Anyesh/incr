@@ -1874,29 +1874,19 @@ Gate: the hard gates hold (198, 219.14, 90). Replay scale by
 `strict-scan.sh`'s `scale-icount` against `7c94b201`: every ratio is in
 0.9974..1.0037.
 
-## A caught Failed read lands Clean
+## A handled read keeps a memo for the revision
 
-- Base: spreadsheet-t10 14bb4ad0. Tip: w/T8-caught-failed-read-lands 2413b901.
-- Change: a compute's landing reads `POISONED` and the new `FAILED_READ`
-  together (`ComputeCtl::poison`) and zeroes `verified_at` for either, but
-  lands Dirty only for `POISONED`; publish accepts an unmoved Failed dep
-  (`failed_unmoved`), reached only when `observed_clean` is false.
+- Base: spreadsheet-t10 adf57986. Tip: w/T8-caught-failed-read-lands 0296a252, the base in a detached worktree; one run of `icount.sh` at the default N per column, and `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_local/propagate/4` and `chain_shared/propagate/4` at 03794a1a. No workloads added.
+- Change: a compute's landing classifies its frame's `POISONED` and `HANDLED` flags (`ComputeCtl::poison`) and records a memo for `HANDLED` alone (`memo_landing`); a walk tests each Dirty node it plans for a memo, the root's compute tests once more, and `max_verified_at` clears a memo bit (a store under `Local`, a load and a cold CAS under `Shared`).
 
 | workload | base | tip | delta |
 |---|---|---|---|
-| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
-| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
-| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
-| `chain_local/propagate/4` / `10` / `100` | 4,634.00 / 9,998.00 / 91,217.02 | 4,642.00 / 10,018.00 / 91,417.02 | +8.00 / +20.00 / +200.00 |
-| `chain_shared/propagate/4` / `10` / `100` | 9,435.20 / 20,540.80 / 188,143.27 | 9,447.22 / 20,570.82 / 188,443.66 | +12.02 / +30.02 / +300.39 |
-| `fanout_local_1000` / `fanout_shared_1000` | 3,472,148.63 / 4,779,634.29 | 3,474,151.50 / 4,782,631.07 | +2,002.87 / +2,996.78 |
-| `delete_cascade_local` / `_shared` | 3,256,576.21 / 4,565,790.38 | 3,258,577.62 / 4,568,786.81 | +2,001.41 / +2,996.43 |
+| `get_clean_local` / `get_clean_shared` | 102 / 198 | 102 / 198 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 219.14 | 155.14 / 219.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 90 | 5 / 90 | 0 |
+| `chain_local/propagate/4` / `10` / `100` | 4,633 / 10,015 / 91,504.01 | 4,714 / 10,210 / 93,409.03 | +81 / +195 / +1,905.02 |
+| `chain_shared/propagate/4` / `10` / `100` | 9,624.22 / 21,029.81 / 193,132.12 | 9,664.22 / 21,123.81 / 194,036.18 | +40 / +94 / +904.06 |
+| `fanout_local_1000` / `fanout_shared_1000` | 3,461,212.14 / 4,804,755.33 | 3,478,229.37 / 4,807,760.25 | +17,017.23 / +3,004.92 |
+| `delete_cascade_local` / `_shared` | 3,246,569.46 / 4,585,757.55 | 3,263,569.91 / 4,588,760.01 | +17,000.45 / +3,002.46 |
 
-Gate: every hard gate counts the same as the base. Each landed compute
-costs 2 more under `Local` and 3 under `Shared` (Intel PT on
-`chain_*/propagate/4`, 4 computes per iteration: `runtime.rs:3543-3545`
-+5 per compute for the mask and the second test, against -2 for the
-two `has` calls they replace and -1 from `mem::replace` code layout;
-`Shared` adds +1 at the `Publish` compare, `runtime.rs:367`). Fan-out
-and delete workloads land one compute per leaf. The rest move by noise
-(`delete_owned_tree_*` +699 / -1,793, `get_contended_shared` -158).
+Gate: every hard gate counts the same as the base. Each propagating compute costs about 19 more under `Local` and 9 under `Shared`. Intel PT at 03794a1a, before the entry test moved to the root only (which took 15 / 12 off `chain_*/propagate/4`), puts per compute: the memo test's load and bit test (`node.rs:422` +7 Local, +6 Shared, plus +1 at each guard), the stamp's memo clear (`node.rs:316` +3 Local; `node.rs:317` +3 and the atomics +7 Shared), the landing's flag mask and memo test (`cycle.rs:440`, `runtime.rs:4103`, +2), and code layout in `compute_attempts` (`Publish`'s compare out of line +3, `segmented_nodes.rs:191` +3, the landing target +4/-4). Fan-out and delete workloads compute one leaf per step. The rest move by noise (`delete_owned_tree_*` -2,280 / +1,164, the others under 5).
