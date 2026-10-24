@@ -3205,9 +3205,7 @@ impl<C: Cells> Runtime<C> {
         } else {
             NodeState::New
         };
-        if !C::SINGLE_THREADED {
-            C::u8_store_relaxed(self.nodes.unrun(id.0), 1);
-        }
+        node.set_unrun(true);
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
                 state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
@@ -3432,7 +3430,7 @@ impl<C: Cells> Runtime<C> {
                         && g0.is_none_or(|g| g == node.generation())
                         // A claim released unrun leaves its thread's read
                         // going on, which may still come after this one.
-                        && C::u8_load_relaxed(self.nodes.unrun(id.0)) == 0 =>
+                        && !node.unrun() =>
                 {
                     #[cfg(test)]
                     self.wait_revisits
@@ -4377,14 +4375,7 @@ impl<C: Cells> Runtime<C> {
         flagged: NodeState,
         unrun: bool,
     ) -> NodeState {
-        if !C::SINGLE_THREADED {
-            // Before the release, which publishes it with the state. Only
-            // the claim's owner writes it, so an equal byte needs no store.
-            let mark = self.nodes.unrun(id.0);
-            if C::u8_load_relaxed(mark) != u8::from(unrun) {
-                C::u8_store_relaxed(mark, u8::from(unrun));
-            }
-        }
+        node.set_unrun(unrun);
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
                 self.report_landing(id);
