@@ -1159,7 +1159,6 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
 }
 
 fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
-    // Fx mixes into the high bits; its low bits follow the key's.
     let h = FxBuildHasher.hash_one((rt, node));
     ((h >> 52 & 63) as usize, 1 << (h >> 58))
 }
@@ -1888,8 +1887,8 @@ pub(crate) fn run_at(
 
 /// The seq of the latest run of `rt`'s `frame`, live or ended, and the
 /// path it started along, which no frame or virtual frame below it changes
-/// while it runs: for a run that may have left the stack, as a member's
-/// that lands at its episode's end. A frame on the stack has them from
+/// while it runs or before its episode's end lands it: for a run that may
+/// have left the stack, as a member's that lands at its episode's end. A frame on the stack has them from
 /// [`run_at`]. No run gives seq 0 and no path.
 pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
     RUNS.with(|r| {
