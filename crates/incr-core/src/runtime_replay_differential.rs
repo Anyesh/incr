@@ -6673,7 +6673,8 @@ fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
 }
 
 /// Seed 0x18aea, shrunk by `replay_shrink`. 20 and 4 are fixpoints; 21
-/// reads 22, which reads 10, 19 and 25, and 13 reaches 11, which reads 12
+/// reads 22, which reads 10, 19, 25 and on one branch 23, and 13 reaches
+/// 11, which reads 12
 /// (bare, reading 22) and 4. Unbounded, `TryGet(20)` after `Get(4)` lands
 /// 11 Failed with 4; at a budget of 3 the bounded run leaves 11 New.
 #[test]
