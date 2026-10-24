@@ -311,7 +311,27 @@ impl<C: Cells> NodeData<C> {
     /// a change from a later verifier.
     #[inline(always)]
     pub fn max_verified_at(&self, v: u64) {
-        C::u64_fetch_max(&self.verified_at, v);
+        let cur = C::u64_load_relaxed(&self.verified_at);
+        if cur & Self::MEMO != 0 {
+            self.stamp_over_memo(cur, v);
+        } else {
+            C::u64_fetch_max(&self.verified_at, v);
+        }
+    }
+
+    /// [`Self::max_verified_at`] over a memo, which the stamp ends. Only the
+    /// claim's holder sets a memo, so none appears between the load and
+    /// the max.
+    #[cold]
+    #[inline(never)]
+    fn stamp_over_memo(&self, mut cur: u64, v: u64) {
+        loop {
+            let new = (cur & !Self::MEMO).max(v);
+            match C::u64_compare_exchange(&self.verified_at, cur, new) {
+                Ok(_) => return,
+                Err(seen) => cur = seen,
+            }
+        }
     }
 
     /// Set on an input's `verified_at` while a `set` holds the input. The
@@ -324,7 +344,12 @@ impl<C: Cells> NodeData<C> {
     /// so a later set claim fails. Cleared only by the recycle's store.
     pub const DELETED: u64 = 1 << 63;
 
-    const REVISION_BITS: u64 = !(Self::SET_CLAIM | Self::DELETED);
+    /// Set on a Dirty query's `verified_at` while it holds a memo for the
+    /// revision in its `changed_at` (`set_memo`). Masked out of the stamp,
+    /// so verification reads 0, never verified; any later stamp ends it.
+    pub const MEMO: u64 = 1 << 61;
+
+    const REVISION_BITS: u64 = !(Self::SET_CLAIM | Self::DELETED | Self::MEMO);
 
     /// Take a `set`'s claim on this input. Returns the stamp it claimed
     /// over, for [`Self::release_set_claim`], or the word holding
@@ -377,11 +402,6 @@ impl<C: Cells> NodeData<C> {
         C::u64_fetch_max(&self.changed_at, v);
     }
 
-    /// A query's `verified_at` while it holds a memo: below every
-    /// revision, so verification treats it as never verified, and any
-    /// later stamp's max replaces it.
-    pub const MEMO: u64 = 1;
-
     /// Keep a Dirty query's value for the rest of revision `rev`: reads in
     /// `rev` take it without a run, and the first read after a set runs
     /// the closure. Raising `changed_at` to `rev` only makes the node
@@ -393,10 +413,11 @@ impl<C: Cells> NodeData<C> {
         self.max_changed_at(rev);
     }
 
-    /// Whether the query, loaded Dirty, holds a memo for revision `rev`.
+    /// Whether the query, loaded Dirty, holds a memo for the revision
+    /// `revision` loads, which only a memo's node loads.
     #[inline(always)]
-    pub(crate) fn memo_at(&self, rev: u64) -> bool {
-        self.verified_at() == Self::MEMO && self.changed_at() == rev
+    pub(crate) fn memo_at(&self, revision: impl FnOnce() -> u64) -> bool {
+        C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && self.changed_at() == revision()
     }
 
     /// Sentinel meaning "a set() is in flight on this input". Any

@@ -428,10 +428,7 @@ fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
     assert_eq!(reader.join().unwrap(), 7);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
-    assert_ne!(
-        rt.verified_at_of(d),
-        crate::node::NodeData::<crate::cells::Shared>::MEMO
-    );
+    assert!(!rt.has_memo_of(d));
     assert!(rt.has_reverse_edge(f, d));
     rt.assert_invariant_i();
     assert_eq!(rt.get(d), 10);
@@ -461,10 +458,7 @@ fn caught_failed_dep_relanded_failed_before_the_first_publish_keeps_no_memo() {
     assert_eq!(reader.join().unwrap(), 7);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
-    assert_ne!(
-        rt.verified_at_of(d),
-        crate::node::NodeData::<crate::cells::Shared>::MEMO
-    );
+    assert!(!rt.has_memo_of(d));
     rt.assert_invariant_i();
 }
 
@@ -478,10 +472,7 @@ fn caught_failed_dep_flipped_during_a_recompute_keeps_no_memo() {
     let (x, y, f, d) = caught_failed_dep(&rt, &gate);
     assert_eq!(rt.get(d), 7);
     assert_eq!(rt.state_of(d), NodeState::Dirty);
-    assert_eq!(
-        rt.verified_at_of(d),
-        crate::node::NodeData::<crate::cells::Shared>::MEMO
-    );
+    assert!(rt.has_memo_of(d));
     assert_eq!(rt.state_of(f), NodeState::Failed);
     rt.assert_invariant_i();
 
@@ -497,10 +488,7 @@ fn caught_failed_dep_flipped_during_a_recompute_keeps_no_memo() {
     assert_eq!(reader.join().unwrap(), 8);
 
     assert_eq!(rt.state_of(d), NodeState::Dirty);
-    assert_ne!(
-        rt.verified_at_of(d),
-        crate::node::NodeData::<crate::cells::Shared>::MEMO
-    );
+    assert!(!rt.has_memo_of(d));
     rt.assert_invariant_i();
     assert_eq!(rt.get(d), 11);
 }

@@ -2384,7 +2384,7 @@ impl<C: Cells> Runtime<C> {
         for &(m, _) in &group.members {
             let node = self.nodes.get(m);
             let verified = node.verified_at();
-            if verified <= NodeData::<C>::MEMO {
+            if verified == 0 {
                 #[cfg(test)]
                 self.group_zero_fails
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

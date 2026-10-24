@@ -2994,7 +2994,7 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Clean | NodeState::Cyclic => continue,
                 // A memo stands for the node's run in this revision, so its
                 // deps are not expanded; the root's compute reads it.
-                NodeState::Dirty if node.memo_at(self.current_revision()) => {
+                NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
                     if is_root {
                         walk.push(Entry {
                             id: cur,
@@ -3298,7 +3298,7 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
-                NodeState::Dirty if node.memo_at(self.current_revision()) => {
+                NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
                     // A walk entry's memo reaches the reader only through
                     // the reading node's own run.
                     if walked {
@@ -3543,10 +3543,10 @@ impl<C: Cells> Runtime<C> {
             // as changed, which catches a walk that passed this node before
             // the claim, and a dep that landed Dirty without a new stamp.
             // A `verified_at` of 0 means never verified, and an empty slot
-            // may sit behind it, so it always fails, as does a memo's.
+            // may sit behind it, so it always fails; a memo reads as 0.
             if verifying {
                 let my_verified = node.verified_at();
-                let mut any_changed = my_verified <= NodeData::<C>::MEMO;
+                let mut any_changed = my_verified == 0;
                 node.for_each_dep(|dep| {
                     if !any_changed && !self.observed_clean(dep, my_verified) {
                         any_changed = true;
@@ -3989,7 +3989,7 @@ impl<C: Cells> Runtime<C> {
     /// The flag a read of `node`, left Dirty by a landing, raises on its
     /// reader: `HANDLED` if the node holds a memo for this revision.
     pub(super) fn dirty_read_poison(&self, node: &NodeData<C>) -> u16 {
-        if node.memo_at(self.current_revision()) {
+        if node.memo_at(|| self.current_revision()) {
             cycle::HANDLED
         } else {
             cycle::POISONED
@@ -4699,6 +4699,12 @@ impl<C: Cells> Runtime<C> {
     #[cfg(not(loom))]
     pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
         self.nodes.get(h.slot()).verified_at()
+    }
+
+    /// Whether `h`'s node holds a memo for the current revision.
+    #[cfg(not(loom))]
+    pub(crate) fn has_memo_of<T>(&self, h: Incr<T>) -> bool {
+        self.nodes.get(h.slot()).memo_at(|| self.current_revision())
     }
 
     #[cfg(not(loom))]
