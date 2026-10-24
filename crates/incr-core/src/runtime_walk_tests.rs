@@ -8,10 +8,12 @@ use std::thread;
 use std::time::Duration;
 
 use super::race_tests::{id, park_at, Gate};
-use super::{ParkPoint, Runtime, EXACT_MODE_AT};
+use super::{ParkPoint, Runtime, Walk, EXACT_MODE_AT};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts, Replay};
 use crate::handle::Incr;
+use crate::node::NodeId;
+use crate::state::NodeState;
 use crate::test_size::test_size;
 use crate::value_code;
 
@@ -2273,4 +2275,21 @@ fn local_stale_dep_whose_episode_cycles_is_not_read() {
 #[test]
 fn shared_stale_dep_whose_episode_cycles_is_not_read() {
     assert_eq!(stale_dep_whose_episode_cycles::<Shared>(), Ok(100));
+}
+
+#[test]
+fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
+    let (r, q, p, x) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
+    let mut walk = Walk::new(r, NodeState::Dirty);
+    walk.visited = Some(Default::default());
+    // R's deps Q and P, P's dep X, a New node with installed deps.
+    walk.expand(q, NodeState::Dirty);
+    walk.visit(p);
+    walk.visit(x);
+    assert!(walk.first_new_expansion(x));
+    walk.prune(3);
+    assert_eq!(walk.work.len(), 3);
+    assert!(walk.is_visited(p));
+    assert!(!walk.is_visited(x));
+    assert!(walk.first_new_expansion(x));
 }
