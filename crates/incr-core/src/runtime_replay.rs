@@ -10,6 +10,7 @@ use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::Placement;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
+use crate::reserve;
 use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
 
 #[cfg(test)]
@@ -725,13 +726,17 @@ impl<C: Cells> Runtime<C> {
                             .expect("incr-core: a virtual hit holds the node it read"),
                     );
                 }
-                Err(on) => loop {
-                    spins += 1;
-                    self.wait_on_claim(on, spins);
-                    if !is_computing(state::load::<C>(self.nodes.get(on.0).state_cell())) {
-                        break;
+                Err(on) => {
+                    let generation = self.nodes.get(on.0).generation();
+                    self.wait_out_reservation(on, generation, None, &mut spins);
+                    loop {
+                        spins += 1;
+                        self.wait_on_claim(on, spins);
+                        if !is_computing(state::load::<C>(self.nodes.get(on.0).state_cell())) {
+                            break;
+                        }
                     }
-                },
+                }
             }
         }
     }
@@ -976,6 +981,14 @@ impl<C: Cells> Runtime<C> {
             let (node, flags) = self.nodes.get_with_flags(slot);
             let claimed = state::try_claim_compute::<C>(node.state_cell());
             let first = match claimed {
+                Ok(src)
+                    if node.generation() == generation
+                        && self.reserved_elsewhere(NodeId(slot), generation) =>
+                {
+                    self.unclaim_unrun(node, src == NodeState::Dirty);
+                    self.roll_back_hit(&taken);
+                    return Err(NodeId(slot));
+                }
                 Ok(src) if node.generation() == generation => src == NodeState::New,
                 Ok(src) => {
                     self.land_unrun(NodeId(slot), node, src);
@@ -1116,7 +1129,11 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
             NodeState::New
         };
+        // The context the doom marks computes `id` again; it may not be
+        // open yet.
+        let reserving = (!C::SINGLE_THREADED).then(|| reserve::Scope::new(Some(reserve::PENDING)));
         self.land_unrun(id, node, target);
+        drop(reserving);
         #[cfg(test)]
         self.dooms.lock().unwrap().push(DoomSeen {
             node: id.0,
@@ -1136,6 +1153,9 @@ impl<C: Cells> Runtime<C> {
             walked,
             false,
         );
+        if let Some(context) = self.reserving_context() {
+            reserve::adopt(context);
+        }
         self.park(ParkPoint::AfterDoom(id));
         Computed::Doomed
     }
@@ -1838,6 +1858,11 @@ impl<C: Cells> Runtime<C> {
         );
         let mut keep = Vec::new();
         let rooted = self.keep_virtual(id, attempt.cidx, &mut keep);
+        let dropping = self.dropping(attempt.cidx);
+        // This thread's contexts compute again every claim this discard
+        // releases, unless the covering one drops their chain.
+        let reserving = (!C::SINGLE_THREADED)
+            .then(|| reserve::Scope::new(self.reserving_context().filter(|_| !dropping)));
         self.release_held_except(attempt.cidx, &keep, bag);
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(Box::new(Unbuilt::new(value)));
@@ -1857,7 +1882,7 @@ impl<C: Cells> Runtime<C> {
                 attempt.first,
                 wrote,
                 attempt.stamp_rev,
-                if self.dropping(attempt.cidx) {
+                if dropping {
                     ChildLanding::Discard
                 } else {
                     ChildLanding::Keep
@@ -1865,8 +1890,20 @@ impl<C: Cells> Runtime<C> {
                 bag,
             ),
         }
+        drop(reserving);
         replay::unwind_past(self.runtime_id, attempt.cidx + 1);
         Computed::Discarded
+    }
+
+    /// The context a doom's reservations belong to: this runtime's
+    /// outermost on the thread, which outlives every context nested in it,
+    /// so a reservation a nested context made for an outer one's entries
+    /// lasts as long as they do. `None` under `Local`, which never reserves.
+    fn reserving_context(&self) -> Option<u64> {
+        if C::SINGLE_THREADED {
+            return None;
+        }
+        replay::with(|c| c.iter().find(|x| x.rt == self.runtime_id).map(|x| x.id))
     }
 
     /// Whether the frame at `cidx` belongs to a chain its context drops.
@@ -2382,17 +2419,50 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether the run `v` stands for has yet to end: its node is still
-    /// New or Dirty, or a claim this thread holds.
+    /// New or Dirty, a claim this thread holds, or another thread's claim
+    /// of a node this thread reserves, which comes back unrun.
     fn vframe_unfinished(&self, v: &VFrame) -> bool {
         let node = self.nodes.get(v.node);
-        node.generation() == v.generation
-            && match state::load::<C>(node.state_cell()) {
-                NodeState::New | NodeState::Dirty => true,
-                NodeState::Computing | NodeState::ComputingDirty => {
-                    cycle_state::holds(self.runtime_id, v.node)
-                }
-                _ => false,
+        if node.generation() != v.generation {
+            return false;
+        }
+        match state::load::<C>(node.state_cell()) {
+            NodeState::New | NodeState::Dirty => true,
+            NodeState::Computing | NodeState::ComputingDirty => {
+                cycle_state::holds(self.runtime_id, v.node) || self.given_back(v)
             }
+            _ => false,
+        }
+    }
+
+    /// Whether another thread's claim of `v`'s node, which this thread
+    /// reserves, came back unrun.
+    #[cold]
+    #[inline(never)]
+    fn given_back(&self, v: &VFrame) -> bool {
+        if C::SINGLE_THREADED || !reserve::mine((self.runtime_id, v.node), v.generation) {
+            return false;
+        }
+        #[cfg(test)]
+        self.give_back_waits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let node = self.nodes.get(v.node);
+        let mut spins = 0;
+        loop {
+            let observed = state::load::<C>(node.state_cell());
+            // After the load: a recycled slot's occupant is no claim of
+            // the reserved node.
+            if node.generation() != v.generation {
+                return false;
+            }
+            match observed {
+                NodeState::New | NodeState::Dirty => return true,
+                NodeState::Computing | NodeState::ComputingDirty => {}
+                _ => return false,
+            }
+            spins += 1;
+            C::backoff(spins);
+        }
     }
 
     /// A virtual frame's pop, as its frame's pop would be: nothing if its
@@ -2655,6 +2725,9 @@ impl<C: Cells> Runtime<C> {
         if let PopEnd::Dissolved = end {
             let (first, wrote) = self.end_dissolved(root, &mut bag);
             let stamp_rev = self.current_revision();
+            // The entry below computes the root again.
+            let _reserving =
+                (!C::SINGLE_THREADED).then(|| reserve::Scope::new(self.reserving_context()));
             self.discard_land_in_group(
                 root,
                 first,
