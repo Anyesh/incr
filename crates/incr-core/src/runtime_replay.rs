@@ -554,8 +554,12 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let stash = s.map.get_mut(&(handle.slot(), handle.generation()))?;
+        // Value code may read Clean nodes, which takes no lock, so the clone
+        // can run under the stash lock.
         let read = match &stash.get_mut().outcome {
-            Outcome::Value(value) => Ok(value.value().downcast_ref::<T>().cloned()),
+            Outcome::Value(value) => Ok(value_code::run(|| {
+                value.value().downcast_ref::<T>().cloned()
+            })),
             Outcome::Panic(_) | Outcome::Tried => Err(()),
         };
         drop(s);
@@ -607,12 +611,13 @@ impl<C: Cells> Runtime<C> {
         raised.payload
     }
 
-    /// Marks a speculative run of `id` at `generation` as tried, so that no
-    /// later speculative run computes it again in this revision whether or
-    /// not this one kept a stash.
+    /// Marks a speculative run of Native node `id` at `generation` as tried
+    /// before its closure runs, so that no other speculative run computes it
+    /// in this revision whether or not this one keeps a stash. A replayable
+    /// node is not marked, since its closure may run again.
     #[cold]
     #[inline(never)]
-    fn mark_tried(&self, id: NodeId, generation: u32) {
+    pub(super) fn mark_tried(&self, id: NodeId, generation: u32) {
         self.stash(
             id.0,
             generation,
@@ -667,18 +672,29 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Takes the stash of node `slot` at `generation` for a real run that
-    /// adopts it. A tried mark stays for the revision.
+    /// adopts it. A Native node keeps a tried mark in its place for the
+    /// revision, whether or not the adoption lands it.
     fn take_stash(&self, slot: u32, generation: u32) -> Option<Stash> {
         if C::u32_load_relaxed(&self.stash_count) == 0 {
             return None;
         }
         let revision = self.current_revision();
+        let native = !self.replayable(slot);
         let mut s = self.stashes.write();
-        if s.revision != revision
-            || (s.map.get_mut(&(slot, generation)))
-                .is_none_or(|e| matches!(e.get_mut().outcome, Outcome::Tried))
-        {
+        if s.revision != revision {
             return None;
+        }
+        let entry = s.map.get_mut(&(slot, generation))?.get_mut();
+        if matches!(entry.outcome, Outcome::Tried) {
+            return None;
+        }
+        if native {
+            let tried = Stash {
+                outcome: Outcome::Tried,
+                deps: Vec::new(),
+                verify_rev: 0,
+            };
+            return Some(std::mem::replace(entry, tried));
         }
         let stash = s.map.remove(&(slot, generation))?;
         C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
@@ -3983,28 +3999,6 @@ pub(super) struct Stash {
     outcome: Outcome,
     deps: Vec<(NodeId, u32)>,
     verify_rev: u64,
-}
-
-/// Marks its speculative attempt's Native node tried when the attempt
-/// ends, by return or unwind: a mark while the run is open would turn away
-/// a reader that should wait for it or find the cycle through it. A
-/// replayable node is not marked, since its closure may run again.
-pub(super) struct TriedOnExit<'a, C: Cells> {
-    rt: &'a Runtime<C>,
-    id: NodeId,
-    generation: u32,
-}
-
-impl<'a, C: Cells> TriedOnExit<'a, C> {
-    pub(super) fn new(rt: &'a Runtime<C>, id: NodeId, generation: u32) -> Self {
-        Self { rt, id, generation }
-    }
-}
-
-impl<C: Cells> Drop for TriedOnExit<'_, C> {
-    fn drop(&mut self) {
-        self.rt.mark_tried(self.id, self.generation);
-    }
 }
 
 enum Outcome {

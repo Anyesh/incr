@@ -888,6 +888,41 @@ fn shared_speculative_cycle_is_recomputed() {
     speculative_cycle_is_recomputed::<Shared>(true);
 }
 
+/// `r`'s speculative run computes the replayable `p` over the Native `n`,
+/// which reads input `d`, and stashes both. `d` is deleted, so the real
+/// claim of `p` takes `n`'s stash and fails it on `d`'s generation: `n`
+/// keeps a tried mark for the revision, and only `p`'s goes.
+fn failed_nested_adoption_keeps_the_tried_mark<C: Cells>(rt: &Runtime<C>) {
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let d = rt.create_input(1_u64);
+    let n = rt.create_query(move |rt| rt.get(d) + 10);
+    let p = rt.create_query_with(move |rt| rt.get(n) + 1, replayable());
+    let b = rt.create_query(|_| 5_u64);
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(p)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(C::u32_load_relaxed(&rt.stash_count), 2);
+    assert_eq!(rt.try_delete_node(d), Ok(()));
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err());
+    assert_eq!(C::u32_load_relaxed(&rt.stash_count), 1, "n lost its mark");
+}
+
+local_and_shared!(
+    failed_nested_adoption_keeps_the_tried_mark,
+    local_failed_nested_adoption_keeps_the_tried_mark,
+    shared_failed_nested_adoption_keeps_the_tried_mark
+);
+
 /// A speculative run's panic in `c` is stashed, not landed, and the later
 /// real `get` raises that payload with no second run, landing `c` Failed.
 fn speculative_panic_is_raised_once<C: Cells>(replay: bool) {

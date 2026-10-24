@@ -784,10 +784,12 @@ fn reached_under_own_set(id: NodeId) -> ! {
 ///
 /// A replayed run can be speculative: after a read returned a
 /// placeholder, the run may evaluate queries the run without a budget
-/// would never evaluate, each at most once per revision. Such a run
-/// lands nothing: its value or panic is kept for the revision, and a
-/// later read of that query takes it unless something the run read has
-/// changed.
+/// would never evaluate. Such a run lands nothing: the value or panic it
+/// ends with is kept for the revision, and a later read of that query
+/// takes it if nothing the run read has changed, and otherwise runs the
+/// closure again, as it does when the run met a cycle. A
+/// [`Replay::Native`](crate::Replay::Native) query runs speculatively at
+/// most once per revision.
 ///
 /// # Panics in user code
 ///
@@ -3602,8 +3604,9 @@ impl<C: Cells> Runtime<C> {
                 );
             }
             let speculative = MODE & VIRT != 0 && replay::speculative();
-            let _tried = (speculative && !self.replayable(id.0))
-                .then(|| replay_impl::TriedOnExit::new(self, id, g));
+            if speculative && !self.replayable(id.0) {
+                self.mark_tried(id, g);
+            }
             let is_recompute = claimed_dirty;
             let first = !claimed_dirty;
 

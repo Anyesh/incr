@@ -1316,6 +1316,7 @@ fn local_speculative_clean_value_drop_is_not_raised() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn shared_speculative_clean_value_drop_is_not_raised() {
     in_shared_child(
         "runtime::drop_panic_tests::shared_speculative_clean_value_drop_is_not_raised",

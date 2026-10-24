@@ -40,7 +40,8 @@ pub enum LockKind {
     Directory,
     /// T9's watch queue.
     WatchQueue,
-    /// A runtime's stashes of speculative runs; nothing is taken under it.
+    /// A runtime's stashes of speculative runs. Only value code, which reads
+    /// Clean nodes without a lock, runs under it.
     Stashes,
 }
 
