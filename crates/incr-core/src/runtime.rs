@@ -4062,9 +4062,9 @@ impl<C: Cells> Runtime<C> {
         {
             self.retire_copies(&replay::Retire::Above(attempt.cidx));
         }
-        // An engine unwind ends no run of the unbounded run's: a cycle
-        // unwind's is the doomed run's retry, which reads the cycle again
-        // from its delivery.
+        // An engine unwind does not end the run: the retry after it is the
+        // same run of the unbounded run's, and reads the cycle again from
+        // its delivery.
         if word & value_code::REPLAY_BIT != 0
             && !doomed
             && (result.is_ok() || cycle_state::unwind_kind().is_none())

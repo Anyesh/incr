@@ -1175,19 +1175,22 @@ impl<C: Cells> Runtime<C> {
         self.keep_read(ctl, cidx, reading, ordinal, what);
     }
 
-    /// The key parts a read by this runtime's frame of `node` at `cidx`
-    /// gets from this runtime: the node's generation, the frame's path and,
-    /// for a member run, its episode.
-    fn key_parts(&self, node: u32, cidx: u32, member: bool) -> replay::KeyParts {
+    /// The key parts a read by this runtime's frame `f` gets from this
+    /// runtime: the node's generation, the frame's path, for a member run
+    /// its episode, and its run's seq, looked up as [`Self::path_at`] and
+    /// the virtual frames look it up, so a retry's key matches the
+    /// deliveries made for it.
+    fn key_parts(&self, f: ActiveRead, member: bool) -> replay::KeyParts {
+        let rt = self.runtime_id;
+        let node = f.node.0;
         let episode = member
-            .then(|| cycle_state::held_episode(self.runtime_id, node))
+            .then(|| cycle_state::held_episode(rt, node))
             .flatten();
-        let generation = self.nodes.get(node).generation();
         (
-            generation,
-            self.path_at(cidx),
+            self.nodes.get(node).generation(),
+            self.path_at(f.cidx),
             episode,
-            replay::run_seq(self.runtime_id, (node, generation, cidx)),
+            replay::seq_of(rt, f.ctl, f.depth),
         )
     }
 
@@ -1214,7 +1217,19 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the caller's contract; the driver that opened the context
         // holds the runtime until it closes it.
         let rt = unsafe { &*owner.cast::<Self>() };
-        rt.key_parts(node, cidx, member)
+        let top = rt.dep_stack.top_frame();
+        debug_assert!(top.is_some_and(|(r, n, _, c)| (r, n.0, c) == (rt.runtime_id, node, cidx)));
+        let (_, node, ctl, cidx) = top.expect("incr-core: the reading frame is on the stack");
+        let depth = rt.dep_stack.depth() as u32;
+        rt.key_parts(
+            ActiveRead {
+                node,
+                ctl,
+                cidx,
+                depth,
+            },
+            member,
+        )
     }
 
     /// A read of `handle` by another runtime's frame, which may be doomed
@@ -2703,9 +2718,13 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn start_run(&self, id: NodeId, cidx: u32, ctl: &ComputeCtl) {
+        let rt = self.runtime_id;
+        if !replay::with(|c| replay::innermost(c, rt).is_some()) {
+            return;
+        }
         let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
         let depth = self.dep_stack.depth() as u32;
-        replay::start_run(self.runtime_id, ctl, depth, frame, self.path_at(cidx));
+        replay::start_run(rt, ctl, depth, frame, self.path_at(cidx));
     }
 
     /// The root of an episode at `cidx` that dissolved or went stale
@@ -3008,7 +3027,7 @@ impl<C: Cells> Runtime<C> {
         // delivered once.
         // SAFETY: the active frame's control block is live.
         let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
-        let (generation, path, episode, seq) = self.key_parts(f.node.0, f.cidx, member);
+        let (generation, path, episode, seq) = self.key_parts(f, member);
         let key = ReadKey {
             node: f.node.0,
             generation,

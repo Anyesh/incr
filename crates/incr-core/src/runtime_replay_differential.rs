@@ -6393,9 +6393,8 @@ fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
 /// which releases 4, 8, 9 and 10 Dirty with no value, so the read walks 4
 /// again and the walk contains the cycle at its entries until 10's
 /// strategy closes it, reading 0. At a budget of 3 a doom stops the first
-/// walk, the driver runs the episode's release, and the frame reading 4
-/// takes the `Direct` delivery made for that first walk: 4 computes with
-/// no walk, closes the cycle at itself, and the read panics "cycle".
+/// walk; after the release, the frame reading 4 must walk again rather
+/// than take the `Direct` delivery made for the first walk.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
@@ -6417,10 +6416,9 @@ fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
 /// Seed 0x59afe69's op 9, `Get(12)`: the walk of 11 in 12's read runs 11
 /// at position 2 twice, first as a walked entry that catches a cycle out
 /// of 10, then, past 10's contained failed read, as the walk's root, which
-/// reads 10 Failed and fails 11, 12 and 13. At a budget of 3 the first run
-/// takes the cycle delivered for its read of 10; a later doom of the same
-/// maker re-arms that delivery, and the root run, a different run under
-/// the same key, takes it again, catches the cycle, and lands Dirty.
+/// reads 10 Failed and fails 11, 12 and 13. At a budget of 3 a later doom
+/// of the first run's maker re-arms the cycle delivered for that run's
+/// read of 10, which the root run, a later run of 11 there, must not take.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {

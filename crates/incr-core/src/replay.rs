@@ -632,8 +632,9 @@ pub(crate) struct Context {
     pub(crate) run_failures: EarliestByFrame,
     /// The count slots of the reads at positions above `boundary`. A run's
     /// seq is its node's count in its slot when it starts (see
-    /// [`start_run`]), so a second run of a node at one position reads none
-    /// of the first's deliveries. A read sets its slot as it starts, empty
+    /// [`start_run`]), which each undoomed end of a run and each rerun of a
+    /// dissolved or stale root raises, so a second run of a node at one
+    /// position reads none of the first's deliveries. A read sets its slot as it starts, empty
     /// or to what the delivery it resumes kept, so a retry counts as the
     /// run it redoes did. Keyed by `(cidx, path)`.
     pub(crate) runs: BTreeMap<(u32, u64), RunSlot>,
@@ -1863,7 +1864,9 @@ pub(crate) fn seq_of(rt: RuntimeId, ctl: *const crate::cycle::ComputeCtl, depth:
     with_seqs(|s| s.of(rt, ctl, depth))
 }
 
-/// The seq of the latest run of `rt`'s `frame`, live or ended.
+/// The seq of the latest run of `rt`'s `frame`, live or ended: for a run
+/// that may have left the stack, as a member's that lands at its episode's
+/// end. A frame on the stack has its seq from [`seq_of`].
 pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> u32 {
     RUNS.with(|r| {
         let r = r.borrow();
