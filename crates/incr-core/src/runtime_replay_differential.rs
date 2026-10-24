@@ -4210,8 +4210,8 @@ fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
 
 /// Seed 0x66a, unbounded: a released claim's later finished run published
 /// deps without dropping its released entry, so its kept count outlived
-/// the list it counted. [`Live::assert_invariants`] finds the Clean node
-/// still holding it.
+/// the list it counted. [`Live::assert_invariants`] finds an entry
+/// counting a list its node no longer has.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_finished_run_drops_its_released_entry() {
@@ -7558,7 +7558,8 @@ fn wave8_seed_d6e1_released_new_walked_fresh() {
 /// Seed 0x148c's base case, shrunk. At budgets 2 and 3 a stand-in's Dirty
 /// landing is reported to its walk as `Unsettled`, which must not lead the
 /// bounded run to compute a node the unbounded run leaves New: after
-/// `Get(7)`, nodes 1 to 4, 14 and 16.
+/// `Get(7)`, nodes 1, 3, 4, 5 and 14. Budgets 2 and 3 hold at least one
+/// landing as unsettled.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
@@ -7636,7 +7637,7 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
         let new: Vec<usize> = (0..unbounded[3].1.len())
             .filter(|&n| unbounded[3].1[n] == NodeState::New)
             .collect();
-        assert_eq!(new, [1, 2, 3, 4, 14, 16], "unbounded");
+        assert_eq!(new, [1, 3, 4, 5, 14], "unbounded");
         let holds = || super::replay_impl::UNSETTLED_HOLDS.with(|n| n.replace(0));
         for frames in [1, 2, 3] {
             holds();
