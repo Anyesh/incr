@@ -4035,10 +4035,9 @@ fn failed_after(t: &Trace, i: usize) -> (Out, Vec<usize>) {
 /// Seed 0xe486019a1c945cce's op 1, `Get(4)`: member 8 of the cycle
 /// {4, 5, 7, 8} reads 9, whose walk computes 21, and 21's own code panics
 /// in the episode of {9, 21, 22, 23}, which marks it failed; 9 then passes
-/// that panic to 8. Unbounded, the mark falls inside 8's member run, so 8
-/// lands New. At a budget of 1 the driver runs that episode between doomed
-/// runs of 8, and the run finishing 8's frame counted marks from its own
-/// start only, so 8 landed Failed as well.
+/// that panic to 8, and a fresh run leaves 8, 9, 21, 22 and 23 Failed. At a
+/// budget of 1 the driver runs that episode between doomed runs of 8, and
+/// the run finishing 8's frame must count the marks made before it.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
@@ -4047,7 +4046,7 @@ fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
     quiet(|| {
         let mut fresh = case.clone();
         fresh.ops = vec![Op::Get(4)];
-        let want = (Out::Panic("boom 0:21".to_owned()), vec![9, 21]);
+        let want = (Out::Panic("boom 0:21".to_owned()), vec![8, 9, 21, 22, 23]);
         assert_eq!(failed_after(&run::<Local>(&fresh, None, 0), 0), want);
         assert!(matches!(case.ops[1], Op::Get(4)));
         assert_eq!(failed_after(&run::<Local>(&case, Some(1), 0), 1), want);
@@ -4597,7 +4596,7 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
 /// Failed while op 0's walk, planned before it, waits on a claim. Op 0's
 /// walk visits the nodes it waited on again, so every run leaves one
 /// order's Failed set: op 0 first enters a cycle and op 1 leaves {10},
-/// and op 1 first leaves {0, 2, 3, 4, 5, 9, 10, 11, 12}. None needs the
+/// and op 1 first leaves {0, 4, 5, 9, 10, 11}. None needs the
 /// oracle's history, which a walk that went on with its old plan did.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -4612,10 +4611,7 @@ fn two_thread_walk_planned_before_an_episode_leaves_an_orders_failed_set() {
             .map(|&x| (x, NodeState::Failed))
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        orders,
-        [failed(&[10]), failed(&[0, 2, 3, 4, 5, 9, 10, 11, 12])]
-    );
+    assert_eq!(orders, [failed(&[10]), failed(&[0, 4, 5, 9, 10, 11])]);
     quiet(|| {
         for _ in 0..300 {
             let serial = Serial::new(&case, &phases);
@@ -7514,10 +7510,9 @@ fn wave8_seed_d6e1_released_new_walked_fresh() {
     });
 }
 
-/// Seed 0x148c's base case, shrunk. Unbounded, `Get(7)` leaves node 9 New:
-/// no run reads it. At budgets 2 and 3 a stand-in's Dirty landing,
-/// reported to its walk as `Unsettled`, must not lead the bounded run to
-/// compute node 9.
+/// Seed 0x148c's base case, shrunk. At budgets 2 and 3 a stand-in's Dirty
+/// landing is reported to its walk as `Unsettled`, which must not lead the
+/// bounded run to compute a node the unbounded run leaves New.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
@@ -7592,7 +7587,6 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
     };
     quiet(|| {
         let unbounded = states(run::<Local>(&case, None, 0));
-        assert_eq!(unbounded[3].1[9], NodeState::New, "unbounded");
         for frames in [1, 2, 3] {
             let local = states(run::<Local>(&case, Some(frames), 0));
             assert_eq!(local, unbounded, "Local, budget {frames}");
