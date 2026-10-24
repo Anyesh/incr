@@ -5111,8 +5111,9 @@ fn replay_seeds() {
 
 /// Seeds that differ under the strict comparator where the unbounded run
 /// leaves a node Dirty and the bounded run lands it Clean; 0xa5b and 0x1359
-/// return other outcomes too. 0xdeb, 0x575, 0x670, 0x29bf2de20fa0e476 and
-/// the cases of [`seed_16d87_takes_no_speculative_memo`] and
+/// return other outcomes too. 0xdeb, 0x575, 0x670, 0x3661524a,
+/// 0x29bf2de20fa0e476 and the cases of
+/// [`seed_16d87_takes_no_speculative_memo`] and
 /// [`a_released_claim_takes_no_delivery_of_its_ended_run`] show it once a
 /// caught Failed read lands Clean: before, the later landing that the
 /// bounded run reads was Dirty too.
@@ -5120,17 +5121,25 @@ fn replay_seeds() {
 #[cfg_attr(miri, ignore)]
 #[ignore = "T8-strict-group-c-dirty-for-clean"]
 fn strict_dirty_for_clean_seeds() {
-    let cases = [0x41eb, 0xd60, 0xdeb, 0x575, 0x670, 0x29bf_2de2_0fa0_e476]
-        .map(|seed| (seed, gen_case(seed, false, false)))
-        .into_iter()
-        .chain(
-            [0xa5b, 0x1359, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d]
-                .map(|seed| (seed, gen_base(seed))),
-        )
-        .chain([
-            (0x16d87, seed_16d87_case()),
-            (0xd371, released_claim_case()),
-        ]);
+    let cases = [
+        0x41eb,
+        0xd60,
+        0xdeb,
+        0x575,
+        0x670,
+        0x3661_524a,
+        0x29bf_2de2_0fa0_e476,
+    ]
+    .map(|seed| (seed, gen_case(seed, false, false)))
+    .into_iter()
+    .chain(
+        [0xa5b, 0x1359, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d]
+            .map(|seed| (seed, gen_base(seed))),
+    )
+    .chain([
+        (0x16d87, seed_16d87_case()),
+        (0xd371, released_claim_case()),
+    ]);
     for (seed, case) in cases {
         quiet(|| {
             differential::<Local>(&case, seed);
@@ -5164,6 +5173,7 @@ fn strict_computed_left_new_seeds() {
 fn strict_recomputed_after_landing_seeds() {
     let cases = [
         (0x65e, gen_case(0x65e, false, false)),
+        (0x3661_4a83, gen_case(0x3661_4a83, false, false)),
         (0x1e89, gen_base(0x1e89)),
     ];
     for (seed, case) in cases {
