@@ -1588,6 +1588,13 @@ impl Drop for Speculating {
     }
 }
 
+/// Runs `f` on the thread's contexts without changing them, so the replay
+/// bit [`with`] keeps stays as it is. `f` must not call user code or the
+/// engine.
+pub(crate) fn peek<R>(f: impl FnOnce(&[Context]) -> R) -> R {
+    CONTEXTS.with(|c| f(&c.borrow()))
+}
+
 /// Runs `f` on the thread's contexts. `f` must not call user code or the
 /// engine.
 pub(crate) fn with<R>(f: impl FnOnce(&mut Vec<Context>) -> R) -> R {
@@ -1936,8 +1943,9 @@ pub(crate) fn run_at(
 /// The seq of the latest run of `rt`'s `frame`, live or ended, and the
 /// path it started along, which no frame or virtual frame below it changes
 /// while it runs or before its episode's end lands it: for a run that may
-/// have left the stack, as a member's that lands at its episode's end. A frame on the stack has them from
-/// [`run_at`]. No run gives seq 0 and no path.
+/// have left the stack, as a member's that lands at its episode's end. A
+/// frame on the stack has them from [`run_at`]. No run gives seq 0 and no
+/// path.
 pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
     RUNS.with(|r| {
         let r = r.borrow();

@@ -2724,7 +2724,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn start_run(&self, id: NodeId, cidx: u32, ctl: &ComputeCtl) {
         let rt = self.runtime_id;
-        if !replay::with(|c| replay::innermost(c, rt).is_some()) {
+        if !replay::peek(|c| replay::innermost(c, rt).is_some()) {
             return;
         }
         let frame = (id.0, self.nodes.get(id.0).generation(), cidx);
@@ -2747,7 +2747,7 @@ impl<C: Cells> Runtime<C> {
             (f.rt == rt && f.cidx + 1 == cidx).then(|| (f.ctl, f.step()))
         })?;
         let (seq, path) = replay::run_at(rt, ctl, below)?;
-        let virtual_below = replay::with(|c| {
+        let virtual_below = replay::peek(|c| {
             (c.iter().filter(|x| x.rt == rt)).any(|x| x.vframe_at(cidx - 1).is_some())
         });
         if virtual_below {
@@ -3399,7 +3399,7 @@ impl<C: Cells> Runtime<C> {
     /// below it extended by the frames on the stack between them.
     pub(super) fn path_at(&self, cidx: u32) -> u64 {
         let rt = self.runtime_id;
-        let base = replay::with(|c| {
+        let base = replay::peek(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
                 .filter_map(|x| x.vframe_below(cidx))
@@ -3457,7 +3457,7 @@ impl<C: Cells> Runtime<C> {
         }) {
             return None;
         }
-        let path = self.path_at(cidx);
+        let (path, _) = self.run_path(node.0, generation, cidx);
         replay::with(|c| {
             c.iter_mut()
                 .filter(|x| x.rt == rt)
@@ -3473,14 +3473,14 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let generation = self.nodes.get(node.0).generation();
         let key = |l: &(u32, u32, u32, u64, u32)| l.0 == node.0 && l.1 == generation && l.2 == cidx;
-        if !replay::with(|c| {
+        if !replay::peek(|c| {
             c.iter()
                 .filter(|x| x.rt == rt)
                 .any(|x| x.lows.iter().any(key))
         }) {
             return None;
         }
-        let path = self.path_at(cidx);
+        let (path, _) = self.run_path(node.0, generation, cidx);
         replay::with(|c| {
             c.iter_mut().filter(|x| x.rt == rt).find_map(|x| {
                 let at = x.lows.iter().position(|l| key(l) && l.3 == path)?;
