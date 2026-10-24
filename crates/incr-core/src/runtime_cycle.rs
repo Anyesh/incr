@@ -1137,7 +1137,7 @@ impl<C: Cells> Runtime<C> {
             });
         let ran = self.member_run(slot, cidx, true, false, false);
         replay::leave_member_run();
-        self.drop_deliveries(replay::run_ended(
+        drop(replay::run_ended(
             self.runtime_id,
             cidx,
             matches!(ran, Ok(None)),

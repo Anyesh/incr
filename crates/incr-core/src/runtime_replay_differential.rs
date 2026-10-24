@@ -1038,18 +1038,10 @@ struct Live<C: Cells> {
 }
 
 /// After an operation: every query's state, every node's dependencies in
-/// the order its last landing installed them, whether a read returned a
-/// node's Dirty value, or had a delivery, that a later landing made Clean,
-/// which queries are Dirty over a recorded dep Failed or Cyclic, and every
-/// node's state, indexed as the deps are. Both runtimes' entries, the
-/// first's first.
-type Snapshot = (
-    Vec<NodeState>,
-    Vec<Vec<u32>>,
-    bool,
-    Vec<bool>,
-    Vec<NodeState>,
-);
+/// the order its last landing installed them, which queries are Dirty over
+/// a recorded dep Failed or Cyclic, and every node's state, indexed as the
+/// deps are. Both runtimes' entries, the first's first.
+type Snapshot = (Vec<NodeState>, Vec<Vec<u32>>, Vec<bool>, Vec<NodeState>);
 
 impl<C: Cells> Live<C> {
     fn new(rts: &[Box<Runtime<C>>; 2], case: &Case) -> Self {
@@ -1130,7 +1122,6 @@ impl<C: Cells> Live<C> {
         let w = &*self.world;
         let mut states = Vec::new();
         let mut deps = Vec::new();
-        let mut replaced = false;
         let mut over_settled = Vec::new();
         let mut nodes = Vec::new();
         for side in 0..2 {
@@ -1151,11 +1142,8 @@ impl<C: Cells> Live<C> {
                 deps.push(d);
                 nodes.push(rt.nodes.get(x).state());
             }
-            replaced |= std::mem::take(&mut *rt.dirty_reads.lock().unwrap())
-                .into_iter()
-                .any(|n| rt.nodes.get(n).state() == NodeState::Clean);
         }
-        (states, deps, replaced, over_settled, nodes)
+        (states, deps, over_settled, nodes)
     }
 }
 
@@ -2366,11 +2354,7 @@ fn first_diff(
         // and a replayed frame reads after that landing with a Clean `get`,
         // so the bounded run may return the later value. A target poisoned
         // by a Failed or Cyclic dep it read has no later value.
-        let dirty_target = target.is_some_and(|q| want.0[q] == NodeState::Dirty && !want.3[q]);
-        // So may a frame that read a node's Dirty value, or took its unwind
-        // or a delivery for its read, which a later landing made Clean: its
-        // next retry reads it with a Clean `get`.
-        let stale_read = want.2 || got.2;
+        let dirty_target = target.is_some_and(|q| want.0[q] == NodeState::Dirty && !want.2[q]);
         // Under two threads the cycle a read reports is built from this
         // thread's frames, so members another thread landed first are left
         // out of it: a verified part of an order's participants matches.
@@ -2382,7 +2366,7 @@ fn first_diff(
                         if !g.is_empty() && g.iter().all(|p| w.contains(p))
                 )
         };
-        let wrong_out = if same(want_out, got_out) || dirty_target || stale_read {
+        let wrong_out = if same(want_out, got_out) || dirty_target {
             None
         } else {
             // A get ordered per read: its outcome is its closure's over its
@@ -2444,7 +2428,7 @@ fn states_diff(want: &Snapshot, got: &Snapshot) -> Option<String> {
         .collect();
     let deps: Vec<String> = (want.1.iter().zip(&got.1).enumerate())
         .filter(|&(x, (w, g))| {
-            w != g && !(w.is_empty() && speculative_landing(want.4[x], got.4[x]))
+            w != g && !(w.is_empty() && speculative_landing(want.3[x], got.3[x]))
         })
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
         .collect();
@@ -2525,12 +2509,10 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
         let mut bounded = labelled(&label, || run::<C>(case, frames, bytes));
         // A forced revisit re-walks its entry, and a bounded run's retried
         // walks force it again at their own points, so only the outputs
-        // and whether a read was replaced are results.
+        // are results.
         if super::forced_revisit() && !C::SINGLE_THREADED {
             for ((_, got), (_, want)) in bounded.iter_mut().zip(&unbounded) {
-                let replaced = got.2;
                 *got = want.clone();
-                got.2 = replaced;
             }
         }
         compare(case, &unbounded, &bounded, &label);

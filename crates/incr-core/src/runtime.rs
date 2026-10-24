@@ -914,10 +914,6 @@ pub struct Runtime<C: Cells> {
     /// Every doom, in order, as the doom point saw it.
     #[cfg(test)]
     pub(crate) dooms: std::sync::Mutex<Vec<replay_impl::DoomSeen>>,
-    /// The nodes whose Dirty value, or whose unwind delivered to a retry,
-    /// a read in a frame returned.
-    #[cfg(test)]
-    pub(crate) dirty_reads: std::sync::Mutex<Vec<u32>>,
     /// Walk skips of a claim this thread holds anchored at a virtual
     /// frame's position, whose taint-memo entries the context owns.
     #[cfg(test)]
@@ -1028,8 +1024,6 @@ impl<C: Cells> Runtime<C> {
             group_verifies: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             dooms: std::sync::Mutex::new(Vec::new()),
-            #[cfg(test)]
-            dirty_reads: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -2254,8 +2248,6 @@ impl<C: Cells> Runtime<C> {
                 Some(value) => {
                     if let Some(f) = frame {
                         if state::load::<C>(node.state_cell()) == NodeState::Dirty {
-                            #[cfg(test)]
-                            self.dirty_reads.lock().unwrap().push(handle.slot());
                             self.note_dirty_read(f, handle, &value);
                         }
                     }
