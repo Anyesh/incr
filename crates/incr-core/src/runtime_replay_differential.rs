@@ -1038,9 +1038,16 @@ struct Live<C: Cells> {
 }
 
 /// After an operation: every query's state, every node's dependencies in
-/// the order its last landing installed them, and every node's state,
-/// indexed as the deps are. Both runtimes' entries, the first's first.
-type Snapshot = (Vec<NodeState>, Vec<Vec<u32>>, Vec<NodeState>);
+/// the order its last landing installed them, every node's state, indexed
+/// as the deps are, and every node's cycle-group record as its members'
+/// (slot, generation) pairs, sorted, indexed the same way. Both runtimes'
+/// entries, the first's first.
+type Snapshot = (
+    Vec<NodeState>,
+    Vec<Vec<u32>>,
+    Vec<NodeState>,
+    Vec<Vec<(u32, u32)>>,
+);
 
 impl<C: Cells> Live<C> {
     fn new(rts: &[Box<Runtime<C>>; 2], case: &Case) -> Self {
@@ -1129,6 +1136,7 @@ impl<C: Cells> Live<C> {
         let mut states = Vec::new();
         let mut deps = Vec::new();
         let mut nodes = Vec::new();
+        let mut groups = Vec::new();
         for side in 0..2 {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
@@ -1146,8 +1154,15 @@ impl<C: Cells> Live<C> {
                 deps.push(d);
                 nodes.push(rt.nodes.get(x).state());
             }
+            let inner = rt.inner.read();
+            for x in 0..rt.nodes.len() {
+                let mut members =
+                    (inner.member_recs.get(&x)).map_or(Vec::new(), |g| g.members.clone());
+                members.sort_unstable();
+                groups.push(members);
+            }
         }
-        (states, deps, nodes)
+        (states, deps, nodes, groups)
     }
 }
 
@@ -2321,8 +2336,9 @@ impl PanicText {
 
 /// The first operation at which `got` differs from the unbounded run's
 /// `want`, with both sides of it: in its outcome, or, after the operations
-/// `settles` marks, in any node's state or recorded deps. An exemption
-/// excuses one operation's outcome and nothing after it.
+/// `settles` marks, in any node's state or recorded deps, and without
+/// `settles` in any node's cycle-group record too. An exemption excuses one
+/// operation's outcome and nothing after it.
 fn first_diff(
     case: &Case,
     want: &Trace,
@@ -2367,7 +2383,7 @@ fn first_diff(
         };
         let wrong_states = settles
             .is_none_or(|s| s[i])
-            .then(|| states_diff(want, got))
+            .then(|| states_diff(want, got, settles.is_none()))
             .flatten();
         if wrong_out.is_some() || wrong_states.is_some() {
             let (w, g) = ((want_out, settled(&want.0)), (got_out, settled(&got.0)));
@@ -2381,8 +2397,8 @@ fn first_diff(
 
 /// T8-speculative-landings, which removes this rule and the next: a
 /// speculative run computes nodes the unbounded run never computes and
-/// lands them Clean with their deps, so a node New there may be Clean, or
-/// Dirty after a later set, with deps here.
+/// lands them Clean with their deps and group records, so a node New there
+/// may be Clean, or Dirty after a later set, with deps and a record here.
 fn speculative_landing(want: NodeState, got: NodeState) -> bool {
     want == NodeState::New && matches!(got, NodeState::Clean | NodeState::Dirty)
 }
@@ -2401,9 +2417,11 @@ fn speculative_delete(op: &Op, want: &Out, got: &Out) -> bool {
 
 static SPECULATIVE_DELETES: AtomicUsize = AtomicUsize::new(0);
 
-/// The nodes whose state or recorded deps differ between two snapshots,
-/// past the speculative landings.
-fn states_diff(want: &Snapshot, got: &Snapshot) -> Option<String> {
+/// The nodes whose state, recorded deps or, with `with_groups`, cycle-group
+/// record differ between two snapshots, past the speculative landings.
+/// The two-thread oracle leaves groups out, so that a record alone never
+/// sends a phase's end to [`consistent`] in place of a matching order.
+fn states_diff(want: &Snapshot, got: &Snapshot, with_groups: bool) -> Option<String> {
     let states: Vec<String> = (want.0.iter().zip(&got.0).enumerate())
         .filter(|(_, (w, g))| w != g && !speculative_landing(**w, **g))
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
@@ -2414,13 +2432,44 @@ fn states_diff(want: &Snapshot, got: &Snapshot) -> Option<String> {
         })
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
         .collect();
-    (!states.is_empty() || !deps.is_empty()).then(|| {
+    let groups: Vec<String> = (want.3.iter().zip(&got.3).enumerate())
+        .filter(|&(x, (w, g))| {
+            with_groups && w != g && !(w.is_empty() && speculative_landing(want.2[x], got.2[x]))
+        })
+        .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
+        .collect();
+    (!states.is_empty() || !deps.is_empty() || !groups.is_empty()).then(|| {
         format!(
-            "states differ [{}], deps differ [{}]",
+            "states differ [{}], deps differ [{}], groups differ [{}]",
             states.join(", "),
-            deps.join(", ")
+            deps.join(", "),
+            groups.join(", ")
         )
     })
+}
+
+#[test]
+fn states_diff_reports_group_records_off_the_two_thread_oracle() {
+    let snap = |state, group| -> Snapshot { (vec![], vec![vec![]], vec![state], vec![group]) };
+    let (want, got) = (
+        snap(NodeState::Clean, vec![(0, 1)]),
+        snap(NodeState::Clean, vec![]),
+    );
+    assert_eq!(
+        states_diff(&want, &got, true).as_deref(),
+        Some("states differ [], deps differ [], groups differ [0: [(0, 1)] for []]")
+    );
+    assert_eq!(states_diff(&want, &got, false), None);
+    let (want, got) = (
+        snap(NodeState::Clean, vec![]),
+        snap(NodeState::Clean, vec![(0, 1)]),
+    );
+    assert!(states_diff(&want, &got, true).is_some());
+    let (want, got) = (
+        snap(NodeState::New, vec![]),
+        snap(NodeState::Clean, vec![(0, 1)]),
+    );
+    assert_eq!(states_diff(&want, &got, true), None);
 }
 
 /// Panics, naming the case, at the first operation at which `got` differs
