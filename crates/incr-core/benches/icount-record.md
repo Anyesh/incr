@@ -1714,3 +1714,39 @@ one per node computed (+1.00 per chain node, +1 per fanout reader).
 computes the chains it then deletes, one pop per node.
 The rest move by noise in both directions (`delete_owned_tree_shared`
 -801, `get_contended_shared` +28, the others under 7).
+
+## A Shared walk checks for other threads' episodes after each claim
+
+- Engine: `w/T8-seed-7c3a12bcc-two-thread-nobudget` at `750144d9` against
+  its base `spreadsheet-t10` at `b123aaec`, the base in a detached
+  worktree; one run of `icount.sh` at the default N per column, and
+  `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_shared/propagate/10` and
+  `simple_count/shared/1000` for the per-line split. No workloads added.
+- Change: `clean_walk` passes each non-root entry's compute an
+  `Option<Planned>` (the runtime's landed-episode count when the walk
+  planned, and this thread's share), and `compute_attempts` compares it
+  with the count after its claim. Under `Local` both are compiled out.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 102 / 196 | 0 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/100` / `diamond_local` | 91,210.03 / 3,919 | 91,210.03 / 3,919 | 0 |
+| `chain_shared/propagate/4` / `10` / `100` | 9,431.24 / 20,536.89 / 188,139.27 | 9,516.21 / 20,759.82 / 190,432.25 | +84.97 / +222.93 / +2,292.98 |
+| `diamond_shared` / `early_cutoff_shared` | 7,853.94 / 3,609.85 | 7,915.93 / 3,643.85 | +61.99 / +34.00 |
+| `fanout_shared_4` / `5` / `1000` | 23,596.15 / 28,963.15 / 4,774,618.30 | 23,671.15 / 29,053.14 / 4,789,629.65 | +75.00 / +89.99 / +15,011.35 |
+| `delete_cascade_shared` | 4,557,778.18 | 4,572,774.02 | +14,995.84 |
+| `collection_insert_then_read/shared_incremental/*` | 7,405.73 / 7,380.05 / 7,385.40 | 7,463.74 / 7,437.98 / 7,443.47 | +58 each |
+| `simple_count/shared/*`, `children_*_shared` | | | +16 each |
+
+Gate: every hard gate and every `Local` workload counts the same as the
+base. `Shared` walks pay per computed entry: 15 on a fanout reader, 22 on
+a chain node. In `chain_shared/propagate/10` (+22.3 per node) PT puts
++9.2 on building the argument and the `unchecked` compare
+(`runtime.rs:2933`), +1.8 on the count load and compare in `replan`, and
+the rest on `compute_attempts` code moved by the extra parameter: the
+`IN_GROUP` test and the `group_verify` match +4 each, the publish +2,
+the `VerifyOnly` branch -6. `delete_cascade_shared` recomputes the chains
+it deletes, one entry per node. The rest move by noise
+(`get_contended_shared` -78, the others under 2).
