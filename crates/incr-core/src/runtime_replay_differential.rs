@@ -3542,9 +3542,31 @@ fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
     case.ops.truncate(10);
     assert!(matches!(case.ops[9], Op::Get(12)));
     quiet(|| {
-        differential::<Local>(&case, seed);
-        differential::<Shared>(&case, seed);
+        // A forced prune leaves the unread node 8 Dirty where the doomed
+        // walk's retry computes it: walk scope, not a result.
+        if *super::FORCE_REPLAN {
+            outcomes_alike::<Local>(&case, seed);
+            outcomes_alike::<Shared>(&case, seed);
+        } else {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        }
     });
+}
+
+/// [`differential`]'s runs, compared by their operations' outcomes alone.
+fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
+    let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
+    let unbounded = outcomes(run::<C>(case, None, 0));
+    for frames in [1, 2, 3] {
+        for bytes in [0, 16 * 1024] {
+            let bounded = outcomes(run::<C>(case, Some(frames), bytes));
+            assert_eq!(
+                bounded, unbounded,
+                "seed {seed:#x}, budget {frames} frames, {bytes} bytes"
+            );
+        }
+    }
 }
 
 /// Seeds 0x833e (and 0x41eb, in [`strict_dirty_for_clean_seeds`]), one thread, and the two-thread seed 0x2b13
