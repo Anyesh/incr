@@ -12,12 +12,14 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::hash_map::Entry as MapEntry;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::deferred::Unbuilt;
+use crate::few::Few;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::state::NodeState;
@@ -194,34 +196,79 @@ pub(crate) struct Delivery {
 
 /// The runs at one position along `path` that have ended undoomed in the
 /// current read of the frame below, as `(node, generation, count)`. Slots
-/// are found by position and path alone (see [`Context::runs`]). `owner` is the reading
-/// frame's depth on the thread's stack, which only decides how long
-/// [`start_read`] keeps the slot; it is 0 for a slot no read set, which a
-/// run's end makes under a virtual frame's blocked read or the opener's.
+/// are found by position and path alone (see [`Context::runs`]). `owner`
+/// is the reading frame's depth on the thread's stack, which only decides
+/// how long [`start_read`] keeps the slot; it is 0 for a slot no read set,
+/// which a run's end makes under a virtual frame's blocked read or the
+/// opener's.
 #[derive(Clone, Default)]
 pub(crate) struct RunSlot {
     pub(crate) path: u64,
     pub(crate) owner: u32,
-    pub(crate) counts: Vec<(u32, u32, u32)>,
+    pub(crate) counts: Few<(u32, u32, u32)>,
 }
 
 impl RunSlot {
     fn count(&self, node: u32, generation: u32) -> u32 {
-        self.counts
-            .iter()
+        (self.counts.as_slice().iter())
             .find(|&&(n, g, _)| (n, g) == (node, generation))
             .map_or(0, |&(_, _, k)| k)
     }
 
     fn bump(&mut self, node: u32, generation: u32) {
-        match self
-            .counts
-            .iter_mut()
+        match (self.counts.as_mut_slice().iter_mut())
             .find(|(n, g, _)| (*n, *g) == (node, generation))
         {
             Some((_, _, k)) => *k += 1,
             None => self.counts.push((node, generation, 1)),
         }
+    }
+}
+
+/// A context's run slots by position, the first at its `boundary + 1`; a
+/// position holds a slot per path its reads were made along.
+#[derive(Default)]
+pub(crate) struct RunSlots(Vec<Few<RunSlot>>);
+
+impl RunSlots {
+    fn at(&self, i: usize) -> &[RunSlot] {
+        self.0.get(i).map_or(&[], Few::as_slice)
+    }
+
+    fn at_mut(&mut self, i: usize) -> &mut Few<RunSlot> {
+        if self.0.len() <= i {
+            self.0.resize_with(i + 1, Few::default);
+        }
+        &mut self.0[i]
+    }
+
+    fn get(&self, i: usize, path: u64) -> Option<&RunSlot> {
+        self.at(i).iter().find(|s| s.path == path)
+    }
+
+    fn entry(&mut self, i: usize, path: u64) -> &mut RunSlot {
+        let slots = self.at_mut(i);
+        let j = match slots.as_slice().iter().position(|s| s.path == path) {
+            Some(j) => j,
+            None => {
+                slots.push(RunSlot {
+                    path,
+                    owner: 0,
+                    counts: Few::None,
+                });
+                slots.as_slice().len() - 1
+            }
+        };
+        &mut slots.as_mut_slice()[j]
+    }
+
+    /// The slots from index `i` on, which this keeps no longer.
+    fn split_off(&mut self, i: usize) -> Self {
+        Self(if i < self.0.len() {
+            self.0.split_off(i)
+        } else {
+            Vec::new()
+        })
     }
 }
 
@@ -312,11 +359,11 @@ impl Retire {
 pub(crate) struct Pending {
     slots: Vec<Option<Delivery>>,
     live: usize,
-    by_key: HashMap<ReadKey, Vec<usize>>,
-    by_maker: HashMap<u32, Vec<usize>>,
-    by_frame: HashMap<(u32, u32, u32), Vec<usize>>,
+    by_key: Index<ReadKey, usize>,
+    by_maker: Index<u32, usize>,
+    by_frame: Index<(u32, u32, u32), usize>,
     /// By the frame's node and generation, at any position.
-    by_node: HashMap<(u32, u32), Vec<usize>>,
+    by_node: Index<(u32, u32), usize>,
     traced: Vec<usize>,
     /// The passed deliveries that carry a landing deeper than just above
     /// their frame, which a pop can retire.
@@ -327,26 +374,35 @@ fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
     (key.node, key.generation, key.cidx)
 }
 
-/// Drops index `i` from the list `map` holds under `at`.
-fn unlist<K: std::hash::Hash + Eq>(map: &mut HashMap<K, Vec<usize>>, at: &K, i: usize) {
-    if let Some(list) = map.get_mut(at) {
-        list.retain(|&j| j != i);
-        if list.is_empty() {
-            map.remove(at);
+type Index<K, T> = HashMap<K, Few<T>, FxBuildHasher>;
+
+fn list<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: K, x: T) {
+    match map.entry(at) {
+        MapEntry::Occupied(mut e) => e.get_mut().push(x),
+        MapEntry::Vacant(e) => {
+            e.insert(Few::One(x));
         }
     }
+}
+
+/// Drops the items `gone` accepts from the list `map` holds under `at`.
+fn unlist<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: &K, gone: impl Fn(&T) -> bool) {
+    if map.get_mut(at).is_some_and(|l| l.retain(|x| !gone(x))) {
+        map.remove(at);
+    }
+}
+
+fn listed<K: std::hash::Hash + Eq, T: Copy>(map: &Index<K, T>, at: &K) -> Vec<T> {
+    map.get(at).map_or_else(Vec::new, |l| l.as_slice().to_vec())
 }
 
 impl Pending {
     pub(crate) fn push(&mut self, d: Delivery) {
         let i = self.slots.len();
-        self.by_key.entry(d.key).or_default().push(i);
-        self.by_maker.entry(d.maker).or_default().push(i);
-        self.by_frame.entry(frame_of(&d.key)).or_default().push(i);
-        self.by_node
-            .entry((d.key.node, d.key.generation))
-            .or_default()
-            .push(i);
+        list(&mut self.by_key, d.key, i);
+        list(&mut self.by_maker, d.maker, i);
+        list(&mut self.by_frame, frame_of(&d.key), i);
+        list(&mut self.by_node, (d.key.node, d.key.generation), i);
         if d.provenance.is_some() {
             self.traced.push(i);
         }
@@ -361,10 +417,12 @@ impl Pending {
         let d = self.slots[i]
             .take()
             .expect("incr-core: a delivery is removed once");
-        unlist(&mut self.by_key, &d.key, i);
-        unlist(&mut self.by_maker, &d.maker, i);
-        unlist(&mut self.by_frame, &frame_of(&d.key), i);
-        unlist(&mut self.by_node, &(d.key.node, d.key.generation), i);
+        unlist(&mut self.by_key, &d.key, |&j| j == i);
+        unlist(&mut self.by_maker, &d.maker, |&j| j == i);
+        unlist(&mut self.by_frame, &frame_of(&d.key), |&j| j == i);
+        unlist(&mut self.by_node, &(d.key.node, d.key.generation), |&j| {
+            j == i
+        });
         if d.provenance.is_some() {
             self.traced.retain(|&j| j != i);
         }
@@ -434,7 +492,7 @@ impl Pending {
 
     /// The deliveries for read `key`, oldest first.
     pub(crate) fn keyed(&self, key: &ReadKey) -> &[usize] {
-        self.by_key.get(key).map_or(&[], Vec::as_slice)
+        self.by_key.get(key).map_or(&[], Few::as_slice)
     }
 
     /// The oldest delivery for read `key` that `f` accepts.
@@ -460,7 +518,7 @@ impl Pending {
 
     /// The deliveries the run at `level` made, oldest first.
     pub(crate) fn of_maker(&self, level: u32) -> Vec<usize> {
-        self.by_maker.get(&level).cloned().unwrap_or_default()
+        listed(&self.by_maker, &level)
     }
 
     /// Removes the deliveries the run at `level` made, oldest first.
@@ -474,10 +532,7 @@ impl Pending {
     /// The deliveries for reads by the frame of `node` at `generation` and
     /// `cidx`, oldest first.
     pub(crate) fn of_frame(&self, node: u32, generation: u32, cidx: u32) -> Vec<usize> {
-        self.by_frame
-            .get(&(node, generation, cidx))
-            .cloned()
-            .unwrap_or_default()
+        listed(&self.by_frame, &(node, generation, cidx))
     }
 
     /// Removes the deliveries for reads by that frame, oldest first.
@@ -491,10 +546,7 @@ impl Pending {
     /// Removes, oldest first, the deliveries for reads by the frames of
     /// `node` at `generation`, at any position.
     pub(crate) fn extract_node(&mut self, node: u32, generation: u32) -> Vec<Delivery> {
-        self.by_node
-            .get(&(node, generation))
-            .cloned()
-            .unwrap_or_default()
+        listed(&self.by_node, &(node, generation))
             .into_iter()
             .map(|i| self.remove(i))
             .collect()
@@ -585,7 +637,7 @@ pub(crate) struct Context {
     pub(crate) vstack: Vec<VFrame>,
     /// Each node's `vstack` positions, lowest first, with the generation
     /// its virtual frame recorded.
-    pub(crate) vindex: HashMap<u32, Vec<(u32, u32)>>,
+    pub(crate) vindex: HashMap<u32, Vec<(u32, u32)>, FxBuildHasher>,
     /// The level of the entry the driver is running, or `None` until the
     /// loop starts.
     pub(crate) running: Option<u32>,
@@ -634,10 +686,10 @@ pub(crate) struct Context {
     /// seq is its node's count in its slot when it starts (see
     /// [`start_run`]), which each undoomed end of a run and each rerun of a
     /// dissolved or stale root raises, so a second run of a node at one
-    /// position reads none of the first's deliveries. A read sets its slot as it starts, empty
-    /// or to what the delivery it resumes kept, so a retry counts as the
-    /// run it redoes did. Keyed by `(cidx, path)`.
-    pub(crate) runs: BTreeMap<(u32, u64), RunSlot>,
+    /// position reads none of the first's deliveries. A read sets its slot
+    /// as it starts, empty or to what the delivery it resumes kept, so a
+    /// retry counts as the run it redoes did.
+    pub(crate) runs: RunSlots,
     /// The level of a landed point a read's judgement met above the
     /// position it read, until the driver drops the chain above it.
     pub(crate) drop_at: Option<u32>,
@@ -680,7 +732,7 @@ impl Context {
             boundary,
             levels: vec![VecDeque::from([target])],
             vstack: Vec::new(),
-            vindex: HashMap::new(),
+            vindex: HashMap::default(),
             running: None,
             running_entry: None,
             pending: Pending::default(),
@@ -693,7 +745,7 @@ impl Context {
             lows: Vec::new(),
             claim_revs: EarliestByFrame::default(),
             run_failures: EarliestByFrame::default(),
-            runs: BTreeMap::new(),
+            runs: RunSlots::default(),
             drop_at: None,
             drop_point: None,
             provenance: None,
@@ -1095,7 +1147,7 @@ thread_local! {
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
-    static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
+    static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
@@ -1109,7 +1161,7 @@ loom::thread_local! {
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
-    static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
+    static SUSPENDED: RefCell<HashMap<u64, (u64, u32), FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
@@ -1155,8 +1207,8 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
 }
 
 fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
-    let h = BuildHasherDefault::<DefaultHasher>::default().hash_one((rt, node)) as usize;
-    ((h >> 6) & 63, 1 << (h & 63))
+    let h = FxBuildHasher.hash_one((rt, node));
+    ((h >> 52 & 63) as usize, 1 << (h >> 58))
 }
 
 /// Marks `nodes` as landings a copy may hold, so that a later landing of
@@ -1533,6 +1585,13 @@ impl Drop for Speculating {
     }
 }
 
+/// Runs `f` on the thread's contexts without changing them, so the replay
+/// bit [`with`] keeps stays as it is. `f` must not call user code or the
+/// engine.
+pub(crate) fn peek<R>(f: impl FnOnce(&[Context]) -> R) -> R {
+    CONTEXTS.with(|c| f(&c.borrow()))
+}
+
 /// Runs `f` on the thread's contexts. `f` must not call user code or the
 /// engine.
 pub(crate) fn with<R>(f: impl FnOnce(&mut Vec<Context>) -> R) -> R {
@@ -1604,7 +1663,8 @@ pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry, frame_keys: Fram
         // The slots above the boundary are now the new context's to keep,
         // as it covers the frames below them.
         if let Some(at) = covering(c, rt, boundary) {
-            x.runs = c[at].runs.split_off(&(boundary + 1, 0));
+            let i = (boundary - c[at].boundary) as usize;
+            x.runs = c[at].runs.split_off(i);
         }
         c.push(x);
     });
@@ -1734,18 +1794,14 @@ pub(crate) fn covering(c: &[Context], rt: RuntimeId, cidx: u32) -> Option<usize>
 /// `path`.
 fn run_slot(c: &[Context], rt: RuntimeId, cidx: u32, path: u64) -> Option<&RunSlot> {
     let x = &c[covering(c, rt, cidx.checked_sub(1)?)?];
-    x.runs.get(&(cidx, path))
+    x.runs.get((cidx - x.boundary - 1) as usize, path)
 }
 
 /// As [`run_slot`], made if missing; none when no context covers the frame
 /// below, as then no record of a run at `cidx` can outlive its context.
 fn run_slot_mut(c: &mut [Context], rt: RuntimeId, cidx: u32, path: u64) -> Option<&mut RunSlot> {
-    let at = covering(c, rt, cidx.checked_sub(1)?)?;
-    Some(c[at].runs.entry((cidx, path)).or_insert_with(|| RunSlot {
-        path,
-        owner: 0,
-        counts: Vec::new(),
-    }))
+    let x = &mut c[covering(c, rt, cidx.checked_sub(1)?)?];
+    Some(x.runs.entry((cidx - x.boundary - 1) as usize, path))
 }
 
 /// A run that started while a context of `rt` was open.
@@ -1755,6 +1811,7 @@ struct Run {
     ctl: usize,
     frame: Frame,
     seq: u32,
+    path: u64,
     /// When it started, among the thread's runs.
     order: u64,
 }
@@ -1828,6 +1885,7 @@ pub(crate) fn start_run(
             ctl: ctl as usize,
             frame,
             seq,
+            path,
             order: r.next,
         }));
     });
@@ -1864,19 +1922,38 @@ pub(crate) fn seq_of(rt: RuntimeId, ctl: *const crate::cycle::ComputeCtl, depth:
     with_seqs(|s| s.of(rt, ctl, depth))
 }
 
-/// The seq of the latest run of `rt`'s `frame`, live or ended: for a run
-/// that may have left the stack, as a member's that lands at its episode's
-/// end. A frame on the stack has its seq from [`seq_of`].
-pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> u32 {
+/// The seq and path of the run of the frame at `depth` whose control block
+/// is `ctl`, if it started one.
+pub(crate) fn run_at(
+    rt: RuntimeId,
+    ctl: *const crate::cycle::ComputeCtl,
+    depth: u32,
+) -> Option<(u32, u64)> {
+    RUNS.with(|r| {
+        let at = depth.checked_sub(1)? as usize;
+        (r.borrow().live.get(at).copied().flatten())
+            .filter(|x| x.rt == rt && x.ctl == ctl as usize)
+            .map(|x| (x.seq, x.path))
+    })
+}
+
+/// The seq of the latest run of `rt`'s `frame`, live or ended, and the
+/// path it started along, which no frame or virtual frame below it changes
+/// while it runs or before its episode's end lands it: for a run that may
+/// have left the stack, as a member's that lands at its episode's end. A
+/// frame on the stack has them from [`run_at`]. No run gives seq 0 and no
+/// path.
+pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> (u32, Option<u64>) {
     RUNS.with(|r| {
         let r = r.borrow();
         let live = (r.live.iter().rev().flatten()).find(|x| x.rt == rt && x.frame == frame);
         let ended = r.ended.get(&(rt, frame));
         match (live, ended) {
-            (Some(l), Some(e)) => if l.order > e.order { l } else { e }.seq,
-            (Some(x), None) | (None, Some(x)) => x.seq,
-            (None, None) => 0,
+            (Some(l), Some(e)) => Some(if l.order > e.order { l } else { e }),
+            (Some(x), None) | (None, Some(x)) => Some(x),
+            (None, None) => None,
         }
+        .map_or((0, None), |x| (x.seq, Some(x.path)))
     })
 }
 
@@ -1907,7 +1984,7 @@ pub(crate) fn run_snapshot(c: &[Context], rt: RuntimeId, below: &VFrame) -> RunS
         .unwrap_or(RunSlot {
             path,
             owner: 0,
-            counts: Vec::new(),
+            counts: Few::None,
         })
 }
 
@@ -1921,25 +1998,23 @@ pub(crate) fn start_read(rt: RuntimeId, cidx: u32, depth: u32, path: u64, from: 
         let Some(at) = covering(c, rt, cidx) else {
             return;
         };
-        let over: Vec<_> = (c[at].runs.range((cidx + 1, 0)..=(cidx + 1, u64::MAX)))
-            .filter(|(_, s)| {
-                s.path != path
-                    && (s.owner == 0 || s.owner >= depth)
-                    && !(c.iter().filter(|x| x.rt == rt))
-                        .filter_map(|x| x.vframe_at(cidx))
-                        .any(|v| extend_path(v.path, Step::virtual_frame(v)) == s.path)
-            })
-            .map(|(&k, _)| k)
-            .collect();
-        for k in over {
-            c[at].runs.remove(&k);
+        let i = (cidx - c[at].boundary) as usize;
+        let over = |s: &RunSlot| s.path != path && (s.owner == 0 || s.owner >= depth);
+        if c[at].runs.at(i).iter().any(over) {
+            let kept: Vec<u64> = (c.iter().filter(|x| x.rt == rt))
+                .filter_map(|x| x.vframe_at(cidx))
+                .map(|v| extend_path(v.path, Step::virtual_frame(v)))
+                .collect();
+            c[at]
+                .runs
+                .at_mut(i)
+                .retain(|s| !over(s) || kept.contains(&s.path));
         }
-        let slot =
-            run_slot_mut(c, rt, cidx + 1, path).expect("incr-core: the context covers the read");
+        let slot = c[at].runs.entry(i, path);
         slot.owner = depth;
         match from.filter(|f| f.path == path) {
             Some(f) => slot.counts = f.counts,
-            None => slot.counts.clear(),
+            None => slot.counts = Few::None,
         }
     });
 }
@@ -2006,15 +2081,15 @@ pub(crate) fn run_ended(rt: RuntimeId, cidx: u32, doomed: bool) -> Vec<Delivery>
 #[derive(Default)]
 pub(crate) struct EarliestByFrame {
     /// Each frame's records, as `(path, maker, value)`.
-    by_frame: HashMap<Frame, Vec<(u64, u32, u64)>>,
-    by_maker: HashMap<u32, Vec<Frame>>,
+    by_frame: Index<Frame, (u64, u32, u64)>,
+    by_maker: Index<u32, Frame>,
     /// The positions of each node's frames, by node and generation.
-    by_node: HashMap<(u32, u32), Vec<u32>>,
+    by_node: Index<(u32, u32), u32>,
     /// The nodes whose runs a release ended, until a doomed run of the node
     /// notes a record again: a record taken for one meanwhile would be one
     /// of the ended runs'.
     #[cfg(debug_assertions)]
-    ended: std::collections::HashSet<(u32, u32)>,
+    ended: std::collections::HashSet<(u32, u32), FxBuildHasher>,
 }
 
 /// A frame's node, generation and position.
@@ -2024,20 +2099,23 @@ impl EarliestByFrame {
     fn note(&mut self, frame: Frame, path: u64, maker: u32, value: u64) {
         #[cfg(debug_assertions)]
         self.ended.remove(&(frame.0, frame.1));
-        let records = self.by_frame.entry(frame).or_default();
-        if records.is_empty() {
-            self.by_node
-                .entry((frame.0, frame.1))
-                .or_default()
-                .push(frame.2);
-        }
-        match records.iter_mut().find(|r| r.0 == path) {
-            Some(r) => r.2 = r.2.min(value),
-            None => {
-                records.push((path, maker, value));
-                self.by_maker.entry(maker).or_default().push(frame);
+        match self.by_frame.entry(frame) {
+            MapEntry::Vacant(e) => {
+                e.insert(Few::One((path, maker, value)));
+                list(&mut self.by_node, (frame.0, frame.1), frame.2);
+            }
+            MapEntry::Occupied(mut e) => {
+                let records = e.get_mut();
+                match records.as_mut_slice().iter_mut().find(|r| r.0 == path) {
+                    Some(r) => {
+                        r.2 = r.2.min(value);
+                        return;
+                    }
+                    None => records.push((path, maker, value)),
+                }
             }
         }
+        list(&mut self.by_maker, maker, frame);
     }
 
     pub(crate) fn has(&self, frame: Frame) -> bool {
@@ -2059,22 +2137,16 @@ impl EarliestByFrame {
     fn remove(&mut self, frame: Frame, f: impl Fn(&(u64, u32, u64)) -> bool) -> Option<u64> {
         let records = self.by_frame.get_mut(&frame)?;
         let mut value = None;
-        records.retain(|r| {
+        let empty = records.retain(|r| {
             let gone = f(r);
             if gone {
                 value = Some(r.2);
             }
             !gone
         });
-        if records.is_empty() {
+        if empty {
             self.by_frame.remove(&frame);
-            let key = (frame.0, frame.1);
-            if let Some(at) = self.by_node.get_mut(&key) {
-                at.retain(|&c| c != frame.2);
-                if at.is_empty() {
-                    self.by_node.remove(&key);
-                }
-            }
+            unlist(&mut self.by_node, &(frame.0, frame.1), |&c| c == frame.2);
         }
         value
     }
@@ -2088,18 +2160,14 @@ impl EarliestByFrame {
     fn end_node(&mut self, node: u32, generation: u32) {
         #[cfg(debug_assertions)]
         self.ended.insert((node, generation));
-        for cidx in self
-            .by_node
-            .get(&(node, generation))
-            .cloned()
-            .unwrap_or_default()
-        {
+        for cidx in listed(&self.by_node, &(node, generation)) {
             self.remove((node, generation, cidx), |_| true);
         }
     }
 
     fn end_maker(&mut self, level: u32) {
-        for frame in self.by_maker.remove(&level).unwrap_or_default() {
+        let frames = self.by_maker.remove(&level);
+        for &frame in frames.as_ref().map_or(&[][..], Few::as_slice) {
             self.remove(frame, |r| r.1 == level);
         }
     }

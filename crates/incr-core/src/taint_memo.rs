@@ -24,13 +24,14 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::value_code::{self, MEMO_BIT};
 
 #[derive(Default)]
 struct Memo {
-    owners: HashMap<(RuntimeId, NodeId), u32>,
+    owners: HashMap<(RuntimeId, NodeId), u32, FxBuildHasher>,
     /// At least every entry's owner, so a pop above it skips the scan.
     deepest: u32,
 }
