@@ -3294,6 +3294,24 @@ fn seed_92b175856b_dissolved_root_retry_computes_alone() {
     });
 }
 
+/// Seed 0x59a582f: at budgets 2 and 3, op 3 `TryGet(1)` gave 0 for 26.
+/// Root 2's episode dissolved at its virtual frame's pop, and the driver's
+/// retry of 2 was sent straight to 10's compute, as 2's run before the
+/// dissolve had read it, where the unbounded run's new run of 2 walks 10;
+/// 2's episode then formed again. The case stops before op 15, whose
+/// superseded landing of 3 is T8-strict-group-c-dirty-for-clean's.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_59a582f_dissolved_root_reads_afresh() {
+    let seed = 0x59a_582f;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(15);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
