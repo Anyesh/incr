@@ -2684,11 +2684,11 @@ fn episode_shape() -> Episode {
 /// entry lands Failed, and parks before X's retry. X's closure switches
 /// to read R first, and the other thread reads R, whose read of X waits
 /// for X's reservation while it holds R's claim. X's retry then reads R:
-/// the waits-for registry breaks that cycle, X lands Failed as a member
-/// of R's episode, and the reads end as in the unbounded run in which the
-/// other thread's read came first. Its read of Y, landed Failed by this
-/// thread, raises "last compute panicked" in place of "y boom", which the
-/// `Shared` payload contract leaves open.
+/// the waits-for registry breaks that cycle by a wound, whose victim
+/// decides which read comes first, and the reads end as in that order's
+/// unbounded run. In either order the other thread's read of R raises
+/// "last compute panicked" for Y, which this thread landed Failed, in place
+/// of "y boom", which the `Shared` payload contract leaves open.
 #[test]
 fn shared_episode_reader_and_a_vframes_retry_break_a_waits_for_cycle() {
     let s = episode_shape();
@@ -2720,20 +2720,33 @@ fn shared_episode_reader_and_a_vframes_retry_break_a_waits_for_cycle() {
         "a record outlived its delivery"
     );
 
-    let u = episode_shape();
-    u.rt.set_max_frames(u32::MAX);
-    u.in_cycle.store(1, SeqCst);
-    let want_other = outcome(|| u.rt.get(u.r));
-    let want_first = outcome(|| u.rt.get(u.x));
+    let serial = |x_first: bool| {
+        let u = episode_shape();
+        u.rt.set_max_frames(u32::MAX);
+        u.in_cycle.store(1, SeqCst);
+        let (want_first, want_other) = if x_first {
+            let f = outcome(|| u.rt.get(u.x));
+            (f, outcome(|| u.rt.get(u.r)))
+        } else {
+            let o = outcome(|| u.rt.get(u.r));
+            (outcome(|| u.rt.get(u.x)), o)
+        };
+        (want_first, want_other, u.rt.state_of(u.x))
+    };
+    let orders = [serial(false), serial(true)];
+    assert_ne!(orders[0].0, orders[1].0);
+    let (_, want_other, want_state) = orders
+        .into_iter()
+        .find(|w| w.0 == first)
+        .unwrap_or_else(|| panic!("{first:?} is no order's read of X"));
     assert_eq!(want_other, Err("y boom".to_string()));
-    assert_eq!(first, want_first);
     assert!(
         other
             .as_ref()
             .is_err_and(|m| m.contains("node 0 read but its last compute panicked")),
         "{other:?}"
     );
-    assert_eq!(s.rt.state_of(s.x), u.rt.state_of(u.x));
+    assert_eq!(s.rt.state_of(s.x), want_state);
 }
 
 /// The position and path of an untaken delivery for a frame of X.
