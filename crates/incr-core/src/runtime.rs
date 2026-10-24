@@ -2111,7 +2111,7 @@ impl<C: Cells> Runtime<C> {
         if bits & IN_GROUP != 0 {
             inner.member_recs.remove(&slot);
         }
-        self.set_released(inner, slot, None);
+        self.set_released(inner, slot, node, None);
         let children = if bits & HAS_INDEX != 0 {
             inner.children.remove(&slot)
         } else {
@@ -4418,27 +4418,43 @@ impl<C: Cells> Runtime<C> {
 
     /// Sets or drops `id`'s [`Inner::released_deps`] entry, under the hold
     /// that publishes its deps.
-    fn set_released(&self, inner: &mut Inner<C>, id: u32, entry: Option<(u32, u32)>) {
-        let node = self.nodes.get(id);
+    #[inline]
+    fn set_released(
+        &self,
+        inner: &mut Inner<C>,
+        id: u32,
+        node: &NodeData<C>,
+        entry: Option<(u32, u32)>,
+    ) {
+        if entry.is_some() || node.released_mark() {
+            Self::write_released(inner, id, node, entry);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write_released(
+        inner: &mut Inner<C>,
+        id: u32,
+        node: &NodeData<C>,
+        entry: Option<(u32, u32)>,
+    ) {
         match entry {
             Some(e) => {
                 inner.released_deps.insert(id, e);
-                node.set_released_mark(true);
             }
             None => {
-                if node.released_mark() {
-                    inner.released_deps.remove(&id);
-                    node.set_released_mark(false);
-                }
+                inner.released_deps.remove(&id);
             }
         }
+        node.set_released_mark(entry.is_some());
     }
 
     /// A finished run published the deps it already had.
     #[cold]
     #[inline(never)]
-    fn drop_released_entry(&self, id: NodeId) {
-        self.set_released(&mut self.inner.write(), id.0, None);
+    fn drop_released_entry(&self, id: NodeId, node: &NodeData<C>) {
+        self.set_released(&mut self.inner.write(), id.0, node, None);
     }
 
     #[cold]
@@ -4755,7 +4771,7 @@ impl<C: Cells> Runtime<C> {
             if same && seen == recorded.len() {
                 // Only this claim's owner writes the mark.
                 if node.released_mark() {
-                    self.drop_released_entry(id);
+                    self.drop_released_entry(id, node);
                 }
                 return Publish::Published;
             }
@@ -4863,7 +4879,7 @@ impl<C: Cells> Runtime<C> {
             .map(|&(_, kept)| kept);
         let len = diff.new.len() as u32;
         let entry = panic.map(|_| (len, kept.unwrap_or(diff.old.len() as u32)));
-        self.set_released(&mut inner, id.0, entry);
+        self.set_released(&mut inner, id.0, node, entry);
 
         for old_dep in diff.old {
             if !diff.new_set.has(*old_dep) {
@@ -4917,9 +4933,15 @@ impl<C: Cells> Runtime<C> {
     /// no read uses, as the `released_hot` bench needs. No other thread may
     /// run on `h`.
     pub fn hold_released_entry<T>(&self, h: Incr<T>) {
-        let len = dep_len(self.nodes.get(h.slot()));
+        let node = self.nodes.get(h.slot());
+        let len = dep_len(node);
         assert!(len >= 2);
-        self.set_released(&mut self.inner.write(), h.slot(), Some((len, len - 1)));
+        self.set_released(
+            &mut self.inner.write(),
+            h.slot(),
+            node,
+            Some((len, len - 1)),
+        );
     }
 
     /// At quiescence, every released entry counts its node's current deps,
@@ -5119,7 +5141,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(displaced) = node.install_deps(&deps) {
             drop(displaced);
         }
-        self.set_released(&mut inner, id.0, None);
+        self.set_released(&mut inner, id.0, node, None);
     }
 
     #[cfg(not(loom))]
