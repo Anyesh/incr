@@ -1958,8 +1958,9 @@ impl<C: Cells> Runtime<C> {
                 // A frame still New or Dirty that its pop does not finish is
                 // retried as the frame the unbounded run never popped, so it
                 // keeps its memo entries: a read of the retry that takes a
-                // delivery skips the walk that made them. Nothing the pop
-                // runs sees them.
+                // delivery skips the walk that made them. Its pop runs nothing
+                // that reads them, since only a held frame, never New or
+                // Dirty, gets a stand-in run with its own entries.
                 let node = self.nodes.get(v.node);
                 let retried = v.ep.is_none()
                     && node.generation() == v.generation
