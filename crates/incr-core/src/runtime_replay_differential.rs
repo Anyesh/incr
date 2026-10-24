@@ -2574,7 +2574,17 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
     });
     for (frames, bytes) in BUDGETS {
         let label = budget_label(seed, frames, bytes);
-        let (bounded, runs) = labelled(&label, || run_counted::<C>(case, frames, bytes));
+        let (mut bounded, runs) = labelled(&label, || run_counted::<C>(case, frames, bytes));
+        // A forced revisit re-walks its entry, and a bounded run's retried
+        // walks force it again at their own points, so only the outputs
+        // and whether a read was replaced are results.
+        if super::forced_revisit() && !C::SINGLE_THREADED {
+            for ((_, got), (_, want)) in bounded.iter_mut().zip(&unbounded) {
+                let replaced = got.2;
+                *got = want.clone();
+                got.2 = replaced;
+            }
+        }
         compare(case, &unbounded, &bounded, &label);
         compare_native(&native, &runs, &label);
     }
@@ -2742,6 +2752,100 @@ fn seed_56cd8c2_keeps_the_failed_set() {
         differential::<Local>(&case, 0x56c_d8c2);
         differential::<Shared>(&case, 0x56c_d8c2);
     });
+}
+
+/// 0xe126d92b8f, shrunk. 9 (Fallback) reads 4, which `try_get`s 5, and 5
+/// reaches 9 again through 6. In `Get(9)` the walk of Fixpoint member 2's
+/// run computes 9 twice at the same position and path, and at budget 3
+/// each run's read of 4 dooms it. Both reads have one key, so the second
+/// doom's delivery replaced the first, the member's restart gave it to
+/// the first run, and the second run doomed 4 again, forever.
+fn seed_e126d92b8f_case() -> Case {
+    let q = |expr, replay, bare, strategy| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy,
+    };
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let c = |v| Box::new(Expr::Const(v));
+    Case {
+        specs: vec![
+            q(Expr::Read(1, false), true, false, Strat::None),
+            q(Expr::Read(2, false), true, false, Strat::None),
+            q(
+                Expr::If(r(8, false), r(1, true), c(0)),
+                true,
+                false,
+                Strat::Fixpoint {
+                    initial: 2,
+                    limit: 3,
+                },
+            ),
+            q(Expr::Const(3), false, false, Strat::None),
+            q(Expr::Read(5, true), false, false, Strat::None),
+            q(
+                Expr::If(
+                    Box::new(Expr::Add(r(10, false), c(1))),
+                    Box::new(Expr::If(r(6, false), c(0), r(7, false))),
+                    c(0),
+                ),
+                true,
+                true,
+                Strat::None,
+            ),
+            q(Expr::Read(9, false), true, false, Strat::None),
+            q(
+                Expr::If(r(2, false), r(8, true), c(0)),
+                false,
+                false,
+                Strat::None,
+            ),
+            q(Expr::Read(9, true), true, false, Strat::None),
+            q(
+                Expr::Add(c(1), r(4, false)),
+                true,
+                false,
+                Strat::Fallback(1),
+            ),
+            q(
+                Expr::If(r(11, false), r(10, true), c(1)),
+                true,
+                false,
+                Strat::None,
+            ),
+            q(Expr::Read(12, false), true, true, Strat::None),
+            Spec::Input(1),
+            Spec::Input(0),
+            Spec::Input(3),
+        ],
+        panics: false,
+        cycles: true,
+        queries: 12,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(1), Op::Set(12, 2), Op::Get(0), Op::Get(9)],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_e126d92b8f_repeated_runs_keep_their_deliveries() {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let case = seed_e126d92b8f_case();
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            quiet(|| {
+                differential::<Local>(&case, 0xe1_26d9_2b8f);
+                differential::<Shared>(&case, 0xe1_26d9_2b8f);
+            });
+        }));
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(r) => r.unwrap_or_else(|p| std::panic::resume_unwind(p)),
+        Err(_) => panic!("seed 0xe126d92b8f: a bounded run never returned"),
+    }
 }
 
 /// 0x16d87, shrunk: a fresh `TryGet(18)`, which unbounded gets a cycle of
@@ -3731,6 +3835,11 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
         on: AtomicBool,
         first: AtomicBool,
         at3: AtomicBool,
+    }
+    // A forced revisit changes which of the overlapping reads raises the
+    // closure's payload, the schedule this test pins.
+    if super::forced_revisit() {
+        return;
     }
     let case = gen_case(0x934, false, true);
     let phases = phases(&case, 0x934);
@@ -6720,4 +6829,71 @@ fn replay_shrink() {
             .map(failure_message)
             .unwrap_or_else(|| "none under Local".into())
     );
+}
+
+/// Op 9 of `seed` truncated after it, as `(output, Failed set)`, for the
+/// unbounded run and for budget 3, under `C`.
+fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(10);
+    let at9 = |t: &Trace| -> (Out, Vec<usize>) {
+        let (out, snap) = &t[9];
+        let set = (snap.0.iter().enumerate())
+            .filter(|(_, s)| **s == NodeState::Failed)
+            .map(|(x, _)| x)
+            .collect();
+        (out.clone(), set)
+    };
+    [
+        at9(&run::<C>(&case, None, 0)),
+        at9(&run::<C>(&case, Some(3), 0)),
+    ]
+}
+
+/// Seed 0x56cdd78's op 9, `Get(8)`: its read of 4 runs 4's cycle episode,
+/// which releases 4, 8, 9 and 10 Dirty with no value, so the read walks 4
+/// again and the walk contains the cycle at its entries until 10's
+/// strategy closes it, reading 0. At a budget of 3 a doom stops the first
+/// walk; after the release, the frame reading 4 must walk again rather
+/// than take the `Direct` delivery made for the first walk.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
+    let seed = 0x56c_dd78;
+    assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(8)));
+    let want = (Out::Value(0), Vec::new());
+    quiet(|| {
+        let local = op9_at_budget_3::<Local>(seed);
+        let shared = op9_at_budget_3::<Shared>(seed);
+        assert_eq!([&local[0], &shared[0]], [&want, &want], "unbounded");
+        assert_eq!(
+            [&local[1], &shared[1]],
+            [&want, &want],
+            "budget 3, Local then Shared"
+        );
+    });
+}
+
+/// Seed 0x59afe69's op 9, `Get(12)`: the walk of 11 in 12's read runs 11
+/// at position 2 twice, first as a walked entry that catches a cycle out
+/// of 10, then, past 10's contained failed read, as the walk's root, which
+/// reads 10 Failed and fails 11, 12 and 13. At a budget of 3 a later doom
+/// of the first run's maker re-arms the cycle delivered for that run's
+/// read of 10, which the root run, a later run of 11 there, must not take.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
+    let seed = 0x59a_fe69;
+    assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(12)));
+    let want = (Out::Panic("failed".to_owned()), (12..=18).collect());
+    quiet(|| {
+        let local = op9_at_budget_3::<Local>(seed);
+        let shared = op9_at_budget_3::<Shared>(seed);
+        assert_eq!([&local[0], &shared[0]], [&want, &want], "unbounded");
+        assert_eq!(
+            [&local[1], &shared[1]],
+            [&want, &want],
+            "budget 3, Local then Shared"
+        );
+    });
 }

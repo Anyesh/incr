@@ -645,6 +645,11 @@ fn a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle<C: Cells>() {
 /// reads from the check, so the reader's landing stamps above W0 and R
 /// runs. Either way R reads the dep's new value.
 fn trust_check_against_a_claim(before: bool) {
+    // A forced revisit releases the reader's claim and parks it at the
+    // claim again, so the schedule never forms.
+    if super::forced_revisit() {
+        return;
+    }
     let rt = Arc::new(Rt::new());
     let y = rt.create_input(1_u64);
     let d = rt.create_query(move |rt: &Rt| rt.get(y) + 100);

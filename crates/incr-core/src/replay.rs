@@ -12,12 +12,13 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::deferred::Unbuilt;
+use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::state::NodeState;
 use crate::taint_memo;
@@ -75,6 +76,8 @@ pub(crate) struct VFrame {
     /// a hash of their [`Step`]s: a frame of the same node at the same
     /// position under another frame or read below is another run.
     pub(crate) path: u64,
+    /// The seq of the frame's run (see [`Context::runs`]).
+    pub(crate) seq: u32,
     /// The level of the entry whose run made it.
     pub(crate) maker: u32,
     /// For an episode's member run, the episode, which waits in the
@@ -110,6 +113,10 @@ pub(crate) struct ReadKey {
     pub(crate) ordinal: u32,
     /// The frame's [`VFrame::path`].
     pub(crate) path: u64,
+    /// The frame's run's seq (see [`Context::runs`]): another run of the
+    /// frame at the position along the path reads none of this one's
+    /// deliveries.
+    pub(crate) seq: u32,
     /// For a member run, the episode its member is in: a discovery run of
     /// the node at the position, and the runs of another episode, are other
     /// runs.
@@ -138,6 +145,7 @@ impl ReadKey {
             reading: v.reading,
             ordinal: v.ordinal,
             path: v.path,
+            seq: v.seq,
             episode: v.member_of,
             foreign: None,
         }
@@ -179,6 +187,42 @@ pub(crate) struct Delivery {
     /// as notes in the unbounded run from then on, so a later pop above
     /// the frame retires them as it retires notes.
     pub(crate) passed: bool,
+    /// For a `Walk` or `Direct`, the runs ended above the frame in its read
+    /// up to where the retry resumes it, which that read starts from.
+    pub(crate) runs: RunSlot,
+}
+
+/// The runs at one position along `path` that have ended undoomed in the
+/// current read of the frame below, as `(node, generation, count)`. Slots
+/// are found by position and path alone (see [`Context::runs`]). `owner` is the reading
+/// frame's depth on the thread's stack, which only decides how long
+/// [`start_read`] keeps the slot; it is 0 for a slot no read set, which a
+/// run's end makes under a virtual frame's blocked read or the opener's.
+#[derive(Clone, Default)]
+pub(crate) struct RunSlot {
+    pub(crate) path: u64,
+    pub(crate) owner: u32,
+    pub(crate) counts: Vec<(u32, u32, u32)>,
+}
+
+impl RunSlot {
+    fn count(&self, node: u32, generation: u32) -> u32 {
+        self.counts
+            .iter()
+            .find(|&&(n, g, _)| (n, g) == (node, generation))
+            .map_or(0, |&(_, _, k)| k)
+    }
+
+    fn bump(&mut self, node: u32, generation: u32) {
+        match self
+            .counts
+            .iter_mut()
+            .find(|(n, g, _)| (*n, *g) == (node, generation))
+        {
+            Some((_, _, k)) => *k += 1,
+            None => self.counts.push((node, generation, 1)),
+        }
+    }
 }
 
 /// The Failed landings noted for a payload that a copy of it carries, each
@@ -586,6 +630,14 @@ pub(crate) struct Context {
     /// member nests every failure marked since, whichever step of the
     /// replay marked it.
     pub(crate) run_failures: EarliestByFrame,
+    /// The count slots of the reads at positions above `boundary`. A run's
+    /// seq is its node's count in its slot when it starts (see
+    /// [`start_run`]), which each undoomed end of a run and each rerun of a
+    /// dissolved or stale root raises, so a second run of a node at one
+    /// position reads none of the first's deliveries. A read sets its slot as it starts, empty
+    /// or to what the delivery it resumes kept, so a retry counts as the
+    /// run it redoes did. Keyed by `(cidx, path)`.
+    pub(crate) runs: BTreeMap<(u32, u64), RunSlot>,
     /// The level of a landed point a read's judgement met above the
     /// position it read, until the driver drops the chain above it.
     pub(crate) drop_at: Option<u32>,
@@ -610,8 +662,9 @@ pub(crate) struct FrameKeys {
     pub(crate) parts: unsafe fn(*const (), u32, u32, bool) -> KeyParts,
 }
 
-/// A frame's node generation, path and member episode.
-pub(crate) type KeyParts = (u32, u64, Option<u64>);
+/// A frame's node generation, path, member episode and run's seq (see
+/// [`Context::runs`]).
+pub(crate) type KeyParts = (u32, u64, Option<u64>, u32);
 
 impl Context {
     pub(crate) fn new(
@@ -640,6 +693,7 @@ impl Context {
             lows: Vec::new(),
             claim_revs: EarliestByFrame::default(),
             run_failures: EarliestByFrame::default(),
+            runs: BTreeMap::new(),
             drop_at: None,
             drop_point: None,
             provenance: None,
@@ -741,6 +795,7 @@ impl Context {
             resumed: None,
             landed: None,
             passed: false,
+            runs: RunSlot::default(),
         });
     }
 
@@ -798,12 +853,12 @@ impl Context {
     /// did. A Dirty `landing` stays: it says a change was in flight, which
     /// a Failed landing would hide. A read after the take means the compute
     /// caught that copy, so a payload at its freed address with the same
-    /// text is another panic. The path tells this frame's delivery from
-    /// another run's at the position, whose taken copy's freed box can hold
-    /// a fresh copy of this one.
+    /// text is another panic. The path and seq tell this frame's delivery
+    /// from another run's at the position, whose taken copy's freed box can
+    /// hold a fresh copy of this one.
     pub(crate) fn retaken_landing(
         &mut self,
-        (node, generation, cidx, path): (u32, u32, u32, u64),
+        (node, generation, cidx, path, seq): (u32, u32, u32, u64, u32),
         last: (u64, u32),
         payload: &(dyn Any + Send),
         landing: NodeState,
@@ -818,6 +873,7 @@ impl Context {
                 d.taken
                     && d.key.read_by(node, generation, cidx, last)
                     && d.key.path == path
+                    && d.key.seq == seq
                     && d.resumed == unwind
                     && matches!(d.what, Delivered::Unwind { cycle: false, .. })
             })?;
@@ -884,12 +940,14 @@ impl Context {
     }
 
     /// Keeps the walk of the read virtual frame `below` was blocked in, from
-    /// where a doom stopped it, for the frame's retry.
+    /// where a doom stopped it, for the frame's retry, with the `runs` (see
+    /// [`run_snapshot`]) ended in it so far.
     pub(crate) fn deliver_walk(
         &mut self,
         below: &VFrame,
         walk: crate::runtime::Walk,
         pushed: Option<u32>,
+        runs: RunSlot,
     ) {
         let key = ReadKey::blocked(below);
         self.pending
@@ -905,14 +963,16 @@ impl Context {
             resumed: None,
             landed: None,
             passed: false,
+            runs,
         });
     }
 
     /// Sends the read virtual frame `below` was blocked in to its compute
     /// in the retry of the entry that made the frame. A pass at a higher
     /// level can pop the frame above it, and that pass's end must not drop
-    /// the delivery before the frame's retry reads it.
-    pub(crate) fn deliver_direct(&mut self, below: &VFrame) {
+    /// the delivery before the frame's retry reads it. A kept one keeps its
+    /// `runs`: the retry that took it ran none of the read's walk.
+    pub(crate) fn deliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
         let key = ReadKey::blocked(below);
         if self
             .pending
@@ -930,6 +990,7 @@ impl Context {
                 resumed: None,
                 landed: None,
                 passed: false,
+                runs,
             });
         }
     }
@@ -1035,6 +1096,7 @@ thread_local! {
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
+    static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
 #[cfg(loom)]
@@ -1048,6 +1110,7 @@ loom::thread_local! {
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
     static SUSPENDED: RefCell<HashMap<u64, (u64, u32)>> = RefCell::new(HashMap::new());
+    static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
 }
 
 #[cfg(all(test, not(loom)))]
@@ -1233,6 +1296,8 @@ pub(crate) struct Step {
     pub(crate) reading: u64,
     /// Which of the frame's reads of that node it is in, from 1.
     pub(crate) ordinal: u32,
+    /// The frame's run's seq (see [`Context::runs`]).
+    pub(crate) seq: u32,
 }
 
 impl Step {
@@ -1244,6 +1309,7 @@ impl Step {
             episode: member.then(|| held_episode(rt, node)).flatten(),
             reading,
             ordinal,
+            seq: 0,
         }
     }
 
@@ -1254,11 +1320,14 @@ impl Step {
             episode: v.member_of,
             reading: v.reading,
             ordinal: v.ordinal,
+            seq: v.seq,
         }
     }
 }
 
-/// The path of a frame above one at `path` that is in `step`.
+/// The path of a frame above one at `path` that is in `step`. A first
+/// run's `seq` is left out, so its paths are those of a frame with no
+/// earlier run.
 pub(crate) fn extend_path(path: u64, step: Step) -> u64 {
     [
         u64::from(step.node),
@@ -1267,6 +1336,7 @@ pub(crate) fn extend_path(path: u64, step: Step) -> u64 {
         u64::from(step.ordinal) + 1,
     ]
     .into_iter()
+    .chain((step.seq != 0).then_some(u64::from(step.seq)))
     .fold(path, |p, x| {
         p.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(x)
     })
@@ -1541,7 +1611,15 @@ pub(crate) fn payload_key(payload: &(dyn Any + Send)) -> PayloadKey {
 /// Opens a context, returning its id.
 pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry, frame_keys: FrameKeys) -> u64 {
     let id = next_id();
-    with(|c| c.push(Context::new(id, rt, boundary, target, frame_keys)));
+    with(|c| {
+        let mut x = Context::new(id, rt, boundary, target, frame_keys);
+        // The slots above the boundary are now the new context's to keep,
+        // as it covers the frames below them.
+        if let Some(at) = covering(c, rt, boundary) {
+            x.runs = c[at].runs.split_off(&(boundary + 1, 0));
+        }
+        c.push(x);
+    });
     id
 }
 
@@ -1583,7 +1661,11 @@ pub(crate) fn take_pending(
 /// it still holds.
 #[must_use]
 pub(crate) fn close(id: u64) -> Vec<Delivery> {
-    let removed = with(|c| c.iter().position(|x| x.id == id).map(|at| c.remove(at)));
+    let removed = with(|c| {
+        let x = c.remove(c.iter().position(|x| x.id == id)?);
+        end_sessions(c, [x.rt]);
+        Some(x)
+    });
     removed.map(|x| x.pending.into_vec()).unwrap_or_default()
 }
 
@@ -1629,6 +1711,7 @@ fn remove_where(mut gone: impl FnMut(&Context) -> bool) {
                 i += 1;
             }
         }
+        end_sessions(c, out.iter().map(|x| x.rt));
         out
     });
     drop(removed);
@@ -1647,6 +1730,7 @@ pub(crate) fn reset() {
 #[inline(never)]
 fn clear() {
     SUSPENDED.with(|s| s.borrow_mut().clear());
+    RUNS.with(|r| *r.borrow_mut() = Runs::default());
     set_carry(None);
     let removed = with(std::mem::take);
     drop(removed);
@@ -1656,6 +1740,253 @@ fn clear() {
 /// as an index into the stack.
 pub(crate) fn covering(c: &[Context], rt: RuntimeId, cidx: u32) -> Option<usize> {
     c.iter().rposition(|x| x.rt == rt && x.boundary <= cidx)
+}
+
+/// The slot (see [`Context::runs`]) of the runs at position `cidx` along
+/// `path`.
+fn run_slot(c: &[Context], rt: RuntimeId, cidx: u32, path: u64) -> Option<&RunSlot> {
+    let x = &c[covering(c, rt, cidx.checked_sub(1)?)?];
+    x.runs.get(&(cidx, path))
+}
+
+/// As [`run_slot`], made if missing; none when no context covers the frame
+/// below, as then no record of a run at `cidx` can outlive its context.
+fn run_slot_mut(c: &mut [Context], rt: RuntimeId, cidx: u32, path: u64) -> Option<&mut RunSlot> {
+    let at = covering(c, rt, cidx.checked_sub(1)?)?;
+    Some(c[at].runs.entry((cidx, path)).or_insert_with(|| RunSlot {
+        path,
+        owner: 0,
+        counts: Vec::new(),
+    }))
+}
+
+/// A run that started while a context of `rt` was open.
+#[derive(Clone, Copy)]
+struct Run {
+    rt: RuntimeId,
+    ctl: usize,
+    frame: Frame,
+    seq: u32,
+    /// When it started, among the thread's runs.
+    order: u64,
+}
+
+/// The thread's runs (see [`start_run`]), until the last context of their
+/// runtime goes.
+#[derive(Default)]
+struct Runs {
+    /// The latest run started at each depth on the thread's stack, from
+    /// depth 1; the entries above the stack's top are runs that ended.
+    live: Vec<Option<Run>>,
+    /// The latest of the runs a later run at their depth replaced while
+    /// claims were held, by frame: a member lands at its episode's end,
+    /// after the members beside it ran at its depth. Emptied at the next
+    /// run's start with no claim held, when every ended run has landed.
+    ended: HashMap<(RuntimeId, Frame), Run, FxBuildHasher>,
+    next: u64,
+}
+
+impl Runs {
+    fn forget(&mut self, rt: RuntimeId) {
+        for x in &mut self.live {
+            if x.is_some_and(|x| x.rt == rt) {
+                *x = None;
+            }
+        }
+        while self.live.last().is_some_and(Option::is_none) {
+            self.live.pop();
+        }
+        self.ended.retain(|&(r, _), _| r != rt);
+    }
+}
+
+/// A run of `frame` along `path` starts, with control block `ctl` at
+/// `depth` on the thread's stack: it is given the seq (see
+/// [`Context::runs`]) its frame has there now, for its whole run. Only a
+/// run under a context of `rt` has one, as a read is replayed only then.
+pub(crate) fn start_run(
+    rt: RuntimeId,
+    ctl: *const crate::cycle::ComputeCtl,
+    depth: u32,
+    frame: Frame,
+    path: u64,
+) {
+    let seq = with(|c| {
+        innermost(c, rt)?;
+        Some(run_slot(c, rt, frame.2, path).map_or(0, |s| s.count(frame.0, frame.1)))
+    });
+    let Some(seq) = seq else {
+        return;
+    };
+    let held = crate::cycle_state::held_any();
+    RUNS.with(|r| {
+        let r = &mut *r.borrow_mut();
+        let at = depth.saturating_sub(1) as usize;
+        if held {
+            for x in r.live.drain(at.min(r.live.len())..).flatten() {
+                let key = (x.rt, x.frame);
+                if r.ended.get(&key).is_none_or(|e| e.order < x.order) {
+                    r.ended.insert(key, x);
+                }
+            }
+        } else {
+            r.live.truncate(at);
+            r.ended.clear();
+        }
+        r.live.resize(at, None);
+        r.next += 1;
+        r.live.push(Some(Run {
+            rt,
+            ctl: ctl as usize,
+            frame,
+            seq,
+            order: r.next,
+        }));
+    });
+}
+
+/// The thread's runs, borrowed to find the seqs of many frames at once.
+pub(crate) struct Seqs<'a>(&'a Runs);
+
+impl Seqs<'_> {
+    /// The seq of the run of `rt`'s frame with control block `ctl` at
+    /// `depth` on the thread's stack, or 0 for one that started with no
+    /// context of `rt` open.
+    pub(crate) fn of(
+        &self,
+        rt: RuntimeId,
+        ctl: *const crate::cycle::ComputeCtl,
+        depth: u32,
+    ) -> u32 {
+        let Some(at) = depth.checked_sub(1) else {
+            return 0;
+        };
+        (self.0.live.get(at as usize).copied().flatten())
+            .filter(|x| x.rt == rt && x.ctl == ctl as usize)
+            .map_or(0, |x| x.seq)
+    }
+}
+
+pub(crate) fn with_seqs<R>(f: impl FnOnce(Seqs<'_>) -> R) -> R {
+    RUNS.with(|r| f(Seqs(&r.borrow())))
+}
+
+/// As [`Seqs::of`], for one frame.
+pub(crate) fn seq_of(rt: RuntimeId, ctl: *const crate::cycle::ComputeCtl, depth: u32) -> u32 {
+    with_seqs(|s| s.of(rt, ctl, depth))
+}
+
+/// The seq of the latest run of `rt`'s `frame`, live or ended: for a run
+/// that may have left the stack, as a member's that lands at its episode's
+/// end. A frame on the stack has its seq from [`seq_of`].
+pub(crate) fn run_seq(rt: RuntimeId, frame: Frame) -> u32 {
+    RUNS.with(|r| {
+        let r = r.borrow();
+        let live = (r.live.iter().rev().flatten()).find(|x| x.rt == rt && x.frame == frame);
+        let ended = r.ended.get(&(rt, frame));
+        match (live, ended) {
+            (Some(l), Some(e)) => if l.order > e.order { l } else { e }.seq,
+            (Some(x), None) | (None, Some(x)) => x.seq,
+            (None, None) => 0,
+        }
+    })
+}
+
+/// Drops the runs of each runtime in `gone` that has no context left in
+/// `c`: a frame that starts before its next context opens has no run, and
+/// must not find one of an earlier frame at its stack address.
+fn end_sessions(c: &[Context], gone: impl IntoIterator<Item = RuntimeId>) {
+    RUNS.with(|r| {
+        let r = &mut *r.borrow_mut();
+        if c.is_empty() {
+            *r = Runs::default();
+            return;
+        }
+        for rt in gone {
+            if innermost(c, rt).is_none() {
+                r.forget(rt);
+            }
+        }
+    });
+}
+
+/// The runs ended so far above virtual frame `below` in its blocked read,
+/// which a `Walk` or `Direct` for that read keeps for the retry.
+pub(crate) fn run_snapshot(c: &[Context], rt: RuntimeId, below: &VFrame) -> RunSlot {
+    let path = extend_path(below.path, Step::virtual_frame(below));
+    run_slot(c, rt, below.cidx + 1, path)
+        .cloned()
+        .unwrap_or(RunSlot {
+            path,
+            owner: 0,
+            counts: Vec::new(),
+        })
+}
+
+/// A read by the frame at `cidx`, at `depth` on the thread's stack,
+/// starts, with its frames above along `path`: they count their runs from
+/// `from`, what the delivery the read resumes kept, or from none. The
+/// reads at `cidx` of frames that were at or above `depth` are over, and
+/// of virtual frames no longer there.
+pub(crate) fn start_read(rt: RuntimeId, cidx: u32, depth: u32, path: u64, from: Option<RunSlot>) {
+    with(|c| {
+        let Some(at) = covering(c, rt, cidx) else {
+            return;
+        };
+        let over: Vec<_> = (c[at].runs.range((cidx + 1, 0)..=(cidx + 1, u64::MAX)))
+            .filter(|(_, s)| {
+                s.path != path
+                    && (s.owner == 0 || s.owner >= depth)
+                    && !(c.iter().filter(|x| x.rt == rt))
+                        .filter_map(|x| x.vframe_at(cidx))
+                        .any(|v| extend_path(v.path, Step::virtual_frame(v)) == s.path)
+            })
+            .map(|(&k, _)| k)
+            .collect();
+        for k in over {
+            c[at].runs.remove(&k);
+        }
+        let slot =
+            run_slot_mut(c, rt, cidx + 1, path).expect("incr-core: the context covers the read");
+        slot.owner = depth;
+        match from.filter(|f| f.path == path) {
+            Some(f) => slot.counts = f.counts,
+            None => slot.counts.clear(),
+        }
+    });
+}
+
+/// The run of `frame` along `path` ended, not doomed, so a later run there
+/// gets the next seq. It is counted in its read's slot, made if missing,
+/// and in each untaken `Walk` or `Direct` kept for a virtual frame's read
+/// at the position below, whose retry resumes after it. A speculative run
+/// is no run of the unbounded run's and counts nowhere.
+pub(crate) fn end_run(rt: RuntimeId, frame: Frame, path: u64) {
+    if speculative() {
+        return;
+    }
+    let (node, generation, cidx) = frame;
+    with(|c| {
+        if let Some(below) = cidx.checked_sub(1) {
+            for x in c.iter_mut().filter(|x| x.rt == rt) {
+                let Some(key) = x.vframe_at(below).map(ReadKey::blocked) else {
+                    continue;
+                };
+                for j in 0..x.pending.keyed(&key).len() {
+                    let d = x.pending.get_mut(x.pending.keyed(&key)[j]);
+                    if !d.taken
+                        && d.runs.path == path
+                        && matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
+                    {
+                        d.runs.bump(node, generation);
+                    }
+                }
+            }
+        }
+        if let Some(slot) = run_slot_mut(c, rt, cidx, path) {
+            slot.bump(node, generation);
+        }
+    });
 }
 
 /// A run at position `cidx` that is not a driver entry's, a member run,
@@ -1698,7 +2029,8 @@ pub(crate) struct EarliestByFrame {
     ended: std::collections::HashSet<(u32, u32)>,
 }
 
-type Frame = (u32, u32, u32);
+/// A frame's node, generation and position.
+pub(crate) type Frame = (u32, u32, u32);
 
 impl EarliestByFrame {
     fn note(&mut self, frame: Frame, path: u64, maker: u32, value: u64) {
