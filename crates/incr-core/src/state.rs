@@ -89,6 +89,15 @@ impl NodeState {
     }
 }
 
+/// `Clean`'s byte in a state cell, which `get`'s fast path compares the
+/// raw load with.
+pub(crate) const CLEAN_BYTE: u8 = NodeState::Clean as u8;
+
+const _: () = assert!(
+    std::mem::size_of::<NodeState>() == 1 && CLEAN_BYTE == 3,
+    "the Clean fast path compares a state cell's raw byte with Clean's"
+);
+
 /// Load the current state with Acquire ordering through the strategy's
 /// state cell. Use on the reader hot path to synchronize with the
 /// Release store that transitioned the node to its current state.
@@ -169,6 +178,13 @@ mod tests {
     fn computing_dirty_roundtrips_through_u8() {
         assert_eq!(NodeState::from_u8(5), NodeState::ComputingDirty);
         assert_eq!(NodeState::ComputingDirty.as_u8(), 5);
+    }
+
+    #[test]
+    fn a_clean_cell_holds_the_fast_paths_byte() {
+        let s = Local::new_state(NodeState::Clean.as_u8());
+        assert_eq!(Local::state_load_acquire(&s), CLEAN_BYTE);
+        assert_eq!(NodeState::from_u8(CLEAN_BYTE), NodeState::Clean);
     }
 
     #[test]

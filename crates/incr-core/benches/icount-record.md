@@ -1986,3 +1986,27 @@ owner writes both and its release publishes both. Base `ca94bbad`, tip
 Gate: the hard gates are exact (196, 218.14, 87). Replay scale by
 `strict-scan.sh`'s `scale-icount` against `ca94bbad`: every ratio is in
 0.9972..1.0000.
+
+## The Clean fast path compares the raw state byte
+
+- Engine: `w/T8-strict-group-c-dirty-for-clean` against its base
+  `0de6042b` (spreadsheet-t10 `5dd1c25f` plus a test-only commit), the
+  base in a detached worktree; one run of `icount.sh` at the default N
+  per column. No workloads added.
+- Change: `get` and `try_get` compare the state cell's raw byte with
+  `Clean`'s (`state::CLEAN_BYTE`, pinned by a const assert) and convert
+  only on the slow path, so the fast path no longer runs `from_u8`'s
+  range check.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` / `get_clean_shared` | 102 / 196 | 100 / 194 | -2 / -2 |
+| `table_hit_local` / `_shared` | 155.14 / 218.14 | 155.14 / 218.14 | 0 |
+| `value_slot_read_local` / `_shared` | 5 / 87 | 5 / 87 | 0 |
+| `chain_local/propagate/100` | 91,217.01 | 91,017.03 | -199.98 |
+| `chain_shared/propagate/100` | 188,143.25 | 187,943.42 | -199.83 |
+| `fanout_shared_1000` | 4,779,633.50 | 4,777,632.74 | -2,000.76 |
+
+Gate: every hard gate is at or under the base. The chains and the fanout
+save 2 per Clean `get` they make: one per chain node (-2.00 per node) and
+two per fanout reader.

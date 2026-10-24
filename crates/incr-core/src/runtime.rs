@@ -2024,8 +2024,9 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(slot);
         self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
 
-        let observed = state::load::<C>(node.state_cell());
-        if observed == NodeState::Clean {
+        // The raw byte, so the fast path skips `from_u8`'s range check.
+        let raw = C::state_load_acquire(node.state_cell());
+        if raw == state::CLEAN_BYTE {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
@@ -2037,7 +2038,7 @@ impl<C: Cells> Runtime<C> {
                 },
             };
         }
-        self.get_slow(handle, observed)
+        self.get_slow(handle, NodeState::from_u8(raw))
     }
 
     /// The non-Clean arm of [`Self::get`]: walk, then read. `observed`
@@ -2061,8 +2062,9 @@ impl<C: Cells> Runtime<C> {
         }
         let slot = handle.slot();
         let node = self.nodes.get(slot);
-        let observed = state::load::<C>(node.state_cell());
-        if observed == NodeState::Clean {
+        // The raw byte, so the fast path skips `from_u8`'s range check.
+        let raw = C::state_load_acquire(node.state_cell());
+        if raw == state::CLEAN_BYTE {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             self.dep_stack
                 .record_dep(self.runtime_id, NodeId(slot), handle.generation());
@@ -2074,7 +2076,7 @@ impl<C: Cells> Runtime<C> {
                 },
             };
         }
-        self.try_get_slow(handle, observed)
+        self.try_get_slow(handle, NodeState::from_u8(raw))
     }
 
     #[inline(never)]
