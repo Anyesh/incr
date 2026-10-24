@@ -594,13 +594,28 @@ impl Pending {
         }
     }
 
-    /// Removes the deliveries for read `key` that `f` accepts.
-    pub(crate) fn remove_keyed(&mut self, key: &ReadKey, f: impl Fn(&Delivery) -> bool) {
+    /// Removes the walk directions for `key`, which hold no user value
+    /// and so may drop inside the contexts' borrow.
+    pub(crate) fn remove_walks(&mut self, key: &ReadKey) {
+        drop(self.remove_keyed(key, |d| matches!(d.what, Delivered::Walk(..))));
+    }
+
+    /// Removes the deliveries for `key` that `f` picks and returns them:
+    /// one may hold a user value, whose `Drop` may read and so must run
+    /// outside the contexts' borrow.
+    #[must_use]
+    pub(crate) fn remove_keyed(
+        &mut self,
+        key: &ReadKey,
+        f: impl Fn(&Delivery) -> bool,
+    ) -> Vec<Delivery> {
+        let mut removed = Vec::new();
         for i in self.keyed(key).to_vec() {
             if f(self.get(i)) {
-                self.remove(i);
+                removed.push(self.remove(i));
             }
         }
+        removed
     }
 
     /// The deliveries the run at `level` made, oldest first.
@@ -934,14 +949,16 @@ impl Context {
     }
 
     /// Delivers `what` to the read virtual frame `below` was blocked in.
-    pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) {
-        self.push_blocked(below, what, None);
+    #[must_use]
+    pub(crate) fn deliver_blocked(&mut self, below: &VFrame, what: Delivered) -> Vec<Delivery> {
+        self.push_blocked(below, what, None)
     }
 
     /// Delivers the unwind out of the running frame at `cidx` to the
     /// read of [`Self::unwind_target`], with the provenance record
     /// published for that read.
-    pub(crate) fn deliver_unwind(&mut self, cidx: u32, what: Delivered) {
+    #[must_use]
+    pub(crate) fn deliver_unwind(&mut self, cidx: u32, what: Delivered) -> Vec<Delivery> {
         let below = self
             .unwind_target(cidx)
             .expect("incr-core: an unwind is delivered to a virtual frame")
@@ -951,7 +968,7 @@ impl Context {
             .provenance
             .take()
             .and_then(|(k, p)| (k == key).then_some(p));
-        self.push_blocked(&below, what, provenance);
+        self.push_blocked(&below, what, provenance)
     }
 
     fn push_blocked(
@@ -959,13 +976,14 @@ impl Context {
         below: &VFrame,
         what: Delivered,
         provenance: Option<Rc<dyn Provenance>>,
-    ) {
+    ) -> Vec<Delivery> {
         let key = ReadKey::blocked(below);
-        self.pending.remove_keyed(&key, |d| d.blocked);
+        let replaced = self.pending.remove_keyed(&key, |d| d.blocked);
         let mut d = Delivery::new(key, below.maker, what);
         d.blocked = true;
         d.provenance = provenance;
         self.pending.push(d);
+        replaced
     }
 
     /// The virtual frame the driver delivers an unwind out of the frame at
@@ -1119,8 +1137,7 @@ impl Context {
         runs: RunSlot,
     ) {
         let key = ReadKey::blocked(below);
-        self.pending
-            .remove_keyed(&key, |d| matches!(d.what, Delivered::Walk(..)));
+        self.pending.remove_walks(&key);
         let mut d = Delivery::new(key, below.maker, Delivered::Walk(Box::new(walk), pushed));
         d.runs = runs;
         self.pending.push(d);
@@ -1701,10 +1718,34 @@ pub(crate) fn peek<R>(f: impl FnOnce(&[Context]) -> R) -> R {
     CONTEXTS.with(|c| f(&c.borrow()))
 }
 
-/// Whether the thread's contexts are borrowed: a user `Drop` of a value
-/// one held, such as a replaced landing's, runs inside [`with`].
+/// Whether the thread's contexts are borrowed: value code runs inside
+/// [`with`], and so would a user `Drop` of a value the contexts held if
+/// an unwind out of a closure dropped it there.
 pub(crate) fn held() -> bool {
     CONTEXTS.with(|c| c.try_borrow_mut().is_err())
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static HELD_DROPS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Counts an unbuilt value dropped inside the contexts' borrow, which
+/// only an unwind out of a [`with`] closure may do. The contexts' own
+/// drop at thread exit, when they can't be reached, counts nothing.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn note_drop() {
+    if CONTEXTS
+        .try_with(|c| c.try_borrow_mut().is_err())
+        .unwrap_or(false)
+    {
+        HELD_DROPS.with(|n| n.set(n.get() + 1));
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_held_drops() -> u32 {
+    HELD_DROPS.with(|n| n.replace(0))
 }
 
 /// Runs `f` on the thread's contexts. `f` must not call user code or the

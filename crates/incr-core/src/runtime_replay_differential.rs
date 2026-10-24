@@ -1113,9 +1113,10 @@ struct Live<C: Cells> {
 }
 
 /// After an operation: every query's state, every node's dependencies in
-/// the order its last landing installed them. Both runtimes' entries, the
-/// first's first.
-type Snapshot = (Vec<NodeState>, Vec<Vec<u32>>);
+/// the order its last landing installed them, and every node's cycle-group
+/// record as its members' (slot, generation) pairs, sorted, indexed as the
+/// deps are. Both runtimes' entries, the first's first.
+type Snapshot = (Vec<NodeState>, Vec<Vec<u32>>, Vec<Vec<(u32, u32)>>);
 
 impl<C: Cells> Live<C> {
     fn new(rts: &[Box<Runtime<C>>; 2], case: &Case) -> Self {
@@ -1173,7 +1174,8 @@ impl<C: Cells> Live<C> {
     }
 
     /// This thread's checks after its operation: no engine panic outside
-    /// the documented ones, and no virtual frame left or pushed twice.
+    /// the documented ones, no virtual frame left or pushed twice, and no
+    /// unbuilt value dropped inside the replay contexts' borrow.
     fn check_thread(&self) -> Result<(), String> {
         if let Some(internal) = INTERNAL.with(|i| i.borrow_mut().take()) {
             return Err(format!("an engine panic: {internal}"));
@@ -1184,6 +1186,12 @@ impl<C: Cells> Live<C> {
         }
         if !crate::replay::vindexes_empty() {
             return Err("a virtual frame is left indexed".to_owned());
+        }
+        let held = crate::replay::take_held_drops();
+        if held != 0 {
+            return Err(format!(
+                "{held} held values dropped inside the replay contexts' borrow"
+            ));
         }
         Ok(())
     }
@@ -1197,6 +1205,7 @@ impl<C: Cells> Live<C> {
         let w = &*self.world;
         let mut states = Vec::new();
         let mut deps = Vec::new();
+        let mut groups = Vec::new();
         for side in 0..2 {
             let rt = w.rt(side);
             for q in 0..self.queries[side] {
@@ -1213,8 +1222,15 @@ impl<C: Cells> Live<C> {
                 rt.nodes.get(x).for_each_dep(|n| d.push(n.0));
                 deps.push(d);
             }
+            let inner = rt.inner.read();
+            for x in 0..rt.nodes.len() {
+                let mut members =
+                    (inner.member_recs.get(&x)).map_or(Vec::new(), |g| g.members.clone());
+                members.sort_unstable();
+                groups.push(members);
+            }
         }
-        (states, deps)
+        (states, deps, groups)
     }
 }
 
@@ -1248,6 +1264,7 @@ fn reset_thread() {
     hook();
     INTERNAL.with(|i| i.borrow_mut().take());
     crate::replay::take_vindex_repushes();
+    crate::replay::take_held_drops();
 }
 
 fn run<C: Cells>(case: &Case, frames: Option<u32>, bytes: usize) -> Trace {
@@ -2401,8 +2418,9 @@ impl PanicText {
 
 /// The first operation at which `got` differs from the unbounded run's
 /// `want`, with both sides of it: in its outcome, or, after the operations
-/// `settles` marks, in any node's state or recorded deps. An exemption
-/// excuses one operation's outcome and nothing after it.
+/// `settles` marks, in any node's state or recorded deps, and without
+/// `settles` in any node's cycle-group record too. An exemption excuses one
+/// operation's outcome and nothing after it.
 fn first_diff(
     want: &Trace,
     got: &Trace,
@@ -2442,7 +2460,7 @@ fn first_diff(
         };
         let wrong_states = settles
             .is_none_or(|s| s[i])
-            .then(|| states_diff(want, got))
+            .then(|| states_diff(want, got, settles.is_none()))
             .flatten();
         if wrong_out.is_some() || wrong_states.is_some() {
             let (w, g) = ((want_out, settled(&want.0)), (got_out, settled(&got.0)));
@@ -2454,8 +2472,11 @@ fn first_diff(
     None
 }
 
-/// The nodes whose state or recorded deps differ between two snapshots.
-fn states_diff(want: &Snapshot, got: &Snapshot) -> Option<String> {
+/// The nodes whose state, recorded deps or, with `with_groups`, cycle-group
+/// record differ between two snapshots. The two-thread oracle leaves
+/// groups out, so that a record alone never sends a phase's end to
+/// [`consistent`] in place of a matching order.
+fn states_diff(want: &Snapshot, got: &Snapshot, with_groups: bool) -> Option<String> {
     let states: Vec<String> = (want.0.iter().zip(&got.0).enumerate())
         .filter(|(_, (w, g))| w != g)
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
@@ -2464,13 +2485,31 @@ fn states_diff(want: &Snapshot, got: &Snapshot) -> Option<String> {
         .filter(|(_, (w, g))| w != g)
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
         .collect();
-    (!states.is_empty() || !deps.is_empty()).then(|| {
+    let groups: Vec<String> = (want.2.iter().zip(&got.2).enumerate())
+        .filter(|(_, (w, g))| with_groups && w != g)
+        .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
+        .collect();
+    (!states.is_empty() || !deps.is_empty() || !groups.is_empty()).then(|| {
         format!(
-            "states differ [{}], deps differ [{}]",
+            "states differ [{}], deps differ [{}], groups differ [{}]",
             states.join(", "),
-            deps.join(", ")
+            deps.join(", "),
+            groups.join(", ")
         )
     })
+}
+
+#[test]
+fn states_diff_reports_group_records_off_the_two_thread_oracle() {
+    let snap = |group| -> Snapshot { (vec![], vec![vec![]], vec![group]) };
+    let (want, got) = (snap(vec![(0, 1)]), snap(vec![]));
+    assert_eq!(
+        states_diff(&want, &got, true).as_deref(),
+        Some("states differ [], deps differ [], groups differ [0: [(0, 1)] for []]")
+    );
+    assert_eq!(states_diff(&want, &got, false), None);
+    let (want, got) = (snap(vec![]), snap(vec![(0, 1)]));
+    assert!(states_diff(&want, &got, true).is_some());
 }
 
 /// Panics, naming the case, at the first operation at which `got` differs

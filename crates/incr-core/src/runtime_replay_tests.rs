@@ -1771,3 +1771,82 @@ fn a_walk_stopped_below_an_entry_that_lands_its_root_clean_goes_on() {
     assert_eq!(stopped_walk_shape::<Shared>(u32::MAX), want);
     assert_eq!(stopped_walk_shape::<Shared>(3), want);
 }
+
+/// Two outcomes of a blocked read, the first a landed value whose `Drop`
+/// reads a Dirty node: the second replaces the first, which must drop
+/// outside the contexts' borrow, where the read can walk and recompute.
+fn a_replaced_blocked_landing_drops_outside_the_contexts<C: Cells>(rt: &Runtime<C>) {
+    struct ReadsOnDrop<C: Cells>(*const Runtime<C>, Incr<u64>);
+    // SAFETY: dropped on the test's thread while the runtime lives.
+    unsafe impl<C: Cells> Send for ReadsOnDrop<C> {}
+    impl<C: Cells> Drop for ReadsOnDrop<C> {
+        fn drop(&mut self) {
+            // SAFETY: as above.
+            let read = unsafe { &*self.0 }.get(self.1);
+            READ.with(|r| r.set(read));
+        }
+    }
+    thread_local! {
+        static READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+    let input = rt.create_input(1_u64);
+    let q = rt.create_query(move |rt| rt.get(input) + 1);
+    assert_eq!(rt.get(q), 2);
+    rt.set(input, 2);
+    unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> crate::replay::KeyParts {
+        unreachable!()
+    }
+    let id = crate::replay::open(
+        rt.runtime_id,
+        1,
+        crate::replay::Entry {
+            node: q.slot(),
+            generation: q.generation(),
+            suspect: false,
+            spec: false,
+            retry: crate::replay::Retry::Compute,
+            walked: false,
+            r5: false,
+        },
+        crate::replay::FrameKeys {
+            owner: std::ptr::null(),
+            parts: no_parts,
+        },
+    );
+    let below = crate::replay::VFrame {
+        node: q.slot(),
+        generation: q.generation(),
+        cidx: 0,
+        low: 0,
+        suspect: false,
+        spec: false,
+        reading: u64::from(input.slot()),
+        ordinal: 0,
+        path: 0,
+        seq: 0,
+        maker: 0,
+        ep: None,
+        member_of: None,
+        computes: 0,
+        deferred: Vec::new(),
+        walked: false,
+    };
+    let landed = |v: Box<dyn std::any::Any + Send>| {
+        crate::replay::Delivered::Landed(crate::deferred::Unbuilt::new(v))
+    };
+    let first = landed(Box::new(ReadsOnDrop(rt as *const Runtime<C>, q)));
+    let replaced = crate::replay::with(|c| {
+        let x = c.iter_mut().find(|x| x.id == id).unwrap();
+        assert!(x.deliver_blocked(&below, first).is_empty());
+        x.deliver_blocked(&below, landed(Box::new(0_u64)))
+    });
+    assert_eq!(READ.with(std::cell::Cell::get), 0);
+    drop(replaced);
+    drop(crate::replay::close(id));
+    assert_eq!(READ.with(std::cell::Cell::get), 3);
+}
+local_and_shared!(
+    a_replaced_blocked_landing_drops_outside_the_contexts,
+    local_a_replaced_blocked_landing_drops_outside_the_contexts,
+    shared_a_replaced_blocked_landing_drops_outside_the_contexts
+);

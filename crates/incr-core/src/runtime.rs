@@ -1610,9 +1610,9 @@ impl<C: Cells> Runtime<C> {
             if word & value_code::REPLAY_BIT == 0 {
                 self.dep_stack.end_diverted_reads(rt);
             } else if word & value_code::COUNTER_MASK == 0 && !replay::held() {
-                // Value code, a landed value's clone among it, and a dropped
-                // value's `Drop` can run inside the contexts' borrow, so only
-                // other reads look there.
+                // A `Drop` that an unwind out of a `replay::with` closure runs
+                // is inside the contexts' borrow, so only other reads look
+                // there.
                 self.undivert_when_taken(f);
             }
         }
