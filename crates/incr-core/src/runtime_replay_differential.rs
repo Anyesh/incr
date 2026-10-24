@@ -5031,6 +5031,53 @@ fn seed_3cb3_reads_a_failed_dep_as_the_revision_left_it() {
     });
 }
 
+/// The same rule inside one read: 0x15b3's op 10 `Get(19)` lands 20 Failed
+/// (`PanicIf(3, 3)` over input 21 = 2), and 19 catches it; 0x264a's op 17
+/// `Get(9)` reads 2 = 4 + `Catch(Read(3))` over 3 and 4, which landed
+/// Failed in an earlier revision and stay failed with input 19 = 3. Each
+/// value is a fresh read's with those nodes held failing; a fresh read
+/// that recomputes them closes a cycle through their recorded edges.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seeds_15b3_264a_read_failed_deps_as_the_revision_left_them() {
+    fn held(seed: u64, failing: &[usize], at: u64, input: (usize, u64), read: Op) -> Case {
+        let mut held = gen_case(seed, false, false);
+        for &q in failing {
+            let Spec::Query { expr, .. } = &mut held.specs[q] else {
+                panic!("{q} is a query");
+            };
+            *expr = Expr::PanicIf(Box::new(Expr::Const(at)), at);
+        }
+        held.specs[input.0] = Spec::Input(input.1);
+        held.ops = vec![read];
+        held
+    }
+    let cases = [
+        (
+            0x15b3,
+            10,
+            held(0x15b3, &[20], 3, (21, 2), Op::Get(19)),
+            9999,
+        ),
+        (
+            0x264a,
+            17,
+            held(0x264a, &[3, 4], 4, (19, 3), Op::Get(9)),
+            10009,
+        ),
+    ];
+    for (seed, op, held, value) in cases {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            let want = run::<Local>(&held, None, 0)[0].0.clone();
+            assert_eq!(want, Out::Value(value), "{seed:#x}");
+            assert_eq!(run::<Shared>(&held, None, 0)[0].0, want, "{seed:#x}");
+            assert_eq!(run::<Local>(&case, None, 0)[op].0, want, "{seed:#x}");
+            assert_eq!(run::<Shared>(&case, None, 0)[op].0, want, "{seed:#x}");
+        });
+    }
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped
