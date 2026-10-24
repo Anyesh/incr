@@ -5318,6 +5318,83 @@ fn strict_computed_left_new_seeds() {
     }
 }
 
+/// 0xd4f2 shrunk: `get(q2)`'s walk computes New former member q1 before
+/// q2. At frame budget 3 that compute is doomed at q1's `try q2` and the
+/// walk's rest is stashed for q10's retry, which reads q2 after the
+/// context landed it Clean. The retry must take the walk so q1 lands
+/// Clean as in the unbounded run, not stay New.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_stashed_for_a_clean_read_lands_its_new_entries() {
+    let q = |expr, bare| Spec::Query {
+        expr,
+        replay: true,
+        bare,
+        strategy: Strat::None,
+    };
+    let mut specs: Vec<Spec> = (0..22).map(|_| q(Expr::Const(0), false)).collect();
+    specs[0] = q(Expr::Read(1, false), false);
+    specs[1] = q(Expr::Read(2, true), false);
+    specs[2] = q(
+        Expr::If(
+            Box::new(Expr::Read(22, false)),
+            Box::new(Expr::Const(0)),
+            Box::new(Expr::Catch(Box::new(Expr::Read(1, false)))),
+        ),
+        false,
+    );
+    specs[9] = q(Expr::Read(10, false), true);
+    specs[10] = q(Expr::Read(2, false), false);
+    specs.push(Spec::Input(1));
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 22,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Set(22, 4), Op::Get(9)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0xd4f2);
+        differential::<Shared>(&case, 0xd4f2);
+    });
+}
+
+/// 0x2165's paired case run single-threaded in every order of its read
+/// pairs: with the pairs swapped, op 10 `Get(7)` left 19 and 20 Clean at
+/// budget 1 where the unbounded run leaves them Dirty: 10's retry reads
+/// past the unwind out of 9 that ends the unbounded run's read, and runs
+/// 3, which the unbounded run never does.
+#[test]
+#[ignore = "T8-retry-reads-past-an-unwind-2165"]
+fn seed_2165_in_every_order() {
+    let case = gen_case(0x2165, false, true);
+    let phases = phases(&case, 0x2165);
+    let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
+    quiet(|| {
+        for swaps in 0..1u64 << pairs {
+            let order = Order::new(&case, &phases, swaps);
+            differential::<Local>(&order.case, 0x2165);
+            differential::<Shared>(&order.case, 0x2165);
+        }
+    });
+}
+
+/// 0x783 at budget 3: in the unbounded run 19 reads 18 before the episode
+/// of 16 to 18 forms, lands Dirty over its superseded landing and poisons
+/// 14, whose read of 19 the bounded run's retry makes only after 19 lands
+/// Clean, so 14 and 15 land Clean.
+#[test]
+#[ignore = "T8-first-landing-before-episode-783"]
+fn seed_783_at_budget_3() {
+    let case = gen_case(0x783, false, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x783);
+        differential::<Shared>(&case, 0x783);
+    });
+}
+
 /// A diverted frame's Clean read with nothing to take is a fast read: with
 /// every retry's frame diverted, each case's bounded runs give the
 /// outcomes, states and deps they give with only the frames a delivery
@@ -5362,6 +5439,22 @@ fn a_diverted_read_with_no_delivery_is_a_fast_read() {
 fn a_retrys_clean_read_takes_its_delivery_seeds() {
     for seed in [0xa5b, 0xbe, 0x41b1] {
         let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
+/// Paired cases run single-threaded, the same read: at budget 1, 0x52b's
+/// `Get(3)` left 3 and 4 Clean where the unbounded run leaves them Dirty,
+/// under the CI depth-1 environment too, and 0x427d's `TryGet(14)` left
+/// 14 Dirty where the unbounded run lands it Failed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn paired_clean_read_delivery_seeds() {
+    for seed in [0x52b, 0x427d] {
+        let case = gen_case(seed, false, true);
         quiet(|| {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);
