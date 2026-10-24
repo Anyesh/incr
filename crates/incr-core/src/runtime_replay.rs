@@ -2052,12 +2052,7 @@ impl<C: Cells> Runtime<C> {
                             let kind = cycle_state::unwind_kind();
                             let contain = entry.walked
                                 && !self.episode_member(entry.node)
-                                && self.containable(
-                                    NodeId(entry.node),
-                                    Some(cidx),
-                                    kind,
-                                    &*payload,
-                                );
+                                && self.containable(NodeId(entry.node), cidx, kind, &*payload);
                             let mut bag = Deferred::new();
                             let payload =
                                 self.continuation_unwound(entry.node, cidx, payload, &mut bag);
@@ -2535,7 +2530,7 @@ impl<C: Cells> Runtime<C> {
         if continuation {
             let contain = v.walked
                 && !self.episode_member(v.node)
-                && self.containable(NodeId(v.node), Some(v.cidx), kind, &*payload);
+                && self.containable(NodeId(v.node), v.cidx, kind, &*payload);
             payload = self.continuation_unwound(v.node, v.cidx, payload, &mut bag);
             if contain {
                 cycle_state::take_unwind_kind();
@@ -3064,17 +3059,17 @@ impl<C: Cells> Runtime<C> {
         }
         // A closure that swallowed the cycle and then panicked on its own
         // sent that panic as the cycle unwind's payload, which a `try_get`
-        // passes on as an ordinary panic, as `entered` does, unless a member
-        // run read a member of its own episode: that read is R5's, whose
-        // unwind stays the cycle's (`member_run_unwound`). It carries the
-        // landings noted for it before the catch, as the native box does.
+        // passes on as an ordinary panic, as `entered` does, unless the read
+        // was of a member this thread holds: that read is R5's, from any
+        // frame, whose unwind stays the cycle's (`member_run_unwound`). It
+        // carries the landings noted for it before the catch, as the native
+        // box does.
         let payload = match payload.downcast::<crate::cycle::CycleUnwind>() {
             Ok(unwind) if kind == ReadKind::TryGet => return Some(Err(unwind.0)),
             Ok(unwind) => unwind,
             Err(payload) => {
                 self.note_delivered(nodes, &*payload);
-                let r5 =
-                    episode.is_some() && cycle_state::held_episode(rt, handle.slot()) == episode;
+                let r5 = cycle_state::held_episode(rt, handle.slot()).is_some();
                 if kind == ReadKind::TryGet && !r5 {
                     resume_unwind(payload);
                 }

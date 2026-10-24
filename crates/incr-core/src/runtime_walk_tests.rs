@@ -2202,6 +2202,81 @@ fn shared_walk_enters_a_cycle_at_its_first_recomputed_member() {
     walk_enters_a_cycle_at_its_first_recomputed_member::<Shared>();
 }
 
+/// `a`, a fixpoint from 0 capped at 5, reads `b` once `k` is 1; `b` reads
+/// `a`, and on an `a` of 2 or more, which only a member run reaches, reads
+/// `c`, which reads `d`, which reads `b` back: R3 in the member run of `b`,
+/// a cycle over the held member `b`, `c` and `d` that aborts the episode.
+/// `x` reads `a` only while `sel` is 0. After `k` and `sel` go to 1, the
+/// walk of `x` recomputes its stale dep `a` and contains the abort, so the
+/// rerun, which no longer reads `a`, gives 100 as a fresh read of `x` does.
+fn stale_dep_whose_episode_cycles<C: Cells>() -> Result<i64, String> {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let k = rt.create_input(0_i64);
+    let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let b_cell = b_cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                if rt.get(k) == 0 {
+                    1
+                } else {
+                    rt.get(*b_cell.get().unwrap()).min(5)
+                }
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let c_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let b = {
+        let c_cell = c_cell.clone();
+        rt.create_query(move |rt| {
+            let v = rt.get(a);
+            if v >= 2 {
+                rt.get(*c_cell.get().unwrap())
+            } else {
+                v + 1
+            }
+        })
+    };
+    let d_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let c = {
+        let d_cell = d_cell.clone();
+        rt.create_query(move |rt| rt.get(*d_cell.get().unwrap()) + 1)
+    };
+    let d = rt.create_query(move |rt| rt.get(b) + 1);
+    b_cell.set(b).unwrap();
+    c_cell.set(c).unwrap();
+    d_cell.set(d).unwrap();
+    let x = rt.create_query(move |rt| {
+        let s = rt.get(sel);
+        if s == 0 {
+            s + rt.get(a)
+        } else {
+            100
+        }
+    });
+    assert_eq!(rt.get(x), 1);
+    rt.set(k, 1);
+    rt.set(sel, 1);
+    let got = catch_unwind(AssertUnwindSafe(|| rt.get(x))).map_err(panic_message);
+    assert_no_notes();
+    got
+}
+
+#[test]
+fn local_stale_dep_whose_episode_cycles_is_not_read() {
+    assert_eq!(stale_dep_whose_episode_cycles::<Local>(), Ok(100));
+}
+
+#[test]
+fn shared_stale_dep_whose_episode_cycles_is_not_read() {
+    assert_eq!(stale_dep_whose_episode_cycles::<Shared>(), Ok(100));
+}
+
 #[test]
 fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
     let (r, q, p, x) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
