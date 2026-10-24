@@ -798,7 +798,7 @@ impl Walk {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 fn forced_revisit() -> bool {
     *FORCE_REVISIT
 }
