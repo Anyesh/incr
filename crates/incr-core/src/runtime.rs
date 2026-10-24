@@ -136,6 +136,8 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// In a read's walk loop, after the walk and before the slot read.
+    AfterWalk(NodeId),
     /// In `compute_attempts`, after the claim CAS and before the check for
     /// another thread's doom reservation.
     BeforeReservationCheck(NodeId),
@@ -2258,6 +2260,7 @@ impl<C: Cells> Runtime<C> {
                     )
                 }
             }
+            self.park(ParkPoint::AfterWalk(NodeId(slot)));
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {

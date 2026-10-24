@@ -1906,3 +1906,45 @@ fn a_claim_from_dirty_after_a_load_of_new_plans_the_node_again() {
 fn a_dirty_landing_before_the_walks_first_load_plans_the_node_again() {
     planned_new_then_landed_dirty(ParkPoint::BeforeComputeOne);
 }
+
+/// A read whose walk lands its root Dirty returns that landing's value:
+/// R, over a dependency cycle it catches, lands Dirty with its run count,
+/// and a second read reruns it. Parked between its walk and its slot read,
+/// the first reader must not return the run the second reader started.
+#[test]
+fn shared_read_returns_the_value_its_walk_landed_dirty() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let c_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let cc = c_cell.clone();
+    let c = rt.create_query(move |rt: &Runtime<Shared>| rt.get(*cc.get().unwrap()));
+    c_cell.set(c).unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let rr = runs.clone();
+    let r = rt.create_query(move |rt: &Runtime<Shared>| {
+        let n = rr.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+        rt.try_get(c).map_or(n * 100, |v| v + n)
+    });
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::AfterWalk(NodeId(r.slot())), gate.clone())],
+    );
+    let first = {
+        let rt = rt.clone();
+        thread::spawn(move || rt.get(r))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(r), NodeState::Dirty);
+    let waits = rt.reservation_waits.load(Ordering::SeqCst);
+    let second = {
+        let rt = rt.clone();
+        thread::spawn(move || rt.get(r))
+    };
+    while !second.is_finished() && rt.reservation_waits.load(Ordering::SeqCst) == waits {
+        thread::sleep(Duration::from_millis(1));
+    }
+    gate.release();
+    assert_eq!(first.join().unwrap(), 100);
+    assert_eq!(second.join().unwrap(), 200);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
