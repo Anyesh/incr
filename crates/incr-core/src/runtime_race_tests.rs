@@ -1676,3 +1676,45 @@ fn a_claim_released_unrun_ends_its_waiters_wait() {
     assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
     rt.assert_invariant_i();
 }
+
+#[test]
+fn a_claim_from_new_released_unrun_after_a_set_stays_new() {
+    let rt = Arc::new(Rt::new());
+    let (x, q, d) = chain(&rt);
+    // Q New with its edges, as a stale recovery or an episode leaves it,
+    // so the set's dirty walk reaches Q's claim.
+    rt.nodes.get(q.slot()).set_state(NodeState::New.as_u8());
+    rt.set(x, 2);
+    let (claimed, rerun) = (Gate::new(), Gate::new());
+    let points = [
+        (ParkPoint::AfterWalkClaim(id(q)), claimed.clone()),
+        (ParkPoint::BeforeComputeOne(id(q)), rerun.clone()),
+    ];
+    claimed.arm();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        for (point, gate) in &points {
+            if *point == p {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let walker = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            super::FORCE_REPLAN_HERE.with(|f| f.set(true));
+            rt.get(d)
+        })
+    };
+    claimed.wait_parked();
+    rt.set(x, 4);
+    assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::ComputingDirty);
+    rerun.arm();
+    claimed.release();
+    rerun.wait_parked();
+    assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::New);
+    rerun.release();
+    assert_eq!(walker.join().unwrap(), 102);
+    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    rt.assert_invariant_i();
+}

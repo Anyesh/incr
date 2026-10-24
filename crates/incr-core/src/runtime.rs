@@ -3071,7 +3071,9 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Releases a claim taken from New or Dirty (`dirty`) before anything
-    /// ran, as no landing: watchers see nothing.
+    /// ran, as no landing: watchers see nothing. A set's flag changes
+    /// nothing, since its walk already passed through to the dependents and
+    /// leaves a New node New.
     #[cold]
     #[inline(never)]
     fn unclaim_unrun(&self, node: &NodeData<C>, dirty: bool) {
@@ -3084,11 +3086,8 @@ impl<C: Cells> Runtime<C> {
             NodeState::New
         };
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
-            let unflagged = state::try_transition::<C>(
-                node.state_cell(),
-                NodeState::ComputingDirty,
-                NodeState::Dirty,
-            );
+            let unflagged =
+                state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
             debug_assert!(unflagged.is_ok(), "incr-core: an unrun claim is held");
         }
     }
