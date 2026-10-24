@@ -2440,6 +2440,80 @@ fn shared_vframe_retry_rechecks_a_recycled_slot() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// At budget 1, Y panics and X reads Y, so X's run dooms and the driver
+/// takes X as an entry. Parked before it, another thread deletes X and
+/// recycles its slot into Z, which it reads to `z`. The entry finds X
+/// gone and `get(X)` panics as stale, as in the serial order with the
+/// delete first, instead of reading Z's state through X's handle.
+fn entry_finds_its_slot_recycled(z_panics: bool) {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    rt.delete_node(x);
+    let z = rt.create_query_with(
+        move |_: &Rt| -> u64 {
+            if z_panics {
+                panic!("z boom")
+            }
+            99
+        },
+        replayable(),
+    );
+    assert_eq!(z.slot(), x.slot(), "Z reuses X's slot");
+    let want_z = if z_panics {
+        Err("z boom".to_string())
+    } else {
+        Ok(99)
+    };
+    assert_eq!(outcome(|| rt.get(z)), want_z);
+    gate.release();
+    let first = first.join();
+    assert!(
+        first.as_ref().is_err_and(|m| m.contains("stale")),
+        "{first:?}"
+    );
+    let later = outcome(|| rt.get(z));
+    if z_panics {
+        assert!(
+            later
+                .as_ref()
+                .is_err_and(|m| m.contains("last compute panicked")),
+            "Z kept its own landing: {later:?}"
+        );
+    } else {
+        assert_eq!(later, want_z, "Z kept its own landing");
+    }
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn shared_entry_finds_its_slot_recycled_into_a_failed_node() {
+    entry_finds_its_slot_recycled(true);
+}
+
+#[test]
+fn shared_entry_finds_its_slot_recycled_into_a_clean_node() {
+    entry_finds_its_slot_recycled(false);
+}
+
 /// Records whether it was dropped while its thread was unwinding, where a
 /// panicking user `Drop` aborts.
 struct DropWitness(Arc<AtomicU8>);
