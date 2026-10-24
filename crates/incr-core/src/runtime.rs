@@ -3546,7 +3546,7 @@ impl<C: Cells> Runtime<C> {
             }
             // Another thread's memo landing since the load leaves a Dirty
             // the claim succeeds on, and the memo stands for this run.
-            if claimed_dirty && node.memo_at(|| self.current_revision()) {
+            if !C::SINGLE_THREADED && claimed_dirty && node.memo_at(|| self.current_revision()) {
                 self.unclaim_unrun(id, node, claimed_dirty);
                 return self.read_memo(walked);
             }

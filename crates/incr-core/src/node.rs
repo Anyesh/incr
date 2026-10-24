@@ -405,7 +405,9 @@ impl<C: Cells> NodeData<C> {
     #[inline(always)]
     pub fn max_changed_at(&self, v: u64) {
         let cur = C::u64_load_relaxed(&self.verified_at);
-        if cur & Self::MEMO != 0 {
+        if C::SINGLE_THREADED {
+            C::u64_store_relaxed(&self.verified_at, cur & !Self::MEMO);
+        } else if cur & Self::MEMO != 0 {
             self.stamp_over_memo(cur, 0);
         }
         C::u64_fetch_max(&self.changed_at, v);
