@@ -1841,6 +1841,38 @@ Replay scale, by `scale-icount.sh` (user-space instructions per test) on
   run event, which took 477.66 s on the fixpoint case where the indexed
   slots take 2.79 s.
 
+## A claim released unrun is marked per node
+
+`3be7b38e` (on `283694ff`) adds a byte per node beside the flags that
+every Shared landing sets before its release CAS: 1 for a release as if
+the run never happened, 0 otherwise. Base `283694ff`, tip `3be7b38e`,
+same box, `icount.sh` defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_shared` | 198 | 198 | 0 |
+| `table_hit_shared` | 219.14 | 219.14 | 0 |
+| `value_slot_read_shared` | 90 | 90 | 0 |
+| `chain_shared/propagate/4` | 9570.22 | 9630.20 | +59.98 |
+| `chain_shared/propagate/10` | 20879.83 | 21029.81 | +149.98 |
+| `chain_shared/propagate/100` | 191542.27 | 193042.17 | +1499.90 |
+| `diamond_shared` | 7960.94 | 8005.92 | +44.98 |
+| `early_cutoff_shared` | 3677.85 | 3702.84 | +24.99 |
+| `fanout_shared_1000` | 4799131.96 | 4810774.51 | +11642.55 |
+| `delete_cascade_shared` | 4585751.71 | 4597770.84 | +12019.13 |
+
+- The rise is 15 instructions per Shared landing: `chain_shared/propagate/N`
+  rises by exactly 15 N, one landing per node. It is `land_as`'s second
+  directory walk to the node's segment (`SegmentedNodes::unrun`) and the
+  load and compare of the byte; the store runs only when the byte
+  changes. The other Shared rows scale with their landings the same way.
+- Every Local row is unchanged (the mark compiles out under
+  `SINGLE_THREADED`), and so are the Clean-get, table-hit and value-slot
+  rows, which land nothing.
+
+Gate: the hard gates hold (198, 219.14, 90). Replay scale by
+`strict-scan.sh`'s `scale-icount` against `7c94b201`: every ratio is in
+0.9974..1.0037.
 
 ## A caught Failed read lands Clean
 

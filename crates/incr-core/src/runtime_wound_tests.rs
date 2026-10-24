@@ -323,6 +323,11 @@ fn shared_swallowed_wound_on_a_first_compute() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_swallowed_wound_in_a_recompute_whose_dep_cuts_off() {
+    // A forced revisit of `q` makes B wait on O's claim of `x`, which the
+    // gates hold until B runs `q`.
+    if super::forced_revisit() {
+        return;
+    }
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_swallowed_wound_in_a_recompute_whose_dep_cuts_off",
         || {

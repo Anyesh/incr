@@ -609,11 +609,14 @@ fn shared_walk_skips_a_vframe_that_another_thread_discard_lands() {
         .filter(|(t, _)| *t == reader_id)
         .map(|&(_, point)| point)
         .collect();
-    assert_eq!(
-        waits,
-        vec![ParkPoint::BeforeComputeOne(p)],
-        "thread 1's only walk compute of P is its root's, and it never waited on P"
-    );
+    // A forced revisit of P computes it from the walk a second time.
+    if !super::forced_revisit() {
+        assert_eq!(
+            waits,
+            vec![ParkPoint::BeforeComputeOne(p)],
+            "thread 1's only walk compute of P is its root's, and it never waited on P"
+        );
+    }
     s.rt.assert_invariant_i();
 }
 
@@ -973,6 +976,71 @@ fn shared_reader_of_a_doomed_reads_released_claim() {
 #[test]
 fn shared_reader_of_a_discarded_frames_released_claim() {
     released_claim_read(|s| ParkPoint::BeforeEntry(id(s.y)));
+}
+
+/// **A waited-out discard is not a landing**, at budget 1: F, Clean at
+/// s = 0, is Dirty after `set(s, 1)`. Reader B plans its walk of F and
+/// stops before its claim; reader A claims F and dooms on its read of the
+/// New query N, and B waits on A's claim. A's doom discards F as if its
+/// run never happened and A's read goes on, so B claims F as planned
+/// instead of revisiting it, which only a landing of A's claim warrants.
+#[test]
+fn shared_reader_that_waited_out_a_discarded_claim_keeps_its_plan() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let s = rt.create_input(0_u64);
+    let n = rt.create_query_with(|_: &Rt| 1_u64, replayable());
+    let f = rt.create_query_with(
+        move |rt: &Rt| match rt.get(s) {
+            0 => 0,
+            v => v * 10 + rt.get(n),
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(f), 0);
+    rt.set(s, 1);
+    rt.set_max_frames(1);
+    let gates = Arc::new([
+        ("b", ParkPoint::BeforeClaim(id(f)), Gate::new()),
+        ("a", ParkPoint::AfterDoom(id(n)), Gate::new()),
+        ("b", ParkPoint::ComputeWaits(id(f)), Gate::new()),
+        ("a", ParkPoint::BeforeEntry(id(n)), Gate::new()),
+    ]);
+    for (_, _, gate) in gates.iter() {
+        gate.arm();
+    }
+    let installed = rt.park_hook.set(Box::new({
+        let gates = gates.clone();
+        move |p| {
+            for (name, point, gate) in gates.iter() {
+                if *point == p && thread::current().name() == Some(name) {
+                    gate.park();
+                }
+            }
+        }
+    }));
+    assert!(installed.is_ok(), "park hook installed twice");
+    let read = |name: &str| {
+        let rt = rt.clone();
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || rt.get(f))
+            .unwrap()
+    };
+    let b = read("b");
+    gates[0].2.wait_parked();
+    let a = read("a");
+    gates[1].2.wait_parked();
+    gates[0].2.release();
+    gates[2].2.wait_parked();
+    gates[2].2.release();
+    gates[1].2.release();
+    gates[3].2.wait_parked();
+    let b = b.join().unwrap();
+    gates[3].2.release();
+    assert_eq!((a.join().unwrap(), b), (11, 11));
+    assert_eq!(rt.wait_revisits.load(SeqCst), 0, "B revisited F");
+    rt.assert_invariant_i();
 }
 
 /// **A `set` during a discard**, at budget 1: F, Clean at s = 0, is

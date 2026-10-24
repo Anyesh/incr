@@ -699,7 +699,7 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
             NodeState::New
         };
-        self.land(id, node, target, target);
+        self.land_unrun(id, node, target);
         if self.drop_cooperatively(None) {
             return Computed::Discarded;
         }
@@ -860,7 +860,7 @@ impl<C: Cells> Runtime<C> {
             let first = match claimed {
                 Ok(src) if node.generation() == generation => src == NodeState::New,
                 Ok(src) => {
-                    self.land(NodeId(slot), node, src, src);
+                    self.land_unrun(NodeId(slot), node, src);
                     self.roll_back_hit(&taken);
                     return Err(NodeId(slot));
                 }
@@ -998,7 +998,7 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
             NodeState::New
         };
-        self.land(id, node, target, target);
+        self.land_unrun(id, node, target);
         #[cfg(test)]
         self.dooms.lock().unwrap().push(DoomSeen {
             node: id.0,
@@ -2173,6 +2173,7 @@ impl<C: Cells> Runtime<C> {
                             Some(entry.generation),
                             entry.walked,
                             None,
+                            Seen::Unwalked,
                         )
                     } else {
                         let (id, generation) = (NodeId(entry.node), Some(entry.generation));
@@ -2184,6 +2185,7 @@ impl<C: Cells> Runtime<C> {
                                 generation,
                                 entry.walked,
                                 None,
+                                Seen::Unwalked,
                             ),
                             Retry::Direct => self.compute_one::<VIRT>(
                                 id,
@@ -2191,6 +2193,7 @@ impl<C: Cells> Runtime<C> {
                                 generation,
                                 entry.walked,
                                 None,
+                                Seen::Unwalked,
                             ),
                         }
                     }
@@ -3223,9 +3226,10 @@ impl<C: Cells> Runtime<C> {
                 return Some(Computed::Unsettled);
             }
             // The read that ran the loop reads the target as the native
-            // compute's reader does after its landing.
+            // compute's reader does after its landing, which a walk entry's
+            // landing leaves unpoisoned.
             if landed {
-                self.episode_landed(self.nodes.get(node));
+                self.episode_landed(self.nodes.get(node), entry.walked);
             }
             if ended == Ended::Unsettled {
                 return Some(Computed::Unsettled);
