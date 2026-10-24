@@ -30,7 +30,7 @@ use std::sync::{Mutex, PoisonError};
 use super::*;
 use crate::locks::Lock;
 use crate::notes::Notes;
-use crate::replay::{payload_key, Landings, Retire};
+use crate::replay::{note_work, payload_key, Landings, Retire};
 
 /// A Failed read's node left Failed before the read could tell which
 /// landing it saw.
@@ -139,12 +139,14 @@ fn release(t: &mut Tickets, mark: u64, landings: RangeInclusive<(u32, u32)>) -> 
         .map(|(&landing, &seq)| (landing, seq))
         .collect();
     let mut stale = Vec::new();
+    note_work(found.len());
     for (landing, seq) in found {
         t.landings.remove(&landing);
         let c = t
             .held
             .get_mut(&seq)
             .expect("incr-core: an indexed landing's ticket is held");
+        note_work(c.nodes.len());
         c.nodes.retain(|&n| n != landing);
         if c.nodes.is_empty() {
             stale.extend(t.held.remove(&seq));
@@ -208,6 +210,7 @@ impl<C: Cells> Runtime<C> {
             .held
             .remove(&seq)
             .expect("incr-core: an indexed landing's ticket is held");
+        note_work(nodes.len());
         for n in &nodes {
             t.landings.remove(n);
         }
@@ -321,6 +324,7 @@ impl<C: Cells> Runtime<C> {
             return Some(payload);
         }
         let mut t = self.tickets.write();
+        note_work(nodes.len());
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
