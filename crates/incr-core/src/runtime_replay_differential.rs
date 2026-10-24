@@ -7241,17 +7241,20 @@ fn two_thread_oracle_rejects_a_made_up_cycle() {
     assert!(!cycle_from_own_frames(|c| c.clear()));
 }
 
-/// Seed 0x3904's first phase at a budget of 1 frame: op 0 `Get(0)` on one
-/// thread, op 1 `Get(6)` on the other. Some runs give 1's `try_get(2)` a
-/// cycle that 6 then reads as 7777, so 5 is 2 and 4 panics, which no order
-/// does; the members 4's claims released, read again in the phase, fail
-/// through 4, and the phase leaves 1 to 6 Failed. In the first such run,
-/// `patch` edits the phase's recorded closure runs before the oracle sees
-/// them; returns whether the oracle took the run, every run before it
-/// checked as usual, and whether 4's history grounds it.
+/// Seed 0x527's first phase at a budget of 1 frame: op 0 `Get(0)` on one
+/// thread, op 1 `Get(4)` on the other. Some runs give the orders' 1 and
+/// cycle panic but leave 3, 4 and 7 Failed, which no order does (the
+/// orders leave nothing or 8 and 15 Failed): 7's last run reads 4 from 19,
+/// which a run of 19 read from 20 as its fixpoint's initial value, and
+/// panics in `PanicIf(Read(19), 4)`, and 4 and 3 fail through it. In the
+/// first such run, `patch` edits the phase's recorded closure runs before
+/// the oracle sees them; returns whether the oracle took the run and
+/// whether 7's history grounds it. Runs stop after the phase, and those
+/// before the first such run go unchecked: 0x527 fails on its own in the
+/// two-thread scan.
 fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> (bool, bool) {
-    let case = gen_case(0x3904, false, true);
-    let phases = phases(&case, 0x3904);
+    let case = gen_case(0x527, false, true);
+    let phases = phases(&case, 0x527);
     assert_eq!(phases[0].ops(), [0, 1]);
     let mut took = None;
     quiet(|| {
@@ -7262,29 +7265,39 @@ fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> (b
             let grounded = AtomicBool::new(false);
             let got = run_two_until(&case, &phases, Some(1), 0, &|_| {}, &|_, prefix, live| {
                 let states = &prefix.last().unwrap().1 .0;
-                if prefix.len() == 2 && (1..=6).all(|x| states[x] == NodeState::Failed) {
+                let failed: Vec<usize> = (0..live.queries[0])
+                    .filter(|&x| states[x] == NodeState::Failed)
+                    .collect();
+                let panicked_on_19 = || {
+                    let evals = live.evals.lock().unwrap();
+                    (evals.values().flatten())
+                        .filter(|e| e.node == (0, 7))
+                        .max_by_key(|e| e.end)
+                        .is_some_and(|e| e.reads == [(0, 19, false, ReadOut::Value(4))])
+                };
+                let v = serial.at_overlap("0x527", prefix, live);
+                if failed == [3, 4, 7] && v == Some(Ok(())) && panicked_on_19() {
                     hit.store(true, SeqCst);
                     patch(&mut live.evals.lock().unwrap());
-                    grounded.store(serial.history_cause("0x3904", prefix, live, 4), SeqCst);
+                    grounded.store(serial.history_cause("0x527", prefix, live, 7), SeqCst);
+                    *verdict.lock().unwrap() = serial.at_overlap("0x527", prefix, live);
+                } else {
+                    *verdict.lock().unwrap() = v;
                 }
-                let v = serial.at_overlap("0x3904", prefix, live);
-                let stop = v.is_some();
-                *verdict.lock().unwrap() = v;
-                stop
+                true
             });
             let verdict = verdict.into_inner().unwrap();
             if !hit.load(SeqCst) {
-                serial.check("0x3904", &got, verdict);
                 continue;
             }
             took = Some((
-                catch_unwind(AssertUnwindSafe(|| serial.check("0x3904", &got, verdict))).is_ok(),
+                catch_unwind(AssertUnwindSafe(|| serial.check("0x527", &got, verdict))).is_ok(),
                 grounded.load(SeqCst),
             ));
             return;
         }
     });
-    took.expect("no run of 0x3904 left 1 to 6 Failed")
+    took.expect("no run of 0x527 left 3, 4 and 7 Failed with 7 panicking on 19's 4")
 }
 
 #[test]
@@ -7293,36 +7306,36 @@ fn two_thread_oracle_takes_a_failed_set_grounded_in_its_history() {
     assert_eq!(cascade_from_a_history_panic(|_| {}), (true, true));
 }
 
+/// 7's read of 19 in the runs that panicked on its 4: 11 panics there
+/// too.
+fn read_eleven(evals: &mut HashMap<usize, Vec<Eval>>) {
+    for e in evals.values_mut().flatten() {
+        if e.node == (0, 7) && e.reads == [(0, 19, false, ReadOut::Value(4))] {
+            e.reads[0].3 = ReadOut::Value(11);
+        }
+    }
+}
+
+/// As above with 7 panicking on an 11 from 19, which no run of 19 gave.
 #[test]
 #[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
 fn two_thread_oracle_rejects_a_history_grounding_over_a_wrong_value() {
-    assert_eq!(
-        cascade_from_a_history_panic(|evals| {
-            for e in evals.values_mut().flatten() {
-                if e.node == (0, 5) && e.value == Some(2) {
-                    e.value = Some(3);
-                }
-            }
-        }),
-        (false, false)
-    );
+    assert_eq!(cascade_from_a_history_panic(read_eleven), (false, false));
 }
 
-/// As above with every value kept but 1's caught cycle naming no
-/// participant, which no order's read of 2 gives: 7777 still follows from
-/// it, but 6, 5 and 4 ground through a read the oracle does not take.
+/// As above with the runs of 19 that gave 4 reading 11 from 20 and giving
+/// it: every run's value follows from its reads, but 7 grounds through a
+/// read of 20 that neither an order nor a run of 20 gives.
 #[test]
 #[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
 fn two_thread_oracle_rejects_a_history_grounding_over_an_untaken_read() {
     assert_eq!(
         cascade_from_a_history_panic(|evals| {
+            read_eleven(evals);
             for e in evals.values_mut().flatten() {
-                if e.node == (0, 1) && e.value == Some(7777) {
-                    for r in &mut e.reads {
-                        if let ReadOut::Cycle(c) = &mut r.3 {
-                            c.clear();
-                        }
-                    }
+                if e.node == (0, 19) && e.value == Some(4) {
+                    e.value = Some(11);
+                    e.reads = vec![(0, 20, true, ReadOut::Value(11))];
                 }
             }
         }),
