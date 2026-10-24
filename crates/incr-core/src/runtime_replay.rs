@@ -1981,8 +1981,9 @@ impl<C: Cells> Runtime<C> {
                 // A frame still New or Dirty that its pop does not finish is
                 // retried as the frame the unbounded run never popped, so it
                 // keeps its memo entries: a read of the retry that takes a
-                // delivery skips the walk that made them. Nothing the pop
-                // runs sees them.
+                // delivery skips the walk that made them. Its pop runs nothing
+                // that reads them, since only a held frame, never New or
+                // Dirty, gets a stand-in run with its own entries.
                 let node = self.nodes.get(v.node);
                 let retried = v.ep.is_none()
                     && node.generation() == v.generation
@@ -2542,10 +2543,12 @@ impl<C: Cells> Runtime<C> {
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
     /// claim lands as if its run never happened, since no frame computes it
-    /// here: the entry below does. It leaves the root's group, as the
-    /// unbounded run's frame goes on to compute the root alone and leaves
-    /// it there. A suspended episode restarts the driver, which runs the
-    /// entries its doom pushed first.
+    /// here: the entry below does. It keeps the root in its group, where the
+    /// unbounded run's frame holds it until its alone landing, so another
+    /// thread verifies the group as in the order where it reads first; this
+    /// entry's retry computes the root alone (`end_dissolved`). A suspended
+    /// episode restarts the driver, which runs the entries its doom pushed
+    /// first.
     fn episode_task_end(&self, root: NodeId, cidx: u32, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         if matches!(end, PopEnd::Dissolved | PopEnd::Retry) {
             self.rerun_root(root, cidx);
@@ -2559,7 +2562,14 @@ impl<C: Cells> Runtime<C> {
         if let PopEnd::Dissolved = end {
             let (first, wrote) = self.end_dissolved(root, &mut bag);
             let stamp_rev = self.current_revision();
-            self.discard_land(root, first, wrote, stamp_rev, &mut bag);
+            self.discard_land_in_group(
+                root,
+                first,
+                wrote,
+                stamp_rev,
+                ChildLanding::Discard,
+                &mut bag,
+            );
         }
         bag.drain(self);
         pop

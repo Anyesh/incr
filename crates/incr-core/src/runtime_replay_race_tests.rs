@@ -1538,6 +1538,110 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
     );
 }
 
+/// The same shape with F, X and Y a landed group and Z's set behind input
+/// t: F's claim, taken from Dirty, lands as before it, still a verified
+/// member of its group, so the other thread's read verifies the group as
+/// in the order where it reads first.
+#[test]
+fn shared_dissolved_member_root_stays_in_its_group() {
+    let run = |frames: u32, park: bool| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let (s, t) = (rt.create_input(0_u64), rt.create_input(0_u64));
+        let gate = Gate::new();
+        let zran = Arc::new(AtomicU8::new(0));
+        let z = {
+            let gate = gate.clone();
+            let ran = zran.clone();
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    if rt.get(t) == 1 && ran.swap(1, SeqCst) == 0 {
+                        if park {
+                            gate.arm();
+                        }
+                        rt.set(s, 1);
+                    }
+                    10
+                },
+                replayable(),
+            )
+        };
+        let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let y = {
+            let fc = fc.clone();
+            rt.create_query_with(
+                move |rt: &Rt| match rt.get(s) {
+                    0 => rt.get(*fc.get().unwrap()) + 1,
+                    _ => 5,
+                },
+                replayable(),
+            )
+        };
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + rt.get(z), replayable());
+        let f = rt.create_query_with(
+            move |rt: &Rt| rt.get(x),
+            QueryOpts {
+                cycle: CycleStrategy::Fallback(Box::new(|_: &Cycle| 100)),
+                replay: Replay::Allowed,
+            },
+        );
+        fc.set(f).unwrap();
+        rt.get(f);
+        assert!(rt.cycle_of(f).is_some(), "F is not in a group");
+        rt.set(t, 1);
+        rt.set_max_frames(frames);
+        // Parks at the level-0 entry's claim after the episode under F's
+        // entry dissolved, not at the claim that entry starts from.
+        let weak = Arc::downgrade(&rt);
+        let (parked, entered) = (gate.clone(), Arc::new(AtomicU8::new(0)));
+        let installed = rt.park_hook.set(Box::new(move |p| {
+            if p == ParkPoint::BeforeEntry(id(f)) && zran.load(SeqCst) == 1 {
+                entered.store(1, SeqCst);
+            }
+            let dirty = weak
+                .upgrade()
+                .is_some_and(|rt| rt.state_of(f) == NodeState::Dirty);
+            if p == ParkPoint::BeforeClaim(id(f)) && entered.load(SeqCst) == 1 && dirty {
+                parked.park();
+            }
+        }));
+        assert!(installed.is_ok());
+        let verified = rt.verified_at_of(f);
+        let reader = {
+            let rt = rt.clone();
+            spawn(move || outcome(|| rt.get(f)))
+        };
+        let mut gap = None;
+        if park {
+            gate.wait_parked();
+            let landed = (
+                rt.state_of(f),
+                rt.cycle_of(f).is_some(),
+                rt.verified_at_of(f) == verified,
+            );
+            let other = {
+                let rt = rt.clone();
+                spawn(move || outcome(|| rt.get(f)))
+            };
+            gap = Some((landed, other.join()));
+            gate.release();
+        }
+        let got = reader.join();
+        rt.assert_invariant_i();
+        (got, gap)
+    };
+    let (want, _) = run(u32::MAX, false);
+    assert_eq!(want, Ok(15));
+    let (got, gap) = run(1, true);
+    let (landed, other) = gap.expect("the driver parked");
+    assert_eq!(
+        landed,
+        (NodeState::Dirty, true, true),
+        "F's discard landing: (state, in its group, verification kept)"
+    );
+    assert_eq!((got, other), (want.clone(), want));
+}
+
 /// What a closure does with the panic of a read below it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Panics {
