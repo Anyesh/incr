@@ -5197,7 +5197,9 @@ fn two_threads() -> bool {
 }
 
 /// The case for `seed`, the base one if `REPLAY_BASE` is set, with a
-/// second runtime if `REPLAY_CROSS` is.
+/// second runtime if `REPLAY_CROSS` is, and the two-thread form of the
+/// case if `REPLAY_TWO` or `REPLAY_PAIRED` is: `REPLAY_PAIRED` alone runs
+/// that case through the single-thread differential.
 fn case_of(seed: u64) -> Case {
     if std::env::var_os("REPLAY_BASE").is_some() {
         gen_base(seed)
@@ -5205,7 +5207,7 @@ fn case_of(seed: u64) -> Case {
         gen_case(
             seed,
             std::env::var_os("REPLAY_CROSS").is_some(),
-            two_threads(),
+            two_threads() || std::env::var_os("REPLAY_PAIRED").is_some(),
         )
     }
 }
@@ -5285,7 +5287,8 @@ fn size(e: &Expr) -> usize {
 
 /// The smallest failing case among seeds `0..REPLAY_SCAN`, by total
 /// expression size and operation count, under Shared if `REPLAY_SHARED`
-/// is set and on two threads if `REPLAY_TWO` is.
+/// is set, on two threads if `REPLAY_TWO` is, and over the two-thread
+/// cases on one thread if `REPLAY_PAIRED` is.
 #[test]
 #[ignore = "a diagnostic that scans seeds"]
 fn replay_scan() {
@@ -6272,8 +6275,8 @@ fn shrink_case(c: &Case) -> Vec<Case> {
     out
 }
 
-/// Shrinks the single-thread case of `REPLAY_SEED` (`REPLAY_BASE` for the
-/// base generator, `REPLAY_TWO` for its paired case) while its run at
+/// Shrinks the single-thread run of `REPLAY_SEED`'s case (chosen as
+/// `replay_scan` chooses it) while its run at
 /// budget `REPLAY_FRAMES` (0 for none) frames, `REPLAY_BYTES` bytes, under
 /// Shared if `REPLAY_SHARED`, still fails with a message containing
 /// `SHRINK_NEEDLE`, and prints the case it ends at. Candidates whose runs
@@ -6287,11 +6290,7 @@ fn replay_shrink() {
     let frames = (frames > 0).then_some(frames);
     let bytes: usize = std::env::var("REPLAY_BYTES").map_or(0, |v| v.parse().expect("bytes"));
     let needle = std::env::var("SHRINK_NEEDLE").unwrap_or_else(|_| "differs".into());
-    let mut case = if std::env::var_os("REPLAY_BASE").is_some() {
-        gen_base(seed)
-    } else {
-        gen_case(seed, false, std::env::var_os("REPLAY_TWO").is_some())
-    };
+    let mut case = case_of(seed);
     let fails = |c: &Case| -> Option<bool> {
         let r = catch_unwind(AssertUnwindSafe(|| {
             let label = budget_label(seed, frames, bytes);
