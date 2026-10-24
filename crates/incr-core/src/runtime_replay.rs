@@ -323,6 +323,7 @@ impl<C: Cells> Runtime<C> {
             .expect("incr-core: a speculative run buffers its value");
         let node = self.nodes.get(id.0);
         let unchanged = !attempt.first
+            && attempt.verify_rev == attempt.stamp_rev
             && match catch_unwind(AssertUnwindSafe(|| {
                 self.arenas
                     .erased(node.type_tag())
@@ -372,16 +373,20 @@ impl<C: Cells> Runtime<C> {
         stamp_rev: u64,
         verify_rev: u64,
     ) -> Computed {
-        self.stash(
-            id.0,
-            generation,
-            Stash {
-                outcome: Outcome::Verified { since },
-                deps: self.current_deps(node),
-                verify_rev,
-            },
-            stamp_rev,
-        );
+        // A set whose walk was pending at the claim may dirty a dep the
+        // scan saw Clean.
+        if verify_rev == stamp_rev {
+            self.stash(
+                id.0,
+                generation,
+                Stash {
+                    outcome: Outcome::Verified { since },
+                    deps: self.current_deps(node),
+                    verify_rev,
+                },
+                stamp_rev,
+            );
+        }
         self.land(id, node, NodeState::Dirty, NodeState::Dirty);
         Computed::Done
     }
@@ -571,8 +576,16 @@ impl<C: Cells> Runtime<C> {
         let (node, flags) = self.nodes.get_with_flags(a.id.0);
         if let Outcome::Verified { since } = a.stash.outcome {
             // A real landing since the speculative verify supersedes it.
-            if node.verified_at() != since || self.current_deps(node) != a.stash.deps {
-                self.land(a.id, node, NodeState::Dirty, NodeState::Dirty);
+            if !a.claimed_dirty
+                || node.verified_at() != since
+                || self.current_deps(node) != a.stash.deps
+            {
+                let target = if a.claimed_dirty {
+                    NodeState::Dirty
+                } else {
+                    NodeState::New
+                };
+                self.land(a.id, node, target, target);
                 return None;
             }
             node.max_verified_at(

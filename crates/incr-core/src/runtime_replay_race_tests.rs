@@ -2685,3 +2685,49 @@ fn a_speculative_verify_across_a_set_keeps_no_stash() {
     );
     assert_eq!(rt.get(top), 2);
 }
+
+/// A set bumps the revision and parks before its walk; a speculative
+/// verify of `mid` then claims in the new revision but scans `leaf` as the
+/// old one left it. It must not stash a verify the walk is about to undo.
+#[test]
+fn a_speculative_verify_before_a_sets_walk_keeps_no_stash() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let leaf = rt.create_query_with(move |rt: &Rt| rt.get(input) / 10, replayable());
+    let mid = rt.create_query_with(move |rt: &Rt| rt.get(leaf), replayable());
+    let top = rt.create_query_with(move |rt: &Rt| rt.get(mid) + 1, replayable());
+    assert_eq!(rt.get(top), 1);
+    rt.set(input, 2);
+    assert_eq!(rt.get(leaf), 0);
+    let b = rt.create_query(|_: &Rt| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(top)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    let gate = Gate::new();
+    gate.arm();
+    hook(&rt, vec![(ParkPoint::SetAfterBump, gate.clone())]);
+    let setter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set(input, 13))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.get(reader), 5);
+    let stashed = rt.stashed_verify(id(mid).0, mid.generation());
+    gate.release();
+    setter.join().unwrap();
+    assert!(
+        !stashed,
+        "a verify over a dep the pending walk dirties is stashed"
+    );
+    assert_eq!(rt.get(top), 2);
+}
