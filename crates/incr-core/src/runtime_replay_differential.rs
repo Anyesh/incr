@@ -5472,6 +5472,32 @@ fn seed_783_at_budget_3() {
     });
 }
 
+/// A query whose run read the node being deleted keeps that dependency,
+/// so the delete is refused at every budget. In 0x2343 node 15's run
+/// completes with the read; in 0xc17 node 7's claim, released by another
+/// node's user panic, lands New over the deps its run read.
+#[test]
+fn delete_of_a_node_a_query_read_is_refused() {
+    for (seed, op) in [(0x2343, 9), (0xc17, 5)] {
+        let mut case = gen_case(seed, false, false);
+        assert!(matches!(case.ops[op], Op::Delete(_)));
+        case.ops.truncate(op + 1);
+        quiet(|| {
+            for (frames, bytes) in std::iter::once((None, 0)).chain(BUDGETS) {
+                let local = run::<Local>(&case, frames, bytes);
+                let shared = run::<Shared>(&case, frames, bytes);
+                for trace in [&local, &shared] {
+                    assert_eq!(
+                        trace[op].0,
+                        Out::Deleted(Err("HasDependents".into())),
+                        "seed {seed:#x} at {frames:?}/{bytes}"
+                    );
+                }
+            }
+        });
+    }
+}
+
 /// A diverted frame's Clean read with nothing to take is a fast read: with
 /// every retry's frame diverted, each case's bounded runs give the
 /// outcomes, states and deps they give with only the frames a delivery
