@@ -1562,10 +1562,18 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Ends the claim the root of a dissolved episode holds as a member,
-    /// returning whether it was taken from New and whether it wrote.
+    /// returning whether it was taken from New and whether it wrote. A root
+    /// still in a landed group has that record noted, so this entry's retry
+    /// of the root computes it alone.
     pub(super) fn end_dissolved(&self, root: NodeId, bag: &mut Deferred<C>) -> (bool, bool) {
         let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)))
             .expect("incr-core: a dissolved root is held");
+        if C::u8_load_relaxed(self.nodes.get_with_flags(root.0).1) & IN_GROUP != 0 {
+            let group = self.inner.read().member_recs.get(&root.0).cloned();
+            if let Some(group) = group {
+                cycle_state::note_dissolved_group(self.runtime_id, root.0, group);
+            }
+        }
         let ended = (e.first, e.wrote);
         bag.push_erased(Box::new(e.into_values()));
         ended
@@ -1827,7 +1835,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        self.land_single(id, node, flags, target, target);
+        self.land_single_as(id, node, flags, target, target, true);
     }
 
     /// [`Self::discard_land`] of a claim released by an unwind of `kind`.
@@ -1865,7 +1873,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, children, bag);
-        self.land(id, self.nodes.get(id.0), target, target);
+        self.land_unrun(id, self.nodes.get(id.0), target);
     }
 
     /// Lands the discarded attempt's children as `children` and stamps the
@@ -2300,12 +2308,7 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
-            self.land(
-                NodeId(c),
-                self.nodes.get(c),
-                NodeState::Dirty,
-                NodeState::Dirty,
-            );
+            self.land_unrun(NodeId(c), self.nodes.get(c), NodeState::Dirty);
         }
     }
 
@@ -2339,6 +2342,12 @@ impl<C: Cells> Runtime<C> {
         if !group.members.iter().any(|&(m, gen)| m == x.0 && gen == g) {
             return GroupEnd::Ordinary;
         }
+        // A discard keeps the root in the group it dissolved, for other
+        // threads, whose orders verify the group; this entry's retry of the
+        // root computes it alone, as the unbounded run's frame does.
+        if cycle_state::is_dissolved_group(rt, x.0, &group) {
+            return GroupEnd::Ordinary;
+        }
         // The members' runs sit where `x`'s frame would.
         let cidx = self.dep_stack.next_cidx();
         // 1. Claim the other members, Dirty to Computing, in slot order.
@@ -2354,7 +2363,7 @@ impl<C: Cells> Runtime<C> {
                 && self.virtual_position(m, generation).is_some();
             let mut ok = !virtual_member && self.claim_member(x, m, &claimed, bag);
             if ok && node.generation() != generation {
-                self.land(NodeId(m), node, NodeState::Dirty, NodeState::Dirty);
+                self.land_unrun(NodeId(m), node, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
@@ -2365,6 +2374,7 @@ impl<C: Cells> Runtime<C> {
                 h.insert((rt, m), Held::new(generation, cidx, false, false))
             });
             claimed.push(m);
+            self.park(ParkPoint::GroupMemberClaimed(NodeId(m)));
         }
 
         // 2. Did anything any member read change since it was verified?

@@ -16,6 +16,7 @@ use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay;
+use crate::runtime::GroupInfo;
 use crate::value_code;
 
 /// The frame whose unwind releases a claim: the frame it stands for, or
@@ -805,6 +806,9 @@ struct EntryState {
 /// and the cycle the last uncaught cycle panic reported.
 struct Outer {
     dissolved: Vec<(RuntimeId, u32)>,
+    /// The landed group of each root whose episode dissolved in this
+    /// entry, held so that no later record can reuse its address.
+    dissolved_groups: Vec<(RuntimeId, u32, Arc<GroupInfo>)>,
     last_cycle: Option<Cycle>,
     /// Each runtime whose budget change this thread has met, with the
     /// `BUDGET_CLOCK` count of the change.
@@ -830,6 +834,7 @@ thread_local! {
     static OUTER: RefCell<Outer> = const {
         RefCell::new(Outer {
             dissolved: Vec::new(),
+            dissolved_groups: Vec::new(),
             last_cycle: None,
             budgets_met: Vec::new(),
         })
@@ -852,6 +857,7 @@ loom::thread_local! {
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
+        dissolved_groups: Vec::new(),
         last_cycle: None,
         budgets_met: Vec::new(),
     });
@@ -979,6 +985,23 @@ pub(crate) fn dissolved_before(rt: RuntimeId, root: u32) -> bool {
 
 pub(crate) fn has_dissolved(rt: RuntimeId, root: u32) -> bool {
     OUTER.with(|o| o.borrow().dissolved.contains(&(rt, root)))
+}
+
+/// Notes that `root`'s episode dissolved over its landed group `group`.
+pub(crate) fn note_dissolved_group(rt: RuntimeId, root: u32, group: Arc<GroupInfo>) {
+    OUTER.with(|o| o.borrow_mut().dissolved_groups.push((rt, root, group)));
+    ENTRY.with(|e| e.outer_set.set(true));
+}
+
+/// Whether `group` is the record whose episode at `root` dissolved in
+/// this outermost entry.
+pub(crate) fn is_dissolved_group(rt: RuntimeId, root: u32, group: &Arc<GroupInfo>) -> bool {
+    OUTER.with(|o| {
+        o.borrow()
+            .dissolved_groups
+            .iter()
+            .any(|(r, n, g)| *r == rt && *n == root && Arc::ptr_eq(g, group))
+    })
 }
 
 /// How many held claims this thread has marked failed: a member run that
@@ -1153,6 +1176,7 @@ pub(crate) fn reset_outermost() {
         OUTER.with(|o| {
             let mut o = o.borrow_mut();
             o.dissolved.clear();
+            o.dissolved_groups.clear();
             o.last_cycle = None;
             o.budgets_met.clear();
         });

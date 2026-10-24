@@ -198,6 +198,8 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, on finding the node claimed by another thread,
     /// before its first wait on that claim.
     ComputeWaits(NodeId),
+    /// In group verify's step 1, after it claimed member `NodeId`.
+    GroupMemberClaimed(NodeId),
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
@@ -465,10 +467,10 @@ enum Computed {
     /// was left unrun and unclaimed, and the walk prunes its plan.
     Replan,
     /// Another thread landed the node Dirty since the walk planned it: a
-    /// claim wait ended with it Dirty, or the walk planned it New and
-    /// claimed it from Dirty. The node was left unrun and unclaimed, and
-    /// the walk visits it again, as a read that came after that landing
-    /// expands its deps before claiming it.
+    /// claim wait ended with it Dirty, not released unrun, or the walk
+    /// planned it New and claimed it from Dirty. The node was left unrun
+    /// and unclaimed, and the walk visits it again, as a read that came
+    /// after that landing expands its deps before claiming it.
     Revisit,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
@@ -930,6 +932,9 @@ pub struct Runtime<C: Cells> {
     /// walk, and walks of a held root resumed.
     #[cfg(test)]
     pub(crate) resumes_past_held: [std::sync::atomic::AtomicU64; 2],
+    /// Walk entries revisited because a claim wait ended with them Dirty.
+    #[cfg(test)]
+    pub(crate) wait_revisits: std::sync::atomic::AtomicU64,
     /// Every episode start, suspension, resumption and member run, in order.
     #[cfg(test)]
     pub(crate) episodes_seen: std::sync::Mutex<Vec<cycle_impl::EpisodeSeen>>,
@@ -1039,6 +1044,8 @@ impl<C: Cells> Runtime<C> {
             virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             resumes_past_held: Default::default(),
+            #[cfg(test)]
+            wait_revisits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             episodes_seen: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -3218,7 +3225,7 @@ impl<C: Cells> Runtime<C> {
     /// leaves a New node New.
     #[cold]
     #[inline(never)]
-    fn unclaim_unrun(&self, node: &NodeData<C>, dirty: bool) {
+    fn unclaim_unrun(&self, id: NodeId, node: &NodeData<C>, dirty: bool) {
         #[cfg(test)]
         self.unrun_unclaims
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3227,6 +3234,9 @@ impl<C: Cells> Runtime<C> {
         } else {
             NodeState::New
         };
+        if !C::SINGLE_THREADED {
+            C::u8_store_relaxed(self.nodes.unrun(id.0), 1);
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
                 state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
@@ -3275,6 +3285,7 @@ impl<C: Cells> Runtime<C> {
             .members
             .iter()
             .any(|&(m, g)| m == cur.0 && g == generation)
+            || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
         {
             return false;
         }
@@ -3447,9 +3458,15 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty
                     if seen != Seen::Unwalked
                         && spins != 0
-                        && g0.is_none_or(|g| g == node.generation()) =>
+                        && g0.is_none_or(|g| g == node.generation())
+                        // A claim released unrun leaves its thread's read
+                        // going on, which may still come after this one.
+                        && C::u8_load_relaxed(self.nodes.unrun(id.0)) == 0 =>
                 {
-                    return Computed::Revisit
+                    #[cfg(test)]
+                    self.wait_revisits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Computed::Revisit;
                 }
                 NodeState::Dirty => {}
             }
@@ -3524,7 +3541,7 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     NodeState::New
                 };
-                self.land(id, node, discard, discard);
+                self.land_unrun(id, node, discard);
                 return Computed::Gone;
             }
             // The claim succeeds on a Dirty that such a landing and a set
@@ -3537,12 +3554,12 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         NodeState::New
                     };
-                    self.land(id, node, discard, discard);
+                    self.land_unrun(id, node, discard);
                     self.raise_owed(payload, bag);
                 }
             }
             if claimed_dirty && seen == Seen::New {
-                self.unclaim_unrun(node, claimed_dirty);
+                self.unclaim_unrun(id, node, claimed_dirty);
                 return Computed::Revisit;
             }
             // When the claim reads from another thread's episode, which left
@@ -3553,7 +3570,7 @@ impl<C: Cells> Runtime<C> {
             if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
                 self.park(ParkPoint::AfterWalkClaim(id));
                 if self.replan(p) {
-                    self.unclaim_unrun(node, claimed_dirty);
+                    self.unclaim_unrun(id, node, claimed_dirty);
                     return Computed::Replan;
                 }
             }
@@ -3625,7 +3642,7 @@ impl<C: Cells> Runtime<C> {
                 // release or re-landing would outlive the run's discard.
                 if let Visit::VerifyOnly(owner) = visit {
                     if MODE & VIRT != 0 && replay::speculative() {
-                        self.land(id, node, NodeState::Dirty, NodeState::Dirty);
+                        self.land_unrun(id, node, NodeState::Dirty);
                         self.memoize(id, owner);
                         return Computed::Done;
                     }
@@ -3635,7 +3652,7 @@ impl<C: Cells> Runtime<C> {
                     // compute to read again, which poisons where needed.
                     GroupEnd::Done(Computed::Done) if !matches!(visit, Visit::VerifyOnly(_)) => {
                         self.park(ParkPoint::EpisodeLanded(id));
-                        return self.episode_landed(node);
+                        return self.episode_landed(node, walked);
                     }
                     GroupEnd::Done(computed) => return computed,
                     GroupEnd::Retry => {
@@ -3683,7 +3700,7 @@ impl<C: Cells> Runtime<C> {
                     {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                     } else {
-                        self.dep_stack.poison_current_frame(self.runtime_id);
+                        self.poison_reader(walked);
                     }
                     return Computed::Done;
                 }
@@ -3692,7 +3709,7 @@ impl<C: Cells> Runtime<C> {
                     // nested get if it still needs it, and that read
                     // poisons where needed; a poison here would cost the
                     // root a Clean landing for an edge it may have dropped.
-                    self.land_single(id, node, flags, NodeState::Dirty, NodeState::Dirty);
+                    self.land_single_as(id, node, flags, NodeState::Dirty, NodeState::Dirty, true);
                     self.memoize(id, owner);
                     return Computed::Done;
                 }
@@ -3848,7 +3865,7 @@ impl<C: Cells> Runtime<C> {
                         PopEnd::Deferred => return Computed::Deferred,
                         PopEnd::Landed => {
                             self.park(ParkPoint::EpisodeLanded(id));
-                            return self.episode_landed(node);
+                            return self.episode_landed(node, walked);
                         }
                         PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
                         PopEnd::Contained => return Computed::Unsettled,
@@ -3931,10 +3948,7 @@ impl<C: Cells> Runtime<C> {
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
-                    // The enclosing compute read this node through a non-Clean
-                    // landing. Its own publish may take the fast path, where
-                    // nothing else would catch that.
-                    self.dep_stack.poison_current_frame(self.runtime_id);
+                    self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
@@ -3950,11 +3964,22 @@ impl<C: Cells> Runtime<C> {
     /// root as soon as it lands, so any state but Clean or Cyclic poisons:
     /// a Clean root leaves Clean only through a walk, which flags the
     /// reader too.
-    fn episode_landed(&self, node: &NodeData<C>) -> Computed {
+    fn episode_landed(&self, node: &NodeData<C>, walked: bool) -> Computed {
         if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
-            self.dep_stack.poison_current_frame(self.runtime_id);
+            self.poison_reader(walked);
         }
         Computed::Done
+    }
+
+    /// After a non-Clean landing: the enclosing compute read this node, and
+    /// its own publish may take the fast path, where nothing else would
+    /// catch that. A walk entry (`walked`) is no such read: a dependent's
+    /// rerun reads it again through a nested get if it still needs it, and
+    /// that read poisons the dependent.
+    fn poison_reader(&self, walked: bool) {
+        if !walked {
+            self.dep_stack.poison_current_frame(self.runtime_id);
+        }
     }
 
     /// The `Err` arm of a compute: the closure panicked, or an engine
@@ -4271,10 +4296,23 @@ impl<C: Cells> Runtime<C> {
         target: NodeState,
         flagged: NodeState,
     ) -> NodeState {
+        self.land_single_as(id, node, flags, target, flagged, false)
+    }
+
+    #[inline(always)]
+    pub(crate) fn land_single_as(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
         if C::u8_load_relaxed(flags) & IN_GROUP != 0 {
             self.leave_group(id, node, flags, target);
         }
-        self.land(id, node, target, flagged)
+        self.land_as(id, node, target, flagged, unrun)
     }
 
     /// The landing of a run of `id` in `compute_one`: a creator's
@@ -4394,6 +4432,33 @@ impl<C: Cells> Runtime<C> {
         target: NodeState,
         flagged: NodeState,
     ) -> NodeState {
+        self.land_as(id, node, target, flagged, false)
+    }
+
+    /// [`Self::land`] of a claim released as if its run never happened, so
+    /// that a thread that waited it out does not take it for a landing
+    /// that a read ordered before its own made.
+    pub(crate) fn land_unrun(&self, id: NodeId, node: &NodeData<C>, target: NodeState) {
+        self.land_as(id, node, target, target, true);
+    }
+
+    #[inline(always)]
+    fn land_as(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
+        if !C::SINGLE_THREADED {
+            // Before the release, which publishes it with the state. Only
+            // the claim's owner writes it, so an equal byte needs no store.
+            let mark = self.nodes.unrun(id.0);
+            if C::u8_load_relaxed(mark) != u8::from(unrun) {
+                C::u8_store_relaxed(mark, u8::from(unrun));
+            }
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
                 self.report_landing(id);
