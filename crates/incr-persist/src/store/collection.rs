@@ -580,18 +580,27 @@ where
     }
 
     fn fold(&self, rt: &Runtime<C>, logged: Option<&LoggedKey>) -> Result<Vec<Record>> {
-        let elements = self.collection.values(rt);
+        let mut elements = self
+            .collection
+            .values(rt)
+            .iter()
+            .map(encode)
+            .collect::<Result<Vec<_>>>()?;
         let has_value = logged.is_some_and(|logged| logged.value.is_some());
         if elements.is_empty() && !has_value {
             return Ok(Vec::new());
         }
+        // A store that never declared this key diffs its catch-up by bytes in
+        // snapshot order, so listing elements in hash order, which differs
+        // per process, would make what it reports differ too. The runtime
+        // stores one value per class of equal elements, so no order of them
+        // changes the state.
+        elements.sort_unstable();
         let mut out = logged.map_or_else(Vec::new, |logged| logged.records(&self.key));
-        for element in &elements {
-            out.push(Record::Insert {
-                key: self.key.clone(),
-                element: encode(element)?,
-            });
-        }
+        out.extend(elements.into_iter().map(|element| Record::Insert {
+            key: self.key.clone(),
+            element,
+        }));
         Ok(out)
     }
 
