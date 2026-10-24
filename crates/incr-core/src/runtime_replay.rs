@@ -2519,10 +2519,12 @@ impl<C: Cells> Runtime<C> {
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
     /// claim lands as if its run never happened, since no frame computes it
-    /// here: the entry below does. It leaves the root's group, as the
-    /// unbounded run's frame goes on to compute the root alone and leaves
-    /// it there. A suspended episode restarts the driver, which runs the
-    /// entries its doom pushed first.
+    /// here: the entry below does. It keeps the root in its group, where the
+    /// unbounded run's frame holds it until its alone landing, so another
+    /// thread verifies the group as in the order where it reads first; this
+    /// entry's retry computes the root alone (`end_dissolved`). A suspended
+    /// episode restarts the driver, which runs the entries its doom pushed
+    /// first.
     fn episode_task_end(&self, root: NodeId, cidx: u32, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         if matches!(end, PopEnd::Dissolved | PopEnd::Retry) {
             self.rerun_root(root, cidx);
@@ -2536,7 +2538,14 @@ impl<C: Cells> Runtime<C> {
         if let PopEnd::Dissolved = end {
             let (first, wrote) = self.end_dissolved(root, &mut bag);
             let stamp_rev = self.current_revision();
-            self.discard_land(root, first, wrote, stamp_rev, &mut bag);
+            self.discard_land_in_group(
+                root,
+                first,
+                wrote,
+                stamp_rev,
+                ChildLanding::Discard,
+                &mut bag,
+            );
         }
         bag.drain(self);
         pop
