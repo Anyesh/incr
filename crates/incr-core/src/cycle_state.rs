@@ -870,7 +870,7 @@ pub(crate) fn with_held<R>(f: impl FnOnce(&mut HeldMap) -> R) -> R {
     })
 }
 
-fn held_any() -> bool {
+pub(crate) fn held_any() -> bool {
     ENTRY.with(|e| e.held_any.get())
 }
 

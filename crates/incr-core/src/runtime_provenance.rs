@@ -325,7 +325,8 @@ impl<C: Cells> Runtime<C> {
         let (Some(payload), Some(last)) = (payload, last_read(deps)) else {
             return landing;
         };
-        let frame = (id.0, generation, cidx, self.path_at(cidx));
+        let seq = replay::run_seq(self.runtime_id, (id.0, generation, cidx));
+        let frame = (id.0, generation, cidx, self.path_at(cidx), seq);
         let rt = self.runtime_id;
         replay::with(|c| {
             c.iter_mut()

@@ -6369,3 +6369,70 @@ fn replay_shrink() {
             .unwrap_or_else(|| "none under Local".into())
     );
 }
+
+/// Op 9 of `seed` truncated after it, as `(output, Failed set)`, for the
+/// unbounded run and for budget 3, under `C`.
+fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(10);
+    let at9 = |t: &Trace| -> (Out, Vec<usize>) {
+        let (out, snap) = &t[9];
+        let set = (snap.0.iter().enumerate())
+            .filter(|(_, s)| **s == NodeState::Failed)
+            .map(|(x, _)| x)
+            .collect();
+        (out.clone(), set)
+    };
+    [
+        at9(&run::<C>(&case, None, 0)),
+        at9(&run::<C>(&case, Some(3), 0)),
+    ]
+}
+
+/// Seed 0x56cdd78's op 9, `Get(8)`: its read of 4 runs 4's cycle episode,
+/// which releases 4, 8, 9 and 10 Dirty with no value, so the read walks 4
+/// again and the walk contains the cycle at its entries until 10's
+/// strategy closes it, reading 0. At a budget of 3 a doom stops the first
+/// walk; after the release, the frame reading 4 must walk again rather
+/// than take the `Direct` delivery made for the first walk.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
+    let seed = 0x56c_dd78;
+    assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(8)));
+    let want = (Out::Value(0), Vec::new());
+    quiet(|| {
+        let local = op9_at_budget_3::<Local>(seed);
+        let shared = op9_at_budget_3::<Shared>(seed);
+        assert_eq!([&local[0], &shared[0]], [&want, &want], "unbounded");
+        assert_eq!(
+            [&local[1], &shared[1]],
+            [&want, &want],
+            "budget 3, Local then Shared"
+        );
+    });
+}
+
+/// Seed 0x59afe69's op 9, `Get(12)`: the walk of 11 in 12's read runs 11
+/// at position 2 twice, first as a walked entry that catches a cycle out
+/// of 10, then, past 10's contained failed read, as the walk's root, which
+/// reads 10 Failed and fails 11, 12 and 13. At a budget of 3 a later doom
+/// of the first run's maker re-arms the cycle delivered for that run's
+/// read of 10, which the root run, a later run of 11 there, must not take.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
+    let seed = 0x59a_fe69;
+    assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(12)));
+    let want = (Out::Panic("failed".to_owned()), (12..=18).collect());
+    quiet(|| {
+        let local = op9_at_budget_3::<Local>(seed);
+        let shared = op9_at_budget_3::<Shared>(seed);
+        assert_eq!([&local[0], &shared[0]], [&want, &want], "unbounded");
+        assert_eq!(
+            [&local[1], &shared[1]],
+            [&want, &want],
+            "budget 3, Local then Shared"
+        );
+    });
+}

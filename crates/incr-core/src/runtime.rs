@@ -3498,6 +3498,9 @@ impl<C: Cells> Runtime<C> {
                     }
                     GroupEnd::Done(computed) => return computed,
                     GroupEnd::Retry => {
+                        if MODE & VIRT != 0 {
+                            self.rerun_root(id, self.dep_stack.next_cidx());
+                        }
                         self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                         continue 'attempt;
                     }
@@ -3505,6 +3508,12 @@ impl<C: Cells> Runtime<C> {
                     // longer a cycle: compute, and rediscover any cycle
                     // that remains.
                     GroupEnd::Ordinary => verifying = false,
+                    GroupEnd::Dissolved => {
+                        if MODE & VIRT != 0 {
+                            self.rerun_root(id, self.dep_stack.next_cidx());
+                        }
+                        verifying = false;
+                    }
                 }
             }
 
@@ -3575,6 +3584,7 @@ impl<C: Cells> Runtime<C> {
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
                 if MODE & VIRT != 0 {
+                    self.start_run(id, cidx, &ctl);
                     if let Some(low) = self.take_low(id, cidx) {
                         ctl.lower(low);
                     }
@@ -3679,10 +3689,16 @@ impl<C: Cells> Runtime<C> {
                         PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
                         PopEnd::Contained => return Computed::Unsettled,
                         PopEnd::Dissolved => {
+                            if MODE & VIRT != 0 {
+                                self.rerun_root(id, cidx);
+                            }
                             self.end_dissolved(id, bag);
                             continue 'run;
                         }
                         PopEnd::Retry => {
+                            if MODE & VIRT != 0 {
+                                self.rerun_root(id, cidx);
+                            }
                             self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                             continue 'attempt;
                         }
@@ -4045,6 +4061,15 @@ impl<C: Cells> Runtime<C> {
             && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT | value_code::KEPT_BIT) != 0
         {
             self.retire_copies(&replay::Retire::Above(attempt.cidx));
+        }
+        // An engine unwind does not end the run: the retry after it is the
+        // same run of the unbounded run's, and reads the cycle again from
+        // its delivery.
+        if word & value_code::REPLAY_BIT != 0
+            && !doomed
+            && (result.is_ok() || cycle_state::unwind_kind().is_none())
+        {
+            self.end_run(id, attempt.cidx);
         }
         None
     }

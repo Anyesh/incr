@@ -118,9 +118,10 @@ impl EpisodeSeen {
 /// How group verification left the node `compute_one` claimed.
 pub(super) enum GroupEnd {
     Done(Computed),
-    /// A member could not be claimed, or the episode dissolved: compute
-    /// the node as an ordinary one.
+    /// A member could not be claimed: compute the node as an ordinary one.
     Ordinary,
+    /// The episode dissolved: compute the node as an ordinary one.
+    Dissolved,
     Retry,
 }
 
@@ -757,6 +758,7 @@ impl<C: Cells> Runtime<C> {
             .push_frame_at(self.runtime_id, id, &ctl, cidx);
         let mut began = None;
         if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+            self.start_run(id, cidx, &ctl);
             if let Some(low) = self.take_low(id, cidx) {
                 ctl.lower(low);
             }
@@ -839,6 +841,11 @@ impl<C: Cells> Runtime<C> {
         });
         drop(replaced);
         drop(spec_buf);
+        if word & value_code::REPLAY_BIT != 0
+            && (result.is_ok() || cycle_state::unwind_kind().is_none())
+        {
+            self.end_run(id, cidx);
+        }
         result.map(|_| Some(ctl.lowlink.get()))
     }
 
@@ -2439,7 +2446,7 @@ impl<C: Cells> Runtime<C> {
             PopEnd::Deferred => GroupEnd::Done(Computed::Deferred),
             PopEnd::Dissolved => {
                 self.end_dissolved(x, bag);
-                GroupEnd::Ordinary
+                GroupEnd::Dissolved
             }
             PopEnd::Retry => GroupEnd::Retry,
             PopEnd::Suspended | PopEnd::Dropped => GroupEnd::Done(Computed::Discarded),
