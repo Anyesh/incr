@@ -29,7 +29,8 @@ use std::sync::{Mutex, PoisonError};
 
 use super::*;
 use crate::locks::Lock;
-use crate::replay::{note_work, payload_key, Landings, PayloadKey, Retire};
+use crate::notes::Notes;
+use crate::replay::{payload_key, Landings, Retire};
 
 /// A Failed read's node left Failed before the read could tell which
 /// landing it saw.
@@ -66,20 +67,6 @@ pub(crate) fn tickets<C: Cells>() -> C::Lock<Tickets> {
     <C::Lock<Tickets> as Lock<Tickets>>::new(Tickets::default())
 }
 
-/// A Failed landing a panic in flight on this thread made, or one of the
-/// landings a read raised again from a ticket or a delivery.
-struct Unwound {
-    rt: RuntimeId,
-    /// The frame position of the landing, on the thread's frame stack,
-    /// which every runtime on the thread shares.
-    cidx: u32,
-    node: (u32, u32),
-    payload: PayloadKey,
-    /// Taken from a ticket by a read: a discarded run's read was no
-    /// reader's observation, so its drop holds the ticket again.
-    restorable: bool,
-}
-
 /// An episode's abort that the walk's entry rooting it at `cidx` contains,
 /// on its way to the episode's boundary.
 pub(super) struct Contained {
@@ -89,13 +76,13 @@ pub(super) struct Contained {
 
 #[cfg(not(loom))]
 thread_local! {
-    static UNWOUND: RefCell<Vec<Unwound>> = const { RefCell::new(Vec::new()) };
+    static NOTES: RefCell<Notes> = const { RefCell::new(Notes::new()) };
     static WALKED_EPISODE: Cell<(u32, u32)> = const { Cell::new((u32::MAX, 0)) };
 }
 
 #[cfg(loom)]
 loom::thread_local! {
-    static UNWOUND: RefCell<Vec<Unwound>> = RefCell::new(Vec::new());
+    static NOTES: RefCell<Notes> = RefCell::new(Notes::new());
     static WALKED_EPISODE: Cell<(u32, u32)> = Cell::new((u32::MAX, 0));
 }
 
@@ -123,26 +110,13 @@ pub(super) fn walked_episode(cidx: u32) -> Option<NodeId> {
     })
 }
 
-/// Adds note `w`'s landing to `nodes` at its depth above `base`, keeping
-/// the shallowest depth of a landing noted twice. A note below `base`
-/// counts as just above it.
-fn add_noted(nodes: &mut Vec<((u32, u32), u32)>, w: &Unwound, base: u32) {
-    let depth = w.cidx.saturating_sub(base);
-    note_work(nodes.len());
-    match nodes.iter_mut().find(|(n, _)| *n == w.node) {
-        Some((_, d)) => *d = (*d).min(depth),
-        None => nodes.push((w.node, depth)),
-    }
-}
-
 /// Edits this thread's notes and keeps `value_code::NOTES_BIT` in step.
-fn with_notes<R>(f: impl FnOnce(&mut Vec<Unwound>) -> R) -> R {
-    UNWOUND.with(|u| {
-        let mut u = u.borrow_mut();
-        note_work(u.len());
-        let held = !u.is_empty();
-        let r = f(&mut u);
-        let holds = !u.is_empty();
+fn with_notes<R>(f: impl FnOnce(&mut Notes) -> R) -> R {
+    NOTES.with(|n| {
+        let mut n = n.borrow_mut();
+        let held = !n.is_empty();
+        let r = f(&mut n);
+        let holds = !n.is_empty();
         if held != holds {
             value_code::set_notes_bit(holds);
         }
@@ -261,26 +235,20 @@ impl<C: Cells> Runtime<C> {
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
-        // This landing replaces the node's earlier Failed landings, so no
-        // payload noted for them may hold the node again.
-        let replaced = |w: &Unwound| w.rt == rt && w.node == landing;
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
             // frame's, whose closure may still hold the payload they follow.
             let at = payload_key(payload);
-            with_notes(|u| {
-                u.retain(|w| !(w.cidx > cidx && w.payload != at || replaced(w)));
-                u.push(Unwound {
-                    rt,
-                    cidx,
-                    node: landing,
-                    payload: at,
-                    restorable: false,
-                });
+            with_notes(|n| {
+                n.forget_from(cidx + 1, Some(at));
+                // This landing replaces the node's earlier Failed landings,
+                // so no payload noted for them may hold the node again.
+                n.forget_node(rt, landing);
+                n.push(rt, at, cidx, landing, false);
             });
         } else if notes_held() {
-            with_notes(|u| u.retain(|w| !replaced(w)));
+            with_notes(|n| n.forget_node(rt, landing));
         }
         self.retire_copies(&Retire::Landing {
             cidx,
@@ -332,18 +300,11 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
         self.retire_copies(&Retire::Contained { cidx, payload: at });
-        let mut nodes = Vec::new();
-        if notes_held() {
-            with_notes(|u| {
-                u.retain(|w| {
-                    let ours = w.cidx >= cidx && w.payload == at;
-                    if ours && w.rt == rt && !nodes.contains(&w.node) {
-                        nodes.push(w.node);
-                    }
-                    !(ours || w.cidx > cidx)
-                });
-            });
-        }
+        let nodes = if notes_held() {
+            with_notes(|n| n.contain(rt, cidx, at))
+        } else {
+            Vec::new()
+        };
         if let Some(payload) = self.hold(nodes, payload) {
             bag.push_erased(payload);
         }
@@ -523,14 +484,10 @@ impl<C: Cells> Runtime<C> {
         if nodes.peek().is_none() {
             return;
         }
-        with_notes(|u| {
-            u.extend(nodes.map(|(node, depth)| Unwound {
-                rt,
-                cidx: base + depth,
-                node,
-                payload: at,
-                restorable,
-            }));
+        with_notes(|n| {
+            for (node, depth) in nodes {
+                n.push(rt, at, base + depth, node, restorable);
+            }
         });
     }
 
@@ -539,7 +496,7 @@ impl<C: Cells> Runtime<C> {
     /// the retry's later pops retire the deeper ones as the unbounded
     /// run's do.
     pub(super) fn note_delivered(&self, nodes: Landings, payload: &(dyn Any + Send)) {
-        self.note_above(nodes.nodes, payload, false);
+        self.note_above(nodes.into_nodes(), payload, false);
     }
 
     /// A delivery keeps a copy of `payload` for a frame's retry while
@@ -553,24 +510,8 @@ impl<C: Cells> Runtime<C> {
             return Landings::default();
         }
         let (rt, at) = (self.runtime_id, payload_key(payload));
-        let mut nodes = Vec::new();
-        with_notes(|u| {
-            for w in u.iter_mut().filter(|w| w.payload == at) {
-                w.restorable = false;
-                if w.rt == rt {
-                    add_noted(&mut nodes, w, base);
-                }
-            }
-        });
-        self.copied(at, nodes)
-    }
-
-    fn copied(&self, at: PayloadKey, nodes: Vec<((u32, u32), u32)>) -> Landings {
-        let landings = Landings {
-            source: Some(at),
-            nodes,
-        };
-        replay::mark_copied(self.runtime_id, &landings);
+        let landings = with_notes(|n| n.copy(rt, at, base));
+        replay::mark_copied(rt, &landings);
         landings
     }
 
@@ -582,17 +523,9 @@ impl<C: Cells> Runtime<C> {
             return Landings::default();
         }
         let (rt, at) = (self.runtime_id, payload_key(payload));
-        let mut nodes = Vec::new();
-        with_notes(|u| {
-            u.retain(|w| {
-                let same = w.payload == at;
-                if same && w.rt == rt {
-                    add_noted(&mut nodes, w, base);
-                }
-                !same
-            });
-        });
-        self.copied(at, nodes)
+        let landings = with_notes(|n| n.take(rt, at, base));
+        replay::mark_copied(rt, &landings);
+        landings
     }
 
     /// Applies `ev` to the copies of this runtime's notes that kept reads
@@ -612,7 +545,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn retire_notes_above(&self, cidx: u32) {
         if notes_held() {
-            with_notes(|u| u.retain(|w| w.cidx <= cidx));
+            with_notes(|n| n.forget_from(cidx + 1, None));
         }
     }
 
@@ -622,7 +555,7 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn retire_notes(&self) {
         if notes_held() {
             let top = self.dep_stack.next_cidx();
-            with_notes(|u| u.retain(|w| w.cidx < top));
+            with_notes(|n| n.forget_from(top, None));
         }
     }
 
@@ -640,16 +573,7 @@ impl<C: Cells> Runtime<C> {
             return Some(payload);
         }
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
-        let mut nodes = Vec::new();
-        with_notes(|u| {
-            u.retain(|w| {
-                let same = w.payload == at;
-                if same && w.rt == rt && w.restorable && !nodes.contains(&w.node) {
-                    nodes.push(w.node);
-                }
-                !same
-            });
-        });
+        let nodes = with_notes(|n| n.restore(rt, at));
         self.hold(nodes, payload)
     }
 
