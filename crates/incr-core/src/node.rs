@@ -399,8 +399,15 @@ impl<C: Cells> NodeData<C> {
     }
 
     /// Raise `changed_at` to `v` if `v` is larger. See [`Self::max_verified_at`].
+    /// Clears a memo first: a landing raises `changed_at` before it
+    /// rewrites `verified_at`, and the old memo must not read as one for
+    /// the new `changed_at`.
     #[inline(always)]
     pub fn max_changed_at(&self, v: u64) {
+        let cur = C::u64_load_relaxed(&self.verified_at);
+        if cur & Self::MEMO != 0 {
+            self.stamp_over_memo(cur, 0);
+        }
         C::u64_fetch_max(&self.changed_at, v);
     }
 
@@ -412,14 +419,19 @@ impl<C: Cells> NodeData<C> {
     #[inline(always)]
     pub(crate) fn set_memo(&self, rev: u64) {
         self.set_verified_at(Self::MEMO);
-        self.max_changed_at(rev);
+        C::u64_fetch_max(&self.changed_at, rev);
     }
 
     /// Whether the query, loaded Dirty, holds a memo for the revision
     /// `revision` loads, which only a memo's node loads.
     #[inline(always)]
     pub(crate) fn memo_at(&self, revision: impl FnOnce() -> u64) -> bool {
-        C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && self.changed_at() == revision()
+        // The bit is loaded again after `changed_at`: a `changed_at` from a
+        // later landing orders the clear before it.
+        C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && {
+            let changed = self.changed_at();
+            C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && changed == revision()
+        }
     }
 
     /// Sentinel meaning "a set() is in flight on this input". Any
@@ -691,6 +703,30 @@ mod tests {
         assert_eq!(n.changed_at(), 11);
         n.max_changed_at(5);
         assert_eq!(n.changed_at(), 11);
+    }
+
+    fn memo_ends_at_a_changed_at_raise<C: Cells>() {
+        let n: NodeData<C> = NodeData::new_query(0, 99);
+        n.set_memo(5);
+        assert!(n.memo_at(|| 5));
+        assert_eq!(n.verified_at(), 0);
+        n.max_changed_at(6);
+        assert!(!n.memo_at(|| 6), "a landing's changed_at kept the old memo");
+        n.set_memo(6);
+        assert!(n.memo_at(|| 6));
+        n.max_verified_at(6);
+        assert!(!n.memo_at(|| 6));
+        assert_eq!(n.verified_at(), 6);
+    }
+
+    #[test]
+    fn memo_ends_at_a_changed_at_raise_local() {
+        memo_ends_at_a_changed_at_raise::<Local>();
+    }
+
+    #[test]
+    fn memo_ends_at_a_changed_at_raise_shared() {
+        memo_ends_at_a_changed_at_raise::<Shared>();
     }
 
     fn set_claim_and_delete_mark<C: Cells>() {
