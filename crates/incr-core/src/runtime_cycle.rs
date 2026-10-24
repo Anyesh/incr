@@ -2447,8 +2447,22 @@ impl<C: Cells> Runtime<C> {
         if let Visit::VerifyOnly(owner) = visit {
             // A tainted node never runs: release the group, and leave `x`
             // Dirty for the closure that still reads it, whose read the
-            // taint memo makes compute `x` alone.
-            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)));
+            // taint memo makes compute `x` alone. Unlike step 1's and the
+            // abort's releases, the claims leave the group: kept in it, a
+            // later read would verify the group again and miss the cycle a
+            // fresh run raises. They land unrun, as this read goes on.
+            for &c in claimed.iter().chain(std::iter::once(&x.0)) {
+                cycle_state::with_held(|h| h.remove(&(self.runtime_id, c)));
+                let (node, flags) = self.nodes.get_with_flags(c);
+                self.land_single_as(
+                    NodeId(c),
+                    node,
+                    flags,
+                    NodeState::Dirty,
+                    NodeState::Dirty,
+                    true,
+                );
+            }
             self.memoize(x, owner);
             return GroupEnd::Done(Computed::Done);
         }

@@ -3294,6 +3294,24 @@ fn seed_92b175856b_dissolved_root_retry_computes_alone() {
     });
 }
 
+/// Seed 0x59a582f: at budgets 2 and 3, op 3 `TryGet(1)` gave 0 for 26.
+/// Root 2's episode dissolved at its virtual frame's pop, and the driver's
+/// retry of 2 was sent straight to 10's compute, as 2's run before the
+/// dissolve had read it, where the unbounded run's new run of 2 walks 10;
+/// 2's episode then formed again. The case stops before op 15, whose
+/// superseded landing of 3 is T8-strict-group-c-dirty-for-clean's.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_59a582f_dissolved_root_reads_afresh() {
+    let seed = 0x59a_582f;
+    let mut case = gen_case(seed, false, false);
+    case.ops.truncate(15);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+    });
+}
+
 /// A case with cycles on two threads in which a thread is wounded out of
 /// an entry above virtual frames that own deferred claims.
 #[test]
@@ -3692,6 +3710,23 @@ fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
     });
 }
 
+/// Seed 0x2897c4266833877, unbounded: op 3's `Get(18)` verifies 18's
+/// group with a tainted walk entry, which releases the group's claims. A
+/// released member that stayed in its group was verified as one again
+/// and gave 7793, where a fresh run raises the cycle.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_tainted_group_release_leaves_its_members_out_of_the_group() {
+    let mut case = gen_case(0x2897_c426_6833_877, false, false);
+    case.ops.truncate(4);
+    assert!(matches!(case.ops[3], Op::Get(18)));
+    quiet(|| {
+        for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
+            assert_eq!(trace[3].0, Out::Panic("cycle".to_owned()));
+        }
+    });
+}
+
 /// [`differential`]'s runs, compared by their operations' outcomes alone.
 fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     let outcomes = |t: Trace| t.into_iter().map(|(o, _)| o).collect::<Vec<_>>();
@@ -3737,7 +3772,8 @@ fn until(done: impl Fn() -> bool) {
 /// Failed, and the walk contains that, so its readers rerun and land
 /// Failed as in either order: the run is serial, with no history for
 /// the oracle to judge. Swap bit 1, not bit 0 (ops 5 and 6), runs op 8
-/// first, which gets the closure's payload.
+/// first, which panics "failed" (last compute panicked) rather than with
+/// the closure's payload: group verify's tainted release leaves the group.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
@@ -3763,7 +3799,7 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
         let first = |i| swapped.of.iter().position(|&j| j == i).unwrap();
         assert!(first(8) < first(7));
         let serial = run::<Shared>(&swapped.case, None, 0);
-        assert_eq!(serial[first(8)].0, Out::Panic("boom 0:11".to_owned()));
+        assert_eq!(serial[first(8)].0, Out::Panic("failed".to_owned()));
         let orders = [
             settled(&run::<Shared>(&case, None, 0)[8].1 .0),
             settled(&serial[first(7)].1 .0),
