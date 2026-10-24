@@ -265,7 +265,7 @@ pub trait DepStack: 'static {
     }
 
     /// [`Self::pop_frame`], with the frame's last non-Clean read (see
-    /// [`Frame::reading`]).
+    /// `Frame::reading`).
     #[inline(always)]
     fn pop_frame_reading(&self) -> (Vec<(NodeId, u32)>, u64) {
         let frame = self.with(|s| {
