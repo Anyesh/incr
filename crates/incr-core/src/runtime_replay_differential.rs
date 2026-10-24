@@ -3754,7 +3754,8 @@ fn until(done: impl Fn() -> bool) {
 /// Failed, and the walk contains that, so its readers rerun and land
 /// Failed as in either order: the run is serial, with no history for
 /// the oracle to judge. Swap bit 1, not bit 0 (ops 5 and 6), runs op 8
-/// first, which gets the closure's payload.
+/// first, which panics "failed" (last compute panicked) rather than with
+/// the closure's payload: group verify's tainted release leaves the group.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
@@ -3780,7 +3781,7 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
         let first = |i| swapped.of.iter().position(|&j| j == i).unwrap();
         assert!(first(8) < first(7));
         let serial = run::<Shared>(&swapped.case, None, 0);
-        assert_eq!(serial[first(8)].0, Out::Panic("boom 0:11".to_owned()));
+        assert_eq!(serial[first(8)].0, Out::Panic("failed".to_owned()));
         let orders = [
             settled(&run::<Shared>(&case, None, 0)[8].1 .0),
             settled(&serial[first(7)].1 .0),
