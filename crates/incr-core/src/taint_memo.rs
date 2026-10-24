@@ -4,17 +4,19 @@
 //! computes it directly instead of expanding its installed deps again,
 //! which would re-run the walk that tainted it once per chain level.
 //!
-//! Entries are owned by the frame of the node whose skip tainted them
-//! (the lowest such frame when there are several) and cleared when it
-//! pops. An owner is one more than that frame's conceptual-stack
-//! position, so a replay context can own entries at its boundary, below
-//! every frame its driver runs. A pop finds the memo through the thread word's bit alone, so a
+//! Entries are owned by the frame of the node whose skip tainted them (the
+//! lowest such frame when there are several) and cleared when it pops. An
+//! owner is one more than that frame's conceptual-stack position. A replay
+//! context's close clears from one above its boundary, as the pop of the
+//! frame at the boundary does: the frame below the boundary outlives the
+//! context. A pop finds the memo through the thread word's bit alone, so a
 //! frame that never tainted carries no owner flag; while the memo is
-//! non-empty, every pop compares its depth with the deepest owner, and
-//! only an owner's pop scans the entries. Clearing early is sound: a node with no entry is walked and
-//! verified as it would be without the memo, and computing a memoized
-//! node directly is always a legal landing, so an entry can only cost a
-//! closure run where a verify would have passed, never a wrong value.
+//! non-empty, every pop compares its depth with the deepest owner, and only
+//! an owner's pop scans the entries. Clearing early is sound: a node with
+//! no entry is walked and verified as it would be without the memo, and
+//! computing a memoized node directly is always a legal landing, so an
+//! entry can only cost a closure run where a verify would have passed,
+//! never a wrong value.
 //!
 //! The memo's non-empty state is a bit of the thread word in
 //! `value_code`, whose low bits count value-code calls, so a single load
