@@ -737,3 +737,35 @@ fn shared_many_caught_unwinds_stay_linear() {
         many_caught_unwinds::<Shared>(shape);
     }
 }
+
+/// One budgeted frame reading `n` nodes of another runtime. Each read is
+/// kept for the frame's retry, under its ordinal among the frame's reads
+/// of that node, and finding that ordinal must not cost a pass over the
+/// frame's earlier reads.
+fn many_foreign_reads<C: Cells>() {
+    let n = 2000;
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    let rt = Runtime::<C>::new();
+    rt.set_max_frames(256);
+    let reader = rt.create_query(move |_| reads.iter().map(|&x| foreign.get(x)).sum::<u64>());
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n * (n - 1) / 2);
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 16 * n,
+        "{work} units of note work for {n} foreign reads"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_many_foreign_reads_stay_linear() {
+    many_foreign_reads::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_many_foreign_reads_stay_linear() {
+    many_foreign_reads::<Shared>();
+}

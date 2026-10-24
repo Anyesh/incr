@@ -1634,6 +1634,7 @@ pub(crate) fn foreign_ordinal(
         return 1;
     }
     KEPT_READS.with(|d| {
+        note_work(d.borrow().len());
         let earlier = d
             .borrow()
             .iter()
