@@ -12,7 +12,7 @@
 
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
@@ -194,10 +194,11 @@ pub(crate) struct Delivery {
 
 /// The runs at one position along `path` that have ended undoomed in the
 /// current read of the frame below, as `(node, generation, count)`. Slots
-/// are found by position and path alone (see [`Context::runs`]). `owner` is the reading
-/// frame's depth on the thread's stack, which only decides how long
-/// [`start_read`] keeps the slot; it is 0 for a slot no read set, which a
-/// run's end makes under a virtual frame's blocked read or the opener's.
+/// are found by position and path alone (see [`Context::runs`]). `owner`
+/// is the reading frame's depth on the thread's stack, which only decides
+/// how long [`start_read`] keeps the slot; it is 0 for a slot no read set,
+/// which a run's end makes under a virtual frame's blocked read or the
+/// opener's.
 #[derive(Clone, Default)]
 pub(crate) struct RunSlot {
     pub(crate) path: u64,
@@ -222,6 +223,53 @@ impl RunSlot {
             Some((_, _, k)) => *k += 1,
             None => self.counts.push((node, generation, 1)),
         }
+    }
+}
+
+/// A context's run slots by position, the first at its `boundary + 1`; a
+/// position holds a slot per path its reads were made along.
+#[derive(Default)]
+pub(crate) struct RunSlots(Vec<Vec<RunSlot>>);
+
+impl RunSlots {
+    fn at(&self, i: usize) -> &[RunSlot] {
+        self.0.get(i).map_or(&[], Vec::as_slice)
+    }
+
+    fn at_mut(&mut self, i: usize) -> &mut Vec<RunSlot> {
+        if self.0.len() <= i {
+            self.0.resize_with(i + 1, Vec::new);
+        }
+        &mut self.0[i]
+    }
+
+    fn get(&self, i: usize, path: u64) -> Option<&RunSlot> {
+        self.at(i).iter().find(|s| s.path == path)
+    }
+
+    fn entry(&mut self, i: usize, path: u64) -> &mut RunSlot {
+        let slots = self.at_mut(i);
+        let j = match slots.iter().position(|s| s.path == path) {
+            Some(j) => j,
+            None => {
+                slots.push(RunSlot {
+                    path,
+                    owner: 0,
+                    counts: Vec::new(),
+                });
+                slots.len() - 1
+            }
+        };
+        &mut slots[j]
+    }
+
+    /// The slots from index `i` on, which this keeps no longer.
+    fn split_off(&mut self, i: usize) -> Self {
+        Self(if i < self.0.len() {
+            self.0.split_off(i)
+        } else {
+            Vec::new()
+        })
     }
 }
 
@@ -638,10 +686,10 @@ pub(crate) struct Context {
     /// seq is its node's count in its slot when it starts (see
     /// [`start_run`]), which each undoomed end of a run and each rerun of a
     /// dissolved or stale root raises, so a second run of a node at one
-    /// position reads none of the first's deliveries. A read sets its slot as it starts, empty
-    /// or to what the delivery it resumes kept, so a retry counts as the
-    /// run it redoes did. Keyed by `(cidx, path)`.
-    pub(crate) runs: BTreeMap<(u32, u64), RunSlot>,
+    /// position reads none of the first's deliveries. A read sets its slot
+    /// as it starts, empty or to what the delivery it resumes kept, so a
+    /// retry counts as the run it redoes did.
+    pub(crate) runs: RunSlots,
     /// The level of a landed point a read's judgement met above the
     /// position it read, until the driver drops the chain above it.
     pub(crate) drop_at: Option<u32>,
@@ -697,7 +745,7 @@ impl Context {
             lows: Vec::new(),
             claim_revs: EarliestByFrame::default(),
             run_failures: EarliestByFrame::default(),
-            runs: BTreeMap::new(),
+            runs: RunSlots::default(),
             drop_at: None,
             drop_point: None,
             provenance: None,
@@ -1608,7 +1656,8 @@ pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry, frame_keys: Fram
         // The slots above the boundary are now the new context's to keep,
         // as it covers the frames below them.
         if let Some(at) = covering(c, rt, boundary) {
-            x.runs = c[at].runs.split_off(&(boundary + 1, 0));
+            let i = (boundary - c[at].boundary) as usize;
+            x.runs = c[at].runs.split_off(i);
         }
         c.push(x);
     });
@@ -1738,18 +1787,14 @@ pub(crate) fn covering(c: &[Context], rt: RuntimeId, cidx: u32) -> Option<usize>
 /// `path`.
 fn run_slot(c: &[Context], rt: RuntimeId, cidx: u32, path: u64) -> Option<&RunSlot> {
     let x = &c[covering(c, rt, cidx.checked_sub(1)?)?];
-    x.runs.get(&(cidx, path))
+    x.runs.get((cidx - x.boundary - 1) as usize, path)
 }
 
 /// As [`run_slot`], made if missing; none when no context covers the frame
 /// below, as then no record of a run at `cidx` can outlive its context.
 fn run_slot_mut(c: &mut [Context], rt: RuntimeId, cidx: u32, path: u64) -> Option<&mut RunSlot> {
-    let at = covering(c, rt, cidx.checked_sub(1)?)?;
-    Some(c[at].runs.entry((cidx, path)).or_insert_with(|| RunSlot {
-        path,
-        owner: 0,
-        counts: Vec::new(),
-    }))
+    let x = &mut c[covering(c, rt, cidx.checked_sub(1)?)?];
+    Some(x.runs.entry((cidx - x.boundary - 1) as usize, path))
 }
 
 /// A run that started while a context of `rt` was open.
@@ -1945,21 +1990,19 @@ pub(crate) fn start_read(rt: RuntimeId, cidx: u32, depth: u32, path: u64, from: 
         let Some(at) = covering(c, rt, cidx) else {
             return;
         };
-        let over: Vec<_> = (c[at].runs.range((cidx + 1, 0)..=(cidx + 1, u64::MAX)))
-            .filter(|(_, s)| {
-                s.path != path
-                    && (s.owner == 0 || s.owner >= depth)
-                    && !(c.iter().filter(|x| x.rt == rt))
-                        .filter_map(|x| x.vframe_at(cidx))
-                        .any(|v| extend_path(v.path, Step::virtual_frame(v)) == s.path)
-            })
-            .map(|(&k, _)| k)
-            .collect();
-        for k in over {
-            c[at].runs.remove(&k);
+        let i = (cidx - c[at].boundary) as usize;
+        let over = |s: &RunSlot| s.path != path && (s.owner == 0 || s.owner >= depth);
+        if c[at].runs.at(i).iter().any(over) {
+            let kept: Vec<u64> = (c.iter().filter(|x| x.rt == rt))
+                .filter_map(|x| x.vframe_at(cidx))
+                .map(|v| extend_path(v.path, Step::virtual_frame(v)))
+                .collect();
+            c[at]
+                .runs
+                .at_mut(i)
+                .retain(|s| !over(s) || kept.contains(&s.path));
         }
-        let slot =
-            run_slot_mut(c, rt, cidx + 1, path).expect("incr-core: the context covers the read");
+        let slot = c[at].runs.entry(i, path);
         slot.owner = depth;
         match from.filter(|f| f.path == path) {
             Some(f) => slot.counts = f.counts,
