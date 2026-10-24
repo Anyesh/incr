@@ -921,7 +921,87 @@ fn cu_member_keeps_its_error_over_a_handled_episode<C: Cells>() {
     rt.assert_invariant_i();
 }
 
+/// Compares Equal unless either side is `boom`, whose compare panics.
+#[derive(Clone, Debug)]
+struct BoomEq {
+    v: u64,
+    boom: bool,
+}
+
+impl PartialEq for BoomEq {
+    fn eq(&self, other: &Self) -> bool {
+        assert!(!self.boom && !other.boom, "eq boom");
+        self.v == other.v
+    }
+}
+
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
+
+/// S (seeded) catches a Failed dep's panic and reads T; T reads S and
+/// `i`, and after `set(i, 1)` T's new value panics in step 3's compare,
+/// after S compared Equal. The rerun is read from a `Drop` while an
+/// engine unwind is pending (a wound reaching user drop glue), so the
+/// abort takes that unwind's kind: S must not keep the memo of an
+/// episode that never landed.
+fn aborted_episode_landing_keeps_no_memo<C: Cells>() {
+    let rt = Arc::new(Runtime::<C>::new());
+    let i = rt.create_input(0_u64);
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let tc = cell::<BoomEq>();
+    let s = {
+        let tc = tc.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                let t = rt.try_get(*tc.get().unwrap()).map_or(0, |t| t.v);
+                BoomEq {
+                    v: t.min(1),
+                    boom: false,
+                }
+            },
+            fixpoint(Fixpoint::new(|| BoomEq { v: 0, boom: false })),
+        )
+    };
+    let t = rt.create_query(move |rt: &Runtime<C>| BoomEq {
+        v: rt.get(s).v + 1,
+        boom: rt.get(i) == 1,
+    });
+    tc.set(t).unwrap();
+    assert_eq!(rt.get(t).v, 2);
+    assert!(rt.has_memo_of(s), "s {:?}", rt.state_of(s));
+    rt.set(i, 1);
+    // Nothing may panic out of the drop, which runs during cleanup.
+    let seen: Arc<std::sync::Mutex<Option<(bool, String)>>> = Arc::default();
+    let rerun = {
+        let (rt, seen) = (Arc::clone(&rt), Arc::clone(&seen));
+        move || {
+            let panicking = std::thread::panicking();
+            crate::cycle_state::set_unwind_kind(Some(crate::cycle_state::UnwindKind::Wound));
+            let got = catch_unwind(AssertUnwindSafe(|| rt.get(t).v));
+            crate::cycle_state::set_unwind_kind(None);
+            let msg = got.err().map(panic_message).unwrap_or_default();
+            *seen.lock().unwrap() = Some((panicking, msg));
+        }
+    };
+    let outer = catch_unwind(AssertUnwindSafe(move || {
+        let _rerun = OnDrop(rerun);
+        panic!("outer");
+    }));
+    assert!(outer.is_err());
+    let (panicking, msg) = seen.lock().unwrap().take().expect("the drop ran");
+    assert!(panicking);
+    assert!(!msg.contains("T8-memo-on-aborted-episode"), "{msg}");
+    assert!(!rt.has_memo_of(s), "s {:?}", rt.state_of(s));
+}
+
 both!(
+    aborted_episode_landing_keeps_no_memo,
     cu_member_keeps_its_error_over_a_handled_episode,
     self_cycle_fallback,
     self_cycle_fixpoint,

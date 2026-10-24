@@ -2162,12 +2162,17 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if memo {
-                node.set_memo(verify_rev);
-            } else if entries[i].1.poison() != 0 {
+            if entries[i].1.poison() != 0 {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
+            }
+        }
+        // Only once every value is written: an abort in step 3 lands the
+        // members as if the episode kept no memo.
+        if memo {
+            for (m, _) in &entries {
+                self.nodes.get(*m).set_memo(verify_rev);
             }
         }
 
@@ -2225,9 +2230,8 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        // Step 3 sets memos before the compare that panicked. With no
-        // engine kind every member lands New, or through `land_failed`,
-        // whose `changed_at` raise clears the memo.
+        // Step 3 sets no memo before its last compare, and a claimed
+        // member holds none from an earlier landing.
         debug_assert!(
             kind.is_none()
                 || entries
