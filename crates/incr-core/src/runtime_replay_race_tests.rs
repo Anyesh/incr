@@ -2800,6 +2800,47 @@ fn a_speculative_verify_across_a_set_keeps_no_stash() {
     assert_eq!(rt.get(top), 2);
 }
 
+/// A speculative run of `c` checks the revision for its stash, then a set
+/// bumps it and reads the stash count before the stash stores it: the
+/// stash, of an ended revision, must still be dropped.
+#[test]
+fn a_stash_stored_after_a_sets_count_load_is_dropped() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = rt.create_input(1_u64);
+    let b = rt.create_query(|_: &Rt| 5_u64);
+    let c = rt.create_query(|_: &Rt| 7_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    let gate = Gate::new();
+    gate.arm();
+    hook(&rt, vec![(ParkPoint::StashAfterCheck(id(c)), gate.clone())]);
+    let parked = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(reader))
+    };
+    gate.wait_parked();
+    rt.set(other, 2);
+    gate.release();
+    assert_eq!(parked.join().unwrap(), 5);
+    assert_eq!(
+        Shared::u32_load_relaxed(&rt.stash_count),
+        0,
+        "a stash of the revision the set ended is kept"
+    );
+    assert_eq!(rt.get(c), 7);
+}
+
 /// A set bumps the revision and parks before its walk; a speculative
 /// verify of `mid` then claims in the new revision but scans `leaf` as the
 /// old one left it. It must not stash a verify the walk is about to undo.

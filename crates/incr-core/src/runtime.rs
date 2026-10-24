@@ -141,6 +141,9 @@ pub(crate) enum ParkPoint {
     /// In red/green verification, after the dep scan found no change and
     /// before the landing CAS.
     VerifyAfterScan(NodeId),
+    /// In `stash`, under the stash lock, after the revision check and
+    /// before the entry and its count are stored.
+    StashAfterCheck(NodeId),
     /// In `set`, after the runtime check and before the claim's hold.
     SetBeforeClaim(NodeId),
     /// In `set`, under its claim, with no guard held, before the compare.
@@ -354,6 +357,8 @@ impl<C: Cells> SetClaim<'_, C> {
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         self.rt.drop_released_tickets();
+        // Pairs with the fence in `stash`, after its store of the count.
+        C::fence_seqcst();
         if C::u32_load_relaxed(&self.rt.stash_count) != 0 {
             self.rt.drop_stashes();
         }

@@ -905,6 +905,7 @@ impl<C: Cells> Runtime<C> {
             if self.current_revision() != revision {
                 return Err(stash);
             }
+            self.park(ParkPoint::StashAfterCheck(NodeId(slot)));
             let ended = (s.revision != revision).then(|| std::mem::take(&mut s.map));
             s.revision = revision;
             let displaced = match s.map.entry((slot, generation)) {
@@ -928,7 +929,25 @@ impl<C: Cells> Runtime<C> {
         if let Some(ended) = ended {
             self.drop_ended(ended);
         }
-        Ok(vacant)
+        // Pairs with the fence in a set between its bump and its load of
+        // `stash_count`: a set that read the count before this store bumped
+        // the revision before this load, and its stashes are this one's to
+        // drop.
+        C::fence_seqcst();
+        if self.current_revision() == revision {
+            return Ok(vacant);
+        }
+        let mut ended = {
+            let mut s = self.stashes.write();
+            if s.revision != revision {
+                return Ok(vacant);
+            }
+            C::u32_store_relaxed(&self.stash_count, 0);
+            std::mem::take(&mut s.map)
+        };
+        let mine = ended.remove(&(slot, generation));
+        self.drop_ended(ended);
+        mine.map_or(Ok(vacant), |mine| Err(mine.0))
     }
 
     /// Whether node `slot` at `generation` has a stash this revision, a
