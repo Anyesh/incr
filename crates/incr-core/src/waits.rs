@@ -85,6 +85,10 @@ loom::thread_local! {
 #[cfg(not(loom))]
 pub(crate) static WOUNDS: AtomicU64 = AtomicU64::new(0);
 
+/// Head-start checks a runtime made of a claim of its own, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) static OWN_CLAIM_CHECKS: AtomicU64 = AtomicU64::new(0);
+
 /// Threads registered now, for tests.
 #[cfg(test)]
 pub(crate) fn registered() -> usize {

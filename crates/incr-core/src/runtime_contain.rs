@@ -249,7 +249,14 @@ impl<C: Cells> Runtime<C> {
     /// ticket again. A speculative run's read takes none: a closure in
     /// the run can catch and drop the payload before the run's discard
     /// would hold it again, and the real run's read is owed it.
-    pub(super) fn take_contained(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
+    /// With tickets held, `Left` too when the slot no longer holds
+    /// `generation`'s node; with none, the read's panic is the one it would
+    /// have made before the delete.
+    pub(super) fn take_contained(
+        &self,
+        id: NodeId,
+        generation: Option<u32>,
+    ) -> Result<Option<Box<dyn Any + Send>>, Left> {
         if !self.tickets_held() || replay::speculative() {
             return Ok(None);
         }
@@ -258,8 +265,12 @@ impl<C: Cells> Runtime<C> {
         // Every Failed landing removes the node from the tickets before its
         // store, so under the lock a node still Failed at this generation
         // is in the latest landing's ticket, if any.
-        let landing = (id.0, node.generation());
         if state::load::<C>(node.state_cell()) != NodeState::Failed {
+            return Err(Left);
+        }
+        // After the state, as a recycle bumps it before its new node lands.
+        let landing = (id.0, node.generation());
+        if generation.is_some_and(|g| g != landing.1) {
             return Err(Left);
         }
         t.prune();
@@ -322,10 +333,12 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         cidx: u32,
         payload: Option<&(dyn Any + Send)>,
+        regenerable: bool,
         bag: &mut Deferred<C>,
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
+        self.note_failed_run(id, generation, cidx, regenerable);
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
@@ -424,7 +437,7 @@ impl<C: Cells> Runtime<C> {
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
-                && state::load::<C>(node.state_cell()) == NodeState::Failed
+                && self.in_failed_landing(slot)
                 && t.of((slot, generation))
                     .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
         });
@@ -487,8 +500,21 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Every landing a ticket keeps is Failed and indexed to it: every
-    /// change from that landing releases it.
+    /// Whether `slot`'s node is in its Failed landing: Failed, or Computing
+    /// under a regenerating run, which lands nothing and puts it back. Exact
+    /// under the tickets lock, under which a rerun moves it and marks it.
+    fn in_failed_landing(&self, slot: u32) -> bool {
+        match state::load::<C>(self.nodes.get(slot).state_cell()) {
+            NodeState::Failed => true,
+            NodeState::Computing | NodeState::ComputingDirty => {
+                crate::replay::is_regen_running(self.runtime_id, slot)
+            }
+            _ => false,
+        }
+    }
+
+    /// Every landing a ticket keeps is in its Failed landing and indexed to
+    /// it: every change from that landing releases it.
     fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {
         let members = ticket.members.lock();
         let live = members.members.iter().filter(|m| m.gone == u64::MAX);
@@ -498,7 +524,7 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(m.node.0);
             assert!(
                 node.generation() == m.node.1
-                    && state::load::<C>(node.state_cell()) == NodeState::Failed
+                    && self.in_failed_landing(m.node.0)
                     && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
@@ -514,16 +540,36 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn flip_failed(&self, id: NodeId) -> bool {
+        self.flip_failed_from(id, NodeState::Failed)
+    }
+
+    /// [`Self::flip_failed`] for a node in state `from`: a regenerating
+    /// run's node is Computing over its Failed landing.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn flip_failed_from(&self, id: NodeId, from: NodeState) -> bool {
         let node = self.nodes.get(id.0);
+        self.park(ParkPoint::FlipBeforeCas(id));
         let mut t = self.tickets.write();
-        if state::try_transition::<C>(node.state_cell(), NodeState::Failed, NodeState::Dirty)
-            .is_err()
-        {
+        let flipped = self.with_failed_run_token(id.0, node.generation(), |token| {
+            state::try_transition::<C>(node.state_cell(), from, NodeState::Dirty)
+                .is_ok()
+                .then_some(token)
+        });
+        let Some(token) = flipped else {
             return false;
+        };
+        if from != NodeState::Failed {
+            // With the flip, under the lock: a compute may take the node
+            // from Dirty once the lock goes.
+            crate::replay::regen_running(self.runtime_id, id.0, false);
         }
         let stale = release(&mut t, u64::MAX, slot_landings(id.0));
         t.buried.extend(stale);
         self.sync_held(&t);
+        drop(t);
+        self.park(ParkPoint::FlippedFailed(id));
+        self.forget_failed_run_if(id.0, node.generation(), token);
         true
     }
 
@@ -565,6 +611,9 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn bury_tickets(&self, slot: u32, generation: u32) {
         if self.tickets_held() {
             self.bury(slot, generation);
+        }
+        if self.regens_held.load(Relaxed) {
+            self.forget_failed_run(slot, generation);
         }
     }
 
