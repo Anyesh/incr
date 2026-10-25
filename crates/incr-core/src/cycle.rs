@@ -402,6 +402,10 @@ pub(crate) const SPECULATIVE: u16 = 1024;
 /// holds (`crate::hold`), so its own landing is held too, and so is its
 /// reader's.
 pub(crate) const HOLD: u16 = 2048;
+/// A `HOLD` frame's write kept what it displaced in `crate::hold`, keyed
+/// by this control block, until the landing's entry takes it or the frame
+/// ends (`crate::hold::KeptGuard`).
+pub(crate) const KEPT: u16 = 4096;
 pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
@@ -419,10 +423,6 @@ pub struct ComputeCtl {
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
-    /// What a `HOLD` frame's write displaced (`Some(None)` for an empty
-    /// slot), until its landing's entry takes it; otherwise it drops with
-    /// the frame, as an ordinary write drops it.
-    pub(crate) kept: Cell<Option<Option<Box<dyn std::any::Any>>>>,
 }
 
 impl ComputeCtl {
@@ -434,7 +434,6 @@ impl ComputeCtl {
             buf: Cell::new(None),
             wrote: Cell::new(0),
             children: Cell::new(std::ptr::null()),
-            kept: Cell::new(None),
         }
     }
 

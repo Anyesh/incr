@@ -876,9 +876,10 @@ fn write_held<T: Value, C: Cells>(
         ctl.wrote.set(1);
         arena.write(slot, value)
     };
-    ctl.kept.set(Some(
+    hold::keep_for(
+        ctl,
         displaced.map(|d| Box::new(d) as Box<dyn std::any::Any>),
-    ));
+    );
     Outcome::Changed
 }
 
@@ -3985,6 +3986,7 @@ impl<C: Cells> Runtime<C> {
                         | if speculative { cycle::SPECULATIVE } else { 0 }
                         | self.rerun_hold(node),
                 );
+                let _kept = (!C::SINGLE_THREADED).then_some(hold::KeptGuard(&ctl));
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
                 if MODE & VIRT != 0 {
@@ -4086,7 +4088,7 @@ impl<C: Cells> Runtime<C> {
                     & (cycle::LOW | cycle::DOOMED | cycle::SPECULATIVE | cycle::HOLD);
                 if parked != 0 {
                     if parked == cycle::HOLD {
-                        self.open_hold(id, node, first, ctl.kept.take(), bag);
+                        self.open_hold(id, node, first, hold::take_kept(&ctl), bag);
                     } else {
                         let attempt = Attempt {
                             first,
@@ -4272,7 +4274,7 @@ impl<C: Cells> Runtime<C> {
         let wrote = ctl.wrote.get() != 0;
         // A panic its run met reading a held landing is held as its value is.
         if kind.is_none() && !C::SINGLE_THREADED && ctl.has(cycle::HOLD) {
-            self.open_hold(id, node, attempt.first, ctl.kept.take(), bag);
+            self.open_hold(id, node, attempt.first, hold::take_kept(ctl), bag);
         }
         if children_stashed {
             let first = attempt.first;

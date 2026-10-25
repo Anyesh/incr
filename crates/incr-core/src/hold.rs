@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cycle::{self, ComputeCtl};
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
@@ -67,6 +68,9 @@ struct HoldSet {
     seq: u64,
     /// A held node was read through the view since the last claim.
     consulted: bool,
+    /// What `HOLD` frames' writes displaced, by control block address
+    /// (`cycle::KEPT`); `Some(None)` was an empty slot.
+    kept: Vec<(usize, Option<Box<dyn Any>>)>,
     /// Every read of a held node through the view or a claim of one again,
     /// so a read can tell whether it rested on any.
     looks: u64,
@@ -371,4 +375,46 @@ pub(crate) fn tainted(rt: RuntimeId) -> bool {
 #[cfg(all(test, not(loom)))]
 pub(crate) fn held_count() -> usize {
     with(|h| h.by_cell.len())
+}
+
+/// A `HOLD` frame's write keeps what it displaced until the frame's landing
+/// opens its entry; a second write of the frame drops the first one's.
+pub(crate) fn keep_for(ctl: &ComputeCtl, displaced: Option<Box<dyn Any>>) {
+    let key = std::ptr::from_ref(ctl) as usize;
+    ctl.raise(cycle::KEPT);
+    let old = with(|h| match h.kept.iter_mut().find(|(k, _)| *k == key) {
+        Some((_, v)) => Some(std::mem::replace(v, displaced)),
+        None => {
+            h.kept.push((key, displaced));
+            None
+        }
+    });
+    drop(old);
+}
+
+/// What `ctl`'s frame kept, for its landing's entry.
+pub(crate) fn take_kept(ctl: &ComputeCtl) -> Option<Option<Box<dyn Any>>> {
+    if !ctl.has(cycle::KEPT) {
+        return None;
+    }
+    ctl.flags.set(ctl.flags.get() & !cycle::KEPT);
+    let key = std::ptr::from_ref(ctl) as usize;
+    with(|h| {
+        let at = h.kept.iter().position(|(k, _)| *k == key)?;
+        Some(h.kept.swap_remove(at).1)
+    })
+}
+
+/// Drops what a compute frame kept and no entry took, when the frame
+/// ends, as an ordinary write drops what it displaced; the key is unique
+/// while the control block lives.
+pub(crate) struct KeptGuard<'a>(pub(crate) &'a ComputeCtl);
+
+impl Drop for KeptGuard<'_> {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0.has(cycle::KEPT) {
+            drop(take_kept(self.0));
+        }
+    }
 }
