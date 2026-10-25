@@ -333,10 +333,12 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         cidx: u32,
         payload: Option<&(dyn Any + Send)>,
+        regenerable: bool,
         bag: &mut Deferred<C>,
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
+        self.note_failed_run(id, generation, cidx, regenerable);
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
@@ -525,16 +527,31 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn flip_failed(&self, id: NodeId) -> bool {
+        self.flip_failed_from(id, NodeState::Failed)
+    }
+
+    /// [`Self::flip_failed`] for a node in state `from`: a regenerating
+    /// run's node is Computing over its Failed landing.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn flip_failed_from(&self, id: NodeId, from: NodeState) -> bool {
         let node = self.nodes.get(id.0);
+        self.park(ParkPoint::FlipBeforeCas(id));
         let mut t = self.tickets.write();
-        if state::try_transition::<C>(node.state_cell(), NodeState::Failed, NodeState::Dirty)
-            .is_err()
-        {
+        let flipped = self.with_failed_run_token(id.0, node.generation(), |token| {
+            state::try_transition::<C>(node.state_cell(), from, NodeState::Dirty)
+                .is_ok()
+                .then_some(token)
+        });
+        let Some(token) = flipped else {
             return false;
-        }
+        };
         let stale = release(&mut t, u64::MAX, slot_landings(id.0));
         t.buried.extend(stale);
         self.sync_held(&t);
+        drop(t);
+        self.park(ParkPoint::FlippedFailed(id));
+        self.forget_failed_run_if(id.0, node.generation(), token);
         true
     }
 
@@ -576,6 +593,9 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn bury_tickets(&self, slot: u32, generation: u32) {
         if self.tickets_held() {
             self.bury(slot, generation);
+        }
+        if self.regens_held.load(Relaxed) {
+            self.forget_failed_run(slot, generation);
         }
     }
 

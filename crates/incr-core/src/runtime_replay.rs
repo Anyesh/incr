@@ -10,6 +10,7 @@ use super::*;
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::Placement;
+use crate::locks::Lock;
 use crate::replay::{self, Delivered, Delivery, Entry, ReadKey, Retry, VFrame};
 use crate::reserve;
 use crate::segmented_nodes::{NOT_REPLAYABLE, REPLAYABLE};
@@ -1244,6 +1245,9 @@ impl<C: Cells> Runtime<C> {
                 _ => {}
             }
         }
+        if word & value_code::REGEN_BIT != 0 {
+            self.regen_read(NodeId(handle.slot()), handle.generation(), observed);
+        }
         if foreign {
             return self.foreign_read(handle, observed, kind, word);
         }
@@ -1521,6 +1525,7 @@ impl<C: Cells> Runtime<C> {
             self.park(ParkPoint::BeforeVirtualClaim(NodeId(slot)));
             match self.claim_virtual(p, top) {
                 Ok(()) => {
+                    self.unregenerable(Some(f));
                     return Some(
                         self.cycle_read(handle, NodeState::Computing, kind, None)
                             .expect("incr-core: a virtual hit holds the node it read"),
@@ -2036,6 +2041,9 @@ impl<C: Cells> Runtime<C> {
         if !self.budgeted() {
             return;
         }
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live.
+        unsafe { &*f.ctl }.raise(cycle::UNREGENERABLE);
         let value: cycle::Erased = Box::new(value_code::run(|| value.clone()));
         let value = Unbuilt::new(value);
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
@@ -2055,7 +2063,8 @@ impl<C: Cells> Runtime<C> {
     /// may be doomed and retried, and the retry's read must take the
     /// unwind again: the unbounded run's frame read the node once, and a
     /// fresh read would run what the unwind left New, Dirty or Failed
-    /// again, or panic as Failed with another payload.
+    /// again, or panic as Failed with another payload. A payload no copy
+    /// can stand for holds the frame instead (`hold_uncopied`).
     #[cold]
     #[inline(never)]
     pub(super) fn note_unwound_read(
@@ -2069,12 +2078,18 @@ impl<C: Cells> Runtime<C> {
         {
             return;
         }
-        let Some((ctl, cidx, reading, ordinal)) = self.dep_stack.unwound_reader(self.runtime_id)
-        else {
+        let Some((f, reading, ordinal)) = self.dep_stack.unwound_read(self.runtime_id) else {
             return;
         };
-        let Some(copy) = replay::copy_payload(payload) else {
-            return;
+        if kind == Some(UnwindKind::Cycle) {
+            self.unregenerable(Some(f));
+        }
+        let (ctl, cidx) = (f.ctl, f.cidx);
+        let regenerable = self.note_took(f, reading, payload);
+        let copy = match replay::copy_payload(payload) {
+            Some(copy) => copy,
+            None if self.hold_uncopied(ctl, regenerable) => return,
+            None => Box::new(replay::Regen(payload.type_id())),
         };
         let what = Delivered::Unwind {
             cycle: kind == Some(UnwindKind::Cycle),
@@ -2090,32 +2105,26 @@ impl<C: Cells> Runtime<C> {
     /// ticket. If a budget is set, the frame may be doomed after its closure
     /// has dropped the one-shot payload, and its retry's read must take it
     /// again, as the unbounded run's one read did: a copy is kept for the
-    /// retry, or, for a payload no copy can stand for, the frame is not
-    /// doomed while it is within the budget. Past the budget the stack bound
-    /// wins, and the retry reads the node Failed with no payload.
+    /// retry, or a payload no copy can stand for holds the frame
+    /// (`hold_uncopied`).
     #[cold]
     #[inline(never)]
     pub(super) fn note_ticket_read(&self, id: NodeId, payload: &(dyn std::any::Any + Send)) {
         if !self.budgeted() {
             return;
         }
-        let Some((ctl, cidx, reading, ordinal)) = self.dep_stack.unwound_reader(self.runtime_id)
-        else {
+        let Some((f, reading, ordinal)) = self.dep_stack.unwound_read(self.runtime_id) else {
             return;
         };
         if reading != u64::from(id.0) | (u64::from(self.nodes.get(id.0).generation()) << 32) {
             return;
         }
-        let Some(copy) = replay::copy_payload(payload) else {
-            if !self.over_budget(self.dep_stack.depth() as u32) {
-                // SAFETY: the reading frame is on the stack, so its control
-                // block is live.
-                let flags = unsafe { &*ctl };
-                if !flags.has(cycle::DOOMED) {
-                    flags.raise(cycle::NO_DOOM);
-                }
-            }
-            return;
+        let (ctl, cidx) = (f.ctl, f.cidx);
+        let regenerable = self.note_took(f, reading, payload);
+        let copy = match replay::copy_payload(payload) {
+            Some(copy) => copy,
+            None if self.hold_uncopied(ctl, regenerable) => return,
+            None => Box::new(replay::Regen(payload.type_id())),
         };
         let what = Delivered::Unwind {
             cycle: false,
@@ -2125,6 +2134,442 @@ impl<C: Cells> Runtime<C> {
             nodes: self.copy_notes(payload, cidx + 1),
         };
         self.keep_read(ctl, cidx, reading, ordinal, what);
+    }
+
+    /// The reading frame with control block `ctl` took a payload no copy
+    /// can stand for, which its closure may drop: it is not doomed while it
+    /// is within the budget, so its one read is the unbounded run's. Past
+    /// the budget a retry regenerates the payload (`regenerate`) if it is
+    /// `regenerable`, so the stack bound holds; else the frame is held there
+    /// too, since rerunning a closure not declared replayable is a run the
+    /// unbounded run never makes. True if the frame is held.
+    pub(super) fn hold_uncopied(&self, ctl: *const cycle::ComputeCtl, regenerable: bool) -> bool {
+        if self.over_budget(self.dep_stack.depth() as u32) {
+            if regenerable {
+                return false;
+            }
+            #[cfg(test)]
+            PAST_BUDGET_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(all(test, not(loom)))]
+            THREAD_PAST_BUDGET_HOLDS.with(|n| n.set(n.get() + 1));
+        }
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live.
+        let flags = unsafe { &*ctl };
+        if !flags.has(cycle::DOOMED) {
+            flags.raise(cycle::NO_DOOM);
+        }
+        true
+    }
+
+    /// Marks frame `frame`'s run as one a rerun of its node does not
+    /// repeat (`cycle::UNREGENERABLE`).
+    pub(super) fn unregenerable(&self, frame: Option<ActiveRead>) {
+        if let Some(f) = frame {
+            // SAFETY: the reading frame is on the stack, so its control
+            // block is live.
+            unsafe { &*f.ctl }.raise(cycle::UNREGENERABLE);
+        }
+    }
+
+    /// Notes for `regenerate` that frame `f`'s read of node `reading`
+    /// (`slot | generation << 32`) took `payload` from a compute or a
+    /// ticket, as the frame's run's read. Returns whether a retry can
+    /// regenerate the payload (`regenerable`).
+    pub(super) fn note_took(
+        &self,
+        f: ActiveRead,
+        reading: u64,
+        payload: &(dyn std::any::Any + Send),
+    ) -> bool {
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live.
+        let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
+        let (generation, path, _, seq) = self.key_parts(f, member);
+        let reader = (f.node.0, generation, path, seq);
+        replay::note_took(self.runtime_id, reader, reading, payload);
+        self.regenerable(reading)
+    }
+
+    /// Notes for `regenerate` that `id` at `generation`, its frame at `cidx`
+    /// just popped, lands Failed with what its run's reads took, keyed as
+    /// `note_took` keyed them. A run that is not `regenerable`, as a member
+    /// landing after its run or a creator's run, which no rerun repeats,
+    /// leaves no record, so its readers are held past the budget.
+    pub(super) fn note_failed_run(
+        &self,
+        id: NodeId,
+        generation: u32,
+        cidx: u32,
+        regenerable: bool,
+    ) {
+        if !self.budgeted() || replay::speculative() {
+            return;
+        }
+        let reading = u64::from(id.0) | (u64::from(generation) << 32);
+        let took = self.took_by_run(id, generation, cidx);
+        if !regenerable || !self.replayable(id.0) {
+            self.forget_failed_run(id.0, generation);
+            return;
+        }
+        let ok = {
+            let regens = self.regens.read();
+            took.iter()
+                .all(|(n, copy)| copy.is_some() || regens.by_node.get(n).is_some_and(|r| r.ok))
+        };
+        let took = took
+            .into_iter()
+            .map(|(n, copy)| (n, copy.map(std::sync::Mutex::new)))
+            .collect();
+        self.regens_held
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut regens = self.regens.write();
+        regens.next_token += 1;
+        let token = regens.next_token;
+        regens
+            .by_node
+            .insert(reading, Regenerable { token, ok, took });
+    }
+
+    /// `id` at `generation`, its frame at `cidx` just popped, lands but not
+    /// Failed: its run's takes and an earlier Failed landing's record go.
+    pub(super) fn unfailed_landing(&self, id: NodeId, generation: u32, cidx: u32) {
+        if !self.budgeted() || replay::speculative() {
+            return;
+        }
+        drop(self.took_by_run(id, generation, cidx));
+        self.forget_failed_run(id.0, generation);
+    }
+
+    /// `id` at `generation`, its frame at `cidx` just popped, lands a
+    /// computed value: its run's takes go. Its earlier Failed record went
+    /// when it left Failed (`flip_failed_from`), and one another thread's
+    /// run lands once the claim is released must stay.
+    pub(super) fn drop_takes(&self, id: NodeId, generation: u32, cidx: u32) {
+        if !self.budgeted() || replay::speculative() {
+            return;
+        }
+        drop(self.took_by_run(id, generation, cidx));
+    }
+
+    /// What the run of `id` at `generation`, whose frame at `cidx` just
+    /// popped, noted its reads took (`replay::note_took`).
+    fn took_by_run(&self, id: NodeId, generation: u32, cidx: u32) -> Vec<replay::Took> {
+        let rt = self.runtime_id;
+        if !replay::takes_noted(rt) {
+            return Vec::new();
+        }
+        let reading = u64::from(id.0) | (u64::from(generation) << 32);
+        let depth = self.dep_stack.depth() as u32;
+        let (seq, path) =
+            replay::ended_run(rt, depth, reading).unwrap_or_else(|| (0, self.path_at(cidx)));
+        replay::took_by_run(rt, (id.0, generation, path, seq))
+    }
+
+    /// Whether a retry can regenerate the payload node `reading` landed
+    /// Failed with: the node may run again, and so may every node its
+    /// regeneration runs.
+    pub(super) fn regenerable(&self, reading: u64) -> bool {
+        self.regens
+            .read()
+            .by_node
+            .get(&reading)
+            .is_some_and(|r| r.ok)
+    }
+
+    /// What the reads of the run node `reading` landed Failed from took, a
+    /// copy of each payload or `None` where its node runs again, if a
+    /// budgeted run landed it.
+    fn took_by(&self, reading: u64) -> Option<Vec<replay::Took>> {
+        let regens = self.regens.read();
+        let r = regens.by_node.get(&reading)?;
+        Some(
+            r.took
+                .iter()
+                .map(|(n, copy)| {
+                    let copy = copy.as_ref().and_then(|c| {
+                        replay::copy_payload(
+                            &**c.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+                        )
+                    });
+                    (*n, copy)
+                })
+                .collect(),
+        )
+    }
+
+    /// Drops the record of node `slot` at `generation`'s Failed landing,
+    /// which it leaves.
+    pub(super) fn forget_failed_run(&self, slot: u32, generation: u32) {
+        if !self.regens_held.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let reading = u64::from(slot) | (u64::from(generation) << 32);
+        self.regens.write().by_node.remove(&reading);
+    }
+
+    /// The token of node `slot` at `generation`'s record, to forget it by
+    /// once the node's claim or Failed state no longer keeps another run
+    /// from landing a new one (`forget_failed_run_if`).
+    pub(super) fn failed_run_token(&self, slot: u32, generation: u32) -> Option<u64> {
+        if !self.regens_held.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let reading = u64::from(slot) | (u64::from(generation) << 32);
+        self.regens.read().by_node.get(&reading).map(|r| r.token)
+    }
+
+    /// Runs `flip` with the token of node `slot` at `generation`'s record,
+    /// under the table's lock: a run writes or forgets its record before its
+    /// landing publishes Failed, so the token is the newest Failed landing's
+    /// record, if that landing wrote one.
+    pub(super) fn with_failed_run_token<R>(
+        &self,
+        slot: u32,
+        generation: u32,
+        flip: impl FnOnce(Option<u64>) -> R,
+    ) -> R {
+        let reading = u64::from(slot) | (u64::from(generation) << 32);
+        let regens = self.regens.read();
+        flip(regens.by_node.get(&reading).map(|r| r.token))
+    }
+
+    /// Forgets node `slot` at `generation`'s record if it is still the one
+    /// `token` names.
+    pub(super) fn forget_failed_run_if(&self, slot: u32, generation: u32, token: Option<u64>) {
+        let Some(token) = token else {
+            return;
+        };
+        let reading = u64::from(slot) | (u64::from(generation) << 32);
+        let mut regens = self.regens.write();
+        if regens
+            .by_node
+            .get(&reading)
+            .is_some_and(|r| r.token == token)
+        {
+            regens.by_node.remove(&reading);
+        }
+    }
+
+    /// The payload a retry's read of Failed node `id` at `generation` raises
+    /// where the unbounded run's read took a payload of type `ty` no copy
+    /// can stand for: the node's closure runs again, as a replayed closure
+    /// may, and a panic of that type is the payload. Each read its run took
+    /// a payload from a compute or a ticket raises that payload again, a
+    /// copy or one regenerated so before the run, so one run is on the
+    /// stack at a time however deep the panics nest; any other read of a
+    /// Failed node found it Failed already and panics with its message.
+    /// `None` if a run aborts, returns, or panics with another type at the
+    /// top: a set since may have changed what the runs read, so the read
+    /// goes on as a read of the node as it is now, which a read racing the
+    /// set may be.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn regenerate(
+        &self,
+        id: NodeId,
+        generation: u32,
+        ty: std::any::TypeId,
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        let top = u64::from(id.0) | (u64::from(generation) << 32);
+        let mut payload = None;
+        // Each level: its node, the reads its run took a payload from
+        // still to make, and the payloads made for them.
+        type Level = (
+            u64,
+            Vec<(u64, Option<Box<dyn std::any::Any + Send>>)>,
+            Vec<(u64, Box<dyn std::any::Any + Send>)>,
+        );
+        let mut stack: Vec<Level> = Vec::new();
+        // A node's last noted run can be newer than the run that read it,
+        // so the reads need not nest.
+        let mut on_stack: HashSet<u64> = HashSet::default();
+        if let Some(took) = self.took_by(top) {
+            stack.push((top, took, Vec::new()));
+            on_stack.insert(top);
+        }
+        while let Some((at, took, made)) = stack.last_mut() {
+            if let Some((n, copy)) = took.pop() {
+                match copy {
+                    Some(copy) => made.push((n, copy)),
+                    None => match self.took_by(n) {
+                        Some(took) if on_stack.insert(n) => stack.push((n, took, Vec::new())),
+                        _ => break,
+                    },
+                }
+                continue;
+            }
+            let at = *at;
+            let made = std::mem::take(made);
+            stack.pop();
+            on_stack.remove(&at);
+            let Some(p) = self.rerun(NodeId(at as u32), (at >> 32) as u32, made) else {
+                break;
+            };
+            match stack.last_mut() {
+                Some(level) => level.2.push((at, p)),
+                None => payload = Some(p),
+            }
+        }
+        for (_, took, made) in stack {
+            drop_payloads(took.into_iter().filter_map(|t| t.1));
+            drop_payloads(made.into_iter().map(|m| m.1));
+        }
+        match payload {
+            Some(p) if (*p).type_id() == ty => {
+                #[cfg(all(test, not(loom)))]
+                THREAD_REGENERATIONS.with(|n| n.set(n.get() + 1));
+                Some(p)
+            }
+            p => {
+                drop_payloads(p);
+                None
+            }
+        }
+    }
+
+    /// `payload`, taken by a read of `handle` under `key` from `rt`'s
+    /// contexts, or for its Regen marker the payload regenerated, which the
+    /// delivery then counts as raised: `None` if it can't be (`regenerate`).
+    fn regenerated<T: Value>(
+        &self,
+        handle: Incr<T>,
+        rt: RuntimeId,
+        key: &ReadKey,
+        payload: Box<dyn std::any::Any + Send>,
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        match payload.downcast::<replay::Regen>() {
+            Ok(regen) => {
+                let raised =
+                    self.regenerate(NodeId(handle.slot()), handle.generation(), regen.0)?;
+                replay::regenerated(rt, key, replay::payload_key(&*raised));
+                Some(raised)
+            }
+            Err(payload) => Some(payload),
+        }
+    }
+
+    /// One run of `regenerate`: node `id`'s closure, if the node is still
+    /// Failed at `generation` and declared replayable, so its closure may
+    /// run again, with its reads of Failed nodes taking from `made`. Returns
+    /// the closure's panic. Nothing lands: the node is claimed from Failed
+    /// for the run and goes back to it, the run's deps are dropped, and a
+    /// read that would compute, wait or create aborts it. It runs outside
+    /// `compute_attempts`, so no Native run limit counts it.
+    ///
+    /// No dep of a Failed node has changed since its run, so a closure that
+    /// reads only the deps that run recorded reads what it read and panics
+    /// as it did, unless it hides state the contract forbids. A run that
+    /// reads any other node took another path, and makes no payload.
+    fn rerun(
+        &self,
+        id: NodeId,
+        generation: u32,
+        made: Vec<(u64, Box<dyn std::any::Any + Send>)>,
+    ) -> Option<Box<dyn std::any::Any + Send>> {
+        let node = self.nodes.get(id.0);
+        if !self.replayable(id.0) || node.generation() != generation {
+            drop_payloads(made.into_iter().map(|m| m.1));
+            return None;
+        }
+        // Another thread's rerun of the node holds it only for that run,
+        // which never waits, so this waits it out. The claim is noted first,
+        // so a rerun that finds the node Computing sees it.
+        replay::regen_claim(self.runtime_id, id.0, true);
+        let mut spins = 0;
+        loop {
+            match state::try_transition::<C>(
+                node.state_cell(),
+                NodeState::Failed,
+                NodeState::Computing,
+            ) {
+                Ok(()) => break,
+                Err(NodeState::Computing | NodeState::ComputingDirty)
+                    if replay::regen_claims(self.runtime_id, id.0) > 1 =>
+                {
+                    spins += 1;
+                    C::backoff(spins);
+                }
+                Err(_) => {
+                    replay::regen_claim(self.runtime_id, id.0, false);
+                    drop_payloads(made.into_iter().map(|m| m.1));
+                    return None;
+                }
+            }
+        }
+        // SAFETY: as in `compute_attempts`: the closure is freed only under
+        // a Dead claim, which can't succeed while this node is Computing.
+        let compute = self
+            .inner
+            .read()
+            .compute_fns
+            .get(id.0 as usize)
+            .and_then(|f| f.as_deref())
+            .map(std::ptr::from_ref);
+        let mut panicked = None;
+        let mut left = made;
+        let mut engine = None;
+        if let Some(compute) = compute {
+            let compute = unsafe { &*compute };
+            let ctl = ComputeCtl::new(cycle::BUFFERED);
+            self.dep_stack.push_frame(self.runtime_id, id, &ctl);
+            replay::regen_open(self.runtime_id, left);
+            value_code::set_bits(value_code::REGEN_BIT, true);
+            let ran = catch_unwind(AssertUnwindSafe(|| compute(self, id.0, &ctl)));
+            let aborted = value_code::thread_word() & value_code::REGEN_ABORTED != 0;
+            value_code::set_bits(value_code::REGEN_BIT | value_code::REGEN_ABORTED, false);
+            left = replay::regen_close();
+            let read = self.dep_stack.pop_frame();
+            let value = ctl.buf.take();
+            let mut recorded = Vec::new();
+            node.for_each_dep(|d| recorded.push(d.0));
+            recorded.sort_unstable();
+            let same_path = read
+                .iter()
+                .all(|(d, _)| recorded.binary_search(&d.0).is_ok());
+            match ran {
+                Err(p) if cycle_state::unwind_kind().is_some() => engine = Some(p),
+                Err(p) if !aborted && same_path => panicked = Some(p),
+                ran => drop_payloads(ran.err()),
+            }
+            drop(catch_unwind(AssertUnwindSafe(move || drop(value))));
+        }
+        let mut flipped = true;
+        if state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed)
+            .is_err()
+        {
+            // A set's walk found the node Computing and walked on through
+            // it: the node leaves Failed as the walk would have flipped it,
+            // in one step, so no read sees it Failed after the set.
+            flipped = self.flip_failed_from(id, NodeState::ComputingDirty);
+        }
+        replay::regen_claim(self.runtime_id, id.0, false);
+        debug_assert!(flipped, "incr-core: a regenerating node left Computing");
+        drop_payloads(left.into_iter().map(|m| m.1));
+        // Raised by a wait, which a regenerating run never makes.
+        if let Some(p) = engine {
+            drop_payloads(panicked);
+            resume_unwind(p);
+        }
+        panicked
+    }
+
+    /// A slow read made by a run of `regenerate`: the first read of a node
+    /// the unbounded run's read took a payload from raises the payload made
+    /// for it, whatever the node's state now; another read of a Failed node
+    /// panics with its message; any other read would compute, wait or land,
+    /// so it aborts the run.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn regen_read(&self, id: NodeId, generation: u32, observed: NodeState) -> ! {
+        let key = u64::from(id.0) | (u64::from(generation) << 32);
+        if let Some(payload) = replay::regen_take(self.runtime_id, key) {
+            resume_unwind(payload);
+        }
+        if observed == NodeState::Failed {
+            panic!("{}", super::provenance_impl::failed_read_message(id.0));
+        }
+        abort_regen()
     }
 
     /// The key parts a read by this runtime's frame `f` gets from this
@@ -2212,13 +2657,17 @@ impl<C: Cells> Runtime<C> {
         if reader == self.runtime_id || flags.has(cycle::DOOMED) || unbudgeted(reader) {
             return self.read_unframed(handle, observed, kind, word);
         }
+        // A rerun of the reader's node reads this runtime's node again, as
+        // it is then.
+        flags.raise(cycle::UNREGENERABLE);
         let rt = self.runtime_id;
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
         let kept = flags.has(cycle::KEPT_READ);
         let ordinal = replay::foreign_ordinal(reader, cidx, ctl, reading, rt, kept);
-        let taken = self
-            .foreign_key(word, (reader, node, flags, cidx), reading, ordinal)
-            .and_then(|key| replay::take_pending(reader, &key, clone_landed::<T>));
+        let key = self.foreign_key(word, (reader, node, flags, cidx), reading, ordinal);
+        let taken = key
+            .as_ref()
+            .and_then(|key| replay::take_pending(reader, key, clone_landed::<T>));
         let outcome = match taken {
             Some(Delivered::Landed(value, _)) => Ok(Ok(*value
                 .into_inner()
@@ -2232,7 +2681,18 @@ impl<C: Cells> Runtime<C> {
                 .downcast::<cycle::CycleUnwind>()
                 .expect("incr-core: a kept cycle is a cycle unwind")
                 .0)),
-            Some(Delivered::Unwind { payload, .. }) => Err(payload),
+            Some(Delivered::Unwind { payload, .. }) => {
+                let raised = match &key {
+                    Some(key) => self.regenerated(handle, reader, key, payload),
+                    None => Some(payload),
+                };
+                match raised {
+                    Some(payload) => Err(payload),
+                    None => catch_unwind(AssertUnwindSafe(|| {
+                        self.read_unframed(handle, observed, kind, word)
+                    })),
+                }
+            }
             Some(Delivered::Walk(..) | Delivered::Direct) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
@@ -3772,6 +4232,7 @@ impl<C: Cells> Runtime<C> {
                 e.deps(),
                 &[],
                 Some(&*payload),
+                false,
                 bag,
             );
             self.end_reservation(id, node);
@@ -4169,7 +4630,7 @@ impl<C: Cells> Runtime<C> {
         // A delivery stays until its maker's run ends, because a retry
         // doomed again after the read comes back to it as an entry and must
         // read what the first one did. A payload that can't be copied is
-        // delivered once.
+        // handed over once, and a later take regenerates it (`regenerate`).
         // SAFETY: the active frame's control block is live.
         let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
         let (generation, path, episode, seq) = self.key_parts(f, member);
@@ -4249,7 +4710,7 @@ impl<C: Cells> Runtime<C> {
             }
             Delivered::Landed(value, poison) => {
                 // SAFETY: the active frame's control block is live.
-                unsafe { &*f.ctl }.raise(poison);
+                unsafe { &*f.ctl }.raise(poison | cycle::UNREGENERABLE);
                 return Some(Ok(*value
                     .into_inner()
                     .downcast::<T>()
@@ -4270,6 +4731,16 @@ impl<C: Cells> Runtime<C> {
         if poison != 0 {
             // SAFETY: the active frame's control block is live.
             unsafe { &*f.ctl }.raise(poison);
+        }
+        // A payload no copy can stand for was delivered once, and a retry
+        // after it regenerates the payload, or reads the node as it is.
+        if cycle {
+            // SAFETY: the active frame's control block is live.
+            unsafe { &*f.ctl }.raise(cycle::UNREGENERABLE);
+        }
+        let payload = self.regenerated(handle, rt, &key, payload)?;
+        if !replay::copyable(&*payload) {
+            self.hold_uncopied(f.ctl, self.regenerable(reading));
         }
         if !cycle {
             // The member marked for the panic was marked in the run it came
@@ -4801,6 +5272,70 @@ impl<C: Cells> Runtime<C> {
                 .any(|x| x.vstack.iter().any(|v| v.cidx == cidx))
         })
     }
+}
+
+/// Readers held past the budget because a payload they took can't be
+/// regenerated (`hold_uncopied`), for the differential scans to report.
+#[cfg(test)]
+pub(crate) static PAST_BUDGET_HOLDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// [`PAST_BUDGET_HOLDS`] on this thread, which tests running beside
+    /// one another leave alone.
+    pub(crate) static THREAD_PAST_BUDGET_HOLDS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// Payloads `Runtime::regenerate` made on this thread.
+    pub(crate) static THREAD_REGENERATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// The Failed landings of a runtime's nodes from budgeted runs, by node
+/// as a `ReadKey`'s `reading`, until each node leaves Failed.
+#[derive(Default)]
+pub(crate) struct Regens {
+    by_node: HashMap<u64, Regenerable>,
+    /// The token the next record gets (`Regenerable::token`).
+    next_token: u64,
+}
+
+pub(crate) fn regens<C: Cells>() -> C::Lock<Regens> {
+    <C::Lock<Regens> as crate::locks::Lock<Regens>>::new(Regens::default())
+}
+
+/// A node's Failed landing, as `Runtime::regenerate` runs it again.
+struct Regenerable {
+    /// Which landing wrote the record: a forget that runs after the node's
+    /// claim is released removes the record only if it is still this one,
+    /// since another thread's run may have landed the node Failed again.
+    token: u64,
+    /// Whether the node may run again, and so may every node a
+    /// regeneration of its payload runs.
+    ok: bool,
+    /// What its run's reads took (`replay::Took`), the copies under a
+    /// mutex only so that the table is `Sync`.
+    took: Vec<(u64, Option<SyncPayload>)>,
+}
+
+type SyncPayload = std::sync::Mutex<Box<dyn std::any::Any + Send>>;
+
+/// Drops payloads a regeneration does not raise; a user `Drop` that
+/// panics there is not the read's panic.
+fn drop_payloads(payloads: impl IntoIterator<Item = Box<dyn std::any::Any + Send>>) {
+    for p in payloads {
+        drop(catch_unwind(AssertUnwindSafe(move || drop(p))));
+    }
+}
+
+/// The payload of a read that aborts the run `Runtime::regenerate` marks.
+struct RegenAbort;
+
+#[cold]
+#[inline(never)]
+pub(super) fn abort_regen() -> ! {
+    value_code::set_bits(value_code::REGEN_ABORTED, true);
+    resume_unwind(Box::new(RegenAbort))
 }
 
 /// A clone of a landed value of type `T`, as a delivery holds it.

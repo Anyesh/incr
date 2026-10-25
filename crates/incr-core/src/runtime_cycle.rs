@@ -1920,6 +1920,7 @@ impl<C: Cells> Runtime<C> {
                     e.deps(),
                     &released,
                     payload,
+                    false,
                     bag,
                 );
             } else {
@@ -2399,6 +2400,7 @@ impl<C: Cells> Runtime<C> {
                     &deps,
                     &members,
                     Some(&*payload),
+                    false,
                     bag,
                 );
             } else if kind.is_none() {

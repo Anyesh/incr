@@ -405,6 +405,10 @@ pub(crate) const SPECULATIVE: u16 = 1024;
 /// memo's value). Without `POISONED` the frame lands Dirty with a memo
 /// for the revision (`NodeData::set_memo`).
 pub(crate) const HANDLED: u16 = 2048;
+/// `ComputeCtl::flags`: the run read a value no rerun of its node reads
+/// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
+/// node, so its panic is not regenerated (`Runtime::regenerate`).
+pub(crate) const UNREGENERABLE: u16 = 4096;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
