@@ -558,13 +558,13 @@ impl<C: Cells> Runtime<C> {
         true
     }
 
-    /// After `id` landed Failed over `deps`: a set's walk stops at a dep
-    /// that is Dirty, whose dependents the walk that made it Dirty flagged,
-    /// but a dep a caught panic leaves Dirty, now or when a run open on this
-    /// thread lands it (other than the released `co_members`, sorted), had
-    /// no such walk. The landing is noted under each such dep for the next
-    /// walk that stops there, so it lasts its revision and not past the
-    /// dep's next change.
+    /// Before `id` lands Failed over `deps`. A set's walk stops at a Dirty
+    /// dep, whose dependents the walk that made it Dirty flagged; a dep a
+    /// caught panic leaves Dirty, now or when a run open on this thread
+    /// (other than the released `co_members`, sorted) lands it, had no such
+    /// walk. The landing is noted under each such dep for the next walk that
+    /// reaches it, so it lasts its revision and not past the dep's next
+    /// change. Speculative landings are noted too: the take checks the node.
     #[inline(always)]
     pub(super) fn note_past_sets(
         &self,
@@ -605,11 +605,15 @@ impl<C: Cells> Runtime<C> {
         self.failed_past.store(true, Relaxed);
     }
 
-    /// A set's walk stopped at `dep`: queues the noted landings over it that
-    /// are still Failed.
+    /// A set's walk reached `dep`: queues the landings noted over it that
+    /// are still Failed, or still Computing toward a Failed landing, which
+    /// the walk then flags so that it lands Dirty.
     #[cold]
     #[inline(never)]
     pub(super) fn take_past_sets(&self, dep: NodeId, queue: &mut Vec<NodeId>) {
+        if !self.tickets.read().past.contains_key(&dep.0) {
+            return;
+        }
         let mut t = self.tickets.write();
         let Some(notes) = t.past.remove(&dep.0) else {
             return;
@@ -619,7 +623,10 @@ impl<C: Cells> Runtime<C> {
         for (id, generation) in notes {
             let node = self.nodes.get(id);
             if node.generation() == generation
-                && state::load::<C>(node.state_cell()) == NodeState::Failed
+                && matches!(
+                    state::load::<C>(node.state_cell()),
+                    NodeState::Failed | NodeState::Computing | NodeState::ComputingDirty
+                )
             {
                 queue.push(NodeId(id));
             }
@@ -665,6 +672,9 @@ impl<C: Cells> Runtime<C> {
         if self.tickets_held() {
             self.bury(slot, generation);
         }
+        if self.failed_past.load(Relaxed) {
+            self.bury_past(slot);
+        }
         if self.regens_held.load(Relaxed) {
             self.forget_failed_run(slot, generation);
         }
@@ -676,6 +686,15 @@ impl<C: Cells> Runtime<C> {
         let mut t = self.tickets.write();
         let stale = release(&mut t, u64::MAX, (slot, generation)..=(slot, generation));
         t.buried.extend(stale);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn bury_past(&self, slot: u32) {
+        let mut t = self.tickets.write();
+        if t.past.remove(&slot).is_some() {
+            self.failed_past.store(!t.past.is_empty(), Relaxed);
+        }
     }
 
     /// A delete's bag drains: drops the tickets its deletes buried, and

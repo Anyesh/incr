@@ -3067,6 +3067,7 @@ impl<C: Cells> Runtime<C> {
         }
 
         let mut expanded_new: Option<HashSet<NodeId>> = None;
+        let past = self.failed_past.load(std::sync::atomic::Ordering::Relaxed);
         while let Some(id) = queue.pop() {
             let (node, flags) = self.nodes.get_with_flags(id.0);
             loop {
@@ -3076,6 +3077,9 @@ impl<C: Cells> Runtime<C> {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
                             .is_ok()
                         {
+                            if past {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3155,7 +3159,8 @@ impl<C: Cells> Runtime<C> {
                     }
                     NodeState::Dirty | NodeState::ComputingDirty => {
                         // Already flagged; the walk that flagged it also
-                        // covered its dependents. The visit must still be
+                        // covered its dependents, except Failed landings
+                        // since (`take_past_sets`). The visit must still be
                         // an RMW, not a plain load: this walk stores a
                         // dep's Dirty and then reaches the node, while a
                         // verifier claims the node and then loads its deps'
@@ -3166,7 +3171,7 @@ impl<C: Cells> Runtime<C> {
                         // reads from it (and sees the dep Dirty) or this CAS
                         // fails on the claim and the next pass flags it.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
-                            if self.failed_past.load(std::sync::atomic::Ordering::Relaxed) {
+                            if past {
                                 self.take_past_sets(id, &mut queue);
                             }
                             break;
@@ -4667,7 +4672,7 @@ impl<C: Cells> Runtime<C> {
     /// or Dirty or New where publication says the panic may hide a change,
     /// or Dirty where a replay delivery raised the panic and its first take
     /// landed the node Dirty (`retaken_landing`). A Failed landing over a
-    /// dep no set's walk passes is noted for the next one (`note_past_sets`).
+    /// dep a set's walk stops at is noted for the next one (`note_past_sets`).
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
     /// `own_run` says the node lands from the compute that just popped, not
