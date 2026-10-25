@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use incr_core::persist_hooks::assert_invariants;
+use incr_core::persist_hooks::{assert_invariants, changed_at, seed_base};
 use incr_core::{Incr, IncrCollection, Runtime};
 use incr_persist::memo::{
     BuildId, FileMemo, Memo, MemoBackend, MemoBuilder, MemoCells, MemoCtx, MemoOptions, MemoTable,
@@ -173,6 +173,9 @@ struct Report {
     reused: u64,
     revalidated: u64,
     corrupt: u64,
+    /// Per node, whether it still carries the stamp a restore seeded:
+    /// reused, or run once after a downgrade and cut off.
+    restored: Vec<bool>,
 }
 
 fn mix(mut z: u64) -> u64 {
@@ -476,6 +479,11 @@ impl<C: Flavor> World<C> {
             .map(|j| self.read(j))
             .collect();
         assert_invariants(self.memo.runtime());
+        let rt = self.memo.runtime();
+        let w0 = seed_base(rt).w0;
+        let restored = (0..self.spec.nodes.len() as u32)
+            .map(|j| changed_at(rt, self.node(j)) == w0)
+            .collect();
         let stats = self.memo.stats();
         Report {
             reads,
@@ -484,6 +492,7 @@ impl<C: Flavor> World<C> {
             reused: stats.reused,
             revalidated: stats.revalidated,
             corrupt: stats.corrupt,
+            restored,
         }
     }
 
@@ -1114,7 +1123,10 @@ fn restart_oracle_shared_threads() {
 /// nodes 8..16 read only `x0`, `e0` and each other, which churn never
 /// writes. `a` checkpoints on one thread while two others set inputs,
 /// write the collections and read, and is killed while they do; `b` must
-/// match a cold run and still reuse the untouched half.
+/// match a cold run and still restore the untouched half. `b` reads on
+/// two threads, so a restore seeded while the other holds its dep's claim
+/// runs once and counts as revalidated; the half is checked by its seed
+/// stamps, not by `reused`.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn checkpoints_under_concurrent_mapped_sets_restore_like_a_cold_run() {
@@ -1158,7 +1170,8 @@ fn checkpoints_under_concurrent_mapped_sets_restore_like_a_cold_run() {
         let (b, cold, _) = run_case::<Shared>(TEST, &spec);
         assert_eq!(b.finals, cold.finals, "round {round}");
         assert_eq!(b.corrupt, 0, "round {round}");
-        assert!(b.reused >= 8, "round {round} reused only {}", b.reused);
+        let lost: Vec<usize> = (8..16).filter(|&j| !b.restored[j]).collect();
+        assert!(lost.is_empty(), "round {round} did not restore {lost:?}");
     }
 }
 
