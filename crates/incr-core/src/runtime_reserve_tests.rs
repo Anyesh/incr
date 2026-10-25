@@ -16,6 +16,7 @@ use super::{ParkPoint, Runtime};
 use crate::cells::Shared;
 use crate::cycle::{QueryOpts, Replay};
 use crate::handle::Incr;
+use crate::state::NodeState;
 
 type Rt = Runtime<Shared>;
 type Outcome = Result<u64, String>;
@@ -741,4 +742,102 @@ fn shared_reservation_of_a_dirty_landing_ends_with_the_read() {
     let want = run(u32::MAX);
     assert!(!want.1, "the unbounded run's join stalled");
     assert_eq!(run(2), want);
+}
+
+/// **A Dirty landing's delivery survives a claim given back unrun**, at
+/// budget 1: A reads T, T reads X, X reads Y and Y reads input I, so A
+/// dooms on X and reserves T and X. X's entry parks after reading Y,
+/// while B waits to read X; a set of I flags X and it lands Dirty. B
+/// claims X before A loads X's state for the landing's delivery, finds
+/// A's reservation and gives the claim back unrun. T's retry must take
+/// the delivery of X's run, as the unbounded T reads that run's value,
+/// rather than run X again. X reads no held landing, so it lands unheld
+/// even while this thread holds landings.
+#[test]
+fn a_dirty_landings_delivery_survives_a_claim_given_back_unrun() {
+    use std::sync::atomic::AtomicU8;
+    fn run(frames: u32) -> (Outcome, Outcome, u8) {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+        let i = rt.create_input(1_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let gate = Gate::new();
+        let x = {
+            let gate = gate.clone();
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(y);
+                    if v != 0 {
+                        gate.park();
+                    }
+                    v + 1
+                },
+                replayable(),
+            )
+        };
+        let t = rt.create_query_with(move |rt: &Rt| rt.get(x) * 100, replayable());
+        let stage = Arc::new(AtomicU8::new(0));
+        let pinned = frames != u32::MAX;
+        if pinned {
+            let stage = stage.clone();
+            let shared = Arc::downgrade(&rt);
+            let wait = move |stage: &AtomicU8, want: u8, ms: u64| {
+                let deadline = Instant::now() + Duration::from_millis(ms);
+                while stage.load(SeqCst) < want && Instant::now() < deadline {
+                    thread::yield_now();
+                }
+            };
+            let installed = rt.park_hook.set(Box::new(move |p| {
+                let who = thread::current().name().map(str::to_owned);
+                match (who.as_deref(), p) {
+                    (Some("b"), ParkPoint::BeforeClaim(n)) if n.0 == x.slot() => {
+                        wait(&stage, 1, 4000);
+                    }
+                    (Some("a"), ParkPoint::HoldLanding(n)) if n.0 == x.slot() => {
+                        let rt = shared.upgrade().unwrap();
+                        let cell = rt.nodes.get(x.slot()).state_cell();
+                        let seen = rt.seen_quietly(cell, crate::state::load::<Shared>(cell));
+                        if seen == NodeState::Dirty
+                            && stage.compare_exchange(0, 1, SeqCst, SeqCst).is_ok()
+                        {
+                            wait(&stage, 2, 4000);
+                        }
+                    }
+                    (Some("b"), ParkPoint::BeforeReservationCheck(n))
+                        if n.0 == x.slot()
+                            && stage.compare_exchange(1, 2, SeqCst, SeqCst).is_ok() =>
+                    {
+                        // Holds the claim while A loads X's state, for at
+                        // most a moment if A waits for its give-back.
+                        wait(&stage, 3, 200);
+                    }
+                    (Some("a"), ParkPoint::BeforeEntry(n)) if n.0 == t.slot() => {
+                        let _ = stage.compare_exchange(2, 3, SeqCst, SeqCst);
+                    }
+                    _ => {}
+                }
+            }));
+            assert!(installed.is_ok());
+        }
+        gate.arm();
+        let a = {
+            let rt = rt.clone();
+            spawn("a", move || rt.get(t))
+        };
+        gate.wait_parked();
+        let b = {
+            let rt = rt.clone();
+            spawn("b", move || rt.get(x))
+        };
+        rt.set(i, 2);
+        gate.release();
+        let (a, b) = (a.join(), b.join());
+        rt.assert_invariant_i();
+        (a, b, stage.load(SeqCst))
+    }
+    let (a, b, _) = run(u32::MAX);
+    let (ga, gb, stage) = run(1);
+    assert_eq!(stage, 3, "the interleaving was not pinned");
+    assert_eq!((ga, gb), (a, b));
 }
