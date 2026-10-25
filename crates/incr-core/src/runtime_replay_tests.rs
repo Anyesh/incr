@@ -1945,13 +1945,28 @@ fn a_caught_custom_payload_survives_the_readers_retries() {
     }
 }
 
+/// Where b's dep c fails in `failed_dep_shape`.
+#[derive(Clone, Copy, Debug)]
+enum CFails {
+    /// At an earlier read, before b runs.
+    Before,
+    /// Inside b's run, at b's read.
+    InB,
+    /// Inside b's run, at the read of w, a dep of b that catches it and
+    /// lands Clean, before b reads c.
+    ViaClean,
+    /// b reads y, a cycle, with `try_get` in place of c, and panics with
+    /// `CustomPayload(5)` for its `Err`.
+    Cycle,
+}
+
 /// A replayable reader r, `outer` levels under the read, catches b's custom
 /// payload and then reads a chain of `chain` levels. b catches the panic of
-/// c, Failed from an earlier read: a read of a node already Failed panics
+/// c, failing where `fails` says: a read of a node already Failed panics
 /// with its message, so b's catch takes the message and b panics with
-/// `CustomPayload(100)`, where c's own payload would have made it
+/// `CustomPayload(100)`, while c's own payload makes it
 /// `CustomPayload(c + 10)`.
-fn already_failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u64 {
+fn failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32, fails: CFails) -> u64 {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     let i = rt.create_input(1_u64);
@@ -1959,10 +1974,30 @@ fn already_failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u6
         move |rt: &Runtime<C>| -> u64 { std::panic::panic_any(CustomPayload(rt.get(i))) },
         replayable(),
     );
-    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(c))).is_err());
+    if matches!(fails, CFails::Before) {
+        assert!(catch_unwind(AssertUnwindSafe(|| rt.get(c))).is_err());
+    }
     rt.set_max_frames(frames);
+    let w = rt.create_query_with(
+        move |rt: &Runtime<C>| u64::from(catch_unwind(AssertUnwindSafe(|| rt.get(c))).is_err()),
+        replayable(),
+    );
+    let y_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let y_self = Arc::clone(&y_cell);
+    let y = rt.create_query_with(
+        move |rt: &Runtime<C>| rt.get(*y_self.get().unwrap()),
+        replayable(),
+    );
+    y_cell.set(y).unwrap();
     let b = rt.create_query_with(
         move |rt: &Runtime<C>| -> u64 {
+            if matches!(fails, CFails::ViaClean) {
+                assert_eq!(rt.get(w), 1);
+            }
+            if matches!(fails, CFails::Cycle) {
+                let got = if rt.try_get(y).is_err() { 5 } else { 6 };
+                std::panic::panic_any(CustomPayload(got))
+            }
             let got = match catch_unwind(AssertUnwindSafe(|| rt.get(c))) {
                 Err(p) => p.downcast::<CustomPayload>().map_or(100, |x| x.0 + 10),
                 Ok(v) => v,
@@ -1994,29 +2029,37 @@ fn already_failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u6
     rt.try_get(top).unwrap_or(7777)
 }
 
-/// A retry that regenerates b's payload reads c as the unbounded run did,
-/// Failed from before with its message, instead of running c again: only
-/// the nodes the payload landed at run again (`regenerate`).
+/// A retry that regenerates b's payload reads c as the unbounded run's b
+/// did: Failed from before, or from w's read, with its message, run again
+/// only where c failed at b's own read (`regenerate`), and a cycle as the
+/// cycle.
 #[test]
-fn a_regenerated_payload_reads_a_dep_failed_from_before_as_failed() {
-    for outer in [0, 1, 3] {
-        for chain in [0, 2, 6] {
-            for local in [true, false] {
-                let shape = |frames| {
-                    if local {
-                        already_failed_dep_shape::<Local>(frames, outer, chain)
-                    } else {
-                        already_failed_dep_shape::<Shared>(frames, outer, chain)
+fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
+    for fails in [CFails::Before, CFails::InB, CFails::ViaClean, CFails::Cycle] {
+        for outer in [0, 1, 3] {
+            for chain in [0, 2, 6] {
+                for local in [true, false] {
+                    let shape = |frames| {
+                        if local {
+                            failed_dep_shape::<Local>(frames, outer, chain, fails)
+                        } else {
+                            failed_dep_shape::<Shared>(frames, outer, chain, fails)
+                        }
+                    };
+                    let want = shape(u32::MAX);
+                    let b = match fails {
+                        CFails::InB => 11,
+                        CFails::Cycle => 5,
+                        CFails::Before | CFails::ViaClean => 100,
+                    };
+                    assert_eq!(want, b * 1000 + 1 + u64::from(chain), "{fails:?}");
+                    for frames in 1..9 {
+                        assert_eq!(
+                            shape(frames),
+                            want,
+                            "{fails:?} local={local} outer={outer} chain={chain} frames={frames}"
+                        );
                     }
-                };
-                let want = shape(u32::MAX);
-                assert_eq!(want, 100_000 + 1 + u64::from(chain));
-                for frames in 1..9 {
-                    assert_eq!(
-                        shape(frames),
-                        want,
-                        "local={local} outer={outer} chain={chain} frames={frames}"
-                    );
                 }
             }
         }
