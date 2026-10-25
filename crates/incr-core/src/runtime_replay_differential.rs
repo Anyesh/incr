@@ -1377,6 +1377,9 @@ impl<C: Cells> Live<C> {
         if !crate::replay::vindexes_empty() {
             return Err("a virtual frame is left indexed".to_owned());
         }
+        if !crate::reserve::none_held() {
+            return Err("an operation left this thread a doom reservation".to_owned());
+        }
         let held = crate::replay::take_held_drops();
         if held != 0 {
             return Err(format!(

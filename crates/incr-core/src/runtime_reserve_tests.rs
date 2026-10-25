@@ -498,3 +498,95 @@ fn a_foreign_rerun_after_a_failed_landing_leaves_no_stale_delivery() {
     );
     rt.assert_invariant_i();
 }
+
+/// **A Dirty landing's reservation does not outlive the read**, at budget
+/// 2: as in [`shared_reservation_ends_at_its_owners_final_landing`], but
+/// X's final run parks after reading Y, a set of I flags it, and it lands
+/// Dirty. T's closure then has another thread read X and joins it; the
+/// unbounded run lets that read rerun X. After R's read no reservation of
+/// R's is left.
+#[test]
+#[ignore = "T10-reservation-dirty-landing-join: stalls on 34412289 too"]
+fn shared_reservation_of_a_dirty_landing_ends_with_the_read() {
+    type Shape = (Arc<Rt>, Incr<u64>, Incr<u64>, Gate, Arc<AtomicBool>);
+    fn shape(rt: Rt) -> Shape {
+        let rt = Arc::new(rt);
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(1_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let gate = Gate::new();
+        let x = {
+            let gate = gate.clone();
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(y);
+                    // Only a run that read Y's real value: the doomed one reads
+                    // the placeholder.
+                    if v != 0 {
+                        gate.park();
+                    }
+                    v + 1
+                },
+                replayable(),
+            )
+        };
+        let stalled = Arc::new(AtomicBool::new(false));
+        let t = {
+            let stalled = stalled.clone();
+            let shared = Arc::downgrade(&rt);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    if v == 0 {
+                        return 0;
+                    }
+                    let waits = rt.reservation_waits.load(SeqCst);
+                    let (tx, rx) = mpsc::channel();
+                    let rt2 = shared.upgrade().unwrap();
+                    thread::spawn(move || {
+                        let _ = tx.send(outcome(|| rt2.get(x)));
+                    });
+                    let deadline = Instant::now() + JOIN_TIMEOUT;
+                    loop {
+                        if let Ok(read) = rx.try_recv() {
+                            return v + read.unwrap_or(1000);
+                        }
+                        if rt.reservation_waits.load(SeqCst) != waits {
+                            stalled.store(true, SeqCst);
+                            return v;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the joined read neither returned nor waited"
+                        );
+                        thread::yield_now();
+                    }
+                },
+                replayable(),
+            )
+        };
+        (rt, t, i, gate, stalled)
+    }
+    fn run(frames: u32) -> (Outcome, bool) {
+        let (rt, t, i, gate, stalled) = shape(Rt::new());
+        rt.set_max_frames(frames);
+        gate.arm();
+        let r = {
+            let rt = rt.clone();
+            spawn("r", move || {
+                let v = rt.get(t);
+                assert!(crate::reserve::none_held(), "R's read left a reservation");
+                v
+            })
+        };
+        gate.wait_parked();
+        rt.set(i, 2);
+        gate.release();
+        let read = r.join();
+        rt.assert_invariant_i();
+        (read, stalled.load(SeqCst))
+    }
+    let want = run(u32::MAX);
+    assert!(!want.1, "the unbounded run's join stalled");
+    assert_eq!(run(2), want);
+}
