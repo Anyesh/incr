@@ -495,3 +495,106 @@ fn shared_held_undo_takes_a_displaced_value_but_not_a_rejected_one() {
     );
     assert!(!crate::hold::active());
 }
+
+/// An entry of `other` that `enter_a` makes inside another runtime's
+/// entry ends `other`'s holds at its exit, whatever kind of entry it is
+/// and wherever it is made from: nothing stays held, the cycle's nodes
+/// are not left Computing, and another thread reads the cycle.
+fn entry_of_another_runtime_ends_its_holds(
+    enter_a: impl FnOnce(Arc<Runtime<Shared>>, Incr<i64>, Incr<i64>),
+) {
+    let (want, _) = local_cycle_value_and_runs();
+    let other = Arc::new(Runtime::<Shared>::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (a, b) = counted_cycle(&other, &runs);
+    enter_a(other.clone(), a, b);
+    assert_eq!(crate::hold::held_count(), 0);
+    for n in [a, b] {
+        let state = other.state_of(n);
+        assert!(
+            !matches!(state, NodeState::Computing | NodeState::ComputingDirty),
+            "{state:?}"
+        );
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = {
+        let other = other.clone();
+        std::thread::spawn(move || tx.send(other.get(a) + other.get(b)).unwrap())
+    };
+    let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(got, Ok(want), "another thread's read of the cycle");
+    reader.join().unwrap();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_get_of_another_runtime_from_a_callback_ends_its_holds() {
+    entry_of_another_runtime_ends_its_holds(|other, a, b| {
+        let rt = Runtime::<Shared>::new();
+        let root = rt.create_query(|_rt| 1_i64);
+        rt.observe(root, move |_: &i64| {
+            let _ = other.get(a) + other.get(b);
+        });
+        rt.stabilize();
+    });
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_try_get_of_another_runtime_from_a_callback_ends_its_holds() {
+    entry_of_another_runtime_ends_its_holds(|other, a, _b| {
+        let rt = Runtime::<Shared>::new();
+        let root = rt.create_query(|_rt| 1_i64);
+        rt.observe(root, move |_: &i64| {
+            let _ = other.try_get(a);
+        });
+        rt.stabilize();
+    });
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_get_of_another_runtime_from_a_local_compute_ends_its_holds() {
+    entry_of_another_runtime_ends_its_holds(|other, a, b| {
+        let rt = Runtime::<Local>::new();
+        let root = rt.create_query(move |_rt| other.get(a) + other.get(b));
+        let _ = rt.get(root);
+    });
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stabilize_of_another_runtime_from_a_local_compute_ends_its_holds() {
+    entry_of_another_runtime_ends_its_holds(|other, a, _b| {
+        other.observe(a, |_: &i64| {});
+        let rt = Runtime::<Local>::new();
+        let root = rt.create_query(move |_rt| {
+            other.stabilize();
+            1_i64
+        });
+        let _ = rt.get(root);
+    });
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_get_of_another_runtime_from_a_local_callback_ends_its_holds() {
+    entry_of_another_runtime_ends_its_holds(|other, a, b| {
+        let rt = Runtime::<Local>::new();
+        let root = rt.create_query(|_rt| 1_i64);
+        rt.observe(root, move |_: &i64| {
+            let _ = other.get(a) + other.get(b);
+        });
+        rt.stabilize();
+    });
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_get_of_another_runtime_from_a_shared_compute_ends_its_holds() {
+    entry_of_another_runtime_ends_its_holds(|other, a, b| {
+        let rt = Runtime::<Shared>::new();
+        let root = rt.create_query(move |_rt| other.get(a) + other.get(b));
+        let _ = rt.get(root);
+    });
+}
