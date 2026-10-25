@@ -8524,3 +8524,75 @@ fn seed_381_first_run_state() {
         differential::<Shared>(&case, 0x381);
     });
 }
+
+/// **A Dirty landing's delivery survives a claim given back unrun.** In
+/// 0x36615207 op0's replay reruns n1 as an entry below n0 and lands it
+/// Dirty; op1, which has waited on n1, claims it there, finds op0's
+/// reservation and gives it back. The landing's delivery to n0's retry
+/// must not depend on that claim: pinned with op1 holding its claim while
+/// op0 loads n1's state, the reads are still a serial order's.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_dirty_landing_delivery_survives_a_given_back_claim() {
+    use std::sync::atomic::AtomicU8;
+    use std::time::{Duration, Instant};
+    let seed = 0x3661_5207;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let stage = Arc::new(AtomicU8::new(0));
+    let rig = |live: &Live<Shared>| {
+        let slot = |n: usize| match &*live.world.tables[0][n].lock().unwrap() {
+            Some(Handle::Plain(h)) => h.slot(),
+            _ => unreachable!(),
+        };
+        let (n0, n1) = (slot(0), slot(1));
+        let stage = stage.clone();
+        let rt = live.world.rts[0].0 as usize;
+        let hooked = live.world.rt(0).park_hook.set(Box::new(move |p| {
+            if TWO_PHASE.with(std::cell::Cell::get) != 0 {
+                return;
+            }
+            // SAFETY: the runtime outlives the run.
+            let rt = unsafe { &*(rt as *const Runtime<Shared>) };
+            let wait = |want: u8| {
+                let deadline = Instant::now() + Duration::from_secs(4);
+                while stage.load(SeqCst) < want && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+            };
+            // Thread 0 runs op1 and thread 1 op0 in this phase.
+            match (TWO_THREAD.with(std::cell::Cell::get), p) {
+                (Some(0), ParkPoint::BeforeClaim(n)) if n.0 == n1 => wait(1),
+                (Some(1), ParkPoint::HoldLanding(n))
+                    if n.0 == n1
+                        && rt.nodes.get(n1).state() == NodeState::Dirty
+                        && stage.compare_exchange(0, 1, SeqCst, SeqCst).is_ok() =>
+                {
+                    wait(2);
+                }
+                (Some(0), ParkPoint::BeforeReservationCheck(n))
+                    if n.0 == n1 && stage.compare_exchange(1, 2, SeqCst, SeqCst).is_ok() =>
+                {
+                    // Holds the claim while op0 loads n1's state, for at
+                    // most a moment if op0 waits for its give-back.
+                    let deadline = Instant::now() + Duration::from_millis(200);
+                    while stage.load(SeqCst) < 3 && Instant::now() < deadline {
+                        std::thread::yield_now();
+                    }
+                }
+                (Some(1), ParkPoint::BeforeEntry(n)) if n.0 == n0 => {
+                    let _ = stage.compare_exchange(2, 3, SeqCst, SeqCst);
+                }
+                _ => {}
+            }
+        }));
+        assert!(hooked.is_ok());
+    };
+    let t = run_two_until(&case, &phases, Some(1), 0, &rig, &|_, _, _| false);
+    assert_eq!(stage.load(SeqCst), 3, "the interleaving was not pinned");
+    let got = (t[0].0.clone(), t[1].0.clone());
+    assert!(
+        got == (Out::Value(7782), Out::Value(6)) || got == (Out::Value(6), Out::Value(7782)),
+        "{got:?} is no serial order's"
+    );
+}

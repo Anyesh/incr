@@ -4245,6 +4245,7 @@ impl<C: Cells> Runtime<C> {
     /// A walk stopped short of its root drops the node's other entries if
     /// the compute left it `unsettled`, as `walk_stopped` does.
     fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32, unsettled: bool) {
+        self.park(ParkPoint::HoldLanding(NodeId(node)));
         let state = state::load::<C>(self.nodes.get(node).state_cell());
         let reading = u64::from(node) | (u64::from(generation) << 32);
         let what = match state {
