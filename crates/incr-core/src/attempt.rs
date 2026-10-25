@@ -248,7 +248,7 @@ impl Attempt {
     /// wounded already, whose landings its retry may retract. True if it
     /// is pinned now.
     #[cfg_attr(
-        not(test),
+        any(not(test), loom),
         expect(
             dead_code,
             reason = "the landing hand-over of T8-44e3 is its first caller"
