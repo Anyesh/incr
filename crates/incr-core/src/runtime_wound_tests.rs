@@ -1519,18 +1519,17 @@ fn shared_kept_value_of_a_swallowed_wound_stays_with_its_node() {
     .assert_clean();
 }
 
-/// **A retraction restores the value a re-run overwrote.** `c` reads `a`
-/// and `b`, which read `c` while `i` is 0: a landed group, with `c` and
-/// `b` Fallback. Once
-/// `i` is 1, A's read of `o` runs the episode at `c`, which shrinks to
-/// {c, b} and releases `a` unrun, so `a`'s entry records no value; `o`
-/// then reads `a`, and A claims it again and computes it alone, reading
-/// only `i`. B's `qb`, which reads `b`, then wounds A: right after the
-/// retraction `a`'s slot holds its value from before A's read, 30, not
-/// the 1 the wounded attempt wrote.
+/// **A retraction restores the value a re-run overwrote.** Once `i` is
+/// 1, `c` and `b` (Fixpoint) read each other, `a` reads `c`, and `b`
+/// reads `a` only while it sees `c`'s seed. A's read of `o` runs the
+/// episode at `c`: its first round reaches `a`, its last does not, so the
+/// cut to {c, b} releases `a` unrun and `a`'s entry records no value. `o`
+/// then reads `a`, and A claims it again and computes it alone. B's `qb`,
+/// which reads `b`, then wounds A: right after the retraction `a`'s slot
+/// holds its value from before A's read, 30, not the 105 the wounded
+/// attempt wrote.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T8-two-40k-195f: a is never a cut member here (with i = 1 it does not read c), so its alone run is not held; reshape so the shrink releases a member"]
 fn shared_retraction_restores_a_released_members_rerun() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_retraction_restores_a_released_members_rerun",
@@ -1538,20 +1537,39 @@ fn shared_retraction_restores_a_released_members_rerun() {
             fn build<C: Cells>(rt: &Runtime<C>, gates: [Gate; 3]) -> [Incr<i64>; 5] {
                 let [gh, gb, go] = gates;
                 let i = rt.create_input(0_i64);
+                let fixpoint = || QueryOpts {
+                    cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).max_iterations(20)),
+                    ..QueryOpts::default()
+                };
                 let a_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
                 let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
                 let c = {
-                    let (a_cell, b_cell) = (a_cell.clone(), b_cell.clone());
-                    rt.create_query_with_fallback(
-                        move |rt| rt.get(*a_cell.get().unwrap()) + rt.get(*b_cell.get().unwrap()),
-                        |cy: &crate::cycle::Cycle| 10 * cy.len() as i64,
+                    let b_cell = b_cell.clone();
+                    rt.create_query_with(
+                        move |rt| match rt.get(i) {
+                            0 => 7,
+                            _ => rt.get(*b_cell.get().unwrap()).min(5),
+                        },
+                        fixpoint(),
                     )
                 };
-                let a = rt.create_query(move |rt| if rt.get(i) == 0 { rt.get(c) } else { 1 });
-                let b = rt.create_query_with_fallback(
-                    move |rt| rt.get(c) + 2,
-                    |cy: &crate::cycle::Cycle| 100 * cy.len() as i64,
-                );
+                let a = rt.create_query(move |rt| match rt.get(i) {
+                    0 => 30,
+                    _ => rt.get(c) + 100,
+                });
+                let b = {
+                    let a_cell = a_cell.clone();
+                    rt.create_query_with(
+                        move |rt| match rt.get(i) {
+                            0 => 8,
+                            _ => match rt.get(c) {
+                                0 => rt.get(*a_cell.get().unwrap()),
+                                seen => seen + 1,
+                            },
+                        },
+                        fixpoint(),
+                    )
+                };
                 let h = rt.create_query(move |rt| {
                     gh.park();
                     rt.get(i)
@@ -1574,7 +1592,7 @@ fn shared_retraction_restores_a_released_members_rerun() {
                 });
                 a_cell.set(a).unwrap();
                 b_cell.set(b).unwrap();
-                assert_eq!([rt.get(o), rt.get(a), rt.get(qb)], [60, 30, 0]);
+                assert_eq!([rt.get(o), rt.get(a), rt.get(qb)], [37, 30, 0]);
                 rt.set(i, 1);
                 [o, qb, a, h, b]
             }
