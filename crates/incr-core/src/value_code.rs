@@ -54,6 +54,10 @@ pub(crate) const REGEN_BIT: u64 = 1 << 56;
 /// Set when a read aborted the run `REGEN_BIT` marks.
 pub(crate) const REGEN_ABORTED: u64 = 1 << 55;
 
+/// Set while this thread holds records of what runs' reads took, for a
+/// regeneration in the engine call (`replay::note_took`).
+pub(crate) const TOOK_BIT: u64 = 1 << 54;
+
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
 /// so a live memo, unwind kind, replay context or note never trips the
 /// contract panic.
@@ -64,7 +68,8 @@ pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT
     | KEPT_BIT
     | FOREIGN_BIT
     | REGEN_BIT
-    | REGEN_ABORTED);
+    | REGEN_ABORTED
+    | TOOK_BIT);
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 

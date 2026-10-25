@@ -1061,6 +1061,10 @@ impl Context {
             .expect("incr-core: an unwind is delivered to a virtual frame")
             .clone();
         let key = ReadKey::blocked(&below);
+        if let Delivered::Unwind { payload, .. } = &what {
+            let reader = (below.node, below.generation, below.path, below.seq);
+            note_took(self.rt, reader, below.reading, &**payload);
+        }
         let provenance = self
             .provenance
             .take()
@@ -1174,11 +1178,7 @@ impl Context {
     /// [`Self::take_unwind`] does. When the read is the running frame's
     /// own compute, its unwind carries the record on to
     /// [`Self::unwind_target`].
-    pub(crate) fn take_landed(
-        &mut self,
-        i: usize,
-        at: u32,
-    ) -> (bool, Box<dyn Any + Send>, Landings) {
+    pub(crate) fn take_landed(&mut self, i: usize, at: u32) -> (bool, Box<dyn Any + Send>) {
         if let Some(below) = self.unwind_target(at) {
             let key = ReadKey::blocked(below);
             self.provenance = self.pending.get(i).provenance.clone().map(|p| (key, p));
@@ -1187,9 +1187,8 @@ impl Context {
             Delivered::Unwind {
                 attributed,
                 payload,
-                nodes,
                 ..
-            } => (attributed, payload, nodes),
+            } => (attributed, payload),
             _ => unreachable!("incr-core: matched as an unwind"),
         }
     }
@@ -1393,6 +1392,7 @@ thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
+    static TOOK: RefCell<HashMap<(RuntimeId, RunKey), Vec<Took>, FxBuildHasher>> = RefCell::new(HashMap::default());
 }
 
 #[cfg(loom)]
@@ -1413,6 +1413,7 @@ loom::thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
+    static TOOK: RefCell<HashMap<(RuntimeId, RunKey), Vec<Took>, FxBuildHasher>> = RefCell::new(HashMap::default());
 }
 
 #[cfg(all(test, not(loom)))]
@@ -2064,16 +2065,13 @@ pub(crate) fn set_carry(carry: Option<Carry>) {
 #[derive(Clone, Copy)]
 pub(crate) struct Regen(pub(crate) std::any::TypeId);
 
-/// The state of `Runtime::regenerate`'s runs on this thread: the payloads
-/// made so far for the Failed nodes they read, each taken by the first
-/// read of its node, the nodes noted as having landed Failed with the
-/// payload being regenerated, and the node whose read aborted the last run
-/// for want of a payload. Nodes are keyed as a `ReadKey`'s `reading`.
+/// The state of a `Runtime::regenerate` run on this thread: the payloads
+/// made for the reads its node's unbounded run took a payload from, each
+/// raised by the first read of its node. Nodes are keyed as a `ReadKey`'s
+/// `reading`.
 pub(crate) struct Regenerating {
     rt: Option<RuntimeId>,
     made: Vec<(u64, Box<dyn Any + Send>)>,
-    noted: Vec<u64>,
-    wanted: Option<u64>,
 }
 
 impl Regenerating {
@@ -2081,65 +2079,83 @@ impl Regenerating {
         Self {
             rt: None,
             made: Vec::new(),
-            noted: Vec::new(),
-            wanted: None,
         }
     }
 }
 
-/// The parts of a regenerating run [`regen_open`] hands over and
-/// [`regen_close`] gives back.
-pub(crate) type RegenParts = (Vec<(u64, Box<dyn Any + Send>)>, Vec<u64>);
+/// Opens a regenerating run of runtime `rt` whose reads take from `made`.
+pub(crate) fn regen_open(rt: RuntimeId, made: Vec<(u64, Box<dyn Any + Send>)>) {
+    REGEN.with(|r| *r.borrow_mut() = Regenerating { rt: Some(rt), made });
+}
 
-/// Opens a regenerating run of runtime `rt` whose reads take from `made`
-/// and want only `noted` nodes.
-pub(crate) fn regen_open(rt: RuntimeId, (made, noted): RegenParts) {
+/// Closes the run [`regen_open`] opened: the payloads its reads left.
+pub(crate) fn regen_close() -> Vec<(u64, Box<dyn Any + Send>)> {
+    REGEN.with(|r| std::mem::replace(&mut *r.borrow_mut(), Regenerating::new()).made)
+}
+
+/// The payload the open run's read of Failed node `key` of runtime `rt`
+/// raises: the one made for it, or none where the unbounded run's read
+/// found the node Failed already and panicked with its message.
+pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> Option<Box<dyn Any + Send>> {
     REGEN.with(|r| {
-        *r.borrow_mut() = Regenerating {
-            rt: Some(rt),
-            made,
-            noted,
-            wanted: None,
+        let mut r = r.borrow_mut();
+        if r.rt != Some(rt) {
+            return None;
         }
+        let i = r.made.iter().position(|m| m.0 == key)?;
+        Some(r.made.swap_remove(i).1)
+    })
+}
+
+/// A run's identity across its frame's retries: its node as `(slot,
+/// generation)`, and its path and seq, as a `ReadKey` has them.
+pub(crate) type RunKey = (u32, u32, u64, u32);
+
+/// What a read took from a compute or a ticket (`note_took`): a copy, or
+/// for a payload no copy can stand for, nothing, as a regeneration runs
+/// the read node again.
+pub(crate) type Took = (u64, Option<Box<dyn Any + Send>>);
+
+fn with_takes<R>(
+    f: impl FnOnce(&mut HashMap<(RuntimeId, RunKey), Vec<Took>, FxBuildHasher>) -> R,
+) -> R {
+    value_code::set_bits(value_code::TOOK_BIT, true);
+    TOOK.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// The seq and path of the run of node `reading` that ended just above
+/// depth `depth`, if it started one.
+pub(crate) fn ended_run(rt: RuntimeId, depth: u32, reading: u64) -> Option<(u32, u64)> {
+    RUNS.with(|r| {
+        (r.borrow().live.get(depth as usize).copied().flatten())
+            .filter(|x| {
+                x.rt == rt && u64::from(x.frame.0) | (u64::from(x.frame.1) << 32) == reading
+            })
+            .map(|x| (x.seq, x.path))
+    })
+}
+
+/// Notes that run `reader`'s read of node `reading` took `payload` from a
+/// compute or a ticket, until the run lands (`took_by_run`) or the engine
+/// call ends.
+pub(crate) fn note_took(rt: RuntimeId, reader: RunKey, reading: u64, payload: &(dyn Any + Send)) {
+    let copy = copy_payload(payload).filter(|_| !payload.is::<Regen>());
+    with_takes(|t| {
+        let took = t.entry((rt, reader)).or_default();
+        took.retain(|x| x.0 != reading);
+        took.push((reading, copy));
     });
 }
 
-/// Closes the run [`regen_open`] opened: what its reads left, and the
-/// node it wanted a payload for.
-pub(crate) fn regen_close() -> (RegenParts, Option<u64>) {
-    REGEN.with(|r| {
-        let r = std::mem::replace(&mut *r.borrow_mut(), Regenerating::new());
-        ((r.made, r.noted), r.wanted)
-    })
+/// Whether this thread has noted reads of runtime `rt` no landing took.
+pub(crate) fn takes_noted(rt: RuntimeId) -> bool {
+    value_code::thread_word() & value_code::TOOK_BIT != 0
+        && TOOK.with(|t| t.borrow().keys().any(|k| k.0 == rt))
 }
 
-/// What a regenerating run's read of a Failed node raises.
-pub(crate) enum RegenRead {
-    /// The payload made for the node.
-    Made(Box<dyn Any + Send>),
-    /// None yet: the node landed Failed with the payload being regenerated,
-    /// so its run makes one, and the read waits for it.
-    Wanted,
-    /// The node did not land with that payload, so the unbounded run's
-    /// read found it Failed from before and panicked with its message.
-    Unnoted,
-}
-
-/// What the open run's read of node `key` of runtime `rt` raises.
-pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> RegenRead {
-    REGEN.with(|r| {
-        let mut r = r.borrow_mut();
-        if r.rt != Some(rt) || !r.noted.contains(&key) {
-            return RegenRead::Unnoted;
-        }
-        match r.made.iter().position(|m| m.0 == key) {
-            Some(i) => RegenRead::Made(r.made.swap_remove(i).1),
-            None => {
-                r.wanted = Some(key);
-                RegenRead::Wanted
-            }
-        }
-    })
+/// What run `run`'s reads took, as it lands.
+pub(crate) fn took_by_run(rt: RuntimeId, run: RunKey) -> Vec<Took> {
+    TOOK.with(|t| t.borrow_mut().remove(&(rt, run)).unwrap_or_default())
 }
 
 /// Runtime `rt`'s nodes claimed by a regenerating run on some thread
@@ -2159,12 +2175,14 @@ pub(crate) fn regen_claim(rt: RuntimeId, slot: u32, held: bool) {
     }
 }
 
-/// Whether `slot` of runtime `rt` is claimed by a regenerating run.
-pub(crate) fn regen_claimed(rt: RuntimeId, slot: u32) -> bool {
+/// How many regenerating runs claim `slot` of runtime `rt`.
+pub(crate) fn regen_claims(rt: RuntimeId, slot: u32) -> usize {
     REGEN_CLAIMS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(&(rt, slot))
+        .iter()
+        .filter(|&&x| x == (rt, slot))
+        .count()
 }
 
 /// Whether [`copy_payload`] can copy `payload`.
@@ -2362,7 +2380,7 @@ fn remove_where(mut gone: impl FnMut(&Context) -> bool) {
 /// starts with none.
 #[inline(always)]
 pub(crate) fn reset() {
-    if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+    if value_code::thread_word() & (value_code::REPLAY_BIT | value_code::TOOK_BIT) != 0 {
         clear();
     }
 }
@@ -2372,6 +2390,8 @@ pub(crate) fn reset() {
 fn clear() {
     SUSPENDED.with(|s| s.borrow_mut().clear());
     RUNS.with(|r| *r.borrow_mut() = Runs::default());
+    TOOK.with(|t| t.borrow_mut().clear());
+    value_code::set_bits(value_code::TOOK_BIT, false);
     set_carry(None);
     let removed = with(std::mem::take);
     drop(removed);

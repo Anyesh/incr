@@ -172,7 +172,7 @@ impl<C: Cells> Runtime<C> {
             })
         };
         let (context, i, _) = found?;
-        let (attributed, payload, noted) = replay::with(|c| {
+        let (attributed, payload) = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == context)
                 .expect("incr-core: the delivery's context is open")
@@ -183,14 +183,26 @@ impl<C: Cells> Runtime<C> {
         }
         // A payload no copy can stand for that an earlier take had: its
         // node runs again, as for a retry's read (`regenerate`).
-        Some(match payload.downcast::<replay::Regen>() {
+        let payload = match payload.downcast::<replay::Regen>() {
             Ok(regen) => {
-                let raised = self.regenerate(id, generation, regen.0, &noted);
+                let raised = self.regenerate(id, generation, regen.0);
                 replay::regenerated_at(context, i, replay::payload_key(&*raised));
                 raised
             }
             Err(payload) => payload,
-        })
+        };
+        // The read took the payload as from a ticket, and a payload no copy
+        // can stand for holds its frame as at `note_ticket_read`.
+        let reading = u64::from(id.0) | (u64::from(generation) << 32);
+        if let Some((f, read, _)) = self.dep_stack.unwound_read(rt) {
+            if read == reading {
+                let regenerable = self.note_took(f, reading, &*payload);
+                if !replay::copyable(&*payload) {
+                    self.hold_uncopied(f.ctl, regenerable);
+                }
+            }
+        }
+        Some(payload)
     }
 
     /// Raises `payload`, which [`Self::owed_payload`] took, as the read's

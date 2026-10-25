@@ -2104,7 +2104,8 @@ fn native_payload_chain<C: Cells>(frames: u32, levels: u64) -> u64 {
 /// unbounded run.
 #[test]
 fn a_chain_catching_non_replayable_custom_payloads_past_the_budget_reads_as_unbounded() {
-    let before = super::replay_impl::PAST_BUDGET_HOLDS.load(Relaxed);
+    let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
+    let before = holds();
     for levels in [3, 12, 24] {
         for frames in 1..9 {
             assert_eq!(
@@ -2119,5 +2120,5 @@ fn a_chain_catching_non_replayable_custom_payloads_past_the_budget_reads_as_unbo
             );
         }
     }
-    assert!(super::replay_impl::PAST_BUDGET_HOLDS.load(Relaxed) > before);
+    assert!(holds() > before);
 }
