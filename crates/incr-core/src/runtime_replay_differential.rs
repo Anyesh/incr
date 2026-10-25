@@ -6242,7 +6242,7 @@ proptest! {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    #[ignore = "T8-strict-group-c-dirty-for-clean, T8-strict-computed-left-new"]
+    #[ignore = "T8-strict-group-c-dirty-for-clean"]
     fn replay_differential_shared_two_threads(seed in any::<u64>()) {
         quiet(|| differential_two(&gen_case(seed, false, true), seed));
     }
