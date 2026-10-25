@@ -887,6 +887,9 @@ pub(crate) struct Context {
     pub(crate) running: Option<u32>,
     pub(crate) pending: Pending,
     pub(crate) running_entry: Option<Entry>,
+    /// The running entry still fronts its level: the driver has neither
+    /// popped nor truncated it.
+    running_fronts: bool,
     /// Every entry of this context is speculative: the context was opened
     /// inside a speculative entry's run.
     pub(crate) spec_base: bool,
@@ -982,6 +985,7 @@ impl Context {
             vindex: HashMap::default(),
             running: None,
             running_entry: None,
+            running_fronts: false,
             pending: Pending::default(),
             spec_base: target.spec,
             claims: Vec::new(),
@@ -1014,17 +1018,16 @@ impl Context {
     pub(crate) fn run_entry(&mut self, level: u32, entry: Entry) {
         self.running = Some(level);
         self.running_entry = Some(entry);
+        self.running_fronts = true;
     }
 
     /// Whether an entry of `node` at `generation` has yet to run: the
-    /// running entry, at the front of its level until the driver pops it,
-    /// is not one, but once popped no longer hides the entry behind it.
+    /// running entry is not one until the driver pops it.
     pub(crate) fn queues(&self, node: u32, generation: u32) -> bool {
-        let running = self
-            .running_entry
-            .and(self.running)
-            .and_then(|level| self.levels.get(level as usize)?.front())
-            .is_some_and(|e| e.node == node && e.generation == generation);
+        let running = self.running_fronts
+            && self
+                .running_entry
+                .is_some_and(|e| e.node == node && e.generation == generation);
         self.queued.get(&(node, generation)).copied().unwrap_or(0) > u32::from(running)
     }
 
@@ -1057,6 +1060,9 @@ impl Context {
     pub(crate) fn drop_oldest(&mut self, level: u32) {
         if let Some(e) = self.levels[level as usize].pop_front() {
             self.unqueue(e);
+            if self.running == Some(level) {
+                self.running_fronts = false;
+            }
         }
     }
 
@@ -1066,6 +1072,9 @@ impl Context {
             for e in q {
                 self.unqueue(e);
             }
+        }
+        if self.running.is_some_and(|level| level as usize >= len) {
+            self.running_fronts = false;
         }
     }
 
