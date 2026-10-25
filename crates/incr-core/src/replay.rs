@@ -1406,7 +1406,7 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
-    static KEPT_EVENTS: RefCell<Vec<Logged>> = const { RefCell::new(Vec::new()) };
+    static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
@@ -1425,7 +1425,7 @@ thread_local! {
 #[cfg(loom)]
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
-    static KEPT_EVENTS: RefCell<Vec<Logged>> = RefCell::new(Vec::new());
+    static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = Cell::new(0);
@@ -1485,6 +1485,43 @@ struct Logged {
     /// The landing's node may be in any copy, so the event reaches copies
     /// of frames at or above it too.
     all: bool,
+    /// The event may retire landings by position, short of the node.
+    wide: bool,
+}
+
+/// The events logged while reads are kept, with the indexes of those that
+/// may retire landings by position and of each node's landings, so that
+/// a kept read's catch-up skips the landings of nodes its copy does not
+/// hold.
+#[derive(Default)]
+struct Events {
+    log: Vec<Logged>,
+    wide: Vec<usize>,
+    landed: HashMap<(RuntimeId, (u32, u32)), Vec<usize>, FxBuildHasher>,
+}
+
+impl Events {
+    fn push(&mut self, l: Logged) {
+        let i = self.log.len();
+        if l.wide {
+            self.wide.push(i);
+        }
+        if let Some(n) = l.ev.node() {
+            self.landed.entry((l.rt, n)).or_default().push(i);
+        }
+        self.log.push(l);
+    }
+
+    fn clear(&mut self) {
+        self.log.clear();
+        self.wide.clear();
+        // As for the copied set, a clear costs the capacity.
+        if self.landed.capacity() > COPIED_KEEP {
+            self.landed = HashMap::default();
+        } else {
+            self.landed.clear();
+        }
+    }
 }
 
 /// Keeps `read` for its frame's retry. Reads of frames that have popped go:
@@ -1506,7 +1543,7 @@ fn keep(mut read: KeptRead, fresh: bool, number: bool) {
         let top = read.cidx + 1 + nodes.depth();
         KEPT_TOP.with(|k| k.set(k.get().max(top)));
     }
-    let seen = KEPT_EVENTS.with(|v| v.borrow().len());
+    let seen = KEPT_EVENTS.with(|v| v.borrow().log.len());
     let gone: Vec<(KeptRead, usize)> = KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
         let ours = |e: &KeptRead| e.rt == read.rt && e.cidx == read.cidx && e.ctl == read.ctl;
@@ -1653,16 +1690,26 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
     let all = ev
         .node()
         .is_some_and(|n| COPIED.with(|c| c.borrow().contains(&(rt, n))));
-    // A landing retires its node from any kept copy, which the copied set
-    // does not mark; another event retires only landings above its
-    // position, or at it for a contained payload.
+    // Short of a copied node, an event retires only landings above its
+    // position, or at it for a contained payload; a landing also retires
+    // its node from the kept copies that hold it, which the copied set
+    // does not mark.
     let reach = match *ev {
         Retire::Contained { cidx, .. } => cidx,
-        Retire::Landing { .. } => 0,
-        Retire::Above(at) => at + 1,
+        _ => ev.cidx() + 1,
     };
-    if value_code::thread_word() & value_code::KEPT_BIT != 0 && KEPT_TOP.with(Cell::get) >= reach {
-        KEPT_EVENTS.with(|v| v.borrow_mut().push(Logged { rt, ev: *ev, all }));
+    if value_code::thread_word() & value_code::KEPT_BIT != 0 {
+        let wide = all || KEPT_TOP.with(Cell::get) >= reach;
+        if wide || ev.node().is_some() {
+            KEPT_EVENTS.with(|v| {
+                v.borrow_mut().push(Logged {
+                    rt,
+                    ev: *ev,
+                    all,
+                    wide,
+                })
+            });
+        }
     }
     with(|c| {
         for x in c.iter_mut().filter(|x| x.rt == rt) {
@@ -1672,18 +1719,45 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
 }
 
 /// Applies to `read`'s copy the events logged since it was kept, as each
-/// applied when it happened: to a read by a frame below the event, or of
-/// any frame for a copied node's landing.
-fn catch_up(read: &mut KeptRead, seen: usize, events: &[Logged]) {
+/// applied when it happened: to a read by a frame below the event, of any
+/// frame for a copied node's landing, or holding the landing's node then.
+/// An event that is not wide changes the copy only through its node, so
+/// only the landings of nodes the copy holds now are looked at.
+fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     let Delivered::Unwind { nodes, .. } = &mut read.what else {
         return;
     };
-    note_work(events.len() - seen);
-    for l in &events[seen..] {
-        if l.rt == read.rt
-            && (read.cidx < l.ev.cidx() || l.all || l.ev.node().is_some_and(|n| nodes.holds(n)))
+    let (rt, cidx) = (read.rt, read.cidx);
+    let from = events.wide.partition_point(|&i| i < seen);
+    // `(index, whether the copy held its node)`
+    let mut todo: Vec<(usize, bool)> = events.wide[from..].iter().map(|&i| (i, false)).collect();
+    if events.log.len() > seen && !events.landed.is_empty() {
+        let copy = nodes.owned_nodes();
+        note_work(copy.len());
+        for &(n, _) in copy.iter() {
+            if let Some(at) = events.landed.get(&(rt, n)) {
+                todo.extend(
+                    at[at.partition_point(|&i| i < seen)..]
+                        .iter()
+                        .map(|&i| (i, true)),
+                );
+            }
+        }
+        todo.sort_unstable();
+        todo.dedup_by(|cur, prev| {
+            let same = cur.0 == prev.0;
+            prev.1 |= same && cur.1;
+            same
+        });
+    }
+    note_work(todo.len());
+    for (i, held) in todo {
+        let l = &events.log[i];
+        if l.rt == rt
+            && (l.wide && (cidx < l.ev.cidx() || l.all)
+                || held && l.ev.node().is_some_and(|n| nodes.holds(n)))
         {
-            nodes.retire(read.cidx, &l.ev, None);
+            nodes.retire(cidx, &l.ev, None);
         }
     }
 }
