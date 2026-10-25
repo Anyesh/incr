@@ -5011,7 +5011,12 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn drop_released_entry(&self, id: NodeId, node: &NodeData<C>) {
-        self.set_released(&mut self.inner.write(), id.0, node, None);
+        let mut inner = self.inner.write();
+        let key = state::cell_key::<C>(node.state_cell());
+        if !C::SINGLE_THREADED && hold::active() && hold::holds(key) {
+            hold::keep_released(key, inner.released_deps.get(&id.0).copied());
+        }
+        self.set_released(&mut inner, id.0, node, None);
     }
 
     #[cold]
