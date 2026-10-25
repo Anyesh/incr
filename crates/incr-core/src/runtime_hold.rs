@@ -50,6 +50,24 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// What a landing's write displaced: kept for the undo record of a
+    /// node this thread holds, else dropped at the drain.
+    pub(super) fn displaced(
+        &self,
+        node: &NodeData<C>,
+        displaced: Option<Box<dyn Any>>,
+        bag: &mut Deferred<C>,
+    ) {
+        let back = if !C::SINGLE_THREADED && hold::active() {
+            hold::keep_value(state::cell_key::<C>(node.state_cell()), displaced)
+        } else {
+            displaced
+        };
+        if let Some(d) = back {
+            bag.push_erased(d);
+        }
+    }
+
     /// `HOLD` for a run of a node this thread holds and has claimed again,
     /// so its write keeps what it displaces for the undo record.
     #[inline(always)]

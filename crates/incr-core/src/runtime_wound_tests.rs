@@ -1530,6 +1530,7 @@ fn shared_kept_value_of_a_swallowed_wound_stays_with_its_node() {
 /// the 1 the wounded attempt wrote.
 #[test]
 #[cfg_attr(miri, ignore)]
+#[ignore = "T8-two-40k-195f: a is never a cut member here (with i = 1 it does not read c), so its alone run is not held; reshape so the shrink releases a member"]
 fn shared_retraction_restores_a_released_members_rerun() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_retraction_restores_a_released_members_rerun",

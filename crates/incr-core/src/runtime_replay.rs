@@ -715,9 +715,7 @@ impl<C: Cells> Runtime<C> {
             arena.write_erased(node.arena_slot(), value, first, &wrote)
         })) {
             Ok((changed, displaced)) => {
-                if let Some(d) = displaced {
-                    bag.push_erased(d);
-                }
+                self.displaced(node, displaced, bag);
                 changed
             }
             // The unbounded run's write panics after its run too, and its

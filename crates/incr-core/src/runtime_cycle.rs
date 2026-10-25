@@ -2119,9 +2119,7 @@ impl<C: Cells> Runtime<C> {
         e.wrote |= wrote.get() != 0;
         let changed = match written {
             Ok((changed, displaced)) => {
-                if let Some(d) = displaced {
-                    bag.push_erased(d);
-                }
+                self.displaced(node, displaced, bag);
                 changed
             }
             Err(payload) => {
