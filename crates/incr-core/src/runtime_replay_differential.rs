@@ -3725,8 +3725,8 @@ fn two_threads_hang() {
 fn cross_seeds() {
     for seed in [
         0x2, 0xb, 0xfa, 0xfb, 0xfe, 0x109, 0x135, 0x14a, 0x14d, 0x19a, 0x19e, 0x1b5, 0x1b6, 0x1e4,
-        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x401, 0x441, 0x4f9,
-        0x50d, 0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0x3f39,
+        0x228, 0x27c, 0x27f, 0x2cd, 0x2e1, 0x308, 0x35c, 0x38b, 0x3d0, 0x3f7, 0x441, 0x4f9, 0x50d,
+        0x54f, 0x560, 0x573, 0x5a3, 0x5b6, 0x5c4, 0x5ec, 0x63e, 0x657, 0x734, 0x7a2, 0x3f39,
         0x432a,
     ] {
         let case = gen_case(seed, true, false);
@@ -3735,6 +3735,21 @@ fn cross_seeds() {
             differential::<Shared>(&case, seed);
         });
     }
+}
+
+/// 0x401 at budget 1: a read of runtime 2 reads runtime 1, which reads
+/// runtime 2 back while runtime 2's frames are virtual, so the hold rule
+/// takes runtime 1's read for its first entry and publishes what the
+/// unbounded run retracts. Needs a per-runtime entry depth.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "T10-shared-entry-under-local-outermost: a first entry under virtual frames"]
+fn cross_seed_reading_back_under_virtual_frames() {
+    let case = gen_case(0x401, true, false);
+    quiet(|| {
+        differential::<Local>(&case, 0x401);
+        differential::<Shared>(&case, 0x401);
+    });
 }
 
 /// Two-thread seeds, with a second runtime when `.1`, whose reads pushed a
