@@ -3858,42 +3858,38 @@ fn seed_1daa_with_levels(levels: usize) -> Case {
     }
 }
 
-/// 0x1daa: op 3's walk of 7 reads 7 through its own cycle, which lands 7
-/// Failed while members 5, 9 and 10 are still queued. They are computed
-/// as on main: passed, they stayed unlanded, and every read of them in op
-/// 6's cycle opened a nested walk, so its runs tripled with each level.
-/// Bounded runs are held to the same bound and to the unbounded run.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn walk_root_failed_by_its_own_read_computes_the_queued_entries() {
-    fn op_6_runs<C: Cells>(case: &Case, frames: Option<u32>) -> u32 {
-        RUNS.with(|r| *r.borrow_mut() = Some(HashMap::new()));
-        let rts = runtimes::<C>(frames, 0);
-        let live = Live::new(&rts, case);
-        reset_thread();
-        let total = || RUNS.with(|r| r.borrow().as_ref().map_or(0, |m| m.values().sum::<u32>()));
-        for op in &case.ops[..6] {
-            live.apply(op);
-        }
-        let before = total();
-        live.apply(&case.ops[6]);
-        let runs = total() - before;
-        RUNS.with(|r| *r.borrow_mut() = None);
-        runs
+/// The closure runs of `case`'s op `op`, after the ops before it.
+fn op_runs<C: Cells>(case: &Case, frames: Option<u32>, op: usize) -> u32 {
+    RUNS.with(|r| *r.borrow_mut() = Some(HashMap::new()));
+    let rts = runtimes::<C>(frames, 0);
+    let live = Live::new(&rts, case);
+    reset_thread();
+    let total = || RUNS.with(|r| r.borrow().as_ref().map_or(0, |m| m.values().sum::<u32>()));
+    for o in &case.ops[..op] {
+        live.apply(o);
     }
+    let before = total();
+    live.apply(&case.ops[op]);
+    let runs = total() - before;
+    RUNS.with(|r| *r.borrow_mut() = None);
+    runs
+}
+
+/// Asserts `op`'s runs in [`seed_1daa_with_levels`] at 0 to 4 levels, at
+/// every budget and under both cell kinds, stay within `bound_for(levels)`.
+fn bound_1daa_runs(op: usize, bound_for: impl Fn(u32) -> u32) {
     quiet(|| {
         for levels in 0..=4 {
             let case = seed_1daa_with_levels(levels);
-            assert!(matches!(case.ops[6], Op::TryGet(9)));
             for frames in [None, Some(1), Some(2), Some(3)] {
-                let bound = 2 * (levels as u32 + 3);
+                let bound = bound_for(levels as u32);
                 for (kind, runs) in [
-                    ("Local", op_6_runs::<Local>(&case, frames)),
-                    ("Shared", op_6_runs::<Shared>(&case, frames)),
+                    ("Local", op_runs::<Local>(&case, frames, op)),
+                    ("Shared", op_runs::<Shared>(&case, frames, op)),
                 ] {
                     assert!(
                         runs <= bound,
-                        "{kind}, {levels} levels, budget {frames:?}: {runs} runs, bound {bound}"
+                        "op {op}, {kind}, {levels} levels, budget {frames:?}: {runs} runs, bound {bound}"
                     );
                 }
             }
@@ -3901,6 +3897,30 @@ fn walk_root_failed_by_its_own_read_computes_the_queued_entries() {
             differential::<Shared>(&case, 0x1daa);
         }
     });
+}
+
+/// 0x1daa: op 3's walk of 7 reads 7 through its own cycle, which lands 7
+/// Failed while members 5, 9 and 10 are still queued. They are computed
+/// as on main: passed, they stayed unlanded, and every read of them in op
+/// 6's cycle opened a nested walk, so its runs tripled with each level.
+/// Op 6 runs 3 + L closures at every budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn walk_root_failed_by_its_own_read_computes_the_queued_entries() {
+    assert!(matches!(seed_1daa_with_levels(0).ops[6], Op::TryGet(9)));
+    bound_1daa_runs(6, |levels| 3 + levels);
+}
+
+/// 0x1daa: op 3's `Get(7)` closes a cycle that 5's Catch takes, below
+/// levels each reading the next three times. On t10 34412289 its runs
+/// tripled with each level; as on main b9f0d0bf, it runs 6 + L closures
+/// unbounded and at most 10 + 2L at a budget, held here to 20 + 4L so
+/// that CI's depth-1 replayable run fits too.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_caught_cycle_under_levels_of_rereads_stays_linear() {
+    assert!(matches!(seed_1daa_with_levels(0).ops[3], Op::Get(7)));
+    bound_1daa_runs(3, |levels| 20 + 4 * levels);
 }
 
 /// Two-thread cases with panics and cycles in which a read's walk landed
@@ -4212,9 +4232,9 @@ fn failed_after(t: &Trace, i: usize) -> (Out, Vec<usize>) {
 /// Seed 0xe486019a1c945cce's op 1, `Get(4)`: member 8 of the cycle
 /// {4, 5, 7, 8} reads 9, whose walk computes 21, and 21's own code panics
 /// in the episode of {9, 21, 22, 23}, which marks it failed; 9 then passes
-/// that panic to 8, and a fresh run leaves 8, 9, 21, 22 and 23 Failed, as
-/// do the unbounded run and a budget of 1. The mark count it was pinned
-/// for is now [`a_member_frame_counts_the_marks_of_its_earlier_runs`]'s.
+/// that panic to 8. A fresh run and the unbounded run leave 9 and 21
+/// Failed and 8, 22 and 23 New, and budgets 1 to 3 the same Failed set.
+/// The mark count it was pinned for is now [`a_member_frame_counts_the_marks_of_its_earlier_runs`]'s.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
@@ -4223,7 +4243,7 @@ fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
     quiet(|| {
         let mut fresh = case.clone();
         fresh.ops = vec![Op::Get(4)];
-        let want = (Out::Panic("boom 0:21".to_owned()), vec![8, 9, 21, 22, 23]);
+        let want = (Out::Panic("boom 0:21".to_owned()), vec![9, 21]);
         assert_eq!(failed_after(&run::<Local>(&fresh, None, 0), 0), want);
         assert!(matches!(case.ops[1], Op::Get(4)));
         assert_eq!(failed_after(&run::<Local>(&case, Some(1), 0), 1), want);
@@ -4902,7 +4922,7 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
 /// Failed while op 0's walk, planned before it, waits on a claim. Op 0's
 /// walk visits the nodes it waited on again, so every run leaves one
 /// order's Failed set: op 0 first enters a cycle and op 1 leaves {10},
-/// and op 1 first leaves {0, 4, 5, 9, 10, 11}. None needs the
+/// and op 1 first leaves {0, 9, 10}. None needs the
 /// oracle's history, which a walk that went on with its old plan did.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -4917,7 +4937,7 @@ fn two_thread_walk_planned_before_an_episode_leaves_an_orders_failed_set() {
             .map(|&x| (x, NodeState::Failed))
             .collect::<Vec<_>>()
     };
-    assert_eq!(orders, [failed(&[10]), failed(&[0, 4, 5, 9, 10, 11])]);
+    assert_eq!(orders, [failed(&[10]), failed(&[0, 9, 10])]);
     quiet(|| {
         for _ in 0..300 {
             let serial = Serial::new(&case, &phases);
@@ -8149,7 +8169,7 @@ fn wave8_seed_d6e1_released_new_walked_fresh() {
 /// Seed 0x148c's base case, shrunk. At budgets 2 and 3 a stand-in's Dirty
 /// landing is reported to its walk as `Unsettled`, which must not lead the
 /// bounded run to compute a node the unbounded run leaves New: after
-/// `Get(7)`, nodes 1 to 4, 14 and 16. Budgets 2 and 3 hold at least one
+/// `Get(7)`, nodes 1, 4, 5 and 14. Budgets 2 and 3 hold at least one
 /// landing as unsettled.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -8228,7 +8248,7 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
         let new: Vec<usize> = (0..unbounded[3].1.len())
             .filter(|&n| unbounded[3].1[n] == NodeState::New)
             .collect();
-        assert_eq!(new, [1, 2, 3, 4, 14, 16], "unbounded");
+        assert_eq!(new, [1, 4, 5, 14], "unbounded");
         let holds = || super::replay_impl::UNSETTLED_HOLDS.with(|n| n.replace(0));
         for frames in [1, 2, 3] {
             holds();
