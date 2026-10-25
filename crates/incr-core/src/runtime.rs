@@ -5183,6 +5183,19 @@ impl<C: Cells> Runtime<C> {
         stale
     }
 
+    /// Whether `node` holds the group record `of` holds.
+    #[cfg(loom)]
+    pub(crate) fn in_group_of(&self, node: ErasedIncr, of: ErasedIncr) -> bool {
+        let inner = self.inner.read();
+        match (
+            inner.member_recs.get(&node.slot()),
+            inner.member_recs.get(&of.slot()),
+        ) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     /// Records `members` as one landed group, as an episode's step 2 does.
     pub(crate) fn force_group_for_test(&self, members: &[ErasedIncr]) {
         let mut inner = self.inner.write();
