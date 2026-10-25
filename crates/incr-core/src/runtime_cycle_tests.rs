@@ -1000,8 +1000,40 @@ fn aborted_episode_landing_keeps_no_memo<C: Cells>() {
     assert!(!rt.has_memo_of(s), "s {:?}", rt.state_of(s));
 }
 
+/// S (seeded) catches a fresh failure of F, which reads nothing, and
+/// reads T, which reads S. Each level of a ladder reads the one below
+/// twice in one entry: S must not run once per path.
+fn episode_over_a_fresh_failure_reruns_boundedly<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let runs = Arc::new(AtomicU32::new(0));
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let tc = cell::<u64>();
+    let s = {
+        let (tc, runs) = (tc.clone(), runs.clone());
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                rt.try_get(*tc.get().unwrap()).unwrap_or(0).min(1)
+            },
+            fixpoint(Fixpoint::new(|| 0_u64)),
+        )
+    };
+    let t = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 1);
+    tc.set(t).unwrap();
+    let mut level = s;
+    for _ in 0..8 {
+        let below = level;
+        level = rt.create_query(move |rt: &Runtime<C>| rt.get(below) + rt.get(below));
+    }
+    assert_eq!(rt.get(level), 256);
+    let n = runs.load(Ordering::SeqCst);
+    assert!(n <= 16, "S ran {n} times");
+}
+
 both!(
     aborted_episode_landing_keeps_no_memo,
+    episode_over_a_fresh_failure_reruns_boundedly,
     cu_member_keeps_its_error_over_a_handled_episode,
     self_cycle_fallback,
     self_cycle_fixpoint,
