@@ -4066,7 +4066,6 @@ fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
 /// 14, none of which an order gives.
 #[test]
 #[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
-#[cfg_attr(miri, ignore)]
 fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
     let case = gen_case(0x5aab, false, true);
     quiet(|| {
@@ -4083,7 +4082,6 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
 /// It fails in about one debug `differential_two` run in five.
 #[test]
 #[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
-#[cfg_attr(miri, ignore)]
 fn a_doomed_frame_keeps_its_node_from_the_other_thread_e4aa8b2e() {
     let case = gen_case(0xe4aa_8b2e, false, true);
     quiet(|| {
@@ -4203,7 +4201,6 @@ fn a_dropped_chain_takes_its_member_runs_failure_counts() {
 
 /// The same truncation under two threads, seed 0x2b13.
 #[test]
-#[cfg_attr(miri, ignore)]
 #[ignore = "T10-cmp-2b13-two-thread-boom: op 4 returns a panic no serial order gives"]
 fn a_two_thread_dropped_chain_takes_its_member_runs_failure_counts() {
     quiet(|| {
@@ -5660,7 +5657,6 @@ fn replay_seeds() {
 /// leaves a node Dirty and the bounded run lands it Clean; 0xa5b returns
 /// other outcomes too.
 #[test]
-#[cfg_attr(miri, ignore)]
 #[ignore = "T8-strict-group-c-dirty-for-clean"]
 fn strict_dirty_for_clean_seeds() {
     for seed in [0xa5b, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d] {
@@ -5675,7 +5671,6 @@ fn strict_dirty_for_clean_seeds() {
 /// Seeds that differ under the strict comparator where the unbounded run
 /// computes nodes the bounded run leaves New.
 #[test]
-#[cfg_attr(miri, ignore)]
 #[ignore = "T8-strict-computed-left-new"]
 fn strict_computed_left_new_seeds() {
     let case = gen_base(0xd4f2);
@@ -5843,7 +5838,6 @@ fn a_speculative_recompute_to_the_same_value_keeps_its_reader_verified() {
 /// [`replay_seeds`], and 0x88f7 is
 /// [`wave8_seed_88f7_released_claims_replay_as_unbounded`].
 #[test]
-#[cfg_attr(miri, ignore)]
 #[ignore = "T8-native-reruns-under-replay"]
 fn native_reruns_under_replay_seeds() {
     NATIVE_COUNT.with(|c| c.set(true));
@@ -6242,35 +6236,30 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     #[ignore = "T8-strict-group-c-dirty-for-clean"]
     fn replay_differential_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     #[ignore = "T8-strict-group-c-dirty-for-clean"]
     fn replay_differential_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, false, false), seed));
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     #[ignore = "T8-strict-group-c-dirty-for-clean, T8-strict-computed-left-new"]
     fn replay_differential_shared_two_threads(seed in any::<u64>()) {
         quiet(|| differential_two(&gen_case(seed, false, true), seed));
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     #[ignore = "cross-runtime reads record no edge, so a speculative entry's early read keeps a value a later set changed"]
     fn replay_differential_cross_runtime_local(seed in any::<u64>()) {
         quiet(|| differential::<Local>(&gen_case(seed, true, false), seed));
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
     #[ignore = "cross-runtime reads record no edge, so a speculative entry's early read keeps a value a later set changed"]
     fn replay_differential_cross_runtime_shared(seed in any::<u64>()) {
         quiet(|| differential::<Shared>(&gen_case(seed, true, false), seed));
@@ -7286,14 +7275,12 @@ fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> (b
 
 #[test]
 #[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
-#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_failed_set_grounded_in_its_history() {
     assert_eq!(cascade_from_a_history_panic(|_| {}), (true, true));
 }
 
 #[test]
 #[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
-#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_history_grounding_over_a_wrong_value() {
     assert_eq!(
         cascade_from_a_history_panic(|evals| {
@@ -7312,7 +7299,6 @@ fn two_thread_oracle_rejects_a_history_grounding_over_a_wrong_value() {
 /// it, but 6, 5 and 4 ground through a read the oracle does not take.
 #[test]
 #[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
-#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_history_grounding_over_an_untaken_read() {
     assert_eq!(
         cascade_from_a_history_panic(|evals| {

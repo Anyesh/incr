@@ -340,13 +340,13 @@ fn cyclic_landing_is_a_change<C: Cells>() {
         let qc = qc.clone();
         rt.create_query(move |rt| {
             if rt.get(g) == 1 {
-                rt.try_get(*qc.get().unwrap()).map_or(-1, |v| v)
+                rt.try_get(*qc.get().unwrap()).unwrap_or(-1)
             } else {
                 5
             }
         })
     };
-    let q = rt.create_query(move |rt| rt.try_get(p).map_or(-1, |v| v));
+    let q = rt.create_query(move |rt| rt.try_get(p).unwrap_or(-1));
     qc.set(q).unwrap();
     let d = rt.create_query(move |rt| rt.try_get(p).map_or(-100, |v| v * 2));
     assert_eq!(rt.get(d), 10);
@@ -491,14 +491,14 @@ fn cyclic_group_grows<C: Cells>() {
             } else {
                 *rc.get().unwrap()
             };
-            rt.try_get(target).map_or(-1, |v| v)
+            rt.try_get(target).unwrap_or(-1)
         })
     };
     let r = {
         let qc = qc.clone();
-        rt.create_query(move |rt| rt.try_get(*qc.get().unwrap()).map_or(-1, |v| v))
+        rt.create_query(move |rt| rt.try_get(*qc.get().unwrap()).unwrap_or(-1))
     };
-    let q = rt.create_query(move |rt| rt.try_get(p).map_or(-1, |v| v));
+    let q = rt.create_query(move |rt| rt.try_get(p).unwrap_or(-1));
     qc.set(q).unwrap();
     rc.set(r).unwrap();
     let d = rt.create_query(move |rt| rt.try_get(p).map_or_else(|c| c.len() as i64, |_| 0));
@@ -742,7 +742,7 @@ fn recovery_pops_are_bounded<C: Cells>() {
         let uc = uc.clone();
         rt.create_query(move |rt| {
             if rt.get(g) == 0 {
-                rt.try_get(*uc.get().unwrap()).map_or(-1, |v| v)
+                rt.try_get(*uc.get().unwrap()).unwrap_or(-1)
             } else {
                 1
             }
@@ -1283,7 +1283,7 @@ fn cross_runtime_reentry<A: Cells, B: Cells>() {
                 if use_get {
                     r1.get(a)
                 } else {
-                    r1.try_get(a).map_or(-1, |v| v)
+                    r1.try_get(a).unwrap_or(-1)
                 }
             })
         };
@@ -1723,40 +1723,36 @@ mod foreign_chain {
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_local() {
         super::foreign_reading_chain_stays_within_the_stack::<Local, Local>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared() {
         super::foreign_reading_chain_stays_within_the_stack::<Local, Shared>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_local() {
         super::foreign_reading_chain_stays_within_the_stack::<Shared, Local>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_shared() {
         super::foreign_reading_chain_stays_within_the_stack::<Shared, Shared>();
     }
@@ -1845,30 +1841,27 @@ mod foreign_panic_chain {
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared() {
         super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(None);
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_shared() {
         super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>(None);
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared_with_b_unbudgeted() {
         super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(Some(u32::MAX));
     }
