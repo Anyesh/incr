@@ -534,11 +534,10 @@ impl Pending {
         }
         if d.provenance.is_some() {
             self.traced += 1;
-            list(
-                &mut self.by_stand,
-                (d.key.cidx, d.key.node, d.key.generation),
-                i,
-            );
+            let own = (d.key.cidx, d.key.node, d.key.generation);
+            for &stand in std::iter::once(&own).chain(&d.below) {
+                list(&mut self.by_stand, stand, i);
+            }
             list(&mut self.by_frontier, frontier(&d), i);
         }
         if d.passed && d.is_deep() {
