@@ -1174,7 +1174,11 @@ impl Context {
     /// [`Self::take_unwind`] does. When the read is the running frame's
     /// own compute, its unwind carries the record on to
     /// [`Self::unwind_target`].
-    pub(crate) fn take_landed(&mut self, i: usize, at: u32) -> (bool, Box<dyn Any + Send>) {
+    pub(crate) fn take_landed(
+        &mut self,
+        i: usize,
+        at: u32,
+    ) -> (bool, Box<dyn Any + Send>, Landings) {
         if let Some(below) = self.unwind_target(at) {
             let key = ReadKey::blocked(below);
             self.provenance = self.pending.get(i).provenance.clone().map(|p| (key, p));
@@ -1183,16 +1187,17 @@ impl Context {
             Delivered::Unwind {
                 attributed,
                 payload,
+                nodes,
                 ..
-            } => (attributed, payload),
+            } => (attributed, payload, nodes),
             _ => unreachable!("incr-core: matched as an unwind"),
         }
     }
 
     /// Marks delivery `i`'s read taken, as `take_delivery` does, and
     /// returns its unwind. The delivery stays until its maker's run ends,
-    /// for a retry doomed again; a payload that can't be copied is
-    /// delivered once.
+    /// for a retry doomed again; a payload that can't be copied is handed
+    /// over once, its delivery keeping a [`Regen`] marker in its place.
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
         let key = self.pending.get(i).key;
         self.pending.take_keyed(&key);
@@ -2061,11 +2066,13 @@ pub(crate) struct Regen(pub(crate) std::any::TypeId);
 
 /// The state of `Runtime::regenerate`'s runs on this thread: the payloads
 /// made so far for the Failed nodes they read, each taken by the first
-/// read of its node, and the node whose read aborted the last run for want
-/// of one. Nodes are keyed as a `ReadScope`'s `reading`.
+/// read of its node, the nodes noted as having landed Failed with the
+/// payload being regenerated, and the node whose read aborted the last run
+/// for want of a payload. Nodes are keyed as a `ReadKey`'s `reading`.
 pub(crate) struct Regenerating {
     rt: Option<RuntimeId>,
     made: Vec<(u64, Box<dyn Any + Send>)>,
+    noted: Vec<u64>,
     wanted: Option<u64>,
 }
 
@@ -2074,48 +2081,90 @@ impl Regenerating {
         Self {
             rt: None,
             made: Vec::new(),
+            noted: Vec::new(),
             wanted: None,
         }
     }
 }
 
-/// Opens a regenerating run of runtime `rt` whose reads take from `made`.
-pub(crate) fn regen_open(rt: RuntimeId, made: Vec<(u64, Box<dyn Any + Send>)>) {
+/// The parts of a regenerating run [`regen_open`] hands over and
+/// [`regen_close`] gives back.
+pub(crate) type RegenParts = (Vec<(u64, Box<dyn Any + Send>)>, Vec<u64>);
+
+/// Opens a regenerating run of runtime `rt` whose reads take from `made`
+/// and want only `noted` nodes.
+pub(crate) fn regen_open(rt: RuntimeId, (made, noted): RegenParts) {
     REGEN.with(|r| {
         *r.borrow_mut() = Regenerating {
             rt: Some(rt),
             made,
+            noted,
             wanted: None,
         }
     });
 }
 
-/// Closes the run [`regen_open`] opened: the payloads its reads left, and
-/// the node it wanted one for.
-pub(crate) fn regen_close() -> (Vec<(u64, Box<dyn Any + Send>)>, Option<u64>) {
+/// Closes the run [`regen_open`] opened: what its reads left, and the
+/// node it wanted a payload for.
+pub(crate) fn regen_close() -> (RegenParts, Option<u64>) {
     REGEN.with(|r| {
         let r = std::mem::replace(&mut *r.borrow_mut(), Regenerating::new());
-        (r.made, r.wanted)
+        ((r.made, r.noted), r.wanted)
     })
 }
 
-/// The payload made for node `key` of runtime `rt`, which a read of it in
-/// the open run raises. Without one the node is wanted, if it is the open
-/// run's runtime's.
-pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> Option<Box<dyn Any + Send>> {
+/// What a regenerating run's read of a Failed node raises.
+pub(crate) enum RegenRead {
+    /// The payload made for the node.
+    Made(Box<dyn Any + Send>),
+    /// None yet: the node landed Failed with the payload being regenerated,
+    /// so its run makes one, and the read waits for it.
+    Wanted,
+    /// The node did not land with that payload, so the unbounded run's
+    /// read found it Failed from before and panicked with its message.
+    Unnoted,
+}
+
+/// What the open run's read of node `key` of runtime `rt` raises.
+pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> RegenRead {
     REGEN.with(|r| {
         let mut r = r.borrow_mut();
-        if r.rt != Some(rt) {
-            return None;
+        if r.rt != Some(rt) || !r.noted.contains(&key) {
+            return RegenRead::Unnoted;
         }
         match r.made.iter().position(|m| m.0 == key) {
-            Some(i) => Some(r.made.swap_remove(i).1),
+            Some(i) => RegenRead::Made(r.made.swap_remove(i).1),
             None => {
                 r.wanted = Some(key);
-                None
+                RegenRead::Wanted
             }
         }
     })
+}
+
+/// Runtime `rt`'s nodes claimed by a regenerating run on some thread
+/// (`Runtime::rerun`), which another thread's rerun of the same node waits
+/// out instead of taking the claim for a compute.
+static REGEN_CLAIMS: std::sync::Mutex<Vec<(RuntimeId, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes or drops `slot` of runtime `rt` as claimed by a regenerating run.
+pub(crate) fn regen_claim(rt: RuntimeId, slot: u32, held: bool) {
+    let mut c = REGEN_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held {
+        c.push((rt, slot));
+    } else if let Some(i) = c.iter().position(|&x| x == (rt, slot)) {
+        c.swap_remove(i);
+    }
+}
+
+/// Whether `slot` of runtime `rt` is claimed by a regenerating run.
+pub(crate) fn regen_claimed(rt: RuntimeId, slot: u32) -> bool {
+    REGEN_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(rt, slot))
 }
 
 /// Whether [`copy_payload`] can copy `payload`.
@@ -2236,6 +2285,15 @@ pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
                     d.resumed = Some(raised);
                 }
             }
+        }
+    });
+}
+
+/// As [`regenerated`], for delivery `i` of context `id`.
+pub(crate) fn regenerated_at(id: u64, i: usize, raised: PayloadKey) {
+    with(|c| {
+        if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+            x.pending.get_mut(i).resumed = Some(raised);
         }
     });
 }

@@ -172,7 +172,7 @@ impl<C: Cells> Runtime<C> {
             })
         };
         let (context, i, _) = found?;
-        let (attributed, payload) = replay::with(|c| {
+        let (attributed, payload, noted) = replay::with(|c| {
             c.iter_mut()
                 .find(|x| x.id == context)
                 .expect("incr-core: the delivery's context is open")
@@ -181,7 +181,16 @@ impl<C: Cells> Runtime<C> {
         if attributed {
             cycle_state::count_failure();
         }
-        Some(payload)
+        // A payload no copy can stand for that an earlier take had: its
+        // node runs again, as for a retry's read (`regenerate`).
+        Some(match payload.downcast::<replay::Regen>() {
+            Ok(regen) => {
+                let raised = self.regenerate(id, generation, regen.0, &noted);
+                replay::regenerated_at(context, i, replay::payload_key(&*raised));
+                raised
+            }
+            Err(payload) => payload,
+        })
     }
 
     /// Raises `payload`, which [`Self::owed_payload`] took, as the read's

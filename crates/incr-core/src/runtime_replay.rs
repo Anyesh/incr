@@ -2114,43 +2114,48 @@ impl<C: Cells> Runtime<C> {
     /// may, and a panic of that type is the payload. A run that reads a
     /// Failed node aborts and runs again once that node's run has made its
     /// payload, which the read then raises, so one run is on the stack at a
-    /// time however long the chain the panic came up. A run that aborts
-    /// otherwise, returns, or panics with another type at the top gives the
-    /// Failed read's message instead.
+    /// time however long the chain the panic came up. Only the nodes in
+    /// `noted`, the landings the payload made, run so: a read of another
+    /// Failed node panics with its message, as the unbounded run's read of
+    /// a node Failed from before did. A run that aborts otherwise, returns,
+    /// or panics with another type at the top gives the Failed read's
+    /// message instead.
     #[cold]
     #[inline(never)]
-    fn regenerate(
+    pub(super) fn regenerate(
         &self,
         id: NodeId,
         generation: u32,
         ty: std::any::TypeId,
+        noted: &replay::Landings,
     ) -> Box<dyn std::any::Any + Send> {
         let key = |slot: u32, generation: u32| u64::from(slot) | (u64::from(generation) << 32);
         let top = key(id.0, generation);
         let mut stack = vec![top];
-        let mut tried = vec![top];
-        let mut made = Vec::new();
+        let mut tried: HashSet<u64> = HashSet::default();
+        tried.insert(top);
+        let mut parts = (
+            Vec::new(),
+            noted.landed.iter().map(|&(s, g)| key(s, g)).collect(),
+        );
         let mut payload = None;
         while let Some(&at) = stack.last() {
-            let (rerun, left) = self.rerun(NodeId(at as u32), (at >> 32) as u32, made);
-            made = left;
+            let (rerun, left) = self.rerun(NodeId(at as u32), (at >> 32) as u32, parts);
+            parts = left;
             match rerun {
                 Rerun::Panicked(p) => {
                     stack.pop();
                     if stack.is_empty() {
                         payload = Some(p);
                     } else {
-                        made.push((at, p));
+                        parts.0.push((at, p));
                     }
                 }
-                Rerun::Wants(want) if !tried.contains(&want) => {
-                    tried.push(want);
-                    stack.push(want);
-                }
+                Rerun::Wants(want) if tried.insert(want) => stack.push(want),
                 Rerun::Wants(_) | Rerun::Failed => break,
             }
         }
-        drop_payloads(made.into_iter().map(|m| m.1));
+        drop_payloads(parts.0.into_iter().map(|m| m.1));
         match payload {
             Some(p) if (*p).type_id() == ty => p,
             p => {
@@ -2169,10 +2174,12 @@ impl<C: Cells> Runtime<C> {
         rt: RuntimeId,
         key: &ReadKey,
         payload: Box<dyn std::any::Any + Send>,
+        noted: &replay::Landings,
     ) -> Box<dyn std::any::Any + Send> {
         match payload.downcast::<replay::Regen>() {
             Ok(regen) => {
-                let raised = self.regenerate(NodeId(handle.slot()), handle.generation(), regen.0);
+                let raised =
+                    self.regenerate(NodeId(handle.slot()), handle.generation(), regen.0, noted);
                 replay::regenerated(rt, key, replay::payload_key(&*raised));
                 raised
             }
@@ -2196,20 +2203,32 @@ impl<C: Cells> Runtime<C> {
         &self,
         id: NodeId,
         generation: u32,
-        made: Vec<(u64, Box<dyn std::any::Any + Send>)>,
-    ) -> (Rerun, Vec<(u64, Box<dyn std::any::Any + Send>)>) {
-        let (node, flags) = self.nodes.get_with_flags(id.0);
-        if !self.replayable(id.0)
-            || node.generation() != generation
-            || state::try_transition::<C>(
+        parts: replay::RegenParts,
+    ) -> (Rerun, replay::RegenParts) {
+        let node = self.nodes.get(id.0);
+        if !self.replayable(id.0) || node.generation() != generation {
+            return (Rerun::Failed, parts);
+        }
+        // Another thread's rerun of the node holds it only for that run,
+        // which never waits, so this waits it out.
+        let mut spins = 0;
+        loop {
+            match state::try_transition::<C>(
                 node.state_cell(),
                 NodeState::Failed,
                 NodeState::Computing,
-            )
-            .is_err()
-        {
-            return (Rerun::Failed, made);
+            ) {
+                Ok(()) => break,
+                Err(NodeState::Computing | NodeState::ComputingDirty)
+                    if replay::regen_claimed(self.runtime_id, id.0) =>
+                {
+                    spins += 1;
+                    C::backoff(spins);
+                }
+                Err(_) => return (Rerun::Failed, parts),
+            }
         }
+        replay::regen_claim(self.runtime_id, id.0, true);
         // SAFETY: as in `compute_attempts`: the closure is freed only under
         // a Dead claim, which can't succeed while this node is Computing.
         let compute = self
@@ -2220,7 +2239,7 @@ impl<C: Cells> Runtime<C> {
             .and_then(|f| f.as_deref())
             .map(std::ptr::from_ref);
         let mut rerun = Rerun::Failed;
-        let mut left = made;
+        let mut left = parts;
         let mut engine = None;
         if let Some(compute) = compute {
             let compute = unsafe { &*compute };
@@ -2270,24 +2289,30 @@ impl<C: Cells> Runtime<C> {
             );
             self.flip_failed(id);
         }
+        replay::regen_claim(self.runtime_id, id.0, false);
         // Raised by a wait, which a regenerating run never makes.
         if let Some(p) = engine {
-            drop_payloads(left.into_iter().map(|m| m.1));
+            drop_payloads(left.0.into_iter().map(|m| m.1));
             resume_unwind(p);
         }
         (rerun, left)
     }
 
     /// A slow read made by a run of `regenerate`: a Failed node's read
-    /// raises the payload made for it, or aborts the run for want of one,
-    /// and any other read would compute, wait or land, so it aborts too.
+    /// raises the payload made for it, aborts the run for want of one, or
+    /// panics with its message if the payload did not land there; any other
+    /// read would compute, wait or land, so it aborts the run.
     #[cold]
     #[inline(never)]
     pub(super) fn regen_read(&self, id: NodeId, generation: u32, observed: NodeState) -> ! {
         if observed == NodeState::Failed {
             let key = u64::from(id.0) | (u64::from(generation) << 32);
-            if let Some(payload) = replay::regen_take(self.runtime_id, key) {
-                resume_unwind(payload);
+            match replay::regen_take(self.runtime_id, key) {
+                replay::RegenRead::Made(payload) => resume_unwind(payload),
+                replay::RegenRead::Wanted => {}
+                replay::RegenRead::Unnoted => {
+                    panic!("{}", super::provenance_impl::failed_read_message(id.0))
+                }
             }
         }
         abort_regen()
@@ -2399,8 +2424,8 @@ impl<C: Cells> Runtime<C> {
                 .downcast::<cycle::CycleUnwind>()
                 .expect("incr-core: a kept cycle is a cycle unwind")
                 .0)),
-            Some(Delivered::Unwind { payload, .. }) => Err(match &key {
-                Some(key) => self.regenerated(handle, reader, key, payload),
+            Some(Delivered::Unwind { payload, nodes, .. }) => Err(match &key {
+                Some(key) => self.regenerated(handle, reader, key, payload, &nodes),
                 None => payload,
             }),
             Some(Delivered::Walk(..) | Delivered::Direct) => {
@@ -4267,7 +4292,7 @@ impl<C: Cells> Runtime<C> {
         // A delivery stays until its maker's run ends, because a retry
         // doomed again after the read comes back to it as an entry and must
         // read what the first one did. A payload that can't be copied is
-        // delivered once.
+        // handed over once, and a later take regenerates it (`regenerate`).
         // SAFETY: the active frame's control block is live.
         let member = unsafe { &*f.ctl }.has(cycle::BUFFERED);
         let (generation, path, episode, seq) = self.key_parts(f, member);
@@ -4371,13 +4396,10 @@ impl<C: Cells> Runtime<C> {
         }
         // A payload no copy can stand for was delivered once, and a retry
         // after it regenerates the payload.
-        let payload = self.regenerated(handle, rt, &key, payload);
+        let payload = self.regenerated(handle, rt, &key, payload, &nodes);
         if !replay::copyable(&*payload) {
             let regenerable = self.replayable(handle.slot())
-                && nodes
-                    .nodes
-                    .iter()
-                    .all(|&((slot, _), _)| self.replayable(slot));
+                && nodes.landed.iter().all(|&(slot, _)| self.replayable(slot));
             self.hold_uncopied(f.ctl, regenerable);
         }
         if !cycle {
