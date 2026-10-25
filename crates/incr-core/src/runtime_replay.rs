@@ -237,16 +237,24 @@ impl<C: Cells> Runtime<C> {
     ///
     /// # Safety
     ///
-    /// `r` points at a runtime's `keep_resolver`, and a compute of that
-    /// runtime is running.
+    /// `r` is a running compute's runtime's [`Self::keep_resolver_ptr`].
     pub(super) unsafe fn resolve_keep(r: *const cycle::KeepResolver, slot: u32) -> bool {
         // SAFETY: the running compute borrows the runtime, so it is in
-        // place around its `keep_resolver`.
+        // place around its `keep_resolver`, and `r`'s provenance covers it.
         let rt = unsafe {
             &*r.byte_sub(std::mem::offset_of!(Self, keep_resolver))
                 .cast::<Self>()
         };
         rt.budgeted() && rt.replayable(slot)
+    }
+
+    /// The `keep_resolver` pointer for [`Self::resolve_keep`], offset from
+    /// the whole runtime: under Stacked Borrows one taken from the field,
+    /// even by `&raw const`, may not reach the rest of the runtime.
+    pub(super) fn keep_resolver_ptr(&self) -> *const cycle::KeepResolver {
+        std::ptr::from_ref(self)
+            .wrapping_byte_add(std::mem::offset_of!(Self, keep_resolver))
+            .cast()
     }
 
     /// Whether node `slot`'s compute may be doomed.

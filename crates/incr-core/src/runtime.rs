@@ -3890,7 +3890,7 @@ impl<C: Cells> Runtime<C> {
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
                         | if speculative { cycle::SPECULATIVE } else { 0 },
-                    &self.keep_resolver,
+                    self.keep_resolver_ptr(),
                 );
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
