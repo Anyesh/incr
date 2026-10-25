@@ -2173,13 +2173,14 @@ fn a_payload_after_a_virtual_cycle_read_reads_as_unbounded() {
 /// `try_get` of y is a cycle, else `CustomPayload(6)`. y reads itself once
 /// k is set, and r reads k first, so with `outer` 0 b's run after the set
 /// is r's read, landing Failed with y a dep from its first run. Returns
-/// what the read gives before and after the set.
-fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> (u64, u64) {
+/// what the read gives before and after the set; with `k0` 1, the read
+/// before is a fresh runtime's read with k set.
+fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32, k0: u64) -> (u64, u64) {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
     let i = rt.create_input(1_u64);
-    let k = rt.create_input(0_u64);
+    let k = rt.create_input(k0);
     let y_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
     let y_self = Arc::clone(&y_cell);
     let y = rt.create_query(move |rt: &Runtime<C>| {
@@ -2233,28 +2234,32 @@ fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> (u64
 }
 
 /// r sees b's payload after b's own run walked a cycle as the unbounded run's
-/// r did, at every budget. With `outer` 0 the unbounded r sees
-/// `CustomPayload(5)`, b's payload for the cycle; deeper, a walk runs b before
-/// r's closure and r reads b's Failed message.
+/// r did, at every budget. The unbounded r sees `CustomPayload(5)`, b's
+/// payload for the cycle, at every depth, as a fresh runtime with k set
+/// gives.
 #[test]
 fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
             for local in [true, false] {
-                let shape = |frames| {
+                let shape = |frames, k0| {
                     if local {
-                        recomputed_cycle_shape::<Local>(frames, outer, chain)
+                        recomputed_cycle_shape::<Local>(frames, outer, chain, k0)
                     } else {
-                        recomputed_cycle_shape::<Shared>(frames, outer, chain)
+                        recomputed_cycle_shape::<Shared>(frames, outer, chain, k0)
                     }
                 };
-                let want = shape(u32::MAX);
-                let saw = if outer == 0 { 5 } else { 2 };
+                let want = shape(u32::MAX, 0);
+                assert_eq!(
+                    want.1,
+                    shape(u32::MAX, 1).0,
+                    "the unbounded read is not the fresh one"
+                );
                 let chain = u64::from(chain);
-                assert_eq!(want, (6001 + chain, saw * 1000 + 1 + chain));
+                assert_eq!(want, (6001 + chain, 5001 + chain));
                 for frames in 1..9 {
                     assert_eq!(
-                        shape(frames),
+                        shape(frames, 0),
                         want,
                         "local={local} outer={outer} chain={chain} frames={frames}"
                     );
