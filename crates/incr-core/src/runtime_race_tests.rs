@@ -1621,9 +1621,12 @@ fn read_of_cycle_member_vs_claim_after_landing() {
 
 /// a <-> b, a cycle `a`'s fallback resolves, with `b` swallowing the panic
 /// of a failing node, so that every episode lands its members Dirty, and
-/// `x` reading `a`. Returns `x`, `a`, the gate in `a`'s closure and the
-/// gate in `x`'s after its read of `a`.
-fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
+/// `x` reading an input `t` and `a`. Setting `t` leaves the revision whose
+/// memo `b`'s caught panic keeps, and makes the next read rerun `x`.
+/// Returns `x`, `a`, `t`, the gate in `a`'s closure and the gate in `x`'s
+/// after its read of `a`.
+fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Gate, Gate) {
+    let t = rt.create_input(0_u64);
     let failed = rt.create_query(|_: &Rt| -> u64 { panic!("failed") });
     let in_a = Gate::new();
     let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
@@ -1646,19 +1649,13 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
     let x = {
         let read_a = read_a.clone();
         rt.create_query(move |rt: &Rt| {
+            let s = rt.get(t);
             let v = rt.get(a);
             read_a.park();
-            v + 100
+            v + s + 100
         })
     };
-    (x, a, in_a, read_a)
-}
-
-/// Moves `rt` past the revision whose caught panic `b` keeps a memo for,
-/// so that the next read of `x` reruns it.
-fn next_revision(rt: &Rt) {
-    let input = rt.create_input(0_u64);
-    rt.set(input, 1);
+    (x, a, t, in_a, read_a)
 }
 
 /// The episode that `x`'s recompute runs through its read of `a`, a
@@ -1670,9 +1667,9 @@ fn next_revision(rt: &Rt) {
 #[test]
 fn reader_of_group_episode_root_claimed_after_landing() {
     let rt = Arc::new(Rt::new());
-    let (x, a, in_a, read_a) = poisoned_episode(&rt);
+    let (x, a, t, in_a, read_a) = poisoned_episode(&rt);
     rt.get(x);
-    next_revision(&rt);
+    rt.set(t, 1);
     assert_eq!(rt.state_of(x), NodeState::Dirty);
     assert_eq!(rt.state_of(a), NodeState::Dirty);
     rt.group_verifies.lock().unwrap().clear();
@@ -1704,9 +1701,9 @@ fn reader_of_group_episode_root_claimed_after_landing() {
 #[test]
 fn reader_of_group_episode_root_keeps_it_until_the_read_takes_the_value() {
     let rt = Arc::new(Rt::new());
-    let (x, a, _in_a, _read_a) = poisoned_episode(&rt);
+    let (x, a, t, _in_a, _read_a) = poisoned_episode(&rt);
     rt.get(x);
-    next_revision(&rt);
+    rt.set(t, 1);
     assert_eq!(rt.state_of(a), NodeState::Dirty);
     let walked = Gate::new();
     park_at(&rt, vec![(ParkPoint::AfterWalk(id(a)), walked.clone())]);
