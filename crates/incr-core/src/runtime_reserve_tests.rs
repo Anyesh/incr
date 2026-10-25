@@ -789,6 +789,50 @@ fn a_shared_entry_under_a_local_one_leaves_no_take_over_behind() {
     );
 }
 
+/// As above with S, between catching X's doom and joining its child,
+/// reading a node of a second Shared runtime. That entry is nested in S's,
+/// which is the thread's outermost Shared entry, so it starts no attempt:
+/// one that did would move the epoch on under the child's take-over of
+/// S's attempt, and S would wait on its child for good.
+#[test]
+fn a_shared_entry_inside_a_shared_one_under_a_local_one_starts_no_attempt() {
+    let shared = Arc::new(Rt::new());
+    let other = Arc::new(Rt::new());
+    shared.set_placeholder(0_u64);
+    let j = other.create_input(5_u64);
+    let o = other.create_query_with(move |rt: &Rt| rt.get(j) + 1, replayable());
+    let i = shared.create_input(3_u64);
+    let y = shared.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+    let x = shared.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+    let s = {
+        let other = other.clone();
+        shared.create_query_with(
+            move |rt: &Rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                let w = other.get(o);
+                v + w + thread::scope(|sc| sc.spawn(|| rt.get(x)).join().unwrap())
+            },
+            replayable(),
+        )
+    };
+    shared.set_max_frames(1);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let local = Runtime::<Local>::new();
+        let l = local.create_query(move |_: &Runtime<Local>| shared.get(s));
+        let got = local.get(l);
+        let _ = tx.send((
+            got,
+            crate::attempt::mine().wounded(),
+            crate::reserve::takes(),
+        ));
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).ok(),
+        Some((34, false, 0))
+    );
+}
+
 /// A closure that catches an ordinary panic of its dep finds its attempt
 /// out of flight at any budget: only a discard's unwind is in flight.
 #[test]

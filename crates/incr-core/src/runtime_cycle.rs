@@ -302,10 +302,14 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn nested_shared_exit(&self) -> NestedSharedExit<'_, C> {
-        NestedSharedExit {
+        let exit = NestedSharedExit {
             rt: self,
             cidx: self.dep_stack.next_cidx(),
-        }
+        };
+        // No retry loop of this runtime begins its attempts under a `Local`
+        // entry: each `Shared` entry here is one.
+        attempt::begin();
+        exit
     }
 
     #[cold]
