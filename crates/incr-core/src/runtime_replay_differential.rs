@@ -3777,6 +3777,118 @@ fn seed_4_walk_root_failed_by_the_other_thread() {
     });
 }
 
+fn map_reads(e: &Expr, to: &impl Fn(usize) -> usize) -> Expr {
+    let f = |x: &Expr| Box::new(map_reads(x, to));
+    match e {
+        Expr::Read(i, t) => Expr::Read(to(*i), *t),
+        Expr::Const(_) | Expr::ReadOther(..) => e.clone(),
+        Expr::Add(a, b) => Expr::Add(f(a), f(b)),
+        Expr::If(a, b, c) => Expr::If(f(a), f(b), f(c)),
+        Expr::PanicIf(a, w) => Expr::PanicIf(f(a), *w),
+        Expr::Catch(a) => Expr::Catch(f(a)),
+        Expr::FirstRun(a, b) => Expr::FirstRun(f(a), f(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(f(a), f(b)),
+    }
+}
+
+/// 0x1daa with `levels` queries between its cycle members 10 and 5, each
+/// reading the next three times, placed before the inputs.
+fn seed_1daa_with_levels(levels: usize) -> Case {
+    let base = gen_case(0x1daa, false, false);
+    let q = base.queries;
+    let shift = |i: usize| if i >= q { i + levels } else { i };
+    let mut specs: Vec<Spec> = (base.specs.iter())
+        .map(|s| match s {
+            Spec::Query {
+                expr,
+                replay,
+                bare,
+                strategy,
+            } => Spec::Query {
+                expr: map_reads(expr, &shift),
+                replay: *replay,
+                bare: *bare,
+                strategy: *strategy,
+            },
+            other => other.clone(),
+        })
+        .collect();
+    if levels > 0 {
+        if let Spec::Query { expr, .. } = &mut specs[10] {
+            *expr = map_reads(expr, &|i| if i == 5 { q } else { i });
+        }
+        let level = |j: usize| {
+            let next = if j + 1 == levels { 5 } else { q + j + 1 };
+            let read = || Box::new(Expr::Read(next, false));
+            Spec::Query {
+                expr: Expr::Add(Box::new(Expr::Add(read(), read())), read()),
+                replay: true,
+                bare: false,
+                strategy: Strat::None,
+            }
+        };
+        specs.splice(q..q, (0..levels).map(level));
+    }
+    let ops = (base.ops.iter())
+        .map(|op| match op {
+            Op::Set(n, v) => Op::Set(shift(*n), *v),
+            Op::Get(..) | Op::TryGet(..) => op.clone(),
+            other => panic!("0x1daa has no {other:?}"),
+        })
+        .collect();
+    Case {
+        specs,
+        queries: q + levels,
+        ops,
+        ..base
+    }
+}
+
+/// 0x1daa: op 3's walk of 7 reads 7 through its own cycle, which lands 7
+/// Failed while members 5, 9 and 10 are still queued. They are computed
+/// as on main: passed, they stayed unlanded, and every read of them in op
+/// 6's cycle opened a nested walk, so its runs tripled with each level.
+/// Bounded runs are held to the same bound and to the unbounded run.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn walk_root_failed_by_its_own_read_computes_the_queued_entries() {
+    fn op_6_runs<C: Cells>(case: &Case, frames: Option<u32>) -> u32 {
+        RUNS.with(|r| *r.borrow_mut() = Some(HashMap::new()));
+        let rts = runtimes::<C>(frames, 0);
+        let live = Live::new(&rts, case);
+        reset_thread();
+        let total = || RUNS.with(|r| r.borrow().as_ref().map_or(0, |m| m.values().sum::<u32>()));
+        for op in &case.ops[..6] {
+            live.apply(op);
+        }
+        let before = total();
+        live.apply(&case.ops[6]);
+        let runs = total() - before;
+        RUNS.with(|r| *r.borrow_mut() = None);
+        runs
+    }
+    quiet(|| {
+        for levels in 0..=4 {
+            let case = seed_1daa_with_levels(levels);
+            assert!(matches!(case.ops[6], Op::TryGet(9)));
+            for frames in [None, Some(1), Some(2), Some(3)] {
+                let bound = 2 * (levels as u32 + 3);
+                for (kind, runs) in [
+                    ("Local", op_6_runs::<Local>(&case, frames)),
+                    ("Shared", op_6_runs::<Shared>(&case, frames)),
+                ] {
+                    assert!(
+                        runs <= bound,
+                        "{kind}, {levels} levels, budget {frames:?}: {runs} runs, bound {bound}"
+                    );
+                }
+            }
+            differential::<Local>(&case, 0x1daa);
+            differential::<Shared>(&case, 0x1daa);
+        }
+    });
+}
+
 /// Two-thread cases with panics and cycles in which a read's walk landed
 /// its node New as a cycle member and the other thread claimed the node
 /// before the read loaded its state. Which thread computes a node first
