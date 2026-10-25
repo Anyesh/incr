@@ -1225,6 +1225,11 @@ impl<C: Cells> Runtime<C> {
             word &= !value_code::FOREIGN_BIT;
         }
         if word & value_code::COUNTER_MASK != 0 {
+            if foreign && self.dep_stack.foreign_keeper(self.runtime_id).is_some() {
+                // As in `diverted_clean_read`: the reader's retry or rerun
+                // would read this runtime again.
+                self.dep_stack.hold_foreign_reader();
+            }
             return Ok(self.value_code_read(handle, self.nodes.get(handle.slot())));
         }
         // A read while a cycle's unwind kind is set comes from a closure that
@@ -2481,11 +2486,18 @@ impl<C: Cells> Runtime<C> {
         replay::regen_claim(self.runtime_id, id.0, true);
         let mut spins = 0;
         loop {
-            match state::try_transition::<C>(
+            // A ticket keeps the node while it reruns (`in_failed_landing`).
+            let t = self.tickets.read();
+            let moved = state::try_transition::<C>(
                 node.state_cell(),
                 NodeState::Failed,
                 NodeState::Computing,
-            ) {
+            );
+            if moved.is_ok() {
+                replay::regen_running(self.runtime_id, id.0, true);
+            }
+            drop(t);
+            match moved {
                 Ok(()) => break,
                 Err(NodeState::Computing | NodeState::ComputingDirty)
                     if replay::regen_claims(self.runtime_id, id.0) > 1 =>
@@ -2500,6 +2512,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
+        let unmark = Unmark(self.runtime_id, id.0);
         // SAFETY: as in `compute_attempts`: the closure is freed only under
         // a Dead claim, which can't succeed while this node is Computing.
         let compute = self
@@ -2538,14 +2551,25 @@ impl<C: Cells> Runtime<C> {
             drop(catch_unwind(AssertUnwindSafe(move || drop(value))));
         }
         let mut flipped = true;
-        if state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed)
-            .is_err()
-        {
+        let t = self.tickets.read();
+        let back =
+            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed);
+        if back.is_ok() {
+            replay::regen_running(self.runtime_id, id.0, false);
+        }
+        drop(t);
+        if back.is_ok() {
+            self.park(ParkPoint::RerunBack(id));
+        }
+        if back.is_err() {
             // A set's walk found the node Computing and walked on through
             // it: the node leaves Failed as the walk would have flipped it,
             // in one step, so no read sees it Failed after the set.
             flipped = self.flip_failed_from(id, NodeState::ComputingDirty);
         }
+        // The move back or the flip cleared the mark with the state: a
+        // later clear could take the mark of the node's next rerun.
+        std::mem::forget(unmark);
         replay::regen_claim(self.runtime_id, id.0, false);
         debug_assert!(flipped, "incr-core: a regenerating node left Computing");
         drop_payloads(left.into_iter().map(|m| m.1));
@@ -2773,6 +2797,9 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the reading frame is on the stack, so its control block
         // is live.
         let flags = unsafe { &*ctl };
+        // A rerun of the reader's node reads this runtime's node again, as
+        // it is then.
+        flags.raise(cycle::UNREGENERABLE);
         // The frame's tag was set under a budget, so unlike `foreign_read`
         // this does not look the reader up: a frame that runs across a
         // budget change is `NO_DOOM`, and what it keeps goes at its pop.
@@ -5332,6 +5359,16 @@ type SyncPayload = std::sync::Mutex<Box<dyn std::any::Any + Send>>;
 fn drop_payloads(payloads: impl IntoIterator<Item = Box<dyn std::any::Any + Send>>) {
     for p in payloads {
         drop(catch_unwind(AssertUnwindSafe(move || drop(p))));
+    }
+}
+
+/// Clears a rerun's `REGEN_RUNNING` mark if `rerun` unwinds before it moves
+/// the node back.
+struct Unmark(RuntimeId, u32);
+
+impl Drop for Unmark {
+    fn drop(&mut self) {
+        replay::regen_running(self.0, self.1, false);
     }
 }
 

@@ -440,7 +440,7 @@ impl<C: Cells> Runtime<C> {
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
-                && state::load::<C>(node.state_cell()) == NodeState::Failed
+                && self.in_failed_landing(slot)
                 && t.of((slot, generation))
                     .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
         });
@@ -503,8 +503,21 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Every landing a ticket keeps is Failed and indexed to it: every
-    /// change from that landing releases it.
+    /// Whether `slot`'s node is in its Failed landing: Failed, or Computing
+    /// under a regenerating run, which lands nothing and puts it back. Exact
+    /// under the tickets lock, under which a rerun moves it and marks it.
+    fn in_failed_landing(&self, slot: u32) -> bool {
+        match state::load::<C>(self.nodes.get(slot).state_cell()) {
+            NodeState::Failed => true,
+            NodeState::Computing | NodeState::ComputingDirty => {
+                crate::replay::is_regen_running(self.runtime_id, slot)
+            }
+            _ => false,
+        }
+    }
+
+    /// Every landing a ticket keeps is in its Failed landing and indexed to
+    /// it: every change from that landing releases it.
     fn check_members(&self, t: &Tickets, id: u64, ticket: &Ticket) {
         let members = ticket.members.lock();
         let live = members.members.iter().filter(|m| m.gone == u64::MAX);
@@ -514,7 +527,7 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(m.node.0);
             assert!(
                 node.generation() == m.node.1
-                    && state::load::<C>(node.state_cell()) == NodeState::Failed
+                    && self.in_failed_landing(m.node.0)
                     && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
@@ -549,6 +562,11 @@ impl<C: Cells> Runtime<C> {
         let Some(token) = flipped else {
             return false;
         };
+        if from != NodeState::Failed {
+            // With the flip, under the lock: a compute may take the node
+            // from Dirty once the lock goes.
+            crate::replay::regen_running(self.runtime_id, id.0, false);
+        }
         let stale = release(&mut t, u64::MAX, slot_landings(id.0));
         t.buried.extend(stale);
         self.sync_held(&t);

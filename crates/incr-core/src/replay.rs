@@ -2423,6 +2423,33 @@ pub(crate) fn regen_claims(rt: RuntimeId, slot: u32) -> usize {
         .count()
 }
 
+/// Runtime `rt`'s nodes a regenerating run took from Failed to Computing
+/// and has not yet put back. Marked and cleared under the runtime's
+/// tickets lock with the node's state, so a ticket's holder reads the two
+/// as one.
+static REGEN_RUNNING: std::sync::Mutex<Vec<(RuntimeId, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Marks or clears `slot` of runtime `rt` as rerunning (`REGEN_RUNNING`);
+/// clearing an unmarked node does nothing.
+pub(crate) fn regen_running(rt: RuntimeId, slot: u32, on: bool) {
+    let mut r = REGEN_RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if on {
+        r.push((rt, slot));
+    } else if let Some(i) = r.iter().position(|&x| x == (rt, slot)) {
+        r.swap_remove(i);
+    }
+}
+
+/// Whether a regenerating run holds `slot` of runtime `rt` out of Failed.
+pub(crate) fn is_regen_running(rt: RuntimeId, slot: u32) -> bool {
+    REGEN_RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(rt, slot))
+}
+
 /// Whether [`copy_payload`] can copy `payload`.
 pub(crate) fn copyable(payload: &(dyn Any + Send)) -> bool {
     payload.is::<crate::cycle::CycleUnwind>()
