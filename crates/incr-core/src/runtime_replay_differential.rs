@@ -3832,11 +3832,16 @@ fn two_thread_schedule_seeds() {
 /// in about 1 run in 1000 with no budget and 2 in 5 at this one. 0x74f with
 /// no budget: a Failed first run that recorded a released entry of 0 kept
 /// deps let `Get(3)` panic "failed" where every order returns 3, in about 1
-/// run in 8.
+/// run in 8. 0x9172 at frame budget 3: under the same rule op 3 reported
+/// `Cycle([5, 6, 10])`, a cycle no order enters, in about 9 runs in 10.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn released_claims_leave_two_threads_a_serial_outcome() {
-    for (seed, frames, bytes) in [(0x7c3a135a4, Some(2), 16 * 1024), (0x74f, None, 0)] {
+    for (seed, frames, bytes) in [
+        (0x7c3a135a4, Some(2), 16 * 1024),
+        (0x74f, None, 0),
+        (0x9172, Some(3), 0),
+    ] {
         let case = gen_case(seed, false, true);
         let phases = phases(&case, seed);
         let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
