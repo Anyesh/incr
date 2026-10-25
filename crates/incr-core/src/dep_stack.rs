@@ -505,11 +505,6 @@ pub trait DepStack: 'static {
         })
     }
 
-    /// Whether any frame on the stack is one of `rt`'s computes.
-    fn has_frame_of(&self, rt: RuntimeId) -> bool {
-        self.with(|s| s.frames.iter().any(|f| f.rt == rt))
-    }
-
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {

@@ -252,8 +252,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A non-Clean read of this runtime from another runtime's frame.
-    /// The read is this runtime's first entry on the thread unless its
-    /// frames are below: then the reading run depends on this attempt's
+    /// The read is this runtime's first entry on the thread unless one of
+    /// its entries is open below: then the reading run depends on this attempt's
     /// stack, so its runtime is tainted and its landing held. A first
     /// entry ends this runtime's held landings at its exit, since nothing
     /// may keep a pointer to the runtime past it: they publish if they
@@ -263,7 +263,7 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn foreign_entry<R>(&self, read: impl FnOnce() -> R) -> R {
-        if self.dep_stack.has_frame_of(self.runtime_id) {
+        if cycle_state::open_entry_of(self.runtime_id) {
             self.taint_reader();
             return read();
         }

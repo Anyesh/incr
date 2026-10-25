@@ -3738,12 +3738,10 @@ fn cross_seeds() {
 }
 
 /// 0x401 at budget 1: a read of runtime 2 reads runtime 1, which reads
-/// runtime 2 back while runtime 2's frames are virtual, so the hold rule
-/// takes runtime 1's read for its first entry and publishes what the
-/// unbounded run retracts. Needs a per-runtime entry depth.
+/// runtime 2 back while runtime 2's frames are virtual: runtime 2's open
+/// entry, not its frames, makes the read-back a re-entry that retracts.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T10-shared-entry-under-local-outermost: a first entry under virtual frames"]
 fn cross_seed_reading_back_under_virtual_frames() {
     let case = gen_case(0x401, true, false);
     quiet(|| {

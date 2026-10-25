@@ -1280,7 +1280,6 @@ fn switch_out(e: &EntryState) {
 }
 
 /// Whether an engine entry of `rt` is open on this thread.
-#[cfg_attr(any(not(test), loom), allow(dead_code))]
 pub(crate) fn open_entry_of(rt: RuntimeId) -> bool {
     let rt = rt.get();
     ENTRY.with(|e| {
