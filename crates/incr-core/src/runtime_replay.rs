@@ -232,6 +232,23 @@ impl<C: Cells> Runtime<C> {
         true
     }
 
+    /// [`cycle::KeepResolver::keeps`] for this runtime: only a replayable
+    /// compute of a budgeted runtime can be retried.
+    ///
+    /// # Safety
+    ///
+    /// `r` points at a runtime's `keep_resolver`, and a compute of that
+    /// runtime is running.
+    pub(super) unsafe fn resolve_keep(r: *const cycle::KeepResolver, slot: u32) -> bool {
+        // SAFETY: the running compute borrows the runtime, so it is in
+        // place around its `keep_resolver`.
+        let rt = unsafe {
+            &*r.byte_sub(std::mem::offset_of!(Self, keep_resolver))
+                .cast::<Self>()
+        };
+        rt.budgeted() && rt.replayable(slot)
+    }
+
     /// Whether node `slot`'s compute may be doomed.
     pub(super) fn replayable(&self, slot: u32) -> bool {
         let bits = C::u8_load_relaxed(self.nodes.get_with_flags(slot).1);
@@ -1648,7 +1665,7 @@ impl<C: Cells> Runtime<C> {
                 .rev()
                 .map(|(i, f)| {
                     let depth = (placed + i + 1) as u32;
-                    (f.rt == rt, f.node.0, f.cidx, f.ctl, f.reading, depth)
+                    (f.rt() == rt, f.node.0, f.cidx, f.ctl, f.reading, depth)
                 })
                 .collect()
         });
@@ -2237,6 +2254,50 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// A Clean read of `handle` by another runtime's frame (see
+    /// [`Self::foreign_read`]) with no replay context open, so there is no
+    /// kept outcome to take: the frame keeps a clone of the value. A slot
+    /// read runs no compute, so there is no unwind to keep.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn foreign_clean_read<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        (reader, ctl, cidx): (RuntimeId, *const cycle::ComputeCtl, u32),
+    ) -> Result<T, NodeState> {
+        let (type_tag, arena_slot) = self.fields_under(handle, node);
+        // Under `Shared` a landing can clear the slot after the Clean load;
+        // the slow path reads such a node again.
+        let value = self
+            .try_read_slot(handle, node, type_tag, arena_slot)
+            .ok_or(NodeState::Clean)?;
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live.
+        let flags = unsafe { &*ctl };
+        // The frame's tag was set under a budget, so unlike `foreign_read`
+        // this does not look the reader up: a frame that runs across a
+        // budget change is `NO_DOOM`, and what it keeps goes at its pop.
+        if flags.has(cycle::DOOMED) {
+            return Ok(value);
+        }
+        let kept = flags.has(cycle::KEPT_READ);
+        flags.raise(cycle::KEPT_READ);
+        replay::keep_foreign_read(
+            replay::KeptRead {
+                rt: reader,
+                cidx,
+                ctl,
+                reading: u64::from(handle.slot()) | (u64::from(handle.generation()) << 32),
+                ordinal: 0,
+                foreign: Some(self.runtime_id),
+                what: Delivered::Landed(Unbuilt::new(clone_landed::<T>(&value))),
+            },
+            !kept,
+        );
+        Ok(value)
+    }
+
     /// The key of the read of this runtime's node `reading` that `frame`,
     /// another runtime's, makes for the `ordinal`th time, when the read is
     /// a retry's in an open context of that runtime.
@@ -2296,7 +2357,7 @@ impl<C: Cells> Runtime<C> {
         self.read_walk::<T, 0>(handle, node, observed, kind, word, None)
     }
 
-    fn budgeted(&self) -> bool {
+    pub(super) fn budgeted(&self) -> bool {
         self.max_frames.load(std::sync::atomic::Ordering::Relaxed) != u32::MAX
             || self
                 .max_stack_bytes
@@ -2340,7 +2401,7 @@ impl<C: Cells> Runtime<C> {
                 .iter()
                 .rev()
                 .enumerate()
-                .take_while(|(_, f)| f.rt == rt)
+                .take_while(|(_, f)| f.rt() == rt)
                 .map(|(i, f)| Below {
                     node: f.node.0,
                     cidx: f.cidx,
@@ -3722,7 +3783,7 @@ impl<C: Cells> Runtime<C> {
         let below = depth.checked_sub(1)?;
         let (ctl, mut step) = self.dep_stack.with(|s| {
             let f = s.frames.get(below.checked_sub(1)? as usize)?;
-            (f.rt == rt && f.cidx + 1 == cidx).then(|| (f.ctl, f.step()))
+            (f.rt() == rt && f.cidx + 1 == cidx).then(|| (f.ctl, f.step()))
         })?;
         let (seq, path) = replay::run_at(rt, ctl, below)?;
         let virtual_below = replay::peek(|c| {
@@ -4408,7 +4469,7 @@ impl<C: Cells> Runtime<C> {
         replay::with_seqs(|seqs| {
             self.dep_stack.with(|s| {
                 (s.frames.iter().zip(1..))
-                    .filter(|(f, _)| f.rt == rt && (from..cidx).contains(&f.cidx))
+                    .filter(|(f, _)| f.rt() == rt && (from..cidx).contains(&f.cidx))
                     .fold(path, |path, (f, depth)| {
                         let mut step = f.step();
                         step.seq = seqs.of(rt, f.ctl, depth);

@@ -738,24 +738,34 @@ fn shared_many_caught_unwinds_stay_linear() {
     }
 }
 
-/// One budgeted frame reading `n` nodes of another runtime, each twice.
-/// Each read is kept for the frame's retry, under its ordinal among the
-/// frame's reads of that node, and finding that ordinal must not cost a
-/// pass over the frame's earlier reads.
-fn many_foreign_reads<C: Cells>() {
+/// One budgeted frame reading `n` nodes of another runtime, each twice,
+/// all of them Clean when `clean`. Each read is kept for the frame's
+/// retry, under its ordinal among the frame's reads of that node, and
+/// finding that ordinal must not cost a pass over the frame's earlier
+/// reads.
+fn many_foreign_reads<C: Cells>(clean: bool) {
     let n = 2000;
     let foreign = Arc::new(Runtime::<Shared>::new());
     let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    if clean {
+        for &x in &reads {
+            foreign.get(x);
+        }
+    }
     let rt = Runtime::<C>::new();
     rt.set_max_frames(256);
-    let reader = rt.create_query(move |_| {
-        reads
-            .iter()
-            .chain(reads.iter())
-            .map(|&x| foreign.get(x))
-            .sum::<u64>()
-    });
+    let reader = rt.create_query_with(
+        move |_| {
+            reads
+                .iter()
+                .chain(reads.iter())
+                .map(|&x| foreign.get(x))
+                .sum::<u64>()
+        },
+        replayable(),
+    );
     crate::replay::take_note_work();
+    crate::dep_stack::take_keep_settles();
     assert_eq!(rt.get(reader), n * (n - 1));
     let work = crate::replay::take_note_work();
     assert!(
@@ -763,16 +773,76 @@ fn many_foreign_reads<C: Cells>() {
         "{work} units of note work for {} foreign reads",
         2 * n
     );
+    // Each read after the first counts its ordinal among the kept ones.
+    assert!(
+        work >= 2 * n - 1,
+        "{work} units of note work: not every foreign read was kept"
+    );
+    assert_eq!(
+        crate::dep_stack::take_keep_settles(),
+        1,
+        "settles of one frame"
+    );
+}
+
+/// An unbudgeted runtime's frame reading `n` Clean nodes of another
+/// runtime settles once that it keeps none of them, and keeps none.
+fn unbudgeted_foreign_clean_reads<C: Cells>() {
+    let n = 1000;
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    for &x in &reads {
+        foreign.get(x);
+    }
+    let rt = Runtime::<C>::new();
+    rt.set_max_frames(u32::MAX);
+    let reader = rt.create_query_with(
+        move |_| reads.iter().map(|&x| foreign.get(x)).sum::<u64>(),
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    crate::dep_stack::take_keep_settles();
+    assert_eq!(rt.get(reader), n * (n - 1) / 2);
+    assert_eq!(
+        crate::dep_stack::take_keep_settles(),
+        1,
+        "settles of one frame"
+    );
+    assert_eq!(crate::replay::take_note_work(), 0, "kept-read work");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_unbudgeted_foreign_clean_reads_settle_once() {
+    unbudgeted_foreign_clean_reads::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unbudgeted_foreign_clean_reads_settle_once() {
+    unbudgeted_foreign_clean_reads::<Shared>();
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn local_many_foreign_reads_stay_linear() {
-    many_foreign_reads::<Local>();
+    many_foreign_reads::<Local>(false);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_many_foreign_reads_stay_linear() {
-    many_foreign_reads::<Shared>();
+    many_foreign_reads::<Shared>(false);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_many_foreign_clean_reads_stay_linear() {
+    many_foreign_reads::<Local>(true);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_many_foreign_clean_reads_stay_linear() {
+    many_foreign_reads::<Shared>(true);
 }
