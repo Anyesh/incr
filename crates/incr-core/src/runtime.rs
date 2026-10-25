@@ -222,6 +222,9 @@ pub(crate) enum ParkPoint {
     /// In `read_failed_node`, after the read took the payload a walk
     /// contained for the node's landing, before it raises it.
     TookContained(NodeId),
+    /// In `rerun`, after a regenerating run moved its node back to Failed,
+    /// before the rerun returns.
+    RerunBack(NodeId),
     /// In `compute_one`, after an episode landed the root, before its
     /// reader learns how.
     EpisodeLanded(NodeId),

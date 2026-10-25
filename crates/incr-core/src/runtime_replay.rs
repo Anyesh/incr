@@ -2553,6 +2553,9 @@ impl<C: Cells> Runtime<C> {
             replay::regen_running(self.runtime_id, id.0, false);
         }
         drop(t);
+        if back.is_ok() {
+            self.park(ParkPoint::RerunBack(id));
+        }
         if back.is_err() {
             // A set's walk found the node Computing and walked on through
             // it: the node leaves Failed as the walk would have flipped it,
