@@ -276,17 +276,38 @@ impl<C: Cells> Runtime<C> {
             .payload
             .take()
             .expect("incr-core: a held ticket has its payload");
+        let base = self.dep_stack.next_cidx();
+        // With no frame on the thread, no walk's entry can hold the ticket
+        // again, so it goes as its members are noted, rather than lent.
+        let alone = (base == 0).then(|| {
+            let live: Vec<(u32, u32)> = c
+                .members
+                .lock()
+                .members
+                .iter()
+                .filter(|m| m.gone == u64::MAX)
+                .map(|m| m.node)
+                .collect();
+            note_work(live.len());
+            for n in &live {
+                t.landings.remove(n);
+            }
+            live
+        });
         let members = c.members.clone();
-        t.lent.insert(j.ticket, c);
+        if alone.is_none() {
+            t.lent.insert(j.ticket, c);
+        }
         self.sync_held(&t);
         drop(t);
         let payload = payload.into_inner().unwrap_or_else(PoisonError::into_inner);
-        let (rt, at, base) = (
-            self.runtime_id,
-            payload_key(&*payload),
-            self.dep_stack.next_cidx(),
-        );
-        with_notes(|n| n.push_lent(rt, at, base, members));
+        match alone {
+            Some(nodes) => self.note_above(nodes.into_iter().map(|n| (n, 0)), &*payload, true),
+            None => {
+                let (rt, at) = (self.runtime_id, payload_key(&*payload));
+                with_notes(|n| n.push_lent(rt, at, base, members));
+            }
+        }
         Ok(Some(payload))
     }
 
@@ -709,6 +730,17 @@ impl<C: Cells> Runtime<C> {
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
         let (nodes, lent) = with_notes(|n| n.restore(rt, at));
         self.hold(nodes, lent, payload)
+    }
+
+    /// The tickets held, lent to reads or buried, and whether the runtime
+    /// says any is, for tests.
+    #[cfg(all(test, not(loom)))]
+    pub(crate) fn tickets_kept(&self) -> (usize, bool) {
+        let t = self.tickets.read();
+        (
+            t.held.len() + t.lent.len() + t.buried.len(),
+            self.tickets_held(),
+        )
     }
 
     /// The contained payloads still held, for tests.
