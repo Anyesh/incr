@@ -2833,6 +2833,7 @@ impl<C: Cells> Runtime<C> {
                         };
                         let v = x.pop_vframe()?;
                         if track {
+                            replay::note_work(x.pending.traced().len());
                             for i in x.pending.traced().to_vec() {
                                 let d = x.pending.get_mut(i);
                                 if d.below.last().map_or(d.key.cidx, |b| b.0) == v.cidx + 1 {

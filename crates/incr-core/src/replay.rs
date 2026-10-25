@@ -1117,6 +1117,7 @@ impl Context {
         node: u32,
         generation: u32,
     ) -> impl Iterator<Item = (usize, u64)> + '_ {
+        note_work(self.pending.traced().len());
         self.pending.traced().iter().filter_map(move |&i| {
             let d = self.pending.get(i);
             let k = d.key;
@@ -1395,8 +1396,8 @@ thread_local! {
     static NOTE_WORK: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Counts `units` elements a pass over this thread's notes, their copies
-/// or its kept reads looked at.
+/// Counts `units` elements a pass over this thread's notes, their copies,
+/// its kept reads or a context's traced deliveries looked at.
 #[inline(always)]
 pub(crate) fn note_work(units: usize) {
     #[cfg(all(test, not(loom)))]
