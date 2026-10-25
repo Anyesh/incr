@@ -2343,7 +2343,8 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
-                    // Context reservations live only while a context is open.
+                    // Outside an open context only a doom's pending claims are
+                    // reserved, and no read takes a value before they are adopted.
                     let reserving = !C::SINGLE_THREADED
                         && value_code::thread_word() & value_code::REPLAY_BIT != 0
                         && reserve::any();
