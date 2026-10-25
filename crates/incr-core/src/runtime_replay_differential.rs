@@ -6007,10 +6007,12 @@ fn strict_dirty_for_clean_seeds() {
     }
 }
 
-/// Seeds that differ under the strict comparator where the unbounded run
-/// computes nodes the bounded run leaves New.
+/// 0xd4f2: a retry's Clean read of a node whose walk a doom stopped takes
+/// the stashed walk, so the walk's New entries land as the unbounded run
+/// lands them (`a_walk_stashed_for_a_clean_read_lands_its_new_entries` is
+/// its shrunk case).
 #[test]
-#[ignore = "T8-strict-computed-left-new"]
+#[cfg_attr(miri, ignore)]
 fn strict_computed_left_new_seeds() {
     let case = gen_base(0xd4f2);
     quiet(|| {
@@ -6587,7 +6589,8 @@ proptest! {
     }
 
     #[test]
-    #[ignore = "T8-strict-group-c-dirty-for-clean, T8-strict-computed-left-new"]
+    #[cfg_attr(miri, ignore)]
+    #[ignore = "T8-strict-group-c-dirty-for-clean"]
     fn replay_differential_shared_two_threads(seed in any::<u64>()) {
         quiet(|| differential_two(&gen_case(seed, false, true), seed));
     }
