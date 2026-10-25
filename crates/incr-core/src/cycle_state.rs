@@ -950,6 +950,7 @@ pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
     if kind == discard && was != discard {
         crate::attempt::enter_flight();
     } else if was == discard && kind != discard && crate::attempt::leave_flight() {
+        crate::reserve::mark_taken();
         set_wounded(true);
     }
 }
@@ -962,6 +963,7 @@ pub(crate) fn settle_discard() -> bool {
         return false;
     }
     value_code::set_unwind_bits(UnwindKind::bits(Some(UnwindKind::Wound)));
+    crate::reserve::mark_taken();
     set_wounded(true);
     true
 }

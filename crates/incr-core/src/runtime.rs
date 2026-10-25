@@ -3916,7 +3916,12 @@ impl<C: Cells> Runtime<C> {
                 let ctl = ComputeCtl::new(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
-                        | if speculative { cycle::SPECULATIVE } else { 0 },
+                        | if speculative { cycle::SPECULATIVE } else { 0 }
+                        | if !C::SINGLE_THREADED && reserve::taken((self.runtime_id, id.0)) {
+                            cycle::NO_DOOM
+                        } else {
+                            0
+                        },
                 );
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);

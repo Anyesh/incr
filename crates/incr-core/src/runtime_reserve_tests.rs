@@ -693,9 +693,12 @@ fn a_take_over_of_a_node_that_lands_dirty_restarts_its_read_boundedly() {
             move |rt: &Rt| rt.try_get(c).map_or(7, |v| v + 1),
             replayable(),
         );
+        let takes = Arc::new(AtomicU32::new(0));
         let t = {
+            let takes = takes.clone();
             rt.create_query_with(
                 move |rt: &Rt| {
+                    takes.fetch_max(crate::reserve::takes(), SeqCst);
                     let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
                     v + thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap())
                 },
@@ -704,6 +707,8 @@ fn a_take_over_of_a_node_that_lands_dirty_restarts_its_read_boundedly() {
         };
         rt.set_max_frames(frames);
         assert_eq!(within_10s(&rt, t), Some(Ok(14)), "budget {frames}");
+        let n = takes.load(SeqCst);
+        assert!(n <= 3, "budget {frames}: {n} take-overs");
         rt.assert_invariant_i();
     }
 }

@@ -90,6 +90,10 @@ impl Drop for Listed {
 
 #[cfg(not(loom))]
 thread_local! {
+    /// Claims an attempt of the outermost read reserved before a waiter
+    /// took it over, which never doom again in that read.
+    static TAKEN: RefCell<Vec<Claim>> = const { RefCell::new(Vec::new()) };
+    static TAKEN_ANY: Cell<bool> = const { Cell::new(false) };
     static MINE: Listed = const { Listed(RefCell::new(Vec::new())) };
     static SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
     /// The [`root_key`] of the innermost read's node, 0 outside reads.
@@ -100,6 +104,8 @@ thread_local! {
 
 #[cfg(loom)]
 loom::thread_local! {
+    static TAKEN: RefCell<Vec<Claim>> = RefCell::new(Vec::new());
+    static TAKEN_ANY: Cell<bool> = Cell::new(false);
     static MINE: Listed = Listed(RefCell::new(Vec::new()));
     static SCOPE: Cell<Option<u64>> = Cell::new(None);
     static ROOT: Cell<u64> = Cell::new(0);
@@ -169,6 +175,9 @@ pub(crate) fn note(claim: Claim, generation: u32) {
     let Some(context) = SCOPE.with(Cell::get) else {
         return;
     };
+    if taken(claim) {
+        return;
+    }
     // Only the read-root group may list it besides this one; a context
     // that reserves it already keeps it, as without a read.
     let again = ROOTS.with(Cell::get) != 0
@@ -232,7 +241,10 @@ impl Drop for Root {
 #[cold]
 #[inline(never)]
 pub(crate) fn note_root(claim: Claim, generation: u32) {
-    if ROOT.with(Cell::get) != root_key(claim) || listed(ROOT_READ, claim, generation) {
+    if ROOT.with(Cell::get) != root_key(claim)
+        || listed(ROOT_READ, claim, generation)
+        || taken(claim)
+    {
         return;
     }
     // Listed even if a context of this thread reserves it already, so it
@@ -347,7 +359,7 @@ pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
 #[cold]
 #[inline(never)]
 pub(crate) fn take_over(claim: Claim, generation: u32, patience: &mut attempt::Patience) -> bool {
-    owner_elsewhere(claim, generation).is_none_or(|a| a.wound_if_stuck(patience))
+    owner_elsewhere(claim, generation).is_none_or(|a| a.wound_if_stuck(claim, patience))
 }
 
 /// Whether this thread reserved `claim` at `generation`.
@@ -473,6 +485,51 @@ pub(crate) fn held() -> Vec<Claim> {
             .flat_map(|g| g.claims.iter().map(|&(c, _)| c))
             .collect()
     })
+}
+
+/// A waiter took over this thread's attempt: the claims its waiters met
+/// are never doomed or reserved again in this outermost read. Each
+/// take-over adds at least the claim its waiter met, which the wounded
+/// attempt reserved and so had not been taken, so a read restarts for
+/// take-overs at most once per claim it can reserve.
+pub(crate) fn mark_taken() {
+    #[cfg(all(test, not(loom)))]
+    TAKES.with(|n| n.set(n.get() + 1));
+    let claims = attempt::take_met();
+    TAKEN.with(|t| t.borrow_mut().extend(claims));
+    TAKEN_ANY.with(|a| a.set(true));
+}
+
+/// Whether a take-over of this outermost read met `claim`.
+#[inline(always)]
+pub(crate) fn taken(claim: Claim) -> bool {
+    TAKEN_ANY.with(Cell::get) && taken_slow(claim)
+}
+
+#[cold]
+#[inline(never)]
+fn taken_slow(claim: Claim) -> bool {
+    TAKEN.with(|t| t.borrow().contains(&claim))
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static TAKES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Take-overs of this thread's outermost read so far, for tests.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn takes() -> u32 {
+    TAKES.with(Cell::get)
+}
+
+/// The outermost read ended.
+pub(crate) fn clear_taken() {
+    #[cfg(all(test, not(loom)))]
+    TAKES.with(|n| n.set(0));
+    if TAKEN_ANY.with(|a| a.replace(false)) {
+        TAKEN.with(|t| t.borrow_mut().clear());
+    }
 }
 
 /// Whether this thread holds no reservation, as it must once its

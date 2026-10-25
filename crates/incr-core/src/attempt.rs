@@ -13,7 +13,10 @@
 //! Every transition is a CAS on the word, and the bits above [`FLAGS`]
 //! count the attempts, so a waiter holding an old attempt's word acts on
 //! no later one. A take-over takes no ticket: any waiter may restart an
-//! older attempt, once per in-flight discard it meets. A waiter that took
+//! older attempt, once per in-flight discard it meets, and lists the claim
+//! it met before its wound: the owner's read never dooms or reserves that
+//! claim again, so a read restarts for take-overs at most once per claim it
+//! can reserve, however often it is doomed. A waiter that took
 //! a value the attempt landed sets [`PINNED`]; a take-over still wounds a
 //! pinned attempt, whose retry publishes its pinned landings as taken
 //! rather than retract a value another thread has returned. Bit 3 is kept
@@ -22,14 +25,18 @@
 #[cfg(not(loom))]
 use std::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc,
+    Arc, Mutex, PoisonError,
 };
 
 #[cfg(loom)]
 use loom::sync::{
     atomic::{AtomicU32, Ordering},
-    Arc,
+    Arc, Mutex,
 };
+#[cfg(loom)]
+use std::sync::PoisonError;
+
+use crate::waits::Claim;
 
 /// A doom's unwind is in flight: set and cleared by the owner only.
 pub(crate) const IN_FLIGHT: u32 = 1;
@@ -41,25 +48,28 @@ const FLAGS: u32 = 15;
 const EPOCH: u32 = FLAGS + 1;
 
 /// Checks of one open flight after which a waiter takes it for an owner
-/// held in user code: the engine's own unwind of a discard closes its
-/// flight sooner, and a waiter that took over each of those would trade
-/// restarts with an owner that dooms again.
+/// held in user code. Waiting and taking over are both serializable, so
+/// this and `STUCK_FOR` choose only the order: an owner still in the
+/// engine's own unwind of a discard closes its flight sooner and keeps
+/// its place, rather than restarting behind the waiter.
 #[cfg(not(loom))]
 const STUCK_AFTER: u32 = crate::waits::REGISTER_AFTER;
 #[cfg(loom)]
 const STUCK_AFTER: u32 = 2;
 
 /// How long one flight must also stay open: an owner descheduled in its
-/// unwind looks the same as one held in user code, and a take-over of it
-/// restarts its read, in a serial order of its own but not the one its
-/// scheduling would have given.
+/// unwind looks the same as one held in user code by checks alone. A
+/// take-over of it is serializable too, but puts the slow owner's read
+/// after the waiter's rather than in the order its start gave.
 #[cfg(not(loom))]
 const STUCK_FOR: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// The word, and a count of the owner's flights.
+/// The word, a count of the owner's flights, and the claims waiters met
+/// as they took the flight over, with the epoch of each.
 struct Word {
     state: AtomicU32,
     flights: AtomicU32,
+    met: Mutex<Vec<(u32, Claim)>>,
 }
 
 /// A thread's attempt word, and the attempt it was read for.
@@ -73,6 +83,7 @@ fn new_word() -> Arc<Word> {
     Arc::new(Word {
         state: AtomicU32::new(0),
         flights: AtomicU32::new(0),
+        met: Mutex::new(Vec::new()),
     })
 }
 
@@ -117,6 +128,19 @@ pub(crate) fn leave_flight() -> bool {
     MINE.with(|w| w.state.fetch_and(!IN_FLIGHT, Ordering::AcqRel) & WOUNDED != 0)
 }
 
+/// The claims waiters met as they took over this thread's current
+/// attempt, read by its owner once it has seen the wound: each waiter
+/// lists its claim before the CAS that wounds.
+pub(crate) fn take_met() -> Vec<Claim> {
+    MINE.with(|w| {
+        let epoch = w.state.load(Ordering::Relaxed) & !FLAGS;
+        let mut met = w.met.lock().unwrap_or_else(PoisonError::into_inner);
+        met.drain(..)
+            .filter_map(|(e, claim)| (e == epoch).then_some(claim))
+            .collect()
+    })
+}
+
 /// A waiter's view of the flight it has seen open, and for how many of
 /// its checks.
 #[derive(Default)]
@@ -138,10 +162,10 @@ impl Attempt {
         self.current(w) && w & WOUNDED != 0
     }
 
-    /// A waiter on this attempt: wounds it once one flight has stayed open
-    /// through [`STUCK_AFTER`] of the waiter's checks and for
-    /// `STUCK_FOR`. True if it is wounded now.
-    pub(crate) fn wound_if_stuck(&self, patience: &mut Patience) -> bool {
+    /// A waiter on this attempt, which met it at `claim`: wounds it once
+    /// one flight has stayed open through [`STUCK_AFTER`] of the waiter's
+    /// checks and for `STUCK_FOR`. True if it is wounded now.
+    pub(crate) fn wound_if_stuck(&self, claim: Claim, patience: &mut Patience) -> bool {
         let w = self.word.state.load(Ordering::Acquire);
         if !self.current(w) {
             return false;
@@ -172,14 +196,15 @@ impl Attempt {
         if patience.since.is_some_and(|t| t.elapsed() < STUCK_FOR) {
             return false;
         }
-        patience.checks >= STUCK_AFTER && self.wound_in_flight()
+        patience.checks >= STUCK_AFTER && self.wound_in_flight(claim)
     }
 
-    /// A waiter on this attempt: wounds it if its discard is in flight,
-    /// pinned or not, since its owner may be in user code that waits on
-    /// the waiter. True if it is wounded now.
-    pub(crate) fn wound_in_flight(&self) -> bool {
+    /// A waiter on this attempt, which met it at `claim`: wounds it if its
+    /// discard is in flight, pinned or not, since its owner may be in user
+    /// code that waits on the waiter. True if it is wounded now.
+    pub(crate) fn wound_in_flight(&self, claim: Claim) -> bool {
         let mut w = self.word.state.load(Ordering::Acquire);
+        let mut listed = false;
         loop {
             if !self.current(w) {
                 return false;
@@ -189,6 +214,12 @@ impl Attempt {
             }
             if w & IN_FLIGHT == 0 {
                 return false;
+            }
+            if !listed {
+                let mut met = self.word.met.lock().unwrap_or_else(PoisonError::into_inner);
+                met.retain(|&(e, _)| e == self.epoch);
+                met.push((self.epoch, claim));
+                listed = true;
             }
             match self.word.state.compare_exchange_weak(
                 w,
