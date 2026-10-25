@@ -2794,8 +2794,8 @@ impl<C: Cells> Runtime<C> {
         // 5. claim release, then the dirty walk, whose Release stores
         //    publish all of the above to claimants that Acquire the
         //    Dirty state.
-        // `changes` begins with the pending marker and ends in
-        // `finish_written`.
+        // `changes` begins before the swap, the first store a Clean read
+        // sees, and ends in `finish_written`, which no unwind leaves.
         let marked = || {
             node.mark_changed_pending();
             self.changes.begin();

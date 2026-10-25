@@ -1459,9 +1459,9 @@ struct CheckedRead {
 }
 
 /// Keeps `seen` for the speculative frame of `ctl` at `cidx` of `rt`, as
-/// [`keep_read`] keeps the read: on the frame's first kept read (`fresh`),
-/// the checked reads of frames at or above its position, which have popped,
-/// go.
+/// [`keep_read`] keeps the read: the checked reads of frames at or above its
+/// position, which have popped, go, and so do the frame's own ones on its
+/// first kept read (`fresh`), which an earlier frame there left.
 pub(crate) fn check_read(
     rt: RuntimeId,
     cidx: u32,
@@ -1471,9 +1471,7 @@ pub(crate) fn check_read(
 ) {
     CHECKED_READS.with(|d| {
         let mut d = d.borrow_mut();
-        if fresh {
-            d.retain(|e| e.rt != rt || e.cidx < cidx);
-        }
+        d.retain(|e| e.rt != rt || e.cidx < cidx || !fresh && e.cidx == cidx && e.ctl == ctl);
         let ours = |e: &&CheckedRead| e.rt == rt && e.cidx == cidx && e.ctl == ctl;
         if !d.iter().rev().take_while(ours).any(|e| e.seen.same(&seen)) {
             d.push(CheckedRead {

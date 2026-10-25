@@ -87,6 +87,12 @@ impl Count {
         self.changes.load(Ordering::Acquire) == self.at
     }
 
+    /// Whether the read found the count before any change began.
+    #[cfg(all(test, loom))]
+    pub(crate) fn before_any(&self) -> bool {
+        self.at == 0
+    }
+
     /// Whether `self` and `other` are of one runtime at one count.
     pub(crate) fn same(&self, other: &Count) -> bool {
         Arc::ptr_eq(&self.changes, &other.changes) && self.at == other.at

@@ -1751,27 +1751,36 @@ fn flip_racing_a_contained_hold_releases_the_ticket() {
         rt.assert_invariant_i();
     });
 }
-/// A read checked against its runtime's `Changes` while a change stores a
-/// value between its begin and end: a check that later finds the count
-/// unmoved never follows a read of the stored value that the checked read
-/// missed, so a stash adopted on the check reads what a read at the
-/// adoption would.
+/// A Clean check and a read made against a runtime's `Changes` while a
+/// change stores a value and then dirties it, as a set's swap and walk do.
+/// A count found before the change moves once the reader has seen any part
+/// of it, and one found after it ended comes with all of it, so a stash
+/// adopted while its count holds read what a read at the adoption would.
 #[test]
 fn loom_checked_read_vs_change() {
     loom::model(|| {
         let changes = Arc::new(Changes::new());
         let value = Arc::new(AtomicU64::new(0));
+        let dirty = Arc::new(AtomicU64::new(0));
         let writer = {
-            let (changes, value) = (changes.clone(), value.clone());
+            let (changes, value, dirty) = (changes.clone(), value.clone(), dirty.clone());
             thread::spawn(move || {
                 let _change = changes.change();
                 value.store(1, Ordering::Release);
+                dirty.store(1, Ordering::Release);
             })
         };
         if let Some(seen) = changes.count() {
+            let clean = dirty.load(Ordering::Acquire) == 0;
             let read = value.load(Ordering::Acquire);
-            let later = value.load(Ordering::Acquire);
-            assert!(!seen.holds() || read == later);
+            let later = (dirty.load(Ordering::Acquire), value.load(Ordering::Acquire));
+            if seen.before_any() {
+                if !clean || read == 1 || later != (0, 0) {
+                    assert!(!seen.holds());
+                }
+            } else {
+                assert!(!clean && read == 1);
+            }
         }
         writer.join().unwrap();
     });
