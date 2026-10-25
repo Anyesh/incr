@@ -291,14 +291,11 @@ fn catching_up_across_a_compaction_reports_each_change_with_snapshot_origin() {
 }
 
 /// A multi-element collection the reader never declared, caught up across
-/// a compaction. The writer folds it in its stored order, which varies with
-/// each store's hash seed, so the reader may report either shape the
-/// `Snapshot` origin allows: the exact `Remove`/`Insert` diff, or a `Delete`
-/// followed by the full contents. Each fresh store draws new hash keys, so
-/// the rounds cover both orders.
+/// a compaction, reports the exact `Remove`/`Insert` diff whatever hash seed
+/// each store draws: the writer hands its elements to the folded log in byte
+/// order. Each fresh store draws new hash keys, so the rounds cover several.
 #[test]
-fn an_undeclared_collection_catches_up_as_a_diff_or_a_delete_and_full_contents() {
-    let (mut diffs, mut rebuilds) = (0, 0);
+fn an_undeclared_collection_catches_up_as_the_exact_diff() {
     for _ in 0..32 {
         let log = MemoryBackend::new();
         let writer = open::<Local, _>(log.clone());
@@ -314,9 +311,7 @@ fn an_undeclared_collection_catches_up_as_a_diff_or_a_delete_and_full_contents()
         reader.refresh().unwrap();
 
         let records = for_key(&seen.lock().unwrap(), "raw");
-        let full = BTreeMap::from([(enc(&1u32), 2), (enc(&6u32), 1)]);
-        let mut reached = BTreeMap::from([(enc(&1u32), 2), (enc(&2u32), 1)]);
-        let diff = sorted_records(vec![
+        let diff = vec![
             Record::Remove {
                 key: "raw".into(),
                 element: enc(&2u32),
@@ -325,30 +320,8 @@ fn an_undeclared_collection_catches_up_as_a_diff_or_a_delete_and_full_contents()
                 key: "raw".into(),
                 element: enc(&6u32),
             },
-        ]);
-        if records.first() == Some(&Record::Delete { key: "raw".into() }) {
-            rebuilds += 1;
-            reached.clear();
-            for record in &records[1..] {
-                let Record::Insert { element, .. } = record else {
-                    panic!("a Delete is followed only by the full contents: {records:?}");
-                };
-                *reached.entry(element.clone()).or_insert(0) += 1;
-            }
-        } else {
-            diffs += 1;
-            assert_eq!(sorted_records(records.clone()), diff, "the exact diff");
-            for record in &records {
-                match record {
-                    Record::Insert { element, .. } => {
-                        *reached.entry(element.clone()).or_insert(0) += 1
-                    }
-                    Record::Remove { element, .. } => take_one(&mut reached, element),
-                    _ => unreachable!(),
-                }
-            }
-        }
-        assert_eq!(reached, full, "the records take the reader to the snapshot");
+        ];
+        assert_eq!(records, diff, "the exact diff, removes first");
         let mut values = reader
             .collection::<u32>("raw")
             .unwrap()
@@ -357,7 +330,52 @@ fn an_undeclared_collection_catches_up_as_a_diff_or_a_delete_and_full_contents()
         values.sort();
         assert_eq!(values, [1, 1, 6], "the reader's state is the writer's");
     }
-    println!("{diffs} diffs, {rebuilds} deletes with full contents");
+}
+
+/// What a store that does not declare "raw" reports for it on catching up
+/// across a compaction, after first loading an earlier snapshot, with the
+/// writer's collection built by inserting `order`. With `undeclared`, the
+/// store declares the key after loading and undeclares it again.
+fn undeclared_catch_up(order: impl IntoIterator<Item = u32>, undeclared: bool) -> Vec<Record> {
+    let log = MemoryBackend::new();
+    let writer = open::<Local, _>(log.clone());
+    let raw = writer.collection::<u32>("raw").unwrap();
+    for value in order {
+        raw.insert(&writer, value).unwrap();
+    }
+    writer.checkpoint().unwrap();
+    let reader = open::<Local, _>(log.read_only());
+    if undeclared {
+        let r_raw = reader.collection::<u32>("raw").unwrap();
+        reader.undeclare(&r_raw).unwrap();
+    }
+    let seen = subscribe(&reader);
+    raw.delete(&writer, &63).unwrap();
+    raw.insert(&writer, 64).unwrap();
+    writer.checkpoint().unwrap();
+    reader.refresh().unwrap();
+    let seen = seen.lock().unwrap();
+    for_key(&seen, "raw")
+}
+
+// Each collection hashes with its own seed, so two of them would list the
+// same 64 elements in the same order only by chance.
+#[test]
+fn an_undeclared_catch_up_reports_the_same_changes_however_the_writer_hashes() {
+    let expected = [
+        Record::Remove {
+            key: "raw".into(),
+            element: enc(&63u32),
+        },
+        Record::Insert {
+            key: "raw".into(),
+            element: enc(&64u32),
+        },
+    ];
+    for undeclared in [false, true] {
+        assert_eq!(undeclared_catch_up(0..64, undeclared), expected);
+        assert_eq!(undeclared_catch_up((0..64).rev(), undeclared), expected);
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]

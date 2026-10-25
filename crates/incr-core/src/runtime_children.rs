@@ -21,6 +21,9 @@ pub(crate) enum ChildLanding {
     /// created are unbound from their keys, so no later run reuses a
     /// value a discarded attempt chose, and deleted where they can be.
     Discard,
+    /// A speculative run's landing whose stash holds the run: its children
+    /// stay the claim in progress's, for the stash's adoption or drop.
+    Stashed,
 }
 
 impl<C: Cells> Runtime<C> {
@@ -210,7 +213,7 @@ impl<C: Cells> Runtime<C> {
     /// the index stays in `Inner::children` until the creator's release,
     /// which needs a delete claim that the compute claim excludes; the
     /// box does not move when the map does.
-    fn index_at(&self, id: NodeId) -> &ChildIndex<C> {
+    pub(crate) fn index_at(&self, id: NodeId) -> &ChildIndex<C> {
         let index: *const ChildIndex<C> = &**self
             .inner
             .read()
@@ -251,6 +254,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         let index = self.index_at(id);
         let candidates = match landing {
+            ChildLanding::Stashed => return,
             ChildLanding::Keep => {
                 index.with(|s| s.land());
                 return;

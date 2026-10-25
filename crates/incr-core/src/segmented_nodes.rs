@@ -1,7 +1,7 @@
 //! Segmented lock-free-on-read store for [`NodeData<C>`].
 //!
 //! Nodes live in never-moving segments of `SEGMENT_SIZE` behind a
-//! [`Directory`] that doubles as the store grows, so a slot index splits
+//! `Directory` that doubles as the store grows, so a slot index splits
 //! into a segment index and an offset by a shift and a mask. A read loads
 //! the directory with Acquire, bounds-checks the segment index, loads the
 //! segment pointer with Relaxed and tests it for null.

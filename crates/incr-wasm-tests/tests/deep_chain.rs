@@ -7,8 +7,8 @@ use incr_core::{CycleStrategy, Incr, Local, QueryOpts, Replay, Runtime, DEFAULT_
 use wasm_bindgen_test::wasm_bindgen_test;
 
 /// A first compute of a 100k chain of replayable queries at the default
-/// budget nests at most 256 frames, inside the harness's shadow stack and
-/// V8 limit, and runs each node at most twice.
+/// budget nests at most `DEFAULT_MAX_FRAMES` frames, inside the harness's
+/// shadow stack and V8 limit, and runs each node at most twice.
 #[wasm_bindgen_test]
 fn chain_of_100k_replays_within_the_frame_budget() {
     const N: usize = 100_000;

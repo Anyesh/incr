@@ -4,14 +4,20 @@
 //! cycle an uncaught cycle panic reported, and the roots whose episodes
 //! dissolved during the current outermost entry.
 
+use std::borrow::{Borrow, BorrowMut};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
+use std::ops::{Deref, DerefMut};
 
 use std::sync::Arc;
 
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
+use crate::deferred::Unbuilt;
+use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
+use crate::replay;
+use crate::runtime::GroupInfo;
 use crate::value_code;
 
 /// The frame whose unwind releases a claim: the frame it stands for, or
@@ -93,24 +99,24 @@ pub(crate) struct Held {
     /// The claim was taken from New.
     pub(crate) first: bool,
     /// The last run's value, or for a seeded member its last output.
-    pub(crate) buf: Option<Erased>,
+    buf: Option<Erased>,
     /// A seeded member's current value inside an episode.
     pub(crate) s: Option<Erased>,
     /// Every dep any run of this claim recorded, for the stale check.
-    pub(crate) deps: Vec<(NodeId, u32)>,
+    deps: Vec<(NodeId, u32)>,
     /// The deps of the last run: its reads of other members are the
     /// iteration's graph.
-    pub(crate) last: Vec<(NodeId, u32)>,
+    last: Vec<(NodeId, u32)>,
     /// Every dep the runs since the episode's last restart recorded, in
     /// first-read order: the landed value depends on all of them, so the
     /// landing installs them all.
-    pub(crate) installed: Vec<NodeId>,
+    installed: Vec<NodeId>,
     pub(crate) wrote: bool,
     /// The last run reached the node's child index.
-    pub(crate) opened: bool,
+    opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    pub(crate) poisoned: bool,
+    poisoned: bool,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
@@ -120,6 +126,9 @@ pub(crate) struct Held {
     /// The member is in the episode's set of unseeded members that read
     /// each other.
     pub(crate) in_cu: bool,
+    /// While the buffer and run record come from a run made under
+    /// speculation: the record from before that run's write.
+    pre_spec: Option<Box<RunRecord>>,
 }
 
 impl Held {
@@ -157,11 +166,29 @@ impl Held {
             episode: None,
             ep: 0,
             in_cu: false,
+            pre_spec: None,
         }
     }
 
-    /// Records one run's deps.
-    pub(crate) fn record_run(&mut self, deps: Vec<(NodeId, u32)>) {
+    /// Records a finished run: its deps, buffer, whether it reached the
+    /// child index and whether it was poisoned. Under speculation it first
+    /// keeps the record it replaces; outside, it settles first. Returns
+    /// the buffer it replaces and the value a settle dropped, for the
+    /// caller to drop outside the held map.
+    pub(crate) fn record(
+        &mut self,
+        look: Look,
+        deps: Vec<(NodeId, u32)>,
+        buf: Option<Erased>,
+        opened: bool,
+        poisoned: bool,
+    ) -> (Option<Erased>, Option<Unbuilt>) {
+        let spec_buf = if look.speculative {
+            self.keep_record();
+            None
+        } else {
+            self.settle()
+        };
         for &d in &deps {
             if !self.deps.contains(&d) {
                 self.deps.push(d);
@@ -171,7 +198,198 @@ impl Held {
             }
         }
         self.last = deps;
+        self.opened = opened;
+        self.poisoned |= poisoned;
+        (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
+
+    /// The claim's run as `look` sees it, and the value a settle dropped,
+    /// for the caller to drop outside the held map.
+    pub(crate) fn look(&mut self, look: Look) -> (Seen<&mut Held>, Option<Unbuilt>) {
+        let spec_buf = self.settle_for(look);
+        (Seen(self), spec_buf)
+    }
+
+    /// [`Self::look`] at a claim out of the held map.
+    pub(crate) fn into_look(mut self, look: Look) -> (Seen<Held>, Option<Unbuilt>) {
+        let spec_buf = self.settle_for(look);
+        (Seen(self), spec_buf)
+    }
+
+    /// Takes the buffer to drop it, leaving the run record as it is.
+    pub(crate) fn discard_buf(&mut self) -> Option<Discarded> {
+        self.buf.take().map(|buf| Discarded {
+            _values: (Some(buf), None),
+        })
+    }
+
+    /// The buffer and seeded value to drop, for a claim released without a
+    /// landing that reads its run.
+    pub(crate) fn into_values(self) -> Discarded {
+        Discarded {
+            _values: (self.buf, self.s),
+        }
+    }
+
+    /// Whether the buffer and record are a speculative run's.
+    pub(crate) fn spec_written(&self) -> bool {
+        self.pre_spec.is_some()
+    }
+
+    /// Keeps a speculative run's buffer and record as the claim's own, for
+    /// a landing that speculation may make.
+    pub(crate) fn adopt(&mut self) {
+        self.pre_spec = None;
+    }
+
+    /// Before a run's buffer and record are written under speculation:
+    /// keeps the record they replace, unless an earlier speculative run's
+    /// write already did.
+    fn keep_record(&mut self) {
+        if self.pre_spec.is_none() {
+            self.pre_spec = Some(Box::new(RunRecord {
+                deps: self.deps.clone(),
+                last: self.last.clone(),
+                installed: self.installed.clone(),
+                opened: self.opened,
+                poisoned: self.poisoned,
+            }));
+        }
+    }
+
+    fn settle_for(&mut self, look: Look) -> Option<Unbuilt> {
+        if look.speculative {
+            None
+        } else {
+            self.settle()
+        }
+    }
+
+    /// Puts back the record a speculative run replaced and returns the
+    /// value it buffered, as the unbounded run may never make that run.
+    fn settle(&mut self) -> Option<Unbuilt> {
+        let r = self.pre_spec.take()?;
+        self.deps = r.deps;
+        self.last = r.last;
+        self.installed = r.installed;
+        self.opened = r.opened;
+        self.poisoned = r.poisoned;
+        self.buf
+            .take()
+            .map(|buf| Unbuilt::<dyn std::any::Any>::new(buf))
+    }
+}
+
+/// How a look at a claim's run stands to speculation: one made under it
+/// sees what a speculative run left, one made outside it settles the
+/// claim first. Only the thread's speculation and a driver entry's or
+/// virtual frame's own flag make one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Look {
+    speculative: bool,
+}
+
+impl Look {
+    #[cfg(all(test, not(loom)))]
+    const SPECULATIVE: Self = Self { speculative: true };
+    #[cfg(all(test, not(loom)))]
+    const REAL: Self = Self { speculative: false };
+
+    /// A look from this thread's run.
+    pub(crate) fn here() -> Self {
+        Self::here_or(false)
+    }
+
+    /// [`Self::here`], speculative also when `spec`: a driver entry's or
+    /// virtual frame's own check of its node.
+    pub(crate) fn here_or(spec: bool) -> Self {
+        Self {
+            speculative: spec || replay::speculative(),
+        }
+    }
+}
+
+/// A claim whose run a [`Look`] has seen: the only way to read its buffer
+/// and run record. [`Held::discard_buf`] and [`Held::into_values`] only hand
+/// them over to be dropped.
+pub(crate) struct Seen<H>(H);
+
+impl<H: Borrow<Held>> Deref for Seen<H> {
+    type Target = Held;
+
+    fn deref(&self) -> &Held {
+        self.0.borrow()
+    }
+}
+
+impl<H: BorrowMut<Held>> DerefMut for Seen<H> {
+    fn deref_mut(&mut self) -> &mut Held {
+        self.0.borrow_mut()
+    }
+}
+
+impl<H: Borrow<Held>> Seen<H> {
+    pub(crate) fn buf(&self) -> &Option<Erased> {
+        &self.0.borrow().buf
+    }
+
+    pub(crate) fn deps(&self) -> &[(NodeId, u32)] {
+        &self.0.borrow().deps
+    }
+
+    pub(crate) fn last(&self) -> &[(NodeId, u32)] {
+        &self.0.borrow().last
+    }
+
+    pub(crate) fn installed(&self) -> &[NodeId] {
+        &self.0.borrow().installed
+    }
+
+    pub(crate) fn opened(&self) -> bool {
+        self.0.borrow().opened
+    }
+
+    pub(crate) fn poisoned(&self) -> bool {
+        self.0.borrow().poisoned
+    }
+}
+
+impl<H: BorrowMut<Held>> Seen<H> {
+    pub(crate) fn take_buf(&mut self) -> Option<Erased> {
+        self.0.borrow_mut().buf.take()
+    }
+
+    pub(crate) fn take_deps(&mut self) -> Vec<(NodeId, u32)> {
+        std::mem::take(&mut self.0.borrow_mut().deps)
+    }
+
+    pub(crate) fn clear_installed(&mut self) {
+        self.0.borrow_mut().installed.clear();
+    }
+}
+
+impl Seen<Held> {
+    pub(crate) fn into_values(self) -> Discarded {
+        self.0.into_values()
+    }
+
+    pub(crate) fn into_held(self) -> Held {
+        self.0
+    }
+}
+
+/// Values taken off a claim only to be dropped.
+pub(crate) struct Discarded {
+    _values: (Option<Erased>, Option<Erased>),
+}
+
+/// A claim's run record, kept while a speculative run's is written over it.
+struct RunRecord {
+    deps: Vec<(NodeId, u32)>,
+    last: Vec<(NodeId, u32)>,
+    installed: Vec<NodeId>,
+    opened: bool,
+    poisoned: bool,
 }
 
 /// An episode between member runs. A doom that discards a member run
@@ -187,6 +405,9 @@ pub(crate) struct Episode {
     pub(crate) cu: Vec<u32>,
     /// The iteration state since the last restart, `None` at a restart.
     pub(crate) round: Option<Round>,
+    /// The root's compute is a walk's entry, which contains the episode's
+    /// abort.
+    pub(crate) walked: bool,
 }
 
 pub(crate) struct Round {
@@ -239,9 +460,9 @@ pub(crate) enum UnwindKind {
 /// claim its subtree deferred to its parent merges groups instead of
 /// moving each claim.
 pub(crate) struct HeldMap {
-    claims: HashMap<(RuntimeId, u32), Held>,
+    claims: HashMap<(RuntimeId, u32), Held, FxBuildHasher>,
     by_anchor: BTreeSet<(RuntimeId, u32, u32)>,
-    groups: HashMap<u64, Group>,
+    groups: HashMap<u64, Group, FxBuildHasher>,
     /// `(rt, owner position, group)` of every group.
     by_owner: BTreeSet<(RuntimeId, u32, u64)>,
     /// The groups a virtual frame owns.
@@ -266,9 +487,9 @@ impl std::ops::Index<&(RuntimeId, u32)> for HeldMap {
 impl HeldMap {
     fn new() -> Self {
         Self {
-            claims: HashMap::new(),
+            claims: HashMap::default(),
             by_anchor: BTreeSet::new(),
-            groups: HashMap::new(),
+            groups: HashMap::default(),
             by_owner: BTreeSet::new(),
             by_virtual_owner: BTreeSet::new(),
             next_group: 1,
@@ -576,13 +797,23 @@ struct EntryState {
     /// The address of a local of the outermost entry, from which a read
     /// measures the stack it has used against a byte budget.
     stack_base: Cell<usize>,
+    /// `BUDGET_CLOCK` when the outermost entry began: a runtime whose
+    /// budget changed later may have frames on the stack that read under
+    /// the budget before.
+    budget_clock: Cell<u64>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
 /// and the cycle the last uncaught cycle panic reported.
 struct Outer {
     dissolved: Vec<(RuntimeId, u32)>,
+    /// The landed group of each root whose episode dissolved in this
+    /// entry, held so that no later record can reuse its address.
+    dissolved_groups: Vec<(RuntimeId, u32, Arc<GroupInfo>)>,
     last_cycle: Option<Cycle>,
+    /// Each runtime whose budget change this thread has met, with the
+    /// `BUDGET_CLOCK` count of the change.
+    budgets_met: Vec<(RuntimeId, u64)>,
 }
 
 #[cfg(not(loom))]
@@ -597,12 +828,16 @@ thread_local! {
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
             stack_base: Cell::new(0),
+            budget_clock: Cell::new(0),
         }
     };
+    static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
     static OUTER: RefCell<Outer> = const {
         RefCell::new(Outer {
             dissolved: Vec::new(),
+            dissolved_groups: Vec::new(),
             last_cycle: None,
+            budgets_met: Vec::new(),
         })
     };
 }
@@ -618,10 +853,14 @@ loom::thread_local! {
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
         stack_base: Cell::new(0),
+        budget_clock: Cell::new(0),
     };
+    static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
+        dissolved_groups: Vec::new(),
         last_cycle: None,
+        budgets_met: Vec::new(),
     });
 }
 
@@ -638,7 +877,7 @@ pub(crate) fn with_held<R>(f: impl FnOnce(&mut HeldMap) -> R) -> R {
     })
 }
 
-fn held_any() -> bool {
+pub(crate) fn held_any() -> bool {
     ENTRY.with(|e| e.held_any.get())
 }
 
@@ -794,6 +1033,23 @@ pub(crate) fn has_dissolved(rt: RuntimeId, root: u32) -> bool {
     OUTER.with(|o| o.borrow().dissolved.contains(&(rt, root)))
 }
 
+/// Notes that `root`'s episode dissolved over its landed group `group`.
+pub(crate) fn note_dissolved_group(rt: RuntimeId, root: u32, group: Arc<GroupInfo>) {
+    OUTER.with(|o| o.borrow_mut().dissolved_groups.push((rt, root, group)));
+    ENTRY.with(|e| e.outer_set.set(true));
+}
+
+/// Whether `group` is the record whose episode at `root` dissolved in
+/// this outermost entry.
+pub(crate) fn is_dissolved_group(rt: RuntimeId, root: u32, group: &Arc<GroupInfo>) -> bool {
+    OUTER.with(|o| {
+        o.borrow()
+            .dissolved_groups
+            .iter()
+            .any(|(r, n, g)| *r == rt && *n == root && Arc::ptr_eq(g, group))
+    })
+}
+
 /// How many held claims this thread has marked failed: a member run that
 /// panics marks its node only if no member nested in it was marked, so
 /// the panic is attributed to the member whose own code raised it.
@@ -825,6 +1081,33 @@ pub(crate) fn outermost_entries() -> u64 {
     OUTERMOST_ENTRIES.with(Cell::get)
 }
 
+/// Counts budget changes across runtimes, so an outermost entry and a
+/// runtime's last change can be ordered.
+static BUDGET_CLOCK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A new `BUDGET_CLOCK` count, for a budget change.
+pub(crate) fn tick_budget_clock() -> u64 {
+    BUDGET_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Whether runtime `rt`'s budget change at `changed` is one this thread
+/// meets for the first time inside its outermost entry, which notes it.
+pub(crate) fn meet_budget_change(rt: RuntimeId, changed: u64) -> bool {
+    if changed <= ENTRY.with(|e| e.budget_clock.get()) {
+        return false;
+    }
+    OUTER.with(|o| {
+        let met = &mut o.borrow_mut().budgets_met;
+        match met.iter_mut().find(|(r, _)| *r == rt) {
+            Some((_, at)) if *at >= changed => return false,
+            Some((_, at)) => *at = changed,
+            None => met.push((rt, changed)),
+        }
+        ENTRY.with(|e| e.outer_set.set(true));
+        true
+    })
+}
+
 /// The stack address the outermost engine entry recorded.
 pub(crate) fn stack_base() -> usize {
     ENTRY.with(|e| e.stack_base.get())
@@ -833,6 +1116,36 @@ pub(crate) fn stack_base() -> usize {
 /// The thread's engine entry depth: 0 outside every engine entry.
 pub(crate) fn depth() -> u32 {
     ENTRY.with(|e| e.depth.get())
+}
+
+/// Counts an episode this thread lands on `rt`, for the last
+/// `OWN_RUNTIMES` runtimes it landed one on. A count dropped or restarted
+/// only makes a walk's own share differ from all landings, which re-plans.
+pub(crate) fn own_episode(rt: RuntimeId) {
+    OWN_EPISODES.with(|o| {
+        let mut o = o.borrow_mut();
+        match o.iter_mut().find(|(r, _)| *r == rt) {
+            Some((_, n)) => *n = n.wrapping_add(1),
+            None => {
+                if o.len() == OWN_RUNTIMES {
+                    o.remove(0);
+                }
+                o.push((rt, 1));
+            }
+        }
+    });
+}
+
+const OWN_RUNTIMES: usize = 8;
+
+/// The episodes this thread has landed on `rt`.
+pub(crate) fn own_episodes(rt: RuntimeId) -> u64 {
+    OWN_EPISODES.with(|o| {
+        o.borrow()
+            .iter()
+            .find(|(r, _)| *r == rt)
+            .map_or(0, |&(_, n)| n)
+    })
 }
 
 /// This thread's wound-wait ticket, taken from `next` at its first
@@ -871,6 +1184,8 @@ impl EntryDepth {
             e.depth.set(depth + 1);
             if depth == 0 {
                 e.stack_base.set(base);
+                e.budget_clock
+                    .set(BUDGET_CLOCK.load(std::sync::atomic::Ordering::Relaxed));
                 #[cfg(all(test, not(loom)))]
                 OUTERMOST_ENTRIES.with(|n| n.set(n.get() + 1));
             }
@@ -907,7 +1222,9 @@ pub(crate) fn reset_outermost() {
         OUTER.with(|o| {
             let mut o = o.borrow_mut();
             o.dissolved.clear();
+            o.dissolved_groups.clear();
             o.last_cycle = None;
+            o.budgets_met.clear();
         });
     }
 }
@@ -956,3 +1273,7 @@ mod binding_tests {
         set_unwind_kind(None);
     }
 }
+
+#[cfg(all(test, not(loom)))]
+#[path = "cycle_state_tests.rs"]
+mod tests;

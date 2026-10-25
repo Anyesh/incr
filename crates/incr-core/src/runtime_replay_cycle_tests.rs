@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
 
 use super::cycle_impl::EpisodeSeen;
-use super::Runtime;
+use super::race_tests::{id, Gate};
+use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{Cycle, CycleStrategy, QueryOpts, Replay};
 use crate::handle::Incr;
@@ -548,6 +549,12 @@ fn walk_driven_discard<C: Cells>() {
         (c, rt.expansions() - before, w.dooms(&rt))
     };
     let unbounded = observe(None);
+    // A forced revisit expands its entry again.
+    if super::forced_revisit() && !C::SINGLE_THREADED {
+        assert_eq!(unbounded.0, Outcome::Value(26));
+        assert_eq!(observe(Some(1)).0, unbounded.0);
+        return;
+    }
     assert_eq!(unbounded, (Outcome::Value(26), 3, String::new()));
     // The plan counts 4, with B expanded again as the loop's target; the
     // driver instead runs that target as the walk's own compute of B, whose
@@ -997,7 +1004,476 @@ fn speculative_chain_drops_without_unwinding<C: Cells>() {
     assert!(drops > 0, "no chain was dropped");
 }
 
+/// A walk entry whose virtual frame's run closes a cycle through itself,
+/// at budget 1. D reads E and then G, E is `try_get(F)` or 7777, F is
+/// `get(G)` or 9999 if it unwinds, and G reads D, so `try_get(D)` closes
+/// the cycle and leaves E and F Dirty over a New G. `try_get(E)`'s walk
+/// then computes G, whose read of D dooms; G's run as a virtual frame
+/// closes the cycle again at D's read of G, and the walk contains that
+/// unwind, as the unbounded run's walk does, because every claim but G's
+/// own ran above G. The unwind releases G's claim too, so counting it
+/// let the cycle out as `try_get(E)`'s `Err` (two-thread seed 0x5b0d).
+fn walk_entry_contains_a_cycle_through_itself<C: Cells>() {
+    let observe = |frames: Option<u32>| {
+        let rt = runtime::<C>(frames);
+        let d_cell = cell::<u64>();
+        let g = {
+            let d_cell = d_cell.clone();
+            rt.create_query_with(move |rt| rt.get(*d_cell.get().unwrap()), replayable())
+        };
+        let f = rt.create_query_with(
+            move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_or(9999),
+            replayable(),
+        );
+        let e = rt.create_query_with(move |rt| rt.try_get(f).unwrap_or(7777), replayable());
+        let d = rt.create_query_with(
+            move |rt| {
+                rt.get(e);
+                rt.get(g)
+            },
+            replayable(),
+        );
+        d_cell.set(d).unwrap();
+        let first = try_get(&rt, d);
+        let second = try_get(&rt, e);
+        rt.assert_invariant_i();
+        (first, second, rt.state_of(e), rt.state_of(g))
+    };
+    let unbounded = observe(None);
+    assert!(matches!(unbounded.0, Outcome::Cycle(_)), "{unbounded:?}");
+    assert_eq!(unbounded.1, Outcome::Value(7777));
+    assert_eq!(observe(Some(1)), unbounded);
+}
+
+/// F = IF(A, M, X) over a chain A of `frames` bools; X = 3 while t = 0,
+/// else IF(P == 0, F + 1, 3) over a chain P of `frames - 1` nodes ending
+/// at R; R = M while s = 0, else 7; M = X + 1. Phase 1 installs
+/// R -> M -> X; phase 2 sets s and t, and reads F, which is New. F's
+/// `u32` has no placeholder, so X's doomed read of F's virtual frame
+/// raises a drop unwind.
+struct HandedOver {
+    f: Incr<u32>,
+    nodes: Vec<Incr<u64>>,
+    flags: Vec<Incr<bool>>,
+    runs: Runs,
+}
+
+const HF: usize = 0;
+const HX: usize = 1;
+const HM: usize = 2;
+const HR: usize = 3;
+
+fn handed_over_graph<C: Cells>(
+    rt: &Runtime<C>,
+    depth: u32,
+) -> (HandedOver, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let runs = Runs::new();
+    let a_in = rt.create_input(true);
+    let s_in = rt.create_input(0_u64);
+    let t_in = rt.create_input(0_u64);
+    let f_cell = cell::<u32>();
+    let x_cell = cell::<u64>();
+    let m = {
+        let (runs, x_cell) = (runs.clone(), x_cell.clone());
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HM);
+                rt.get(*x_cell.get().unwrap()) + 1
+            },
+            replayable(),
+        )
+    };
+    let r = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HR);
+                if rt.get(s_in) == 0 {
+                    rt.get(m)
+                } else {
+                    7
+                }
+            },
+            replayable(),
+        )
+    };
+    let mut p = r;
+    let mut nodes = vec![m, r];
+    for _ in 1..depth {
+        let below = p;
+        p = rt.create_query_with(
+            move |rt| {
+                let _ = rt.get(t_in);
+                rt.get(below)
+            },
+            replayable(),
+        );
+        nodes.push(p);
+    }
+    let x = {
+        let (runs, f_cell) = (runs.clone(), f_cell.clone());
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HX);
+                if rt.get(t_in) == 0 {
+                    return 3;
+                }
+                if rt.get(p) == 0 {
+                    u64::from(rt.get(*f_cell.get().unwrap())) + 1
+                } else {
+                    3
+                }
+            },
+            replayable(),
+        )
+    };
+    x_cell.set(x).unwrap();
+    nodes.push(x);
+    let mut a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+    let mut flags = vec![a];
+    for _ in 1..depth {
+        let below = a;
+        a = rt.create_query_with(move |rt| rt.get(below), replayable());
+        flags.push(a);
+    }
+    let f = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HF);
+                let v = if rt.get(a) { rt.get(m) } else { rt.get(x) };
+                v as u32
+            },
+            replayable(),
+        )
+    };
+    f_cell.set(f).unwrap();
+    (
+        HandedOver {
+            f,
+            nodes,
+            flags,
+            runs,
+        },
+        r,
+        s_in,
+        t_in,
+    )
+}
+
+/// **A doom's handed-over memo entries and a dropped chain**: X's
+/// speculative entry walks R -> M into X's own frame, memoizing M under X,
+/// and R's compute dooms X, handing M's entry to the context. X's doomed
+/// read of F's virtual frame, with no placeholder, raises a drop unwind,
+/// but X's doomed frame takes it as its discard, so no chain is dropped
+/// with M's entry handed over and M is never computed, as unbounded.
+fn doom_handed_memo_meets_no_chain_drop<C: Cells>() {
+    for frames in 1..=4 {
+        let depth = frames;
+        let observe = |frames: Option<u32>| {
+            let rt = runtime::<C>(frames);
+            let (g, r, s_in, t_in) = handed_over_graph(&rt, depth);
+            assert_eq!(get(&rt, r), Outcome::Value(4));
+            rt.set(s_in, 1);
+            rt.set(t_in, 1);
+            let before = [HF, HX, HM, HR].map(|i| g.runs.of(i));
+            let f = get(&rt, g.f);
+            rt.assert_invariant_i();
+            let after = [HF, HX, HM, HR].map(|i| g.runs.of(i));
+            let ran: Vec<u32> = (0..4).map(|i| after[i] - before[i]).collect();
+            let states: Vec<NodeState> = g
+                .nodes
+                .iter()
+                .map(|&n| rt.state_of(n))
+                .chain(g.flags.iter().map(|&n| rt.state_of(n)))
+                .collect();
+            let values: Vec<Outcome<u64>> = g.nodes.iter().map(|&n| get(&rt, n)).collect();
+            rt.assert_invariant_i();
+            (f, states, values, ran)
+        };
+        let (f, states, values, ran) = observe(None);
+        assert_eq!(f, Outcome::Value(4_u32));
+        {
+            let (bf, bstates, bvalues, bran) = observe(Some(frames));
+            assert_eq!(bran[HM], ran[HM], "frames {frames}: closure runs of M");
+            assert_eq!(
+                (&bf, &bstates, &bvalues),
+                (&f, &states, &values),
+                "frames {frames}"
+            );
+        }
+    }
+}
+
+/// [`handed_over_graph`] with F = IF(A, k, X + W) a `u64` over an input
+/// k, and a root G = F + W, where W is M, or with `grouped` a Fallback
+/// member N = M + 1 of a 2-cycle with M = X + N. R reads W while s = 0.
+/// F reaches neither W nor X once A is true.
+struct LandedF {
+    g: Incr<u64>,
+    f: Incr<u64>,
+    m: Incr<u64>,
+    x: Incr<u64>,
+    r: Incr<u64>,
+    s_in: Incr<u64>,
+    t_in: Incr<u64>,
+    nodes: Vec<Incr<u64>>,
+    flags: Vec<Incr<bool>>,
+    runs: Runs,
+}
+
+const HG: usize = 4;
+const HN: usize = 5;
+
+fn landed_f_graph<C: Cells>(rt: &Runtime<C>, depth: u32, grouped: bool) -> LandedF {
+    let runs = Runs::new();
+    let a_in = rt.create_input(true);
+    let s_in = rt.create_input(0_u64);
+    let t_in = rt.create_input(0_u64);
+    let k_in = rt.create_input(5_u64);
+    let f_cell = cell::<u64>();
+    let x_cell = cell::<u64>();
+    let n_cell = cell::<u64>();
+    let m = {
+        let (runs, x_cell, n_cell) = (runs.clone(), x_cell.clone(), n_cell.clone());
+        let opts = if grouped {
+            replayable_fallback(|_: &Cycle| 1000)
+        } else {
+            replayable()
+        };
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HM);
+                let x = rt.get(*x_cell.get().unwrap());
+                match n_cell.get() {
+                    Some(&n) => x + rt.get(n),
+                    None => x + 1,
+                }
+            },
+            opts,
+        )
+    };
+    let w = if grouped {
+        let runs = runs.clone();
+        let n = rt.create_query_with(
+            move |rt| {
+                runs.hit(HN);
+                rt.get(m) + 1
+            },
+            replayable_fallback(|_: &Cycle| 2000),
+        );
+        n_cell.set(n).unwrap();
+        n
+    } else {
+        m
+    };
+    let r = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HR);
+                if rt.get(s_in) == 0 {
+                    rt.get(w)
+                } else {
+                    7
+                }
+            },
+            replayable(),
+        )
+    };
+    let mut p = r;
+    let mut nodes = vec![m, w, r];
+    for _ in 1..depth {
+        let below = p;
+        p = rt.create_query_with(
+            move |rt| {
+                let _ = rt.get(t_in);
+                rt.get(below)
+            },
+            replayable(),
+        );
+        nodes.push(p);
+    }
+    let x = {
+        let (runs, f_cell) = (runs.clone(), f_cell.clone());
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HX);
+                if rt.get(t_in) == 0 {
+                    return 3;
+                }
+                if rt.get(p) == 0 {
+                    rt.get(*f_cell.get().unwrap()) + 1
+                } else {
+                    3
+                }
+            },
+            replayable(),
+        )
+    };
+    x_cell.set(x).unwrap();
+    nodes.push(x);
+    let mut a = rt.create_query_with(move |rt| rt.get(a_in), replayable());
+    let mut flags = vec![a];
+    for _ in 1..depth {
+        let below = a;
+        a = rt.create_query_with(move |rt| rt.get(below), replayable());
+        flags.push(a);
+    }
+    let f = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HF);
+                if rt.get(a) {
+                    rt.get(k_in)
+                } else {
+                    rt.get(x) + rt.get(w)
+                }
+            },
+            replayable(),
+        )
+    };
+    f_cell.set(f).unwrap();
+    let g = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs.hit(HG);
+                rt.get(f) + rt.get(w)
+            },
+            replayable(),
+        )
+    };
+    nodes.extend([f, g]);
+    LandedF {
+        g,
+        f,
+        m,
+        x,
+        r,
+        s_in,
+        t_in,
+        nodes,
+        flags,
+        runs,
+    }
+}
+
+/// **A reserved VFrame node keeps a doom's handed-over memo entry**
+/// (Shared): under G's read of F, X's entry walks R -> W into X's frame,
+/// memoizing W under X, and R's compute dooms X, handing W's entry to the
+/// context. Parked at X's doomed read of F, which has a virtual frame,
+/// another thread reads F and waits on its reservation instead of landing
+/// it. W's entry must then verify W Clean (group-verify it when
+/// `grouped`), and the reads of G, F and X are the unbounded run's in
+/// that order.
+fn reserved_vframe_handed_memo(grouped: bool) {
+    for frames in 1..=4 {
+        let depth = frames;
+        let observe = |frames: Option<u32>| {
+            let rt = runtime::<Shared>(frames);
+            let g = landed_f_graph(&rt, depth, grouped);
+            let (m, w) = (get(&rt, g.m), get(&rt, g.r));
+            assert_eq!(
+                (m, w),
+                if grouped {
+                    (Outcome::Value(1000), Outcome::Value(2000))
+                } else {
+                    (Outcome::Value(4), Outcome::Value(4))
+                }
+            );
+            rt.set(g.s_in, 1);
+            rt.set(g.t_in, 1);
+            let before = [HF, HX, HM, HR, HG, HN].map(|i| g.runs.of(i));
+            let (root, f, x) = match frames {
+                None => {
+                    let root = get(&rt, g.g);
+                    let f = get(&rt, g.f);
+                    (root, f, get(&rt, g.x))
+                }
+                Some(_) => {
+                    let doomed_read = Gate::new();
+                    let point = ParkPoint::DoomedRead(id(g.f));
+                    let installed = rt.park_hook.set(Box::new({
+                        let gate = doomed_read.clone();
+                        move |p| {
+                            if p == point {
+                                gate.park();
+                            }
+                        }
+                    }));
+                    assert!(installed.is_ok(), "park hook installed twice");
+                    doomed_read.arm();
+                    let (root, f) = std::thread::scope(|s| {
+                        let reader = s.spawn(|| get(&rt, g.g));
+                        doomed_read.wait_parked();
+                        assert_ne!(rt.state_of(g.f), NodeState::Clean, "frames {frames:?}");
+                        let waits = rt.reservation_waits.load(SeqCst);
+                        let other = s.spawn(|| get(&rt, g.f));
+                        super::race_tests::await_reservation_wait(&rt, waits);
+                        assert_ne!(
+                            rt.state_of(g.f),
+                            NodeState::Clean,
+                            "frames {frames:?}: F landed under the reservation"
+                        );
+                        doomed_read.release();
+                        (reader.join().unwrap(), other.join().unwrap())
+                    });
+                    (root, f, get(&rt, g.x))
+                }
+            };
+            rt.assert_invariant_i();
+            let after = [HF, HX, HM, HR, HG, HN].map(|i| g.runs.of(i));
+            let ran: Vec<u32> = (0..6).map(|i| after[i] - before[i]).collect();
+            let states: Vec<NodeState> = g
+                .nodes
+                .iter()
+                .map(|&n| rt.state_of(n))
+                .chain(g.flags.iter().map(|&n| rt.state_of(n)))
+                .collect();
+            let values: Vec<Outcome<u64>> = g.nodes.iter().map(|&n| get(&rt, n)).collect();
+            rt.assert_invariant_i();
+            (root, f, x, states, values, ran)
+        };
+        let (root, f, x, states, values, ran) = observe(None);
+        let w = if grouped { 2000 } else { 4 };
+        assert_eq!(
+            (&root, &f, &x),
+            (
+                &Outcome::Value(5 + w),
+                &Outcome::Value(5),
+                &Outcome::Value(3)
+            )
+        );
+        assert_eq!((ran[HM], ran[HN]), (0, 0), "unbounded: W verifies Clean");
+        let (broot, bf, bx, bstates, bvalues, bran) = observe(Some(frames));
+        assert_eq!(
+            (bran[HM], bran[HN]),
+            (ran[HM], ran[HN]),
+            "frames {frames}: closure runs of M and N"
+        );
+        assert_eq!(
+            (&broot, &bf, &bx, &bstates, &bvalues),
+            (&root, &f, &x, &states, &values),
+            "frames {frames}"
+        );
+    }
+}
+
+#[test]
+fn shared_reserved_vframe_keeps_handed_memo() {
+    reserved_vframe_handed_memo(false);
+}
+
+#[test]
+fn shared_reserved_vframe_keeps_handed_memo_in_group() {
+    reserved_vframe_handed_memo(true);
+}
+
 local_and_shared!(
+    doom_handed_memo_meets_no_chain_drop,
+    walk_entry_contains_a_cycle_through_itself,
     speculative_chain_drops_without_unwinding,
     virtual_hit_above_an_earlier_one,
     drop_through_a_native_frame,

@@ -11,7 +11,7 @@
 //! An entry is one word, the node's slot and generation, written under
 //! the table's miss mutex with a Release store and read with an Acquire
 //! load. Directories, pages and the column and sheet levels are never
-//! freed before the table drops (see [`Directory`]), so a lock-free hit
+//! freed before the table drops (see `Directory`), so a lock-free hit
 //! reads no memory a writer can free, under `Local` and `Shared` alike.
 //!
 //! A lookup is not a dependency, as for `NodeTable`: a hit returns a node

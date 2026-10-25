@@ -36,6 +36,7 @@ pub(crate) struct GateInner {
     reached_rx: Mutex<Receiver<()>>,
     release_tx: Mutex<Sender<()>>,
     release_rx: Mutex<Receiver<()>>,
+    test: Option<String>,
 }
 
 impl Gate {
@@ -48,6 +49,7 @@ impl Gate {
             reached_rx: Mutex::new(reached_rx),
             release_tx: Mutex::new(release_tx),
             release_rx: Mutex::new(release_rx),
+            test: thread::current().name().map(str::to_owned),
         }))
     }
 
@@ -60,12 +62,16 @@ impl Gate {
             return;
         }
         self.0.reached_tx.lock().unwrap().send(()).unwrap();
-        self.0
+        if self
+            .0
             .release_rx
             .lock()
             .unwrap()
             .recv_timeout(PARK_TIMEOUT)
-            .expect("parked thread was never released");
+            .is_err()
+        {
+            super::park_timed_out(self.0.test.as_deref());
+        }
     }
 
     pub(crate) fn wait_parked(&self) {
@@ -95,6 +101,20 @@ pub(super) fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>)
         }
     }));
     assert!(installed.is_ok(), "park hook installed twice");
+}
+
+/// Waits until `rt` counts a wait on a doom reservation past `before`:
+/// another thread's read met the reservation and now waits it out.
+pub(super) fn await_reservation_wait<C: Cells>(rt: &Runtime<C>, before: u32) {
+    // Before the parked thread's own timeout, whose abort would hide this assert.
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
+    while rt.reservation_waits.load(Ordering::SeqCst) <= before {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the other read never met the reservation"
+        );
+        std::thread::yield_now();
+    }
 }
 
 pub(super) fn id<T>(h: Incr<T>) -> NodeId {
@@ -1457,6 +1477,112 @@ fn read_of_cycle_member_vs_claim_after_landing() {
     rt.assert_invariant_i();
 }
 
+/// a <-> b, a cycle `a`'s fallback resolves, with `b` catching a
+/// panicking read so that every episode lands its members Dirty, and
+/// `x` reading `a`. Returns `x`, `a`, the gate in `a`'s closure and the
+/// gate in `x`'s after its read of `a`.
+fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
+    let failed = rt.create_query(|_: &Rt| -> u64 { panic!("boom") });
+    let in_a = Gate::new();
+    let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
+    let a = {
+        let (in_a, b_cell) = (in_a.clone(), Arc::clone(&b_cell));
+        rt.create_query_with_fallback(
+            move |rt: &Rt| {
+                in_a.park();
+                rt.get(*b_cell.get().unwrap()) + 1
+            },
+            |_: &crate::Cycle| 0,
+        )
+    };
+    let b = rt.create_query(move |rt: &Rt| {
+        let v = catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1);
+        rt.get(a) + v
+    });
+    b_cell.set(b).unwrap();
+    let read_a = Gate::new();
+    let x = {
+        let read_a = read_a.clone();
+        rt.create_query(move |rt: &Rt| {
+            let v = rt.get(a);
+            read_a.park();
+            v + 100
+        })
+    };
+    (x, a, in_a, read_a)
+}
+
+/// The episode that `x`'s recompute runs through its read of `a`, a
+/// group member, lands `a` Dirty, and once the read has taken the value,
+/// another thread claims `a`; the read's reservation of `a` keeps that
+/// claim out until then. `x`, whose deps are unchanged and so not
+/// validated at publish, must still not land Clean over it (seed 0x74f on
+/// two threads, budget None).
+#[test]
+fn reader_of_group_episode_root_claimed_after_landing() {
+    let rt = Arc::new(Rt::new());
+    let (x, a, in_a, read_a) = poisoned_episode(&rt);
+    rt.get(x);
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    rt.group_verifies.lock().unwrap().clear();
+    read_a.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(x))
+    };
+    read_a.wait_parked();
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    in_a.arm();
+    let claimer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(a))
+    };
+    in_a.wait_parked();
+    assert_eq!(rt.state_of(a), NodeState::Computing);
+    read_a.release();
+    reader.join().unwrap();
+    in_a.release();
+    claimer.join().unwrap();
+    assert_eq!(rt.group_verifies.lock().unwrap().first(), Some(&id(a).0));
+    rt.assert_invariant_i();
+}
+
+/// The episode that `x`'s read of `a` runs, as that read's walk root,
+/// lands `a` Dirty; until the read has taken the value, another thread's
+/// claim of `a` waits out the read's reservation instead of running `a`.
+#[test]
+fn reader_of_group_episode_root_keeps_it_until_the_read_takes_the_value() {
+    let rt = Arc::new(Rt::new());
+    let (x, a, _in_a, _read_a) = poisoned_episode(&rt);
+    rt.get(x);
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    let walked = Gate::new();
+    park_at(&rt, vec![(ParkPoint::AfterWalk(id(a)), walked.clone())]);
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(x))
+    };
+    walked.wait_parked();
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    let waits = rt.reservation_waits.load(Ordering::SeqCst);
+    let claimer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(a))
+    };
+    while !claimer.is_finished() && rt.reservation_waits.load(Ordering::SeqCst) == waits {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        rt.reservation_waits.load(Ordering::SeqCst) > waits,
+        "the claimer ran `a` before the read took its value"
+    );
+    walked.release();
+    reader.join().unwrap();
+    claimer.join().unwrap();
+    rt.assert_invariant_i();
+}
+
 /// `a` and `b` read each other while `g` is 0, and `a` reads only `g`
 /// otherwise. Returns them with `a` Clean at 7.
 pub(super) fn clean_node_that_can_turn_cyclic(rt: &Rt) -> (Incr<u64>, Incr<i64>, Incr<i64>) {
@@ -1554,4 +1680,305 @@ fn a_get_waiting_on_a_compute_checks_the_locks_it_holds() {
         msg.contains("waiting on a claim while holding [CollectionLog]"),
         "got: {msg}"
     );
+}
+
+/// A walk entry's claim released unrun after the episode check: a reader
+/// waiting on that claim goes on, and reads the node once it lands.
+#[test]
+fn a_claim_released_unrun_ends_its_waiters_wait() {
+    let rt = Arc::new(Rt::new());
+    let (x, q, d) = chain(&rt);
+    rt.set(x, 2);
+    let (claimed, waiting) = (Gate::new(), Gate::new());
+    // The walker passes the reader's park point before its claim, so the
+    // reader's gate is armed only once the walker holds the claim.
+    let points = [
+        (ParkPoint::AfterWalkClaim(id(q)), claimed.clone()),
+        (ParkPoint::BeforeComputeOne(id(q)), waiting.clone()),
+    ];
+    claimed.arm();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        for (point, gate) in &points {
+            if *point == p {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let walker = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            super::FORCE_REPLAN_HERE.with(|f| f.set(true));
+            rt.get(d)
+        })
+    };
+    claimed.wait_parked();
+    waiting.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(q))
+    };
+    waiting.wait_parked();
+    waiting.release();
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::Computing);
+    claimed.release();
+    assert_eq!(reader.join().unwrap(), 1);
+    assert_eq!(walker.join().unwrap(), 101);
+    // A forced revisit releases claims unrun too.
+    if !super::forced_revisit() {
+        assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    }
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn a_claim_from_new_released_unrun_after_a_set_stays_new() {
+    let rt = Arc::new(Rt::new());
+    let (x, q, d) = chain(&rt);
+    // Q New with its edges, as a stale recovery or an episode leaves it,
+    // so the set's dirty walk reaches Q's claim.
+    rt.nodes.get(q.slot()).set_state(NodeState::New.as_u8());
+    rt.set(x, 2);
+    let (claimed, rerun) = (Gate::new(), Gate::new());
+    let points = [
+        (ParkPoint::AfterWalkClaim(id(q)), claimed.clone()),
+        (ParkPoint::BeforeComputeOne(id(q)), rerun.clone()),
+    ];
+    claimed.arm();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        for (point, gate) in &points {
+            if *point == p {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let walker = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || {
+            super::FORCE_REPLAN_HERE.with(|f| f.set(true));
+            rt.get(d)
+        })
+    };
+    claimed.wait_parked();
+    rt.set(x, 4);
+    assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::ComputingDirty);
+    rerun.arm();
+    claimed.release();
+    rerun.wait_parked();
+    assert_eq!(rt.nodes.get(q.slot()).state(), NodeState::New);
+    rerun.release();
+    assert_eq!(walker.join().unwrap(), 102);
+    // A forced revisit releases claims unrun too.
+    if !super::forced_revisit() {
+        assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), 1);
+    }
+    rt.assert_invariant_i();
+}
+
+/// a = get(b); b = try_get(c), or 7777 on a cycle; c = get(a) with a
+/// Fallback of 3. A read of `a` from New meets the cycle at `a` and gets
+/// 7777, leaving `a` Dirty; a read after that walks to `c` first and gets 3.
+fn caught_cycle_under_a_fallback(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
+    let cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let b_reads = cell.clone();
+    let b = rt.create_query(move |rt| rt.try_get(*b_reads.get().unwrap()).unwrap_or(7777));
+    let a = rt.create_query(move |rt| rt.get(b));
+    let c = rt.create_query_with_fallback(move |rt| rt.get(a), |_| 3_u64);
+    cell.set(c).unwrap();
+    (a, b)
+}
+
+/// Reads of `a` one after the other give 7777 and then 3.
+#[test]
+fn a_caught_cycle_under_a_fallback_answers_a_second_read_from_its_walk() {
+    let rt = Rt::new();
+    let (a, _) = caught_cycle_under_a_fallback(&rt);
+    assert_eq!(rt.get(a), 7777);
+    assert_eq!(rt.get(a), 3);
+}
+
+/// Thread A loads `a` New, then B claims and lands it Dirty while A waits
+/// on the claim. A's read comes after B's, so it gets 3, as a serial
+/// second read does: its walk plans `a` again and expands its deps first,
+/// where verifying `a` under its own claim met the cycle at `a`.
+#[test]
+fn a_walk_that_waited_out_a_dirty_landing_plans_the_node_again() {
+    let rt = Arc::new(Rt::new());
+    let (a, b) = caught_cycle_under_a_fallback(&rt);
+    let (loaded, holding) = (Gate::new(), Gate::new());
+    let points = [
+        (ParkPoint::BeforeClaim(id(a)), "A", loaded.clone()),
+        (ParkPoint::BeforeComputeOne(id(b)), "B", holding.clone()),
+    ];
+    loaded.arm();
+    holding.arm();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        let name = thread::current().name().map(str::to_owned);
+        for (point, who, gate) in &points {
+            if *point == p && name.as_deref() == Some(*who) {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let first = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("A".into())
+            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(a))))
+            .unwrap()
+    };
+    loaded.wait_parked();
+    let second = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("B".into())
+            .spawn(move || rt.try_get(a))
+            .unwrap()
+    };
+    holding.wait_parked();
+    loaded.release();
+    thread::sleep(Duration::from_millis(20));
+    holding.release();
+    assert_eq!(second.join().unwrap(), Ok(7777));
+    assert_eq!(first.join().unwrap().ok(), Some(3));
+}
+
+/// Group verify releases the members it claimed unrun when a later member
+/// fails its claim: A's verify of `p` in the group {p, x, q} claims `x`,
+/// and `q`, which left the group Clean, fails. B planned its read of `x`
+/// before A's claim and waited it out, so it finds `x` Dirty as it planned
+/// it and claims it instead of revisiting it.
+#[test]
+fn a_walk_that_waited_out_a_released_group_claim_keeps_its_plan() {
+    let rt = Arc::new(Rt::new());
+    let k = rt.create_input(0_i64);
+    let p = rt.create_query(move |rt| rt.get(k) + 1);
+    let x = rt.create_query(move |rt| rt.get(k) * 10);
+    let q = rt.create_query(|_| 5_i64);
+    assert_eq!((rt.get(p), rt.get(x), rt.get(q)), (1, 0, 5));
+    assert!(p.slot() < x.slot() && x.slot() < q.slot());
+    rt.force_group_for_test(&[p.erase(), x.erase(), q.erase()]);
+    let (node, flags) = rt.nodes.get_with_flags(q.slot());
+    rt.leave_group(id(q), node, flags, NodeState::Clean);
+    rt.set(k, 1);
+    let (planned, claimed, waits) = (Gate::new(), Gate::new(), Gate::new());
+    let points = [
+        (ParkPoint::BeforeClaim(id(x)), "B", planned.clone()),
+        (ParkPoint::GroupMemberClaimed(id(x)), "A", claimed.clone()),
+        (ParkPoint::ComputeWaits(id(x)), "B", waits.clone()),
+    ];
+    for (_, _, gate) in &points {
+        gate.arm();
+    }
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        let name = thread::current().name().map(str::to_owned);
+        for (at, who, gate) in &points {
+            if *at == point && name.as_deref() == Some(*who) {
+                gate.park();
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let read = |name: &str, h: Incr<i64>| {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || rt.get(h))
+            .unwrap()
+    };
+    let b = read("B", x);
+    planned.wait_parked();
+    let a = read("A", p);
+    claimed.wait_parked();
+    planned.release();
+    waits.wait_parked();
+    waits.release();
+    claimed.release();
+    assert_eq!((a.join().unwrap(), b.join().unwrap()), (2, 10));
+    assert_eq!(rt.wait_revisits.load(Ordering::SeqCst), 0, "B revisited x");
+    rt.assert_invariant_i();
+}
+
+/// Thread A's walk plans `a` New and parks at `at`; another read lands
+/// `a` Dirty meanwhile. A's claim from Dirty plans `a` again, so it gets
+/// 3, as a serial second read does.
+fn planned_new_then_landed_dirty(at: fn(NodeId) -> ParkPoint) {
+    let rt = Arc::new(Rt::new());
+    let (a, _) = caught_cycle_under_a_fallback(&rt);
+    let planned = Gate::new();
+    planned.arm();
+    let parks = planned.clone();
+    let installed = rt.park_hook.set(Box::new(move |p| {
+        if p == at(id(a)) && thread::current().name() == Some("A") {
+            parks.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let first = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("A".into())
+            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(a))))
+            .unwrap()
+    };
+    planned.wait_parked();
+    assert_eq!(rt.try_get(a), Ok(7777));
+    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    planned.release();
+    assert_eq!(first.join().unwrap().ok(), Some(3));
+}
+
+#[test]
+fn a_claim_from_dirty_after_a_load_of_new_plans_the_node_again() {
+    planned_new_then_landed_dirty(ParkPoint::BeforeClaim);
+}
+
+#[test]
+fn a_dirty_landing_before_the_walks_first_load_plans_the_node_again() {
+    planned_new_then_landed_dirty(ParkPoint::BeforeComputeOne);
+}
+
+/// A read whose walk lands its root Dirty returns that landing's value:
+/// R, over a dependency cycle it catches, lands Dirty with its run count,
+/// and a second read reruns it. Parked between its walk and its slot read,
+/// the first reader must not return the run the second reader started.
+#[test]
+fn shared_read_returns_the_value_its_walk_landed_dirty() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let c_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let cc = c_cell.clone();
+    let c = rt.create_query(move |rt: &Runtime<Shared>| rt.get(*cc.get().unwrap()));
+    c_cell.set(c).unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let rr = runs.clone();
+    let r = rt.create_query(move |rt: &Runtime<Shared>| {
+        let n = rr.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+        rt.try_get(c).map_or(n * 100, |v| v + n)
+    });
+    let gate = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::AfterWalk(NodeId(r.slot())), gate.clone())],
+    );
+    let first = {
+        let rt = rt.clone();
+        thread::spawn(move || rt.get(r))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(r), NodeState::Dirty);
+    let waits = rt.reservation_waits.load(Ordering::SeqCst);
+    let second = {
+        let rt = rt.clone();
+        thread::spawn(move || rt.get(r))
+    };
+    while !second.is_finished() && rt.reservation_waits.load(Ordering::SeqCst) == waits {
+        thread::sleep(Duration::from_millis(1));
+    }
+    gate.release();
+    assert_eq!(first.join().unwrap(), 100);
+    assert_eq!(second.join().unwrap(), 200);
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
 }

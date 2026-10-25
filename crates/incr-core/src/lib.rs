@@ -29,6 +29,7 @@ mod dep_set;
 pub mod dep_stack;
 mod dependent_list;
 mod directory;
+mod few;
 pub mod fx;
 pub mod generic_arena;
 pub mod grid_table;
@@ -43,10 +44,12 @@ mod loom_models;
 #[cfg(all(test, loom))]
 mod loom_seed_models;
 pub mod node;
+mod notes;
 #[doc(hidden)]
 pub mod persist_hooks;
 mod reclaim_probe;
 mod replay;
+mod reserve;
 pub mod runtime;
 pub mod segmented_nodes;
 mod set_stack;

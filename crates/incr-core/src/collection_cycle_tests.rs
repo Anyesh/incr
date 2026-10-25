@@ -204,9 +204,13 @@ fn group_by_refuses<C: Cells>() {
 
     // The refusal left the router marked for a rebuild, whose key_fn pass
     // over the snapshot meets M again. The read's walk runs the router as
-    // M's dep, before M's closure, so the cycle reaches this `try_get`.
+    // M's dep, and the cycle it closes runs wholly above that entry, so the
+    // walk contains it and M reruns as from scratch: its read is refused
+    // again and it lands its fallback.
     s.insert(&rt, 4);
-    assert!(rt.try_get(m).is_err(), "the rebuild read a provisional M");
+    refused.store(false, SeqCst);
+    assert_eq!(rt.try_get(m).ok(), Some(7));
+    assert!(refused.load(SeqCst), "the rebuild read a provisional M");
     assert_eq!(
         grouped.routed_state(&rt),
         routed,

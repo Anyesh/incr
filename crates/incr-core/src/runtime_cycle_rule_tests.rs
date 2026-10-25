@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Runtime;
@@ -930,7 +930,237 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
     );
 }
 
+/// A group verify's episode panics in member b: b lands Failed, released
+/// with the Fixpoint co-member a it reads. A later set that reaches only a
+/// must still let b recompute, so with j back at
+/// 1 the cycle converges to a = 2, b = 3 as it first did.
+fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let bc = cell::<i64>();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = rt.get(*bc.get().unwrap());
+                if rt.get(j) == 0 {
+                    v
+                } else {
+                    v.min(2)
+                }
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a);
+        assert!(v < 3, "b boom");
+        v + 1
+    });
+    bc.set(b).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b), 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"b boom"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert_eq!(rt.get(a), 2);
+    rt.assert_invariant_i();
+}
+
+/// As [`wave6_failed_member_over_dirty_co_member`], with the set reaching
+/// b only through two co-members: j is read by c, c by a, a by b.
+fn failed_member_two_hops_from_the_set<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let cc = cell::<i64>();
+    let a = {
+        let cc = cc.clone();
+        rt.create_query_with(
+            move |rt| rt.get(*cc.get().unwrap()),
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a);
+        assert!(v < 3, "b boom");
+        v + 1
+    });
+    let c = rt.create_query(move |rt| {
+        let v = rt.get(b);
+        if rt.get(j) == 0 {
+            v
+        } else {
+            v.min(2)
+        }
+    });
+    cc.set(c).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b), 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"b boom"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert_eq!(rt.get(c), 2);
+    rt.assert_invariant_i();
+}
+
+/// A co-member reads k only in the episode that fails b, so k's edge is
+/// only in its run's record; setting k must still let b recompute.
+fn failed_member_cured_through_a_recorded_dep<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let k = rt.create_input(0_i64);
+    let bc = cell::<i64>();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = rt.get(*bc.get().unwrap());
+                if rt.get(j) == 0 && rt.get(k) == 0 {
+                    v
+                } else {
+                    v.min(2)
+                }
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| {
+        let v = rt.get(a);
+        assert!(v < 3, "b boom");
+        v + 1
+    });
+    bc.set(b).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b), 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"b boom"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(k, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    rt.assert_invariant_i();
+}
+
+/// The cycle forms inside root x's own frame, which panics: x lands
+/// Failed through its compute's panic path, over the member y it read.
+fn failed_frame_node_over_its_released_member<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let yc = cell::<i64>();
+    let x = {
+        let yc = yc.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = rt.get(*yc.get().unwrap());
+                assert!(v < 3, "x boom");
+                v + 1
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let y = rt.create_query(move |rt| if rt.get(j) == 1 { 1 } else { rt.get(x) + 5 });
+    yc.set(y).unwrap();
+    assert_eq!(rt.get(x), 2);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(x)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(x), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(x)).ok(), Some(2));
+    rt.assert_invariant_i();
+}
+
+/// An `i64` whose compare panics only between 3 and 6.
+#[derive(Clone, Debug)]
+struct EqBomb(i64);
+
+impl PartialEq for EqBomb {
+    fn eq(&self, other: &Self) -> bool {
+        assert!(
+            (self.0.min(other.0), self.0.max(other.0)) != (3, 6),
+            "EqBomb"
+        );
+        self.0 == other.0
+    }
+}
+
+/// Step 3's write of b compares b's stored 3 with its converged 6 and
+/// panics: b lands Failed, and a set reaching it through the co-members
+/// must still let it recompute.
+fn failed_compare_over_a_co_member<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let cc = cell::<i64>();
+    let a = {
+        let cc = cc.clone();
+        rt.create_query_with(
+            move |rt| rt.get(*cc.get().unwrap()),
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..Default::default()
+            },
+        )
+    };
+    let b = rt.create_query(move |rt| EqBomb(rt.get(a) + 1));
+    let c = rt.create_query(move |rt| {
+        let v = rt.get(b).0;
+        if rt.get(j) == 0 {
+            v.min(5)
+        } else {
+            v.min(2)
+        }
+    });
+    cc.set(c).unwrap();
+    assert_eq!(rt.get(a), 2);
+    assert_eq!(rt.get(b).0, 3);
+
+    rt.set(j, 0);
+    let err = quiet(|| rt.get(b)).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"EqBomb"));
+    assert_eq!(rt.state_of(b), NodeState::Failed);
+
+    rt.set(j, 1);
+    assert_ne!(rt.state_of(b), NodeState::Failed);
+    assert_eq!(quiet(|| rt.get(b)).ok().map(|v| v.0), Some(3));
+    rt.assert_invariant_i();
+}
+
 both!(
+    wave6_failed_member_over_dirty_co_member,
+    failed_member_two_hops_from_the_set,
+    failed_member_cured_through_a_recorded_dep,
+    failed_frame_node_over_its_released_member,
+    failed_compare_over_a_co_member,
     a_panic_after_a_swallowed_cycle_lands_failed,
     member_run_unwind_is_the_readers_err,
     g1_group_verify_falls_back_from_p,
@@ -1017,7 +1247,7 @@ macro_rules! pairs {
 pairs!(
     cross_runtime_reentry,
     cross_runtime_read_records_nothing,
-    foreign_reader_is_never_doomed,
+    foreign_reader_is_doomed_and_retried,
     foreign_ring_read_is_not_rerun,
 );
 
@@ -1240,24 +1470,58 @@ mod flags_reload {
     }
 }
 
+/// What a replayable frame reads first in [`foreign_reader_is_doomed_and_retried`].
+#[derive(Clone, Copy, Debug)]
+enum FirstRead {
+    Own,
+    /// Another runtime's input, Clean when read.
+    ForeignClean,
+    /// Another runtime's query over that input, New when read, so the
+    /// read computes it.
+    ForeignComputed,
+}
+
 /// A replayable frame at budget 1 that reads 64 leaves runs twice, once
-/// doomed; after a read of another runtime's node it is never doomed, so
-/// its leaves nest natively and it runs once.
-fn foreign_reader_is_never_doomed<A: Cells, B: Cells>() {
-    for foreign in [false, true] {
+/// doomed, whatever it first reads; see [`foreign_reader_is_doomed_with`]. The last leaf sets another runtime's
+/// input when it runs, which is after the first read in the unbounded run
+/// and between the doomed run and its retry here. A retry takes a non-Clean
+/// foreign read's outcome again, so it agrees with the unbounded run; a
+/// Clean foreign read keeps nothing, so the retry reads the node again and
+/// sees the set, the documented limitation.
+fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
+    foreign_reader_is_doomed_with::<A, B>(64);
+}
+
+/// [`foreign_reader_is_doomed_and_retried`] with `n` leaves.
+fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
+    for first in [
+        FirstRead::Own,
+        FirstRead::ForeignClean,
+        FirstRead::ForeignComputed,
+    ] {
         let r1 = Box::new(Runtime::<A>::new());
         let r2 = Box::new(Runtime::<B>::new());
         r1.set_placeholder(0_u64);
         r1.set_max_frames(1);
         let x = r2.create_input(1000_u64);
-        let leaves: Vec<Incr<u64>> = (0..64_u64).map(|i| r1.create_query(move |_| i)).collect();
+        let q = r2.create_query(move |rt| rt.get(x));
+        let mut leaves: Vec<Incr<u64>> = (0..n - 1).map(|i| r1.create_query(move |_| i)).collect();
+        let r2_ = OtherRt(&*r2);
+        leaves.push(r1.create_query(move |_| {
+            r2_.set(x, 2000);
+            n - 1
+        }));
         let runs = Arc::new(AtomicU32::new(0));
         let wide = {
             let (r2, runs) = (OtherRt(&*r2), runs.clone());
             r1.create_query_with(
                 move |rt| {
                     runs.fetch_add(1, Ordering::Relaxed);
-                    let base = if foreign { r2.get(x) } else { 1000 };
+                    let base = match first {
+                        FirstRead::Own => 1000,
+                        FirstRead::ForeignClean => r2.get(x),
+                        FirstRead::ForeignComputed => r2.get(q),
+                    };
                     base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
                 },
                 QueryOpts {
@@ -1266,9 +1530,13 @@ fn foreign_reader_is_never_doomed<A: Cells, B: Cells>() {
                 },
             )
         };
-        assert_eq!(r1.get(wide), 1000 + (0..64).sum::<u64>());
-        assert_eq!(runs.load(Ordering::Relaxed), if foreign { 1 } else { 2 });
-        assert_eq!(r1.dooms.lock().unwrap().is_empty(), foreign);
+        let base = match first {
+            FirstRead::ForeignClean => 2000,
+            FirstRead::Own | FirstRead::ForeignComputed => 1000,
+        };
+        assert_eq!(r1.get(wide), base + (0..n).sum::<u64>(), "{first:?}");
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "{first:?}");
+        assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
     }
 }
 
@@ -1313,5 +1581,660 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
     assert_eq!(run(u32::MAX), Ok(7777));
     for frames in [1, 2] {
         assert_eq!(run(frames), Ok(7777), "budget {frames}");
+    }
+}
+
+/// A replayable chain of `n` levels read top-down in runtime A, where every
+/// level reads an input of runtime B and then the next level. Run on a
+/// spawned thread's default stack, which the frame budget must bound, as
+/// it does a chain that reads only its own runtime.
+fn foreign_reading_chain_stays_within_the_stack<A: Cells, B: Cells>() {
+    let n = crate::test_size::test_size(100_000);
+    let got = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        let x = r2.create_input(1_i64);
+        let mut below: Option<Incr<i64>> = None;
+        for _ in 0..n {
+            let (r2, next) = (OtherRt(&*r2), below);
+            below = Some(r1.create_query_with(
+                move |rt| r2.get(x) + next.map_or(0, |b| rt.get(b)),
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(got, n as i64);
+}
+
+mod foreign_chain {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_local() {
+        super::foreign_reading_chain_stays_within_the_stack::<Local, Local>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared() {
+        super::foreign_reading_chain_stays_within_the_stack::<Local, Shared>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_local() {
+        super::foreign_reading_chain_stays_within_the_stack::<Shared, Local>();
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_shared() {
+        super::foreign_reading_chain_stays_within_the_stack::<Shared, Shared>();
+    }
+}
+
+/// A panic payload no copy can stand for.
+struct Uncopyable;
+
+/// Silences the panics of [`Uncopyable`] payloads, one per level of
+/// `foreign_panicking_chain_stays_within_the_stack`, and leaves every
+/// other panic to the default hook.
+fn quiet_uncopyable() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.payload().is::<Uncopyable>() {
+                default(info);
+            }
+        }));
+    });
+}
+
+/// As [`foreign_reading_chain_stays_within_the_stack`], with every level
+/// catching the panic of its own node of runtime B, whose payload no kept
+/// read can carry. Such a reader stays undoomed only within the budget, so
+/// the chain is bounded as one with a ticket payload is.
+/// `b_frames` is B's frame budget, if not the default: the reader is A's
+/// frame, so A's budget bounds it whatever B's is.
+fn foreign_panicking_chain_stays_within_the_stack<A: Cells, B: Cells>(b_frames: Option<u32>) {
+    let n = crate::test_size::test_size(100_000);
+    assert_eq!(
+        foreign_panicking_chain::<A, B>(n, None, b_frames).0,
+        n as i64
+    );
+}
+
+/// The chain of [`foreign_panicking_chain_stays_within_the_stack`], `n`
+/// levels with the given frame budgets, giving A's result and how many
+/// times each level ran, the top level first.
+fn foreign_panicking_chain<A: Cells, B: Cells>(
+    n: usize,
+    a_frames: Option<u32>,
+    b_frames: Option<u32>,
+) -> (i64, Vec<u32>) {
+    quiet_uncopyable();
+    std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        if let Some(frames) = a_frames {
+            r1.set_max_frames(frames);
+        }
+        if let Some(frames) = b_frames {
+            r2.set_max_frames(frames);
+        }
+        let runs: Arc<Vec<AtomicU32>> = Arc::new((0..n).map(|_| AtomicU32::new(0)).collect());
+        let mut below: Option<Incr<i64>> = None;
+        for level in (0..n).rev() {
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let (r2, next, runs) = (OtherRt(&*r2), below, runs.clone());
+            below = Some(r1.create_query_with(
+                move |rt| {
+                    runs[level].fetch_add(1, Ordering::Relaxed);
+                    let caught = quiet(|| r2.get(bq)).is_err();
+                    i64::from(caught) + next.map_or(0, |b| rt.get(b))
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        let got = r1.get(below.unwrap());
+        (
+            got,
+            runs.iter().map(|r| r.load(Ordering::Relaxed)).collect(),
+        )
+    })
+    .join()
+    .unwrap()
+}
+
+mod foreign_panic_chain {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(None);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn shared_shared() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>(None);
+    }
+
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
+    )]
+    #[cfg_attr(miri, ignore)]
+    fn local_shared_with_b_unbudgeted() {
+        super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(Some(u32::MAX));
+    }
+}
+
+/// Small foreign-read cases that run under Miri: a non-Clean foreign read
+/// kept for a doomed frame's retry, the Clean read's documented gap, and
+/// an uncopyable foreign panic holding its reader within the budget only.
+mod foreign_miri {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    fn doomed_reader_local_shared() {
+        super::foreign_reader_is_doomed_with::<Local, Shared>(4);
+    }
+
+    #[test]
+    fn doomed_reader_shared_local() {
+        super::foreign_reader_is_doomed_with::<Shared, Local>(4);
+    }
+
+    #[test]
+    fn panic_chain_past_the_budget_local_shared() {
+        panic_chain_past_the_budget::<Local, Shared>();
+    }
+
+    #[test]
+    fn panic_chain_past_the_budget_shared_shared() {
+        panic_chain_past_the_budget::<Shared, Shared>();
+    }
+
+    /// At A's budget of 4, the three levels within it took an uncopyable
+    /// foreign payload and are held, so they run once; levels past it are
+    /// doomed and retried.
+    fn panic_chain_past_the_budget<A: crate::cells::Cells, B: crate::cells::Cells>() {
+        let (got, runs) = super::foreign_panicking_chain::<A, B>(12, Some(4), None);
+        assert_eq!(got, 12);
+        assert_eq!(runs[..3], [1, 1, 1]);
+        assert!(runs[3..].contains(&2), "{runs:?}");
+    }
+}
+
+/// A chain of readers of runtime A, each catching the panic of its own
+/// node of runtime B, whose payload no kept read can carry, under A's
+/// frame budget `frames` and byte budget `bytes`. The outermost reader is
+/// at the bottom of the stack, within any budget, so its foreign read's
+/// hold keeps it undoomed and it sees its own payload; a retry would read
+/// B's node again and see the Failed node's.
+fn outermost_foreign_reader_keeps_its_payload<A: Cells, B: Cells>(budget: fn(&Runtime<A>)) {
+    quiet_uncopyable();
+    let outer = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        budget(&r1);
+        let mut below: Option<Incr<i64>> = None;
+        for level in 0..200 {
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let (r2, next) = (OtherRt(&*r2), below);
+            let weight = if level == 199 { 1_000_000 } else { 1 };
+            below = Some(r1.create_query_with(
+                move |rt| {
+                    let own = quiet(|| r2.get(bq)).is_err_and(|p| p.is::<Uncopyable>());
+                    i64::from(own) * weight + next.map_or(0, |b| rt.get(b))
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap()) / 1_000_000
+    })
+    .join()
+    .unwrap();
+    assert_eq!(outer, 1, "the outermost reader saw a retry's payload");
+}
+
+/// Runs `read` with about `kib` KiB more of this thread's stack in use.
+#[inline(never)]
+fn deeper<R>(kib: usize, read: impl FnOnce() -> R) -> R {
+    if kib == 0 {
+        return read();
+    }
+    let pad = std::hint::black_box([0_u8; 1024]);
+    let out = deeper(kib - 1, read);
+    std::hint::black_box(&pad);
+    out
+}
+
+/// The outermost reader takes its first uncopyable foreign read within
+/// the byte budget, then a second one from deep in its own closure's
+/// stack, past it. The first read still holds the frame, which is within
+/// the budget, so the outermost reader sees its own payload.
+fn a_later_deep_hold_keeps_the_first<A: Cells, B: Cells>() {
+    quiet_uncopyable();
+    let outer = std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        r1.set_max_frames(u32::MAX);
+        r1.set_max_stack_bytes(64 * 1024);
+        let mut below: Option<Incr<i64>> = None;
+        for level in 0..200 {
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let deep = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let (r2, next) = (OtherRt(&*r2), below);
+            let outermost = level == 199;
+            below = Some(r1.create_query_with(
+                move |rt| {
+                    if !outermost {
+                        return next.map_or(0, |b| rt.get(b));
+                    }
+                    let own = quiet(|| r2.get(bq)).is_err_and(|p| p.is::<Uncopyable>());
+                    let _ = deeper(96, || quiet(|| r2.get(deep)));
+                    i64::from(own) + next.map_or(0, |b| rt.get(b))
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            ));
+        }
+        r1.get(below.unwrap())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(outer, 1, "the outermost reader saw a retry's payload");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_shared_a_later_deep_hold_keeps_the_first() {
+    a_later_deep_hold_keeps_the_first::<Local, Shared>();
+}
+
+mod foreign_hold_within_budget {
+    use crate::cells::{Local, Shared};
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn frame_budget() {
+        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(|r| {
+            r.set_max_frames(8);
+            r.set_max_stack_bytes(0);
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn byte_budget() {
+        super::outermost_foreign_reader_keeps_its_payload::<Local, Shared>(|r| {
+            r.set_max_frames(u32::MAX);
+            r.set_max_stack_bytes(64 * 1024);
+        });
+    }
+
+    /// The byte budget set by another thread while `set_max_frames` lists
+    /// the runtime.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn byte_budget_set_by_a_racing_thread() {
+        super::outermost_foreign_reader_keeps_its_payload::<Shared, Shared>(|r| {
+            crate::runtime::replay_tests::race_budget_setters(r, 64 * 1024);
+        });
+    }
+}
+
+thread_local! {
+    static CLONES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// A value that counts its clones on this thread.
+#[derive(PartialEq)]
+struct Counted(i64);
+
+impl Clone for Counted {
+    fn clone(&self) -> Self {
+        CLONES.with(|c| c.set(c.get() + 1));
+        Counted(self.0)
+    }
+}
+
+fn clones_of(read: impl FnOnce()) -> u32 {
+    CLONES.with(|c| c.set(0));
+    read();
+    CLONES.with(Cell::get)
+}
+
+/// With no budget no read is retried, so a foreign read keeps no copy:
+/// a frame's read of another runtime's New node clones its value as often
+/// as a read from outside any frame does.
+fn unbudgeted_foreign_read_keeps_no_clone<A: Cells, B: Cells>() {
+    let direct = {
+        let r2 = Runtime::<B>::new();
+        let bq = r2.create_query(|_| Counted(7));
+        clones_of(|| {
+            r2.get(bq);
+        })
+    };
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_max_frames(u32::MAX);
+    let bq = r2.create_query(|_| Counted(7));
+    let other = OtherRt(&*r2);
+    let q = r1.create_query(move |_| other.get(bq).0);
+    let framed = clones_of(|| {
+        r1.get(q);
+    });
+    assert_eq!(
+        framed, direct,
+        "clones of a framed foreign read, unbudgeted"
+    );
+}
+
+#[test]
+fn local_shared_unbudgeted_foreign_read_keeps_no_clone() {
+    unbudgeted_foreign_read_keeps_no_clone::<Local, Shared>();
+}
+
+#[test]
+fn shared_shared_unbudgeted_foreign_read_keeps_no_clone() {
+    unbudgeted_foreign_read_keeps_no_clone::<Shared, Shared>();
+}
+
+/// X reads B's uncopyable panic `held_at` KiB deep, then `during` runs,
+/// then X reads its own runtime's Y, which reads Z, `deep` KiB deep.
+/// Returns X's value: 10 for its own payload, plus Y's 2.
+fn hold_then_own_read<A: Cells, B: Cells>(
+    before: fn(&Runtime<A>),
+    during: fn(&Runtime<A>),
+    held_at: usize,
+    deep: usize,
+) -> i64 {
+    quiet_uncopyable();
+    std::thread::spawn(move || {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        before(&r1);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+        let z = r1.create_query_with(|_| 1_i64, opts());
+        let y = r1.create_query_with(move |rt| rt.get(z) + 1, opts());
+        let r2 = OtherRt(&*r2);
+        let x = r1.create_query_with(
+            move |rt| {
+                let own =
+                    deeper(held_at, || quiet(|| r2.get(bq))).is_err_and(|p| p.is::<Uncopyable>());
+                during(rt);
+                10 * i64::from(own) + deeper(deep, || rt.get(y))
+            },
+            opts(),
+        );
+        r1.get(x)
+    })
+    .join()
+    .unwrap()
+}
+
+/// [`hold_then_own_read`] with X's first read of its own runtime's A,
+/// which panics with a message, in place of B's uncopyable panic.
+fn own_panic_then_own_read<A: Cells>(before: fn(&Runtime<A>), during: fn(&Runtime<A>)) -> i64 {
+    std::thread::spawn(move || {
+        let r1 = Runtime::<A>::new();
+        r1.set_placeholder(0_i64);
+        before(&r1);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let a = r1.create_query(|_| -> i64 { std::panic::panic_any("own") });
+        let z = r1.create_query_with(|_| 1_i64, opts());
+        let y = r1.create_query_with(move |rt| rt.get(z) + 1, opts());
+        let x = r1.create_query_with(
+            move |rt| {
+                let own =
+                    quiet(|| rt.get(a)).is_err_and(|p| p.downcast_ref::<&str>() == Some(&"own"));
+                during(rt);
+                10 * i64::from(own) + rt.get(y)
+            },
+            opts(),
+        );
+        r1.get(x)
+    })
+    .join()
+    .unwrap()
+}
+
+/// X reads Y1 and then Y2, siblings that each take an uncopyable foreign
+/// read `held_at` KiB deep and then read their own runtime 96 KiB deep,
+/// under a 64 KiB byte budget. Returns how many times each ran.
+fn sibling_holds<A: Cells, B: Cells>(held_at: [usize; 2]) -> [usize; 2] {
+    quiet_uncopyable();
+    std::thread::spawn(move || {
+        let runs: &'static [AtomicUsize; 2] = Box::leak(Box::default());
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_placeholder(0_i64);
+        r1.set_max_frames(u32::MAX);
+        r1.set_max_stack_bytes(64 * 1024);
+        let opts = || QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        };
+        let ys = [0, 1].map(|i| {
+            let z = r1.create_query_with(|_| 1_i64, opts());
+            let bq = r2.create_query(|_| -> i64 { std::panic::panic_any(Uncopyable) });
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with(
+                move |rt| {
+                    runs[i].fetch_add(1, Ordering::SeqCst);
+                    let _ = deeper(held_at[i], || quiet(|| r2.get(bq)));
+                    deeper(96, || rt.get(z))
+                },
+                opts(),
+            )
+        });
+        let x = r1.create_query_with(move |rt| rt.get(ys[0]) + rt.get(ys[1]), opts());
+        r1.get(x);
+        runs.each_ref().map(|n| n.load(Ordering::SeqCst))
+    })
+    .join()
+    .unwrap()
+}
+
+/// A hold Y1 took and gave up with its frame does not hold Y2, a later
+/// frame at the same place: Y2's own hold, past the budget, leaves it
+/// doomed and run again when it reads past the budget.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_popped_siblings_hold_does_not_hold_the_next_frame() {
+    let (both, second) = (
+        sibling_holds::<Local, Shared>([96, 96]),
+        sibling_holds::<Local, Shared>([0, 96]),
+    );
+    assert!(both[1] > 1 && second[1] > 1, "{both:?} {second:?}");
+}
+
+mod review_8b_held_deep_read {
+    use super::{hold_then_own_read, Runtime};
+    use crate::cells::{Cells, Local, Shared};
+
+    fn none<C: Cells>(_: &Runtime<C>) {}
+
+    fn unbudgeted<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+    }
+
+    fn bytes_64k<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(64 * 1024);
+    }
+
+    /// X's hold, taken within the byte budget, keeps X undoomed as
+    /// `NO_DOOM` would when X's own later read is past the budget, so X
+    /// sees its own payload as the unbudgeted run does.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_held_frame_reading_deep_keeps_its_payload() {
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 0, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(bytes_64k, none, 0, 96),
+            12
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_a_held_frame_reading_deep_keeps_its_payload() {
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(unbudgeted, none, 0, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(bytes_64k, none, 0, 96),
+            12
+        );
+    }
+}
+
+mod review_8b_mid_compute_budget {
+    use super::{hold_then_own_read, own_panic_then_own_read, Runtime};
+    use crate::cells::{Cells, Local, Shared};
+
+    fn none<C: Cells>(_: &Runtime<C>) {}
+
+    fn unbudgeted<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+    }
+
+    fn frames_2<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(2);
+    }
+
+    /// A frame budget set while X runs applies to reads made after it, so
+    /// X's foreign read made before it is not retried: X sees its own
+    /// payload, as with no budget and with the budget set beforehand.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_set_mid_compute_keeps_the_earlier_payload() {
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 0, 0),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(frames_2, none, 0, 0),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, frames_2, 0, 0),
+            12
+        );
+    }
+
+    fn bytes_64k<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(64 * 1024);
+    }
+
+    fn bytes_1m<C: Cells>(r: &Runtime<C>) {
+        r.set_max_frames(u32::MAX);
+        r.set_max_stack_bytes(1024 * 1024);
+    }
+
+    /// X's hold, taken 96 KiB deep where no budget or a 1 MiB one held
+    /// it, still holds X once a 64 KiB budget is set mid-compute.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_tightened_mid_compute_keeps_an_earlier_hold() {
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, none, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(unbudgeted, bytes_64k, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Local, Shared>(bytes_1m, bytes_64k, 96, 96),
+            12
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn shared_a_budget_tightened_mid_compute_keeps_an_earlier_hold() {
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(bytes_1m, bytes_64k, 96, 96),
+            12
+        );
+        assert_eq!(
+            hold_then_own_read::<Shared, Shared>(unbudgeted, bytes_64k, 96, 96),
+            12
+        );
+    }
+
+    /// A frame budget set while X runs keeps X's earlier read of its own
+    /// runtime's panic, which nothing kept while X's runtime had no budget.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_budget_set_mid_compute_keeps_an_earlier_own_panic() {
+        assert_eq!(own_panic_then_own_read::<Local>(unbudgeted, none), 12);
+        assert_eq!(own_panic_then_own_read::<Local>(frames_2, none), 12);
+        assert_eq!(own_panic_then_own_read::<Local>(unbudgeted, frames_2), 12);
+        assert_eq!(own_panic_then_own_read::<Shared>(unbudgeted, frames_2), 12);
     }
 }

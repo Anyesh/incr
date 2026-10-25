@@ -336,14 +336,18 @@ fn run_parked(build: Build<Shared>, call: Call, nth: usize) -> Result<(bool, boo
         let armed = Arc::clone(&armed);
         let event_tx = std::sync::Mutex::new(event_tx.clone());
         let release_rx = std::sync::Mutex::new(release_rx);
+        let test = std::thread::current().name().map(str::to_owned);
         let installed = rt.park_hook.set(Box::new(move |point| {
             if point == ParkPoint::RebuildAfterSnapshot && armed.load(MemOrdering::SeqCst) {
                 event_tx.lock().unwrap().send(Event::Parked).unwrap();
-                release_rx
+                if release_rx
                     .lock()
                     .unwrap()
                     .recv_timeout(PARK_TIMEOUT)
-                    .expect("never released");
+                    .is_err()
+                {
+                    crate::runtime::park_timed_out(test.as_deref());
+                }
             }
         }));
         assert!(installed.is_ok());

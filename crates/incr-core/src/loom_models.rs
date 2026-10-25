@@ -828,9 +828,12 @@ fn loom_wound_keeps_a_member_computed_alone_in_its_group() {
         wc.set(w).unwrap();
         assert_eq!((rt.get(m), rt.get(x), rt.get(w)), (0, 1, 0));
         rt.force_group_for_test(&[x.erase(), m.erase()]);
+        let (node, flags) = rt.nodes.get_with_flags(m.slot());
         rt.leave_group(
             crate::node::NodeId(m.slot()),
-            rt.nodes.get_with_flags(m.slot()).1,
+            node,
+            flags,
+            crate::state::NodeState::Clean,
         );
         rt.set(k, 1);
 
@@ -845,6 +848,81 @@ fn loom_wound_keeps_a_member_computed_alone_in_its_group() {
         assert_eq!(reads_w.join().unwrap(), 500);
         assert_eq!(reads_m.join().unwrap(), 100);
         assert_eq!(rt.get(x), 101);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// The landed group {r, x, y} after k is set to 1: r reads x, x
+/// (Fallback) reads y, and y reads x, so r is out of the cycle. A's
+/// group verify of r runs an episode that releases x and y; until A's
+/// read ends unwounded the other thread still sees them in the group, so
+/// B's read of y verifies the group, or waits for A, as a single-thread
+/// order does. Seeing them out, B computes y alone and enters the cycle
+/// at the unseeded y: a cycle error neither single-thread order raises.
+fn released_group(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
+    let k = rt.create_input(0_u64);
+    let yc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let x = {
+        let yc = yc.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Rt| match rt.get(k) {
+                0 => 0,
+                _ => rt.get(*yc.get().unwrap()) + 1,
+            },
+            |_c: &crate::cycle::Cycle| 10,
+        )
+    };
+    let y = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(x) + 100,
+    });
+    let r = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 1,
+        _ => rt.get(x) + 1000,
+    });
+    yc.set(y).unwrap();
+    assert_eq!((rt.get(r), rt.get(x), rt.get(y)), (1, 0, 0));
+    rt.force_group_for_test(&[r.erase(), x.erase(), y.erase()]);
+    rt.set(k, 1);
+    (r, y)
+}
+
+#[test]
+#[ignore = "T8-44e3-clean-landing-variant"]
+fn loom_released_group_members_stay_grouped_until_the_read_ends() {
+    run(|| {
+        let orders: Vec<(
+            Result<u64, crate::cycle::Cycle>,
+            Result<u64, crate::cycle::Cycle>,
+        )> = [true, false]
+            .into_iter()
+            .map(|r_first| {
+                let rt = Rt::new();
+                let (r, y) = released_group(&rt);
+                if r_first {
+                    let a = rt.try_get(r);
+                    (a, rt.try_get(y))
+                } else {
+                    let b = rt.try_get(y);
+                    (rt.try_get(r), b)
+                }
+            })
+            .collect();
+        let rt = Arc::new(Rt::new());
+        let (r, y) = released_group(&rt);
+        let reads_r = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(r))
+        };
+        let reads_y = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(y))
+        };
+        let got = (reads_r.join().unwrap(), reads_y.join().unwrap());
+        assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
 
         rt.assert_invariant_i();
         rt.assert_walks_complete();
@@ -1392,6 +1470,82 @@ fn virtual_hit_claim_race() {
     });
 }
 
+/// A Fallback cycle F -> X -> ... -> F of `len` nodes at budget
+/// `frames`, entered at F on one thread and at X on the other: each
+/// thread's chain dooms on nodes the other's entries need, and its
+/// replay keeps every node the doom released reserved until its outermost
+/// context is removed. Each thread can wait on the other's reservation while
+/// holding its own, across its context's retries; wound-wait resolves
+/// any such wait, nothing stays reserved, and the pair of reads is one
+/// serial order's.
+fn doom_reservations_cross(len: usize, frames: u32) {
+    fn shape(len: usize, frames: u32) -> (Arc<Rt>, Incr<u64>, Incr<u64>) {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+        let fc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let mut next = {
+            let fc = fc.clone();
+            rt.create_query_with(move |rt: &Rt| rt.get(*fc.get().unwrap()) + 1, replayable())
+        };
+        for _ in 2..len {
+            let n = next;
+            next = rt.create_query_with(move |rt: &Rt| rt.get(n) + 1, replayable());
+        }
+        let x = next;
+        let f = rt.create_query_with(
+            move |rt: &Rt| rt.get(x) + 1,
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::Fallback(Box::new(|_| 100)),
+                replay: crate::cycle::Replay::Allowed,
+            },
+        );
+        fc.set(f).unwrap();
+        (rt, f, x)
+    }
+    run(move || {
+        let serial = |f_first: bool| {
+            let (rt, f, x) = shape(len, frames);
+            if f_first {
+                let vf = panic_message(|| rt.get(f));
+                (vf, panic_message(|| rt.get(x)))
+            } else {
+                let vx = panic_message(|| rt.get(x));
+                (panic_message(|| rt.get(f)), vx)
+            }
+        };
+        let orders = [serial(true), serial(false)];
+        let (rt, f, x) = shape(len, frames);
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || panic_message(|| rt.get(x)))
+        };
+        let vf = panic_message(|| rt.get(f));
+        let got = (vf, other.join().unwrap());
+        assert!(orders.contains(&got), "{got:?} not in {orders:?}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+    });
+}
+
+/// [`doom_reservations_cross`] on F <-> X at budget 1: each read dooms on
+/// the other thread's entry node.
+#[test]
+fn doom_reservations_cross_direct() {
+    doom_reservations_cross(2, 1);
+}
+
+/// [`doom_reservations_cross`] on a cycle of three at budget 2: each doom
+/// discards the frame below it, whose node stays reserved while the
+/// context's entries run.
+#[test]
+fn doom_reservations_cross_held() {
+    doom_reservations_cross(3, 2);
+}
+
 /// F, Clean at s = 0, reads a New query N once s is set, so at budget 1
 /// its run claimed from Dirty dooms on N and is discarded, while another
 /// thread sets s again. The discard landing keeps that set's dirtying:
@@ -1571,6 +1725,61 @@ fn drain_vs_set() {
         assert!(reports <= 2, "Q was reported {reports} times");
         assert!(rt.drain_dirtied_watched().is_empty());
         assert_eq!(rt.get(q), 3);
+        rt.assert_invariant_i();
+    });
+}
+
+/// A contained panic payload that counts the live copies.
+struct Boom(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Boom {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// As `unread_contained_panic_is_released`, with the set racing the read:
+/// x's walk contains F's panic and holds it in a ticket after F's Failed
+/// store, while a set of j flips F from Failed to Dirty. The flip must
+/// release F's ticket in every order, so once F recomputes Clean no
+/// payload is held.
+#[test]
+fn flip_racing_a_contained_hold_releases_the_ticket() {
+    run(|| {
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = Arc::new(Rt::new());
+        let sel = rt.create_input(0_u64);
+        let j = rt.create_input(1_u64);
+        let f = {
+            let live = live.clone();
+            rt.create_query(move |rt: &Rt| {
+                let v = rt.get(j);
+                if v == 0 {
+                    live.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::panic::panic_any(Boom(live.clone()));
+                }
+                v
+            })
+        };
+        let x = rt.create_query(move |rt: &Rt| if rt.get(sel) == 0 { rt.get(f) } else { 100 });
+        assert_eq!(rt.get(x), 1);
+        rt.set(j, 0);
+        rt.set(sel, 1);
+
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(j, 3))
+        };
+        assert_eq!(may_unwind(|| rt.get(x)), Some(100));
+        setter.join().unwrap();
+
+        assert_eq!(rt.get(f), 3);
+        assert_eq!(rt.get(x), 100);
+        assert_eq!(
+            live.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "F is Clean but its contained payload is still held"
+        );
         rt.assert_invariant_i();
     });
 }

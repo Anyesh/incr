@@ -29,3 +29,10 @@ fn child_that_spins_is_killed_at_the_timeout() {
     )
     .assert_killed();
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+#[should_panic(expected = "never ran a test named child_selftest::no_such_test")]
+fn child_that_names_no_test_fails() {
+    run_in_child("child_selftest::no_such_test", || {});
+}

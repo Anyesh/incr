@@ -3,10 +3,10 @@
 //! (Shared). Each binding builds its own copy, so the thread-local state
 //! here is per extension module.
 //!
-//! A Python callback that raises inside an engine closure stashes the
-//! `PyErr` thread-locally and panics; the engine's compute boundary marks
-//! the node Failed and unwinds back to the API entry point, which
-//! re-raises the original exception. Engine panics that are not Python
+//! A Python callback that raises inside an engine closure panics with the
+//! `PyErr` in its payload; the engine's compute boundary marks the node
+//! Failed and unwinds back to the API entry point, which re-raises the
+//! original exception. Engine panics that are not Python
 //! exceptions (cycles, stale handles, failed nodes) surface as
 //! `RuntimeError` with the engine's message, or `CycleError` for a cycle.
 
@@ -14,6 +14,7 @@ use pyo3::prelude::*;
 use pyo3::pyclass::CompareOp;
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, PoisonError};
 
 use incr_core::{Cells, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, Runtime};
 
@@ -28,17 +29,11 @@ pub trait Exceptions {
 }
 
 thread_local! {
-    /// Each exception a Python callback raised in the current outermost
-    /// boundary, under the token of the `PyStashPanic` that carries it. Kept
-    /// until that boundary exits, because the replay driver can deliver a
-    /// held panic to a read made after nested boundaries have returned.
-    static PENDING_PYERR: RefCell<Vec<(u64, PyErr)>> = const { RefCell::new(Vec::new()) };
     static BOUNDARY_DEPTH: Cell<u32> = const { Cell::new(0) };
     /// The runtime of the innermost engine call or query callback on this
     /// thread, with the check of its active frame, or `None` outside every
     /// one.
     static ACTIVE_RT: Cell<Option<ActiveRuntime>> = const { Cell::new(None) };
-    static LAST_TOKEN: Cell<u64> = const { Cell::new(0) };
     /// An engine unwind a nested boundary caught, carried through the
     /// Python frames between it and the engine as `_IncrEngineUnwind`
     /// and resumed unchanged where that exception reaches the engine again.
@@ -51,12 +46,27 @@ struct ActiveRuntime {
     frame_doomed: unsafe fn(*const ()) -> bool,
 }
 
-/// The panic payload for a stashed Python exception. A boundary re-raises
-/// the stash only for the token it was stored under, so a stash whose
-/// panic an engine catch swallowed never labels a later error.
-struct PyStashPanic {
-    token: u64,
-    msg: String,
+/// Exceptions of `PyStashPanic`s the engine dropped unraised, such as one
+/// an engine catch swallowed. Dropping a `PyErr` can run Python finalizers,
+/// so they wait here for the next outermost boundary's exit. Global, as a
+/// `Shared` runtime can drop a payload on a thread with no boundary.
+static PARKED: Mutex<Vec<PyErr>> = Mutex::new(Vec::new());
+
+/// The panic payload for a Python exception raised inside the engine. It
+/// carries the exception itself, because the engine can hold the panic
+/// past the call that raised it: a speculative run's stashed outcome is
+/// raised by a later call's read.
+struct PyStashPanic(Option<PyErr>);
+
+impl Drop for PyStashPanic {
+    fn drop(&mut self) {
+        if let Some(err) = self.0.take() {
+            PARKED
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(err);
+        }
+    }
 }
 
 /// Invoke a Python callable from inside an engine closure. A raised
@@ -91,15 +101,9 @@ pub fn raise_into_engine(e: PyErr) -> ! {
         drop(e);
         std::panic::resume_unwind(Box::new("incr: python code raised in a doomed frame"));
     }
-    let token = LAST_TOKEN.with(|t| {
-        t.set(t.get() + 1);
-        t.get()
-    });
-    let msg = format!("incr: python code raised: {e}");
-    PENDING_PYERR.with(|c| c.borrow_mut().push((token, e)));
     // Not `panic!`: the exception is re-raised as itself, so the panic
     // hook's message would only be noise on stderr.
-    std::panic::resume_unwind(Box::new(PyStashPanic { token, msg }))
+    std::panic::resume_unwind(Box::new(PyStashPanic(Some(e))))
 }
 
 /// Whether Python code raising now runs in a doomed frame: the active
@@ -138,17 +142,9 @@ impl Drop for RestoreActive {
     }
 }
 
-fn take_stash(token: u64) -> Option<PyErr> {
-    PENDING_PYERR.with(|c| {
-        let mut stash = c.borrow_mut();
-        let at = stash.iter().position(|(t, _)| *t == token)?;
-        Some(stash.swap_remove(at).1)
-    })
-}
-
 /// Marks a `pyerr_boundary` in progress; the outermost one drops every
-/// exception still stashed when it exits, such as one an engine catch
-/// swallowed, and the payload of an `_IncrEngineUnwind` Python swallowed.
+/// parked exception when it exits, and the payload of an
+/// `_IncrEngineUnwind` Python swallowed.
 struct Boundary;
 
 impl Boundary {
@@ -165,12 +161,15 @@ impl Drop for Boundary {
             d.get()
         });
         if depth == 0 {
-            // Dropped after the borrow ends: a finalizer that runs may raise
-            // into a callback that stashes again.
-            let stale = PENDING_PYERR.with(|c| std::mem::take(&mut *c.borrow_mut()));
-            drop(stale);
+            // The carried unwind first, as its payload may park an
+            // exception; each is dropped after its borrow or lock ends, since
+            // a finalizer that runs may raise into a callback that stashes
+            // again.
             let stale_unwind = ENGINE_UNWIND.with(|u| u.borrow_mut().take());
             drop(stale_unwind);
+            let parked =
+                std::mem::take(&mut *PARKED.lock().unwrap_or_else(PoisonError::into_inner));
+            drop(parked);
         }
     }
 }
@@ -213,10 +212,15 @@ fn catch_into_python<E: Exceptions, R>(f: impl FnOnce() -> R) -> PyResult<R> {
     // Taken on every error, so a cycle panic that Rust code caught
     // never labels a later error.
     let cycle = incr_core::take_last_cycle();
-    if let Some(stashed) = payload.downcast_ref::<PyStashPanic>() {
-        return Err(take_stash(stashed.token)
-            .unwrap_or_else(|| pyo3::exceptions::PyRuntimeError::new_err(stashed.msg.clone())));
-    }
+    let payload = match payload.downcast::<PyStashPanic>() {
+        Ok(mut stashed) => {
+            return Err(stashed
+                .0
+                .take()
+                .expect("incr: a stash payload is raised once"));
+        }
+        Err(payload) => payload,
+    };
     if let Some(cycle) = cycle {
         return Err(cycle_error::<E>(&cycle));
     }

@@ -849,6 +849,199 @@ local_and_shared!(
     shared_unwind_out_of_an_entry
 );
 
+/// T reads F, F reads w and U, and once c is 1 U reads F: with `u_panics`
+/// F takes a fallback and U panics after reading it, otherwise the cycle
+/// panics at depth 0. Below budget 2 U's virtual hit claims F, Dirty from
+/// its first revision, and U's entry's unwind releases that claim with
+/// the discard landing. What every read and later set lands is the
+/// unbounded run's.
+fn user_panic_releases_a_virtual_hit_claim<C: Cells>(
+    frames: Option<u32>,
+    u_panics: bool,
+) -> Vec<(Out, [NodeState; 3])> {
+    let rt = runtime::<C>(frames);
+    let c = rt.create_input(0_u64);
+    let w = rt.create_input(5_u64);
+    let f_later = Later::default();
+    let fl = f_later.clone();
+    let u = rt.create_query_with(
+        move |rt| {
+            if rt.get(c) == 0 {
+                return 1;
+            }
+            let v = rt.get(later(&fl));
+            if u_panics {
+                std::panic::panic_any(String::from("u boom"));
+            }
+            v
+        },
+        replayable(),
+    );
+    let body = move |rt: &Runtime<C>| rt.get(w) + rt.get(u);
+    let f = if u_panics {
+        rt.create_query_with(body, fallback(100))
+    } else {
+        rt.create_query_with(body, replayable())
+    };
+    f_later.set(f).unwrap();
+    let t = rt.create_query_with(move |rt| rt.get(f) + 1, replayable());
+    let mut seen = Vec::new();
+    let mut read = |rt: &Runtime<C>| {
+        let out = get(rt, t);
+        rt.assert_invariant_i();
+        seen.push((out, [t, f, u].map(|h| rt.state_of(h))));
+    };
+    read(&rt);
+    rt.set(c, 1);
+    read(&rt);
+    rt.set(w, 6);
+    read(&rt);
+    rt.set(c, 0);
+    read(&rt);
+    seen
+}
+
+fn a_user_panic_releases_a_virtual_hit_claim<C: Cells>() {
+    for u_panics in [false, true] {
+        let unbounded = user_panic_releases_a_virtual_hit_claim::<C>(None, u_panics);
+        let Out::Panic(text) = &unbounded[1].0 else {
+            panic!("{unbounded:?}")
+        };
+        assert!(
+            text.contains(if u_panics {
+                "u boom"
+            } else {
+                "dependency cycle"
+            }),
+            "{text}"
+        );
+        assert_eq!(unbounded[3].0, Out::Value(8));
+        for frames in [1, 2, 3] {
+            assert_eq!(
+                user_panic_releases_a_virtual_hit_claim::<C>(Some(frames), u_panics),
+                unbounded,
+                "U panics: {u_panics}, budget {frames}"
+            );
+        }
+    }
+}
+local_and_shared!(
+    a_user_panic_releases_a_virtual_hit_claim,
+    local_a_user_panic_releases_a_virtual_hit_claim,
+    shared_a_user_panic_releases_a_virtual_hit_claim
+);
+
+/// Seed 0x88f7, shrunk: a cycle n4 -> n6 -> n7 -> n8 -> n9 -> n10 -> n11
+/// -> n12 -> n4 (n4 and the native n12 with fallbacks, n6 catching, n10
+/// and n5 with `try_get`), where n12 panics once its value is 3 mod 7.
+/// After `get(n4)` panics and `sel` is set to 0, the walk of `get(n9)`
+/// runs n12 first, whose panic releases the cycle's other claims New
+/// (e9eea59d). Returns each read's outcome and the node states after it.
+fn wave8_released_new_cycle_run<C: Cells>(frames: Option<u32>) -> Vec<(Out, Vec<NodeState>)> {
+    let rt = runtime::<C>(frames);
+    let two = rt.create_input(2_u64);
+    let sel = rt.create_input(3_u64);
+    let n4_later = Later::default();
+    let n10_later = Later::default();
+    let even = |v: u64| v.is_multiple_of(2);
+    let (l10, l4) = (n10_later.clone(), n4_later.clone());
+    let n15 = rt.create_query_with(
+        move |rt| {
+            let v = if even(rt.get(later(&l10))) {
+                0
+            } else {
+                rt.try_get(two).unwrap_or(7777)
+            };
+            v + 1
+        },
+        replayable(),
+    );
+    let n13 = rt.create_query_with(|_| 3_u64, replayable());
+    let n12 = rt.create_query_with(
+        move |rt| {
+            let v = if even(rt.get(later(&l4))) {
+                if even(rt.get(sel)) {
+                    rt.get(n15)
+                } else {
+                    rt.get(n13)
+                }
+            } else {
+                0
+            };
+            if v % 7 == 3 {
+                std::panic::panic_any(String::from("boom 12"));
+            }
+            v
+        },
+        QueryOpts {
+            replay: Replay::Native,
+            cycle: CycleStrategy::fallback(|_| 1_u64),
+        },
+    );
+    let n11 = rt.create_query_with(
+        move |rt| {
+            rt.get(n12);
+            1
+        },
+        replayable(),
+    );
+    let n10 = rt.create_query_with(move |rt| rt.try_get(n11).unwrap_or(7777), replayable());
+    n10_later.set(n10).unwrap();
+    let n9 = rt.create_query_with(move |rt| u64::from(!even(rt.get(n10))), replayable());
+    let n8 = rt.create_query_with(move |rt| rt.get(n9), replayable());
+    let n7 = rt.create_query_with(move |rt| rt.get(n8), replayable());
+    let n6 = rt.create_query_with(
+        move |rt| catch_unwind(AssertUnwindSafe(|| rt.get(n7))).unwrap_or(9999),
+        replayable(),
+    );
+    let l4 = n4_later.clone();
+    let n5 = rt.create_query_with(
+        move |rt| rt.try_get(later(&l4)).unwrap_or(7777),
+        replayable(),
+    );
+    let n4 = rt.create_query_with(
+        move |rt| {
+            if even(rt.get(n6)) {
+                0
+            } else {
+                rt.try_get(n11).unwrap_or(7777) + rt.get(n5)
+            }
+        },
+        fallback(0),
+    );
+    n4_later.set(n4).unwrap();
+    let nodes = [n4, n5, n6, n7, n8, n9, n10, n11, n12, n15];
+    let mut seen = Vec::new();
+    let mut read = |rt: &Runtime<C>, h: Incr<u64>| {
+        let out = get(rt, h);
+        rt.assert_invariant_i();
+        seen.push((out, nodes.iter().map(|&n| rt.state_of(n)).collect()));
+    };
+    read(&rt, n4);
+    rt.set(sel, 0);
+    read(&rt, n9);
+    seen
+}
+
+/// The unbounded run's walk contains n12's panic in the entries n8 and n7,
+/// so n9 lands Failed inside n8 and `get(n9)` reports its last compute
+/// panicked, with n7 and n8 Failed. Every budget must give that.
+fn wave8_released_new_cycle_replays_as_unbounded<C: Cells>() {
+    let unbounded = wave8_released_new_cycle_run::<C>(None);
+    for frames in [1, 2, 3] {
+        assert_eq!(
+            wave8_released_new_cycle_run::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+local_and_shared!(
+    wave8_released_new_cycle_replays_as_unbounded,
+    wave8_local_released_new_cycle_replays_as_unbounded,
+    wave8_shared_released_new_cycle_replays_as_unbounded
+);
+
 /// P, New, reads N at budget 1, so the read dooms P. Once N is Dirty, its
 /// input changed after a compute, so its verify fails, and once it is
 /// New. The doom point finds N released, Dirty or New with
@@ -1255,4 +1448,577 @@ local_and_shared!(
     doomed_child_query_read_terminates,
     local_doomed_child_query_read_terminates,
     shared_doomed_child_query_read_terminates
+);
+
+/// A (Fallback 4) reads X inside a `catch_unwind`, then reads X again;
+/// X reads B, and B reads A and panics on A's fallback. In the unbounded
+/// run B's first panic lands X and B Dirty, since A, a new dep, is still
+/// computing, so A's second read runs them again and B's second panic
+/// reaches `get(A)` with its payload. At budget 2 both of X's reads of B
+/// doom, and the level-0 retry that takes the second delivery first runs
+/// the caught read again, which takes the first delivery.
+fn caught_member_panic_read_twice<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("b boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(move |rt| rt.get(b) + 4, replayable());
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, b].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+fn caught_member_panic_keeps_its_payload<C: Cells>() {
+    let unbounded = caught_member_panic_read_twice::<C>(None);
+    assert_eq!(
+        unbounded,
+        (Out::Panic("b boom".into()), vec![NodeState::Failed; 3])
+    );
+    for frames in [1, 2, 3] {
+        assert_eq!(
+            caught_member_panic_read_twice::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+#[test]
+fn local_caught_member_panic_keeps_its_payload() {
+    caught_member_panic_keeps_its_payload::<Local>();
+}
+
+#[test]
+fn shared_caught_member_panic_keeps_its_payload() {
+    caught_member_panic_keeps_its_payload::<Shared>();
+}
+
+/// The caught-member shape with X first catching its read of C, which
+/// reads A and panics "c boom" on A's fallback, and then reading B. Both
+/// of X's reads doom at a budget, so X's frames hold a delivery for each,
+/// and at budget 2 the frame of A's second read holds only C's.
+fn caught_member_panic_two_deliveries<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let member = |text: &'static str| {
+        let al = a_later.clone();
+        rt.create_query_with(
+            move |rt| {
+                let a = rt.get(later(&al));
+                if a == 4 {
+                    std::panic::panic_any(String::from(text));
+                }
+                a
+            },
+            replayable(),
+        )
+    };
+    let c = member("c boom");
+    let b = member("b boom");
+    let x = rt.create_query_with(
+        move |rt| {
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
+            rt.get(b) + 4
+        },
+        replayable(),
+    );
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, b, c].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+/// The two-deliveries shape with B replaced by D, a query with no deps
+/// whose panic text is C's "c boom". X catches its read of C, and D's
+/// panic escapes X.
+fn caught_read_same_text_as_escape<C: Cells>(frames: Option<u32>) -> (Out, Vec<NodeState>) {
+    let rt = runtime::<C>(frames);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let c = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("c boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let d = rt.create_query_with(
+        |_| -> u64 { std::panic::panic_any(String::from("c boom")) },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt| {
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(c)));
+            rt.get(d) + 4
+        },
+        replayable(),
+    );
+    let a = rt.create_query_with(
+        move |rt| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let got = get(&rt, a);
+    rt.assert_invariant_i();
+    (got, [a, x, d, c].iter().map(|&h| rt.state_of(h)).collect())
+}
+
+/// D's panic shares the text of C's, which X caught, but A's second
+/// read finds X Failed and must raise "last compute panicked", as the
+/// unbounded run does, not "c boom".
+fn wave6_escape_match_by_text_marks_caught_read<C: Cells>() {
+    let unbounded = caught_read_same_text_as_escape::<C>(None);
+    assert!(
+        matches!(&unbounded.0, Out::Panic(m) if m.contains("last compute panicked")),
+        "{unbounded:?}"
+    );
+    for frames in 1..=4 {
+        let got = caught_read_same_text_as_escape::<C>(Some(frames));
+        assert!(
+            matches!(&got.0, Out::Panic(m) if m.contains("last compute panicked")),
+            "budget {frames}: {got:?}"
+        );
+        assert_eq!(got.1, unbounded.1, "budget {frames} states");
+    }
+}
+
+/// Single-thread runs keep the payload text exact: at every budget A's
+/// second read of X raises "b boom" as the unbounded run does, not "last
+/// compute panicked" when the path's only delivery is for X's caught read.
+fn wave6_failed_read_after_a_caught_delivery_keeps_the_payload<C: Cells>() {
+    let unbounded = caught_member_panic_two_deliveries::<C>(None);
+    assert_eq!(
+        unbounded,
+        (Out::Panic("b boom".into()), vec![NodeState::Failed; 4])
+    );
+    for frames in 1..=4 {
+        let got = caught_member_panic_two_deliveries::<C>(Some(frames));
+        assert_eq!(got, unbounded, "budget {frames}");
+    }
+}
+
+local_and_shared!(
+    wave6_escape_match_by_text_marks_caught_read,
+    local_wave6_escape_match_by_text_marks_caught_read,
+    shared_wave6_escape_match_by_text_marks_caught_read
+);
+
+local_and_shared!(
+    wave6_failed_read_after_a_caught_delivery_keeps_the_payload,
+    wave6_local_failed_read_after_a_caught_delivery_keeps_the_payload,
+    wave6_shared_failed_read_after_a_caught_delivery_keeps_the_payload
+);
+
+/// The caught-member shape with A a walk's non-root entry: R reads A
+/// while `sel` is 0, and A reads X only once `on` is set. Setting both
+/// makes R's walk run A, whose panic the walk contains, and R reruns
+/// without A. Returns R's read, then X's and A's.
+fn walked_caught_member<C: Cells>(frames: Option<u32>) -> (Out, Out, Out) {
+    let rt = runtime::<C>(frames);
+    let on = rt.create_input(0_u64);
+    let sel = rt.create_input(0_u64);
+    let a_later = Later::default();
+    let al = a_later.clone();
+    let b = rt.create_query_with(
+        move |rt| {
+            let a = rt.get(later(&al));
+            if a == 4 {
+                std::panic::panic_any(String::from("b boom"));
+            }
+            a
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(move |rt| rt.get(b) + 4, replayable());
+    let a = rt.create_query_with(
+        move |rt| {
+            if rt.get(on) == 0 {
+                return 1;
+            }
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(9999);
+            if caught % 2 == 0 {
+                3
+            } else {
+                rt.get(x)
+            }
+        },
+        fallback(4),
+    );
+    a_later.set(a).unwrap();
+    let r = rt.create_query_with(
+        move |rt| if rt.get(sel) == 0 { rt.get(a) } else { 100 },
+        replayable(),
+    );
+    assert_eq!(get(&rt, r), Out::Value(1));
+    rt.set(on, 1);
+    rt.set(sel, 1);
+    let got = (get(&rt, r), get(&rt, x), get(&rt, a));
+    rt.assert_invariant_i();
+    got
+}
+
+/// At every budget the walk's ticket holds X's landing and X's read gets
+/// "b boom", as in the unbounded run.
+fn walked_caught_member_keeps_its_ticket<C: Cells>() {
+    let unbounded = walked_caught_member::<C>(None);
+    assert_eq!(
+        (&unbounded.0, &unbounded.1),
+        (&Out::Value(100), &Out::Panic("b boom".into()))
+    );
+    for frames in 1..=5 {
+        assert_eq!(
+            walked_caught_member::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    walked_caught_member_keeps_its_ticket,
+    local_walked_caught_member_keeps_its_ticket,
+    shared_walked_caught_member_keeps_its_ticket
+);
+
+/// A reads itself, a fallback cycle, then catches its `try_get` of B. B
+/// reads C under `catch_unwind` and panics unless that read gives an even
+/// value; C's `try_get` of B meets the cycle B..C, which has no strategy,
+/// so C gives 7777 and B panics and lands Failed. Returns A's value and
+/// the states of A, B and C.
+fn caught_cycle_in_fallback_member<C: Cells>(frames: Option<u32>) -> (u64, [NodeState; 3]) {
+    let rt = runtime::<C>(frames);
+    let (a_cell, b_cell): (Later, Later) = Default::default();
+    let a = {
+        let (a_cell, b_cell) = (a_cell.clone(), b_cell.clone());
+        rt.create_query_with(
+            move |rt| {
+                if rt.get(later(&a_cell)) % 2 == 0 {
+                    0
+                } else {
+                    catch_unwind(AssertUnwindSafe(|| {
+                        rt.try_get(later(&b_cell)).unwrap_or(7777)
+                    }))
+                    .unwrap_or(9999)
+                }
+            },
+            fallback(1),
+        )
+    };
+    a_cell.set(a).unwrap();
+    let c_cell: Later = Default::default();
+    let b = {
+        let c_cell = c_cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(later(&c_cell)))).unwrap_or(9999);
+                if v % 2 == 0 {
+                    0
+                } else {
+                    panic!("b boom")
+                }
+            },
+            replayable(),
+        )
+    };
+    b_cell.set(b).unwrap();
+    let c = rt.create_query_with(move |rt| rt.try_get(b).unwrap_or(7777), replayable());
+    c_cell.set(c).unwrap();
+    let got = rt.get(a);
+    rt.assert_invariant_i();
+    (got, [rt.state_of(a), rt.state_of(b), rt.state_of(c)])
+}
+
+/// At budget 1, B's Failed landing must survive as in the unbounded run
+/// (seed 0xa18d458163c687fe).
+fn caught_cycle_in_fallback_member_lands_failed<C: Cells>() {
+    let unbounded = caught_cycle_in_fallback_member::<C>(None);
+    assert_eq!(unbounded.0, 1);
+    assert_eq!(unbounded.1[1], NodeState::Failed);
+    for frames in 1..=4 {
+        assert_eq!(
+            caught_cycle_in_fallback_member::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    caught_cycle_in_fallback_member_lands_failed,
+    local_caught_cycle_in_fallback_member_lands_failed,
+    shared_caught_cycle_in_fallback_member_lands_failed
+);
+
+/// After a set, R's rerun computes X, which catches B's panic, swallows
+/// Y's self-cycle and re-raises B's payload; R's `try_get` passes it on as
+/// an ordinary panic, and with `nested` R's `get` passes it on as the
+/// cycle's unwind. At every budget `get(top)` must panic as in the
+/// unbounded run. Returns top's read and the states of B, X and R.
+fn wave7_rethrown_panic_after_swallowed_cycle<C: Cells>(
+    frames: Option<u32>,
+    nested: bool,
+) -> (Out, [NodeState; 3]) {
+    let rt = runtime::<C>(frames);
+    let k = rt.create_input(0_u64);
+    let b = rt.create_query_with(|_rt| -> u64 { panic!("b boom") }, replayable());
+    let y_cell: Later = Default::default();
+    let y = {
+        let y_cell = y_cell.clone();
+        rt.create_query_with(move |rt| rt.get(later(&y_cell)), replayable())
+    };
+    y_cell.set(y).unwrap();
+    let x = rt.create_query_with(
+        move |rt| {
+            let r = catch_unwind(AssertUnwindSafe(|| rt.get(b)));
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(y)));
+            match r {
+                Ok(v) => v,
+                Err(p) => std::panic::resume_unwind(p),
+            }
+        },
+        replayable(),
+    );
+    let r = rt.create_query_with(
+        move |rt| {
+            if rt.get(k) == 0 {
+                return 1;
+            }
+            if nested {
+                rt.get(x)
+            } else {
+                rt.try_get(x).unwrap_or(7777)
+            }
+        },
+        replayable(),
+    );
+    let top = rt.create_query_with(
+        move |rt| {
+            let v = rt.get(r);
+            if rt.get(k) == 0 {
+                v
+            } else {
+                0
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(top), 1);
+    rt.set(k, 1);
+    let got = get(&rt, top);
+    rt.assert_invariant_i();
+    (got, [rt.state_of(b), rt.state_of(x), rt.state_of(r)])
+}
+
+fn wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload<C: Cells>() {
+    for nested in [false, true] {
+        let unbounded = wave7_rethrown_panic_after_swallowed_cycle::<C>(None, nested);
+        assert_eq!(
+            unbounded.0,
+            Out::Panic("b boom".to_owned()),
+            "nested {nested}"
+        );
+        for frames in (1..=4).chain([u32::MAX]) {
+            assert_eq!(
+                wave7_rethrown_panic_after_swallowed_cycle::<C>(Some(frames), nested),
+                unbounded,
+                "budget {frames}, nested {nested}"
+            );
+        }
+    }
+}
+
+/// As above with R's nested `get` under top's `try_get`, which first reads
+/// R once w's walk runs top: top lands Failed with B's payload, carried up
+/// as the cycle's unwind, and the walk's ticket holds B's landing with it. Returns w's read, then
+/// b's, and the states of B, X, R and top.
+fn wave7_nested_rethrown_panic_in_a_walk<C: Cells>(
+    frames: Option<u32>,
+) -> (Out, Out, [NodeState; 4]) {
+    let rt = runtime::<C>(frames);
+    let k = rt.create_input(0_u64);
+    let sel = rt.create_input(0_u64);
+    let b = rt.create_query_with(|_rt| -> u64 { panic!("b boom") }, replayable());
+    let y_cell: Later = Default::default();
+    let y = {
+        let y_cell = y_cell.clone();
+        rt.create_query_with(move |rt| rt.get(later(&y_cell)), replayable())
+    };
+    y_cell.set(y).unwrap();
+    let x = rt.create_query_with(
+        move |rt| {
+            let r = catch_unwind(AssertUnwindSafe(|| rt.get(b)));
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(y)));
+            match r {
+                Ok(v) => v,
+                Err(p) => std::panic::resume_unwind(p),
+            }
+        },
+        replayable(),
+    );
+    let r = rt.create_query_with(move |rt| rt.get(x), replayable());
+    let top = rt.create_query_with(
+        move |rt| {
+            if rt.get(k) == 0 {
+                return 1;
+            }
+            rt.try_get(r).unwrap_or(7777)
+        },
+        replayable(),
+    );
+    let w = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(top) } else { 100 });
+    assert_eq!(rt.get(w), 1);
+    rt.set(k, 1);
+    rt.set(sel, 1);
+    let got = get(&rt, w);
+    let got_b = get(&rt, b);
+    rt.assert_invariant_i();
+    (
+        got,
+        got_b,
+        [
+            rt.state_of(b),
+            rt.state_of(x),
+            rt.state_of(r),
+            rt.state_of(top),
+        ],
+    )
+}
+
+fn wave7_nested_rethrown_panic_keeps_its_landings<C: Cells>() {
+    let unbounded = wave7_nested_rethrown_panic_in_a_walk::<C>(None);
+    assert_eq!(unbounded.0, Out::Value(100));
+    assert_eq!(unbounded.1, Out::Panic("b boom".to_owned()));
+    for frames in (1..=4).chain([u32::MAX]) {
+        assert_eq!(
+            wave7_nested_rethrown_panic_in_a_walk::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    wave7_nested_rethrown_panic_keeps_its_landings,
+    local_wave7_nested_rethrown_panic_keeps_its_landings,
+    shared_wave7_nested_rethrown_panic_keeps_its_landings
+);
+
+local_and_shared!(
+    wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload,
+    local_wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload,
+    shared_wave7_rethrown_panic_after_swallowed_cycle_keeps_its_payload
+);
+
+/// P reads A, A reads B, B reads M under `catch_unwind` and panics if that
+/// read failed, and M's `try_get` of A meets the cycle A..M, which has no
+/// strategy. M is created first, so the episode A roots runs M's member
+/// run first, and M's `try_get` of A, a held member without a buffer, runs
+/// A nested in it. B's panic rides out of that run as the cycle's unwind,
+/// which reaches M as the cycle's, so M is not the member that failed and
+/// the episode's abort leaves every node New. Returns P's outcome and the
+/// states of P, A, B and M.
+fn member_try_get_in_caught_cycle<C: Cells>(frames: Option<u32>) -> (String, [NodeState; 4]) {
+    let rt = runtime::<C>(frames);
+    let (a_cell, m_cell): (Later, Later) = Default::default();
+    let m = {
+        let a_cell = a_cell.clone();
+        rt.create_query_with(
+            move |rt| rt.try_get(later(&a_cell)).unwrap_or(7777),
+            replayable(),
+        )
+    };
+    m_cell.set(m).unwrap();
+    let b = {
+        let m_cell = m_cell.clone();
+        rt.create_query_with(
+            move |rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(later(&m_cell)))).unwrap_or(9999);
+                if v == 9999 {
+                    panic!("b boom")
+                }
+                v
+            },
+            replayable(),
+        )
+    };
+    let a = rt.create_query_with(move |rt| rt.get(b), replayable());
+    a_cell.set(a).unwrap();
+    let mut p = a;
+    for _ in 0..3 {
+        let below = p;
+        p = rt.create_query_with(move |rt| rt.get(below), replayable());
+    }
+    let got = match catch_unwind(AssertUnwindSafe(|| rt.get(p))) {
+        Ok(v) => format!("value {v}"),
+        Err(e) => e
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_owned())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_default(),
+    };
+    rt.assert_invariant_i();
+    (got, [p, a, b, m].map(|q| rt.state_of(q)))
+}
+
+/// At every budget the member's `try_get` leaves it New as in the
+/// unbounded run (seeds 0x58b6599 and 0x58b6d24).
+fn member_try_get_in_caught_cycle_stays_new<C: Cells>() {
+    let unbounded = member_try_get_in_caught_cycle::<C>(None);
+    assert_eq!(unbounded.0, "b boom");
+    assert_eq!(unbounded.1, [NodeState::New; 4]);
+    for frames in 1..=4 {
+        assert_eq!(
+            member_try_get_in_caught_cycle::<C>(Some(frames)),
+            unbounded,
+            "budget {frames}"
+        );
+    }
+}
+
+local_and_shared!(
+    member_try_get_in_caught_cycle_stays_new,
+    local_member_try_get_in_caught_cycle_stays_new,
+    shared_member_try_get_in_caught_cycle_stays_new
 );

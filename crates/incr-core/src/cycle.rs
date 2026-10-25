@@ -444,12 +444,19 @@ pub(crate) const PH_SEEN: u16 = 32;
 /// a retry.
 pub(crate) const KEPT_READ: u16 = 64;
 /// A member run at its anchor, below the frames that read it, or a frame
-/// that has read another runtime's node in this run: it is never doomed,
-/// and marking stops at it.
+/// within the budget that took a payload no kept read carries: it is never
+/// doomed, and marking stops at it.
 pub(crate) const NO_DOOM: u16 = 128;
 /// `ComputeCtl::flags`: the compute is a walk's entry, or a replay of
 /// one, which contains a panic out of it (`compute_panicked`).
 pub(crate) const WALKED: u16 = 256;
+/// `ComputeCtl::flags`: the frame read another runtime's node with an
+/// outcome no kept read carries. Its own runtime treats it as `NO_DOOM`
+/// within that runtime's budget only, which the other runtime can't see.
+pub(crate) const FOREIGN_HOLD: u16 = 512;
+/// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
+/// make: its value is buffered and its landing withheld (`replay::Stash`).
+pub(crate) const SPECULATIVE: u16 = 1024;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
