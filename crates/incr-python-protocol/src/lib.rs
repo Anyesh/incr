@@ -161,13 +161,15 @@ impl Drop for Boundary {
             d.get()
         });
         if depth == 0 {
-            // Dropped after the borrow ends: a finalizer that runs may raise
-            // into a callback that stashes again.
+            // The carried unwind first, as its payload may park an
+            // exception; each is dropped after its borrow or lock ends, since
+            // a finalizer that runs may raise into a callback that stashes
+            // again.
+            let stale_unwind = ENGINE_UNWIND.with(|u| u.borrow_mut().take());
+            drop(stale_unwind);
             let parked =
                 std::mem::take(&mut *PARKED.lock().unwrap_or_else(PoisonError::into_inner));
             drop(parked);
-            let stale_unwind = ENGINE_UNWIND.with(|u| u.borrow_mut().take());
-            drop(stale_unwind);
         }
     }
 }
