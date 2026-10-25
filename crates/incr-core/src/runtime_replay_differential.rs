@@ -3979,6 +3979,24 @@ fn two_thread_oracle_takes_a_panic_of_any_text() {
     });
 }
 
+/// 0x5651: a walk planned its root New with no deps, and the root's claim
+/// waited on the other thread, which ran it and landed it New with the
+/// deps it read. Computed then without expanding them, those deps ran
+/// nested under the root and closed a cycle no order of the reads has.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_wait_ended_new_seeds() {
+    let seed = 0x5651;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let label = format!("seed {seed:#x}, two threads {phases:?}, budget 1 frame, 16384 bytes");
+    quiet(|| {
+        for _ in 0..40 {
+            Serial::new(&case, &phases).differential(&label, Some(1), 16 * 1024, &|_| {});
+        }
+    });
+}
+
 /// Two-thread seeds with panics or cycles whose overlapping reads, at most
 /// budgets, come out as the unbounded run of the other order: which read
 /// lands a node both read first decides which gets a closure's payload,
