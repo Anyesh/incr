@@ -1535,6 +1535,9 @@ fn from_frame(kept: &[(KeptRead, usize)], cidx: u32) -> usize {
     from
 }
 
+/// The capacity of the copied set kept across a clear.
+const COPIED_KEEP: usize = 1024;
+
 /// Marks `nodes` as landings a copy may hold, so that a later landing of
 /// one of them finds the copies to drop it from. A shared copy marks only
 /// the notes its log's earlier copies did not.
@@ -1664,7 +1667,16 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
         );
         value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
-            COPIED.with(|c| c.borrow_mut().clear());
+            COPIED.with(|c| {
+                let mut c = c.borrow_mut();
+                // A clear costs the capacity, which one big replay leaves
+                // behind for every later kept episode.
+                if c.capacity() > COPIED_KEEP {
+                    *c = CopiedSet::default();
+                } else {
+                    c.clear();
+                }
+            });
             COPIED_GEN.with(|g| g.set(g.get() + 1));
         }
         out
