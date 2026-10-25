@@ -340,9 +340,7 @@ impl<C: Cells> Runtime<C> {
     /// ([`Self::first_entry`]).
     #[inline]
     pub(super) fn first_nested(&self) -> bool {
-        !C::SINGLE_THREADED
-            && cycle_state::depth() != 0
-            && !cycle_state::open_entry_of(self.runtime_id)
+        !C::SINGLE_THREADED && cycle_state::first_nested_of(self.runtime_id)
     }
 
     /// An entry of this runtime other than a read (a stabilize, an
@@ -366,11 +364,10 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn first_entry<R>(&self, entry: impl FnOnce() -> R) -> R {
-        let reader = self.dep_stack.hold_reader();
-        // SAFETY: the reading frame is below this entry on the stack, so
-        // its control block outlives it (see `Frame::ctl`).
-        let reader = reader.map(|c| unsafe { &*c });
-        let reader_held = reader.is_some_and(|c| c.has(crate::cycle::HOLD));
+        // No frame carries `HOLD` while no hold is active, so the reader is
+        // looked up only when one is, or when this entry made one.
+        let reader_held = hold::active() && self.hold_reader_has(crate::cycle::HOLD);
+        debug_assert!(reader_held || !self.hold_reader_has(crate::cycle::HOLD));
         let outcome = catch_unwind(AssertUnwindSafe(entry));
         if hold::holds_runtime(self.runtime_id) {
             let unwound = outcome.is_err()
@@ -385,8 +382,12 @@ impl<C: Cells> Runtime<C> {
                 self.publish_own();
                 // The frames' pops passed their HOLD to the reader, but
                 // what it read is published now.
-                if let Some(c) = reader.filter(|_| !reader_held) {
-                    c.clear(crate::cycle::HOLD);
+                if !reader_held {
+                    if let Some(c) = self.dep_stack.hold_reader() {
+                        // SAFETY: the reading frame is below this entry on
+                        // the stack, so its control block outlives it.
+                        unsafe { &*c }.clear(crate::cycle::HOLD);
+                    }
                 }
             }
         }
@@ -394,6 +395,14 @@ impl<C: Cells> Runtime<C> {
             Ok(r) => r,
             Err(payload) => resume_unwind(payload),
         }
+    }
+
+    fn hold_reader_has(&self, flag: u16) -> bool {
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live (see `Frame::ctl`).
+        self.dep_stack
+            .hold_reader()
+            .is_some_and(|c| unsafe { &*c }.has(flag))
     }
 
     /// The reading frame's landing depends on state this attempt has not

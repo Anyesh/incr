@@ -1187,6 +1187,7 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         frame: Option<ActiveRead>,
         mut word: u64,
+        first: bool,
     ) -> Result<T, Cycle> {
         let foreign = word & value_code::FOREIGN_BIT != 0;
         if foreign {
@@ -1215,7 +1216,7 @@ impl<C: Cells> Runtime<C> {
             }
         }
         if foreign {
-            return self.foreign_read(handle, observed, kind, word);
+            return self.foreign_read(handle, observed, kind, word, first);
         }
         // A delivery goes to its frame's retry in a non-speculative run: a
         // speculative run that computes the same node is on another path,
@@ -2152,8 +2153,10 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         kind: ReadKind,
         word: u64,
+        first: bool,
     ) -> Result<T, Cycle> {
-        if C::SINGLE_THREADED {
+        // A first nested entry has no entry of this runtime open below it.
+        if C::SINGLE_THREADED || first {
             return self.foreign_read_framed(handle, observed, kind, word);
         }
         self.foreign_entry(|| self.foreign_read_framed(handle, observed, kind, word))
@@ -2305,7 +2308,7 @@ impl<C: Cells> Runtime<C> {
         }
         if word & (value_code::COUNTER_MASK | value_code::REPLAY_BIT | value_code::UNWIND_MASK) != 0
         {
-            return self.read_cold(handle, observed, kind, None, word);
+            return self.read_cold(handle, observed, kind, None, word, false);
         }
         self.read_walk::<T, 0>(handle, node, observed, kind, word, None)
     }

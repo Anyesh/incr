@@ -2304,7 +2304,7 @@ impl<C: Cells> Runtime<C> {
         if !C::SINGLE_THREADED && frame.is_none() && self.first_nested() {
             return self.first_read(handle, node, observed, kind);
         }
-        self.read_dispatch(handle, node, observed, kind, frame)
+        self.read_dispatch(handle, node, observed, kind, frame, false)
     }
 
     #[inline(always)]
@@ -2315,6 +2315,7 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         kind: ReadKind,
         frame: Option<ActiveRead>,
+        first: bool,
     ) -> Result<T, Cycle> {
         let word = value_code::thread_word();
         if word
@@ -2325,7 +2326,7 @@ impl<C: Cells> Runtime<C> {
             != 0
             || frame.is_some_and(|f| self.doomed_or_past_budget(f))
         {
-            return self.read_cold(handle, observed, kind, frame, word);
+            return self.read_cold(handle, observed, kind, frame, word, first);
         }
         self.read_walk::<T, 0>(handle, node, observed, kind, word, frame)
     }
@@ -2341,7 +2342,7 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         kind: ReadKind,
     ) -> Result<T, Cycle> {
-        self.first_entry(|| self.read_dispatch(handle, node, observed, kind, None))
+        self.first_entry(|| self.read_dispatch(handle, node, observed, kind, None, true))
     }
 
     /// Whether a read from frame `f` must take the cold path: the frame
