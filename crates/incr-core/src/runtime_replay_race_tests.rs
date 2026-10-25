@@ -76,6 +76,16 @@ fn spawn<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> Bounded<R
 }
 
 impl<R> Bounded<R> {
+    /// The thread's result, or `self` back if it has not returned within
+    /// `d`.
+    fn join_within(self, d: Duration) -> Result<R, Self> {
+        match self.0.recv_timeout(d) {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => std::panic::resume_unwind(e),
+            Err(_) => Err(self),
+        }
+    }
+
     fn join(self) -> R {
         match self.0.recv_timeout(JOIN_TIMEOUT) {
             Ok(Ok(r)) => r,
@@ -1608,9 +1618,10 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
 /// The same shape with F, X and Y a landed group and Z's set behind input
 /// t: F's claim, taken from Dirty, lands as before it, under no record
 /// naming X or Y, which the dissolve released, and unverified, as a
-/// member that leaves its group lands; it is reserved for the context's
-/// retry, so the other thread's read waits and reads as in the order where
-/// the driver reads first.
+/// member that leaves its group lands. The driver's read holds X and Y
+/// until it publishes (`crate::hold`), so the other thread's read of F
+/// waits for the driver and reads as in the order where the driver reads
+/// first.
 #[test]
 fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
     let run = |frames: u32, park: bool| {
@@ -1687,29 +1698,44 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
                 rt.state_of(f),
                 rt.cycle_of(f).is_some(),
                 rt.verified_at_of(f) == verified,
+                [x, y].map(|m| rt.nodes.get(m.slot()).state()),
+                rt.stale_group_records(),
             );
-            let waits = rt.reservation_waits.load(SeqCst);
             let other = {
                 let rt = rt.clone();
                 spawn(move || outcome(|| rt.get(f)))
             };
-            await_reservation_wait(&rt, waits);
+            let other = other.join_within(Duration::from_millis(200));
+            let waited = (other.is_err(), rt.state_of(f));
             gate.release();
-            gap = Some((landed, other));
+            gap = Some((landed, waited, other));
         }
         let got = reader.join();
-        let gap = gap.map(|(landed, other)| (landed, other.join()));
+        let gap = gap
+            .map(|(landed, waited, other)| (landed, waited, other.unwrap_or_else(Bounded::join)));
         rt.assert_invariant_i();
         (got, gap)
     };
     let (want, _) = run(u32::MAX, false);
     assert_eq!(want, Ok(15));
     let (got, gap) = run(1, true);
-    let (landed, other) = gap.expect("the driver parked");
+    let (landed, waited, other) = gap.expect("the driver parked");
     assert_eq!(
         landed,
-        (NodeState::Dirty, false, false),
-        "F's discard landing: (state, in a group, verification kept)"
+        (
+            NodeState::Dirty,
+            false,
+            false,
+            [NodeState::Computing; 2],
+            Vec::new()
+        ),
+        "F's discard landing: (state, in a group, verification kept, X and Y \
+         to another thread, stale group records)"
+    );
+    assert_eq!(
+        waited,
+        (true, NodeState::Dirty),
+        "the other read while the driver is parked: (still waiting, F's state)"
     );
     assert_eq!((got, other), (want.clone(), want));
 }
