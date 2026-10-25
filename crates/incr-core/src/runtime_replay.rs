@@ -2783,7 +2783,7 @@ impl<C: Cells> Runtime<C> {
             reading: u64::from(handle.slot()) | (u64::from(handle.generation()) << 32),
             ordinal: 0,
             foreign: Some(self.runtime_id),
-            what: Delivered::Landed(Unbuilt::new(clone_landed::<T>(&value))),
+            what: Delivered::Landed(Unbuilt::new(clone_landed::<T>(&value)), cycle::POISONED),
         };
         let kept = flags.has(cycle::KEPT_READ);
         flags.raise(cycle::KEPT_READ);

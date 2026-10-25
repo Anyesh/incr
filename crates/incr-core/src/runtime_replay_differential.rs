@@ -7747,6 +7747,7 @@ fn history_failed_set(
             end,
             caught,
             returned,
+            closing: Vec::new(),
         };
         let value = ReadOut::Value;
         let mut evals = HashMap::from([

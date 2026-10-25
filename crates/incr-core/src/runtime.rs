@@ -3411,13 +3411,14 @@ impl<C: Cells> Runtime<C> {
                 // A Failed entry's compute does nothing and a Failed root's
                 // raises, so neither needs its deps cleaned first.
                 NodeState::Failed if !is_root => continue,
-                NodeState::Failed => walk.visit(cur, false),
+                NodeState::Failed => walk.visit(cur, generation, false),
                 // A memo stands for the node's run in this revision, so its
                 // deps are not expanded; the root's compute reads it.
                 NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
                     if is_root {
                         walk.push(Entry {
                             id: cur,
+                            generation,
                             taint: NO_TAINT,
                         });
                     }
@@ -4538,9 +4539,9 @@ impl<C: Cells> Runtime<C> {
     /// above it raises: `HANDLED` for a user panic of a node that
     /// landed Failed, `POISONED` otherwise.
     pub(super) fn unwound_poison(&self, kind: Option<UnwindKind>) -> u16 {
-        let reading = self.dep_stack.unwound_reader(self.runtime_id);
+        let reading = self.dep_stack.unwound_read(self.runtime_id);
         match reading {
-            Some((_, _, reading, _))
+            Some((_, reading, _))
                 if self.nodes.get(reading as u32).generation() == (reading >> 32) as u32 =>
             {
                 self.failed_poison(kind, reading as u32)
