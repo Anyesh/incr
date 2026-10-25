@@ -497,7 +497,8 @@ enum Computed {
     Discarded,
     /// Another thread landed or released an episode since the walk
     /// planned: the node was left unrun and unclaimed, and the walk prunes
-    /// its plan, or plans again if no entry has settled.
+    /// its plan, or plans again if no entry has settled. From a walk, the
+    /// release case: its caller reads the root again from its state now.
     Replan,
     /// Another thread landed the node since the walk planned it: a claim
     /// wait ended with it Dirty or New, not released unrun, or the walk
@@ -2343,10 +2344,12 @@ impl<C: Cells> Runtime<C> {
                 Computed::Doomed | Computed::Discarded => {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
-                Computed::Skipped(_) | Computed::Replan | Computed::Revisit => {
-                    unreachable!(
-                        "incr-core: a walk's root is never skipped, replanned or revisited"
-                    )
+                Computed::Replan => {
+                    observed = state::load::<C>(node.state_cell());
+                    continue;
+                }
+                Computed::Skipped(_) | Computed::Revisit => {
+                    unreachable!("incr-core: a walk's root is never skipped or revisited")
                 }
             }
             self.park(ParkPoint::AfterWalk(NodeId(slot)));
@@ -3079,12 +3082,17 @@ impl<C: Cells> Runtime<C> {
         // takes locks in this release.
         let word = value_code::checked_word();
 
-        // Fast path: already clean.
-        let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
-        if observed == NodeState::Clean {
-            return Computed::Done;
+        loop {
+            // Fast path: already clean.
+            let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
+            if observed == NodeState::Clean {
+                return Computed::Done;
+            }
+            match self.clean_walk::<0>(id, gen, word, observed) {
+                Computed::Replan => {}
+                computed => return computed,
+            }
         }
-        self.clean_walk::<0>(id, gen, word, observed)
     }
 
     /// [`Self::ensure_clean`] past its fast path, for a caller that took
@@ -3181,15 +3189,16 @@ impl<C: Cells> Runtime<C> {
                         if released {
                             // The plan may have expanded through the released
                             // claims' old states anywhere, nodes it ran
-                            // included, so it starts again as a walk begun now.
-                            let root = self.nodes.get(id.0);
-                            if root.generation() != gen {
+                            // included, so the read starts again from its
+                            // root's state now, through the checks its entry
+                            // made: the root may be Computing by now.
+                            if self.nodes.get(id.0).generation() != gen {
                                 return Computed::Gone;
                             }
-                            walk = Walk::new(id, state::load::<C>(root.state_cell()));
                             #[cfg(test)]
                             self.root_replans
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Computed::Replan;
                         } else {
                             walk.push(Entry { id: cur, taint });
                             unchecked = Some(cur);
