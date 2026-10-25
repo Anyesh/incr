@@ -435,7 +435,7 @@ fn shared_entry_under_a_local_entry_ends_what_it_left_reserved() {
 
 /// A Local closure that reads two Shared chains sharing their lower half,
 /// each doomed at budget 1: the second Shared entry starts where the
-/// first did and finds no context of it, and both reads, and what the
+/// first did with no context of it left, and both reads, and what the
 /// thread holds afterwards, are the unbounded run's.
 #[test]
 fn second_shared_entry_under_a_local_entry_starts_with_no_context() {
@@ -458,7 +458,11 @@ fn second_shared_entry_under_a_local_entry_starts_with_no_context() {
         let local = Runtime::<crate::cells::Local>::new();
         let read = {
             let shared = shared.clone();
-            local.create_query(move |_| (shared.get(a), shared.get(b)))
+            local.create_query(move |_| {
+                let first = shared.get(a);
+                let left = crate::replay::with(|c| c.len());
+                (first, left, shared.get(b))
+            })
         };
         let got = local.get(read);
         let no_doom = shared.dooms.lock().unwrap().is_empty();

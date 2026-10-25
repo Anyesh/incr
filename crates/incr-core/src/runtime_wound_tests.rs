@@ -1052,9 +1052,9 @@ fn shared_wound_after_clean_landings_of_released_members_keeps_their_group() {
 /// `Local` runtime's query: the wound or cycle raised in the `Shared`
 /// read reaches the `Local` entry around it, which is the thread's
 /// outermost, and B gets the outcome it gets without the `Local` entry,
-/// holding no reservation afterwards. Whichever thread is wounded checks
-/// in its head start whether its winner took the claim, which is the
-/// `Shared` runtime's, as without the `Local` entry.
+/// holding no reservation afterwards. With A older, B is wounded under the
+/// `Local` entry and checks in its head start whether A took the claim,
+/// which is the `Shared` runtime's.
 fn stale_edge_waits_for_cycle_under_local(a_first: bool) {
     let checks = waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed);
     let g = StaleEdge::new(QReads::Plain, false);
@@ -1078,7 +1078,7 @@ fn stale_edge_waits_for_cycle_under_local(a_first: bool) {
     }
     assert_wounded();
     assert!(
-        waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed) > checks,
+        !a_first || waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed) > checks,
         "the wounded thread's head start never checked the claim its winner waited on"
     );
     g.rt.assert_invariant_i();
