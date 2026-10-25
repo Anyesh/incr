@@ -64,6 +64,10 @@ pub(crate) struct EntrySeen {
 /// How a virtual frame's pop left its context's driver.
 enum VPop {
     Next,
+    /// The frame, rooting no claims and with no stand-in, leaves its run
+    /// to the retry below, which reads the node afresh once it has run
+    /// what precedes that read again.
+    Left,
     /// A doom (`true`) or a dropped chain pushed entries: the driver picks
     /// its next entry again.
     Restart(bool),
@@ -2977,9 +2981,12 @@ impl<C: Cells> Runtime<C> {
                     self.tarjan_pop(id, &v, &mut kept)
                 };
                 match popped {
-                    VPop::Next => {
+                    VPop::Next | VPop::Left => {
                         if retried && !kept.is_empty() {
                             taint_memo::restore(kept);
+                        }
+                        if matches!(popped, VPop::Left) && !C::SINGLE_THREADED && reserve::any() {
+                            self.end_unowed_reservation(v.node, v.generation);
                         }
                         popped_frames.push((v.clone(), false));
                     }
@@ -3495,7 +3502,7 @@ impl<C: Cells> Runtime<C> {
                 };
             }
         } else if !rooted {
-            return VPop::Next;
+            return VPop::Left;
         }
         let mut bag = Deferred::new();
         if v.spec {
@@ -3875,11 +3882,15 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Ends this thread's context reservation of the node at `slot`, which
-    /// a read just took Dirty, unless this thread runs it again: its frame
-    /// is on the stack, it holds the claim, or a context still replays it.
-    /// A reservation kept past that would make another thread's read of
-    /// the node wait on a rerun that never comes. Takes the reservation
-    /// table's lock only to end one.
+    /// a read just took Dirty, a replay landing just left Dirty, or a
+    /// virtual frame's pop just left to the retry below it, unless this
+    /// thread still owes the node's run from here: its frame is on the
+    /// stack, it holds the claim, or a context stacks its virtual frame or
+    /// has an entry of it yet to run. A retry below that reads the node
+    /// again owes nothing: it first runs again what precedes that read,
+    /// and a reservation kept through that would make another thread's
+    /// read of the node, joined there, wait on a run not yet begun. Takes
+    /// the reservation table's lock only to end one.
     #[cold]
     #[inline(never)]
     pub(super) fn end_unowed_reservation(&self, slot: u32, generation: u32) {
@@ -3891,10 +3902,8 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         let owed = replay::with(|c| {
-            c.iter().any(|x| {
-                x.rt == rt
-                    && (x.position(slot, generation).is_some() || x.has_entry(slot, generation))
-            })
+            c.iter()
+                .any(|x| x.rt == rt && (x.stacks(slot, generation) || x.queues(slot, generation)))
         });
         if !owed {
             reserve::end_landed((rt, slot), generation);
@@ -4079,7 +4088,7 @@ impl<C: Cells> Runtime<C> {
                     payload,
                 },
             );
-            x.levels.truncate(level as usize);
+            x.truncate_levels(level as usize);
             x.trim_levels();
             (replaced, x.truncate_vstack(level as usize))
         });
@@ -4109,9 +4118,9 @@ impl<C: Cells> Runtime<C> {
                 .iter_mut()
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
-            x.levels.truncate(q as usize + 1);
+            x.truncate_levels(q as usize + 1);
             if !keep {
-                x.levels[q as usize].pop_front();
+                x.drop_oldest(q);
             }
             x.trim_levels();
             // Entries a doom handed over from the dropped frames go with
@@ -4330,6 +4339,17 @@ impl<C: Cells> Runtime<C> {
                 x.claims.retain(|&(l, _)| l < level);
             }
         });
+        // `hold_landing` above ran while this entry still counted as yet to
+        // run.
+        if landed && level > 0 && !C::SINGLE_THREADED && reserve::any() {
+            let mut state = state::load::<C>(self.nodes.get(node).state_cell());
+            if is_computing(state) {
+                state = self.given_back_state(node, generation).unwrap_or(state);
+            }
+            if state == NodeState::Dirty {
+                self.end_unowed_reservation(node, generation);
+            }
+        }
         if level == 0 {
             self.close_context(id, boundary);
             if ended == Ended::Contained {
@@ -4355,7 +4375,9 @@ impl<C: Cells> Runtime<C> {
     /// it right after the compute. If an episode landed it with no value,
     /// that read gets the episode's cycle, as the read that ran it would.
     /// A walk stopped short of its root drops the node's other entries if
-    /// the compute left it `unsettled`, as `walk_stopped` does.
+    /// the compute left it `unsettled`, as `walk_stopped` does. A Dirty
+    /// landing ends the node's run, so its reservation ends too unless this
+    /// thread runs it again.
     fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32, unsettled: bool) {
         self.park(ParkPoint::HoldLanding(NodeId(node)));
         let mut state = state::load::<C>(self.nodes.get(node).state_cell());
@@ -4424,6 +4446,9 @@ impl<C: Cells> Runtime<C> {
             }
         });
         drop(unkept);
+        if state == NodeState::Dirty && !C::SINGLE_THREADED && reserve::any() {
+            self.end_unowed_reservation(node, generation);
+        }
     }
 
     /// Closes context `id` and unwinds `payload` on to the read that ran

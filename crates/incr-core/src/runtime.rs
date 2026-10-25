@@ -4614,10 +4614,11 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Ends this thread's context reservation of `id` if its run `landed`
-    /// settled, as the unbounded run's frame releases its claim there. An
-    /// unsettled landing keeps it until a later run of this context lands
-    /// the node settled or the context is removed, so that no other thread
-    /// reruns the node in between.
+    /// settled, as the unbounded run's frame releases its claim there. A
+    /// Dirty replay landing or a Dirty read ends it through
+    /// [`Self::end_unowed_reservation`] unless this thread runs the node
+    /// again; any other unsettled landing keeps it until a later run lands
+    /// the node settled or the context is removed.
     pub(super) fn end_reservation_landed(&self, id: NodeId, node: &NodeData<C>, landed: NodeState) {
         if landed.is_settled() {
             self.end_reservation(id, node);
