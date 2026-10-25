@@ -89,7 +89,9 @@ impl<C: Cells> Provenance for Hold<C> {
 
 impl<C: Cells> Drop for Hold<C> {
     fn drop(&mut self) {
-        self.table.write().live.retain(|r| r.id != self.id);
+        let mut table = self.table.write();
+        replay::note_work(table.live.len());
+        table.live.retain(|r| r.id != self.id);
     }
 }
 
@@ -165,6 +167,7 @@ impl<C: Cells> Runtime<C> {
         let found = {
             let records = self.provenance.read();
             candidates.into_iter().find(|&(_, _, record)| {
+                replay::note_work(records.live.len());
                 records
                     .live
                     .iter()
@@ -222,13 +225,15 @@ impl<C: Cells> Runtime<C> {
         let Some(reader) = reader else {
             return;
         };
-        let record = self
-            .provenance
-            .read()
-            .live
-            .iter()
-            .find(|r| r.reader == reader)
-            .map(|r| r.id);
+        let record = {
+            let records = self.provenance.read();
+            replay::note_work(records.live.len());
+            records
+                .live
+                .iter()
+                .find(|r| r.reader == reader)
+                .map(|r| r.id)
+        };
         if let Some(record) = record {
             replay::set_carry(Some(Carry {
                 rt,
@@ -265,6 +270,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(c) = carried {
             if !self.provenance.read().live.is_empty() {
                 let mut records = self.provenance.write();
+                replay::note_work(records.live.len());
                 if let Some(r) = records.live.iter_mut().find(|r| r.id == c.record) {
                     if !r.propagated.contains(&(id.0, generation)) {
                         r.propagated.push((id.0, generation));

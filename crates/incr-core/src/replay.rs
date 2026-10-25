@@ -1442,7 +1442,8 @@ thread_local! {
 }
 
 /// Counts `units` elements a pass over this thread's notes, their copies,
-/// its kept reads or a context's traced deliveries looked at.
+/// its kept reads, a context's traced deliveries or the provenance records
+/// looked at.
 #[inline(always)]
 pub(crate) fn note_work(units: usize) {
     #[cfg(all(test, not(loom)))]
