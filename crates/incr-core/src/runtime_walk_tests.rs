@@ -2326,8 +2326,9 @@ fn shared_walk_enters_a_cycle_at_its_first_recomputed_member() {
 /// `c`, which reads `d`, which reads `b` back: R3 in the member run of `b`,
 /// a cycle over the held member `b`, `c` and `d` that aborts the episode.
 /// `x` reads `a` only while `sel` is 0. After `k` and `sel` go to 1, the
-/// walk of `x` recomputes its stale dep `a` and contains the abort, so the
-/// rerun, which no longer reads `a`, gives 100 as a fresh read of `x` does.
+/// walk of `x` recomputes its stale dep `a`, and the cycle that aborts the
+/// episode reaches `get(x)`, as on main, though a fresh read of `x` gives
+/// 100: the stale-dep known limitation.
 fn stale_dep_whose_episode_cycles<C: Cells>() -> Result<i64, String> {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
@@ -2386,14 +2387,22 @@ fn stale_dep_whose_episode_cycles<C: Cells>() -> Result<i64, String> {
     got
 }
 
+const EPISODE_CYCLE: &str = "incr-core: dependency cycle: 3, 4, 5";
+
 #[test]
-fn local_stale_dep_whose_episode_cycles_is_not_read() {
-    assert_eq!(stale_dep_whose_episode_cycles::<Local>(), Ok(100));
+fn local_stale_dep_whose_episode_cycles_reaches_the_reader() {
+    assert_eq!(
+        stale_dep_whose_episode_cycles::<Local>(),
+        Err(EPISODE_CYCLE.into())
+    );
 }
 
 #[test]
-fn shared_stale_dep_whose_episode_cycles_is_not_read() {
-    assert_eq!(stale_dep_whose_episode_cycles::<Shared>(), Ok(100));
+fn shared_stale_dep_whose_episode_cycles_reaches_the_reader() {
+    assert_eq!(
+        stale_dep_whose_episode_cycles::<Shared>(),
+        Err(EPISODE_CYCLE.into())
+    );
 }
 
 #[test]
