@@ -400,6 +400,10 @@ pub(crate) const FOREIGN_HOLD: u16 = 512;
 /// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
 /// make: its value is buffered and its landing withheld (`replay::Stash`).
 pub(crate) const SPECULATIVE: u16 = 1024;
+/// `ComputeCtl::flags`: the frame kept a read (`KEPT_READ`) whose stash
+/// adoption can't check: of its own runtime, or of another runtime's node
+/// that was not Clean or was read while that runtime was changing.
+pub(crate) const KEPT_UNCHECKED: u16 = 2048;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at

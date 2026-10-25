@@ -17,6 +17,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
+use crate::changes::Count;
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::deferred::Unbuilt;
 use crate::few::Few;
@@ -1351,6 +1352,7 @@ pub(crate) struct KeptRead {
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
     static KEPT_EVENTS: RefCell<Vec<Logged>> = const { RefCell::new(Vec::new()) };
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static COPIED: RefCell<[u64; 64]> = const { RefCell::new([0; 64]) };
@@ -1370,6 +1372,7 @@ thread_local! {
 #[cfg(loom)]
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = RefCell::new(Vec::new());
     static KEPT_EVENTS: RefCell<Vec<Logged>> = RefCell::new(Vec::new());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static COPIED: RefCell<[u64; 64]> = RefCell::new([0; 64]);
@@ -1443,6 +1446,60 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
 /// raises gives it.
 pub(crate) fn keep_foreign_read(read: KeptRead, fresh: bool) {
     keep(read, fresh, true);
+}
+
+/// A speculative frame's Clean read of another runtime, with that
+/// runtime's count of changes as the read found it, which the frame's
+/// stash is adopted only while it still holds.
+struct CheckedRead {
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+}
+
+/// Keeps `seen` for the speculative frame of `ctl` at `cidx` of `rt`, as
+/// [`keep_read`] keeps the read: on the frame's first kept read (`fresh`),
+/// the checked reads of frames at or above its position, which have popped,
+/// go.
+pub(crate) fn check_read(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+    fresh: bool,
+) {
+    CHECKED_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        if fresh {
+            d.retain(|e| e.rt != rt || e.cidx < cidx);
+        }
+        let ours = |e: &&CheckedRead| e.rt == rt && e.cidx == cidx && e.ctl == ctl;
+        if !d.iter().rev().take_while(ours).any(|e| e.seen.same(&seen)) {
+            d.push(CheckedRead {
+                rt,
+                cidx,
+                ctl,
+                seen,
+            });
+        }
+    });
+}
+
+/// The checked reads of the frame of `ctl` at `cidx` of `rt`, which is
+/// popping, taken with those of frames above it.
+pub(crate) fn take_checked_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<Count> {
+    CHECKED_READS.with(|d| {
+        d.borrow_mut()
+            .extract_if(.., |e| e.rt == rt && e.cidx >= cidx)
+            .filter(|e| e.cidx == cidx && e.ctl == ctl)
+            .map(|e| e.seen)
+            .collect()
+    })
 }
 
 fn keep(mut read: KeptRead, fresh: bool, number: bool) {
@@ -1642,6 +1699,9 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
             COPIED.with(|c| *c.borrow_mut() = [0; 64]);
             COPIED_GEN.with(|g| g.set(g.get() + 1));
+            if !speculative() {
+                CHECKED_READS.with(|c| c.borrow_mut().clear());
+            }
         }
         out
     })

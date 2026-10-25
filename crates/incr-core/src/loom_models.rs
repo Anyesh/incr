@@ -16,9 +16,11 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
+use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
+use crate::changes::Changes;
 use crate::generic_arena::GenericArena;
 use crate::handle::Incr;
 use crate::loom_cells::Loom;
@@ -1747,5 +1749,30 @@ fn flip_racing_a_contained_hold_releases_the_ticket() {
             "F is Clean but its contained payload is still held"
         );
         rt.assert_invariant_i();
+    });
+}
+/// A read checked against its runtime's `Changes` while a change stores a
+/// value between its begin and end: a check that later finds the count
+/// unmoved never follows a read of the stored value that the checked read
+/// missed, so a stash adopted on the check reads what a read at the
+/// adoption would.
+#[test]
+fn loom_checked_read_vs_change() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let value = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (changes, value) = (changes.clone(), value.clone());
+            thread::spawn(move || {
+                let _change = changes.change();
+                value.store(1, Ordering::Release);
+            })
+        };
+        if let Some(seen) = changes.count() {
+            let read = value.load(Ordering::Acquire);
+            let later = value.load(Ordering::Acquire);
+            assert!(!seen.holds() || read == later);
+        }
+        writer.join().unwrap();
     });
 }

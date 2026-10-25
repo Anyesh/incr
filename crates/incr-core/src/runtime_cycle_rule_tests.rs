@@ -1476,6 +1476,9 @@ enum FirstRead {
     Own,
     /// Another runtime's input, Clean when read.
     ForeignClean,
+    /// That input, which the last leaf, replayable and so keeping its
+    /// reads of other runtimes, reads again after its set, Clean.
+    ForeignCleanAgain,
     /// Another runtime's query over that input, New when read, so the
     /// read computes it.
     ForeignComputed,
@@ -1500,48 +1503,76 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
     for first in [
         FirstRead::Own,
         FirstRead::ForeignClean,
+        FirstRead::ForeignCleanAgain,
         FirstRead::ForeignComputed,
         FirstRead::ForeignLandedClean,
     ] {
-        let runs = doomed_reader_runs::<A, B>(n, first);
+        let runs = doomed_reader_runs::<A, B>(n, first, false);
         // The landed case runs a third time; the ignored
         // `landed_foreign_reader_runs_twice` tracks it.
         if !matches!(first, FirstRead::ForeignLandedClean) {
-            assert_eq!(runs, 2, "{first:?}");
+            assert_eq!(runs, (2, 1), "{first:?}");
         }
     }
 }
 
 /// One case of [`foreign_reader_is_doomed_with`], asserting the reader's
-/// value and its doom and returning how many times its closure ran.
-fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead) -> u32 {
+/// value and its doom and returning how many times its closure and the
+/// last leaf's, which sets the other runtime's input, ran. If `steady`, the
+/// last leaf first runs alone and the reader leaves it out until a set of
+/// an input both read, and the counts are of that second revision: the
+/// reader's run is doomed on a leaf whose last run read the other runtime
+/// and that no walk of the reader's deps cleans first.
+fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead, steady: bool) -> (u32, u32) {
     let r1 = Box::new(Runtime::<A>::new());
     let r2 = Box::new(Runtime::<B>::new());
     r1.set_placeholder(0_u64);
     r1.set_max_frames(1);
+    let y = r1.create_input(0_u64);
     let x = r2.create_input(1000_u64);
     let q = r2.create_query(move |rt| rt.get(x));
     let mut leaves: Vec<Incr<u64>> = (0..n - 1).map(|i| r1.create_query(move |_| i)).collect();
     let r2_ = OtherRt(&*r2);
-    leaves.push(r1.create_query(move |_| {
-        r2_.set(x, 2000);
-        if matches!(first, FirstRead::ForeignLandedClean) {
-            r2_.get(q);
-        }
-        n - 1
-    }));
+    let leaf_runs = Arc::new(AtomicU32::new(0));
+    let leaf = leaf_runs.clone();
+    let last = r1.create_query_with(
+        move |rt| {
+            leaf.fetch_add(1, Ordering::Relaxed);
+            rt.get(y);
+            r2_.set(x, 2000);
+            match first {
+                FirstRead::ForeignCleanAgain => assert_eq!(r2_.get(x), 2000),
+                FirstRead::ForeignLandedClean => assert_eq!(r2_.get(q), 2000),
+                _ => {}
+            }
+            n - 1
+        },
+        QueryOpts {
+            replay: match first {
+                FirstRead::ForeignCleanAgain => Replay::Allowed,
+                _ => Replay::Native,
+            },
+            ..Default::default()
+        },
+    );
+    leaves.push(last);
     let runs = Arc::new(AtomicU32::new(0));
     let wide = {
         let (r2, runs) = (OtherRt(&*r2), runs.clone());
         r1.create_query_with(
             move |rt| {
                 runs.fetch_add(1, Ordering::Relaxed);
+                let all = !steady || rt.get(y) != 0;
                 let base = match first {
                     FirstRead::Own => 1000,
-                    FirstRead::ForeignClean => r2.get(x),
+                    FirstRead::ForeignClean | FirstRead::ForeignCleanAgain => r2.get(x),
                     FirstRead::ForeignComputed | FirstRead::ForeignLandedClean => r2.get(q),
                 };
-                base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
+                let read = if all { n } else { n - 1 };
+                base + leaves[..read as usize]
+                    .iter()
+                    .map(|&l| rt.get(l))
+                    .sum::<u64>()
             },
             QueryOpts {
                 replay: Replay::Allowed,
@@ -1549,19 +1580,129 @@ fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead) -> u32 {
             },
         )
     };
-    assert_eq!(r1.get(wide), 1000 + (0..n).sum::<u64>(), "{first:?}");
+    if steady {
+        r1.get(last);
+        r1.get(wide);
+    } else {
+        assert_eq!(r1.get(wide), 1000 + (0..n).sum::<u64>(), "{first:?}");
+    }
     assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
-    runs.load(Ordering::Relaxed)
+    if steady {
+        r1.set(y, 1);
+        r1.dooms.lock().unwrap().clear();
+        runs.store(0, Ordering::Relaxed);
+        leaf_runs.store(0, Ordering::Relaxed);
+        let base = if matches!(first, FirstRead::Own) {
+            1000
+        } else {
+            2000
+        };
+        assert_eq!(r1.get(wide), base + (0..n).sum::<u64>(), "{first:?}");
+        assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
+    }
+    (
+        runs.load(Ordering::Relaxed),
+        leaf_runs.load(Ordering::Relaxed),
+    )
 }
 
 #[test]
 #[ignore = "T10-speculative-landing-third-foreign-reader-run"]
 fn landed_foreign_reader_runs_twice() {
-    let first = FirstRead::ForeignLandedClean;
-    assert_eq!(doomed_reader_runs::<Local, Local>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Local, Shared>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Shared, Local>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Shared, Shared>(64, first), 2);
+    rereading_foreign_reader_runs(FirstRead::ForeignLandedClean, false);
+}
+
+/// [`landed_foreign_reader_runs_twice`] in a second revision, where the
+/// last leaf's previous run read the other runtime.
+#[test]
+fn landed_foreign_reader_runs_twice_in_steady_state() {
+    rereading_foreign_reader_runs(FirstRead::ForeignLandedClean, true);
+}
+
+/// The last leaf's speculative run reads the other runtime's input Clean
+/// after its set, and nothing changes that runtime before the retry adopts
+/// the run.
+#[test]
+fn clean_foreign_rereader_runs_twice() {
+    rereading_foreign_reader_runs(FirstRead::ForeignCleanAgain, false);
+}
+
+#[test]
+fn clean_foreign_rereader_runs_twice_in_steady_state() {
+    rereading_foreign_reader_runs(FirstRead::ForeignCleanAgain, true);
+}
+
+fn rereading_foreign_reader_runs(first: FirstRead, steady: bool) {
+    for n in [64, 4, 2] {
+        let runs = [
+            doomed_reader_runs::<Local, Local>(n, first, steady),
+            doomed_reader_runs::<Local, Shared>(n, first, steady),
+            doomed_reader_runs::<Shared, Local>(n, first, steady),
+            doomed_reader_runs::<Shared, Shared>(n, first, steady),
+        ];
+        assert_eq!(runs, [(2, 1); 4], "{n}");
+    }
+}
+
+/// A reader doomed on its first leaf, whose later leaves run speculatively:
+/// a replayable one reads another runtime's input Clean, and the next sets
+/// that input. Returns the reader's value, how many times the replayable
+/// leaf ran, and whether the reader was doomed.
+fn set_after_clean_read_runs<A: Cells, B: Cells>(budget: bool) -> (u64, u32, bool) {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    if budget {
+        r1.set_max_frames(1);
+    }
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query(|_| 1_u64);
+    let reader = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let setter = {
+        let r2 = OtherRt(&*r2);
+        r1.create_query(move |_| {
+            r2.set(x, 3000);
+            0_u64
+        })
+    };
+    let wide = r1.create_query_with(
+        move |rt| rt.get(first) + rt.get(reader) + rt.get(setter),
+        replayable(),
+    );
+    let value = r1.get(wide);
+    let doomed = !r1.dooms.lock().unwrap().is_empty();
+    (value, runs.load(Ordering::Relaxed), doomed)
+}
+
+/// Under a budget the setter's speculative run moves the other runtime's
+/// count before the retry adopts the reader's stash, so the reader runs
+/// again, reads the later set and gives 3001.
+#[test]
+#[ignore = "T10-speculative-foreign-set-before-read"]
+fn set_after_clean_read_keeps_the_read() {
+    for budget in [false, true] {
+        let runs = [
+            set_after_clean_read_runs::<Local, Local>(budget),
+            set_after_clean_read_runs::<Local, Shared>(budget),
+            set_after_clean_read_runs::<Shared, Local>(budget),
+            set_after_clean_read_runs::<Shared, Shared>(budget),
+        ];
+        assert_eq!(runs, [(1001, 1, budget); 4], "{budget}");
+    }
 }
 
 /// A value whose `Clone` reads another runtime's input, as the value-code

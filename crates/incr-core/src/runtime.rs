@@ -376,6 +376,9 @@ impl<C: Cells> SetClaim<'_, C> {
         self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
+        // After the walk, so a dependent read Clean before the walk
+        // dirtied it was read with the change in progress.
+        self.rt.changes.end();
         self.rt.drop_released_tickets();
         // Pairs with the fence in `stash`, after its store of the count.
         C::fence_seqcst();
@@ -982,6 +985,9 @@ pub struct Runtime<C: Cells> {
     pub(crate) stashes: OrderedLock<replay_impl::Stashes, C>,
     /// How many stashes `stashes` holds, so a claim can skip its lock.
     pub(crate) stash_count: C::U32,
+    /// What other runtimes' speculative runs check their Clean reads of
+    /// this one against.
+    pub(crate) changes: crate::changes::Changes,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
@@ -1096,6 +1102,7 @@ impl<C: Cells> Runtime<C> {
             drop_unwinds: std::sync::atomic::AtomicU32::new(0),
             stashes: OrderedLock::new(LockKind::Stashes, replay_impl::Stashes::default()),
             stash_count: C::new_u32(0),
+            changes: crate::changes::Changes::new(),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -1778,6 +1785,7 @@ impl<C: Cells> Runtime<C> {
         self.refuse_delete_under_own_set(id);
         self.park(ParkPoint::DeleteAfterHandleCheck(id));
 
+        let _change = self.changes.change();
         let mut spins: u32 = 0;
         match self.claim_single(root, &mut spins) {
             SingleClaim::Claimed => {}
@@ -2007,6 +2015,7 @@ impl<C: Cells> Runtime<C> {
         self.assert_not_own_compute(id, handle.generation());
         self.refuse_delete_under_own_set(id);
 
+        let _change = self.changes.change();
         let mut spins: u32 = 0;
         match self.claim_single(handle, &mut spins) {
             SingleClaim::Claimed => self.park(ParkPoint::DeleteAfterCheck(id)),
@@ -2785,7 +2794,13 @@ impl<C: Cells> Runtime<C> {
         // 5. claim release, then the dirty walk, whose Release stores
         //    publish all of the above to claimants that Acquire the
         //    Dirty state.
-        match arena.compare_and_write(arena_slot, value, || node.mark_changed_pending()) {
+        // `changes` begins with the pending marker and ends in
+        // `finish_written`.
+        let marked = || {
+            node.mark_changed_pending();
+            self.changes.begin();
+        };
+        match arena.compare_and_write(arena_slot, value, marked) {
             Compared::Equal(equal) => {
                 // The set that wrote this value released its claim before
                 // its walk, and this call must not return before that
