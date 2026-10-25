@@ -2174,10 +2174,12 @@ impl<C: Cells> Runtime<C> {
             .collect();
         self.regens_held
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.regens
-            .write()
+        let mut regens = self.regens.write();
+        regens.next_token += 1;
+        let token = regens.next_token;
+        regens
             .by_node
-            .insert(reading, Regenerable { ok, took });
+            .insert(reading, Regenerable { token, ok, took });
     }
 
     /// `id` at `generation`, its frame at `cidx` just popped, lands but not
@@ -2255,6 +2257,34 @@ impl<C: Cells> Runtime<C> {
         }
         let reading = u64::from(slot) | (u64::from(generation) << 32);
         self.regens.write().by_node.remove(&reading);
+    }
+
+    /// The token of node `slot` at `generation`'s record, to forget it by
+    /// once the node's claim or Failed state no longer keeps another run
+    /// from landing a new one (`forget_failed_run_if`).
+    pub(super) fn failed_run_token(&self, slot: u32, generation: u32) -> Option<u64> {
+        if !self.regens_held.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let reading = u64::from(slot) | (u64::from(generation) << 32);
+        self.regens.read().by_node.get(&reading).map(|r| r.token)
+    }
+
+    /// Forgets node `slot` at `generation`'s record if it is still the one
+    /// `token` names.
+    pub(super) fn forget_failed_run_if(&self, slot: u32, generation: u32, token: Option<u64>) {
+        let Some(token) = token else {
+            return;
+        };
+        let reading = u64::from(slot) | (u64::from(generation) << 32);
+        let mut regens = self.regens.write();
+        if regens
+            .by_node
+            .get(&reading)
+            .is_some_and(|r| r.token == token)
+        {
+            regens.by_node.remove(&reading);
+        }
     }
 
     /// The payload a retry's read of Failed node `id` at `generation` raises
@@ -5105,6 +5135,8 @@ thread_local! {
 #[derive(Default)]
 pub(crate) struct Regens {
     by_node: HashMap<u64, Regenerable>,
+    /// The token the next record gets (`Regenerable::token`).
+    next_token: u64,
 }
 
 pub(crate) fn regens<C: Cells>() -> C::Lock<Regens> {
@@ -5113,6 +5145,10 @@ pub(crate) fn regens<C: Cells>() -> C::Lock<Regens> {
 
 /// A node's Failed landing, as `Runtime::regenerate` runs it again.
 struct Regenerable {
+    /// Which landing wrote the record: a forget that runs after the node's
+    /// claim is released removes the record only if it is still this one,
+    /// since another thread's run may have landed the node Failed again.
+    token: u64,
     /// Whether the node may run again, and so may every node a
     /// regeneration of its payload runs.
     ok: bool,

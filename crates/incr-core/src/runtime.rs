@@ -4357,10 +4357,15 @@ impl<C: Cells> Runtime<C> {
         self.children_landing(id, flags, ChildLanding::Discard, false, bag);
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
+        let token = if landing == NodeState::Failed {
+            self.failed_run_token(id.0, node.generation())
+        } else {
+            None
+        };
         let landed = self.land_single(id, node, flags, landing, flagged);
         if landing == NodeState::Failed && landed != NodeState::Failed {
             self.park(ParkPoint::FailedLandedOtherwise(id));
-            self.forget_failed_run(id.0, node.generation());
+            self.forget_failed_run_if(id.0, node.generation(), token);
         }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.

@@ -365,6 +365,8 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn flip_failed_from(&self, id: NodeId, from: NodeState) -> bool {
         let node = self.nodes.get(id.0);
+        // Read while the node is Failed, when no run can land a new record.
+        let token = self.failed_run_token(id.0, node.generation());
         let mut t = self.tickets.write();
         if state::try_transition::<C>(node.state_cell(), from, NodeState::Dirty).is_err() {
             return false;
@@ -374,7 +376,7 @@ impl<C: Cells> Runtime<C> {
         self.sync_held(&t);
         drop(t);
         self.park(ParkPoint::FlippedFailed(id));
-        self.forget_failed_run(id.0, node.generation());
+        self.forget_failed_run_if(id.0, node.generation(), token);
         true
     }
 
