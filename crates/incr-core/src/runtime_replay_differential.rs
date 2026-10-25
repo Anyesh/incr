@@ -4380,6 +4380,14 @@ fn walk_replans_after_an_aborted_episode() {
                 let n = live.world.rt(0).root_replans.load(SeqCst);
                 replans.store(n, SeqCst);
             }
+            let rt = live.world.rt(0);
+            for slot in 0..rt.nodes.len() {
+                let state = rt.nodes.get(slot).state();
+                assert!(
+                    !matches!(state, NodeState::Computing | NodeState::ComputingDirty),
+                    "node {slot} is {state:?} after phase {p}, with both threads at the barrier"
+                );
+            }
             let v = serial.at_overlap("0x88c0", prefix, live);
             if p == before {
                 hold.on.store(true, SeqCst);
