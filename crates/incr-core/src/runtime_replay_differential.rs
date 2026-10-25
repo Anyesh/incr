@@ -8857,16 +8857,16 @@ fn op9_at_budget_3<C: Cells>(seed: u64) -> [(Out, Vec<usize>); 2] {
 
 /// Seed 0x56cdd78's op 9, `Get(8)`: its read of 4 runs 4's cycle episode,
 /// which releases 4, 8, 9 and 10 Dirty with no value, so the read walks 4
-/// again and the walk contains the cycle at its entries until 10's
-/// strategy closes it, reading 0. At a budget of 3 a doom stops the first
-/// walk; after the release, the frame reading 4 must walk again rather
-/// than take the `Direct` delivery made for the first walk.
+/// again, and the cycle a walk entry closes reaches the read, as on main.
+/// At a budget of 3 a doom stops the first walk; after the release, the
+/// frame reading 4 must walk again rather than take the `Direct` delivery
+/// made for the first walk, and so gives the unbounded outcome.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_episodes_reread_walks_instead_of_taking_the_first_walks_direct() {
     let seed = 0x56c_dd78;
     assert!(matches!(gen_case(seed, false, false).ops[9], Op::Get(8)));
-    let want = (Out::Value(0), Vec::new());
+    let want = (Out::Panic("cycle".into()), Vec::new());
     quiet(|| {
         let local = op9_at_budget_3::<Local>(seed);
         let shared = op9_at_budget_3::<Shared>(seed);
