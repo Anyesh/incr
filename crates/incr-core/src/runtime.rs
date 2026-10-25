@@ -581,6 +581,10 @@ pub(crate) struct Walk {
     /// Created at the walk's first New expansion or group expansion, in
     /// one box so that a walk with neither tests one pointer at its drop.
     expanded: Option<Box<Expanded>>,
+    /// The entry a discarded compute pushed back for the reading frame's
+    /// retry. It stays on top while set: the next pending pop takes it,
+    /// and whatever drops the entry first clears it.
+    repushed: Option<NodeId>,
 }
 
 #[derive(Default, Clone)]
@@ -604,6 +608,7 @@ impl Walk {
                 .is_some_and(|e| e.is_pending() && e.id.0 == id)
         {
             self.work.pop();
+            self.repushed = None;
         }
     }
     #[inline]
@@ -616,6 +621,7 @@ impl Walk {
             first_visits: 0,
             visited: None,
             expanded: None,
+            repushed: None,
         }
     }
 
@@ -627,6 +633,13 @@ impl Walk {
             .get_or_insert_with(Box::default)
             .new
             .insert(id)
+    }
+
+    /// Pushes back `entry`, whose compute a discard undid, for the reading
+    /// frame's retry to run again.
+    fn repush(&mut self, entry: Entry) {
+        self.push(entry);
+        self.repushed = Some(entry.id);
     }
 
     #[inline(always)]
@@ -706,6 +719,9 @@ impl Walk {
                 parent.taint = parent.taint.min(taint);
             }
         }
+        if top == self.work.len() {
+            self.repushed = None;
+        }
         self.work.drain(cut..top);
     }
 
@@ -725,6 +741,9 @@ impl Walk {
         for at in (1..self.work.len()).rev() {
             let entry = self.work[at];
             if entry.is_pending() && entry.id == id {
+                if at == self.work.len() - 1 {
+                    self.repushed = None;
+                }
                 self.work.remove(at);
                 if entry.taint < NO_TAINT {
                     if let Some(parent) = self.work[..at].iter_mut().rev().find(|e| e.is_pending())
@@ -748,6 +767,9 @@ impl Walk {
     /// expansions of the nodes it left no pending entry, so that a later
     /// visit of one plans it as a walk that never met it would.
     fn prune(&mut self, keep: usize) {
+        if keep < self.work.len() {
+            self.repushed = None;
+        }
         let mut gone: HashSet<NodeId> = self
             .work
             .drain(keep..)
@@ -3109,8 +3131,13 @@ impl<C: Cells> Runtime<C> {
                 // lands it); its compute then raises or reruns over what it
                 // reads itself, so as with a root found Failed, they need
                 // no cleaning. A passed entry hands on its taint as a Done
-                // compute would, in case the root is retried.
-                if !is_root && state::load::<C>(root_node.state_cell()) == NodeState::Failed {
+                // compute would, in case the root is retried. An entry a
+                // discarded compute pushed back was popped before the root
+                // landed Failed, as the unbounded run's compute of it was.
+                if !is_root
+                    && (MODE & VIRT == 0 || walk.repushed.take() != Some(cur))
+                    && state::load::<C>(root_node.state_cell()) == NodeState::Failed
+                {
                     if taint < NO_TAINT {
                         walk.taint(taint);
                     }
