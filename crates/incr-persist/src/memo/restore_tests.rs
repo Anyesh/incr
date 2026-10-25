@@ -271,6 +271,72 @@ kinds!(
     a_set_between_a_deps_fp_read_and_its_seed_reruns_both,
 );
 
+type Clamped = (
+    Arc<Store<Shared, MemoryBackend>>,
+    Input<u64>,
+    Memo<Shared, MemoryBackend>,
+    MemoTable<u32, u64>,
+    MemoTable<u32, u64>,
+);
+
+/// `scaled(k) = min(x, 1) * k`, parking at `gate` after it reads `x`, and
+/// `plus(k) = scaled(k) + 1`, counting runs.
+fn clamped(backends: &Backends, gate: &Arc<Gate>, runs: &Arc<AtomicUsize>) -> Clamped {
+    let store = backends.store();
+    let x = store.input("x", 1_u64).unwrap();
+    let xh = x.handle();
+    let mut builder = MemoBuilder::new(MemoOptions::new(BuildId::Fixed(BUILD)));
+    let scaled = builder.table::<u32, u64>("scaled", 1);
+    let plus = builder.table::<u32, u64>("plus", 1);
+    let (counted, gate) = (Arc::clone(runs), Arc::clone(gate));
+    builder.define(scaled, move |ctx, k| {
+        counted.fetch_add(1, SeqCst);
+        let x = ctx.rt().get(xh).min(1);
+        gate.park();
+        x * u64::from(*k)
+    });
+    let counted = Arc::clone(runs);
+    builder.define(plus, move |ctx, k| {
+        counted.fetch_add(1, SeqCst);
+        ctx.get(scaled, *k) + 1
+    });
+    let memo = builder.open(&store, backends.memo.clone()).unwrap();
+    (store, x, memo, scaled, plus)
+}
+
+/// `plus(2)` is restored while another thread holds `scaled(2)`'s claim,
+/// running it after a set its value does not depend on. The trust check
+/// can't tell that run from one that moves the value, and can't wait on
+/// it under the memo lock, so `plus` seeds `RecomputeFirst`: it counts as
+/// revalidated and runs once, cut off at its stored value.
+#[test]
+fn a_restore_over_a_claimed_dep_reruns_the_entry_once() {
+    let backends = Backends::new();
+    let gate = Arc::new(Gate::default());
+    {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let (_store, _x, memo, _, plus) = clamped(&backends, &gate, &runs);
+        assert_eq!(memo.runtime().get(memo.get_or_insert(plus, 2)), 3);
+        assert_eq!(memo.checkpoint().unwrap().written, 2);
+    }
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (store, x, memo, scaled, plus) = clamped(&backends, &gate, &runs);
+    store.set(x, 3).unwrap();
+    gate.arm();
+    thread::scope(|s| {
+        let reader = s.spawn(|| memo.runtime().get(memo.get_or_insert(scaled, 2)));
+        gate.wait_parked();
+        let q = memo.get_or_insert(plus, 2);
+        let stats = memo.stats();
+        assert_eq!((stats.reused, stats.revalidated), (0, 2));
+        gate.release();
+        assert_eq!(reader.join().unwrap(), 2);
+        assert_eq!(memo.runtime().get(q), 3);
+    });
+    assert_eq!(runs.load(SeqCst), 2);
+    assert_invariants(memo.runtime());
+}
+
 /// Armed by the one test that stores `Parked`; `inspect` clones the value
 /// between its two holds, so its first clone parks the checkpoint there.
 static CLONE_GATE: LazyLock<Gate> = LazyLock::new(Gate::default);
