@@ -2725,13 +2725,16 @@ enum Lookup {
     ForeignTable,
     ForeignAlive,
     OwnAlive,
+    ForeignCount,
+    OwnLabel,
 }
 
 /// `foreign_ticket_shape` with b's read of j replaced by `lookup`: a get on
-/// another runtime's table, `is_alive` of another runtime's node, or
-/// `is_alive` of a node of b's own runtime. After the walk holds b's
-/// payload, the test thread flips the lookup's answer (an insert or a
-/// delete), which dirties nothing; a rerun of b sees the new answer.
+/// another runtime's table, `is_alive` of another runtime's node or of a
+/// node of b's own runtime, another runtime's node count, or a label of
+/// b's own runtime. After the walk holds b's payload, the test thread
+/// flips the lookup's answer (an insert, a delete or a label), which
+/// dirties nothing; a rerun of b sees the new answer.
 fn lookup_ticket_shape<C: Cells>(
     lookup: Lookup,
     frames: u32,
@@ -2755,6 +2758,8 @@ fn lookup_ticket_shape<C: Cells>(
                 Lookup::ForeignTable => b_table.get(&b_other, &3).is_some(),
                 Lookup::ForeignAlive => b_other.is_alive(gone),
                 Lookup::OwnAlive => rt.is_alive(own_gone),
+                Lookup::ForeignCount => b_other.node_count() == 1,
+                Lookup::OwnLabel => rt.label(own_gone.slot()).is_none(),
             };
             std::panic::panic_any(CustomPayload(100 * rt.get(i) + if seen { 1 } else { 5 }))
         },
@@ -2772,8 +2777,9 @@ fn lookup_ticket_shape<C: Cells>(
         Lookup::ForeignTable => {
             table.get_or_insert_input(&other, 3, || 0);
         }
-        Lookup::ForeignAlive => other.delete_node(gone),
+        Lookup::ForeignAlive | Lookup::ForeignCount => other.delete_node(gone),
         Lookup::OwnAlive => rt.delete_node(own_gone),
+        Lookup::OwnLabel => rt.set_label(own_gone.slot(), "seen".into()),
     }
     let mut top_b = b;
     for _ in 0..mid {
@@ -2805,13 +2811,15 @@ fn lookup_ticket_shape<C: Cells>(
 
 /// Every budget gives what the unbounded run gives for
 /// `lookup_ticket_shape`, which takes the walk's payload: 205 for the
-/// table miss, 201 while the node was alive.
+/// table miss, 201 while the node was alive, counted or unlabelled.
 fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
     let mut differ = Vec::new();
     for (lookup, payload) in [
         (Lookup::ForeignTable, 205_u64),
         (Lookup::ForeignAlive, 201),
         (Lookup::OwnAlive, 201),
+        (Lookup::ForeignCount, 201),
+        (Lookup::OwnLabel, 201),
     ] {
         for outer in [0, 1, 3, 8] {
             for mid in [0, 1, 3] {
