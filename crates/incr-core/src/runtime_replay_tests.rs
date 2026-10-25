@@ -1945,6 +1945,84 @@ fn a_caught_custom_payload_survives_the_readers_retries() {
     }
 }
 
+/// A replayable reader r, `outer` levels under the read, catches b's custom
+/// payload and then reads a chain of `chain` levels. b catches the panic of
+/// c, Failed from an earlier read: a read of a node already Failed panics
+/// with its message, so b's catch takes the message and b panics with
+/// `CustomPayload(100)`, where c's own payload would have made it
+/// `CustomPayload(c + 10)`.
+fn already_failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    let i = rt.create_input(1_u64);
+    let c = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 { std::panic::panic_any(CustomPayload(rt.get(i))) },
+        replayable(),
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(c))).is_err());
+    rt.set_max_frames(frames);
+    let b = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let got = match catch_unwind(AssertUnwindSafe(|| rt.get(c))) {
+                Err(p) => p.downcast::<CustomPayload>().map_or(100, |x| x.0 + 10),
+                Ok(v) => v,
+            };
+            std::panic::panic_any(CustomPayload(got))
+        },
+        replayable(),
+    );
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let v = deep;
+        deep = rt.create_query_with(move |rt| rt.get(v) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut top = r;
+    for _ in 0..outer {
+        let v = top;
+        top = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    rt.try_get(top).unwrap_or(7777)
+}
+
+/// A retry that regenerates b's payload reads c as the unbounded run did,
+/// Failed from before with its message, instead of running c again: only
+/// the nodes the payload landed at run again (`regenerate`).
+#[test]
+fn a_regenerated_payload_reads_a_dep_failed_from_before_as_failed() {
+    for outer in [0, 1, 3] {
+        for chain in [0, 2, 6] {
+            for local in [true, false] {
+                let shape = |frames| {
+                    if local {
+                        already_failed_dep_shape::<Local>(frames, outer, chain)
+                    } else {
+                        already_failed_dep_shape::<Shared>(frames, outer, chain)
+                    }
+                };
+                let want = shape(u32::MAX);
+                assert_eq!(want, 100_000 + 1 + u64::from(chain));
+                for frames in 1..9 {
+                    assert_eq!(
+                        shape(frames),
+                        want,
+                        "local={local} outer={outer} chain={chain} frames={frames}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// A replayable chain of `levels` readers, each catching the custom panic
 /// payload of its own non-replayable dep and then reading the level below,
 /// read at budget `frames`. Returns the count of payloads caught with the
