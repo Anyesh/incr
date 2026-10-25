@@ -1944,3 +1944,59 @@ fn a_caught_custom_payload_survives_the_readers_retries() {
         }
     }
 }
+
+/// A replayable chain of `levels` readers, each catching the custom panic
+/// payload of its own non-replayable dep and then reading the level below,
+/// read at budget `frames`. Returns the count of payloads caught with the
+/// expected value.
+fn native_payload_chain<C: Cells>(frames: u32, levels: u64) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let i = rt.create_input(1_u64);
+    let mut below = rt.create_query_with(move |rt| rt.get(i) - 1, replayable());
+    for k in 0..levels {
+        let d = rt.create_query(move |rt: &Runtime<C>| -> u64 {
+            std::panic::panic_any(CustomPayload(k + rt.get(i)))
+        });
+        let next = below;
+        below = rt.create_query_with(
+            move |rt| {
+                let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(d))) {
+                    Err(p) => p
+                        .downcast_ref::<CustomPayload>()
+                        .is_some_and(|c| c.0 == k + 1),
+                    Ok(_) => false,
+                };
+                u64::from(saw) + rt.get(next)
+            },
+            replayable(),
+        );
+    }
+    rt.try_get(below).unwrap_or(7777)
+}
+
+/// A chain of readers deeper than the budget, each catching a custom
+/// payload from a dep not declared replayable, whose closure the engine
+/// must not run again: each reader is held past the budget instead
+/// (`hold_uncopied`), and every catch sees its payload, as in the
+/// unbounded run.
+#[test]
+fn a_chain_catching_non_replayable_custom_payloads_past_the_budget_reads_as_unbounded() {
+    let before = super::replay_impl::PAST_BUDGET_HOLDS.load(Relaxed);
+    for levels in [3, 12, 24] {
+        for frames in 1..9 {
+            assert_eq!(
+                native_payload_chain::<Local>(frames, levels),
+                levels,
+                "local frames={frames}"
+            );
+            assert_eq!(
+                native_payload_chain::<Shared>(frames, levels),
+                levels,
+                "shared frames={frames}"
+            );
+        }
+    }
+    assert!(super::replay_impl::PAST_BUDGET_HOLDS.load(Relaxed) > before);
+}
