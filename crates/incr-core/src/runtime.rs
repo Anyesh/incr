@@ -2299,26 +2299,49 @@ impl<C: Cells> Runtime<C> {
             .dep_stack
             .record_read(self.runtime_id, NodeId(slot), handle.generation());
 
-        let read = || {
-            let word = value_code::thread_word();
-            if word
-                & (value_code::COUNTER_MASK
-                    | value_code::REPLAY_BIT
-                    | value_code::UNWIND_MASK
-                    | value_code::FOREIGN_BIT)
-                != 0
-                || frame.is_some_and(|f| self.doomed_or_past_budget(f))
-            {
-                return self.read_cold(handle, observed, kind, frame, word);
-            }
-            self.read_walk::<T, 0>(handle, node, observed, kind, word, frame)
-        };
         // The read's exit, not its walk's, ends the holds: the walk is
         // retried until the node settles, which a retraction undoes.
         if !C::SINGLE_THREADED && frame.is_none() && self.first_nested() {
-            return self.first_entry(read);
+            return self.first_read(handle, node, observed, kind);
         }
-        read()
+        self.read_dispatch(handle, node, observed, kind, frame)
+    }
+
+    #[inline(always)]
+    fn read_dispatch<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        observed: NodeState,
+        kind: ReadKind,
+        frame: Option<ActiveRead>,
+    ) -> Result<T, Cycle> {
+        let word = value_code::thread_word();
+        if word
+            & (value_code::COUNTER_MASK
+                | value_code::REPLAY_BIT
+                | value_code::UNWIND_MASK
+                | value_code::FOREIGN_BIT)
+            != 0
+            || frame.is_some_and(|f| self.doomed_or_past_budget(f))
+        {
+            return self.read_cold(handle, observed, kind, frame, word);
+        }
+        self.read_walk::<T, 0>(handle, node, observed, kind, word, frame)
+    }
+
+    /// [`Self::read_slow`] for this runtime's first entry inside another
+    /// runtime's, whose exit ends its holds ([`Self::first_entry`]).
+    #[cold]
+    #[inline(never)]
+    fn first_read<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        observed: NodeState,
+        kind: ReadKind,
+    ) -> Result<T, Cycle> {
+        self.first_entry(|| self.read_dispatch(handle, node, observed, kind, None))
     }
 
     /// Whether a read from frame `f` must take the cold path: the frame
