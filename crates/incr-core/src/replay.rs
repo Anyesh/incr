@@ -1006,6 +1006,13 @@ impl Context {
             .find_map(|(level, q)| q.front().map(|e| (level as u32, *e)))
     }
 
+    pub(crate) fn has_entry(&self, node: u32, generation: u32) -> bool {
+        self.levels.iter().any(|q| {
+            q.iter()
+                .any(|e| e.node == node && e.generation == generation)
+        })
+    }
+
     pub(crate) fn push_entry(&mut self, level: u32, entry: Entry) {
         let level = level as usize;
         if self.levels.len() <= level {

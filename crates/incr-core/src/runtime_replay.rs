@@ -3874,6 +3874,32 @@ impl<C: Cells> Runtime<C> {
         drop(ended);
     }
 
+    /// Ends this thread's context reservation of the node at `slot`, which
+    /// a read just took Dirty, unless this thread runs it again: its frame
+    /// is on the stack, it holds the claim, or a context still replays it.
+    /// A reservation kept past that would make another thread's read of
+    /// the node wait on a rerun that never comes.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn end_unowed_reservation(&self, slot: u32, generation: u32) {
+        let rt = self.runtime_id;
+        if replay::speculative() || !reserve::mine((rt, slot), generation) {
+            return;
+        }
+        if self.dep_stack.frame_cidx(rt, NodeId(slot)).is_some() || cycle_state::holds(rt, slot) {
+            return;
+        }
+        let owed = replay::with(|c| {
+            c.iter().any(|x| {
+                x.rt == rt
+                    && (x.position(slot, generation).is_some() || x.has_entry(slot, generation))
+            })
+        });
+        if !owed {
+            reserve::end_landed((rt, slot), generation);
+        }
+    }
+
     /// Drops the deliveries, claim watermarks and failure counts held, in
     /// any of this runtime's contexts, for the frames of the nodes in
     /// `released`, whose claims a user panic's release just landed: that

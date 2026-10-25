@@ -2350,6 +2350,12 @@ impl<C: Cells> Runtime<C> {
                             self.note_dirty_read(f, handle, &value);
                         }
                     }
+                    if !C::SINGLE_THREADED
+                        && reserve::any()
+                        && state::load::<C>(node.state_cell()) == NodeState::Dirty
+                    {
+                        self.end_unowed_reservation(slot, handle.generation());
+                    }
                     return Ok(value);
                 }
                 None => match self.read_missing(handle, node) {
