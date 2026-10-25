@@ -2481,11 +2481,18 @@ impl<C: Cells> Runtime<C> {
         replay::regen_claim(self.runtime_id, id.0, true);
         let mut spins = 0;
         loop {
-            match state::try_transition::<C>(
+            // A ticket keeps the node while it reruns (`in_failed_landing`).
+            let t = self.tickets.read();
+            let moved = state::try_transition::<C>(
                 node.state_cell(),
                 NodeState::Failed,
                 NodeState::Computing,
-            ) {
+            );
+            if moved.is_ok() {
+                replay::regen_running(self.runtime_id, id.0, true);
+            }
+            drop(t);
+            match moved {
                 Ok(()) => break,
                 Err(NodeState::Computing | NodeState::ComputingDirty)
                     if replay::regen_claims(self.runtime_id, id.0) > 1 =>
@@ -2500,6 +2507,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
+        let _unmark = Unmark(self.runtime_id, id.0);
         // SAFETY: as in `compute_attempts`: the closure is freed only under
         // a Dead claim, which can't succeed while this node is Computing.
         let compute = self
@@ -2538,9 +2546,14 @@ impl<C: Cells> Runtime<C> {
             drop(catch_unwind(AssertUnwindSafe(move || drop(value))));
         }
         let mut flipped = true;
-        if state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed)
-            .is_err()
-        {
+        let t = self.tickets.read();
+        let back =
+            state::try_transition::<C>(node.state_cell(), NodeState::Computing, NodeState::Failed);
+        if back.is_ok() {
+            replay::regen_running(self.runtime_id, id.0, false);
+        }
+        drop(t);
+        if back.is_err() {
             // A set's walk found the node Computing and walked on through
             // it: the node leaves Failed as the walk would have flipped it,
             // in one step, so no read sees it Failed after the set.
@@ -5329,6 +5342,15 @@ type SyncPayload = std::sync::Mutex<Box<dyn std::any::Any + Send>>;
 
 /// Drops payloads a regeneration does not raise; a user `Drop` that
 /// panics there is not the read's panic.
+/// Clears a rerun's `REGEN_RUNNING` mark on every way out of `rerun`.
+struct Unmark(RuntimeId, u32);
+
+impl Drop for Unmark {
+    fn drop(&mut self) {
+        replay::regen_running(self.0, self.1, false);
+    }
+}
+
 fn drop_payloads(payloads: impl IntoIterator<Item = Box<dyn std::any::Any + Send>>) {
     for p in payloads {
         drop(catch_unwind(AssertUnwindSafe(move || drop(p))));
