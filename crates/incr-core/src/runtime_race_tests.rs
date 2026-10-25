@@ -106,7 +106,8 @@ pub(super) fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>)
 /// Waits until `rt` counts a wait on a doom reservation past `before`:
 /// another thread's read met the reservation and now waits it out.
 pub(super) fn await_reservation_wait<C: Cells>(rt: &Runtime<C>, before: u32) {
-    let deadline = std::time::Instant::now() + PARK_TIMEOUT;
+    // Before the parked thread's own timeout, whose abort would hide this assert.
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
     while rt.reservation_waits.load(Ordering::SeqCst) <= before {
         assert!(
             std::time::Instant::now() < deadline,
