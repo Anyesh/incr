@@ -6004,12 +6004,12 @@ fn a_walk_stashed_for_a_clean_read_lands_its_new_entries() {
 }
 
 /// 0x2165's paired case run single-threaded in every order of its read
-/// pairs: with the pairs swapped, op 10 `Get(7)` left 19 and 20 Clean at
-/// budget 1 where the unbounded run leaves them Dirty: 10's retry reads
-/// past the unwind out of 9 that ends the unbounded run's read, and runs
-/// 3, which the unbounded run never does.
+/// pairs matches its unbounded run at every budget. With the pairs
+/// swapped, op 10 `Get(7)`'s retry must not read past the unwind out of 9
+/// that ends the unbounded run's read and run 3, which would leave 19 and
+/// 20 Clean at budget 1 where the unbounded run leaves them Dirty.
 #[test]
-#[ignore = "T8-retry-reads-past-an-unwind-2165"]
+#[cfg_attr(miri, ignore)]
 fn seed_2165_in_every_order() {
     let case = gen_case(0x2165, false, true);
     let phases = phases(&case, 0x2165);
