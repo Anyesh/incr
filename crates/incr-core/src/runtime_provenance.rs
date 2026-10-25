@@ -113,12 +113,14 @@ impl<C: Cells> Runtime<C> {
     /// `compute_attempts`' Failed arm: the read panics "last compute
     /// panicked", or takes the payload a walk contained for the landing it
     /// sees (`take_contained`). Returns when the node has left Failed since
-    /// the read saw it, to be read again. A payload a record owes the read
-    /// was taken after the load, by `owed_payload`.
+    /// the read saw it, or a delete recycled the slot past `generation`, to
+    /// be read again. A payload a record owes the read was taken after the
+    /// load, by `owed_payload`.
     #[cold]
     #[inline(never)]
-    pub(super) fn read_failed_node(&self, id: NodeId) {
-        let Ok(payload) = self.take_contained(id) else {
+    pub(super) fn read_failed_node(&self, id: NodeId, generation: Option<u32>) {
+        self.park(ParkPoint::FailedReadBeforeTake(id));
+        let Ok(payload) = self.take_contained(id, generation) else {
             return;
         };
         // A closure that catches this panic has read a node with no value,

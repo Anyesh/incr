@@ -2426,12 +2426,12 @@ fn shared_stale_dep_whose_episode_cycles_is_not_read() {
 #[test]
 fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
     let (r, q, p, x) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
-    let mut walk = Walk::new(r, NodeState::Dirty);
+    let mut walk = Walk::new(r, 0, NodeState::Dirty);
     walk.visited = Some(Default::default());
     // R's deps Q and P, P's dep X, a New node with installed deps.
-    walk.expand(q, NodeState::Dirty);
-    walk.visit(p, false);
-    walk.visit(x, true);
+    walk.expand(q, 0, NodeState::Dirty);
+    walk.visit(p, 0, false);
+    walk.visit(x, 0, true);
     assert!(walk.first_new_expansion(x));
     walk.prune(3);
     assert_eq!(walk.work.len(), 3);
@@ -2443,14 +2443,14 @@ fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
 #[test]
 fn an_untainted_entry_merged_into_its_parent_keeps_the_new_mark() {
     let (r, p, x) = (NodeId(1), NodeId(2), NodeId(3));
-    let mut walk = Walk::new(r, NodeState::Dirty);
+    let mut walk = Walk::new(r, 0, NodeState::Dirty);
     walk.work.clear();
-    walk.visit(p, true);
-    walk.visit(p, false);
+    walk.visit(p, 0, true);
+    walk.visit(p, 0, false);
     walk.drop_repeats(walk.work.len());
     assert_eq!(walk.work.len(), 1);
     assert_eq!(walk.work[0].taint, NO_TAINT_NEW);
-    walk.visit(x, false);
+    walk.visit(x, 0, false);
     walk.unsettled(x);
     assert_eq!(walk.work.len(), 1);
     assert_eq!(walk.work[0].taint, NO_TAINT_NEW);

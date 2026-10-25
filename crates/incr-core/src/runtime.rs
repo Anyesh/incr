@@ -141,6 +141,8 @@ pub(crate) enum ParkPoint {
     /// In `compute_attempts`, after the claim CAS and before the check for
     /// another thread's doom reservation.
     BeforeReservationCheck(NodeId),
+    /// In `clean_walk`, before a visit of a non-root entry loads its state.
+    BeforeVisit(NodeId),
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
@@ -215,6 +217,9 @@ pub(crate) enum ParkPoint {
     /// In a Failed read that found a payload it may take, after it loaded
     /// the node's generation and before the record lock.
     FailedReadBeforeRecheck(NodeId),
+    /// In `read_failed_node`, before `take_contained` loads the slot's
+    /// generation.
+    FailedReadBeforeTake(NodeId),
     /// In `seed_query`'s `inner.write()`, before the trust check of the
     /// trusted dep `NodeId`.
     SeedBeforeTrust(NodeId),
@@ -556,8 +561,11 @@ struct Entry {
     /// it New). A tainted node is reachable only through edges that
     /// may be stale, so the walk must not run its closure: the parent's
     /// closure decides whether it is still read. The kind shares the
-    /// field so that an entry stays 8 bytes.
+    /// field so that an entry stays 12 bytes.
     taint: u32,
+    /// `id`'s generation when the walk met it: a dep that a recompute
+    /// stopped reading can be deleted and its slot recycled meanwhile.
+    generation: u32,
 }
 
 impl Entry {
@@ -618,11 +626,12 @@ impl Walk {
         }
     }
     #[inline]
-    fn new(root: NodeId, root_state: NodeState) -> Self {
+    fn new(root: NodeId, generation: u32, root_state: NodeState) -> Self {
         Self {
             work: vec![Entry {
                 id: root,
                 taint: Self::visit_kind(root_state),
+                generation,
             }],
             first_visits: 0,
             visited: None,
@@ -671,10 +680,11 @@ impl Walk {
     }
 
     #[inline]
-    fn visit(&mut self, id: NodeId, new: bool) {
+    fn visit(&mut self, id: NodeId, generation: u32, new: bool) {
         self.push(Entry {
             id,
             taint: if new { NO_TAINT_NEW } else { NO_TAINT },
+            generation,
         });
         self.first_visits += 1;
         if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
@@ -796,9 +806,13 @@ impl Walk {
     /// visit that expanded it (or the group it is now a member of).
     #[cold]
     #[inline(never)]
-    fn revisit(&mut self, id: NodeId) {
+    fn revisit(&mut self, id: NodeId, generation: u32) {
         self.forget(|&n| n == id);
-        self.push(Entry { id, taint: VISIT });
+        self.push(Entry {
+            id,
+            taint: VISIT,
+            generation,
+        });
     }
 
     fn forget(&mut self, gone: impl Fn(&NodeId) -> bool) {
@@ -814,10 +828,11 @@ impl Walk {
     }
 
     #[inline]
-    fn expand(&mut self, dep: NodeId, dep_state: NodeState) {
+    fn expand(&mut self, dep: NodeId, generation: u32, dep_state: NodeState) {
         self.push(Entry {
             id: dep,
             taint: Self::visit_kind(dep_state),
+            generation,
         });
     }
 
@@ -1636,6 +1651,9 @@ impl<C: Cells> Runtime<C> {
         }
         match state::load::<C>(node.state_cell()) {
             NodeState::Clean => Ok(self.read_slot(handle, node, type_tag, arena_slot)),
+            // The state of the node a delete recycled the slot into is not
+            // the handle's to act on.
+            _ if node.generation() != handle.generation() => self.stale_handle(handle),
             now => Err(now),
         }
     }
@@ -2403,6 +2421,9 @@ impl<C: Cells> Runtime<C> {
         node: &NodeData<C>,
     ) -> Result<Cycle, NodeState> {
         let state = state::load::<C>(node.state_cell());
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
         if matches!(state, NodeState::Cyclic | NodeState::New) {
             if let Some(cycle) = self.cycle_of(handle) {
                 return Ok(cycle);
@@ -2445,17 +2466,16 @@ impl<C: Cells> Runtime<C> {
                 },
             }
         }
+        // The state may be the node's a delete recycled the slot into.
+        if node.generation() != handle.generation() {
+            self.stale_handle(handle);
+        }
         match state {
             // A concurrent delete is no contract breach, so the read gets
             // the panic any reader of a node being deleted gets. Under
             // Local only this thread can be mid-delete, so the value code
             // was called from inside the delete.
-            NodeState::Dead if !C::SINGLE_THREADED => {
-                if node.generation() != handle.generation() {
-                    self.stale_handle(handle);
-                }
-                deleted_while_reading(id)
-            }
+            NodeState::Dead if !C::SINGLE_THREADED => deleted_while_reading(id),
             _ => value_code::contract_panic(),
         }
     }
@@ -3085,11 +3105,12 @@ impl<C: Cells> Runtime<C> {
     /// exempt because its caller reads its slot as soon as the walk
     /// returns.
     ///
-    /// `gen` is the caller's handle generation for the root. A walk entry
-    /// carries none (installed deps are ids only); one whose slot is
-    /// recycled under the walk is dropped, because the parent that
-    /// recorded it sees the dead dep at its publish. A root found
-    /// recycled is reported as `Gone` for the caller's stale panic.
+    /// `gen` is the caller's handle generation for the root; each walk
+    /// entry carries its node's generation from when the walk met it. An
+    /// entry whose node is deleted under the walk is dropped, because only
+    /// a dep its parent no longer reads, or one deleted with it in one
+    /// owned set, can be deleted. A root found recycled is reported as
+    /// `Gone` for the caller's stale panic.
     #[inline]
     fn ensure_clean(&self, id: NodeId, gen: u32) -> Computed {
         // The check precedes the fast path because a Clean read still
@@ -3157,7 +3178,7 @@ impl<C: Cells> Runtime<C> {
             self.planned()
         };
         let mut walk = resume.unwrap_or_else(|| {
-            let mut walk = Walk::new(id, observed);
+            let mut walk = Walk::new(id, gen, observed);
             if !C::SINGLE_THREADED {
                 walk.failed_from = cycle_state::failed_here_count();
             }
@@ -3169,7 +3190,12 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         let mut revisited: Vec<NodeId> = Vec::new();
 
-        while let Some(Entry { id: cur, taint }) = walk.work.pop() {
+        while let Some(Entry {
+            id: cur,
+            taint,
+            generation,
+        }) = walk.work.pop()
+        {
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
                 // A root another thread landed Failed computes as one found
@@ -3212,7 +3238,7 @@ impl<C: Cells> Runtime<C> {
                 let mut computed = self.compute_one::<MODE>(
                     cur,
                     visit,
-                    is_root.then_some(gen),
+                    Some(generation),
                     !is_root,
                     (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
                         .then_some(planned),
@@ -3221,19 +3247,27 @@ impl<C: Cells> Runtime<C> {
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
-                    walk.revisit(cur);
+                    walk.revisit(cur, generation);
                     continue;
                 }
                 if !C::SINGLE_THREADED && computed == Computed::Replan {
                     planned = self.planned();
                     if !self.prune_settled(&mut walk) {
-                        walk.push(Entry { id: cur, taint });
+                        walk.push(Entry {
+                            id: cur,
+                            taint,
+                            generation,
+                        });
                         unchecked = Some(cur);
                     }
                     continue;
                 }
                 if computed != Computed::Done {
-                    let entry = Entry { id: cur, taint };
+                    let entry = Entry {
+                        id: cur,
+                        taint,
+                        generation,
+                    };
                     match self.walk_stopped(id, entry, visit, is_root, &mut walk, computed) {
                         Ok(after) => computed = after,
                         Err(stopped) => return stopped,
@@ -3254,11 +3288,28 @@ impl<C: Cells> Runtime<C> {
             }
 
             let (node, flags) = self.nodes.get_with_flags(cur.0);
+            if !is_root {
+                self.park(ParkPoint::BeforeVisit(cur));
+            }
             let observed = if taint == VISIT {
                 state::load::<C>(node.state_cell())
             } else {
                 NodeState::Computing
             };
+            // Expanding a recycled slot would run the new node's deps for
+            // a stale read: the root's ends the read, and a dep's was
+            // deleted unread or with its reader in one owned set.
+            if node.generation() != generation {
+                if cur == id {
+                    return Computed::Gone;
+                }
+                continue;
+            }
+            // Skipped as a recycled dep is: its delete has not bumped the
+            // generation yet.
+            if observed == NodeState::Dead && !is_root {
+                continue;
+            }
             // A node with a virtual frame stands for a frame on the stack,
             // so the walk skips it as it skips a real one.
             if MODE & VIRT != 0
@@ -3331,6 +3382,7 @@ impl<C: Cells> Runtime<C> {
                     walk.push(Entry {
                         id: cur,
                         taint: VISIT,
+                        generation,
                     });
                 }
                 NodeState::Deleting => {
@@ -3338,6 +3390,7 @@ impl<C: Cells> Runtime<C> {
                     walk.push(Entry {
                         id: cur,
                         taint: VISIT,
+                        generation,
                     });
                 }
                 _ => {
@@ -3354,12 +3407,12 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    walk.visit(cur, observed == NodeState::New);
+                    walk.visit(cur, generation, observed == NodeState::New);
                     node.for_each_dep(|dep| {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
                         if !dep_state.is_settled() {
-                            walk.expand(dep, dep_state);
+                            walk.expand(dep, dep_node.generation(), dep_state);
                         }
                     });
                 }
@@ -3496,7 +3549,7 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        walk.visit(cur, false);
+        walk.visit(cur, generation, false);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group
@@ -3506,9 +3559,10 @@ impl<C: Cells> Runtime<C> {
                 {
                     return;
                 }
-                let dep_state = state::load::<C>(self.nodes.get(dep.0).state_cell());
+                let dep_node = self.nodes.get(dep.0);
+                let dep_state = state::load::<C>(dep_node.state_cell());
                 if !dep_state.is_settled() {
-                    walk.expand(dep, dep_state);
+                    walk.expand(dep, dep_node.generation(), dep_state);
                 }
             });
         }
@@ -3597,8 +3651,10 @@ impl<C: Cells> Runtime<C> {
 
         'attempt: loop {
             let observed = state::load::<C>(node.state_cell());
-            // A wait can outlast the node, whose slot then holds another.
-            if spins != 0 && g0.is_some_and(|g| g != node.generation()) {
+            // A reader of a known generation must not act on the state of
+            // the node a delete recycled the slot into; generation loads
+            // after the state, as a recycle bumps it first.
+            if g0.is_some_and(|g| g != node.generation()) {
                 return Computed::Gone;
             }
             // After the load, so a landing that passed the held payload's
@@ -3636,15 +3692,13 @@ impl<C: Cells> Runtime<C> {
                 // whose rerun reads it only if it still needs it.
                 NodeState::Failed if walked => return Computed::Done,
                 NodeState::Failed => {
-                    self.read_failed_node(id);
+                    self.read_failed_node(id, g0);
                     continue;
                 }
+                // Only a dep its parent no longer reads, or one deleted with
+                // it in one owned set, can be deleted.
+                NodeState::Dead if walked => return Computed::Gone,
                 NodeState::Dead => {
-                    // A bumped generation under Dead is a delete that has
-                    // unhooked the node but not recycled the slot yet.
-                    if g0.is_some_and(|g| g != node.generation()) {
-                        return Computed::Gone;
-                    }
                     // An observer's read of a node whose delete has not
                     // bumped its generation yet: the observer goes with it.
                     if observe_impl::is_observed(self.runtime_id, id.0) {
@@ -3688,7 +3742,7 @@ impl<C: Cells> Runtime<C> {
                 }
                 NodeState::Dirty => {}
             }
-            if MODE & VIRT != 0 && spins != 0 && gen.is_none() {
+            if MODE & VIRT != 0 && spins != 0 && walked {
                 if let Some(owner) = self.post_wait_owner(id) {
                     return Computed::Skipped(owner);
                 }

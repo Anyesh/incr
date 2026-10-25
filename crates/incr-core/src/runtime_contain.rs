@@ -249,7 +249,14 @@ impl<C: Cells> Runtime<C> {
     /// ticket again. A speculative run's read takes none: a closure in
     /// the run can catch and drop the payload before the run's discard
     /// would hold it again, and the real run's read is owed it.
-    pub(super) fn take_contained(&self, id: NodeId) -> Result<Option<Box<dyn Any + Send>>, Left> {
+    /// With tickets held, `Left` too when the slot no longer holds
+    /// `generation`'s node; with none, the read's panic is the one it would
+    /// have made before the delete.
+    pub(super) fn take_contained(
+        &self,
+        id: NodeId,
+        generation: Option<u32>,
+    ) -> Result<Option<Box<dyn Any + Send>>, Left> {
         if !self.tickets_held() || replay::speculative() {
             return Ok(None);
         }
@@ -258,8 +265,12 @@ impl<C: Cells> Runtime<C> {
         // Every Failed landing removes the node from the tickets before its
         // store, so under the lock a node still Failed at this generation
         // is in the latest landing's ticket, if any.
-        let landing = (id.0, node.generation());
         if state::load::<C>(node.state_cell()) != NodeState::Failed {
+            return Err(Left);
+        }
+        // After the state, as a recycle bumps it before its new node lands.
+        let landing = (id.0, node.generation());
+        if generation.is_some_and(|g| g != landing.1) {
             return Err(Left);
         }
         t.prune();

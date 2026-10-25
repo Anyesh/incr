@@ -1470,6 +1470,11 @@ impl<C: Cells> Runtime<C> {
                 | NodeState::ComputingDirty => {}
                 _ => return None,
             }
+            // The handle's frame would never land if the slot now holds
+            // another node; generation loads after the state.
+            if self.nodes.get(slot).generation() != handle.generation() {
+                self.stale_handle(handle);
+            }
             // A doomed frame of the node is still on the stack, under a
             // native compute its run makes: the read is one of that frame.
             if cycle_state::holds(rt, slot) || self.dep_stack.frame_cidx(rt, NodeId(slot)).is_some()
@@ -2964,11 +2969,11 @@ impl<C: Cells> Runtime<C> {
                 // Dirty, gets a stand-in run with its own entries.
                 let node = self.nodes.get(v.node);
                 let retried = v.ep.is_none()
-                    && node.generation() == v.generation
                     && matches!(
                         state::load::<C>(node.state_cell()),
                         NodeState::New | NodeState::Dirty
-                    );
+                    )
+                    && node.generation() == v.generation;
                 self.note_ancestor(&v);
                 // The frame that was reading the frame popped just above gets
                 // the direct compute of that read, whether a stand-in run in
@@ -3278,10 +3283,12 @@ impl<C: Cells> Runtime<C> {
     /// of a node this thread reserves, which comes back unrun.
     fn vframe_unfinished(&self, v: &VFrame) -> bool {
         let node = self.nodes.get(v.node);
+        let state = state::load::<C>(node.state_cell());
+        // After the load: a recycle bumps it before its node's state.
         if node.generation() != v.generation {
             return false;
         }
-        match state::load::<C>(node.state_cell()) {
+        match state {
             NodeState::New | NodeState::Dirty => true,
             NodeState::Computing | NodeState::ComputingDirty => {
                 cycle_state::holds(self.runtime_id, v.node) || self.given_back(v)
@@ -4369,6 +4376,10 @@ impl<C: Cells> Runtime<C> {
             }
             _ => None,
         };
+        // Seqlock order, as `fields_under`: what was read is the entry's
+        // node's only if a recycle has not bumped the generation since.
+        C::fence_acquire();
+        let what = what.filter(|_| self.nodes.get(node).generation() == generation);
         // What the contexts don't keep drops after their borrow: a landed
         // value is the user's.
         let unkept = replay::with(|c| {
