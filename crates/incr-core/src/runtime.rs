@@ -97,9 +97,12 @@ pub(crate) struct Inner<C: Cells> {
     /// Each query whose deps a user panic's union replaced as it released
     /// the query New ([`Runtime::land_panic_released`]): that union's
     /// length, and how many of its deps, from the front, it held before
-    /// the released run. A Failed landing's union carries an entry the
-    /// query already had and starts none, so after a failed run those held
-    /// deps include what that run read. Any other publish of its deps drops
+    /// its first released run since its deps were last published without a
+    /// panic. A Failed landing's union keeps the old deps as its prefix and
+    /// carries an entry the query already had, so a released run's deps
+    /// stay unheld through it, as do the failed run's reads past the count;
+    /// it starts none, so a failed run with no entry before it has its
+    /// reads held. Any other publish of its deps drops
     /// it, as does its delete; a Stale publish, which installs nothing,
     /// keeps it. A read's walk uses it only for a released New node.
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
@@ -4440,11 +4443,10 @@ impl<C: Cells> Runtime<C> {
         self.land_single(id, node, flags, NodeState::New, NodeState::New);
     }
 
-    /// How many of `id`'s deps, from the front, it held before its released
-    /// run ([`Inner::released_deps`]), if a user panic released it New over
-    /// more. The mark is stored before
-    /// the release's state CAS lands the node New, and the walk loads that
-    /// state with acquire.
+    /// How many of `id`'s deps, from the front, it held before its first
+    /// released run ([`Inner::released_deps`]), if a user panic released it
+    /// New over more. The mark is stored before the release's state CAS
+    /// lands the node New, and the walk loads that state with acquire.
     #[inline]
     fn released_kept(&self, id: NodeId, node: &NodeData<C>) -> Option<u32> {
         if !node.released_mark() {
@@ -4768,11 +4770,12 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Validate a compute's recorded deps, then install them and update
-    /// reverse edges. With `panicked` the installed list is the union of
+    /// reverse edges. With `panic` the installed list is the union of
     /// the old deps and the recorded ones, and a new dep that is `Failed`
     /// does not supersede: the compute that read it fails with it, and the
-    /// dep's own recovery walk reaches this node through the new edge. Diffs old vs
-    /// new deps so static-dep queries (the common case) skip the
+    /// dep's own recovery walk reaches this node through the new edge, and
+    /// the node's released entry follows [`PanicUnion`]. Diffs old vs new
+    /// deps so static-dep queries (the common case) skip the
     /// inner.write() acquire and the dependents vector edits on
     /// recompute.
     ///
