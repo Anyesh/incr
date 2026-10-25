@@ -1913,7 +1913,7 @@ fn custom_payload_shape<C: Cells>(
 
 /// A reader that catches a dep's custom panic payload, which the engine
 /// cannot copy for a retry, branches on it as the unbounded run does under
-/// every budget that leaves the reader below the budget itself.
+/// every budget, the reader at the budget itself included.
 #[test]
 fn a_caught_custom_payload_survives_the_readers_retries() {
     for d_replayable in [true, false] {
@@ -1930,8 +1930,7 @@ fn a_caught_custom_payload_survives_the_readers_retries() {
                     for local in [true, false] {
                         let want = shape(u32::MAX, local);
                         assert_eq!(want, 42_000 + 1 + u64::from(chain));
-                        // At the budget itself, see `hold_uncopied`.
-                        for frames in (2..9).filter(|&f| f != outer + 1) {
+                        for frames in 1..9 {
                             assert_eq!(
                                 shape(frames, local),
                                 want,

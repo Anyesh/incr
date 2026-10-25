@@ -776,3 +776,120 @@ fn local_many_foreign_reads_stay_linear() {
 fn shared_many_foreign_reads_stay_linear() {
     many_foreign_reads::<Shared>();
 }
+
+#[cfg(not(debug_assertions))]
+#[derive(Debug)]
+struct ChainPayload(u64);
+
+#[cfg(not(debug_assertions))]
+thread_local! {
+    /// The payloads the chain's readers caught, kept so that no payload's
+    /// box is freed for the next to take its address: the engine keys a
+    /// payload by its address and type, so every node's would share one
+    /// key, a collision B7-reused-address-payload-content tracks.
+    static CAUGHT: std::cell::RefCell<Vec<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Silences the panics of [`ChainPayload`] payloads, one per chain node,
+/// and leaves every other panic to the default hook.
+#[cfg(not(debug_assertions))]
+fn quiet_chain_payload() {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !info.payload().is::<ChainPayload>() {
+                default(info);
+            }
+        }));
+    });
+}
+
+/// A 100k chain whose every level catches the custom panic payload of its
+/// own Failed dep's ticket before it reads the level below, at budget
+/// `frames`: each catch sees the payload, as in the unbounded run, a level
+/// at the budget included, whose retries regenerate it, and the stack stays
+/// within the thread's. The deps' panics are contained by a walk first, as
+/// in `ticket_catching_chain`, because a chain whose levels compute their
+/// panicking deps is quadratic under a budget whatever the payload
+/// (T8-nested-caught-chain-quadratic).
+#[cfg(not(debug_assertions))]
+fn custom_payload_chain_100k<C: Cells>(frames: u32) {
+    quiet_chain_payload();
+    let n = crate::test_size::test_size(100_000) as u64;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    let j = rt.create_input(1_u64);
+    let sel = rt.create_input(0_u64);
+    let ds: Vec<Incr<u64>> = (0..n)
+        .map(|k| {
+            rt.create_query_with(
+                move |rt: &Runtime<C>| -> u64 {
+                    if rt.get(j) == 0 {
+                        std::panic::panic_any(ChainPayload(k));
+                    }
+                    0
+                },
+                replayable(),
+            )
+        })
+        .collect();
+    let all = ds.clone();
+    let x = rt.create_query(move |rt: &Runtime<C>| {
+        if rt.get(sel) == 0 {
+            all.iter().map(|&d| rt.get(d)).sum()
+        } else {
+            0
+        }
+    });
+    rt.get(x);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 0);
+    assert_eq!(rt.contained_payloads(), n as usize);
+    rt.set_max_frames(frames);
+    let mut next = rt.create_query_with(move |rt| rt.get(sel) + 6, replayable());
+    for (k, &d) in (0..n).zip(&ds) {
+        let below = next;
+        next = rt.create_query_with(
+            move |rt| {
+                let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(d))) {
+                    Err(p) => {
+                        let saw = p.downcast_ref::<ChainPayload>().is_some_and(|c| c.0 == k);
+                        CAUGHT.with(|c| c.borrow_mut().push(p));
+                        u64::from(saw)
+                    }
+                    Ok(_) => 0,
+                };
+                saw + rt.get(below)
+            },
+            replayable(),
+        );
+    }
+    assert_eq!(rt.get(next), n + 7);
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_custom_payload_chain_100k_at_budget_256_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Local>(256));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Local>(1));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_custom_payload_chain_100k_at_budget_256_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Shared>(256));
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread() {
+    on_stack(1 << 20, || custom_payload_chain_100k::<Shared>(1));
+}
