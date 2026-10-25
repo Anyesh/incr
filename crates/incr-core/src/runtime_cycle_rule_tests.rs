@@ -1652,9 +1652,8 @@ fn set_after_clean_read_runs<A: Cells, B: Cells>(budget: bool) -> (u64, u32, boo
     let r1 = Box::new(Runtime::<A>::new());
     let r2 = Box::new(Runtime::<B>::new());
     r1.set_placeholder(0_u64);
-    if budget {
-        r1.set_max_frames(1);
-    }
+    // Unbudgeted wins over `INCR_MAX_DEPTH`.
+    r1.set_max_frames(if budget { 1 } else { u32::MAX });
     let x = r2.create_input(1000_u64);
     let replayable = || QueryOpts {
         replay: Replay::Allowed,
@@ -1714,9 +1713,8 @@ fn stashed_clean_read_after_set<A: Cells, B: Cells>(budget: bool) -> (u64, u32) 
     let r1 = Box::new(Runtime::<A>::new());
     let r2 = Box::new(Runtime::<B>::new());
     r1.set_placeholder(0_u64);
-    if budget {
-        r1.set_max_frames(1);
-    }
+    // Unbudgeted wins over `INCR_MAX_DEPTH`.
+    r1.set_max_frames(if budget { 1 } else { u32::MAX });
     let x = r2.create_input(1000_u64);
     let replayable = || QueryOpts {
         replay: Replay::Allowed,
