@@ -1840,18 +1840,6 @@ impl<C: Cells> Runtime<C> {
         self.release_held_where(cidx, discarding, kind, subtree, &[], payload, bag);
     }
 
-    /// Whether this thread holds no claim of `id` once the frame at `cidx`
-    /// unwinds: it has no frame of `id`, and holds no claim of it or one
-    /// anchored at or above `cidx` that the unwind releases.
-    pub(super) fn unwind_releases(&self, id: NodeId, cidx: u32) -> bool {
-        let rt = self.runtime_id;
-        self.dep_stack.frame_cidx(rt, id).is_none()
-            && cycle_state::with_held(|h| {
-                h.get(&(rt, id.0))
-                    .is_none_or(|e| e.anchor() >= cidx && released_at(rt, e, cidx))
-            })
-    }
-
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
     /// the claims in `keep`.
     pub(super) fn release_held_except(&self, cidx: u32, keep: &[u32], bag: &mut Deferred<C>) {

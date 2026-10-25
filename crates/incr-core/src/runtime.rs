@@ -27,7 +27,7 @@ use crate::arena_registry::{ArenaRegistry, ArenaTags};
 use crate::cells::Cells;
 use crate::children::ChildIndex;
 use crate::cycle::{
-    self, ComputeCtl, Cycle, CycleStrategy, CycleUnwind, ErasedOpts, ErasedStrategy, Outcome,
+    self, ComputeCtl, Cycle, CycleStrategy, ErasedOpts, ErasedStrategy, Outcome,
     QueryOpts,
 };
 use crate::cycle_state::{self, EntryDepth, UnwindKind};
@@ -4564,37 +4564,23 @@ impl<C: Cells> Runtime<C> {
         bag.drain_carried(payload)
     }
 
-    /// Whether walk entry `entry`, at position `cidx`, contains an unwind
-    /// out of its compute, asked before the compute's frame releases its
-    /// claims: a panic, or a cycle none of whose members this thread will
-    /// still hold or has a virtual frame of, so that every member ran above
-    /// the walk and the unwind released it. The entry's own claim and the
-    /// claims held at or above its position are not counted: the unwind
-    /// releases them too, and a virtual frame's run still holds the entry's
-    /// when this is asked. A closure that swallowed a cycle and then
-    /// panicked is contained as any panic. A wounded thread must reach its
+    /// Whether a walk's entry contains an unwind out of its compute: a
+    /// panic, including one a closure raised after swallowing a cycle. A
+    /// cycle goes on to the reader, as every member's run would close it
+    /// again for the recorder's rerun. A wounded thread must reach its
     /// outermost entry, so it contains none.
     pub(super) fn containable(
         &self,
-        entry: NodeId,
-        cidx: u32,
+        _entry: NodeId,
+        _cidx: u32,
         kind: Option<UnwindKind>,
-        payload: &(dyn std::any::Any + Send),
+        _payload: &(dyn std::any::Any + Send),
     ) -> bool {
         if cycle_state::wounded() {
             return false;
         }
         match kind {
             None => true,
-            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_none_or(|c| {
-                c.0.participants()
-                    .iter()
-                    .map(|p| NodeId(p.slot()))
-                    .all(|p| {
-                        (p == entry || self.unwind_releases(p, cidx))
-                            && self.virtual_owner(p).is_none()
-                    })
-            }),
             Some(_) => false,
         }
     }
