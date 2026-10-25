@@ -676,7 +676,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     /// dependency, and so not allowed inside a compute of this runtime.
     pub fn get(&self, rt: &Runtime<C>, key: &K) -> Option<Incr<T>> {
         self.check_runtime(rt);
-        self.lookup_outside_own_compute(rt, "get");
+        self.refuse_own_compute_lookup(rt, "get");
         self.find(rt, self.hash(key), key)
     }
 
@@ -704,7 +704,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     /// during the call may or may not be. `f` may insert and remove.
     pub fn for_each(&self, rt: &Runtime<C>, mut f: impl FnMut(&K, Incr<T>)) {
         self.check_runtime(rt);
-        self.lookup_outside_own_compute(rt, "for_each");
+        self.refuse_own_compute_lookup(rt, "for_each");
         self.array.read(|array| {
             for bucket in array.buckets.iter() {
                 if C::u32_load_acquire(&bucket.meta) & STATE_MASK != LIVE {
@@ -837,7 +837,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
 
     /// Refuses a lookup inside a compute of the table's runtime; inside
     /// another runtime's compute, see `DepStack::unrecorded_lookup`.
-    fn lookup_outside_own_compute(&self, rt: &Runtime<C>, call: &str) {
+    fn refuse_own_compute_lookup(&self, rt: &Runtime<C>, call: &str) {
         assert!(
             rt.dep_stack.unrecorded_lookup() != Some(rt.runtime_id),
             "incr-core: NodeTable::{call} called during compute; a lookup is not a \

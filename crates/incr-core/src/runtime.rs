@@ -2106,8 +2106,8 @@ impl<C: Cells> Runtime<C> {
         self.alive(handle)
     }
 
-    /// [`Self::is_alive`] for the engine's own checks, which are no
-    /// lookup of the running compute's.
+    /// [`Self::is_alive`] for the engine's own checks, which do not mark
+    /// the running compute (see `DepStack::unrecorded_lookup`).
     pub(crate) fn alive(&self, handle: impl Into<ErasedIncr>) -> bool {
         let handle = handle.into();
         if handle.runtime_id() != self.runtime_id {
@@ -2657,6 +2657,8 @@ impl<C: Cells> Runtime<C> {
     /// during this `get`.
     pub fn get_traced<T: Value>(&self, handle: Incr<T>) -> (T, crate::trace::PropagationTrace) {
         use crate::trace::TraceAction;
+        // The trace's counts are read with no dependency.
+        self.dep_stack.unrecorded_lookup();
 
         // Arm tracing: clear any prior log, then flip the gate so
         // compute_one starts appending events.
