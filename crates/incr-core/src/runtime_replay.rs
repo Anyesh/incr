@@ -3279,25 +3279,40 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn given_back(&self, v: &VFrame) -> bool {
-        if C::SINGLE_THREADED || !reserve::mine((self.runtime_id, v.node), v.generation) {
-            return false;
-        }
         #[cfg(test)]
         self.give_back_waits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let node = self.nodes.get(v.node);
+        matches!(
+            self.given_back_state(v.node, v.generation),
+            Some(NodeState::New | NodeState::Dirty)
+        )
+    }
+
+    /// The state another thread's claim of `node`, which this thread
+    /// reserves at `generation`, leaves once it ends, or `None` if this
+    /// thread does not reserve it.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn given_back_state(&self, node: u32, generation: u32) -> Option<NodeState> {
+        if C::SINGLE_THREADED || !reserve::mine((self.runtime_id, node), generation) {
+            return None;
+        }
+        let node_data = self.nodes.get(node);
         let mut spins = 0;
         loop {
-            let observed = state::load::<C>(node.state_cell());
+            let observed = state::load::<C>(node_data.state_cell());
             // After the load: a recycled slot's occupant is no claim of
             // the reserved node.
-            if node.generation() != v.generation {
-                return false;
+            if node_data.generation() != generation {
+                return None;
             }
-            match observed {
-                NodeState::New | NodeState::Dirty => return true,
-                NodeState::Computing | NodeState::ComputingDirty => {}
-                _ => return false,
+            if !is_computing(observed) {
+                return Some(observed);
+            }
+            // Another thread may end the reservation under the wait; its
+            // claim is then no give-back and may wait on this thread.
+            if !reserve::mine((self.runtime_id, node), generation) {
+                return None;
             }
             spins += 1;
             C::backoff(spins);
@@ -4315,7 +4330,17 @@ impl<C: Cells> Runtime<C> {
     /// A walk stopped short of its root drops the node's other entries if
     /// the compute left it `unsettled`, as `walk_stopped` does.
     fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32, unsettled: bool) {
-        let state = state::load::<C>(self.nodes.get(node).state_cell());
+        self.park(ParkPoint::HoldLanding(NodeId(node)));
+        let mut state = state::load::<C>(self.nodes.get(node).state_cell());
+        if is_computing(state) {
+            debug_assert!(
+                !cycle_state::holds(self.runtime_id, node),
+                "incr-core: a held landing's node is claimed by this thread"
+            );
+            // A claim made since the landing, of a node this thread
+            // reserves, gives back the state the landing left.
+            state = self.given_back_state(node, generation).unwrap_or(state);
+        }
         let reading = u64::from(node) | (u64::from(generation) << 32);
         let what = match state {
             NodeState::Dirty => self
