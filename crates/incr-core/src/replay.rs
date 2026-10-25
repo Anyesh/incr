@@ -758,7 +758,7 @@ impl Pending {
                 let d = self.get(i);
                 !d.taken
                     && d.key.foreign.is_none()
-                    && matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
+                    && matches!(d.what, Delivered::Landed(..) | Delivered::Unwind { .. })
             })
         })
     }
@@ -835,12 +835,13 @@ pub(crate) struct Carry {
 
 pub(crate) enum Delivered {
     /// An unwind out of a non-speculative entry: a cycle unwind, whose
-    /// payload is the `CycleUnwind`, or a user panic. It poisons the
-    /// reader unless it is the cycle of a node that landed `Cyclic`, which
-    /// a read of the node raises with the node landed.
+    /// payload is the `CycleUnwind`, or a user panic. `poison` is the flag
+    /// it raises on the reader (`Runtime::unwound_poison`), 0 for the
+    /// cycle of a node that landed `Cyclic`, which a read of the node
+    /// raises with the node landed.
     Unwind {
         cycle: bool,
-        poison: bool,
+        poison: u16,
         /// A member was marked failed in the run the panic came out of,
         /// so a member run that takes it again is not.
         attributed: bool,
@@ -850,12 +851,14 @@ pub(crate) enum Delivered {
         nodes: Landings,
     },
     /// The entry landed without a Clean value. The unbounded run's read
-    /// takes the slot as the compute left it, poisoned, where a later read
-    /// would walk and run the node again. It is that value, cloned when
-    /// the delivery is made, because a later run in the context may
-    /// compute the node again before the retry reads it. Until a read
-    /// takes it, it is a clone the unbounded run never builds.
-    Landed(Unbuilt<dyn Any + Send>),
+    /// takes the slot as the compute left it, raising the flag beside it
+    /// on the reader (`Runtime::dirty_read_poison`), where a later read
+    /// would walk and run the node again unless it holds a memo. It is
+    /// that value, cloned when the delivery is made, because a later run
+    /// in the context may compute the node again before the retry reads
+    /// it. Until a read takes it, it is a clone the unbounded run never
+    /// builds.
+    Landed(Unbuilt<dyn Any + Send>, u16),
     /// The rest of the walk of the frame's blocked read, from the compute
     /// a doom stopped it at: the retry's walk of that read resumes it, as
     /// the unbounded run's walk goes on after that compute. With the node
@@ -2216,7 +2219,9 @@ pub(crate) fn take_pending(
             // run must not resume that walk or recompute its node.
             x.pending.take_keyed(key);
             Some(match &x.pending.get(at).what {
-                Delivered::Landed(value) => Delivered::Landed(Unbuilt::new(clone(value.value()))),
+                Delivered::Landed(value, poison) => {
+                    Delivered::Landed(Unbuilt::new(clone(value.value())), *poison)
+                }
                 Delivered::Walk(..) | Delivered::Direct => {
                     unreachable!("incr-core: a walk's direction is not a value")
                 }

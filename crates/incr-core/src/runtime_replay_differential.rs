@@ -5327,6 +5327,218 @@ fn caught_cycle_then_clean_read() {
     });
 }
 
+/// n_i = n_{i+1} + n_{i+1} for i < k - 1, n_{k-1} catches the panic of its
+/// read of n_k, and n_k panics on the input it reads.
+fn caught_failed_chain(k: usize, ops: Vec<Op>) -> Case {
+    let read = |t| Box::new(Expr::Read(t, false));
+    let mut specs: Vec<Spec> = (0..k - 1)
+        .map(|i| replayable(Expr::Add(read(i + 1), read(i + 1)), Strat::None))
+        .collect();
+    specs.push(replayable(Expr::Catch(read(k)), Strat::None));
+    specs.push(replayable(Expr::PanicIf(read(k + 1), 0), Strat::None));
+    specs.push(Spec::Input(0));
+    Case {
+        specs,
+        panics: true,
+        cycles: false,
+        queries: k + 1,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    }
+}
+
+/// [`caught_failed_chain`] with the catching node in a cycle: n_{k-1}
+/// catches n_{k+1}'s panic and reads n_k, which reads n_{k-1} back, both
+/// with a fallback.
+fn caught_failed_cycle_chain(k: usize, ops: Vec<Op>) -> Case {
+    let read = |t| Box::new(Expr::Read(t, false));
+    let mut specs: Vec<Spec> = (0..k - 1)
+        .map(|i| replayable(Expr::Add(read(i + 1), read(i + 1)), Strat::None))
+        .collect();
+    specs.push(replayable(
+        Expr::Add(Box::new(Expr::Catch(read(k + 1))), read(k)),
+        Strat::Fallback(1),
+    ));
+    specs.push(replayable(Expr::Read(k - 1, false), Strat::Fallback(2)));
+    specs.push(replayable(Expr::PanicIf(read(k + 2), 0), Strat::None));
+    specs.push(Spec::Input(0));
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: k + 2,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    }
+}
+
+/// A closure that catches the panic of a dep that landed Failed keeps its
+/// value as a memo for the revision, and a later read in the revision
+/// takes it. It ran again on every read, so the chain above it ran 2^k
+/// computes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn caught_failed_read_keeps_its_value_for_the_revision() {
+    let k = 10;
+    let value = Out::Value(9999 << (k - 1));
+    quiet(|| {
+        let fresh = caught_failed_chain(k, vec![Op::Get(0)]);
+        let twice = caught_failed_chain(k, vec![Op::Get(k - 1), Op::Get(k - 1)]);
+        for shared in [false, true] {
+            let run_of = |case: &Case| {
+                if shared {
+                    run_logged::<Shared>(case, None, 0, true)
+                } else {
+                    run_logged::<Local>(case, None, 0, true)
+                }
+            };
+            let (trace, runs) = run_of(&fresh);
+            assert_eq!(trace[0].0, value, "shared {shared}");
+            assert_eq!(runs[0].len(), k + 1, "shared {shared}: one run per node");
+            let (trace, runs) = run_of(&twice);
+            assert_eq!(trace[0].0, trace[1].0, "shared {shared}");
+            assert!(
+                runs[1].is_empty(),
+                "shared {shared}: the second get ran {:?}",
+                runs[1]
+            );
+        }
+        for case in [&fresh, &twice] {
+            differential::<Local>(case, 0);
+            differential::<Shared>(case, 0);
+        }
+        let deep = caught_failed_chain(20, vec![Op::Get(0), Op::Get(0)]);
+        for (trace, runs) in [
+            run_logged::<Local>(&deep, None, 0, true),
+            run_logged::<Shared>(&deep, None, 0, true),
+        ] {
+            assert_eq!(trace[0].0, Out::Value(9999 << 19));
+            assert_eq!(trace[1].0, trace[0].0);
+            assert_eq!(runs[0].len(), 21, "one run per node");
+            assert!(runs[1].is_empty(), "the second get ran {:?}", runs[1]);
+        }
+    });
+}
+
+/// As [`caught_failed_read_keeps_its_value_for_the_revision`], with the
+/// catching node a member of a cycle the episode lands: the chain above
+/// it runs each node once.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_episode_over_a_caught_failed_read_keeps_its_value_for_the_revision() {
+    let k = 20;
+    let case = caught_failed_cycle_chain(k, vec![Op::Get(0), Op::Get(0)]);
+    quiet(|| {
+        for (trace, runs) in [
+            run_logged::<Local>(&case, None, 0, true),
+            run_logged::<Shared>(&case, None, 0, true),
+        ] {
+            assert_eq!(trace[1].0, trace[0].0);
+            for n in 0..k - 1 {
+                let ran = runs[0].iter().filter(|e| e.node == (0, n)).count();
+                assert_eq!(ran, 1, "node {n} ran {ran} times");
+            }
+            assert!(runs[1].is_empty(), "the second get ran {:?}", runs[1]);
+        }
+        let short = caught_failed_cycle_chain(6, vec![Op::Get(0), Op::Get(0)]);
+        differential::<Local>(&short, 0);
+        differential::<Shared>(&short, 0);
+    });
+}
+
+/// 0x3cb3: op 2's `Get(15)` lands 14 Failed inside the cycle 15 -> ... ->
+/// 11 -> 12 -> 13 -> 14 -> 15, and op 3's `Get(11)`, in the same revision,
+/// reads 12 -> 13 = `Catch(Read(14))` over that failure. The value is the
+/// one a fresh `Get(11)` gives with 14 held failing; a fresh read that
+/// recomputes 14 closes the cycle instead, which is not the revision's
+/// history.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_3cb3_reads_a_failed_dep_as_the_revision_left_it() {
+    let case = gen_case(0x3cb3, false, false);
+    assert!(matches!(case.ops[3], Op::Get(11)));
+    let mut held = case.clone();
+    let Spec::Query { expr, .. } = &mut held.specs[14] else {
+        panic!("14 is a query");
+    };
+    *expr = Expr::PanicIf(Box::new(Expr::Const(4)), 4);
+    held.specs[23] = Spec::Input(3);
+    held.ops = vec![Op::Get(11)];
+    quiet(|| {
+        let want = run::<Local>(&held, None, 0)[0].0.clone();
+        assert_eq!(want, Out::Value(20004));
+        assert_eq!(run::<Shared>(&held, None, 0)[0].0, want);
+        assert_eq!(run::<Local>(&case, None, 0)[3].0, want);
+        assert_eq!(run::<Shared>(&case, None, 0)[3].0, want);
+    });
+}
+
+/// The same rule inside one read: 0x15b3's op 10 `Get(19)` lands 20 Failed
+/// (`PanicIf(3, 3)` over input 21 = 2), and 19 catches it; 0x264a's op 17
+/// `Get(9)` reads 2 = 4 + `Catch(Read(3))` over 3 and 4, which landed
+/// Failed in an earlier revision and stay failed with input 19 = 3. Each
+/// value is a fresh read's with those nodes held failing; a fresh read
+/// that recomputes them closes a cycle through their recorded edges.
+/// 0x2501's op 4 `TryGet(7)` reads 8 over 4 and 5, Failed earlier in the
+/// revision. 0x66a's op 3 `Get(4)` follows op 2's episode, which landed
+/// 4 at its fallback over a cycle through 10, 1 and 0, all of which failed
+/// in that episode: with them held failing no cycle closes, so 4 is no
+/// strategy value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seeds_read_failed_deps_as_the_revision_left_them() {
+    fn held(seed: u64, failing: &[usize], at: u64, input: (usize, u64), read: Op) -> Case {
+        let mut held = gen_case(seed, false, false);
+        for &q in failing {
+            let Spec::Query { expr, .. } = &mut held.specs[q] else {
+                panic!("{q} is a query");
+            };
+            *expr = Expr::PanicIf(Box::new(Expr::Const(at)), at);
+        }
+        held.specs[input.0] = Spec::Input(input.1);
+        held.ops = vec![read];
+        held
+    }
+    let cases = [
+        (
+            0x15b3,
+            10,
+            held(0x15b3, &[20], 3, (21, 2), Op::Get(19)),
+            9999,
+        ),
+        (
+            0x264a,
+            17,
+            held(0x264a, &[3, 4], 4, (19, 3), Op::Get(9)),
+            10009,
+        ),
+        (
+            0x2501,
+            4,
+            held(0x2501, &[4, 5], 4, (9, 3), Op::TryGet(7)),
+            1,
+        ),
+        (
+            0x66a,
+            3,
+            held(0x66a, &[0, 1, 10], 4, (15, 3), Op::Get(4)),
+            6,
+        ),
+    ];
+    for (seed, op, held, value) in cases {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            let want = run::<Local>(&held, None, 0)[0].0.clone();
+            assert_eq!(want, Out::Value(value), "{seed:#x}");
+            assert_eq!(run::<Shared>(&held, None, 0)[0].0, want, "{seed:#x}");
+            assert_eq!(run::<Local>(&case, None, 0)[op].0, want, "{seed:#x}");
+            assert_eq!(run::<Shared>(&case, None, 0)[op].0, want, "{seed:#x}");
+        });
+    }
+}
+
 /// Shared seeds a deferral of group exits to the read's end got wrong on
 /// one thread, against Local: in 0x68d3 a verify-only visit of a member
 /// whose exit was deferred computed it, and in 0x40d8 a discard dropped

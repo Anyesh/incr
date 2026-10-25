@@ -400,6 +400,11 @@ pub(crate) const FOREIGN_HOLD: u16 = 512;
 /// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
 /// make: its value is buffered and its landing withheld (`replay::Stash`).
 pub(crate) const SPECULATIVE: u16 = 1024;
+/// `ComputeCtl::flags`: a read in the frame gave an outcome that holds
+/// until the next set (the panic of a node that landed Failed, or a
+/// memo's value). Without `POISONED` the frame lands Dirty with a memo
+/// for the revision (`NodeData::set_memo`).
+pub(crate) const HANDLED: u16 = 2048;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -463,6 +468,11 @@ impl ComputeCtl {
     #[inline(always)]
     pub(crate) fn has(&self, flag: u16) -> bool {
         self.flags.get() & flag != 0
+    }
+
+    /// The frame's `POISONED` and `HANDLED` flags.
+    pub(crate) fn poison(&self) -> u16 {
+        self.flags.get() & (POISONED | HANDLED)
     }
 
     #[inline(always)]

@@ -3211,6 +3211,17 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => continue,
+                // A memo stands for the node's run in this revision, so its
+                // deps are not expanded; the root's compute reads it.
+                NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
+                    if is_root {
+                        walk.push(Entry {
+                            id: cur,
+                            taint: NO_TAINT,
+                        });
+                    }
+                    continue;
+                }
                 NodeState::Dirty
                     if C::u8_load_relaxed(flags) & IN_GROUP != 0
                         && self.expand_group(cur, &mut walk) =>
@@ -3528,6 +3539,9 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => return Computed::Done,
+                NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
+                    return self.read_memo(walked);
+                }
                 NodeState::Computing | NodeState::ComputingDirty => {
                     // A walk's deps-first computes can defer the walk's own
                     // root into this thread's held map: its reader reads it
@@ -3701,6 +3715,12 @@ impl<C: Cells> Runtime<C> {
                 self.unclaim_unrun(node, claimed_dirty);
                 return Computed::Revisit;
             }
+            // Another thread's memo landing since the load leaves a Dirty
+            // the claim succeeds on, and the memo stands for this run.
+            if !C::SINGLE_THREADED && claimed_dirty && node.memo_at(|| self.current_revision()) {
+                self.unclaim_unrun(node, claimed_dirty);
+                return self.read_memo(walked);
+            }
             // When the claim reads from another thread's episode, which left
             // this node New or Dirty, it reads the count that episode
             // bumped first: the episode may have landed Clean a node this
@@ -3833,7 +3853,7 @@ impl<C: Cells> Runtime<C> {
             // as changed, which catches a walk that passed this node before
             // the claim, and a dep that landed Dirty without a new stamp.
             // A `verified_at` of 0 means never verified, and an empty slot
-            // may sit behind it, so it always fails.
+            // may sit behind it, so it always fails; a memo reads as 0.
             if verifying {
                 let my_verified = node.verified_at();
                 let mut any_changed = my_verified == 0;
@@ -3853,7 +3873,7 @@ impl<C: Cells> Runtime<C> {
                     {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                     } else {
-                        self.poison_reader(walked);
+                        self.poison_reader(walked, cycle::POISONED);
                     }
                     return Computed::Done;
                 }
@@ -4079,8 +4099,11 @@ impl<C: Cells> Runtime<C> {
                     continue 'attempt;
                 }
 
-                let poisoned = ctl.has(cycle::POISONED);
-                if poisoned {
+                let poison = ctl.poison();
+                let memo = self.memo_landing(poison, verify_rev);
+                if memo {
+                    node.set_memo(verify_rev);
+                } else if poison != 0 {
                     // The value may be built on a result the closure
                     // swallowed from a dep that did not land Clean or whose
                     // cleanup failed, and that dep's stamps need not have
@@ -4096,7 +4119,7 @@ impl<C: Cells> Runtime<C> {
                 // ComputingDirty mid-compute, if a new dep changed after we
                 // read it, or if a dep we read did not itself land Clean, so
                 // the next reader recomputes against the newer input.
-                let target = if published == Publish::Superseded || poisoned {
+                let target = if published == Publish::Superseded || poison != 0 {
                     NodeState::Dirty
                 } else {
                     NodeState::Clean
@@ -4106,7 +4129,14 @@ impl<C: Cells> Runtime<C> {
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
-                    self.poison_reader(walked);
+                    self.poison_reader(
+                        walked,
+                        if memo {
+                            cycle::HANDLED
+                        } else {
+                            cycle::POISONED
+                        },
+                    );
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
@@ -4123,20 +4153,24 @@ impl<C: Cells> Runtime<C> {
     /// a Clean root leaves Clean only through a walk, which flags the
     /// reader too.
     fn episode_landed(&self, node: &NodeData<C>, walked: bool) -> Computed {
-        if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
-            self.poison_reader(walked);
+        match node.state() {
+            NodeState::Clean | NodeState::Cyclic => {}
+            NodeState::Dirty => self.poison_reader(walked, self.dirty_read_poison(node)),
+            _ => self.poison_reader(walked, cycle::POISONED),
         }
         Computed::Done
     }
 
     /// After a non-Clean landing: the enclosing compute read this node, and
     /// its own publish may take the fast path, where nothing else would
-    /// catch that. A walk entry (`walked`) is no such read: a dependent's
+    /// catch that, so `flag` (`POISONED`, or `HANDLED` for a memo) goes on
+    /// its frame. A walk entry (`walked`) is no such read: a dependent's
     /// rerun reads it again through a nested get if it still needs it, and
     /// that read poisons the dependent.
-    fn poison_reader(&self, walked: bool) {
+    fn poison_reader(&self, walked: bool, flag: u16) {
         if !walked {
-            self.dep_stack.poison_current_frame(self.runtime_id);
+            self.dep_stack
+                .poison_current_frame_with(self.runtime_id, flag);
         }
     }
 
@@ -4231,7 +4265,8 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
         bag: &mut Deferred<C>,
     ) -> ! {
-        self.dep_stack.poison_current_frame(self.runtime_id);
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, self.unwound_poison(kind));
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
@@ -4268,6 +4303,63 @@ impl<C: Cells> Runtime<C> {
                     })
             }),
             Some(_) => false,
+        }
+    }
+
+    /// The flag the reader of an unwind with `kind` out of the compute
+    /// above it raises: `HANDLED` for a user panic of a node that
+    /// landed Failed, `POISONED` otherwise.
+    pub(super) fn unwound_poison(&self, kind: Option<UnwindKind>) -> u16 {
+        let reading = self.dep_stack.unwound_reader(self.runtime_id);
+        match reading {
+            Some((_, _, reading, _))
+                if self.nodes.get(reading as u32).generation() == (reading >> 32) as u32 =>
+            {
+                self.failed_poison(kind, reading as u32)
+            }
+            _ => cycle::POISONED,
+        }
+    }
+
+    /// [`Self::unwound_poison`] for an unwind out of node `slot`.
+    pub(super) fn failed_poison(&self, kind: Option<UnwindKind>, slot: u32) -> u16 {
+        if kind.is_none() && self.nodes.get(slot).state() == NodeState::Failed {
+            cycle::HANDLED
+        } else {
+            cycle::POISONED
+        }
+    }
+
+    /// Whether a run that raised `poison` at `verify_rev` lands with a
+    /// memo: it handled an outcome that holds until the next set, read
+    /// nothing else unsettled, and, after its publish, no set has moved
+    /// the revision since its claim. A dep its publish found unsettled is
+    /// then one of the handled reads, so a Superseded publish still lands
+    /// a memo: its Dirty landing and the memo's revision cover the set
+    /// the check guards against.
+    pub(super) fn memo_landing(&self, poison: u16, verify_rev: u64) -> bool {
+        poison == cycle::HANDLED && self.current_revision() == verify_rev
+    }
+
+    /// A read of a node holding a memo for this revision: it takes the
+    /// node's value, and a walk entry's memo reaches the reader only
+    /// through the reading node's own run.
+    fn read_memo(&self, walked: bool) -> Computed {
+        if walked {
+            return Computed::Done;
+        }
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
+        Computed::Unsettled
+    }
+
+    /// The flag a read of `node`, left Dirty by a landing, raises on its
+    /// reader: `HANDLED` if the node holds a memo for this revision.
+    pub(super) fn dirty_read_poison(&self, node: &NodeData<C>) -> u16 {
+        if node.memo_at(|| self.current_revision()) {
+            cycle::HANDLED
+        } else {
+            cycle::POISONED
         }
     }
 
@@ -5037,6 +5129,12 @@ impl<C: Cells> Runtime<C> {
     #[cfg(not(loom))]
     pub(crate) fn verified_at_of<T>(&self, h: Incr<T>) -> u64 {
         self.nodes.get(h.slot()).verified_at()
+    }
+
+    /// Whether `h`'s node holds a memo for the current revision.
+    #[cfg(not(loom))]
+    pub(crate) fn has_memo_of<T>(&self, h: Incr<T>) -> bool {
+        self.nodes.get(h.slot()).memo_at(|| self.current_revision())
     }
 
     #[cfg(not(loom))]

@@ -1832,7 +1832,7 @@ fn a_replaced_blocked_landing_drops_outside_the_contexts<C: Cells>(rt: &Runtime<
         walked: false,
     };
     let landed = |v: Box<dyn std::any::Any + Send>| {
-        crate::replay::Delivered::Landed(crate::deferred::Unbuilt::new(v))
+        crate::replay::Delivered::Landed(crate::deferred::Unbuilt::new(v), crate::cycle::POISONED)
     };
     let first = landed(Box::new(ReadsOnDrop(rt as *const Runtime<C>, q)));
     let replaced = crate::replay::with(|c| {

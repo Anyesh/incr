@@ -413,14 +413,17 @@ fn shared_vframe_node_reader_waits_through_the_retrys_compute() {
     s.rt.assert_invariant_i();
 }
 
-/// T reads X1, X1 reads X2, X2 reads Y, and Y reads T with `try_get`,
-/// all replayable; T counts runs.
+/// T reads X1, X1 reads X2 (until switched to catch the panic of a dep
+/// that always fails and count those runs), X2 reads Y, and Y reads T
+/// with `try_get`, all replayable; T counts runs.
 struct Below {
     rt: Arc<Rt>,
     t: Incr<u64>,
     x1: Incr<u64>,
     y: Incr<u64>,
     t_runs: Arc<AtomicU32>,
+    caught: Arc<AtomicBool>,
+    x1_caught: Arc<AtomicU32>,
 }
 
 fn below_shape(rt: Rt) -> Below {
@@ -436,7 +439,23 @@ fn below_shape(rt: Rt) -> Below {
         )
     };
     let x2 = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
-    let x1 = rt.create_query_with(move |rt: &Rt| rt.get(x2) + 1, replayable());
+    let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let caught = Arc::new(AtomicBool::new(false));
+    let x1_caught = Arc::new(AtomicU32::new(0));
+    let x1 = {
+        let (caught, fc, x1_caught) = (caught.clone(), fc.clone(), x1_caught.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if !caught.load(SeqCst) {
+                    return rt.get(x2) + 1;
+                }
+                x1_caught.fetch_add(1, SeqCst);
+                let f = *fc.get().unwrap();
+                catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v)
+            },
+            replayable(),
+        )
+    };
     let t = {
         let t_runs = t_runs.clone();
         rt.create_query_with(
@@ -448,12 +467,16 @@ fn below_shape(rt: Rt) -> Below {
         )
     };
     tc.set(t).unwrap();
+    fc.set(rt.create_query(|_: &Rt| -> u64 { panic!("fails") }))
+        .unwrap();
     Below {
         rt,
         t,
         x1,
         y,
         t_runs,
+        caught,
+        x1_caught,
     }
 }
 
@@ -953,6 +976,72 @@ fn shared_delete_and_recycle_before_the_scan() {
 #[test]
 fn shared_delete_and_recycle_between_scan_and_claim() {
     delete_and_recycle_during_replay(Recycle::BeforeClaim);
+}
+
+/// The recycling shape with X1 switched to catch a Failed dep and read by
+/// another thread before Y's scan of T, or between the scan and its claim.
+/// At both points X1 is reserved for the doomed context's retry, so the
+/// other thread's read waits, the retry lands X1's memo, and that read
+/// takes it without a run.
+fn memo_landing_during_replay(when: Recycle) {
+    // X1's runs and T's outcome, with the other thread's read of X1 or,
+    // for the reference, without it.
+    let run = |other_reads: bool| {
+        let s = below_shape(Rt::new());
+        s.rt.set_max_frames(1);
+        let gate = Gate::new();
+        let point = match when {
+            Recycle::BeforeScan => ParkPoint::BeforeEntry(id(s.y)),
+            Recycle::BeforeClaim => ParkPoint::BeforeVirtualClaim(id(s.t)),
+        };
+        hook(&s.rt, vec![(point, gate.clone())]);
+        gate.arm();
+        let reader = {
+            let (rt, t) = (s.rt.clone(), s.t);
+            spawn(move || outcome(|| rt.get(t)))
+        };
+        gate.wait_parked();
+        s.caught.store(true, SeqCst);
+        let other = other_reads.then(|| {
+            let waits = s.rt.reservation_waits.load(SeqCst);
+            let other = {
+                let (rt, x1) = (s.rt.clone(), s.x1);
+                spawn(move || outcome(|| rt.get(x1)))
+            };
+            await_reservation_wait(&s.rt, waits);
+            assert_eq!(s.x1_caught.load(SeqCst), 0, "the waiting read ran X1");
+            other
+        });
+        gate.release();
+        let got = reader.join();
+        if let Some(other) = other {
+            assert_eq!(other.join(), Ok(7));
+        }
+        if other_reads {
+            assert!(s.rt.has_memo_of(s.x1));
+        }
+        s.rt.assert_invariant_i();
+        (got, s.x1_caught.load(SeqCst))
+    };
+    let (got, runs) = run(true);
+    let unbounded = below_shape(Rt::new());
+    unbounded.rt.set_max_frames(u32::MAX);
+    unbounded.caught.store(true, SeqCst);
+    assert_eq!(unbounded.rt.get(unbounded.x1), 7);
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert_eq!(want, Ok(8));
+    assert_eq!(got, want);
+    assert_eq!(runs, run(false).1, "X1 ran again over its memo");
+}
+
+#[test]
+fn shared_memo_landing_before_the_scan() {
+    memo_landing_during_replay(Recycle::BeforeScan);
+}
+
+#[test]
+fn shared_memo_landing_between_scan_and_claim() {
+    memo_landing_during_replay(Recycle::BeforeClaim);
 }
 
 /// The Local form of a delete during replay: Y's closure deletes X, whose

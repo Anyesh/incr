@@ -407,6 +407,141 @@ fn b3_dep_recomputed_for_an_unwalked_set_supersedes_new_dependent() {
     assert_eq!(rt.get(d), 60);
 }
 
+/// `f` panics while `x` is even; `d` catches that panic as 7 and reads
+/// `y`, parking on `gate` once its reads are done.
+fn caught_failed_dep(rt: &Rt, gate: &Gate) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let x = rt.create_input(0_u64);
+    let y = rt.create_input(0_u64);
+    let f = rt.create_query(move |rt: &Rt| {
+        let v = rt.get(x);
+        assert!(v % 2 == 1, "even");
+        v
+    });
+    let d = {
+        let gate = gate.clone();
+        rt.create_query(move |rt: &Rt| {
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v * 10) + rt.get(y);
+            gate.park();
+            v
+        })
+    };
+    (x, y, f, d)
+}
+
+/// A set moves `d`'s Failed dep `f` between `d`'s first read and its
+/// publish, before `d`'s edge exists, so the walk can't reach `d`: it
+/// lands Dirty with no memo.
+#[test]
+fn caught_failed_dep_flipped_before_the_first_publish_keeps_no_memo() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (x, _, f, d) = caught_failed_dep(&rt, &gate);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    rt.set(x, 1);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 7);
+
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert!(!rt.has_memo_of(d));
+    assert!(rt.has_reverse_edge(f, d));
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 10);
+}
+
+/// As above, and `f` lands Failed again for the set before `d` publishes,
+/// so the Failed state `d` finds is not the one it read.
+#[test]
+fn caught_failed_dep_relanded_failed_before_the_first_publish_keeps_no_memo() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (x, _, f, d) = caught_failed_dep(&rt, &gate);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    gate.wait_parked();
+    rt.set(x, 2);
+    let refail = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err())
+    };
+    assert!(refail.join().unwrap());
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 7);
+
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert!(!rt.has_memo_of(d));
+    rt.assert_invariant_i();
+}
+
+/// `d` lands Dirty with a memo over Failed `f`; a recompute for `y` reads
+/// `f` Failed again, and a set that moves `f` mid-compute leaves it no
+/// memo.
+#[test]
+fn caught_failed_dep_flipped_during_a_recompute_keeps_no_memo() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (x, y, f, d) = caught_failed_dep(&rt, &gate);
+    assert_eq!(rt.get(d), 7);
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert!(rt.has_memo_of(d));
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    rt.assert_invariant_i();
+
+    rt.set(y, 1);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    gate.wait_parked();
+    rt.set(x, 1);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 8);
+
+    assert_eq!(rt.state_of(d), NodeState::Dirty);
+    assert!(!rt.has_memo_of(d));
+    rt.assert_invariant_i();
+    assert_eq!(rt.get(d), 11);
+}
+
+/// A read loads `d` Dirty with no memo for the revision, another thread
+/// lands `d` with one, and the read claims `d` after: it takes the memo
+/// instead of running `d` again in the revision.
+#[test]
+fn claim_after_another_threads_memo_takes_the_memo() {
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (_, y, _, d) = caught_failed_dep(&rt, &gate);
+    assert_eq!(rt.get(d), 7);
+    rt.set(y, 1);
+    let unclaims = rt.unrun_unclaims.load(Ordering::Relaxed);
+    let before_claim = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::BeforeClaim(id(d)), before_claim.clone())],
+    );
+    let reader = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(d))
+    };
+    before_claim.wait_parked();
+    assert_eq!(rt.get(d), 8);
+    assert!(rt.has_memo_of(d));
+    before_claim.release();
+    assert_eq!(reader.join().unwrap(), 8);
+    assert!(rt.has_memo_of(d));
+    assert_eq!(rt.unrun_unclaims.load(Ordering::Relaxed), unclaims + 1);
+}
+
 #[test]
 fn b1_publish_lands_between_delete_check_and_claim() {
     let rt = Arc::new(Rt::new());
@@ -1414,10 +1549,17 @@ fn get_before_read_vs_delete_recycle() {
 fn read_of_cycle_member_vs_claim_after_landing() {
     let rt = Arc::new(Rt::new());
     let inp = rt.create_input(0_u64);
-    let failed = rt.create_query(move |rt: &Rt| match rt.get(inp) {
-        0 => panic!("boom"),
-        v => v,
-    });
+    // While inp is 0, `failed` reads itself, and a closure that catches
+    // its cycle lands poisoned.
+    let self_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
+    let failed = {
+        let self_cell = Arc::clone(&self_cell);
+        rt.create_query(move |rt: &Rt| match rt.get(inp) {
+            0 => rt.get(*self_cell.get().unwrap()),
+            v => v,
+        })
+    };
+    self_cell.set(failed).unwrap();
     let in_a = Gate::new();
     let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
     let a = {
@@ -1428,7 +1570,7 @@ fn read_of_cycle_member_vs_claim_after_landing() {
             catch_unwind(AssertUnwindSafe(|| rt.try_get(b).unwrap_or(7777))).unwrap_or(9999)
         })
     };
-    // b catches the panic of a read, so the episode lands Dirty and its
+    // b catches the cycle of a read, so the episode lands Dirty and its
     // members New, with their group.
     let b = rt.create_query(move |rt: &Rt| {
         let v = catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1);
@@ -1477,12 +1619,17 @@ fn read_of_cycle_member_vs_claim_after_landing() {
     rt.assert_invariant_i();
 }
 
-/// a <-> b, a cycle `a`'s fallback resolves, with `b` catching a
-/// panicking read so that every episode lands its members Dirty, and
-/// `x` reading `a`. Returns `x`, `a`, the gate in `a`'s closure and the
-/// gate in `x`'s after its read of `a`.
+/// a <-> b, a cycle `a`'s fallback resolves, with `b` catching the cycle
+/// of a node that reads itself so that every episode lands its members
+/// Dirty, and `x` reading `a`. Returns `x`, `a`, the gate in `a`'s closure
+/// and the gate in `x`'s after its read of `a`.
 fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
-    let failed = rt.create_query(|_: &Rt| -> u64 { panic!("boom") });
+    let self_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
+    let failed = {
+        let self_cell = Arc::clone(&self_cell);
+        rt.create_query(move |rt: &Rt| rt.get(*self_cell.get().unwrap()))
+    };
+    self_cell.set(failed).unwrap();
     let in_a = Gate::new();
     let b_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
     let a = {

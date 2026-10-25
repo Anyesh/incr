@@ -331,7 +331,7 @@ impl<C: Cells> Runtime<C> {
         word & value_code::REPLAY_BIT != 0
             && replay::speculative()
             && !ctl.has(cycle::DOOMED)
-            && (ctl.flags.get() & (cycle::POISONED | cycle::KEPT_READ) != 0
+            && (ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_READ) != 0
                 || deps.iter().any(|&(d, generation)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
@@ -590,7 +590,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
                 Landing::Landed(_) if root => {
-                    self.poison_reader(walked);
+                    self.poison_reader(walked, cycle::POISONED);
                     return Adopted::Landed(Computed::Unsettled);
                 }
                 Landing::Stale if root => return Adopted::Stale,
@@ -1460,7 +1460,10 @@ impl<C: Cells> Runtime<C> {
         let top = f.cidx.max(self.dep_stack.next_cidx().wrapping_sub(1));
         let mut spins = 0;
         loop {
-            match state::load::<C>(self.nodes.get(slot).state_cell()) {
+            let node = self.nodes.get(slot);
+            match state::load::<C>(node.state_cell()) {
+                // Another thread's memo landing: the read takes the memo.
+                NodeState::Dirty if node.memo_at(|| self.current_revision()) => return None,
                 NodeState::New
                 | NodeState::Dirty
                 | NodeState::Computing
@@ -1530,8 +1533,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The lowest virtual frame above position `p`, up to `top`, whose
-    /// node another thread has landed, deleted or recycled since the
-    /// frame was made: a landed point.
+    /// node another thread has landed (a memo counts), deleted or recycled
+    /// since the frame was made: a landed point.
     fn landed_above(&self, p: u32, top: u32) -> Option<u32> {
         let rt = self.runtime_id;
         replay::with(|c| {
@@ -1542,13 +1545,14 @@ impl<C: Cells> Runtime<C> {
                 .filter(|v| {
                     let node = self.nodes.get(v.node);
                     node.generation() != v.generation
-                        || matches!(
-                            state::load::<C>(node.state_cell()),
+                        || match state::load::<C>(node.state_cell()) {
                             NodeState::Clean
-                                | NodeState::Cyclic
-                                | NodeState::Failed
-                                | NodeState::Dead
-                        )
+                            | NodeState::Cyclic
+                            | NodeState::Failed
+                            | NodeState::Dead => true,
+                            NodeState::Dirty => node.memo_at(|| self.current_revision()),
+                            _ => false,
+                        }
                 })
                 .map(|v| v.cidx)
                 .min()
@@ -1771,9 +1775,13 @@ impl<C: Cells> Runtime<C> {
             let (node, flags) = self.nodes.get_with_flags(slot);
             let claimed = state::try_claim_compute::<C>(node.state_cell());
             let first = match claimed {
+                // Another thread's memo landing since the scan, or a node
+                // another context holds reserved.
                 Ok(src)
                     if node.generation() == generation
-                        && self.reserved_elsewhere(NodeId(slot), generation) =>
+                        && (src == NodeState::Dirty
+                            && node.memo_at(|| self.current_revision())
+                            || self.reserved_elsewhere(NodeId(slot), generation)) =>
                 {
                     self.unclaim_unrun(node, src == NodeState::Dirty);
                     self.roll_back_hit(&taken);
@@ -2023,7 +2031,14 @@ impl<C: Cells> Runtime<C> {
         let value = Unbuilt::new(value);
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
         let ordinal = self.dep_stack.reads_of_current(self.runtime_id);
-        self.keep_read(f.ctl, f.cidx, reading, ordinal, Delivered::Landed(value));
+        let poison = self.dirty_read_poison(self.nodes.get(handle.slot()));
+        self.keep_read(
+            f.ctl,
+            f.cidx,
+            reading,
+            ordinal,
+            Delivered::Landed(value, poison),
+        );
     }
 
     /// The active frame's read took `payload`, a user panic or a cycle
@@ -2054,7 +2069,7 @@ impl<C: Cells> Runtime<C> {
         };
         let what = Delivered::Unwind {
             cycle: kind == Some(UnwindKind::Cycle),
-            poison: true,
+            poison: self.unwound_poison(kind),
             attributed: false,
             payload: copy,
             nodes: self.copy_notes(payload, cidx + 1),
@@ -2095,7 +2110,7 @@ impl<C: Cells> Runtime<C> {
         };
         let what = Delivered::Unwind {
             cycle: false,
-            poison: true,
+            poison: cycle::HANDLED,
             attributed: false,
             payload: copy,
             nodes: self.copy_notes(payload, cidx + 1),
@@ -2196,7 +2211,7 @@ impl<C: Cells> Runtime<C> {
             .foreign_key(word, (reader, node, flags, cidx), reading, ordinal)
             .and_then(|key| replay::take_pending(reader, &key, clone_landed::<T>));
         let outcome = match taken {
-            Some(Delivered::Landed(value)) => Ok(Ok(*value
+            Some(Delivered::Landed(value, _)) => Ok(Ok(*value
                 .into_inner()
                 .downcast::<T>()
                 .expect("incr-core: a landed value has its node's type"))),
@@ -2217,10 +2232,13 @@ impl<C: Cells> Runtime<C> {
             })),
         };
         let what = match &outcome {
-            Ok(Ok(value)) => Some(Delivered::Landed(Unbuilt::new(clone_landed::<T>(value)))),
+            Ok(Ok(value)) => Some(Delivered::Landed(
+                Unbuilt::new(clone_landed::<T>(value)),
+                cycle::POISONED,
+            )),
             Ok(Err(c)) => Some(Delivered::Unwind {
                 cycle: true,
-                poison: false,
+                poison: 0,
                 attributed: false,
                 payload: Box::new(cycle::CycleUnwind(c.clone())),
                 nodes: replay::Landings::default(),
@@ -2234,7 +2252,7 @@ impl<C: Cells> Runtime<C> {
                 }
                 copy.map(|payload| Delivered::Unwind {
                     cycle: false,
-                    poison: false,
+                    poison: 0,
                     attributed: false,
                     payload,
                     nodes: replay::Landings::default(),
@@ -2626,7 +2644,7 @@ impl<C: Cells> Runtime<C> {
                 // the entry it was blocked on, made for the read.
                 if x.pending
                     .find_keyed(&key, |d| {
-                        matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
+                        matches!(d.what, Delivered::Landed(..) | Delivered::Unwind { .. })
                     })
                     .is_some()
                 {
@@ -3529,7 +3547,7 @@ impl<C: Cells> Runtime<C> {
     /// popping frame's own flag.
     fn alone_lands_dirty(&self, slot: u32, spec: bool) -> bool {
         self.look_held(slot, Look::here_or(spec), |e| {
-            e.poisoned()
+            e.poison() != 0
                 || e.last().iter().any(|&(d, _)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
@@ -3649,12 +3667,17 @@ impl<C: Cells> Runtime<C> {
         if pos == 0 {
             // The read that ran the loop reads the target as a compute's
             // unwind leaves its reader.
-            self.dep_stack.poison_current_frame(self.runtime_id);
+            self.dep_stack
+                .poison_current_frame_with(self.runtime_id, self.unwound_poison(kind));
             bag.drain(self);
             self.unwind_out_of(id, boundary, kind, payload);
         }
         cycle_state::take_unwind_kind();
-        let poison = !(continuation && self.episode_member(node));
+        let poison = if continuation && self.episode_member(node) {
+            0
+        } else {
+            self.failed_poison(kind, v.node)
+        };
         let replaced = replay::with(|c| match c.iter_mut().find(|x| x.id == id) {
             Some(x) => x.deliver_unwind(
                 v.cidx,
@@ -4018,7 +4041,11 @@ impl<C: Cells> Runtime<C> {
         cycle_state::take_unwind_kind();
         // An R5 member run's unwind leaves its reader unpoisoned, as the
         // member stays held for its episode.
-        let poison = !self.episode_member(entry.node);
+        let poison = if self.episode_member(entry.node) {
+            0
+        } else {
+            self.failed_poison(kind, entry.node)
+        };
         let (replaced, abandoned) = replay::with(|c| {
             let x = c
                 .iter_mut()
@@ -4193,9 +4220,9 @@ impl<C: Cells> Runtime<C> {
             Delivered::Walk(..) | Delivered::Direct => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
-            Delivered::Landed(value) => {
+            Delivered::Landed(value, poison) => {
                 // SAFETY: the active frame's control block is live.
-                unsafe { &*f.ctl }.raise(cycle::POISONED);
+                unsafe { &*f.ctl }.raise(poison);
                 return Some(Ok(*value
                     .into_inner()
                     .downcast::<T>()
@@ -4213,9 +4240,9 @@ impl<C: Cells> Runtime<C> {
         // unwind, or a `try_get` that returns it, has still read a dep that
         // did not land. The native walk computes a Dirty reader's deps
         // before its closure, so that reader never lands Clean over them.
-        if poison {
+        if poison != 0 {
             // SAFETY: the active frame's control block is live.
-            unsafe { &*f.ctl }.raise(cycle::POISONED);
+            unsafe { &*f.ctl }.raise(poison);
         }
         if !cycle {
             // The member marked for the panic was marked in the run it came
@@ -4315,9 +4342,12 @@ impl<C: Cells> Runtime<C> {
         let state = state::load::<C>(self.nodes.get(node).state_cell());
         let reading = u64::from(node) | (u64::from(generation) << 32);
         let what = match state {
-            NodeState::Dirty => self
-                .slot_value(node)
-                .map(|v| Delivered::Landed(Unbuilt::new(v))),
+            NodeState::Dirty => self.slot_value(node).map(|v| {
+                Delivered::Landed(
+                    Unbuilt::new(v),
+                    self.dirty_read_poison(self.nodes.get(node)),
+                )
+            }),
             NodeState::New | NodeState::Cyclic => {
                 self.inner
                     .read()
@@ -4328,7 +4358,11 @@ impl<C: Cells> Runtime<C> {
                         attributed: false,
                         // As `episode_landed` poisons a reader of a node
                         // left New, and not of one left Cyclic.
-                        poison: state == NodeState::New,
+                        poison: if state == NodeState::New {
+                            cycle::POISONED
+                        } else {
+                            0
+                        },
                         payload: Box::new(cycle::CycleUnwind(g.cycle.clone())),
                         nodes: replay::Landings::default(),
                     })

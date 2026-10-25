@@ -951,7 +951,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 ctl.buf.take(),
                 !ctl.children.get().is_null(),
-                ctl.has(cycle::POISONED),
+                ctl.poison(),
             );
             // An engine unwind is no fault of the member's.
             if result.is_err() && cycle_state::unwind_kind().is_none() {
@@ -1032,7 +1032,7 @@ impl<C: Cells> Runtime<C> {
             deps,
             ctl.buf.take(),
             !ctl.children.get().is_null(),
-            ctl.has(cycle::POISONED),
+            ctl.poison(),
         );
         debug_assert!(
             replaced.is_none() && spec_buf.is_none(),
@@ -1299,6 +1299,7 @@ impl<C: Cells> Runtime<C> {
             cu: Vec::new(),
             round: None,
             walked,
+            uncut: cycle_state::has_dissolved(rt, root.0),
         });
         #[cfg(test)]
         self.episodes_seen
@@ -1625,6 +1626,7 @@ impl<C: Cells> Runtime<C> {
                 match self.shrink_to_root_scc(ep.root, &mut ep.members, &mut ep.cu, &graph, bag) {
                     Shrink::Kept => {}
                     Shrink::Shrunk => {
+                        ep.uncut = true;
                         ep.round = None;
                         continue 'restart;
                     }
@@ -1635,6 +1637,7 @@ impl<C: Cells> Runtime<C> {
             return self.land_episode(
                 &ep.members,
                 &ep.cu,
+                ep.uncut,
                 r.cycle,
                 r.stamp_rev,
                 r.verify_rev,
@@ -2102,12 +2105,15 @@ impl<C: Cells> Runtime<C> {
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
             None
         } else {
-            if e.poisoned() {
+            let poison = e.poison();
+            if self.memo_landing(poison, verify_rev) {
+                node.set_memo(verify_rev);
+            } else if poison != 0 {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
             }
-            let (target, children) = if published == Publish::Superseded || e.poisoned() {
+            let (target, children) = if published == Publish::Superseded || poison != 0 {
                 (NodeState::Dirty, ChildLanding::Keep)
             } else {
                 (NodeState::Clean, ChildLanding::Sweep)
@@ -2135,6 +2141,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         members: &[u32],
         cu: &[u32],
+        uncut: bool,
         cycle: Cycle,
         stamp_rev: u64,
         verify_rev: u64,
@@ -2238,6 +2245,16 @@ impl<C: Cells> Runtime<C> {
         }
         drop(inner);
 
+        // A member's handled outcome holds for the revision, and every
+        // member's value is built on it, so all of them keep a memo. Not
+        // with CU left: a CU member run again alone may skip the reads
+        // that put it in CU and read the memos as values. Nor if it skipped
+        // the cut to the root's SCC (`uncut`): a panic in this entry may
+        // have cut the cycle the strategy values were given for, and a read
+        // later in the revision holds the nodes it failed failing.
+        let poison = entries.iter().fold(0, |p, (_, e)| p | e.poison());
+        let memo = cu.is_empty() && !uncut && self.memo_landing(poison, verify_rev);
+
         // Step 3: write the values and stamp.
         for i in 0..entries.len() {
             let m = entries[i].0;
@@ -2276,19 +2293,27 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if entries[i].1.poisoned() {
+            if entries[i].1.poison() != 0 {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
+            }
+        }
+        // Only once every value is written: an abort in step 3 lands the
+        // members as if the episode kept no memo.
+        if memo {
+            for (m, _) in &entries {
+                self.nodes.get(*m).set_memo(verify_rev);
             }
         }
 
         // Steps 4 and 5: land, all Dirty if any member was flagged or a
         // new dep may hide a change.
         let dirty = superseded
-            || entries.iter().any(|(m, e)| {
-                e.poisoned() || self.nodes.get(*m).state() == NodeState::ComputingDirty
-            });
+            || poison != 0
+            || entries
+                .iter()
+                .any(|(m, _)| self.nodes.get(*m).state() == NodeState::ComputingDirty);
         for (m, e) in entries {
             let node = self.nodes.get(m);
             self.record_trace(
@@ -2336,6 +2361,15 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
+        // Step 3 sets no memo before its last compare, and a claimed
+        // member holds none from an earlier landing.
+        debug_assert!(
+            kind.is_none()
+                || entries
+                    .iter()
+                    .all(|(m, _)| !self.nodes.get(*m).memo_at(|| verify_rev)),
+            "incr-core: an engine unwind aborted an episode landing over a member's memo (T8-memo-on-aborted-episode)"
+        );
         let contain = self.episode_contains(cidx, kind, &*payload);
         let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {

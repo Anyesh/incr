@@ -116,7 +116,8 @@ pub(crate) struct Held {
     opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    poisoned: bool,
+    /// The `POISONED` and `HANDLED` flags of the runs' frames.
+    poison: u16,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
@@ -161,7 +162,7 @@ impl Held {
             wrote: false,
             opened: false,
             changed: false,
-            poisoned: false,
+            poison: 0,
             failed: false,
             episode: None,
             ep: 0,
@@ -171,7 +172,8 @@ impl Held {
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
-    /// child index and whether it was poisoned. Under speculation it first
+    /// child index and its frame's `POISONED` and `HANDLED` flags
+    /// (`poison`). Under speculation it first
     /// keeps the record it replaces; outside, it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
     /// caller to drop outside the held map.
@@ -181,7 +183,7 @@ impl Held {
         deps: Vec<(NodeId, u32)>,
         buf: Option<Erased>,
         opened: bool,
-        poisoned: bool,
+        poison: u16,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
             self.keep_record();
@@ -199,7 +201,7 @@ impl Held {
         }
         self.last = deps;
         self.opened = opened;
-        self.poisoned |= poisoned;
+        self.poison |= poison;
         (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
 
@@ -252,7 +254,7 @@ impl Held {
                 last: self.last.clone(),
                 installed: self.installed.clone(),
                 opened: self.opened,
-                poisoned: self.poisoned,
+                poison: self.poison,
             }));
         }
     }
@@ -273,7 +275,7 @@ impl Held {
         self.last = r.last;
         self.installed = r.installed;
         self.opened = r.opened;
-        self.poisoned = r.poisoned;
+        self.poison = r.poison;
         self.buf
             .take()
             .map(|buf| Unbuilt::<dyn std::any::Any>::new(buf))
@@ -349,8 +351,9 @@ impl<H: Borrow<Held>> Seen<H> {
         self.0.borrow().opened
     }
 
-    pub(crate) fn poisoned(&self) -> bool {
-        self.0.borrow().poisoned
+    /// The runs' `POISONED` and `HANDLED` flags: either lands Dirty.
+    pub(crate) fn poison(&self) -> u16 {
+        self.0.borrow().poison
     }
 }
 
@@ -389,7 +392,7 @@ struct RunRecord {
     last: Vec<(NodeId, u32)>,
     installed: Vec<NodeId>,
     opened: bool,
-    poisoned: bool,
+    poison: u16,
 }
 
 /// An episode between member runs. A doom that discards a member run
@@ -399,7 +402,8 @@ pub(crate) struct Episode {
     pub(crate) root: NodeId,
     pub(crate) cidx: u32,
     pub(crate) validated: bool,
-    /// The landing's one cut to the root's SCC in the final reads has run.
+    /// The landing's one cut to the root's SCC in the final reads has run,
+    /// or is skipped (`uncut`).
     pub(crate) pruned: bool,
     pub(crate) members: Vec<u32>,
     pub(crate) cu: Vec<u32>,
@@ -408,6 +412,10 @@ pub(crate) struct Episode {
     /// The root's compute is a walk's entry, which contains the episode's
     /// abort.
     pub(crate) walked: bool,
+    /// The episode skipped the cut to the root's SCC: the root dissolved
+    /// an episode earlier in this entry, or the landing's one cut shrank
+    /// it and it ran again uncut.
+    pub(crate) uncut: bool,
 }
 
 pub(crate) struct Round {
