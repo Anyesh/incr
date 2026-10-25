@@ -1619,15 +1619,17 @@ fn read_of_cycle_member_vs_claim_after_landing() {
     rt.assert_invariant_i();
 }
 
-/// a <-> b, a cycle `a`'s fallback resolves, with `b` catching the cycle
-/// of a node that reads itself so that every episode lands its members
-/// Dirty, and `x` reading `a`. Returns `x`, `a`, the gate in `a`'s closure
-/// and the gate in `x`'s after its read of `a`.
+/// a <-> b, a cycle `a`'s fallback resolves, with `b` reading a node that
+/// swallows its own self-read, so lands Dirty and poisons every episode
+/// into landing its members Dirty, and `x` reading `a`. Returns `x`, `a`,
+/// the gate in `a`'s closure and the gate in `x`'s after its read of `a`.
 fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
     let self_cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::default();
     let failed = {
         let self_cell = Arc::clone(&self_cell);
-        rt.create_query(move |rt: &Rt| rt.get(*self_cell.get().unwrap()))
+        rt.create_query(move |rt: &Rt| {
+            catch_unwind(AssertUnwindSafe(|| rt.get(*self_cell.get().unwrap()))).unwrap_or(1)
+        })
     };
     self_cell.set(failed).unwrap();
     let in_a = Gate::new();
@@ -1642,10 +1644,7 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
             |_: &crate::Cycle| 0,
         )
     };
-    let b = rt.create_query(move |rt: &Rt| {
-        let v = catch_unwind(AssertUnwindSafe(|| rt.get(failed))).unwrap_or(1);
-        rt.get(a) + v
-    });
+    let b = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(failed));
     b_cell.set(b).unwrap();
     let read_a = Gate::new();
     let x = {
