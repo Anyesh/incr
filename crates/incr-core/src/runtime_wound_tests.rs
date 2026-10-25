@@ -1047,3 +1047,59 @@ fn shared_wound_after_clean_landings_of_released_members_keeps_their_group() {
     )
     .assert_clean();
 }
+
+/// [`stale_edge_waits_for_cycle`] with B's read of `q` made inside a
+/// `Local` runtime's query: the wound or cycle raised in the `Shared`
+/// read reaches the `Local` entry around it, which is the thread's
+/// outermost, and B gets the outcome it gets without the `Local` entry,
+/// holding no reservation afterwards. Whichever thread is wounded checks
+/// in its head start whether its winner took the claim, which is the
+/// `Shared` runtime's, as without the `Local` entry.
+fn stale_edge_waits_for_cycle_under_local(a_first: bool) {
+    let checks = waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed);
+    let g = StaleEdge::new(QReads::Plain, false);
+    let q = g.q;
+    let shared = Arc::clone(&g.rt);
+    let (thread_a, thread_b) = g.run(a_first, move |_| {
+        let local = Runtime::<crate::cells::Local>::new();
+        let n = local.create_query(move |_| shared.get(q));
+        let v = catch_unwind(AssertUnwindSafe(|| local.get(n)));
+        assert!(crate::reserve::none_held(), "B kept a reservation");
+        v.unwrap_or_else(|p| std::panic::resume_unwind(p))
+    });
+    assert_eq!(thread_a.join().unwrap(), 4);
+    let b_result = thread_b.join().unwrap();
+    if a_first {
+        assert_eq!(b_result.unwrap(), 4);
+    } else {
+        let message = panic_message(b_result.unwrap_err());
+        assert!(message.contains("dependency cycle"), "{message}");
+        assert_eq!(g.rt.get(q), 4);
+    }
+    assert_wounded();
+    assert!(
+        waits::OWN_CLAIM_CHECKS.load(Ordering::Relaxed) > checks,
+        "the wounded thread's head start never checked the claim its winner waited on"
+    );
+    g.rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stale_edge_under_local_with_a_older() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_stale_edge_under_local_with_a_older",
+        || stale_edge_waits_for_cycle_under_local(true),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stale_edge_under_local_with_b_older() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_stale_edge_under_local_with_b_older",
+        || stale_edge_waits_for_cycle_under_local(false),
+    )
+    .assert_clean();
+}

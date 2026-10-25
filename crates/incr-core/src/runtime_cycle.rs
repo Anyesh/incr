@@ -349,6 +349,10 @@ impl<C: Cells> Runtime<C> {
                 "incr-core: a wounded thread waits for its winner holding reservations"
             );
             waits::await_winner(C::backoff, |(rt, slot)| {
+                #[cfg(all(test, not(loom)))]
+                if rt == self.runtime_id {
+                    waits::OWN_CLAIM_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 rt == self.runtime_id
                     && !matches!(
                         state::load::<C>(self.nodes.get(slot).state_cell()),

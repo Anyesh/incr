@@ -322,3 +322,113 @@ fn a_nested_read_of_the_same_node_leaves_its_reservation_to_the_enclosing_read()
     drop(outer);
     assert!(!reserved_elsewhere(claim));
 }
+
+/// A Shared read nested in a Local runtime's outermost entry dooms at
+/// budget 1 and reserves the claims its doom released. Once the Local
+/// read has returned no entry is open on the thread, so none of those
+/// reservations may be left: after a set, another thread recomputes the
+/// chain without waiting on them.
+#[test]
+fn shared_reservations_end_with_the_local_entry_around_them() {
+    let shared = Arc::new(Rt::new());
+    shared.set_placeholder(0_u64);
+    shared.set_max_frames(1);
+    let x = shared.create_input(1_u64);
+    let mut top = x;
+    for _ in 0..8 {
+        let below = top;
+        top = shared.create_query_with(move |rt: &Rt| rt.get(below) + 1, replayable());
+    }
+    let local = Runtime::<crate::cells::Local>::new();
+    let read = {
+        let shared = shared.clone();
+        local.create_query(move |_| shared.get(top))
+    };
+    assert_eq!(local.get(read), 9);
+    assert!(!shared.dooms.lock().unwrap().is_empty(), "no doom ran");
+    assert!(
+        crate::reserve::none_held(),
+        "a reservation outlived every entry on the thread"
+    );
+    shared.set(x, 2);
+    let other = {
+        let shared = shared.clone();
+        spawn("other", move || shared.get(top))
+    };
+    assert_eq!(other.join(), Ok(10));
+}
+
+/// The same nesting where the chain's leaf panics: the doomed read's
+/// retry panics out of the Shared read and the Local entry around it.
+/// No entry is open once it has, so no reservation may be left: after
+/// the leaf is cured, another thread recomputes the chain without
+/// waiting on one.
+#[test]
+fn shared_reservations_end_when_a_panic_leaves_the_local_entry_around_them() {
+    let shared = Arc::new(Rt::new());
+    shared.set_placeholder(0_u64);
+    shared.set_max_frames(1);
+    let boom = Arc::new(AtomicBool::new(true));
+    let s = shared.create_input(1_u64);
+    let leaf = {
+        let boom = boom.clone();
+        shared.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(s);
+                if boom.load(SeqCst) {
+                    panic!("leaf boom");
+                }
+                v
+            },
+            replayable(),
+        )
+    };
+    let mut top = leaf;
+    for _ in 0..4 {
+        let below = top;
+        top = shared.create_query_with(move |rt: &Rt| rt.get(below) + 1, replayable());
+    }
+    let local = Runtime::<crate::cells::Local>::new();
+    let read = {
+        let shared = shared.clone();
+        local.create_query(move |_| shared.get(top))
+    };
+    assert!(outcome(|| local.get(read)).is_err());
+    assert!(!shared.dooms.lock().unwrap().is_empty(), "no doom ran");
+    assert!(
+        crate::reserve::none_held(),
+        "a reservation outlived every entry on the thread"
+    );
+    boom.store(false, SeqCst);
+    shared.set(s, 2);
+    let other = {
+        let shared = shared.clone();
+        spawn("other", move || shared.get(top))
+    };
+    assert_eq!(other.join(), Ok(6));
+}
+
+/// The Shared read under a Local entry is its runtime kind's outermost
+/// entry and ends what the thread still reserves when it exits, as a
+/// Shared outermost entry does: a reservation its compute left PENDING
+/// (here noted directly, standing in for a doom whose mark unwound) is
+/// gone before the Local closure goes on.
+#[test]
+fn shared_entry_under_a_local_entry_ends_what_it_left_reserved() {
+    let shared = Arc::new(Rt::new());
+    let leftover = (crate::handle::RuntimeId::for_test(u64::MAX - 11), 3);
+    let leaves = shared.create_query(move |_: &Rt| {
+        let _scope = crate::reserve::Scope::new(Some(crate::reserve::PENDING));
+        crate::reserve::note(leftover, 0);
+        1_u64
+    });
+    let local = Runtime::<crate::cells::Local>::new();
+    let read = {
+        let shared = shared.clone();
+        local.create_query(move |_| {
+            let v = shared.get(leaves);
+            (v, crate::reserve::none_held())
+        })
+    };
+    assert_eq!(local.get(read), (1, true));
+}
