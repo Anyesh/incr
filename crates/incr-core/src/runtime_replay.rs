@@ -400,7 +400,7 @@ impl<C: Cells> Runtime<C> {
             let counts = replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl);
             ForeignReads {
                 context: (!counts.is_empty())
-                    .then(replay::innermost_context)
+                    .then(replay::outermost_context)
                     .flatten(),
                 counts,
             }
@@ -4839,7 +4839,7 @@ pub(super) struct Stash {
 }
 
 /// A stashed run's Clean reads of other runtimes, with those runtimes'
-/// changes as the reads found them and the thread's innermost context, of
+/// changes as the reads found them and the thread's outermost context, of
 /// any runtime, when the run ended.
 #[derive(Default)]
 struct ForeignReads {
@@ -4848,10 +4848,10 @@ struct ForeignReads {
 }
 
 impl ForeignReads {
-    /// While the context that made the run is open, a change since its reads
-    /// was made by the runs after them, which the unbounded run also makes
-    /// after them, or by another thread at no fixed point; once it has ended
-    /// the unbounded run reads now, so every count must hold.
+    /// While a context open at the run's end is still open, a change since
+    /// its reads was made by the runs after them, which the unbounded run
+    /// also makes after them, or by another thread at no fixed point; once
+    /// all have ended the unbounded run reads now, so every count must hold.
     fn adoptable(&self) -> bool {
         self.counts.is_empty()
             || self.context.is_some_and(replay::context_open)

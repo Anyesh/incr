@@ -1500,10 +1500,11 @@ fn thread_tag() -> u64 {
     })
 }
 
-/// This thread's innermost context, of any runtime.
-pub(crate) fn innermost_context() -> Option<ContextName> {
+/// This thread's outermost context, of any runtime: contexts nest, so some
+/// context open now is still open later exactly when this one is.
+pub(crate) fn outermost_context() -> Option<ContextName> {
     let thread = thread_tag();
-    peek(|c| c.last().map(|x| (thread, x.id)))
+    peek(|c| c.first().map(|x| (thread, x.id)))
 }
 
 /// Whether context `name` is open on this thread, at any depth.

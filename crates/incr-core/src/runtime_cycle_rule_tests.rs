@@ -1687,6 +1687,74 @@ fn set_after_clean_read_runs<A: Cells, B: Cells>(budget: bool) -> (u64, u32, boo
     (value, runs.load(Ordering::Relaxed), doomed)
 }
 
+/// [`set_after_clean_read_runs`] one native frame below a replayable one,
+/// with a frame budget of `budget` (`u32::MAX` for none): the native frame
+/// stops a doom's marking, and the replayable reader above it is doomed on
+/// an earlier leaf, so the native frame's run is speculative and a doom
+/// below it opens a context of its own.
+fn nested_set_after_clean_read_runs<A: Cells, B: Cells>(budget: u32) -> (u64, u32, bool) {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    r1.set_max_frames(budget);
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let native = || QueryOpts {
+        replay: Replay::Native,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query_with(|_| 1_u64, native());
+    let reader = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let setter = {
+        let r2 = OtherRt(&*r2);
+        r1.create_query_with(
+            move |_| {
+                r2.set(x, 3000);
+                0_u64
+            },
+            native(),
+        )
+    };
+    let inner = r1.create_query_with(
+        move |rt| rt.get(first) + rt.get(reader) + rt.get(setter),
+        replayable(),
+    );
+    let mid = r1.create_query_with(move |rt| rt.get(inner), native());
+    let lead = r1.create_query_with(|_| 0_u64, native());
+    let outer = r1.create_query_with(move |rt| rt.get(lead) + rt.get(mid), replayable());
+    let value = r1.get(outer);
+    let doomed = !r1.dooms.lock().unwrap().is_empty();
+    (value, runs.load(Ordering::Relaxed), doomed)
+}
+
+/// The inner doom's context has ended when the outer retry adopts the
+/// reader's stash, but the outer context that made it is still open.
+#[test]
+fn nested_set_after_clean_read_keeps_the_read() {
+    for budget in [u32::MAX, 1, 2, 3] {
+        let runs = [
+            nested_set_after_clean_read_runs::<Local, Local>(budget),
+            nested_set_after_clean_read_runs::<Local, Shared>(budget),
+            nested_set_after_clean_read_runs::<Shared, Local>(budget),
+            nested_set_after_clean_read_runs::<Shared, Shared>(budget),
+        ];
+        assert_eq!(runs, [(1001, 1, budget != u32::MAX); 4], "{budget}");
+    }
+}
+
 /// The setter's speculative run moves the other runtime's count before the
 /// retry adopts the reader's stash, in the context that made both, as the
 /// unbounded run sets after the read.
