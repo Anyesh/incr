@@ -1400,6 +1400,8 @@ impl<C: Cells> Live<C> {
     fn assert_invariants(&self) {
         self.world.rt(0).assert_invariant_i();
         self.world.rt(1).assert_invariant_i();
+        self.world.rt(0).assert_released_entries_match_deps();
+        self.world.rt(1).assert_released_entries_match_deps();
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -3954,6 +3956,49 @@ fn two_thread_schedule_seeds() {
     }
 }
 
+/// Two-thread seeds whose outcomes hang on how a user panic's released
+/// claims land and walk: every run's outcomes must be some order's.
+/// 0x7c3a135a4 at frame budget 2: landing the claims New let the other
+/// thread's `Get(16)` return 1 where every order of the two reads panics,
+/// in about 1 run in 1000 with no budget and 2 in 5 at this one. 0x74f with
+/// no budget: a Failed first run that recorded a released entry of 0 kept
+/// deps let `Get(3)` panic "failed" where every order returns 3, in about 1
+/// run in 8. 0x9172 at frame budget 3: under the same rule op 3 reported
+/// `Cycle([5, 6, 10])`, a cycle no order enters, in about 9 runs in 10.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn released_claims_leave_two_threads_a_serial_outcome() {
+    for (seed, frames, bytes) in [
+        (0x7c3a135a4, Some(2), 16 * 1024),
+        (0x74f, None, 0),
+        (0x9172, Some(3), 0),
+    ] {
+        let case = gen_case(seed, false, true);
+        let phases = phases(&case, seed);
+        let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
+        quiet(|| {
+            let orders: Vec<Vec<Out>> = (0..1u64 << pairs)
+                .map(|swaps| {
+                    let order = Order::new(&case, &phases, swaps);
+                    let t = run::<Shared>(&order.case, None, 0);
+                    let mut at = vec![0; t.len()];
+                    for (j, &i) in order.of.iter().enumerate() {
+                        at[i] = j;
+                    }
+                    at.iter().map(|&j| t[j].0.clone()).collect()
+                })
+                .collect();
+            for _ in 0..60 {
+                let got: Vec<Out> = run_two(&case, &phases, frames, bytes)
+                    .into_iter()
+                    .map(|(out, _)| out)
+                    .collect();
+                assert!(orders.contains(&got), "{seed:#x}: {got:?} is no order's");
+            }
+        });
+    }
+}
+
 /// Two-thread seeds where, under a budget, the other thread computed a node
 /// a doom released for its context's retry: each run's outcomes must be
 /// some read order's unbounded outcomes. In 0x36615207 the owner's run
@@ -4167,10 +4212,9 @@ fn failed_after(t: &Trace, i: usize) -> (Out, Vec<usize>) {
 /// Seed 0xe486019a1c945cce's op 1, `Get(4)`: member 8 of the cycle
 /// {4, 5, 7, 8} reads 9, whose walk computes 21, and 21's own code panics
 /// in the episode of {9, 21, 22, 23}, which marks it failed; 9 then passes
-/// that panic to 8. Unbounded, the mark falls inside 8's member run, so 8
-/// lands New. At a budget of 1 the driver runs that episode between doomed
-/// runs of 8, and the run finishing 8's frame counted marks from its own
-/// start only, so 8 landed Failed as well.
+/// that panic to 8, and a fresh run leaves 8, 9, 21, 22 and 23 Failed, as
+/// do the unbounded run and a budget of 1. The mark count it was pinned
+/// for is now [`a_member_frame_counts_the_marks_of_its_earlier_runs`]'s.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
@@ -4179,7 +4223,7 @@ fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
     quiet(|| {
         let mut fresh = case.clone();
         fresh.ops = vec![Op::Get(4)];
-        let want = (Out::Panic("boom 0:21".to_owned()), vec![9, 21]);
+        let want = (Out::Panic("boom 0:21".to_owned()), vec![8, 9, 21, 22, 23]);
         assert_eq!(failed_after(&run::<Local>(&fresh, None, 0), 0), want);
         assert!(matches!(case.ops[1], Op::Get(4)));
         assert_eq!(failed_after(&run::<Local>(&case, Some(1), 0), 1), want);
@@ -4302,6 +4346,54 @@ fn a_tainted_group_release_gives_a_clean_entry_orders_value() {
         }
         differential::<Local>(&case, seed);
         differential::<Shared>(&case, seed);
+    });
+}
+
+/// Seed 0x39e2, unbounded: op 0's panic releases the claims of 0's reads,
+/// and they land New over the deps their runs recorded. Op 1's `Get(4)`
+/// walk expanded those deps and ran 3 first, so the cycle through 4 was
+/// entered at 3 and panicked "boom 0:3", where a fresh run of 4 enters it
+/// at 4 and gets 7777.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_walk_leaves_a_new_nodes_deps_to_its_run() {
+    let mut case = gen_case(0x39e2, false, false);
+    case.ops.truncate(2);
+    assert!(matches!(case.ops[1], Op::Get(4)));
+    quiet(|| {
+        for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
+            assert!(matches!(trace[1].0, Out::Value(7777)), "{:?}", trace[1].0);
+        }
+    });
+}
+
+/// Seed 0x36618028's op 4, `Get(15)`, at a budget of 1: the run finishing
+/// a doomed member's frame counts the failure marks made since the
+/// frame's first run, or 15 and 16 land New where the unbounded run lands
+/// them Failed. 0xe486 no longer reaches that count.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_member_frame_counts_the_marks_of_its_earlier_runs() {
+    let mut case = gen_case(0x3661_8028, false, false);
+    case.ops.truncate(5);
+    assert!(matches!(case.ops[4], Op::Get(15)));
+    quiet(|| {
+        differential::<Local>(&case, 0x3661_8028);
+        differential::<Shared>(&case, 0x3661_8028);
+    });
+}
+
+/// Seed 0x66a, unbounded: a released claim's later finished run published
+/// deps without dropping its released entry, so its kept count outlived
+/// the list it counted. [`Live::assert_invariants`] finds an entry
+/// counting a list its node no longer has.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_finished_run_drops_its_released_entry() {
+    let case = gen_case(0x66a, false, false);
+    quiet(|| {
+        run::<Local>(&case, None, 0);
+        run::<Shared>(&case, None, 0);
     });
 }
 
@@ -4711,7 +4803,7 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
 /// Failed while op 0's walk, planned before it, waits on a claim. Op 0's
 /// walk visits the nodes it waited on again, so every run leaves one
 /// order's Failed set: op 0 first enters a cycle and op 1 leaves {10},
-/// and op 1 first leaves {0, 2, 3, 4, 5, 9, 10, 11, 12}. None needs the
+/// and op 1 first leaves {0, 4, 5, 9, 10, 11}. None needs the
 /// oracle's history, which a walk that went on with its old plan did.
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -4726,10 +4818,7 @@ fn two_thread_walk_planned_before_an_episode_leaves_an_orders_failed_set() {
             .map(|&x| (x, NodeState::Failed))
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        orders,
-        [failed(&[10]), failed(&[0, 2, 3, 4, 5, 9, 10, 11, 12])]
-    );
+    assert_eq!(orders, [failed(&[10]), failed(&[0, 4, 5, 9, 10, 11])]);
     quiet(|| {
         for _ in 0..300 {
             let serial = Serial::new(&case, &phases);
@@ -7953,9 +8042,11 @@ fn wave8_seed_d6e1_released_new_walked_fresh() {
     });
 }
 
-/// Seed 0x148c's base case, shrunk, from review 8b: at budgets 1 to 3
-/// stand-ins' Dirty landings reach their walks as `Unsettled`, and every
-/// operation's outcome and query states match the unbounded run's.
+/// Seed 0x148c's base case, shrunk. At budgets 2 and 3 a stand-in's Dirty
+/// landing is reported to its walk as `Unsettled`, which must not lead the
+/// bounded run to compute a node the unbounded run leaves New: after
+/// `Get(7)`, nodes 1 to 4, 14 and 16. Budgets 2 and 3 hold at least one
+/// landing as unsettled.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
@@ -8030,8 +8121,18 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
     };
     quiet(|| {
         let unbounded = states(run::<Local>(&case, None, 0));
+        let new: Vec<usize> = (0..unbounded[3].1.len())
+            .filter(|&n| unbounded[3].1[n] == NodeState::New)
+            .collect();
+        assert_eq!(new, [1, 2, 3, 4, 14, 16], "unbounded");
+        let holds = || super::replay_impl::UNSETTLED_HOLDS.with(|n| n.replace(0));
         for frames in [1, 2, 3] {
+            holds();
             let local = states(run::<Local>(&case, Some(frames), 0));
+            assert!(
+                frames < 2 || holds() > 0,
+                "budget {frames}: no Unsettled landing"
+            );
             assert_eq!(local, unbounded, "Local, budget {frames}");
             let shared = states(run::<Shared>(&case, Some(frames), 0));
             assert_eq!(shared, unbounded, "Shared, budget {frames}");

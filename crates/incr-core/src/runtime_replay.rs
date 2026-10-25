@@ -125,6 +125,8 @@ thread_local! {
     /// `UNBUDGETED`.
     pub(crate) static NOTE_DECIDED: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::Cell::new(None) };
+    /// Landings this thread's `hold_landing` held as unsettled.
+    pub(crate) static UNSETTLED_HOLDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// A runtime's place in `UNBUDGETED`, which its drop gives up, and the
@@ -4364,6 +4366,10 @@ impl<C: Cells> Runtime<C> {
     /// A walk stopped short of its root drops the node's other entries if
     /// the compute left it `unsettled`, as `walk_stopped` does.
     fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32, unsettled: bool) {
+        #[cfg(test)]
+        if unsettled {
+            UNSETTLED_HOLDS.with(|n| n.set(n.get() + 1));
+        }
         self.park(ParkPoint::HoldLanding(NodeId(node)));
         let mut state = state::load::<C>(self.nodes.get(node).state_cell());
         if is_computing(state) {

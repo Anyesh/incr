@@ -2248,3 +2248,44 @@ and `scale-icount` run on the train that lands this branch.
 | `delete_cascade_local` / `_shared` | 3,246,570.95 / 4,581,756.20 | 3,264,570.20 / 4,589,765.05 | +17,999.25 / +8,008.85 |
 
 Gate: every hard gate counts the same as the base. Each propagating compute costs 25 more under `Local` and 21 under `Shared`: 24 / 13 from the memo as first built (below) and 1 / 8 from the review fixes. Of the fixes, the `changed_at` clear costs 1 under `Local` (a branch-free store) and 3 under `Shared` (a load and a bit test), and the `Shared` claim's second memo test costs 5; `Local` skips that test, since no other thread can land between its load and its claim. The memo as first built, by Intel PT per compute: the two memo tests' load and bit test (`node.rs:422` +7 Local, +6 Shared, and +1 at each guard), the stamp's memo clear (`node.rs:316` +3 Local; `node.rs:317` +3 and the atomics +7 Shared), the landing's flag mask and memo test (`cycle.rs:440`, `runtime.rs:4103`, +2), and code layout in `compute_attempts` (`Publish`'s compare out of line +3, `segmented_nodes.rs:191` +3, the landing target +4/-4). Testing only the root's compute for a memo would save 4 / 3 per compute, but a walk entry whose memo landed after the walk planned it then reruns and can compute another value (0x66a's Local op 2). Fan-out and delete workloads compute one leaf per step, and the workloads that compute a few nodes per step move by the same per-compute cost (`simple_count/*` +25 / +22, `children_*` +20 to +28, `early_cutoff_*` +34 / +26, `diamond_*` +75 / +62, `collection_insert_then_read/*_incremental/*` +61 / +52). The rest move by noise (`delete_owned_tree_*` -3,100 / -528, the others under 12).
+## Released claims' walk rule and the per-node released mark
+
+`w/T10-ub-f2ad3443-wrong-values` (tip `4a29dee5`, on `89d83e76`) keeps
+a read's walk to the deps a released claim's last finished run read
+(`Inner::released_deps`), and marks a node holding such an entry in bit
+0x40 of `NodeData::dep_count`, so the same-deps publish and the walk
+test the node instead of a runtime-wide count. Base `89d83e76`, same box,
+`icount.sh` defaults; "branch" is `c044a098`, the rule without the mark.
+
+| workload | base | branch | tip | delta |
+|---|---|---|---|---|
+| `get_clean_local` | 102 | | 102 | 0 |
+| `get_clean_shared` | 196 | | 196 | 0 |
+| `table_hit_shared` | 218.14 | | 218.14 | 0 |
+| `value_slot_read_shared` | 87 | | 87 | 0 |
+| `chain_local/propagate/4` | 4633 | 4697 | 4709 | +76 |
+| `chain_shared/propagate/4` | 9555.20 | 9611.20 | 9599.20 | +44 |
+| `fanout_local_4` | 17187.01 | 17330 | 17362 | +174.99 |
+| `delete_single_local` | 711 | 714 | 716 | +5 |
+
+- The rule costs 64 per `chain_local/propagate/4` iteration (Intel PT,
+  base against branch): the walk's kept-count expansion 28, the
+  same-deps publish's entry check 12, extra dep scans 20; the rest is
+  `compute_attempts` code moving between inlined sites, netting 0.
+- The mark adds 12 more under Local: `count_of` now masks the count
+  under both strategies (released entries exist under Local), about one
+  instruction per dep scan. Shared already masked for the unrun mark, and
+  its rows fall by up to 12.
+- A first version called `set_released` out of line and looked the node
+  up again by slot on every publish of new deps and every delete:
+  `delete_single_local` +4.8%, `fanout_local_4` +3.0%. Testing the mark
+  inline at the caller, with the node it holds, brought those to +0.7%
+  and +1.0%.
+- `released_hot` (Shared set+get on a static-dep node, one never-read
+  released entry present against none): +4.5% to +5.4% instructions per
+  op at 1, 4 and 8 threads with the runtime-wide count, +0.00% to +0.17%
+  with the mark.
+
+Gate: the hard gates are exact (102, 196, 218.14, 87). Replay scale by
+`strict-scan.sh`'s `scale-icount` on `8d006e54` against `89d83e76`: every ratio within
+0.4%.

@@ -22,7 +22,7 @@
 //!   52     4     arena_slot    u32
 //!   56     2     type_tag      u16
 //!   58     1     state         Cells::State
-//!   59     1     dep_count     Cells::U8    (high bit: the unrun mark)
+//!   59     1     dep_count     Cells::U8    (0x80 the unrun mark, 0x40 the released mark)
 //!   60     4     generation    Cells::U32
 //! ```
 //!
@@ -480,14 +480,10 @@ impl<C: Cells> NodeData<C> {
         Self::count_of(C::u8_load_relaxed(&self.dep_count))
     }
 
-    /// The count in a `dep_count` cell value, without the unrun bit.
+    /// The count in a `dep_count` cell value, without its marks.
     #[inline(always)]
     fn count_of(raw: u8) -> u8 {
-        if C::SINGLE_THREADED {
-            raw
-        } else {
-            raw & !Self::UNRUN
-        }
+        raw & Self::COUNT_MASK
     }
 
     #[inline(always)]
@@ -510,15 +506,35 @@ impl<C: Cells> NodeData<C> {
     /// claim's owner calls it, before the release that publishes it.
     #[inline(always)]
     pub(crate) fn set_unrun(&self, unrun: bool) {
-        if C::SINGLE_THREADED {
-            return;
+        if !C::SINGLE_THREADED {
+            self.set_mark(Self::UNRUN, unrun);
         }
+    }
+
+    /// Whether the runtime holds a released entry for the node
+    /// (`Inner::released_deps`). An install keeps it.
+    #[inline(always)]
+    pub(crate) fn released_mark(&self) -> bool {
+        C::u8_load_relaxed(&self.dep_count) & Self::RELEASED != 0
+    }
+
+    /// Only the claim's owner calls it, under the hold that sets or drops
+    /// the entry.
+    #[inline(always)]
+    pub(crate) fn set_released_mark(&self, released: bool) {
+        self.set_mark(Self::RELEASED, released);
+    }
+
+    /// The unrun and released marks, which an install keeps.
+    #[inline(always)]
+    fn marks(&self) -> u8 {
+        C::u8_load_relaxed(&self.dep_count) & !Self::COUNT_MASK
+    }
+
+    #[inline(always)]
+    fn set_mark(&self, bit: u8, on: bool) {
         let raw = C::u8_load_relaxed(&self.dep_count);
-        let marked = if unrun {
-            raw | Self::UNRUN
-        } else {
-            raw & !Self::UNRUN
-        };
+        let marked = if on { raw | bit } else { raw & !bit };
         if marked != raw {
             // Release like install_deps's, so a scan that reads this
             // value still sees the deps installed before it.
@@ -567,7 +583,7 @@ impl<C: Cells> NodeData<C> {
             // overflow marker before this store finds the null and
             // retries on the count stored next.
             let displaced = self.overflow_deps.replace(None);
-            C::u8_store_release(&self.dep_count, count as u8 | self.unrun_bit());
+            C::u8_store_release(&self.dep_count, count as u8 | self.marks());
             displaced
         } else {
             let list = Box::new(DepList {
@@ -578,7 +594,7 @@ impl<C: Cells> NodeData<C> {
             // marker and the DepList length is authoritative. This is
             // what lifts the old 255-dep ceiling: a query may read any
             // number of inputs.
-            C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER | self.unrun_bit());
+            C::u8_store_release(&self.dep_count, Self::OVERFLOW_MARKER | self.marks());
             displaced
         }
     }
@@ -590,6 +606,12 @@ impl<C: Cells> NodeData<C> {
     /// `dep_count` bit for [`Self::unrun`], kept there because the
     /// claim's owner writes both and its release publishes both.
     const UNRUN: u8 = 0x80;
+
+    /// `dep_count` bit for [`Self::released_mark`]: `NodeData` fills its
+    /// line, and a publish already reads this cell.
+    const RELEASED: u8 = 0x40;
+
+    const COUNT_MASK: u8 = 0x0f;
 
     /// Iterate over the node's recorded dependencies. A scan may race an
     /// `install_deps` on another thread (the dirty walk scans without a
@@ -674,6 +696,15 @@ impl<C: Cells> NodeData<C> {
     }
 }
 
+const _: () = {
+    type N = NodeData<crate::cells::Local>;
+    assert!(
+        N::OVERFLOW_MARKER & !N::COUNT_MASK == 0
+            && N::UNRUN & N::RELEASED == 0
+            && (N::UNRUN | N::RELEASED) & N::COUNT_MASK == 0,
+        "dep_count's count, unrun and released bits overlap"
+    );
+};
 const _: () = assert!(
     std::mem::size_of::<NodeData<crate::cells::Local>>() == 64,
     "NodeData<Local> must be exactly one 64-byte cache line"
@@ -880,5 +911,34 @@ mod tests {
         n.set_unrun(true);
         assert!(!n.unrun(), "a single-threaded node keeps no mark");
         assert_eq!(n.dep_count(), 2);
+    }
+
+    #[test]
+    fn the_released_mark_leaves_the_deps_alone() {
+        fn check<C: crate::cells::Cells>() {
+            for len in [3, 20] {
+                let n: NodeData<C> = NodeData::new_query(0, 0);
+                let deps: Vec<NodeId> = (0..len).map(NodeId).collect();
+                drop(n.install_deps(&deps));
+                let count = n.dep_count();
+                n.set_released_mark(true);
+                n.set_unrun(true);
+                assert!(n.released_mark());
+                assert_eq!(n.dep_count(), count);
+                assert_eq!(collect_deps(&n), deps);
+                n.set_unrun(false);
+                assert!(n.released_mark(), "the unrun mark leaves it alone");
+                let fewer: Vec<NodeId> = (0..2).map(NodeId).collect();
+                drop(n.install_deps(&fewer));
+                assert!(n.released_mark(), "an install keeps it");
+                assert_eq!(collect_deps(&n), fewer);
+                drop(n.install_deps(&deps));
+                n.set_released_mark(false);
+                assert!(!n.released_mark());
+                assert_eq!(n.dep_count(), count);
+            }
+        }
+        check::<Local>();
+        check::<Shared>();
     }
 }
