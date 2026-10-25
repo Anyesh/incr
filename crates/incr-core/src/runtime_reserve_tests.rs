@@ -506,7 +506,6 @@ fn a_foreign_rerun_after_a_failed_landing_leaves_no_stale_delivery() {
 /// unbounded run lets that read rerun X. After R's read no reservation of
 /// R's is left.
 #[test]
-#[ignore = "T10-reservation-dirty-landing-join: stalls on 34412289 too"]
 fn shared_reservation_of_a_dirty_landing_ends_with_the_read() {
     type Shape = (Arc<Rt>, Incr<u64>, Incr<u64>, Gate, Arc<AtomicBool>);
     fn shape(rt: Rt) -> Shape {
