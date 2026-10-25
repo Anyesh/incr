@@ -581,6 +581,16 @@ pub(crate) struct Walk {
     /// Created at the walk's first New expansion or group expansion, in
     /// one box so that a walk with neither tests one pointer at its drop.
     expanded: Option<Box<Expanded>>,
+    /// The entry a discarded compute pushed back for the reading frame's
+    /// retry. It stays on top while set: the next pending pop takes it,
+    /// and whatever drops the entry first clears it.
+    repushed: Option<NodeId>,
+    /// Whether this thread's own reads landed the root Failed while it was
+    /// walked, and how many of its Failed landings in the outermost entry
+    /// that has accounted for. Both carry over a resume, so a doomed
+    /// attempt's retry counts as the unbounded run's walk does.
+    root_failed_here: bool,
+    failed_from: usize,
 }
 
 #[derive(Default, Clone)]
@@ -604,6 +614,7 @@ impl Walk {
                 .is_some_and(|e| e.is_pending() && e.id.0 == id)
         {
             self.work.pop();
+            self.repushed = None;
         }
     }
     #[inline]
@@ -616,6 +627,9 @@ impl Walk {
             first_visits: 0,
             visited: None,
             expanded: None,
+            repushed: None,
+            root_failed_here: false,
+            failed_from: 0,
         }
     }
 
@@ -627,6 +641,13 @@ impl Walk {
             .get_or_insert_with(Box::default)
             .new
             .insert(id)
+    }
+
+    /// Pushes back `entry`, whose compute a discard undid, for the reading
+    /// frame's retry to run again.
+    fn repush(&mut self, entry: Entry) {
+        self.push(entry);
+        self.repushed = Some(entry.id);
     }
 
     #[inline(always)]
@@ -706,6 +727,9 @@ impl Walk {
                 parent.taint = parent.taint.min(taint);
             }
         }
+        if top == self.work.len() {
+            self.repushed = None;
+        }
         self.work.drain(cut..top);
     }
 
@@ -725,6 +749,9 @@ impl Walk {
         for at in (1..self.work.len()).rev() {
             let entry = self.work[at];
             if entry.is_pending() && entry.id == id {
+                if at == self.work.len() - 1 {
+                    self.repushed = None;
+                }
                 self.work.remove(at);
                 if entry.taint < NO_TAINT {
                     if let Some(parent) = self.work[..at].iter_mut().rev().find(|e| e.is_pending())
@@ -748,6 +775,9 @@ impl Walk {
     /// expansions of the nodes it left no pending entry, so that a later
     /// visit of one plans it as a walk that never met it would.
     fn prune(&mut self, keep: usize) {
+        if keep < self.work.len() {
+            self.repushed = None;
+        }
         let mut gone: HashSet<NodeId> = self
             .work
             .drain(keep..)
@@ -3074,6 +3104,19 @@ impl<C: Cells> Runtime<C> {
         self.clean_walk::<0>(id, gen, word, observed)
     }
 
+    /// Whether this thread's own reads landed the walk's root Failed since
+    /// the walk began, a doomed attempt and its retry included.
+    #[cold]
+    #[inline(never)]
+    fn root_failed_here(&self, walk: &mut Walk, root: NodeId, gen: u32) -> bool {
+        if !walk.root_failed_here {
+            walk.root_failed_here =
+                cycle_state::failed_here_since(walk.failed_from, self.runtime_id, root.0, gen);
+            walk.failed_from = cycle_state::failed_here_count();
+        }
+        walk.root_failed_here
+    }
+
     /// [`Self::ensure_clean`] past its fast path, for a caller that took
     /// `word` from `value_code::checked_word` and loaded `id` as
     /// `observed`, not Clean. A root that went Clean since is left at its
@@ -3113,8 +3156,15 @@ impl<C: Cells> Runtime<C> {
         } else {
             self.planned()
         };
-        let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
+        let mut walk = resume.unwrap_or_else(|| {
+            let mut walk = Walk::new(id, observed);
+            if !C::SINGLE_THREADED {
+                walk.failed_from = cycle_state::failed_here_count();
+            }
+            walk
+        });
         let mut root = Computed::Done;
+        let root_node = self.nodes.get(id.0);
         let mut unchecked = None;
         #[cfg(test)]
         let mut revisited: Vec<NodeId> = Vec::new();
@@ -3122,6 +3172,23 @@ impl<C: Cells> Runtime<C> {
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
+                // A root another thread landed Failed computes as one found
+                // Failed, so its queued entries need no cleaning; one this
+                // thread's own reads failed leaves them to run, as with no
+                // other thread. A passed entry hands on its taint in case
+                // the root is retried. An entry a discarded compute pushed
+                // back was popped before the landing, as in the unbounded run.
+                if !is_root
+                    && !C::SINGLE_THREADED
+                    && (MODE & VIRT == 0 || walk.repushed.take() != Some(cur))
+                    && state::load::<C>(root_node.state_cell()) == NodeState::Failed
+                    && !self.root_failed_here(&mut walk, id, gen)
+                {
+                    if taint < NO_TAINT {
+                        walk.taint(taint);
+                    }
+                    continue;
+                }
                 self.park(ParkPoint::BeforeComputeOne(cur));
                 let visit = if is_root || taint >= NO_TAINT {
                     Visit::Full
@@ -3211,6 +3278,10 @@ impl<C: Cells> Runtime<C> {
             }
             match observed {
                 NodeState::Clean | NodeState::Cyclic => continue,
+                // A Failed entry's compute does nothing and a Failed root's
+                // raises, so neither needs its deps cleaned first.
+                NodeState::Failed if !is_root => continue,
+                NodeState::Failed => walk.visit(cur, false),
                 // A memo stands for the node's run in this revision, so its
                 // deps are not expanded; the root's compute reads it.
                 NodeState::Dirty if node.memo_at(|| self.current_revision()) => {
@@ -4429,6 +4500,9 @@ impl<C: Cells> Runtime<C> {
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
+        if !C::SINGLE_THREADED && landed == NodeState::Failed {
+            cycle_state::note_failed_here(self.runtime_id, id.0, node.generation());
+        }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {

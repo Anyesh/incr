@@ -4657,7 +4657,7 @@ impl<C: Cells> Runtime<C> {
                 None => {
                     // The discarded compute is a frame the reading frame's
                     // retry runs again.
-                    walk.push(entry);
+                    walk.repush(entry);
                     self.stash_walk(root, (!is_root).then_some(walk), Some(entry.id.0));
                     return Err(computed);
                 }

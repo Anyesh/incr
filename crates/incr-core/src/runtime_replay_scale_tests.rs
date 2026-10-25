@@ -636,6 +636,89 @@ fn shared_wide_diverted_retry() {
     wide_diverted_retry::<Shared>();
 }
 
+/// Sizes for the Failed-walk scaling tests. Main b9f0d0bf walks n + 1
+/// entries for the chain and k + 3 for the fan-in; a walk that rewalks the
+/// Failed node's deps per reader grows as n^2 / 2.
+const FAILED_WALK_SIZES: &[usize] = if cfg!(miri) {
+    &[4, 8]
+} else {
+    &[250, 500, 1000]
+};
+
+/// A chain of `n` queries over a Failed node, rerun after a set below the
+/// chain: each rerun's read of the Failed node below it walks only that
+/// node, as a walk entry Failed computes to nothing and a Failed root
+/// raises, so the walks stay linear.
+fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
+    for &n in FAILED_WALK_SIZES {
+        failed_entry_chain_of::<C>(n, frames);
+    }
+}
+
+fn failed_entry_chain_of<C: Cells>(n: usize, frames: Option<u32>) {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let runs = counters(1);
+    let mut below = {
+        let runs = runs.clone();
+        rt.create_query_with(
+            move |rt| {
+                runs[0].fetch_add(1, SeqCst);
+                rt.get(input) + rt.get(failed)
+            },
+            opts(),
+        )
+    };
+    for _ in 1..n {
+        let (runs, dep) = (runs.clone(), below);
+        below = rt.create_query_with(
+            move |rt| {
+                runs[0].fetch_add(1, SeqCst);
+                rt.get(dep) + 1
+            },
+            opts(),
+        );
+    }
+    let top = below;
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    rt.set(input, 1);
+    runs[0].store(0, SeqCst);
+    let pops = rt.walk_pops.load(SeqCst);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let pops = rt.walk_pops.load(SeqCst) - pops;
+    assert_eq!(runs[0].load(SeqCst), n as u32);
+    assert!(pops <= 2 * n as u64 + 2, "{pops} walk pops for a {n}-chain");
+}
+
+#[test]
+fn local_failed_entry_chain() {
+    on_stack(1 << 28, || failed_entry_chain::<Local>(None));
+}
+
+#[test]
+fn shared_failed_entry_chain() {
+    on_stack(1 << 28, || failed_entry_chain::<Shared>(None));
+}
+
+#[test]
+fn local_failed_entry_chain_at_budget_1() {
+    on_stack(1 << 28, || failed_entry_chain::<Local>(Some(1)));
+}
+
+#[test]
+fn shared_failed_entry_chain_at_budget_1() {
+    on_stack(1 << 28, || failed_entry_chain::<Shared>(Some(1)));
+}
+
 #[derive(Copy, Clone, Debug)]
 enum Caught {
     /// Each query panics with the same text.
@@ -910,4 +993,60 @@ fn local_contained_chain_stays_linear_at_budget_1() {
 #[test]
 fn shared_contained_chain_stays_linear_at_budget_1() {
     on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
+}
+
+/// `k` Dirty readers over one Failed node with a Failed chain of `k` below
+/// it, whose edges a Clean run recorded, all entries of one walk: the walk
+/// passes the Failed node without walking the chain once per reader.
+fn failed_entry_fan_in<C: Cells>() {
+    for &k in FAILED_WALK_SIZES {
+        failed_entry_fan_in_of::<C>(k);
+    }
+}
+
+fn failed_entry_fan_in_of<C: Cells>(k: usize) {
+    let rt = Runtime::<C>::new();
+    let fail = rt.create_input(0_u64);
+    let mut failed = rt.create_query(move |rt| {
+        assert_eq!(rt.get(fail), 0, "failed below the fan");
+        0
+    });
+    for _ in 0..k {
+        let below = failed;
+        failed = rt.create_query(move |rt| rt.get(below) + 1);
+    }
+    let input = rt.create_input(0_u64);
+    let readers: Arc<Vec<Incr<u64>>> = Arc::new(
+        (0..k)
+            .map(|_| rt.create_query(move |rt| rt.get(input) + rt.get(failed)))
+            .collect(),
+    );
+    let top = {
+        let readers = readers.clone();
+        rt.create_query(move |rt| {
+            for &r in readers.iter() {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+            }
+            0
+        })
+    };
+    rt.get(top);
+    rt.set(fail, 1);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
+    assert_eq!(rt.state_of(failed), NodeState::Failed);
+    rt.set(input, 1);
+    let pops = rt.walk_pops.load(SeqCst);
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(top)));
+    let pops = rt.walk_pops.load(SeqCst) - pops;
+    assert!(pops <= 4 * k as u64 + 2, "{pops} walk pops for {k} readers");
+}
+
+#[test]
+fn local_failed_entry_fan_in() {
+    on_stack(1 << 28, failed_entry_fan_in::<Local>);
+}
+
+#[test]
+fn shared_failed_entry_fan_in() {
+    on_stack(1 << 28, failed_entry_fan_in::<Shared>);
 }

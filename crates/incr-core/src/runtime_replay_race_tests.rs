@@ -2704,8 +2704,7 @@ fn shared_walked_vframe_dirtied_after_it_let_the_failure_out() {
 /// the episode lands F Failed and delivers the payload to T's virtual
 /// frame, which holds no claim: the landing publishes a record first.
 /// The other thread's read of T waits out T's reservation, then reads F
-/// Failed through a walk that computes X and Y, which the record's match
-/// does not cover, so only the record and the reads' end are checked here.
+/// Failed.
 #[test]
 fn shared_vframe_landed_failed_over_an_episodes_delivery() {
     let rt = Arc::new(Rt::new());
