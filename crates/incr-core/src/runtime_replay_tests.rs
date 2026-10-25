@@ -2082,9 +2082,9 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
                 }
             }
         }
-        // Under ViaClean b read w, which its catch left Dirty, and under
-        // the cycle shapes a cycle, neither of which a rerun of b reads
-        // again, so r is held past the budget instead.
+        // Only Before and InB regenerate b: under ViaClean b read w, which
+        // its catch left Dirty, and under the cycle shapes b read a cycle,
+        // and a rerun of b repeats neither.
         let (regens_after, holds_after) = counts();
         if matches!(fails, CFails::Before | CFails::InB) {
             assert!(regens_after > regens, "{fails:?} regenerated nothing");
@@ -2233,7 +2233,9 @@ fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> (u64
 }
 
 /// r sees b's payload after b's own run walked a cycle as the unbounded run's
-/// r did, at every budget.
+/// r did, at every budget. With `outer` 0 the unbounded r sees
+/// `CustomPayload(5)`, b's payload for the cycle; deeper, a walk runs b before
+/// r's closure and r reads b's Failed message.
 #[test]
 fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
     for outer in [0, 1, 3] {
@@ -2247,6 +2249,9 @@ fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
                     }
                 };
                 let want = shape(u32::MAX);
+                let saw = if outer == 0 { 5 } else { 2 };
+                let chain = u64::from(chain);
+                assert_eq!(want, (6001 + chain, saw * 1000 + 1 + chain));
                 for frames in 1..9 {
                     assert_eq!(
                         shape(frames),
@@ -2331,9 +2336,9 @@ fn recomputed_virtual_shape<C: Cells>(
 }
 
 /// f's run after the set reads v as a cycle, past the budget a virtual
-/// hit, which a rerun of f does not read again, so r is held for f's
-/// payload instead of given a regenerated one, and sees it as the
-/// unbounded run's r did.
+/// hit, which a rerun of f does not read again: every shape reads as the
+/// unbounded run, and across them some reader of f is held for f's
+/// payload instead of given a regenerated one.
 #[test]
 fn a_payload_after_a_virtual_cycle_read_holds_its_reader() {
     let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
