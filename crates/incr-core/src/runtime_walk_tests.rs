@@ -2197,6 +2197,39 @@ fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
     assert_eq!(got, if failed { n as i64 } else { 0 });
 }
 
+/// The chain at 2000 with a ticket per caught read, every read's ticket
+/// taken while the frames below hold theirs: the tickets' work stays
+/// linear in the reads.
+fn ticket_catching_chain_work<C: Cells>() {
+    let n = 2000;
+    let work = thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            crate::replay::take_note_work();
+            assert_eq!(ticket_catching_chain::<C>(n, true, true), n as i64);
+            crate::replay::take_note_work()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(
+        work <= 16 * n as u64,
+        "{work} units of note work for {n} reads"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_catching_chain_work_stays_linear() {
+    ticket_catching_chain_work::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_catching_chain_work_stays_linear() {
+    ticket_catching_chain_work::<Shared>();
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn local_catching_chain_stays_within_the_stack() {

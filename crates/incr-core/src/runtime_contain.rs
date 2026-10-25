@@ -102,6 +102,7 @@ impl Tickets {
     /// Lets the tickets go whose read's note went without holding them
     /// again, with their landings.
     fn prune(&mut self) {
+        note_work(self.lent.len());
         let dropped: Vec<u64> = self
             .lent
             .iter()
