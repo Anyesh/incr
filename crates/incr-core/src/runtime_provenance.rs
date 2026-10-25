@@ -158,6 +158,7 @@ impl<C: Cells> Runtime<C> {
         self.dep_stack
             .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
         if let Some(payload) = payload {
+            self.park(ParkPoint::TookContained(id));
             self.note_ticket_read(id, &*payload);
             resume_unwind(payload);
         }

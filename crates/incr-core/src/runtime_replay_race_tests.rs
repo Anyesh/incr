@@ -3892,3 +3892,188 @@ fn a_flip_after_another_forgets_the_record_of_the_failure_it_flips() {
         "x is Dirty with the record of a Failed landing a flip took back"
     );
 }
+
+/// x's walk contains `failed`'s panic once x stops reading it, holding a
+/// ticket for `failed`. Thread B's read of q2 reruns q1, whose read of
+/// `failed` takes that ticket as lent and stops; a regeneration on thread A
+/// then reruns `failed`, which stops in its closure. q1's contained panic
+/// holds the lent ticket again: a rerunning node is still the Failed
+/// landing the ticket keeps.
+#[test]
+fn a_ticket_held_again_keeps_a_node_a_regeneration_reruns() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1000);
+    let took = Gate::new();
+    let rerun = Gate::new();
+    let in_rerun = rerun.clone();
+    let sel = rt.create_input(0_u64);
+    let j = rt.create_input(1_u64);
+    let failed = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(j);
+            in_rerun.park();
+            assert!(v != 0, "failed below the chain");
+            v
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if rt.get(sel) == 0 {
+                rt.get(failed)
+            } else {
+                100
+            }
+        },
+        replayable(),
+    );
+    let q1 = rt.create_query_with(move |rt: &Rt| rt.get(failed) + 1, replayable());
+    let q2 = rt.create_query_with(move |rt: &Rt| rt.get(q1) + 1, replayable());
+    assert_eq!(rt.get(q2), 3);
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    let key = u64::from(id(failed).0) | (u64::from(failed.generation()) << 32);
+    assert!(rt.regenerable(key), "failed's run left no record");
+    assert_eq!(
+        rt.contained_payloads(),
+        1,
+        "x's walk held no ticket for failed"
+    );
+    let at_take = took.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::TookContained(id(failed)) {
+            at_take.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    took.arm();
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(q2)))
+                .unwrap_err()
+                .downcast_ref::<&str>()
+                .copied()
+        })
+    };
+    took.wait_parked();
+    rerun.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            rt.regenerate(
+                id(failed),
+                failed.generation(),
+                std::any::TypeId::of::<&'static str>(),
+            )
+            .is_some()
+        })
+    };
+    rerun.wait_parked();
+    took.release();
+    assert_eq!(
+        b.join(),
+        Some("failed below the chain"),
+        "q2's read lost failed's payload"
+    );
+    rerun.release();
+    assert!(a.join(), "the regeneration made no payload");
+}
+
+/// As above, with a second regeneration of `failed` on thread C that moves
+/// it Failed to Computing while the first, on thread A, has moved it back
+/// but not yet returned. A's return must not clear C's mark: q1's held
+/// ticket keeps `failed` while C reruns it.
+#[test]
+fn a_finished_regeneration_keeps_the_mark_of_the_next_rerun() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1000);
+    let took = Gate::new();
+    let back = Gate::new();
+    let rerun = Gate::new();
+    let in_rerun = rerun.clone();
+    let sel = rt.create_input(0_u64);
+    let j = rt.create_input(1_u64);
+    let failed = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(j);
+            in_rerun.park();
+            assert!(v != 0, "failed below the chain");
+            v
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if rt.get(sel) == 0 {
+                rt.get(failed)
+            } else {
+                100
+            }
+        },
+        replayable(),
+    );
+    let q1 = rt.create_query_with(move |rt: &Rt| rt.get(failed) + 1, replayable());
+    let q2 = rt.create_query_with(move |rt: &Rt| rt.get(q1) + 1, replayable());
+    assert_eq!(rt.get(q2), 3);
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(
+        rt.contained_payloads(),
+        1,
+        "x's walk held no ticket for failed"
+    );
+    let (at_take, at_back) = (took.clone(), back.clone());
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::TookContained(id(failed)) {
+            at_take.park();
+        } else if point == ParkPoint::RerunBack(id(failed)) {
+            at_back.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let regenerate = |rt: &Arc<Rt>| {
+        let rt = Arc::clone(rt);
+        spawn(move || {
+            rt.regenerate(
+                id(failed),
+                failed.generation(),
+                std::any::TypeId::of::<&'static str>(),
+            )
+            .is_some()
+        })
+    };
+    took.arm();
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(q2)))
+                .unwrap_err()
+                .downcast_ref::<&str>()
+                .copied()
+        })
+    };
+    took.wait_parked();
+    back.arm();
+    let a = regenerate(&rt);
+    back.wait_parked();
+    rerun.arm();
+    let c = regenerate(&rt);
+    rerun.wait_parked();
+    back.release();
+    assert!(a.join(), "the first regeneration made no payload");
+    took.release();
+    assert_eq!(
+        b.join(),
+        Some("failed below the chain"),
+        "q2's read lost failed's payload"
+    );
+    rerun.release();
+    assert!(c.join(), "the second regeneration made no payload");
+}
