@@ -3817,11 +3817,12 @@ fn two_thread_schedule_seeds() {
 
 /// Two-thread seeds where, under a budget, the other thread computed a node
 /// a doom released for its context's retry: each run's outcomes must be
-/// some read order's unbounded outcomes.
+/// some read order's unbounded outcomes. In 0x36615207 the owner's run
+/// lands the node Dirty, which leaves it to a rerun its reservation keeps.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_doom_reservation_seeds() {
-    for (seed, frames) in [(0x11d, 1), (0x3661_4919, 1)] {
+    for (seed, frames) in [(0x11d, 1), (0x3661_4919, 1), (0x3661_5207, 1)] {
         let case = gen_case(seed, false, true);
         let phases = phases(&case, seed);
         let pairs = phases.iter().filter(|p| p.ops().len() == 2).count();
