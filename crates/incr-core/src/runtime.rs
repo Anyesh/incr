@@ -936,6 +936,8 @@ pub struct Runtime<C: Cells> {
     tickets: C::Lock<contain_impl::Tickets>,
     tickets_held: std::sync::atomic::AtomicBool,
     regens: C::Lock<replay_impl::Regens>,
+    /// Set once `regens` holds a record, so a delete looks for one only then.
+    regens_held: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1062,6 +1064,7 @@ impl<C: Cells> Runtime<C> {
             tickets: contain_impl::tickets::<C>(),
             tickets_held: std::sync::atomic::AtomicBool::new(false),
             regens: replay_impl::regens::<C>(),
+            regens_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -4183,6 +4186,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 &[],
                 Some(&*payload),
+                true,
                 bag,
             );
         }
@@ -4254,6 +4258,8 @@ impl<C: Cells> Runtime<C> {
     /// landed the node Dirty (`retaken_landing`).
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
+    /// `own_run` says the node lands from the compute that just popped, not
+    /// as a held member after its run left the stack.
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -4265,6 +4271,7 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         co_members: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
+        own_run: bool,
         bag: &mut Deferred<C>,
     ) {
         let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
@@ -4289,7 +4296,17 @@ impl<C: Cells> Runtime<C> {
             if !C::SINGLE_THREADED {
                 self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
             }
-            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, bag);
+            let regenerable = own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0;
+            mark = self.failed_landing(
+                id,
+                node.generation(),
+                attempt.cidx,
+                payload,
+                regenerable,
+                bag,
+            );
+        } else {
+            self.unfailed_landing(id, node.generation(), attempt.cidx);
         }
         let flagged = if landing == NodeState::New {
             NodeState::New

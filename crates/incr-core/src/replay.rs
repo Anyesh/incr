@@ -1392,7 +1392,7 @@ thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
-    static TOOK: RefCell<HashMap<(RuntimeId, RunKey), Vec<Took>, FxBuildHasher>> = RefCell::new(HashMap::default());
+    static TOOK: RefCell<Takes> = RefCell::new(HashMap::default());
 }
 
 #[cfg(loom)]
@@ -1413,7 +1413,7 @@ loom::thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
-    static TOOK: RefCell<HashMap<(RuntimeId, RunKey), Vec<Took>, FxBuildHasher>> = RefCell::new(HashMap::default());
+    static TOOK: RefCell<Takes> = RefCell::new(HashMap::default());
 }
 
 #[cfg(all(test, not(loom)))]
@@ -2116,9 +2116,18 @@ pub(crate) type RunKey = (u32, u32, u64, u32);
 /// the read node again.
 pub(crate) type Took = (u64, Option<Box<dyn Any + Send>>);
 
-fn with_takes<R>(
-    f: impl FnOnce(&mut HashMap<(RuntimeId, RunKey), Vec<Took>, FxBuildHasher>) -> R,
-) -> R {
+/// What each run's reads took (see [`note_took`]), by the read node.
+type Takes = HashMap<
+    (RuntimeId, RunKey),
+    HashMap<u64, Option<Box<dyn Any + Send>>, FxBuildHasher>,
+    FxBuildHasher,
+>;
+
+/// A sentinel read node: the run took a payload from another runtime's
+/// node, which no rerun of the run's node makes again.
+const FOREIGN_TOOK: u64 = u64::MAX;
+
+fn with_takes<R>(f: impl FnOnce(&mut Takes) -> R) -> R {
     value_code::set_bits(value_code::TOOK_BIT, true);
     TOOK.with(|t| f(&mut t.borrow_mut()))
 }
@@ -2141,9 +2150,17 @@ pub(crate) fn ended_run(rt: RuntimeId, depth: u32, reading: u64) -> Option<(u32,
 pub(crate) fn note_took(rt: RuntimeId, reader: RunKey, reading: u64, payload: &(dyn Any + Send)) {
     let copy = copy_payload(payload).filter(|_| !payload.is::<Regen>());
     with_takes(|t| {
-        let took = t.entry((rt, reader)).or_default();
-        took.retain(|x| x.0 != reading);
-        took.push((reading, copy));
+        t.entry((rt, reader)).or_default().insert(reading, copy);
+    });
+}
+
+/// Notes that run `reader` of runtime `rt` took a payload from another
+/// runtime's node.
+pub(crate) fn note_foreign_took(rt: RuntimeId, reader: RunKey) {
+    with_takes(|t| {
+        t.entry((rt, reader))
+            .or_default()
+            .insert(FOREIGN_TOOK, None);
     });
 }
 
@@ -2155,7 +2172,8 @@ pub(crate) fn takes_noted(rt: RuntimeId) -> bool {
 
 /// What run `run`'s reads took, as it lands.
 pub(crate) fn took_by_run(rt: RuntimeId, run: RunKey) -> Vec<Took> {
-    TOOK.with(|t| t.borrow_mut().remove(&(rt, run)).unwrap_or_default())
+    TOOK.with(|t| t.borrow_mut().remove(&(rt, run)))
+        .map_or_else(Vec::new, |took| took.into_iter().collect())
 }
 
 /// Runtime `rt`'s nodes claimed by a regenerating run on some thread

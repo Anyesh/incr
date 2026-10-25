@@ -231,11 +231,12 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         cidx: u32,
         payload: Option<&(dyn Any + Send)>,
+        regenerable: bool,
         bag: &mut Deferred<C>,
     ) -> u64 {
         let rt = self.runtime_id;
         let landing = (id.0, generation);
-        self.note_failed_run(id, generation, cidx);
+        self.note_failed_run(id, generation, cidx, regenerable);
         if let Some(payload) = payload {
             // The frames above `cidx` belong to this unwind, so an earlier
             // unwind's notes there are spent. Notes at `cidx` are the reading
@@ -372,7 +373,7 @@ impl<C: Cells> Runtime<C> {
         t.buried.extend(stale);
         self.sync_held(&t);
         drop(t);
-        self.forget_failed_run(id);
+        self.forget_failed_run(id.0, node.generation());
         true
     }
 
@@ -414,6 +415,9 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn bury_tickets(&self, slot: u32, generation: u32) {
         if self.tickets_held() {
             self.bury(slot, generation);
+        }
+        if self.regens_held.load(Relaxed) {
+            self.forget_failed_run(slot, generation);
         }
     }
 

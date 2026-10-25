@@ -178,9 +178,6 @@ impl<C: Cells> Runtime<C> {
                 .expect("incr-core: the delivery's context is open")
                 .take_landed(i, at)
         });
-        if attributed {
-            cycle_state::count_failure();
-        }
         // A payload no copy can stand for that an earlier take had: its
         // node runs again, as for a retry's read (`regenerate`).
         let payload = match payload.downcast::<replay::Regen>() {
@@ -191,6 +188,9 @@ impl<C: Cells> Runtime<C> {
             }
             Err(payload) => payload,
         };
+        if attributed {
+            cycle_state::count_failure();
+        }
         // The read took the payload as from a ticket, and a payload no copy
         // can stand for holds its frame as at `note_ticket_read`.
         let reading = u64::from(id.0) | (u64::from(generation) << 32);
