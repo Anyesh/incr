@@ -160,3 +160,79 @@ fn a_thread_counts_episodes_on_a_bounded_set_of_runtimes() {
     assert_eq!(own_episodes(rts[0]), 0);
     assert!(OWN_EPISODES.with(|o| o.borrow().len()) < rts.len());
 }
+
+/// Entries of a Local runtime L and Shared runtimes S and T nested as
+/// L, S, L, S, T on one thread: each runtime's first entry, and the
+/// first Shared one, are told apart from the thread's outermost.
+#[test]
+fn entries_count_per_runtime_under_another_runtimes_outermost() {
+    use super::{open_entry_of, EntryDepth};
+    let (l, s, t) = (
+        RuntimeId::for_test(u64::MAX - 21),
+        RuntimeId::for_test(u64::MAX - 22),
+        RuntimeId::for_test(u64::MAX - 23),
+    );
+    let flags = |e: &EntryDepth| {
+        (
+            e.is_outermost(),
+            e.first_for_runtime(),
+            e.shared_outermost(),
+        )
+    };
+    assert!(!open_entry_of(l));
+    let l1 = EntryDepth::enter(l, false);
+    assert_eq!(flags(&l1), (true, true, false));
+    let s1 = EntryDepth::enter(s, true);
+    assert_eq!(flags(&s1), (false, true, true));
+    let l2 = EntryDepth::enter(l, false);
+    assert_eq!(flags(&l2), (false, false, false));
+    let s2 = EntryDepth::enter(s, true);
+    assert_eq!(flags(&s2), (false, false, false));
+    let t1 = EntryDepth::enter(t, true);
+    assert_eq!(flags(&t1), (false, true, false));
+    assert!(open_entry_of(l) && open_entry_of(s) && open_entry_of(t));
+    drop(t1);
+    assert!(!open_entry_of(t));
+    drop(s2);
+    drop(l2);
+    assert!(open_entry_of(s));
+    drop(s1);
+    assert!(!open_entry_of(s) && open_entry_of(l));
+    let s3 = EntryDepth::enter(s, true);
+    assert_eq!(flags(&s3), (false, true, true));
+    drop(s3);
+    drop(l1);
+    assert!(!open_entry_of(l));
+}
+
+/// A third runtime's entries are listed; a runtime whose inner count ends
+/// while another is listed is listed too on its next entry, never counted
+/// twice.
+#[test]
+fn a_runtime_reentered_while_another_is_listed_counts_once() {
+    use super::{open_entry_of, EntryDepth};
+    let (l, s, t) = (
+        RuntimeId::for_test(u64::MAX - 31),
+        RuntimeId::for_test(u64::MAX - 32),
+        RuntimeId::for_test(u64::MAX - 33),
+    );
+    let l1 = EntryDepth::enter(l, false);
+    let s1 = EntryDepth::enter(s, true);
+    let t1 = EntryDepth::enter(t, true);
+    assert!(t1.first_for_runtime());
+    drop(s1);
+    assert!(!open_entry_of(s) && open_entry_of(t));
+    let s2 = EntryDepth::enter(s, true);
+    assert!(s2.first_for_runtime());
+    let s3 = EntryDepth::enter(s, true);
+    assert!(!s3.first_for_runtime());
+    drop(t1);
+    assert!(!open_entry_of(t) && open_entry_of(s));
+    let t2 = EntryDepth::enter(t, true);
+    assert!(t2.first_for_runtime());
+    drop(t2);
+    drop(s3);
+    drop(s2);
+    assert!(!open_entry_of(s) && open_entry_of(l));
+    drop(l1);
+}

@@ -2138,6 +2138,12 @@ pub(crate) fn drop_from(rt: RuntimeId, cidx: u32) {
     remove_where(|x| x.rt == rt && x.boundary >= cidx);
 }
 
+/// Removes every context, of any runtime, whose boundary is at or above
+/// `cidx`: the entry that began there has exited.
+pub(crate) fn drop_all_from(cidx: u32) {
+    remove_where(|x| x.boundary >= cidx);
+}
+
 /// Removes the contexts of `rt` that the unwind of the frame at `cidx`
 /// leaves: those opened by its reads, above it, and one not yet running
 /// whose target is that frame, since the read that would run it is
