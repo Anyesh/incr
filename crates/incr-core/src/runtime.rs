@@ -5173,6 +5173,7 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// What `h`'s slot holds now, whatever its state.
+    #[cfg(not(loom))]
     pub(crate) fn slot_value_for_test<T: Value>(&self, h: Incr<T>) -> Option<T> {
         let node = self.nodes.get(h.slot());
         self.arenas
