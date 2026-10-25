@@ -1785,7 +1785,7 @@ impl<C: Cells> Runtime<C> {
         self.refuse_delete_under_own_set(id);
         self.park(ParkPoint::DeleteAfterHandleCheck(id));
 
-        let _change = self.changes.change();
+        let _change = self.changes.change(replay::speculative());
         let mut spins: u32 = 0;
         match self.claim_single(root, &mut spins) {
             SingleClaim::Claimed => {}
@@ -2015,7 +2015,7 @@ impl<C: Cells> Runtime<C> {
         self.assert_not_own_compute(id, handle.generation());
         self.refuse_delete_under_own_set(id);
 
-        let _change = self.changes.change();
+        let _change = self.changes.change(replay::speculative());
         let mut spins: u32 = 0;
         match self.claim_single(handle, &mut spins) {
             SingleClaim::Claimed => self.park(ParkPoint::DeleteAfterCheck(id)),
@@ -2798,7 +2798,7 @@ impl<C: Cells> Runtime<C> {
         // sees, and ends in `finish_written`, which no unwind leaves.
         let marked = || {
             node.mark_changed_pending();
-            self.changes.begin();
+            self.changes.begin(replay::speculative());
         };
         match arena.compare_and_write(arena_slot, value, marked) {
             Compared::Equal(equal) => {

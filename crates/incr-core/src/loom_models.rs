@@ -20,7 +20,7 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
-use crate::changes::Changes;
+use crate::changes::{Changes, Count};
 use crate::generic_arena::GenericArena;
 use crate::handle::Incr;
 use crate::loom_cells::Loom;
@@ -1765,7 +1765,7 @@ fn loom_checked_read_vs_change() {
         let writer = {
             let (changes, value, dirty) = (changes.clone(), value.clone(), dirty.clone());
             thread::spawn(move || {
-                let _change = changes.change();
+                let _change = changes.change(false);
                 value.store(1, Ordering::Release);
                 dirty.store(1, Ordering::Release);
             })
@@ -1783,5 +1783,38 @@ fn loom_checked_read_vs_change() {
             }
         }
         writer.join().unwrap();
+    });
+}
+
+/// A speculative and a non-speculative change race a checked read: once the
+/// reader has seen any part of the non-speculative one, or it has ended, a
+/// count found before both no longer passes as moved by speculative runs
+/// only.
+#[test]
+fn loom_speculative_changes_vs_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let real = Arc::new(AtomicU64::new(0));
+        let writers = [true, false].map(|speculative| {
+            let (changes, real) = (changes.clone(), real.clone());
+            thread::spawn(move || {
+                let _change = changes.change(speculative);
+                if !speculative {
+                    real.store(1, Ordering::Release);
+                }
+            })
+        });
+        let seen = changes.count();
+        if let Some(seen) = &seen {
+            if seen.before_any() && real.load(Ordering::Acquire) == 1 {
+                assert!(!seen.only_speculative_since());
+            }
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(!seen.only_speculative_since());
+        }
     });
 }

@@ -4848,13 +4848,15 @@ struct ForeignReads {
 }
 
 impl ForeignReads {
-    /// While a context open at the run's end is still open, a change since
-    /// its reads was made by the runs after them, which the unbounded run
-    /// also makes after them, or by another thread at no fixed point; once
-    /// all have ended the unbounded run reads now, so every count must hold.
+    /// While a context open at the run's end is still open, a speculative
+    /// run's change since the reads was made by a run after them, which the
+    /// unbounded run also makes after them; any other change, or any change
+    /// once all those contexts have ended, may come before the unbounded
+    /// run's read, so the counts must hold.
     fn adoptable(&self) -> bool {
         self.counts.is_empty()
             || self.context.is_some_and(replay::context_open)
+                && self.counts.iter().all(Count::only_speculative_since)
             || self.counts.iter().all(Count::holds)
     }
 }
