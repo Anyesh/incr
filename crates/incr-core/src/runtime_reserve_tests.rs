@@ -672,6 +672,42 @@ fn a_closure_that_catches_a_doom_in_a_cycle_joins_a_reader_of_a_member() {
     }
 }
 
+/// X catches a cycle and so lands Dirty whenever it is read, and T
+/// catches X's doom and joins a child reading X. The restart a take-over
+/// gives T reads X Dirty again, over budget: if X dooms again, T and its
+/// next child trade take-overs for good. Each take-over must add a claim
+/// the read never reserves again, so T's read sees at most one per node
+/// it reaches (T, X, C).
+#[test]
+fn a_take_over_of_a_node_that_lands_dirty_restarts_its_read_boundedly() {
+    for frames in [u32::MAX, 1, 2] {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let cc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let c = {
+            let cc = cc.clone();
+            rt.create_query_with(move |rt: &Rt| rt.get(*cc.get().unwrap()), replayable())
+        };
+        cc.set(c).unwrap();
+        let x = rt.create_query_with(
+            move |rt: &Rt| rt.try_get(c).map_or(7, |v| v + 1),
+            replayable(),
+        );
+        let t = {
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                    v + thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap())
+                },
+                replayable(),
+            )
+        };
+        rt.set_max_frames(frames);
+        assert_eq!(within_10s(&rt, t), Some(Ok(14)), "budget {frames}");
+        rt.assert_invariant_i();
+    }
+}
+
 /// A closure that catches an ordinary panic of its dep finds its attempt
 /// out of flight at any budget: only a discard's unwind is in flight.
 #[test]
