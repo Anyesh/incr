@@ -167,6 +167,18 @@ def assert_discarded_then_lands_its_own_outcome(rt, node, name, raises, runs):
     assert runs == [name, name]
 
 
+def assert_given_up_unrun_then_lands_its_own_outcome(rt, node, name, raises, runs):
+    """`node`'s read in a discard's finally raised the discard again before
+    running it, so the next read runs it once and gets its own outcome."""
+    assert runs == []
+    if raises:
+        with pytest.raises(ValueError, match=f"{name} failed"):
+            rt.get(node)
+    else:
+        assert rt.get(node) == 7
+    assert runs == [name]
+
+
 @pytest.mark.parametrize("raises", [False, True], ids=["returns", "raises"])
 @pytest.mark.parametrize("cleanup_read", ["get", "try_get"])
 def test_a_read_in_finally_during_a_wound_is_given_up_with_the_run(
@@ -270,7 +282,7 @@ def test_a_read_in_finally_during_a_discard_is_given_up_with_the_run(
     assert getattr(rt, top_read)(t) == 5
     assert inner_runs == ["i"], "the speculative entry never ran"
     assert seen == ["_IncrEngineUnwind"]
-    assert_discarded_then_lands_its_own_outcome(rt, c, "c", raises, runs)
+    assert_given_up_unrun_then_lands_its_own_outcome(rt, c, "c", raises, runs)
     # Discarded too, never Failed: the real read raises its own exception.
     with pytest.raises(ZeroDivisionError, match="speculative"):
         rt.get(inner)
