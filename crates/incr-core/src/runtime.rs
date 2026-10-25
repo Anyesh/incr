@@ -5154,6 +5154,14 @@ impl<C: Cells> Runtime<C> {
             .expect("a forced node is New");
     }
 
+    /// What `h`'s slot holds now, whatever its state.
+    pub(crate) fn slot_value_for_test<T: Value>(&self, h: Incr<T>) -> Option<T> {
+        let node = self.nodes.get(h.slot());
+        self.arenas
+            .tagged_arena::<T>(node.type_tag())
+            .and_then(|arena| arena.try_read(node.arena_slot()))
+    }
+
     /// Each node a group record names at its current generation that does
     /// not hold that same record, which `group_verify` would claim as a
     /// group the node has left.
