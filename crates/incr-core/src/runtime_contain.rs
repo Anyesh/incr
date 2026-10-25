@@ -365,13 +365,16 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn flip_failed_from(&self, id: NodeId, from: NodeState) -> bool {
         let node = self.nodes.get(id.0);
-        // Read while the node is Failed, when no run can land a new record.
-        let token = self.failed_run_token(id.0, node.generation());
         self.park(ParkPoint::FlipBeforeCas(id));
         let mut t = self.tickets.write();
-        if state::try_transition::<C>(node.state_cell(), from, NodeState::Dirty).is_err() {
+        let flipped = self.with_failed_run_token(id.0, node.generation(), |token| {
+            state::try_transition::<C>(node.state_cell(), from, NodeState::Dirty)
+                .is_ok()
+                .then_some(token)
+        });
+        let Some(token) = flipped else {
             return false;
-        }
+        };
         let stale = release(&mut t, u64::MAX, slot_landings(id.0));
         t.buried.extend(stale);
         self.sync_held(&t);

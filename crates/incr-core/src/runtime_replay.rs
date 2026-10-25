@@ -2270,6 +2270,21 @@ impl<C: Cells> Runtime<C> {
         self.regens.read().by_node.get(&reading).map(|r| r.token)
     }
 
+    /// Runs `flip` with the token of node `slot` at `generation`'s record,
+    /// under the table's lock: a run writes or forgets its record before its
+    /// landing publishes Failed, so the token is the newest Failed landing's
+    /// record, if that landing wrote one.
+    pub(super) fn with_failed_run_token<R>(
+        &self,
+        slot: u32,
+        generation: u32,
+        flip: impl FnOnce(Option<u64>) -> R,
+    ) -> R {
+        let reading = u64::from(slot) | (u64::from(generation) << 32);
+        let regens = self.regens.read();
+        flip(regens.by_node.get(&reading).map(|r| r.token))
+    }
+
     /// Forgets node `slot` at `generation`'s record if it is still the one
     /// `token` names.
     pub(super) fn forget_failed_run_if(&self, slot: u32, generation: u32, token: Option<u64>) {
