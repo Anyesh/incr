@@ -193,6 +193,9 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a Stale publish landed `New` and before
     /// the retry, with the attempt's bag carried along.
     StaleRetry(NodeId),
+    /// In `compute_one`, after a run that did not land Clean released its
+    /// claim, with the attempt's bag carried along.
+    UnsettledLanding(NodeId),
     /// In `compute_one`, after an episode landed the root, before its
     /// reader learns how.
     EpisodeLanded(NodeId),
@@ -4099,6 +4102,7 @@ impl<C: Cells> Runtime<C> {
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
+                    self.park_with_bag(ParkPoint::UnsettledLanding(id), bag);
                     self.unfailed_landing(id, node.generation(), cidx);
                     self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });

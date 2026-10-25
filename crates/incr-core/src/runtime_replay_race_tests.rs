@@ -3397,3 +3397,65 @@ fn a_set_during_a_regeneration_flips_the_node_it_runs() {
     let again = catch_unwind(AssertUnwindSafe(|| rt.get(b))).unwrap_err();
     assert_eq!(again.downcast_ref::<Custom>().map(|c| c.0), Some(15));
 }
+
+/// x's run on thread A, from the walk of A's read of p, lands Dirty, a
+/// set having superseded it, and A's claim goes; thread B then runs x,
+/// which panics with `Custom(12)` and lands Failed with a record a reader's
+/// retry past the budget would regenerate x's payload from. A's landing,
+/// finishing after B's, must not forget that record. x is a dep A's walk
+/// recomputes, not a read's own node, which a Dirty landing would reserve
+/// for A (`reserve::note_root`).
+#[test]
+fn a_superseded_landing_keeps_the_next_runs_failed_record() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let in_x = Gate::new();
+    let landed = Gate::new();
+    let i = rt.create_input(0_u64);
+    let x_gate = in_x.clone();
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(i);
+            if v < 2 {
+                x_gate.park();
+                return v;
+            }
+            std::panic::panic_any(Custom(v + 10))
+        },
+        replayable(),
+    );
+    let at_landing = landed.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::UnsettledLanding(id(x)) {
+            at_landing.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let p = rt.create_query_with(move |rt: &Rt| rt.get(x), replayable());
+    assert_eq!(rt.get(p), 0);
+    rt.set(i, 1);
+    in_x.arm();
+    landed.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err())
+    };
+    in_x.wait_parked();
+    rt.set(i, 2);
+    in_x.release();
+    landed.wait_parked();
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err())
+    };
+    assert!(b.join());
+    let key = u64::from(id(x).0) | (u64::from(x.generation()) << 32);
+    assert!(rt.regenerable(key), "x's run left no record");
+    landed.release();
+    assert!(a.join());
+    assert!(
+        rt.regenerable(key),
+        "a landing that went before forgot x's record"
+    );
+}
