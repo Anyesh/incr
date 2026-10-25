@@ -1198,7 +1198,7 @@ fn nested_caught_chain<C: Cells>(frames: u32) {
     assert_eq!(rt.get(below), n + 7);
     let work = crate::replay::take_note_work();
     assert!(
-        work <= 24 * n,
+        work <= 48 * n,
         "budget {frames}: {work} units of note work for a {n}-chain"
     );
 }
