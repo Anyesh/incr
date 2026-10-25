@@ -356,8 +356,9 @@ struct SetClaim<'a, C: Cells> {
     /// The input's `verified_at` the claim was taken over.
     base: u64,
     held: bool,
-    /// Whether the write counts itself in `changes`, as decided under the
-    /// claim's hold.
+    /// Whether the write counts a change in `changes`, as decided under the
+    /// claim's hold. It begins at the claim, before the swap a Clean read
+    /// sees, and ends after the walk or when the claim drops.
     counted: bool,
 }
 
@@ -383,7 +384,7 @@ impl<C: Cells> SetClaim<'_, C> {
         // After the walk, so a dependent read Clean before the walk
         // dirtied it was read with the change in progress.
         if self.counted {
-            self.rt.changes.end();
+            self.rt.end_change();
         }
         self.rt.drop_released_tickets();
         // Pairs with the fence in `stash`, after its store of the count.
@@ -401,6 +402,9 @@ impl<C: Cells> Drop for SetClaim<'_, C> {
         if self.held {
             self.node.release_set_claim(self.base, self.base);
             set_stack::pop(self.rt.runtime_id, self.id.0);
+        }
+        if self.counted {
+            self.rt.end_change();
         }
     }
 }
@@ -1202,9 +1206,31 @@ impl<C: Cells> Runtime<C> {
         C::u8_load_relaxed(&self.read_speculatively) != 0
     }
 
+    #[inline(always)]
     pub(crate) fn counted_change(&self) -> Option<crate::changes::Change<'_>> {
-        self.counts_changes()
-            .then(|| self.changes.change(replay::speculative()))
+        if self.counts_changes() {
+            Some(self.begin_change())
+        } else {
+            None
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn begin_change(&self) -> crate::changes::Change<'_> {
+        self.changes.change(replay::speculative())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn begin_set_change(&self) {
+        self.changes.begin(replay::speculative());
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn end_change(&self) {
+        self.changes.end();
     }
 
     fn bump_revision(&self) -> u64 {
@@ -1871,9 +1897,10 @@ impl<C: Cells> Runtime<C> {
                     if !inner.dependents[handle.slot() as usize].is_empty() {
                         return SingleClaim::HasDependents;
                     }
-                    let change = self.counted_change();
                     if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok() {
-                        return SingleClaim::Claimed(change);
+                        // Under the hold, which orders it against the flag's
+                        // flip; a reader that sees `Dead` reads nothing.
+                        return SingleClaim::Claimed(self.counted_change());
                     }
                 }
             }
@@ -2763,6 +2790,9 @@ impl<C: Cells> Runtime<C> {
                     Ok(base) => {
                         let arena_slot = node.arena_slot();
                         let counted = self.counts_changes();
+                        if counted {
+                            self.begin_set_change();
+                        }
                         drop(inner);
                         set_stack::push(self.runtime_id, slot);
                         let claim = SetClaim {
@@ -2821,16 +2851,7 @@ impl<C: Cells> Runtime<C> {
         // 5. claim release, then the dirty walk, whose Release stores
         //    publish all of the above to claimants that Acquire the
         //    Dirty state.
-        // `changes` begins before the swap, the first store a Clean read
-        // sees, and ends in `finish_written`, which no unwind leaves.
-        let counted = claim.counted;
-        let marked = || {
-            node.mark_changed_pending();
-            if counted {
-                self.changes.begin(replay::speculative());
-            }
-        };
-        match arena.compare_and_write(arena_slot, value, marked) {
+        match arena.compare_and_write(arena_slot, value, || node.mark_changed_pending()) {
             Compared::Equal(equal) => {
                 // The set that wrote this value released its claim before
                 // its walk, and this call must not return before that
