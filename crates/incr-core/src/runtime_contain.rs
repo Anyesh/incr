@@ -367,6 +367,7 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(id.0);
         // Read while the node is Failed, when no run can land a new record.
         let token = self.failed_run_token(id.0, node.generation());
+        self.park(ParkPoint::FlipBeforeCas(id));
         let mut t = self.tickets.write();
         if state::try_transition::<C>(node.state_cell(), from, NodeState::Dirty).is_err() {
             return false;

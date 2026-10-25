@@ -199,6 +199,8 @@ pub(crate) enum ParkPoint {
     /// In `land_failed`, after a landing meant as Failed released its
     /// claim landing otherwise, before it forgets its record.
     FailedLandedOtherwise(NodeId),
+    /// In `flip_failed_from`, before the flip's CAS.
+    FlipBeforeCas(NodeId),
     /// In `flip_failed_from`, after the flip released the node, before it
     /// forgets the node's record.
     FlippedFailed(NodeId),
