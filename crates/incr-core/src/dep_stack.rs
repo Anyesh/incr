@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
 use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED};
-use crate::handle::RuntimeId;
+use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
 use crate::replay::Step;
 
@@ -32,7 +32,8 @@ use crate::replay::Step;
 #[doc(hidden)]
 pub struct Frame {
     pub(crate) node: NodeId,
-    pub(crate) rt: RuntimeId,
+    /// The frame's runtime, read through [`Frame::rt`].
+    tagged_rt: FrameRt,
     /// The runtime whose Clean reads [`DepStack::record_dep`] records in
     /// this frame: `rt`, or [`RuntimeId::SENTINEL`] while a replay
     /// context holds a delivery for one of the frame's reads, so that its
@@ -50,9 +51,23 @@ pub struct Frame {
 }
 
 impl Frame {
+    #[inline(always)]
+    pub(crate) fn rt(&self) -> RuntimeId {
+        self.tagged_rt.rt()
+    }
+
+    /// Whether the frame is `rt`'s, never the sentinel. A frame that does
+    /// not divert holds `rt` untagged in `read_rt`, so the common case
+    /// skips the mask.
+    #[inline(always)]
+    fn is_of(&self, rt: RuntimeId) -> bool {
+        debug_assert_ne!(rt, RuntimeId::SENTINEL);
+        self.read_rt == rt || self.rt() == rt
+    }
+
     /// Whether the frame diverts its Clean reads (see [`Frame::read_rt`]).
     fn diverts(&self) -> bool {
-        self.read_rt != self.rt
+        self.read_rt != self.rt()
     }
 
     /// How many times the frame has read the node it reads now, this read
@@ -70,7 +85,7 @@ impl Frame {
         // (see `Frame::ctl`).
         let member = unsafe { &*self.ctl }.has(BUFFERED);
         Step::of(
-            self.rt,
+            self.rt(),
             self.node.0,
             member,
             self.reading,
@@ -120,21 +135,24 @@ pub struct Placement {
 impl Frames {
     #[inline(always)]
     fn active(&mut self, rt: RuntimeId) -> Option<&mut Frame> {
-        self.frames.last_mut().filter(|top| top.rt == rt)
+        self.frames.last_mut().filter(|top| top.is_of(rt))
     }
 
     /// For a Clean read the top frame does not record as `rt`'s own:
     /// whether the frame diverts its Clean reads, leaving the read to
-    /// [`DepStack::diverted_read`]. Another runtime's frame keeps no read
-    /// (its retry reads the node again), nor does a callback's barrier,
-    /// whose `read_rt` is its `rt`, the sentinel. A call without arguments, not an
+    /// [`DepStack::diverted_read`], or is untested or keeps another
+    /// runtime's (see [`FrameRt`]), leaving it to that runtime's
+    /// [`DepStack::foreign_keeper`]. A callback's barrier, settled when it
+    /// is pushed, does neither. A call without arguments, not an
     /// empty arm, because with an empty arm or more registers to pass the
     /// Clean read inlined into `get` spills more, 2 to 10 instructions per
     /// read.
     #[cold]
     #[inline(never)]
     fn top_diverts_clean_reads(&mut self) -> bool {
-        self.frames.last().is_some_and(Frame::diverts)
+        self.frames
+            .last()
+            .is_some_and(|top| top.tagged_rt.diverts_or_tagged(top.read_rt))
     }
 
     /// A non-Clean read another runtime serves to the top frame: it sets
@@ -232,7 +250,7 @@ impl Frames {
     fn frame(node: NodeId, rt: RuntimeId, ctl: &ComputeCtl, cidx: u32) -> Frame {
         Frame {
             node,
-            rt,
+            tagged_rt: FrameRt::untested(rt),
             read_rt: rt,
             deps: Vec::with_capacity(4),
             ctl,
@@ -261,11 +279,16 @@ pub trait DepStack: 'static {
     #[inline(always)]
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
         crate::lock_order::enter_frame();
-        self.with(|s| {
-            let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
-            s.push(Frames::frame(node, rt, ctl, cidx));
-            cidx
-        })
+        // Left to the inliner, any change to what the push writes has
+        // moved this closure out of line, at about 57 instructions a push.
+        self.with(
+            #[inline(always)]
+            |s| {
+                let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
+                s.push(Frames::frame(node, rt, ctl, cidx));
+                cidx
+            },
+        )
     }
 
     /// Push a frame at conceptual-stack position `cidx`: an episode's
@@ -325,6 +348,41 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// Settles whether the top frame keeps other runtimes' Clean reads (see
+    /// [`FrameRt`]), for a frame that knows when it is pushed.
+    fn settle_foreign_keeping(&self, keeps: bool) {
+        self.with(|s| {
+            if let Some(top) = s.frames.last_mut() {
+                top.tagged_rt = FrameRt::settled(top.rt(), keeps);
+            }
+        });
+    }
+
+    /// The top frame's runtime, control block and position, when it is
+    /// another runtime's than `rt` and keeps `rt`'s Clean reads (see
+    /// [`FrameRt`]). A frame still untested is settled here,
+    /// by its runtime, once.
+    fn foreign_keeper(&self, rt: RuntimeId) -> Option<(RuntimeId, *const ComputeCtl, u32)> {
+        let (tagged, node, ctl, cidx) = self.with(|s| {
+            s.frames
+                .last()
+                .filter(|top| top.rt() != rt)
+                .map(|top| (top.tagged_rt, top.node, top.ctl, top.cidx))
+        })?;
+        let keeps = if tagged.is_untested() {
+            #[cfg(all(test, not(loom)))]
+            KEEP_SETTLES.with(|n| n.set(n.get() + 1));
+            // SAFETY: the frame is on the stack, so it is running and its
+            // control block is live.
+            let keeps = unsafe { (*ctl).keeps_foreign(node.0) };
+            self.settle_foreign_keeping(keeps);
+            keeps
+        } else {
+            tagged.keeps_foreign()
+        };
+        keeps.then(|| (tagged.rt(), ctl, cidx))
+    }
+
     /// Sends the top frame's Clean reads to the slow path (see
     /// [`Frame::read_rt`]).
     fn divert_clean_reads(&self) {
@@ -338,7 +396,7 @@ pub trait DepStack: 'static {
     /// Ends [`Self::divert_clean_reads`] for `rt`'s top frame.
     fn end_diverted_reads(&self, rt: RuntimeId) {
         self.with(|s| {
-            if let Some(top) = s.frames.last_mut().filter(|top| top.rt == rt) {
+            if let Some(top) = s.frames.last_mut().filter(|top| top.rt() == rt) {
                 top.read_rt = rt;
             }
         });
@@ -353,7 +411,7 @@ pub trait DepStack: 'static {
             let top = s
                 .frames
                 .last()
-                .filter(|top| top.rt == rt && top.diverts())?;
+                .filter(|top| top.rt() == rt && top.diverts())?;
             Some(ActiveRead {
                 node: top.node,
                 ctl: top.ctl,
@@ -388,7 +446,7 @@ pub trait DepStack: 'static {
         self.with(|s| {
             s.frames
                 .last()
-                .is_some_and(|top| top.rt == rt && top.diverts())
+                .is_some_and(|top| top.rt() == rt && top.diverts())
         })
     }
 
@@ -396,7 +454,7 @@ pub trait DepStack: 'static {
     #[inline(always)]
     fn record_dep_or_foreign(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> bool {
         self.with(|s| match s.frames.last_mut() {
-            Some(top) if top.rt == rt => {
+            Some(top) if top.is_of(rt) => {
                 top.deps.push((dep, generation));
                 false
             }
@@ -407,13 +465,13 @@ pub trait DepStack: 'static {
 
     /// The top frame's runtime, node, control block and position.
     fn top_frame(&self) -> Option<(RuntimeId, NodeId, *const ComputeCtl, u32)> {
-        self.with(|s| s.frames.last().map(|f| (f.rt, f.node, f.ctl, f.cidx)))
+        self.with(|s| s.frames.last().map(|f| (f.rt(), f.node, f.ctl, f.cidx)))
     }
 
     /// Raises `flag` on each of `rt`'s frames that is not doomed.
     fn raise_on_undoomed(&self, rt: RuntimeId, flag: u16) {
         self.with(|s| {
-            for f in s.frames.iter().filter(|f| f.rt == rt) {
+            for f in s.frames.iter().filter(|f| f.rt() == rt) {
                 // SAFETY: a frame's control block is live while it is on
                 // the stack (see `Frame::ctl`).
                 let ctl = unsafe { &*f.ctl };
@@ -442,7 +500,7 @@ pub trait DepStack: 'static {
         self.with(|s| {
             let depth = s.frames.len() as u32;
             let top = match s.frames.last_mut() {
-                Some(top) if top.rt == rt => top,
+                Some(top) if top.is_of(rt) => top,
                 Some(_) => {
                     s.foreign_non_clean_read();
                     return None;
@@ -536,7 +594,7 @@ pub trait DepStack: 'static {
         self.with(|s| {
             s.frames
                 .last()
-                .filter(|top| top.rt == rt)
+                .filter(|top| top.rt() == rt)
                 .map(|top| (top.node, top.ctl))
         })
     }
@@ -549,7 +607,7 @@ pub trait DepStack: 'static {
             s.frames.last().is_some_and(|top| {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
-                top.rt != rt && unsafe { &*top.ctl }.has(DOOMED)
+                top.rt() != rt && unsafe { &*top.ctl }.has(DOOMED)
             })
         })
     }
@@ -564,13 +622,17 @@ pub trait DepStack: 'static {
     /// at any depth. A callback's barrier frame belongs to no runtime and
     /// does not count.
     fn any_compute_frame(&self) -> bool {
-        self.with(|s| s.frames.iter().any(|f| f.rt != RuntimeId::SENTINEL))
+        self.with(|s| s.frames.iter().any(|f| f.rt() != RuntimeId::SENTINEL))
     }
 
     /// The depth of the innermost frame on this stack computing `node`
     /// of runtime `rt`, if one is. Depth 0 is the outermost frame.
     fn frame_depth(&self, rt: RuntimeId, node: NodeId) -> Option<usize> {
-        self.with(|s| s.frames.iter().rposition(|f| f.node == node && f.rt == rt))
+        self.with(|s| {
+            s.frames
+                .iter()
+                .rposition(|f| f.node == node && f.rt() == rt)
+        })
     }
 
     /// The position of the innermost frame on this stack computing
@@ -580,7 +642,7 @@ pub trait DepStack: 'static {
             s.frames
                 .iter()
                 .rev()
-                .find(|f| f.node == node && f.rt == rt)
+                .find(|f| f.node == node && f.rt() == rt)
                 .map(|f| f.cidx)
         })
     }
@@ -628,6 +690,18 @@ impl DepStack for LocalDepStack {
 }
 
 pub struct SharedDepStack;
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static KEEP_SETTLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many untested frames [`DepStack::foreign_keeper`] settled on this
+/// thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_keep_settles() -> u64 {
+    KEEP_SETTLES.with(|n| n.replace(0))
+}
 
 thread_local! {
     /// Without a destructor, so an access needs no check of the
@@ -785,6 +859,7 @@ mod tests {
         assert_eq!((f.node, f.cidx, reads), (NodeId(100), 0, 1));
         let barrier = ComputeCtl::new(0);
         s.push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &barrier, u32::MAX);
+        s.settle_foreign_keeping(false);
         assert_eq!(s.record_dep(rt(1), NodeId(5), 2, 4), 4);
         s.pop_frame();
         assert_eq!(s.pop_frame_reading(), (vec![(NodeId(5), 2)], 5 | 2 << 32));
