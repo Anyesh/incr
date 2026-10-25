@@ -1359,6 +1359,7 @@ thread_local! {
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static THREAD_TAG: Cell<u64> = const { Cell::new(0) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
@@ -1379,6 +1380,7 @@ loom::thread_local! {
     static COPIED_GEN: Cell<u64> = Cell::new(0);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
+    static THREAD_TAG: Cell<u64> = Cell::new(0);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
@@ -1482,6 +1484,20 @@ pub(crate) fn check_read(
             });
         }
     });
+}
+
+/// This thread's innermost context of `rt`, named so that no context of
+/// another thread, now or later, has the same name: context ids count per
+/// thread.
+pub(crate) fn context_name(rt: RuntimeId) -> Option<(u64, u64)> {
+    static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let thread = THREAD_TAG.with(|t| {
+        if t.get() == 0 {
+            t.set(NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        t.get()
+    });
+    peek(|c| innermost(c, rt).map(|i| (thread, c[i].id)))
 }
 
 /// The checked reads of the frame of `ctl` at `cidx` of `rt`, which is

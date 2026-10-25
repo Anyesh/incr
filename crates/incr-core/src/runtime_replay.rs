@@ -397,9 +397,15 @@ impl<C: Cells> Runtime<C> {
             );
         }
         let foreign = if ctl.has(cycle::KEPT_READ) {
-            replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl)
+            let counts = replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl);
+            ForeignReads {
+                context: (!counts.is_empty())
+                    .then(|| replay::context_name(self.runtime_id))
+                    .flatten(),
+                counts,
+            }
         } else {
-            Vec::new()
+            ForeignReads::default()
         };
         let kept = self.stash(
             id.0,
@@ -454,7 +460,7 @@ impl<C: Cells> Runtime<C> {
                 Stash {
                     outcome: Outcome::Verified { since },
                     deps: self.current_deps(node),
-                    foreign: Vec::new(),
+                    foreign: ForeignReads::default(),
                     verify_rev,
                     index: None,
                 },
@@ -578,7 +584,7 @@ impl<C: Cells> Runtime<C> {
             failed |= !matches!(
                 a.stash.outcome,
                 Outcome::Value { .. } | Outcome::Verified { .. }
-            ) || !a.stash.foreign.iter().all(Count::holds);
+            ) || !a.stash.foreign.adoptable(rt);
             if failed {
                 bag.push_erased(Box::new(a.stash.outcome));
                 if root {
@@ -899,7 +905,7 @@ impl<C: Cells> Runtime<C> {
             Stash {
                 outcome: Outcome::Panic(Unbuilt::new(payload)),
                 deps: deps.to_vec(),
-                foreign: Vec::new(),
+                foreign: ForeignReads::default(),
                 verify_rev: attempt.verify_rev,
                 index,
             },
@@ -947,7 +953,7 @@ impl<C: Cells> Runtime<C> {
             Stash {
                 outcome: Outcome::Tried,
                 deps: Vec::new(),
-                foreign: Vec::new(),
+                foreign: ForeignReads::default(),
                 verify_rev: 0,
                 index: None,
             },
@@ -1055,7 +1061,7 @@ impl<C: Cells> Runtime<C> {
             let tried = Stash {
                 outcome: Outcome::Tried,
                 deps: Vec::new(),
-                foreign: Vec::new(),
+                foreign: ForeignReads::default(),
                 verify_rev: 0,
                 index: None,
             };
@@ -4826,11 +4832,30 @@ struct Adopting {
 pub(super) struct Stash {
     outcome: Outcome,
     deps: Vec<(NodeId, u32)>,
-    /// Other runtimes' changes as the run's Clean reads of them found them.
-    foreign: Vec<Count>,
+    foreign: ForeignReads,
     verify_rev: u64,
     /// A creator's child index as its run left it, unlanded.
     index: Option<StashedIndex>,
+}
+
+/// A stashed run's Clean reads of other runtimes, with those runtimes'
+/// changes as the reads found them and the context the run was made in.
+#[derive(Default)]
+struct ForeignReads {
+    counts: Vec<Count>,
+    context: Option<(u64, u64)>,
+}
+
+impl ForeignReads {
+    /// Within the context that made the run, a change since its reads was
+    /// made by the runs after them, which the unbounded run also makes after
+    /// them, or by another thread at no fixed point; elsewhere the unbounded
+    /// run reads now, so every count must hold.
+    fn adoptable(&self, rt: RuntimeId) -> bool {
+        self.counts.is_empty()
+            || self.context.is_some() && replay::context_name(rt) == self.context
+            || self.counts.iter().all(Count::holds)
+    }
 }
 
 /// The child index of a creator whose run is stashed: the index's run

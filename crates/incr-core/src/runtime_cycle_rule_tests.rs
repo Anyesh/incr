@@ -1687,11 +1687,10 @@ fn set_after_clean_read_runs<A: Cells, B: Cells>(budget: bool) -> (u64, u32, boo
     (value, runs.load(Ordering::Relaxed), doomed)
 }
 
-/// Under a budget the setter's speculative run moves the other runtime's
-/// count before the retry adopts the reader's stash, so the reader runs
-/// again, reads the later set and gives 3001.
+/// The setter's speculative run moves the other runtime's count before the
+/// retry adopts the reader's stash, in the context that made both, as the
+/// unbounded run sets after the read.
 #[test]
-#[ignore = "T10-speculative-foreign-set-before-read"]
 fn set_after_clean_read_keeps_the_read() {
     for budget in [false, true] {
         let runs = [
