@@ -1031,8 +1031,45 @@ fn episode_over_a_fresh_failure_reruns_boundedly<C: Cells>() {
     assert!(n <= 16, "S ran {n} times");
 }
 
+/// S (seeded) catches a Failed dep's panic and reads T; T reads S, and
+/// U (a fallback) only while S is 0, and U reads T. U is on the cycle in
+/// the first iteration's reads and off it in the final ones, so the
+/// landing's cut shrinks the episode, which runs again uncut and keeps no
+/// memo.
+fn an_episode_the_landing_cut_shrank_keeps_no_memo<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let (tc, uc) = (cell::<u64>(), cell::<u64>());
+    let s = {
+        let tc = tc.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                rt.try_get(*tc.get().unwrap()).unwrap_or(0).min(1)
+            },
+            fixpoint(Fixpoint::new(|| 0_u64)),
+        )
+    };
+    let t = {
+        let uc = uc.clone();
+        rt.create_query(move |rt: &Runtime<C>| match rt.get(s) {
+            0 => rt.try_get(*uc.get().unwrap()).unwrap_or(0) + 1,
+            v => v + 1,
+        })
+    };
+    let u = rt.create_query_with_fallback(
+        move |rt: &Runtime<C>| rt.try_get(t).unwrap_or(0),
+        |_: &Cycle| 5_u64,
+    );
+    tc.set(t).unwrap();
+    uc.set(u).unwrap();
+    assert_eq!(rt.get(s), 1);
+    assert!(!rt.has_memo_of(s), "s {:?}", rt.state_of(s));
+}
+
 both!(
     aborted_episode_landing_keeps_no_memo,
+    an_episode_the_landing_cut_shrank_keeps_no_memo,
     episode_over_a_fresh_failure_reruns_boundedly,
     cu_member_keeps_its_error_over_a_handled_episode,
     self_cycle_fallback,
