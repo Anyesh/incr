@@ -3136,6 +3136,7 @@ impl<C: Cells> Runtime<C> {
             self.planned()
         };
         let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
+        let mut ran_unsettled = false;
         let mut root = Computed::Done;
         let mut unchecked = None;
         #[cfg(test)]
@@ -3173,6 +3174,7 @@ impl<C: Cells> Runtime<C> {
                         .then_some(planned),
                     seen,
                 );
+                ran_unsettled |= computed == Computed::Unsettled;
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
@@ -3181,8 +3183,11 @@ impl<C: Cells> Runtime<C> {
                 }
                 if !C::SINGLE_THREADED && computed == Computed::Replan {
                     // A resumed walk's placeholder count tells it nothing
-                    // about releases since its plan, which goes on.
-                    let released = !resumed && self.released_since(planned);
+                    // about releases since its plan, which goes on. A walk
+                    // that left a closure Unsettled would rerun it from the
+                    // root, and two threads whose caught cycles release each
+                    // other's claims would then restart each other without end.
+                    let released = !resumed && !ran_unsettled && self.released_since(planned);
                     resumed = false;
                     planned = self.planned();
                     if !self.prune_settled(&mut walk) {
