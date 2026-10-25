@@ -416,6 +416,12 @@ impl<C: Cells> Runtime<C> {
             crate::cycle_state::own_episode(self.runtime_id, landed);
             C::u64_fetch_add(&self.episodes_landed, landed);
         }
+        // A release counted when its claims landed held: a walk planned
+        // since then expanded through their held states, and must see the
+        // count move when they publish.
+        if entries.iter().any(|e| e.unrun) {
+            self.count_release();
+        }
         let mut bag = Deferred::new();
         let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
         let mut rest = entries.into_iter();
