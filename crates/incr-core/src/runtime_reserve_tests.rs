@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use super::race_tests::{await_reservation_wait, id, Gate};
 use super::{ParkPoint, Runtime};
-use crate::cells::Shared;
+use crate::cells::{Local, Shared};
 use crate::child_test::run_in_child;
 use crate::cycle::{QueryOpts, Replay};
 use crate::handle::Incr;
@@ -750,6 +750,43 @@ fn a_doomed_closures_destructor_reads_inside_its_unwind() {
         },
     )
     .assert_clean();
+}
+
+/// A Local query L reads T on a Shared runtime, where T catches X's doom
+/// and joins a child that takes it over, so the wound reaches L's entry and
+/// L reads T again in a second Shared entry. Neither Shared entry is the
+/// thread's outermost, yet each is an attempt of its own: once L returns,
+/// the thread keeps no wound and no taken claim from them.
+#[test]
+fn a_shared_entry_under_a_local_one_leaves_no_take_over_behind() {
+    let shared = Arc::new(Rt::new());
+    shared.set_placeholder(0_u64);
+    let i = shared.create_input(3_u64);
+    let y = shared.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+    let x = shared.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+    let t = shared.create_query_with(
+        move |rt: &Rt| {
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap())
+        },
+        replayable(),
+    );
+    shared.set_max_frames(1);
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let local = Runtime::<Local>::new();
+        let l = local.create_query(move |_: &Runtime<Local>| shared.get(t));
+        let got = local.get(l);
+        let _ = tx.send((
+            got,
+            crate::attempt::mine().wounded(),
+            crate::reserve::takes(),
+        ));
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).ok(),
+        Some((28, false, 0))
+    );
 }
 
 /// A closure that catches an ordinary panic of its dep finds its attempt
