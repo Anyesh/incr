@@ -382,8 +382,10 @@ impl<C: Cells> SetClaim<'_, C> {
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
         // After the walk, so a dependent read Clean before the walk
-        // dirtied it was read with the change in progress.
+        // dirtied it was read with the change in progress. Cleared, since
+        // a buried panic below unwinds through `Drop`.
         if self.counted {
+            self.counted = false;
             self.rt.end_change();
         }
         self.rt.drop_released_tickets();
