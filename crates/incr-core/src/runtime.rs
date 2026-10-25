@@ -603,8 +603,8 @@ enum Computed {
     /// Another thread landed an episode since the walk planned: the node
     /// was left unrun and unclaimed, and the walk prunes its plan.
     Replan,
-    /// Another thread landed the node Dirty since the walk planned it: a
-    /// claim wait ended with it Dirty, not released unrun, or the walk
+    /// Another thread landed the node since the walk planned it: a claim
+    /// wait ended with it Dirty or New, not released unrun, or the walk
     /// planned it New and claimed it from Dirty. The node was left unrun
     /// and unclaimed, and the walk visits it again, as a read that came
     /// after that landing expands its deps before claiming it.
@@ -1073,6 +1073,9 @@ pub struct Runtime<C: Cells> {
     pub(crate) max_frames: std::sync::atomic::AtomicU32,
     /// The byte budget, or 0 when it is off.
     pub(crate) max_stack_bytes: std::sync::atomic::AtomicUsize,
+    /// Settles, for another runtime's first Clean read from one of this
+    /// runtime's frames, whether the frame keeps such reads.
+    keep_resolver: cycle::KeepResolver,
     /// `set_max_frames` has been called, so a byte budget set later keeps
     /// its frame budget instead of taking the default's place.
     frames_set: std::sync::atomic::AtomicBool,
@@ -1202,6 +1205,9 @@ impl<C: Cells> Runtime<C> {
             tracing_armed: C::new_u8(0),
             max_frames: std::sync::atomic::AtomicU32::new(replay_defaults().0),
             max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
+            keep_resolver: cycle::KeepResolver {
+                keeps: Self::resolve_keep,
+            },
             frames_set: std::sync::atomic::AtomicBool::new(false),
             budget_entry: replay_impl::BudgetEntry::new(runtime_id, replay_defaults().0),
             all_replayable: replay_defaults().1,
@@ -1832,6 +1838,19 @@ impl<C: Cells> Runtime<C> {
                 // there.
                 self.undivert_when_taken(f);
             }
+        } else if let Some(reader) = self.dep_stack.foreign_keeper(rt) {
+            let word = value_code::thread_word();
+            if word & value_code::COUNTER_MASK == 0 && !replay::held() {
+                if word & value_code::REPLAY_BIT == 0 {
+                    return self.foreign_clean_read(handle, node, reader);
+                }
+                // A retry's read may take what its doomed run kept, which
+                // the slow path's foreign read does.
+                return Err(NodeState::Clean);
+            }
+            // Not kept, so the frame must not be doomed: a retry would
+            // read this runtime again.
+            self.dep_stack.hold_foreign_reader();
         }
         let (type_tag, arena_slot) = self.fields_under(handle, node);
         match self.try_read_slot(handle, node, type_tag, arena_slot) {
@@ -3850,6 +3869,18 @@ impl<C: Cells> Runtime<C> {
                         self.memoize(id, owner);
                         return Computed::Done;
                     }
+                    // The thread waited on ran the node and left it New with
+                    // the deps it read, which a later read expands first.
+                    if seen != Seen::Unwalked
+                        && spins != 0
+                        && g0.is_none_or(|g| g == node.generation())
+                        && !node.unrun()
+                    {
+                        #[cfg(test)]
+                        self.wait_revisits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Computed::Revisit;
+                    }
                 }
                 // The generation check below would end a recycled root.
                 NodeState::Dirty
@@ -4165,10 +4196,11 @@ impl<C: Cells> Runtime<C> {
                 // runtime's, and the Failed transition plus the frame pop
                 // below restore every invariant the unwind could have
                 // interrupted; no lock is held while user code runs.
-                let ctl = ComputeCtl::new(
+                let ctl = ComputeCtl::resolved_by(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
                         | if speculative { cycle::SPECULATIVE } else { 0 },
+                    self.keep_resolver_ptr(),
                 );
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
