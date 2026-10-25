@@ -3762,6 +3762,21 @@ fn two_thread_repush_seeds() {
     }
 }
 
+/// Two-thread 0x4: op 3's walk expands 8's installed edges while 8 is New,
+/// then op 2's thread lands 8 Failed, and op 3's walk went on to compute
+/// 8's deps 4, 3, 2 and 7, leaving them Failed where both orders leave
+/// them Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_4_walk_root_failed_by_the_other_thread() {
+    let case = gen_case(4, false, true);
+    quiet(|| {
+        for _ in 0..5 {
+            differential_two(&case, 4);
+        }
+    });
+}
+
 /// Two-thread cases with panics and cycles in which a read's walk landed
 /// its node New as a cycle member and the other thread claimed the node
 /// before the read loaded its state. Which thread computes a node first
