@@ -1,8 +1,9 @@
 //! Doom reservations end with their owner: at a wound, when a cycle
-//! unwind drops the owner's context before its retry, and when the
-//! owner's retry panics. Each test parks the dooming thread holding a
-//! reservation, has another thread wait on it, and checks that both
-//! threads finish with a serial order's outcomes.
+//! unwind drops the owner's context before its retry, when the owner's
+//! retry panics, and at the owner's final landing of the node. Each test
+//! parks the dooming thread, has another thread read a node it reserved
+//! or reserved and landed, and checks that both threads finish with a
+//! serial order's outcomes.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
@@ -397,4 +398,103 @@ fn shared_reservation_ends_at_its_owners_final_landing() {
     let want = run(u32::MAX);
     assert!(!want.1, "the unbounded run's join stalled");
     assert_eq!(run(2), want);
+}
+
+/// Reads `x` on another thread while its doomed owner is parked, after
+/// the owner's landing of it: the read must not wait on a reservation.
+fn read_unreserved(rt: &Arc<Rt>, x: Incr<u64>) -> Outcome {
+    let (claim, generation) = ((rt.runtime_id, id(x).0), x.generation());
+    let reserved = thread::spawn(move || crate::reserve::elsewhere(claim, generation));
+    assert!(
+        !reserved.join().unwrap(),
+        "the owner's landing left X reserved"
+    );
+    let waits = rt.reservation_waits.load(SeqCst);
+    let read = {
+        let rt = rt.clone();
+        spawn("other", move || rt.get(x))
+    }
+    .join();
+    assert_eq!(
+        rt.reservation_waits.load(SeqCst),
+        waits,
+        "the read of X waited"
+    );
+    read
+}
+
+/// **A foreign rerun after the owner's Clean landing**, at budget 1: R
+/// reads F, F reads X and X reads input I, so R dooms on X; X's entry
+/// lands it Clean, which ends R's reservation of X, and R parks before
+/// F's entry. A set of I dirties X and another thread reads X. F's retry
+/// reads X as it then is, so once both reads are done F holds X's new
+/// value.
+#[test]
+fn a_foreign_rerun_after_the_owners_landing_leaves_no_stale_delivery() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let i = rt.create_input(1_u64);
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+    let f = rt.create_query_with(move |rt: &Rt| rt.get(x) * 10, replayable());
+    let entry = Gate::new();
+    hook(&rt, "r", ParkPoint::BeforeEntry(id(f)), entry.clone());
+    entry.arm();
+    let r = {
+        let rt = rt.clone();
+        spawn("r", move || rt.get(f))
+    };
+    entry.wait_parked();
+    rt.set(i, 2);
+    let x_read = read_unreserved(&rt, x);
+    entry.release();
+    let f_read = r.join();
+    assert_eq!(x_read, Ok(3));
+    assert!(matches!(f_read, Ok(20) | Ok(30)), "{f_read:?}");
+    assert_eq!(rt.get(f), 30, "F kept the value X had before the set");
+    rt.assert_invariant_i();
+}
+
+/// **A Failed landing's delivery stays the read it stands for**, at
+/// budget 1: R reads F, F reads X and X reads input I, panicking while I
+/// is 1. R dooms on X, X's entry lands it Failed and its panic is
+/// delivered to F's retry; R parks before F's entry. A set of I to 2 lets
+/// X compute, and another thread reads X. F's retry takes the panic, as
+/// the unbounded run's F read it when X landed, but once both reads are
+/// done F must not stay Failed over X's new value.
+#[test]
+fn a_foreign_rerun_after_a_failed_landing_leaves_no_stale_delivery() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let i = rt.create_input(1_u64);
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            let v = rt.get(i);
+            assert!(v != 1, "x boom");
+            v + 1
+        },
+        replayable(),
+    );
+    let f = rt.create_query_with(move |rt: &Rt| rt.get(x) * 10, replayable());
+    let entry = Gate::new();
+    hook(&rt, "r", ParkPoint::BeforeEntry(id(f)), entry.clone());
+    entry.arm();
+    let r = {
+        let rt = rt.clone();
+        spawn("r", move || rt.get(f))
+    };
+    entry.wait_parked();
+    rt.set(i, 2);
+    let x_read = read_unreserved(&rt, x);
+    entry.release();
+    let f_read = r.join();
+    assert_eq!(f_read, Err("x boom".to_string()));
+    assert_eq!(x_read, Ok(3));
+    assert_eq!(
+        outcome(|| rt.get(f)),
+        Ok(30),
+        "F stayed Failed over X's new value"
+    );
+    rt.assert_invariant_i();
 }
