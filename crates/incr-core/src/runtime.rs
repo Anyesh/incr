@@ -938,6 +938,8 @@ pub struct Runtime<C: Cells> {
     pub(crate) provenance: provenance_impl::Table<C>,
     tickets: C::Lock<contain_impl::Tickets>,
     tickets_held: std::sync::atomic::AtomicBool,
+    /// `tickets` notes a Failed landing past a set's walk.
+    failed_past: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1066,6 +1068,7 @@ impl<C: Cells> Runtime<C> {
             provenance: provenance_impl::table::<C>(),
             tickets: contain_impl::tickets::<C>(),
             tickets_held: std::sync::atomic::AtomicBool::new(false),
+            failed_past: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -3017,6 +3020,9 @@ impl<C: Cells> Runtime<C> {
                         // reads from it (and sees the dep Dirty) or this CAS
                         // fails on the claim and the next pass flags it.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
+                            if self.failed_past.load(std::sync::atomic::Ordering::Relaxed) {
+                                self.take_past_sets(id, &mut queue);
+                            }
                             break;
                         }
                     }
@@ -4275,7 +4281,8 @@ impl<C: Cells> Runtime<C> {
     /// the old and recorded deps is published, and the node lands Failed,
     /// or Dirty or New where publication says the panic may hide a change,
     /// or Dirty where a replay delivery raised the panic and its first take
-    /// landed the node Dirty (`retaken_landing`).
+    /// landed the node Dirty (`retaken_landing`). A Failed landing over a
+    /// dep no set's walk passes is noted for the next one (`note_past_sets`).
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
     #[allow(clippy::too_many_arguments)]
@@ -4314,6 +4321,7 @@ impl<C: Cells> Runtime<C> {
                 self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
             }
             mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, bag);
+            self.note_past_sets(id, node.generation(), deps, co_members);
         }
         let flagged = if landing == NodeState::New {
             NodeState::New

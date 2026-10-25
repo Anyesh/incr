@@ -7417,6 +7417,49 @@ fn shared_seed_77d_unread_walk_entry() {
     quiet(|| differential::<Shared>(&gen_case(0x77d, false, true), 0x77d));
 }
 
+/// A Failed landing over a dep a set's walk stops at outlasted the dep's
+/// next change. Seed 0x2897c4266833a03: op 1's walk reruns spec 1 over
+/// spec 2, which a caught panic left Dirty, and spec 1 panics; the sets of
+/// 21 stop at spec 2, so ops 14 and 22 read "failed" where a fresh read
+/// gives 0. Bounded runs give the unbounded run's outcomes.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failed_landing_stays_in_reach_of_sets() {
+    let seed = 0x0289_7c42_6683_3a03;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+        let trace = run::<Local>(&case, None, 0);
+        for i in [14, 22] {
+            let fresh = fresh_read(&case, i, &trace).expect("a read");
+            assert!(
+                fresh_agrees(&trace[i].0, &fresh),
+                "seed {seed:#x} op {i} {:?} gave {:?}, a fresh read {fresh:?}",
+                case.ops[i],
+                trace[i].0
+            );
+        }
+    });
+}
+
+/// Seed 0x264a: at op 4 spec 4 panics over spec 5, a cycle's head still
+/// open on the same thread, which then lands Dirty, so op 12's set of 19
+/// stopped at spec 5 and left specs 4 and 3 Failed.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_failed_landing_over_an_open_cycle_head_stays_in_reach_of_sets() {
+    let seed = 0x264a;
+    let case = gen_case(seed, false, false);
+    assert!(matches!(case.ops[12], Op::Set(19, 0)));
+    quiet(|| {
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
+        let trace = run::<Local>(&case, None, 0);
+        assert_eq!([3, 4].map(|x| trace[12].1 .0[x]), [NodeState::Dirty; 2]);
+    });
+}
+
 /// Seed 0x922f4fd7cf058ec: at budget 1, a walk's entry dooms with a
 /// repeat pending entry of its node beneath it. The replayed compute must
 /// not pop that repeat from the stashed walk: unbounded, the repeat

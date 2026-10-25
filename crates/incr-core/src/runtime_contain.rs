@@ -58,6 +58,9 @@ pub(crate) struct Tickets {
     /// dropped once the delete, sweep or walk that released them holds no
     /// lock and has finished.
     buried: Vec<Ticket>,
+    /// By the slot of a dep a set's walk stops at, the Failed landings over
+    /// it (slot, generation) that no walk flagged; see `note_past_sets`.
+    past: BTreeMap<u32, Vec<(u32, u32)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -525,6 +528,74 @@ impl<C: Cells> Runtime<C> {
         t.buried.extend(stale);
         self.sync_held(&t);
         true
+    }
+
+    /// After `id` landed Failed over `deps`: a set's walk stops at a dep
+    /// that is Dirty, whose dependents the walk that made it Dirty flagged,
+    /// but a dep a caught panic leaves Dirty, now or when a run open on this
+    /// thread lands it (other than the released `co_members`, sorted), had
+    /// no such walk. The landing is noted under each such dep for the next
+    /// walk that stops there, so it lasts its revision and not past the
+    /// dep's next change.
+    #[inline(always)]
+    pub(super) fn note_past_sets(
+        &self,
+        id: NodeId,
+        generation: u32,
+        deps: &[(NodeId, u32)],
+        co_members: &[u32],
+    ) {
+        let past = |&(dep, _): &(NodeId, u32)| match state::load::<C>(
+            self.nodes.get(dep.0).state_cell(),
+        ) {
+            NodeState::Dirty | NodeState::ComputingDirty => true,
+            NodeState::Computing => {
+                co_members.binary_search(&dep.0).is_err() && self.own_claim_owner(dep).is_some()
+            }
+            _ => false,
+        };
+        if deps.iter().any(past) {
+            self.note_past(id, generation, deps.iter().filter(|d| past(d)));
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn note_past<'a>(
+        &self,
+        id: NodeId,
+        generation: u32,
+        deps: impl Iterator<Item = &'a (NodeId, u32)>,
+    ) {
+        let mut t = self.tickets.write();
+        for &(dep, _) in deps {
+            let notes = t.past.entry(dep.0).or_default();
+            if !notes.contains(&(id.0, generation)) {
+                notes.push((id.0, generation));
+            }
+        }
+        self.failed_past.store(true, Relaxed);
+    }
+
+    /// A set's walk stopped at `dep`: queues the noted landings over it that
+    /// are still Failed.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn take_past_sets(&self, dep: NodeId, queue: &mut Vec<NodeId>) {
+        let mut t = self.tickets.write();
+        let Some(notes) = t.past.remove(&dep.0) else {
+            return;
+        };
+        self.failed_past.store(!t.past.is_empty(), Relaxed);
+        drop(t);
+        for (id, generation) in notes {
+            let node = self.nodes.get(id);
+            if node.generation() == generation
+                && state::load::<C>(node.state_cell()) == NodeState::Failed
+            {
+                queue.push(NodeId(id));
+            }
+        }
     }
 
     /// After a set's walk: drops the tickets its flips released.
