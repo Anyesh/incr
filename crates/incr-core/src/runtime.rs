@@ -4991,7 +4991,7 @@ impl<C: Cells> Runtime<C> {
     /// At quiescence, every released entry counts its node's current deps,
     /// as each publish that replaces them sets or drops it, and only nodes
     /// with an entry carry the released mark.
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn assert_released_entries_match_deps(&self) {
         let inner = self.inner.read();
         for (&slot, &(len, kept)) in &inner.released_deps {
