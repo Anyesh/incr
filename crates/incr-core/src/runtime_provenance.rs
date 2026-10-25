@@ -23,6 +23,7 @@
 //! outside the result under the Shared payload contract.
 
 use std::any::Any;
+use std::collections::hash_map::Entry as MapEntry;
 use std::panic::resume_unwind;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use crate::replay::{self, Carry, Provenance, ReadKey};
 
 /// The read a record is for: the virtual frame's node and generation,
 /// the node it was blocked reading and which of its reads of it that was.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Reader {
     node: u32,
     generation: u32,
@@ -53,7 +54,6 @@ impl From<ReadKey> for Reader {
 }
 
 struct Record {
-    id: u64,
     reader: Reader,
     /// The nodes, as `(node, generation)`, a Failed landing of which on
     /// another thread let the record's read failure out unchanged. A later
@@ -66,7 +66,37 @@ struct Record {
 #[derive(Default)]
 pub(crate) struct Records {
     next: u64,
-    live: Vec<Record>,
+    live: HashMap<u64, Record, FxBuildHasher>,
+    /// The live records' ids by their reader, oldest first.
+    by_reader: HashMap<Reader, Vec<u64>, FxBuildHasher>,
+}
+
+impl Records {
+    fn insert(&mut self, reader: Reader) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.live.insert(
+            id,
+            Record {
+                reader,
+                propagated: Vec::new(),
+            },
+        );
+        self.by_reader.entry(reader).or_default().push(id);
+        id
+    }
+
+    fn remove(&mut self, id: u64) {
+        let Some(r) = self.live.remove(&id) else {
+            return;
+        };
+        if let MapEntry::Occupied(mut ids) = self.by_reader.entry(r.reader) {
+            ids.get_mut().retain(|&i| i != id);
+            if ids.get().is_empty() {
+                ids.remove();
+            }
+        }
+    }
 }
 
 pub(crate) type Table<C> = Arc<<C as Cells>::Lock<Records>>;
@@ -89,7 +119,7 @@ impl<C: Cells> Provenance for Hold<C> {
 
 impl<C: Cells> Drop for Hold<C> {
     fn drop(&mut self) {
-        self.table.write().live.retain(|r| r.id != self.id);
+        self.table.write().remove(self.id);
     }
 }
 
@@ -170,8 +200,8 @@ impl<C: Cells> Runtime<C> {
             candidates.into_iter().find(|&(_, _, record)| {
                 records
                     .live
-                    .iter()
-                    .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
+                    .get(&record)
+                    .is_some_and(|r| r.propagated.contains(&(id.0, generation)))
             })
         };
         let (context, i, _) = found?;
@@ -247,13 +277,13 @@ impl<C: Cells> Runtime<C> {
         let Some(reader) = reader else {
             return;
         };
-        let record = self
-            .provenance
-            .read()
-            .live
-            .iter()
-            .find(|r| r.reader == reader)
-            .map(|r| r.id);
+        let record = {
+            let records = self.provenance.read();
+            records
+                .by_reader
+                .get(&reader)
+                .and_then(|ids| ids.first().copied())
+        };
         if let Some(record) = record {
             replay::set_carry(Some(Carry {
                 rt,
@@ -290,7 +320,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(c) = carried {
             if !self.provenance.read().live.is_empty() {
                 let mut records = self.provenance.write();
-                if let Some(r) = records.live.iter_mut().find(|r| r.id == c.record) {
+                if let Some(r) = records.live.get_mut(&c.record) {
                     if !r.propagated.contains(&(id.0, generation)) {
                         r.propagated.push((id.0, generation));
                     }
@@ -307,17 +337,7 @@ impl<C: Cells> Runtime<C> {
             }) else {
                 return;
             };
-            let record = {
-                let mut records = self.provenance.write();
-                let record = records.next;
-                records.next += 1;
-                records.live.push(Record {
-                    id: record,
-                    reader: key.into(),
-                    propagated: Vec::new(),
-                });
-                record
-            };
+            let record = { self.provenance.write().insert(key.into()) };
             let hold: Rc<dyn Provenance> = Rc::new(Hold::<C> {
                 table: Arc::clone(&self.provenance),
                 id: record,
