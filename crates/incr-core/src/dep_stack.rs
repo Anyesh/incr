@@ -325,8 +325,8 @@ pub trait DepStack: 'static {
     /// `rt`'s active frame, if it has one. The generation lets publish
     /// detect a dep that was deleted, and possibly recycled, after the
     /// read. A top frame of another runtime's records nothing. Returns
-    /// `type_tag`, the node's arena tag, or [`DIVERTED_TAG`] when the top
-    /// frame diverts its Clean reads (see [`Frame::read_rt`]): nothing is
+    /// `type_tag`, the node's arena tag, or `DIVERTED_TAG` when the top
+    /// frame diverts its Clean reads (see `Frame::read_rt`): nothing is
     /// recorded, and the read finds no arena, so it leaves through the
     /// empty-slot branch it already has, where the frame's own runtime
     /// records it.
@@ -384,7 +384,7 @@ pub trait DepStack: 'static {
     }
 
     /// Sends the top frame's Clean reads to the slow path (see
-    /// [`Frame::read_rt`]).
+    /// `Frame::read_rt`).
     fn divert_clean_reads(&self) {
         self.with(|s| {
             if let Some(top) = s.frames.last_mut() {
