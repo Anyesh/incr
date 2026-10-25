@@ -846,3 +846,68 @@ fn local_many_foreign_clean_reads_stay_linear() {
 fn shared_many_foreign_clean_reads_stay_linear() {
     many_foreign_reads::<Shared>(true);
 }
+
+/// The note work of the second read of a chain of `n` queries over a
+/// Failed node at budget `frames`, after a set below the chain. One
+/// payload goes up the chain, and its ticket
+/// gains a landing per step: each reader takes the ticket and the next
+/// landing holds it again.
+fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let mut below = rt.create_query_with(move |rt| rt.get(input) + rt.get(failed), opts());
+    for _ in 1..n {
+        let dep = below;
+        below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
+    }
+    let top = below;
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    rt.set(input, 1);
+    crate::replay::take_note_work();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    crate::replay::take_note_work()
+}
+
+fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
+    let sizes: &[usize] = if cfg!(miri) {
+        &[8]
+    } else {
+        &[1000, 2000, 4000]
+    };
+    for &n in sizes {
+        let work = contained_chain::<C>(frames, n);
+        assert!(
+            work <= 16 * n as u64,
+            "{frames:?}: {work} units of note work for a {n}-chain"
+        );
+    }
+}
+
+#[test]
+fn local_contained_chain_stays_linear() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(None));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(None));
+}
+
+#[test]
+fn local_contained_chain_stays_linear_at_budget_1() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(1)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_1() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
+}

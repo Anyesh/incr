@@ -353,6 +353,12 @@ impl Landings {
         }
     }
 
+    fn holds(&mut self, node: (u32, u32)) -> bool {
+        let nodes = self.owned_nodes();
+        note_work(nodes.len());
+        nodes.iter().any(|&(n, _)| n == node)
+    }
+
     pub(crate) fn into_nodes(mut self) -> Vec<((u32, u32), u32)> {
         std::mem::take(self.owned_nodes())
     }
@@ -1511,10 +1517,19 @@ fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
 }
 
 /// Marks `nodes` as landings a copy may hold, so that a later landing of
-/// one of them finds the copies to drop it from. A shared copy marks only
-/// the notes its log's earlier copies did not.
+/// one of them finds the contexts' deliveries to drop it from. Only a
+/// context's deliveries need the marks: a kept read applies a landing to
+/// its copy when the copy holds the node (`catch_up`), and a context that
+/// opens marks the kept reads' copies.
 pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
-    let generation = COPIED_GEN.with(Cell::get);
+    if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+        mark(rt, nodes);
+    }
+}
+
+/// A shared copy marks only the notes its log's earlier copies did not.
+fn mark(rt: RuntimeId, nodes: &Landings) {
+    let generation = copied_generation();
     COPIED.with(|c| {
         let mut c = c.borrow_mut();
         let mut mark = |n| {
@@ -1538,12 +1553,44 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
                 };
                 note_work(len - from);
                 for e in log.entries[from..*len].iter().filter(|e| e.gone >= *epoch) {
-                    mark(e.node);
+                    match &e.lent {
+                        None => mark(e.node),
+                        // A ticket's members went into earlier copies of
+                        // the notes that stood for it, so only its later
+                        // members are new.
+                        Some((members, len)) => {
+                            let mut joined = members.lock();
+                            let from = match joined.marked {
+                                (g, upto) if g == generation => upto.min(*len),
+                                _ => 0,
+                            };
+                            note_work(len - from);
+                            for m in joined.members[from..*len]
+                                .iter()
+                                .filter(|m| m.gone >= *epoch)
+                            {
+                                mark(m.node);
+                            }
+                            joined.marked = (generation, (*len).max(from));
+                        }
+                    }
                 }
                 log.marked = (generation, (*len).max(from));
             }
         }
     });
+}
+
+/// This thread's copied set's generation, unique among every thread's, as
+/// a ticket's members are marked from any thread.
+fn copied_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COPIED_GEN.with(|g| {
+        if g.get() == 0 {
+            g.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        g.get()
+    })
 }
 
 /// Whether a kept read or a context's delivery may hold copied landings.
@@ -1560,15 +1607,15 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
         let (w, b) = copied_bit(rt, n);
         COPIED.with(|c| c.borrow()[w] & b != 0)
     });
-    // Short of a copied node, an event retires only landings above its
+    // A landing retires its node from any kept copy, which the copied set
+    // does not mark; another event retires only landings above its
     // position, or at it for a contained payload.
     let reach = match *ev {
         Retire::Contained { cidx, .. } => cidx,
-        _ => ev.cidx() + 1,
+        Retire::Landing { .. } => 0,
+        Retire::Above(at) => at + 1,
     };
-    if value_code::thread_word() & value_code::KEPT_BIT != 0
-        && (all || KEPT_TOP.with(Cell::get) >= reach)
-    {
+    if value_code::thread_word() & value_code::KEPT_BIT != 0 && KEPT_TOP.with(Cell::get) >= reach {
         KEPT_EVENTS.with(|v| v.borrow_mut().push(Logged { rt, ev: *ev, all }));
     }
     with(|c| {
@@ -1587,10 +1634,23 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &[Logged]) {
     };
     note_work(events.len() - seen);
     for l in &events[seen..] {
-        if l.rt == read.rt && (read.cidx < l.ev.cidx() || l.all) {
+        if l.rt == read.rt
+            && (read.cidx < l.ev.cidx() || l.all || l.ev.node().is_some_and(|n| nodes.holds(n)))
+        {
             nodes.retire(read.cidx, &l.ev, None);
         }
     }
+}
+
+/// Marks the kept reads' copies for a context that opens.
+fn mark_kept() {
+    KEPT_READS.with(|d| {
+        for (e, _) in d.borrow().iter() {
+            if let Delivered::Unwind { nodes, .. } = &e.what {
+                mark(e.rt, nodes);
+            }
+        }
+    });
 }
 
 /// The reads kept for the run of control block `ctl` at `cidx`.
@@ -1641,7 +1701,7 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
         value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
             COPIED.with(|c| *c.borrow_mut() = [0; 64]);
-            COPIED_GEN.with(|g| g.set(g.get() + 1));
+            COPIED_GEN.with(|g| g.set(0));
         }
         out
     })
@@ -2126,6 +2186,9 @@ pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry, frame_keys: Fram
         }
         c.push(x);
     });
+    if value_code::thread_word() & value_code::KEPT_BIT != 0 {
+        mark_kept();
+    }
     id
 }
 
