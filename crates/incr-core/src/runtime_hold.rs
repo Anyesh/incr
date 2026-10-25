@@ -8,6 +8,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::cells::Cells;
+use crate::cycle::ComputeCtl;
 use crate::cycle_state::{self, UnwindKind};
 use crate::deferred::Deferred;
 use crate::fx::FxBuildHasher;
@@ -130,9 +131,10 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         node: &NodeData<C>,
         first: bool,
-        kept: Option<Option<Box<dyn Any>>>,
+        ctl: Option<&ComputeCtl>,
         bag: &mut Deferred<C>,
     ) {
+        let kept = ctl.and_then(hold::take_kept);
         let cell = state::cell_key::<C>(node.state_cell());
         let verified_at = Some(node.verified_at());
         if let Some(own) = hold::open(

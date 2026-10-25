@@ -4089,7 +4089,7 @@ impl<C: Cells> Runtime<C> {
                     & (cycle::LOW | cycle::DOOMED | cycle::SPECULATIVE | cycle::HOLD);
                 if parked != 0 {
                     if parked == cycle::HOLD {
-                        self.open_hold(id, node, first, hold::take_kept(&ctl), bag);
+                        self.open_hold(id, node, first, Some(&ctl), bag);
                     } else {
                         let attempt = Attempt {
                             first,
@@ -4280,7 +4280,7 @@ impl<C: Cells> Runtime<C> {
         let wrote = ctl.wrote.get() != 0;
         // A panic its run met reading a held landing is held as its value is.
         if kind.is_none() && !C::SINGLE_THREADED && ctl.has(cycle::HOLD) {
-            self.open_hold(id, node, attempt.first, hold::take_kept(ctl), bag);
+            self.open_hold(id, node, attempt.first, Some(ctl), bag);
         }
         if children_stashed {
             let first = attempt.first;
