@@ -2208,25 +2208,27 @@ fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
     assert_eq!(got, if failed { n as i64 } else { 0 });
 }
 
-/// The chain at 2000 with a ticket per caught read, every read's ticket
-/// taken while the frames below hold theirs: the tickets' work stays
-/// linear in the reads.
+/// The chain at 2000 to 64000 with a ticket per caught read, every read's
+/// ticket taken while the frames below hold theirs: the tickets' work
+/// stays linear in the reads. A retry's read of a regenerable payload keeps
+/// a copy of its notes, about 20 units a read.
 fn ticket_catching_chain_work<C: Cells>() {
-    let n = 2000;
-    let work = thread::Builder::new()
-        .stack_size(2 << 20)
-        .spawn(move || {
-            crate::replay::take_note_work();
-            assert_eq!(ticket_catching_chain::<C>(n, true, true), n as i64);
-            crate::replay::take_note_work()
-        })
-        .unwrap()
-        .join()
-        .unwrap();
-    assert!(
-        work <= 16 * n as u64,
-        "{work} units of note work for {n} reads"
-    );
+    for n in [2000, 4000, 16000, test_size(64_000)] {
+        let work = thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                crate::replay::take_note_work();
+                assert_eq!(ticket_catching_chain::<C>(n, true, true), n as i64);
+                crate::replay::take_note_work()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            work <= 24 * n as u64,
+            "{work} units of note work for {n} reads"
+        );
+    }
 }
 
 #[test]
