@@ -1728,10 +1728,9 @@ impl<C: Cells> Runtime<C> {
 
     /// Sets the unwind kind of a drop unwind about to be raised.
     pub(super) fn set_drop_kind(&self) {
-        debug_assert_ne!(
-            cycle_state::unwind_kind(),
-            Some(UnwindKind::Wound),
-            "a speculative drop under a caught wound"
+        debug_assert!(
+            std::thread::panicking() || cycle_state::unwind_kind() != Some(UnwindKind::Wound),
+            "incr-core: a speculative drop under a caught wound"
         );
         #[cfg(test)]
         self.drop_unwinds
