@@ -236,10 +236,14 @@ fn alternating_runtimes_switch_back_on_exit() {
         })
         .collect();
     assert!(open_entry_of(l) && open_entry_of(s));
-    for e in entries.into_iter().rev() {
+    let mut entries = entries.into_iter();
+    let l1 = entries.next().unwrap();
+    for e in entries.rev() {
         drop(e);
     }
-    assert!(!open_entry_of(l) && !open_entry_of(s));
+    assert!(open_entry_of(l) && !open_entry_of(s));
     let s1 = EntryDepth::enter(s, true);
-    assert!(s1.is_outermost() && s1.shared_outermost());
+    assert!(!s1.is_outermost() && s1.first_for_runtime() && s1.shared_outermost());
+    drop(s1);
+    drop(l1);
 }

@@ -1247,8 +1247,8 @@ fn switch_in(e: &EntryState, key: u64) -> EntryDepth {
                 shared_outermost: key & SHARED_KEY != 0 && no_shared_below,
             }
         }
-        // An entry from a destructor of this thread's locals, after the
-        // list's: it is taken as a nested entry of the runtime below.
+        // An entry from a destructor of this thread's locals, after
+        // `OUTER_RTS`'s: it is taken as a nested entry of the runtime below.
         Err(_) => EntryDepth {
             outermost: false,
             switched: false,
