@@ -8,7 +8,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::race_tests::{await_reservation_wait, id, Gate};
 use super::{ParkPoint, Runtime};
@@ -321,4 +321,80 @@ fn a_nested_read_of_the_same_node_leaves_its_reservation_to_the_enclosing_read()
     assert!(reserved_elsewhere(claim), "the nested read ended it");
     drop(outer);
     assert!(!reserved_elsewhere(claim));
+}
+
+/// **A reservation outlives the owner's final landing**, at budget 2: R
+/// reads T, T reads X, X reads Y and Y reads input I, so R dooms on Y and
+/// reserves T and X. On T's final run, after it has read X, R parks and a
+/// set of I dirties X again; T's closure then has another thread read X
+/// and joins it. The unbounded run lets that read rerun X, so T's join
+/// must not wait on R's reservation of X.
+#[test]
+fn shared_reservation_ends_at_its_owners_final_landing() {
+    type Shape = (Arc<Rt>, Incr<u64>, Incr<u64>, Gate, Arc<AtomicBool>);
+    fn shape(rt: Rt) -> Shape {
+        let rt = Arc::new(rt);
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(1_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+        let gate = Gate::new();
+        let stalled = Arc::new(AtomicBool::new(false));
+        let t = {
+            let (gate, stalled) = (gate.clone(), stalled.clone());
+            let shared = Arc::downgrade(&rt);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    if v == 0 {
+                        return 0;
+                    }
+                    gate.park();
+                    let waits = rt.reservation_waits.load(SeqCst);
+                    let (tx, rx) = mpsc::channel();
+                    let rt2 = shared.upgrade().unwrap();
+                    thread::spawn(move || {
+                        let _ = tx.send(outcome(|| rt2.get(x)));
+                    });
+                    // A wait on R's reservation, held until this read ends,
+                    // hangs a plain join.
+                    let deadline = Instant::now() + JOIN_TIMEOUT;
+                    loop {
+                        if let Ok(read) = rx.try_recv() {
+                            return v + read.unwrap_or(1000);
+                        }
+                        if rt.reservation_waits.load(SeqCst) != waits {
+                            stalled.store(true, SeqCst);
+                            return v;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the joined read neither returned nor waited"
+                        );
+                        thread::yield_now();
+                    }
+                },
+                replayable(),
+            )
+        };
+        (rt, t, i, gate, stalled)
+    }
+    fn run(frames: u32) -> (Outcome, bool) {
+        let (rt, t, i, gate, stalled) = shape(Rt::new());
+        rt.set_max_frames(frames);
+        gate.arm();
+        let r = {
+            let rt = rt.clone();
+            spawn("r", move || rt.get(t))
+        };
+        gate.wait_parked();
+        rt.set(i, 2);
+        gate.release();
+        let read = r.join();
+        rt.assert_invariant_i();
+        (read, stalled.load(SeqCst))
+    }
+    let want = run(u32::MAX);
+    assert!(!want.1, "the unbounded run's join stalled");
+    assert_eq!(run(2), want);
 }
