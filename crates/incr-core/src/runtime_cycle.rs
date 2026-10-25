@@ -1925,6 +1925,10 @@ impl<C: Cells> Runtime<C> {
             } else {
                 self.land_panic_released(id, attempt, e.wrote, e.deps(), &released, bag);
             }
+            // A cycle's retry may run a member again; a user panic ends its run.
+            if !discarding && kind.is_none() {
+                self.end_reservation(id, self.nodes.get(slot));
+            }
             // A discarded claim's run is one the unbounded run never makes,
             // or makes again on the retry.
             if kind == Some(UnwindKind::Discard) {
@@ -2122,6 +2126,7 @@ impl<C: Cells> Runtime<C> {
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
             let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
+            self.end_reservation_landed(id, node, landed);
             self.record_trace(
                 id,
                 crate::trace::TraceAction::Recomputed {
@@ -2338,7 +2343,8 @@ impl<C: Cells> Runtime<C> {
             };
             let flags = self.nodes.get_with_flags(m).1;
             self.children_landing(NodeId(m), flags, children, e.opened(), bag);
-            self.land(NodeId(m), node, target, flagged);
+            let landed = self.land(NodeId(m), node, target, flagged);
+            self.end_reservation_landed(NodeId(m), node, landed);
             bag.push_erased(Box::new(e.into_values()));
         }
         PopEnd::Landed
@@ -2398,6 +2404,9 @@ impl<C: Cells> Runtime<C> {
                 self.land_panic_released(id, attempt, e.wrote, e.deps(), &members, bag);
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
+            }
+            if kind.is_none() {
+                self.end_reservation(id, self.nodes.get(*m));
             }
             bag.push_erased(Box::new((e.take_buf(), e.s.take())));
         }
@@ -2590,9 +2599,9 @@ impl<C: Cells> Runtime<C> {
                     "incr-core: group verify re-lands member {m} over an empty slot"
                 );
                 node.max_verified_at(verify_rev);
-                if self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty)
-                    == NodeState::Clean
-                {
+                let landed = self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty);
+                self.end_reservation_landed(NodeId(m), node, landed);
+                if landed == NodeState::Clean {
                     self.record_trace(NodeId(m), crate::trace::TraceAction::VerifiedClean);
                 }
             }

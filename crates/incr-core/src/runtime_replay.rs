@@ -683,6 +683,7 @@ impl<C: Cells> Runtime<C> {
                     .min(C::walked(&self.walk, &self.revision)),
             );
             let landed = self.land_single(a.id, node, flags, NodeState::Clean, NodeState::Dirty);
+            self.end_reservation_landed(a.id, node, landed);
             if landed == NodeState::Clean {
                 self.record_trace(a.id, crate::trace::TraceAction::VerifiedClean);
             }
@@ -794,6 +795,7 @@ impl<C: Cells> Runtime<C> {
             self.land_children(a.id, landing, index.opened, bag);
         }
         let landed = self.land_single(a.id, node, flags, target, NodeState::Dirty);
+        self.end_reservation_landed(a.id, node, landed);
         self.record_trace(
             a.id,
             crate::trace::TraceAction::Recomputed {
@@ -3755,6 +3757,7 @@ impl<C: Cells> Runtime<C> {
                 Some(&*payload),
                 bag,
             );
+            self.end_reservation(id, node);
         }
         if let Some(spec_buf) = spec_buf {
             bag.push_erased(Box::new(spec_buf));
