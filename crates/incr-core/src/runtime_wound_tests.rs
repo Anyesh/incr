@@ -1828,6 +1828,7 @@ fn shared_retraction_restores_a_released_members_rerun() {
             );
             assert_eq!((got_o, got_qb), (Ok(want.0), Ok(want.1)));
             rt.assert_invariant_i();
+            rt.assert_released_entries_match_deps();
         },
     )
     .assert_clean();

@@ -5502,6 +5502,12 @@ impl<C: Cells> Runtime<C> {
             .filter(|&&(len, _)| len as usize == diff.old.len())
             .map(|&(_, kept)| kept);
         let len = diff.new.len() as u32;
+        if held {
+            hold::keep_released(
+                state::cell_key::<C>(node.state_cell()),
+                inner.released_deps.get(&id.0).copied(),
+            );
+        }
         let entry = match panic {
             Some(PanicUnion::Released(_)) => Some((len, kept.unwrap_or(diff.old.len() as u32))),
             Some(PanicUnion::Failed(_)) => kept.map(|kept| (len, kept)),

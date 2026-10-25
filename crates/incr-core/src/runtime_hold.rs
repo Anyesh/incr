@@ -548,6 +548,11 @@ impl<C: Cells> Runtime<C> {
                 if let Some((rec, in_group)) = e.undo.rec.take() {
                     self.restore_rec(&mut inner, e.slot, rec, in_group);
                 }
+                // An entry over a list that lost a dep counted the whole
+                // old list.
+                if let Some(prior) = e.undo.released.take() {
+                    self.set_released(&mut inner, e.slot, node, prior.filter(|_| !lost[i]));
+                }
             }
             for (slot, rec) in cut_recs {
                 self.restore_rec(&mut inner, slot, rec, true);

@@ -44,6 +44,8 @@ pub(crate) struct Undo {
     /// record from before the cut. A wound takes it back early
     /// ([`take_recs`]).
     pub(crate) rec: Option<(Option<Arc<GroupInfo>>, bool)>,
+    /// The node's released-dep entry (`Inner::released_deps`).
+    pub(crate) released: Option<Option<(u32, u32)>>,
 }
 
 pub(crate) struct Held {
@@ -243,6 +245,7 @@ pub(crate) fn open(
                 verified_at,
                 deps: None,
                 rec: cut.map(|c| (c.rec, true)),
+                released: None,
             },
         }));
         h.by_cell.insert(cell, at);
@@ -267,6 +270,15 @@ pub(crate) fn keep_deps(cell: usize, old: impl FnOnce() -> Vec<(NodeId, u32)>) {
     with(|h| {
         if let Some(e) = h.get(cell).filter(|e| e.undo.deps.is_none()) {
             e.undo.deps = Some(old());
+        }
+    });
+}
+
+/// The released-dep entry a held node's landing is about to replace.
+pub(crate) fn keep_released(cell: usize, prior: Option<(u32, u32)>) {
+    with(|h| {
+        if let Some(e) = h.get(cell).filter(|e| e.undo.released.is_none()) {
+            e.undo.released = Some(prior);
         }
     });
 }
