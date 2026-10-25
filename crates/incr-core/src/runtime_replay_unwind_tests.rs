@@ -851,10 +851,10 @@ local_and_shared!(
     shared_unwind_out_of_an_entry
 );
 
-/// T reads F, F reads w and U, and once c is 1 U reads F, with `u_panics`
-/// F taking a fallback and U panicking after reading it. T's walk runs U
-/// as F's dep, before F's closure, so the cycle reaches the read with or
-/// without F's fallback. Below budget 2 U's virtual hit claims F, Dirty from
+/// T reads F, F reads w and U, and once c is 1 U reads F. With `u_panics`
+/// F takes a fallback and U panics after reading it; otherwise F has no
+/// fallback. T's walk runs U as F's dep, before F's closure, so either way
+/// the cycle reaches the read. Below budget 2 U's virtual hit claims F, Dirty from
 /// its first revision, and U's entry's unwind releases that claim with
 /// the discard landing. What every read and later set lands is the
 /// unbounded run's.
@@ -910,7 +910,7 @@ fn a_user_panic_releases_a_virtual_hit_claim<C: Cells>() {
         let Out::Panic(text) = &unbounded[1].0 else {
             panic!("{unbounded:?}")
         };
-        assert!(text.contains("dependency cycle"), "{text}");
+        assert!(text.ends_with("dependency cycle: 2, 3"), "{text}");
         assert_eq!(unbounded[3].0, Out::Value(8));
         for frames in [1, 2, 3] {
             assert_eq!(

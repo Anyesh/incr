@@ -2297,7 +2297,7 @@ fn shared_read_returns_the_value_its_walk_landed_dirty() {
             .join()
             .expect_err("C's cycle reaches the second read"),
     );
-    assert!(cycle.contains("dependency cycle"), "{cycle}");
+    assert!(cycle.ends_with("dependency cycle: 0"), "{cycle}");
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
 
