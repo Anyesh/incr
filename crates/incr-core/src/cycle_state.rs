@@ -789,6 +789,9 @@ struct EntryState {
     ticket: Cell<u64>,
     /// Set by a wound until the outermost entry retries.
     wounded: Cell<bool>,
+    /// A take-over met a claim the outermost entry keeps unreserved
+    /// across its retries, as long as the ticket.
+    taken: Cell<bool>,
     failures: Cell<u64>,
     /// Set when `Outer` may hold something, so that an outermost entry
     /// with nothing to reset touches only this block, which has no
@@ -828,6 +831,7 @@ thread_local! {
             cur_rt: Cell::new(0),
             ticket: Cell::new(0),
             wounded: Cell::new(false),
+            taken: Cell::new(false),
             failures: Cell::new(0),
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
@@ -855,6 +859,7 @@ loom::thread_local! {
         cur_rt: Cell::new(0),
         ticket: Cell::new(0),
         wounded: Cell::new(false),
+        taken: Cell::new(false),
         failures: Cell::new(0),
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
@@ -1154,6 +1159,16 @@ pub(crate) fn ticket(next: impl FnOnce() -> u64) -> u64 {
     })
 }
 
+/// Whether a take-over of this thread's outermost entry met a claim.
+#[inline(always)]
+pub(crate) fn any_taken() -> bool {
+    ENTRY.with(|e| e.taken.get())
+}
+
+pub(crate) fn set_any_taken(taken: bool) {
+    ENTRY.with(|e| e.taken.set(taken));
+}
+
 pub(crate) fn set_wounded(wounded: bool) {
     ENTRY.with(|e| e.wounded.set(wounded));
 }
@@ -1251,6 +1266,9 @@ impl Drop for EntryDepth {
             e.depth.set(depth);
             if depth == 0 {
                 e.ticket.set(0);
+                if e.taken.get() {
+                    crate::reserve::clear_taken();
+                }
             }
             if self.switched {
                 switch_out(e);

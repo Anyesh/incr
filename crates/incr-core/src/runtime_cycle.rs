@@ -206,7 +206,6 @@ struct OutermostExit;
 
 impl Drop for OutermostExit {
     fn drop(&mut self) {
-        reserve::clear_taken();
         if !reserve::none_held() {
             replay::reset();
             reserve::end_contexts();
@@ -315,7 +314,6 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn end_nested_shared(&self, cidx: u32) {
-        reserve::clear_taken();
         replay::drop_all_from(cidx);
         if cycle_state::wounded() {
             reserve::end_all();
