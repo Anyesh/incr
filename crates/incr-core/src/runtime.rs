@@ -2354,14 +2354,7 @@ impl<C: Cells> Runtime<C> {
                 type_tag,
             );
             if C::SINGLE_THREADED {
-                return self.read_clean_local(
-                    handle,
-                    node,
-                    type_tag,
-                    arena_slot,
-                    |v| v,
-                    |now| self.get_slow(handle, now),
-                );
+                return self.read_clean_local(handle, type_tag, arena_slot, |v| v, Self::get_slow);
             }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => value,
@@ -2406,9 +2399,7 @@ impl<C: Cells> Runtime<C> {
                 type_tag,
             );
             if C::SINGLE_THREADED {
-                return self.read_clean_local(handle, node, type_tag, arena_slot, Ok, |now| {
-                    self.try_get_slow(handle, now)
-                });
+                return self.read_clean_local(handle, type_tag, arena_slot, Ok, Self::try_get_slow);
             }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => Ok(value),
@@ -2691,30 +2682,51 @@ impl<C: Cells> Runtime<C> {
     /// [`Self::try_read_slot`] for a Clean `get` or `try_get` under
     /// `Local`, where an empty slot is [`Self::read_failed`], and the value
     /// is cloned straight into the return place. A diverted read's
-    /// `DIVERTED_TAG` names no arena, and that miss goes on as
-    /// [`Self::reload_after_empty_slot`] does, to `slow` if it must, so the
-    /// fast path tests nothing extra.
+    /// `DIVERTED_TAG` names no arena, so the fast path tests nothing extra
+    /// and that miss goes on in [`Self::local_arena_miss`].
     #[inline(always)]
     fn read_clean_local<T: Value, R>(
         &self,
         handle: Incr<T>,
-        node: &NodeData<C>,
         type_tag: u16,
         arena_slot: u32,
         read: impl FnOnce(T) -> R,
-        slow: impl FnOnce(NodeState) -> R,
+        slow: impl FnOnce(&Self, Incr<T>, NodeState) -> R,
     ) -> R {
         debug_assert!(C::SINGLE_THREADED);
         self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
         let Some(arena) = self.arenas.tagged_arena::<T>(type_tag) else {
-            return match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
-                Ok(value) => read(value),
-                Err(now) => slow(now),
-            };
+            return self.local_arena_miss(handle, read, slow);
         };
         let value = value_code::run(|| arena.read_or(arena_slot, || self.read_failed(handle)));
         debug_assert_local_read_kept!(self.nodes.get(handle.slot()), handle.generation());
         read(value)
+    }
+
+    /// [`Self::read_clean_local`] found no arena for the tag `record_dep`
+    /// handed back. The node's own tag has one only when that tag was
+    /// `DIVERTED_TAG`, and the diverted read goes on as
+    /// [`Self::diverted_clean_read`] answers it; any other miss is
+    /// [`Self::read_failed`]. Taking no tag, and `read` and `slow` as
+    /// function items that capture nothing, keeps the fast path's registers
+    /// as they are without this branch.
+    #[cold]
+    #[inline(never)]
+    fn local_arena_miss<T: Value, R>(
+        &self,
+        handle: Incr<T>,
+        read: impl FnOnce(T) -> R,
+        slow: impl FnOnce(&Self, Incr<T>, NodeState) -> R,
+    ) -> R {
+        let node = self.nodes.get(handle.slot());
+        let (type_tag, _) = self.fields_under(handle, node);
+        if self.arenas.tagged_arena::<T>(type_tag).is_none() {
+            self.read_failed(handle);
+        }
+        match self.diverted_clean_read(handle, node) {
+            Ok(value) => read(value),
+            Err(now) => slow(self, handle, now),
+        }
     }
 
     /// [`Self::read_slot`], with `None` for an empty slot.
