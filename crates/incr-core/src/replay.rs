@@ -2093,9 +2093,8 @@ pub(crate) fn regen_close() -> Vec<(u64, Box<dyn Any + Send>)> {
     REGEN.with(|r| std::mem::replace(&mut *r.borrow_mut(), Regenerating::new()).made)
 }
 
-/// The payload the open run's read of Failed node `key` of runtime `rt`
-/// raises: the one made for it, or none where the unbounded run's read
-/// found the node Failed already and panicked with its message.
+/// The payload made for the open run's read of node `key` of runtime
+/// `rt`, if the unbounded run's read took one and no read since raised it.
 pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> Option<Box<dyn Any + Send>> {
     REGEN.with(|r| {
         let mut r = r.borrow_mut();
@@ -2123,10 +2122,6 @@ type Takes = HashMap<
     FxBuildHasher,
 >;
 
-/// A sentinel read node: the run took a payload from another runtime's
-/// node, which no rerun of the run's node makes again.
-const FOREIGN_TOOK: u64 = u64::MAX;
-
 fn with_takes<R>(f: impl FnOnce(&mut Takes) -> R) -> R {
     value_code::set_bits(value_code::TOOK_BIT, true);
     TOOK.with(|t| f(&mut t.borrow_mut()))
@@ -2151,16 +2146,6 @@ pub(crate) fn note_took(rt: RuntimeId, reader: RunKey, reading: u64, payload: &(
     let copy = copy_payload(payload).filter(|_| !payload.is::<Regen>());
     with_takes(|t| {
         t.entry((rt, reader)).or_default().insert(reading, copy);
-    });
-}
-
-/// Notes that run `reader` of runtime `rt` took a payload from another
-/// runtime's node.
-pub(crate) fn note_foreign_took(rt: RuntimeId, reader: RunKey) {
-    with_takes(|t| {
-        t.entry((rt, reader))
-            .or_default()
-            .insert(FOREIGN_TOOK, None);
     });
 }
 

@@ -1217,21 +1217,6 @@ impl<C: Cells> Runtime<C> {
             }
         }
         if word & value_code::REGEN_BIT != 0 {
-            // A Cyclic node's read computes nothing.
-            if observed == NodeState::Cyclic {
-                if let Some(read) = self.cycle_read(handle, observed, kind, None) {
-                    return read;
-                }
-            }
-            // A Dirty node's slot holds the value its landing left, which
-            // the unbounded run's read took.
-            if observed == NodeState::Dirty {
-                let node = self.nodes.get(handle.slot());
-                let (type_tag, arena_slot) = self.fields_under(handle, node);
-                if let Some(value) = self.try_read_slot(handle, node, type_tag, arena_slot) {
-                    return Ok(value);
-                }
-            }
             self.regen_read(NodeId(handle.slot()), handle.generation(), observed);
         }
         if foreign {
@@ -2013,6 +1998,9 @@ impl<C: Cells> Runtime<C> {
         if !self.budgeted() {
             return;
         }
+        // SAFETY: the reading frame is on the stack, so its control block
+        // is live.
+        unsafe { &*f.ctl }.raise(cycle::UNREGENERABLE);
         let value: cycle::Erased = Box::new(value_code::run(|| value.clone()));
         let value = Unbuilt::new(value);
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
@@ -2119,6 +2107,16 @@ impl<C: Cells> Runtime<C> {
             flags.raise(cycle::NO_DOOM);
         }
         true
+    }
+
+    /// Marks frame `frame`'s run as one a rerun of its node does not
+    /// repeat (`cycle::UNREGENERABLE`).
+    pub(super) fn unregenerable(&self, frame: Option<ActiveRead>) {
+        if let Some(f) = frame {
+            // SAFETY: the reading frame is on the stack, so its control
+            // block is live.
+            unsafe { &*f.ctl }.raise(cycle::UNREGENERABLE);
+        }
     }
 
     /// Notes for `regenerate` that frame `f`'s read of node `reading`
@@ -2447,19 +2445,20 @@ impl<C: Cells> Runtime<C> {
         panicked
     }
 
-    /// A slow read made by a run of `regenerate`: a Failed node's read
-    /// raises the payload made for it, or panics with its message if the
-    /// unbounded run's read took none; any other read would compute, wait
-    /// or land, so it aborts the run.
+    /// A slow read made by a run of `regenerate`: the first read of a node
+    /// the unbounded run's read took a payload from raises the payload made
+    /// for it, whatever the node's state now; another read of a Failed node
+    /// panics with its message; any other read would compute, wait or land,
+    /// so it aborts the run.
     #[cold]
     #[inline(never)]
     pub(super) fn regen_read(&self, id: NodeId, generation: u32, observed: NodeState) -> ! {
+        let key = u64::from(id.0) | (u64::from(generation) << 32);
+        if let Some(payload) = replay::regen_take(self.runtime_id, key) {
+            resume_unwind(payload);
+        }
         if observed == NodeState::Failed {
-            let key = u64::from(id.0) | (u64::from(generation) << 32);
-            match replay::regen_take(self.runtime_id, key) {
-                Some(payload) => resume_unwind(payload),
-                None => panic!("{}", super::provenance_impl::failed_read_message(id.0)),
-            }
+            panic!("{}", super::provenance_impl::failed_read_message(id.0));
         }
         abort_regen()
     }
@@ -2549,6 +2548,9 @@ impl<C: Cells> Runtime<C> {
         if reader == self.runtime_id || flags.has(cycle::DOOMED) || unbudgeted(reader) {
             return self.read_unframed(handle, observed, kind, word);
         }
+        // A rerun of the reader's node reads this runtime's node again, as
+        // it is then.
+        flags.raise(cycle::UNREGENERABLE);
         let rt = self.runtime_id;
         let reading = u64::from(handle.slot()) | (u64::from(handle.generation()) << 32);
         let kept = flags.has(cycle::KEPT_READ);
@@ -2601,12 +2603,6 @@ impl<C: Cells> Runtime<C> {
             // An engine unwind, a wound, leaves the reader's run too.
             Err(_) if cycle_state::unwind_kind().is_some() => None,
             Err(payload) => {
-                // A rerun of the reader's node reads this runtime's node as
-                // a foreign read, which takes no payload.
-                if let Some(key) = &key {
-                    let run = (key.node, key.generation, key.path, key.seq);
-                    replay::note_foreign_took(reader, run);
-                }
                 let copy = replay::copy_payload(&**payload);
                 if copy.is_none() {
                     self.dep_stack.hold_foreign_reader();
@@ -4060,7 +4056,7 @@ impl<C: Cells> Runtime<C> {
                 e.deps(),
                 &[],
                 Some(&*payload),
-                !self.episode_member(slot),
+                false,
                 bag,
             );
         }
@@ -4533,7 +4529,7 @@ impl<C: Cells> Runtime<C> {
             }
             Delivered::Landed(value) => {
                 // SAFETY: the active frame's control block is live.
-                unsafe { &*f.ctl }.raise(cycle::POISONED);
+                unsafe { &*f.ctl }.raise(cycle::POISONED | cycle::UNREGENERABLE);
                 return Some(Ok(*value
                     .into_inner()
                     .downcast::<T>()
@@ -4557,6 +4553,10 @@ impl<C: Cells> Runtime<C> {
         }
         // A payload no copy can stand for was delivered once, and a retry
         // after it regenerates the payload, or reads the node as it is.
+        if cycle {
+            // SAFETY: the active frame's control block is live.
+            unsafe { &*f.ctl }.raise(cycle::UNREGENERABLE);
+        }
         let payload = self.regenerated(handle, rt, &key, payload)?;
         if !replay::copyable(&*payload) {
             self.hold_uncopied(f.ctl, self.regenerable(reading));

@@ -2283,6 +2283,7 @@ impl<C: Cells> Runtime<C> {
         loop {
             if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
                 if let Some(value) = self.stashed_read(handle) {
+                    self.unregenerable(frame);
                     return Ok(value);
                 }
             }
@@ -2294,6 +2295,7 @@ impl<C: Cells> Runtime<C> {
             {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
                 if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
+                    self.unregenerable(frame);
                     return read;
                 }
             }
@@ -2304,12 +2306,14 @@ impl<C: Cells> Runtime<C> {
                 Computed::Done | Computed::Unsettled => {
                     if MODE & VIRT != 0 {
                         if let Some(value) = self.stashed_read(handle) {
+                            self.unregenerable(frame);
                             return Ok(value);
                         }
                     }
                 }
                 Computed::Gone => self.stale_handle(handle),
                 Computed::Deferred => {
+                    self.unregenerable(frame);
                     return self
                         .cycle_read(
                             handle,
@@ -4085,6 +4089,7 @@ impl<C: Cells> Runtime<C> {
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
+                    self.unfailed_landing(id, node.generation(), cidx);
                     self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
@@ -4186,7 +4191,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 &[],
                 Some(&*payload),
-                true,
+                !ctl.has(cycle::UNREGENERABLE),
                 bag,
             );
         }
@@ -4259,7 +4264,8 @@ impl<C: Cells> Runtime<C> {
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
     /// `own_run` says the node lands from the compute that just popped, not
-    /// as a held member after its run left the stack.
+    /// as a held member after its run left the stack, and that run read
+    /// nothing a rerun reads otherwise (`cycle::UNREGENERABLE`).
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -4330,6 +4336,9 @@ impl<C: Cells> Runtime<C> {
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
+        if landing == NodeState::Failed && landed != NodeState::Failed {
+            self.forget_failed_run(id.0, node.generation());
+        }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {
