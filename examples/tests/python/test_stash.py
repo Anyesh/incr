@@ -278,7 +278,7 @@ def test_a_read_in_finally_during_a_discard_is_given_up_with_the_run(
 
 
 @BOTH
-def test_a_swallowed_exception_is_dropped_when_the_call_returns(module):
+def test_a_speculative_runs_exception_is_raised_by_the_real_read_then_dropped(module):
     rt = doom_ready(module)
     refs = []
 
@@ -292,8 +292,36 @@ def test_a_swallowed_exception_is_dropped_when_the_call_returns(module):
     t = rt.create_query(
         lambda r: r.get(s) if r.get(a) == PLACEHOLDER else 0, replay=True
     )
+    # The doomed run read `s` speculatively; the engine keeps that run's
+    # outcome for `s`'s real read, which raises it without running `s`.
     assert rt.get(t) == 0
-    assert refs and all(ref() is None for ref in refs)
+    with pytest.raises(ZeroDivisionError):
+        rt.get(s)
+    assert len(refs) == 1
+    assert refs[0]() is None
+
+
+@BOTH
+def test_an_exception_the_engine_drops_unraised_is_freed_by_that_call(module):
+    rt = doom_ready(module)
+    refs = []
+    x = rt.create_input(0)
+
+    def raises(r):
+        p = Payload()
+        refs.append(weakref.ref(p))
+        raise ZeroDivisionError(p)
+
+    a = rt.create_query(lambda r: 1, replay=True)
+    s = rt.create_query(raises)
+    t = rt.create_query(
+        lambda r: r.get(s) if r.get(a) == PLACEHOLDER else 0, replay=True
+    )
+    assert rt.get(t) == 0
+    assert len(refs) == 1 and refs[0]() is not None, "the outcome is kept for s"
+    # A set ends the revision, which drops the outcome unraised.
+    rt.set(x, 1)
+    assert refs[0]() is None
 
 
 @BOTH
