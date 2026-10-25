@@ -4325,7 +4325,7 @@ fn until(done: impl Fn() -> bool) {
 }
 
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
-/// cycle, and each order of them leaves {3..13} Failed. Here op 7's
+/// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
 /// Failed; the walk then computes 3 from its plan, 3's read meets 12
 /// Failed, and the walk contains that, so its readers rerun and land
@@ -4402,7 +4402,7 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
             *verdict.lock().unwrap() = v;
             stop
         });
-        let failed = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map(|x| (x, NodeState::Failed));
+        let failed = [0, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].map(|x| (x, NodeState::Failed));
         assert_eq!(orders, [failed, failed].map(Vec::from));
         assert_eq!(*left.lock().unwrap(), failed);
         let verdict = verdict.into_inner().unwrap();

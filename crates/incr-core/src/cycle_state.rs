@@ -809,6 +809,8 @@ struct EntryState {
     /// budget changed later may have frames on the stack that read under
     /// the budget before.
     budget_clock: Cell<u64>,
+    /// The length of `Outer::failed_here`, read by every Shared walk.
+    failed_here: Cell<usize>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -822,6 +824,8 @@ struct Outer {
     /// Each runtime whose budget change this thread has met, with the
     /// `BUDGET_CLOCK` count of the change.
     budgets_met: Vec<(RuntimeId, u64)>,
+    /// The nodes this thread has landed Failed, at their generations.
+    failed_here: Vec<(RuntimeId, u32, u32)>,
 }
 
 #[cfg(not(loom))]
@@ -837,6 +841,7 @@ thread_local! {
             held_any: Cell::new(false),
             stack_base: Cell::new(0),
             budget_clock: Cell::new(0),
+            failed_here: Cell::new(0),
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
@@ -846,6 +851,7 @@ thread_local! {
             dissolved_groups: Vec::new(),
             last_cycle: None,
             budgets_met: Vec::new(),
+            failed_here: Vec::new(),
         })
     };
 }
@@ -862,6 +868,7 @@ loom::thread_local! {
         held_any: Cell::new(false),
         stack_base: Cell::new(0),
         budget_clock: Cell::new(0),
+        failed_here: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
@@ -869,6 +876,7 @@ loom::thread_local! {
         dissolved_groups: Vec::new(),
         last_cycle: None,
         budgets_met: Vec::new(),
+        failed_here: Vec::new(),
     });
 }
 
@@ -1071,6 +1079,30 @@ pub(crate) fn meet_budget_change(rt: RuntimeId, changed: u64) -> bool {
     })
 }
 
+pub(crate) fn note_failed_here(rt: RuntimeId, slot: u32, generation: u32) {
+    OUTER.with(|o| o.borrow_mut().failed_here.push((rt, slot, generation)));
+    ENTRY.with(|e| {
+        e.outer_set.set(true);
+        e.failed_here.set(e.failed_here.get() + 1);
+    });
+}
+
+/// How many Failed landings this thread has made in its outermost entry.
+pub(crate) fn failed_here_count() -> usize {
+    ENTRY.with(|e| e.failed_here.get())
+}
+
+/// Whether one of this thread's Failed landings after its first `from`
+/// in its outermost entry is of `slot` of `rt` at `generation`.
+pub(crate) fn failed_here_since(from: usize, rt: RuntimeId, slot: u32, generation: u32) -> bool {
+    OUTER.with(|o| {
+        let o = o.borrow();
+        o.failed_here
+            .get(from..)
+            .is_some_and(|f| f.contains(&(rt, slot, generation)))
+    })
+}
+
 /// The stack address the outermost engine entry recorded.
 pub(crate) fn stack_base() -> usize {
     ENTRY.with(|e| e.stack_base.get())
@@ -1188,6 +1220,8 @@ pub(crate) fn reset_outermost() {
             o.dissolved_groups.clear();
             o.last_cycle = None;
             o.budgets_met.clear();
+            o.failed_here.clear();
+            ENTRY.with(|e| e.failed_here.set(0));
         });
     }
 }

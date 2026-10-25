@@ -585,6 +585,12 @@ pub(crate) struct Walk {
     /// retry. It stays on top while set: the next pending pop takes it,
     /// and whatever drops the entry first clears it.
     repushed: Option<NodeId>,
+    /// Whether this thread's own reads landed the root Failed while it was
+    /// walked, and how many of its Failed landings in the outermost entry
+    /// that has accounted for. Both carry over a resume, so a doomed
+    /// attempt's retry counts as the unbounded run's walk does.
+    root_failed_here: bool,
+    failed_from: usize,
 }
 
 #[derive(Default, Clone)]
@@ -622,6 +628,8 @@ impl Walk {
             visited: None,
             expanded: None,
             repushed: None,
+            root_failed_here: false,
+            failed_from: 0,
         }
     }
 
@@ -3077,6 +3085,19 @@ impl<C: Cells> Runtime<C> {
         self.clean_walk::<0>(id, gen, word, observed)
     }
 
+    /// Whether this thread's own reads landed the walk's root Failed since
+    /// the walk began, a doomed attempt and its retry included.
+    #[cold]
+    #[inline(never)]
+    fn root_failed_here(&self, walk: &mut Walk, root: NodeId, gen: u32) -> bool {
+        if !walk.root_failed_here {
+            walk.root_failed_here =
+                cycle_state::failed_here_since(walk.failed_from, self.runtime_id, root.0, gen);
+            walk.failed_from = cycle_state::failed_here_count();
+        }
+        walk.root_failed_here
+    }
+
     /// [`Self::ensure_clean`] past its fast path, for a caller that took
     /// `word` from `value_code::checked_word` and loaded `id` as
     /// `observed`, not Clean. A root that went Clean since is left at its
@@ -3116,7 +3137,13 @@ impl<C: Cells> Runtime<C> {
         } else {
             self.planned()
         };
-        let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
+        let mut walk = resume.unwrap_or_else(|| {
+            let mut walk = Walk::new(id, observed);
+            if !C::SINGLE_THREADED {
+                walk.failed_from = cycle_state::failed_here_count();
+            }
+            walk
+        });
         let mut root = Computed::Done;
         let root_node = self.nodes.get(id.0);
         let mut unchecked = None;
@@ -3126,17 +3153,17 @@ impl<C: Cells> Runtime<C> {
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
-                // The root can land Failed while entries it expanded are
-                // still queued (a dep's run reads it, or another thread
-                // lands it); its compute then raises or reruns over what it
-                // reads itself, so as with a root found Failed, they need
-                // no cleaning. A passed entry hands on its taint as a Done
-                // compute would, in case the root is retried. An entry a
-                // discarded compute pushed back was popped before the root
-                // landed Failed, as the unbounded run's compute of it was.
+                // A root another thread landed Failed computes as one found
+                // Failed, so its queued entries need no cleaning; one this
+                // thread's own reads failed leaves them to run, as with no
+                // other thread. A passed entry hands on its taint in case
+                // the root is retried. An entry a discarded compute pushed
+                // back was popped before the landing, as in the unbounded run.
                 if !is_root
+                    && !C::SINGLE_THREADED
                     && (MODE & VIRT == 0 || walk.repushed.take() != Some(cur))
                     && state::load::<C>(root_node.state_cell()) == NodeState::Failed
+                    && !self.root_failed_here(&mut walk, id, gen)
                 {
                     if taint < NO_TAINT {
                         walk.taint(taint);
@@ -4441,6 +4468,9 @@ impl<C: Cells> Runtime<C> {
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
+        if !C::SINGLE_THREADED && landed == NodeState::Failed {
+            cycle_state::note_failed_here(self.runtime_id, id.0, node.generation());
+        }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {
