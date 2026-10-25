@@ -38,6 +38,17 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// [`Self::seen`] for engine bookkeeping that is no read by the
+    /// running frame, which a hit would hold for nothing.
+    #[inline(always)]
+    pub(crate) fn seen_quietly(&self, cell: &C::State, raw: NodeState) -> NodeState {
+        if !C::SINGLE_THREADED && is_computing(raw) {
+            hold::peek(state::cell_key::<C>(cell)).unwrap_or(raw)
+        } else {
+            raw
+        }
+    }
+
     /// A read of a held landing makes the reading frame's landing depend
     /// on it, so that landing is held too.
     #[cold]

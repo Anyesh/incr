@@ -142,6 +142,14 @@ pub(crate) fn active() -> bool {
 /// its held landing's target, unless the owner has claimed it again.
 #[cold]
 #[inline(never)]
+/// [`view`] for engine bookkeeping that is no read: it marks nothing.
+pub(crate) fn peek(cell: usize) -> Option<NodeState> {
+    if !active() {
+        return None;
+    }
+    with(|h| h.get(cell).filter(|e| !e.reclaimed).map(|e| e.target))
+}
+
 pub(crate) fn view(cell: usize) -> Option<NodeState> {
     if !active() {
         return None;

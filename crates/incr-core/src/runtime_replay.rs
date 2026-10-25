@@ -1563,7 +1563,9 @@ impl<C: Cells> Runtime<C> {
                 .filter(|v| {
                     let node = self.nodes.get(v.node);
                     node.generation() != v.generation
-                        || match self.seen(node.state_cell(), state::load::<C>(node.state_cell())) {
+                        || match self
+                            .seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()))
+                        {
                             NodeState::Clean
                             | NodeState::Cyclic
                             | NodeState::Failed
@@ -3785,7 +3787,7 @@ impl<C: Cells> Runtime<C> {
     /// of a node this thread reserves, which comes back unrun.
     fn vframe_unfinished(&self, v: &VFrame) -> bool {
         let node = self.nodes.get(v.node);
-        let state = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
+        let state = self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
         // After the load: a recycle bumps it before its node's state.
         if node.generation() != v.generation {
             return false;
@@ -3825,7 +3827,7 @@ impl<C: Cells> Runtime<C> {
         let node_data = self.nodes.get(node);
         let mut spins = 0;
         loop {
-            let observed = self.seen(
+            let observed = self.seen_quietly(
                 node_data.state_cell(),
                 state::load::<C>(node_data.state_cell()),
             );
@@ -4889,7 +4891,7 @@ impl<C: Cells> Runtime<C> {
         }
         self.park(ParkPoint::HoldLanding(NodeId(node)));
         let cell = self.nodes.get(node).state_cell();
-        let mut state = self.seen(cell, state::load::<C>(cell));
+        let mut state = self.seen_quietly(cell, state::load::<C>(cell));
         if is_computing(state) {
             debug_assert!(
                 !cycle_state::holds(self.runtime_id, node),

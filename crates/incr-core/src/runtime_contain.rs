@@ -437,7 +437,10 @@ impl<C: Cells> Runtime<C> {
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
-                && self.in_failed_landing(slot)
+                && self.in_failed_landing(
+                    slot,
+                    self.seen(node.state_cell(), state::load::<C>(node.state_cell())),
+                )
                 && t.of((slot, generation))
                     .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
         });
@@ -500,12 +503,12 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Whether `slot`'s node is in its Failed landing: Failed, or Computing
-    /// under a regenerating run, which lands nothing and puts it back. Exact
-    /// under the tickets lock, under which a rerun moves it and marks it.
-    fn in_failed_landing(&self, slot: u32) -> bool {
-        let cell = self.nodes.get(slot).state_cell();
-        match self.seen(cell, state::load::<C>(cell)) {
+    /// Whether `slot`'s node, in `state` as this thread sees it, is in its
+    /// Failed landing: Failed, or Computing under a regenerating run, which
+    /// lands nothing and puts it back. Exact under the tickets lock, under
+    /// which a rerun moves it and marks it.
+    fn in_failed_landing(&self, slot: u32, state: NodeState) -> bool {
+        match state {
             NodeState::Failed => true,
             NodeState::Computing | NodeState::ComputingDirty => {
                 crate::replay::is_regen_running(self.runtime_id, slot)
@@ -525,7 +528,10 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(m.node.0);
             assert!(
                 node.generation() == m.node.1
-                    && self.in_failed_landing(m.node.0)
+                    && self.in_failed_landing(
+                        m.node.0,
+                        self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
+                    )
                     && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
