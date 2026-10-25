@@ -1776,12 +1776,25 @@ impl<C: Cells> Runtime<C> {
         });
     }
 
+    /// Counts a release of held claims, before they land, for the walks
+    /// other threads planned while they were held: a claim that reads one
+    /// of the landings also reads the count.
+    pub(super) fn count_release(&self) {
+        if !C::SINGLE_THREADED {
+            cycle_state::own_episode(self.runtime_id, RELEASED);
+            C::u64_fetch_add(&self.episodes_landed, RELEASED);
+        }
+    }
+
     /// Releases `slots` from the held map with the discard landing,
     /// except `keep`. They leave their group, as the unbounded run's
     /// episode cuts them at the same point.
     fn release_members(&self, slots: &[u32], keep: Option<u32>, bag: &mut Deferred<C>) {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
+        if slots.iter().any(|&m| Some(m) != keep) {
+            self.count_release();
+        }
         for &m in slots {
             if Some(m) == keep {
                 continue;
@@ -1890,6 +1903,7 @@ impl<C: Cells> Runtime<C> {
         if entries.is_empty() {
             return;
         }
+        self.count_release();
         entries.sort_unstable_by_key(|(slot, _)| *slot);
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
         let stamp_rev = self.current_revision();
@@ -2157,8 +2171,8 @@ impl<C: Cells> Runtime<C> {
         if !C::SINGLE_THREADED {
             // Before the members land, so that a read of one of their
             // landings also reads the count.
-            cycle_state::own_episode(self.runtime_id);
-            C::u64_fetch_add(&self.episodes_landed, 1);
+            cycle_state::own_episode(self.runtime_id, LANDED);
+            C::u64_fetch_add(&self.episodes_landed, LANDED);
         }
         let rt = self.runtime_id;
         let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
@@ -2199,6 +2213,7 @@ impl<C: Cells> Runtime<C> {
         });
         if stale {
             drop(inner);
+            self.count_release();
             for (m, e) in entries {
                 let (node, flags) = self.nodes.get_with_flags(m);
                 if e.first {
@@ -2368,6 +2383,8 @@ impl<C: Cells> Runtime<C> {
         payload: Payload,
         bag: &mut Deferred<C>,
     ) -> ! {
+        // The landing counted itself, but its members now land unrun.
+        self.count_release();
         let kind = cycle_state::take_unwind_kind();
         // Step 3 sets no memo before its last compare, and a claimed
         // member holds none from an earlier landing.

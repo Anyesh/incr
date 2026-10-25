@@ -147,9 +147,9 @@ fn a_look_here_follows_the_thread_speculation() {
 fn a_thread_counts_episodes_on_a_bounded_set_of_runtimes() {
     let rts: Vec<RuntimeId> = (0..20).map(|_| RuntimeId::allocate()).collect();
     for &rt in &rts {
-        own_episode(rt);
+        own_episode(rt, 1);
     }
-    own_episode(rts[19]);
+    own_episode(rts[19], 1);
     assert_eq!(own_episodes(rts[19]), 2);
     assert_eq!(own_episodes(rts[0]), 0);
     assert!(OWN_EPISODES.with(|o| o.borrow().len()) < rts.len());

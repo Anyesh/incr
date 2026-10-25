@@ -505,6 +505,13 @@ struct Planned {
     own: u64,
 }
 
+/// What a landed episode adds to `episodes_landed`.
+pub(crate) const LANDED: u64 = 1;
+/// What a release of held claims adds to `episodes_landed`: it lands them
+/// unrun, and a plan may have expanded through their old states anywhere,
+/// so a walk tells it from a landing.
+pub(crate) const RELEASED: u64 = 1 << 32;
+
 /// Test toggle: with `INCR_FORCE_REVISIT` set, every untainted walk
 /// entry under `Shared` counts once as planned New, so a claim of it from
 /// Dirty visits it again.
@@ -548,8 +555,10 @@ enum Computed {
     /// The node's run was doomed and discarded: it is a virtual frame,
     /// and a replay driver runs it again.
     Discarded,
-    /// Another thread landed an episode since the walk planned: the node
-    /// was left unrun and unclaimed, and the walk prunes its plan.
+    /// Another thread landed or released an episode since the walk
+    /// planned: the node was left unrun and unclaimed, and the walk prunes
+    /// its plan, or plans again if no entry has settled. From a walk, the
+    /// release case: its caller reads the root again from its state now.
     Replan,
     /// Another thread landed the node since the walk planned it: a claim
     /// wait ended with it Dirty or New, not released unrun, or the walk
@@ -1091,6 +1100,9 @@ pub struct Runtime<C: Cells> {
     /// Walk entry claims released unrun after the episode check.
     #[cfg(test)]
     pub(crate) unrun_unclaims: std::sync::atomic::AtomicU32,
+    /// Walks planned again from their root after another thread's release.
+    #[cfg(test)]
+    pub(crate) root_replans: std::sync::atomic::AtomicU32,
     /// Waits on another thread's doom reservation, for tests.
     #[cfg(test)]
     pub(crate) reservation_waits: std::sync::atomic::AtomicU32,
@@ -1205,6 +1217,8 @@ impl<C: Cells> Runtime<C> {
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             unrun_unclaims: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            root_replans: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             reservation_waits: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
@@ -2452,10 +2466,12 @@ impl<C: Cells> Runtime<C> {
                 Computed::Doomed | Computed::Discarded => {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
-                Computed::Skipped(_) | Computed::Replan | Computed::Revisit => {
-                    unreachable!(
-                        "incr-core: a walk's root is never skipped, replanned or revisited"
-                    )
+                Computed::Replan => {
+                    observed = state::load::<C>(node.state_cell());
+                    continue;
+                }
+                Computed::Skipped(_) | Computed::Revisit => {
+                    unreachable!("incr-core: a walk's root is never skipped or revisited")
                 }
             }
             self.park(ParkPoint::AfterWalk(NodeId(slot)));
@@ -3196,12 +3212,17 @@ impl<C: Cells> Runtime<C> {
         // takes locks in this release.
         let word = value_code::checked_word();
 
-        // Fast path: already clean.
-        let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
-        if observed == NodeState::Clean {
-            return Computed::Done;
+        loop {
+            // Fast path: already clean.
+            let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
+            if observed == NodeState::Clean {
+                return Computed::Done;
+            }
+            match self.clean_walk::<0>(id, gen, word, observed) {
+                Computed::Replan => {}
+                computed => return computed,
+            }
         }
-        self.clean_walk::<0>(id, gen, word, observed)
     }
 
     /// Whether this thread's own reads landed the walk's root Failed since
@@ -3251,7 +3272,8 @@ impl<C: Cells> Runtime<C> {
         // A resumed walk was planned before its doom, at a count no longer
         // known, so it checks against none: it re-plans if any other
         // thread has landed an episode.
-        let mut planned = if resume.is_some() {
+        let mut resumed = resume.is_some();
+        let mut planned = if resumed {
             Planned { all: 0, own: 0 }
         } else {
             self.planned()
@@ -3263,6 +3285,7 @@ impl<C: Cells> Runtime<C> {
             }
             walk
         });
+        let mut ran_unsettled = false;
         let mut root = Computed::Done;
         let root_node = self.nodes.get(id.0);
         let mut unchecked = None;
@@ -3323,6 +3346,7 @@ impl<C: Cells> Runtime<C> {
                         .then_some(planned),
                     seen,
                 );
+                ran_unsettled |= computed == Computed::Unsettled;
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
@@ -3330,14 +3354,43 @@ impl<C: Cells> Runtime<C> {
                     continue;
                 }
                 if !C::SINGLE_THREADED && computed == Computed::Replan {
+                    // A resumed walk's placeholder count tells it nothing
+                    // about releases since its plan, which goes on. A walk
+                    // that left a closure Unsettled would rerun it from the
+                    // root, and two threads whose caught cycles release each
+                    // other's claims would then restart each other without end.
+                    // A root its deps-first computes deferred into this
+                    // thread's held map is not walked again, since its walk
+                    // would wait on this thread's own claim: the plan goes on
+                    // to the root's compute, which reads it as deferred.
+                    let released = !resumed
+                        && !ran_unsettled
+                        && self.released_since(planned)
+                        && !cycle_state::holds(self.runtime_id, id.0);
+                    resumed = false;
                     planned = self.planned();
                     if !self.prune_settled(&mut walk) {
-                        walk.push(Entry {
-                            id: cur,
-                            taint,
-                            generation,
-                        });
-                        unchecked = Some(cur);
+                        if released {
+                            // The plan may have expanded through the released
+                            // claims' old states anywhere, nodes it ran
+                            // included, so the read starts again from its
+                            // root's state now, through the checks its entry
+                            // made: the root may be Computing by now.
+                            if self.nodes.get(id.0).generation() != gen {
+                                return Computed::Gone;
+                            }
+                            #[cfg(test)]
+                            self.root_replans
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return Computed::Replan;
+                        } else {
+                            walk.push(Entry {
+                                id: cur,
+                                taint,
+                                generation,
+                            });
+                            unchecked = Some(cur);
+                        }
                     }
                     continue;
                 }
@@ -3538,8 +3591,8 @@ impl<C: Cells> Runtime<C> {
         Planned { all, own }
     }
 
-    /// Whether another thread has landed an episode on this runtime since
-    /// `planned`.
+    /// Whether another thread has landed an episode or released held
+    /// claims on this runtime since `planned`.
     #[inline(always)]
     fn replan(&self, planned: Planned) -> bool {
         #[cfg(test)]
@@ -3555,6 +3608,16 @@ impl<C: Cells> Runtime<C> {
     fn others_landed(&self, planned: Planned, all: u64) -> bool {
         let own = cycle_state::own_episodes(self.runtime_id);
         all.wrapping_sub(planned.all) != own.wrapping_sub(planned.own)
+    }
+
+    /// Whether another thread has released held claims on this runtime
+    /// since `planned`.
+    #[cold]
+    #[inline(never)]
+    fn released_since(&self, planned: Planned) -> bool {
+        let all = C::u64_load_acquire(&self.episodes_landed);
+        let own = cycle_state::own_episodes(self.runtime_id);
+        all.wrapping_sub(planned.all) / RELEASED != own.wrapping_sub(planned.own) / RELEASED
     }
 
     /// After a claim CAS of `id` at `generation` succeeded: whether another

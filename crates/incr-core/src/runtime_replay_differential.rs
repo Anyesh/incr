@@ -4531,6 +4531,105 @@ fn two_thread_oracle_takes_a_failed_set_of_an_overlap() {
     });
 }
 
+/// 0x88c0's ops 3 (`Get(7)`) and 2 (`Get(4)`) overlap on the cycle
+/// 6 -> 5 -> 6, which no strategy breaks. Here op 2's walk plans while
+/// op 3 holds 6, and waits on one of op 3's claims (7 under the
+/// released-deps walk, 6 before it); op 3's episode then aborts, leaving
+/// its members New or Dirty, and a walk that computed the rest of its old
+/// plan would read 4's fallback where every order panics with the cycle.
+/// In a child, since a stalled schedule unwinds op 3 from its park point
+/// with its claims still held, which hangs op 2.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_walk_replans_after_an_aborted_episode() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_walk_replans_after_an_aborted_episode",
+        walk_replans_after_an_aborted_episode,
+    )
+    .assert_clean();
+}
+
+fn walk_replans_after_an_aborted_episode() {
+    struct Hold {
+        on: AtomicBool,
+        held6: AtomicBool,
+        reached: AtomicBool,
+    }
+    let case = gen_case(0x88c0, false, true);
+    let phases = phases(&case, 0x88c0);
+    let at = |i| phases.iter().position(|p| p.ops().contains(&i)).unwrap();
+    let (before, overlap) = (at(1), at(2));
+    assert_eq!(phases[overlap].of(0), Some(3));
+    assert_eq!(phases[overlap].of(1), Some(2));
+    quiet(|| {
+        let hold = Arc::new(Hold {
+            on: AtomicBool::new(false),
+            held6: AtomicBool::new(false),
+            reached: AtomicBool::new(false),
+        });
+        // Thread 0 runs op 3 and holds while it holds 6, until op 2's walk
+        // has planned and waits on a claim of op 3's; thread 1 runs op 2
+        // once 6 is held.
+        let rig = |live: &Live<Shared>| {
+            let (hold, world) = (hold.clone(), live.world.clone());
+            let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                if !hold.on.load(SeqCst) {
+                    return;
+                }
+                match (TWO_THREAD.with(std::cell::Cell::get), p) {
+                    (Some(0), _)
+                        if !hold.reached.load(SeqCst)
+                            && world.handle(0, 6).state(world.rt(0)) == NodeState::Computing =>
+                    {
+                        hold.held6.store(true, SeqCst);
+                        until(|| hold.reached.load(SeqCst));
+                    }
+                    (Some(1), ParkPoint::BeforeComputeOne(n))
+                        if hold.held6.load(SeqCst)
+                            && world.rt(0).nodes.get(n.0).state() == NodeState::Computing =>
+                    {
+                        hold.reached.store(true, SeqCst)
+                    }
+                    (Some(1), _) => until(|| hold.held6.load(SeqCst)),
+                    _ => {}
+                }
+            });
+            assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+        };
+        let serial = Serial::new(&case, &phases);
+        let (verdict, replans) = (Mutex::new(None), AtomicU32::new(0));
+        let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+            if p == overlap {
+                hold.on.store(false, SeqCst);
+                let n = live.world.rt(0).root_replans.load(SeqCst);
+                replans.store(n, SeqCst);
+            }
+            let rt = live.world.rt(0);
+            for slot in 0..rt.nodes.len() {
+                let state = rt.nodes.get(slot).state();
+                assert!(
+                    !matches!(state, NodeState::Computing | NodeState::ComputingDirty),
+                    "node {slot} is {state:?} after phase {p}, with both threads at the barrier"
+                );
+            }
+            let v = serial.at_overlap("0x88c0", prefix, live);
+            if p == before {
+                hold.on.store(true, SeqCst);
+            }
+            let stop = v.is_some();
+            *verdict.lock().unwrap() = v;
+            stop
+        });
+        assert!(
+            hold.reached.load(SeqCst),
+            "op 2's walk never reached a claim of op 3's"
+        );
+        assert!(replans.load(SeqCst) > 0, "op 2's walk never planned again");
+        let verdict = verdict.into_inner().unwrap();
+        serial.check("0x88c0", &got, verdict);
+    });
+}
+
 /// 0x1006's ops 6 (`Get(12)`) and 7 (`Get(7)`) overlap on the cold cycle
 /// 8 -> 9 -> 10 -> 11 -> 12 -> 8, whose strategy members are 11 and 12.
 /// Op 7 enters it at 8, which has none, so 7's `try_get(4)` gets the
