@@ -1866,7 +1866,7 @@ impl<C: Cells> Runtime<C> {
                 },
             );
         });
-        if !C::SINGLE_THREADED {
+        if !C::SINGLE_THREADED && !std::thread::panicking() {
             self.doom_unwind();
         }
         ctl.raise(cycle::PH_SEEN);
@@ -1885,7 +1885,9 @@ impl<C: Cells> Runtime<C> {
             ctl.has(cycle::DOOMED),
             "incr-core: a placeholder read dooms its frame"
         );
-        if !C::SINGLE_THREADED && ctl.has(cycle::DOOMED) {
+        // A read from a destructor in an unwind can't raise again, so it
+        // takes the placeholder, as under `Local`.
+        if !C::SINGLE_THREADED && ctl.has(cycle::DOOMED) && !std::thread::panicking() {
             self.doom_unwind();
         }
         ctl.raise(cycle::PH_SEEN);
