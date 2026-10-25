@@ -1039,10 +1039,14 @@ fn walk_entry_cycle_through_itself_reaches_the_reader<C: Cells>() {
         (first, second, rt.state_of(e), rt.state_of(g))
     };
     let unbounded = observe(None);
-    assert!(matches!(unbounded.0, Outcome::Cycle(_)), "{unbounded:?}");
-    assert!(
-        matches!(&unbounded.1, Outcome::Cycle(c) if c.len() == 4),
-        "{unbounded:?}"
+    assert_eq!(
+        unbounded,
+        (
+            Outcome::Cycle(vec![0, 3]),
+            Outcome::Cycle(vec![0, 1, 2, 3]),
+            NodeState::Dirty,
+            NodeState::New
+        )
     );
     assert_eq!(observe(Some(1)), unbounded);
 }
