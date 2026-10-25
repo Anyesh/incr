@@ -589,3 +589,115 @@ fn shared_reservation_of_a_dirty_landing_ends_with_the_read() {
     assert!(!want.1, "the unbounded run's join stalled");
     assert_eq!(run(2), want);
 }
+
+/// **A reservation does not outlive the entry that reran its node**: R
+/// reads V, V joins another thread's read of X, parks, and then reads X.
+/// X reads input I and then Y1 while I is 1, else Y2, a node no run has
+/// computed. A set of I while V is parked leaves X Dirty, so V's read
+/// runs X, X runs Y2 below it, and at budget 2 R dooms on Y2 and
+/// reserves V and X. X's entry parks after reading Y, a second set of I
+/// flags it, and it lands Dirty. V's entry runs V again from its start,
+/// so it joins a read of X again: X's run is over, as in the unbounded
+/// run, so that read must rerun X rather than wait on the reservation.
+#[test]
+fn shared_reservation_ends_with_the_entry_that_reran_its_node() {
+    fn run(frames: u32) -> (Outcome, u32, bool, bool) {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+        let i = rt.create_input(1_u64);
+        let y1 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let y2 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let (gx, gv) = (Gate::new(), Gate::new());
+        let x = {
+            let gx = gx.clone();
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = if rt.get(i) == 1 {
+                        rt.get(y1)
+                    } else {
+                        rt.get(y2)
+                    };
+                    if v != 0 {
+                        gx.park();
+                    }
+                    v + 1
+                },
+                replayable(),
+            )
+        };
+        let joins = Arc::new(AtomicU32::new(0));
+        let stalled = Arc::new(AtomicBool::new(false));
+        let v = {
+            let (gv, joins, stalled) = (gv.clone(), joins.clone(), stalled.clone());
+            let shared = Arc::downgrade(&rt);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    joins.fetch_add(1, SeqCst);
+                    let waits = rt.reservation_waits.load(SeqCst);
+                    let (tx, rx) = mpsc::channel();
+                    let rt2 = shared.upgrade().unwrap();
+                    thread::spawn(move || {
+                        let _ = tx.send(outcome(|| rt2.get(x)));
+                    });
+                    let deadline = Instant::now() + JOIN_TIMEOUT;
+                    let joined = loop {
+                        if let Ok(read) = rx.try_recv() {
+                            break read.unwrap_or(1000);
+                        }
+                        if rt.reservation_waits.load(SeqCst) != waits {
+                            stalled.store(true, SeqCst);
+                            break 2000;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the joined read neither returned nor waited"
+                        );
+                        thread::yield_now();
+                    };
+                    gv.park();
+                    joined + rt.get(x)
+                },
+                replayable(),
+            )
+        };
+        gv.arm();
+        let r = {
+            let rt = rt.clone();
+            spawn("r", move || {
+                let got = rt.get(v);
+                assert!(crate::reserve::none_held(), "R's read left a reservation");
+                got
+            })
+        };
+        gv.wait_parked();
+        rt.set(i, 2);
+        gx.arm();
+        gv.release();
+        gx.wait_parked();
+        rt.set(i, 3);
+        gx.release();
+        let read = r.join();
+        rt.assert_invariant_i();
+        let doomed = !rt.dooms.lock().unwrap().is_empty();
+        (read, joins.load(SeqCst), stalled.load(SeqCst), doomed)
+    }
+    let (_, joins, stalled, doomed) = run(u32::MAX);
+    assert_eq!(
+        (joins, stalled, doomed),
+        (1, false, false),
+        "the unbounded run"
+    );
+    let (read, joins, stalled, doomed) = run(2);
+    assert!(doomed, "no doom ran");
+    // A run that joins after the retry's may meet the doom again.
+    assert!(joins >= 2, "V's retry did not join");
+    assert!(
+        matches!(read, Ok(v) if v < 1000),
+        "R's read or a joined read failed: {read:?}"
+    );
+    assert!(
+        !stalled,
+        "the joined read waited on R's reservation: {read:?}"
+    );
+}
