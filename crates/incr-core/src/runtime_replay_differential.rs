@@ -6410,12 +6410,14 @@ fn replay_scan() {
     scan(from..n, std::env::var_os("REPLAY_ALL").is_some(), check);
 }
 
+/// An operation, a closure run's node, and a node it read.
+type RunRead = (usize, (usize, usize), (usize, usize));
+
 /// What [`disagreements`] found in one run of a case.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Disagreements {
-    /// A closure run that read one node twice with different outcomes, by
-    /// operation, reader and target.
-    in_run: Vec<(usize, (usize, usize), (usize, usize))>,
+    /// A closure run that read one node twice with different outcomes.
+    in_run: Vec<RunRead>,
     /// A node with more than one outcome in one revision, by the operation
     /// that saw the second and the node.
     in_revision: Vec<(usize, (usize, usize))>,
@@ -6424,17 +6426,67 @@ struct Disagreements {
     skipped: usize,
 }
 
-/// The reads and results of `ops` that disagree, a revision running from
+/// Every `(a, b)` where node `a`'s expression reaches node `b` through
+/// reads, on either side.
+fn reach(specs: &[Vec<Spec>; 2]) -> HashSet<((usize, usize), (usize, usize))> {
+    fn reads(e: &Expr, side: usize, out: &mut Vec<(usize, usize)>) {
+        match e {
+            Expr::Const(_) => {}
+            Expr::Read(d, _) => out.push((side, *d)),
+            Expr::ReadOther(d, _) => out.push((1 - side, *d)),
+            Expr::Add(a, b) | Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
+                reads(a, side, out);
+                reads(b, side, out);
+            }
+            Expr::If(a, b, c) => {
+                reads(a, side, out);
+                reads(b, side, out);
+                reads(c, side, out);
+            }
+            Expr::PanicIf(a, _) | Expr::Catch(a) => reads(a, side, out),
+        }
+    }
+    let deps = |(side, i): (usize, usize)| {
+        let mut out = Vec::new();
+        if let Some(Spec::Query { expr, .. }) = specs[side].get(i) {
+            reads(expr, side, &mut out);
+        }
+        out
+    };
+    let mut pairs = HashSet::new();
+    for (side, nodes) in specs.iter().enumerate() {
+        for i in 0..nodes.len() {
+            let mut todo = deps((side, i));
+            while let Some(n) = todo.pop() {
+                if pairs.insert(((side, i), n)) {
+                    todo.extend(deps(n));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// The reads and results of `case` that disagree, a revision running from
 /// one write to the next. Only a node's last run in a revision counts, an
-/// earlier one having been discarded. A read whose target is an open run is
-/// left out of the revision count, since R2 and R3 answer it from the
-/// stack, and a cycle counts as an unwind, since a `try_get` and a `get` of
-/// one node differ only in that.
-fn disagreements(ops: &[Op], outs: &[Out], evals: &[Vec<Eval>]) -> Disagreements {
+/// earlier one having been discarded, and a cycle counts as an unwind, since
+/// a `try_get` and a `get` of one node differ only in that. The revision
+/// count leaves out a read whose target is an open run or on a static cycle
+/// with the reader, and a cycle member's own result, since R2 to R5 answer
+/// those from the iteration and a strategy picks what lands; readers outside
+/// the cycle and the operations see what landed.
+fn disagreements(case: &Case, outs: &[Out], evals: &[Vec<Eval>]) -> Disagreements {
     use std::collections::hash_map::Entry;
+    let ops = &case.ops;
+    let mut specs = [case.specs.clone(), case.specs2.clone()];
     let mut found = Disagreements::default();
     let mut start = 0;
     while start < ops.len() {
+        if let (Op::Recreate(i, spec), Some(Out::Recreated(_))) = (&ops[start], outs.get(start)) {
+            specs[0][*i] = spec.clone();
+        }
+        let reach = reach(&specs);
+        let mates = |a, b| reach.contains(&(a, b)) && reach.contains(&(b, a));
         let end = (start + 1..ops.len())
             .find(|&k| !ops[k].is_read())
             .unwrap_or(ops.len());
@@ -6491,11 +6543,13 @@ fn disagreements(ops: &[Op], outs: &[Out], evals: &[Vec<Eval>]) -> Disagreements
                             o.insert(v);
                         }
                     }
-                    if !e.closing.contains(&r) {
+                    if !e.closing.contains(&r) && !mates(e.node, target) {
                         see(k, target, v);
                     }
                 }
-                see(k, e.node, e.value);
+                if !mates(e.node, e.node) {
+                    see(k, e.node, e.value);
+                }
             }
             let target = match ops[k] {
                 Op::Get(i) | Op::TryGet(i) => Some((0, i)),
@@ -6531,8 +6585,27 @@ fn disagreements_count_one_run_and_one_revision() {
         closing,
     };
     let read = |target, out| (0, target, true, out);
-    let ops = [Op::Get(13), Op::Get(15), Op::Set(0, 1), Op::Get(2)];
+    let ops = vec![Op::Get(13), Op::Get(15), Op::Set(0, 1), Op::Get(2)];
     let outs = [Out::Value(7777), Out::Value(5), Out::Done, Out::Value(9)];
+    let mut specs = vec![Spec::Input(0); 16];
+    let reads = |target| Spec::Query {
+        expr: Expr::Read(target, true),
+        replay: true,
+        bare: false,
+        strategy: Strat::None,
+    };
+    specs[13] = reads(15);
+    specs[2] = reads(3);
+    specs[3] = reads(2);
+    let case = Case {
+        specs,
+        panics: false,
+        cycles: true,
+        queries: 16,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops,
+    };
     let evals = [
         vec![
             run(15, vec![], Some(4), 1, vec![]),
@@ -6561,7 +6634,7 @@ fn disagreements_count_one_run_and_one_revision() {
             run(
                 3,
                 vec![read(2, ReadOut::Cycle(vec![2, 3]))],
-                Some(2),
+                Some(7),
                 5,
                 vec![0],
             ),
@@ -6569,7 +6642,7 @@ fn disagreements_count_one_run_and_one_revision() {
         ],
     ];
     assert_eq!(
-        disagreements(&ops, &outs, &evals),
+        disagreements(&case, &outs, &evals),
         Disagreements {
             in_run: vec![(0, (0, 13), (0, 15))],
             in_revision: vec![(0, (0, 15))],
@@ -6621,7 +6694,7 @@ fn replay_run_counts() {
             .collect();
         runs.sort_unstable();
         let (outs, evals) = (outs.into_inner(), evals.into_inner());
-        let found = disagreements(&case.ops, &outs, &evals);
+        let found = disagreements(case, &outs, &evals);
         (ok, outs, runs, found)
     }
     // libtest's `test ... ` line has no newline yet, so the first line
