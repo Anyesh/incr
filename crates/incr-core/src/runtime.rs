@@ -2712,6 +2712,12 @@ impl<C: Cells> Runtime<C> {
         &self,
         handle: Incr<T>,
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
+        // A set from a closure that caught a discard, a doom's included,
+        // raises it again as a read does: its run is discarded, and the
+        // unbounded run never makes the write.
+        if cycle_state::unwind_kind() == Some(UnwindKind::Discard) && !std::thread::panicking() {
+            std::panic::resume_unwind(Box::new(cycle::DiscardUnwind));
+        }
         let slot = handle.slot();
         let id = NodeId(slot);
         let (node, flags) = self.nodes.get_with_flags(slot);
