@@ -1562,6 +1562,87 @@ fn landed_foreign_reader_runs_twice() {
     assert_eq!(doomed_reader_runs::<Shared, Shared>(64, first), 2);
 }
 
+/// A value whose `Clone` reads another runtime's input, as the value-code
+/// contract allows of a Clean node.
+struct ReadsOther<B: Cells> {
+    rt: OtherRt<B>,
+    x: Incr<u64>,
+    seen: u64,
+}
+
+impl<B: Cells> Clone for ReadsOther<B> {
+    fn clone(&self) -> Self {
+        Self {
+            rt: OtherRt(self.rt.0),
+            x: self.x,
+            seen: self.rt.get(self.x),
+        }
+    }
+}
+
+impl<B: Cells> PartialEq for ReadsOther<B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.seen == other.seen
+    }
+}
+
+/// A replayable reader within a budget of 8 frames whose read of another
+/// runtime's input is in value code, where nothing is kept for a retry,
+/// over a chain of 20 replayable queries whose deepest sets that input.
+/// The chain runs past the budget and is doomed, but the reader is held,
+/// so it runs once and agrees with the unbounded run.
+fn value_code_foreign_read_holds_its_frame<A: Cells, B: Cells>() {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    r1.set_max_frames(8);
+    let x = r2.create_input(1000_u64);
+    let v = r1.create_input(ReadsOther {
+        rt: OtherRt(&*r2),
+        x,
+        seen: 0,
+    });
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let r2_ = OtherRt(&*r2);
+    let mut below = r1.create_query_with(
+        move |_| {
+            r2_.set(x, 2000);
+            1
+        },
+        replayable(),
+    );
+    for _ in 0..19 {
+        below = r1.create_query_with(move |rt| rt.get(below) + 1, replayable());
+    }
+    let runs = Arc::new(AtomicU32::new(0));
+    let reader = {
+        let runs = runs.clone();
+        r1.create_query_with(
+            move |rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                rt.get(v).seen + rt.get(below)
+            },
+            replayable(),
+        )
+    };
+    assert_eq!(r1.get(reader), 1020);
+    assert!(!r1.dooms.lock().unwrap().is_empty());
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn local_shared_value_code_foreign_read_holds_its_frame() {
+    value_code_foreign_read_holds_its_frame::<Local, Shared>();
+}
+
+#[test]
+fn shared_shared_value_code_foreign_read_holds_its_frame() {
+    value_code_foreign_read_holds_its_frame::<Shared, Shared>();
+}
+
 /// Seed 0x3f39 shrunk: rt1's ring 7 -> 8 -> 9 -> 11 -> 7 of replayable
 /// queries with no strategy, 11 reading 7 by `try_get`, and rt2's X =
 /// rt1 8 + Y. Read once, rt1 8 is 7777, but read again after the first
