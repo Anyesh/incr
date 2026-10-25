@@ -932,8 +932,9 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
 
 /// A group verify's episode panics in member b: b lands Failed, released
 /// with the Fixpoint co-member a it reads. A later set that reaches only a
-/// must still let b recompute, so with j back at
-/// 1 the cycle converges to a = 2, b = 3 as it first did.
+/// must still let b recompute: b is no longer Failed, and its read reports
+/// the cycle it closes through a, as a fresh read of b alone does (the
+/// first read's 3 comes from reading a first).
 fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
     let rt = Runtime::<C>::new();
     let j = rt.create_input(1_i64);
@@ -971,8 +972,10 @@ fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
-    assert_eq!(rt.get(a), 2);
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2"));
+    // Entry order (B7-fixpoint-head-after-member-cycle): a's walk recomputes
+    // b first and enters the cycle at b again; a fresh read of a gives 2.
+    assert!(is_cycle(&*quiet(|| rt.get(a)).unwrap_err(), "1, 2"));
     rt.assert_invariant_i();
 }
 
@@ -1016,7 +1019,7 @@ fn failed_member_two_hops_from_the_set<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2, 3"));
     assert_eq!(rt.get(c), 2);
     rt.assert_invariant_i();
 }
@@ -1061,12 +1064,13 @@ fn failed_member_cured_through_a_recorded_dep<C: Cells>() {
 
     rt.set(k, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "2, 3"));
     rt.assert_invariant_i();
 }
 
-/// The cycle forms inside root x's own frame, which panics: x lands
-/// Failed through its compute's panic path, over the member y it read.
+/// Once j is 0, y reads x and closes a cycle inside root x's own frame:
+/// the read reports it and leaves x and y Dirty, as main does, and setting
+/// j back lets x recompute.
 fn failed_frame_node_over_its_released_member<C: Cells>() {
     let rt = Runtime::<C>::new();
     let j = rt.create_input(1_i64);
@@ -1091,13 +1095,21 @@ fn failed_frame_node_over_its_released_member<C: Cells>() {
 
     rt.set(j, 0);
     let err = quiet(|| rt.get(x)).unwrap_err();
-    assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
-    assert_eq!(rt.state_of(x), NodeState::Failed);
+    assert!(is_cycle(&*err, "1, 2"));
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    assert_eq!(rt.state_of(y), NodeState::Dirty);
 
     rt.set(j, 1);
-    assert_ne!(rt.state_of(x), NodeState::Failed);
     assert_eq!(quiet(|| rt.get(x)).ok(), Some(2));
+    assert_eq!(rt.state_of(x), NodeState::Clean);
+    assert_eq!(rt.state_of(y), NodeState::Clean);
     rt.assert_invariant_i();
+}
+
+/// Whether `err` is the depth-0 cycle panic naming exactly `participants`.
+fn is_cycle(err: &(dyn std::any::Any + Send), participants: &str) -> bool {
+    err.downcast_ref::<String>()
+        .is_some_and(|m| m.ends_with(&format!("dependency cycle: {participants}")))
 }
 
 /// An `i64` whose compare panics only between 3 and 6.
@@ -1151,7 +1163,7 @@ fn failed_compare_over_a_co_member<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok().map(|v| v.0), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2, 3"));
     rt.assert_invariant_i();
 }
 
