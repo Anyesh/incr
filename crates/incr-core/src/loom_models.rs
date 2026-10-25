@@ -1561,6 +1561,58 @@ fn give_back_wait_ends_on_a_landing() {
     give_back_wait(true);
 }
 
+/// [`give_back_wait`] where the other thread takes over: this thread's
+/// reservation of X is held by an attempt whose discard is in flight, and
+/// the other thread wounds that attempt, claims X and keeps the claim until
+/// this thread's wait has returned. The wait must end once the wound takes
+/// the reservation away, not wait out a claim that outlives it.
+#[test]
+fn give_back_wait_ends_when_a_take_over_keeps_the_claim() {
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        assert_eq!(rt.get(x), 2);
+        rt.set(i, 2);
+        let (slot, generation) = (x.slot(), x.generation());
+        crate::attempt::begin();
+        {
+            let _scope = crate::reserve::Scope::new(Some(1));
+            crate::reserve::note((rt.runtime_id, slot), generation);
+        }
+        crate::attempt::enter_flight();
+        let attempt = crate::attempt::mine();
+        let returned = Arc::new(AtomicBool::new(false));
+        let taker = {
+            let rt = Arc::clone(&rt);
+            let returned = Arc::clone(&returned);
+            thread::spawn(move || {
+                if !attempt.wound_in_flight((rt.runtime_id, slot)) {
+                    return false;
+                }
+                let cell = rt.nodes.get(slot).state_cell();
+                crate::state::try_transition::<Loom>(cell, NodeState::Dirty, NodeState::Computing)
+                    .unwrap();
+                while !returned.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                crate::state::try_transition::<Loom>(cell, NodeState::Computing, NodeState::Clean)
+                    .unwrap();
+                true
+            })
+        };
+        let left = rt.given_back_state(slot, generation);
+        returned.store(true, Ordering::Release);
+        assert!(left.is_none() || left == Some(NodeState::Dirty), "{left:?}");
+        let wounded = crate::attempt::leave_flight();
+        crate::reserve::end_all();
+        let took = taker.join().unwrap();
+        assert_eq!(took, wounded);
+        assert!(left.is_some() || took, "the wait ended with no take-over");
+    });
+}
+
 /// [`doom_reservations_cross`] on F <-> X at budget 1: each read dooms on
 /// the other thread's entry node.
 #[test]
