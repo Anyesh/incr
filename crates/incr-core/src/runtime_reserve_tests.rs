@@ -1,14 +1,15 @@
 //! Doom reservations end with their owner: at a wound, when a cycle
-//! unwind drops the owner's context before its retry, and when the
-//! owner's retry panics. Each test parks the dooming thread holding a
-//! reservation, has another thread wait on it, and checks that both
-//! threads finish with a serial order's outcomes.
+//! unwind drops the owner's context before its retry, when the owner's
+//! retry panics, and at the owner's final landing of the node. Each test
+//! parks the dooming thread, has another thread read a node it reserved
+//! or reserved and landed, and checks that both threads finish with a
+//! serial order's outcomes.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::SeqCst};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::race_tests::{await_reservation_wait, id, Gate};
 use super::{ParkPoint, Runtime};
@@ -321,4 +322,423 @@ fn a_nested_read_of_the_same_node_leaves_its_reservation_to_the_enclosing_read()
     assert!(reserved_elsewhere(claim), "the nested read ended it");
     drop(outer);
     assert!(!reserved_elsewhere(claim));
+}
+
+/// A Shared read nested in a Local runtime's outermost entry dooms at
+/// budget 1 and reserves the claims its doom released. Once the Local
+/// read has returned no entry is open on the thread, so none of those
+/// reservations may be left: after a set, another thread recomputes the
+/// chain without waiting on them.
+#[test]
+fn shared_reservations_end_with_the_local_entry_around_them() {
+    let shared = Arc::new(Rt::new());
+    shared.set_placeholder(0_u64);
+    shared.set_max_frames(1);
+    let x = shared.create_input(1_u64);
+    let mut top = x;
+    for _ in 0..8 {
+        let below = top;
+        top = shared.create_query_with(move |rt: &Rt| rt.get(below) + 1, replayable());
+    }
+    let local = Runtime::<crate::cells::Local>::new();
+    let read = {
+        let shared = shared.clone();
+        local.create_query(move |_| shared.get(top))
+    };
+    assert_eq!(local.get(read), 9);
+    assert!(!shared.dooms.lock().unwrap().is_empty(), "no doom ran");
+    assert!(
+        crate::reserve::none_held(),
+        "a reservation outlived every entry on the thread"
+    );
+    shared.set(x, 2);
+    let other = {
+        let shared = shared.clone();
+        spawn("other", move || shared.get(top))
+    };
+    assert_eq!(other.join(), Ok(10));
+}
+
+/// The same nesting where the chain's leaf panics: the doomed read's
+/// retry panics out of the Shared read and the Local entry around it.
+/// No entry is open once it has, so no reservation may be left: after
+/// the leaf is cured, another thread recomputes the chain without
+/// waiting on one.
+#[test]
+fn shared_reservations_end_when_a_panic_leaves_the_local_entry_around_them() {
+    let shared = Arc::new(Rt::new());
+    shared.set_placeholder(0_u64);
+    shared.set_max_frames(1);
+    let boom = Arc::new(AtomicBool::new(true));
+    let s = shared.create_input(1_u64);
+    let leaf = {
+        let boom = boom.clone();
+        shared.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(s);
+                if boom.load(SeqCst) {
+                    panic!("leaf boom");
+                }
+                v
+            },
+            replayable(),
+        )
+    };
+    let mut top = leaf;
+    for _ in 0..4 {
+        let below = top;
+        top = shared.create_query_with(move |rt: &Rt| rt.get(below) + 1, replayable());
+    }
+    let local = Runtime::<crate::cells::Local>::new();
+    let read = {
+        let shared = shared.clone();
+        local.create_query(move |_| shared.get(top))
+    };
+    assert!(outcome(|| local.get(read)).is_err());
+    assert!(!shared.dooms.lock().unwrap().is_empty(), "no doom ran");
+    assert!(
+        crate::reserve::none_held(),
+        "a reservation outlived every entry on the thread"
+    );
+    boom.store(false, SeqCst);
+    shared.set(s, 2);
+    let other = {
+        let shared = shared.clone();
+        spawn("other", move || shared.get(top))
+    };
+    assert_eq!(other.join(), Ok(6));
+}
+
+/// The Shared read under a Local entry is its runtime kind's outermost
+/// entry and ends what the thread still reserves when it exits, as a
+/// Shared outermost entry does: a reservation its compute left PENDING
+/// (here noted directly, standing in for a doom whose mark unwound) is
+/// gone before the Local closure goes on.
+#[test]
+fn shared_entry_under_a_local_entry_ends_what_it_left_reserved() {
+    let shared = Arc::new(Rt::new());
+    let leftover = (crate::handle::RuntimeId::for_test(u64::MAX - 11), 3);
+    let leaves = shared.create_query(move |_: &Rt| {
+        let _scope = crate::reserve::Scope::new(Some(crate::reserve::PENDING));
+        crate::reserve::note(leftover, 0);
+        1_u64
+    });
+    let local = Runtime::<crate::cells::Local>::new();
+    let read = {
+        let shared = shared.clone();
+        local.create_query(move |_| {
+            let v = shared.get(leaves);
+            (v, crate::reserve::none_held())
+        })
+    };
+    assert_eq!(local.get(read), (1, true));
+}
+
+/// A Local closure that reads two Shared chains sharing their lower half,
+/// each doomed at budget 1: the second Shared entry starts where the
+/// first did with no context of it left, and both reads, and what the
+/// thread holds afterwards, are the unbounded run's.
+#[test]
+fn second_shared_entry_under_a_local_entry_starts_with_no_context() {
+    let run = |budget: u32| {
+        let shared = Arc::new(Rt::new());
+        shared.set_placeholder(0_u64);
+        shared.set_max_frames(budget);
+        let x = shared.create_input(1_u64);
+        let mut low = x;
+        for _ in 0..4 {
+            let below = low;
+            low = shared.create_query_with(move |rt: &Rt| rt.get(below) + 1, replayable());
+        }
+        let (mut a, mut b) = (low, low);
+        for _ in 0..4 {
+            let (below_a, below_b) = (a, b);
+            a = shared.create_query_with(move |rt: &Rt| rt.get(below_a) + 1, replayable());
+            b = shared.create_query_with(move |rt: &Rt| rt.get(below_b) * 2, replayable());
+        }
+        let local = Runtime::<crate::cells::Local>::new();
+        let read = {
+            let shared = shared.clone();
+            local.create_query(move |_| {
+                let first = shared.get(a);
+                let left = crate::replay::with(|c| c.len());
+                (first, left, shared.get(b))
+            })
+        };
+        let got = local.get(read);
+        let no_doom = shared.dooms.lock().unwrap().is_empty();
+        (got, no_doom)
+    };
+    let (unbounded, _) = run(u32::MAX);
+    let (bounded, no_doom) = run(1);
+    assert!(!no_doom, "no doom ran");
+    assert_eq!(bounded, unbounded);
+    assert!(crate::reserve::none_held());
+}
+
+/// **A reservation outlives the owner's final landing**, at budget 2: R
+/// reads T, T reads X, X reads Y and Y reads input I, so R dooms on Y and
+/// reserves T and X. On T's final run, after it has read X, R parks and a
+/// set of I dirties X again; T's closure then has another thread read X
+/// and joins it. The unbounded run lets that read rerun X, so T's join
+/// must not wait on R's reservation of X.
+#[test]
+fn shared_reservation_ends_at_its_owners_final_landing() {
+    type Shape = (Arc<Rt>, Incr<u64>, Incr<u64>, Gate, Arc<AtomicBool>);
+    fn shape(rt: Rt) -> Shape {
+        let rt = Arc::new(rt);
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(1_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+        let gate = Gate::new();
+        let stalled = Arc::new(AtomicBool::new(false));
+        let t = {
+            let (gate, stalled) = (gate.clone(), stalled.clone());
+            let shared = Arc::downgrade(&rt);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    if v == 0 {
+                        return 0;
+                    }
+                    gate.park();
+                    let waits = rt.reservation_waits.load(SeqCst);
+                    let (tx, rx) = mpsc::channel();
+                    let rt2 = shared.upgrade().unwrap();
+                    thread::spawn(move || {
+                        let _ = tx.send(outcome(|| rt2.get(x)));
+                    });
+                    // A wait on R's reservation, held until this read ends,
+                    // hangs a plain join.
+                    let deadline = Instant::now() + JOIN_TIMEOUT;
+                    loop {
+                        if let Ok(read) = rx.try_recv() {
+                            return v + read.unwrap_or(1000);
+                        }
+                        if rt.reservation_waits.load(SeqCst) != waits {
+                            stalled.store(true, SeqCst);
+                            return v;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the joined read neither returned nor waited"
+                        );
+                        thread::yield_now();
+                    }
+                },
+                replayable(),
+            )
+        };
+        (rt, t, i, gate, stalled)
+    }
+    fn run(frames: u32) -> (Outcome, bool) {
+        let (rt, t, i, gate, stalled) = shape(Rt::new());
+        rt.set_max_frames(frames);
+        gate.arm();
+        let r = {
+            let rt = rt.clone();
+            spawn("r", move || rt.get(t))
+        };
+        gate.wait_parked();
+        rt.set(i, 2);
+        gate.release();
+        let read = r.join();
+        rt.assert_invariant_i();
+        (read, stalled.load(SeqCst))
+    }
+    let want = run(u32::MAX);
+    assert!(!want.1, "the unbounded run's join stalled");
+    assert_eq!(run(2), want);
+}
+
+/// Reads `x` on another thread while its doomed owner is parked, after
+/// the owner's landing of it: the read must not wait on a reservation.
+fn read_unreserved(rt: &Arc<Rt>, x: Incr<u64>) -> Outcome {
+    let (claim, generation) = ((rt.runtime_id, id(x).0), x.generation());
+    let reserved = thread::spawn(move || crate::reserve::elsewhere(claim, generation));
+    assert!(
+        !reserved.join().unwrap(),
+        "the owner's landing left X reserved"
+    );
+    let waits = rt.reservation_waits.load(SeqCst);
+    let read = {
+        let rt = rt.clone();
+        spawn("other", move || rt.get(x))
+    }
+    .join();
+    assert_eq!(
+        rt.reservation_waits.load(SeqCst),
+        waits,
+        "the read of X waited"
+    );
+    read
+}
+
+/// **A foreign rerun after the owner's Clean landing**, at budget 1: R
+/// reads F, F reads X and X reads input I, so R dooms on X; X's entry
+/// lands it Clean, which ends R's reservation of X, and R parks before
+/// F's entry. A set of I dirties X and another thread reads X. F's retry
+/// reads X as it then is, so once both reads are done F holds X's new
+/// value.
+#[test]
+fn a_foreign_rerun_after_the_owners_landing_leaves_no_stale_delivery() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let i = rt.create_input(1_u64);
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+    let f = rt.create_query_with(move |rt: &Rt| rt.get(x) * 10, replayable());
+    let entry = Gate::new();
+    hook(&rt, "r", ParkPoint::BeforeEntry(id(f)), entry.clone());
+    entry.arm();
+    let r = {
+        let rt = rt.clone();
+        spawn("r", move || rt.get(f))
+    };
+    entry.wait_parked();
+    rt.set(i, 2);
+    let x_read = read_unreserved(&rt, x);
+    entry.release();
+    let f_read = r.join();
+    assert_eq!(x_read, Ok(3));
+    assert!(matches!(f_read, Ok(20) | Ok(30)), "{f_read:?}");
+    assert_eq!(rt.get(f), 30, "F kept the value X had before the set");
+    rt.assert_invariant_i();
+}
+
+/// **A Failed landing's delivery stays the read it stands for**, at
+/// budget 1: R reads F, F reads X and X reads input I, panicking while I
+/// is 1. R dooms on X, X's entry lands it Failed and its panic is
+/// delivered to F's retry; R parks before F's entry. A set of I to 2 lets
+/// X compute, and another thread reads X. F's retry takes the panic, as
+/// the unbounded run's F read it when X landed, but once both reads are
+/// done F must not stay Failed over X's new value.
+#[test]
+fn a_foreign_rerun_after_a_failed_landing_leaves_no_stale_delivery() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let i = rt.create_input(1_u64);
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            let v = rt.get(i);
+            assert!(v != 1, "x boom");
+            v + 1
+        },
+        replayable(),
+    );
+    let f = rt.create_query_with(move |rt: &Rt| rt.get(x) * 10, replayable());
+    let entry = Gate::new();
+    hook(&rt, "r", ParkPoint::BeforeEntry(id(f)), entry.clone());
+    entry.arm();
+    let r = {
+        let rt = rt.clone();
+        spawn("r", move || rt.get(f))
+    };
+    entry.wait_parked();
+    rt.set(i, 2);
+    let x_read = read_unreserved(&rt, x);
+    entry.release();
+    let f_read = r.join();
+    assert_eq!(f_read, Err("x boom".to_string()));
+    assert_eq!(x_read, Ok(3));
+    assert_eq!(
+        outcome(|| rt.get(f)),
+        Ok(30),
+        "F stayed Failed over X's new value"
+    );
+    rt.assert_invariant_i();
+}
+
+/// **A Dirty landing's reservation does not outlive the read**, at budget
+/// 2: as in [`shared_reservation_ends_at_its_owners_final_landing`], but
+/// X's final run parks after reading Y, a set of I flags it, and it lands
+/// Dirty. T's closure then has another thread read X and joins it; the
+/// unbounded run lets that read rerun X. After R's read no reservation of
+/// R's is left.
+#[test]
+#[ignore = "T10-reservation-dirty-landing-join: stalls on 34412289 too"]
+fn shared_reservation_of_a_dirty_landing_ends_with_the_read() {
+    type Shape = (Arc<Rt>, Incr<u64>, Incr<u64>, Gate, Arc<AtomicBool>);
+    fn shape(rt: Rt) -> Shape {
+        let rt = Arc::new(rt);
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(1_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let gate = Gate::new();
+        let x = {
+            let gate = gate.clone();
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(y);
+                    // Only a run that read Y's real value: the doomed one reads
+                    // the placeholder.
+                    if v != 0 {
+                        gate.park();
+                    }
+                    v + 1
+                },
+                replayable(),
+            )
+        };
+        let stalled = Arc::new(AtomicBool::new(false));
+        let t = {
+            let stalled = stalled.clone();
+            let shared = Arc::downgrade(&rt);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    if v == 0 {
+                        return 0;
+                    }
+                    let waits = rt.reservation_waits.load(SeqCst);
+                    let (tx, rx) = mpsc::channel();
+                    let rt2 = shared.upgrade().unwrap();
+                    thread::spawn(move || {
+                        let _ = tx.send(outcome(|| rt2.get(x)));
+                    });
+                    let deadline = Instant::now() + JOIN_TIMEOUT;
+                    loop {
+                        if let Ok(read) = rx.try_recv() {
+                            return v + read.unwrap_or(1000);
+                        }
+                        if rt.reservation_waits.load(SeqCst) != waits {
+                            stalled.store(true, SeqCst);
+                            return v;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "the joined read neither returned nor waited"
+                        );
+                        thread::yield_now();
+                    }
+                },
+                replayable(),
+            )
+        };
+        (rt, t, i, gate, stalled)
+    }
+    fn run(frames: u32) -> (Outcome, bool) {
+        let (rt, t, i, gate, stalled) = shape(Rt::new());
+        rt.set_max_frames(frames);
+        gate.arm();
+        let r = {
+            let rt = rt.clone();
+            spawn("r", move || {
+                let v = rt.get(t);
+                assert!(crate::reserve::none_held(), "R's read left a reservation");
+                v
+            })
+        };
+        gate.wait_parked();
+        rt.set(i, 2);
+        gate.release();
+        let read = r.join();
+        rt.assert_invariant_i();
+        (read, stalled.load(SeqCst))
+    }
+    let want = run(u32::MAX);
+    assert!(!want.1, "the unbounded run's join stalled");
+    assert_eq!(run(2), want);
 }

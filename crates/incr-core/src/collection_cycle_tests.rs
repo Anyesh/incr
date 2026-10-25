@@ -251,7 +251,7 @@ fn group_by_refuses_through_a_deferral<C: Cells>() {
         },
     );
     let router = grouped.version_node();
-    let m = rt.create_query_with(move |rt| rt.try_get(router).map_or(7, |v| v), fixpoint(20));
+    let m = rt.create_query_with(move |rt| rt.try_get(router).unwrap_or(7), fixpoint(20));
     m_cell.set(m).unwrap();
     for x in 1..=3 {
         s.insert(&rt, x);
@@ -274,7 +274,7 @@ fn group_by_refuses_a_member_upstream<C: Cells>() {
     let f = s.filter(&rt, move |&x| x <= r.rt().get(*m.get().unwrap()));
     let grouped = f.group_by(&rt, |&x| x % 2);
     let router = grouped.version_node();
-    let m = rt.create_query_with(move |rt| rt.try_get(router).map_or(7, |v| v), fixpoint(20));
+    let m = rt.create_query_with(move |rt| rt.try_get(router).unwrap_or(7), fixpoint(20));
     m_cell.set(m).unwrap();
     for x in 1..=3 {
         s.insert(&rt, x);

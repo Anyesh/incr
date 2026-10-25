@@ -353,6 +353,12 @@ impl Landings {
         }
     }
 
+    fn holds(&mut self, node: (u32, u32)) -> bool {
+        let nodes = self.owned_nodes();
+        note_work(nodes.len());
+        nodes.iter().any(|&(n, _)| n == node)
+    }
+
     pub(crate) fn into_nodes(mut self) -> Vec<((u32, u32), u32)> {
         std::mem::take(self.owned_nodes())
     }
@@ -468,7 +474,15 @@ pub(crate) struct Pending {
     untaken: HashMap<(u32, u32, u32), u32, FxBuildHasher>,
     /// By the frame's node and generation, at any position.
     by_node: Index<(u32, u32), usize>,
-    traced: Vec<usize>,
+    /// How many deliveries carry a provenance record.
+    traced: usize,
+    /// The deliveries with a record, by each frame a read of whose node
+    /// they stand for, as `(cidx, node, generation)`: their own and those
+    /// in their `below`.
+    by_stand: Index<(u32, u32, u32), usize>,
+    /// The deliveries with a record, by the position of the lowest frame
+    /// they stand for, which the pop of the virtual frame below extends.
+    by_frontier: Index<u32, usize>,
     /// The passed deliveries that carry a landing deeper than just above
     /// their frame, which a pop can retire.
     deep: Vec<usize>,
@@ -476,6 +490,11 @@ pub(crate) struct Pending {
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
     (key.node, key.generation, key.cidx)
+}
+
+/// The position of the lowest frame `d` stands for a read of.
+fn frontier(d: &Delivery) -> u32 {
+    d.below.last().map_or(d.key.cidx, |b| b.0)
 }
 
 fn read_of(key: &ReadKey) -> (u32, u32, u32, u64) {
@@ -508,15 +527,18 @@ fn unlist<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: &K, gone: impl 
 }
 
 /// Drops the items `gone` accepts from each list `map` holds under `keys`,
-/// passing over each list once.
+/// passing over each list once; with `many` false the keys are taken as
+/// distinct, which spares a single removal the set.
 fn unlist_all<K: std::hash::Hash + Eq + Copy>(
     map: &mut Index<K, usize>,
-    mut keys: impl ExactSizeIterator<Item = K>,
+    keys: impl Iterator<Item = K>,
     gone: impl Fn(&usize) -> bool,
+    many: bool,
 ) {
-    if keys.len() == 1 {
-        let k = keys.next().expect("one key");
-        unlist(map, &k, gone);
+    if !many {
+        for k in keys {
+            unlist(map, &k, &gone);
+        }
         return;
     }
     let mut seen = HashSet::with_hasher(FxBuildHasher);
@@ -543,7 +565,12 @@ impl Pending {
             *self.untaken.entry(frame_of(&d.key)).or_default() += 1;
         }
         if d.provenance.is_some() {
-            self.traced.push(i);
+            self.traced += 1;
+            let own = (d.key.cidx, d.key.node, d.key.generation);
+            for &stand in std::iter::once(&own).chain(&d.below) {
+                list(&mut self.by_stand, stand, i);
+            }
+            list(&mut self.by_frontier, frontier(&d), i);
         }
         if d.passed && d.is_deep() {
             self.deep.push(i);
@@ -582,24 +609,38 @@ impl Pending {
         if out.is_empty() {
             return;
         }
+        let many = out.len() > 1;
         let slots = &self.slots;
         let gone = |&j: &usize| slots[j].is_none();
-        unlist_all(&mut self.by_key, out.iter().map(|d| d.key), gone);
-        unlist_all(&mut self.by_maker, out.iter().map(|d| d.maker), gone);
+        unlist_all(&mut self.by_key, out.iter().map(|d| d.key), gone, many);
+        unlist_all(&mut self.by_maker, out.iter().map(|d| d.maker), gone, many);
         unlist_all(
             &mut self.by_frame,
             out.iter().map(|d| frame_of(&d.key)),
             gone,
+            many,
         );
-        unlist_all(&mut self.by_read, out.iter().map(|d| read_of(&d.key)), gone);
+        unlist_all(
+            &mut self.by_read,
+            out.iter().map(|d| read_of(&d.key)),
+            gone,
+            many,
+        );
         unlist_all(
             &mut self.by_node,
             out.iter().map(|d| (d.key.node, d.key.generation)),
             gone,
+            many,
         );
-        if out.iter().any(|d| d.provenance.is_some()) {
-            note_work(self.traced.len());
-            self.traced.retain(|j| !gone(j));
+        let traced = || out.iter().filter(|d| d.provenance.is_some());
+        if traced().next().is_some() {
+            self.traced -= traced().count();
+            let stands = traced().flat_map(|d| {
+                std::iter::once((d.key.cidx, d.key.node, d.key.generation))
+                    .chain(d.below.iter().copied())
+            });
+            unlist_all(&mut self.by_stand, stands, gone, many);
+            unlist_all(&mut self.by_frontier, traced().map(frontier), gone, many);
         }
         if out.iter().any(|d| d.passed) {
             note_work(self.deep.len());
@@ -808,7 +849,7 @@ impl Pending {
                 let d = self.get(i);
                 !d.taken
                     && d.key.foreign.is_none()
-                    && matches!(d.what, Delivered::Landed(_) | Delivered::Unwind { .. })
+                    && matches!(d.what, Delivered::Landed(..) | Delivered::Unwind { .. })
             })
         })
     }
@@ -820,9 +861,33 @@ impl Pending {
         self.remove_all(is)
     }
 
-    /// The deliveries that carry a provenance record, oldest first.
-    pub(crate) fn traced(&self) -> &[usize] {
-        &self.traced
+    /// Whether any delivery carries a provenance record.
+    pub(crate) fn has_traced(&self) -> bool {
+        self.traced != 0
+    }
+
+    /// The deliveries with a record that stand for a read of `frame`'s
+    /// node, as `(cidx, node, generation)`, oldest first.
+    pub(crate) fn standing_for(&self, frame: (u32, u32, u32)) -> Vec<usize> {
+        let mut found = listed(&self.by_stand, &frame);
+        note_work(found.len());
+        found.sort_unstable();
+        found
+    }
+
+    /// The virtual frame `v`, as `(cidx, node, generation)`, popped: the
+    /// deliveries with a record whose lowest frame sat just above it now
+    /// stand for its read too.
+    pub(crate) fn extend_below(&mut self, v: (u32, u32, u32)) {
+        let Some(above) = self.by_frontier.remove(&(v.0 + 1)) else {
+            return;
+        };
+        note_work(above.as_slice().len());
+        for &i in above.as_slice() {
+            self.get_mut(i).below.push(v);
+            list(&mut self.by_stand, v, i);
+            list(&mut self.by_frontier, v.0, i);
+        }
     }
 
     pub(crate) fn into_vec(self) -> Vec<Delivery> {
@@ -883,12 +948,13 @@ pub(crate) struct Carry {
 
 pub(crate) enum Delivered {
     /// An unwind out of a non-speculative entry: a cycle unwind, whose
-    /// payload is the `CycleUnwind`, or a user panic. It poisons the
-    /// reader unless it is the cycle of a node that landed `Cyclic`, which
-    /// a read of the node raises with the node landed.
+    /// payload is the `CycleUnwind`, or a user panic. `poison` is the flag
+    /// it raises on the reader (`Runtime::unwound_poison`), 0 for the
+    /// cycle of a node that landed `Cyclic`, which a read of the node
+    /// raises with the node landed.
     Unwind {
         cycle: bool,
-        poison: bool,
+        poison: u16,
         /// A member was marked failed in the run the panic came out of,
         /// so a member run that takes it again is not.
         attributed: bool,
@@ -898,12 +964,14 @@ pub(crate) enum Delivered {
         nodes: Landings,
     },
     /// The entry landed without a Clean value. The unbounded run's read
-    /// takes the slot as the compute left it, poisoned, where a later read
-    /// would walk and run the node again. It is that value, cloned when
-    /// the delivery is made, because a later run in the context may
-    /// compute the node again before the retry reads it. Until a read
-    /// takes it, it is a clone the unbounded run never builds.
-    Landed(Unbuilt<dyn Any + Send>),
+    /// takes the slot as the compute left it, raising the flag beside it
+    /// on the reader (`Runtime::dirty_read_poison`), where a later read
+    /// would walk and run the node again unless it holds a memo. It is
+    /// that value, cloned when the delivery is made, because a later run
+    /// in the context may compute the node again before the retry reads
+    /// it. Until a read takes it, it is a clone the unbounded run never
+    /// builds.
+    Landed(Unbuilt<dyn Any + Send>, u16),
     /// The rest of the walk of the frame's blocked read, from the compute
     /// a doom stopped it at: the retry's walk of that read resumes it, as
     /// the unbounded run's walk goes on after that compute. With the node
@@ -1115,6 +1183,10 @@ impl Context {
             .expect("incr-core: an unwind is delivered to a virtual frame")
             .clone();
         let key = ReadKey::blocked(&below);
+        if let Delivered::Unwind { payload, .. } = &what {
+            let reader = (below.node, below.generation, below.path, below.seq);
+            note_took(self.rt, reader, below.reading, &**payload);
+        }
         let provenance = self
             .provenance
             .take()
@@ -1171,15 +1243,14 @@ impl Context {
         node: u32,
         generation: u32,
     ) -> impl Iterator<Item = (usize, u64)> + '_ {
-        self.pending.traced().iter().filter_map(move |&i| {
-            let d = self.pending.get(i);
-            let k = d.key;
-            let p = d.provenance.as_ref()?;
-            (d.is_untaken_panic()
-                && ((k.cidx == at && k.node == node && k.generation == generation)
-                    || d.below.contains(&(at, node, generation))))
-            .then(|| (i, p.record()))
-        })
+        self.pending
+            .standing_for((at, node, generation))
+            .into_iter()
+            .filter_map(move |i| {
+                let d = self.pending.get(i);
+                let p = d.provenance.as_ref()?;
+                d.is_untaken_panic().then(|| (i, p.record()))
+            })
     }
 
     /// The landing, Dirty or Failed, for the frame of `node` at `cidx`
@@ -1245,8 +1316,8 @@ impl Context {
 
     /// Marks delivery `i`'s read taken, as `take_delivery` does, and
     /// returns its unwind. The delivery stays until its maker's run ends,
-    /// for a retry doomed again; a payload that can't be copied is
-    /// delivered once.
+    /// for a retry doomed again; a payload that can't be copied is handed
+    /// over once, its delivery keeping a [`Regen`] marker in its place.
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
         let key = self.pending.get(i).key;
         self.pending.take_keyed(&key);
@@ -1262,7 +1333,29 @@ impl Context {
             unreachable!("incr-core: taken as an unwind");
         };
         let Some(copy) = copy_payload(&**payload) else {
-            return self.pending.remove(i).what;
+            // The one payload goes to this read, and a retry doomed again
+            // regenerates it.
+            let regen: Box<dyn Any + Send> = Box::new(Regen((**payload).type_id()));
+            let d = self.pending.get_mut(i);
+            let Delivered::Unwind {
+                cycle,
+                poison,
+                attributed,
+                payload,
+                nodes,
+            } = &mut d.what
+            else {
+                unreachable!("incr-core: taken as an unwind");
+            };
+            let payload = std::mem::replace(payload, regen);
+            d.resumed = Some(payload_key(&*payload));
+            return Delivered::Unwind {
+                cycle: *cycle,
+                poison: *poison,
+                attributed: *attributed,
+                payload,
+                nodes: nodes.clone(),
+            };
         };
         let what = Delivered::Unwind {
             cycle: *cycle,
@@ -1402,12 +1495,16 @@ pub(crate) struct KeptRead {
     pub(crate) what: Delivered,
 }
 
+/// The landings copies may hold, as `(runtime, (slot, generation))`.
+type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
+
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
-    static KEPT_EVENTS: RefCell<Vec<Logged>> = const { RefCell::new(Vec::new()) };
+    static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
-    static COPIED: RefCell<[u64; 64]> = const { RefCell::new([0; 64]) };
+    static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
+    static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
@@ -1419,14 +1516,16 @@ thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
+    static TOOK: RefCell<Takes> = RefCell::new(HashMap::default());
 }
 
 #[cfg(loom)]
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
-    static KEPT_EVENTS: RefCell<Vec<Logged>> = RefCell::new(Vec::new());
+    static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
-    static COPIED: RefCell<[u64; 64]> = RefCell::new([0; 64]);
+    static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
+    static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = Cell::new(0);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
@@ -1438,6 +1537,7 @@ loom::thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
+    static TOOK: RefCell<Takes> = RefCell::new(HashMap::default());
 }
 
 #[cfg(all(test, not(loom)))]
@@ -1447,7 +1547,8 @@ thread_local! {
 }
 
 /// Counts `units` elements a pass over this thread's notes, their copies,
-/// its kept reads or a delivery index's list looked at.
+/// its kept reads, a context's traced deliveries, the provenance records
+/// or a delivery index's list looked at.
 #[inline(always)]
 pub(crate) fn note_work(units: usize) {
     #[cfg(all(test, not(loom)))]
@@ -1483,17 +1584,65 @@ struct Logged {
     /// The landing's node may be in any copy, so the event reaches copies
     /// of frames at or above it too.
     all: bool,
+    /// The event may retire landings by position, short of the node.
+    wide: bool,
+}
+
+/// The events logged while reads are kept, with the indexes of those that
+/// may retire landings by position and of each node's landings, so that
+/// a kept read's catch-up skips the landings of nodes its copy does not
+/// hold.
+#[derive(Default)]
+struct Events {
+    log: Vec<Logged>,
+    wide: Vec<usize>,
+    landed: HashMap<(RuntimeId, (u32, u32)), Vec<usize>, FxBuildHasher>,
+}
+
+impl Events {
+    fn push(&mut self, l: Logged) {
+        let i = self.log.len();
+        if l.wide {
+            self.wide.push(i);
+        }
+        if let Some(n) = l.ev.node() {
+            self.landed.entry((l.rt, n)).or_default().push(i);
+        }
+        self.log.push(l);
+    }
+
+    fn clear(&mut self) {
+        self.log.clear();
+        self.wide.clear();
+        // As for the copied set, a clear costs the capacity.
+        if self.landed.capacity() > COPIED_KEEP {
+            self.landed = HashMap::default();
+        } else {
+            self.landed.clear();
+        }
+    }
 }
 
 /// Keeps `read` for its frame's retry. Reads of frames that have popped go:
 /// every frame at or above the reading one's position, but the reading
 /// one, which is a run of its own if this is its first such read.
 pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
+    keep(read, fresh, false);
+}
+
+/// [`keep_read`] for a read of another runtime's node whose ordinal (see
+/// [`foreign_ordinal`]) no take needed first: the count that keeping it
+/// raises gives it.
+pub(crate) fn keep_foreign_read(read: KeptRead, fresh: bool) {
+    keep(read, fresh, true);
+}
+
+fn keep(mut read: KeptRead, fresh: bool, number: bool) {
     if let Delivered::Unwind { nodes, .. } = &read.what {
         let top = read.cidx + 1 + nodes.depth();
         KEPT_TOP.with(|k| k.set(k.get().max(top)));
     }
-    let seen = KEPT_EVENTS.with(|v| v.borrow().len());
+    let seen = KEPT_EVENTS.with(|v| v.borrow().log.len());
     let gone: Vec<(KeptRead, usize)> = KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
         let ours = |e: &KeptRead| e.rt == read.rt && e.cidx == read.cidx && e.ctl == read.ctl;
@@ -1504,14 +1653,14 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
             .rposition(|(e, _)| e.cidx < read.cidx || !fresh && ours(e))
             .map_or(0, |i| i + 1);
         note_work(d.len() - from);
-        let gone: Vec<(KeptRead, usize)> = d
-            .extract_if(from.., |(e, _)| {
-                e.rt == read.rt && e.cidx >= read.cidx && (fresh || !ours(e))
-            })
-            .collect();
-        for (e, _) in &gone {
-            count_foreign(e, false);
-        }
+        let goes = |e: &KeptRead| e.rt == read.rt && e.cidx >= read.cidx && (fresh || !ours(e));
+        // Mostly the frame's own latest read is all there is past `from`.
+        let gone: Vec<(KeptRead, usize)> = if d[from..].iter().any(|(e, _)| goes(e)) {
+            d.extract_if(from.., |(e, _)| goes(e)).collect()
+        } else {
+            Vec::new()
+        };
+        uncount_foreign(&gone, d.is_empty());
         // Most replay coverage runs in release, and the scans of kept reads
         // rely on this.
         if cfg!(any(test, debug_assertions)) {
@@ -1520,7 +1669,15 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
                 "incr-core: kept reads run in frame order"
             );
         }
-        count_foreign(&read, true);
+        let count = count_foreign(&read, true);
+        if number {
+            read.ordinal = count;
+        } else {
+            debug_assert!(
+                read.foreign.is_none() || read.ordinal == count,
+                "incr-core: a kept foreign read's ordinal is not its count"
+            );
+        }
         d.push((read, seen));
         gone
     });
@@ -1540,21 +1697,27 @@ fn from_frame(kept: &[(KeptRead, usize)], cidx: u32) -> usize {
     from
 }
 
-fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
-    let h = FxBuildHasher.hash_one((rt, node));
-    ((h >> 52 & 63) as usize, 1 << (h >> 58))
-}
+/// The capacity of the copied set kept across a clear.
+const COPIED_KEEP: usize = 1024;
 
 /// Marks `nodes` as landings a copy may hold, so that a later landing of
-/// one of them finds the copies to drop it from. A shared copy marks only
-/// the notes its log's earlier copies did not.
+/// one of them finds the contexts' deliveries to drop it from. Only a
+/// context's deliveries need the marks: a kept read applies a landing to
+/// its copy when the copy holds the node (`catch_up`), and a context that
+/// opens marks the kept reads' copies.
 pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
-    let generation = COPIED_GEN.with(Cell::get);
+    if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+        mark(rt, nodes);
+    }
+}
+
+/// A shared copy marks only the notes its log's earlier copies did not.
+fn mark(rt: RuntimeId, nodes: &Landings) {
+    let generation = copied_generation();
     COPIED.with(|c| {
         let mut c = c.borrow_mut();
         let mut mark = |n| {
-            let (w, b) = copied_bit(rt, n);
-            c[w] |= b;
+            c.insert((rt, n));
         };
         match &nodes.nodes {
             Nodes::Owned(nodes) => {
@@ -1573,12 +1736,44 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
                 };
                 note_work(len - from);
                 for e in log.entries[from..*len].iter().filter(|e| e.gone >= *epoch) {
-                    mark(e.node);
+                    match &e.lent {
+                        None => mark(e.node),
+                        // A ticket's members went into earlier copies of
+                        // the notes that stood for it, so only its later
+                        // members are new.
+                        Some((members, len)) => {
+                            let mut joined = members.lock();
+                            let from = match joined.marked {
+                                (g, upto) if g == generation => upto.min(*len),
+                                _ => 0,
+                            };
+                            note_work(len - from);
+                            for m in joined.members[from..*len]
+                                .iter()
+                                .filter(|m| m.gone >= *epoch)
+                            {
+                                mark(m.node);
+                            }
+                            joined.marked = (generation, (*len).max(from));
+                        }
+                    }
                 }
                 log.marked = (generation, (*len).max(from));
             }
         }
     });
+}
+
+/// This thread's copied set's generation, unique among every thread's, as
+/// a ticket's members are marked from any thread.
+fn copied_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COPIED_GEN.with(|g| {
+        if g.get() == 0 {
+            g.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        g.get()
+    })
 }
 
 /// Whether a kept read or a context's delivery may hold copied landings.
@@ -1591,20 +1786,29 @@ pub(crate) fn copies_held() -> bool {
 /// outside a speculative run. A kept read takes the events when a retry
 /// takes it, so an event costs nothing per kept read.
 pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
-    let all = ev.node().is_some_and(|n| {
-        let (w, b) = copied_bit(rt, n);
-        COPIED.with(|c| c.borrow()[w] & b != 0)
-    });
+    let all = ev
+        .node()
+        .is_some_and(|n| COPIED.with(|c| c.borrow().contains(&(rt, n))));
     // Short of a copied node, an event retires only landings above its
-    // position, or at it for a contained payload.
+    // position, or at it for a contained payload; a landing also retires
+    // its node from the kept copies that hold it, which the copied set
+    // does not mark.
     let reach = match *ev {
         Retire::Contained { cidx, .. } => cidx,
         _ => ev.cidx() + 1,
     };
-    if value_code::thread_word() & value_code::KEPT_BIT != 0
-        && (all || KEPT_TOP.with(Cell::get) >= reach)
-    {
-        KEPT_EVENTS.with(|v| v.borrow_mut().push(Logged { rt, ev: *ev, all }));
+    if value_code::thread_word() & value_code::KEPT_BIT != 0 {
+        let wide = all || KEPT_TOP.with(Cell::get) >= reach;
+        if wide || ev.node().is_some() {
+            KEPT_EVENTS.with(|v| {
+                v.borrow_mut().push(Logged {
+                    rt,
+                    ev: *ev,
+                    all,
+                    wide,
+                })
+            });
+        }
     }
     with(|c| {
         for x in c.iter_mut().filter(|x| x.rt == rt) {
@@ -1614,18 +1818,58 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
 }
 
 /// Applies to `read`'s copy the events logged since it was kept, as each
-/// applied when it happened: to a read by a frame below the event, or of
-/// any frame for a copied node's landing.
-fn catch_up(read: &mut KeptRead, seen: usize, events: &[Logged]) {
+/// applied when it happened: to a read by a frame below the event, of any
+/// frame for a copied node's landing, or holding the landing's node then.
+/// An event that is not wide changes the copy only through its node, so
+/// only the landings of nodes the copy holds now are looked at.
+fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     let Delivered::Unwind { nodes, .. } = &mut read.what else {
         return;
     };
-    note_work(events.len() - seen);
-    for l in &events[seen..] {
-        if l.rt == read.rt && (read.cidx < l.ev.cidx() || l.all) {
-            nodes.retire(read.cidx, &l.ev, None);
+    let (rt, cidx) = (read.rt, read.cidx);
+    let from = events.wide.partition_point(|&i| i < seen);
+    // `(index, whether the copy held its node)`
+    let mut todo: Vec<(usize, bool)> = events.wide[from..].iter().map(|&i| (i, false)).collect();
+    if events.log.len() > seen && !events.landed.is_empty() {
+        let copy = nodes.owned_nodes();
+        note_work(copy.len());
+        for &(n, _) in copy.iter() {
+            if let Some(at) = events.landed.get(&(rt, n)) {
+                todo.extend(
+                    at[at.partition_point(|&i| i < seen)..]
+                        .iter()
+                        .map(|&i| (i, true)),
+                );
+            }
+        }
+        todo.sort_unstable();
+        todo.dedup_by(|cur, prev| {
+            let same = cur.0 == prev.0;
+            prev.1 |= same && cur.1;
+            same
+        });
+    }
+    note_work(todo.len());
+    for (i, held) in todo {
+        let l = &events.log[i];
+        if l.rt == rt
+            && (l.wide && (cidx < l.ev.cidx() || l.all)
+                || held && l.ev.node().is_some_and(|n| nodes.holds(n)))
+        {
+            nodes.retire(cidx, &l.ev, None);
         }
     }
+}
+
+/// Marks the kept reads' copies for a context that opens.
+fn mark_kept() {
+    KEPT_READS.with(|d| {
+        for (e, _) in d.borrow().iter() {
+            if let Delivered::Unwind { nodes, .. } = &e.what {
+                mark(e.rt, nodes);
+            }
+        }
+    });
 }
 
 /// The reads kept for the run of control block `ctl` at `cidx`.
@@ -1666,18 +1910,26 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
     KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
         let from = from_frame(&d, cidx);
-        let out: Vec<(KeptRead, usize)> = d.extract_if(from.., |(e, _)| which(e)).collect();
-        for (e, _) in &out {
-            count_foreign(e, false);
-        }
+        let mut out = Vec::with_capacity(d.len() - from);
+        out.extend(d.extract_if(from.., |(e, _)| which(e)));
+        uncount_foreign(&out, d.is_empty());
         debug_assert!(
             !d.is_empty() || FOREIGN_KEPT.with(|m| m.borrow().is_empty()),
             "incr-core: a foreign read's count outlived its kept read"
         );
         value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
-            COPIED.with(|c| *c.borrow_mut() = [0; 64]);
-            COPIED_GEN.with(|g| g.set(g.get() + 1));
+            COPIED.with(|c| {
+                let mut c = c.borrow_mut();
+                // A clear costs the capacity, which one big replay leaves
+                // behind for every later kept episode.
+                if c.capacity() > COPIED_KEEP {
+                    *c = CopiedSet::default();
+                } else {
+                    c.clear();
+                }
+            });
+            COPIED_GEN.with(|g| g.set(0));
         }
         out
     })
@@ -1731,30 +1983,55 @@ fn foreign_key(e: &KeptRead) -> Option<ForeignKey> {
         .map(|foreign| (e.rt, e.cidx, e.ctl as usize, e.reading, foreign))
 }
 
-/// Counts `e` in or out of `FOREIGN_KEPT`, which holds, for each
-/// [`ForeignKey`], how many of the kept reads are under it.
-fn count_foreign(e: &KeptRead, kept: bool) {
-    let Some(key) = foreign_key(e) else {
+/// Counts out the reads in `gone`, which have left the kept reads; when
+/// `none_left`, none is kept, so no count is left either. Debug builds
+/// count each out even then, so a count the reads lost track of panics
+/// rather than going with the clear.
+fn uncount_foreign(gone: &[(KeptRead, usize)], none_left: bool) {
+    if gone.is_empty() {
         return;
+    }
+    if none_left && !cfg!(debug_assertions) {
+        FOREIGN_KEPT.with(|m| m.borrow_mut().clear());
+        return;
+    }
+    for (e, _) in gone {
+        count_foreign(e, false);
+    }
+    debug_assert!(
+        !none_left || FOREIGN_KEPT.with(|m| m.borrow().is_empty()),
+        "incr-core: a foreign read's count outlived its kept read"
+    );
+}
+
+/// Counts `e` in or out of `FOREIGN_KEPT`, which holds, for each
+/// [`ForeignKey`], how many of the kept reads are under it, and returns
+/// how many are now (0 for a read of this runtime's).
+fn count_foreign(e: &KeptRead, kept: bool) -> u32 {
+    let Some(key) = foreign_key(e) else {
+        return 0;
     };
     FOREIGN_KEPT.with(|m| {
         let mut m = m.borrow_mut();
         match m.entry(key) {
             MapEntry::Occupied(mut o) if !kept => {
                 *o.get_mut() -= 1;
-                if *o.get() == 0 {
+                let left = *o.get();
+                if left == 0 {
                     o.remove();
                 }
+                left
             }
-            MapEntry::Occupied(mut o) => *o.get_mut() += 1,
-            MapEntry::Vacant(v) if kept => {
-                v.insert(1);
+            MapEntry::Occupied(mut o) => {
+                *o.get_mut() += 1;
+                *o.get()
             }
+            MapEntry::Vacant(v) if kept => *v.insert(1),
             MapEntry::Vacant(_) => {
                 unreachable!("incr-core: a foreign read left the kept reads uncounted")
             }
         }
-    });
+    })
 }
 
 /// The id the next context or episode gets.
@@ -2082,14 +2359,182 @@ pub(crate) fn set_carry(carry: Option<Carry>) {
     CARRY.with(|c| c.set(carry));
 }
 
+/// What a kept read holds in place of a payload no copy can stand for,
+/// once the one payload is gone: the payload's type, which the retry's
+/// read regenerates by running the node's closure again
+/// (`Runtime::regenerate`).
+#[derive(Clone, Copy)]
+pub(crate) struct Regen(pub(crate) std::any::TypeId);
+
+/// The state of a `Runtime::regenerate` run on this thread: the payloads
+/// made for the reads its node's unbounded run took a payload from, each
+/// raised by the first read of its node. Nodes are keyed as a `ReadKey`'s
+/// `reading`.
+pub(crate) struct Regenerating {
+    rt: Option<RuntimeId>,
+    made: Vec<(u64, Box<dyn Any + Send>)>,
+}
+
+impl Regenerating {
+    pub(crate) const fn new() -> Self {
+        Self {
+            rt: None,
+            made: Vec::new(),
+        }
+    }
+}
+
+/// Opens a regenerating run of runtime `rt` whose reads take from `made`.
+pub(crate) fn regen_open(rt: RuntimeId, made: Vec<(u64, Box<dyn Any + Send>)>) {
+    REGEN.with(|r| *r.borrow_mut() = Regenerating { rt: Some(rt), made });
+}
+
+/// Closes the run [`regen_open`] opened: the payloads its reads left.
+pub(crate) fn regen_close() -> Vec<(u64, Box<dyn Any + Send>)> {
+    REGEN.with(|r| std::mem::replace(&mut *r.borrow_mut(), Regenerating::new()).made)
+}
+
+/// The payload made for the open run's read of node `key` of runtime
+/// `rt`, if the unbounded run's read took one and no read since raised it.
+pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> Option<Box<dyn Any + Send>> {
+    REGEN.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.rt != Some(rt) {
+            return None;
+        }
+        let i = r.made.iter().position(|m| m.0 == key)?;
+        Some(r.made.swap_remove(i).1)
+    })
+}
+
+/// A run's identity across its frame's retries: its node as `(slot,
+/// generation)`, and its path and seq, as a `ReadKey` has them.
+pub(crate) type RunKey = (u32, u32, u64, u32);
+
+/// What a read took from a compute or a ticket (`note_took`): a copy, or
+/// for a payload no copy can stand for, nothing, as a regeneration runs
+/// the read node again.
+pub(crate) type Took = (u64, Option<Box<dyn Any + Send>>);
+
+/// What each run's reads took (see [`note_took`]), by the read node.
+type Takes = HashMap<
+    (RuntimeId, RunKey),
+    HashMap<u64, Option<Box<dyn Any + Send>>, FxBuildHasher>,
+    FxBuildHasher,
+>;
+
+fn with_takes<R>(f: impl FnOnce(&mut Takes) -> R) -> R {
+    value_code::set_bits(value_code::TOOK_BIT, true);
+    TOOK.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// The seq and path of the run of node `reading` that ended just above
+/// depth `depth`, if it started one.
+pub(crate) fn ended_run(rt: RuntimeId, depth: u32, reading: u64) -> Option<(u32, u64)> {
+    RUNS.with(|r| {
+        (r.borrow().live.get(depth as usize).copied().flatten())
+            .filter(|x| {
+                x.rt == rt && u64::from(x.frame.0) | (u64::from(x.frame.1) << 32) == reading
+            })
+            .map(|x| (x.seq, x.path))
+    })
+}
+
+/// Notes that run `reader`'s read of node `reading` took `payload` from a
+/// compute or a ticket, until the run lands (`took_by_run`) or the engine
+/// call ends.
+pub(crate) fn note_took(rt: RuntimeId, reader: RunKey, reading: u64, payload: &(dyn Any + Send)) {
+    let copy = copy_payload(payload).filter(|_| !payload.is::<Regen>());
+    with_takes(|t| {
+        t.entry((rt, reader)).or_default().insert(reading, copy);
+    });
+}
+
+/// Whether this thread has noted reads of runtime `rt` no landing took.
+pub(crate) fn takes_noted(rt: RuntimeId) -> bool {
+    value_code::thread_word() & value_code::TOOK_BIT != 0
+        && TOOK.with(|t| t.borrow().keys().any(|k| k.0 == rt))
+}
+
+/// What run `run`'s reads took, as it lands.
+pub(crate) fn took_by_run(rt: RuntimeId, run: RunKey) -> Vec<Took> {
+    TOOK.with(|t| t.borrow_mut().remove(&(rt, run)))
+        .map_or_else(Vec::new, |took| took.into_iter().collect())
+}
+
+/// Runtime `rt`'s nodes claimed by a regenerating run on some thread
+/// (`Runtime::rerun`), which another thread's rerun of the same node waits
+/// out instead of taking the claim for a compute.
+static REGEN_CLAIMS: std::sync::Mutex<Vec<(RuntimeId, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes or drops `slot` of runtime `rt` as claimed by a regenerating run.
+pub(crate) fn regen_claim(rt: RuntimeId, slot: u32, held: bool) {
+    let mut c = REGEN_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held {
+        c.push((rt, slot));
+    } else if let Some(i) = c.iter().position(|&x| x == (rt, slot)) {
+        c.swap_remove(i);
+    }
+}
+
+/// How many regenerating runs claim `slot` of runtime `rt`.
+pub(crate) fn regen_claims(rt: RuntimeId, slot: u32) -> usize {
+    REGEN_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|&&x| x == (rt, slot))
+        .count()
+}
+
+/// Runtime `rt`'s nodes a regenerating run took from Failed to Computing
+/// and has not yet put back. Marked and cleared under the runtime's
+/// tickets lock with the node's state, so a ticket's holder reads the two
+/// as one.
+static REGEN_RUNNING: std::sync::Mutex<Vec<(RuntimeId, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Marks or clears `slot` of runtime `rt` as rerunning (`REGEN_RUNNING`);
+/// clearing an unmarked node does nothing.
+pub(crate) fn regen_running(rt: RuntimeId, slot: u32, on: bool) {
+    let mut r = REGEN_RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if on {
+        r.push((rt, slot));
+    } else if let Some(i) = r.iter().position(|&x| x == (rt, slot)) {
+        r.swap_remove(i);
+    }
+}
+
+/// Whether a regenerating run holds `slot` of runtime `rt` out of Failed.
+pub(crate) fn is_regen_running(rt: RuntimeId, slot: u32) -> bool {
+    REGEN_RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(&(rt, slot))
+}
+
+/// Whether [`copy_payload`] can copy `payload`.
+pub(crate) fn copyable(payload: &(dyn Any + Send)) -> bool {
+    payload.is::<crate::cycle::CycleUnwind>()
+        || payload.is::<String>()
+        || payload.is::<&'static str>()
+        || payload.is::<Regen>()
+}
+
 /// A copy of a panic payload of a type the engine knows: a cycle unwind's
-/// or a `panic!` message.
+/// or a `panic!` message. A type added here is added to [`copyable`] too.
 pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + Send>> {
     if let Some(unwind) = payload.downcast_ref::<crate::cycle::CycleUnwind>() {
         return Some(Box::new(crate::cycle::CycleUnwind(unwind.0.clone())));
     }
     if let Some(message) = payload.downcast_ref::<String>() {
         return Some(Box::new(message.clone()));
+    }
+    if let Some(regen) = payload.downcast_ref::<Regen>() {
+        return Some(Box::new(*regen));
     }
     payload
         .downcast_ref::<&'static str>()
@@ -2137,6 +2582,9 @@ pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry, frame_keys: Fram
         }
         c.push(x);
     });
+    if value_code::thread_word() & value_code::KEPT_BIT != 0 {
+        mark_kept();
+    }
     id
 }
 
@@ -2164,7 +2612,9 @@ pub(crate) fn take_pending(
             // run must not resume that walk or recompute its node.
             x.pending.take_keyed(key);
             Some(match &x.pending.get(at).what {
-                Delivered::Landed(value) => Delivered::Landed(Unbuilt::new(clone(value.value()))),
+                Delivered::Landed(value, poison) => {
+                    Delivered::Landed(Unbuilt::new(clone(value.value())), *poison)
+                }
                 Delivered::Walk(..) | Delivered::Direct => {
                     unreachable!("incr-core: a walk's direction is not a value")
                 }
@@ -2172,6 +2622,34 @@ pub(crate) fn take_pending(
             })
         })
     })
+}
+
+/// The taken delivery of a payload no copy can stand for, for read `key`
+/// of `rt`'s contexts, was regenerated as the payload `raised`: it counts
+/// as the source of the landings the delivery carries, as a copy raised
+/// by a take does (`Delivery::resumed`).
+pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
+    with(|c| {
+        for x in c.iter_mut().filter(|x| x.rt == rt) {
+            for i in x.pending.keyed(key).to_vec() {
+                let d = x.pending.get_mut(i);
+                if d.taken
+                    && matches!(&d.what, Delivered::Unwind { payload, .. } if payload.is::<Regen>())
+                {
+                    d.resumed = Some(raised);
+                }
+            }
+        }
+    });
+}
+
+/// As [`regenerated`], for delivery `i` of context `id`.
+pub(crate) fn regenerated_at(id: u64, i: usize, raised: PayloadKey) {
+    with(|c| {
+        if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+            x.pending.get_mut(i).resumed = Some(raised);
+        }
+    });
 }
 
 /// Removes context `id`, if it is still open, returning the deliveries
@@ -2190,6 +2668,12 @@ pub(crate) fn close(id: u64) -> Vec<Delivery> {
 /// a caught unwind has left the reads that opened them.
 pub(crate) fn drop_from(rt: RuntimeId, cidx: u32) {
     remove_where(|x| x.rt == rt && x.boundary >= cidx);
+}
+
+/// Removes every context, of any runtime, whose boundary is at or above
+/// `cidx`: the entry that began there has exited.
+pub(crate) fn drop_all_from(cidx: u32) {
+    remove_where(|x| x.boundary >= cidx);
 }
 
 /// Removes the contexts of `rt` that the unwind of the frame at `cidx`
@@ -2238,7 +2722,7 @@ fn remove_where(mut gone: impl FnMut(&Context) -> bool) {
 /// starts with none.
 #[inline(always)]
 pub(crate) fn reset() {
-    if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+    if value_code::thread_word() & (value_code::REPLAY_BIT | value_code::TOOK_BIT) != 0 {
         clear();
     }
 }
@@ -2248,6 +2732,8 @@ pub(crate) fn reset() {
 fn clear() {
     SUSPENDED.with(|s| s.borrow_mut().clear());
     RUNS.with(|r| *r.borrow_mut() = Runs::default());
+    TOOK.with(|t| t.borrow_mut().clear());
+    value_code::set_bits(value_code::TOOK_BIT, false);
     set_carry(None);
     let removed = with(std::mem::take);
     drop(removed);

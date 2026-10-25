@@ -285,7 +285,7 @@ fn unseeded_cycle_forms_breaks_reforms<C: Cells>() {
     };
     let b = rt.create_query(move |rt| rt.try_get(a).map_or(-1, |v| v * 2));
     bc.set(b).unwrap();
-    let d = rt.create_query(move |rt| rt.try_get(b).map_or(-100, |v| v));
+    let d = rt.create_query(move |rt| rt.try_get(b).unwrap_or(-100));
 
     assert_eq!(rt.get(d), -100);
     assert_eq!(rt.state_of(a), NodeState::Cyclic);
@@ -886,7 +886,192 @@ fn poison_reaches_the_landing_through_step<C: Cells>() {
     assert_eq!(rt.state_of(f), NodeState::Dirty);
 }
 
+/// S (seeded) catches a Failed dep's panic and reads A; A reads B only
+/// while S is 0, so A and B join CU in the first round and A stays in it
+/// after S converges. A's cycle error holds for the revision: a second
+/// read of A must not run it alone against S's value.
+fn cu_member_keeps_its_error_over_a_handled_episode<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (ac, bc) = (cell::<u64>(), cell::<u64>());
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let s = {
+        let ac = ac.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                rt.try_get(*ac.get().unwrap()).unwrap_or(0) + 1
+            },
+            fixpoint(Fixpoint::new(|| 0_u64)),
+        )
+    };
+    let a = {
+        let bc = bc.clone();
+        rt.create_query(move |rt: &Runtime<C>| match rt.try_get(s) {
+            Ok(0) => rt.try_get(*bc.get().unwrap()).unwrap_or(50),
+            Ok(v) => v,
+            Err(_) => 77,
+        })
+    };
+    let b = rt.create_query(move |rt: &Runtime<C>| rt.try_get(a).unwrap_or(60));
+    ac.set(a).unwrap();
+    bc.set(b).unwrap();
+    let first = rt.try_get(a).map_err(|c| slots(&c));
+    let second = rt.try_get(a).map_err(|c| slots(&c));
+    assert_eq!(first.is_ok(), second.is_ok(), "{first:?} then {second:?}");
+    rt.assert_invariant_i();
+}
+
+/// Compares Equal unless either side is `boom`, whose compare panics.
+#[derive(Clone, Debug)]
+struct BoomEq {
+    v: u64,
+    boom: bool,
+}
+
+impl PartialEq for BoomEq {
+    fn eq(&self, other: &Self) -> bool {
+        assert!(!self.boom && !other.boom, "eq boom");
+        self.v == other.v
+    }
+}
+
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)()
+    }
+}
+
+/// S (seeded) catches a Failed dep's panic and reads T; T reads S and
+/// `i`, and after `set(i, 1)` T's new value panics in step 3's compare,
+/// after S compared Equal. The rerun is read from a `Drop` while an
+/// engine unwind is pending (a wound reaching user drop glue), so the
+/// abort takes that unwind's kind: S must not keep the memo of an
+/// episode that never landed.
+fn aborted_episode_landing_keeps_no_memo<C: Cells>() {
+    let rt = Arc::new(Runtime::<C>::new());
+    let i = rt.create_input(0_u64);
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let tc = cell::<BoomEq>();
+    let s = {
+        let tc = tc.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                let t = rt.try_get(*tc.get().unwrap()).map_or(0, |t| t.v);
+                BoomEq {
+                    v: t.min(1),
+                    boom: false,
+                }
+            },
+            fixpoint(Fixpoint::new(|| BoomEq { v: 0, boom: false })),
+        )
+    };
+    let t = rt.create_query(move |rt: &Runtime<C>| BoomEq {
+        v: rt.get(s).v + 1,
+        boom: rt.get(i) == 1,
+    });
+    tc.set(t).unwrap();
+    assert_eq!(rt.get(t).v, 2);
+    assert!(rt.has_memo_of(s), "s {:?}", rt.state_of(s));
+    rt.set(i, 1);
+    // Nothing may panic out of the drop, which runs during cleanup.
+    let seen: Arc<std::sync::Mutex<Option<(bool, String)>>> = Arc::default();
+    let rerun = {
+        let (rt, seen) = (Arc::clone(&rt), Arc::clone(&seen));
+        move || {
+            let panicking = std::thread::panicking();
+            crate::cycle_state::set_unwind_kind(Some(crate::cycle_state::UnwindKind::Wound));
+            let got = catch_unwind(AssertUnwindSafe(|| rt.get(t).v));
+            crate::cycle_state::set_unwind_kind(None);
+            let msg = got.err().map(panic_message).unwrap_or_default();
+            *seen.lock().unwrap() = Some((panicking, msg));
+        }
+    };
+    let outer = catch_unwind(AssertUnwindSafe(move || {
+        let _rerun = OnDrop(rerun);
+        panic!("outer");
+    }));
+    assert!(outer.is_err());
+    let (panicking, msg) = seen.lock().unwrap().take().expect("the drop ran");
+    assert!(panicking);
+    assert!(msg.contains("eq boom"), "{msg}");
+    assert!(!rt.has_memo_of(s), "s {:?}", rt.state_of(s));
+}
+
+/// S (seeded) catches a fresh failure of F, which reads nothing, and
+/// reads T, which reads S. Each level of a ladder reads the one below
+/// twice in one entry: S must not run once per path.
+fn episode_over_a_fresh_failure_reruns_boundedly<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let runs = Arc::new(AtomicU32::new(0));
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let tc = cell::<u64>();
+    let s = {
+        let (tc, runs) = (tc.clone(), runs.clone());
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                rt.try_get(*tc.get().unwrap()).unwrap_or(0).min(1)
+            },
+            fixpoint(Fixpoint::new(|| 0_u64)),
+        )
+    };
+    let t = rt.create_query(move |rt: &Runtime<C>| rt.get(s) + 1);
+    tc.set(t).unwrap();
+    let mut level = s;
+    for _ in 0..8 {
+        let below = level;
+        level = rt.create_query(move |rt: &Runtime<C>| rt.get(below) + rt.get(below));
+    }
+    assert_eq!(rt.get(level), 256);
+    let n = runs.load(Ordering::SeqCst);
+    assert!(n <= 16, "S ran {n} times");
+}
+
+/// S (seeded) catches a Failed dep's panic and reads T; T reads S, and
+/// U (a fallback) only while S is 0, and U reads T. U is on the cycle in
+/// the first iteration's reads and off it in the final ones, so the
+/// landing's cut shrinks the episode, which runs again uncut and keeps no
+/// memo.
+fn an_episode_the_landing_cut_shrank_keeps_no_memo<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let f = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("fails") });
+    let (tc, uc) = (cell::<u64>(), cell::<u64>());
+    let s = {
+        let tc = tc.clone();
+        rt.create_query_with(
+            move |rt: &Runtime<C>| {
+                let _ = catch_unwind(AssertUnwindSafe(|| rt.get(f)));
+                rt.try_get(*tc.get().unwrap()).unwrap_or(0).min(1)
+            },
+            fixpoint(Fixpoint::new(|| 0_u64)),
+        )
+    };
+    let t = {
+        let uc = uc.clone();
+        rt.create_query(move |rt: &Runtime<C>| match rt.get(s) {
+            0 => rt.try_get(*uc.get().unwrap()).unwrap_or(0) + 1,
+            v => v + 1,
+        })
+    };
+    let u = rt.create_query_with_fallback(
+        move |rt: &Runtime<C>| rt.try_get(t).unwrap_or(0),
+        |_: &Cycle| 5_u64,
+    );
+    tc.set(t).unwrap();
+    uc.set(u).unwrap();
+    assert_eq!(rt.get(s), 1);
+    assert!(!rt.has_memo_of(s), "s {:?}", rt.state_of(s));
+}
+
 both!(
+    aborted_episode_landing_keeps_no_memo,
+    an_episode_the_landing_cut_shrank_keeps_no_memo,
+    episode_over_a_fresh_failure_reruns_boundedly,
+    cu_member_keeps_its_error_over_a_handled_episode,
     self_cycle_fallback,
     self_cycle_fixpoint,
     self_cycle_unseeded,

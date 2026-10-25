@@ -240,10 +240,12 @@ impl<T> Default for QueryOpts<T> {
 /// may therefore run more than once for one read, under the contract in
 /// [`Runtime`](crate::Runtime)'s docs.
 ///
-/// A run that has read another runtime's node is not cut short after
-/// that read, since its rerun would read the other runtime again; its
-/// reads nest natively instead. A deep chain that alternates between two
-/// runtimes therefore recurses past the budget.
+/// A run's reads of another runtime's nodes are kept, each value by a
+/// clone, so the rerun takes what the cut-short run read rather than
+/// reading the other runtime again. A read that ended in a panic whose
+/// payload can't be copied keeps the run from being cut short after it
+/// instead; its reads nest natively, so a deep chain that alternates
+/// between two runtimes through such reads recurses past the budget.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Replay {
     /// Reads nest natively at any depth.
@@ -398,6 +400,31 @@ pub(crate) const FOREIGN_HOLD: u16 = 512;
 /// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
 /// make: its value is buffered and its landing withheld (`replay::Stash`).
 pub(crate) const SPECULATIVE: u16 = 1024;
+/// `ComputeCtl::flags`: a read in the frame gave an outcome that holds
+/// until the next set (the panic of a node that landed Failed, or a
+/// memo's value). Without `POISONED` the frame lands Dirty with a memo
+/// for the revision (`NodeData::set_memo`).
+pub(crate) const HANDLED: u16 = 2048;
+/// `ComputeCtl::flags`: the run read a value no rerun of its node reads
+/// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
+/// node, so its panic is not regenerated (`Runtime::regenerate`).
+pub(crate) const UNREGENERABLE: u16 = 4096;
+
+const _: () = assert!(crate::bits::disjoint(&[
+    RECOMPUTE as u64,
+    BUFFERED as u64,
+    LOW as u64,
+    POISONED as u64,
+    DOOMED as u64,
+    PH_SEEN as u64,
+    KEPT_READ as u64,
+    NO_DOOM as u64,
+    WALKED as u64,
+    FOREIGN_HOLD as u64,
+    SPECULATIVE as u64,
+    HANDLED as u64,
+    UNREGENERABLE as u64,
+]));
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -414,23 +441,58 @@ pub struct ComputeCtl {
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
+    /// The frame's runtime's [`KeepResolver`], or null for a frame that
+    /// settles its keeping when it is pushed or keeps nothing.
+    keep: *const KeepResolver,
+}
+
+/// Lives inside its runtime and answers whether a frame of node `slot` of
+/// that runtime keeps other runtimes' Clean reads for its retry. The
+/// runtime's `keep_resolver_ptr` is good while one of its computes runs,
+/// since the compute borrows the runtime; a pointer taken from the field
+/// itself may not reach the rest of the runtime.
+pub(crate) struct KeepResolver {
+    pub(crate) keeps: unsafe fn(*const KeepResolver, u32) -> bool,
 }
 
 impl ComputeCtl {
     #[inline(always)]
     pub(crate) fn new(flags: u16) -> Self {
+        Self::resolved_by(flags, std::ptr::null())
+    }
+
+    #[inline(always)]
+    pub(crate) fn resolved_by(flags: u16, keep: *const KeepResolver) -> Self {
         Self {
             flags: Cell::new(flags),
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
             children: Cell::new(std::ptr::null()),
+            keep,
         }
+    }
+
+    /// Whether this frame, of node `slot`, keeps other runtimes' Clean
+    /// reads.
+    ///
+    /// # Safety
+    ///
+    /// The frame must be running, so that its runtime is borrowed.
+    pub(crate) unsafe fn keeps_foreign(&self, slot: u32) -> bool {
+        // SAFETY: the caller's frame is running, so the runtime holding
+        // the resolver is borrowed and in place.
+        !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
     }
 
     #[inline(always)]
     pub(crate) fn has(&self, flag: u16) -> bool {
         self.flags.get() & flag != 0
+    }
+
+    /// The frame's `POISONED` and `HANDLED` flags.
+    pub(crate) fn poison(&self) -> u16 {
+        self.flags.get() & (POISONED | HANDLED)
     }
 
     #[inline(always)]

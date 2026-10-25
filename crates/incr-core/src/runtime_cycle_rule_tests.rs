@@ -340,13 +340,13 @@ fn cyclic_landing_is_a_change<C: Cells>() {
         let qc = qc.clone();
         rt.create_query(move |rt| {
             if rt.get(g) == 1 {
-                rt.try_get(*qc.get().unwrap()).map_or(-1, |v| v)
+                rt.try_get(*qc.get().unwrap()).unwrap_or(-1)
             } else {
                 5
             }
         })
     };
-    let q = rt.create_query(move |rt| rt.try_get(p).map_or(-1, |v| v));
+    let q = rt.create_query(move |rt| rt.try_get(p).unwrap_or(-1));
     qc.set(q).unwrap();
     let d = rt.create_query(move |rt| rt.try_get(p).map_or(-100, |v| v * 2));
     assert_eq!(rt.get(d), 10);
@@ -491,14 +491,14 @@ fn cyclic_group_grows<C: Cells>() {
             } else {
                 *rc.get().unwrap()
             };
-            rt.try_get(target).map_or(-1, |v| v)
+            rt.try_get(target).unwrap_or(-1)
         })
     };
     let r = {
         let qc = qc.clone();
-        rt.create_query(move |rt| rt.try_get(*qc.get().unwrap()).map_or(-1, |v| v))
+        rt.create_query(move |rt| rt.try_get(*qc.get().unwrap()).unwrap_or(-1))
     };
-    let q = rt.create_query(move |rt| rt.try_get(p).map_or(-1, |v| v));
+    let q = rt.create_query(move |rt| rt.try_get(p).unwrap_or(-1));
     qc.set(q).unwrap();
     rc.set(r).unwrap();
     let d = rt.create_query(move |rt| rt.try_get(p).map_or_else(|c| c.len() as i64, |_| 0));
@@ -742,7 +742,7 @@ fn recovery_pops_are_bounded<C: Cells>() {
         let uc = uc.clone();
         rt.create_query(move |rt| {
             if rt.get(g) == 0 {
-                rt.try_get(*uc.get().unwrap()).map_or(-1, |v| v)
+                rt.try_get(*uc.get().unwrap()).unwrap_or(-1)
             } else {
                 1
             }
@@ -1283,7 +1283,7 @@ fn cross_runtime_reentry<A: Cells, B: Cells>() {
                 if use_get {
                     r1.get(a)
                 } else {
-                    r1.try_get(a).map_or(-1, |v| v)
+                    r1.try_get(a).unwrap_or(-1)
                 }
             })
         };
@@ -1479,15 +1479,18 @@ enum FirstRead {
     /// Another runtime's query over that input, New when read, so the
     /// read computes it.
     ForeignComputed,
+    /// That query, which the last leaf reads again after its set, so the
+    /// retry finds it landed Clean on the set's value.
+    ForeignLandedClean,
 }
 
-/// A replayable frame at budget 1 that reads 64 leaves runs twice, once
-/// doomed, whatever it first reads; see [`foreign_reader_is_doomed_with`]. The last leaf sets another runtime's
-/// input when it runs, which is after the first read in the unbounded run
-/// and between the doomed run and its retry here. A retry takes a non-Clean
-/// foreign read's outcome again, so it agrees with the unbounded run; a
-/// Clean foreign read keeps nothing, so the retry reads the node again and
-/// sees the set, the documented limitation.
+/// A replayable frame at budget 1 that reads 64 leaves is doomed and
+/// retried, whatever it first reads; see [`foreign_reader_is_doomed_with`].
+/// The last leaf sets another runtime's input when it runs, which is after
+/// the first read in the unbounded run and between the doomed run and its
+/// retry here. A retry takes its doomed
+/// run's foreign read outcome again, Clean or not, so it agrees with the
+/// unbounded run.
 fn foreign_reader_is_doomed_and_retried<A: Cells, B: Cells>() {
     foreign_reader_is_doomed_with::<A, B>(64);
 }
@@ -1498,46 +1501,148 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
         FirstRead::Own,
         FirstRead::ForeignClean,
         FirstRead::ForeignComputed,
+        FirstRead::ForeignLandedClean,
     ] {
-        let r1 = Box::new(Runtime::<A>::new());
-        let r2 = Box::new(Runtime::<B>::new());
-        r1.set_placeholder(0_u64);
-        r1.set_max_frames(1);
-        let x = r2.create_input(1000_u64);
-        let q = r2.create_query(move |rt| rt.get(x));
-        let mut leaves: Vec<Incr<u64>> = (0..n - 1).map(|i| r1.create_query(move |_| i)).collect();
-        let r2_ = OtherRt(&*r2);
-        leaves.push(r1.create_query(move |_| {
-            r2_.set(x, 2000);
-            n - 1
-        }));
-        let runs = Arc::new(AtomicU32::new(0));
-        let wide = {
-            let (r2, runs) = (OtherRt(&*r2), runs.clone());
-            r1.create_query_with(
-                move |rt| {
-                    runs.fetch_add(1, Ordering::Relaxed);
-                    let base = match first {
-                        FirstRead::Own => 1000,
-                        FirstRead::ForeignClean => r2.get(x),
-                        FirstRead::ForeignComputed => r2.get(q),
-                    };
-                    base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
-                },
-                QueryOpts {
-                    replay: Replay::Allowed,
-                    ..Default::default()
-                },
-            )
-        };
-        let base = match first {
-            FirstRead::ForeignClean => 2000,
-            FirstRead::Own | FirstRead::ForeignComputed => 1000,
-        };
-        assert_eq!(r1.get(wide), base + (0..n).sum::<u64>(), "{first:?}");
-        assert_eq!(runs.load(Ordering::Relaxed), 2, "{first:?}");
-        assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
+        let runs = doomed_reader_runs::<A, B>(n, first);
+        // The landed case runs a third time; the ignored
+        // `landed_foreign_reader_runs_twice` tracks it.
+        if !matches!(first, FirstRead::ForeignLandedClean) {
+            assert_eq!(runs, 2, "{first:?}");
+        }
     }
+}
+
+/// One case of [`foreign_reader_is_doomed_with`], asserting the reader's
+/// value and its doom and returning how many times its closure ran.
+fn doomed_reader_runs<A: Cells, B: Cells>(n: u64, first: FirstRead) -> u32 {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    r1.set_max_frames(1);
+    let x = r2.create_input(1000_u64);
+    let q = r2.create_query(move |rt| rt.get(x));
+    let mut leaves: Vec<Incr<u64>> = (0..n - 1).map(|i| r1.create_query(move |_| i)).collect();
+    let r2_ = OtherRt(&*r2);
+    leaves.push(r1.create_query(move |_| {
+        r2_.set(x, 2000);
+        if matches!(first, FirstRead::ForeignLandedClean) {
+            r2_.get(q);
+        }
+        n - 1
+    }));
+    let runs = Arc::new(AtomicU32::new(0));
+    let wide = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                let base = match first {
+                    FirstRead::Own => 1000,
+                    FirstRead::ForeignClean => r2.get(x),
+                    FirstRead::ForeignComputed | FirstRead::ForeignLandedClean => r2.get(q),
+                };
+                base + leaves.iter().map(|&l| rt.get(l)).sum::<u64>()
+            },
+            QueryOpts {
+                replay: Replay::Allowed,
+                ..Default::default()
+            },
+        )
+    };
+    assert_eq!(r1.get(wide), 1000 + (0..n).sum::<u64>(), "{first:?}");
+    assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
+    runs.load(Ordering::Relaxed)
+}
+
+#[test]
+#[ignore = "T10-speculative-landing-third-foreign-reader-run"]
+fn landed_foreign_reader_runs_twice() {
+    let first = FirstRead::ForeignLandedClean;
+    assert_eq!(doomed_reader_runs::<Local, Local>(64, first), 2);
+    assert_eq!(doomed_reader_runs::<Local, Shared>(64, first), 2);
+    assert_eq!(doomed_reader_runs::<Shared, Local>(64, first), 2);
+    assert_eq!(doomed_reader_runs::<Shared, Shared>(64, first), 2);
+}
+
+/// A value whose `Clone` reads another runtime's input, as the value-code
+/// contract allows of a Clean node.
+struct ReadsOther<B: Cells> {
+    rt: OtherRt<B>,
+    x: Incr<u64>,
+    seen: u64,
+}
+
+impl<B: Cells> Clone for ReadsOther<B> {
+    fn clone(&self) -> Self {
+        Self {
+            rt: OtherRt(self.rt.0),
+            x: self.x,
+            seen: self.rt.get(self.x),
+        }
+    }
+}
+
+impl<B: Cells> PartialEq for ReadsOther<B> {
+    fn eq(&self, other: &Self) -> bool {
+        self.seen == other.seen
+    }
+}
+
+/// A replayable reader within a budget of 8 frames whose read of another
+/// runtime's input is in value code, where nothing is kept for a retry,
+/// over a chain of 20 replayable queries whose deepest sets that input.
+/// The chain runs past the budget and is doomed, but the reader is held,
+/// so it runs once and agrees with the unbounded run.
+fn value_code_foreign_read_holds_its_frame<A: Cells, B: Cells>() {
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    r1.set_placeholder(0_u64);
+    r1.set_max_frames(8);
+    let x = r2.create_input(1000_u64);
+    let v = r1.create_input(ReadsOther {
+        rt: OtherRt(&*r2),
+        x,
+        seen: 0,
+    });
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let r2_ = OtherRt(&*r2);
+    let mut below = r1.create_query_with(
+        move |_| {
+            r2_.set(x, 2000);
+            1
+        },
+        replayable(),
+    );
+    for _ in 0..19 {
+        below = r1.create_query_with(move |rt| rt.get(below) + 1, replayable());
+    }
+    let runs = Arc::new(AtomicU32::new(0));
+    let reader = {
+        let runs = runs.clone();
+        r1.create_query_with(
+            move |rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                rt.get(v).seen + rt.get(below)
+            },
+            replayable(),
+        )
+    };
+    assert_eq!(r1.get(reader), 1020);
+    assert!(!r1.dooms.lock().unwrap().is_empty());
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn local_shared_value_code_foreign_read_holds_its_frame() {
+    value_code_foreign_read_holds_its_frame::<Local, Shared>();
+}
+
+#[test]
+fn shared_shared_value_code_foreign_read_holds_its_frame() {
+    value_code_foreign_read_holds_its_frame::<Shared, Shared>();
 }
 
 /// Seed 0x3f39 shrunk: rt1's ring 7 -> 8 -> 9 -> 11 -> 7 of replayable
@@ -1618,40 +1723,36 @@ mod foreign_chain {
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_local() {
         super::foreign_reading_chain_stays_within_the_stack::<Local, Local>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared() {
         super::foreign_reading_chain_stays_within_the_stack::<Local, Shared>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_local() {
         super::foreign_reading_chain_stays_within_the_stack::<Shared, Local>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_shared() {
         super::foreign_reading_chain_stays_within_the_stack::<Shared, Shared>();
     }
@@ -1740,37 +1841,34 @@ mod foreign_panic_chain {
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared() {
         super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(None);
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_shared() {
         super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>(None);
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared_with_b_unbudgeted() {
         super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(Some(u32::MAX));
     }
 }
 
-/// Small foreign-read cases that run under Miri: a non-Clean foreign read
-/// kept for a doomed frame's retry, the Clean read's documented gap, and
+/// Small foreign-read cases that run under Miri: foreign reads, Clean or
+/// not, kept for a doomed frame's retry, and
 /// an uncopyable foreign panic holding its reader within the budget only.
 mod foreign_miri {
     use crate::cells::{Local, Shared};
@@ -1987,6 +2085,80 @@ fn local_shared_unbudgeted_foreign_read_keeps_no_clone() {
 #[test]
 fn shared_shared_unbudgeted_foreign_read_keeps_no_clone() {
     unbudgeted_foreign_read_keeps_no_clone::<Shared, Shared>();
+}
+
+/// The same for a read of another runtime's Clean node.
+fn unbudgeted_foreign_clean_read_keeps_no_clone<A: Cells, B: Cells>() {
+    let r2 = Box::new(Runtime::<B>::new());
+    let bq = r2.create_query(|_| Counted(7));
+    r2.get(bq);
+    let direct = clones_of(|| {
+        r2.get(bq);
+    });
+    let r1 = Box::new(Runtime::<A>::new());
+    r1.set_max_frames(u32::MAX);
+    let other = OtherRt(&*r2);
+    let q = r1.create_query_with(
+        move |_| other.get(bq).0,
+        QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        },
+    );
+    let framed = clones_of(|| {
+        r1.get(q);
+    });
+    assert_eq!(
+        framed, direct,
+        "clones of a framed foreign Clean read, unbudgeted"
+    );
+}
+
+#[test]
+fn local_shared_unbudgeted_foreign_clean_read_keeps_no_clone() {
+    unbudgeted_foreign_clean_read_keeps_no_clone::<Local, Shared>();
+}
+
+#[test]
+fn shared_shared_unbudgeted_foreign_clean_read_keeps_no_clone() {
+    unbudgeted_foreign_clean_read_keeps_no_clone::<Shared, Shared>();
+}
+
+/// A budgeted replayable frame keeps its read of another runtime's Clean
+/// node for a retry, and the kept copy goes when the frame pops, so no
+/// copy outlives the read that could take it.
+fn budgeted_foreign_clean_read_frees_its_clone<A: Cells, B: Cells>() {
+    let probe = Arc::new(());
+    let r2 = Box::new(Runtime::<B>::new());
+    let p = probe.clone();
+    let bq = r2.create_query(move |_| p.clone());
+    drop(r2.get(bq));
+    let held = Arc::strong_count(&probe);
+    let r1 = Box::new(Runtime::<A>::new());
+    let other = OtherRt(&*r2);
+    let q = r1.create_query_with(
+        move |_| Arc::strong_count(&other.get(bq)) as u64,
+        QueryOpts {
+            replay: Replay::Allowed,
+            ..Default::default()
+        },
+    );
+    assert!(r1.get(q) as usize > held + 1, "the read kept no copy");
+    assert_eq!(
+        Arc::strong_count(&probe),
+        held,
+        "a kept copy outlived its frame"
+    );
+}
+
+#[test]
+fn local_shared_budgeted_foreign_clean_read_frees_its_clone() {
+    budgeted_foreign_clean_read_frees_its_clone::<Local, Shared>();
+}
+
+#[test]
+fn shared_shared_budgeted_foreign_clean_read_frees_its_clone() {
+    budgeted_foreign_clean_read_frees_its_clone::<Shared, Shared>();
 }
 
 /// X reads B's uncopyable panic `held_at` KiB deep, then `during` runs,
