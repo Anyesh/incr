@@ -46,6 +46,8 @@ pub(crate) struct Tickets {
     /// The tickets reads took, with their payloads, until a walk's entry
     /// holds one again or the read's note goes.
     lent: BTreeMap<u64, Ticket>,
+    /// The lent tickets whose read's note went, which `prune` lets go.
+    dropped: Arc<Mutex<Vec<u64>>>,
     /// The ticket of each landing a held or lent ticket keeps, which is one
     /// at most, with the landing's place among its members and the order it
     /// joined in, so that a node's flip to Dirty removes it only from a
@@ -102,18 +104,13 @@ impl Tickets {
     /// Lets the tickets go whose read's note went without holding them
     /// again, with their landings.
     fn prune(&mut self) {
-        note_work(self.lent.len());
-        let dropped: Vec<u64> = self
-            .lent
-            .iter()
-            .filter(|(_, c)| c.members.dropped())
-            .map(|(&id, _)| id)
-            .collect();
+        let dropped =
+            std::mem::take(&mut *self.dropped.lock().unwrap_or_else(PoisonError::into_inner));
+        note_work(dropped.len());
         for id in dropped {
-            let c = self
-                .lent
-                .remove(&id)
-                .expect("incr-core: a lent ticket is listed");
+            let Some(c) = self.lent.remove(&id) else {
+                continue;
+            };
             let members = c.members.lock();
             note_work(members.members.len());
             for m in &members.members {
@@ -437,7 +434,7 @@ impl<C: Cells> Runtime<C> {
             (
                 seq,
                 Ticket {
-                    members: Arc::new(Members::new(seq)),
+                    members: Arc::new(Members::new(seq, t.dropped.clone())),
                     live: 0,
                     payload: None,
                 },

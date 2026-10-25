@@ -14,7 +14,7 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::fx::FxBuildHasher;
@@ -41,8 +41,9 @@ pub(crate) struct Members {
     /// The ticket's id.
     pub(crate) id: u64,
     joined: Mutex<Joined>,
-    /// The read's note went without holding the ticket again.
-    dropped: AtomicBool,
+    /// The tickets whose read's note went without holding them again, for
+    /// their runtime to let go.
+    dropped: Arc<Mutex<Vec<u64>>>,
 }
 
 #[derive(Default)]
@@ -60,11 +61,11 @@ pub(crate) struct Member {
 }
 
 impl Members {
-    pub(crate) fn new(id: u64) -> Self {
+    pub(crate) fn new(id: u64, dropped: Arc<Mutex<Vec<u64>>>) -> Self {
         Self {
             id,
             joined: Mutex::default(),
-            dropped: AtomicBool::new(false),
+            dropped,
         }
     }
 
@@ -72,12 +73,11 @@ impl Members {
         self.joined.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn dropped(&self) -> bool {
-        self.dropped.load(SeqCst)
-    }
-
     fn drop_note(&self) {
-        self.dropped.store(true, SeqCst);
+        self.dropped
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(self.id);
     }
 }
 
