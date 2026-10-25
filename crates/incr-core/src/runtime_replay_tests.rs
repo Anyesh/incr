@@ -1959,6 +1959,8 @@ enum CFails {
     /// `try_get` in place of c, and panics with `CustomPayload(5)` for its
     /// `Err`.
     Cycle,
+    /// As `Cycle`, with y's cycle first walked by b's own `try_get`.
+    FreshCycle,
 }
 
 /// A replayable reader r, `outer` levels under the read, catches b's custom
@@ -1998,7 +2000,7 @@ fn failed_dep_shape<C: Cells>(frames: u32, outer: u32, chain: u32, fails: CFails
             if matches!(fails, CFails::ViaClean) {
                 assert_eq!(rt.get(w), 1);
             }
-            if matches!(fails, CFails::Cycle) {
+            if matches!(fails, CFails::Cycle | CFails::FreshCycle) {
                 let got = if rt.try_get(y).is_err() { 5 } else { 6 };
                 std::panic::panic_any(CustomPayload(got))
             }
@@ -2045,7 +2047,13 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
             super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get),
         )
     };
-    for fails in [CFails::Before, CFails::InB, CFails::ViaClean, CFails::Cycle] {
+    for fails in [
+        CFails::Before,
+        CFails::InB,
+        CFails::ViaClean,
+        CFails::Cycle,
+        CFails::FreshCycle,
+    ] {
         let (regens, holds) = counts();
         for outer in [0, 1, 3] {
             for chain in [0, 2, 6] {
@@ -2060,7 +2068,7 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
                     let want = shape(u32::MAX);
                     let b = match fails {
                         CFails::InB => 11,
-                        CFails::Cycle => 5,
+                        CFails::Cycle | CFails::FreshCycle => 5,
                         CFails::Before | CFails::ViaClean => 100,
                     };
                     assert_eq!(want, b * 1000 + 1 + u64::from(chain), "{fails:?}");
@@ -2075,14 +2083,286 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
             }
         }
         // Under ViaClean b read w, which its catch left Dirty, and under
-        // Cycle a Cyclic node, so b does not land Failed, and r is held past
-        // the budget instead.
+        // the cycle shapes a cycle, neither of which a rerun of b reads
+        // again, so r is held past the budget instead.
+        let (regens_after, holds_after) = counts();
         if matches!(fails, CFails::Before | CFails::InB) {
-            let (regens_after, holds_after) = counts();
             assert!(regens_after > regens, "{fails:?} regenerated nothing");
             assert_eq!(holds_after, holds, "{fails:?} held a reader");
         }
     }
+}
+
+/// v reads r through `outer` levels, r catches the panic of f and then
+/// reads a chain of `chain` levels, and f's `try_get` of v cycles, so f
+/// panics with `CustomPayload(5)`. Past the budget f's retry reads v as a
+/// virtual hit, a cycle read as f's first run's was.
+fn cyclic_failed_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let i = rt.create_input(1_u64);
+    let v_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let v_read = Arc::clone(&v_cell);
+    let f = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let got = if rt.try_get(*v_read.get().unwrap()).is_err() {
+                5
+            } else {
+                6
+            };
+            std::panic::panic_any(CustomPayload(got))
+        },
+        replayable(),
+    );
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let d = deep;
+        deep = rt.create_query_with(move |rt| rt.get(d) + 1, replayable());
+    }
+    let mut top = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    for _ in 0..outer {
+        let t = top;
+        top = rt.create_query_with(move |rt| rt.get(t), replayable());
+    }
+    let v = rt.create_query_with(move |rt| rt.get(top), replayable());
+    v_cell.set(v).unwrap();
+    rt.try_get(v).unwrap_or(7777)
+}
+
+/// f's retry past the budget reads v as a virtual hit, so f's payload is
+/// one no rerun of f makes again, and r sees it as the unbounded run's r
+/// did.
+#[test]
+fn a_payload_after_a_virtual_cycle_read_reads_as_unbounded() {
+    for outer in [0, 1, 3] {
+        for chain in [0, 2, 6] {
+            for local in [true, false] {
+                let shape = |frames| {
+                    if local {
+                        cyclic_failed_shape::<Local>(frames, outer, chain)
+                    } else {
+                        cyclic_failed_shape::<Shared>(frames, outer, chain)
+                    }
+                };
+                let want = shape(u32::MAX);
+                assert_eq!(want, 5001 + u64::from(chain));
+                for frames in 1..9 {
+                    assert_eq!(
+                        shape(frames),
+                        want,
+                        "local={local} outer={outer} chain={chain} frames={frames}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// r, `outer` levels under the read, catches the panic of b and then reads
+/// a chain of `chain` levels; b panics with `CustomPayload(5)` if its
+/// `try_get` of y is a cycle, else `CustomPayload(6)`. y reads itself once
+/// k is set, and r reads k first, so with `outer` 0 b's run after the set
+/// is r's read, landing Failed with y a dep from its first run. Returns
+/// what the read gives before and after the set.
+fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> (u64, u64) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let i = rt.create_input(1_u64);
+    let k = rt.create_input(0_u64);
+    let y_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let y_self = Arc::clone(&y_cell);
+    let y = rt.create_query(move |rt: &Runtime<C>| {
+        if rt.get(k) == 1 {
+            rt.get(*y_self.get().unwrap())
+        } else {
+            0
+        }
+    });
+    y_cell.set(y).unwrap();
+    let b = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let got = if rt.try_get(y).is_err() { 5 } else { 6 };
+            std::panic::panic_any(CustomPayload(got))
+        },
+        replayable(),
+    );
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let d = deep;
+        deep = rt.create_query_with(move |rt| rt.get(d) + 1, replayable());
+    }
+    let mut top = rt.create_query_with(
+        move |rt| {
+            // k first, so the set reruns r before a walk verifies b.
+            rt.get(k);
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or_else(
+                    || {
+                        if p.is::<String>() || p.is::<&str>() {
+                            2
+                        } else {
+                            4
+                        }
+                    },
+                    |c| c.0,
+                ),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    for _ in 0..outer {
+        let t = top;
+        top = rt.create_query_with(move |rt| rt.get(t), replayable());
+    }
+    let before = rt.try_get(top).unwrap_or(7777);
+    rt.set(k, 1);
+    (before, rt.try_get(top).unwrap_or(7777))
+}
+
+/// r sees b's payload after b's own run walked a cycle as the unbounded run's
+/// r did, at every budget.
+#[test]
+fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
+    for outer in [0, 1, 3] {
+        for chain in [0, 2, 6] {
+            for local in [true, false] {
+                let shape = |frames| {
+                    if local {
+                        recomputed_cycle_shape::<Local>(frames, outer, chain)
+                    } else {
+                        recomputed_cycle_shape::<Shared>(frames, outer, chain)
+                    }
+                };
+                let want = shape(u32::MAX);
+                for frames in 1..9 {
+                    assert_eq!(
+                        shape(frames),
+                        want,
+                        "local={local} outer={outer} chain={chain} frames={frames}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// v reads r through `outer` levels once k is set, r catches the panic of f
+/// and then reads a chain of `chain` levels, and f panics with
+/// `CustomPayload(5)` if its `try_get` of v is a cycle, else
+/// `CustomPayload(6)`, or with `CustomPayload(v + 5)` from a `get` under
+/// `fallback`, where v resolves a cycle to 40. After the set f's run reads
+/// v as a cycle, past the budget a virtual hit, and lands Failed with v a
+/// dep from its first run. Returns what reads of r before and of v after
+/// the set give.
+fn recomputed_virtual_shape<C: Cells>(
+    frames: u32,
+    outer: u32,
+    chain: u32,
+    fallback: bool,
+) -> (u64, u64) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let i = rt.create_input(1_u64);
+    let k = rt.create_input(0_u64);
+    let v_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let v_read = Arc::clone(&v_cell);
+    let f = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let got = if rt.try_get(*v_read.get().unwrap()).is_err() {
+                5
+            } else {
+                6
+            };
+            std::panic::panic_any(CustomPayload(got))
+        },
+        replayable(),
+    );
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let d = deep;
+        deep = rt.create_query_with(move |rt| rt.get(d) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            // k first, so the set reruns r before a walk verifies f.
+            rt.get(k);
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut top = r;
+    for _ in 0..outer {
+        let t = top;
+        top = rt.create_query_with(move |rt| rt.get(t), replayable());
+    }
+    let v = rt.create_query_with(
+        move |rt: &Runtime<C>| if rt.get(k) == 1 { rt.get(top) } else { 0 },
+        QueryOpts {
+            replay: Replay::Allowed,
+            cycle: if fallback {
+                CycleStrategy::fallback(|_| 40)
+            } else {
+                CycleStrategy::None
+            },
+        },
+    );
+    v_cell.set(v).unwrap();
+    let before = rt.try_get(r).unwrap_or(7777);
+    rt.set(k, 1);
+    (before, rt.try_get(v).unwrap_or(7777))
+}
+
+/// f's run after the set reads v as a cycle, past the budget a virtual
+/// hit, which a rerun of f does not read again, so r is held for f's
+/// payload instead of given a regenerated one, and sees it as the
+/// unbounded run's r did.
+#[test]
+fn a_payload_after_a_virtual_cycle_read_holds_its_reader() {
+    let holds = || super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get);
+    let before = holds();
+    for fallback in [false, true] {
+        for outer in [0, 1, 3] {
+            for chain in [0, 2, 6] {
+                for local in [true, false] {
+                    let shape = |frames| {
+                        if local {
+                            recomputed_virtual_shape::<Local>(frames, outer, chain, fallback)
+                        } else {
+                            recomputed_virtual_shape::<Shared>(frames, outer, chain, fallback)
+                        }
+                    };
+                    let want = shape(u32::MAX);
+                    for frames in 1..9 {
+                        assert_eq!(
+                            shape(frames),
+                            want,
+                            "fallback={fallback} local={local} outer={outer} chain={chain} \
+                             frames={frames}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(holds() > before, "held no reader of f");
 }
 
 /// A replayable chain of `levels` readers, each catching the custom panic
