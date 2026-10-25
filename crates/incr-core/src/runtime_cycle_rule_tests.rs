@@ -1889,6 +1889,80 @@ fn retry_set_before_stashed_read_is_seen() {
     }
 }
 
+/// [`stashed_clean_read_after_set`] run from a replayable query of a third
+/// runtime, doomed on its first leaf, whose retry reads the reader, sets
+/// the input and reads the stashed leaf: the third runtime's context is
+/// still open, but the set is no speculative run's. Returns the query's
+/// value and the leaf's runs.
+fn stashed_read_under_other_context<A: Cells, B: Cells>(budget: bool) -> (u64, u32) {
+    let r0 = Box::new(Runtime::<A>::new());
+    let r1 = Box::new(Runtime::<A>::new());
+    let r2 = Box::new(Runtime::<B>::new());
+    // Unbudgeted wins over `INCR_MAX_DEPTH`.
+    let frames = if budget { 1 } else { u32::MAX };
+    for r in [&r0, &r1] {
+        r.set_placeholder(0_u64);
+        r.set_max_frames(frames);
+    }
+    let x = r2.create_input(1000_u64);
+    let replayable = || QueryOpts {
+        replay: Replay::Allowed,
+        ..Default::default()
+    };
+    let runs = Arc::new(AtomicU32::new(0));
+    let first = r1.create_query(|_| 1_u64);
+    let leaf = {
+        let (r2, runs) = (OtherRt(&*r2), runs.clone());
+        r1.create_query_with(
+            move |_| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                r2.get(x)
+            },
+            replayable(),
+        )
+    };
+    let wide = r1.create_query_with(
+        move |rt| match rt.get(first) {
+            0 => rt.get(leaf),
+            v => v,
+        },
+        replayable(),
+    );
+    let lead = r0.create_query(|_| 1_u64);
+    let query = {
+        let (r1, r2) = (OtherRt(&*r1), OtherRt(&*r2));
+        r0.create_query_with(
+            move |rt| match rt.get(lead) {
+                0 => 0,
+                _ => {
+                    r1.get(wide);
+                    r2.set(x, 2000);
+                    r1.get(leaf)
+                }
+            },
+            replayable(),
+        )
+    };
+    let value = r0.get(query);
+    assert_eq!(!r1.dooms.lock().unwrap().is_empty(), budget);
+    (value, runs.load(Ordering::Relaxed))
+}
+
+#[test]
+fn stashed_read_under_other_context_sees_the_set() {
+    for budget in [false, true] {
+        let runs = [
+            stashed_read_under_other_context::<Local, Local>(budget),
+            stashed_read_under_other_context::<Local, Shared>(budget),
+            stashed_read_under_other_context::<Shared, Local>(budget),
+            stashed_read_under_other_context::<Shared, Shared>(budget),
+        ];
+        // The budget's extra run is the speculative one off the placeholder.
+        let leaf_runs = if budget { 2 } else { 1 };
+        assert_eq!(runs, [(2000, leaf_runs); 4], "{budget}");
+    }
+}
+
 /// A value whose `Clone` reads another runtime's input, as the value-code
 /// contract allows of a Clean node.
 struct ReadsOther<B: Cells> {

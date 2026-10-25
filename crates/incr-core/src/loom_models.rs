@@ -1818,3 +1818,21 @@ fn loom_speculative_changes_vs_check() {
         }
     });
 }
+
+/// [`loom_speculative_changes_vs_check`]'s other side: with only a
+/// speculative change, a count found before it passes once it has ended.
+#[test]
+fn loom_speculative_change_passes_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let writer = {
+            let changes = changes.clone();
+            thread::spawn(move || drop(changes.change(true)))
+        };
+        let seen = changes.count();
+        writer.join().unwrap();
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(seen.only_speculative_since());
+        }
+    });
+}

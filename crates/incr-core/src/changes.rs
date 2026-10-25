@@ -116,10 +116,10 @@ impl Count {
             && (now >> 32).wrapping_sub(self.at >> 32) == speculative.wrapping_sub(self.speculative)
     }
 
-    /// Whether the read found the count before any change began.
+    /// Whether the read found neither word moved by any change.
     #[cfg(all(test, loom))]
     pub(crate) fn before_any(&self) -> bool {
-        self.at == 0
+        self.at == 0 && self.speculative == 0
     }
 
     /// Whether `self` and `other` are of one runtime at one count.

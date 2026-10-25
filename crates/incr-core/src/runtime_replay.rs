@@ -4849,10 +4849,11 @@ struct ForeignReads {
 
 impl ForeignReads {
     /// While a context open at the run's end is still open, a speculative
-    /// run's change since the reads was made by a run after them, which the
-    /// unbounded run also makes after them; any other change, or any change
-    /// once all those contexts have ended, may come before the unbounded
-    /// run's read, so the counts must hold.
+    /// run's change since the reads is taken as one the unbounded run makes
+    /// after them, as main assumes of every stash: true of this thread's
+    /// later speculative runs, not of another thread's. Any other change, or
+    /// any change once all those contexts have ended, may come before the
+    /// unbounded run's read, so the counts must hold.
     fn adoptable(&self) -> bool {
         self.counts.is_empty()
             || self.context.is_some_and(replay::context_open)
