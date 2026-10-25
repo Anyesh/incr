@@ -6589,12 +6589,13 @@ fn seed_783_at_budget_3() {
     });
 }
 
-/// A query whose run read the node being deleted keeps that dependency,
-/// so the delete is refused at every budget. In 0x2343 node 15's run
-/// completes with the read; in 0xc17 node 7's claim, released by another
-/// node's user panic, lands New over the deps its run read.
+/// A delete of a node that a query's unwound run read gives the unbounded
+/// outcome at every budget: the run's cycle reached its reader, so the run
+/// kept no dependency on the node and the delete succeeds, as on main
+/// (0x2343 op 9; 0xc17 op 5, where node 7's claim was released by another
+/// node's user panic).
 #[test]
-fn delete_of_a_node_a_query_read_is_refused() {
+fn delete_after_an_unwound_read_gives_the_unbounded_outcome() {
     for (seed, op) in [(0x2343, 9), (0xc17, 5)] {
         let mut case = gen_case(seed, false, false);
         assert!(matches!(case.ops[op], Op::Delete(_)));
@@ -6606,7 +6607,7 @@ fn delete_of_a_node_a_query_read_is_refused() {
                 for trace in [&local, &shared] {
                     assert_eq!(
                         trace[op].0,
-                        Out::Deleted(Err("HasDependents".into())),
+                        Out::Deleted(Ok(())),
                         "seed {seed:#x} at {frames:?}/{bytes}"
                     );
                 }
