@@ -3989,6 +3989,10 @@ impl<C: Cells> Runtime<C> {
                         return self.discard_doomed(id, attempt, &ctl, Some(payload), bag);
                     }
                     Err(payload) => {
+                        debug_assert!(
+                            !payload.is::<cycle::DoomUnwind>(),
+                            "incr-core: a doom unwind reached an undoomed frame"
+                        );
                         return self.compute_panicked(
                             id,
                             node,
@@ -4004,7 +4008,7 @@ impl<C: Cells> Runtime<C> {
                             bag,
                             walked,
                             payload,
-                        )
+                        );
                     }
                 };
 

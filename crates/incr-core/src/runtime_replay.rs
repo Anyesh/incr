@@ -1712,6 +1712,13 @@ impl<C: Cells> Runtime<C> {
         Computed::Discarded
     }
 
+    /// Raises a [`cycle::DoomUnwind`] from a doomed frame's read.
+    fn doom_unwind(&self) -> ! {
+        debug_assert!(!C::SINGLE_THREADED);
+        cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+        resume_unwind(Box::new(cycle::DoomUnwind))
+    }
+
     /// Sets the unwind kind of a drop unwind about to be raised.
     pub(super) fn set_drop_kind(&self) {
         #[cfg(test)]
@@ -1851,6 +1858,9 @@ impl<C: Cells> Runtime<C> {
                 },
             );
         });
+        if !C::SINGLE_THREADED {
+            self.doom_unwind();
+        }
         ctl.raise(cycle::PH_SEEN);
         Some(placeholder)
     }
@@ -1867,6 +1877,9 @@ impl<C: Cells> Runtime<C> {
             ctl.has(cycle::DOOMED),
             "incr-core: a placeholder read dooms its frame"
         );
+        if !C::SINGLE_THREADED && ctl.has(cycle::DOOMED) {
+            self.doom_unwind();
+        }
         ctl.raise(cycle::PH_SEEN);
         self.placeholder::<T>()
             .expect("incr-core: a doomed read's type has a placeholder")
@@ -3528,6 +3541,10 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
         failures: u64,
     ) -> VPop {
+        debug_assert!(
+            !payload.is::<cycle::DoomUnwind>(),
+            "incr-core: a doom unwind left the doomed frames"
+        );
         let kind = cycle_state::unwind_kind();
         let mut bag = Deferred::new();
         let mut payload = payload;
@@ -3889,6 +3906,10 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
         failures: u64,
     ) -> Option<Computed> {
+        debug_assert!(
+            !payload.is::<cycle::DoomUnwind>(),
+            "incr-core: a doom unwind left the doomed frames"
+        );
         let kind = cycle_state::unwind_kind();
         if kind == Some(UnwindKind::Discard) {
             let (own, enclosing) = replay::with(|c| {

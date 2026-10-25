@@ -475,3 +475,10 @@ pub(crate) struct WoundUnwind;
 /// The payload a speculative entry's discard unwind carries on from a
 /// closure that swallowed it.
 pub(crate) struct DiscardUnwind;
+
+/// The payload a `Shared` doomed frame raises at its placeholder read in
+/// place of running on past it. It carries the discard kind, and every
+/// frame it passes is doomed and lands the discard, so it never leaves the
+/// doomed frames: user code there could join a thread that reads a node
+/// the doom reserved for this thread's retry.
+pub(crate) struct DoomUnwind;
