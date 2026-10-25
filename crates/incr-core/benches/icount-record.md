@@ -2171,3 +2171,63 @@ scale by `scale-icount` against `01797eba`: Shared rows rise at most
 0.32% (`shared_wide_diverted_retry`; `shared_taint_100k_at_budget_1`
 0.30%), Local rows move within -0.43..+0.10%, and `replay_scale_tests`
 take 15.53 s against 15.45 s (mean of four alternating runs each).
+
+## A frame settles at its first foreign Clean read whether it keeps them
+
+`a5ccc570` keeps a budgeted frame's Clean reads of another runtime's
+nodes for its retry. Every frame is pushed with an untested tag in its
+runtime id's top bits; another runtime's first Clean read from it takes
+the cold route once, asks the frame's runtime through a pointer in its
+`ComputeCtl` whether the compute is replayable under a budget, and
+settles the tag. `045626d4` forces `push_frame`'s closure inline, without
+which any change to what the push writes moves it out of line
+(T10-perf-push-frame-inline-fragile). Base `34412289`, tip `fb454aa8`,
+same box, `icount.sh` defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 101 | 101 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_shared` | 218.14 | 218.14 | 0 |
+| `value_slot_read_shared` | 87 | 87 | 0 |
+| `chain_local/propagate/100` | 98022.02 | 97125.01 | -897.01 |
+| `chain_shared/propagate/100` | 199484.56 | 199887.44 | +402.88 |
+| `diamond_local` | 4138 | 4114 | -24.00 |
+| `diamond_shared` | 8238.95 | 8253.95 | +15.00 |
+| `fanout_local_4` | 17638.01 | 17567 | -71.01 |
+| `fanout_local_1000` | 3555228.91 | 3542218.08 | -13010.83 |
+| `fanout_shared_1000` | 4937066.01 | 4939074.09 | +2008.08 |
+| `foreign_clean_read_unbudgeted_u64` | 7335.93 | 7522.8 | +186.87 |
+| `foreign_clean_read_unbudgeted_u64_x1000` | 223968.18 | 224154.27 | +186.09 |
+| `foreign_clean_read_unbudgeted_4k` | 24301.05 | 24475.6 | +174.55 |
+| `foreign_clean_read_budgeted_u64` | 7335.8 | 27594.12 | +20258.32 |
+| `foreign_clean_read_budgeted_u64_x1000` | 223968.22 | 1566277.13 | +1342308.91 |
+| `foreign_clean_read_budgeted_4k` | 24366.33 | 57693.78 | +33327.45 |
+| `foreign_dirty_read_unbudgeted_u64` | 48367.06 | 48582.34 | +215.28 |
+| `foreign_dirty_read_budgeted_u64` | 85088.38 | 81211.91 | -3876.47 |
+
+- About 4 instructions per compute under `Shared`: PT on
+  `chain_shared/propagate/100` puts the +4 in `clean_walk`, 2 in
+  `cycle.rs` (the `ComputeCtl` resolver pointer) and 2 in `dep_stack.rs`
+  (the untested tag in the push), the rest ±1 layout. Local rows fall
+  because the push is forced inline.
+- An unbudgeted frame reading other runtimes pays one settle, 0 per read
+  (16 reads +187, 1000 reads +187): `diverted_clean_read` 100,
+  `foreign_keeper` 69, `reload_after_empty_slot` 15, `resolve_keep` 10,
+  `ComputeCtl::keeps_foreign` 5, `get` -22. Its non-Clean foreign reads
+  pay about 6 each in the masked `rt()` fallback of `Frame::is_of`.
+- A budgeted frame's Clean foreign read costs 1,266 (16 reads) to 1,342
+  (1000 reads) for its kept clone, 0.55x to 0.59x a non-Clean read's
+  keep on the same base (dirty budgeted minus unbudgeted, 2,295 per read). The keep
+  path's cuts (no extract when nothing goes, a presized extract at pop,
+  one uncount pass that clears the counts when none is left) also take
+  242 per read off a non-Clean keep.
+- Settling at push was the first form: a cached budget bit and the
+  replayable test after the push cost 11 to 15 per compute
+  (`chain_local/propagate/100` +1.12% to +1.63%), all of it per compute
+  on every runtime, budgeted by default or not.
+
+Gate: the hard gates are exact (101/193, 218.14/87). `rc-sweep`
+against `34412289` changes no value and flags no run count, and the
+strict scan lists the same seeds as `34412289`'s. Replay scale timing
+and `scale-icount` run on the train that lands this branch.

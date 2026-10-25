@@ -492,7 +492,9 @@ impl<C: Flavor> World<C> {
             C::churn_threaded(self, churn);
         }
         let mut rng = churn.seed;
-        for step in 1.. {
+        let mut step = 0;
+        loop {
+            step += 1;
             let op = match pick(&mut rng, 4) {
                 0 => Some(Op::Read(pick(&mut rng, self.spec.nodes.len()) as u32)),
                 1 => Some(Op::Checkpoint),
@@ -505,7 +507,6 @@ impl<C: Flavor> World<C> {
                 say(READY);
             }
         }
-        unreachable!()
     }
 }
 

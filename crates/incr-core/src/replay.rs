@@ -353,6 +353,12 @@ impl Landings {
         }
     }
 
+    fn holds(&mut self, node: (u32, u32)) -> bool {
+        let nodes = self.owned_nodes();
+        note_work(nodes.len());
+        nodes.iter().any(|&(n, _)| n == node)
+    }
+
     pub(crate) fn into_nodes(mut self) -> Vec<((u32, u32), u32)> {
         std::mem::take(self.owned_nodes())
     }
@@ -1435,6 +1441,17 @@ struct Logged {
 /// every frame at or above the reading one's position, but the reading
 /// one, which is a run of its own if this is its first such read.
 pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
+    keep(read, fresh, false);
+}
+
+/// [`keep_read`] for a read of another runtime's node whose ordinal (see
+/// [`foreign_ordinal`]) no take needed first: the count that keeping it
+/// raises gives it.
+pub(crate) fn keep_foreign_read(read: KeptRead, fresh: bool) {
+    keep(read, fresh, true);
+}
+
+fn keep(mut read: KeptRead, fresh: bool, number: bool) {
     if let Delivered::Unwind { nodes, .. } = &read.what {
         let top = read.cidx + 1 + nodes.depth();
         KEPT_TOP.with(|k| k.set(k.get().max(top)));
@@ -1450,14 +1467,14 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
             .rposition(|(e, _)| e.cidx < read.cidx || !fresh && ours(e))
             .map_or(0, |i| i + 1);
         note_work(d.len() - from);
-        let gone: Vec<(KeptRead, usize)> = d
-            .extract_if(from.., |(e, _)| {
-                e.rt == read.rt && e.cidx >= read.cidx && (fresh || !ours(e))
-            })
-            .collect();
-        for (e, _) in &gone {
-            count_foreign(e, false);
-        }
+        let goes = |e: &KeptRead| e.rt == read.rt && e.cidx >= read.cidx && (fresh || !ours(e));
+        // Mostly the frame's own latest read is all there is past `from`.
+        let gone: Vec<(KeptRead, usize)> = if d[from..].iter().any(|(e, _)| goes(e)) {
+            d.extract_if(from.., |(e, _)| goes(e)).collect()
+        } else {
+            Vec::new()
+        };
+        uncount_foreign(&gone, d.is_empty());
         // Most replay coverage runs in release, and the scans of kept reads
         // rely on this.
         if cfg!(any(test, debug_assertions)) {
@@ -1466,7 +1483,15 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
                 "incr-core: kept reads run in frame order"
             );
         }
-        count_foreign(&read, true);
+        let count = count_foreign(&read, true);
+        if number {
+            read.ordinal = count;
+        } else {
+            debug_assert!(
+                read.foreign.is_none() || read.ordinal == count,
+                "incr-core: a kept foreign read's ordinal is not its count"
+            );
+        }
         d.push((read, seen));
         gone
     });
@@ -1492,10 +1517,19 @@ fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
 }
 
 /// Marks `nodes` as landings a copy may hold, so that a later landing of
-/// one of them finds the copies to drop it from. A shared copy marks only
-/// the notes its log's earlier copies did not.
+/// one of them finds the contexts' deliveries to drop it from. Only a
+/// context's deliveries need the marks: a kept read applies a landing to
+/// its copy when the copy holds the node (`catch_up`), and a context that
+/// opens marks the kept reads' copies.
 pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
-    let generation = COPIED_GEN.with(Cell::get);
+    if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+        mark(rt, nodes);
+    }
+}
+
+/// A shared copy marks only the notes its log's earlier copies did not.
+fn mark(rt: RuntimeId, nodes: &Landings) {
+    let generation = copied_generation();
     COPIED.with(|c| {
         let mut c = c.borrow_mut();
         let mut mark = |n| {
@@ -1519,12 +1553,44 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
                 };
                 note_work(len - from);
                 for e in log.entries[from..*len].iter().filter(|e| e.gone >= *epoch) {
-                    mark(e.node);
+                    match &e.lent {
+                        None => mark(e.node),
+                        // A ticket's members went into earlier copies of
+                        // the notes that stood for it, so only its later
+                        // members are new.
+                        Some((members, len)) => {
+                            let mut joined = members.lock();
+                            let from = match joined.marked {
+                                (g, upto) if g == generation => upto.min(*len),
+                                _ => 0,
+                            };
+                            note_work(len - from);
+                            for m in joined.members[from..*len]
+                                .iter()
+                                .filter(|m| m.gone >= *epoch)
+                            {
+                                mark(m.node);
+                            }
+                            joined.marked = (generation, (*len).max(from));
+                        }
+                    }
                 }
                 log.marked = (generation, (*len).max(from));
             }
         }
     });
+}
+
+/// This thread's copied set's generation, unique among every thread's, as
+/// a ticket's members are marked from any thread.
+fn copied_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    COPIED_GEN.with(|g| {
+        if g.get() == 0 {
+            g.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        g.get()
+    })
 }
 
 /// Whether a kept read or a context's delivery may hold copied landings.
@@ -1541,15 +1607,15 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
         let (w, b) = copied_bit(rt, n);
         COPIED.with(|c| c.borrow()[w] & b != 0)
     });
-    // Short of a copied node, an event retires only landings above its
+    // A landing retires its node from any kept copy, which the copied set
+    // does not mark; another event retires only landings above its
     // position, or at it for a contained payload.
     let reach = match *ev {
         Retire::Contained { cidx, .. } => cidx,
-        _ => ev.cidx() + 1,
+        Retire::Landing { .. } => 0,
+        Retire::Above(at) => at + 1,
     };
-    if value_code::thread_word() & value_code::KEPT_BIT != 0
-        && (all || KEPT_TOP.with(Cell::get) >= reach)
-    {
+    if value_code::thread_word() & value_code::KEPT_BIT != 0 && KEPT_TOP.with(Cell::get) >= reach {
         KEPT_EVENTS.with(|v| v.borrow_mut().push(Logged { rt, ev: *ev, all }));
     }
     with(|c| {
@@ -1568,10 +1634,23 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &[Logged]) {
     };
     note_work(events.len() - seen);
     for l in &events[seen..] {
-        if l.rt == read.rt && (read.cidx < l.ev.cidx() || l.all) {
+        if l.rt == read.rt
+            && (read.cidx < l.ev.cidx() || l.all || l.ev.node().is_some_and(|n| nodes.holds(n)))
+        {
             nodes.retire(read.cidx, &l.ev, None);
         }
     }
+}
+
+/// Marks the kept reads' copies for a context that opens.
+fn mark_kept() {
+    KEPT_READS.with(|d| {
+        for (e, _) in d.borrow().iter() {
+            if let Delivered::Unwind { nodes, .. } = &e.what {
+                mark(e.rt, nodes);
+            }
+        }
+    });
 }
 
 /// The reads kept for the run of control block `ctl` at `cidx`.
@@ -1612,10 +1691,9 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
     KEPT_READS.with(|d| {
         let mut d = d.borrow_mut();
         let from = from_frame(&d, cidx);
-        let out: Vec<(KeptRead, usize)> = d.extract_if(from.., |(e, _)| which(e)).collect();
-        for (e, _) in &out {
-            count_foreign(e, false);
-        }
+        let mut out = Vec::with_capacity(d.len() - from);
+        out.extend(d.extract_if(from.., |(e, _)| which(e)));
+        uncount_foreign(&out, d.is_empty());
         debug_assert!(
             !d.is_empty() || FOREIGN_KEPT.with(|m| m.borrow().is_empty()),
             "incr-core: a foreign read's count outlived its kept read"
@@ -1623,7 +1701,7 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
         value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
             COPIED.with(|c| *c.borrow_mut() = [0; 64]);
-            COPIED_GEN.with(|g| g.set(g.get() + 1));
+            COPIED_GEN.with(|g| g.set(0));
         }
         out
     })
@@ -1677,30 +1755,55 @@ fn foreign_key(e: &KeptRead) -> Option<ForeignKey> {
         .map(|foreign| (e.rt, e.cidx, e.ctl as usize, e.reading, foreign))
 }
 
-/// Counts `e` in or out of `FOREIGN_KEPT`, which holds, for each
-/// [`ForeignKey`], how many of the kept reads are under it.
-fn count_foreign(e: &KeptRead, kept: bool) {
-    let Some(key) = foreign_key(e) else {
+/// Counts out the reads in `gone`, which have left the kept reads; when
+/// `none_left`, none is kept, so no count is left either. Debug builds
+/// count each out even then, so a count the reads lost track of panics
+/// rather than going with the clear.
+fn uncount_foreign(gone: &[(KeptRead, usize)], none_left: bool) {
+    if gone.is_empty() {
         return;
+    }
+    if none_left && !cfg!(debug_assertions) {
+        FOREIGN_KEPT.with(|m| m.borrow_mut().clear());
+        return;
+    }
+    for (e, _) in gone {
+        count_foreign(e, false);
+    }
+    debug_assert!(
+        !none_left || FOREIGN_KEPT.with(|m| m.borrow().is_empty()),
+        "incr-core: a foreign read's count outlived its kept read"
+    );
+}
+
+/// Counts `e` in or out of `FOREIGN_KEPT`, which holds, for each
+/// [`ForeignKey`], how many of the kept reads are under it, and returns
+/// how many are now (0 for a read of this runtime's).
+fn count_foreign(e: &KeptRead, kept: bool) -> u32 {
+    let Some(key) = foreign_key(e) else {
+        return 0;
     };
     FOREIGN_KEPT.with(|m| {
         let mut m = m.borrow_mut();
         match m.entry(key) {
             MapEntry::Occupied(mut o) if !kept => {
                 *o.get_mut() -= 1;
-                if *o.get() == 0 {
+                let left = *o.get();
+                if left == 0 {
                     o.remove();
                 }
+                left
             }
-            MapEntry::Occupied(mut o) => *o.get_mut() += 1,
-            MapEntry::Vacant(v) if kept => {
-                v.insert(1);
+            MapEntry::Occupied(mut o) => {
+                *o.get_mut() += 1;
+                *o.get()
             }
+            MapEntry::Vacant(v) if kept => *v.insert(1),
             MapEntry::Vacant(_) => {
                 unreachable!("incr-core: a foreign read left the kept reads uncounted")
             }
         }
-    });
+    })
 }
 
 /// The id the next context or episode gets.
@@ -2083,6 +2186,9 @@ pub(crate) fn open(rt: RuntimeId, boundary: u32, target: Entry, frame_keys: Fram
         }
         c.push(x);
     });
+    if value_code::thread_word() & value_code::KEPT_BIT != 0 {
+        mark_kept();
+    }
     id
 }
 

@@ -926,6 +926,44 @@ fn unread_contained_panic_is_released<C: Cells>() {
     assert_no_notes();
 }
 
+/// A read outside any compute takes a contained panic, which no frame
+/// below can contain again: the ticket goes with it, so none is held or
+/// lent after, however often the read repeats.
+fn top_level_read_takes_the_ticket<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v != 0, "f boom");
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(f) } else { 100 });
+    for round in 0..3 {
+        rt.set(j, 1);
+        rt.set(sel, 0);
+        assert_eq!(rt.get(x), 1);
+        rt.set(j, 0);
+        rt.set(sel, 1);
+        assert_eq!(rt.get(x), 100);
+        assert_eq!(rt.contained_payloads(), 1);
+        let err = catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err();
+        assert!(panic_message(err).contains("f boom"));
+        assert_eq!(rt.tickets_kept(), (0, false), "round {round}");
+        assert_no_notes();
+    }
+}
+
+#[test]
+fn local_top_level_read_takes_the_ticket() {
+    top_level_read_takes_the_ticket::<Local>();
+}
+
+#[test]
+fn shared_top_level_read_takes_the_ticket() {
+    top_level_read_takes_the_ticket::<Shared>();
+}
+
 #[test]
 fn local_unread_contained_panic_is_released() {
     unread_contained_panic_is_released::<Local>();
@@ -2157,6 +2195,39 @@ fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
         .join()
         .unwrap();
     assert_eq!(got, if failed { n as i64 } else { 0 });
+}
+
+/// The chain at 2000 with a ticket per caught read, every read's ticket
+/// taken while the frames below hold theirs: the tickets' work stays
+/// linear in the reads.
+fn ticket_catching_chain_work<C: Cells>() {
+    let n = 2000;
+    let work = thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            crate::replay::take_note_work();
+            assert_eq!(ticket_catching_chain::<C>(n, true, true), n as i64);
+            crate::replay::take_note_work()
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(
+        work <= 16 * n as u64,
+        "{work} units of note work for {n} reads"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_ticket_catching_chain_work_stays_linear() {
+    ticket_catching_chain_work::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_ticket_catching_chain_work_stays_linear() {
+    ticket_catching_chain_work::<Shared>();
 }
 
 #[test]

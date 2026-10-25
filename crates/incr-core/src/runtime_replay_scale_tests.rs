@@ -738,24 +738,34 @@ fn shared_many_caught_unwinds_stay_linear() {
     }
 }
 
-/// One budgeted frame reading `n` nodes of another runtime, each twice.
-/// Each read is kept for the frame's retry, under its ordinal among the
-/// frame's reads of that node, and finding that ordinal must not cost a
-/// pass over the frame's earlier reads.
-fn many_foreign_reads<C: Cells>() {
+/// One budgeted frame reading `n` nodes of another runtime, each twice,
+/// all of them Clean when `clean`. Each read is kept for the frame's
+/// retry, under its ordinal among the frame's reads of that node, and
+/// finding that ordinal must not cost a pass over the frame's earlier
+/// reads.
+fn many_foreign_reads<C: Cells>(clean: bool) {
     let n = 2000;
     let foreign = Arc::new(Runtime::<Shared>::new());
     let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    if clean {
+        for &x in &reads {
+            foreign.get(x);
+        }
+    }
     let rt = Runtime::<C>::new();
     rt.set_max_frames(256);
-    let reader = rt.create_query(move |_| {
-        reads
-            .iter()
-            .chain(reads.iter())
-            .map(|&x| foreign.get(x))
-            .sum::<u64>()
-    });
+    let reader = rt.create_query_with(
+        move |_| {
+            reads
+                .iter()
+                .chain(reads.iter())
+                .map(|&x| foreign.get(x))
+                .sum::<u64>()
+        },
+        replayable(),
+    );
     crate::replay::take_note_work();
+    crate::dep_stack::take_keep_settles();
     assert_eq!(rt.get(reader), n * (n - 1));
     let work = crate::replay::take_note_work();
     assert!(
@@ -763,16 +773,141 @@ fn many_foreign_reads<C: Cells>() {
         "{work} units of note work for {} foreign reads",
         2 * n
     );
+    // Each read after the first counts its ordinal among the kept ones.
+    assert!(
+        work >= 2 * n - 1,
+        "{work} units of note work: not every foreign read was kept"
+    );
+    assert_eq!(
+        crate::dep_stack::take_keep_settles(),
+        1,
+        "settles of one frame"
+    );
+}
+
+/// An unbudgeted runtime's frame reading `n` Clean nodes of another
+/// runtime settles once that it keeps none of them, and keeps none.
+fn unbudgeted_foreign_clean_reads<C: Cells>() {
+    let n = 1000;
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    for &x in &reads {
+        foreign.get(x);
+    }
+    let rt = Runtime::<C>::new();
+    rt.set_max_frames(u32::MAX);
+    let reader = rt.create_query_with(
+        move |_| reads.iter().map(|&x| foreign.get(x)).sum::<u64>(),
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    crate::dep_stack::take_keep_settles();
+    assert_eq!(rt.get(reader), n * (n - 1) / 2);
+    assert_eq!(
+        crate::dep_stack::take_keep_settles(),
+        1,
+        "settles of one frame"
+    );
+    assert_eq!(crate::replay::take_note_work(), 0, "kept-read work");
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_unbudgeted_foreign_clean_reads_settle_once() {
+    unbudgeted_foreign_clean_reads::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unbudgeted_foreign_clean_reads_settle_once() {
+    unbudgeted_foreign_clean_reads::<Shared>();
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn local_many_foreign_reads_stay_linear() {
-    many_foreign_reads::<Local>();
+    many_foreign_reads::<Local>(false);
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_many_foreign_reads_stay_linear() {
-    many_foreign_reads::<Shared>();
+    many_foreign_reads::<Shared>(false);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_many_foreign_clean_reads_stay_linear() {
+    many_foreign_reads::<Local>(true);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_many_foreign_clean_reads_stay_linear() {
+    many_foreign_reads::<Shared>(true);
+}
+
+/// The note work of the second read of a chain of `n` queries over a
+/// Failed node at budget `frames`, after a set below the chain. One
+/// payload goes up the chain, and its ticket
+/// gains a landing per step: each reader takes the ticket and the next
+/// landing holds it again.
+fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let mut below = rt.create_query_with(move |rt| rt.get(input) + rt.get(failed), opts());
+    for _ in 1..n {
+        let dep = below;
+        below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
+    }
+    let top = below;
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    rt.set(input, 1);
+    crate::replay::take_note_work();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    crate::replay::take_note_work()
+}
+
+fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
+    let sizes: &[usize] = if cfg!(miri) {
+        &[8]
+    } else {
+        &[1000, 2000, 4000]
+    };
+    for &n in sizes {
+        let work = contained_chain::<C>(frames, n);
+        assert!(
+            work <= 16 * n as u64,
+            "{frames:?}: {work} units of note work for a {n}-chain"
+        );
+    }
+}
+
+#[test]
+fn local_contained_chain_stays_linear() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(None));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(None));
+}
+
+#[test]
+fn local_contained_chain_stays_linear_at_budget_1() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(1)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_1() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
 }
