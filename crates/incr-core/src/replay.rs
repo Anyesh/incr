@@ -468,7 +468,15 @@ pub(crate) struct Pending {
     untaken: HashMap<(u32, u32, u32), u32, FxBuildHasher>,
     /// By the frame's node and generation, at any position.
     by_node: Index<(u32, u32), usize>,
-    traced: Vec<usize>,
+    /// How many deliveries carry a provenance record.
+    traced: usize,
+    /// The deliveries with a record, by each frame a read of whose node
+    /// they stand for, as `(cidx, node, generation)`: their own and those
+    /// in their `below`.
+    by_stand: Index<(u32, u32, u32), usize>,
+    /// The deliveries with a record, by the position of the lowest frame
+    /// they stand for, which the pop of the virtual frame below extends.
+    by_frontier: Index<u32, usize>,
     /// The passed deliveries that carry a landing deeper than just above
     /// their frame, which a pop can retire.
     deep: Vec<usize>,
@@ -476,6 +484,11 @@ pub(crate) struct Pending {
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
     (key.node, key.generation, key.cidx)
+}
+
+/// The position of the lowest frame `d` stands for a read of.
+fn frontier(d: &Delivery) -> u32 {
+    d.below.last().map_or(d.key.cidx, |b| b.0)
 }
 
 fn read_of(key: &ReadKey) -> (u32, u32, u32, u64) {
@@ -520,7 +533,13 @@ impl Pending {
             *self.untaken.entry(frame_of(&d.key)).or_default() += 1;
         }
         if d.provenance.is_some() {
-            self.traced.push(i);
+            self.traced += 1;
+            list(
+                &mut self.by_stand,
+                (d.key.cidx, d.key.node, d.key.generation),
+                i,
+            );
+            list(&mut self.by_frontier, frontier(&d), i);
         }
         if d.passed && d.is_deep() {
             self.deep.push(i);
@@ -544,7 +563,12 @@ impl Pending {
             j == i
         });
         if d.provenance.is_some() {
-            self.traced.retain(|&j| j != i);
+            self.traced -= 1;
+            let own = (d.key.cidx, d.key.node, d.key.generation);
+            for stand in std::iter::once(&own).chain(&d.below) {
+                unlist(&mut self.by_stand, stand, |&j| j == i);
+            }
+            unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
         if d.passed {
             self.deep.retain(|&j| j != i);
@@ -766,9 +790,33 @@ impl Pending {
             .collect()
     }
 
-    /// The deliveries that carry a provenance record, oldest first.
-    pub(crate) fn traced(&self) -> &[usize] {
-        &self.traced
+    /// Whether any delivery carries a provenance record.
+    pub(crate) fn has_traced(&self) -> bool {
+        self.traced != 0
+    }
+
+    /// The deliveries with a record that stand for a read of `frame`'s
+    /// node, as `(cidx, node, generation)`, oldest first.
+    pub(crate) fn standing_for(&self, frame: (u32, u32, u32)) -> Vec<usize> {
+        let mut found = listed(&self.by_stand, &frame);
+        note_work(found.len());
+        found.sort_unstable();
+        found
+    }
+
+    /// The virtual frame `v`, as `(cidx, node, generation)`, popped: the
+    /// deliveries with a record whose lowest frame sat just above it now
+    /// stand for its read too.
+    pub(crate) fn extend_below(&mut self, v: (u32, u32, u32)) {
+        let Some(above) = self.by_frontier.remove(&(v.0 + 1)) else {
+            return;
+        };
+        note_work(above.as_slice().len());
+        for &i in above.as_slice() {
+            self.get_mut(i).below.push(v);
+            list(&mut self.by_stand, v, i);
+            list(&mut self.by_frontier, v.0, i);
+        }
     }
 
     pub(crate) fn into_vec(self) -> Vec<Delivery> {
@@ -1117,16 +1165,14 @@ impl Context {
         node: u32,
         generation: u32,
     ) -> impl Iterator<Item = (usize, u64)> + '_ {
-        note_work(self.pending.traced().len());
-        self.pending.traced().iter().filter_map(move |&i| {
-            let d = self.pending.get(i);
-            let k = d.key;
-            let p = d.provenance.as_ref()?;
-            (d.is_untaken_panic()
-                && ((k.cidx == at && k.node == node && k.generation == generation)
-                    || d.below.contains(&(at, node, generation))))
-            .then(|| (i, p.record()))
-        })
+        self.pending
+            .standing_for((at, node, generation))
+            .into_iter()
+            .filter_map(move |i| {
+                let d = self.pending.get(i);
+                let p = d.provenance.as_ref()?;
+                d.is_untaken_panic().then(|| (i, p.record()))
+            })
     }
 
     /// The landing, Dirty or Failed, for the frame of `node` at `cidx`
