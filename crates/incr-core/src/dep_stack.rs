@@ -261,11 +261,16 @@ pub trait DepStack: 'static {
     #[inline(always)]
     fn push_frame(&self, rt: RuntimeId, node: NodeId, ctl: &ComputeCtl) -> u32 {
         crate::lock_order::enter_frame();
-        self.with(|s| {
-            let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
-            s.push(Frames::frame(node, rt, ctl, cidx));
-            cidx
-        })
+        // Left to the inliner, any change to what the push writes has
+        // moved this closure out of line, at about 57 instructions a push.
+        self.with(
+            #[inline(always)]
+            |s| {
+                let cidx = (s.frames.len() as u32).wrapping_add(s.bias);
+                s.push(Frames::frame(node, rt, ctl, cidx));
+                cidx
+            },
+        )
     }
 
     /// Push a frame at conceptual-stack position `cidx`: an episode's
