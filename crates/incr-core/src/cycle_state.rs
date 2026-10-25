@@ -116,7 +116,7 @@ pub(crate) struct Held {
     opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    /// The runs' frames' `ComputeCtl::poison` flags.
+    /// The `POISONED` and `HANDLED` flags of the runs' frames.
     poison: u16,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
@@ -172,7 +172,7 @@ impl Held {
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
-    /// child index and its frame's `ComputeCtl::poison` flags
+    /// child index and its frame's `POISONED` and `HANDLED` flags
     /// (`poison`). Under speculation it first
     /// keeps the record it replaces; outside, it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
@@ -351,7 +351,7 @@ impl<H: Borrow<Held>> Seen<H> {
         self.0.borrow().opened
     }
 
-    /// The runs' `ComputeCtl::poison` flags: any lands Dirty.
+    /// The runs' `POISONED` and `HANDLED` flags: either lands Dirty.
     pub(crate) fn poison(&self) -> u16 {
         self.0.borrow().poison
     }
@@ -402,7 +402,8 @@ pub(crate) struct Episode {
     pub(crate) root: NodeId,
     pub(crate) cidx: u32,
     pub(crate) validated: bool,
-    /// The landing's one cut to the root's SCC in the final reads has run.
+    /// The landing's one cut to the root's SCC in the final reads has run,
+    /// or is skipped (`uncut`).
     pub(crate) pruned: bool,
     pub(crate) members: Vec<u32>,
     pub(crate) cu: Vec<u32>,
