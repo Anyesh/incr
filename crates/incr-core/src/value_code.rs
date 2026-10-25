@@ -71,6 +71,18 @@ pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT
     | REGEN_ABORTED
     | TOOK_BIT);
 
+const _: () = assert!(crate::bits::disjoint(&[
+    MEMO_BIT,
+    UNWIND_MASK,
+    REPLAY_BIT,
+    NOTES_BIT,
+    KEPT_BIT,
+    FOREIGN_BIT,
+    REGEN_BIT,
+    REGEN_ABORTED,
+    TOOK_BIT,
+]));
+
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
 #[cfg(not(loom))]

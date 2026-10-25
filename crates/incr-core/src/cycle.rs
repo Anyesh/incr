@@ -410,6 +410,22 @@ pub(crate) const HANDLED: u16 = 2048;
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
 
+const _: () = assert!(crate::bits::disjoint(&[
+    RECOMPUTE as u64,
+    BUFFERED as u64,
+    LOW as u64,
+    POISONED as u64,
+    DOOMED as u64,
+    PH_SEEN as u64,
+    KEPT_READ as u64,
+    NO_DOOM as u64,
+    WALKED as u64,
+    FOREIGN_HOLD as u64,
+    SPECULATIVE as u64,
+    HANDLED as u64,
+    UNREGENERABLE as u64,
+]));
+
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
 /// it while the closure runs.

@@ -578,6 +578,7 @@ pub(crate) const ARMED: u8 = 1;
 /// `clean_walk` mode bit: a replay context of this runtime is open, so
 /// the walk skips nodes that have virtual frames.
 pub(crate) const VIRT: u8 = 2;
+const _: () = assert!(crate::bits::disjoint(&[ARMED as u64, VIRT as u64]));
 
 /// Which read reached a slow path: `get` panics where `try_get` returns
 /// `Err(Cycle)`.

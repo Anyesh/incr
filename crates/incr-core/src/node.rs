@@ -162,6 +162,17 @@ pub struct NodeData<C: Cells> {
     pub(crate) generation: C::U32,
 }
 
+const _: () = assert!(crate::bits::disjoint(&[
+    NodeData::<crate::cells::Local>::MEMO,
+    NodeData::<crate::cells::Local>::SET_CLAIM,
+    NodeData::<crate::cells::Local>::DELETED,
+]));
+const _: () = assert!(crate::bits::disjoint(&[
+    NodeData::<crate::cells::Local>::COUNT_MASK as u64,
+    NodeData::<crate::cells::Local>::RELEASED as u64,
+    NodeData::<crate::cells::Local>::UNRUN as u64,
+]));
+
 impl<C: Cells> NodeData<C> {
     /// The `changed_at` of an input created, recycled or set at revision
     /// `revision`: revisions are even, inputs carry the odd stamp below
