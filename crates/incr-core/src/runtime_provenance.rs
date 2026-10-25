@@ -185,7 +185,7 @@ impl<C: Cells> Runtime<C> {
         // node runs again, as for a retry's read (`regenerate`).
         let payload = match payload.downcast::<replay::Regen>() {
             Ok(regen) => {
-                let raised = self.regenerate(id, generation, regen.0);
+                let raised = self.regenerate(id, generation, regen.0)?;
                 replay::regenerated_at(context, i, replay::payload_key(&*raised));
                 raised
             }

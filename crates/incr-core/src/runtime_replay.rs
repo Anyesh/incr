@@ -2209,9 +2209,11 @@ impl<C: Cells> Runtime<C> {
     /// a payload from a compute or a ticket raises that payload again, a
     /// copy or one regenerated so before the run, so one run is on the
     /// stack at a time however deep the panics nest; any other read of a
-    /// Failed node found it Failed already and panics with its message. A
-    /// run that aborts, returns, or panics with another type at the top
-    /// gives the Failed read's message instead.
+    /// Failed node found it Failed already and panics with its message.
+    /// `None` if a run aborts, returns, or panics with another type at the
+    /// top: a set since may have changed what the runs read, so the read
+    /// goes on as a read of the node as it is now, which a read racing the
+    /// set may be.
     #[cold]
     #[inline(never)]
     pub(super) fn regenerate(
@@ -2219,7 +2221,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         generation: u32,
         ty: std::any::TypeId,
-    ) -> Box<dyn std::any::Any + Send> {
+    ) -> Option<Box<dyn std::any::Any + Send>> {
         let top = u64::from(id.0) | (u64::from(generation) << 32);
         let mut payload = None;
         // Each level: its node, the reads its run took a payload from
@@ -2265,31 +2267,32 @@ impl<C: Cells> Runtime<C> {
             drop_payloads(made.into_iter().map(|m| m.1));
         }
         match payload {
-            Some(p) if (*p).type_id() == ty => p,
+            Some(p) if (*p).type_id() == ty => Some(p),
             p => {
                 drop_payloads(p);
-                Box::new(super::provenance_impl::failed_read_message(id.0))
+                None
             }
         }
     }
 
     /// `payload`, taken by a read of `handle` under `key` from `rt`'s
     /// contexts, or for its Regen marker the payload regenerated, which the
-    /// delivery then counts as raised.
+    /// delivery then counts as raised: `None` if it can't be (`regenerate`).
     fn regenerated<T: Value>(
         &self,
         handle: Incr<T>,
         rt: RuntimeId,
         key: &ReadKey,
         payload: Box<dyn std::any::Any + Send>,
-    ) -> Box<dyn std::any::Any + Send> {
+    ) -> Option<Box<dyn std::any::Any + Send>> {
         match payload.downcast::<replay::Regen>() {
             Ok(regen) => {
-                let raised = self.regenerate(NodeId(handle.slot()), handle.generation(), regen.0);
+                let raised =
+                    self.regenerate(NodeId(handle.slot()), handle.generation(), regen.0)?;
                 replay::regenerated(rt, key, replay::payload_key(&*raised));
-                raised
+                Some(raised)
             }
-            Err(payload) => payload,
+            Err(payload) => Some(payload),
         }
     }
 
@@ -2520,10 +2523,18 @@ impl<C: Cells> Runtime<C> {
                 .downcast::<cycle::CycleUnwind>()
                 .expect("incr-core: a kept cycle is a cycle unwind")
                 .0)),
-            Some(Delivered::Unwind { payload, .. }) => Err(match &key {
-                Some(key) => self.regenerated(handle, reader, key, payload),
-                None => payload,
-            }),
+            Some(Delivered::Unwind { payload, .. }) => {
+                let raised = match &key {
+                    Some(key) => self.regenerated(handle, reader, key, payload),
+                    None => Some(payload),
+                };
+                match raised {
+                    Some(payload) => Err(payload),
+                    None => catch_unwind(AssertUnwindSafe(|| {
+                        self.read_unframed(handle, observed, kind, word)
+                    })),
+                }
+            }
             Some(Delivered::Walk(..) | Delivered::Direct) => {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
@@ -4491,8 +4502,8 @@ impl<C: Cells> Runtime<C> {
             unsafe { &*f.ctl }.raise(cycle::POISONED);
         }
         // A payload no copy can stand for was delivered once, and a retry
-        // after it regenerates the payload.
-        let payload = self.regenerated(handle, rt, &key, payload);
+        // after it regenerates the payload, or reads the node as it is.
+        let payload = self.regenerated(handle, rt, &key, payload)?;
         if !replay::copyable(&*payload) {
             self.hold_uncopied(f.ctl, self.regenerable(reading));
         }
