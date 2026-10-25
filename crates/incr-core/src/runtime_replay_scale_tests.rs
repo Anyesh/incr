@@ -1017,3 +1017,57 @@ fn local_caught_fan_over_deep_chain_stays_linear() {
 fn shared_caught_fan_over_deep_chain_stays_linear() {
     on_stack(1 << 26, || caught_fan_over_deep_chain::<Shared>(256));
 }
+
+/// As above with one text for every panic: each box takes an address an
+/// earlier caught one freed, so the panics share a payload key and a note
+/// log per address, and each kept read's copy holds every landing caught
+/// on its log before it. The retry must not pay that prefix again per
+/// read.
+fn same_text_fan_over_chain<C: Cells>(n: u64) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let failing: Vec<Incr<u64>> = (0..n)
+        .map(|_| rt.create_query_with(|_| -> u64 { panic!("fan") }, replayable()))
+        .collect();
+    let top = chain(&rt, 600).nodes[0];
+    let reader = rt.create_query_with(
+        move |rt| {
+            let caught = failing
+                .iter()
+                .filter(|&&f| catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err())
+                .count() as u64;
+            caught + rt.get(top)
+        },
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n + 600);
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
+    crate::replay::take_note_work()
+}
+
+fn same_text_fan_over_chain_stays_linear<C: Cells>() {
+    let sizes: &[u64] = if cfg!(miri) {
+        &[8]
+    } else {
+        &[1000, 4000, 16000]
+    };
+    for &n in sizes {
+        let work = same_text_fan_over_chain::<C>(n);
+        assert!(
+            work <= 24 * n,
+            "{work} units of note work for {n} caught panics of one text"
+        );
+    }
+}
+
+#[test]
+fn local_same_text_fan_over_chain_stays_linear() {
+    on_stack(1 << 26, same_text_fan_over_chain_stays_linear::<Local>);
+}
+
+#[test]
+fn shared_same_text_fan_over_chain_stays_linear() {
+    on_stack(1 << 26, same_text_fan_over_chain_stays_linear::<Shared>);
+}
