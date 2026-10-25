@@ -987,6 +987,11 @@ pub struct Runtime<C: Cells> {
     /// The node of every group verification, in order.
     #[cfg(test)]
     pub(crate) group_verifies: std::sync::Mutex<Vec<u32>>,
+    /// Every claim a wound or a T8 discard landed as unrun: the node,
+    /// whether its episode had dissolved on that thread, and whether its
+    /// group record then named a member that had left it.
+    #[cfg(test)]
+    pub(crate) unwound_landings: std::sync::Mutex<Vec<(u32, bool, bool)>>,
     /// Every doom, in order, as the doom point saw it.
     #[cfg(test)]
     pub(crate) dooms: std::sync::Mutex<Vec<replay_impl::DoomSeen>>,
@@ -1109,6 +1114,8 @@ impl<C: Cells> Runtime<C> {
             walk_pops: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             group_verifies: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            unwound_landings: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             dooms: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]

@@ -1674,7 +1674,8 @@ impl<C: Cells> Runtime<C> {
 
     /// Cuts `ep` to the root's SCC in `graph`, the member graph of the
     /// last runs, releasing the rest with the discard landing. A root
-    /// alone with no self-edge dissolves.
+    /// alone with no self-edge dissolves. The members kept leave a group
+    /// the cut released others from ([`Self::leave_cut_group`]).
     fn shrink_to_root_scc(
         &self,
         root: NodeId,
@@ -1697,6 +1698,7 @@ impl<C: Cells> Runtime<C> {
         if scc.len() == 1 && !graph[at].contains(&at) {
             cycle_state::dissolved_before(rt, root.0);
             self.release_members(root, members, Some(root.0), bag);
+            self.leave_cut_group(&[root.0]);
             return Shrink::Dissolved;
         }
         if scc.len() == members.len() {
@@ -1708,6 +1710,7 @@ impl<C: Cells> Runtime<C> {
             .filter(|m| scc.binary_search(m).is_err())
             .collect();
         self.release_members(root, &gone, None, bag);
+        self.leave_cut_group(&scc);
         cu.retain(|m| scc.binary_search(m).is_ok());
         *members = scc;
         Shrink::Shrunk
@@ -1799,6 +1802,34 @@ impl<C: Cells> Runtime<C> {
             owned.retain(|&g| h.owner(g).owned_by(cidx, u32::MAX, path));
             h.hand_over(rt, &owned, &[], parent, node, virtual_frame);
         });
+    }
+
+    /// Takes each of `kept`, members a cut keeps claimed, out of a group
+    /// whose record names a member that is no longer in it, so that the
+    /// cut leaves no such record. They leave unverified, as a member
+    /// landing Dirty out of its group does, since a wound lands them Dirty.
+    fn leave_cut_group(&self, kept: &[u32]) {
+        for &m in kept {
+            let (node, flags) = self.nodes.get_with_flags(m);
+            if C::u8_load_relaxed(flags) & IN_GROUP != 0 && self.names_departed(m) {
+                self.leave_group(NodeId(m), node, flags, NodeState::Dirty);
+            }
+        }
+    }
+
+    /// Whether `slot`'s group record names a member that is no longer in
+    /// it.
+    fn names_departed(&self, slot: u32) -> bool {
+        let inner = self.inner.read();
+        let Some(group) = inner.member_recs.get(&slot) else {
+            return false;
+        };
+        group.members.iter().any(|&(m, _)| {
+            !inner
+                .member_recs
+                .get(&m)
+                .is_some_and(|g| Arc::ptr_eq(g, group))
+        })
     }
 
     /// Releases `slots` from the held map with the discard landing,
@@ -2019,6 +2050,13 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         if matches!(kind, Some(UnwindKind::Wound | UnwindKind::Discard)) {
+            #[cfg(test)]
+            {
+                let dissolved = cycle_state::has_dissolved(self.runtime_id, id.0);
+                let stale = self.names_departed(id.0);
+                let mut landings = self.unwound_landings.lock().unwrap();
+                landings.push((id.0, dissolved, stale));
+            }
             self.discard_land_in_group(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         } else {
             self.discard_land(id, first, wrote, stamp_rev, bag);

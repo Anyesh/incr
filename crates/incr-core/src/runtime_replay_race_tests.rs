@@ -1606,12 +1606,13 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
 }
 
 /// The same shape with F, X and Y a landed group and Z's set behind input
-/// t: F's claim, taken from Dirty, lands as before it, still a verified
-/// member of its group, and reserved for the context's retry, so the other
-/// thread's read waits and reads as in the order where the driver reads
-/// first.
+/// t: F's claim, taken from Dirty, lands as before it, under no record
+/// naming X or Y, which the dissolve released, and unverified, as a
+/// member that leaves its group lands; it is reserved for the context's
+/// retry, so the other thread's read waits and reads as in the order where
+/// the driver reads first.
 #[test]
-fn shared_dissolved_member_root_stays_in_its_group() {
+fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
     let run = |frames: u32, park: bool| {
         let rt = Arc::new(Rt::new());
         rt.set_placeholder(0_u64);
@@ -1707,8 +1708,8 @@ fn shared_dissolved_member_root_stays_in_its_group() {
     let (landed, other) = gap.expect("the driver parked");
     assert_eq!(
         landed,
-        (NodeState::Dirty, true, true),
-        "F's discard landing: (state, in its group, verification kept)"
+        (NodeState::Dirty, false, false),
+        "F's discard landing: (state, in a group, verification kept)"
     );
     assert_eq!((got, other), (want.clone(), want));
 }

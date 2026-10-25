@@ -3490,12 +3490,12 @@ impl<C: Cells> Runtime<C> {
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
     /// claim lands as if its run never happened, since no frame computes it
-    /// here: the entry below does. It keeps the root in its group, where the
-    /// unbounded run's frame holds it until its alone landing, so another
-    /// thread verifies the group as in the order where it reads first; this
-    /// entry's retry computes the root alone (`end_dissolved`). A suspended
-    /// episode restarts the driver, which runs the entries its doom pushed
-    /// first.
+    /// here: the entry below does. It keeps a group it is still in, one the
+    /// cut released no member from, where the unbounded run's frame holds
+    /// it until its alone landing, so another thread verifies the group as
+    /// in the order where it reads first; this entry's retry computes the
+    /// root alone (`end_dissolved`). A suspended episode restarts the
+    /// driver, which runs the entries its doom pushed first.
     fn episode_task_end(&self, root: NodeId, cidx: u32, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         if matches!(end, PopEnd::Dissolved | PopEnd::Retry) {
             self.rerun_root(root, cidx);

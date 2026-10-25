@@ -986,7 +986,8 @@ impl Dissolve {
         }
     }
 
-    fn concurrent(first_reads_y: bool) -> Vec<Result<i64, String>> {
+    /// The outcome, the runtime's `unwound_landings`, and `r`'s slot.
+    fn concurrent(first_reads_y: bool) -> Concurrent {
         let g = Dissolve::new();
         let wounds = waits::WOUNDS.load(Ordering::Relaxed);
         g.early.arm();
@@ -1008,17 +1009,20 @@ impl Dissolve {
             (a.join().unwrap(), b.join().unwrap())
         });
         assert!(waits::WOUNDS.load(Ordering::Relaxed) > wounds, "no wound");
+        let landings = g.rt.unwound_landings.lock().unwrap().clone();
         let outcome = g.outcome(a, b);
         g.rt.assert_invariant_i();
-        outcome
+        (outcome, landings, g.r.slot())
     }
 }
+
+type Concurrent = (Vec<Result<i64, String>>, Vec<(u32, bool, bool)>, u32);
 
 fn dissolve_keeps_the_released_members_grouped(first_reads_y: bool) {
     let a_first = Dissolve::single_thread(true);
     let b_first = Dissolve::single_thread(false);
     for round in 0..20 {
-        let got = Dissolve::concurrent(first_reads_y);
+        let (got, ..) = Dissolve::concurrent(first_reads_y);
         assert!(
             got == a_first || got == b_first,
             "round {round}: {got:?}, single-thread {a_first:?} or {b_first:?}"
@@ -1036,6 +1040,35 @@ fn shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped",
         || dissolve_keeps_the_released_members_grouped(true),
+    )
+    .assert_clean();
+}
+
+/// A's wound after its episode at `r` dissolved lands `r` as before its
+/// claim, but not back into the group the cut released `z`, `y` and `w`
+/// from. Back in that group alone, `r` is group-verified by B, who cannot
+/// claim a member on its own stack and computes `r` alone (seed
+/// 0x366148bf).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left",
+        || {
+            for first_reads_y in [true, false] {
+                for round in 0..5 {
+                    let (_, landings, r) = Dissolve::concurrent(first_reads_y);
+                    assert!(
+                        landings.iter().any(|&(slot, dissolved, _)| slot == r && dissolved),
+                        "round {round}: no wound landed r after its dissolve: {landings:?}"
+                    );
+                    assert!(
+                        landings.iter().all(|&(_, _, stale)| !stale),
+                        "round {round} first_reads_y {first_reads_y}: {landings:?}"
+                    );
+                }
+            }
+        },
     )
     .assert_clean();
 }
