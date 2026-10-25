@@ -3224,7 +3224,7 @@ impl<C: Cells> Runtime<C> {
     /// thread does not reserve it.
     #[cold]
     #[inline(never)]
-    fn given_back_state(&self, node: u32, generation: u32) -> Option<NodeState> {
+    pub(crate) fn given_back_state(&self, node: u32, generation: u32) -> Option<NodeState> {
         if C::SINGLE_THREADED || !reserve::mine((self.runtime_id, node), generation) {
             return None;
         }
