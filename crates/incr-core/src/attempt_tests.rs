@@ -64,6 +64,8 @@ fn a_waiter_takes_over_only_a_flight_that_stays_open() {
             "a new flight starts the count over"
         );
     }
+    assert!(!a.wound_if_stuck(&mut patience), "open for under STUCK_FOR");
+    std::thread::sleep(STUCK_FOR);
     assert!(a.wound_if_stuck(&mut patience));
     assert!(leave_flight());
 }

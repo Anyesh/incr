@@ -49,6 +49,13 @@ const STUCK_AFTER: u32 = crate::waits::REGISTER_AFTER;
 #[cfg(loom)]
 const STUCK_AFTER: u32 = 2;
 
+/// How long one flight must also stay open: an owner descheduled in its
+/// unwind looks the same as one held in user code, and a take-over of it
+/// restarts its read, in a serial order of its own but not the one its
+/// scheduling would have given.
+#[cfg(not(loom))]
+const STUCK_FOR: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// The word, and a count of the owner's flights.
 struct Word {
     state: AtomicU32,
@@ -116,6 +123,8 @@ pub(crate) fn leave_flight() -> bool {
 pub(crate) struct Patience {
     seen: Option<(usize, u32, u32)>,
     checks: u32,
+    #[cfg(not(loom))]
+    since: Option<std::time::Instant>,
 }
 
 impl Attempt {
@@ -130,8 +139,8 @@ impl Attempt {
     }
 
     /// A waiter on this attempt: wounds it once one flight has stayed open
-    /// through [`STUCK_AFTER`] of the waiter's checks. True if it is
-    /// wounded now.
+    /// through [`STUCK_AFTER`] of the waiter's checks and for
+    /// `STUCK_FOR`. True if it is wounded now.
     pub(crate) fn wound_if_stuck(&self, patience: &mut Patience) -> bool {
         let w = self.word.state.load(Ordering::Acquire);
         if !self.current(w) {
@@ -153,10 +162,16 @@ impl Attempt {
             *patience = Patience {
                 seen: Some(flight),
                 checks: 0,
+                #[cfg(not(loom))]
+                since: Some(std::time::Instant::now()),
             };
             return false;
         }
         patience.checks += 1;
+        #[cfg(not(loom))]
+        if patience.since.is_some_and(|t| t.elapsed() < STUCK_FOR) {
+            return false;
+        }
         patience.checks >= STUCK_AFTER && self.wound_in_flight()
     }
 
