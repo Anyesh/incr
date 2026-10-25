@@ -27,7 +27,7 @@ use crate::arena_registry::{ArenaRegistry, ArenaTags};
 use crate::cells::Cells;
 use crate::children::ChildIndex;
 use crate::cycle::{
-    self, ComputeCtl, Cycle, CycleStrategy, ErasedOpts, ErasedStrategy, Outcome,
+    self, ComputeCtl, Cycle, CycleStrategy, CycleUnwind, ErasedOpts, ErasedStrategy, Outcome,
     QueryOpts,
 };
 use crate::cycle_state::{self, EntryDepth, UnwindKind};
@@ -4466,8 +4466,8 @@ impl<C: Cells> Runtime<C> {
     /// The `Err` arm of a compute: the closure panicked, or an engine
     /// unwind passed through it. Lands the node and every claim this
     /// thread held above its frame, then resumes the unwind. A walk's entry
-    /// (`walked`) contains a panic, or a cycle whose claims all ran above
-    /// it, and returns `Unsettled`: the recorder's rerun reads the node
+    /// (`walked`) contains a panic and returns `Unsettled`: the recorder's
+    /// rerun reads the node
     /// again if it still does, and the payload stays with the Failed node
     /// for that read.
     #[cold]
@@ -4495,7 +4495,7 @@ impl<C: Cells> Runtime<C> {
         // A closure that catches a speculative run's discard can't land a
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
-        let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
+        let contain = walked && self.containable(kind, &*payload);
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -4565,22 +4565,22 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Whether a walk's entry contains an unwind out of its compute: a
-    /// panic, including one a closure raised after swallowing a cycle. A
-    /// cycle goes on to the reader, as every member's run would close it
-    /// again for the recorder's rerun. A wounded thread must reach its
-    /// outermost entry, so it contains none.
+    /// panic, including one a closure raised after catching a cycle, which
+    /// unwinds with the cycle's kind and its own payload. A cycle goes on
+    /// to the reader, as every member's run would close it again for the
+    /// recorder's rerun. A wounded thread must reach its outermost entry,
+    /// so it contains none.
     pub(super) fn containable(
         &self,
-        _entry: NodeId,
-        _cidx: u32,
         kind: Option<UnwindKind>,
-        _payload: &(dyn std::any::Any + Send),
+        payload: &(dyn std::any::Any + Send),
     ) -> bool {
         if cycle_state::wounded() {
             return false;
         }
         match kind {
             None => true,
+            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_none(),
             Some(_) => false,
         }
     }
