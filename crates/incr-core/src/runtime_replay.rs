@@ -2366,7 +2366,7 @@ impl<C: Cells> Runtime<C> {
     /// may still be writing or walking, so until none is, this is false.
     #[cold]
     #[inline(never)]
-    fn checked_reads_ready(&self) -> bool {
+    pub(crate) fn checked_reads_ready(&self) -> bool {
         const TURNED_ON: u8 = 1;
         const READY: u8 = 2;
         match C::u8_load_acquire(&self.read_speculatively) {
