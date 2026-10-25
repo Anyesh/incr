@@ -8245,7 +8245,8 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
     });
 }
 
-/// Seed 0x9ab9's base case, shrunk. Unbounded, `TryGet(12)` reads 0. At
+/// Seed 0x9ab9's base case, shrunk. Unbounded, `TryGet(12)` gets the cycle
+/// [5, 6, 13, 14] that a walk entry closes, as on main. At
 /// budget 1 a speculative run of node 3 (slot 20) writes its slot and is
 /// discarded, so `discard_target` takes the value back and lands the node
 /// New where the unbounded run leaves it Dirty; the claim releases and
@@ -8366,7 +8367,7 @@ fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
     let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
     quiet(|| {
         let unbounded = outs(run::<Local>(&case, None, 0));
-        assert_eq!(unbounded[2], Out::Value(0), "unbounded");
+        assert_eq!(unbounded[2], Out::Cycle(vec![5, 6, 13, 14]), "unbounded");
         for frames in [1, 2, 3] {
             let local = outs(run::<Local>(&case, Some(frames), 0));
             assert_eq!(local, unbounded, "Local, budget {frames}");
