@@ -2887,3 +2887,9 @@ test the node instead of a runtime-wide count. Base `89d83e76`, same box,
 Gate: the hard gates are exact (102, 196, 218.14, 87). Replay scale by
 `strict-scan.sh`'s `scale-icount` on `8d006e54` against `89d83e76`: every ratio within
 0.4%.
+
+## t10 562ebeed (train B) merged into t11
+
+- Engine: `w/T11-sync-562ebeed` (merge `f52e82e4`) against t11 `7dbc7dd9`, this box through buildlock, `icount.sh` defaults.
+- Exact: `get_clean_local` 95, `get_clean_shared` 190, `table_hit_local` 150.14, `table_hit_shared` 216.14, `value_slot_read_local` 5, `value_slot_read_shared` 87.
+- Propagation rises are train B's own: the same workloads measured on t10 `c3b8e377` -> `562ebeed` rise within 1.7 points of the sync's. t10 vs t11: `chain_local/propagate/100` +20.97% vs +22.33%, `diamond_local` +16.33% vs +18.06%, `early_cutoff_local` +13.00% vs +14.09%, `simple_count/local/1000` +11.52% vs +11.57%, `collection_insert_then_read/local_incremental/1000` +10.45% vs +10.75%, `delete_cascade_local` +7.50% vs +7.35%, `fanout_local_1000` +6.95% vs +6.76%, `foreign_dirty_read_unbudgeted_u64` +19.81% vs +21.18%, `children_churn_local` +1.61% vs +1.53%. `chain_shared/propagate/100` rises less on t11 (+9.93%) than on t10 (+27.09%).
