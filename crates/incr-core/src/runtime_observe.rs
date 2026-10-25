@@ -411,8 +411,8 @@ impl<C: Cells> Runtime<C> {
         C::fence_acquire();
         let failed = !cycle_state::wounded()
             && cycle_state::unwind_kind().is_none()
-            && node.generation() == handle.generation()
-            && node.state() == NodeState::Failed;
+            && node.state() == NodeState::Failed
+            && node.generation() == handle.generation();
         if !failed {
             resume_unwind(payload);
         }

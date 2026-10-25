@@ -413,14 +413,17 @@ fn shared_vframe_node_reader_waits_through_the_retrys_compute() {
     s.rt.assert_invariant_i();
 }
 
-/// T reads X1, X1 reads X2, X2 reads Y, and Y reads T with `try_get`,
-/// all replayable; T counts runs.
+/// T reads X1, X1 reads X2 (until switched to catch the panic of a dep
+/// that always fails and count those runs), X2 reads Y, and Y reads T
+/// with `try_get`, all replayable; T counts runs.
 struct Below {
     rt: Arc<Rt>,
     t: Incr<u64>,
     x1: Incr<u64>,
     y: Incr<u64>,
     t_runs: Arc<AtomicU32>,
+    caught: Arc<AtomicBool>,
+    x1_caught: Arc<AtomicU32>,
 }
 
 fn below_shape(rt: Rt) -> Below {
@@ -436,7 +439,23 @@ fn below_shape(rt: Rt) -> Below {
         )
     };
     let x2 = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
-    let x1 = rt.create_query_with(move |rt: &Rt| rt.get(x2) + 1, replayable());
+    let fc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let caught = Arc::new(AtomicBool::new(false));
+    let x1_caught = Arc::new(AtomicU32::new(0));
+    let x1 = {
+        let (caught, fc, x1_caught) = (caught.clone(), fc.clone(), x1_caught.clone());
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if !caught.load(SeqCst) {
+                    return rt.get(x2) + 1;
+                }
+                x1_caught.fetch_add(1, SeqCst);
+                let f = *fc.get().unwrap();
+                catch_unwind(AssertUnwindSafe(|| rt.get(f))).map_or(7, |v| v)
+            },
+            replayable(),
+        )
+    };
     let t = {
         let t_runs = t_runs.clone();
         rt.create_query_with(
@@ -448,12 +467,16 @@ fn below_shape(rt: Rt) -> Below {
         )
     };
     tc.set(t).unwrap();
+    fc.set(rt.create_query(|_: &Rt| -> u64 { panic!("fails") }))
+        .unwrap();
     Below {
         rt,
         t,
         x1,
         y,
         t_runs,
+        caught,
+        x1_caught,
     }
 }
 
@@ -955,6 +978,124 @@ fn shared_delete_and_recycle_before_the_scan() {
 #[test]
 fn shared_delete_and_recycle_between_scan_and_claim() {
     delete_and_recycle_during_replay(Recycle::BeforeClaim);
+}
+
+/// The recycling shape with X1 switched to catch a Failed dep and read by
+/// another thread before Y's scan of T, or between the scan and its claim.
+/// At both points X1 is reserved for the doomed context's retry, so the
+/// other thread's read waits, the retry lands X1's memo, and that read
+/// takes it without a run.
+fn memo_landing_during_replay(when: Recycle) {
+    // X1's runs and T's outcome, with the other thread's read of X1 or,
+    // for the reference, without it.
+    let run = |other_reads: bool| {
+        let s = below_shape(Rt::new());
+        s.rt.set_max_frames(1);
+        let gate = Gate::new();
+        let point = match when {
+            Recycle::BeforeScan => ParkPoint::BeforeEntry(id(s.y)),
+            Recycle::BeforeClaim => ParkPoint::BeforeVirtualClaim(id(s.t)),
+        };
+        hook(&s.rt, vec![(point, gate.clone())]);
+        gate.arm();
+        let reader = {
+            let (rt, t) = (s.rt.clone(), s.t);
+            spawn(move || outcome(|| rt.get(t)))
+        };
+        gate.wait_parked();
+        s.caught.store(true, SeqCst);
+        let other = other_reads.then(|| {
+            let waits = s.rt.reservation_waits.load(SeqCst);
+            let other = {
+                let (rt, x1) = (s.rt.clone(), s.x1);
+                spawn(move || outcome(|| rt.get(x1)))
+            };
+            await_reservation_wait(&s.rt, waits);
+            assert_eq!(s.x1_caught.load(SeqCst), 0, "the waiting read ran X1");
+            other
+        });
+        gate.release();
+        let got = reader.join();
+        if let Some(other) = other {
+            assert_eq!(other.join(), Ok(7));
+        }
+        if other_reads {
+            assert!(s.rt.has_memo_of(s.x1));
+        }
+        s.rt.assert_invariant_i();
+        (got, s.x1_caught.load(SeqCst))
+    };
+    let (got, runs) = run(true);
+    let unbounded = below_shape(Rt::new());
+    unbounded.rt.set_max_frames(u32::MAX);
+    unbounded.caught.store(true, SeqCst);
+    assert_eq!(unbounded.rt.get(unbounded.x1), 7);
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert_eq!(want, Ok(8));
+    assert_eq!(got, want);
+    assert_eq!(runs, run(false).1, "X1 ran again over its memo");
+}
+
+#[test]
+fn shared_memo_landing_before_the_scan() {
+    memo_landing_during_replay(Recycle::BeforeScan);
+}
+
+#[test]
+fn shared_memo_landing_between_scan_and_claim() {
+    memo_landing_during_replay(Recycle::BeforeClaim);
+}
+
+/// As `between_scan_and_claim`, but the other thread deletes T itself,
+/// the node Y's read judges, and recycles its slot into a New query Z.
+/// `get(T)` panics as stale, as the unbounded run does with the delete
+/// first, and Z's closure never runs and Z stays New.
+#[test]
+fn shared_virtual_claim_of_a_target_recycled_into_a_new_node() {
+    let s = below_shape(Rt::new());
+    s.rt.set_max_frames(1);
+    let gate = Gate::new();
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeVirtualClaim(id(s.t)), gate.clone())],
+    );
+    gate.arm();
+    let reader = {
+        let (rt, t) = (s.rt.clone(), s.t);
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    gate.wait_parked();
+    s.rt.delete_node(s.t);
+    let z_runs = Arc::new(AtomicU32::new(0));
+    let z = {
+        let z_runs = z_runs.clone();
+        s.rt.create_query_with(
+            move |_: &Rt| {
+                z_runs.fetch_add(1, SeqCst);
+                9_u64
+            },
+            replayable(),
+        )
+    };
+    assert_eq!(z.slot(), s.t.slot(), "Z reuses T's slot");
+    gate.release();
+    let got = reader.join();
+
+    let unbounded = below_shape(Rt::new());
+    unbounded.rt.set_max_frames(u32::MAX);
+    unbounded.rt.delete_node(unbounded.t);
+    unbounded
+        .rt
+        .create_query_with(|_: &Rt| 9_u64, replayable::<u64>());
+    let want = outcome(|| unbounded.rt.get(unbounded.t));
+    assert!(
+        want.as_ref().is_err_and(|m| m.contains("stale")),
+        "{want:?}"
+    );
+    assert_eq!(got, want);
+    assert_eq!(z_runs.load(SeqCst), 0, "Z ran on the reader's behalf");
+    assert_eq!(s.rt.state_of(z), NodeState::New);
+    s.rt.assert_invariant_i();
 }
 
 /// The Local form of a delete during replay: Y's closure deletes X, whose
@@ -2443,6 +2584,129 @@ fn shared_vframe_retry_rechecks_a_recycled_slot() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// At budget 1, Y panics and X reads Y, so X's run dooms and the driver
+/// takes X as an entry. Parked before it, another thread deletes X and
+/// recycles its slot into Z, which it reads to `z`. The entry finds X
+/// gone and `get(X)` panics as stale, as in the serial order with the
+/// delete first, instead of reading Z's state through X's handle.
+fn entry_finds_its_slot_recycled(z_panics: bool) {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    hook(&rt, vec![(ParkPoint::BeforeEntry(id(x)), gate.clone())]);
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    rt.delete_node(x);
+    let z = rt.create_query_with(
+        move |_: &Rt| -> u64 {
+            if z_panics {
+                panic!("z boom")
+            }
+            99
+        },
+        replayable(),
+    );
+    assert_eq!(z.slot(), x.slot(), "Z reuses X's slot");
+    let want_z = if z_panics {
+        Err("z boom".to_string())
+    } else {
+        Ok(99)
+    };
+    assert_eq!(outcome(|| rt.get(z)), want_z);
+    gate.release();
+    let first = first.join();
+    assert!(
+        first.as_ref().is_err_and(|m| m.contains("stale")),
+        "{first:?}"
+    );
+    let later = outcome(|| rt.get(z));
+    if z_panics {
+        assert!(
+            later
+                .as_ref()
+                .is_err_and(|m| m.contains("last compute panicked")),
+            "Z kept its own landing: {later:?}"
+        );
+    } else {
+        assert_eq!(later, want_z, "Z kept its own landing");
+    }
+    rt.assert_invariant_i();
+}
+
+#[test]
+fn shared_entry_finds_its_slot_recycled_into_a_failed_node() {
+    entry_finds_its_slot_recycled(true);
+}
+
+#[test]
+fn shared_entry_finds_its_slot_recycled_into_a_clean_node() {
+    entry_finds_its_slot_recycled(false);
+}
+
+/// X landed Failed by its own panic. A read of X parks in the Failed arm
+/// before it looks for a contained payload; another thread deletes X and
+/// recycles its slot into Z, which a walk of W lands Failed with a held
+/// "z boom" ticket. The read panics as stale, as in the serial order with
+/// the delete first, and Z keeps its ticket for Z's own reader.
+#[test]
+fn shared_failed_read_finds_its_slot_recycled_into_a_contained_failure() {
+    let rt = Arc::new(Rt::new());
+    let sel = rt.create_input(0_u64);
+    let j = rt.create_input(1_u64);
+    let x = rt.create_query(|_: &Rt| -> u64 { panic!("x boom") });
+    assert_eq!(outcome(|| rt.get(x)), Err("x boom".to_string()));
+    let gate = Gate::new();
+    hook(
+        &rt,
+        vec![(ParkPoint::FailedReadBeforeTake(id(x)), gate.clone())],
+    );
+    gate.arm();
+    let reader = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    gate.wait_parked();
+    rt.delete_node(x);
+    let z = rt.create_query(move |rt: &Rt| {
+        let v = rt.get(j);
+        assert!(v != 0, "z boom");
+        v
+    });
+    assert_eq!(z.slot(), x.slot(), "Z reuses X's slot");
+    let w = rt.create_query(move |rt: &Rt| if rt.get(sel) == 0 { rt.get(z) } else { 100 });
+    assert_eq!(rt.get(w), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(w), 100);
+    assert_eq!(rt.state_of(z), NodeState::Failed);
+    assert_eq!(rt.contained_payloads(), 1);
+    gate.release();
+    let got = reader.join();
+    assert!(got.as_ref().is_err_and(|m| m.contains("stale")), "{got:?}");
+    assert_eq!(rt.contained_payloads(), 1, "the read took Z's ticket");
+    assert_eq!(
+        outcome(|| rt.get(z)),
+        Err("z boom".to_string()),
+        "Z kept its own landing"
+    );
+    rt.assert_invariant_i();
+}
+
 /// Records whether it was dropped while its thread was unwinding, where a
 /// panicking user `Drop` aborts.
 struct DropWitness(Arc<AtomicU8>);
@@ -2618,8 +2882,7 @@ fn shared_walked_vframe_dirtied_after_it_let_the_failure_out() {
 /// the episode lands F Failed and delivers the payload to T's virtual
 /// frame, which holds no claim: the landing publishes a record first.
 /// The other thread's read of T waits out T's reservation, then reads F
-/// Failed through a walk that computes X and Y, which the record's match
-/// does not cover, so only the record and the reads' end are checked here.
+/// Failed.
 #[test]
 fn shared_vframe_landed_failed_over_an_episodes_delivery() {
     let rt = Arc::new(Rt::new());
@@ -3344,4 +3607,480 @@ fn a_stashed_value_is_cloned_outside_the_stash_lock() {
         1,
         "x ran again while its stash was shared"
     );
+}
+
+struct Custom(u64);
+
+/// b catches the `Custom` panic of c, which reads input i, and panics with
+/// `Custom(c + 10)`; r reads b at budget 1, so its retry regenerates b's
+/// payload (`regenerate`). Another thread sets i while b's closure runs
+/// for that regeneration: the run raises c's payload as the unbounded run
+/// took it, before the set, and b, back from the run, leaves Failed as the
+/// set's walk would have flipped it, so a read after the set runs b again
+/// with i's new value.
+#[test]
+fn a_set_during_a_regeneration_flips_the_node_it_runs() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let i = rt.create_input(1_u64);
+    let c = rt.create_query_with(
+        move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(i))) },
+        replayable(),
+    );
+    let in_regen = gate.clone();
+    let b = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            if crate::value_code::thread_word() & crate::value_code::REGEN_BIT != 0 {
+                in_regen.park();
+            }
+            let got = match catch_unwind(AssertUnwindSafe(|| rt.get(c))) {
+                Err(p) => p.downcast::<Custom>().map_or(100, |x| x.0 + 10),
+                Ok(v) => v,
+            };
+            std::panic::panic_any(Custom(got))
+        },
+        replayable(),
+    );
+    let j = rt.create_input(1_u64);
+    let deep = rt.create_query_with(move |rt: &Rt| rt.get(j), replayable());
+    let r = rt.create_query_with(
+        move |rt: &Rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<Custom>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.try_get(r).unwrap_or(7777))
+    };
+    gate.wait_parked();
+    rt.set(i, 5);
+    gate.release();
+    assert_eq!(reader.join(), 11_001);
+    let again = catch_unwind(AssertUnwindSafe(|| rt.get(b))).unwrap_err();
+    assert_eq!(again.downcast_ref::<Custom>().map(|c| c.0), Some(15));
+}
+
+/// x's run on thread A, from the walk of A's read of p, lands Dirty, a
+/// set having superseded it, and A's claim goes; thread B then runs x,
+/// which panics with `Custom(12)` and lands Failed with a record a reader's
+/// retry past the budget would regenerate x's payload from. A's landing,
+/// finishing after B's, must not forget that record. x is a dep A's walk
+/// recomputes, not a read's own node, which a Dirty landing would reserve
+/// for A (`reserve::note_root`).
+#[test]
+fn a_superseded_landing_keeps_the_next_runs_failed_record() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let in_x = Gate::new();
+    let landed = Gate::new();
+    let i = rt.create_input(0_u64);
+    let x_gate = in_x.clone();
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(i);
+            if v < 2 {
+                x_gate.park();
+                return v;
+            }
+            std::panic::panic_any(Custom(v + 10))
+        },
+        replayable(),
+    );
+    let at_landing = landed.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::UnsettledLanding(id(x)) {
+            at_landing.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let p = rt.create_query_with(move |rt: &Rt| rt.get(x), replayable());
+    assert_eq!(rt.get(p), 0);
+    rt.set(i, 1);
+    in_x.arm();
+    landed.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err())
+    };
+    in_x.wait_parked();
+    rt.set(i, 2);
+    in_x.release();
+    landed.wait_parked();
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err())
+    };
+    assert!(b.join());
+    let key = u64::from(id(x).0) | (u64::from(x.generation()) << 32);
+    assert!(rt.regenerable(key), "x's run left no record");
+    landed.release();
+    assert!(a.join());
+    assert!(
+        rt.regenerable(key),
+        "a landing that went before forgot x's record"
+    );
+}
+
+/// x's run on thread A, from the walk of A's read of p, panics after a set
+/// flagged it, so its Failed landing lands Dirty and A's claim goes; thread
+/// B then runs x, which panics with `Custom(12)` and lands Failed with its
+/// own record. A's landing, forgetting the record it wrote, must not
+/// forget B's.
+#[test]
+fn a_flagged_failed_landing_keeps_the_next_runs_record() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let in_x = Gate::new();
+    let landed = Gate::new();
+    let i = rt.create_input(0_u64);
+    let x_gate = in_x.clone();
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(i);
+            if v == 0 {
+                return 0;
+            }
+            if v == 1 {
+                x_gate.park();
+            }
+            std::panic::panic_any(Custom(v + 10))
+        },
+        replayable(),
+    );
+    let at_landing = landed.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::FailedLandedOtherwise(id(x)) {
+            at_landing.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let p = rt.create_query_with(move |rt: &Rt| rt.get(x), replayable());
+    assert_eq!(rt.get(p), 0);
+    rt.set(i, 1);
+    in_x.arm();
+    landed.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err())
+    };
+    in_x.wait_parked();
+    rt.set(i, 2);
+    in_x.release();
+    landed.wait_parked();
+    let a_record = rt.failed_run_token(id(x).0, x.generation());
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(x)))
+                .unwrap_err()
+                .downcast_ref::<Custom>()
+                .map(|c| c.0)
+        })
+    };
+    assert_eq!(b.join(), Some(12));
+    let b_record = rt.failed_run_token(id(x).0, x.generation());
+    assert!(
+        b_record.is_some() && b_record != a_record,
+        "x's run left no record"
+    );
+    landed.release();
+    assert!(a.join());
+    assert_eq!(
+        rt.failed_run_token(id(x).0, x.generation()),
+        b_record,
+        "a landing that went before forgot x's record"
+    );
+}
+
+/// A set on thread A flips Failed x to Dirty and releases it; thread B
+/// then runs x, which panics with `Custom(12)` and lands Failed with a new
+/// record. The flip, forgetting x's old record, must not forget B's.
+#[test]
+fn a_flip_keeps_the_record_of_a_run_after_it() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let flipped = Gate::new();
+    let i = rt.create_input(1_u64);
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(i) + 10)) },
+        replayable(),
+    );
+    let at_flip = flipped.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::FlippedFailed(id(x)) {
+            at_flip.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    let key = u64::from(id(x).0) | (u64::from(x.generation()) << 32);
+    assert!(rt.regenerable(key), "x's first run left no record");
+    flipped.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.set(i, 2))
+    };
+    flipped.wait_parked();
+    let first = rt.failed_run_token(id(x).0, x.generation());
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(x)))
+                .unwrap_err()
+                .downcast_ref::<Custom>()
+                .map(|c| c.0)
+        })
+    };
+    assert_eq!(b.join(), Some(12));
+    let second = rt.failed_run_token(id(x).0, x.generation());
+    assert!(
+        second.is_some() && second != first,
+        "x's second run left no record"
+    );
+    flipped.release();
+    a.join();
+    assert_eq!(
+        rt.failed_run_token(id(x).0, x.generation()),
+        second,
+        "the flip forgot the record of the run after it"
+    );
+}
+
+/// A set of i on thread A walks Failed x and stops before its flip; a set
+/// of j on the test's thread flips x and forgets its record, and a read
+/// there runs x, which panics and lands Failed with a new record. A's flip
+/// then takes x to Dirty and must forget that record, which no landing of
+/// x stands for any more.
+#[test]
+fn a_flip_after_another_forgets_the_record_of_the_failure_it_flips() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let before_cas = Gate::new();
+    let i = rt.create_input(1_u64);
+    let j = rt.create_input(1_u64);
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(i) + rt.get(j))) },
+        replayable(),
+    );
+    let at_cas = before_cas.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::FlipBeforeCas(id(x)) {
+            at_cas.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    before_cas.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.set(i, 2))
+    };
+    before_cas.wait_parked();
+    rt.set(j, 2);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    assert!(rt.failed_run_token(id(x).0, x.generation()).is_some());
+    before_cas.release();
+    a.join();
+    assert_eq!(
+        rt.failed_run_token(id(x).0, x.generation()),
+        None,
+        "x is Dirty with the record of a Failed landing a flip took back"
+    );
+}
+
+/// x's walk contains `failed`'s panic once x stops reading it, holding a
+/// ticket for `failed`. Thread B's read of q2 reruns q1, whose read of
+/// `failed` takes that ticket as lent and stops; a regeneration on thread A
+/// then reruns `failed`, which stops in its closure. q1's contained panic
+/// holds the lent ticket again: a rerunning node is still the Failed
+/// landing the ticket keeps.
+#[test]
+fn a_ticket_held_again_keeps_a_node_a_regeneration_reruns() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1000);
+    let took = Gate::new();
+    let rerun = Gate::new();
+    let in_rerun = rerun.clone();
+    let sel = rt.create_input(0_u64);
+    let j = rt.create_input(1_u64);
+    let failed = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(j);
+            in_rerun.park();
+            assert!(v != 0, "failed below the chain");
+            v
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if rt.get(sel) == 0 {
+                rt.get(failed)
+            } else {
+                100
+            }
+        },
+        replayable(),
+    );
+    let q1 = rt.create_query_with(move |rt: &Rt| rt.get(failed) + 1, replayable());
+    let q2 = rt.create_query_with(move |rt: &Rt| rt.get(q1) + 1, replayable());
+    assert_eq!(rt.get(q2), 3);
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    let key = u64::from(id(failed).0) | (u64::from(failed.generation()) << 32);
+    assert!(rt.regenerable(key), "failed's run left no record");
+    assert_eq!(
+        rt.contained_payloads(),
+        1,
+        "x's walk held no ticket for failed"
+    );
+    let at_take = took.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::TookContained(id(failed)) {
+            at_take.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    took.arm();
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(q2)))
+                .unwrap_err()
+                .downcast_ref::<&str>()
+                .copied()
+        })
+    };
+    took.wait_parked();
+    rerun.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            rt.regenerate(
+                id(failed),
+                failed.generation(),
+                std::any::TypeId::of::<&'static str>(),
+            )
+            .is_some()
+        })
+    };
+    rerun.wait_parked();
+    took.release();
+    assert_eq!(
+        b.join(),
+        Some("failed below the chain"),
+        "q2's read lost failed's payload"
+    );
+    rerun.release();
+    assert!(a.join(), "the regeneration made no payload");
+}
+
+/// As above, with a second regeneration of `failed` on thread C that moves
+/// it Failed to Computing while the first, on thread A, has moved it back
+/// but not yet returned. A's return must not clear C's mark: q1's held
+/// ticket keeps `failed` while C reruns it.
+#[test]
+fn a_finished_regeneration_keeps_the_mark_of_the_next_rerun() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1000);
+    let took = Gate::new();
+    let back = Gate::new();
+    let rerun = Gate::new();
+    let in_rerun = rerun.clone();
+    let sel = rt.create_input(0_u64);
+    let j = rt.create_input(1_u64);
+    let failed = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(j);
+            in_rerun.park();
+            assert!(v != 0, "failed below the chain");
+            v
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            if rt.get(sel) == 0 {
+                rt.get(failed)
+            } else {
+                100
+            }
+        },
+        replayable(),
+    );
+    let q1 = rt.create_query_with(move |rt: &Rt| rt.get(failed) + 1, replayable());
+    let q2 = rt.create_query_with(move |rt: &Rt| rt.get(q1) + 1, replayable());
+    assert_eq!(rt.get(q2), 3);
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    assert_eq!(rt.get(x), 100);
+    assert_eq!(
+        rt.contained_payloads(),
+        1,
+        "x's walk held no ticket for failed"
+    );
+    let (at_take, at_back) = (took.clone(), back.clone());
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::TookContained(id(failed)) {
+            at_take.park();
+        } else if point == ParkPoint::RerunBack(id(failed)) {
+            at_back.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let regenerate = |rt: &Arc<Rt>| {
+        let rt = Arc::clone(rt);
+        spawn(move || {
+            rt.regenerate(
+                id(failed),
+                failed.generation(),
+                std::any::TypeId::of::<&'static str>(),
+            )
+            .is_some()
+        })
+    };
+    took.arm();
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(q2)))
+                .unwrap_err()
+                .downcast_ref::<&str>()
+                .copied()
+        })
+    };
+    took.wait_parked();
+    back.arm();
+    let a = regenerate(&rt);
+    back.wait_parked();
+    rerun.arm();
+    let c = regenerate(&rt);
+    rerun.wait_parked();
+    back.release();
+    assert!(a.join(), "the first regeneration made no payload");
+    took.release();
+    assert_eq!(
+        b.join(),
+        Some("failed below the chain"),
+        "q2's read lost failed's payload"
+    );
+    rerun.release();
+    assert!(c.join(), "the second regeneration made no payload");
 }

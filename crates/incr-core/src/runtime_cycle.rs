@@ -974,7 +974,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 ctl.buf.take(),
                 !ctl.children.get().is_null(),
-                ctl.has(cycle::POISONED),
+                ctl.poison(),
             );
             // An engine unwind is no fault of the member's.
             if result.is_err() && cycle_state::unwind_kind().is_none() {
@@ -1055,7 +1055,7 @@ impl<C: Cells> Runtime<C> {
             deps,
             ctl.buf.take(),
             !ctl.children.get().is_null(),
-            ctl.has(cycle::POISONED),
+            ctl.poison(),
         );
         debug_assert!(
             replaced.is_none() && spec_buf.is_none(),
@@ -1322,6 +1322,7 @@ impl<C: Cells> Runtime<C> {
             cu: Vec::new(),
             round: None,
             walked,
+            uncut: cycle_state::has_dissolved(rt, root.0),
         });
         #[cfg(test)]
         self.episodes_seen
@@ -1648,6 +1649,7 @@ impl<C: Cells> Runtime<C> {
                 match self.shrink_to_root_scc(ep.root, &mut ep.members, &mut ep.cu, &graph, bag) {
                     Shrink::Kept => {}
                     Shrink::Shrunk => {
+                        ep.uncut = true;
                         ep.round = None;
                         continue 'restart;
                     }
@@ -1658,6 +1660,7 @@ impl<C: Cells> Runtime<C> {
             return self.land_episode(
                 &ep.members,
                 &ep.cu,
+                ep.uncut,
                 r.cycle,
                 r.stamp_rev,
                 r.verify_rev,
@@ -1796,12 +1799,25 @@ impl<C: Cells> Runtime<C> {
         });
     }
 
+    /// Counts a release of held claims, before they land, for the walks
+    /// other threads planned while they were held: a claim that reads one
+    /// of the landings also reads the count.
+    pub(super) fn count_release(&self) {
+        if !C::SINGLE_THREADED {
+            cycle_state::own_episode(self.runtime_id, RELEASED);
+            C::u64_fetch_add(&self.episodes_landed, RELEASED);
+        }
+    }
+
     /// Releases `slots` from the held map with the discard landing,
     /// except `keep`. They leave their group, as the unbounded run's
     /// episode cuts them at the same point.
     fn release_members(&self, slots: &[u32], keep: Option<u32>, bag: &mut Deferred<C>) {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
+        if slots.iter().any(|&m| Some(m) != keep) {
+            self.count_release();
+        }
         for &m in slots {
             if Some(m) == keep {
                 continue;
@@ -1910,6 +1926,7 @@ impl<C: Cells> Runtime<C> {
         if entries.is_empty() {
             return;
         }
+        self.count_release();
         entries.sort_unstable_by_key(|(slot, _)| *slot);
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
         let stamp_rev = self.current_revision();
@@ -1940,10 +1957,15 @@ impl<C: Cells> Runtime<C> {
                     e.deps(),
                     &released,
                     payload,
+                    false,
                     bag,
                 );
             } else {
                 self.land_panic_released(id, attempt, e.wrote, e.deps(), &released, bag);
+            }
+            // A cycle's retry may run a member again; a user panic ends its run.
+            if !discarding && kind.is_none() {
+                self.end_reservation(id, self.nodes.get(slot));
             }
             // A discarded claim's run is one the unbounded run never makes,
             // or makes again on the retry.
@@ -2125,12 +2147,15 @@ impl<C: Cells> Runtime<C> {
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
             None
         } else {
-            if e.poisoned() {
+            let poison = e.poison();
+            if self.memo_landing(poison, verify_rev) {
+                node.set_memo(verify_rev);
+            } else if poison != 0 {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
             }
-            let (target, children) = if published == Publish::Superseded || e.poisoned() {
+            let (target, children) = if published == Publish::Superseded || poison != 0 {
                 (NodeState::Dirty, ChildLanding::Keep)
             } else {
                 (NodeState::Clean, ChildLanding::Sweep)
@@ -2139,6 +2164,7 @@ impl<C: Cells> Runtime<C> {
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
             let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
+            self.end_reservation_landed(id, node, landed);
             self.record_trace(
                 id,
                 crate::trace::TraceAction::Recomputed {
@@ -2158,6 +2184,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         members: &[u32],
         cu: &[u32],
+        uncut: bool,
         cycle: Cycle,
         stamp_rev: u64,
         verify_rev: u64,
@@ -2167,8 +2194,8 @@ impl<C: Cells> Runtime<C> {
         if !C::SINGLE_THREADED {
             // Before the members land, so that a read of one of their
             // landings also reads the count.
-            cycle_state::own_episode(self.runtime_id);
-            C::u64_fetch_add(&self.episodes_landed, 1);
+            cycle_state::own_episode(self.runtime_id, LANDED);
+            C::u64_fetch_add(&self.episodes_landed, LANDED);
         }
         let rt = self.runtime_id;
         let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
@@ -2209,6 +2236,7 @@ impl<C: Cells> Runtime<C> {
         });
         if stale {
             drop(inner);
+            self.count_release();
             for (m, e) in entries {
                 let (node, flags) = self.nodes.get_with_flags(m);
                 if e.first {
@@ -2249,6 +2277,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
+            self.set_released(&mut inner, *m, node, None);
         }
         let group = Arc::new(GroupInfo {
             members: entries.iter().map(|(m, e)| (*m, e.generation)).collect(),
@@ -2260,6 +2289,16 @@ impl<C: Cells> Runtime<C> {
             C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
         }
         drop(inner);
+
+        // A member's handled outcome holds for the revision, and every
+        // member's value is built on it, so all of them keep a memo. Not
+        // with CU left: a CU member run again alone may skip the reads
+        // that put it in CU and read the memos as values. Nor if it skipped
+        // the cut to the root's SCC (`uncut`): a panic in this entry may
+        // have cut the cycle the strategy values were given for, and a read
+        // later in the revision holds the nodes it failed failing.
+        let poison = entries.iter().fold(0, |p, (_, e)| p | e.poison());
+        let memo = cu.is_empty() && !uncut && self.memo_landing(poison, verify_rev);
 
         // Step 3: write the values and stamp.
         for i in 0..entries.len() {
@@ -2299,19 +2338,27 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if entries[i].1.poisoned() {
+            if entries[i].1.poison() != 0 {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
+            }
+        }
+        // Only once every value is written: an abort in step 3 lands the
+        // members as if the episode kept no memo.
+        if memo {
+            for (m, _) in &entries {
+                self.nodes.get(*m).set_memo(verify_rev);
             }
         }
 
         // Steps 4 and 5: land, all Dirty if any member was flagged or a
         // new dep may hide a change.
         let dirty = superseded
-            || entries.iter().any(|(m, e)| {
-                e.poisoned() || self.nodes.get(*m).state() == NodeState::ComputingDirty
-            });
+            || poison != 0
+            || entries
+                .iter()
+                .any(|(m, _)| self.nodes.get(*m).state() == NodeState::ComputingDirty);
         for (m, e) in entries {
             let node = self.nodes.get(m);
             self.record_trace(
@@ -2336,7 +2383,8 @@ impl<C: Cells> Runtime<C> {
             };
             let flags = self.nodes.get_with_flags(m).1;
             self.children_landing(NodeId(m), flags, children, e.opened(), bag);
-            self.land(NodeId(m), node, target, flagged);
+            let landed = self.land(NodeId(m), node, target, flagged);
+            self.end_reservation_landed(NodeId(m), node, landed);
             bag.push_erased(Box::new(e.into_values()));
         }
         PopEnd::Landed
@@ -2358,7 +2406,18 @@ impl<C: Cells> Runtime<C> {
         payload: Payload,
         bag: &mut Deferred<C>,
     ) -> ! {
+        // The landing counted itself, but its members now land unrun.
+        self.count_release();
         let kind = cycle_state::take_unwind_kind();
+        // Step 3 sets no memo before its last compare, and a claimed
+        // member holds none from an earlier landing.
+        debug_assert!(
+            kind.is_none()
+                || entries
+                    .iter()
+                    .all(|(m, _)| !self.nodes.get(*m).memo_at(|| verify_rev)),
+            "incr-core: an engine unwind aborted an episode landing over a member's memo (T8-memo-on-aborted-episode)"
+        );
         let contain = self.episode_contains(cidx, kind, &*payload);
         let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {
@@ -2381,12 +2440,16 @@ impl<C: Cells> Runtime<C> {
                     &deps,
                     &members,
                     Some(&*payload),
+                    false,
                     bag,
                 );
             } else if kind.is_none() {
                 self.land_panic_released(id, attempt, e.wrote, e.deps(), &members, bag);
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
+            }
+            if kind.is_none() {
+                self.end_reservation(id, self.nodes.get(*m));
             }
             bag.push_erased(Box::new((e.take_buf(), e.s.take())));
         }
@@ -2579,9 +2642,9 @@ impl<C: Cells> Runtime<C> {
                     "incr-core: group verify re-lands member {m} over an empty slot"
                 );
                 node.max_verified_at(verify_rev);
-                if self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty)
-                    == NodeState::Clean
-                {
+                let landed = self.land(NodeId(m), node, NodeState::Clean, NodeState::Dirty);
+                self.end_reservation_landed(NodeId(m), node, landed);
+                if landed == NodeState::Clean {
                     self.record_trace(NodeId(m), crate::trace::TraceAction::VerifiedClean);
                 }
             }

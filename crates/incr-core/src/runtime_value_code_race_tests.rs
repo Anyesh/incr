@@ -182,6 +182,62 @@ fn value_code_read_that_misses_the_fast_path_reads_a_node_now_clean() {
     rt.assert_invariant_i();
 }
 
+/// As `reads_a_node_now_clean`, but after q lands and before the reload,
+/// another thread deletes q and recycles its slot into a New query Z.
+/// The read panics as stale, as in the serial order with the delete
+/// first, not with the contract panic; the set keeps its old value and
+/// Z's closure has not run.
+#[test]
+fn shared_value_code_read_finds_its_slot_recycled_into_a_new_node() {
+    let rt = Arc::new(Rt::new());
+    let src = rt.create_input(3_u64);
+    let computing = Gate::new();
+    let q = {
+        let computing = computing.clone();
+        rt.create_query(move |rt: &Rt| {
+            let v = rt.get(src);
+            computing.park();
+            v * 2
+        })
+    };
+    let x = rt.create_input(Probe(0));
+    computing.arm();
+    let computer = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(q))
+    };
+    computing.wait_parked();
+
+    let reload = Gate::new();
+    park_at(
+        &rt,
+        vec![(ParkPoint::ValueCodeBeforeReload(id(q)), reload.clone())],
+    );
+    let reader = set_reading(&rt, x, q);
+    reload.wait_parked();
+    computing.release();
+    assert_eq!(computer.join().unwrap(), 6);
+    rt.delete_node(q);
+    let z_runs = Arc::new(AtomicUsize::new(0));
+    let z = {
+        let z_runs = Arc::clone(&z_runs);
+        rt.create_query(move |_: &Rt| {
+            z_runs.fetch_add(1, Ordering::SeqCst);
+            5_u64
+        })
+    };
+    assert_eq!(z.slot(), q.slot(), "Z reuses q's slot");
+    reload.release();
+    let message = reader.join().unwrap().unwrap_err();
+    assert!(message.contains("stale"), "{message}");
+    assert!(!message.contains(CONTRACT_MESSAGE), "{message}");
+    assert_eq!(rt.get(x).0, 0);
+    assert_eq!(z_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(rt.state_of(z), crate::state::NodeState::New);
+    assert_eq!(rt.get(z), 5, "Z kept its own landing");
+    rt.assert_invariant_i();
+}
+
 /// A delete parked after its `Dead` claim, before the generation bump:
 /// the read gets the panic any reader of a node being deleted gets, not
 /// the contract panic or the stale one, and the set it ran under keeps

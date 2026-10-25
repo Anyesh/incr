@@ -1,5 +1,5 @@
 use super::{own_episode, own_episodes, Held, Look, OWN_EPISODES};
-use crate::cycle::Erased;
+use crate::cycle::{self, Erased};
 use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
@@ -21,14 +21,14 @@ fn read_unbuilt(b: &Option<Unbuilt>) -> Option<u32> {
 #[test]
 fn a_real_look_settles_what_a_speculative_run_wrote() {
     let mut e = Held::new(0, 1, false, true);
-    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, false);
+    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, 0);
     assert!(replaced.is_none() && spec.is_none());
     let (replaced, spec) = e.record(
         Look::SPECULATIVE,
         vec![(NodeId(3), 0)],
         value(7777),
         true,
-        true,
+        cycle::POISONED,
     );
     assert_eq!(read(&replaced), Some(1));
     assert!(spec.is_none());
@@ -37,7 +37,7 @@ fn a_real_look_settles_what_a_speculative_run_wrote() {
         assert!(settled.is_none());
         assert_eq!(read(seen.buf()), Some(7777));
         assert_eq!(seen.last(), &[(NodeId(3), 0)]);
-        assert!(seen.opened() && seen.poisoned());
+        assert!(seen.opened() && seen.poison() != 0);
     }
     assert!(e.spec_written());
     let (seen, settled) = e.look(Look::REAL);
@@ -46,22 +46,28 @@ fn a_real_look_settles_what_a_speculative_run_wrote() {
     assert_eq!(seen.deps(), &[(NodeId(2), 0)]);
     assert_eq!(seen.last(), &[(NodeId(2), 0)]);
     assert_eq!(seen.installed(), &[NodeId(2)]);
-    assert!(!seen.opened() && !seen.poisoned());
+    assert!(!seen.opened() && seen.poison() == 0);
     assert!(!seen.spec_written());
 }
 
 #[test]
 fn a_real_write_settles_before_it_records() {
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, true);
+    e.record(
+        Look::REAL,
+        vec![(NodeId(2), 0)],
+        value(1),
+        false,
+        cycle::POISONED,
+    );
     e.record(
         Look::SPECULATIVE,
         vec![(NodeId(3), 0)],
         value(7777),
         false,
-        false,
+        0,
     );
-    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(4), 0)], value(5), true, false);
+    let (replaced, spec) = e.record(Look::REAL, vec![(NodeId(4), 0)], value(5), true, 0);
     assert!(replaced.is_none());
     assert_eq!(read_unbuilt(&spec), Some(7777));
     let (seen, settled) = e.look(Look::REAL);
@@ -70,19 +76,19 @@ fn a_real_write_settles_before_it_records() {
     assert_eq!(seen.deps(), &[(NodeId(2), 0), (NodeId(4), 0)]);
     assert_eq!(seen.last(), &[(NodeId(4), 0)]);
     assert_eq!(seen.installed(), &[NodeId(2), NodeId(4)]);
-    assert!(seen.opened() && seen.poisoned());
+    assert!(seen.opened() && seen.poison() != 0);
 }
 
 #[test]
 fn an_adopted_speculative_run_survives_a_real_look() {
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, false);
+    e.record(Look::REAL, vec![(NodeId(2), 0)], value(1), false, 0);
     e.record(
         Look::SPECULATIVE,
         vec![(NodeId(3), 0)],
         value(7777),
         false,
-        false,
+        0,
     );
     e.adopt();
     let (seen, settled) = e.into_look(Look::REAL);
@@ -94,20 +100,14 @@ fn an_adopted_speculative_run_survives_a_real_look() {
 #[test]
 fn a_settle_restores_the_record_from_before_the_first_speculative_run() {
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, false);
-    e.record(
-        Look::SPECULATIVE,
-        vec![(NodeId(3), 0)],
-        value(7),
-        true,
-        false,
-    );
+    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, 0);
+    e.record(Look::SPECULATIVE, vec![(NodeId(3), 0)], value(7), true, 0);
     let (replaced, _) = e.record(
         Look::SPECULATIVE,
         vec![(NodeId(4), 0)],
         value(8),
         false,
-        true,
+        cycle::POISONED,
     );
     assert_eq!(read(&replaced), Some(7));
     let (seen, settled) = e.look(Look::REAL);
@@ -115,20 +115,14 @@ fn a_settle_restores_the_record_from_before_the_first_speculative_run() {
     assert_eq!(seen.deps(), &[(NodeId(2), 0)]);
     assert_eq!(seen.last(), &[(NodeId(2), 0)]);
     assert_eq!(seen.installed(), &[NodeId(2)]);
-    assert!(!seen.opened() && !seen.poisoned());
+    assert!(!seen.opened() && seen.poison() == 0);
 }
 
 #[test]
 fn a_speculative_look_or_a_discard_keeps_the_mark() {
     let mut e = Held::new(0, 1, false, true);
-    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, false);
-    e.record(
-        Look::SPECULATIVE,
-        vec![(NodeId(3), 0)],
-        value(7),
-        false,
-        false,
-    );
+    e.record(Look::REAL, vec![(NodeId(2), 0)], None, false, 0);
+    e.record(Look::SPECULATIVE, vec![(NodeId(3), 0)], value(7), false, 0);
     assert!(e.discard_buf().is_some());
     assert!(e.spec_written());
     let (seen, settled) = e.into_look(Look::SPECULATIVE);
@@ -153,9 +147,9 @@ fn a_look_here_follows_the_thread_speculation() {
 fn a_thread_counts_episodes_on_a_bounded_set_of_runtimes() {
     let rts: Vec<RuntimeId> = (0..20).map(|_| RuntimeId::allocate()).collect();
     for &rt in &rts {
-        own_episode(rt);
+        own_episode(rt, 1);
     }
-    own_episode(rts[19]);
+    own_episode(rts[19], 1);
     assert_eq!(own_episodes(rts[19]), 2);
     assert_eq!(own_episodes(rts[0]), 0);
     assert!(OWN_EPISODES.with(|o| o.borrow().len()) < rts.len());
