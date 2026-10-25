@@ -2755,3 +2755,10 @@ scale by `scale-icount` against `01797eba`: Shared rows rise at most
 0.32% (`shared_wide_diverted_retry`; `shared_taint_100k_at_budget_1`
 0.30%), Local rows move within -0.43..+0.10%, and `replay_scale_tests`
 take 15.53 s against 15.45 s (mean of four alternating runs each).
+
+## t10 34412289 merged into t11: Local Clean get takes diverted reads off its fast path
+
+- Engine: `w/T11-sync-34412289` (63bae51c, with 3cacb115 and 463b3c40) against t11 `09bcda8c`, this box through buildlock.
+- `get_clean_local` 94 -> 95. t10's own path change is -1 (93 when the merge has no diverted handling, which is wrong for a diverted read). Testing `DIVERTED_TAG` on the Local fast path cost 5 (98); moving the case into the arena miss (`local_arena_miss`, cold, re-reads the node's tag) leaves +2 over 93: a spill and reload of the type tag around `record_dep`, because the miss branch now returns a value where it used to diverge in `read_failed`. Accepted by the integrator; follow-up B7-local-get-diverted-miss-tail.
+- Exact: `get_clean_shared` 192, `table_hit_local` 150.14, `table_hit_shared` 216.14, `value_slot_read_local` 5, `value_slot_read_shared` 87.
+- The other workloads move with t10's engine changes and match between the merge with and without the diverted handling.
