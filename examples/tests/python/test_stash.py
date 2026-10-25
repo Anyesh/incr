@@ -283,9 +283,11 @@ def test_a_read_in_finally_during_a_discard_is_given_up_with_the_run(
     assert inner_runs == ["i"], "the speculative entry never ran"
     assert seen == ["_IncrEngineUnwind"]
     assert_given_up_unrun_then_lands_its_own_outcome(rt, c, "c", raises, runs)
-    # Discarded too, never Failed: the real read raises its own exception.
+    # Never Failed: the real read raises the exception the speculative run
+    # kept, without running `inner` again.
     with pytest.raises(ZeroDivisionError, match="speculative"):
         rt.get(inner)
+    assert inner_runs == ["i"]
     assert capfd.readouterr().err == ""
 
 
