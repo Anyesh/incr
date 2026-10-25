@@ -627,8 +627,8 @@ fn a_closure_that_catches_a_doom_joins_a_reader_of_the_doomed_node() {
     }
 }
 
-/// As above with X in a cycle with W, whose read of X `try_get` catches,
-/// and T's child reading W: over budget the doom falls inside the
+/// As above with X in a cycle with W, each reading the other with
+/// `try_get`, and T's child reading W: over budget the doom falls inside the
 /// episode, whose claims the doomed frames may keep held while T's catch
 /// runs the join.
 #[test]
@@ -640,7 +640,10 @@ fn a_closure_that_catches_a_doom_in_a_cycle_joins_a_reader_of_a_member() {
         let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
         let w = {
             let xc = xc.clone();
-            rt.create_query_with(move |rt: &Rt| rt.get(*xc.get().unwrap()) + 1, replayable())
+            rt.create_query_with(
+                move |rt: &Rt| rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1),
+                replayable(),
+            )
         };
         let x = rt.create_query_with(
             move |rt: &Rt| rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000),
