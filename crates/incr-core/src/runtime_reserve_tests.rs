@@ -627,6 +627,47 @@ fn a_closure_that_catches_a_doom_joins_a_reader_of_the_doomed_node() {
     }
 }
 
+/// As above with X in a cycle with W, whose read of X `try_get` catches,
+/// and T's child reading W: over budget the doom falls inside the
+/// episode, whose claims the doomed frames may keep held while T's catch
+/// runs the join.
+#[test]
+fn a_closure_that_catches_a_doom_in_a_cycle_joins_a_reader_of_a_member() {
+    let run = |frames: u32| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(3_u64);
+        let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let w = {
+            let xc = xc.clone();
+            rt.create_query_with(move |rt: &Rt| rt.get(*xc.get().unwrap()) + 1, replayable())
+        };
+        let x = rt.create_query_with(
+            move |rt: &Rt| rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000),
+            replayable(),
+        );
+        xc.set(x).unwrap();
+        let t = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                v + thread::scope(|s| s.spawn(|| rt.get(w)).join().unwrap())
+            },
+            replayable(),
+        );
+        rt.set_max_frames(frames);
+        let got = within_10s(&rt, t);
+        if got.is_some() {
+            rt.assert_invariant_i();
+        }
+        got
+    };
+    let unbounded = run(u32::MAX);
+    assert!(matches!(unbounded, Some(Ok(_))), "{unbounded:?}");
+    for frames in [1, 2] {
+        assert_eq!(run(frames), unbounded, "budget {frames}");
+    }
+}
+
 static JOIN_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static JOIN_TARGET: OnceLock<(Arc<Rt>, Incr<JoinV>)> = OnceLock::new();
 static JOIN_CHILD: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
