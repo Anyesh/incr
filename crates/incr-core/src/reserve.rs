@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 #[cfg(not(loom))]
 use std::hash::{Hash, Hasher};
 
+use crate::attempt::{self, Attempt};
 #[cfg(not(loom))]
 use crate::fx::FxHasher;
 use crate::waits::Claim;
@@ -53,12 +54,12 @@ static LIVE: AtomicUsize = AtomicUsize::new(0);
 static BUCKETS: [AtomicU32; BUCKETS_LEN] = [const { AtomicU32::new(0) }; BUCKETS_LEN];
 
 #[cfg(not(loom))]
-static TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
+static TABLE: Mutex<BTreeMap<Claim, (Entry, Attempt)>> = Mutex::new(BTreeMap::new());
 
 #[cfg(loom)]
 loom::lazy_static! {
     static ref LIVE: AtomicUsize = AtomicUsize::new(0);
-    static ref TABLE: Mutex<BTreeMap<Claim, Entry>> = Mutex::new(BTreeMap::new());
+    static ref TABLE: Mutex<BTreeMap<Claim, (Entry, Attempt)>> = Mutex::new(BTreeMap::new());
 }
 
 /// One context's reservations on this thread, as claim and generation.
@@ -112,7 +113,7 @@ pub(crate) const PENDING: u64 = 0;
 /// context's end ends.
 const ROOT_READ: u64 = u64::MAX;
 
-fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, Entry>> {
+fn table() -> impl std::ops::DerefMut<Target = BTreeMap<Claim, (Entry, Attempt)>> {
     #[cfg(not(loom))]
     {
         TABLE.lock().unwrap_or_else(|e| e.into_inner())
@@ -278,8 +279,8 @@ fn list(context: u64, claim: Claim, generation: u32, again: bool) {
         let token = m.token();
         {
             let mut t = table();
-            match t.insert(claim, (generation, token)) {
-                Some(prev) if prev == (generation, token) && !again => return,
+            match t.insert(claim, ((generation, token), attempt::mine())) {
+                Some((prev, _)) if prev == (generation, token) && !again => return,
                 Some(_) => {}
                 None => {
                     #[cfg(not(loom))]
@@ -315,15 +316,37 @@ fn reserved(claim: Claim, generation: u32) -> Option<bool> {
     let token = MINE.with(Listed::token);
     table()
         .get(&claim)
-        .filter(|&&(g, _)| g == generation)
-        .map(|&(_, owner)| owner == token)
+        .filter(|((g, _), a)| *g == generation && !a.wounded())
+        .map(|&((_, owner), _)| owner == token)
 }
 
-/// Whether another thread reserved `claim` at `generation`.
+/// The attempt of another thread that reserved `claim` at `generation`.
+fn owner_elsewhere(claim: Claim, generation: u32) -> Option<Attempt> {
+    if !any() || !bucket_hit(claim) {
+        return None;
+    }
+    let token = MINE.with(Listed::token);
+    table()
+        .get(&claim)
+        .filter(|&&((g, owner), _)| g == generation && owner != token)
+        .map(|(_, a)| a.clone())
+}
+
+/// Whether another thread reserved `claim` at `generation` for an attempt
+/// no waiter has wounded: a wounded attempt's reservations hold no one.
 #[cold]
 #[inline(never)]
 pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
-    reserved(claim, generation) == Some(false)
+    owner_elsewhere(claim, generation).is_some_and(|a| !a.wounded())
+}
+
+/// A waiter on another thread's reservation of `claim`: wounds the
+/// owner's attempt if its doom's unwind is in flight, which frees the
+/// reservation. True if the reservation holds no one now.
+#[cold]
+#[inline(never)]
+pub(crate) fn take_over(claim: Claim, generation: u32) -> bool {
+    owner_elsewhere(claim, generation).is_none_or(|a| a.wound_in_flight())
 }
 
 /// Whether this thread reserved `claim` at `generation`.
@@ -339,7 +362,7 @@ pub(crate) fn mine(claim: Claim, generation: u32) -> bool {
 fn unlist(claims: &[(Claim, u32)], token: usize, shared: bool) {
     let mut t = table();
     for &(claim, generation) in claims {
-        if t.get(&claim) == Some(&(generation, token))
+        if t.get(&claim).map(|e| e.0) == Some((generation, token))
             && !(shared && still_listed(claim, generation))
         {
             t.remove(&claim);

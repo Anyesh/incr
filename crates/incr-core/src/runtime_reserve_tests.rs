@@ -668,6 +668,53 @@ fn a_closure_that_catches_a_doom_in_a_cycle_joins_a_reader_of_a_member() {
     }
 }
 
+/// A closure that catches an ordinary panic of its dep finds its attempt
+/// out of flight at any budget: only a discard's unwind is in flight.
+#[test]
+fn a_caught_user_panic_never_puts_the_attempt_in_flight() {
+    for frames in [u32::MAX, 1, 2] {
+        let rt = Rt::new();
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let f = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(y);
+                assert!(v == 0, "f boom {v}");
+                v
+            },
+            replayable(),
+        );
+        let seen: Arc<std::sync::Mutex<Vec<bool>>> = Arc::default();
+        let t = {
+            let seen = seen.clone();
+            rt.create_query_with(
+                move |rt: &Rt| match catch_unwind(AssertUnwindSafe(|| rt.get(f))) {
+                    Ok(v) => v,
+                    Err(p)
+                        if p.is::<crate::cycle::DoomUnwind>()
+                            || p.is::<crate::cycle::DiscardUnwind>() =>
+                    {
+                        std::panic::resume_unwind(p)
+                    }
+                    Err(_) => {
+                        seen.lock().unwrap().push(crate::attempt::in_flight());
+                        7
+                    }
+                },
+                replayable(),
+            )
+        };
+        rt.set_max_frames(frames);
+        assert_eq!(outcome(|| rt.get(t)), Ok(7), "budget {frames}");
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|&f| !f),
+            "budget {frames}: {seen:?}"
+        );
+    }
+}
+
 static JOIN_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static JOIN_TARGET: OnceLock<(Arc<Rt>, Incr<JoinV>)> = OnceLock::new();
 static JOIN_CHILD: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);

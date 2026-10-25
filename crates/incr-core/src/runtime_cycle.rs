@@ -20,7 +20,7 @@ use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
-use crate::{reserve, set_stack, waits};
+use crate::{attempt, reserve, set_stack, waits};
 
 /// What a compute attempt carries into its landings.
 #[derive(Copy, Clone)]
@@ -347,6 +347,9 @@ impl<C: Cells> Runtime<C> {
             if outermost {
                 cycle_state::reset_outermost();
                 replay::reset();
+                if !C::SINGLE_THREADED {
+                    attempt::begin();
+                }
             }
             match catch_unwind(AssertUnwindSafe(&mut *f)) {
                 Ok(r) => return Ok(r),
@@ -369,6 +372,9 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         payload: Box<dyn std::any::Any + Send>,
     ) -> Option<Cycle> {
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
         if outermost {
             self.retire_notes();
@@ -567,8 +573,12 @@ impl<C: Cells> Runtime<C> {
             self.reservation_waits
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-        while reserve::elsewhere(claim, generation) {
-            self.spin_holding(id, also, spins, || !reserve::elsewhere(claim, generation));
+        // An owner whose doom's unwind is in flight may be in user code
+        // that waits on this thread; taking over wounds its attempt.
+        let held =
+            || reserve::elsewhere(claim, generation) && !reserve::take_over(claim, generation);
+        while held() {
+            self.spin_holding(id, also, spins, || !held());
         }
         *spins = (*spins).max(1);
     }

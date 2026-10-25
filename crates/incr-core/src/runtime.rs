@@ -3973,6 +3973,12 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
 
+                // A waiter took over a node this thread's discard left
+                // reserved: the pop raises the wound the attempt retries
+                // from, as for a swallowed wound.
+                if result.is_err() && !C::SINGLE_THREADED && cycle_state::settle_discard() {
+                    result = Err(Box::new(cycle::WoundUnwind));
+                }
                 if result.is_err() && ctl.has(cycle::SPECULATIVE) {
                     self.unbuild_speculative(&ctl, bag);
                 }
@@ -4177,6 +4183,9 @@ impl<C: Cells> Runtime<C> {
         walked: bool,
         payload: Box<dyn std::any::Any + Send>,
     ) -> Computed {
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         let kind = cycle_state::take_unwind_kind();
         let (payload, children_stashed) = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
             self.stash_panic(id, ctl, deps, &attempt, payload)

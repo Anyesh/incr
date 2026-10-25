@@ -939,8 +939,31 @@ pub(crate) fn unwind_kind() -> Option<UnwindKind> {
     UnwindKind::of_word(value_code::thread_word())
 }
 
+/// Sets the thread's unwind kind. A discard is in flight exactly while
+/// the kind is [`UnwindKind::Discard`], which the attempt word mirrors for
+/// waiters; leaving it after a waiter wounded the attempt marks the thread
+/// wounded, so its outermost entry retries whatever it was unwinding.
 pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
+    let was = unwind_kind();
     value_code::set_unwind_bits(UnwindKind::bits(kind));
+    let discard = Some(UnwindKind::Discard);
+    if kind == discard && was != discard {
+        crate::attempt::enter_flight();
+    } else if was == discard && kind != discard && crate::attempt::leave_flight() {
+        set_wounded(true);
+    }
+}
+
+/// Where the engine catches a discard: if a waiter wounded the attempt
+/// while it was in flight, the discard becomes a wound, decided by the
+/// same CAS that ends the flight. True if it did.
+pub(crate) fn settle_discard() -> bool {
+    if unwind_kind() != Some(UnwindKind::Discard) || !crate::attempt::leave_flight() {
+        return false;
+    }
+    value_code::set_unwind_bits(UnwindKind::bits(Some(UnwindKind::Wound)));
+    set_wounded(true);
+    true
 }
 
 pub(crate) fn take_unwind_kind() -> Option<UnwindKind> {

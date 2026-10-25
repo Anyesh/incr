@@ -3545,6 +3545,9 @@ impl<C: Cells> Runtime<C> {
             !payload.is::<cycle::DoomUnwind>(),
             "incr-core: a doom unwind left the doomed frames"
         );
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         let kind = cycle_state::unwind_kind();
         let mut bag = Deferred::new();
         let mut payload = payload;
@@ -3910,6 +3913,9 @@ impl<C: Cells> Runtime<C> {
             !payload.is::<cycle::DoomUnwind>(),
             "incr-core: a doom unwind left the doomed frames"
         );
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         let kind = cycle_state::unwind_kind();
         if kind == Some(UnwindKind::Discard) {
             let (own, enclosing) = replay::with(|c| {
