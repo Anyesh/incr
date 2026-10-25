@@ -193,6 +193,17 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a Stale publish landed `New` and before
     /// the retry, with the attempt's bag carried along.
     StaleRetry(NodeId),
+    /// In `compute_one`, after a run that did not land Clean released its
+    /// claim, with the attempt's bag carried along.
+    UnsettledLanding(NodeId),
+    /// In `land_failed`, after a landing meant as Failed released its
+    /// claim landing otherwise, before it forgets its record.
+    FailedLandedOtherwise(NodeId),
+    /// In `flip_failed_from`, before the flip's CAS.
+    FlipBeforeCas(NodeId),
+    /// In `flip_failed_from`, after the flip released the node, before it
+    /// forgets the node's record.
+    FlippedFailed(NodeId),
     /// In `compute_one`, after an episode landed the root, before its
     /// reader learns how.
     EpisodeLanded(NodeId),
@@ -938,6 +949,9 @@ pub struct Runtime<C: Cells> {
     pub(crate) provenance: provenance_impl::Table<C>,
     tickets: C::Lock<contain_impl::Tickets>,
     tickets_held: std::sync::atomic::AtomicBool,
+    regens: C::Lock<replay_impl::Regens>,
+    /// Set once `regens` holds a record, so a delete looks for one only then.
+    regens_held: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     pub(crate) park_hook: std::sync::OnceLock<ParkHook>,
     #[cfg(test)]
@@ -1066,6 +1080,8 @@ impl<C: Cells> Runtime<C> {
             provenance: provenance_impl::table::<C>(),
             tickets: contain_impl::tickets::<C>(),
             tickets_held: std::sync::atomic::AtomicBool::new(false),
+            regens: replay_impl::regens::<C>(),
+            regens_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             park_hook: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -1451,8 +1467,13 @@ impl<C: Cells> Runtime<C> {
         self.dep_stack.any_compute_frame()
     }
 
-    /// Whether this runtime's active frame on this thread is doomed.
+    /// Whether this runtime's active frame on this thread is doomed, so a
+    /// node it would create is the pending handle. A run regenerating a
+    /// payload (`regenerate`) creates nothing, and aborts here.
     pub(crate) fn frame_doomed(&self) -> bool {
+        if value_code::thread_word() & value_code::REGEN_BIT != 0 {
+            replay_impl::abort_regen();
+        }
         self.dep_stack
             .active_frame(self.runtime_id)
             .is_some_and(|(ctl, _)| {
@@ -2250,7 +2271,8 @@ impl<C: Cells> Runtime<C> {
             & (value_code::COUNTER_MASK
                 | value_code::REPLAY_BIT
                 | value_code::UNWIND_MASK
-                | value_code::FOREIGN_BIT)
+                | value_code::FOREIGN_BIT
+                | value_code::REGEN_BIT)
             != 0
             || frame.is_some_and(|f| self.doomed_or_past_budget(f))
         {
@@ -2291,6 +2313,7 @@ impl<C: Cells> Runtime<C> {
         loop {
             if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
                 if let Some(value) = self.stashed_read(handle) {
+                    self.unregenerable(frame);
                     return Ok(value);
                 }
             }
@@ -2302,22 +2325,28 @@ impl<C: Cells> Runtime<C> {
             {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
                 if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
+                    self.unregenerable(frame);
                     return read;
                 }
             }
             // `get` found the node not Clean, so the walk starts at once.
             let walk =
                 || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
-            match self.entered(kind, walk)? {
+            let walked = self
+                .entered(kind, walk)
+                .inspect_err(|_| self.unregenerable(frame));
+            match walked? {
                 Computed::Done | Computed::Unsettled => {
                     if MODE & VIRT != 0 {
                         if let Some(value) = self.stashed_read(handle) {
+                            self.unregenerable(frame);
                             return Ok(value);
                         }
                     }
                 }
                 Computed::Gone => self.stale_handle(handle),
                 Computed::Deferred => {
+                    self.unregenerable(frame);
                     return self
                         .cycle_read(
                             handle,
@@ -2338,19 +2367,24 @@ impl<C: Cells> Runtime<C> {
             }
             self.park(ParkPoint::AfterWalk(NodeId(slot)));
             let (type_tag, arena_slot) = self.fields_under(handle, node);
+            // Also loaded before the slot is read, so a value another
+            // thread lands Clean after a Dirty read is still noted as Dirty.
+            let dirty = || state::load::<C>(node.state_cell()) == NodeState::Dirty;
+            let dirty_before = frame.is_some() && dirty();
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
-                    if let Some(f) = frame {
-                        if state::load::<C>(node.state_cell()) == NodeState::Dirty
-                            && !self.unchanged_stash(handle.slot(), handle.generation())
-                        {
+                    if let Some(f) = frame.filter(|_| dirty_before || dirty()) {
+                        if !self.unchanged_stash(handle.slot(), handle.generation()) {
                             self.note_dirty_read(f, handle, &value);
                         }
                     }
                     return Ok(value);
                 }
                 None => match self.read_missing(handle, node) {
-                    Ok(cycle) => return Err(cycle),
+                    Ok(cycle) => {
+                        self.unregenerable(frame);
+                        return Err(cycle);
+                    }
                     Err(NodeState::Clean) => {
                         return Ok(self.read_slot(handle, node, type_tag, arena_slot));
                     }
@@ -4065,6 +4099,8 @@ impl<C: Cells> Runtime<C> {
                     }
                     // Leaving the group is safe: a New node's record is inert,
                     // and the retry computes the node alone.
+                    // The retry's run has this run's key.
+                    self.drop_takes(id, node.generation(), cidx);
                     self.land_run(
                         id,
                         node,
@@ -4103,9 +4139,11 @@ impl<C: Cells> Runtime<C> {
                 };
                 // The run computed the node alone, as the unbounded run's
                 // does, so the node leaves its group.
+                self.drop_takes(id, node.generation(), cidx);
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
+                    self.park_with_bag(ParkPoint::UnsettledLanding(id), bag);
                     self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
@@ -4185,10 +4223,12 @@ impl<C: Cells> Runtime<C> {
         if children_stashed {
             let first = attempt.first;
             let stashed = ChildLanding::Stashed;
+            self.unfailed_landing(id, node.generation(), attempt.cidx);
             self.discard_land_in_group(id, first, wrote, attempt.stamp_rev, stashed, bag);
         } else if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
+            self.unfailed_landing(id, node.generation(), attempt.cidx);
             self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
         } else {
             // Publish the union of the old deps and whatever was recorded
@@ -4207,6 +4247,7 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 &[],
                 Some(&*payload),
+                !ctl.has(cycle::UNREGENERABLE),
                 bag,
             );
         }
@@ -4278,6 +4319,9 @@ impl<C: Cells> Runtime<C> {
     /// landed the node Dirty (`retaken_landing`).
     /// `co_members`, sorted, are the claims released with it, which count
     /// as settled. `payload` is the panic, when the caller has it.
+    /// `own_run` says the node lands from the compute that just popped, not
+    /// as a held member after its run left the stack, and that run read
+    /// nothing a rerun reads otherwise (`cycle::UNREGENERABLE`).
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -4289,6 +4333,7 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         co_members: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
+        own_run: bool,
         bag: &mut Deferred<C>,
     ) {
         let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
@@ -4313,7 +4358,17 @@ impl<C: Cells> Runtime<C> {
             if !C::SINGLE_THREADED {
                 self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
             }
-            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, bag);
+            let regenerable = own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0;
+            mark = self.failed_landing(
+                id,
+                node.generation(),
+                attempt.cidx,
+                payload,
+                regenerable,
+                bag,
+            );
+        } else {
+            self.unfailed_landing(id, node.generation(), attempt.cidx);
         }
         let flagged = if landing == NodeState::New {
             NodeState::New
@@ -4336,7 +4391,16 @@ impl<C: Cells> Runtime<C> {
         self.children_landing(id, flags, ChildLanding::Discard, false, bag);
         // The panic fails this attempt in the unbounded run too, so the node
         // leaves its group.
+        let token = if landing == NodeState::Failed {
+            self.failed_run_token(id.0, node.generation())
+        } else {
+            None
+        };
         let landed = self.land_single(id, node, flags, landing, flagged);
+        if landing == NodeState::Failed && landed != NodeState::Failed {
+            self.park(ParkPoint::FailedLandedOtherwise(id));
+            self.forget_failed_run_if(id.0, node.generation(), token);
+        }
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {

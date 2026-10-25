@@ -102,7 +102,7 @@ fn last_read(deps: &[(NodeId, u32)]) -> Option<(u64, u32)> {
 }
 
 /// The message of a read of node `slot` landed Failed.
-fn failed_read_message(slot: u32) -> String {
+pub(super) fn failed_read_message(slot: u32) -> String {
     format!(
         "incr-core: node {slot} read but its last compute panicked; it stays Failed until a \
          dependency changes (set an upstream input to retry)"
@@ -178,8 +178,29 @@ impl<C: Cells> Runtime<C> {
                 .expect("incr-core: the delivery's context is open")
                 .take_landed(i, at)
         });
+        // A payload no copy can stand for that an earlier take had: its
+        // node runs again, as for a retry's read (`regenerate`).
+        let payload = match payload.downcast::<replay::Regen>() {
+            Ok(regen) => {
+                let raised = self.regenerate(id, generation, regen.0)?;
+                replay::regenerated_at(context, i, replay::payload_key(&*raised));
+                raised
+            }
+            Err(payload) => payload,
+        };
         if attributed {
             cycle_state::count_failure();
+        }
+        // The read took the payload as from a ticket, and a payload no copy
+        // can stand for holds its frame as at `note_ticket_read`.
+        let reading = u64::from(id.0) | (u64::from(generation) << 32);
+        if let Some((f, read, _)) = self.dep_stack.unwound_read(rt) {
+            if read == reading {
+                let regenerable = self.note_took(f, reading, &*payload);
+                if !replay::copyable(&*payload) {
+                    self.hold_uncopied(f.ctl, regenerable);
+                }
+            }
         }
         Some(payload)
     }

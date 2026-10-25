@@ -561,10 +561,17 @@ pub trait DepStack: 'static {
     /// `rt`'s active frame as the reader of an unwind out of the compute
     /// that popped above it, with the node it reads and how many times it
     /// has read it.
-    fn unwound_reader(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32, u64, u32)> {
+    fn unwound_read(&self, rt: RuntimeId) -> Option<(ActiveRead, u64, u32)> {
         self.with(|s| {
+            let depth = s.frames.len() as u32;
             let top = s.reader(rt)?;
-            Some((top.ctl, top.cidx, top.reading, top.reads_of_reading()))
+            let f = ActiveRead {
+                node: top.node,
+                ctl: top.ctl,
+                cidx: top.cidx,
+                depth,
+            };
+            Some((f, top.reading, top.reads_of_reading()))
         })
     }
 

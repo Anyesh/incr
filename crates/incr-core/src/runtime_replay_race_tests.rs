@@ -3338,3 +3338,294 @@ fn a_stashed_value_is_cloned_outside_the_stash_lock() {
         "x ran again while its stash was shared"
     );
 }
+
+struct Custom(u64);
+
+/// b catches the `Custom` panic of c, which reads input i, and panics with
+/// `Custom(c + 10)`; r reads b at budget 1, so its retry regenerates b's
+/// payload (`regenerate`). Another thread sets i while b's closure runs
+/// for that regeneration: the run raises c's payload as the unbounded run
+/// took it, before the set, and b, back from the run, leaves Failed as the
+/// set's walk would have flipped it, so a read after the set runs b again
+/// with i's new value.
+#[test]
+fn a_set_during_a_regeneration_flips_the_node_it_runs() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let i = rt.create_input(1_u64);
+    let c = rt.create_query_with(
+        move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(i))) },
+        replayable(),
+    );
+    let in_regen = gate.clone();
+    let b = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            if crate::value_code::thread_word() & crate::value_code::REGEN_BIT != 0 {
+                in_regen.park();
+            }
+            let got = match catch_unwind(AssertUnwindSafe(|| rt.get(c))) {
+                Err(p) => p.downcast::<Custom>().map_or(100, |x| x.0 + 10),
+                Ok(v) => v,
+            };
+            std::panic::panic_any(Custom(got))
+        },
+        replayable(),
+    );
+    let j = rt.create_input(1_u64);
+    let deep = rt.create_query_with(move |rt: &Rt| rt.get(j), replayable());
+    let r = rt.create_query_with(
+        move |rt: &Rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<Custom>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.try_get(r).unwrap_or(7777))
+    };
+    gate.wait_parked();
+    rt.set(i, 5);
+    gate.release();
+    assert_eq!(reader.join(), 11_001);
+    let again = catch_unwind(AssertUnwindSafe(|| rt.get(b))).unwrap_err();
+    assert_eq!(again.downcast_ref::<Custom>().map(|c| c.0), Some(15));
+}
+
+/// x's run on thread A, from the walk of A's read of p, lands Dirty, a
+/// set having superseded it, and A's claim goes; thread B then runs x,
+/// which panics with `Custom(12)` and lands Failed with a record a reader's
+/// retry past the budget would regenerate x's payload from. A's landing,
+/// finishing after B's, must not forget that record. x is a dep A's walk
+/// recomputes, not a read's own node, which a Dirty landing would reserve
+/// for A (`reserve::note_root`).
+#[test]
+fn a_superseded_landing_keeps_the_next_runs_failed_record() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let in_x = Gate::new();
+    let landed = Gate::new();
+    let i = rt.create_input(0_u64);
+    let x_gate = in_x.clone();
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(i);
+            if v < 2 {
+                x_gate.park();
+                return v;
+            }
+            std::panic::panic_any(Custom(v + 10))
+        },
+        replayable(),
+    );
+    let at_landing = landed.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::UnsettledLanding(id(x)) {
+            at_landing.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let p = rt.create_query_with(move |rt: &Rt| rt.get(x), replayable());
+    assert_eq!(rt.get(p), 0);
+    rt.set(i, 1);
+    in_x.arm();
+    landed.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err())
+    };
+    in_x.wait_parked();
+    rt.set(i, 2);
+    in_x.release();
+    landed.wait_parked();
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err())
+    };
+    assert!(b.join());
+    let key = u64::from(id(x).0) | (u64::from(x.generation()) << 32);
+    assert!(rt.regenerable(key), "x's run left no record");
+    landed.release();
+    assert!(a.join());
+    assert!(
+        rt.regenerable(key),
+        "a landing that went before forgot x's record"
+    );
+}
+
+/// x's run on thread A, from the walk of A's read of p, panics after a set
+/// flagged it, so its Failed landing lands Dirty and A's claim goes; thread
+/// B then runs x, which panics with `Custom(12)` and lands Failed with its
+/// own record. A's landing, forgetting the record it wrote, must not
+/// forget B's.
+#[test]
+fn a_flagged_failed_landing_keeps_the_next_runs_record() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let in_x = Gate::new();
+    let landed = Gate::new();
+    let i = rt.create_input(0_u64);
+    let x_gate = in_x.clone();
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(i);
+            if v == 0 {
+                return 0;
+            }
+            if v == 1 {
+                x_gate.park();
+            }
+            std::panic::panic_any(Custom(v + 10))
+        },
+        replayable(),
+    );
+    let at_landing = landed.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::FailedLandedOtherwise(id(x)) {
+            at_landing.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    let p = rt.create_query_with(move |rt: &Rt| rt.get(x), replayable());
+    assert_eq!(rt.get(p), 0);
+    rt.set(i, 1);
+    in_x.arm();
+    landed.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(p))).is_err())
+    };
+    in_x.wait_parked();
+    rt.set(i, 2);
+    in_x.release();
+    landed.wait_parked();
+    let a_record = rt.failed_run_token(id(x).0, x.generation());
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(x)))
+                .unwrap_err()
+                .downcast_ref::<Custom>()
+                .map(|c| c.0)
+        })
+    };
+    assert_eq!(b.join(), Some(12));
+    let b_record = rt.failed_run_token(id(x).0, x.generation());
+    assert!(
+        b_record.is_some() && b_record != a_record,
+        "x's run left no record"
+    );
+    landed.release();
+    assert!(a.join());
+    assert_eq!(
+        rt.failed_run_token(id(x).0, x.generation()),
+        b_record,
+        "a landing that went before forgot x's record"
+    );
+}
+
+/// A set on thread A flips Failed x to Dirty and releases it; thread B
+/// then runs x, which panics with `Custom(12)` and lands Failed with a new
+/// record. The flip, forgetting x's old record, must not forget B's.
+#[test]
+fn a_flip_keeps_the_record_of_a_run_after_it() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let flipped = Gate::new();
+    let i = rt.create_input(1_u64);
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(i) + 10)) },
+        replayable(),
+    );
+    let at_flip = flipped.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::FlippedFailed(id(x)) {
+            at_flip.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    let key = u64::from(id(x).0) | (u64::from(x.generation()) << 32);
+    assert!(rt.regenerable(key), "x's first run left no record");
+    flipped.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.set(i, 2))
+    };
+    flipped.wait_parked();
+    let first = rt.failed_run_token(id(x).0, x.generation());
+    let b = {
+        let rt = Arc::clone(&rt);
+        spawn(move || {
+            catch_unwind(AssertUnwindSafe(|| rt.get(x)))
+                .unwrap_err()
+                .downcast_ref::<Custom>()
+                .map(|c| c.0)
+        })
+    };
+    assert_eq!(b.join(), Some(12));
+    let second = rt.failed_run_token(id(x).0, x.generation());
+    assert!(
+        second.is_some() && second != first,
+        "x's second run left no record"
+    );
+    flipped.release();
+    a.join();
+    assert_eq!(
+        rt.failed_run_token(id(x).0, x.generation()),
+        second,
+        "the flip forgot the record of the run after it"
+    );
+}
+
+/// A set of i on thread A walks Failed x and stops before its flip; a set
+/// of j on the test's thread flips x and forgets its record, and a read
+/// there runs x, which panics and lands Failed with a new record. A's flip
+/// then takes x to Dirty and must forget that record, which no landing of
+/// x stands for any more.
+#[test]
+fn a_flip_after_another_forgets_the_record_of_the_failure_it_flips() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(3);
+    let before_cas = Gate::new();
+    let i = rt.create_input(1_u64);
+    let j = rt.create_input(1_u64);
+    let x = rt.create_query_with(
+        move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(i) + rt.get(j))) },
+        replayable(),
+    );
+    let at_cas = before_cas.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == ParkPoint::FlipBeforeCas(id(x)) {
+            at_cas.park();
+        }
+    }));
+    assert!(installed.is_ok());
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    before_cas.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.set(i, 2))
+    };
+    before_cas.wait_parked();
+    rt.set(j, 2);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    assert!(rt.failed_run_token(id(x).0, x.generation()).is_some());
+    before_cas.release();
+    a.join();
+    assert_eq!(
+        rt.failed_run_token(id(x).0, x.generation()),
+        None,
+        "x is Dirty with the record of a Failed landing a flip took back"
+    );
+}

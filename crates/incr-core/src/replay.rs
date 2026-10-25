@@ -1067,6 +1067,10 @@ impl Context {
             .expect("incr-core: an unwind is delivered to a virtual frame")
             .clone();
         let key = ReadKey::blocked(&below);
+        if let Delivered::Unwind { payload, .. } = &what {
+            let reader = (below.node, below.generation, below.path, below.seq);
+            note_took(self.rt, reader, below.reading, &**payload);
+        }
         let provenance = self
             .provenance
             .take()
@@ -1197,8 +1201,8 @@ impl Context {
 
     /// Marks delivery `i`'s read taken, as `take_delivery` does, and
     /// returns its unwind. The delivery stays until its maker's run ends,
-    /// for a retry doomed again; a payload that can't be copied is
-    /// delivered once.
+    /// for a retry doomed again; a payload that can't be copied is handed
+    /// over once, its delivery keeping a [`Regen`] marker in its place.
     pub(crate) fn take_unwind(&mut self, i: usize) -> Delivered {
         let key = self.pending.get(i).key;
         self.pending.take_keyed(&key);
@@ -1214,7 +1218,29 @@ impl Context {
             unreachable!("incr-core: taken as an unwind");
         };
         let Some(copy) = copy_payload(&**payload) else {
-            return self.pending.remove(i).what;
+            // The one payload goes to this read, and a retry doomed again
+            // regenerates it.
+            let regen: Box<dyn Any + Send> = Box::new(Regen((**payload).type_id()));
+            let d = self.pending.get_mut(i);
+            let Delivered::Unwind {
+                cycle,
+                poison,
+                attributed,
+                payload,
+                nodes,
+            } = &mut d.what
+            else {
+                unreachable!("incr-core: taken as an unwind");
+            };
+            let payload = std::mem::replace(payload, regen);
+            d.resumed = Some(payload_key(&*payload));
+            return Delivered::Unwind {
+                cycle: *cycle,
+                poison: *poison,
+                attributed: *attributed,
+                payload,
+                nodes: nodes.clone(),
+            };
         };
         let what = Delivered::Unwind {
             cycle: *cycle,
@@ -1359,6 +1385,7 @@ thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
     static KEPT_EVENTS: RefCell<Vec<Logged>> = const { RefCell::new(Vec::new()) };
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
+    static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
     static COPIED: RefCell<[u64; 64]> = const { RefCell::new([0; 64]) };
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
@@ -1371,6 +1398,7 @@ thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
+    static TOOK: RefCell<Takes> = RefCell::new(HashMap::default());
 }
 
 #[cfg(loom)]
@@ -1378,6 +1406,7 @@ loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
     static KEPT_EVENTS: RefCell<Vec<Logged>> = RefCell::new(Vec::new());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
+    static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
     static COPIED: RefCell<[u64; 64]> = RefCell::new([0; 64]);
     static COPIED_GEN: Cell<u64> = Cell::new(0);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
@@ -1390,6 +1419,7 @@ loom::thread_local! {
     // `count_foreign`.
     static FOREIGN_KEPT: RefCell<HashMap<ForeignKey, u32, FxBuildHasher>> = RefCell::new(HashMap::default());
     static RUNS: RefCell<Runs> = RefCell::new(Runs::default());
+    static TOOK: RefCell<Takes> = RefCell::new(HashMap::default());
 }
 
 #[cfg(all(test, not(loom)))]
@@ -2131,14 +2161,155 @@ pub(crate) fn set_carry(carry: Option<Carry>) {
     CARRY.with(|c| c.set(carry));
 }
 
+/// What a kept read holds in place of a payload no copy can stand for,
+/// once the one payload is gone: the payload's type, which the retry's
+/// read regenerates by running the node's closure again
+/// (`Runtime::regenerate`).
+#[derive(Clone, Copy)]
+pub(crate) struct Regen(pub(crate) std::any::TypeId);
+
+/// The state of a `Runtime::regenerate` run on this thread: the payloads
+/// made for the reads its node's unbounded run took a payload from, each
+/// raised by the first read of its node. Nodes are keyed as a `ReadKey`'s
+/// `reading`.
+pub(crate) struct Regenerating {
+    rt: Option<RuntimeId>,
+    made: Vec<(u64, Box<dyn Any + Send>)>,
+}
+
+impl Regenerating {
+    pub(crate) const fn new() -> Self {
+        Self {
+            rt: None,
+            made: Vec::new(),
+        }
+    }
+}
+
+/// Opens a regenerating run of runtime `rt` whose reads take from `made`.
+pub(crate) fn regen_open(rt: RuntimeId, made: Vec<(u64, Box<dyn Any + Send>)>) {
+    REGEN.with(|r| *r.borrow_mut() = Regenerating { rt: Some(rt), made });
+}
+
+/// Closes the run [`regen_open`] opened: the payloads its reads left.
+pub(crate) fn regen_close() -> Vec<(u64, Box<dyn Any + Send>)> {
+    REGEN.with(|r| std::mem::replace(&mut *r.borrow_mut(), Regenerating::new()).made)
+}
+
+/// The payload made for the open run's read of node `key` of runtime
+/// `rt`, if the unbounded run's read took one and no read since raised it.
+pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> Option<Box<dyn Any + Send>> {
+    REGEN.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.rt != Some(rt) {
+            return None;
+        }
+        let i = r.made.iter().position(|m| m.0 == key)?;
+        Some(r.made.swap_remove(i).1)
+    })
+}
+
+/// A run's identity across its frame's retries: its node as `(slot,
+/// generation)`, and its path and seq, as a `ReadKey` has them.
+pub(crate) type RunKey = (u32, u32, u64, u32);
+
+/// What a read took from a compute or a ticket (`note_took`): a copy, or
+/// for a payload no copy can stand for, nothing, as a regeneration runs
+/// the read node again.
+pub(crate) type Took = (u64, Option<Box<dyn Any + Send>>);
+
+/// What each run's reads took (see [`note_took`]), by the read node.
+type Takes = HashMap<
+    (RuntimeId, RunKey),
+    HashMap<u64, Option<Box<dyn Any + Send>>, FxBuildHasher>,
+    FxBuildHasher,
+>;
+
+fn with_takes<R>(f: impl FnOnce(&mut Takes) -> R) -> R {
+    value_code::set_bits(value_code::TOOK_BIT, true);
+    TOOK.with(|t| f(&mut t.borrow_mut()))
+}
+
+/// The seq and path of the run of node `reading` that ended just above
+/// depth `depth`, if it started one.
+pub(crate) fn ended_run(rt: RuntimeId, depth: u32, reading: u64) -> Option<(u32, u64)> {
+    RUNS.with(|r| {
+        (r.borrow().live.get(depth as usize).copied().flatten())
+            .filter(|x| {
+                x.rt == rt && u64::from(x.frame.0) | (u64::from(x.frame.1) << 32) == reading
+            })
+            .map(|x| (x.seq, x.path))
+    })
+}
+
+/// Notes that run `reader`'s read of node `reading` took `payload` from a
+/// compute or a ticket, until the run lands (`took_by_run`) or the engine
+/// call ends.
+pub(crate) fn note_took(rt: RuntimeId, reader: RunKey, reading: u64, payload: &(dyn Any + Send)) {
+    let copy = copy_payload(payload).filter(|_| !payload.is::<Regen>());
+    with_takes(|t| {
+        t.entry((rt, reader)).or_default().insert(reading, copy);
+    });
+}
+
+/// Whether this thread has noted reads of runtime `rt` no landing took.
+pub(crate) fn takes_noted(rt: RuntimeId) -> bool {
+    value_code::thread_word() & value_code::TOOK_BIT != 0
+        && TOOK.with(|t| t.borrow().keys().any(|k| k.0 == rt))
+}
+
+/// What run `run`'s reads took, as it lands.
+pub(crate) fn took_by_run(rt: RuntimeId, run: RunKey) -> Vec<Took> {
+    TOOK.with(|t| t.borrow_mut().remove(&(rt, run)))
+        .map_or_else(Vec::new, |took| took.into_iter().collect())
+}
+
+/// Runtime `rt`'s nodes claimed by a regenerating run on some thread
+/// (`Runtime::rerun`), which another thread's rerun of the same node waits
+/// out instead of taking the claim for a compute.
+static REGEN_CLAIMS: std::sync::Mutex<Vec<(RuntimeId, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes or drops `slot` of runtime `rt` as claimed by a regenerating run.
+pub(crate) fn regen_claim(rt: RuntimeId, slot: u32, held: bool) {
+    let mut c = REGEN_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held {
+        c.push((rt, slot));
+    } else if let Some(i) = c.iter().position(|&x| x == (rt, slot)) {
+        c.swap_remove(i);
+    }
+}
+
+/// How many regenerating runs claim `slot` of runtime `rt`.
+pub(crate) fn regen_claims(rt: RuntimeId, slot: u32) -> usize {
+    REGEN_CLAIMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|&&x| x == (rt, slot))
+        .count()
+}
+
+/// Whether [`copy_payload`] can copy `payload`.
+pub(crate) fn copyable(payload: &(dyn Any + Send)) -> bool {
+    payload.is::<crate::cycle::CycleUnwind>()
+        || payload.is::<String>()
+        || payload.is::<&'static str>()
+        || payload.is::<Regen>()
+}
+
 /// A copy of a panic payload of a type the engine knows: a cycle unwind's
-/// or a `panic!` message.
+/// or a `panic!` message. A type added here is added to [`copyable`] too.
 pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + Send>> {
     if let Some(unwind) = payload.downcast_ref::<crate::cycle::CycleUnwind>() {
         return Some(Box::new(crate::cycle::CycleUnwind(unwind.0.clone())));
     }
     if let Some(message) = payload.downcast_ref::<String>() {
         return Some(Box::new(message.clone()));
+    }
+    if let Some(regen) = payload.downcast_ref::<Regen>() {
+        return Some(Box::new(*regen));
     }
     payload
         .downcast_ref::<&'static str>()
@@ -2226,6 +2397,34 @@ pub(crate) fn take_pending(
     })
 }
 
+/// The taken delivery of a payload no copy can stand for, for read `key`
+/// of `rt`'s contexts, was regenerated as the payload `raised`: it counts
+/// as the source of the landings the delivery carries, as a copy raised
+/// by a take does (`Delivery::resumed`).
+pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
+    with(|c| {
+        for x in c.iter_mut().filter(|x| x.rt == rt) {
+            for i in x.pending.keyed(key).to_vec() {
+                let d = x.pending.get_mut(i);
+                if d.taken
+                    && matches!(&d.what, Delivered::Unwind { payload, .. } if payload.is::<Regen>())
+                {
+                    d.resumed = Some(raised);
+                }
+            }
+        }
+    });
+}
+
+/// As [`regenerated`], for delivery `i` of context `id`.
+pub(crate) fn regenerated_at(id: u64, i: usize, raised: PayloadKey) {
+    with(|c| {
+        if let Some(x) = c.iter_mut().find(|x| x.id == id) {
+            x.pending.get_mut(i).resumed = Some(raised);
+        }
+    });
+}
+
 /// Removes context `id`, if it is still open, returning the deliveries
 /// it still holds.
 #[must_use]
@@ -2290,7 +2489,7 @@ fn remove_where(mut gone: impl FnMut(&Context) -> bool) {
 /// starts with none.
 #[inline(always)]
 pub(crate) fn reset() {
-    if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+    if value_code::thread_word() & (value_code::REPLAY_BIT | value_code::TOOK_BIT) != 0 {
         clear();
     }
 }
@@ -2300,6 +2499,8 @@ pub(crate) fn reset() {
 fn clear() {
     SUSPENDED.with(|s| s.borrow_mut().clear());
     RUNS.with(|r| *r.borrow_mut() = Runs::default());
+    TOOK.with(|t| t.borrow_mut().clear());
+    value_code::set_bits(value_code::TOOK_BIT, false);
     set_carry(None);
     let removed = with(std::mem::take);
     drop(removed);

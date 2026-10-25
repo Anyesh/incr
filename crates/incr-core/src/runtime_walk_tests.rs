@@ -1024,18 +1024,16 @@ fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>, custom:
 /// A replayable run that takes a contained ticket, drops the payload and is
 /// doomed by a later read past the budget must leave its retry the same
 /// payload: h is `6 + g` = 16, as unbounded. A payload no copy can stand
-/// for keeps h from being doomed only while h is within the budget, so at
-/// budget 1, where h's first read is past it, the retry reads f Failed with
-/// no payload: 10 plus the length of that read's message.
+/// for keeps h from being doomed, past the budget too since f is not
+/// replayable and so can't run again to regenerate it (`hold_uncopied`).
 fn wave6_doomed_run_keeps_the_ticket_it_took<C: Cells>() {
     for custom in [false, true] {
         let unbounded = wave6_doomed_run_after_taking_a_ticket::<C>(None, custom);
         assert_eq!(unbounded, 6 + 10, "custom {custom}");
         for b in 1..=3 {
-            let want = if custom && b == 1 { 139 } else { unbounded };
             assert_eq!(
                 wave6_doomed_run_after_taking_a_ticket::<C>(Some(b), custom),
-                want,
+                unbounded,
                 "budget {b}, custom {custom}"
             );
         }
@@ -2132,7 +2130,10 @@ fn quiet_ticket_booms() {
 /// f_i's panic and then reads level i + 1. With `failed`, every f_i is
 /// Failed with its own contained ticket, a `NotClone` payload if `custom`,
 /// so every level takes a ticket payload. Returns the count of caught
-/// panics.
+/// panics. A `NotClone` f_i is replayable, so a retry past the budget
+/// regenerates its payload; with a non-replayable one the readers would be
+/// held past the budget and the stack would not be bounded (CHANGELOG,
+/// Known limitations).
 fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 {
     quiet_ticket_booms();
     let rt = Runtime::<C>::new();
@@ -2141,13 +2142,23 @@ fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 
     let sel = rt.create_input(0_i64);
     let fs: Vec<Incr<i64>> = (0..n)
         .map(|_| {
-            rt.create_query(move |rt: &Runtime<C>| {
-                if rt.get(j) == 0 && custom {
-                    std::panic::panic_any(NotClone(1));
-                }
-                assert!(rt.get(j) != 0, "ticket boom");
-                0
-            })
+            rt.create_query_with(
+                move |rt: &Runtime<C>| {
+                    if rt.get(j) == 0 && custom {
+                        std::panic::panic_any(NotClone(1));
+                    }
+                    assert!(rt.get(j) != 0, "ticket boom");
+                    0
+                },
+                QueryOpts {
+                    replay: if custom {
+                        Replay::Allowed
+                    } else {
+                        Replay::Native
+                    },
+                    ..Default::default()
+                },
+            )
         })
         .collect();
     let all = fs.clone();

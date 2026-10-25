@@ -400,6 +400,10 @@ pub(crate) const FOREIGN_HOLD: u16 = 512;
 /// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
 /// make: its value is buffered and its landing withheld (`replay::Stash`).
 pub(crate) const SPECULATIVE: u16 = 1024;
+/// `ComputeCtl::flags`: the run read a value no rerun of its node reads
+/// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
+/// node, so its panic is not regenerated (`Runtime::regenerate`).
+pub(crate) const UNREGENERABLE: u16 = 2048;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
