@@ -117,7 +117,7 @@ impl<C: Cells> Runtime<C> {
             }
             // Only a verify or an unrun release lands without opening an
             // entry first, and a release to New is of a claim from New; a
-            // cut's claim off its rerun takes its origin from the cut.
+            // cut's claim released unrun takes its origin from the cut.
             let first = target == NodeState::New;
             let own = hold::open(
                 cell,

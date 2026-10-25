@@ -483,11 +483,6 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn raise_wound(&self) -> ! {
-        // `held_landing` does this at the first landing too; here it also
-        // covers what the unwind decides from records before it lands.
-        if !C::SINGLE_THREADED && hold::active() {
-            self.retract_held_records();
-        }
         cycle_state::set_wounded(true);
         cycle_state::set_unwind_kind(Some(UnwindKind::Wound));
         resume_unwind(Box::new(WoundUnwind))
@@ -2067,6 +2062,8 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         if matches!(kind, Some(UnwindKind::Wound | UnwindKind::Discard)) {
+            self.discard_land_in_group(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
+            // As the landing left them: it keeps the record and `IN_GROUP`.
             #[cfg(test)]
             {
                 let dissolved = cycle_state::has_dissolved(self.runtime_id, id.0);
@@ -2075,7 +2072,6 @@ impl<C: Cells> Runtime<C> {
                 let mut landings = self.unwound_landings.lock().unwrap();
                 landings.push((id.0, dissolved, stale, grouped));
             }
-            self.discard_land_in_group(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         } else {
             self.discard_land(id, first, wrote, stamp_rev, bag);
         }
@@ -2169,6 +2165,11 @@ impl<C: Cells> Runtime<C> {
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
         let first = e.first;
+        // A cut's claim lands held: its entry opens before the write, so
+        // the undo keeps what the write displaces.
+        if !C::SINGLE_THREADED && hold::cut_kept(rt, slot) {
+            self.open_hold(id, node, first, None, bag);
+        }
         let written = catch_unwind(AssertUnwindSafe(|| {
             arena.write_erased(node.arena_slot(), value, first, &wrote)
         }));
