@@ -2069,6 +2069,35 @@ impl<C: Cells> Runtime<C> {
         Ok(landed)
     }
 
+    /// Whether a Failed node an episode member read reaches a member back
+    /// through the recorded deps of Failed nodes: a panic out of the cycle
+    /// failed each node it passed until a member caught it.
+    fn failure_reads_back(&self, entries: &[(u32, Seen<Held>)]) -> bool {
+        let mut members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
+        members.sort_unstable();
+        let failed = |s: u32| self.nodes.get(s).state() == NodeState::Failed;
+        let mut stack: Vec<u32> = entries
+            .iter()
+            .flat_map(|(_, e)| e.last().iter().map(|(d, _)| d.0))
+            .filter(|&d| members.binary_search(&d).is_err() && failed(d))
+            .collect();
+        let mut seen: std::collections::HashSet<u32> = stack.iter().copied().collect();
+        while let Some(f) = stack.pop() {
+            let mut back = false;
+            self.nodes.get(f).for_each_dep(|d| {
+                if members.binary_search(&d.0).is_ok() {
+                    back = true;
+                } else if failed(d.0) && seen.insert(d.0) {
+                    stack.push(d.0);
+                }
+            });
+            if back {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Lands an episode whose claims are complete (the plan's Landing
     /// steps 2 to 5; step 1 is the iteration that produced the values).
     #[allow(clippy::too_many_arguments)]
@@ -2182,9 +2211,14 @@ impl<C: Cells> Runtime<C> {
         // A member's handled outcome holds for the revision, and every
         // member's value is built on it, so all of them keep a memo. Not
         // with CU left: a CU member run again alone may skip the reads
-        // that put it in CU and read the memos as values.
+        // that put it in CU and read the memos as values. Nor if a panic
+        // cut the cycle (`Self::failure_reads_back`): a read later in the
+        // revision holds the nodes it failed failing, and need not close
+        // the cycle the strategy values were given for.
         let poison = entries.iter().fold(0, |p, (_, e)| p | e.poison());
-        let memo = cu.is_empty() && self.memo_landing(poison, verify_rev);
+        let memo = cu.is_empty()
+            && self.memo_landing(poison, verify_rev)
+            && !self.failure_reads_back(&entries);
 
         // Step 3: write the values and stamp.
         for i in 0..entries.len() {

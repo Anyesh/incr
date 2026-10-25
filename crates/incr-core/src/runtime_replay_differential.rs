@@ -5289,9 +5289,14 @@ fn seed_3cb3_reads_a_failed_dep_as_the_revision_left_it() {
 /// Failed in an earlier revision and stay failed with input 19 = 3. Each
 /// value is a fresh read's with those nodes held failing; a fresh read
 /// that recomputes them closes a cycle through their recorded edges.
+/// 0x2501's op 4 `TryGet(7)` reads 8 over 4 and 5, Failed earlier in the
+/// revision. 0x66a's op 3 `Get(4)` follows op 2's episode, which landed
+/// 4 at its fallback over a cycle through 10, 1 and 0, all of which failed
+/// in that episode: with them held failing no cycle closes, so 4 is no
+/// strategy value.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn seeds_15b3_264a_read_failed_deps_as_the_revision_left_them() {
+fn seeds_read_failed_deps_as_the_revision_left_them() {
     fn held(seed: u64, failing: &[usize], at: u64, input: (usize, u64), read: Op) -> Case {
         let mut held = gen_case(seed, false, false);
         for &q in failing {
@@ -5316,6 +5321,18 @@ fn seeds_15b3_264a_read_failed_deps_as_the_revision_left_them() {
             17,
             held(0x264a, &[3, 4], 4, (19, 3), Op::Get(9)),
             10009,
+        ),
+        (
+            0x2501,
+            4,
+            held(0x2501, &[4, 5], 4, (9, 3), Op::TryGet(7)),
+            1,
+        ),
+        (
+            0x66a,
+            3,
+            held(0x66a, &[0, 1, 10], 4, (15, 3), Op::Get(4)),
+            6,
         ),
     ];
     for (seed, op, held, value) in cases {
