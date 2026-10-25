@@ -43,6 +43,7 @@ mod loom_models;
 #[cfg(all(test, loom))]
 mod loom_seed_models;
 pub mod node;
+mod notes;
 #[doc(hidden)]
 pub mod persist_hooks;
 mod reclaim_probe;

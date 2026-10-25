@@ -2720,9 +2720,9 @@ fn shared_walked_vframe_dirtied_after_it_let_the_failure_out() {
 /// frame pops as the root of an episode in which F panics "f boom", so
 /// the episode lands F Failed and delivers the payload to T's virtual
 /// frame, which holds no claim: the landing publishes a record first.
-/// The other thread's T then reads F Failed through a walk that computes
-/// X and Y, which the record's match does not cover, so only the record
-/// and the reads' end are checked here.
+/// The other thread's read of T waits out T's reservation, then reads F
+/// Failed through a walk that computes X and Y, which the record's match
+/// does not cover, so only the record and the reads' end are checked here.
 #[test]
 fn shared_vframe_landed_failed_over_an_episodes_delivery() {
     let rt = Arc::new(Rt::new());
@@ -2769,11 +2769,16 @@ fn shared_vframe_landed_failed_over_an_episodes_delivery() {
         1,
         "the episode published no record"
     );
-    let other = outcome(|| rt.get(t));
-    assert!(failed(&other), "{other:?}");
+    let waits = rt.reservation_waits.load(SeqCst);
+    let other = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(t)))
+    };
+    await_reservation_wait(&rt, waits);
     gate.release();
-    let first = first.join();
+    let (first, other) = (first.join(), other.join());
     assert!(first.is_err(), "{first:?}");
+    assert!(failed(&other), "{other:?}");
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }

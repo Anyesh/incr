@@ -237,6 +237,20 @@ pub(crate) enum ParkPoint {
     ObserverBeforePreCheck(NodeId),
 }
 
+/// Ends the whole test binary: a parked thread's panic can be caught as a
+/// compute's, and a test that accepts any error then passes on it.
+#[cfg(test)]
+pub(crate) fn park_timed_out(test: Option<&str>) -> ! {
+    use std::io::Write as _;
+    // Past the test harness's output capture, which the abort discards.
+    let _ = writeln!(
+        std::io::stderr(),
+        "incr-core test: a thread parked by {} was never released",
+        test.unwrap_or("an unnamed thread")
+    );
+    std::process::abort()
+}
+
 /// The panic of a read that found its node `Dead` under the handle's
 /// generation: a delete has claimed it and not yet unhooked it.
 #[cold]

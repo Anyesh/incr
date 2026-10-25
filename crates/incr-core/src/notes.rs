@@ -1,0 +1,380 @@
+//! A thread's notes: the Failed landings its panics in flight made, and
+//! the landings its reads raised again, each at its frame position and
+//! by the payload it was noted for (`runtime_contain`).
+//!
+//! A frame that catches many panics keeps a note per panic, and a read
+//! that raises one keeps a copy of every note of its payload. Each
+//! payload's notes are a log per runtime that the copies share, so a copy
+//! costs nothing per note, and the positions each payload has notes at are
+//! indexed, so retiring notes above a frame visits only the payloads it
+//! retires.
+
+use std::cell::RefCell;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
+
+use crate::fx::FxBuildHasher;
+use crate::handle::RuntimeId;
+use crate::replay::{note_work, Landings, PayloadKey};
+
+/// One runtime's notes of one payload, in the order noted. A note leaves
+/// by the number of the removal that took it, not from the log, so that a
+/// copy taken before still finds it.
+#[derive(Default)]
+pub(crate) struct Log {
+    pub(crate) entries: Vec<Noted>,
+    /// The copied set's generation and how far into `entries` it has
+    /// marked the notes copies took (`replay::mark_copied`).
+    pub(crate) marked: (u64, usize),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Noted {
+    pub(crate) node: (u32, u32),
+    pub(crate) cidx: u32,
+    /// Taken from a ticket by a read: a discarded run's read was no
+    /// reader's observation, so its drop holds the ticket again.
+    restorable: bool,
+    /// The number of the removal that took the note, `u64::MAX` while it
+    /// is noted.
+    pub(crate) gone: u64,
+}
+
+impl Log {
+    /// The landings of the first `len` notes still noted at removal
+    /// `epoch`, each at its shallowest depth above `base`. A note below
+    /// `base` counts as just above it.
+    pub(crate) fn landings(&self, len: usize, epoch: u64, base: u32) -> Vec<((u32, u32), u32)> {
+        note_work(len);
+        let mut nodes: Vec<((u32, u32), u32)> = Vec::new();
+        let mut at: HashMap<(u32, u32), usize, FxBuildHasher> = HashMap::default();
+        for e in self.entries[..len].iter().filter(|e| e.gone >= epoch) {
+            let depth = e.cidx.saturating_sub(base);
+            match at.entry(e.node) {
+                Entry::Occupied(i) => {
+                    let d = &mut nodes[*i.get()].1;
+                    *d = (*d).min(depth);
+                }
+                Entry::Vacant(v) => {
+                    v.insert(nodes.len());
+                    nodes.push((e.node, depth));
+                }
+            }
+        }
+        nodes
+    }
+}
+
+/// A note's place: entry `idx` of log `log` of payload `key`'s group.
+#[derive(Clone, Copy)]
+struct At {
+    key: PayloadKey,
+    log: u32,
+    idx: u32,
+}
+
+/// The notes of one payload.
+struct Group {
+    logs: Vec<RuntimeLog>,
+    /// The positions with a note, with the notes there, some of which may
+    /// have gone since.
+    levels: BTreeMap<u32, Level>,
+}
+
+struct RuntimeLog {
+    rt: RuntimeId,
+    log: Rc<RefCell<Log>>,
+    /// The notes before this one were copied, so none is restorable.
+    copied: usize,
+}
+
+#[derive(Default)]
+struct Level {
+    live: u32,
+    at: Vec<(u32, u32)>,
+}
+
+impl Group {
+    fn top(&self) -> Option<u32> {
+        self.levels.last_key_value().map(|(&cidx, _)| cidx)
+    }
+
+    fn log(&self, rt: RuntimeId) -> Option<&RuntimeLog> {
+        self.logs.iter().find(|l| l.rt == rt)
+    }
+
+    /// Takes note `idx` of log `log` out at removal `epoch`, returning its
+    /// landing if it was still noted.
+    fn take(&self, log: u32, idx: u32, epoch: u64) -> Option<(u32, u32)> {
+        let mut l = self.logs[log as usize].log.borrow_mut();
+        let e = &mut l.entries[idx as usize];
+        (e.gone == u64::MAX).then(|| {
+            e.gone = epoch;
+            e.node
+        })
+    }
+}
+
+pub(crate) struct Notes {
+    groups: BTreeMap<PayloadKey, Group>,
+    /// Each payload's highest position with a note.
+    tops: BTreeSet<(u32, PayloadKey)>,
+    /// Where each landing was noted. A place may have been taken since, or
+    /// hold another note after its payload's notes all went.
+    by_node: BTreeMap<(RuntimeId, (u32, u32)), Vec<At>>,
+    /// The removals so far.
+    epoch: u64,
+    live: usize,
+}
+
+impl Notes {
+    pub(crate) const fn new() -> Self {
+        Self {
+            groups: BTreeMap::new(),
+            tops: BTreeSet::new(),
+            by_node: BTreeMap::new(),
+            epoch: 0,
+            live: 0,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.live == 0
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        rt: RuntimeId,
+        key: PayloadKey,
+        cidx: u32,
+        node: (u32, u32),
+        restorable: bool,
+    ) {
+        note_work(1);
+        let g = self.groups.entry(key).or_insert_with(|| Group {
+            logs: Vec::new(),
+            levels: BTreeMap::new(),
+        });
+        let old = g.top();
+        let log = match g.logs.iter().position(|l| l.rt == rt) {
+            Some(i) => i,
+            None => {
+                g.logs.push(RuntimeLog {
+                    rt,
+                    log: Rc::default(),
+                    copied: 0,
+                });
+                g.logs.len() - 1
+            }
+        };
+        let idx = {
+            let mut l = g.logs[log].log.borrow_mut();
+            l.entries.push(Noted {
+                node,
+                cidx,
+                restorable,
+                gone: u64::MAX,
+            });
+            l.entries.len() - 1
+        };
+        let (log, idx) = (log as u32, idx as u32);
+        let level = g.levels.entry(cidx).or_default();
+        level.live += 1;
+        level.at.push((log, idx));
+        let new = g.top();
+        self.retop(key, old, new);
+        self.by_node
+            .entry((rt, node))
+            .or_default()
+            .push(At { key, log, idx });
+        self.live += 1;
+    }
+
+    fn retop(&mut self, key: PayloadKey, old: Option<u32>, new: Option<u32>) {
+        if old != new {
+            if let Some(top) = old {
+                self.tops.remove(&(top, key));
+            }
+            if let Some(top) = new {
+                self.tops.insert((top, key));
+            }
+        }
+    }
+
+    /// Ends a removal: the notes it took stay visible to the copies taken
+    /// before it.
+    fn removed(&mut self) {
+        self.epoch += 1;
+        if self.live == 0 {
+            self.by_node.clear();
+        }
+    }
+
+    /// Removes `rt`'s notes of `node`'s landing.
+    pub(crate) fn forget_node(&mut self, rt: RuntimeId, node: (u32, u32)) {
+        let Some(places) = self.by_node.remove(&(rt, node)) else {
+            return;
+        };
+        note_work(places.len());
+        for at in places {
+            let Some(g) = self.groups.get_mut(&at.key) else {
+                continue;
+            };
+            let Some(l) = g.logs.get(at.log as usize).filter(|l| l.rt == rt) else {
+                continue;
+            };
+            let cidx = match l.log.borrow().entries.get(at.idx as usize) {
+                Some(e) if e.node == node && e.gone == u64::MAX => e.cidx,
+                _ => continue,
+            };
+            g.take(at.log, at.idx, self.epoch);
+            let old = g.top();
+            let level = g
+                .levels
+                .get_mut(&cidx)
+                .expect("incr-core: a note's level is indexed");
+            level.live -= 1;
+            if level.live == 0 {
+                g.levels.remove(&cidx);
+            }
+            let new = g.top();
+            if new.is_none() {
+                self.groups.remove(&at.key);
+            }
+            self.live -= 1;
+            self.retop(at.key, old, new);
+        }
+        self.removed();
+    }
+
+    /// Removes the notes at `from` and above, but those of `keep`.
+    pub(crate) fn forget_from(&mut self, from: u32, keep: Option<PayloadKey>) {
+        let keys: Vec<PayloadKey> = self
+            .tops
+            .iter()
+            .rev()
+            .take_while(|&&(top, _)| top >= from)
+            .filter(|&&(_, key)| Some(key) != keep)
+            .map(|&(_, key)| key)
+            .collect();
+        note_work(keys.len() + 1);
+        for key in keys {
+            self.forget_levels(key, from, None);
+        }
+        self.removed();
+    }
+
+    /// Removes `key`'s notes at `from` and above, returning those of `rt`
+    /// as (entry, landing).
+    fn forget_levels(
+        &mut self,
+        key: PayloadKey,
+        from: u32,
+        rt: Option<RuntimeId>,
+    ) -> Vec<(u32, (u32, u32))> {
+        let Some(g) = self.groups.get_mut(&key) else {
+            return Vec::new();
+        };
+        let old = g.top();
+        let gone = g.levels.split_off(&from);
+        let mine = rt.and_then(|rt| g.logs.iter().position(|l| l.rt == rt));
+        let mut out = Vec::new();
+        for (_, level) in gone {
+            note_work(level.at.len());
+            self.live -= level.live as usize;
+            for (log, idx) in level.at {
+                if let Some(node) = g.take(log, idx, self.epoch) {
+                    if mine == Some(log as usize) {
+                        out.push((idx, node));
+                    }
+                }
+            }
+        }
+        let new = g.top();
+        if new.is_none() {
+            self.groups.remove(&key);
+        }
+        self.retop(key, old, new);
+        out
+    }
+
+    /// A walk's entry at `cidx` contains `key`'s payload: the notes above
+    /// `cidx` go, and `key`'s at it. Returns `rt`'s landings of `key` that
+    /// went, in the order noted.
+    pub(crate) fn contain(&mut self, rt: RuntimeId, cidx: u32, key: PayloadKey) -> Vec<(u32, u32)> {
+        let mut ours = self.forget_levels(key, cidx, Some(rt));
+        if let Some(above) = cidx.checked_add(1) {
+            self.forget_from(above, None);
+        } else {
+            self.removed();
+        }
+        ours.sort_unstable_by_key(|&(idx, _)| idx);
+        let mut seen = BTreeSet::new();
+        ours.into_iter()
+            .filter_map(|(_, node)| seen.insert(node).then_some(node))
+            .collect()
+    }
+
+    /// A copy of `rt`'s notes of `key`, at their depths above `base`. The
+    /// notes of `key` it copies are no longer restorable.
+    pub(crate) fn copy(&mut self, rt: RuntimeId, key: PayloadKey, base: u32) -> Landings {
+        let Some(g) = self.groups.get_mut(&key) else {
+            return Landings::owned(Some(key), Vec::new());
+        };
+        note_work(g.logs.len());
+        for l in &mut g.logs {
+            l.copied = l.log.borrow().entries.len();
+        }
+        let top = g.top().expect("incr-core: a group holds a note");
+        match g.log(rt) {
+            Some(l) => Landings::shared(Some(key), l.log.clone(), self.epoch, base, top),
+            None => Landings::owned(Some(key), Vec::new()),
+        }
+    }
+
+    fn remove_group(&mut self, key: PayloadKey) -> Option<Group> {
+        let g = self.groups.remove(&key)?;
+        let live: u32 = g.levels.values().map(|l| l.live).sum();
+        note_work(g.levels.len());
+        self.live -= live as usize;
+        self.retop(key, g.top(), None);
+        self.removed();
+        Some(g)
+    }
+
+    /// Takes `key`'s notes, returning `rt`'s landings of them at their
+    /// depths above `base`.
+    pub(crate) fn take(&mut self, rt: RuntimeId, key: PayloadKey, base: u32) -> Landings {
+        let epoch = self.epoch;
+        let nodes = self
+            .remove_group(key)
+            .and_then(|g| {
+                g.log(rt).map(|l| {
+                    let l = l.log.borrow();
+                    l.landings(l.entries.len(), epoch, base)
+                })
+            })
+            .unwrap_or_default();
+        Landings::owned(Some(key), nodes)
+    }
+
+    /// Takes `key`'s notes, returning `rt`'s restorable landings.
+    pub(crate) fn restore(&mut self, rt: RuntimeId, key: PayloadKey) -> Vec<(u32, u32)> {
+        let Some(g) = self.remove_group(key) else {
+            return Vec::new();
+        };
+        let Some(l) = g.log(rt) else {
+            return Vec::new();
+        };
+        let log = l.log.borrow();
+        note_work(log.entries.len());
+        let mut seen = BTreeSet::new();
+        log.entries
+            .iter()
+            .enumerate()
+            .filter(|&(i, e)| e.gone == u64::MAX && e.restorable && i >= l.copied)
+            .filter_map(|(_, e)| seen.insert(e.node).then_some(e.node))
+            .collect()
+    }
+}
