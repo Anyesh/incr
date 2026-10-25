@@ -3485,7 +3485,6 @@ impl<C: Cells> Runtime<C> {
             .iter()
             .any(|&(m, g)| m == cur.0 && g == generation)
             || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
-            || !C::SINGLE_THREADED && hold::released_here(self.runtime_id, cur.0)
         {
             return false;
         }

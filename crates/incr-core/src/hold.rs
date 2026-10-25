@@ -73,13 +73,6 @@ struct HoldSet {
     /// runtime whose frames are below them, or a retracted read), so their
     /// landings retract at the exit of their first entry.
     tainted: Vec<RuntimeId>,
-    /// Members an episode's cut released (`released_here`): the owner
-    /// computes them alone, not through the group record they keep until
-    /// publication.
-    released: Vec<(RuntimeId, u32)>,
-    /// The cut exits (`leave_cut_group`) publication runs before any
-    /// state word, once every record is final; a retraction drops them.
-    cut_exits: Vec<(RuntimeId, Vec<u32>)>,
 }
 
 impl HoldSet {
@@ -311,11 +304,10 @@ pub(crate) struct Taken {
     /// In landing order.
     pub(crate) entries: Vec<Held>,
     pub(crate) episodes: u64,
-    pub(crate) cut_exits: Vec<Vec<u32>>,
 }
 
-/// Takes `rt`'s entries, with the episodes it landed and its cut exits,
-/// for publication or retraction, and clears its taint and releases.
+/// Takes `rt`'s entries, with the episodes it landed, for publication or
+/// retraction, and clears its taint.
 pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
         let mut taken: Vec<Held> = Vec::new();
@@ -326,16 +318,8 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
         }
         h.by_cell.retain(|_, at| h.entries[*at].is_some());
         h.tainted.retain(|r| *r != rt);
-        h.released.retain(|(r, _)| *r != rt);
-        let mut cut_exits = Vec::new();
-        h.cut_exits.retain_mut(|(r, slots)| {
-            if *r == rt {
-                cut_exits.push(std::mem::take(slots));
-            }
-            *r != rt
-        });
         // A taint keeps the bit, so that the `HOLD` it raised passes up.
-        if h.by_cell.is_empty() && h.tainted.is_empty() && h.cut_exits.is_empty() {
+        if h.by_cell.is_empty() && h.tainted.is_empty() {
             h.entries.clear();
             h.consulted = false;
             value_code::set_held_bit(false);
@@ -349,24 +333,8 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
         Taken {
             entries: taken,
             episodes,
-            cut_exits,
         }
     })
-}
-
-/// An episode's cut released `slots` of `rt`.
-pub(crate) fn note_released(rt: RuntimeId, slots: &[u32]) {
-    with(|h| h.released.extend(slots.iter().map(|&s| (rt, s))));
-}
-
-pub(crate) fn released_here(rt: RuntimeId, slot: u32) -> bool {
-    active() && with(|h| h.released.contains(&(rt, slot)))
-}
-
-/// A cut's exit of `slots` from their group, run at publication.
-pub(crate) fn defer_cut_exit(rt: RuntimeId, slots: Vec<u32>) {
-    value_code::set_held_bit(true);
-    with(|h| h.cut_exits.push((rt, slots)));
 }
 
 /// Whether this thread holds landings of `rt`, or has tainted it.

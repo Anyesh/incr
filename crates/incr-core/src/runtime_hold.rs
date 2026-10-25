@@ -318,16 +318,7 @@ impl<C: Cells> Runtime<C> {
     }
 
     fn publish_own(&self) {
-        let hold::Taken {
-            entries,
-            episodes,
-            cut_exits,
-        } = hold::take(self.runtime_id);
-        // Every record is final and every member still Computing, so no
-        // other thread sees a record that names a member gone from it.
-        for slots in &cut_exits {
-            self.leave_cut_group(slots);
-        }
+        let hold::Taken { entries, episodes } = hold::take(self.runtime_id);
         if episodes != 0 {
             // Before the members land, so a read of one of their landings
             // also reads the count.
