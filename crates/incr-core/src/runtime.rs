@@ -2343,18 +2343,21 @@ impl<C: Cells> Runtime<C> {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
-                    if let Some(f) = frame {
-                        if state::load::<C>(node.state_cell()) == NodeState::Dirty
-                            && !self.unchanged_stash(handle.slot(), handle.generation())
-                        {
-                            self.note_dirty_read(f, handle, &value);
-                        }
-                    }
-                    if !C::SINGLE_THREADED
-                        && reserve::any()
+                    // Context reservations live only while a context is open.
+                    let reserving = !C::SINGLE_THREADED
+                        && value_code::thread_word() & value_code::REPLAY_BIT != 0
+                        && reserve::any();
+                    if (frame.is_some() || reserving)
                         && state::load::<C>(node.state_cell()) == NodeState::Dirty
                     {
-                        self.end_unowed_reservation(slot, handle.generation());
+                        if let Some(f) = frame {
+                            if !self.unchanged_stash(handle.slot(), handle.generation()) {
+                                self.note_dirty_read(f, handle, &value);
+                            }
+                        }
+                        if reserving {
+                            self.end_unowed_reservation(slot, handle.generation());
+                        }
                     }
                     return Ok(value);
                 }

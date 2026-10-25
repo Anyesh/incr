@@ -3878,12 +3878,13 @@ impl<C: Cells> Runtime<C> {
     /// a read just took Dirty, unless this thread runs it again: its frame
     /// is on the stack, it holds the claim, or a context still replays it.
     /// A reservation kept past that would make another thread's read of
-    /// the node wait on a rerun that never comes.
+    /// the node wait on a rerun that never comes. Takes the reservation
+    /// table's lock only to end one.
     #[cold]
     #[inline(never)]
     pub(super) fn end_unowed_reservation(&self, slot: u32, generation: u32) {
         let rt = self.runtime_id;
-        if replay::speculative() || !reserve::mine((rt, slot), generation) {
+        if replay::speculative() || !reserve::in_context((rt, slot), generation) {
             return;
         }
         if self.dep_stack.frame_cidx(rt, NodeId(slot)).is_some() || cycle_state::holds(rt, slot) {
