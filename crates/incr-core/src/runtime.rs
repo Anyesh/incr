@@ -236,6 +236,9 @@ pub(crate) enum ParkPoint {
     /// In `observer_read`, after the compare that follows `ensure_clean`
     /// and before the seqlock pre-check.
     ObserverBeforePreCheck(NodeId),
+    /// At the end of `release_members`, once an episode's cut at this root
+    /// has released its other members.
+    MembersReleased(NodeId),
 }
 
 /// Ends the whole test binary: a parked thread's panic can be caught as a

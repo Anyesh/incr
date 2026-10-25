@@ -1695,7 +1695,7 @@ impl<C: Cells> Runtime<C> {
             .collect();
         if scc.len() == 1 && !graph[at].contains(&at) {
             cycle_state::dissolved_before(rt, root.0);
-            self.release_members(members, Some(root.0), bag);
+            self.release_members(root, members, Some(root.0), bag);
             return Shrink::Dissolved;
         }
         if scc.len() == members.len() {
@@ -1706,7 +1706,7 @@ impl<C: Cells> Runtime<C> {
             .copied()
             .filter(|m| scc.binary_search(m).is_err())
             .collect();
-        self.release_members(&gone, None, bag);
+        self.release_members(root, &gone, None, bag);
         cu.retain(|m| scc.binary_search(m).is_ok());
         *members = scc;
         Shrink::Shrunk
@@ -1802,8 +1802,14 @@ impl<C: Cells> Runtime<C> {
 
     /// Releases `slots` from the held map with the discard landing,
     /// except `keep`. They leave their group, as the unbounded run's
-    /// episode cuts them at the same point.
-    fn release_members(&self, slots: &[u32], keep: Option<u32>, bag: &mut Deferred<C>) {
+    /// episode at `root` cuts them at the same point.
+    fn release_members(
+        &self,
+        root: NodeId,
+        slots: &[u32],
+        keep: Option<u32>,
+        bag: &mut Deferred<C>,
+    ) {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
         for &m in slots {
@@ -1821,6 +1827,7 @@ impl<C: Cells> Runtime<C> {
                 bag.push_erased(Box::new(e.into_values()));
             }
         }
+        self.park(ParkPoint::MembersReleased(root));
     }
 
     /// Lands every claim of this runtime held at or above `cidx`: with

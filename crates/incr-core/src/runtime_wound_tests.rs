@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use super::observe_impl::observed_is_clear;
 use super::race_tests::{id, park_at, Gate};
 use super::{NodeId, ParkPoint, Runtime};
-use crate::cells::Shared;
+use crate::cells::{Cells, Local, Shared};
 use crate::cycle::{CycleStrategy, Fixpoint, QueryOpts};
 use crate::handle::Incr;
 use crate::state::NodeState;
@@ -867,8 +867,8 @@ fn shared_tainted_group_verify_release_keeps_the_group() {
 /// waits on `r`, and A's read of `y` closes the waits-for cycle. With
 /// `first_reads_y`, `z`'s run after the dissolve reads `y` first, so A is
 /// wounded before it lands a released member.
-struct Dissolve {
-    rt: Arc<Runtime<Shared>>,
+struct DissolveOn<C: Cells> {
+    rt: Arc<Runtime<C>>,
     r: Incr<i64>,
     z: Incr<i64>,
     y: Incr<i64>,
@@ -880,9 +880,11 @@ struct Dissolve {
     first_reads_y: Arc<AtomicBool>,
 }
 
-impl Dissolve {
+type Dissolve = DissolveOn<Shared>;
+
+impl<C: Cells> DissolveOn<C> {
     fn new() -> Self {
-        let rt = Arc::new(Runtime::<Shared>::new());
+        let rt = Arc::new(Runtime::<C>::new());
         let k = rt.create_input(0_i64);
         let z_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
         let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
@@ -943,7 +945,7 @@ impl Dissolve {
         assert_eq!((rt.get(r), rt.get(z), rt.get(y), rt.get(w)), (1, 0, 0, 0));
         rt.force_group_for_test(&[r.erase(), z.erase(), y.erase(), w.erase()]);
         rt.set(k, 1);
-        Dissolve {
+        DissolveOn {
             rt,
             r,
             z,
@@ -959,7 +961,7 @@ impl Dissolve {
         catch_unwind(AssertUnwindSafe(|| self.rt.get(node))).map_err(panic_message)
     }
 
-    /// A's read of `r`, B's of `y`, then a read of every node.
+    /// A's read of `r`, B's read, then a read of every node.
     fn outcome(&self, a: Result<i64, String>, b: Result<i64, String>) -> Vec<Result<i64, String>> {
         vec![
             a,
@@ -970,7 +972,9 @@ impl Dissolve {
             self.read(self.w),
         ]
     }
+}
 
+impl Dissolve {
     fn single_thread(a_first: bool) -> Vec<Result<i64, String>> {
         let g = Dissolve::new();
         if a_first {
@@ -1100,6 +1104,73 @@ fn shared_stale_edge_under_local_with_b_older() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_stale_edge_under_local_with_b_older",
         || stale_edge_waits_for_cycle_under_local(false),
+    )
+    .assert_clean();
+}
+
+/// A's read of `r`, then B's of `w`, on one thread.
+fn released_member_reads<C: Cells>() -> Vec<Result<i64, String>> {
+    let g = DissolveOn::<C>::new();
+    let a = g.read(g.r);
+    g.outcome(a, g.read(g.w))
+}
+
+/// **A cut's released members stay the owner's until its read returns.**
+/// A's read of `r` on [`Dissolve`] dissolves its episode, releases `z`,
+/// `y` and `w`, and parks. They are still A's, as in the unbounded run,
+/// where its episode holds them until it ends: B's read of `w` waits on
+/// A instead of computing `w` from a release A's attempt may still
+/// retract, and both reads match A's first, as a single thread or Local
+/// gives them.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "T8-two-40k-195f commit 4"]
+fn shared_released_member_waits_for_the_cut_owners_read() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_released_member_waits_for_the_cut_owners_read",
+        || {
+            let want = released_member_reads::<Local>();
+            assert_eq!(released_member_reads::<Shared>(), want);
+            let g = Dissolve::new();
+            let released = Gate::new();
+            park_at(
+                &g.rt,
+                vec![(ParkPoint::MembersReleased(id(g.r)), released.clone())],
+            );
+            released.arm();
+            let (states, b_waited, b_done_early, a, b) = thread::scope(|s| {
+                let g = &g;
+                let a = s.spawn(move || g.read(g.r));
+                released.wait_parked();
+                let states: Vec<NodeState> = [g.z, g.y, g.w]
+                    .map(|m| g.rt.nodes.get(m.slot()).state())
+                    .into();
+                let b = s.spawn(move || g.read(g.w));
+                let deadline = Instant::now() + Duration::from_secs(20);
+                let w = (g.rt.runtime_id, g.w.slot());
+                while !waits::waited_on(w) && !b.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                let (b_waited, b_done_early) = (waits::waited_on(w), b.is_finished());
+                released.release();
+                (
+                    states,
+                    b_waited,
+                    b_done_early,
+                    a.join().unwrap(),
+                    b.join().unwrap(),
+                )
+            });
+            assert_eq!(
+                states,
+                [NodeState::Computing; 3],
+                "a released member left A's claim before A's read returned"
+            );
+            assert!(!b_done_early, "B read w while A's attempt was unpublished");
+            assert!(b_waited, "B never waited on w");
+            assert_eq!(g.outcome(a, b), want);
+            g.rt.assert_invariant_i();
+        },
     )
     .assert_clean();
 }
