@@ -2370,6 +2370,8 @@ impl<C: Cells> Runtime<C> {
         for (m, e) in &entries {
             let id = NodeId(*m);
             let node = self.nodes.get(*m);
+            // Before the deps compare: the held branch below continues past the loop end.
+            self.drop_landed_entry(&mut inner, *m, node);
             let mut old: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| old.push(d));
             let new: &[NodeId] = e.installed();
@@ -2404,7 +2406,6 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            self.set_released(&mut inner, *m, node, None);
         }
         let group = Arc::new(GroupInfo {
             members: entries.iter().map(|(m, e)| (*m, e.generation)).collect(),

@@ -5011,12 +5011,27 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn drop_released_entry(&self, id: NodeId, node: &NodeData<C>) {
-        let mut inner = self.inner.write();
+        self.drop_marked_entry(&mut self.inner.write(), id.0, node);
+    }
+
+    /// Drops `slot`'s released entry as its landing replaces the run it
+    /// counted, under the hold that publishes the landing.
+    #[inline]
+    fn drop_landed_entry(&self, inner: &mut Inner<C>, slot: u32, node: &NodeData<C>) {
+        if node.released_mark() {
+            self.drop_marked_entry(inner, slot, node);
+        }
+    }
+
+    /// A held landing keeps the entry for its retraction to put back.
+    #[cold]
+    #[inline(never)]
+    fn drop_marked_entry(&self, inner: &mut Inner<C>, slot: u32, node: &NodeData<C>) {
         let key = state::cell_key::<C>(node.state_cell());
         if !C::SINGLE_THREADED && hold::active() && hold::holds(key) {
-            hold::keep_released(key, inner.released_deps.get(&id.0).copied());
+            hold::keep_released(key, inner.released_deps.get(&slot).copied());
         }
-        self.set_released(&mut inner, id.0, node, None);
+        self.set_released(inner, slot, node, None);
     }
 
     #[cold]
