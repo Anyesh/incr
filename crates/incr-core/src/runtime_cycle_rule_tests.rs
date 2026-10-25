@@ -1535,7 +1535,10 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
             FirstRead::Own | FirstRead::ForeignComputed => 1000,
         };
         assert_eq!(r1.get(wide), base + (0..n).sum::<u64>(), "{first:?}");
-        assert_eq!(runs.load(Ordering::Relaxed), 2, "{first:?}");
+        // A Shared doomed frame unwinds at its placeholder read, so it takes
+        // one doomed run per leaf where Local's one doomed run reads them all.
+        let want = if A::SINGLE_THREADED { 2 } else { n as u32 + 1 };
+        assert_eq!(runs.load(Ordering::Relaxed), want, "{first:?}");
         assert!(!r1.dooms.lock().unwrap().is_empty(), "{first:?}");
     }
 }
