@@ -47,8 +47,9 @@ struct Waiter {
     waiting_on: Claim,
     holds: Vec<Claim>,
     state: Arc<AtomicU8>,
-    /// For a wounded waiter, the oldest waiter on the cycle it was on.
-    winner: Option<Arc<AtomicU8>>,
+    /// For a wounded waiter, the oldest waiter on the cycle it was on and
+    /// the claim that waiter waits on.
+    winner: Option<(Arc<AtomicU8>, Claim)>,
 }
 
 struct Registry {
@@ -72,12 +73,12 @@ loom::lazy_static! {
 
 #[cfg(not(loom))]
 thread_local! {
-    static WINNER: std::cell::RefCell<Option<Arc<AtomicU8>>> = const { std::cell::RefCell::new(None) };
+    static WINNER: std::cell::RefCell<Option<(Arc<AtomicU8>, Claim)>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(loom)]
 loom::thread_local! {
-    static WINNER: std::cell::RefCell<Option<Arc<AtomicU8>>> = std::cell::RefCell::new(None);
+    static WINNER: std::cell::RefCell<Option<(Arc<AtomicU8>, Claim)>> = std::cell::RefCell::new(None);
 }
 
 /// Wounds dealt, for tests.
@@ -148,7 +149,10 @@ impl Registration {
                     .copied()
                     .min_by_key(|&i| reg.waiters[i].ticket)
                     .expect("a cycle has a waiter");
-                let winner = reg.waiters[oldest].state.clone();
+                let winner = (
+                    reg.waiters[oldest].state.clone(),
+                    reg.waiters[oldest].waiting_on,
+                );
                 for &i in &chain {
                     if i != oldest {
                         reg.waiters[i].winner = Some(winner.clone());
@@ -193,15 +197,17 @@ impl Drop for Registration {
 }
 
 /// Before a wounded entry retries: waits until the oldest waiter on the
-/// cycle it was wounded on has stopped waiting, and then for as many
+/// cycle it was wounded on has stopped waiting, and then until `taken`
+/// says the claim it waited on is no longer free, for at most as many
 /// backoffs again. Its wait ends once this thread's released claims are
 /// free, and the head start lets it take them before a retry takes them
-/// straight back and is wounded again over the same cycle. Waiting for
-/// its claim itself would need a hook on every claim, and waiting for its
-/// whole entry could deadlock on a lock the caller holds across this one.
-/// The wounded thread holds nothing while it waits.
-pub(crate) fn await_winner(mut backoff: impl FnMut(u32)) {
-    let Some(winner) = WINNER.with(|w| w.borrow_mut().take()) else {
+/// straight back and is wounded again over the same cycle; a fixed count
+/// of backoffs gave up a time slice each on a loaded box. The bound
+/// covers a winner that takes another way, and waiting for its whole
+/// entry could deadlock on a lock the caller holds across this one. The
+/// wounded thread holds nothing while it waits.
+pub(crate) fn await_winner(mut backoff: impl FnMut(u32), taken: impl Fn(Claim) -> bool) {
+    let Some((winner, claim)) = WINNER.with(|w| w.borrow_mut().take()) else {
         return;
     };
     let mut spins = 0;
@@ -210,6 +216,45 @@ pub(crate) fn await_winner(mut backoff: impl FnMut(u32)) {
         backoff(spins);
     }
     for spins in REGISTER_AFTER..2 * REGISTER_AFTER {
+        if taken(claim) {
+            return;
+        }
         backoff(spins);
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+    use crate::handle::RuntimeId;
+
+    /// A wounded thread's head start ends once the claim its winner waited
+    /// on is taken, not after a fixed number of backoffs, each of which can
+    /// give up a time slice on a loaded box.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn head_start_ends_once_the_winners_claim_is_taken() {
+        crate::child_test::run_in_child(
+            "waits::tests::head_start_ends_once_the_winners_claim_is_taken",
+            || {
+                let rt = RuntimeId::for_test(u64::MAX - 7);
+                let (c1, c2) = ((rt, 1), (rt, 2));
+                let older = Registration::new(|_| 1, c2, vec![c1]);
+                let younger = Registration::new(|_| 2, c1, vec![c2]);
+                assert!(younger.wounded() && !older.wounded());
+                drop(younger);
+                drop(older);
+                let mut backoffs = 0;
+                await_winner(
+                    |_| backoffs += 1,
+                    |claim| {
+                        assert_eq!(claim, c2, "the claim the winner waited on");
+                        true
+                    },
+                );
+                assert_eq!(backoffs, 0);
+            },
+        )
+        .assert_clean();
     }
 }

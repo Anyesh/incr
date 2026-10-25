@@ -8,8 +8,8 @@
 //! [`KeyedCollection`] and [`Entry`] are the generic keyed-collection
 //! engine layer. [`drive_reflector`] is the kube-rs integration built on
 //! top of it: it consumes a raw `watcher()`/`reflector()` event stream
-//! directly, not `store_shared()`/`ReflectHandle` (see the [`reflector`]
-//! module docs for why).
+//! directly, not `store_shared()`/`ReflectHandle`, whose stream carries
+//! only `Apply` and `InitDone` events and so would lose every delete.
 //!
 //! Hardcoded to `Shared` mode (`incr_concurrent`'s re-export), not
 //! generic over strategy: kube-rs controllers are inherently

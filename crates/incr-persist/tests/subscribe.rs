@@ -360,6 +360,52 @@ fn an_undeclared_collection_catches_up_as_a_diff_or_a_delete_and_full_contents()
     println!("{diffs} diffs, {rebuilds} deletes with full contents");
 }
 
+/// What a store that does not declare "raw" reports for it on catching up
+/// across a compaction, after first loading an earlier snapshot, with the
+/// writer's collection built by inserting `order`. With `undeclared`, the
+/// store declares the key after loading and undeclares it again.
+fn undeclared_catch_up(order: impl IntoIterator<Item = u32>, undeclared: bool) -> Vec<Record> {
+    let log = MemoryBackend::new();
+    let writer = open::<Local, _>(log.clone());
+    let raw = writer.collection::<u32>("raw").unwrap();
+    for value in order {
+        raw.insert(&writer, value).unwrap();
+    }
+    writer.checkpoint().unwrap();
+    let reader = open::<Local, _>(log.read_only());
+    if undeclared {
+        let r_raw = reader.collection::<u32>("raw").unwrap();
+        reader.undeclare(&r_raw).unwrap();
+    }
+    let seen = subscribe(&reader);
+    raw.delete(&writer, &63).unwrap();
+    raw.insert(&writer, 64).unwrap();
+    writer.checkpoint().unwrap();
+    reader.refresh().unwrap();
+    let seen = seen.lock().unwrap();
+    for_key(&seen, "raw")
+}
+
+// Each collection hashes with its own seed, so two of them would list the
+// same 64 elements in the same order only by chance.
+#[test]
+fn an_undeclared_catch_up_reports_the_same_changes_however_the_writer_hashes() {
+    let expected = [
+        Record::Remove {
+            key: "raw".into(),
+            element: enc(&63u32),
+        },
+        Record::Insert {
+            key: "raw".into(),
+            element: enc(&64u32),
+        },
+    ];
+    for undeclared in [false, true] {
+        assert_eq!(undeclared_catch_up(0..64, undeclared), expected);
+        assert_eq!(undeclared_catch_up((0..64).rev(), undeclared), expected);
+    }
+}
+
 #[derive(Debug, Default, PartialEq)]
 struct Mirrored {
     declared: Option<(Kind, Vec<u8>)>,

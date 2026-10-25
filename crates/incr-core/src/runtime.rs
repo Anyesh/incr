@@ -44,6 +44,7 @@ use crate::locks::OrderedLock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
 use crate::reclaim_probe::{self, RetireSite};
 use crate::replay;
+use crate::reserve;
 use crate::segmented_nodes::{
     SegmentedNodes, HAS_CHILDREN, HAS_INDEX, HAS_STRATEGY, IN_GROUP, NOT_REPLAYABLE, OWNED, WATCHED,
 };
@@ -116,7 +117,11 @@ macro_rules! push_query {
                 let new_value = $f(rt);
                 let node = rt.nodes.get(slot);
                 let outcome = match ctl.flags.get()
-                    & (cycle::RECOMPUTE | cycle::BUFFERED | cycle::LOW | cycle::DOOMED)
+                    & (cycle::RECOMPUTE
+                        | cycle::BUFFERED
+                        | cycle::LOW
+                        | cycle::DOOMED
+                        | cycle::SPECULATIVE)
                 {
                     0 => {
                         ctl.wrote.set(1);
@@ -229,9 +234,20 @@ pub(crate) enum ParkPoint {
     BeforeComputeOne(NodeId),
     /// In `compute_one`, after the state load and before the claim CAS.
     BeforeClaim(NodeId),
+    /// In a read's walk loop, after the walk and before the slot read.
+    AfterWalk(NodeId),
+    /// In `compute_attempts`, after the claim CAS and before the check for
+    /// another thread's doom reservation.
+    BeforeReservationCheck(NodeId),
+    /// In `compute_one`, after a walk entry's claim and before the check
+    /// for episodes other threads landed since the walk planned.
+    AfterWalkClaim(NodeId),
     /// In red/green verification, after the dep scan found no change and
     /// before the landing CAS.
     VerifyAfterScan(NodeId),
+    /// In `stash`, under the stash lock, after the revision check and
+    /// before the entry and its count are stored.
+    StashAfterCheck(NodeId),
     /// In `set`, after the runtime check and before the claim's hold.
     SetBeforeClaim(NodeId),
     /// In `set`, under its claim, with no guard held, before the compare.
@@ -275,15 +291,22 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a Stale publish landed `New` and before
     /// the retry, with the attempt's bag carried along.
     StaleRetry(NodeId),
+    /// In `compute_one`, after an episode landed the root, before its
+    /// reader learns how.
+    EpisodeLanded(NodeId),
     /// At a doom, after the node the read wanted was released and pushed
     /// and before the reading frame gets its placeholder.
     AfterDoom(NodeId),
+    /// In a doomed frame's read of `NodeId`, before its state is loaded.
+    DoomedRead(NodeId),
     /// In a replay driver's loop, after it took its next entry and before
     /// the virtual frames at and above that entry's level pop.
     BeforeEntry(NodeId),
     /// In `compute_one`, on finding the node claimed by another thread,
     /// before its first wait on that claim.
     ComputeWaits(NodeId),
+    /// In group verify's step 1, after it claimed member `NodeId`.
+    GroupMemberClaimed(NodeId),
     /// In a read's judgement of a node with a virtual frame, after the scan
     /// of the virtual frames above it and before their claims.
     BeforeVirtualClaim(NodeId),
@@ -310,6 +333,20 @@ pub(crate) enum ParkPoint {
     /// In `observer_read`, after the compare that follows `ensure_clean`
     /// and before the seqlock pre-check.
     ObserverBeforePreCheck(NodeId),
+}
+
+/// Ends the whole test binary: a parked thread's panic can be caught as a
+/// compute's, and a test that accepts any error then passes on it.
+#[cfg(test)]
+pub(crate) fn park_timed_out(test: Option<&str>) -> ! {
+    use std::io::Write as _;
+    // Past the test harness's output capture, which the abort discards.
+    let _ = writeln!(
+        std::io::stderr(),
+        "incr-core test: a thread parked by {} was never released",
+        test.unwrap_or("an unnamed thread")
+    );
+    std::process::abort()
 }
 
 /// The panic of a read that found its node `Dead` under the handle's
@@ -451,6 +488,12 @@ impl<C: Cells> SetClaim<'_, C> {
         self.rt.mark_dependents_dirty(self.id, self.flags);
         self.rt.park(ParkPoint::SetAfterWalk);
         drop(walk_done);
+        self.rt.drop_released_tickets();
+        // Pairs with the fence in `stash`, after its store of the count.
+        C::fence_seqcst();
+        if C::u32_load_relaxed(&self.rt.stash_count) != 0 {
+            self.rt.drop_stashes();
+        }
         std::mem::forget(self);
         stamp
     }
@@ -507,6 +550,32 @@ enum Visit {
     Direct,
 }
 
+/// What a walk under `Shared` planned under, as `Runtime::planned`.
+#[derive(Copy, Clone)]
+struct Planned {
+    all: u64,
+    own: u64,
+}
+
+/// Test toggle: with `INCR_FORCE_REVISIT` set, every untainted walk
+/// entry under `Shared` counts once as planned New, so a claim of it from
+/// Dirty visits it again.
+#[cfg(test)]
+static FORCE_REVISIT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("INCR_FORCE_REVISIT").is_some());
+
+/// Test toggle: with `INCR_FORCE_REPLAN` set, every walk entry's check
+/// finds another thread's episode.
+#[cfg(test)]
+static FORCE_REPLAN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("INCR_FORCE_REPLAN").is_some());
+
+#[cfg(test)]
+thread_local! {
+    /// `FORCE_REPLAN` for this thread alone.
+    pub(crate) static FORCE_REPLAN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// How `compute_one` left the node it was handed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Computed {
@@ -531,6 +600,15 @@ enum Computed {
     /// The node's run was doomed and discarded: it is a virtual frame,
     /// and a replay driver runs it again.
     Discarded,
+    /// Another thread landed an episode since the walk planned: the node
+    /// was left unrun and unclaimed, and the walk prunes its plan.
+    Replan,
+    /// Another thread landed the node Dirty since the walk planned it: a
+    /// claim wait ended with it Dirty, not released unrun, or the walk
+    /// planned it New and claimed it from Dirty. The node was left unrun
+    /// and unclaimed, and the walk visits it again, as a read that came
+    /// after that landing expands its deps before claiming it.
+    Revisit,
     /// A claim wait ended with the node New or Dirty and a virtual frame
     /// of it on this thread, which stands for a frame on the stack: the
     /// walk skips it and taints the path under this memo owner.
@@ -563,7 +641,20 @@ const VISIT: u32 = u32::MAX;
 const VISIT_COMPUTING: u32 = u32::MAX - 1;
 
 /// `Entry::taint` of a pending entry no skipped dep has reached.
-const NO_TAINT: u32 = u32::MAX - 2;
+const NO_TAINT: u32 = u32::MAX - 3;
+
+/// `NO_TAINT` of a node the walk's visit found New. Above `NO_TAINT`, so
+/// a taint merged into it drops the mark; merging `NO_TAINT` is skipped.
+const NO_TAINT_NEW: u32 = u32::MAX - 2;
+
+/// What a walk that hands `compute_one` an untainted entry planned of it.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum Seen {
+    /// No walk that can visit the node again.
+    Unwalked,
+    Dirty,
+    New,
+}
 
 /// One entry of `ensure_clean`'s walk. A visit (`taint >= VISIT_COMPUTING`)
 /// expands `x`'s non-Clean deps; the pending entry is pushed on the first
@@ -573,7 +664,8 @@ struct Entry {
     id: NodeId,
     /// `VISIT` or `VISIT_COMPUTING`, or on a pending entry the lowest
     /// frame depth among the Computing deps this thread holds that were
-    /// skipped under it, or `NO_TAINT`. A tainted node is reachable only through edges that
+    /// skipped under it, or `NO_TAINT` (`NO_TAINT_NEW` if its visit found
+    /// it New). A tainted node is reachable only through edges that
     /// may be stale, so the walk must not run its closure: the parent's
     /// closure decides whether it is still read. The kind shares the
     /// field so that an entry stays 8 bytes.
@@ -705,10 +797,10 @@ impl Walk {
     }
 
     #[inline]
-    fn visit(&mut self, id: NodeId) {
+    fn visit(&mut self, id: NodeId, new: bool) {
         self.push(Entry {
             id,
-            taint: NO_TAINT,
+            taint: if new { NO_TAINT_NEW } else { NO_TAINT },
         });
         self.first_visits += 1;
         if self.visited.is_some() || self.first_visits == EXACT_MODE_AT {
@@ -756,8 +848,10 @@ impl Walk {
             .map(|e| e.taint)
             .min()
             .unwrap_or(NO_TAINT);
-        if let Some(parent) = self.work[..cut].iter_mut().rev().find(|e| e.is_pending()) {
-            parent.taint = parent.taint.min(taint);
+        if taint < NO_TAINT {
+            if let Some(parent) = self.work[..cut].iter_mut().rev().find(|e| e.is_pending()) {
+                parent.taint = parent.taint.min(taint);
+            }
         }
         self.work.drain(cut..top);
     }
@@ -779,8 +873,11 @@ impl Walk {
             let entry = self.work[at];
             if entry.is_pending() && entry.id == id {
                 self.work.remove(at);
-                if let Some(parent) = self.work[..at].iter_mut().rev().find(|e| e.is_pending()) {
-                    parent.taint = parent.taint.min(entry.taint);
+                if entry.taint < NO_TAINT {
+                    if let Some(parent) = self.work[..at].iter_mut().rev().find(|e| e.is_pending())
+                    {
+                        parent.taint = parent.taint.min(entry.taint);
+                    }
                 }
             }
         }
@@ -792,6 +889,45 @@ impl Walk {
             .collect();
         visited.insert(id);
         self.visited = Some(visited);
+    }
+
+    /// Drops the plan above `work[keep - 1]`, and with it the visits and
+    /// expansions of the nodes it left no pending entry, so that a later
+    /// visit of one plans it as a walk that never met it would.
+    fn prune(&mut self, keep: usize) {
+        let mut gone: HashSet<NodeId> = self
+            .work
+            .drain(keep..)
+            .filter(|e| e.is_pending())
+            .map(|e| e.id)
+            .collect();
+        for e in self.work.iter().filter(|e| e.is_pending()) {
+            gone.remove(&e.id);
+        }
+        if !gone.is_empty() {
+            self.forget(|id| gone.contains(id));
+        }
+    }
+
+    /// Visits `id` again as a walk that never met it would, past a first
+    /// visit that expanded it (or the group it is now a member of).
+    #[cold]
+    #[inline(never)]
+    fn revisit(&mut self, id: NodeId) {
+        self.forget(|&n| n == id);
+        self.push(Entry { id, taint: VISIT });
+    }
+
+    fn forget(&mut self, gone: impl Fn(&NodeId) -> bool) {
+        if let Some(visited) = &mut self.visited {
+            visited.retain(|id| !gone(id));
+        }
+        if let Some(expanded) = &mut self.expanded {
+            expanded.new.retain(|id| !gone(id));
+            expanded
+                .groups
+                .retain(|g| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
+        }
     }
 
     #[inline]
@@ -839,6 +975,11 @@ impl Walk {
     }
 }
 
+#[cfg(all(test, not(loom)))]
+fn forced_revisit() -> bool {
+    *FORCE_REVISIT
+}
+
 #[inline(always)]
 fn is_computing(state: NodeState) -> bool {
     matches!(state, NodeState::Computing | NodeState::ComputingDirty)
@@ -866,9 +1007,15 @@ fn reached_under_own_set(id: NodeId) -> ! {
 ///
 /// A replayed run can be speculative: after a read returned a
 /// placeholder, the run may evaluate queries the run without a budget
-/// would never evaluate. A panic there is swallowed and lands nothing
-/// `Failed`, so a query that the real run does evaluate raises its own
-/// panic then.
+/// would never evaluate. Such a run lands nothing: the value or panic it
+/// ends with, and the children it created, are kept for the revision, and
+/// a later read of that query takes them if nothing the run read has
+/// changed, and otherwise runs the closure again. So does a later read of a
+/// query whose run kept nothing: it read a dep that did not land Clean or
+/// a panic that another speculative run kept, it read through a run that
+/// kept nothing, or it met a cycle. A
+/// [`Replay::Native`](crate::Replay::Native) query runs speculatively at
+/// most once per revision.
 ///
 /// # Panics in user code
 ///
@@ -883,6 +1030,13 @@ fn reached_under_own_set(id: NodeId) -> ! {
 /// is swallowed, so the original panic arrives unchanged. One that panics
 /// while the thread is already unwinding aborts the process, exactly as a
 /// panicking `Drop` inside a `Vec` does.
+///
+/// Under a budget, replay also builds values that the run without one
+/// never builds: a doomed run's value, the value of a speculative run that
+/// no later read takes, and the clones a speculative run's reads return.
+/// They are dropped and their `Drop` runs, but a panic in it reaches no
+/// read: the runtime drops them with the panic swallowed, or in a run it
+/// discards.
 ///
 /// Under `Shared`, displaced values are reclaimed through hazard
 /// pointers, so a value's `Drop` may run inside a later, unrelated
@@ -903,6 +1057,10 @@ pub struct Runtime<C: Cells> {
     /// Taken only inside an `inner` section or with no lock held.
     pub(crate) watch_queue: OrderedLock<watch_impl::WatchQueue, C>,
     pub(crate) revision: <C as Cells>::U64,
+    /// Episodes landed on this runtime, by every thread: an episode can
+    /// land a member Clean over nodes it leaves New or Dirty, which a
+    /// walk another thread planned earlier would go on to compute.
+    pub(crate) episodes_landed: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording; the call that swaps it
@@ -918,6 +1076,7 @@ pub struct Runtime<C: Cells> {
     /// `set_max_frames` has been called, so a byte budget set later keeps
     /// its frame budget instead of taking the default's place.
     frames_set: std::sync::atomic::AtomicBool,
+    budget_entry: replay_impl::BudgetEntry,
     /// `INCR_TEST_ALL_REPLAYABLE`: every query not marked
     /// `NOT_REPLAYABLE` is replayable.
     pub(crate) all_replayable: bool,
@@ -944,14 +1103,17 @@ pub struct Runtime<C: Cells> {
     /// Every doom, in order, as the doom point saw it.
     #[cfg(test)]
     pub(crate) dooms: std::sync::Mutex<Vec<replay_impl::DoomSeen>>,
-    /// The nodes whose Dirty value, or whose unwind delivered to a retry,
-    /// a read in a frame returned.
-    #[cfg(test)]
-    pub(crate) dirty_reads: std::sync::Mutex<Vec<u32>>,
     /// Walk skips of a claim this thread holds anchored at a virtual
     /// frame's position, whose taint-memo entries the context owns.
     #[cfg(test)]
     pub(crate) virtual_anchor_skips: std::sync::atomic::AtomicU64,
+    /// Reads of a held root that went past `cycle_read` to resume a doomed
+    /// walk, and walks of a held root resumed.
+    #[cfg(test)]
+    pub(crate) resumes_past_held: [std::sync::atomic::AtomicU64; 2],
+    /// Walk entries revisited because a claim wait ended with them Dirty.
+    #[cfg(test)]
+    pub(crate) wait_revisits: std::sync::atomic::AtomicU64,
     /// Every episode start, suspension, resumption and member run, in order.
     #[cfg(test)]
     pub(crate) episodes_seen: std::sync::Mutex<Vec<cycle_impl::EpisodeSeen>>,
@@ -961,9 +1123,23 @@ pub struct Runtime<C: Cells> {
     /// Drop unwinds raised.
     #[cfg(test)]
     pub(crate) drop_unwinds: std::sync::atomic::AtomicU32,
+    /// Speculative runs' withheld landings of this revision.
+    pub(crate) stashes: OrderedLock<replay_impl::Stashes, C>,
+    /// How many stashes `stashes` holds, so a claim can skip its lock.
+    pub(crate) stash_count: C::U32,
     /// Speculative chains a driver dropped with no unwind.
     #[cfg(test)]
     pub(crate) cooperative_drops: std::sync::atomic::AtomicU32,
+    /// Walk entry claims released unrun after the episode check.
+    #[cfg(test)]
+    pub(crate) unrun_unclaims: std::sync::atomic::AtomicU32,
+    /// Waits on another thread's doom reservation, for tests.
+    #[cfg(test)]
+    pub(crate) reservation_waits: std::sync::atomic::AtomicU32,
+    /// Pops that waited for another thread's claim of a node this thread
+    /// reserves to come back, for tests.
+    #[cfg(test)]
+    pub(crate) give_back_waits: std::sync::atomic::AtomicU32,
     /// Every entry a driver ran, as it found its context.
     #[cfg(test)]
     pub(crate) entries: std::sync::Mutex<Vec<replay_impl::EntrySeen>>,
@@ -980,8 +1156,14 @@ pub struct Runtime<C: Cells> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DoomGate(pub(crate) bool);
 
-/// The default frame budget.
-pub const DEFAULT_MAX_FRAMES: u32 = 256;
+/// The default frame budget: 256, or 32 when incr-core is built with
+/// debug assertions, whose frames are 14 to 18 times larger. A chain at
+/// the budget is deepest once replay runs it, at about 1.5 KiB a nested
+/// read (1.86 KiB under `Shared`) in release and 26 KiB in debug: under
+/// 480 KiB of a spawned thread's 2 MiB stack in release, leaving each
+/// closure on the chain about 6 KiB of its own, and under 840 KiB in
+/// debug, leaving about 38 KiB, room for a debug closure's local buffers.
+pub const DEFAULT_MAX_FRAMES: u32 = if cfg!(debug_assertions) { 32 } else { 256 };
 
 /// The default frame budget and whether every query is replayable, from
 /// `INCR_MAX_DEPTH` and `INCR_TEST_ALL_REPLAYABLE`, read once.
@@ -1006,19 +1188,22 @@ impl<C: Cells> Default for Runtime<C> {
 
 impl<C: Cells> Runtime<C> {
     pub fn new() -> Self {
+        let runtime_id = RuntimeId::allocate();
         Self {
             nodes: SegmentedNodes::new(),
             arenas: ArenaRegistry::new(),
             inner: OrderedLock::new(LockKind::Inner, Inner::new()),
             watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
+            episodes_landed: C::new_u64(0),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
-            runtime_id: RuntimeId::allocate(),
+            runtime_id,
             tracing_armed: C::new_u8(0),
             max_frames: std::sync::atomic::AtomicU32::new(replay_defaults().0),
             max_stack_bytes: std::sync::atomic::AtomicUsize::new(0),
             frames_set: std::sync::atomic::AtomicBool::new(false),
+            budget_entry: replay_impl::BudgetEntry::new(runtime_id, replay_defaults().0),
             all_replayable: replay_defaults().1,
             provenance: provenance_impl::table::<C>(),
             tickets: contain_impl::tickets::<C>(),
@@ -1040,17 +1225,27 @@ impl<C: Cells> Runtime<C> {
             #[cfg(test)]
             dooms: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
-            dirty_reads: std::sync::Mutex::new(Vec::new()),
-            #[cfg(test)]
             virtual_anchor_skips: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            resumes_past_held: Default::default(),
+            #[cfg(test)]
+            wait_revisits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             episodes_seen: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             deliveries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             drop_unwinds: std::sync::atomic::AtomicU32::new(0),
+            stashes: OrderedLock::new(LockKind::Stashes, replay_impl::Stashes::default()),
+            stash_count: C::new_u32(0),
             #[cfg(test)]
             cooperative_drops: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            unrun_unclaims: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            reservation_waits: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            give_back_waits: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             entries: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -1443,19 +1638,27 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
-    /// Sets the frame budget, 256 unless `INCR_MAX_DEPTH` says otherwise:
-    /// a read made by a replayable query's compute when this runtime's
-    /// frames on the thread number `n` or more (every runtime's, under
-    /// `Shared`) replays instead of nesting, if the read's type has a
-    /// placeholder. Replay changes where computes run, never a result.
+    /// Sets the frame budget, [`DEFAULT_MAX_FRAMES`] unless `INCR_MAX_DEPTH`
+    /// says otherwise: a read made by a replayable query's compute when
+    /// this runtime's frames on the thread number `n` or more (every
+    /// runtime's, under `Shared`) replays instead of nesting, if the read's
+    /// type has a placeholder. Replay changes where computes run, never a
+    /// result. A compute running on a thread when that thread first meets
+    /// a budget change is never replayed for it, since its reads before
+    /// were made under the budget before.
     ///
     /// Panics if `n` is 0.
     pub fn set_max_frames(&self, n: u32) {
         assert!(n > 0, "incr-core: the frame budget is at least 1");
-        self.frames_set
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        self.max_frames
-            .store(n, std::sync::atomic::Ordering::Relaxed);
+        self.set_budget(|| {
+            self.frames_set
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            (
+                n,
+                self.max_stack_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        });
     }
 
     /// Sets a byte budget beside the frame budget, off when `n` is 0 (the
@@ -1464,14 +1667,17 @@ impl<C: Cells> Runtime<C> {
     /// bytes. Frames differ in size with the closure and the build, so
     /// the frame count alone does not bound the stack. Like
     /// [`Self::set_max_frames`], it wins over `INCR_MAX_DEPTH`: a runtime
-    /// that has not set its frame budget gets the default of 256.
+    /// that has not set its frame budget gets [`DEFAULT_MAX_FRAMES`]. A
+    /// change spares running computes as [`Self::set_max_frames`]'s does.
     pub fn set_max_stack_bytes(&self, n: usize) {
-        if !self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
-            self.max_frames
-                .store(DEFAULT_MAX_FRAMES, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.max_stack_bytes
-            .store(n, std::sync::atomic::Ordering::Relaxed);
+        self.set_budget(|| {
+            let frames = if self.frames_set.load(std::sync::atomic::Ordering::Relaxed) {
+                self.max_frames.load(std::sync::atomic::Ordering::Relaxed)
+            } else {
+                DEFAULT_MAX_FRAMES
+            };
+            (frames, n)
+        });
     }
 
     /// Sets the fallback of every query of `T` created with
@@ -1575,7 +1781,9 @@ impl<C: Cells> Runtime<C> {
     /// member, which clears the slot, between the load and the read. A
     /// Clean reload is read again, so only a Clean node with an empty slot
     /// is the invariant panic; `Err` hands back any other state, which the
-    /// read goes on from as if it had loaded it first.
+    /// read goes on from as if it had loaded it first. A diverted read's
+    /// `type_tag` is `DIVERTED_TAG`, and [`Self::diverted_clean_read`]
+    /// answers it, with `Err(Clean)` for a read that goes on as a slow one.
     #[cold]
     #[inline(never)]
     fn reload_after_empty_slot<T: Value>(
@@ -1585,12 +1793,50 @@ impl<C: Cells> Runtime<C> {
         type_tag: u16,
         arena_slot: u32,
     ) -> Result<T, NodeState> {
+        if type_tag == crate::dep_stack::DIVERTED_TAG {
+            return self.diverted_clean_read(handle, node);
+        }
         if C::SINGLE_THREADED {
             self.read_failed(handle);
         }
         match state::load::<C>(node.state_cell()) {
             NodeState::Clean => Ok(self.read_slot(handle, node, type_tag, arena_slot)),
             now => Err(now),
+        }
+    }
+
+    /// A Clean read the top frame diverted (see `Frame::read_rt`). The
+    /// frame's own read that a replay context holds a delivery for goes on
+    /// as the slow read the unbounded run made before the node landed
+    /// Clean, which takes the delivery; any other is the fast read.
+    #[cold]
+    #[inline(never)]
+    fn diverted_clean_read<T: Value>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+    ) -> Result<T, NodeState> {
+        let rt = self.runtime_id;
+        let (dep, generation) = (NodeId(handle.slot()), handle.generation());
+        if let Some(f) = self.dep_stack.diverted_read(rt) {
+            let word = value_code::thread_word();
+            if self.delivery_waits(f, handle, word) {
+                return Err(NodeState::Clean);
+            }
+            self.dep_stack.record_diverted_read(rt, dep, generation);
+            if word & value_code::REPLAY_BIT == 0 {
+                self.dep_stack.end_diverted_reads(rt);
+            } else if word & value_code::COUNTER_MASK == 0 && !replay::held() {
+                // A `Drop` that an unwind out of a `replay::with` closure runs
+                // is inside the contexts' borrow, so only other reads look
+                // there.
+                self.undivert_when_taken(f);
+            }
+        }
+        let (type_tag, arena_slot) = self.fields_under(handle, node);
+        match self.try_read_slot(handle, node, type_tag, arena_slot) {
+            Some(value) => Ok(value),
+            None => self.reload_after_empty_slot(handle, node, type_tag, arena_slot),
         }
     }
 
@@ -2097,13 +2343,19 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(slot);
         self.park(ParkPoint::GetAfterHandleCheck(NodeId(slot)));
 
-        // The raw byte, so the Clean test skips `from_u8`'s range check.
-        let observed = C::state_load_acquire(node.state_cell());
-        if observed == NodeState::Clean.as_u8() {
+        // The raw byte, so the fast path skips `from_u8`'s range check.
+        let raw = C::state_load_acquire(node.state_cell());
+        if raw == state::CLEAN_BYTE {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            self.dep_stack
-                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
-            if C::SINGLE_THREADED {
+            let type_tag = self.dep_stack.record_dep(
+                self.runtime_id,
+                NodeId(slot),
+                handle.generation(),
+                type_tag,
+            );
+            // A diverted read finds no arena and must leave through the
+            // empty-slot branch below, which `read_clean_local` lacks.
+            if C::SINGLE_THREADED && type_tag != crate::dep_stack::DIVERTED_TAG {
                 return self.read_clean_local(handle, type_tag, arena_slot);
             }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
@@ -2114,7 +2366,7 @@ impl<C: Cells> Runtime<C> {
                 },
             };
         }
-        self.get_slow(handle, NodeState::from_u8(observed))
+        self.get_slow(handle, NodeState::from_u8(raw))
     }
 
     /// The non-Clean arm of [`Self::get`]: walk, then read. `observed`
@@ -2138,12 +2390,17 @@ impl<C: Cells> Runtime<C> {
         }
         let slot = handle.slot();
         let node = self.nodes.get(slot);
-        let observed = state::load::<C>(node.state_cell());
-        if observed == NodeState::Clean {
+        // The raw byte, so the fast path skips `from_u8`'s range check.
+        let raw = C::state_load_acquire(node.state_cell());
+        if raw == state::CLEAN_BYTE {
             let (type_tag, arena_slot) = self.fields_under(handle, node);
-            self.dep_stack
-                .record_dep(self.runtime_id, NodeId(slot), handle.generation());
-            if C::SINGLE_THREADED {
+            let type_tag = self.dep_stack.record_dep(
+                self.runtime_id,
+                NodeId(slot),
+                handle.generation(),
+                type_tag,
+            );
+            if C::SINGLE_THREADED && type_tag != crate::dep_stack::DIVERTED_TAG {
                 return Ok(self.read_clean_local(handle, type_tag, arena_slot));
             }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
@@ -2154,7 +2411,7 @@ impl<C: Cells> Runtime<C> {
                 },
             };
         }
-        self.try_get_slow(handle, observed)
+        self.try_get_slow(handle, NodeState::from_u8(raw))
     }
 
     #[inline(never)]
@@ -2203,7 +2460,12 @@ impl<C: Cells> Runtime<C> {
             .record_read(self.runtime_id, NodeId(slot), handle.generation());
 
         let word = value_code::thread_word();
-        if word & (value_code::COUNTER_MASK | value_code::REPLAY_BIT | value_code::UNWIND_MASK) != 0
+        if word
+            & (value_code::COUNTER_MASK
+                | value_code::REPLAY_BIT
+                | value_code::UNWIND_MASK
+                | value_code::FOREIGN_BIT)
+            != 0
             || frame.is_some_and(|f| self.doomed_or_past_budget(f))
         {
             return self.read_cold(handle, observed, kind, frame, word);
@@ -2239,8 +2501,19 @@ impl<C: Cells> Runtime<C> {
         frame: Option<ActiveRead>,
     ) -> Result<T, Cycle> {
         let slot = handle.slot();
+        let _root = reserve::Root::arm(!C::SINGLE_THREADED, (self.runtime_id, slot));
         loop {
-            if observed == NodeState::Cyclic || is_computing(observed) {
+            if MODE & VIRT != 0 && matches!(observed, NodeState::New | NodeState::Dirty) {
+                if let Some(value) = self.stashed_read(handle) {
+                    return Ok(value);
+                }
+            }
+            // A read whose walk a doom stopped goes on with it even if its
+            // root is held by now, as the unbounded run's walk goes on past
+            // the entry that left it held.
+            if (observed == NodeState::Cyclic || is_computing(observed))
+                && !(MODE & VIRT != 0 && self.resume_pending(NodeId(slot)))
+            {
                 let armed = frame.filter(|_| MODE & ARMED != 0);
                 if let Some(read) = self.cycle_read(handle, observed, kind, armed) {
                     return read;
@@ -2250,7 +2523,13 @@ impl<C: Cells> Runtime<C> {
             let walk =
                 || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
             match self.entered(kind, walk)? {
-                Computed::Done | Computed::Unsettled => {}
+                Computed::Done | Computed::Unsettled => {
+                    if MODE & VIRT != 0 {
+                        if let Some(value) = self.stashed_read(handle) {
+                            return Ok(value);
+                        }
+                    }
+                }
                 Computed::Gone => self.stale_handle(handle),
                 Computed::Deferred => {
                     return self
@@ -2265,15 +2544,20 @@ impl<C: Cells> Runtime<C> {
                 Computed::Doomed | Computed::Discarded => {
                     return Ok(self.placeholder_read::<T>(frame));
                 }
-                Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
+                Computed::Skipped(_) | Computed::Replan | Computed::Revisit => {
+                    unreachable!(
+                        "incr-core: a walk's root is never skipped, replanned or revisited"
+                    )
+                }
             }
+            self.park(ParkPoint::AfterWalk(NodeId(slot)));
             let (type_tag, arena_slot) = self.fields_under(handle, node);
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
                     if let Some(f) = frame {
-                        if state::load::<C>(node.state_cell()) == NodeState::Dirty {
-                            #[cfg(test)]
-                            self.dirty_reads.lock().unwrap().push(handle.slot());
+                        if state::load::<C>(node.state_cell()) == NodeState::Dirty
+                            && !self.unchanged_stash(handle.slot(), handle.generation())
+                        {
                             self.note_dirty_read(f, handle, &value);
                         }
                     }
@@ -2898,13 +3182,7 @@ impl<C: Cells> Runtime<C> {
                         // walk); re-examine.
                     }
                     NodeState::Failed => {
-                        let mark = self.ticket_mark();
-                        if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
-                            .is_ok()
-                        {
-                            if let Some(mark) = mark {
-                                self.left_failed(id, mark);
-                            }
+                        if self.flip_failed(id) {
                             let inner = self.inner.read();
                             if C::u8_load_relaxed(flags) & WATCHED != 0 {
                                 self.enqueue_watched(id, node);
@@ -3071,20 +3349,66 @@ impl<C: Cells> Runtime<C> {
             }
             return self.compute_direct::<MODE>(id, gen);
         }
+        // A resumed walk was planned before its doom, at a count no longer
+        // known, so it checks against none: it re-plans if any other
+        // thread has landed an episode.
+        let mut planned = if resume.is_some() {
+            Planned { all: 0, own: 0 }
+        } else {
+            self.planned()
+        };
         let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
         let mut root = Computed::Done;
+        let mut unchecked = None;
+        #[cfg(test)]
+        let mut revisited: Vec<NodeId> = Vec::new();
 
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
                 self.park(ParkPoint::BeforeComputeOne(cur));
-                let visit = if is_root || taint == NO_TAINT {
+                let visit = if is_root || taint >= NO_TAINT {
                     Visit::Full
                 } else {
                     Visit::VerifyOnly(taint)
                 };
-                let mut computed =
-                    self.compute_one::<MODE>(cur, visit, is_root.then_some(gen), !is_root);
+                // A tainted entry never runs its closure, so it verifies in
+                // place whatever another thread landed; a tainted root runs
+                // it, but its taint has replaced the New mark.
+                #[cfg(test)]
+                let forced = *FORCE_REVISIT && !revisited.contains(&cur);
+                #[cfg(not(test))]
+                let forced = false;
+                let seen = if C::SINGLE_THREADED || taint < NO_TAINT {
+                    Seen::Unwalked
+                } else if taint == NO_TAINT_NEW || forced {
+                    Seen::New
+                } else {
+                    Seen::Dirty
+                };
+                let mut computed = self.compute_one::<MODE>(
+                    cur,
+                    visit,
+                    is_root.then_some(gen),
+                    !is_root,
+                    (!C::SINGLE_THREADED && !is_root && unchecked.take() != Some(cur))
+                        .then_some(planned),
+                    seen,
+                );
+                if !C::SINGLE_THREADED && computed == Computed::Revisit {
+                    #[cfg(test)]
+                    revisited.push(cur);
+                    walk.revisit(cur);
+                    continue;
+                }
+                if !C::SINGLE_THREADED && computed == Computed::Replan {
+                    planned = self.planned();
+                    if !self.prune_settled(&mut walk) {
+                        walk.push(Entry { id: cur, taint });
+                        unchecked = Some(cur);
+                    }
+                    continue;
+                }
                 if computed != Computed::Done {
                     let entry = Entry { id: cur, taint };
                     match self.walk_stopped(id, entry, visit, is_root, &mut walk, computed) {
@@ -3094,7 +3418,7 @@ impl<C: Cells> Runtime<C> {
                 }
                 if is_root {
                     root = computed;
-                } else if taint != NO_TAINT {
+                } else if taint < NO_TAINT {
                     walk.taint(taint);
                 }
                 continue;
@@ -3192,7 +3516,7 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    walk.visit(cur);
+                    walk.visit(cur, observed == NodeState::New);
                     node.for_each_dep(|dep| {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
@@ -3210,6 +3534,98 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// What a walk under `Shared` plans under: the runtime's episode
+    /// count and this thread's share of it.
+    #[inline(always)]
+    fn planned(&self) -> Planned {
+        if C::SINGLE_THREADED {
+            return Planned { all: 0, own: 0 };
+        }
+        let all = C::u64_load_acquire(&self.episodes_landed);
+        // This thread's share is at most the count.
+        let own = if all == 0 {
+            0
+        } else {
+            cycle_state::own_episodes(self.runtime_id)
+        };
+        Planned { all, own }
+    }
+
+    /// Whether another thread has landed an episode on this runtime since
+    /// `planned`.
+    #[inline(always)]
+    fn replan(&self, planned: Planned) -> bool {
+        #[cfg(test)]
+        if *FORCE_REPLAN || FORCE_REPLAN_HERE.with(std::cell::Cell::get) {
+            return true;
+        }
+        let all = C::u64_load_acquire(&self.episodes_landed);
+        all != planned.all && self.others_landed(planned, all)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn others_landed(&self, planned: Planned, all: u64) -> bool {
+        let own = cycle_state::own_episodes(self.runtime_id);
+        all.wrapping_sub(planned.all) != own.wrapping_sub(planned.own)
+    }
+
+    /// After a claim CAS of `id` at `generation` succeeded: whether another
+    /// thread's doom reserved the node, so the claim must be given back
+    /// unrun and the reservation waited out.
+    #[inline(always)]
+    fn reserved_elsewhere(&self, id: NodeId, generation: u32) -> bool {
+        !C::SINGLE_THREADED
+            && reserve::any()
+            && reserve::elsewhere((self.runtime_id, id.0), generation)
+    }
+
+    /// Releases a claim taken from New or Dirty (`dirty`) before anything
+    /// ran, as no landing: watchers see nothing. A set's flag changes
+    /// nothing, since its walk already passed through to the dependents and
+    /// leaves a New node New.
+    #[cold]
+    #[inline(never)]
+    fn unclaim_unrun(&self, node: &NodeData<C>, dirty: bool) {
+        #[cfg(test)]
+        self.unrun_unclaims
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let back = if dirty {
+            NodeState::Dirty
+        } else {
+            NodeState::New
+        };
+        node.set_unrun(true);
+        if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
+            let unflagged =
+                state::try_transition::<C>(node.state_cell(), NodeState::ComputingDirty, back);
+            debug_assert!(unflagged.is_ok(), "incr-core: an unrun claim is held");
+        }
+    }
+
+    /// Drops the part of `walk`'s plan under its lowest pending node that
+    /// is Clean or Cyclic now, as a walk planned now would not expand it,
+    /// and keeps the rest with what the walk has learned. False if no
+    /// pending node has settled.
+    #[cold]
+    #[inline(never)]
+    fn prune_settled(&self, walk: &mut Walk) -> bool {
+        let settled = walk.work.iter().position(|e| {
+            e.is_pending()
+                && matches!(
+                    state::load::<C>(self.nodes.get(e.id.0).state_cell()),
+                    NodeState::Clean | NodeState::Cyclic
+                )
+        });
+        match settled {
+            Some(at) => {
+                walk.prune(at + 1);
+                true
+            }
+            None => false,
+        }
     }
 
     /// The first time a walk reaches a Dirty member of a landed group, it
@@ -3230,6 +3646,7 @@ impl<C: Cells> Runtime<C> {
             .members
             .iter()
             .any(|&(m, g)| m == cur.0 && g == generation)
+            || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
         {
             return false;
         }
@@ -3241,7 +3658,7 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        walk.visit(cur);
+        walk.visit(cur, false);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group
@@ -3266,7 +3683,8 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn compute_direct<const MODE: u8>(&self, id: NodeId, gen: u32) -> Computed {
-        let mut computed = self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false);
+        let mut computed =
+            self.compute_one::<MODE>(id, Visit::Direct, Some(gen), false, None, Seen::Unwalked);
         if computed == Computed::Discarded {
             computed = self.walk_discarded(Visit::Direct).unwrap_or(computed);
         }
@@ -3303,6 +3721,9 @@ impl<C: Cells> Runtime<C> {
     /// nothing included (`Gone`, the input arm, a retry that found the
     /// node computed by another thread). The `Err` path drains in
     /// carried mode before it resumes the panic.
+    ///
+    /// `planned` is what a walk entry under `Shared` was planned under, and
+    /// `seen` what the walk's visit found of an untainted entry.
     #[inline(always)]
     fn compute_one<const MODE: u8>(
         &self,
@@ -3310,13 +3731,17 @@ impl<C: Cells> Runtime<C> {
         visit: Visit,
         gen: Option<u32>,
         walked: bool,
+        planned: Option<Planned>,
+        seen: Seen,
     ) -> Computed {
         let mut bag = Deferred::new();
-        let computed = self.compute_attempts::<MODE>(id, visit, gen, walked, &mut bag);
+        let computed =
+            self.compute_attempts::<MODE>(id, visit, gen, walked, planned, seen, &mut bag);
         bag.drain(self);
         computed
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn compute_attempts<const MODE: u8>(
         &self,
@@ -3324,6 +3749,8 @@ impl<C: Cells> Runtime<C> {
         visit: Visit,
         gen: Option<u32>,
         walked: bool,
+        planned: Option<Planned>,
+        seen: Seen,
         bag: &mut Deferred<C>,
     ) -> Computed {
         let (node, flags) = self.nodes.get_with_flags(id.0);
@@ -3332,6 +3759,10 @@ impl<C: Cells> Runtime<C> {
 
         'attempt: loop {
             let observed = state::load::<C>(node.state_cell());
+            // A wait can outlast the node, whose slot then holds another.
+            if spins != 0 && g0.is_some_and(|g| g != node.generation()) {
+                return Computed::Gone;
+            }
             // After the load, so a landing that passed the held payload's
             // failure on is seen whatever state it left the node in since.
             if MODE & VIRT != 0 && !C::SINGLE_THREADED && !walked {
@@ -3388,6 +3819,20 @@ impl<C: Cells> Runtime<C> {
                         return Computed::Done;
                     }
                 }
+                // The generation check below would end a recycled root.
+                NodeState::Dirty
+                    if seen != Seen::Unwalked
+                        && spins != 0
+                        && g0.is_none_or(|g| g == node.generation())
+                        // A claim released unrun leaves its thread's read
+                        // going on, which may still come after this one.
+                        && !node.unrun() =>
+                {
+                    #[cfg(test)]
+                    self.wait_revisits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Computed::Revisit;
+                }
                 NodeState::Dirty => {}
             }
             if MODE & VIRT != 0 && spins != 0 && gen.is_none() {
@@ -3424,6 +3869,9 @@ impl<C: Cells> Runtime<C> {
                 }
             };
 
+            if MODE & VIRT != 0 && self.stashed_claim(id, g) {
+                return Computed::Done;
+            }
             self.park(ParkPoint::BeforeClaim(id));
 
             // Verification claims the node too, so a walk that arrives
@@ -3458,8 +3906,14 @@ impl<C: Cells> Runtime<C> {
                 } else {
                     NodeState::New
                 };
-                self.land(id, node, discard, discard);
+                self.land_unrun(id, node, discard);
                 return Computed::Gone;
+            }
+            self.park(ParkPoint::BeforeReservationCheck(id));
+            if self.reserved_elsewhere(id, g) {
+                self.unclaim_unrun(node, claimed_dirty);
+                self.wait_out_reservation(id, g, None, &mut spins);
+                continue;
             }
             // The claim succeeds on a Dirty that such a landing and a set
             // made since the load, and until it is released no landing of
@@ -3471,8 +3925,24 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         NodeState::New
                     };
-                    self.land(id, node, discard, discard);
+                    self.land_unrun(id, node, discard);
                     self.raise_owed(payload, bag);
+                }
+            }
+            if claimed_dirty && seen == Seen::New {
+                self.unclaim_unrun(node, claimed_dirty);
+                return Computed::Revisit;
+            }
+            // When the claim reads from another thread's episode, which left
+            // this node New or Dirty, it reads the count that episode
+            // bumped first: the episode may have landed Clean a node this
+            // plan reaches the node through, which a walk planned now
+            // skips. A claim not ordered after an episode may run before it.
+            if let Some(p) = planned.filter(|_| !C::SINGLE_THREADED) {
+                self.park(ParkPoint::AfterWalkClaim(id));
+                if self.replan(p) {
+                    self.unclaim_unrun(node, claimed_dirty);
+                    return Computed::Replan;
                 }
             }
 
@@ -3493,7 +3963,38 @@ impl<C: Cells> Runtime<C> {
             // walk, and a verified_at naming a revision whose walk had not
             // dirtied our deps yet would let us verify Clean past it (B6).
             let stamp_rev = self.current_revision();
-            let verify_rev = C::walked(&self.walk, &self.revision);
+            let mut verify_rev = C::walked(&self.walk, &self.revision);
+
+            let mut adopted_panic = None;
+            if C::u32_load_relaxed(&self.stash_count) != 0 && !matches!(visit, Visit::VerifyOnly(_))
+            {
+                // A group member's verify is its group's, which no stash
+                // stands for.
+                if verifying
+                    && C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0
+                {
+                    self.drop_stash(id, g, bag);
+                } else {
+                    match self.adopt_stash(id, g, claimed_dirty, walked, bag) {
+                        replay_impl::Adopted::No => {}
+                        replay_impl::Adopted::Panicked(raised) => {
+                            verifying = false;
+                            adopted_panic = Some(raised);
+                        }
+                        replay_impl::Adopted::Landed(computed) => {
+                            self.adopted_pop(id);
+                            return computed;
+                        }
+                        // The stashed run ended, as its pop does, before its
+                        // landing found a dep gone; the retry is the next run.
+                        replay_impl::Adopted::Stale => {
+                            self.adopted_pop(id);
+                            self.park_with_bag(ParkPoint::StaleRetry(id), bag);
+                            continue 'attempt;
+                        }
+                    }
+                }
+            }
 
             // The flags byte is loaded only now, after the claim and the
             // generation recheck: until the claim, another thread's
@@ -3526,19 +4027,23 @@ impl<C: Cells> Runtime<C> {
                 // release or re-landing would outlive the run's discard.
                 if let Visit::VerifyOnly(owner) = visit {
                     if MODE & VIRT != 0 && replay::speculative() {
-                        self.land(id, node, NodeState::Dirty, NodeState::Dirty);
+                        self.land_unrun(id, node, NodeState::Dirty);
                         self.memoize(id, owner);
                         return Computed::Done;
                     }
                 }
-                match self.group_verify(id, g, visit, bag) {
+                match self.group_verify(id, g, visit, walked, bag) {
                     // A tainted verify leaves the node Dirty for the root's
                     // compute to read again, which poisons where needed.
                     GroupEnd::Done(Computed::Done) if !matches!(visit, Visit::VerifyOnly(_)) => {
-                        return self.episode_landed(node)
+                        self.park(ParkPoint::EpisodeLanded(id));
+                        return self.episode_landed(node, walked);
                     }
                     GroupEnd::Done(computed) => return computed,
                     GroupEnd::Retry => {
+                        if MODE & VIRT != 0 {
+                            self.rerun_root(id, self.dep_stack.next_cidx());
+                        }
                         self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                         continue 'attempt;
                     }
@@ -3546,6 +4051,12 @@ impl<C: Cells> Runtime<C> {
                     // longer a cycle: compute, and rediscover any cycle
                     // that remains.
                     GroupEnd::Ordinary => verifying = false,
+                    GroupEnd::Dissolved => {
+                        if MODE & VIRT != 0 {
+                            self.rerun_root(id, self.dep_stack.next_cidx());
+                        }
+                        verifying = false;
+                    }
                 }
             }
 
@@ -3565,13 +4076,16 @@ impl<C: Cells> Runtime<C> {
                 });
                 if !any_changed {
                     self.park(ParkPoint::VerifyAfterScan(id));
+                    if MODE & VIRT != 0 && replay::speculative() {
+                        return self.stash_verify(id, node, g, my_verified, stamp_rev, verify_rev);
+                    }
                     node.max_verified_at(verify_rev);
                     if self.land_single(id, node, flags, NodeState::Clean, NodeState::Dirty)
                         == NodeState::Clean
                     {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                     } else {
-                        self.dep_stack.poison_current_frame(self.runtime_id);
+                        self.poison_reader(walked);
                     }
                     return Computed::Done;
                 }
@@ -3580,14 +4094,14 @@ impl<C: Cells> Runtime<C> {
                     // nested get if it still needs it, and that read
                     // poisons where needed; a poison here would cost the
                     // root a Clean landing for an edge it may have dropped.
-                    self.land_single(id, node, flags, NodeState::Dirty, NodeState::Dirty);
+                    self.land_single_as(id, node, flags, NodeState::Dirty, NodeState::Dirty, true);
                     self.memoize(id, owner);
                     return Computed::Done;
                 }
                 // Keep the claim and recompute; the closure's nested reads
                 // clean the changed deps.
             }
-            if MODE & ARMED != 0 {
+            if MODE & ARMED != 0 && adopted_panic.is_none() {
                 return self.doom(
                     id,
                     node,
@@ -3596,6 +4110,16 @@ impl<C: Cells> Runtime<C> {
                     matches!(visit, Visit::Direct),
                     walked,
                 );
+            }
+            let speculative = MODE & VIRT != 0 && replay::speculative();
+            if speculative && !self.replayable(id.0) && !self.mark_tried(id, g) {
+                let target = if claimed_dirty {
+                    NodeState::Dirty
+                } else {
+                    NodeState::New
+                };
+                self.land(id, node, target, target);
+                return Computed::Done;
             }
             let is_recompute = claimed_dirty;
             let first = !claimed_dirty;
@@ -3611,14 +4135,22 @@ impl<C: Cells> Runtime<C> {
                 // interrupted; no lock is held while user code runs.
                 let ctl = ComputeCtl::new(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
-                        | if walked { cycle::WALKED } else { 0 },
+                        | if walked { cycle::WALKED } else { 0 }
+                        | if speculative { cycle::SPECULATIVE } else { 0 },
                 );
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
                 if MODE & VIRT != 0 {
+                    self.start_run(id, cidx, &ctl);
                     if let Some(low) = self.take_low(id, cidx) {
                         ctl.lower(low);
                     }
+                    // The unbounded run's frame claimed before the sets its
+                    // doomed runs made, so a dep they changed supersedes it.
+                    if let Some(rev) = self.take_claim_rev(id, cidx) {
+                        verify_rev = verify_rev.min(rev);
+                    }
+                    self.divert_for_deliveries(id, cidx);
                 }
                 // SAFETY: the closure was read under the read hold at
                 // generation `g`, and the claim above was rechecked against `g`.
@@ -3627,16 +4159,20 @@ impl<C: Cells> Runtime<C> {
                 // succeed while this node is Computing. `SlotVec` never moves
                 // its entries, so the `Box` still points where it was read.
                 let compute = unsafe { &*compute };
-                let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    compute(self, id.0, &ctl)
-                }));
-                let deps = self.dep_stack.pop_frame();
+                let mut result = match adopted_panic.take() {
+                    Some(raised) => Err(self.raise_adopted(raised)),
+                    None => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        compute(self, id.0, &ctl)
+                    })),
+                };
+                let (deps, reading) = self.dep_stack.pop_frame_reading();
                 let word = value_code::thread_word();
                 if word
                     & (value_code::MEMO_BIT
                         | value_code::UNWIND_MASK
                         | value_code::REPLAY_BIT
-                        | value_code::NOTES_BIT)
+                        | value_code::NOTES_BIT
+                        | value_code::KEPT_BIT)
                     != 0
                 {
                     let attempt = Attempt {
@@ -3645,6 +4181,11 @@ impl<C: Cells> Runtime<C> {
                         stamp_rev,
                         verify_rev,
                     };
+                    if let Err(payload) = &result {
+                        if word & value_code::UNWIND_MASK != 0 {
+                            cycle_impl::clear_caught_cycle(&**payload, &deps, reading);
+                        }
+                    }
                     if let Some(dropped) =
                         self.after_pop_word(id, word, &mut result, attempt, &ctl, &deps, bag)
                     {
@@ -3652,6 +4193,9 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
 
+                if result.is_err() && ctl.has(cycle::SPECULATIVE) {
+                    self.unbuild_speculative(&ctl, bag);
+                }
                 let outcome = match result {
                     Ok(outcome) => outcome,
                     // A doomed run reads placeholders, so a cycle it raises
@@ -3690,25 +4234,41 @@ impl<C: Cells> Runtime<C> {
                     }
                 };
 
-                if ctl.flags.get() & (cycle::LOW | cycle::DOOMED) != 0 {
+                if ctl.flags.get() & (cycle::LOW | cycle::DOOMED | cycle::SPECULATIVE) != 0 {
+                    let attempt = Attempt {
+                        first,
+                        cidx,
+                        stamp_rev,
+                        verify_rev,
+                    };
                     if ctl.has(cycle::DOOMED) {
-                        let attempt = Attempt {
-                            first,
-                            cidx,
-                            stamp_rev,
-                            verify_rev,
-                        };
                         return self.discard_doomed(id, attempt, &ctl, None, bag);
+                    }
+                    if !ctl.has(cycle::LOW) {
+                        return self.stash_speculative(id, g, attempt, &ctl, deps, bag);
                     }
                     match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
                         PopEnd::Deferred => return Computed::Deferred,
-                        PopEnd::Landed => return self.episode_landed(node),
+                        PopEnd::Landed => {
+                            self.park(ParkPoint::EpisodeLanded(id));
+                            return self.episode_landed(node, walked);
+                        }
                         PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
+                        PopEnd::Contained => return Computed::Unsettled,
                         PopEnd::Dissolved => {
+                            if MODE & VIRT != 0 {
+                                self.rerun_root(id, cidx);
+                            }
                             self.end_dissolved(id, bag);
+                            if MODE & VIRT != 0 {
+                                self.end_dissolved_reads(id, g, cidx);
+                            }
                             continue 'run;
                         }
                         PopEnd::Retry => {
+                            if MODE & VIRT != 0 {
+                                self.rerun_root(id, cidx);
+                            }
                             self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                             continue 'attempt;
                         }
@@ -3778,10 +4338,7 @@ impl<C: Cells> Runtime<C> {
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
-                    // The enclosing compute read this node through a non-Clean
-                    // landing. Its own publish may take the fast path, where
-                    // nothing else would catch that.
-                    self.dep_stack.poison_current_frame(self.runtime_id);
+                    self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
@@ -3793,12 +4350,26 @@ impl<C: Cells> Runtime<C> {
 
     /// A root whose episode landed it: a reader that reads it Dirty, or
     /// New with no value, must not land Clean over it, as after a
-    /// single-node landing.
-    fn episode_landed(&self, node: &NodeData<C>) -> Computed {
-        if matches!(node.state(), NodeState::Dirty | NodeState::New) {
-            self.dep_stack.poison_current_frame(self.runtime_id);
+    /// single-node landing. Under `Shared` another thread can claim the
+    /// root as soon as it lands, so any state but Clean or Cyclic poisons:
+    /// a Clean root leaves Clean only through a walk, which flags the
+    /// reader too.
+    fn episode_landed(&self, node: &NodeData<C>, walked: bool) -> Computed {
+        if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
+            self.poison_reader(walked);
         }
         Computed::Done
+    }
+
+    /// After a non-Clean landing: the enclosing compute read this node, and
+    /// its own publish may take the fast path, where nothing else would
+    /// catch that. A walk entry (`walked`) is no such read: a dependent's
+    /// rerun reads it again through a nested get if it still needs it, and
+    /// that read poisons the dependent.
+    fn poison_reader(&self, walked: bool) {
+        if !walked {
+            self.dep_stack.poison_current_frame(self.runtime_id);
+        }
     }
 
     /// The `Err` arm of a compute: the closure panicked, or an engine
@@ -3824,14 +4395,16 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Computed {
         let kind = cycle_state::take_unwind_kind();
+        let (payload, children_stashed) = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
+            self.stash_panic(id, ctl, deps, &attempt, payload)
+        } else {
+            (payload, false)
+        };
         replay::unwind_past(self.runtime_id, attempt.cidx);
         // A closure that catches a speculative run's discard can't land a
         // value over it.
         let kind = replay::run_unwind_kind(kind, replay::speculative());
-        let contain = walked && self.containable(kind, &*payload);
-        if !contain {
-            self.note_unwound_read(&*payload, kind);
-        }
+        let contain = walked && self.containable(id, attempt.cidx, kind, &*payload);
         self.release_unwound_from(
             attempt.cidx,
             id.0,
@@ -3841,28 +4414,22 @@ impl<C: Cells> Runtime<C> {
             bag,
         );
         let wrote = ctl.wrote.get() != 0;
-        if kind.is_some() {
+        if children_stashed {
+            let first = attempt.first;
+            let stashed = ChildLanding::Stashed;
+            self.discard_land_in_group(id, first, wrote, attempt.stamp_rev, stashed, bag);
+        } else if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
             self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
-            if contain {
-                self.retire_notes_above(attempt.cidx);
-                return Computed::Unsettled;
-            }
-            // A closure that catches the unwind has read a dep that did not
-            // land, which its publish counts as settled if it read it before.
-            self.dep_stack.poison_current_frame(self.runtime_id);
-            cycle_state::set_unwind_kind(kind);
-            bag.drain_carried(payload);
-        }
-        // Publish the union of the old deps and whatever was recorded
-        // before the panic. Without the recorded subset, a first-compute
-        // panic leaves no reverse edges at all and no set() can ever flip
-        // the node out of Failed; without the old set, a recompute panic
-        // would lose recovery paths through deps the failed run had not
-        // reached yet. Extra edges only cause spurious re-verification,
-        // never staleness.
-        if contain {
+        } else {
+            // Publish the union of the old deps and whatever was recorded
+            // before the panic. Without the recorded subset, a first-compute
+            // panic leaves no reverse edges at all and no set() can ever
+            // flip the node out of Failed; without the old set, a recompute
+            // panic would lose recovery paths through deps the failed run
+            // had not reached yet. Extra edges only cause spurious
+            // re-verification, never staleness.
             self.land_failed(
                 id,
                 node,
@@ -3871,48 +4438,66 @@ impl<C: Cells> Runtime<C> {
                 wrote,
                 deps,
                 &[],
-                None,
-                Some(payload),
+                Some(&*payload),
                 bag,
             );
-            // Spent even if the landing was not Failed, which drops the box.
-            self.retire_notes_above(attempt.cidx);
+        }
+        // After the landings, whose notes the kept copy carries.
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
+        }
+        if contain {
+            self.contain(attempt.cidx, payload, bag);
             return Computed::Unsettled;
         }
-        self.land_failed(
-            id,
-            node,
-            flags,
-            attempt,
-            wrote,
-            deps,
-            &[],
-            Some(&*payload),
-            None,
-            bag,
-        );
-        // An enclosing closure that catches the unwind has still read a
-        // dep that did not land Clean.
-        self.dep_stack.poison_current_frame(self.runtime_id);
-        bag.drain_carried(payload);
+        self.leave_frame(kind, payload, bag)
     }
 
-    /// Whether a walk's entry contains an unwind out of its compute: a
-    /// panic, or a cycle none of whose members this thread still holds or
-    /// has a virtual frame of, so that every member ran above the walk and
-    /// the unwind released it. A wounded thread must reach its outermost
-    /// entry, so it contains none.
-    fn containable(&self, kind: Option<UnwindKind>, payload: &(dyn std::any::Any + Send)) -> bool {
+    /// The unwind out of a frame whose claims have landed goes on to the
+    /// reading frame: a closure that catches it has read a dep that did not
+    /// land Clean.
+    #[cold]
+    pub(super) fn leave_frame(
+        &self,
+        kind: Option<UnwindKind>,
+        payload: Box<dyn std::any::Any + Send>,
+        bag: &mut Deferred<C>,
+    ) -> ! {
+        self.dep_stack.poison_current_frame(self.runtime_id);
+        cycle_state::set_unwind_kind(kind);
+        bag.drain_carried(payload)
+    }
+
+    /// Whether walk entry `entry`, at position `cidx`, contains an unwind
+    /// out of its compute, asked before the compute's frame releases its
+    /// claims: a panic, or a cycle none of whose members this thread will
+    /// still hold or has a virtual frame of, so that every member ran above
+    /// the walk and the unwind released it. The entry's own claim and the
+    /// claims held at or above its position are not counted: the unwind
+    /// releases them too, and a virtual frame's run still holds the entry's
+    /// when this is asked. A closure that swallowed a cycle and then
+    /// panicked is contained as any panic. A wounded thread must reach its
+    /// outermost entry, so it contains none.
+    pub(super) fn containable(
+        &self,
+        entry: NodeId,
+        cidx: u32,
+        kind: Option<UnwindKind>,
+        payload: &(dyn std::any::Any + Send),
+    ) -> bool {
         if cycle_state::wounded() {
             return false;
         }
         match kind {
             None => true,
-            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_some_and(|c| {
+            Some(UnwindKind::Cycle) => payload.downcast_ref::<CycleUnwind>().is_none_or(|c| {
                 c.0.participants()
                     .iter()
                     .map(|p| NodeId(p.slot()))
-                    .all(|p| self.own_claim_owner(p).is_none() && self.virtual_owner(p).is_none())
+                    .all(|p| {
+                        (p == entry || self.unwind_releases(p, cidx))
+                            && self.virtual_owner(p).is_none()
+                    })
             }),
             Some(_) => false,
         }
@@ -3920,10 +4505,11 @@ impl<C: Cells> Runtime<C> {
 
     /// Fix 5's landing of a claim whose closure panicked: the union of
     /// the old and recorded deps is published, and the node lands Failed,
-    /// or Dirty or New where publication says the panic may hide a change.
+    /// or Dirty or New where publication says the panic may hide a change,
+    /// or Dirty where a replay delivery raised the panic and its first take
+    /// landed the node Dirty (`retaken_landing`).
     /// `co_members`, sorted, are the claims released with it, which count
-    /// as settled. `payload` is the panic, when the caller has it, or
-    /// `contained` when a walk contained it and the node keeps it.
+    /// as settled. `payload` is the panic, when the caller has it.
     #[allow(clippy::too_many_arguments)]
     fn land_failed(
         &self,
@@ -3935,10 +4521,8 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         co_members: &[u32],
         payload: Option<&(dyn std::any::Any + Send)>,
-        contained: Option<Box<dyn std::any::Any + Send>>,
         bag: &mut Deferred<C>,
     ) {
-        let view = payload.or(contained.as_deref());
         let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
             // A stale dep's slot may already belong to another node, so no
             // union is published. The old deps keep their reverse edges.
@@ -3954,12 +4538,14 @@ impl<C: Cells> Runtime<C> {
             // mid-compute, land Dirty now so the next reader retries.
             Publish::Published => NodeState::Failed,
         };
+        let landing =
+            self.retaken_landing(id, node.generation(), attempt.cidx, deps, payload, landing);
         let mut mark = 0;
         if landing == NodeState::Failed {
             if !C::SINGLE_THREADED {
-                self.before_failed_landing(id, node.generation(), attempt.cidx, view);
+                self.before_failed_landing(id, node.generation(), attempt.cidx, payload);
             }
-            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, contained);
+            mark = self.failed_landing(id, node.generation(), attempt.cidx, payload, bag);
         }
         let flagged = if landing == NodeState::New {
             NodeState::New
@@ -3986,8 +4572,37 @@ impl<C: Cells> Runtime<C> {
         // A set flagged the compute, so it landed Dirty past the walk that
         // would have released its ticket.
         if mark != 0 && landed != NodeState::Failed {
-            self.left_failed(id, mark);
+            self.left_failed_landing(id, mark, bag);
         }
+    }
+
+    /// The landing of a claim a user panic released without failing it.
+    /// A node that lands Failed, now or as the unwind goes on, read it,
+    /// directly or through other released claims, so a set that would cure
+    /// the failure may reach that node only through this one: the union of
+    /// its old and recorded deps is published, as [`Self::land_failed`]
+    /// publishes them, and it lands New, which a set's walk passes through
+    /// where Dirty stops it.
+    /// `co_members`, sorted, are the claims released with it.
+    fn land_panic_released(
+        &self,
+        id: NodeId,
+        attempt: Attempt,
+        wrote: bool,
+        deps: &[(NodeId, u32)],
+        co_members: &[u32],
+        bag: &mut Deferred<C>,
+    ) {
+        let (node, flags) = self.nodes.get_with_flags(id.0);
+        // Any outcome lands New, which recomputes.
+        self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag);
+        if wrote {
+            node.max_changed_at(attempt.stamp_rev);
+        } else if attempt.first {
+            node.set_verified_at(0);
+        }
+        self.children_landing(id, flags, ChildLanding::Discard, false, bag);
+        self.land_single(id, node, flags, NodeState::New, NodeState::New);
     }
 
     /// A frame pop found the memo, unwind or replay bit in the thread word.
@@ -4006,20 +4621,43 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         bag: &mut Deferred<C>,
     ) -> Option<Computed> {
-        if word & value_code::NOTES_BIT != 0 && result.is_ok() {
+        // A doomed run's pop is discarded and its retry pops in its place,
+        // so it retires nothing the unbounded run keeps.
+        let doomed = ctl.has(cycle::DOOMED);
+        if word & value_code::NOTES_BIT != 0 && result.is_ok() && !doomed {
             self.retire_notes_above(attempt.cidx);
+        }
+        if word & value_code::KEPT_BIT != 0 {
+            replay::drop_kept_from(self.runtime_id, attempt.cidx);
         }
         if self.after_pop(word, result.is_ok()) {
             *result = Err(match UnwindKind::of_word(word) {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
                 _ => Box::new(cycle::WoundUnwind),
             });
-        } else if result.is_ok() && self.speculative_lands_dirty(word, ctl, deps) {
+        } else if result.is_ok() && self.speculative_lands_dirty(id, word, ctl, deps) {
             if self.drop_cooperatively(None) {
                 return Some(self.discard_dropped(id, attempt, ctl, bag));
             }
             self.set_drop_kind();
             *result = Err(Box::new(cycle::DiscardUnwind));
+        }
+        // After the rewrites: a swallowed discard or wound is no pop of the
+        // unbounded run's.
+        if result.is_ok()
+            && !doomed
+            && word & (value_code::NOTES_BIT | value_code::REPLAY_BIT | value_code::KEPT_BIT) != 0
+        {
+            self.retire_copies(&replay::Retire::Above(attempt.cidx));
+        }
+        // An engine unwind does not end the run: the retry after it is the
+        // same run of the unbounded run's, and reads the cycle again from
+        // its delivery.
+        if word & value_code::REPLAY_BIT != 0
+            && !doomed
+            && (result.is_ok() || cycle_state::unwind_kind().is_none())
+        {
+            self.end_run(id, attempt.cidx);
         }
         None
     }
@@ -4052,10 +4690,23 @@ impl<C: Cells> Runtime<C> {
         target: NodeState,
         flagged: NodeState,
     ) -> NodeState {
+        self.land_single_as(id, node, flags, target, flagged, false)
+    }
+
+    #[inline(always)]
+    pub(crate) fn land_single_as(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
         if C::u8_load_relaxed(flags) & IN_GROUP != 0 {
-            self.leave_group(id, flags);
+            self.leave_group(id, node, flags, target);
         }
-        self.land(id, node, target, flagged)
+        self.land_as(id, node, target, flagged, unrun)
     }
 
     /// The landing of a run of `id` in `compute_one`: a creator's
@@ -4106,13 +4757,26 @@ impl<C: Cells> Runtime<C> {
             self.land_children(id, landing, !run.children.get().is_null(), bag);
         }
         if bits & IN_GROUP != 0 {
-            self.leave_group(id, flags);
+            self.leave_group(id, self.nodes.get(id.0), flags, target);
         }
     }
 
+    /// Takes `id` out of its group for a landing in `target`. A member's
+    /// value is its group's, which its own closure need not give, so one
+    /// landing Dirty is left unverified (rule (b)) and reruns rather than
+    /// verify on its own deps.
     #[cold]
     #[inline(never)]
-    pub(crate) fn leave_group(&self, id: NodeId, flags: &C::U8) {
+    pub(crate) fn leave_group(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        flags: &C::U8,
+        target: NodeState,
+    ) {
+        if target == NodeState::Dirty {
+            node.set_verified_at(0);
+        }
         let mut inner = self.inner.write();
         inner.member_recs.remove(&id.0);
         C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !IN_GROUP);
@@ -4131,9 +4795,14 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Memoize a node verify-only left non-Clean under the frame at depth
-    /// `owner`, whose pop clears the entry.
+    /// `owner`, whose pop clears the entry. A speculative run memoizes
+    /// nothing: the unbounded run has no such run, and an entry it left
+    /// under an owner below it would send a later real read of the node
+    /// straight to its compute.
     fn memoize(&self, id: NodeId, owner: u32) {
-        taint_memo::memoize(self.runtime_id, id, owner);
+        if !replay::speculative() {
+            taint_memo::memoize(self.runtime_id, id, owner);
+        }
     }
 
     /// Leave this thread's `Computing` claim for `target`, or for `flagged`
@@ -4157,6 +4826,32 @@ impl<C: Cells> Runtime<C> {
         target: NodeState,
         flagged: NodeState,
     ) -> NodeState {
+        self.land_as(id, node, target, flagged, false)
+    }
+
+    /// [`Self::land`] of a claim released as if its run never happened, so
+    /// that a thread that waited it out does not take it for a landing
+    /// that a read ordered before its own made.
+    pub(crate) fn land_unrun(&self, id: NodeId, node: &NodeData<C>, target: NodeState) {
+        self.land_as(id, node, target, target, true);
+    }
+
+    #[inline(always)]
+    fn land_as(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
+        node.set_unrun(unrun);
+        if !C::SINGLE_THREADED && unrun {
+            reserve::note((self.runtime_id, id.0), node.generation());
+        }
+        if !C::SINGLE_THREADED && !unrun && target == NodeState::Dirty {
+            reserve::note_root((self.runtime_id, id.0), node.generation());
+        }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
                 self.report_landing(id);
@@ -4339,7 +5034,10 @@ impl<C: Cells> Runtime<C> {
     /// first could pair an old stamp with a newer `Clean`.
     fn observed_clean(&self, dep: NodeId, rev: u64) -> bool {
         let node = self.nodes.get(dep.0);
-        node.state().is_settled() && node.changed_at() <= rev
+        let state = node.state();
+        (state.is_settled()
+            || state == NodeState::Dirty && self.unchanged_stash(dep.0, node.generation()))
+            && node.changed_at() <= rev
     }
 
     #[cfg(test)]
@@ -4497,8 +5195,29 @@ impl<C: Cells> Runtime<C> {
 #[cfg(test)]
 impl<C: Cells> Runtime<C> {
     #[cfg(not(loom))]
+    fn computing_flags(&self) -> u16 {
+        let (ctl, _) = (self.dep_stack.active_frame(self.runtime_id)).expect("a compute is active");
+        // SAFETY: an active frame's control block is live while the frame
+        // is on the stack (see `Frame::ctl`).
+        unsafe { (*ctl).flags.get() }
+    }
+
+    #[cfg(not(loom))]
+    /// Whether this runtime's active compute claimed its node New, so the
+    /// node has landed nothing since it was made.
+    pub(crate) fn computing_first(&self) -> bool {
+        self.computing_flags() & cycle::RECOMPUTE == 0
+    }
+
+    #[cfg(not(loom))]
+    pub(crate) fn computing_speculative(&self) -> bool {
+        self.computing_flags() & cycle::SPECULATIVE != 0
+    }
+
+    #[cfg(not(loom))]
     /// Give `member` installed edges to `extra` on top of its own, with
-    /// the reverse edges, as an episode leaves a cycle's members.
+    /// the reverse edges, as an episode leaves a cycle's members. It
+    /// installs without the member's claim, so no other thread may run.
     pub(crate) fn add_edges_for_test<T, U>(&self, member: Incr<T>, extra: &[Incr<U>]) {
         let mut inner = self.inner.write();
         let id = NodeId(member.slot());
@@ -4644,6 +5363,10 @@ mod replay_scale_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_race_tests.rs"]
 mod replay_race_tests;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_reserve_tests.rs"]
+mod reserve_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_replay_differential.rs"]

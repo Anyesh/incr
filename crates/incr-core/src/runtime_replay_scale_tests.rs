@@ -3,6 +3,9 @@
 //! entry, the byte budget beating the frame budget, and dooms under
 //! `stabilize`.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
+#[cfg(not(debug_assertions))]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -575,4 +578,201 @@ fn local_doom_under_stabilize() {
 #[test]
 fn shared_doom_under_stabilize() {
     doom_under_stabilize::<Shared>();
+}
+
+/// A retry diverted for the unwind of a read reads 100k Clean nodes first:
+/// each diverted read finds no delivery for its node without counting the
+/// frame's earlier reads, so the retry stays linear. The shape is
+/// `caught_delivery_after_its_node_lands`, whose T reads the nodes first.
+#[cfg(not(debug_assertions))]
+fn wide_diverted_retry<C: Cells>() {
+    let n = 100_000;
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let leaves: Arc<Vec<Incr<u64>>> =
+        Arc::new((0..n as u64).map(|i| rt.create_query(move |_| i)).collect());
+    for &leaf in leaves.iter() {
+        rt.get(leaf);
+    }
+    let s_cell: Arc<OnceLock<Incr<u64>>> = Arc::new(OnceLock::new());
+    let s_for_p = s_cell.clone();
+    let p = rt.create_query_with(
+        move |rt| rt.get(*s_for_p.get().unwrap()),
+        QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 3).max_iterations(1)),
+            replay: crate::cycle::Replay::Allowed,
+        },
+    );
+    let s = rt.create_query_with(move |rt| rt.get(p), replayable());
+    s_cell.set(s).unwrap();
+    let diverted = Arc::new(AtomicBool::new(false));
+    let seen = diverted.clone();
+    let t = rt.create_query_with(
+        move |rt| {
+            if rt.dep_stack.diverts_clean_reads(rt.runtime_id) {
+                seen.store(true, SeqCst);
+            }
+            let sum = leaves.iter().map(|&leaf| rt.get(leaf)).sum::<u64>();
+            let _ = catch_unwind(AssertUnwindSafe(|| rt.get(s)));
+            let _ = rt.get(p);
+            sum
+        },
+        replayable(),
+    );
+    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(t)));
+    assert!(diverted.load(SeqCst), "the retry was not diverted");
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn local_wide_diverted_retry() {
+    wide_diverted_retry::<Local>();
+}
+
+#[cfg(not(debug_assertions))]
+#[test]
+fn shared_wide_diverted_retry() {
+    wide_diverted_retry::<Shared>();
+}
+
+#[derive(Copy, Clone, Debug)]
+enum Caught {
+    /// Each query panics with the same text.
+    Same,
+    /// Each query panics with its own text, so no two payloads match.
+    Distinct,
+    /// The reader catches a query that reads the panicking one, so each
+    /// panic lands at two positions.
+    Nested,
+    /// The reader also reads a query that catches a panic of its own and
+    /// returns, whose pop retires that panic's note among the reader's.
+    Mixed,
+}
+
+/// `n` replayable queries that panic, each read and caught by one
+/// replayable reader at budget 1. With no placeholder the reads take the
+/// native path. Each caught panic's landing stays noted while the reader
+/// runs, and a payload reuses the last one's address, so under `Same` the
+/// copy a read keeps matches every earlier note: the work on notes, their
+/// copies and the kept reads stays linear only if copies share the notes.
+fn many_caught_unwinds<C: Cells>(shape: Caught) {
+    let n = 2000;
+    let rt = Runtime::<C>::new();
+    rt.set_max_frames(1);
+    let failing = |rt: &Runtime<C>, i: usize| match shape {
+        Caught::Distinct => {
+            rt.create_query_with(move |_| -> u64 { panic!("boom {i}") }, replayable())
+        }
+        _ => rt.create_query_with(|_| -> u64 { panic!("boom") }, replayable()),
+    };
+    let read: Vec<(Incr<u64>, Option<Incr<u64>>)> = (0..n)
+        .map(|i| {
+            let x = failing(&rt, i);
+            match shape {
+                Caught::Nested => (
+                    rt.create_query_with(move |rt| rt.get(x), replayable()),
+                    None,
+                ),
+                Caught::Mixed => {
+                    let inner = failing(&rt, i);
+                    let ok = rt.create_query_with(
+                        move |rt| {
+                            u64::from(catch_unwind(AssertUnwindSafe(|| rt.get(inner))).is_err())
+                        },
+                        replayable(),
+                    );
+                    (x, Some(ok))
+                }
+                _ => (x, None),
+            }
+        })
+        .collect();
+    let reader = rt.create_query_with(
+        move |rt| {
+            read.iter()
+                .map(|&(x, ok)| {
+                    let caught = u64::from(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+                    caught + ok.map_or(0, |ok| rt.get(ok))
+                })
+                .sum::<u64>()
+        },
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    let caught = match shape {
+        Caught::Mixed => 2 * n,
+        _ => n,
+    };
+    assert_eq!(rt.get(reader), caught as u64);
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 16 * caught as u64,
+        "{shape:?}: {work} units of note work for {caught} caught unwinds"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_many_caught_unwinds_stay_linear() {
+    for shape in [
+        Caught::Same,
+        Caught::Distinct,
+        Caught::Nested,
+        Caught::Mixed,
+    ] {
+        many_caught_unwinds::<Local>(shape);
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_many_caught_unwinds_stay_linear() {
+    for shape in [
+        Caught::Same,
+        Caught::Distinct,
+        Caught::Nested,
+        Caught::Mixed,
+    ] {
+        many_caught_unwinds::<Shared>(shape);
+    }
+}
+
+/// One budgeted frame reading `n` nodes of another runtime, each twice.
+/// Each read is kept for the frame's retry, under its ordinal among the
+/// frame's reads of that node, and finding that ordinal must not cost a
+/// pass over the frame's earlier reads.
+fn many_foreign_reads<C: Cells>() {
+    let n = 2000;
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    let rt = Runtime::<C>::new();
+    rt.set_max_frames(256);
+    let reader = rt.create_query(move |_| {
+        reads
+            .iter()
+            .chain(reads.iter())
+            .map(|&x| foreign.get(x))
+            .sum::<u64>()
+    });
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n * (n - 1));
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 32 * n,
+        "{work} units of note work for {} foreign reads",
+        2 * n
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_many_foreign_reads_stay_linear() {
+    many_foreign_reads::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_many_foreign_reads_stay_linear() {
+    many_foreign_reads::<Shared>();
 }

@@ -18,8 +18,9 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
-use crate::cycle_state::{Episode, Held, Round, Step};
-use crate::{set_stack, waits};
+use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
+use crate::deferred::Unbuilt;
+use crate::{reserve, set_stack, waits};
 
 /// What a compute attempt carries into its landings.
 #[derive(Copy, Clone)]
@@ -58,6 +59,9 @@ pub(super) enum PopEnd {
     /// chain cooperatively instead, its claims discarded: the reader is
     /// answered as a discarded compute's.
     Dropped,
+    /// The root's compute is a walk's entry, which contained the episode's
+    /// abort: its claims have landed, and the walk goes on.
+    Contained,
 }
 
 /// What an episode did, for tests.
@@ -114,9 +118,10 @@ impl EpisodeSeen {
 /// How group verification left the node `compute_one` claimed.
 pub(super) enum GroupEnd {
     Done(Computed),
-    /// A member could not be claimed, or the episode dissolved: compute
-    /// the node as an ordinary one.
+    /// A member could not be claimed: compute the node as an ordinary one.
     Ordinary,
+    /// The episode dissolved: compute the node as an ordinary one.
+    Dissolved,
     Retry,
 }
 
@@ -190,6 +195,30 @@ fn in_cycles(adj: &[Vec<usize>]) -> Vec<bool> {
     (0..adj.len())
         .map(|v| size[comp[v]] > 1 || adj[v].contains(&v))
         .collect()
+}
+
+/// Ends what an outermost engine entry leaves of its replay, whichever
+/// way it exits: contexts of another runtime that its unwinds kept, or a
+/// doom's PENDING reservations from a `mark` that unwound. A reservation
+/// left behind would keep another thread waiting until this one enters
+/// the engine again.
+struct OutermostExit;
+
+impl Drop for OutermostExit {
+    fn drop(&mut self) {
+        if !reserve::none_held() {
+            replay::reset();
+            reserve::end_contexts();
+        }
+    }
+}
+
+/// Removes this thread's contexts and ends its reservations, those a doom
+/// noted before `mark` opened their context included: `reset` alone
+/// misses them when no context is open.
+fn end_replay() {
+    replay::reset();
+    reserve::end_all();
 }
 
 impl<C: Cells> Runtime<C> {
@@ -268,6 +297,7 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         f: &mut impl FnMut() -> R,
     ) -> Result<R, Cycle> {
+        let _exit = (outermost && !C::SINGLE_THREADED).then(|| OutermostExit);
         loop {
             if outermost {
                 cycle_state::reset_outermost();
@@ -311,7 +341,20 @@ impl<C: Cells> Runtime<C> {
                 cycle_state::held_keys().is_empty(),
                 "incr-core: a wounded thread waits for its winner holding claims"
             );
-            waits::await_winner(C::backoff);
+            // Another runtime's contexts, which `drop_from` keeps, would keep
+            // their reservations while the winner waits on one of them.
+            end_replay();
+            debug_assert!(
+                reserve::none_held(),
+                "incr-core: a wounded thread waits for its winner holding reservations"
+            );
+            waits::await_winner(C::backoff, |(rt, slot)| {
+                rt == self.runtime_id
+                    && !matches!(
+                        state::load::<C>(self.nodes.get(slot).state_cell()),
+                        NodeState::New | NodeState::Dirty
+                    )
+            });
             return None;
         }
         match cycle_state::take_unwind_kind() {
@@ -384,6 +427,11 @@ impl<C: Cells> Runtime<C> {
         holds.extend(also.map(|x| (self.runtime_id, x.0)));
         holds.extend(cycle_state::held_keys());
         holds.extend(set_stack::claims());
+        holds.extend(
+            reserve::held()
+                .into_iter()
+                .filter(|&c| c != (self.runtime_id, on.0)),
+        );
         // A thread that holds nothing is no one's owner, so no waits-for
         // cycle can pass through it and it never needs a registration.
         if holds.is_empty() {
@@ -441,6 +489,32 @@ impl<C: Cells> Runtime<C> {
         } else {
             C::backoff(*spins);
         }
+    }
+
+    /// Waits, as a claim wait on `id`, until no other thread reserves it
+    /// at `generation`, holding `also`'s claim outside its frames. Leaves
+    /// `spins` non-zero, so the claim retried after it is a waited one.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn wait_out_reservation(
+        &self,
+        id: NodeId,
+        generation: u32,
+        also: Option<NodeId>,
+        spins: &mut u32,
+    ) {
+        let claim = (self.runtime_id, id.0);
+        // Release, so a test that sees the count also sees this thread's
+        // unclaim of `id` before it.
+        #[cfg(test)]
+        if reserve::elsewhere(claim, generation) {
+            self.reservation_waits
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        while reserve::elsewhere(claim, generation) {
+            self.spin_holding(id, also, spins, || !reserve::elsewhere(claim, generation));
+        }
+        *spins = (*spins).max(1);
     }
 
     /// Runs a cycle callback with no lock held, as value code, under a
@@ -522,16 +596,14 @@ impl<C: Cells> Runtime<C> {
                 .find(|f| f.node.0 == slot && f.rt == rt)
                 .map(|f| f.cidx)
         });
-        let held = cycle_state::with_held(|h| {
-            h.get(&(rt, slot)).map(|e| {
-                (
-                    e.anchor(),
-                    e.in_cu,
-                    e.buf.is_some(),
-                    e.episode.clone(),
-                    e.ep,
-                )
-            })
+        let held = self.look_held(slot, Look::here(), |e| {
+            (
+                e.anchor(),
+                e.in_cu,
+                e.buf().is_some(),
+                e.episode.clone(),
+                e.ep,
+            )
         });
         // A held node with a virtual frame stands for a frame on the stack.
         let on_stack = match on_stack {
@@ -608,7 +680,7 @@ impl<C: Cells> Runtime<C> {
             // One position above its reader, as the driver runs a held
             // entry: nested member runs at one anchor would share it, and a
             // doom marks frames by position.
-            let mut r5 = self.member_run(slot, at + 1, true);
+            let mut r5 = self.member_run(slot, at + 1, true, false, false);
             // A read past the budget in the member run doomed it. If the
             // member run was the doom's bottom frame, its context runs here
             // until the member is buffered, and the loop's member run passes
@@ -667,19 +739,20 @@ impl<C: Cells> Runtime<C> {
                 return unwind.0.clone();
             }
         }
+        self.note_unwound_read(&*payload, cycle_state::unwind_kind());
         resume_unwind(payload)
     }
 
     /// A clone of a held node's current value (`s`) or buffer.
     fn held_value<T: Value>(&self, slot: u32, current: bool) -> T {
-        cycle_state::with_held(|h| {
-            let e = &h[&(self.runtime_id, slot)];
-            let v = if current { &e.s } else { &e.buf };
+        self.look_held(slot, Look::here(), |seen| {
+            let v = if current { &seen.s } else { seen.buf() };
             let v = v
                 .as_ref()
                 .expect("incr-core: a held member has a value to read");
             value_code::run(|| downcast::<T>(v).clone())
         })
+        .expect("incr-core: a read member is held")
     }
 
     /// A strategy member's value when no episode runs: `g` of the cycle
@@ -719,12 +792,22 @@ impl<C: Cells> Runtime<C> {
     /// Runs held node `slot`'s closure as a member run at position
     /// `cidx`: its value is buffered in the held map, with the deps it
     /// recorded. Returns the run's lowlink, or the panic it ended in, with
-    /// the node marked failed unless the run was speculative.
+    /// the node marked failed unless the run was speculative. A `walked`
+    /// run finishes a walk's compute, so the virtual frames a doom in it
+    /// makes contain a panic as that walk does. A `stand_in` run of a node
+    /// outside any episode finishes a frame the unbounded run computes
+    /// natively, so its panic marks the node failed as that compute's
+    /// landing does, never counted as a member's failure nested in its
+    /// readers' runs. Otherwise a run that finishes a doomed one counts the
+    /// failures marked since the earliest of those runs began as nested in
+    /// it.
     pub(super) fn member_run(
         &self,
         slot: u32,
         cidx: u32,
         doomable: bool,
+        walked: bool,
+        stand_in: bool,
     ) -> Result<Option<u32>, Payload> {
         let id = NodeId(slot);
         let compute = {
@@ -736,27 +819,43 @@ impl<C: Cells> Runtime<C> {
                 .map(std::ptr::from_ref)
                 .expect("incr-core: a held node is a query")
         };
-        let ctl = ComputeCtl::new(if doomable {
-            cycle::BUFFERED
-        } else {
-            cycle::BUFFERED | cycle::NO_DOOM
-        });
+        let ctl = ComputeCtl::new(
+            if doomable {
+                cycle::BUFFERED
+            } else {
+                cycle::BUFFERED | cycle::NO_DOOM
+            } | if walked { cycle::WALKED } else { 0 },
+        );
         ctl.lowlink.set(cidx);
         self.dep_stack
             .push_frame_at(self.runtime_id, id, &ctl, cidx);
+        let mut began = None;
         if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
+            self.start_run(id, cidx, &ctl);
             if let Some(low) = self.take_low(id, cidx) {
                 ctl.lower(low);
             }
+            began = self.take_run_failures(id, cidx);
+            self.divert_for_deliveries(id, cidx);
         }
         // SAFETY: this thread holds the node's claim, so its closure is
         // not freed (see `compute_attempts`).
         let compute = unsafe { &*compute };
-        let failures = cycle_state::failures();
+        let failures = began.unwrap_or_else(cycle_state::failures);
         let first = replay::peek_id();
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
-        let deps = self.dep_stack.pop_frame();
+        let (deps, reading) = self.dep_stack.pop_frame_reading();
         let word = value_code::thread_word();
+        // A member run starts after its episode root's pop, so nothing
+        // below it drops what it kept.
+        if word & value_code::KEPT_BIT != 0 {
+            replay::drop_kept_from(self.runtime_id, cidx);
+        }
+        if let Err(payload) = &result {
+            if word & value_code::UNWIND_MASK != 0 {
+                clear_caught_cycle(&**payload, &deps, reading);
+            }
+        }
         if word & (value_code::MEMO_BIT | value_code::UNWIND_MASK) != 0
             && self.after_pop(word, result.is_ok())
         {
@@ -768,6 +867,13 @@ impl<C: Cells> Runtime<C> {
         if ctl.has(cycle::DOOMED)
             && (result.is_ok() || !matches!(cycle_state::unwind_kind(), Some(UnwindKind::Wound)))
         {
+            replay::note_run_failures(
+                self.runtime_id,
+                slot,
+                self.nodes.get(slot).generation(),
+                cidx,
+                failures,
+            );
             self.member_run_doomed(slot, cidx, first, &ctl, result.err());
             return Ok(None);
         }
@@ -785,23 +891,35 @@ impl<C: Cells> Runtime<C> {
                 return result.map(|_| None);
             }
         }
-        let replaced = cycle_state::with_held(|h| {
+        let look = Look::here();
+        let (replaced, spec_buf) = cycle_state::with_held(|h| {
             let e = h
                 .get_mut(&(self.runtime_id, slot))
                 .expect("incr-core: a member run's node is held");
-            e.record_run(deps);
-            e.opened = !ctl.children.get().is_null();
-            e.poisoned |= ctl.has(cycle::POISONED);
+            let out = e.record(
+                look,
+                deps,
+                ctl.buf.take(),
+                !ctl.children.get().is_null(),
+                ctl.has(cycle::POISONED),
+            );
             // An engine unwind is no fault of the member's.
-            if result.is_err()
-                && cycle_state::failures() == failures
-                && cycle_state::unwind_kind().is_none()
-            {
-                cycle_state::mark_failed(e);
+            if result.is_err() && cycle_state::unwind_kind().is_none() {
+                if stand_in && e.episode.is_none() {
+                    e.failed = true;
+                } else if cycle_state::failures() == failures {
+                    cycle_state::mark_failed(e);
+                }
             }
-            std::mem::replace(&mut e.buf, ctl.buf.take())
+            out
         });
         drop(replaced);
+        drop(spec_buf);
+        if word & value_code::REPLAY_BIT != 0
+            && (result.is_ok() || cycle_state::unwind_kind().is_none())
+        {
+            self.end_run(id, cidx);
+        }
         result.map(|_| Some(ctl.lowlink.get()))
     }
 
@@ -822,18 +940,18 @@ impl<C: Cells> Runtime<C> {
         cycle_state::take_unwind_kind();
         let mut bag = Deferred::new();
         if let Some(payload) = payload.and_then(|p| self.restore_contained(p)) {
-            bag.push_erased(payload);
+            bag.push_erased(Box::new(Unbuilt::new(payload)));
         }
         if let Some(value) = ctl.buf.take() {
-            bag.push_erased(value);
+            bag.push_erased(Box::new(Unbuilt::new(value)));
         }
         self.release_held_from(cidx + 1, true, Some(UnwindKind::Discard), &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
-                .and_then(|e| e.buf.take())
+                .and_then(Held::discard_buf)
         });
         if let Some(old) = old {
-            bag.push_erased(old);
+            bag.push_erased(Box::new(old));
         }
         replay::unwind_past_since(self.runtime_id, cidx + 1, first);
         bag.drain(self);
@@ -858,11 +976,18 @@ impl<C: Cells> Runtime<C> {
         let lowlink = ctl.lowlink.get().min(cidx);
         let seeded = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & HAS_STRATEGY != 0;
         let mut held = Held::new(generation, lowlink, seeded, first);
-        held.buf = ctl.buf.take();
-        held.poisoned = ctl.has(cycle::POISONED);
         held.wrote = ctl.wrote.get() != 0;
-        held.opened = !ctl.children.get().is_null();
-        held.record_run(deps);
+        let (replaced, spec_buf) = held.record(
+            Look::here(),
+            deps,
+            ctl.buf.take(),
+            !ctl.children.get().is_null(),
+            ctl.has(cycle::POISONED),
+        );
+        debug_assert!(
+            replaced.is_none() && spec_buf.is_none(),
+            "incr-core: a new claim replaces nothing"
+        );
         held.own(cidx, id.0, None);
         let displaced = cycle_state::with_held(|h| h.insert((rt, id.0), held));
         debug_assert!(displaced.is_none(), "incr-core: node {} held twice", id.0);
@@ -881,7 +1006,7 @@ impl<C: Cells> Runtime<C> {
             self.set_drop_kind();
             bag.drain_carried(Box::new(cycle::DiscardUnwind));
         }
-        self.episode(id, cidx, bag)
+        self.episode(id, cidx, ctl.has(cycle::WALKED), bag)
     }
 
     /// Every claim of this runtime held at or above `cidx`, re-anchored at
@@ -901,12 +1026,23 @@ impl<C: Cells> Runtime<C> {
     /// into `members`.
     fn member_graph(&self, members: &[u32]) -> Vec<Vec<usize>> {
         let rt = self.runtime_id;
-        cycle_state::with_held(|h| {
+        let look = Look::here();
+        let mut spec_bufs = Vec::new();
+        let graph = cycle_state::with_held(|h| {
             members
                 .iter()
                 .map(|m| {
-                    let mut out: Vec<usize> = h[&(rt, *m)]
-                        .last
+                    let (seen, spec_buf) = h
+                        .get_mut(&(rt, *m))
+                        .expect("incr-core: an episode member is held")
+                        .look(look);
+                    debug_assert!(
+                        spec_buf.is_none(),
+                        "incr-core: an episode member is settled before its graph"
+                    );
+                    spec_bufs.extend(spec_buf);
+                    let mut out: Vec<usize> = seen
+                        .last()
                         .iter()
                         .filter_map(|(d, _)| members.binary_search(&d.0).ok())
                         .collect();
@@ -915,7 +1051,9 @@ impl<C: Cells> Runtime<C> {
                     out
                 })
                 .collect()
-        })
+        });
+        self.drop_spec_bufs(spec_bufs);
+        graph
     }
 
     /// Runs `f`, user code attributed to member `slot`: a panic marks the
@@ -940,32 +1078,107 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Ends an episode with an unwind: every member is released, a member
-    /// whose own code panicked through fix 5's panic path and the others
-    /// with the discard landing, and the unwind resumes.
+    /// Ends an episode with an unwind: every member is released as
+    /// [`Self::release_held_from`] lands it, and the unwind resumes, or
+    /// stops at the episode's boundary if the walk's entry rooting it
+    /// contains it.
     fn abort_episode(&self, cidx: u32, payload: Payload, bag: &mut Deferred<C>) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.note_unwound_read(&*payload, kind);
+        let contain = self.episode_contains(cidx, kind, &*payload);
         self.release_unwound_from(cidx, u32::MAX, kind, kind.is_some(), Some(&*payload), bag);
-        // The root's reader that catches the unwind has read a node that
-        // did not land, as after a single node's unwind.
-        self.dep_stack.poison_current_frame(self.runtime_id);
-        cycle_state::set_unwind_kind(kind);
-        bag.drain_carried(payload)
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
+        }
+        if contain {
+            self.raise_contained(cidx, payload);
+        }
+        self.leave_frame(kind, payload, bag)
+    }
+
+    /// Whether the walk's entry whose compute roots the episode at `cidx`,
+    /// if one does, contains its abort, asked before the releases as
+    /// `compute_panicked` asks. A contained abort drops the replay contexts
+    /// the root's frame opened, as that frame's unwind would; the caller
+    /// tells the reading frame of any other that its read unwound, after
+    /// the landings it keeps a copy of. A cycle of the episode's own held
+    /// members escapes, as a direct episode's does: containing it lets a
+    /// retry that reaches those members as walk entries answer otherwise
+    /// than the unbounded run. A cycle a member run met through nodes the
+    /// episode does not hold is that run's unwind, and is contained as one.
+    fn episode_contains(
+        &self,
+        cidx: u32,
+        kind: Option<UnwindKind>,
+        payload: &(dyn Any + Send),
+    ) -> bool {
+        let contain = contain_impl::walked_episode(cidx).is_some_and(|root| {
+            !self.own_members_cycle(root, payload) && self.containable(root, cidx, kind, payload)
+        });
+        if contain {
+            replay::unwind_past(self.runtime_id, cidx);
+        }
+        contain
+    }
+
+    /// Whether `payload` is a cycle whose participants, `root` aside, are
+    /// all claims this thread holds.
+    fn own_members_cycle(&self, root: NodeId, payload: &(dyn Any + Send)) -> bool {
+        payload.downcast_ref::<CycleUnwind>().is_some_and(|c| {
+            c.0.participants()
+                .iter()
+                .all(|p| p.slot() == root.0 || cycle_state::holds(self.runtime_id, p.slot()))
+        })
     }
 
     /// Drops a user value an episode no longer needs, attributing a
     /// panicking `Drop` to the member it belonged to.
-    fn drop_member_value(
-        &self,
-        slot: u32,
-        cidx: u32,
-        value: Option<Erased>,
-        bag: &mut Deferred<C>,
-    ) {
+    fn drop_member_value<V>(&self, slot: u32, cidx: u32, value: Option<V>, bag: &mut Deferred<C>) {
         if let Some(value) = value {
             self.attributed(slot, cidx, bag, || drop(value));
         }
+    }
+
+    /// Whether episode member `slot` has no buffer, a speculative run's
+    /// settled first.
+    fn unbuffered(&self, slot: u32) -> bool {
+        let (spec_buf, none) = self.take_held(slot, |e| {
+            let (seen, spec_buf) = e.look(Look::here());
+            (spec_buf, seen.buf().is_none())
+        });
+        drop(spec_buf);
+        none
+    }
+
+    /// `f` on held node `slot`'s run as `look` sees it, if held.
+    pub(super) fn look_held<R>(
+        &self,
+        slot: u32,
+        look: Look,
+        f: impl FnOnce(&Seen<&mut Held>) -> R,
+    ) -> Option<R> {
+        let mut f = Some(f);
+        loop {
+            // What a settle took is dropped before `f` runs, which may run
+            // user code; the claim's next look settles nothing.
+            let seen = cycle_state::with_held(|h| {
+                let Some(e) = h.get_mut(&(self.runtime_id, slot)) else {
+                    return Ok(None);
+                };
+                match e.look(look) {
+                    (seen, None) => Ok(Some(f.take().expect("look_held calls f once")(&seen))),
+                    (_, Some(spec_buf)) => Err(spec_buf),
+                }
+            });
+            match seen {
+                Ok(seen) => return seen,
+                Err(spec_buf) => self.drop_spec_bufs(Some(spec_buf)),
+            }
+        }
+    }
+
+    /// Drops what settles took off claims, outside the held map.
+    fn drop_spec_bufs(&self, spec_bufs: impl IntoIterator<Item = Unbuilt>) {
+        spec_bufs.into_iter().for_each(drop);
     }
 
     fn take_held<R>(&self, slot: u32, f: impl FnOnce(&mut Held) -> R) -> R {
@@ -995,9 +1208,9 @@ impl<C: Cells> Runtime<C> {
                 id: replay::member_run_episode(cidx),
                 slot,
             });
-        let ran = self.member_run(slot, cidx, true);
+        let ran = self.member_run(slot, cidx, true, false, false);
         replay::leave_member_run();
-        self.drop_deliveries(replay::run_ended(
+        drop(replay::run_ended(
             self.runtime_id,
             cidx,
             matches!(ran, Ok(None)),
@@ -1014,8 +1227,14 @@ impl<C: Cells> Runtime<C> {
 
     /// The episode rooted at `root`, at conceptual-stack position `cidx`:
     /// iterate the members to a landing, defer the group to a lower root,
-    /// or dissolve it.
-    pub(super) fn episode(&self, root: NodeId, cidx: u32, bag: &mut Deferred<C>) -> PopEnd {
+    /// or dissolve it. `walked` if the root's compute is a walk's entry.
+    pub(super) fn episode(
+        &self,
+        root: NodeId,
+        cidx: u32,
+        walked: bool,
+        bag: &mut Deferred<C>,
+    ) -> PopEnd {
         #[cfg(test)]
         self.episodes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1029,6 +1248,7 @@ impl<C: Cells> Runtime<C> {
             members: self.claim_members(cidx),
             cu: Vec::new(),
             round: None,
+            walked,
         });
         #[cfg(test)]
         self.episodes_seen
@@ -1041,7 +1261,24 @@ impl<C: Cells> Runtime<C> {
     /// Runs episode `ep` on from where it stands. A member run that a doom
     /// discards suspends it in the context of that run's virtual frame,
     /// whose pop resumes it with the same member in the same iteration.
-    pub(super) fn run_episode(&self, mut ep: Box<Episode>, bag: &mut Deferred<C>) -> PopEnd {
+    ///
+    /// An episode rooted at a walk's entry is where its contained abort
+    /// stops, so that the entry's compute ends `Contained`.
+    pub(super) fn run_episode(&self, ep: Box<Episode>, bag: &mut Deferred<C>) -> PopEnd {
+        if !ep.walked {
+            return self.episode_rounds(ep, bag);
+        }
+        let _walked = contain_impl::WalkedEpisode::enter(ep.cidx, ep.root);
+        match catch_unwind(AssertUnwindSafe(|| self.episode_rounds(ep, bag))) {
+            Ok(end) => end,
+            Err(payload) => {
+                self.contain_unwind(payload, bag);
+                PopEnd::Contained
+            }
+        }
+    }
+
+    fn episode_rounds(&self, mut ep: Box<Episode>, bag: &mut Deferred<C>) -> PopEnd {
         let rt = self.runtime_id;
         let cidx = ep.cidx;
         let id = ep.id;
@@ -1071,18 +1308,27 @@ impl<C: Cells> Runtime<C> {
                     .copied()
                     .filter(|m| strategies.binary_search_by_key(m, |(s, _)| *s).is_err())
                     .collect();
-                cycle_state::with_held(|h| {
+                // A restart clears what the members installed, which a later
+                // settle would put back.
+                let look = Look::here();
+                let settled: Vec<Unbuilt> = cycle_state::with_held(|h| {
                     h.root_at(rt, &ep.members, cidx);
-                    for m in &ep.members {
-                        let e = h
-                            .get_mut(&(rt, *m))
-                            .expect("incr-core: an episode member is held");
-                        e.episode = Some(cycle.clone());
-                        e.ep = id;
-                        e.in_cu = ep.cu.binary_search(m).is_ok();
-                        e.installed.clear();
-                    }
+                    ep.members
+                        .iter()
+                        .filter_map(|m| {
+                            let (mut e, spec_buf) = h
+                                .get_mut(&(rt, *m))
+                                .expect("incr-core: an episode member is held")
+                                .look(look);
+                            e.episode = Some(cycle.clone());
+                            e.ep = id;
+                            e.in_cu = ep.cu.binary_search(m).is_ok();
+                            e.clear_installed();
+                            spec_buf
+                        })
+                        .collect()
                 });
+                drop(settled);
                 // Every claim precedes this capture, because membership growth
                 // restarts the episode.
                 let stamp_rev = self.current_revision();
@@ -1119,7 +1365,7 @@ impl<C: Cells> Runtime<C> {
                     // 1. Clear the unseeded buffers.
                     Step::Clear => {
                         for &m in &r.unseeded {
-                            let old = self.take_held(m, |e| e.buf.take());
+                            let old = self.take_held(m, Held::discard_buf);
                             self.drop_member_value(m, cidx, old, bag);
                         }
                         r.low = cidx;
@@ -1144,7 +1390,7 @@ impl<C: Cells> Runtime<C> {
                             r.step = Step::Check;
                             continue;
                         };
-                        if self.take_held(m, |e| e.buf.is_none())
+                        if self.unbuffered(m)
                             && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
                         {
                             return self.suspend_episode(ep);
@@ -1221,7 +1467,15 @@ impl<C: Cells> Runtime<C> {
                         // 4. The strategy members' next values.
                         let mut converged = vec![true; r.strategies.len()];
                         for (i, (m, s)) in r.strategies.iter().enumerate() {
-                            let out = self.take_held(*m, |e| e.buf.take());
+                            let (out, spec_buf) = self.take_held(*m, |e| {
+                                let (mut seen, spec_buf) = e.look(Look::here());
+                                (seen.take_buf(), spec_buf)
+                            });
+                            debug_assert!(
+                                spec_buf.is_none(),
+                                "incr-core: a strategy member is settled before its step"
+                            );
+                            self.drop_member_value(*m, cidx, spec_buf, bag);
                             if s.max_iterations().is_none() {
                                 self.drop_member_value(*m, cidx, out, bag);
                                 continue;
@@ -1287,7 +1541,7 @@ impl<C: Cells> Runtime<C> {
                             .filter(|m| ep.cu.binary_search(m).is_err())
                             .collect();
                         for &m in &outside {
-                            let old = self.take_held(m, |e| e.buf.take());
+                            let old = self.take_held(m, Held::discard_buf);
                             self.drop_member_value(m, cidx, old, bag);
                         }
                         r.low = cidx;
@@ -1306,7 +1560,7 @@ impl<C: Cells> Runtime<C> {
                             break;
                         };
                         *next += 1;
-                        if self.take_held(m, |e| e.buf.is_none())
+                        if self.unbuffered(m)
                             && !self.run_member(m, cidx, (id, root), &mut r.low, bag)
                         {
                             *next -= 1;
@@ -1386,12 +1640,20 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Ends the claim the root of a dissolved episode holds as a member,
-    /// returning whether it was taken from New and whether it wrote.
+    /// returning whether it was taken from New and whether it wrote. A root
+    /// still in a landed group has that record noted, so this entry's retry
+    /// of the root computes it alone.
     pub(super) fn end_dissolved(&self, root: NodeId, bag: &mut Deferred<C>) -> (bool, bool) {
         let e = cycle_state::with_held(|h| h.remove(&(self.runtime_id, root.0)))
             .expect("incr-core: a dissolved root is held");
+        if C::u8_load_relaxed(self.nodes.get_with_flags(root.0).1) & IN_GROUP != 0 {
+            let group = self.inner.read().member_recs.get(&root.0).cloned();
+            if let Some(group) = group {
+                cycle_state::note_dissolved_group(self.runtime_id, root.0, group);
+            }
+        }
         let ended = (e.first, e.wrote);
-        bag.push_erased(Box::new((e.buf, e.s)));
+        bag.push_erased(Box::new(e.into_values()));
         ended
     }
 
@@ -1478,15 +1740,15 @@ impl<C: Cells> Runtime<C> {
             let entry = cycle_state::with_held(|h| h.remove(&(rt, m)));
             if let Some(e) = entry {
                 self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
-                bag.push_erased(Box::new((e.buf, e.s)));
+                bag.push_erased(Box::new(e.into_values()));
             }
         }
     }
 
-    /// Lands every claim of this runtime held at or above `cidx`: a claim
-    /// whose own code panicked in user code takes fix 5's panic path, and
-    /// every other claim, and every claim under an engine unwind or a
-    /// discard (`discarding`), the discard landing.
+    /// Lands every claim of this runtime held at or above `cidx`: with
+    /// `discarding`, each takes the discard landing; otherwise, under a
+    /// user panic, a claim whose own code panicked takes fix 5's panic
+    /// path and every other claim [`Self::land_panic_released`].
     pub(super) fn release_held_from(
         &self,
         cidx: u32,
@@ -1514,6 +1776,18 @@ impl<C: Cells> Runtime<C> {
     ) {
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
         self.release_held_where(cidx, discarding, kind, subtree, &[], payload, bag);
+    }
+
+    /// Whether this thread holds no claim of `id` once the frame at `cidx`
+    /// unwinds: it has no frame of `id`, and holds no claim of it or one
+    /// anchored at or above `cidx` that the unwind releases.
+    pub(super) fn unwind_releases(&self, id: NodeId, cidx: u32) -> bool {
+        let rt = self.runtime_id;
+        self.dep_stack.frame_cidx(rt, id).is_none()
+            && cycle_state::with_held(|h| {
+                h.get(&(rt, id.0))
+                    .is_none_or(|e| e.anchor() >= cidx && released_at(rt, e, cidx))
+            })
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
@@ -1557,11 +1831,7 @@ impl<C: Cells> Runtime<C> {
                 slots.dedup();
             }
             slots.retain(|m| {
-                !keep.contains(m)
-                    && h.get(&(rt, *m)).is_some_and(|e| {
-                        !replay::is_suspended(e.ep)
-                            && !replay::waits_for_suspended(rt, e.anchor(), cidx)
-                    })
+                !keep.contains(m) && h.get(&(rt, *m)).is_some_and(|e| released_at(rt, e, cidx))
             });
             slots
                 .into_iter()
@@ -1575,23 +1845,53 @@ impl<C: Cells> Runtime<C> {
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
         let stamp_rev = self.current_revision();
         let verify_rev = C::walked(&self.walk, &self.revision);
+        let look = Look::here();
         for (slot, e) in entries {
+            let (e, spec_buf) = e.into_look(look);
+            if let Some(spec_buf) = spec_buf {
+                bag.push_erased(Box::new(spec_buf));
+            }
             let id = NodeId(slot);
-            if e.failed && !discarding {
+            let attempt = Attempt {
+                first: e.first,
+                cidx,
+                stamp_rev,
+                verify_rev,
+            };
+            if discarding {
+                self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
+            } else if e.failed {
                 let (node, flags) = self.nodes.get_with_flags(slot);
-                let attempt = Attempt {
-                    first: e.first,
-                    cidx,
-                    stamp_rev,
-                    verify_rev,
-                };
                 self.land_failed(
-                    id, node, flags, attempt, e.wrote, &e.deps, &released, payload, None, bag,
+                    id,
+                    node,
+                    flags,
+                    attempt,
+                    e.wrote,
+                    e.deps(),
+                    &released,
+                    payload,
+                    bag,
                 );
             } else {
-                self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
+                self.land_panic_released(id, attempt, e.wrote, e.deps(), &released, bag);
             }
-            bag.push_erased(Box::new((e.buf, e.s)));
+            // A discarded claim's run is one the unbounded run never makes,
+            // or makes again on the retry.
+            if kind == Some(UnwindKind::Discard) {
+                bag.push_erased(Box::new(Unbuilt::new(Box::new(e.into_values()))));
+            } else {
+                bag.push_erased(Box::new(e.into_values()));
+            }
+        }
+        // A user panic's release is one the unbounded run makes too, and it
+        // ends the runs of the released nodes' frames: a delivery, claim
+        // watermark or failure count kept for a retry of one of them would
+        // reach the node's next, fresh run at that position. A cycle unwind's release keeps them, since the
+        // doomed run's retry reads the cycle from them again, as do a doom's
+        // discard and a wound.
+        if kind.is_none() {
+            self.end_released_runs(&released);
         }
     }
 
@@ -1613,7 +1913,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        self.land_single(id, node, flags, target, target);
+        self.land_single_as(id, node, flags, target, target, true);
     }
 
     /// [`Self::discard_land`] of a claim released by an unwind of `kind`.
@@ -1651,12 +1951,12 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let target = self.discard_target(id, first, wrote, stamp_rev, children, bag);
-        self.land(id, self.nodes.get(id.0), target, target);
+        self.land_unrun(id, self.nodes.get(id.0), target);
     }
 
     /// Lands the discarded attempt's children as `children` and stamps the
     /// node for its discard landing, which lands it in the state returned.
-    fn discard_target(
+    pub(super) fn discard_target(
         &self,
         id: NodeId,
         first: bool,
@@ -1667,7 +1967,12 @@ impl<C: Cells> Runtime<C> {
     ) -> NodeState {
         let (node, flags) = self.nodes.get_with_flags(id.0);
         self.children_landing(id, flags, children, false, bag);
-        if wrote {
+        if wrote && replay::speculative() {
+            self.unwrite_speculative(node, bag);
+            node.max_changed_at(stamp_rev);
+            node.set_verified_at(0);
+            NodeState::New
+        } else if wrote {
             node.max_changed_at(stamp_rev);
             NodeState::New
         } else if first {
@@ -1678,25 +1983,47 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Takes back the value a discarded speculative run wrote into `node`'s
+    /// slot, which the unbounded run may never build, so that no later
+    /// write displaces it into a real run's bag. The node lands New with an
+    /// empty slot, as a first compute that wrote nothing.
+    #[cold]
+    #[inline(never)]
+    fn unwrite_speculative(&self, node: &NodeData<C>, bag: &mut Deferred<C>) {
+        let arena = self.arenas.erased(node.type_tag());
+        if let Some(value) = arena.clear_unbuilt(node.arena_slot()) {
+            bag.push_erased(Box::new(value));
+        }
+    }
+
     /// Lands held node `slot` from its last run's buffer, as
     /// `compute_attempts` lands a run that popped neither LOW nor rooting a
     /// claim: a virtual hit's claim stood for its frame on the stack, and
     /// that frame turned out to be no cycle's member. `revs` are the stamp
-    /// and verify revisions taken before the run. `Ok(false)` if a dep went
-    /// stale, so that the node landed New for a retry; `Err` if writing the
-    /// value panicked, with the claim still held.
+    /// and verify revisions taken before the run. `Ok` with the state the
+    /// node landed in, or `None` if a dep went stale, so that the node
+    /// landed New for a retry; `Err` if writing the value panicked, with
+    /// the claim still held.
     pub(super) fn land_alone(
         &self,
         slot: u32,
         (stamp_rev, verify_rev): (u64, u64),
         bag: &mut Deferred<C>,
-    ) -> Result<bool, Payload> {
+    ) -> Result<Option<NodeState>, Payload> {
         let rt = self.runtime_id;
         let id = NodeId(slot);
         let (node, flags) = self.nodes.get_with_flags(slot);
-        let mut e = cycle_state::with_held(|h| h.remove(&(rt, slot)))
+        let e = cycle_state::with_held(|h| h.remove(&(rt, slot)))
             .expect("incr-core: a landing claim is held");
-        let value = e.buf.take().expect("incr-core: a finished run has a value");
+        debug_assert!(
+            !e.spec_written() || replay::speculative(),
+            "incr-core: a held node lands a speculative run's buffer"
+        );
+        let (mut e, spec_buf) = e.into_look(Look::here());
+        if let Some(spec_buf) = spec_buf {
+            bag.push_erased(Box::new(spec_buf));
+        }
+        let value = e.take_buf().expect("incr-core: a finished run has a value");
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
         let first = e.first;
@@ -1712,46 +2039,46 @@ impl<C: Cells> Runtime<C> {
                 changed
             }
             Err(payload) => {
-                cycle_state::with_held(|h| h.insert((rt, slot), e));
+                cycle_state::with_held(|h| h.insert((rt, slot), e.into_held()));
                 return Err(payload);
             }
         };
         if changed || first {
             node.max_changed_at(stamp_rev);
         }
-        let published = self.publish_deps(id, &e.last, None, verify_rev, bag);
+        let published = self.publish_deps(id, e.last(), None, verify_rev, bag);
         let landed = if published == Publish::Stale {
             if first && !e.wrote {
                 node.set_verified_at(0);
             }
-            self.children_landing(id, flags, ChildLanding::Discard, e.opened, bag);
+            self.children_landing(id, flags, ChildLanding::Discard, e.opened(), bag);
             // Leaving the group is safe: a New node's record is inert.
             self.land_single(id, node, flags, NodeState::New, NodeState::New);
-            false
+            None
         } else {
-            if e.poisoned {
+            if e.poisoned() {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
             }
-            let (target, children) = if published == Publish::Superseded || e.poisoned {
+            let (target, children) = if published == Publish::Superseded || e.poisoned() {
                 (NodeState::Dirty, ChildLanding::Keep)
             } else {
                 (NodeState::Clean, ChildLanding::Sweep)
             };
-            self.children_landing(id, flags, children, e.opened, bag);
+            self.children_landing(id, flags, children, e.opened(), bag);
             // The run computed the node alone, as the frame's run in the
             // unbounded run does, so the node leaves its group.
-            self.land_single(id, node, flags, target, NodeState::Dirty);
+            let landed = self.land_single(id, node, flags, target, NodeState::Dirty);
             self.record_trace(
                 id,
                 crate::trace::TraceAction::Recomputed {
                     value_changed: changed,
                 },
             );
-            true
+            Some(landed)
         };
-        bag.push_erased(Box::new((e.buf, e.s)));
+        bag.push_erased(Box::new(e.into_values()));
         Ok(landed)
     }
 
@@ -1768,8 +2095,14 @@ impl<C: Cells> Runtime<C> {
         cidx: u32,
         bag: &mut Deferred<C>,
     ) -> PopEnd {
+        if !C::SINGLE_THREADED {
+            // Before the members land, so that a read of one of their
+            // landings also reads the count.
+            cycle_state::own_episode(self.runtime_id);
+            C::u64_fetch_add(&self.episodes_landed, 1);
+        }
         let rt = self.runtime_id;
-        let mut entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
+        let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             members
                 .iter()
                 .map(|&m| {
@@ -1781,11 +2114,26 @@ impl<C: Cells> Runtime<C> {
                 })
                 .collect()
         });
+        debug_assert!(
+            replay::speculative() || entries.iter().all(|(_, e)| !e.spec_written()),
+            "incr-core: an episode lands a speculative run's record"
+        );
+        let look = Look::here();
+        let mut entries: Vec<(u32, Seen<Held>)> = entries
+            .into_iter()
+            .map(|(m, e)| {
+                let (e, spec_buf) = e.into_look(look);
+                if let Some(spec_buf) = spec_buf {
+                    bag.push_erased(Box::new(spec_buf));
+                }
+                (m, e)
+            })
+            .collect();
 
         // Step 2: validate, install and record the group under one hold.
         let mut inner = self.inner.write();
         let stale = entries.iter().any(|(_, e)| {
-            e.deps.iter().any(|&(d, generation)| {
+            e.deps().iter().any(|&(d, generation)| {
                 let dep = self.nodes.get(d.0);
                 dep.generation() != generation || dep.state() == NodeState::Dead
             })
@@ -1801,7 +2149,7 @@ impl<C: Cells> Runtime<C> {
                 // Leaving the group is safe: a New member's record is inert,
                 // and the root's retry records the group again.
                 self.land_single(NodeId(m), node, flags, NodeState::New, NodeState::New);
-                bag.push_erased(Box::new((e.buf, e.s)));
+                bag.push_erased(Box::new(e.into_values()));
             }
             return PopEnd::Retry;
         }
@@ -1811,7 +2159,7 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(*m);
             let mut old: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| old.push(d));
-            let new: &[NodeId] = &e.installed;
+            let new: &[NodeId] = e.installed();
             superseded |= new.iter().any(|d| {
                 members.binary_search(&d.0).is_err()
                     && !old.contains(d)
@@ -1858,7 +2206,7 @@ impl<C: Cells> Runtime<C> {
                 entries[i].1.changed = true;
             } else {
                 let e = &mut entries[i].1;
-                let value = if e.seeded { e.s.take() } else { e.buf.take() }
+                let value = if e.seeded { e.s.take() } else { e.take_buf() }
                     .expect("incr-core: a landing member has a value");
                 let first = e.first;
                 let wrote = Cell::new(0_u8);
@@ -1882,7 +2230,7 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            if entries[i].1.poisoned {
+            if entries[i].1.poisoned() {
                 node.set_verified_at(0);
             } else {
                 node.max_verified_at(verify_rev);
@@ -1893,7 +2241,7 @@ impl<C: Cells> Runtime<C> {
         // new dep may hide a change.
         let dirty = superseded
             || entries.iter().any(|(m, e)| {
-                e.poisoned || self.nodes.get(*m).state() == NodeState::ComputingDirty
+                e.poisoned() || self.nodes.get(*m).state() == NodeState::ComputingDirty
             });
         for (m, e) in entries {
             let node = self.nodes.get(m);
@@ -1918,20 +2266,23 @@ impl<C: Cells> Runtime<C> {
                 _ => ChildLanding::Discard,
             };
             let flags = self.nodes.get_with_flags(m).1;
-            self.children_landing(NodeId(m), flags, children, e.opened, bag);
+            self.children_landing(NodeId(m), flags, children, e.opened(), bag);
             self.land(NodeId(m), node, target, flagged);
-            bag.push_erased(Box::new((e.buf, e.s)));
+            bag.push_erased(Box::new(e.into_values()));
         }
         PopEnd::Landed
     }
 
-    /// Step 3 ended in a panic (a `PartialEq` of a member's value): every
-    /// member whose slot was written is stamped and lands New, the member
-    /// whose compare panicked lands through fix 5's panic path, and the
-    /// others take the unwind's landing ([`Self::unwound_land`]).
+    /// Step 3 ended in a panic (a `PartialEq` of a member's value): the
+    /// member whose compare panicked lands through fix 5's panic path if
+    /// it wrote nothing, and the others through
+    /// [`Self::land_panic_released`] for a user panic,
+    /// or the unwind's landing ([`Self::unwound_land`]) for an engine
+    /// one, where a member whose slot was written is stamped and lands
+    /// New.
     fn abort_landing(
         &self,
-        entries: &mut [(u32, Held)],
+        entries: &mut [(u32, Seen<Held>)],
         stamp_rev: u64,
         verify_rev: u64,
         cidx: u32,
@@ -1939,19 +2290,19 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.note_unwound_read(&*payload, kind);
+        let contain = self.episode_contains(cidx, kind, &*payload);
         let members: Vec<u32> = entries.iter().map(|(m, _)| *m).collect();
         for (m, e) in entries.iter_mut() {
             let id = NodeId(*m);
+            let attempt = Attempt {
+                first: e.first,
+                cidx,
+                stamp_rev,
+                verify_rev,
+            };
             if e.failed && !e.wrote {
                 let (node, flags) = self.nodes.get_with_flags(*m);
-                let attempt = Attempt {
-                    first: e.first,
-                    cidx,
-                    stamp_rev,
-                    verify_rev,
-                };
-                let deps = std::mem::take(&mut e.deps);
+                let deps = e.take_deps();
                 self.land_failed(
                     id,
                     node,
@@ -1961,17 +2312,22 @@ impl<C: Cells> Runtime<C> {
                     &deps,
                     &members,
                     Some(&*payload),
-                    None,
                     bag,
                 );
+            } else if kind.is_none() {
+                self.land_panic_released(id, attempt, e.wrote, e.deps(), &members, bag);
             } else {
                 self.unwound_land(id, e.first, e.wrote, stamp_rev, kind, bag);
             }
-            bag.push_erased(Box::new((e.buf.take(), e.s.take())));
+            bag.push_erased(Box::new((e.take_buf(), e.s.take())));
         }
-        self.dep_stack.poison_current_frame(self.runtime_id);
-        cycle_state::set_unwind_kind(kind);
-        bag.drain_carried(payload)
+        if !contain {
+            self.note_unwound_read(&*payload, kind);
+        }
+        if contain {
+            self.raise_contained(cidx, payload);
+        }
+        self.leave_frame(kind, payload, bag)
     }
 
     /// Claims group member `m`, Dirty to Computing, for the group verify
@@ -1989,6 +2345,16 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty,
                 NodeState::Computing,
             ) {
+                Ok(()) if self.reserved_elsewhere(NodeId(m), node.generation()) => {
+                    let generation = node.generation();
+                    self.unclaim_unrun(node, true);
+                    let waited = catch_unwind(AssertUnwindSafe(|| {
+                        self.wait_out_reservation(NodeId(m), generation, Some(x), &mut spins)
+                    }));
+                    if let Err(payload) = waited {
+                        self.unclaim_group(x, claimed, bag, payload);
+                    }
+                }
                 Ok(()) => return true,
                 Err(s)
                     if !C::SINGLE_THREADED && is_computing(s) && !self.holds_claim(NodeId(m)) =>
@@ -2030,22 +2396,18 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
-            self.land(
-                NodeId(c),
-                self.nodes.get(c),
-                NodeState::Dirty,
-                NodeState::Dirty,
-            );
+            self.land_unrun(NodeId(c), self.nodes.get(c), NodeState::Dirty);
         }
     }
 
     /// Group verification of the Dirty group member `x`, whose claim
-    /// `compute_one` holds at generation `g`.
+    /// `compute_one` holds at generation `g`, `walked` if as a walk's entry.
     pub(super) fn group_verify(
         &self,
         x: NodeId,
         g: u32,
         visit: Visit,
+        walked: bool,
         bag: &mut Deferred<C>,
     ) -> GroupEnd {
         let rt = self.runtime_id;
@@ -2068,6 +2430,12 @@ impl<C: Cells> Runtime<C> {
         if !group.members.iter().any(|&(m, gen)| m == x.0 && gen == g) {
             return GroupEnd::Ordinary;
         }
+        // A discard keeps the root in the group it dissolved, for other
+        // threads, whose orders verify the group; this entry's retry of the
+        // root computes it alone, as the unbounded run's frame does.
+        if cycle_state::is_dissolved_group(rt, x.0, &group) {
+            return GroupEnd::Ordinary;
+        }
         // The members' runs sit where `x`'s frame would.
         let cidx = self.dep_stack.next_cidx();
         // 1. Claim the other members, Dirty to Computing, in slot order.
@@ -2083,7 +2451,7 @@ impl<C: Cells> Runtime<C> {
                 && self.virtual_position(m, generation).is_some();
             let mut ok = !virtual_member && self.claim_member(x, m, &claimed, bag);
             if ok && node.generation() != generation {
-                self.land(NodeId(m), node, NodeState::Dirty, NodeState::Dirty);
+                self.land_unrun(NodeId(m), node, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
@@ -2094,6 +2462,7 @@ impl<C: Cells> Runtime<C> {
                 h.insert((rt, m), Held::new(generation, cidx, false, false))
             });
             claimed.push(m);
+            self.park(ParkPoint::GroupMemberClaimed(NodeId(m)));
         }
 
         // 2. Did anything any member read change since it was verified?
@@ -2170,15 +2539,16 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         });
-        match self.episode(x, cidx, bag) {
+        match self.episode(x, cidx, walked, bag) {
             PopEnd::Landed => GroupEnd::Done(Computed::Done),
             PopEnd::Deferred => GroupEnd::Done(Computed::Deferred),
             PopEnd::Dissolved => {
                 self.end_dissolved(x, bag);
-                GroupEnd::Ordinary
+                GroupEnd::Dissolved
             }
             PopEnd::Retry => GroupEnd::Retry,
             PopEnd::Suspended | PopEnd::Dropped => GroupEnd::Done(Computed::Discarded),
+            PopEnd::Contained => GroupEnd::Done(Computed::Unsettled),
         }
     }
 }
@@ -2191,4 +2561,28 @@ fn cycle_panic(cycle: Cycle) -> ! {
     let message = format!("incr-core: dependency cycle: {cycle}");
     cycle_state::set_last_cycle(cycle);
     panic!("{message}");
+}
+
+/// Whether an unwind from position `cidx` releases held claim `e`: an
+/// episode suspended over it, or one it waits for, keeps it.
+fn released_at(rt: RuntimeId, e: &Held, cidx: u32) -> bool {
+    !replay::is_suspended(e.ep) && !replay::waits_for_suspended(rt, e.anchor(), cidx)
+}
+
+/// A run that unwinds with a cycle's kind and its own payload, having read
+/// past the read the cycle came in through: its closure caught the cycle,
+/// so the kind is stale and the panic is the closure's, as `read_cold`
+/// makes it at a non-Clean read. A Clean read leaves the kind alone, so the
+/// pop clears it here.
+#[cold]
+#[inline(never)]
+pub(super) fn clear_caught_cycle(payload: &(dyn Any + Send), deps: &[(NodeId, u32)], reading: u64) {
+    if cycle_state::unwind_kind() == Some(UnwindKind::Cycle)
+        && !payload.is::<CycleUnwind>()
+        && deps
+            .last()
+            .is_some_and(|&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) != reading)
+    {
+        cycle_state::set_unwind_kind(None);
+    }
 }

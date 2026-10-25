@@ -223,6 +223,19 @@ impl<C: Cells> Deferred<C> {
     /// `payload` with its kind restored.
     #[cold]
     pub(crate) fn drain_carried(&mut self, payload: Box<dyn Any + Send>) -> ! {
+        self.drop_isolated();
+        resume_unwind(payload)
+    }
+
+    /// Drops every item under [`isolate`], for an owner whose items no
+    /// run of the unbounded run built.
+    #[cold]
+    pub(crate) fn drain_isolated(mut self) {
+        self.drop_isolated();
+        self.forget_empty();
+    }
+
+    fn drop_isolated(&mut self) {
         if let Some(token) = self.dep_list.take() {
             isolate(|| retire_dep_list::<C>(token));
         }
@@ -231,7 +244,6 @@ impl<C: Cells> Deferred<C> {
                 isolate(|| drop(item));
             }
         }
-        resume_unwind(payload)
     }
 }
 
@@ -286,7 +298,9 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
     /// Normal mode: see the module docs.
     #[inline(always)]
     pub(crate) fn drain(mut self, rt: &Runtime<C>) {
-        rt.drop_buried_tickets();
+        if let Some(payload) = rt.drop_buried_tickets() {
+            self.drain_after(rt, payload);
+        }
         if let Err(payload) = catch_unwind(AssertUnwindSafe(|| {
             self.node.drop_parts();
             if self.dep_list.is_some() || self.members.is_some() {
@@ -334,10 +348,25 @@ impl<'rt, C: Cells> DeleteBag<'rt, C> {
         }
     }
 
+    /// A buried ticket's payload panicked as it dropped: the inline node's
+    /// steps still run, a second panic among them isolated, and the rest
+    /// drops, in push order, with the bag as that panic resumes.
+    #[cold]
+    fn drain_after(mut self, rt: &Runtime<C>, payload: Box<dyn Any + Send>) -> ! {
+        isolate(|| self.node.drop_parts());
+        rt.dep_stack.poison_current_frame(rt.runtime_id);
+        resume_unwind(payload)
+    }
+
     /// The normal-mode panic exit: poison the reading frame and resume,
     /// leaving the items not yet dropped to drop, in order, with the bag.
+    /// The tickets the delete buried drop first, a panic of theirs
+    /// isolated, so no later delete raises it.
     #[cold]
     fn unwind(&mut self, rt: &Runtime<C>, payload: Box<dyn Any + Send>) -> ! {
+        if let Some(secondary) = rt.drop_buried_tickets() {
+            mem::forget(secondary);
+        }
         if let Some(members) = self.members.as_mut() {
             members.reverse();
         }
@@ -391,10 +420,45 @@ fn retire_dep_list<C: Cells>(token: RetiredDeps<C>) {
     reclaim_probe::reached(RetireSite::DepListRetire);
 }
 
+/// A value only a speculative or discarded run made, which the unbounded
+/// run never builds, or builds again on the retry: its `Drop` is no event
+/// of that run's, so it drops under [`isolate`] wherever it drops.
+pub(crate) struct Unbuilt<V: ?Sized = dyn Any>(Option<Box<V>>);
+
+impl<V: ?Sized> Unbuilt<V> {
+    pub(crate) fn new(value: Box<V>) -> Self {
+        Self(Some(value))
+    }
+
+    pub(crate) fn value(&self) -> &V {
+        self.0
+            .as_deref()
+            .expect("an unbuilt value is held until it drops")
+    }
+
+    /// The value, for a read that delivers it: from then on it is built.
+    pub(crate) fn into_inner(mut self) -> Box<V> {
+        self.0
+            .take()
+            .expect("an unbuilt value is held until it drops")
+    }
+}
+
+impl<V: ?Sized> Drop for Unbuilt<V> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            #[cfg(all(test, not(loom)))]
+            crate::replay::note_drop();
+            isolate(|| drop(value));
+        }
+    }
+}
+
 /// Runs one cleanup step and swallows its panic, so an exit that already
 /// carries a payload delivers that payload unchanged. The secondary
-/// payload is forgotten, not dropped, because its own `Drop` could
-/// panic again.
+/// payload is dropped under its own catch. If that drop panics too, its
+/// payload is dropped when it is a message and forgotten otherwise, since
+/// its own `Drop` could panic again.
 ///
 /// The thread's engine unwind kind is saved before the step and
 /// restored after it here, discarding whatever the step set, so a wound
@@ -403,7 +467,13 @@ fn retire_dep_list<C: Cells>(token: RetiredDeps<C>) {
 pub(crate) fn isolate(step: impl FnOnce()) {
     let kind = cycle_state::unwind_kind();
     if let Err(payload) = catch_unwind(AssertUnwindSafe(step)) {
-        std::mem::forget(payload);
+        if let Err(again) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+            if again.is::<&'static str>() || again.is::<String>() {
+                drop(again);
+            } else {
+                std::mem::forget(again);
+            }
+        }
     }
     cycle_state::set_unwind_kind(kind);
 }

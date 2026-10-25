@@ -20,10 +20,11 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::cells::{Cells, PtrCell};
+use crate::deferred::Unbuilt;
 use crate::directory::Directory;
 use crate::generic_arena::GenericArena;
 use crate::value::Value;
-use crate::value_slot::Compared;
+use crate::value_slot::{Compared, ValueSlot};
 
 /// Object-safe arena interface, for code that holds a node's tag but
 /// not its value type.
@@ -54,6 +55,11 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     #[doc(hidden)]
     fn clear_value(&self, slot: u32) -> Option<Box<dyn Any>>;
 
+    /// [`Self::clear_value`] for a value no run the unbounded one makes
+    /// built, dropped under isolation wherever its `Drop` runs.
+    #[doc(hidden)]
+    fn clear_unbuilt(&self, slot: u32) -> Option<Unbuilt>;
+
     /// Whether `slot` holds a value. Clones it to find out, so it is for
     /// debug assertions only.
     #[doc(hidden)]
@@ -66,6 +72,16 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     /// A clone of the value in `slot`, if it holds one.
     #[doc(hidden)]
     fn read_erased(&self, slot: u32) -> Option<Box<dyn Any + Send>>;
+
+    /// Whether `slot` holds a value equal to `value`, which must be of the
+    /// arena's type. Runs the type's `PartialEq`, which may panic.
+    #[doc(hidden)]
+    fn equals_erased(&self, slot: u32, value: &(dyn Any + Send)) -> bool;
+
+    /// A clone of `value`, which must be of the arena's type. Runs the
+    /// type's `Clone`, which may panic.
+    #[doc(hidden)]
+    fn clone_erased(&self, value: &(dyn Any + Send)) -> Box<dyn Any + Send>;
 }
 
 impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
@@ -98,6 +114,11 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
         self.clear(slot).map(|d| Box::new(d) as Box<dyn Any>)
     }
 
+    fn clear_unbuilt(&self, slot: u32) -> Option<Unbuilt> {
+        self.clear(slot)
+            .map(|d| Unbuilt::new(<C::ValueSlot<T> as ValueSlot<T>>::isolating(d)))
+    }
+
     fn has_value(&self, slot: u32) -> bool {
         crate::value_code::run(|| self.try_read(slot).is_some())
     }
@@ -108,6 +129,20 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
 
     fn read_erased(&self, slot: u32) -> Option<Box<dyn Any + Send>> {
         crate::value_code::run(|| self.try_read(slot)).map(|v| Box::new(v) as Box<dyn Any + Send>)
+    }
+
+    fn equals_erased(&self, slot: u32, value: &(dyn Any + Send)) -> bool {
+        let value = value
+            .downcast_ref::<T>()
+            .expect("incr-core: a stashed value has its node's type");
+        crate::value_code::run(|| self.eq_current(slot, value))
+    }
+
+    fn clone_erased(&self, value: &(dyn Any + Send)) -> Box<dyn Any + Send> {
+        let value = value
+            .downcast_ref::<T>()
+            .expect("incr-core: a stashed value has its node's type");
+        Box::new(crate::value_code::run(|| value.clone()))
     }
 }
 
@@ -263,8 +298,11 @@ impl<C: Cells> ArenaRegistry<C> {
     #[inline(never)]
     fn add<T: Value>(&self, tags: &mut ArenaTags) -> u16 {
         let type_id = TypeId::of::<T>();
+        // `DIVERTED_TAG` marks a diverted read, so no arena has it.
         let tag = u16::try_from(tags.tags.len())
-            .expect("incr-core: more than 65536 distinct value types in one runtime");
+            .ok()
+            .filter(|&tag| tag != crate::dep_stack::DIVERTED_TAG)
+            .expect("incr-core: more than 65535 distinct value types in one runtime");
         self.entries.grow_to(tag as usize);
         let arena = Arc::new(GenericArena::<T, C>::new());
         let typed = Arc::as_ptr(&arena).cast::<()>();

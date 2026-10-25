@@ -318,7 +318,14 @@ impl<C: Cells> Runtime<C> {
             C::fence_acquire();
             (state::load::<C>(node.state_cell()), stamp)
         };
-        self.dep_stack.record_dep(self.runtime_id, id, gen);
+        // No kept read carries an observer's read to a retry of another
+        // runtime's frame.
+        if self
+            .dep_stack
+            .record_dep_or_foreign(self.runtime_id, id, gen)
+        {
+            self.dep_stack.hold_foreign_reader();
+        }
         self.park(ParkPoint::ObserverAfterEntryCheck(id));
         if observed != NodeState::Clean {
             self.observer_walk(handle, observed, entry_stamp)?;
@@ -385,7 +392,9 @@ impl<C: Cells> Runtime<C> {
             Computed::Deferred => Err(ObsErr::Cycle(stamp)),
             // The reading run is thrown away and its retry reads again.
             Computed::Doomed | Computed::Discarded => Err(ObsErr::Gone),
-            Computed::Skipped(_) => unreachable!("incr-core: a walk's root is never skipped"),
+            Computed::Skipped(_) | Computed::Replan | Computed::Revisit => {
+                unreachable!("incr-core: a walk's root is never skipped or replanned")
+            }
         }
     }
 
