@@ -1833,3 +1833,83 @@ fn shared_retraction_restores_a_released_members_rerun() {
     )
     .assert_clean();
 }
+
+/// **A retraction restores a released claim's entry.** `x` (Fixpoint)
+/// reads `y`, which reads `x` once `j` is 0; with `k` at 1, `x`'s run
+/// panics inside the episode, and `y`'s claim is released New over `[j]`
+/// and the `x` its run read, with an entry keeping `[j]`. With `k` back at
+/// 0, B's `c` reads `x`: the episode reruns `y` from New and lands it held
+/// Clean, which drops the entry, and `c` then raises a wound. The
+/// retraction lands `y` New over the same two deps, so its entry is back
+/// and a walk still expands only `j`.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_retraction_restores_a_released_claims_entry() {
+    let other = Arc::new(Runtime::<Shared>::new());
+    let j = other.create_input(1_i64);
+    let k = other.create_input(0_i64);
+    let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let x = {
+        let y_cell = y_cell.clone();
+        other.create_query_with(
+            move |rt| {
+                let v = rt.get(*y_cell.get().unwrap());
+                assert!(rt.get(k) == 0, "x boom");
+                (v + 1).min(3)
+            },
+            QueryOpts {
+                cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+                ..QueryOpts::default()
+            },
+        )
+    };
+    let y = other.create_query(move |rt| if rt.get(j) == 1 { 1 } else { rt.get(x) });
+    y_cell.set(y).unwrap();
+    assert_eq!(other.get(x), 2);
+
+    other.set(j, 0);
+    other.set(k, 1);
+    let err = catch_unwind(AssertUnwindSafe(|| other.get(x))).unwrap_err();
+    assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
+    let kept =
+        move |rt: &Runtime<Shared>| rt.released_kept(NodeId(y.slot()), rt.nodes.get(y.slot()));
+    assert_eq!(other.state_of(y), NodeState::New);
+    assert_eq!(kept(&other), Some(1), "y's entry after the release");
+    other.assert_released_entries_match_deps();
+
+    other.set(k, 0);
+    let wounded = Arc::new(AtomicBool::new(false));
+    let c = {
+        let wounded = wounded.clone();
+        other.create_query(move |rt| {
+            let v = rt.get(x);
+            if !wounded.swap(true, Ordering::SeqCst) {
+                rt.raise_wound();
+            }
+            v
+        })
+    };
+    let rt = Runtime::<Shared>::new();
+    let retracted: Arc<OnceLock<(NodeState, Option<u32>)>> = Arc::new(OnceLock::new());
+    let root = {
+        let (other, retracted) = (other.clone(), retracted.clone());
+        rt.create_query(move |_| {
+            let first = catch_unwind(AssertUnwindSafe(|| other.get(c)));
+            if first.is_err() {
+                let _ = retracted.set((other.state_of(y), kept(&other)));
+            }
+            first.unwrap_or(0)
+        })
+    };
+    assert_eq!(rt.get(root), 3);
+    assert!(wounded.load(Ordering::SeqCst));
+    assert_eq!(
+        retracted.get().copied(),
+        Some((NodeState::New, Some(1))),
+        "y's state and entry right after the retraction"
+    );
+    assert_eq!(other.get(y), 3);
+    other.assert_released_entries_match_deps();
+    other.assert_invariant_i();
+    assert_eq!(crate::hold::held_count(), 0);
+}
