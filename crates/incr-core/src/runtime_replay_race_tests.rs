@@ -3344,10 +3344,10 @@ struct Custom(u64);
 /// b catches the `Custom` panic of c, which reads input i, and panics with
 /// `Custom(c + 10)`; r reads b at budget 1, so its retry regenerates b's
 /// payload (`regenerate`). Another thread sets i while b's closure runs
-/// for that regeneration: the set's walk finds b Computing, and b, back
-/// from the run, leaves Failed as the walk would have flipped it. The run
-/// finds c Dirty and makes no payload, so the retry's read runs b again
-/// with i's new value, as a read after the set does.
+/// for that regeneration: the run raises c's payload as the unbounded run
+/// took it, before the set, and b, back from the run, leaves Failed as the
+/// set's walk would have flipped it, so a read after the set runs b again
+/// with i's new value.
 #[test]
 fn a_set_during_a_regeneration_flips_the_node_it_runs() {
     let rt = Arc::new(Rt::new());
@@ -3393,5 +3393,7 @@ fn a_set_during_a_regeneration_flips_the_node_it_runs() {
     gate.wait_parked();
     rt.set(i, 5);
     gate.release();
-    assert_eq!(reader.join(), 15_001);
+    assert_eq!(reader.join(), 11_001);
+    let again = catch_unwind(AssertUnwindSafe(|| rt.get(b))).unwrap_err();
+    assert_eq!(again.downcast_ref::<Custom>().map(|c| c.0), Some(15));
 }

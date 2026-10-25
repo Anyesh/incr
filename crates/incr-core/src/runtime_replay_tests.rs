@@ -2203,7 +2203,6 @@ fn member_b<C: Cells>(rt: &Runtime<C>, i: Incr<u64>) -> Incr<u64> {
     let member = || QueryOpts {
         replay: Replay::Allowed,
         cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_u64)),
-        ..Default::default()
     };
     let b = rt.create_query_with(
         move |rt: &Runtime<C>| -> u64 {
@@ -2232,7 +2231,8 @@ fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
             super::replay_impl::THREAD_PAST_BUDGET_HOLDS.with(std::cell::Cell::get),
         )
     };
-    let (regens, holds) = counts();
+    let regens = counts().0;
+    let (mut creating_held, mut member_held) = (0, 0);
     for outer in [0, 1, 3] {
         for chain in [0, 2, 6] {
             let creating = |frames, local| {
@@ -2254,26 +2254,31 @@ fn an_unregenerable_payload_holds_its_reader_past_the_budget() {
                 assert_eq!(member(u32::MAX, local), 11_001 + u64::from(chain));
                 for frames in 1..9 {
                     let at = format!("local={local} outer={outer} chain={chain} frames={frames}");
+                    let before = counts().1;
                     assert_eq!(
                         creating(frames, local),
                         11_001 + u64::from(chain),
                         "creating {at}"
                     );
+                    creating_held += counts().1 - before;
+                    let before = counts().1;
                     assert_eq!(
                         member(frames, local),
                         11_001 + u64::from(chain),
                         "member {at}"
                     );
+                    member_held += counts().1 - before;
                 }
             }
         }
     }
-    let (regens_after, holds_after) = counts();
     assert_eq!(
-        regens_after, regens,
+        counts().0,
+        regens,
         "a payload no rerun makes was regenerated"
     );
-    assert!(holds_after > holds, "no reader was held");
+    assert!(creating_held > 0, "no creating reader was held");
+    assert!(member_held > 0, "no member reader was held");
 }
 
 /// As [`an_unregenerable_payload_holds_its_reader_past_the_budget`], where
