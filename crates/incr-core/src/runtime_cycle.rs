@@ -1698,7 +1698,7 @@ impl<C: Cells> Runtime<C> {
         if scc.len() == 1 && !graph[at].contains(&at) {
             cycle_state::dissolved_before(rt, root.0);
             self.release_members(root, members, Some(root.0), bag);
-            self.leave_cut_group(&[root.0]);
+            self.exit_cut(vec![root.0], members);
             return Shrink::Dissolved;
         }
         if scc.len() == members.len() {
@@ -1710,7 +1710,7 @@ impl<C: Cells> Runtime<C> {
             .filter(|m| scc.binary_search(m).is_err())
             .collect();
         self.release_members(root, &gone, None, bag);
-        self.leave_cut_group(&scc);
+        self.exit_cut(scc.clone(), &gone);
         cu.retain(|m| scc.binary_search(m).is_ok());
         *members = scc;
         Shrink::Shrunk
@@ -1804,11 +1804,24 @@ impl<C: Cells> Runtime<C> {
         });
     }
 
+    /// The cut's exit from the group: at once under `Local`; under
+    /// `Shared` the released members keep the record until publication,
+    /// which runs the exit for them and `kept` (`crate::hold`).
+    fn exit_cut(&self, kept: Vec<u32>, released: &[u32]) {
+        if C::SINGLE_THREADED {
+            self.leave_cut_group(&kept);
+        } else {
+            let mut slots = kept;
+            slots.extend(released.iter().copied());
+            hold::defer_cut_exit(self.runtime_id, slots);
+        }
+    }
+
     /// Takes each of `kept`, members a cut keeps claimed, out of a group
     /// whose record names a member that is no longer in it, so that the
     /// cut leaves no such record. They leave unverified, as a member
     /// landing Dirty out of its group does, since a wound lands them Dirty.
-    fn leave_cut_group(&self, kept: &[u32]) {
+    pub(super) fn leave_cut_group(&self, kept: &[u32]) {
         for &m in kept {
             let (node, flags) = self.nodes.get_with_flags(m);
             if C::u8_load_relaxed(flags) & IN_GROUP != 0 && self.names_departed(m) {
@@ -1852,10 +1865,21 @@ impl<C: Cells> Runtime<C> {
             if let Some(e) = entry {
                 // A cut is an exposure: its released members stay Computing to
                 // other threads until the attempt ends (`crate::hold`).
-                if !C::SINGLE_THREADED {
+                if C::SINGLE_THREADED {
+                    self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
+                } else {
                     self.open_hold(NodeId(m), self.nodes.get(m), e.first, None, bag);
+                    hold::note_released(rt, &[m]);
+                    let discard = ChildLanding::Discard;
+                    self.discard_land_in_group(
+                        NodeId(m),
+                        e.first,
+                        e.wrote,
+                        stamp_rev,
+                        discard,
+                        bag,
+                    );
                 }
-                self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
                 bag.push_erased(Box::new(e.into_values()));
             }
         }
@@ -2626,6 +2650,12 @@ impl<C: Cells> Runtime<C> {
         // threads, whose orders verify the group; this entry's retry of the
         // root computes it alone, as the unbounded run's frame does.
         if cycle_state::is_dissolved_group(rt, x.0, &group) {
+            return GroupEnd::Ordinary;
+        }
+        // A member this read's cut released keeps the record until
+        // publication; the owner computes it alone, as `Local` does once
+        // it left the group.
+        if !C::SINGLE_THREADED && hold::released_here(rt, x.0) {
             return GroupEnd::Ordinary;
         }
         // The members' runs sit where `x`'s frame would.

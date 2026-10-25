@@ -515,7 +515,7 @@ impl<C: Cells> Runtime<C> {
                 };
                 if self.nodes.get(d.0).generation() != dg {
                     failed = true;
-                } else if !self.observed_clean(d, rev) {
+                } else if !self.published_clean(d, rev) {
                     match self.claim_stashed(d, dg) {
                         Some(dep) => stack.push(dep),
                         None => failed = true,
@@ -562,7 +562,7 @@ impl<C: Cells> Runtime<C> {
                     if let Some(Outcome::Verified { since }) =
                         stack.last().map(|t| &t.stash.outcome)
                     {
-                        failed = !self.observed_clean(adopted, *since);
+                        failed = !self.published_clean(adopted, *since);
                     }
                 }
                 Landing::Landed(_) if root => {

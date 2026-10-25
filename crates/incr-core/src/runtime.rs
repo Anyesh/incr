@@ -3485,6 +3485,7 @@ impl<C: Cells> Runtime<C> {
             .iter()
             .any(|&(m, g)| m == cur.0 && g == generation)
             || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
+            || !C::SINGLE_THREADED && hold::released_here(self.runtime_id, cur.0)
         {
             return false;
         }
@@ -4943,6 +4944,16 @@ impl<C: Cells> Runtime<C> {
     /// loaded first because the Release that publishes a recompute's
     /// `changed_at` stamp is its finishing state CAS: reading the stamp
     /// first could pair an old stamp with a newer `Clean`.
+    /// [`Self::observed_clean`] that counts only published landings, for
+    /// a stash's adoption, whose value must not rest on an own held dep.
+    pub(super) fn published_clean(&self, dep: NodeId, rev: u64) -> bool {
+        let node = self.nodes.get(dep.0);
+        let state = node.state();
+        (state.is_settled()
+            || state == NodeState::Dirty && self.unchanged_stash(dep.0, node.generation()))
+            && node.changed_at() <= rev
+    }
+
     fn observed_clean(&self, dep: NodeId, rev: u64) -> bool {
         let node = self.nodes.get(dep.0);
         let state = node.state();

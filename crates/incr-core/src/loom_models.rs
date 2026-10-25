@@ -891,7 +891,6 @@ fn released_group(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
 }
 
 #[test]
-#[ignore = "T8-44e3-clean-landing-variant"]
 fn loom_released_group_members_stay_grouped_until_the_read_ends() {
     run(|| {
         let orders: Vec<(
@@ -970,7 +969,6 @@ fn held_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
 }
 
 #[test]
-#[ignore = "T8-two-40k-195f commit 4"]
 fn loom_held_episode_wound_retracts_values() {
     run(|| {
         let orders: Vec<(
@@ -1019,7 +1017,6 @@ fn loom_held_episode_wound_retracts_values() {
 /// setter changes x: the held members publish Dirty if the set came
 /// first, and the set's walk reaches o either way.
 #[test]
-#[ignore = "T8-two-40k-195f commit 4"]
 fn loom_held_landing_publishes_under_set() {
     run(|| {
         let rt = Arc::new(Rt::new());
@@ -1080,7 +1077,6 @@ fn republished_group(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
 }
 
 #[test]
-#[ignore = "T8-two-40k-195f commit 4"]
 fn loom_held_group_record_precedes_state() {
     run(|| {
         let orders: Vec<(
@@ -1181,7 +1177,6 @@ fn shrunk_cut<C: crate::cells::Cells>(
 }
 
 #[test]
-#[ignore = "T8-two-40k-195f commit 4"]
 fn loom_own_landed_reread_matches_local() {
     run(|| {
         let local_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
