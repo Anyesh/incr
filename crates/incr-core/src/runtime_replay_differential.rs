@@ -4359,10 +4359,12 @@ fn two_thread_walk_replans_after_an_aborted_episode() {
             assert!(live.world.rt(0).park_hook.set(hook).is_ok());
         };
         let serial = Serial::new(&case, &phases);
-        let verdict = Mutex::new(None);
+        let (verdict, replans) = (Mutex::new(None), AtomicU32::new(0));
         let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
             if p == overlap {
                 hold.on.store(false, SeqCst);
+                let n = live.world.rt(0).root_replans.load(SeqCst);
+                replans.store(n, SeqCst);
             }
             let v = serial.at_overlap("0x88c0", prefix, live);
             if p == before {
@@ -4373,6 +4375,7 @@ fn two_thread_walk_replans_after_an_aborted_episode() {
             stop
         });
         assert!(hold.at6.load(SeqCst), "op 2's walk never reached 6");
+        assert!(replans.load(SeqCst) > 0, "op 2's walk never planned again");
         let verdict = verdict.into_inner().unwrap();
         serial.check("0x88c0", &got, verdict);
     });

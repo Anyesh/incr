@@ -1815,6 +1815,9 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
         let mut bag = Deferred::new();
+        if !taken.is_empty() {
+            self.count_release();
+        }
         for &(slot, first) in taken {
             cycle_state::with_held(|h| h.remove(&(rt, slot)));
             let kind = Some(UnwindKind::Discard);
@@ -3700,6 +3703,7 @@ impl<C: Cells> Runtime<C> {
         let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) else {
             return payload;
         };
+        self.count_release();
         let (e, spec_buf) = e.into_look(Look::here());
         self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
         let id = NodeId(slot);
@@ -3933,6 +3937,9 @@ impl<C: Cells> Runtime<C> {
                 .unwrap_or_default()
         });
         let stamp_rev = self.current_revision();
+        if !slots.is_empty() {
+            self.count_release();
+        }
         for slot in slots {
             if let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) {
                 self.unwound_land(NodeId(slot), e.first, e.wrote, stamp_rev, kind, bag);

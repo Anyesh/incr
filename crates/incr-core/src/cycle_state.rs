@@ -1073,19 +1073,19 @@ pub(crate) fn depth() -> u32 {
     ENTRY.with(|e| e.depth.get())
 }
 
-/// Counts an episode this thread lands on `rt`, for the last
-/// `OWN_RUNTIMES` runtimes it landed one on. A count dropped or restarted
+/// Adds `by` to this thread's share of `rt`'s episode count, for the last
+/// `OWN_RUNTIMES` runtimes it counted on. A count dropped or restarted
 /// only makes a walk's own share differ from all landings, which re-plans.
-pub(crate) fn own_episode(rt: RuntimeId) {
+pub(crate) fn own_episode(rt: RuntimeId, by: u64) {
     OWN_EPISODES.with(|o| {
         let mut o = o.borrow_mut();
         match o.iter_mut().find(|(r, _)| *r == rt) {
-            Some((_, n)) => *n = n.wrapping_add(1),
+            Some((_, n)) => *n = n.wrapping_add(by),
             None => {
                 if o.len() == OWN_RUNTIMES {
                     o.remove(0);
                 }
-                o.push((rt, 1));
+                o.push((rt, by));
             }
         }
     });
