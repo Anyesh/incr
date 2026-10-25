@@ -18,6 +18,11 @@ use crate::handle::Incr;
 use crate::state::NodeState;
 use crate::waits;
 
+/// A poll for another thread's progress gives up within the 10 s a gated
+/// thread parks and a child test runs, so a failed poll reports itself
+/// instead of being killed.
+const POLL_DEADLINE: Duration = Duration::from_secs(4);
+
 /// Asserts the cycle was resolved by wounds. Usually one: a retry that
 /// takes its released claims back before the older thread does, which
 /// `await_winner`'s head start makes rare but cannot rule out under load,
@@ -798,7 +803,7 @@ impl Released {
                 g.a_thread.set(thread::current().id()).unwrap();
                 g.read(g.r)
             });
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + POLL_DEADLINE;
             while waits::registered() == 0 {
                 match g
                     .visits
@@ -859,25 +864,29 @@ fn shared_tainted_group_verify_release_keeps_the_group() {
 /// Once `k` is 1, `r` (Fixpoint) reads `z`, and `y` when `z` is not 0;
 /// `z` (Fixpoint) reads `w`, and `y` when `w` is 0; `y` (unseeded) reads
 /// `w`, then `z` when `w` is 0 and `r` otherwise; `w` (Fixpoint) is 7.
-/// All four keep a record of one group. In an episode's first iteration
-/// the seeds are 0, so `r` reaches no other member: A's episode at `r`
-/// dissolves and releases `z`, `y` and `w` ungrouped, while B's at `y`
-/// keeps {y, z} and lets `r` join. B waits on A's claim of `y` first, so
-/// B is older; A parks in `z` after the dissolve until B, which took `y`,
-/// waits on `r`, and A's read of `y` closes the waits-for cycle. With
-/// `first_reads_y`, `z`'s run after the dissolve reads `y` first, so A is
-/// wounded before it lands a released member.
+/// All four keep a record of one group, and `b` reads `y`. In an
+/// episode's first iteration the seeds are 0, so `r` reaches no other
+/// member: A's episode at `r` dissolves and releases `z`, `y` and `w`
+/// from the group, as under Local, but they stay A's claims until its
+/// read ends. B's read of `b` waits on
+/// A's claim of `y` holding `b`, so B is older; A parks in `z` after the
+/// dissolve until B waits, and its one read of `b` closes the waits-for
+/// cycle: from `z` before A lands a released member (`z_reads_b`), or
+/// from `r` once `z` and `w` have landed (`r_reads_b`).
 struct DissolveOn<C: Cells> {
     rt: Arc<Runtime<C>>,
     r: Incr<i64>,
     z: Incr<i64>,
     y: Incr<i64>,
     w: Incr<i64>,
+    /// B's entry: a claim B holds while it waits on A's `y`.
+    b: Incr<i64>,
     /// Parks `z`'s run in A's episode, with every member claimed.
     early: Gate,
-    /// Parks `z`'s run after the dissolve, A holding only `r` and `z`.
+    /// Parks `z`'s run after the dissolve.
     late: Gate,
-    first_reads_y: Arc<AtomicBool>,
+    z_reads_b: Arc<AtomicBool>,
+    r_reads_b: Arc<AtomicBool>,
 }
 
 type Dissolve = DissolveOn<Shared>;
@@ -889,36 +898,47 @@ impl<C: Cells> DissolveOn<C> {
         let z_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
         let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
         let w_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let (z_reads_b, r_reads_b) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
         let fixpoint = || QueryOpts {
             cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64).max_iterations(20)),
             ..QueryOpts::default()
         };
         let r = {
-            let (z_cell, y_cell) = (z_cell.clone(), y_cell.clone());
+            let (z_cell, y_cell, b_cell) = (z_cell.clone(), y_cell.clone(), b_cell.clone());
+            let r_reads_b = r_reads_b.clone();
             rt.create_query_with(
                 move |rt| match rt.get(k) {
                     0 => 1,
                     _ if rt.get(*z_cell.get().unwrap()) == 0 => 1,
-                    _ => (rt.get(*y_cell.get().unwrap()) + 1).min(50),
+                    _ => {
+                        // B holds `b`, so this read wounds A and never returns.
+                        if r_reads_b.swap(false, Ordering::SeqCst) {
+                            rt.get(*b_cell.get().unwrap());
+                        }
+                        (rt.get(*y_cell.get().unwrap()) + 1).min(50)
+                    }
                 },
                 fixpoint(),
             )
         };
         let (early, late) = (Gate::new(), Gate::new());
-        let first_reads_y = Arc::new(AtomicBool::new(false));
         let z = {
-            let (y_cell, w_cell) = (y_cell.clone(), w_cell.clone());
+            let (y_cell, w_cell, b_cell) = (y_cell.clone(), w_cell.clone(), b_cell.clone());
             let (early, late) = (early.clone(), late.clone());
-            let first_reads_y = first_reads_y.clone();
+            let z_reads_b = z_reads_b.clone();
             rt.create_query_with(
                 move |rt| {
                     if rt.get(k) == 0 {
                         return 0;
                     }
                     late.park();
-                    // B holds `y`, so this read wounds A and never returns.
-                    if first_reads_y.load(Ordering::SeqCst) {
-                        rt.get(*y_cell.get().unwrap());
+                    // As in `r`: a read that wounds A and never returns.
+                    if z_reads_b.swap(false, Ordering::SeqCst) {
+                        rt.get(*b_cell.get().unwrap());
                     }
                     early.park();
                     match rt.get(*w_cell.get().unwrap()) {
@@ -938,9 +958,11 @@ impl<C: Cells> DissolveOn<C> {
             })
         };
         let w = rt.create_query_with(move |rt| 7 * rt.get(k), fixpoint());
+        let b = rt.create_query(move |rt| rt.get(y));
         z_cell.set(z).unwrap();
         y_cell.set(y).unwrap();
         w_cell.set(w).unwrap();
+        b_cell.set(b).unwrap();
         assert!(r.slot() < z.slot() && z.slot() < y.slot() && y.slot() < w.slot());
         assert_eq!((rt.get(r), rt.get(z), rt.get(y), rt.get(w)), (1, 0, 0, 0));
         rt.force_group_for_test(&[r.erase(), z.erase(), y.erase(), w.erase()]);
@@ -951,9 +973,11 @@ impl<C: Cells> DissolveOn<C> {
             z,
             y,
             w,
+            b,
             early,
             late,
-            first_reads_y,
+            z_reads_b,
+            r_reads_b,
         }
     }
 
@@ -979,15 +1003,15 @@ impl Dissolve {
         let g = Dissolve::new();
         if a_first {
             let a = g.read(g.r);
-            g.outcome(a, g.read(g.y))
+            g.outcome(a, g.read(g.b))
         } else {
-            let b = g.read(g.y);
+            let b = g.read(g.b);
             g.outcome(g.read(g.r), b)
         }
     }
 
     /// The outcome, the runtime's `unwound_landings`, and `r`'s slot.
-    fn concurrent(first_reads_y: bool) -> Concurrent {
+    fn concurrent(z_reads_b: bool) -> Concurrent {
         let g = Dissolve::new();
         let wounds = waits::WOUNDS.load(Ordering::Relaxed);
         g.early.arm();
@@ -995,16 +1019,21 @@ impl Dissolve {
             let g = &g;
             let a = s.spawn(move || g.read(g.r));
             g.early.wait_parked();
-            let b = s.spawn(move || g.read(g.y));
+            let b = s.spawn(move || g.read(g.b));
             g.late.arm();
             g.early.release();
             g.late.wait_parked();
-            let deadline = Instant::now() + Duration::from_secs(20);
-            while !waits::waited_on((g.rt.runtime_id, g.r.slot())) {
-                assert!(Instant::now() < deadline, "B never waited on r");
+            let deadline = Instant::now() + POLL_DEADLINE;
+            while !waits::waited_on((g.rt.runtime_id, g.y.slot())) {
+                assert!(Instant::now() < deadline, "B never waited on y");
                 thread::sleep(Duration::from_millis(1));
             }
-            g.first_reads_y.store(first_reads_y, Ordering::SeqCst);
+            let flag = if z_reads_b {
+                &g.z_reads_b
+            } else {
+                &g.r_reads_b
+            };
+            flag.store(true, Ordering::SeqCst);
             g.late.release();
             (a.join().unwrap(), b.join().unwrap())
         });
@@ -1018,11 +1047,11 @@ impl Dissolve {
 
 type Concurrent = (Vec<Result<i64, String>>, Vec<(u32, bool, bool)>, u32);
 
-fn dissolve_keeps_the_released_members_grouped(first_reads_y: bool) {
+fn dissolve_keeps_the_released_members_grouped(z_reads_b: bool) {
     let a_first = Dissolve::single_thread(true);
     let b_first = Dissolve::single_thread(false);
     for round in 0..20 {
-        let (got, ..) = Dissolve::concurrent(first_reads_y);
+        let (got, ..) = Dissolve::concurrent(z_reads_b);
         assert!(
             got == a_first || got == b_first,
             "round {round}: {got:?}, single-thread {a_first:?} or {b_first:?}"
@@ -1054,16 +1083,16 @@ fn shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left() 
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left",
         || {
-            for first_reads_y in [true, false] {
+            for z_reads_b in [true, false] {
                 for round in 0..5 {
-                    let (_, landings, r) = Dissolve::concurrent(first_reads_y);
+                    let (_, landings, r) = Dissolve::concurrent(z_reads_b);
                     assert!(
                         landings.iter().any(|&(slot, dissolved, _)| slot == r && dissolved),
                         "round {round}: no wound landed r after its dissolve: {landings:?}"
                     );
                     assert!(
                         landings.iter().all(|&(_, _, stale)| !stale),
-                        "round {round} first_reads_y {first_reads_y}: {landings:?}"
+                        "round {round} z_reads_b {z_reads_b}: {landings:?}"
                     );
                 }
             }
@@ -1072,8 +1101,9 @@ fn shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left() 
     .assert_clean();
 }
 
-/// As above, with A landing `w` and `z` Clean outside the group before its
-/// wound: B's group verify fails on the Clean `z` and computes `y` alone.
+/// As above, with A's wound after it landed `w` and `z`: their landings
+/// retract with the read, so B verifies the group as a single thread
+/// would.
 #[test]
 fn shared_wound_after_clean_landings_of_released_members_keeps_their_group() {
     crate::child_test::run_in_child(
@@ -1139,18 +1169,18 @@ fn shared_stale_edge_under_local_with_b_older() {
     .assert_clean();
 }
 
-/// A's read of `r`, then B's of `w`, on one thread.
+/// A's read of `r`, then B's of `b`, on one thread.
 fn released_member_reads<C: Cells>() -> Vec<Result<i64, String>> {
     let g = DissolveOn::<C>::new();
     let a = g.read(g.r);
-    g.outcome(a, g.read(g.w))
+    g.outcome(a, g.read(g.b))
 }
 
 /// **A cut's released members stay the owner's until its read returns.**
 /// A's read of `r` on [`Dissolve`] dissolves its episode, releases `z`,
 /// `y` and `w`, and parks. They are still A's, as in the unbounded run,
-/// where its episode holds them until it ends: B's read of `w` waits on
-/// A instead of computing `w` from a release A's attempt may still
+/// where its episode holds them until it ends: B's read of `b` waits on
+/// A's `y` instead of computing `y` from a release A's attempt may still
 /// retract, and both reads match A's first, as a single thread or Local
 /// gives them.
 #[test]
@@ -1175,13 +1205,13 @@ fn shared_released_member_waits_for_the_cut_owners_read() {
                 let states: Vec<NodeState> = [g.z, g.y, g.w]
                     .map(|m| g.rt.nodes.get(m.slot()).state())
                     .into();
-                let b = s.spawn(move || g.read(g.w));
-                let deadline = Instant::now() + Duration::from_secs(20);
-                let w = (g.rt.runtime_id, g.w.slot());
-                while !waits::waited_on(w) && !b.is_finished() && Instant::now() < deadline {
+                let b = s.spawn(move || g.read(g.b));
+                let deadline = Instant::now() + POLL_DEADLINE;
+                let y = (g.rt.runtime_id, g.y.slot());
+                while !waits::waited_on(y) && !b.is_finished() && Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(1));
                 }
-                let (b_waited, b_done_early) = (waits::waited_on(w), b.is_finished());
+                let (b_waited, b_done_early) = (waits::waited_on(y), b.is_finished());
                 released.release();
                 (
                     states,
@@ -1197,7 +1227,7 @@ fn shared_released_member_waits_for_the_cut_owners_read() {
                 "a released member left A's claim before A's read returned"
             );
             assert!(!b_done_early, "B read w while A's attempt was unpublished");
-            assert!(b_waited, "B never waited on w");
+            assert!(b_waited, "B never waited on y");
             assert_eq!(g.outcome(a, b), want);
             g.rt.assert_invariant_i();
         },
@@ -1248,9 +1278,9 @@ fn shared_cut_group_exit_publishes_and_retracts_with_the_read() {
                 let g = DissolveOn::<Local>::new();
                 if a_first {
                     let a = g.read(g.r);
-                    g.outcome(a, g.read(g.y))
+                    g.outcome(a, g.read(g.b))
                 } else {
-                    let b = g.read(g.y);
+                    let b = g.read(g.b);
                     g.outcome(g.read(g.r), b)
                 }
             });
@@ -1277,7 +1307,7 @@ fn shared_cut_group_exit_publishes_and_retracts_with_the_read() {
                     {
                         // B holds still from A's wound until A's retraction is seen,
                         // so nothing B lands can hide or fake the retracted records.
-                        let deadline = Instant::now() + Duration::from_secs(20);
+                        let deadline = Instant::now() + POLL_DEADLINE;
                         while at_retraction.get().is_none() && Instant::now() < deadline {
                             thread::sleep(Duration::from_millis(1));
                         }
@@ -1295,17 +1325,17 @@ fn shared_cut_group_exit_publishes_and_retracts_with_the_read() {
                 g.early.wait_parked();
                 let b = s.spawn(|| {
                     b_thread.set(thread::current().id()).unwrap();
-                    g.read(g.y)
+                    g.read(g.b)
                 });
                 g.late.arm();
                 g.early.release();
                 g.late.wait_parked();
-                let deadline = Instant::now() + Duration::from_secs(20);
-                while !waits::waited_on((g.rt.runtime_id, g.r.slot())) {
-                    assert!(Instant::now() < deadline, "B never waited on r");
+                let deadline = Instant::now() + POLL_DEADLINE;
+                while !waits::waited_on((g.rt.runtime_id, g.y.slot())) {
+                    assert!(Instant::now() < deadline, "B never waited on y");
                     thread::sleep(Duration::from_millis(1));
                 }
-                g.first_reads_y.store(true, Ordering::SeqCst);
+                g.z_reads_b.store(true, Ordering::SeqCst);
                 g.late.release();
                 (a.join().unwrap(), b.join().unwrap())
             });
