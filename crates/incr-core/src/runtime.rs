@@ -3984,9 +3984,9 @@ impl<C: Cells> Runtime<C> {
                 let ctl = ComputeCtl::new(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
-                        | if speculative { cycle::SPECULATIVE } else { 0 }
-                        | self.rerun_hold(id, node),
+                        | if speculative { cycle::SPECULATIVE } else { 0 },
                 );
+                self.rerun_hold(id, node, &ctl);
                 let _kept = (!C::SINGLE_THREADED).then_some(hold::KeptGuard(&ctl));
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);

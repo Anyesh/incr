@@ -70,19 +70,24 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// `HOLD` for a run of a node this thread holds and has claimed again,
-    /// or a claim a cut kept and took out of its group, so its write keeps
-    /// what it displaces for the undo record and its landing is held.
+    /// Raises `HOLD` on a run of a node this thread holds and has claimed
+    /// again, or of a claim a cut kept and took out of its group, so its
+    /// write keeps what it displaces for the undo record and its landing
+    /// is held.
     #[inline(always)]
-    pub(super) fn rerun_hold(&self, id: NodeId, node: &NodeData<C>) -> u16 {
-        if !C::SINGLE_THREADED
-            && hold::active()
-            && (hold::holds(state::cell_key::<C>(node.state_cell()))
-                || hold::cut_kept(self.runtime_id, id.0))
+    pub(super) fn rerun_hold(&self, id: NodeId, node: &NodeData<C>, ctl: &ComputeCtl) {
+        if !C::SINGLE_THREADED && hold::active() {
+            self.raise_rerun_hold(id, node, ctl);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn raise_rerun_hold(&self, id: NodeId, node: &NodeData<C>, ctl: &ComputeCtl) {
+        if hold::holds(state::cell_key::<C>(node.state_cell()))
+            || hold::cut_kept(self.runtime_id, id.0)
         {
-            crate::cycle::HOLD
-        } else {
-            0
+            ctl.raise(crate::cycle::HOLD);
         }
     }
 
