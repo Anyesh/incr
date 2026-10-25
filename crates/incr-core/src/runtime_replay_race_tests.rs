@@ -1714,7 +1714,9 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
                 let rt = rt.clone();
                 spawn(move || outcome(|| rt.get(f)))
             };
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // Under PARK_TIMEOUT, so a read that skips the wait fails here
+            // rather than in the parked driver's abort.
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
             while !reached.load(SeqCst) && std::time::Instant::now() < deadline {
                 thread::yield_now();
             }

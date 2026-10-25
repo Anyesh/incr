@@ -182,7 +182,8 @@ pub(crate) fn shows(cell: usize) -> bool {
 }
 
 /// The target of this thread's held landing for `cell`, as [`view`]
-/// shows it but without counting as a look.
+/// shows it but without counting as a look or marking the view
+/// consulted.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn target(cell: usize) -> Option<NodeState> {
     active()
