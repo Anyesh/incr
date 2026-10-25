@@ -41,3 +41,8 @@ harness = false
 [[bench]]
 name = "icount"
 harness = false
+
+[[bench]]
+name = "released_hot"
+harness = false
+required-features = ["test-hooks"]
