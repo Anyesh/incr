@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED};
+use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED, UNREGENERABLE};
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -180,6 +180,8 @@ impl Frames {
         // SAFETY: the frame is on the stack, so its control block is live
         // (see `Frame::ctl`).
         let ctl = unsafe { &*top.ctl };
+        // A rerun of the reader's node reads the other runtime again.
+        ctl.raise(UNREGENERABLE);
         if !ctl.has(DOOMED) {
             let held = ctl.has(FOREIGN_HOLD);
             ctl.raise(FOREIGN_HOLD);
