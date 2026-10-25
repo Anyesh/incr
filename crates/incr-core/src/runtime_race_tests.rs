@@ -1623,9 +1623,8 @@ fn read_of_cycle_member_vs_claim_after_landing() {
 /// of a failing node, so that every episode lands its members Dirty, and
 /// `x` reading an input `t` and `a`. Setting `t` leaves the revision whose
 /// memo `b`'s caught panic keeps, and makes the next read rerun `x`.
-/// Returns `x`, `a`, `t`, the gate in `a`'s closure and the gate in `x`'s
-/// after its read of `a`.
-fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Gate, Gate) {
+/// Returns `x`, `a`, `t` and the gate in `a`'s closure.
+fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Gate) {
     let t = rt.create_input(0_u64);
     let failed = rt.create_query(|_: &Rt| -> u64 { panic!("failed") });
     let in_a = Gate::new();
@@ -1645,63 +1644,19 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Gate, Gate) {
         rt.get(a) + v
     });
     b_cell.set(b).unwrap();
-    let read_a = Gate::new();
-    let x = {
-        let read_a = read_a.clone();
-        rt.create_query(move |rt: &Rt| {
-            let s = rt.get(t);
-            let v = rt.get(a);
-            read_a.park();
-            v + s + 100
-        })
-    };
-    (x, a, t, in_a, read_a)
-}
-
-/// The episode that `x`'s recompute runs through its read of `a`, a
-/// group member, lands `a` Dirty, and once the read has taken the value,
-/// another thread claims `a`; the read's reservation of `a` keeps that
-/// claim out until then. `x`, whose deps are unchanged and so not
-/// validated at publish, must still not land Clean over it (seed 0x74f on
-/// two threads, budget None).
-#[test]
-fn reader_of_group_episode_root_claimed_after_landing() {
-    let rt = Arc::new(Rt::new());
-    let (x, a, t, in_a, read_a) = poisoned_episode(&rt);
-    rt.get(x);
-    rt.set(t, 1);
-    assert_eq!(rt.state_of(x), NodeState::Dirty);
-    assert_eq!(rt.state_of(a), NodeState::Dirty);
-    rt.group_verifies.lock().unwrap().clear();
-    read_a.arm();
-    let reader = {
-        let rt = Arc::clone(&rt);
-        thread::spawn(move || rt.get(x))
-    };
-    read_a.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Dirty);
-    in_a.arm();
-    let claimer = {
-        let rt = Arc::clone(&rt);
-        thread::spawn(move || rt.get(a))
-    };
-    in_a.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Computing);
-    read_a.release();
-    reader.join().unwrap();
-    in_a.release();
-    claimer.join().unwrap();
-    assert_eq!(rt.group_verifies.lock().unwrap().first(), Some(&id(a).0));
-    rt.assert_invariant_i();
+    let x = rt.create_query(move |rt: &Rt| rt.get(t) + rt.get(a) + 100);
+    (x, a, t, in_a)
 }
 
 /// The episode that `x`'s read of `a` runs, as that read's walk root,
-/// lands `a` Dirty; until the read has taken the value, another thread's
-/// claim of `a` waits out the read's reservation instead of running `a`.
+/// lands `a` Dirty with the memo `b`'s caught panic keeps for the
+/// revision. Until the read has taken the value, another thread's read of
+/// `a` takes that memo and runs nothing, so it cannot reland `a` under the
+/// read (seed 0x74f's race needs a rerun of `a` that the memo excludes).
 #[test]
-fn reader_of_group_episode_root_keeps_it_until_the_read_takes_the_value() {
+fn reader_of_group_episode_root_shares_its_memo_until_the_read_takes_the_value() {
     let rt = Arc::new(Rt::new());
-    let (x, a, t, _in_a, _read_a) = poisoned_episode(&rt);
+    let (x, a, t, in_a) = poisoned_episode(&rt);
     rt.get(x);
     rt.set(t, 1);
     assert_eq!(rt.state_of(a), NodeState::Dirty);
@@ -1713,21 +1668,23 @@ fn reader_of_group_episode_root_keeps_it_until_the_read_takes_the_value() {
     };
     walked.wait_parked();
     assert_eq!(rt.state_of(a), NodeState::Dirty);
-    let waits = rt.reservation_waits.load(Ordering::SeqCst);
+    in_a.arm();
     let claimer = {
         let rt = Arc::clone(&rt);
         thread::spawn(move || rt.get(a))
     };
-    while !claimer.is_finished() && rt.reservation_waits.load(Ordering::SeqCst) == waits {
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT;
+    while !claimer.is_finished() && std::time::Instant::now() < deadline {
         thread::sleep(Duration::from_millis(1));
     }
-    assert!(
-        rt.reservation_waits.load(Ordering::SeqCst) > waits,
-        "the claimer ran `a` before the read took its value"
-    );
+    let ran = in_a.0.reached_rx.lock().unwrap().try_recv().is_ok();
+    // A release sent ahead lets a later armed park of `a` pass at once.
+    in_a.release();
+    assert!(!ran, "the claimer ran `a` under the read");
+    assert!(claimer.is_finished(), "the claimer waited on the read");
+    let a_value = claimer.join().unwrap();
     walked.release();
-    reader.join().unwrap();
-    claimer.join().unwrap();
+    assert_eq!(reader.join().unwrap(), a_value + 101);
     rt.assert_invariant_i();
 }
 
