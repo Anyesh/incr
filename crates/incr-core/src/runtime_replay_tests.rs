@@ -2718,3 +2718,143 @@ fn local_a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded() {
 fn shared_a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded() {
     a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded::<Shared>();
 }
+
+/// A value whose `Clone` reads node `j` of another runtime, a read that is
+/// no dependency of the node that clones it.
+struct ReadsOther {
+    other: Arc<Runtime<Shared>>,
+    j: Incr<u64>,
+    seen: u64,
+}
+
+impl Clone for ReadsOther {
+    fn clone(&self) -> Self {
+        Self {
+            other: Arc::clone(&self.other),
+            j: self.j,
+            seen: self.other.get(self.j),
+        }
+    }
+}
+
+impl PartialEq for ReadsOther {
+    fn eq(&self, other: &Self) -> bool {
+        self.seen == other.seen
+    }
+}
+
+/// `foreign_ticket_shape` with b's read of j moved into value code: b
+/// clones `v`, whose `Clone` reads j of the other runtime. When x's walk
+/// runs b, j is Dirty, so the value code's read takes the cold path and
+/// finds j Clean (5) only on its reload, after another thread computed it.
+/// The test thread then moves j to 9, and r reads b's payload past the
+/// budget: a rerun of b would read 9.
+fn value_code_foreign_shape<C: Cells>(frames: u32, outer: u32, chain: u32) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let jin = other.create_input(1_u64);
+    let j = other.create_query(move |o: &Runtime<Shared>| o.get(jin));
+    assert_eq!(other.get(j), 1);
+    let v = rt.create_input(ReadsOther {
+        other: Arc::clone(&other),
+        j,
+        seen: 0,
+    });
+    let i = rt.create_input(1_u64);
+    let k = rt.create_input(0_u64);
+    let b = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let at = 100 * rt.get(i);
+            std::panic::panic_any(CustomPayload(at + rt.get(v).seen))
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt| if rt.get(k) == 0 { rt.get(b) } else { 7 },
+        replayable(),
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    let armed = Arc::new(AtomicBool::new(false));
+    let (hook_armed, hook_other) = (Arc::clone(&armed), Arc::clone(&other));
+    let j_id = NodeId(j.slot());
+    let installed = other.park_hook.set(Box::new(move |point| {
+        if point == super::ParkPoint::ValueCodeBeforeReload(j_id) && hook_armed.swap(false, SeqCst)
+        {
+            let o = Arc::clone(&hook_other);
+            assert_eq!(std::thread::spawn(move || o.get(j)).join().unwrap(), 5);
+        }
+    }));
+    assert!(installed.is_ok());
+    other.set(jin, 5);
+    armed.store(true, SeqCst);
+    rt.set(i, 2);
+    rt.set(k, 1);
+    assert_eq!(rt.get(x), 7);
+    assert!(!armed.load(SeqCst), "b's value code never reloaded j");
+    other.set(jin, 9);
+    assert_eq!(other.get(j), 9);
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let d = deep;
+        deep = rt.create_query_with(move |rt| rt.get(d) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut top = r;
+    for _ in 0..outer {
+        let t = top;
+        top = rt.create_query_with(move |rt| rt.get(t), replayable());
+    }
+    rt.try_get(top).unwrap_or(7777)
+}
+
+/// Every budget gives the unbounded run's 205002+chain for
+/// `value_code_foreign_shape`: b's run read the other runtime from value
+/// code, so its payload is not rebuilt by a rerun.
+fn a_payload_after_a_value_code_foreign_read_reads_as_unbounded<C: Cells>() {
+    let mut differ = Vec::new();
+    for outer in [0, 1, 3] {
+        for chain in [0, 2, 6] {
+            let want = value_code_foreign_shape::<C>(u32::MAX, outer, chain);
+            assert_eq!(
+                want,
+                205_002 + u64::from(chain),
+                "the unbounded run did not take the walk's payload: outer={outer} chain={chain}"
+            );
+            for frames in 1..9 {
+                let got = value_code_foreign_shape::<C>(frames, outer, chain);
+                if got != want {
+                    differ.push(format!(
+                        "outer={outer} chain={chain} frames={frames}: {got} != {want}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} budgets differ from the unbounded run:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
+#[test]
+fn local_a_payload_after_a_value_code_foreign_read_reads_as_unbounded() {
+    a_payload_after_a_value_code_foreign_read_reads_as_unbounded::<Local>();
+}
+
+#[test]
+fn shared_a_payload_after_a_value_code_foreign_read_reads_as_unbounded() {
+    a_payload_after_a_value_code_foreign_read_reads_as_unbounded::<Shared>();
+}
