@@ -253,8 +253,10 @@ impl<C: Cells> Runtime<C> {
 
     /// A non-Clean read of this runtime from another runtime's frame.
     /// The read is this runtime's first entry on the thread unless one of
-    /// its entries is open below: then the reading run depends on this attempt's
-    /// stack, so its runtime is tainted and its landing held. A first
+    /// its entries is open below: then, if the read rested on a held
+    /// landing, the reading run depends on state this attempt has not
+    /// published, so its runtime is tainted and its landing held; a read
+    /// that met only claims got what `Local` gets, a cycle. A first
     /// entry ends this runtime's held landings at its exit, since nothing
     /// may keep a pointer to the runtime past it: they publish if they
     /// read only published state, and retract (landing as not computed)
@@ -264,8 +266,12 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     pub(super) fn foreign_entry<R>(&self, read: impl FnOnce() -> R) -> R {
         if cycle_state::open_entry_of(self.runtime_id) {
-            self.taint_reader();
-            return read();
+            let before = hold::looks();
+            let r = read();
+            if hold::looks() != before {
+                self.taint_reader();
+            }
+            return r;
         }
         self.first_entry(read)
     }

@@ -67,6 +67,9 @@ struct HoldSet {
     seq: u64,
     /// A held node was read through the view since the last claim.
     consulted: bool,
+    /// Every read of a held node through the view or a claim of one again,
+    /// so a read can tell whether it rested on any.
+    looks: u64,
     /// Episodes landed, per runtime, for `own_episode` at publication.
     episodes: Vec<(RuntimeId, u64)>,
     /// Runtimes whose runs read state this attempt has not published (a
@@ -113,6 +116,7 @@ pub(crate) fn view(cell: usize) -> Option<NodeState> {
     with(|h| {
         let t = h.get(cell).filter(|e| !e.reclaimed).map(|e| e.target)?;
         h.consulted = true;
+        h.looks += 1;
         Some(t)
     })
 }
@@ -130,8 +134,15 @@ pub(crate) fn reclaim(cell: usize, expected: NodeState) -> bool {
             return false;
         };
         e.reclaimed = true;
+        h.looks += 1;
         true
     })
+}
+
+/// A count of reads that rested on a held landing, to compare across one
+/// read.
+pub(crate) fn looks() -> u64 {
+    with(|h| h.looks)
 }
 
 /// Whether the view shows a landing for `cell`, without reading it.
