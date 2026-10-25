@@ -2289,20 +2289,18 @@ impl<C: Cells> Runtime<C> {
         if flags.has(cycle::DOOMED) {
             return Ok(value);
         }
+        let read = replay::KeptRead {
+            rt: reader,
+            cidx,
+            ctl,
+            reading: u64::from(handle.slot()) | (u64::from(handle.generation()) << 32),
+            ordinal: 0,
+            foreign: Some(self.runtime_id),
+            what: Delivered::Landed(Unbuilt::new(clone_landed::<T>(&value))),
+        };
         let kept = flags.has(cycle::KEPT_READ);
         flags.raise(cycle::KEPT_READ);
-        replay::keep_foreign_read(
-            replay::KeptRead {
-                rt: reader,
-                cidx,
-                ctl,
-                reading: u64::from(handle.slot()) | (u64::from(handle.generation()) << 32),
-                ordinal: 0,
-                foreign: Some(self.runtime_id),
-                what: Delivered::Landed(Unbuilt::new(clone_landed::<T>(&value))),
-            },
-            !kept,
-        );
+        replay::keep_foreign_read(read, !kept);
         Ok(value)
     }
 
