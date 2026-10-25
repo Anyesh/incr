@@ -67,6 +67,11 @@ impl RuntimeId {
 #[derive(Copy, Clone, Debug)]
 pub struct FrameRt(u64);
 
+const _: () = assert!(crate::bits::disjoint(&[
+    FrameRt::UNTESTED,
+    FrameRt::KEEPS_FOREIGN
+]));
+
 impl FrameRt {
     const UNTESTED: u64 = 1 << 63;
     const KEEPS_FOREIGN: u64 = 1 << 62;

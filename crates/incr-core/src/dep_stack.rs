@@ -549,11 +549,17 @@ pub trait DepStack: 'static {
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
+        self.poison_current_frame_with(rt, POISONED);
+    }
+
+    /// [`Self::poison_current_frame`] with `flag`, `POISONED` or
+    /// `HANDLED`.
+    fn poison_current_frame_with(&self, rt: RuntimeId, flag: u16) {
         self.with(|s| {
             if let Some(top) = s.reader(rt) {
                 // SAFETY: the frame is on the stack, so its control block
                 // is live (see `Frame::ctl`).
-                unsafe { (*top.ctl).raise(POISONED) };
+                unsafe { (*top.ctl).raise(flag) };
             }
         })
     }
@@ -561,10 +567,17 @@ pub trait DepStack: 'static {
     /// `rt`'s active frame as the reader of an unwind out of the compute
     /// that popped above it, with the node it reads and how many times it
     /// has read it.
-    fn unwound_reader(&self, rt: RuntimeId) -> Option<(*const ComputeCtl, u32, u64, u32)> {
+    fn unwound_read(&self, rt: RuntimeId) -> Option<(ActiveRead, u64, u32)> {
         self.with(|s| {
+            let depth = s.frames.len() as u32;
             let top = s.reader(rt)?;
-            Some((top.ctl, top.cidx, top.reading, top.reads_of_reading()))
+            let f = ActiveRead {
+                node: top.node,
+                ctl: top.ctl,
+                cidx: top.cidx,
+                depth,
+            };
+            Some((f, top.reading, top.reads_of_reading()))
         })
     }
 

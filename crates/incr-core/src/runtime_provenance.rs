@@ -23,6 +23,7 @@
 //! outside the result under the Shared payload contract.
 
 use std::any::Any;
+use std::collections::hash_map::Entry as MapEntry;
 use std::panic::resume_unwind;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use crate::replay::{self, Carry, Provenance, ReadKey};
 
 /// The read a record is for: the virtual frame's node and generation,
 /// the node it was blocked reading and which of its reads of it that was.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Reader {
     node: u32,
     generation: u32,
@@ -53,7 +54,6 @@ impl From<ReadKey> for Reader {
 }
 
 struct Record {
-    id: u64,
     reader: Reader,
     /// The nodes, as `(node, generation)`, a Failed landing of which on
     /// another thread let the record's read failure out unchanged. A later
@@ -66,7 +66,37 @@ struct Record {
 #[derive(Default)]
 pub(crate) struct Records {
     next: u64,
-    live: Vec<Record>,
+    live: HashMap<u64, Record, FxBuildHasher>,
+    /// The live records' ids by their reader, oldest first.
+    by_reader: HashMap<Reader, Vec<u64>, FxBuildHasher>,
+}
+
+impl Records {
+    fn insert(&mut self, reader: Reader) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        self.live.insert(
+            id,
+            Record {
+                reader,
+                propagated: Vec::new(),
+            },
+        );
+        self.by_reader.entry(reader).or_default().push(id);
+        id
+    }
+
+    fn remove(&mut self, id: u64) {
+        let Some(r) = self.live.remove(&id) else {
+            return;
+        };
+        if let MapEntry::Occupied(mut ids) = self.by_reader.entry(r.reader) {
+            ids.get_mut().retain(|&i| i != id);
+            if ids.get().is_empty() {
+                ids.remove();
+            }
+        }
+    }
 }
 
 pub(crate) type Table<C> = Arc<<C as Cells>::Lock<Records>>;
@@ -89,7 +119,7 @@ impl<C: Cells> Provenance for Hold<C> {
 
 impl<C: Cells> Drop for Hold<C> {
     fn drop(&mut self) {
-        self.table.write().live.retain(|r| r.id != self.id);
+        self.table.write().remove(self.id);
     }
 }
 
@@ -102,7 +132,7 @@ fn last_read(deps: &[(NodeId, u32)]) -> Option<(u64, u32)> {
 }
 
 /// The message of a read of node `slot` landed Failed.
-fn failed_read_message(slot: u32) -> String {
+pub(super) fn failed_read_message(slot: u32) -> String {
     format!(
         "incr-core: node {slot} read but its last compute panicked; it stays Failed until a \
          dependency changes (set an upstream input to retry)"
@@ -113,17 +143,20 @@ impl<C: Cells> Runtime<C> {
     /// `compute_attempts`' Failed arm: the read panics "last compute
     /// panicked", or takes the payload a walk contained for the landing it
     /// sees (`take_contained`). Returns when the node has left Failed since
-    /// the read saw it, to be read again. A payload a record owes the read
-    /// was taken after the load, by `owed_payload`.
+    /// the read saw it, or a delete recycled the slot past `generation`, to
+    /// be read again. A payload a record owes the read was taken after the
+    /// load, by `owed_payload`.
     #[cold]
     #[inline(never)]
-    pub(super) fn read_failed_node(&self, id: NodeId) {
-        let Ok(payload) = self.take_contained(id) else {
+    pub(super) fn read_failed_node(&self, id: NodeId, generation: Option<u32>) {
+        self.park(ParkPoint::FailedReadBeforeTake(id));
+        let Ok(payload) = self.take_contained(id, generation) else {
             return;
         };
-        // A closure that catches this panic has still read a node with no
-        // value, so it must not land Clean over it.
-        self.dep_stack.poison_current_frame(self.runtime_id);
+        // A closure that catches this panic has read a node with no value,
+        // which stays so until a set flips it.
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
         if let Some(payload) = payload {
             self.note_ticket_read(id, &*payload);
             resume_unwind(payload);
@@ -167,8 +200,8 @@ impl<C: Cells> Runtime<C> {
             candidates.into_iter().find(|&(_, _, record)| {
                 records
                     .live
-                    .iter()
-                    .any(|r| r.id == record && r.propagated.contains(&(id.0, generation)))
+                    .get(&record)
+                    .is_some_and(|r| r.propagated.contains(&(id.0, generation)))
             })
         };
         let (context, i, _) = found?;
@@ -178,8 +211,29 @@ impl<C: Cells> Runtime<C> {
                 .expect("incr-core: the delivery's context is open")
                 .take_landed(i, at)
         });
+        // A payload no copy can stand for that an earlier take had: its
+        // node runs again, as for a retry's read (`regenerate`).
+        let payload = match payload.downcast::<replay::Regen>() {
+            Ok(regen) => {
+                let raised = self.regenerate(id, generation, regen.0)?;
+                replay::regenerated_at(context, i, replay::payload_key(&*raised));
+                raised
+            }
+            Err(payload) => payload,
+        };
         if attributed {
             cycle_state::count_failure();
+        }
+        // The read took the payload as from a ticket, and a payload no copy
+        // can stand for holds its frame as at `note_ticket_read`.
+        let reading = u64::from(id.0) | (u64::from(generation) << 32);
+        if let Some((f, read, _)) = self.dep_stack.unwound_read(rt) {
+            if read == reading {
+                let regenerable = self.note_took(f, reading, &*payload);
+                if !replay::copyable(&*payload) {
+                    self.hold_uncopied(f.ctl, regenerable);
+                }
+            }
         }
         Some(payload)
     }
@@ -190,7 +244,8 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn raise_owed(&self, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) -> ! {
-        self.dep_stack.poison_current_frame(self.runtime_id);
+        self.dep_stack
+            .poison_current_frame_with(self.runtime_id, cycle::HANDLED);
         bag.drain_carried(payload)
     }
 
@@ -222,13 +277,13 @@ impl<C: Cells> Runtime<C> {
         let Some(reader) = reader else {
             return;
         };
-        let record = self
-            .provenance
-            .read()
-            .live
-            .iter()
-            .find(|r| r.reader == reader)
-            .map(|r| r.id);
+        let record = {
+            let records = self.provenance.read();
+            records
+                .by_reader
+                .get(&reader)
+                .and_then(|ids| ids.first().copied())
+        };
         if let Some(record) = record {
             replay::set_carry(Some(Carry {
                 rt,
@@ -265,7 +320,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(c) = carried {
             if !self.provenance.read().live.is_empty() {
                 let mut records = self.provenance.write();
-                if let Some(r) = records.live.iter_mut().find(|r| r.id == c.record) {
+                if let Some(r) = records.live.get_mut(&c.record) {
                     if !r.propagated.contains(&(id.0, generation)) {
                         r.propagated.push((id.0, generation));
                     }
@@ -282,17 +337,7 @@ impl<C: Cells> Runtime<C> {
             }) else {
                 return;
             };
-            let record = {
-                let mut records = self.provenance.write();
-                let record = records.next;
-                records.next += 1;
-                records.live.push(Record {
-                    id: record,
-                    reader: key.into(),
-                    propagated: Vec::new(),
-                });
-                record
-            };
+            let record = { self.provenance.write().insert(key.into()) };
             let hold: Rc<dyn Provenance> = Rc::new(Hold::<C> {
                 table: Arc::clone(&self.provenance),
                 id: record,
