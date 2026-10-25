@@ -636,12 +636,26 @@ fn shared_wide_diverted_retry() {
     wide_diverted_retry::<Shared>();
 }
 
+/// Sizes for the Failed-walk scaling tests. Main b9f0d0bf walks n + 1
+/// entries for the chain and k + 3 for the fan-in; a walk that rewalks the
+/// Failed node's deps per reader grows as n^2 / 2.
+const FAILED_WALK_SIZES: &[usize] = if cfg!(miri) {
+    &[4, 8]
+} else {
+    &[250, 500, 1000]
+};
+
 /// A chain of `n` queries over a Failed node, rerun after a set below the
 /// chain: each rerun's read of the Failed node below it walks only that
 /// node, as a walk entry Failed computes to nothing and a Failed root
 /// raises, so the walks stay linear.
 fn failed_entry_chain<C: Cells>(frames: Option<u32>) {
-    let n = if cfg!(miri) { 8 } else { 1000 };
+    for &n in FAILED_WALK_SIZES {
+        failed_entry_chain_of::<C>(n, frames);
+    }
+}
+
+fn failed_entry_chain_of<C: Cells>(n: usize, frames: Option<u32>) {
     let rt = Runtime::<C>::new();
     let opts = || match frames {
         Some(_) => replayable(),
@@ -850,7 +864,12 @@ fn shared_many_foreign_reads_stay_linear() {
 /// it, whose edges a Clean run recorded, all entries of one walk: the walk
 /// passes the Failed node without walking the chain once per reader.
 fn failed_entry_fan_in<C: Cells>() {
-    let k = if cfg!(miri) { 8 } else { 200 };
+    for &k in FAILED_WALK_SIZES {
+        failed_entry_fan_in_of::<C>(k);
+    }
+}
+
+fn failed_entry_fan_in_of<C: Cells>(k: usize) {
     let rt = Runtime::<C>::new();
     let fail = rt.create_input(0_u64);
     let mut failed = rt.create_query(move |rt| {
