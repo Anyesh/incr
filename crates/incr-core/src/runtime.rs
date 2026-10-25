@@ -2353,10 +2353,15 @@ impl<C: Cells> Runtime<C> {
                 handle.generation(),
                 type_tag,
             );
-            // A diverted read finds no arena and must leave through the
-            // empty-slot branch below, which `read_clean_local` lacks.
-            if C::SINGLE_THREADED && type_tag != crate::dep_stack::DIVERTED_TAG {
-                return self.read_clean_local(handle, type_tag, arena_slot);
+            if C::SINGLE_THREADED {
+                return self.read_clean_local(
+                    handle,
+                    node,
+                    type_tag,
+                    arena_slot,
+                    |v| v,
+                    |now| self.get_slow(handle, now),
+                );
             }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => value,
@@ -2400,8 +2405,10 @@ impl<C: Cells> Runtime<C> {
                 handle.generation(),
                 type_tag,
             );
-            if C::SINGLE_THREADED && type_tag != crate::dep_stack::DIVERTED_TAG {
-                return Ok(self.read_clean_local(handle, type_tag, arena_slot));
+            if C::SINGLE_THREADED {
+                return self.read_clean_local(handle, node, type_tag, arena_slot, Ok, |now| {
+                    self.try_get_slow(handle, now)
+                });
             }
             return match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => Ok(value),
@@ -2682,19 +2689,32 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// [`Self::try_read_slot`] for a Clean `get` or `try_get` under
-    /// `Local`, where an empty slot is [`Self::read_failed`]
-    /// (`reload_after_empty_slot`), and the value is cloned straight into
-    /// the return place.
+    /// `Local`, where an empty slot is [`Self::read_failed`], and the value
+    /// is cloned straight into the return place. A diverted read's
+    /// `DIVERTED_TAG` names no arena, and that miss goes on as
+    /// [`Self::reload_after_empty_slot`] does, to `slow` if it must, so the
+    /// fast path tests nothing extra.
     #[inline(always)]
-    fn read_clean_local<T: Value>(&self, handle: Incr<T>, type_tag: u16, arena_slot: u32) -> T {
+    fn read_clean_local<T: Value, R>(
+        &self,
+        handle: Incr<T>,
+        node: &NodeData<C>,
+        type_tag: u16,
+        arena_slot: u32,
+        read: impl FnOnce(T) -> R,
+        slow: impl FnOnce(NodeState) -> R,
+    ) -> R {
         debug_assert!(C::SINGLE_THREADED);
         self.park(ParkPoint::GetBeforeRead(NodeId(handle.slot())));
         let Some(arena) = self.arenas.tagged_arena::<T>(type_tag) else {
-            self.read_failed(handle)
+            return match self.reload_after_empty_slot(handle, node, type_tag, arena_slot) {
+                Ok(value) => read(value),
+                Err(now) => slow(now),
+            };
         };
         let value = value_code::run(|| arena.read_or(arena_slot, || self.read_failed(handle)));
         debug_assert_local_read_kept!(self.nodes.get(handle.slot()), handle.generation());
-        value
+        read(value)
     }
 
     /// [`Self::read_slot`], with `None` for an empty slot.
