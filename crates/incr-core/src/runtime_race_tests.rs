@@ -1982,3 +1982,82 @@ fn shared_read_returns_the_value_its_walk_landed_dirty() {
     assert_eq!(second.join().unwrap(), 200);
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
+
+/// p stabilizes an observer of r, then reads x. r reads y and v = y + 1,
+/// and once f is set only y; y then reads r and p. The observer's walk of
+/// r from Dirty computes y before v: y's nested read of r leaves v Dirty
+/// (tainted by y), r's read of y defers r into this thread's held map, and
+/// y's read of p (on the stack below the walk) defers y too, so r stays
+/// held by this thread. Another thread then releases claims before v, so
+/// the walk replans with a root it holds itself. Returns p's read and
+/// whether the release ran.
+fn observer_walk_with_its_root_held_here(release: bool) -> (Option<u64>, bool) {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let f = rt.create_input(0_u64);
+    let cell: Arc<std::sync::OnceLock<(Incr<u64>, Incr<u64>)>> =
+        Arc::new(std::sync::OnceLock::new());
+    let y_reads = cell.clone();
+    let y = rt.create_query_with_fallback(
+        move |rt| {
+            if rt.get(f) == 1 {
+                let (r, p) = *y_reads.get().unwrap();
+                rt.get(r) + rt.get(p)
+            } else {
+                rt.get(x)
+            }
+        },
+        |_| 7_u64,
+    );
+    let v = rt.create_query(move |rt| rt.get(y) + 1);
+    let r = rt.create_query_with_fallback(
+        move |rt| {
+            if rt.get(f) == 1 {
+                rt.get(y)
+            } else {
+                rt.get(y) + rt.get(v)
+            }
+        },
+        |_| 9_u64,
+    );
+    let p = rt.create_query_with_fallback(
+        move |rt| {
+            rt.stabilize();
+            rt.get(x)
+        },
+        |_| 0_u64,
+    );
+    cell.set((r, p)).unwrap();
+    assert_eq!(rt.get(r), 3);
+    rt.observe(r, |_| {});
+    assert_eq!(rt.get(p), 1);
+    rt.set(f, 1);
+    rt.set(x, 2);
+    let released = Arc::new(AtomicBool::new(false));
+    let hook_released = released.clone();
+    let hook_rt = Arc::downgrade(&rt);
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        let rt = hook_rt.upgrade().unwrap();
+        if matches!(point, ParkPoint::BeforeComputeOne(_))
+            && rt.own_claim_owner(id(r)).is_some()
+            && release
+            && !hook_released.swap(true, Ordering::Relaxed)
+        {
+            thread::spawn(move || rt.count_release()).join().unwrap();
+        }
+    }));
+    assert!(installed.is_ok());
+    super::FORCE_REPLAN_HERE.with(|f| f.set(true));
+    let read = catch_unwind(AssertUnwindSafe(|| rt.get(p)));
+    super::FORCE_REPLAN_HERE.with(|f| f.set(false));
+    (read.ok(), released.load(Ordering::Relaxed))
+}
+
+#[test]
+fn an_observer_walk_replanned_with_its_root_held_here_reads_as_unreplanned() {
+    let (unreplanned, _) = observer_walk_with_its_root_held_here(false);
+    let (read, released) = observer_walk_with_its_root_held_here(true);
+    assert!(released, "r was never held here");
+    assert!(unreplanned.is_some());
+    assert_eq!(read, unreplanned);
+}

@@ -3187,7 +3187,13 @@ impl<C: Cells> Runtime<C> {
                     // that left a closure Unsettled would rerun it from the
                     // root, and two threads whose caught cycles release each
                     // other's claims would then restart each other without end.
-                    let released = !resumed && !ran_unsettled && self.released_since(planned);
+                    // A root its deps-first computes deferred into this
+                    // thread's held map is not walked again: the plan goes
+                    // on to the root's compute, which reads it as deferred.
+                    let released = !resumed
+                        && !ran_unsettled
+                        && self.released_since(planned)
+                        && self.own_claim_owner(id).is_none();
                     resumed = false;
                     planned = self.planned();
                     if !self.prune_settled(&mut walk) {
