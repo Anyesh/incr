@@ -1647,6 +1647,9 @@ impl<C: Cells> Runtime<C> {
                 // the slow path's foreign read does.
                 return Err(NodeState::Clean);
             }
+            // Not kept, so the frame must not be doomed: a retry would
+            // read this runtime again.
+            self.dep_stack.hold_foreign_reader();
         }
         let (type_tag, arena_slot) = self.fields_under(handle, node);
         match self.try_read_slot(handle, node, type_tag, arena_slot) {
