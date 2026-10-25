@@ -870,7 +870,9 @@ fn write_held<T: Value, C: Cells>(
         ctl.wrote.set(1);
         arena.write(slot, value)
     };
-    hold::keep_written(displaced.map(|d| Box::new(d) as Box<dyn std::any::Any>));
+    ctl.kept.set(Some(
+        displaced.map(|d| Box::new(d) as Box<dyn std::any::Any>),
+    ));
     Outcome::Changed
 }
 
@@ -941,9 +943,6 @@ pub struct Runtime<C: Cells> {
     /// land a member Clean over nodes it leaves New or Dirty, which a
     /// walk another thread planned earlier would go on to compute.
     pub(crate) episodes_landed: <C as Cells>::U64,
-    /// Threads holding landings of this runtime (`hold`), which reach it
-    /// by pointer until their outermost exit.
-    pub(crate) held_by: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
@@ -1068,14 +1067,6 @@ impl<C: Cells> Default for Runtime<C> {
     }
 }
 
-impl<C: Cells> Drop for Runtime<C> {
-    fn drop(&mut self) {
-        if !C::SINGLE_THREADED {
-            self.drop_held();
-        }
-    }
-}
-
 impl<C: Cells> Runtime<C> {
     pub fn new() -> Self {
         let runtime_id = RuntimeId::allocate();
@@ -1086,7 +1077,6 @@ impl<C: Cells> Runtime<C> {
             watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
             episodes_landed: C::new_u64(0),
-            held_by: C::new_u64(0),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id,
@@ -3979,7 +3969,8 @@ impl<C: Cells> Runtime<C> {
                 let ctl = ComputeCtl::new(
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
-                        | if speculative { cycle::SPECULATIVE } else { 0 },
+                        | if speculative { cycle::SPECULATIVE } else { 0 }
+                        | self.rerun_hold(node),
                 );
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
                 ctl.lowlink.set(cidx);
@@ -4082,7 +4073,7 @@ impl<C: Cells> Runtime<C> {
                     & (cycle::LOW | cycle::DOOMED | cycle::SPECULATIVE | cycle::HOLD);
                 if parked != 0 {
                     if parked == cycle::HOLD {
-                        self.open_hold(id, node, first, bag);
+                        self.open_hold(id, node, first, ctl.kept.take(), bag);
                     } else {
                         let attempt = Attempt {
                             first,
@@ -4268,7 +4259,7 @@ impl<C: Cells> Runtime<C> {
         let wrote = ctl.wrote.get() != 0;
         // A panic its run met reading a held landing is held as its value is.
         if kind.is_none() && !C::SINGLE_THREADED && ctl.has(cycle::HOLD) {
-            self.open_hold(id, node, attempt.first, bag);
+            self.open_hold(id, node, attempt.first, ctl.kept.take(), bag);
         }
         if children_stashed {
             let first = attempt.first;

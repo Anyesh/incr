@@ -1815,7 +1815,7 @@ impl<C: Cells> Runtime<C> {
                 // A cut is an exposure: its released members stay Computing to
                 // other threads until the attempt ends (`crate::hold`).
                 if !C::SINGLE_THREADED {
-                    self.open_hold(NodeId(m), self.nodes.get(m), e.first, bag);
+                    self.open_hold(NodeId(m), self.nodes.get(m), e.first, None, bag);
                 }
                 self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
                 bag.push_erased(Box::new(e.into_values()));
@@ -2267,7 +2267,7 @@ impl<C: Cells> Runtime<C> {
         if !C::SINGLE_THREADED {
             hold::note_episode(self.runtime_id);
             for (m, e) in &entries {
-                self.open_hold(NodeId(*m), self.nodes.get(*m), e.first, bag);
+                self.open_hold(NodeId(*m), self.nodes.get(*m), e.first, None, bag);
             }
         }
         let mut superseded = false;

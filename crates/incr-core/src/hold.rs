@@ -21,7 +21,9 @@ use crate::value_code;
 
 /// What a node's first held landing in the attempt displaced, made once
 /// and kept through the node's later re-landings. A field left `None`
-/// was not written by the attempt.
+/// was not written by the attempt. `changed_at` is not restored: it only
+/// grows, so a retracted node's readers see a change and recompute rather
+/// than verify against a value they never read.
 #[derive(Default)]
 pub(crate) struct Undo {
     /// The claim came from `New`, so a retraction lands it `New`.
@@ -58,30 +60,19 @@ pub(crate) struct Held {
     pub(crate) undo: Undo,
 }
 
-/// Publishes (`true`) or retracts another runtime's held landings from
-/// the outermost exit of the runtime the thread entered first: one
-/// attempt spans every runtime its reads reach, and a wound retries it
-/// whole.
-#[derive(Clone, Copy)]
-pub(crate) struct Ender {
-    pub(crate) rt: *const (),
-    pub(crate) end: unsafe fn(*const (), bool),
-}
-
 #[derive(Default)]
 struct HoldSet {
     by_cell: HashMap<usize, usize, FxBuildHasher>,
     entries: Vec<Option<Held>>,
     seq: u64,
-    /// The value a `HOLD` frame's write displaced, until its landing
-    /// opens the entry.
-    kept: Option<Option<Box<dyn Any>>>,
     /// A held node was read through the view since the last claim.
     consulted: bool,
     /// Episodes landed, per runtime, for `own_episode` at publication.
     episodes: Vec<(RuntimeId, u64)>,
-    /// One per runtime with entries, in the order they opened.
-    enders: Vec<(RuntimeId, Ender)>,
+    /// Runtimes whose runs read state this attempt has not published (a
+    /// runtime whose frames are below them, or a retracted read), so their
+    /// landings retract at the exit of their first entry.
+    tainted: Vec<RuntimeId>,
 }
 
 impl HoldSet {
@@ -153,9 +144,10 @@ pub(crate) fn holds(cell: usize) -> bool {
 }
 
 /// Opens the entry for a landing about to be held, with the stamps it
-/// will overwrite, unless the node already has one. The value a `HOLD`
-/// frame's write kept goes to a new entry's undo, or back to the caller
-/// to drop when the entry exists.
+/// will overwrite, unless the node already has one. `kept`, what a `HOLD`
+/// frame's write displaced, goes to the undo unless an earlier write in
+/// the attempt is already there; then it comes back for the caller to
+/// drop.
 pub(crate) fn open(
     cell: usize,
     rt: RuntimeId,
@@ -163,16 +155,18 @@ pub(crate) fn open(
     generation: u32,
     first: bool,
     verified_at: Option<u64>,
-    ender: impl FnOnce() -> Ender,
+    kept: Option<Option<Box<dyn Any>>>,
 ) -> Option<Box<dyn Any>> {
     value_code::set_held_bit(true);
     with(|h| {
-        let kept = h.kept.take();
-        if h.by_cell.contains_key(&cell) {
-            return kept.flatten();
-        }
-        if !h.enders.iter().any(|(r, _)| *r == rt) {
-            h.enders.push((rt, ender()));
+        if let Some(e) = h.get(cell) {
+            return match kept {
+                Some(value) if e.undo.value.is_none() => {
+                    e.undo.value = Some(value);
+                    None
+                }
+                other => other.flatten(),
+            };
         }
         let at = h.entries.len();
         h.entries.push(Some(Held {
@@ -196,11 +190,6 @@ pub(crate) fn open(
         h.by_cell.insert(cell, at);
         None
     })
-}
-
-/// A `HOLD` frame's write displaced `value`, for the landing's entry.
-pub(crate) fn keep_written(value: Option<Box<dyn Any>>) {
-    with(|h| h.kept = Some(value));
 }
 
 /// The value a held node's write displaced: kept for the undo if it is
@@ -311,8 +300,8 @@ pub(crate) fn forget(cell: usize) -> Option<Held> {
 }
 
 /// Takes `rt`'s entries in landing order, with the episodes it landed,
-/// for publication or retraction, and whether `rt` had an ender here.
-pub(crate) fn take(rt: RuntimeId) -> (Vec<Held>, u64, bool) {
+/// for publication or retraction, and clears its taint.
+pub(crate) fn take(rt: RuntimeId) -> (Vec<Held>, u64) {
     with(|h| {
         let mut taken: Vec<Held> = Vec::new();
         for e in h.entries.iter_mut() {
@@ -321,12 +310,9 @@ pub(crate) fn take(rt: RuntimeId) -> (Vec<Held>, u64, bool) {
             }
         }
         h.by_cell.retain(|_, at| h.entries[*at].is_some());
-        let enders = h.enders.len();
-        h.enders.retain(|(r, _)| *r != rt);
-        let ended = h.enders.len() != enders;
-        // An ender outlives its runtime's entries when a delete forgot
-        // them, and the outermost exit still owes it the call.
-        if h.by_cell.is_empty() && h.enders.is_empty() {
+        h.tainted.retain(|r| *r != rt);
+        // A taint keeps the bit, so that the `HOLD` it raised passes up.
+        if h.by_cell.is_empty() && h.tainted.is_empty() {
             h.entries.clear();
             h.consulted = false;
             value_code::set_held_bit(false);
@@ -337,25 +323,27 @@ pub(crate) fn take(rt: RuntimeId) -> (Vec<Held>, u64, bool) {
             .iter()
             .position(|(r, _)| *r == rt)
             .map_or(0, |i| h.episodes.swap_remove(i).1);
-        (taken, episodes, ended)
+        (taken, episodes)
     })
 }
 
-/// The enders of the runtimes other than `rt` this thread holds landings
-/// of.
-pub(crate) fn others(rt: RuntimeId) -> Vec<Ender> {
-    with(|h| {
-        h.enders
-            .iter()
-            .filter(|(r, _)| *r != rt)
-            .map(|(_, e)| *e)
-            .collect()
-    })
-}
-
-/// Whether this thread holds landings of `rt`.
+/// Whether this thread holds landings of `rt`, or has tainted it.
 pub(crate) fn holds_runtime(rt: RuntimeId) -> bool {
-    active() && with(|h| h.enders.iter().any(|(r, _)| *r == rt))
+    active() && with(|h| h.tainted.contains(&rt) || h.entries.iter().flatten().any(|e| e.rt == rt))
+}
+
+/// `rt`'s runs read state this attempt has not published.
+pub(crate) fn taint(rt: RuntimeId) {
+    value_code::set_held_bit(true);
+    with(|h| {
+        if !h.tainted.contains(&rt) {
+            h.tainted.push(rt);
+        }
+    });
+}
+
+pub(crate) fn tainted(rt: RuntimeId) -> bool {
+    active() && with(|h| h.tainted.contains(&rt))
 }
 
 /// How many nodes this thread holds now.

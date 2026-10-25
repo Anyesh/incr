@@ -2,10 +2,12 @@
 //! held landings, holding a landing, and the attempt's end, which
 //! publishes them or, after a wound, retracts them.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use crate::cells::Cells;
+use crate::cycle_state::{self, UnwindKind};
 use crate::deferred::Deferred;
 use crate::fx::FxBuildHasher;
 use crate::hold::{self, Held};
@@ -48,6 +50,20 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// `HOLD` for a run of a node this thread holds and has claimed again,
+    /// so its write keeps what it displaces for the undo record.
+    #[inline(always)]
+    pub(super) fn rerun_hold(&self, node: &NodeData<C>) -> u16 {
+        if !C::SINGLE_THREADED
+            && hold::active()
+            && hold::holds(state::cell_key::<C>(node.state_cell()))
+        {
+            crate::cycle::HOLD
+        } else {
+            0
+        }
+    }
+
     /// `land_as` while this thread holds landings: the landing is held if
     /// the node already has an entry, or if it was decided by reading a
     /// held landing since the claim; `None` lets it land.
@@ -69,16 +85,16 @@ impl<C: Cells> Runtime<C> {
             // Only a verify or an unrun release lands without opening an
             // entry first; a release to New is of a claim from New.
             let first = target == NodeState::New;
-            let kept = hold::open(
+            let own = hold::open(
                 cell,
                 self.runtime_id,
                 id.0,
                 node.generation(),
                 first,
                 None,
-                || self.ender(),
+                None,
             );
-            debug_assert!(kept.is_none(), "incr-core: a new entry takes no kept value");
+            debug_assert!(own.is_none(), "incr-core: a new entry hands back no value");
         }
         hold::land(cell, target, flagged, unrun);
         Some(target)
@@ -93,6 +109,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         node: &NodeData<C>,
         first: bool,
+        kept: Option<Option<Box<dyn Any>>>,
         bag: &mut Deferred<C>,
     ) {
         let cell = state::cell_key::<C>(node.state_cell());
@@ -104,7 +121,7 @@ impl<C: Cells> Runtime<C> {
             node.generation(),
             first,
             verified_at,
-            || self.ender(),
+            kept,
         ) {
             bag.push_erased(own);
         }
@@ -121,6 +138,8 @@ impl<C: Cells> Runtime<C> {
         self.has_dependents_held(c, listed)
     }
 
+    /// Scans every held node's dep lists, O(held deps) per check; a
+    /// delete inside a read that holds landings is rare.
     #[cold]
     #[inline(never)]
     fn has_dependents_held(&self, c: u32, listed: &DependentList) -> bool {
@@ -185,7 +204,16 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         }
-        drop(held);
+        // As a retraction ends an entry: children the held run opened are
+        // discarded, and its values drop at the drain.
+        let mut bag = Deferred::new();
+        if let Some((_, opened)) = held.children {
+            self.land_children_now(NodeId(slot), ChildLanding::Discard, opened, &mut bag);
+        }
+        if let Some(Some(old)) = held.undo.value {
+            bag.push_erased(old);
+        }
+        bag.drain(self);
         Some(SingleClaim::Claimed)
     }
 
@@ -194,78 +222,63 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn publish_held(&self) {
-        self.end_held(true);
+        self.publish_own();
     }
 
-    /// The attempt was wounded: every held landing goes back, on every
-    /// runtime it reached.
+    /// The attempt was wounded: every held landing goes back.
     #[cold]
     #[inline(never)]
     pub(super) fn retract_held(&self) {
-        self.end_held(false);
+        let (entries, _episodes) = hold::take(self.runtime_id);
+        self.retract_entries(entries);
     }
 
-    /// Other runtimes first, each to the end even if one panics, then
-    /// this one; the first panic goes on.
-    fn end_held(&self, publish: bool) {
-        let mut failed = None;
-        for e in hold::others(self.runtime_id) {
-            // SAFETY: an ender's runtime is live: its `Drop` refuses while
-            // a thread holds its landings (`held_by`), and this thread
-            // does until this call.
-            let ended = catch_unwind(AssertUnwindSafe(|| unsafe { (e.end)(e.rt, publish) }));
-            if let Err(payload) = ended {
-                failed.get_or_insert(payload);
+    /// A non-Clean read of this runtime from another runtime's frame.
+    /// The read is this runtime's first entry on the thread unless its
+    /// frames are below: then the reading run depends on this attempt's
+    /// stack, so its runtime is tainted and its landing held. A first
+    /// entry ends this runtime's held landings at its exit, since nothing
+    /// may keep a pointer to the runtime past it: they publish if they
+    /// read only published state, and retract (landing as not computed)
+    /// if the runtime is tainted or the thread wounded, which taints the
+    /// reader in turn.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn foreign_entry<R>(&self, read: impl FnOnce() -> R) -> R {
+        if self.dep_stack.has_frame_of(self.runtime_id) {
+            self.taint_reader();
+            return read();
+        }
+        let outcome = catch_unwind(AssertUnwindSafe(read));
+        if hold::holds_runtime(self.runtime_id) {
+            let unwound = outcome.is_err()
+                && matches!(
+                    cycle_state::unwind_kind(),
+                    Some(UnwindKind::Wound | UnwindKind::Discard)
+                );
+            if unwound || cycle_state::wounded() || hold::tainted(self.runtime_id) {
+                self.retract_held();
+                self.taint_reader();
+            } else {
+                self.publish_own();
             }
         }
-        let own = catch_unwind(AssertUnwindSafe(|| self.end_own(publish)));
-        if let Some(payload) = failed.or(own.err()) {
-            resume_unwind(payload);
+        match outcome {
+            Ok(r) => r,
+            Err(payload) => resume_unwind(payload),
         }
     }
 
-    fn end_own(&self, publish: bool) {
-        if publish {
-            self.publish_own();
-        } else {
-            let (entries, _episodes, ended) = hold::take(self.runtime_id);
-            self.release_ender(ended);
-            self.retract_entries(entries);
+    /// The reading frame's landing depends on state this attempt has not
+    /// published: it is held, and its runtime tainted.
+    fn taint_reader(&self) {
+        if let Some(reader) = self.dep_stack.raise_hold() {
+            hold::taint(reader);
         }
-    }
-
-    fn release_ender(&self, ended: bool) {
-        if ended {
-            C::u64_fetch_add(&self.held_by, u64::MAX);
-        }
-    }
-
-    /// What another runtime's outermost exit calls to end this one's held
-    /// landings; counts this thread in `held_by`.
-    fn ender(&self) -> hold::Ender {
-        C::u64_fetch_add(&self.held_by, 1);
-        hold::Ender {
-            rt: (self as *const Self).cast(),
-            end: end_erased::<C>,
-        }
-    }
-
-    /// Drops the landings this thread holds of a runtime being dropped:
-    /// its nodes go with it.
-    pub(super) fn drop_held(&self) {
-        if hold::holds_runtime(self.runtime_id) {
-            let (_entries, _episodes, ended) = hold::take(self.runtime_id);
-            self.release_ender(ended);
-        }
-        assert!(
-            C::u64_load_acquire(&self.held_by) == 0,
-            "incr-core: a runtime was dropped while a read on another thread holds its landings"
-        );
     }
 
     fn publish_own(&self) {
-        let (entries, episodes, ended) = hold::take(self.runtime_id);
-        self.release_ender(ended);
+        let (entries, episodes) = hold::take(self.runtime_id);
         if episodes != 0 {
             // Before the members land, so a read of one of their landings
             // also reads the count.
@@ -440,10 +453,4 @@ impl<C: Cells> Runtime<C> {
         }
         bag.drain(self);
     }
-}
-
-/// SAFETY: `rt` is a live `Runtime<C>`.
-unsafe fn end_erased<C: Cells>(rt: *const (), publish: bool) {
-    // SAFETY: the caller's.
-    unsafe { &*rt.cast::<Runtime<C>>() }.end_own(publish);
 }

@@ -419,6 +419,10 @@ pub struct ComputeCtl {
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
+    /// What a `HOLD` frame's write displaced (`Some(None)` for an empty
+    /// slot), until its landing's entry takes it; otherwise it drops with
+    /// the frame, as an ordinary write drops it.
+    pub(crate) kept: Cell<Option<Option<Box<dyn std::any::Any>>>>,
 }
 
 impl ComputeCtl {
@@ -430,6 +434,7 @@ impl ComputeCtl {
             buf: Cell::new(None),
             wrote: Cell::new(0),
             children: Cell::new(std::ptr::null()),
+            kept: Cell::new(None),
         }
     }
 

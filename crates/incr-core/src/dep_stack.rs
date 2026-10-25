@@ -490,14 +490,24 @@ pub trait DepStack: 'static {
 
     /// Marks the nearest compute frame, past any callback's barrier, as
     /// having read a landing this thread holds, so its own landing is held.
-    fn raise_hold(&self) {
+    /// Returns the frame's runtime.
+    fn raise_hold(&self) -> Option<RuntimeId> {
         self.with(|s| {
-            if let Some(f) = s.frames.iter().rev().find(|f| f.rt != RuntimeId::SENTINEL) {
-                // SAFETY: the frame is on the stack, so its control block
-                // is live (see `Frame::ctl`).
-                unsafe { (*f.ctl).raise(HOLD) };
-            }
-        });
+            let f = s
+                .frames
+                .iter()
+                .rev()
+                .find(|f| f.rt != RuntimeId::SENTINEL)?;
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            unsafe { (*f.ctl).raise(HOLD) };
+            Some(f.rt)
+        })
+    }
+
+    /// Whether any frame on the stack is one of `rt`'s computes.
+    fn has_frame_of(&self, rt: RuntimeId) -> bool {
+        self.with(|s| s.frames.iter().any(|f| f.rt == rt))
     }
 
     /// Mark `rt`'s active frame, if any, as having read a dep that did

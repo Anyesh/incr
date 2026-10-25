@@ -2155,6 +2155,19 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         word: u64,
     ) -> Result<T, Cycle> {
+        if C::SINGLE_THREADED {
+            return self.foreign_read_framed(handle, observed, kind, word);
+        }
+        self.foreign_entry(|| self.foreign_read_framed(handle, observed, kind, word))
+    }
+
+    fn foreign_read_framed<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        kind: ReadKind,
+        word: u64,
+    ) -> Result<T, Cycle> {
         let Some((reader, node, ctl, cidx)) = self.dep_stack.top_frame() else {
             return self.read_unframed(handle, observed, kind, word);
         };
