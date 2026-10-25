@@ -1616,12 +1616,11 @@ fn shared_dissolved_root_lands_as_before_its_claim() {
 }
 
 /// The same shape with F, X and Y a landed group and Z's set behind input
-/// t: F's claim, taken from Dirty, lands as before it, under no record
-/// naming X or Y, which the dissolve released, and unverified, as a
-/// member that leaves its group lands. The driver's read holds X and Y
-/// until it publishes (`crate::hold`), so the other thread's read of F
-/// waits for the driver and reads as in the order where the driver reads
-/// first.
+/// t: F's claim, taken from Dirty, lands held, under no record naming X
+/// or Y, which the dissolve released, and unverified, as a member that
+/// leaves its group lands. The driver's read holds F, X and Y until it
+/// publishes (`crate::hold`), so the other thread's read of F waits for
+/// the driver and reads as in the order where the driver reads first.
 #[test]
 fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
     let run = |frames: u32, park: bool| {
@@ -1672,16 +1671,12 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
         rt.set_max_frames(frames);
         // Parks at the level-0 entry's claim after the episode under F's
         // entry dissolved, not at the claim that entry starts from.
-        let weak = Arc::downgrade(&rt);
         let (parked, entered) = (gate.clone(), Arc::new(AtomicU8::new(0)));
         let installed = rt.park_hook.set(Box::new(move |p| {
             if p == ParkPoint::BeforeEntry(id(f)) && zran.load(SeqCst) == 1 {
                 entered.store(1, SeqCst);
             }
-            let dirty = weak
-                .upgrade()
-                .is_some_and(|rt| rt.state_of(f) == NodeState::Dirty);
-            if p == ParkPoint::BeforeClaim(id(f)) && entered.load(SeqCst) == 1 && dirty {
+            if p == ParkPoint::BeforeClaim(id(f)) && entered.load(SeqCst) == 1 {
                 parked.park();
             }
         }));
@@ -1723,7 +1718,7 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
     assert_eq!(
         landed,
         (
-            NodeState::Dirty,
+            NodeState::Computing,
             false,
             false,
             [NodeState::Computing; 2],
@@ -1734,7 +1729,7 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
     );
     assert_eq!(
         waited,
-        (true, NodeState::Dirty),
+        (true, NodeState::Computing),
         "the other read while the driver is parked: (still waiting, F's state)"
     );
     assert_eq!((got, other), (want.clone(), want));
