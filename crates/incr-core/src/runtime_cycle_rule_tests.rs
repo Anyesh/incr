@@ -932,8 +932,9 @@ fn member_run_unwind_is_the_readers_err<C: Cells>() {
 
 /// A group verify's episode panics in member b: b lands Failed, released
 /// with the Fixpoint co-member a it reads. A later set that reaches only a
-/// must still let b recompute, so with j back at
-/// 1 the cycle converges to a = 2, b = 3 as it first did.
+/// must still let b recompute: b is no longer Failed, and its read reports
+/// the cycle it closes through a, as a fresh read of b alone does (the
+/// first read's 3 comes from reading a first).
 fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
     let rt = Runtime::<C>::new();
     let j = rt.create_input(1_i64);
@@ -971,7 +972,7 @@ fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2"));
     assert_eq!(rt.get(a), 2);
     rt.assert_invariant_i();
 }
@@ -1016,7 +1017,7 @@ fn failed_member_two_hops_from_the_set<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2, 3"));
     assert_eq!(rt.get(c), 2);
     rt.assert_invariant_i();
 }
@@ -1061,7 +1062,7 @@ fn failed_member_cured_through_a_recorded_dep<C: Cells>() {
 
     rt.set(k, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok(), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "2, 3"));
     rt.assert_invariant_i();
 }
 
@@ -1160,7 +1161,7 @@ fn failed_compare_over_a_co_member<C: Cells>() {
 
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
-    assert_eq!(quiet(|| rt.get(b)).ok().map(|v| v.0), Some(3));
+    assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2, 3"));
     rt.assert_invariant_i();
 }
 
