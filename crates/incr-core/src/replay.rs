@@ -13,7 +13,7 @@
 use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry as MapEntry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
@@ -1348,12 +1348,15 @@ pub(crate) struct KeptRead {
     pub(crate) what: Delivered,
 }
 
+/// The landings copies may hold, as `(runtime, (slot, generation))`.
+type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
+
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
     static KEPT_EVENTS: RefCell<Vec<Logged>> = const { RefCell::new(Vec::new()) };
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
-    static COPIED: RefCell<[u64; 64]> = const { RefCell::new([0; 64]) };
+    static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
@@ -1372,7 +1375,7 @@ loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
     static KEPT_EVENTS: RefCell<Vec<Logged>> = RefCell::new(Vec::new());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
-    static COPIED: RefCell<[u64; 64]> = RefCell::new([0; 64]);
+    static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = Cell::new(0);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
@@ -1486,11 +1489,6 @@ fn from_frame(kept: &[(KeptRead, usize)], cidx: u32) -> usize {
     from
 }
 
-fn copied_bit(rt: RuntimeId, node: (u32, u32)) -> (usize, u64) {
-    let h = FxBuildHasher.hash_one((rt, node));
-    ((h >> 52 & 63) as usize, 1 << (h >> 58))
-}
-
 /// Marks `nodes` as landings a copy may hold, so that a later landing of
 /// one of them finds the copies to drop it from. A shared copy marks only
 /// the notes its log's earlier copies did not.
@@ -1499,8 +1497,7 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
     COPIED.with(|c| {
         let mut c = c.borrow_mut();
         let mut mark = |n| {
-            let (w, b) = copied_bit(rt, n);
-            c[w] |= b;
+            c.insert((rt, n));
         };
         match &nodes.nodes {
             Nodes::Owned(nodes) => {
@@ -1537,10 +1534,9 @@ pub(crate) fn copies_held() -> bool {
 /// outside a speculative run. A kept read takes the events when a retry
 /// takes it, so an event costs nothing per kept read.
 pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
-    let all = ev.node().is_some_and(|n| {
-        let (w, b) = copied_bit(rt, n);
-        COPIED.with(|c| c.borrow()[w] & b != 0)
-    });
+    let all = ev
+        .node()
+        .is_some_and(|n| COPIED.with(|c| c.borrow().contains(&(rt, n))));
     // Short of a copied node, an event retires only landings above its
     // position, or at it for a contained payload.
     let reach = match *ev {
@@ -1622,7 +1618,7 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
         );
         value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
-            COPIED.with(|c| *c.borrow_mut() = [0; 64]);
+            COPIED.with(|c| c.borrow_mut().clear());
             COPIED_GEN.with(|g| g.set(g.get() + 1));
         }
         out
