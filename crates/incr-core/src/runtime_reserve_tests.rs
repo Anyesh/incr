@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use super::race_tests::{await_reservation_wait, id, Gate};
 use super::{ParkPoint, Runtime};
-use crate::cells::{Local, Shared};
+use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_in_child;
 use crate::cycle::{QueryOpts, Replay};
 use crate::handle::Incr;
@@ -748,6 +748,178 @@ fn a_doomed_closures_destructor_reads_inside_its_unwind() {
                 assert_eq!(within_10s(&rt, t), Some(Ok(14)), "budget {frames}");
             }
         },
+    )
+    .assert_clean();
+}
+
+struct OnDrop<F: FnMut()>(F);
+
+impl<F: FnMut()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+fn message(got: std::thread::Result<u64>) -> String {
+    match got {
+        Ok(v) => format!("Ok({v})"),
+        Err(e) if e.is::<crate::cycle::WoundUnwind>() => "a wound".to_string(),
+        Err(e) => e
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "an engine unwind".to_string()),
+    }
+}
+
+/// T holds a guard whose destructor reads P, which panics, and `try_get`s
+/// C, which closes a cycle of its own, catching both; T's read of A unwinds
+/// a cycle through T. The destructor's reads must leave the cycle's unwind
+/// as they found it, and keep their own: `try_get(T)` reports what it does
+/// without the guard, the guard catches P's panic and C's cycle as `Err`,
+/// and C stays a cycle, not a failure.
+fn a_destructors_read_keeps_a_cycles_unwind<C: Cells>() {
+    let mut reports = Vec::new();
+    for guarded in [false, true] {
+        let rt = Runtime::<C>::new();
+        let p = rt.create_query(|_: &Runtime<C>| -> u64 { panic!("p boom") });
+        let bb: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let a = {
+            let bb = bb.clone();
+            rt.create_query(move |rt: &Runtime<C>| rt.get(*bb.get().unwrap()))
+        };
+        bb.set(rt.create_query(move |rt: &Runtime<C>| rt.get(a)))
+            .unwrap();
+        let dd: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let c = {
+            let dd = dd.clone();
+            rt.create_query(move |rt: &Runtime<C>| rt.get(*dd.get().unwrap()))
+        };
+        dd.set(rt.create_query(move |rt: &Runtime<C>| rt.get(c)))
+            .unwrap();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let t = {
+            let seen = seen.clone();
+            rt.create_query(move |rt: &Runtime<C>| {
+                let _guard = guarded.then(|| {
+                    OnDrop(|| {
+                        let got = catch_unwind(AssertUnwindSafe(|| rt.get(p)));
+                        seen.lock().unwrap().push(message(got));
+                        let got = catch_unwind(AssertUnwindSafe(|| rt.try_get(c).is_err()));
+                        seen.lock()
+                            .unwrap()
+                            .push(format!("{:?}", got.map_err(|e| message(Err(e)))));
+                    })
+                });
+                rt.get(a)
+            })
+        };
+        let got = catch_unwind(AssertUnwindSafe(|| rt.try_get(t).map_err(|_| ())));
+        reports.push(format!("{:?}", got.map_err(|e| message(Err(e)))));
+        if guarded {
+            assert_eq!(*seen.lock().unwrap(), ["p boom", "Ok(true)"]);
+            let again = catch_unwind(AssertUnwindSafe(|| rt.try_get(c).is_err()));
+            assert!(
+                matches!(again, Ok(true)),
+                "the cycle C closes landed as a failure"
+            );
+        }
+    }
+    assert_eq!(reports[0], reports[1]);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_destructors_read_keeps_a_cycles_unwind_local() {
+    run_in_child(
+        "runtime::reserve_tests::a_destructors_read_keeps_a_cycles_unwind_local",
+        a_destructors_read_keeps_a_cycles_unwind::<Local>,
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_destructors_read_keeps_a_cycles_unwind_shared() {
+    run_in_child(
+        "runtime::reserve_tests::a_destructors_read_keeps_a_cycles_unwind_shared",
+        a_destructors_read_keeps_a_cycles_unwind::<Shared>,
+    )
+    .assert_clean();
+}
+
+/// T holds a guard whose destructor reads P on a second runtime, which
+/// panics, and catches it; over budget, T's read of Y raises T's doom, so
+/// the guard reads inside the doom's unwind. With `wound`, a waiter that met
+/// T's claim wounds T's attempt once, while that discard is in flight, just
+/// before the read. The read must leave the unwind's kind and flight to T's
+/// own catch: the guard never catches a wound, and T returns its value.
+/// Inside the doomed run the read is speculative, so P's panic may reach
+/// the guard as a discard.
+fn destructor_read_on_another_runtime(wound: bool) {
+    for frames in [u32::MAX, 1, 2] {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let other = Arc::new(Rt::new());
+        let p = other.create_query(|_: &Rt| -> u64 { panic!("p boom") });
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let tt: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let wounds = Arc::new(AtomicU32::new(0));
+        let t = {
+            let (other, seen, wounds, tt) =
+                (other.clone(), seen.clone(), wounds.clone(), tt.clone());
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let _guard = OnDrop(|| {
+                        if wound && crate::attempt::in_flight() && wounds.load(SeqCst) == 0 {
+                            let claim = (rt.runtime_id, tt.get().unwrap().slot());
+                            let attempt = crate::attempt::mine();
+                            thread::scope(|s| {
+                                s.spawn(|| assert!(attempt.wound_in_flight(claim)));
+                            });
+                            wounds.fetch_add(1, SeqCst);
+                        }
+                        let got = catch_unwind(AssertUnwindSafe(|| other.get(p)));
+                        seen.lock().unwrap().push(message(got));
+                    });
+                    rt.get(y) + 10
+                },
+                replayable(),
+            )
+        };
+        tt.set(t).unwrap();
+        rt.set_max_frames(frames);
+        assert_eq!(within_10s(&rt, t), Some(Ok(14)), "budget {frames}");
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "budget {frames}");
+        assert!(
+            seen.iter().all(|m| m != "a wound"),
+            "budget {frames}: {seen:?}"
+        );
+        if wound && frames == 1 {
+            assert!(wounds.load(SeqCst) > 0, "no wound at budget 1");
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_destructors_read_on_another_runtime_keeps_a_doom() {
+    run_in_child(
+        "runtime::reserve_tests::a_destructors_read_on_another_runtime_keeps_a_doom",
+        || destructor_read_on_another_runtime(false),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_destructors_read_on_another_runtime_keeps_a_wounded_doom() {
+    run_in_child(
+        "runtime::reserve_tests::a_destructors_read_on_another_runtime_keeps_a_wounded_doom",
+        || destructor_read_on_another_runtime(true),
     )
     .assert_clean();
 }
