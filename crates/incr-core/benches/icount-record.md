@@ -2822,3 +2822,10 @@ Gate: the hard gates are exact (101/193, 218.14/87). `rc-sweep`
 against `34412289` changes no value and flags no run count, and the
 strict scan lists the same seeds as `34412289`'s. Replay scale timing
 and `scale-icount` run on the train that lands this branch.
+
+## t10 c3b8e377 (train A) merged into t11: the typed arena pointer is NonNull
+
+- Engine: `w/T11-sync-c3b8e377` (merge `4824a1d7` plus `9954f55b`) against t11 `f319af73`, this box through buildlock, `icount.sh` defaults.
+- The merge alone left `get_clean_local` at 97 (+2): no source on the path changed, but LLVM stopped eliding the null test of `Some(&*entry.typed)` in `ArenaRegistry::tagged_arena` (`test; je` after the arena pointer's load). `9954f55b` holds `ArenaEntry::typed` as `NonNull<()>`, so the load carries the non-null fact: `get_clean_local` 95 (exact), `get_clean_shared` 192 -> 190.
+- Exact: `table_hit_local` 150.14, `table_hit_shared` 216.14, `value_slot_read_local` 5, `value_slot_read_shared` 87.
+- `children_rerun_1k` +2981 Local, +2988 Shared (about 3 per child compute) is train A's own: t10 `34412289` -> `c3b8e377` measures +2995 and +3004 on the same box (the per-compute resolver pointer and untested frame tag of "A frame settles at its first foreign Clean read whether it keeps them"). The other workloads move by train A's changes, mostly down on Local (`chain_local/propagate/100` -2.8%, the forced-inline push).
