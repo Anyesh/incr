@@ -4212,6 +4212,82 @@ fn until(done: impl Fn() -> bool) {
     }
 }
 
+/// 0x527's ops 0 (`Get(0)`) and 1 (`Get(4)`) overlap. Op 1's attempt runs
+/// a nested episode under its `try_get(8)` that lands 8 and 15 Dirty,
+/// then parks until op 0 waits on its claim of 19; op 1 then waits on op
+/// 0, the younger op 1 is wounded, and op 0 finds 8 Dirty where either
+/// order has it New or op 1 finished. Op 0 then computes 8 alone and lands
+/// it Failed, and op 1's retry reads that: `Panic("failed")` where every
+/// order of the two reads gives a cycle panic. A wounded attempt is in
+/// no order, so no other read may build on its landings.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "T10-two-527-failed-read-escapes: a wounded attempt's nested-episode landings stay public until Variant V holds them (T8-44e3-clean-landing-variant)"]
+fn two_thread_read_builds_on_no_wounded_attempts_nested_episode() {
+    crate::child_test::run_in_child(
+        "runtime::replay_differential::two_thread_read_builds_on_no_wounded_attempts_nested_episode",
+        || {
+            struct Hold {
+                on: AtomicBool,
+                landed: AtomicBool,
+                b_started: AtomicBool,
+            }
+            let case = gen_case(0x527, false, true);
+            let phases = phases(&case, 0x527);
+            assert_eq!(phases[0].ops(), [0, 1]);
+            assert_eq!(phases[0].of(0), Some(1));
+            quiet(|| {
+                for round in 0..10 {
+                    let hold = Arc::new(Hold {
+                        on: AtomicBool::new(true),
+                        landed: AtomicBool::new(false),
+                        b_started: AtomicBool::new(false),
+                    });
+                    // Thread 0 runs op 1 and holds after its episode lands
+                    // 8 or 15 until op 0 waits; thread 1 runs op 0 and
+                    // starts only after that landing.
+                    let rig = |live: &Live<Shared>| {
+                        let (hold, world) = (hold.clone(), live.world.clone());
+                        let slot = |i: usize| NodeId(world.handle(0, i).erased().slot());
+                        let (n8, n15) = (slot(8), slot(15));
+                        let hook: crate::runtime::ParkHook = Box::new(move |p| {
+                            if !hold.on.load(SeqCst) {
+                                return;
+                            }
+                            match TWO_THREAD.with(std::cell::Cell::get) {
+                                Some(0) if matches!(p, ParkPoint::EpisodeLanded(id) if id == n8 || id == n15)
+                                    && !hold.landed.swap(true, SeqCst) =>
+                                {
+                                    until(|| crate::waits::registered() > 0);
+                                }
+                                Some(1) if !hold.b_started.swap(true, SeqCst) => {
+                                    until(|| hold.landed.load(SeqCst));
+                                }
+                                _ => {}
+                            }
+                        });
+                        assert!(live.world.rt(0).park_hook.set(hook).is_ok());
+                    };
+                    let serial = Serial::new(&case, &phases);
+                    let wounds = crate::waits::WOUNDS.load(SeqCst);
+                    let verdict = Mutex::new(None);
+                    let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
+                        hold.on.store(false, SeqCst);
+                        let v = serial.at_overlap("0x527", prefix, live);
+                        let stop = p == 0 || v.is_some();
+                        *verdict.lock().unwrap() = v;
+                        stop
+                    });
+                    assert!(hold.landed.load(SeqCst), "round {round}: op 1 landed no episode of 8 or 15");
+                    assert!(crate::waits::WOUNDS.load(SeqCst) > wounds, "round {round}: no wound");
+                    serial.check("0x527", &got, verdict.into_inner().unwrap());
+                }
+            });
+        },
+    )
+    .assert_clean();
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
