@@ -413,11 +413,11 @@ pub(crate) const UNREGENERABLE: u16 = 4096;
 /// `ComputeCtl::flags`: the frame read a landing this thread's attempt
 /// holds (`crate::hold`), so its own landing is held too, and so is its
 /// reader's.
-pub(crate) const HOLD: u16 = 8192;
+pub(crate) const HOLD: u16 = 16384;
 /// A `HOLD` frame's write kept what it displaced in `crate::hold`, keyed
 /// by this control block, until the landing's entry takes it or the frame
 /// ends (`crate::hold::KeptGuard`).
-pub(crate) const KEPT: u16 = 16384;
+pub(crate) const KEPT: u16 = 32768;
 pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
 
 const _: () = assert!(crate::bits::disjoint(&[
