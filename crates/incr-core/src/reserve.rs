@@ -3,10 +3,10 @@
 //! A doom releases claims whose nodes the dooming thread's replay contexts
 //! compute again, where the unbounded run keeps them claimed on that
 //! thread's stack. A reservation keeps every other thread from computing
-//! such a node until the thread lands it from a finished run, where the
-//! unbounded run's frame releases its claim, or until the thread's
-//! outermost context of that runtime, which outlives every context nested
-//! in it, is removed; the dooming thread's own claims and unrun releases
+//! such a node until the thread lands it settled from a finished run,
+//! where the unbounded run's frame releases its claim, or until the
+//! thread's outermost context of that runtime, which outlives every
+//! context nested in it, is removed; the dooming thread's own claims and unrun releases
 //! of the node keep it. It is stored
 //! before the release that publishes it, so a claim that reads the release
 //! sees it. A node generation has at most one reservation: reserving it
