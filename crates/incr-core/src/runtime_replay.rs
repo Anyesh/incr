@@ -2773,6 +2773,9 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the reading frame is on the stack, so its control block
         // is live.
         let flags = unsafe { &*ctl };
+        // A rerun of the reader's node reads this runtime's node again, as
+        // it is then.
+        flags.raise(cycle::UNREGENERABLE);
         // The frame's tag was set under a budget, so unlike `foreign_read`
         // this does not look the reader up: a frame that runs across a
         // budget change is `NO_DOOM`, and what it keeps goes at its pop.
