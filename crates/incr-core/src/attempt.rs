@@ -40,28 +40,50 @@ pub(crate) const WOUNDED: u32 = 4;
 const FLAGS: u32 = 15;
 const EPOCH: u32 = FLAGS + 1;
 
+/// Checks of one open flight after which a waiter takes it for an owner
+/// held in user code: the engine's own unwind of a discard closes its
+/// flight sooner, and a waiter that took over each of those would trade
+/// restarts with an owner that dooms again.
+#[cfg(not(loom))]
+const STUCK_AFTER: u32 = crate::waits::REGISTER_AFTER;
+#[cfg(loom)]
+const STUCK_AFTER: u32 = 2;
+
+/// The word, and a count of the owner's flights.
+struct Word {
+    state: AtomicU32,
+    flights: AtomicU32,
+}
+
 /// A thread's attempt word, and the attempt it was read for.
 #[derive(Clone)]
 pub(crate) struct Attempt {
-    word: Arc<AtomicU32>,
+    word: Arc<Word>,
     epoch: u32,
+}
+
+fn new_word() -> Arc<Word> {
+    Arc::new(Word {
+        state: AtomicU32::new(0),
+        flights: AtomicU32::new(0),
+    })
 }
 
 #[cfg(not(loom))]
 thread_local! {
-    static MINE: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    static MINE: Arc<Word> = new_word();
 }
 
 #[cfg(loom)]
 loom::thread_local! {
-    static MINE: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
+    static MINE: Arc<Word> = new_word();
 }
 
 /// This thread's current attempt.
 pub(crate) fn mine() -> Attempt {
     MINE.with(|w| Attempt {
         word: w.clone(),
-        epoch: w.load(Ordering::Relaxed) & !FLAGS,
+        epoch: w.state.load(Ordering::Relaxed) & !FLAGS,
     })
 }
 
@@ -69,20 +91,31 @@ pub(crate) fn mine() -> Attempt {
 /// retries: every flag clears, and the epoch moves on.
 pub(crate) fn begin() {
     MINE.with(|w| {
-        let epoch = (w.load(Ordering::Relaxed) & !FLAGS).wrapping_add(EPOCH);
-        w.store(epoch, Ordering::Release);
+        let epoch = (w.state.load(Ordering::Relaxed) & !FLAGS).wrapping_add(EPOCH);
+        w.state.store(epoch, Ordering::Release);
     });
 }
 
-/// The owner raises a doom's unwind.
+/// The owner raises a discard's unwind.
 pub(crate) fn enter_flight() {
-    MINE.with(|w| w.fetch_or(IN_FLIGHT, Ordering::AcqRel));
+    MINE.with(|w| {
+        w.flights.fetch_add(1, Ordering::Relaxed);
+        w.state.fetch_or(IN_FLIGHT, Ordering::AcqRel);
+    });
 }
 
-/// The engine has caught this thread's doom unwind: whether a waiter
-/// wounded the attempt while it was in flight.
+/// The engine has caught this thread's discard: whether a waiter wounded
+/// the attempt while it was in flight.
 pub(crate) fn leave_flight() -> bool {
-    MINE.with(|w| w.fetch_and(!IN_FLIGHT, Ordering::AcqRel) & WOUNDED != 0)
+    MINE.with(|w| w.state.fetch_and(!IN_FLIGHT, Ordering::AcqRel) & WOUNDED != 0)
+}
+
+/// A waiter's view of the flight it has seen open, and for how many of
+/// its checks.
+#[derive(Default)]
+pub(crate) struct Patience {
+    seen: Option<(usize, u32, u32)>,
+    checks: u32,
 }
 
 impl Attempt {
@@ -92,15 +125,46 @@ impl Attempt {
 
     /// Whether this attempt was wounded; false once it has ended.
     pub(crate) fn wounded(&self) -> bool {
-        let w = self.word.load(Ordering::Acquire);
+        let w = self.word.state.load(Ordering::Acquire);
         self.current(w) && w & WOUNDED != 0
+    }
+
+    /// A waiter on this attempt: wounds it once one flight has stayed open
+    /// through [`STUCK_AFTER`] of the waiter's checks. True if it is
+    /// wounded now.
+    pub(crate) fn wound_if_stuck(&self, patience: &mut Patience) -> bool {
+        let w = self.word.state.load(Ordering::Acquire);
+        if !self.current(w) {
+            return false;
+        }
+        if w & WOUNDED != 0 {
+            return true;
+        }
+        if w & IN_FLIGHT == 0 {
+            patience.seen = None;
+            return false;
+        }
+        let flight = (
+            Arc::as_ptr(&self.word) as usize,
+            self.epoch,
+            self.word.flights.load(Ordering::Relaxed),
+        );
+        if patience.seen != Some(flight) {
+            *patience = Patience {
+                seen: Some(flight),
+                checks: 0,
+            };
+            return false;
+        }
+        patience.checks += 1;
+        patience.checks >= STUCK_AFTER && self.wound_in_flight()
     }
 
     /// A waiter on this attempt: wounds it if its discard is in flight,
     /// pinned or not, since its owner may be in user code that waits on
     /// the waiter. True if it is wounded now.
     pub(crate) fn wound_in_flight(&self) -> bool {
-        let mut w = self.word.load(Ordering::Acquire);
+        let mut w = self.word.state.load(Ordering::Acquire);
         loop {
             if !self.current(w) {
                 return false;
@@ -111,7 +175,7 @@ impl Attempt {
             if w & IN_FLIGHT == 0 {
                 return false;
             }
-            match self.word.compare_exchange_weak(
+            match self.word.state.compare_exchange_weak(
                 w,
                 w | WOUNDED,
                 Ordering::AcqRel,
@@ -140,7 +204,7 @@ impl Attempt {
         )
     )]
     pub(crate) fn pin(&self) -> bool {
-        let mut w = self.word.load(Ordering::Acquire);
+        let mut w = self.word.state.load(Ordering::Acquire);
         loop {
             if !self.current(w) || w & WOUNDED != 0 {
                 return false;
@@ -148,7 +212,7 @@ impl Attempt {
             if w & PINNED != 0 {
                 return true;
             }
-            match self.word.compare_exchange_weak(
+            match self.word.state.compare_exchange_weak(
                 w,
                 w | PINNED,
                 Ordering::AcqRel,
@@ -163,7 +227,7 @@ impl Attempt {
     /// The flags of this attempt's word; none once it has ended.
     #[cfg(all(test, not(loom)))]
     fn flags(&self) -> u32 {
-        let w = self.word.load(Ordering::Acquire);
+        let w = self.word.state.load(Ordering::Acquire);
         if self.current(w) {
             w & FLAGS
         } else {
@@ -175,7 +239,7 @@ impl Attempt {
 /// Whether this thread's attempt has a discard in flight, for tests.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn in_flight() -> bool {
-    MINE.with(|w| w.load(Ordering::Relaxed) & IN_FLIGHT != 0)
+    MINE.with(|w| w.state.load(Ordering::Relaxed) & IN_FLIGHT != 0)
 }
 
 /// Attempts a waiter wounded, for tests and the scans' counts.

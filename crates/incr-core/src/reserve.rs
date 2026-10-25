@@ -341,12 +341,13 @@ pub(crate) fn elsewhere(claim: Claim, generation: u32) -> bool {
 }
 
 /// A waiter on another thread's reservation of `claim`: wounds the
-/// owner's attempt if its doom's unwind is in flight, which frees the
-/// reservation. True if the reservation holds no one now.
+/// owner's attempt once its discard has stayed in flight through the
+/// waiter's `patience`, which frees the reservation. True if the
+/// reservation holds no one now.
 #[cold]
 #[inline(never)]
-pub(crate) fn take_over(claim: Claim, generation: u32) -> bool {
-    owner_elsewhere(claim, generation).is_none_or(|a| a.wound_in_flight())
+pub(crate) fn take_over(claim: Claim, generation: u32, patience: &mut attempt::Patience) -> bool {
+    owner_elsewhere(claim, generation).is_none_or(|a| a.wound_if_stuck(patience))
 }
 
 /// Whether this thread reserved `claim` at `generation`.

@@ -46,3 +46,24 @@ fn an_old_attempts_word_acts_on_no_later_attempt() {
     assert_eq!(mine().flags(), IN_FLIGHT);
     assert!(!leave_flight());
 }
+
+#[test]
+fn a_waiter_takes_over_only_a_flight_that_stays_open() {
+    begin();
+    let a = mine();
+    let mut patience = Patience::default();
+    enter_flight();
+    for _ in 0..STUCK_AFTER {
+        assert!(!a.wound_if_stuck(&mut patience));
+    }
+    assert!(!leave_flight());
+    enter_flight();
+    for _ in 0..STUCK_AFTER {
+        assert!(
+            !a.wound_if_stuck(&mut patience),
+            "a new flight starts the count over"
+        );
+    }
+    assert!(a.wound_if_stuck(&mut patience));
+    assert!(leave_flight());
+}

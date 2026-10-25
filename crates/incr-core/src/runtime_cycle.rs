@@ -573,10 +573,13 @@ impl<C: Cells> Runtime<C> {
             self.reservation_waits
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-        // An owner whose doom's unwind is in flight may be in user code
-        // that waits on this thread; taking over wounds its attempt.
-        let held =
-            || reserve::elsewhere(claim, generation) && !reserve::take_over(claim, generation);
+        // An owner whose discard stays in flight may be in user code that
+        // waits on this thread; taking over wounds its attempt.
+        let patience = std::cell::RefCell::new(attempt::Patience::default());
+        let held = || {
+            reserve::elsewhere(claim, generation)
+                && !reserve::take_over(claim, generation, &mut patience.borrow_mut())
+        };
         while held() {
             self.spin_holding(id, also, spins, || !held());
         }
