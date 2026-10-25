@@ -1225,6 +1225,11 @@ impl<C: Cells> Runtime<C> {
             word &= !value_code::FOREIGN_BIT;
         }
         if word & value_code::COUNTER_MASK != 0 {
+            if foreign && self.dep_stack.foreign_keeper(self.runtime_id).is_some() {
+                // As in `diverted_clean_read`: the reader's retry or rerun
+                // would read this runtime again.
+                self.dep_stack.hold_foreign_reader();
+            }
             return Ok(self.value_code_read(handle, self.nodes.get(handle.slot())));
         }
         // A read while a cycle's unwind kind is set comes from a closure that
