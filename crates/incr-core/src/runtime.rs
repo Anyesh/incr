@@ -94,12 +94,13 @@ pub(crate) struct Inner<C: Cells> {
     /// The group each landed cycle member belongs to, flagged by
     /// `IN_GROUP`.
     pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
-    /// Each query whose deps a panicked run's union replaced (a user panic
-    /// releasing it New, [`Runtime::land_panic_released`], or failing it):
-    /// that union's length, and how many of its deps, from the front, its
-    /// last finished run read. Any other publish of its deps drops it, as
-    /// does its delete; a Stale publish, which installs nothing, keeps it.
-    /// A read's walk uses it only for a released New node.
+    /// Each query whose deps a user panic's union replaced as it released
+    /// the query New ([`Runtime::land_panic_released`]): that union's
+    /// length, and how many of its deps, from the front, its last finished
+    /// run read. A Failed landing's union carries an entry the query
+    /// already had and starts none. Any other publish of its deps drops
+    /// it, as does its delete; a Stale publish, which installs nothing,
+    /// keeps it. A read's walk uses it only for a released New node.
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
 }
 
@@ -400,6 +401,28 @@ impl<C: Cells> Drop for SetClaim<'_, C> {
         if self.held {
             self.node.release_set_claim(self.base, self.base);
             set_stack::pop(self.rt.runtime_id, self.id.0);
+        }
+    }
+}
+
+/// A panicked run's landing, which publishes the union of its old and
+/// recorded deps, with the claims released alongside it.
+#[derive(Copy, Clone)]
+enum PanicUnion<'a> {
+    /// Carries the node's released entry but starts none: an entry of 0
+    /// kept deps after a failed first run makes a later released landing
+    /// walk none of the deps that run read, and two threads then land a
+    /// value no read order gives (0x74f).
+    Failed(&'a [u32]),
+    /// A claim the panic released New: a read's walk keeps to the old deps
+    /// ([`Inner::released_deps`]).
+    Released(&'a [u32]),
+}
+
+impl<'a> PanicUnion<'a> {
+    fn co_members(self) -> &'a [u32] {
+        match self {
+            Self::Failed(m) | Self::Released(m) => m,
         }
     }
 }
@@ -4320,7 +4343,13 @@ impl<C: Cells> Runtime<C> {
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
-        let landing = match self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag) {
+        let landing = match self.publish_deps(
+            id,
+            deps,
+            Some(PanicUnion::Failed(co_members)),
+            attempt.verify_rev,
+            bag,
+        ) {
             // A stale dep's slot may already belong to another node, so no
             // union is published. The old deps keep their reverse edges.
             Publish::Stale => NodeState::New,
@@ -4394,7 +4423,13 @@ impl<C: Cells> Runtime<C> {
     ) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
         // Any outcome lands New, which recomputes.
-        self.publish_deps(id, deps, Some(co_members), attempt.verify_rev, bag);
+        self.publish_deps(
+            id,
+            deps,
+            Some(PanicUnion::Released(co_members)),
+            attempt.verify_rev,
+            bag,
+        );
         if wrote {
             node.max_changed_at(attempt.stamp_rev);
         } else if attempt.first {
@@ -4751,7 +4786,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         id: NodeId,
         recorded: &[(NodeId, u32)],
-        panic: Option<&[u32]>,
+        panic: Option<PanicUnion<'_>>,
         verify_rev: u64,
         bag: &mut Deferred<C>,
     ) -> Publish {
@@ -4813,7 +4848,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         node: &NodeData<C>,
         recorded: &[(NodeId, u32)],
-        panic: Option<&[u32]>,
+        panic: Option<PanicUnion<'_>>,
         verify_rev: u64,
         bag: &mut Deferred<C>,
         old_deps: &[NodeId],
@@ -4838,7 +4873,7 @@ impl<C: Cells> Runtime<C> {
         id: NodeId,
         node: &NodeData<C>,
         recorded: &[(NodeId, u32)],
-        panic: Option<&[u32]>,
+        panic: Option<PanicUnion<'_>>,
         verify_rev: u64,
         bag: &mut Deferred<C>,
         diff: DepDiff<'_, S>,
@@ -4858,9 +4893,9 @@ impl<C: Cells> Runtime<C> {
         let settled = |d: &NodeId| {
             diff.old_set.has(*d)
                 || self.observed_clean(*d, verify_rev)
-                || panic.is_some_and(|members| {
+                || panic.is_some_and(|p| {
                     self.nodes.get(d.0).state() == NodeState::Failed
-                        || members.binary_search(&d.0).is_ok()
+                        || p.co_members().binary_search(&d.0).is_ok()
                 })
         };
         let superseded = !diff.new.iter().all(settled);
@@ -4878,7 +4913,11 @@ impl<C: Cells> Runtime<C> {
             .filter(|&&(len, _)| len as usize == diff.old.len())
             .map(|&(_, kept)| kept);
         let len = diff.new.len() as u32;
-        let entry = panic.map(|_| (len, kept.unwrap_or(diff.old.len() as u32)));
+        let entry = match panic {
+            Some(PanicUnion::Released(_)) => Some((len, kept.unwrap_or(diff.old.len() as u32))),
+            Some(PanicUnion::Failed(_)) => kept.map(|kept| (len, kept)),
+            None => None,
+        };
         self.set_released(&mut inner, id.0, node, entry);
 
         for old_dep in diff.old {
