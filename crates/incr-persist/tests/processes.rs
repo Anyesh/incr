@@ -527,7 +527,9 @@ fn a_memo_checkpoint_lock_held_by_another_process_is_busy() {
 
 fn memo_checkpoint_loop() {
     let memo = FileMemo::open(child_dir()).unwrap();
-    for round in 1.. {
+    let mut round = 0;
+    loop {
+        round += 1;
         let done = write_checkpoint(&memo, memo_input(0..round * 50)).unwrap();
         if let Some(old) = done.replaced {
             memo.remove_generation(old).unwrap();
