@@ -217,6 +217,11 @@ impl Attempt {
             }
             if !listed {
                 let mut met = self.word.met.lock().unwrap_or_else(PoisonError::into_inner);
+                // Rechecked under the lock: a waiter of a later attempt that
+                // listed first is seen here, and its entry is kept.
+                if !self.current(self.word.state.load(Ordering::Acquire)) {
+                    return false;
+                }
                 met.retain(|&(e, _)| e == self.epoch);
                 met.push((self.epoch, claim));
                 listed = true;
