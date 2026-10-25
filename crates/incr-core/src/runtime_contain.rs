@@ -580,6 +580,24 @@ impl<C: Cells> Runtime<C> {
         true
     }
 
+    /// A retraction lands the held Failed landings of `slots` unrun: their
+    /// tickets let go of them as a flip's do.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn release_retracted(&self, slots: &[u32], bag: &mut Deferred<C>) {
+        if slots.is_empty() || !self.tickets_held() {
+            return;
+        }
+        let mut t = self.tickets.write();
+        let mut stale = Vec::new();
+        for &slot in slots {
+            stale.extend(release(&mut t, u64::MAX, slot_landings(slot)));
+        }
+        self.sync_held(&t);
+        drop(t);
+        defer(stale, bag);
+    }
+
     /// After a set's walk: drops the tickets its flips released.
     #[inline(always)]
     pub(super) fn drop_released_tickets(&self) {

@@ -589,6 +589,12 @@ impl<C: Cells> Runtime<C> {
                 self.land_children_now(NodeId(e.slot), ChildLanding::Discard, opened, &mut bag);
             }
         }
+        let failed: Vec<u32> = entries
+            .iter()
+            .filter(|e| e.target == NodeState::Failed)
+            .map(|e| e.slot)
+            .collect();
+        self.release_retracted(&failed, &mut bag);
         for e in entries {
             let back = if e.undo.first {
                 NodeState::New
