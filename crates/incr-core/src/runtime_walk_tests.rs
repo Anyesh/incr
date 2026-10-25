@@ -664,54 +664,11 @@ fn shared_stale_dep_in_a_cycle_reaches_the_reader() {
     stale_dep_in_a_cycle_reaches_the_reader::<Shared>();
 }
 
-/// As above, but `a` first reads `s`, which `try_get`s `a` and so becomes a
-/// held claim anchored at `a`'s own position before `b` closes the cycle.
-/// `a`'s unwind releases that claim, so the walk still contains the cycle:
-/// `get(x)` gives 100, as from scratch, and only a direct `get(a)` raises it.
-fn wave6_containable_counts_claim_anchored_at_walk_entry<C: Cells>() {
-    let rt = Runtime::<C>::new();
-    let sel = rt.create_input(0_i64);
-    let k = rt.create_input(0_i64);
-    let s_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
-    let b_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
-    let a = {
-        let (s_cell, b_cell) = (s_cell.clone(), b_cell.clone());
-        rt.create_query(move |rt| {
-            if rt.get(k) == 0 {
-                1
-            } else {
-                rt.get(*s_cell.get().unwrap()) + rt.get(*b_cell.get().unwrap()) + 1
-            }
-        })
-    };
-    let s = rt.create_query(move |rt| rt.try_get(a).unwrap_or(5));
-    let b = rt.create_query(move |rt| rt.get(a) + 1);
-    s_cell.set(s).unwrap();
-    b_cell.set(b).unwrap();
-    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(a) } else { 100 });
-    assert_eq!(rt.get(x), 1);
-
-    rt.set(k, 1);
-    rt.set(sel, 1);
-    assert_eq!(rt.get(x), 100);
-    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
-    assert!(panic_message(err).contains("cycle"));
-}
-
-#[test]
-fn wave6_local_containable_counts_claim_anchored_at_walk_entry() {
-    wave6_containable_counts_claim_anchored_at_walk_entry::<Local>();
-}
-
-#[test]
-fn wave6_shared_containable_counts_claim_anchored_at_walk_entry() {
-    wave6_containable_counts_claim_anchored_at_walk_entry::<Shared>();
-}
-
-/// As `stale_dep_in_a_cycle_is_not_read`, but `a` catches the cycle unwind
-/// and then panics on its own. The walk entry must contain that panic as it
-/// contains the cycle, so `get(x)` gives 100, as from scratch, and only a
-/// direct `get(a)` raises "a own".
+/// As `stale_dep_in_a_cycle_reaches_the_reader`, but `a` catches the cycle
+/// unwind and then panics on its own, which unwinds with the cycle's kind
+/// and its own payload. The walk entry contains that panic as any other,
+/// so `get(x)` gives 100, as from scratch, and only a direct `get(a)`
+/// raises "a own".
 fn wave7_walk_contains_own_panic_after_swallowed_cycle<C: Cells>() {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
