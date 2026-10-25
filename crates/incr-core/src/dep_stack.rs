@@ -385,6 +385,22 @@ pub trait DepStack: 'static {
         keeps.then(|| (tagged.rt(), ctl, cidx))
     }
 
+    /// For a lookup that records no dependency (`Runtime::is_alive`,
+    /// `node_count`, `label`, `graph_snapshot` and `cycle_of`, a table's
+    /// `get` and `for_each`): the top frame's runtime, if a compute is running,
+    /// after raising `UNREGENERABLE` on that frame when it keeps other
+    /// runtimes' Clean reads, since a rerun of its node would look again
+    /// as things are then.
+    fn unrecorded_lookup(&self) -> Option<RuntimeId> {
+        let top = self.with(|s| s.frames.last().map(Frame::rt))?;
+        if let Some((_, ctl, _)) = self.foreign_keeper(RuntimeId::SENTINEL) {
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            unsafe { &*ctl }.raise(UNREGENERABLE);
+        }
+        Some(top)
+    }
+
     /// Sends the top frame's Clean reads to the slow path (see
     /// `Frame::read_rt`).
     fn divert_clean_reads(&self) {

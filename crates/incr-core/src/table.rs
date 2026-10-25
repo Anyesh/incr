@@ -298,7 +298,7 @@ impl<K: TableKey, C: Cells> Array<K, C> {
             // SAFETY: a Live bucket's key is initialized.
             let equal =
                 e.hash == hash && value_code::run(|| unsafe { e.key.assume_init_ref() } == key);
-            (equal && rt.is_alive(ErasedIncr::new(e.slot, e.generation, rt.runtime_id)))
+            (equal && rt.alive(ErasedIncr::new(e.slot, e.generation, rt.runtime_id)))
                 .then_some((e.slot, e.generation))
         })
     }
@@ -312,7 +312,7 @@ impl<K: TableKey, C: Cells> Array<K, C> {
             if e.hash != hash || !value_code::run(|| unsafe { e.key.assume_init_ref() } == key) {
                 return None;
             }
-            if rt.is_alive(ErasedIncr::new(e.slot, e.generation, rt.runtime_id)) {
+            if rt.alive(ErasedIncr::new(e.slot, e.generation, rt.runtime_id)) {
                 return Some((e.slot, e.generation));
             }
             Self::tombstone(bucket);
@@ -377,7 +377,7 @@ impl<K: TableKey, C: Cells> Array<K, C> {
                 // SAFETY: a Live bucket's data is published and never
                 // written again in this array.
                 let e = bucket.data.with(|e| unsafe { &*e });
-                if rt.is_alive(ErasedIncr::new(e.slot, e.generation, rt.runtime_id)) {
+                if rt.alive(ErasedIncr::new(e.slot, e.generation, rt.runtime_id)) {
                     alive.push(e);
                 }
             }
@@ -676,7 +676,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     /// dependency, and so not allowed inside a compute of this runtime.
     pub fn get(&self, rt: &Runtime<C>, key: &K) -> Option<Incr<T>> {
         self.check_runtime(rt);
-        self.refuse_in_compute(rt, "get");
+        self.lookup_outside_own_compute(rt, "get");
         self.find(rt, self.hash(key), key)
     }
 
@@ -704,7 +704,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
     /// during the call may or may not be. `f` may insert and remove.
     pub fn for_each(&self, rt: &Runtime<C>, mut f: impl FnMut(&K, Incr<T>)) {
         self.check_runtime(rt);
-        self.refuse_in_compute(rt, "for_each");
+        self.lookup_outside_own_compute(rt, "for_each");
         self.array.read(|array| {
             for bucket in array.buckets.iter() {
                 if C::u32_load_acquire(&bucket.meta) & STATE_MASK != LIVE {
@@ -715,7 +715,7 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
                     // and the array stays allocated for the whole read.
                     let e = unsafe { &*e };
                     let handle = Incr::new(e.slot, e.generation, self.runtime_id);
-                    if rt.is_alive(handle) {
+                    if rt.alive(handle) {
                         // SAFETY: a Live bucket's key is initialized.
                         f(unsafe { e.key.assume_init_ref() }, handle);
                     }
@@ -835,9 +835,11 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         }
     }
 
-    fn refuse_in_compute(&self, rt: &Runtime<C>, call: &str) {
+    /// Refuses a lookup inside a compute of the table's runtime; inside
+    /// another runtime's compute, see `DepStack::unrecorded_lookup`.
+    fn lookup_outside_own_compute(&self, rt: &Runtime<C>, call: &str) {
         assert!(
-            !rt.dep_stack.current_frame_active(rt.runtime_id),
+            rt.dep_stack.unrecorded_lookup() != Some(rt.runtime_id),
             "incr-core: NodeTable::{call} called during compute; a lookup is not a \
              dependency, so a compute finds its nodes through get_or_insert_*",
         );
