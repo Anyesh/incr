@@ -504,10 +504,12 @@ impl<C: Cells> Runtime<C> {
         spins: &mut u32,
     ) {
         let claim = (self.runtime_id, id.0);
+        // Release, so a test that sees the count also sees this thread's
+        // unclaim of `id` before it.
         #[cfg(test)]
         if reserve::elsewhere(claim, generation) {
             self.reservation_waits
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
         while reserve::elsewhere(claim, generation) {
             self.spin_holding(id, also, spins, || !reserve::elsewhere(claim, generation));
