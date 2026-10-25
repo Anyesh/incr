@@ -1124,6 +1124,112 @@ fn loom_held_group_record_precedes_state() {
     });
 }
 
+/// c (Fallback) reads a and b, which read c: a landed group. Once i is 1, a
+/// no longer reads c, so the episode at c that o's read runs shrinks to
+/// {c, b} and releases a, held with a Dirty target; o then reads a, and its
+/// owner computes a alone inside the attempt. Counts every closure run.
+fn shrunk_cut<C: crate::cells::Cells>(
+    rt: &Runtime<C>,
+    runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (Incr<i64>, Incr<i64>) {
+    let i = rt.create_input(0_i64);
+    let ac: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+    let bc: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+    let run = move |runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+        runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    let c = {
+        let (ac, bc, runs) = (ac.clone(), bc.clone(), runs.clone());
+        rt.create_query_with_fallback(
+            move |rt: &Runtime<C>| {
+                run(&runs);
+                rt.get(*ac.get().unwrap()) + rt.get(*bc.get().unwrap())
+            },
+            |cy: &crate::cycle::Cycle| 10 * cy.len() as i64,
+        )
+    };
+    let a = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            if rt.get(i) == 0 {
+                rt.get(c)
+            } else {
+                1
+            }
+        })
+    };
+    let b = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            rt.get(c) + 2
+        })
+    };
+    let o = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            rt.get(c) + rt.get(a)
+        })
+    };
+    ac.set(a).unwrap();
+    bc.set(b).unwrap();
+    assert_eq!((rt.get(o), rt.get(a)), (60, 30));
+    rt.set(i, 1);
+    (o, a)
+}
+
+#[test]
+#[ignore = "T8-two-40k-195f commit 4"]
+fn loom_own_landed_reread_matches_local() {
+    run(|| {
+        let local_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local = Runtime::<crate::cells::Local>::new();
+        let (o, a) = shrunk_cut(&local, &local_runs);
+        let want = (local.get(o), local.get(a));
+        let local_runs = local_runs.load(std::sync::atomic::Ordering::Relaxed);
+        let local_b_first = {
+            let rt = Runtime::<crate::cells::Local>::new();
+            let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
+            let b = rt.get(a);
+            (rt.get(o), b)
+        };
+
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = Rt::new();
+        let (o, a) = shrunk_cut(&rt, &runs);
+        assert_eq!((rt.get(o), rt.get(a)), want);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            local_runs,
+            "closure runs differ from Local's"
+        );
+
+        let rt = Arc::new(Rt::new());
+        let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
+        let reads_o = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(o))
+        };
+        let reads_a = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(a))
+        };
+        let got = (reads_o.join().unwrap(), reads_a.join().unwrap());
+        assert!(
+            got == want || got == local_b_first,
+            "{got:?}, Local {want:?} or {local_b_first:?}"
+        );
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+        assert_eq!(rt.nodes.get(a.slot()).state(), NodeState::Clean);
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
 /// A (Fallback) reads B while s is 0, and B reads A. A reader enters the
 /// cycle while a setter breaks it: the final values are the acyclic ones.
 #[test]
