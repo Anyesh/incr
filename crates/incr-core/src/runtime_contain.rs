@@ -373,6 +373,7 @@ impl<C: Cells> Runtime<C> {
         t.buried.extend(stale);
         self.sync_held(&t);
         drop(t);
+        self.park(ParkPoint::FlippedFailed(id));
         self.forget_failed_run(id.0, node.generation());
         true
     }

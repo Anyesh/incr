@@ -196,6 +196,12 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a run that did not land Clean released its
     /// claim, with the attempt's bag carried along.
     UnsettledLanding(NodeId),
+    /// In `land_failed`, after a landing meant as Failed released its
+    /// claim landing otherwise, before it forgets its record.
+    FailedLandedOtherwise(NodeId),
+    /// In `flip_failed_from`, after the flip released the node, before it
+    /// forgets the node's record.
+    FlippedFailed(NodeId),
     /// In `compute_one`, after an episode landed the root, before its
     /// reader learns how.
     EpisodeLanded(NodeId),
@@ -4353,6 +4359,7 @@ impl<C: Cells> Runtime<C> {
         // leaves its group.
         let landed = self.land_single(id, node, flags, landing, flagged);
         if landing == NodeState::Failed && landed != NodeState::Failed {
+            self.park(ParkPoint::FailedLandedOtherwise(id));
             self.forget_failed_run(id.0, node.generation());
         }
         // A set flagged the compute, so it landed Dirty past the walk that
