@@ -2370,7 +2370,7 @@ fn a_payload_after_a_virtual_cycle_read_holds_its_reader() {
 /// read at budget `frames`. Returns the count of payloads caught with the
 /// expected value.
 fn native_payload_chain<C: Cells>(frames: u32, levels: u64) -> u64 {
-    let rt = Runtime::<C>::new();
+    let rt = native_runtime::<C>();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
     let i = rt.create_input(1_u64);
