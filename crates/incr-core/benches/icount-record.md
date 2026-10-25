@@ -2122,6 +2122,56 @@ are `reserve::elsewhere` (3.8% of instructions), `BTreeMap::remove`
 lookup, and each context end removes its entries from the shared map.
 B7-reservation-table-cost tracks a per-node reservation word instead.
 
+## A read reserves its own node it lands Dirty
+
+`decdbb12` (on `01797eba`) keeps another thread from rerunning a read's
+own node between the read's walk landing it Dirty and the read taking
+the value. Every non-Clean Shared read swaps a packed key into a
+thread-local on entry and restores it on exit, and a run's Dirty
+landing compares the key. Base `01797eba`, tip `ce60e567` (`decdbb12`
+changes only cold reservation paths and tests), same box, `icount.sh`
+defaults.
+
+| workload | base | tip | delta |
+|---|---|---|---|
+| `get_clean_local` | 101 | 101 | 0 |
+| `get_clean_shared` | 193 | 193 | 0 |
+| `table_hit_local` | 155.14 | 155.14 | 0 |
+| `table_hit_shared` | 218.14 | 218.14 | 0 |
+| `value_slot_read_local` | 5 | 5 | 0 |
+| `value_slot_read_shared` | 87 | 87 | 0 |
+| `chain_shared/propagate/4` | 9689.20 | 9720.20 | +31.00 |
+| `diamond_shared` | 8055.93 | 8082.92 | +26.99 |
+| `early_cutoff_shared` | 3731.86 | 3750.84 | +18.98 |
+| `fanout_shared_4` | 24054.05 | 24146.04 | +91.99 |
+| `fanout_shared_1000` | 4859013.54 | 4875922.19 | +16908.65 |
+| `delete_cascade_shared` | 4666318.23 | 4687099.07 | +20780.84 |
+| `simple_count/shared/1000` | 4178.24 | 4197.13 | +18.89 |
+| `chain_local/propagate/4` | 4657 | 4661 | +4 |
+| `fanout_local_4` | 17256 | 17272 | +16 |
+
+- About 18 instructions per non-Clean Shared read. In `fanout_shared_4`'s
+  PT diff (+92 per iteration, five such reads) packing the key costs 15,
+  the thread-local swap and restore 34 (`mem::replace`, the accessor and
+  `catch_unwind`'s closure), the guard's two exit tests 20, and the Dirty
+  test in `land_as` 10 (2 per landing); the -19/+10 swings between
+  `dep_stack.rs:454` and `segmented_nodes.rs` are layout.
+- A first form held `Option<(Claim, bool)>` in the thread-local and the
+  guard in an `Option`: +40 per read, in 24-byte replaces and drop glue.
+  A `u64` key, a per-thread count of root reservations as the exit
+  filter (`reserve::any()` is non-zero whenever any thread holds a doom
+  reservation) and a constant guard under `Local` cut it to the above.
+- Local rows rise 4 per non-Clean read though the guard folds away: PT
+  on `chain_local/propagate/4` spreads the +4 over `read_walk`'s
+  register and segment-lookup lines with no `reserve.rs` line, so it is
+  layout.
+
+Gate: the hard gates are exact (101/193, 155.14/218.14, 5/87). Replay
+scale by `scale-icount` against `01797eba`: Shared rows rise at most
+0.32% (`shared_wide_diverted_retry`; `shared_taint_100k_at_budget_1`
+0.30%), Local rows move within -0.43..+0.10%, and `replay_scale_tests`
+take 15.53 s against 15.45 s (mean of four alternating runs each).
+
 ## A handled read keeps a memo for the revision
 
 - Base: spreadsheet-t10 ac199763. Tip: w/T8-caught-failed-read-lands 2cf9dc31, each in a detached worktree; one run of `icount.sh` at the default N per column. The attribution below comes from `pt-lines.sh` (N = 10, `-m 8,128`) on `chain_local/propagate/4` and `chain_shared/propagate/4` at 03794a1a against adf57986, and from `icount.sh` runs of each review fix against 8ccd53c3. No workloads added.

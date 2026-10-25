@@ -395,11 +395,14 @@ pub(crate) const WALKED: u16 = 256;
 /// outcome no kept read carries. Its own runtime treats it as `NO_DOOM`
 /// within that runtime's budget only, which the other runtime can't see.
 pub(crate) const FOREIGN_HOLD: u16 = 512;
+/// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
+/// make: its value is buffered and its landing withheld (`replay::Stash`).
+pub(crate) const SPECULATIVE: u16 = 1024;
 /// `ComputeCtl::flags`: a read in the frame gave an outcome that holds
 /// until the next set (the panic of a node that landed Failed, or a
 /// memo's value). Without `POISONED` the frame lands Dirty with a memo
 /// for the revision (`NodeData::set_memo`).
-pub(crate) const HANDLED: u16 = 1024;
+pub(crate) const HANDLED: u16 = 2048;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at

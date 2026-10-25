@@ -207,7 +207,8 @@ struct OutermostExit;
 impl Drop for OutermostExit {
     fn drop(&mut self) {
         if !reserve::none_held() {
-            end_replay();
+            replay::reset();
+            reserve::end_contexts();
         }
     }
 }
@@ -1939,7 +1940,7 @@ impl<C: Cells> Runtime<C> {
 
     /// Lands the discarded attempt's children as `children` and stamps the
     /// node for its discard landing, which lands it in the state returned.
-    fn discard_target(
+    pub(super) fn discard_target(
         &self,
         id: NodeId,
         first: bool,

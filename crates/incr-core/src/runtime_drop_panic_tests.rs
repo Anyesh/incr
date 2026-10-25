@@ -1282,10 +1282,11 @@ fn shared_doomed_runs_value_drop_is_not_raised() {
     );
 }
 
-/// A doomed run's placeholder leads it to read `c`, which no placeholder
-/// stands in for, so it computes natively, speculatively, and lands
-/// Clean. The unbounded run never reads `c`, so the value its recompute
-/// displaces is one that run never built.
+/// A doomed run's placeholder leads it to read `c`, which the unbounded run
+/// never reads, so it computes `c` speculatively and stashes the value
+/// without landing it. The set ends the revision and drops the stash under
+/// `isolate`, and `c` stays New: no value of it exists for a later
+/// recompute to displace.
 fn speculative_clean_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
     rt.set_placeholder(0_u64);
     rt.set_max_frames(1);
@@ -1303,24 +1304,19 @@ fn speculative_clean_value_drop_is_not_raised<C: Cells>(rt: &Runtime<C>) {
         replayable(),
     );
     assert_eq!(rt.get(r), 5);
-    assert_eq!(
-        rt.state_of(c),
-        NodeState::Clean,
-        "the speculative run landed c"
-    );
+    assert_eq!(rt.state_of(c), NodeState::New, "a speculative run landed c");
     rt.set(input, 2);
     let got = catch_unwind(AssertUnwindSafe(|| rt.get(c).0));
     assert_eq!(got.ok(), Some(12));
 }
 
 #[test]
-#[ignore = "known limitation (CHANGELOG): under a frame budget, replay memoizes nodes the unbudgeted run does not reach, and their values drop like any memoized value"]
 fn local_speculative_clean_value_drop_is_not_raised() {
     speculative_clean_value_drop_is_not_raised(&Runtime::<Local>::new());
 }
 
 #[test]
-#[ignore = "known limitation (CHANGELOG): under a frame budget, replay memoizes nodes the unbudgeted run does not reach, and their values drop like any memoized value"]
+#[cfg_attr(miri, ignore)]
 fn shared_speculative_clean_value_drop_is_not_raised() {
     in_shared_child(
         "runtime::drop_panic_tests::shared_speculative_clean_value_drop_is_not_raised",

@@ -72,6 +72,16 @@ pub trait ErasedArena<C: Cells>: Send + Sync + 'static {
     /// A clone of the value in `slot`, if it holds one.
     #[doc(hidden)]
     fn read_erased(&self, slot: u32) -> Option<Box<dyn Any + Send>>;
+
+    /// Whether `slot` holds a value equal to `value`, which must be of the
+    /// arena's type. Runs the type's `PartialEq`, which may panic.
+    #[doc(hidden)]
+    fn equals_erased(&self, slot: u32, value: &(dyn Any + Send)) -> bool;
+
+    /// A clone of `value`, which must be of the arena's type. Runs the
+    /// type's `Clone`, which may panic.
+    #[doc(hidden)]
+    fn clone_erased(&self, value: &(dyn Any + Send)) -> Box<dyn Any + Send>;
 }
 
 impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
@@ -119,6 +129,20 @@ impl<T: Value, C: Cells> ErasedArena<C> for GenericArena<T, C> {
 
     fn read_erased(&self, slot: u32) -> Option<Box<dyn Any + Send>> {
         crate::value_code::run(|| self.try_read(slot)).map(|v| Box::new(v) as Box<dyn Any + Send>)
+    }
+
+    fn equals_erased(&self, slot: u32, value: &(dyn Any + Send)) -> bool {
+        let value = value
+            .downcast_ref::<T>()
+            .expect("incr-core: a stashed value has its node's type");
+        crate::value_code::run(|| self.eq_current(slot, value))
+    }
+
+    fn clone_erased(&self, value: &(dyn Any + Send)) -> Box<dyn Any + Send> {
+        let value = value
+            .downcast_ref::<T>()
+            .expect("incr-core: a stashed value has its node's type");
+        Box::new(crate::value_code::run(|| value.clone()))
     }
 }
 

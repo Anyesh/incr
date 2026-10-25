@@ -2308,13 +2308,63 @@ fn shared_vframe_reader_waits_then_dirties_it() {
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
 }
 
+/// With no budget, a set that lands after X claimed and before it reads
+/// `i` supersedes X's deps, so X's own panic lands it Dirty and the next
+/// read runs it again.
+#[test]
+fn shared_set_during_xs_compute_lands_x_dirty() {
+    let rt = Arc::new(Rt::new());
+    let i = rt.create_input(0_u64);
+    let y = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            if rt.get(i) == 1 {
+                return 7;
+            }
+            panic!("y boom")
+        },
+        replayable(),
+    );
+    let x_runs = Arc::new(AtomicU32::new(0));
+    let (claimed, wait_claimed) = mpsc::channel::<()>();
+    let (go, wait_go) = mpsc::channel::<()>();
+    let x = {
+        let x_runs = x_runs.clone();
+        let (claimed, wait_go) = (Mutex::new(claimed), Mutex::new(wait_go));
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if x_runs.fetch_add(1, SeqCst) == 0 {
+                    claimed.lock().unwrap().send(()).unwrap();
+                    wait_go.lock().unwrap().recv().unwrap();
+                }
+                if rt.get(i) == 1 {
+                    panic!("x own");
+                }
+                rt.get(y) + 1
+            },
+            replayable(),
+        )
+    };
+    let first = {
+        let rt = rt.clone();
+        spawn(move || outcome(|| rt.get(x)))
+    };
+    wait_claimed.recv().unwrap();
+    rt.set(i, 1);
+    go.send(()).unwrap();
+    assert_eq!(first.join(), Err("x own".to_string()));
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    assert_eq!(outcome(|| rt.get(x)), Err("x own".to_string()));
+    assert_eq!(x_runs.load(SeqCst), 2);
+    assert_eq!(rt.state_of(x), NodeState::Failed);
+}
+
 /// The retry loads X New and parks before its claim while the other
 /// thread's read of X waits for the reservation, and a set flips Y Dirty
-/// and makes X panic "x own". The retry claims X from New and runs it at
-/// the new revision, as the serial order with the set and then this
-/// thread's read first does, and the other thread reads X Failed.
+/// and makes X panic "x own". The doomed run claimed X before the set, so
+/// the set overlaps X's frame as it does in
+/// [`shared_set_during_xs_compute_lands_x_dirty`]: the retry's panic lands
+/// X Dirty, and the waiting read runs X again and lands it Failed.
 #[test]
-#[ignore = "the retry's own panic after a set lands X Dirty, not Failed; T8-set-before-retry-claim-lands-dirty"]
 fn shared_vframe_set_before_the_retrys_claim_under_a_waiting_reader() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
@@ -2374,8 +2424,12 @@ fn shared_vframe_set_before_the_retrys_claim_under_a_waiting_reader() {
     claim.release();
     let (first, other) = (first.join(), other.join());
     assert_eq!(first, Err("x own".to_string()));
-    assert!(failed(&other), "{other:?}");
-    assert_eq!(x_runs.load(SeqCst), 2, "X ran doomed and as the retry");
+    assert_eq!(other, Err("x own".to_string()));
+    assert_eq!(
+        x_runs.load(SeqCst),
+        3,
+        "X ran doomed, as the retry and for the waiting read"
+    );
     assert_eq!(rt.state_of(x), NodeState::Failed);
     rt.assert_invariant_i();
     assert_eq!(rt.provenance_records(), 0, "a record outlived its delivery");
@@ -3112,4 +3166,276 @@ fn shared_retaken_delivery_with_a_waiting_reader() {
         retaken_a_first()
     );
     s.rt.assert_invariant_i();
+}
+
+/// Two replayable readers each doom at budget 1 and go on to the Native
+/// `n`. Thread 1's speculative read of `n` passes the tried check and
+/// parks before its claim; the main thread's speculative run then computes
+/// `n`, stashes it and lands it back New. Thread 1's claim then succeeds
+/// on New, and must not run `n` a second time in the revision.
+#[test]
+fn a_claim_after_another_threads_speculative_run_does_not_run_it_again() {
+    let mut rt = Rt::new();
+    rt.all_replayable = false;
+    let rt = Arc::new(rt);
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let n = rt.create_query(move |rt: &Rt| {
+        counted.fetch_add(1, SeqCst);
+        rt.get(input) + 10
+    });
+    let reader = || {
+        let b = rt.create_query(|_: &Rt| 5_u64);
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let x = rt.get(b);
+                if x == 0 {
+                    rt.get(n)
+                } else {
+                    x
+                }
+            },
+            replayable(),
+        )
+    };
+    let (r1, r2) = (reader(), reader());
+    let gate = Gate::new();
+    gate.arm();
+    hook(&rt, vec![(ParkPoint::BeforeClaim(id(n)), gate.clone())]);
+    let parked = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(r1))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.get(r2), 5);
+    assert_eq!(runs.load(SeqCst), 1);
+    gate.release();
+    assert_eq!(parked.join().unwrap(), 5);
+    assert_eq!(runs.load(SeqCst), 1, "n ran speculatively twice");
+    assert_eq!(rt.get(n), 11);
+    assert_eq!(runs.load(SeqCst), 1);
+}
+
+/// A speculative verify of `mid` scans its deps, then a set ends the
+/// revision before it stashes: the stash must not hold for the set's
+/// revision, where a speculative read would take `mid` as unchanged.
+#[test]
+fn a_speculative_verify_across_a_set_keeps_no_stash() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let leaf = rt.create_query_with(move |rt: &Rt| rt.get(input) / 10, replayable());
+    let mid = rt.create_query_with(move |rt: &Rt| rt.get(leaf), replayable());
+    let top = rt.create_query_with(move |rt: &Rt| rt.get(mid) + 1, replayable());
+    assert_eq!(rt.get(top), 1);
+    rt.set(input, 2);
+    let b = rt.create_query(|_: &Rt| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(top)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    let gate = Gate::new();
+    gate.arm();
+    hook(
+        &rt,
+        vec![(ParkPoint::VerifyAfterScan(id(mid)), gate.clone())],
+    );
+    let parked = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(reader))
+    };
+    gate.wait_parked();
+    rt.set(input, 13);
+    gate.release();
+    assert_eq!(parked.join().unwrap(), 5);
+    assert!(
+        !rt.stashed_verify(id(mid).0, mid.generation()),
+        "a verify from before the set is stashed for its revision"
+    );
+    assert_eq!(rt.get(top), 2);
+}
+
+/// A speculative run of `c` checks the revision for its stash, then a set
+/// bumps it and reads the stash count before the stash stores it: the
+/// stash, of an ended revision, must still be dropped.
+#[test]
+fn a_stash_stored_after_a_sets_count_load_is_dropped() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = rt.create_input(1_u64);
+    let b = rt.create_query(|_: &Rt| 5_u64);
+    let c = rt.create_query(|_: &Rt| 7_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    let gate = Gate::new();
+    gate.arm();
+    hook(&rt, vec![(ParkPoint::StashAfterCheck(id(c)), gate.clone())]);
+    let parked = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(reader))
+    };
+    gate.wait_parked();
+    rt.set(other, 2);
+    gate.release();
+    assert_eq!(parked.join().unwrap(), 5);
+    assert_eq!(
+        Shared::u32_load_relaxed(&rt.stash_count),
+        0,
+        "a stash of the revision the set ended is kept"
+    );
+    assert_eq!(rt.get(c), 7);
+}
+
+/// A set bumps the revision and parks before its walk; a speculative
+/// verify of `mid` then claims in the new revision but scans `leaf` as the
+/// old one left it. It must not stash a verify the walk is about to undo.
+#[test]
+fn a_speculative_verify_before_a_sets_walk_keeps_no_stash() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(1_u64);
+    let leaf = rt.create_query_with(move |rt: &Rt| rt.get(input) / 10, replayable());
+    let mid = rt.create_query_with(move |rt: &Rt| rt.get(leaf), replayable());
+    let top = rt.create_query_with(move |rt: &Rt| rt.get(mid) + 1, replayable());
+    assert_eq!(rt.get(top), 1);
+    rt.set(input, 2);
+    assert_eq!(rt.get(leaf), 0);
+    let b = rt.create_query(|_: &Rt| 5_u64);
+    let reader = rt.create_query_with(
+        move |rt: &Rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                rt.get(top)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    let gate = Gate::new();
+    gate.arm();
+    hook(&rt, vec![(ParkPoint::SetAfterBump, gate.clone())]);
+    let setter = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.set(input, 13))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.get(reader), 5);
+    let stashed = rt.stashed_verify(id(mid).0, mid.generation());
+    gate.release();
+    setter.join().unwrap();
+    assert!(
+        !stashed,
+        "a verify over a dep the pending walk dirties is stashed"
+    );
+    assert_eq!(rt.get(top), 2);
+}
+
+static SLOW_ARMED: AtomicBool = AtomicBool::new(false);
+static SLOW_IN_CLONE: AtomicBool = AtomicBool::new(false);
+static SLOW_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// A value whose next `Clone` after [`SLOW_ARMED`] is set waits for
+/// [`SLOW_RELEASED`].
+#[derive(Debug, PartialEq)]
+struct Slow(u64);
+
+impl Clone for Slow {
+    fn clone(&self) -> Self {
+        if SLOW_ARMED.swap(false, SeqCst) {
+            SLOW_IN_CLONE.store(true, SeqCst);
+            while !SLOW_RELEASED.load(SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Slow(self.0)
+    }
+}
+
+/// A speculative read clones a stashed value with the stash lock released,
+/// so a user `Clone` that waits on another thread cannot hold up that
+/// thread's stash bookkeeping, and a real claim that adopts the value
+/// meanwhile lands a clone of it rather than running the closure again.
+#[test]
+fn a_stashed_value_is_cloned_outside_the_stash_lock() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let input = rt.create_input(7_u64);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let x = rt.create_query_with(
+        move |rt: &Rt| {
+            counted.fetch_add(1, SeqCst);
+            Slow(rt.get(input))
+        },
+        replayable(),
+    );
+    let reader = || {
+        let b = rt.create_query(|_: &Rt| 5_u64);
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(b);
+                if v == 0 {
+                    rt.get(x).0
+                } else {
+                    v
+                }
+            },
+            replayable(),
+        )
+    };
+    let (r1, r2) = (reader(), reader());
+    assert_eq!(rt.get(r1), 5);
+    assert!(rt.stashed(id(x).0, x.generation(), false), "x is stashed");
+    SLOW_ARMED.store(true, SeqCst);
+    let cloning = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || rt.get(r2))
+    };
+    while !SLOW_IN_CLONE.load(SeqCst) {
+        thread::sleep(Duration::from_millis(1));
+    }
+    let (tx, rx) = mpsc::channel();
+    let looking = {
+        let rt = Arc::clone(&rt);
+        thread::spawn(move || tx.send(rt.stashed(id(x).0, x.generation(), false)).unwrap())
+    };
+    let looked = rx.recv_timeout(Duration::from_secs(2));
+    assert_eq!(rt.get(x), Slow(7));
+    SLOW_RELEASED.store(true, SeqCst);
+    assert_eq!(cloning.join().unwrap(), 5);
+    looking.join().unwrap();
+    assert_eq!(
+        looked,
+        Ok(true),
+        "the stash lock is held across a user Clone"
+    );
+    assert_eq!(
+        runs.load(SeqCst),
+        1,
+        "x ran again while its stash was shared"
+    );
 }
