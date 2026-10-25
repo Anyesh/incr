@@ -1850,3 +1850,43 @@ local_and_shared!(
     local_a_replaced_blocked_landing_drops_outside_the_contexts,
     shared_a_replaced_blocked_landing_drops_outside_the_contexts
 );
+
+/// The running entry of a node, once popped, does not hide another entry
+/// of the node queued below it: that entry still owes the node's run.
+#[test]
+fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
+    let rt = Runtime::<Shared>::new();
+    let q = rt.create_query(|_| 0_u64);
+    unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> crate::replay::KeyParts {
+        unreachable!()
+    }
+    let entry = crate::replay::Entry {
+        node: q.slot(),
+        generation: q.generation(),
+        suspect: false,
+        spec: false,
+        retry: crate::replay::Retry::Compute,
+        walked: false,
+        r5: false,
+    };
+    let id = crate::replay::open(
+        rt.runtime_id,
+        1,
+        entry,
+        crate::replay::FrameKeys {
+            owner: std::ptr::null(),
+            parts: no_parts,
+        },
+    );
+    let queued = crate::replay::with(|c| {
+        let x = c.iter_mut().find(|x| x.id == id).unwrap();
+        x.push_entry(1, entry);
+        x.running = Some(1);
+        x.running_entry = Some(entry);
+        let before = x.queues(entry.node, entry.generation);
+        x.pop_entry(1);
+        (before, x.queues(entry.node, entry.generation))
+    });
+    drop(crate::replay::close(id));
+    assert_eq!(queued, (true, true));
+}
