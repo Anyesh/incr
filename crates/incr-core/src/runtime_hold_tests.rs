@@ -598,3 +598,75 @@ fn shared_get_of_another_runtime_from_a_shared_compute_ends_its_holds() {
         let _ = rt.get(root);
     });
 }
+
+/// A walk of B's `x` cleans `f`, which reads B's cycle, held in the
+/// attempt, and panics: x's entry contains the panic and holds its
+/// payload for f's Failed landing, also held. A wound then retracts the
+/// attempt, so f lands Dirty unrun, and the retry's run of f returns. No
+/// ticket may outlive the retracted landing it was held for.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_retracted_failed_landing_releases_its_ticket() {
+    let other = Arc::new(Runtime::<Shared>::new());
+    let k = other.create_input(1_i64);
+    let sel = other.create_input(0_i64);
+    let j = other.create_input(1_i64);
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        other.create_query_with_fallback(
+            move |rt| rt.get(*bc.get().unwrap()) + rt.get(k),
+            |_c: &Cycle| 100,
+        )
+    };
+    let b = other.create_query(move |rt| rt.get(a) * 2);
+    bc.set(b).unwrap();
+    let f_runs = Arc::new(AtomicUsize::new(0));
+    let f = {
+        let f_runs = f_runs.clone();
+        other.create_query(move |rt| {
+            let run = f_runs.fetch_add(1, Ordering::SeqCst) + 1;
+            let v = rt.get(j) + rt.get(a);
+            assert!(rt.get(j) != 0 || run != 2, "f boom {run}");
+            v
+        })
+    };
+    let wounded = Arc::new(AtomicBool::new(false));
+    // At the wound: the payloads held and the landings this thread holds.
+    let at_wound = Arc::new(std::sync::Mutex::new((0, 0)));
+    let x = {
+        let (wounded, at_wound) = (wounded.clone(), at_wound.clone());
+        other.create_query(move |rt| {
+            if rt.get(sel) == 0 {
+                return rt.get(f);
+            }
+            if !wounded.swap(true, Ordering::SeqCst) {
+                *at_wound.lock().unwrap() = (rt.contained_payloads(), crate::hold::held_count());
+                rt.raise_wound();
+            }
+            100
+        })
+    };
+    // A runtime does not track another's nodes, so each read is a new
+    // query of A's.
+    let rt = Runtime::<Shared>::new();
+    let read_x = |rt: &Runtime<Shared>| {
+        let other = other.clone();
+        let root = rt.create_query(move |_| other.get(x));
+        rt.get(root)
+    };
+    read_x(&rt);
+    other.set(k, 2);
+    other.set(j, 0);
+    other.set(sel, 1);
+    assert_eq!(read_x(&rt), 100);
+    assert!(wounded.load(Ordering::SeqCst));
+    let (payloads, held) = *at_wound.lock().unwrap();
+    assert_eq!(payloads, 1, "f's contained panic was held at the wound");
+    assert!(held > 0, "the attempt held landings at the wound");
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(f_runs.load(Ordering::SeqCst), 3);
+    assert_eq!(other.state_of(f), NodeState::Clean);
+    assert_eq!(other.contained_payloads(), 0);
+    assert_eq!(other.tickets_kept(), (0, false));
+}
