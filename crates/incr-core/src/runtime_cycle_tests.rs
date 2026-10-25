@@ -285,7 +285,7 @@ fn unseeded_cycle_forms_breaks_reforms<C: Cells>() {
     };
     let b = rt.create_query(move |rt| rt.try_get(a).map_or(-1, |v| v * 2));
     bc.set(b).unwrap();
-    let d = rt.create_query(move |rt| rt.try_get(b).map_or(-100, |v| v));
+    let d = rt.create_query(move |rt| rt.try_get(b).unwrap_or(-100));
 
     assert_eq!(rt.get(d), -100);
     assert_eq!(rt.state_of(a), NodeState::Cyclic);

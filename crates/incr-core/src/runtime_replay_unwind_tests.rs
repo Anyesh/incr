@@ -443,6 +443,8 @@ fn deps_of<C: Cells>(rt: &Runtime<C>, h: Incr<u64>) -> Vec<u32> {
 /// its virtual frame, which panics. The unbounded run never reads Q, so M
 /// lands as a discard: neither Failed nor with the deps of a run the
 /// unbounded run never makes.
+// `fetch_update` is `try_update` from Rust 1.99, after the 1.88 MSRV.
+#[allow(deprecated)]
 fn panic_in_a_speculative_entrys_continuation<C: Cells>() {
     let run = |frames: Option<u32>| {
         let rt = runtime::<C>(frames);

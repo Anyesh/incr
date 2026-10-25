@@ -487,8 +487,8 @@ impl<C: Cells> Runtime<C> {
         let mut holds: Vec<waits::Claim> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
-                .filter(|f| f.rt != RuntimeId::SENTINEL)
-                .map(|f| (f.rt, f.node.0))
+                .filter(|f| f.rt() != RuntimeId::SENTINEL)
+                .map(|f| (f.rt(), f.node.0))
                 .collect()
         });
         holds.extend(also.map(|x| (self.runtime_id, x.0)));
@@ -605,6 +605,7 @@ impl<C: Cells> Runtime<C> {
         let ctl = ComputeCtl::new(0);
         self.dep_stack
             .push_frame_at(RuntimeId::SENTINEL, NodeId::SENTINEL, &ctl, u32::MAX);
+        self.dep_stack.settle_foreign_keeping(false);
         let _barrier = Barrier(self);
         value_code::run(f)
     }
@@ -620,7 +621,7 @@ impl<C: Cells> Runtime<C> {
         let mut slots: Vec<u32> = self.dep_stack.with(|s| {
             s.frames
                 .iter()
-                .filter(|f| f.rt == rt && f.cidx >= p)
+                .filter(|f| f.rt() == rt && f.cidx >= p)
                 .map(|f| f.node.0)
                 .collect()
         });
@@ -639,7 +640,7 @@ impl<C: Cells> Runtime<C> {
         self.dep_stack.with(|s| {
             s.frames
                 .iter()
-                .any(|f| f.cidx >= p && f.cidx != u32::MAX && f.rt != rt)
+                .any(|f| f.cidx >= p && f.cidx != u32::MAX && f.rt() != rt)
         })
     }
 
@@ -667,7 +668,7 @@ impl<C: Cells> Runtime<C> {
             s.frames
                 .iter()
                 .rev()
-                .find(|f| f.node.0 == slot && f.rt == rt)
+                .find(|f| f.node.0 == slot && f.rt() == rt)
                 .map(|f| f.cidx)
         });
         let held = self.look_held(slot, Look::here(), |e| {
@@ -893,6 +894,9 @@ impl<C: Cells> Runtime<C> {
         ctl.lowlink.set(cidx);
         self.dep_stack
             .push_frame_at(self.runtime_id, id, &ctl, cidx);
+        if doomable && self.budgeted() {
+            self.dep_stack.settle_foreign_keeping(true);
+        }
         let mut began = None;
         if value_code::thread_word() & value_code::REPLAY_BIT != 0 {
             self.start_run(id, cidx, &ctl);

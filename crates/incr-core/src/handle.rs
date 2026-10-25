@@ -43,12 +43,73 @@ impl RuntimeId {
     /// Allocate a fresh runtime id. Called once per `Runtime::new`.
     pub(crate) fn allocate() -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(1);
-        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            id & FrameRt::TAGS == 0,
+            "incr-core: runtime ids ran into the frame tag bit"
+        );
+        Self(id)
     }
 
     #[inline]
     pub fn get(self) -> u64 {
         self.0
+    }
+}
+
+/// A frame's runtime id with two tags in the top bits, which no allocated
+/// id reaches: a frame is pushed untested, and the first Clean read of
+/// another runtime's node from it settles whether it keeps such reads for
+/// its retry (see `DepStack::foreign_keeper`). A type of its own, so code
+/// that compares it with a [`RuntimeId`] without [`FrameRt::rt`] does not
+/// compile.
+#[doc(hidden)]
+#[derive(Copy, Clone, Debug)]
+pub struct FrameRt(u64);
+
+impl FrameRt {
+    const UNTESTED: u64 = 1 << 63;
+    const KEEPS_FOREIGN: u64 = 1 << 62;
+    const TAGS: u64 = Self::UNTESTED | Self::KEEPS_FOREIGN;
+
+    #[inline(always)]
+    pub(crate) fn untested(rt: RuntimeId) -> Self {
+        Self(rt.0 | Self::UNTESTED)
+    }
+
+    /// `rt`, settled as keeping other runtimes' Clean reads or not.
+    #[inline(always)]
+    pub(crate) fn settled(rt: RuntimeId, keeps_foreign: bool) -> Self {
+        Self(
+            rt.0 | if keeps_foreign {
+                Self::KEEPS_FOREIGN
+            } else {
+                0
+            },
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn rt(self) -> RuntimeId {
+        RuntimeId(self.0 & !Self::TAGS)
+    }
+
+    #[inline(always)]
+    pub(crate) fn is_untested(self) -> bool {
+        self.0 & Self::UNTESTED != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn keeps_foreign(self) -> bool {
+        self.0 & Self::KEEPS_FOREIGN != 0
+    }
+
+    /// Whether `read_rt` differs from the frame's runtime or the frame is
+    /// untested or keeps other runtimes' Clean reads: one compare covers
+    /// all three.
+    #[inline(always)]
+    pub(crate) fn diverts_or_tagged(self, read_rt: RuntimeId) -> bool {
+        self.0 != read_rt.0
     }
 }
 

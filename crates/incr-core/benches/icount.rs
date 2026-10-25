@@ -12,8 +12,8 @@ use std::hint::black_box;
 use std::process::ExitCode;
 use workloads::{
     BatchRebuild, Chain, ChildrenChurn, ChildrenRerun, DeleteCascade, DeleteOwnedTree,
-    DeleteSingle, Diamond, EarlyCutoff, Fanout, GetClean, GetContended, InsertThenRead, TableHit,
-    TableMiss, ValueSlotRead, Workload,
+    DeleteSingle, Diamond, EarlyCutoff, Fanout, ForeignRead, GetClean, GetContended,
+    InsertThenRead, TableHit, TableMiss, ValueSlotRead, Workload,
 };
 
 // Allowed because the criterion helpers in the shared workloads are
@@ -108,6 +108,22 @@ registry! {
     "children_rerun_1k_shared", 10_000 => ChildrenRerun::<Shared>::new(1_000);
     "children_churn_local", 100_000 => ChildrenChurn::<Local>::new();
     "children_churn_shared", 100_000 => ChildrenChurn::<Shared>::new();
+    "foreign_clean_read_budgeted_u64", 100_000 =>
+        ForeignRead::new(true, 16, false, |n| n as u64, |&v| v as i64);
+    "foreign_clean_read_unbudgeted_u64", 100_000 =>
+        ForeignRead::new(false, 16, false, |n| n as u64, |&v| v as i64);
+    "foreign_clean_read_budgeted_4k", 100_000 =>
+        ForeignRead::new(true, 16, false, |_| vec![1_u8; 4096], |v| v.len() as i64);
+    "foreign_clean_read_unbudgeted_4k", 100_000 =>
+        ForeignRead::new(false, 16, false, |_| vec![1_u8; 4096], |v| v.len() as i64);
+    "foreign_clean_read_budgeted_u64_x1000", 2_000 =>
+        ForeignRead::new(true, 1000, false, |n| n as u64, |&v| v as i64);
+    "foreign_clean_read_unbudgeted_u64_x1000", 2_000 =>
+        ForeignRead::new(false, 1000, false, |n| n as u64, |&v| v as i64);
+    "foreign_dirty_read_budgeted_u64", 20_000 =>
+        ForeignRead::new(true, 16, true, |n| n as u64, |&v| v as i64);
+    "foreign_dirty_read_unbudgeted_u64", 20_000 =>
+        ForeignRead::new(false, 16, true, |n| n as u64, |&v| v as i64);
 }
 
 fn usage() -> ExitCode {
