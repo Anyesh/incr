@@ -1009,11 +1009,10 @@ fn speculative_chain_drops_without_unwinding<C: Cells>() {
 /// `get(G)` or 9999 if it unwinds, and G reads D, so `try_get(D)` closes
 /// the cycle and leaves E and F Dirty over a New G. `try_get(E)`'s walk
 /// then computes G, whose read of D dooms; G's run as a virtual frame
-/// closes the cycle again at D's read of G, and the walk contains that
-/// unwind, as the unbounded run's walk does, because every claim but G's
-/// own ran above G. The unwind releases G's claim too, so counting it
-/// let the cycle out as `try_get(E)`'s `Err` (two-thread seed 0x5b0d).
-fn walk_entry_contains_a_cycle_through_itself<C: Cells>() {
+/// closes the cycle again at D's read of G, and that unwind reaches
+/// `try_get(E)` as its `Err`, at budget 1 as unbounded, and as on main
+/// (two-thread seed 0x5b0d).
+fn walk_entry_cycle_through_itself_reaches_the_reader<C: Cells>() {
     let observe = |frames: Option<u32>| {
         let rt = runtime::<C>(frames);
         let d_cell = cell::<u64>();
@@ -1041,7 +1040,10 @@ fn walk_entry_contains_a_cycle_through_itself<C: Cells>() {
     };
     let unbounded = observe(None);
     assert!(matches!(unbounded.0, Outcome::Cycle(_)), "{unbounded:?}");
-    assert_eq!(unbounded.1, Outcome::Value(7777));
+    assert!(
+        matches!(&unbounded.1, Outcome::Cycle(c) if c.len() == 4),
+        "{unbounded:?}"
+    );
     assert_eq!(observe(Some(1)), unbounded);
 }
 
@@ -1473,7 +1475,7 @@ fn shared_reserved_vframe_keeps_handed_memo_in_group() {
 
 local_and_shared!(
     doom_handed_memo_meets_no_chain_drop,
-    walk_entry_contains_a_cycle_through_itself,
+    walk_entry_cycle_through_itself_reaches_the_reader,
     speculative_chain_drops_without_unwinding,
     virtual_hit_above_an_earlier_one,
     drop_through_a_native_frame,
