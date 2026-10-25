@@ -90,6 +90,10 @@ pub(crate) struct Log {
     /// The copied set's generation and how far into `entries` it has
     /// marked the notes copies took (`replay::mark_copied`).
     pub(crate) marked: (u64, usize),
+    /// As `marked`, for the kept reads' copies (`replay::keep`).
+    pub(crate) kept_marked: (u64, usize),
+    /// The copy of this log [`Notes::note_copy`] noted last.
+    renoted: Option<Renoted>,
 }
 
 #[derive(Clone)]
@@ -112,7 +116,18 @@ impl Log {
     /// `epoch`, each at its shallowest depth above `base`. A note below
     /// `base` counts as just above it.
     pub(crate) fn landings(&self, len: usize, epoch: u64, base: u32) -> Vec<((u32, u32), u32)> {
-        note_work(len);
+        self.landings_in(0, len, epoch, base)
+    }
+
+    /// As [`Self::landings`], of the notes from entry `from` on only.
+    fn landings_in(
+        &self,
+        from: usize,
+        len: usize,
+        epoch: u64,
+        base: u32,
+    ) -> Vec<((u32, u32), u32)> {
+        note_work(len - from);
         let mut nodes: Vec<((u32, u32), u32)> = Vec::new();
         let mut at: HashMap<(u32, u32), usize, FxBuildHasher> = HashMap::default();
         let mut add = |node: (u32, u32), depth: u32| match at.entry(node) {
@@ -125,7 +140,7 @@ impl Log {
                 nodes.push((node, depth));
             }
         };
-        for e in self.entries[..len].iter().filter(|e| e.gone >= epoch) {
+        for e in self.entries[from..len].iter().filter(|e| e.gone >= epoch) {
             let depth = e.cidx.saturating_sub(base);
             match &e.lent {
                 None => add(e.node, depth),
@@ -202,6 +217,18 @@ pub(crate) struct Notes {
     /// hold another note after its payload's notes all went.
     by_node: BTreeMap<(RuntimeId, (u32, u32)), Vec<At>>,
     live: usize,
+    /// Bumped when a note goes, which voids every log's `renoted`.
+    renote_gen: u64,
+}
+
+struct Renoted {
+    renote_gen: u64,
+    len: usize,
+    epoch: u64,
+    from_base: u32,
+    rt: RuntimeId,
+    key: PayloadKey,
+    base: u32,
 }
 
 impl Notes {
@@ -211,6 +238,7 @@ impl Notes {
             tops: BTreeSet::new(),
             by_node: BTreeMap::new(),
             live: 0,
+            renote_gen: 0,
         }
     }
 
@@ -227,6 +255,50 @@ impl Notes {
         restorable: bool,
     ) {
         self.push_noted(rt, key, cidx, node, None, restorable);
+    }
+
+    /// Notes, under `key` and above `base`, the landings a copy holds: the
+    /// first `len` entries of `log` still noted at removal `epoch`, at
+    /// their depths above `from_base`. When the copy of `log` noted last
+    /// went to the same place, at an epoch no later, and no note has gone
+    /// since, the entries it held are noted already, so only later ones
+    /// are: a second note of a node at the same place, or deeper than
+    /// another, retires with that one and adds no landing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn note_copy(
+        &mut self,
+        rt: RuntimeId,
+        key: PayloadKey,
+        base: u32,
+        log: &Rc<RefCell<Log>>,
+        len: usize,
+        epoch: u64,
+        from_base: u32,
+    ) {
+        let from = match &log.borrow().renoted {
+            Some(r)
+                if (r.renote_gen, r.rt, r.key, r.base, r.from_base)
+                    == (self.renote_gen, rt, key, base, from_base)
+                    && r.len <= len
+                    && r.epoch <= epoch =>
+            {
+                r.len
+            }
+            _ => 0,
+        };
+        let nodes = log.borrow().landings_in(from, len, epoch, from_base);
+        for (node, depth) in nodes {
+            self.push(rt, key, base + depth, node, false);
+        }
+        log.borrow_mut().renoted = Some(Renoted {
+            renote_gen: self.renote_gen,
+            len,
+            epoch,
+            from_base,
+            rt,
+            key,
+            base,
+        });
     }
 
     /// Notes the ticket `members` stands for, which a read took with the
@@ -345,6 +417,7 @@ impl Notes {
                 self.groups.remove(&at.key);
             }
             self.live -= 1;
+            self.renote_gen += 1;
             self.retop(at.key, old, new);
         }
         self.removed();
@@ -381,6 +454,7 @@ impl Notes {
         for (_, level) in gone {
             note_work(level.at.len());
             self.live -= level.live as usize;
+            self.renote_gen += 1;
             for (log, idx) in level.at {
                 let Some(e) = g.take(log, idx, removal) else {
                     continue;
@@ -448,6 +522,7 @@ impl Notes {
         let live: u32 = g.levels.values().map(|l| l.live).sum();
         note_work(g.levels.len());
         self.live -= live as usize;
+        self.renote_gen += 1;
         self.retop(key, g.top(), None);
         self.removed();
         Some(g)

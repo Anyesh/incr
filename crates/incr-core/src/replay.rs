@@ -359,6 +359,21 @@ impl Landings {
         nodes.iter().any(|&(n, _)| n == node)
     }
 
+    /// The log, length, removal epoch and base of a copy that still
+    /// shares its log.
+    pub(crate) fn as_shared(&self) -> Option<(&Rc<RefCell<Log>>, usize, u64, u32)> {
+        match &self.nodes {
+            Nodes::Shared {
+                log,
+                len,
+                epoch,
+                base,
+                ..
+            } => Some((log, *len, *epoch, *base)),
+            Nodes::Owned(_) => None,
+        }
+    }
+
     pub(crate) fn into_nodes(mut self) -> Vec<((u32, u32), u32)> {
         std::mem::take(self.owned_nodes())
     }
@@ -369,17 +384,21 @@ impl Landings {
                 note_work(nodes.len());
                 nodes.iter().any(|&(_, depth)| depth > 0)
             }
+            // No landing is deeper than `depth`.
             Nodes::Shared {
                 log,
                 len,
                 epoch,
                 base,
-                ..
-            } => log
-                .borrow()
-                .landings(*len, *epoch, *base)
-                .iter()
-                .any(|&(_, depth)| depth > 0),
+                depth,
+            } => {
+                *depth > 0
+                    && log
+                        .borrow()
+                        .landings(*len, *epoch, *base)
+                        .iter()
+                        .any(|&(_, depth)| depth > 0)
+            }
         }
     }
 
@@ -1410,6 +1429,11 @@ thread_local! {
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
+    static KEPT_HELD: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
+    static KEPT_GEN: Cell<u64> = const { Cell::new(0) };
+    // A kept copy holds landings `KEPT_HELD` does not mark: every landing
+    // counts as one a kept copy may hold.
+    static KEPT_ALL: Cell<bool> = const { Cell::new(false) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
@@ -1429,6 +1453,9 @@ loom::thread_local! {
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static COPIED: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
     static COPIED_GEN: Cell<u64> = Cell::new(0);
+    static KEPT_HELD: RefCell<CopiedSet> = RefCell::new(CopiedSet::default());
+    static KEPT_GEN: Cell<u64> = Cell::new(0);
+    static KEPT_ALL: Cell<bool> = Cell::new(false);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
@@ -1487,17 +1514,22 @@ struct Logged {
     all: bool,
     /// The event may retire landings by position, short of the node.
     wide: bool,
+    /// The landing's node may be in a kept read's copy.
+    kept: bool,
 }
 
 /// The events logged while reads are kept, with the indexes of those that
-/// may retire landings by position and of each node's landings, so that
-/// a kept read's catch-up skips the landings of nodes its copy does not
-/// hold.
+/// may retire landings by position and of the landings of nodes a kept
+/// copy held, so that a kept read's catch-up skips the landings of nodes
+/// its copy does not hold, and with none since it was kept, looks at no
+/// node of its copy.
 #[derive(Default)]
 struct Events {
     log: Vec<Logged>,
     wide: Vec<usize>,
     landed: HashMap<(RuntimeId, (u32, u32)), Vec<usize>, FxBuildHasher>,
+    /// The latest event in `landed`.
+    last_kept: Option<usize>,
 }
 
 impl Events {
@@ -1506,8 +1538,9 @@ impl Events {
         if l.wide {
             self.wide.push(i);
         }
-        if let Some(n) = l.ev.node() {
+        if let Some(n) = l.ev.node().filter(|_| l.kept) {
             self.landed.entry((l.rt, n)).or_default().push(i);
+            self.last_kept = Some(i);
         }
         self.log.push(l);
     }
@@ -1521,6 +1554,7 @@ impl Events {
         } else {
             self.landed.clear();
         }
+        self.last_kept = None;
     }
 }
 
@@ -1542,6 +1576,14 @@ fn keep(mut read: KeptRead, fresh: bool, number: bool) {
     if let Delivered::Unwind { nodes, .. } = &read.what {
         let top = read.cidx + 1 + nodes.depth();
         KEPT_TOP.with(|k| k.set(k.get().max(top)));
+        // A copy taken apart already cost its size, which its catch-up may
+        // cost again; a shared one marks only the notes no earlier copy
+        // of its log did.
+        if nodes.as_shared().is_some() {
+            mark_in(Marks::Kept, read.rt, nodes);
+        } else if !matches!(&nodes.nodes, Nodes::Owned(n) if n.is_empty()) {
+            KEPT_ALL.with(|k| k.set(true));
+        }
     }
     let seen = KEPT_EVENTS.with(|v| v.borrow().log.len());
     let gone: Vec<(KeptRead, usize)> = KEPT_READS.with(|d| {
@@ -1612,10 +1654,32 @@ pub(crate) fn mark_copied(rt: RuntimeId, nodes: &Landings) {
     }
 }
 
-/// A shared copy marks only the notes its log's earlier copies did not.
 fn mark(rt: RuntimeId, nodes: &Landings) {
-    let generation = copied_generation();
-    COPIED.with(|c| {
+    mark_in(Marks::Copied, rt, nodes);
+}
+
+/// Which set of landings copies may hold: the contexts' deliveries'
+/// (`COPIED`) or the kept reads' (`KEPT_HELD`).
+#[derive(Clone, Copy)]
+enum Marks {
+    Copied,
+    Kept,
+}
+
+fn log_marks(log: &mut Log, marks: Marks) -> &mut (u64, usize) {
+    match marks {
+        Marks::Copied => &mut log.marked,
+        Marks::Kept => &mut log.kept_marked,
+    }
+}
+
+/// A shared copy marks only the notes its log's earlier copies did not.
+fn mark_in(marks: Marks, rt: RuntimeId, nodes: &Landings) {
+    let (generation, set) = match marks {
+        Marks::Copied => (copied_generation(), &COPIED),
+        Marks::Kept => (kept_generation(), &KEPT_HELD),
+    };
+    set.with(|c| {
         let mut c = c.borrow_mut();
         let mut mark = |n| {
             c.insert((rt, n));
@@ -1631,7 +1695,7 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
                 log, len, epoch, ..
             } => {
                 let mut log = log.borrow_mut();
-                let from = match log.marked {
+                let from = match *log_marks(&mut log, marks) {
                     (g, upto) if g == generation => upto.min(*len),
                     _ => 0,
                 };
@@ -1639,6 +1703,12 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
                 for e in log.entries[from..*len].iter().filter(|e| e.gone >= *epoch) {
                     match &e.lent {
                         None => mark(e.node),
+                        // A ticket's members outlive the kept set, so
+                        // marks on them would restart with every set: the
+                        // copy counts every landing instead.
+                        Some(_) if matches!(marks, Marks::Kept) => {
+                            KEPT_ALL.with(|k| k.set(true));
+                        }
                         // A ticket's members went into earlier copies of
                         // the notes that stood for it, so only its later
                         // members are new.
@@ -1659,7 +1729,7 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
                         }
                     }
                 }
-                log.marked = (generation, (*len).max(from));
+                *log_marks(&mut log, marks) = (generation, (*len).max(from));
             }
         }
     });
@@ -1668,13 +1738,27 @@ fn mark(rt: RuntimeId, nodes: &Landings) {
 /// This thread's copied set's generation, unique among every thread's, as
 /// a ticket's members are marked from any thread.
 fn copied_generation() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     COPIED_GEN.with(|g| {
         if g.get() == 0 {
-            g.set(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            g.set(new_generation());
         }
         g.get()
     })
+}
+
+/// As [`copied_generation`], for the kept reads' set.
+fn kept_generation() -> u64 {
+    KEPT_GEN.with(|g| {
+        if g.get() == 0 {
+            g.set(new_generation());
+        }
+        g.get()
+    })
+}
+
+fn new_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether a kept read or a context's delivery may hold copied landings.
@@ -1692,21 +1776,25 @@ pub(crate) fn retire_copies(rt: RuntimeId, ev: &Retire) {
         .is_some_and(|n| COPIED.with(|c| c.borrow().contains(&(rt, n))));
     // Short of a copied node, an event retires only landings above its
     // position, or at it for a contained payload; a landing also retires
-    // its node from the kept copies that hold it, which the copied set
-    // does not mark.
+    // its node from the kept copies that hold it, which the kept set
+    // marks and the copied set does not.
     let reach = match *ev {
         Retire::Contained { cidx, .. } => cidx,
         _ => ev.cidx() + 1,
     };
     if value_code::thread_word() & value_code::KEPT_BIT != 0 {
         let wide = all || KEPT_TOP.with(Cell::get) >= reach;
-        if wide || ev.node().is_some() {
+        let kept = ev.node().is_some_and(|n| {
+            KEPT_ALL.with(Cell::get) || KEPT_HELD.with(|k| k.borrow().contains(&(rt, n)))
+        });
+        if wide || kept {
             KEPT_EVENTS.with(|v| {
                 v.borrow_mut().push(Logged {
                     rt,
                     ev: *ev,
                     all,
                     wide,
+                    kept,
                 })
             });
         }
@@ -1731,7 +1819,7 @@ fn catch_up(read: &mut KeptRead, seen: usize, events: &Events) {
     let from = events.wide.partition_point(|&i| i < seen);
     // `(index, whether the copy held its node)`
     let mut todo: Vec<(usize, bool)> = events.wide[from..].iter().map(|&i| (i, false)).collect();
-    if events.log.len() > seen && !events.landed.is_empty() {
+    if events.last_kept.is_some_and(|i| i >= seen) {
         let copy = nodes.owned_nodes();
         note_work(copy.len());
         for &(n, _) in copy.iter() {
@@ -1820,20 +1908,25 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
         );
         value_code::set_kept_bit(!d.is_empty());
         if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
-            COPIED.with(|c| {
-                let mut c = c.borrow_mut();
-                // A clear costs the capacity, which one big replay leaves
-                // behind for every later kept episode.
-                if c.capacity() > COPIED_KEEP {
-                    *c = CopiedSet::default();
-                } else {
-                    c.clear();
-                }
-            });
+            COPIED.with(clear_set);
             COPIED_GEN.with(|g| g.set(0));
+            KEPT_HELD.with(clear_set);
+            KEPT_GEN.with(|g| g.set(0));
+            KEPT_ALL.with(|k| k.set(false));
         }
         out
     })
+}
+
+fn clear_set(set: &RefCell<CopiedSet>) {
+    let mut set = set.borrow_mut();
+    // A clear costs the capacity, which one big replay leaves behind for
+    // every later kept episode.
+    if set.capacity() > COPIED_KEEP {
+        *set = CopiedSet::default();
+    } else {
+        set.clear();
+    }
 }
 
 /// No read is kept, so no copy takes the logged events.
