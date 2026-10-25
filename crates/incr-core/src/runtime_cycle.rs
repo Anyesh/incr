@@ -2424,16 +2424,7 @@ impl<C: Cells> Runtime<C> {
                             node.max_changed_at(stamp_rev);
                             e.changed = true;
                         }
-                        // An equal value hands back the rejected one, which
-                        // is not what the slot held.
-                        let displaced = if C::SINGLE_THREADED || !(changed || first) {
-                            displaced
-                        } else {
-                            hold::keep_value(state::cell_key::<C>(node.state_cell()), displaced)
-                        };
-                        if let Some(d) = displaced {
-                            bag.push_erased(d);
-                        }
+                        self.displaced(node, displaced, changed || first, bag);
                     }
                     Err(payload) => {
                         e.failed = true;
