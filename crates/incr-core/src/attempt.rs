@@ -300,7 +300,6 @@ impl Attempt {
 
 /// Whether this thread's attempt has a discard in flight, for tests and
 /// debug checks.
-#[cfg(any(test, debug_assertions))]
 pub(crate) fn in_flight() -> bool {
     MINE.with(|w| w.state.load(Ordering::Relaxed) & IN_FLIGHT != 0)
 }
