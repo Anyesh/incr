@@ -4120,24 +4120,24 @@ fn a_doomed_reread_of_the_blocked_node_leaves_the_walk_to_the_retry() {
     });
 }
 
-/// Seed 0x2897c4266833877, unbounded: op 3's `Get(18)` verifies 18's
-/// group with a tainted walk entry, which releases the group's claims. A
-/// released member that stays in its group is verified as one again and
-/// gives 7793, where a fresh run raises the cycle. Leaving the group fixes
-/// this but breaks [`seed_92b175856b_dissolved_root_retry_computes_alone`]
-/// when the release happens inside an attempt a byte budget discards; a fix
-/// must pass both.
+/// Seed 0x2897c4266833877: op 3's `Get(18)` verifies 18's group with a
+/// tainted walk entry, which releases the group's claims, and a later
+/// verify of 16 recomputes the group from 16. That enters the cycle where
+/// a fresh run of `[Get(16), Get(18)]` does, and gives that order's 7793,
+/// not `Get(18)` alone's cycle (B7-clean-walk-entry-order).
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T10-ub-69a2639d: a released group member is verified with its stale group"]
-fn a_tainted_group_release_still_raises_the_cycle() {
-    let mut case = gen_case(0x0289_7c42_6683_3877, false, false);
+fn a_tainted_group_release_gives_a_clean_entry_orders_value() {
+    let seed = 0x0289_7c42_6683_3877;
+    let mut case = gen_case(seed, false, false);
     case.ops.truncate(4);
     assert!(matches!(case.ops[3], Op::Get(18)));
     quiet(|| {
         for trace in [run::<Local>(&case, None, 0), run::<Shared>(&case, None, 0)] {
-            assert_eq!(trace[3].0, Out::Panic("cycle".to_owned()));
+            assert_eq!(trace[3].0, Out::Value(7793));
         }
+        differential::<Local>(&case, seed);
+        differential::<Shared>(&case, seed);
     });
 }
 
