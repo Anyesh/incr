@@ -1445,8 +1445,13 @@ impl<C: Cells> Runtime<C> {
         self.dep_stack.any_compute_frame()
     }
 
-    /// Whether this runtime's active frame on this thread is doomed.
+    /// Whether this runtime's active frame on this thread is doomed, so a
+    /// node it would create is the pending handle. A run regenerating a
+    /// payload (`regenerate`) creates nothing, and aborts here.
     pub(crate) fn frame_doomed(&self) -> bool {
+        if value_code::thread_word() & value_code::REGEN_BIT != 0 {
+            replay_impl::abort_regen();
+        }
         self.dep_stack
             .active_frame(self.runtime_id)
             .is_some_and(|(ctl, _)| {
@@ -2231,7 +2236,8 @@ impl<C: Cells> Runtime<C> {
             & (value_code::COUNTER_MASK
                 | value_code::REPLAY_BIT
                 | value_code::UNWIND_MASK
-                | value_code::FOREIGN_BIT)
+                | value_code::FOREIGN_BIT
+                | value_code::REGEN_BIT)
             != 0
             || frame.is_some_and(|f| self.doomed_or_past_budget(f))
         {

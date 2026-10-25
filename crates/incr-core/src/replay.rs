@@ -1208,7 +1208,29 @@ impl Context {
             unreachable!("incr-core: taken as an unwind");
         };
         let Some(copy) = copy_payload(&**payload) else {
-            return self.pending.remove(i).what;
+            // The one payload goes to this read, and a retry doomed again
+            // regenerates it.
+            let regen: Box<dyn Any + Send> = Box::new(Regen((**payload).type_id()));
+            let d = self.pending.get_mut(i);
+            let Delivered::Unwind {
+                cycle,
+                poison,
+                attributed,
+                payload,
+                nodes,
+            } = &mut d.what
+            else {
+                unreachable!("incr-core: taken as an unwind");
+            };
+            let payload = std::mem::replace(payload, regen);
+            d.resumed = Some(payload_key(&*payload));
+            return Delivered::Unwind {
+                cycle: *cycle,
+                poison: *poison,
+                attributed: *attributed,
+                payload,
+                nodes: nodes.clone(),
+            };
         };
         let what = Delivered::Unwind {
             cycle: *cycle,
@@ -1353,6 +1375,7 @@ thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
     static KEPT_EVENTS: RefCell<Vec<Logged>> = const { RefCell::new(Vec::new()) };
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
+    static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
     static COPIED: RefCell<[u64; 64]> = const { RefCell::new([0; 64]) };
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
@@ -1372,6 +1395,7 @@ loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
     static KEPT_EVENTS: RefCell<Vec<Logged>> = RefCell::new(Vec::new());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
+    static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
     static COPIED: RefCell<[u64; 64]> = RefCell::new([0; 64]);
     static COPIED_GEN: Cell<u64> = Cell::new(0);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
@@ -2028,11 +2052,78 @@ pub(crate) fn set_carry(carry: Option<Carry>) {
     CARRY.with(|c| c.set(carry));
 }
 
+/// What a kept read holds in place of a payload no copy can stand for,
+/// once the one payload is gone: the payload's type, which the retry's
+/// read regenerates by running the node's closure again
+/// (`Runtime::regenerate`).
+#[derive(Clone, Copy)]
+pub(crate) struct Regen(pub(crate) std::any::TypeId);
+
+/// The state of `Runtime::regenerate`'s runs on this thread: the payloads
+/// made so far for the Failed nodes they read, each taken by the first
+/// read of its node, and the node whose read aborted the last run for want
+/// of one. Nodes are keyed as a `ReadScope`'s `reading`.
+pub(crate) struct Regenerating {
+    rt: Option<RuntimeId>,
+    made: Vec<(u64, Box<dyn Any + Send>)>,
+    wanted: Option<u64>,
+}
+
+impl Regenerating {
+    pub(crate) const fn new() -> Self {
+        Self {
+            rt: None,
+            made: Vec::new(),
+            wanted: None,
+        }
+    }
+}
+
+/// Opens a regenerating run of runtime `rt` whose reads take from `made`.
+pub(crate) fn regen_open(rt: RuntimeId, made: Vec<(u64, Box<dyn Any + Send>)>) {
+    REGEN.with(|r| {
+        *r.borrow_mut() = Regenerating {
+            rt: Some(rt),
+            made,
+            wanted: None,
+        }
+    });
+}
+
+/// Closes the run [`regen_open`] opened: the payloads its reads left, and
+/// the node it wanted one for.
+pub(crate) fn regen_close() -> (Vec<(u64, Box<dyn Any + Send>)>, Option<u64>) {
+    REGEN.with(|r| {
+        let r = std::mem::replace(&mut *r.borrow_mut(), Regenerating::new());
+        (r.made, r.wanted)
+    })
+}
+
+/// The payload made for node `key` of runtime `rt`, which a read of it in
+/// the open run raises. Without one the node is wanted, if it is the open
+/// run's runtime's.
+pub(crate) fn regen_take(rt: RuntimeId, key: u64) -> Option<Box<dyn Any + Send>> {
+    REGEN.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.rt != Some(rt) {
+            return None;
+        }
+        match r.made.iter().position(|m| m.0 == key) {
+            Some(i) => Some(r.made.swap_remove(i).1),
+            None => {
+                r.wanted = Some(key);
+                None
+            }
+        }
+    })
+}
+
 /// Whether [`copy_payload`] can copy `payload`.
 pub(crate) fn copyable(payload: &(dyn Any + Send)) -> bool {
     payload.is::<crate::cycle::CycleUnwind>()
         || payload.is::<String>()
         || payload.is::<&'static str>()
+        || payload.is::<Regen>()
 }
 
 /// A copy of a panic payload of a type the engine knows: a cycle unwind's
@@ -2043,6 +2134,9 @@ pub(crate) fn copy_payload(payload: &(dyn Any + Send)) -> Option<Box<dyn Any + S
     }
     if let Some(message) = payload.downcast_ref::<String>() {
         return Some(Box::new(message.clone()));
+    }
+    if let Some(regen) = payload.downcast_ref::<Regen>() {
+        return Some(Box::new(*regen));
     }
     payload
         .downcast_ref::<&'static str>()
@@ -2125,6 +2219,25 @@ pub(crate) fn take_pending(
             })
         })
     })
+}
+
+/// The taken delivery of a payload no copy can stand for, for read `key`
+/// of `rt`'s contexts, was regenerated as the payload `raised`: it counts
+/// as the source of the landings the delivery carries, as a copy raised
+/// by a take does (`Delivery::resumed`).
+pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
+    with(|c| {
+        for x in c.iter_mut().filter(|x| x.rt == rt) {
+            for i in x.pending.keyed(key).to_vec() {
+                let d = x.pending.get_mut(i);
+                if d.taken
+                    && matches!(&d.what, Delivered::Unwind { payload, .. } if payload.is::<Regen>())
+                {
+                    d.resumed = Some(raised);
+                }
+            }
+        }
+    });
 }
 
 /// Removes context `id`, if it is still open, returning the deliveries

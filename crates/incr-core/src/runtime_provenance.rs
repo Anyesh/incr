@@ -102,7 +102,7 @@ fn last_read(deps: &[(NodeId, u32)]) -> Option<(u64, u32)> {
 }
 
 /// The message of a read of node `slot` landed Failed.
-fn failed_read_message(slot: u32) -> String {
+pub(super) fn failed_read_message(slot: u32) -> String {
     format!(
         "incr-core: node {slot} read but its last compute panicked; it stays Failed until a \
          dependency changes (set an upstream input to retry)"
