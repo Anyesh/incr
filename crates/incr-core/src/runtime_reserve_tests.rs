@@ -533,6 +533,75 @@ fn a_doomed_runs_joined_child_reads_a_node_the_doom_released() {
     }
 }
 
+/// R reads X, whose read dooms past the budget, then S, which dooms too.
+/// X joins a thread that reads S, but only on a run whose read of X1 is no
+/// placeholder, so only its retry as an entry does. A doomed R that ran on
+/// past X's placeholder would have released S under a reservation before
+/// that entry ran; the child must not wait on it, as on main, where nothing
+/// holds S when X runs.
+#[test]
+fn an_entrys_joined_child_reads_a_sibling_its_doom_never_reached() {
+    for frames in [u32::MAX, 1, 2] {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(3_u64);
+        let s1 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let s = rt.create_query_with(move |rt: &Rt| rt.get(s1) + 1, replayable());
+        let x1 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let x = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(x1);
+                if v == 0 {
+                    return 0;
+                }
+                v + thread::scope(|sc| sc.spawn(|| rt.get(s)).join().unwrap())
+            },
+            replayable(),
+        );
+        let r = rt.create_query_with(move |rt: &Rt| rt.get(x) + rt.get(s), replayable());
+        rt.set_max_frames(frames);
+        assert_eq!(within_10s(&rt, r), Some(Ok(13 + 5 + 5)), "budget {frames}");
+        rt.set(i, 4);
+        assert_eq!(within_10s(&rt, r), Some(Ok(14 + 6 + 6)), "budget {frames}");
+        rt.assert_invariant_i();
+    }
+}
+
+/// As above with S of a type that has no placeholder, so a doomed R that
+/// ran on past X's placeholder would run S natively, and S, reading S1
+/// past the budget, would doom and release itself under a reservation
+/// before X's entry joins the child that reads it.
+#[test]
+fn an_entrys_joined_child_reads_a_sibling_a_doomed_run_would_read_natively() {
+    for frames in [u32::MAX, 1, 2] {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(3_u64);
+        let s1 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let s = rt.create_query_with(move |rt: &Rt| rt.get(s1) as u32 + 1, replayable());
+        let x1 = rt.create_query_with(move |rt: &Rt| rt.get(i) + 10, replayable());
+        let x = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = rt.get(x1);
+                if v == 0 {
+                    return 0;
+                }
+                v + u64::from(thread::scope(|sc| sc.spawn(|| rt.get(s)).join().unwrap()))
+            },
+            replayable(),
+        );
+        let r = rt.create_query_with(
+            move |rt: &Rt| rt.get(x) + u64::from(rt.get(s)),
+            replayable(),
+        );
+        rt.set_max_frames(frames);
+        assert_eq!(within_10s(&rt, r), Some(Ok(13 + 5 + 5)), "budget {frames}");
+        rt.set(i, 4);
+        assert_eq!(within_10s(&rt, r), Some(Ok(14 + 6 + 6)), "budget {frames}");
+        rt.assert_invariant_i();
+    }
+}
+
 static JOIN_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static JOIN_TARGET: OnceLock<(Arc<Rt>, Incr<JoinV>)> = OnceLock::new();
 static JOIN_CHILD: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
