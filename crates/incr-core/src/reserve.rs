@@ -498,7 +498,7 @@ pub(crate) fn mark_taken() {
     crate::cycle_state::set_any_taken(true);
 }
 
-/// Whether a take-over of this outermost read met `claim`.
+/// Whether a take-over during the thread's outermost entry met `claim`.
 #[inline(always)]
 pub(crate) fn taken(claim: Claim) -> bool {
     crate::cycle_state::any_taken() && taken_slow(claim)
@@ -515,7 +515,7 @@ thread_local! {
     static TAKES: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Take-overs of this thread's outermost read so far, for tests.
+/// Take-overs during the thread's outermost entry so far, for tests.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn takes() -> u32 {
     TAKES.with(Cell::get)

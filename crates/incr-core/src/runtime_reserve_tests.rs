@@ -852,13 +852,19 @@ fn a_take_over_under_a_local_entry_restarts_its_read_boundedly() {
             move |rt: &Rt| rt.try_get(c).map_or(7, |v| v + 1),
             replayable(),
         );
-        let t = shared.create_query_with(
-            move |rt: &Rt| {
-                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
-                v + thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap())
-            },
-            replayable(),
-        );
+        let takes = Arc::new(AtomicU32::new(0));
+        let t = {
+            let takes = takes.clone();
+            shared.create_query_with(
+                move |rt: &Rt| {
+                    let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                    let w = thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap());
+                    takes.fetch_max(crate::reserve::takes(), SeqCst);
+                    v + w
+                },
+                replayable(),
+            )
+        };
         shared.set_max_frames(frames);
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
@@ -871,6 +877,9 @@ fn a_take_over_under_a_local_entry_restarts_its_read_boundedly() {
             Some(14),
             "budget {frames}"
         );
+        if frames == 1 {
+            assert!(takes.load(SeqCst) > 0, "no take-over at budget 1");
+        }
     }
 }
 
