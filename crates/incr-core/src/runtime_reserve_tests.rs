@@ -628,7 +628,8 @@ fn a_closure_that_catches_a_doom_joins_a_reader_of_the_doomed_node() {
 }
 
 /// As above with X in a cycle with W, each reading the other with
-/// `try_get`, and T's child reading W: over budget the doom falls inside the
+/// `try_get`, and T's child reading W with `try_get`, as a member of a
+/// cycle with no strategy has no value for `get`: over budget the doom falls inside the
 /// episode, whose claims the doomed frames may keep held while T's catch
 /// runs the join.
 #[test]
@@ -653,7 +654,7 @@ fn a_closure_that_catches_a_doom_in_a_cycle_joins_a_reader_of_a_member() {
         let t = rt.create_query_with(
             move |rt: &Rt| {
                 let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
-                v + thread::scope(|s| s.spawn(|| rt.get(w)).join().unwrap())
+                v + thread::scope(|s| s.spawn(|| rt.try_get(w).unwrap_or(9)).join().unwrap())
             },
             replayable(),
         );
