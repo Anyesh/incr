@@ -491,8 +491,8 @@ enum Computed {
     /// Another thread landed an episode since the walk planned: the node
     /// was left unrun and unclaimed, and the walk prunes its plan.
     Replan,
-    /// Another thread landed the node Dirty since the walk planned it: a
-    /// claim wait ended with it Dirty, not released unrun, or the walk
+    /// Another thread landed the node since the walk planned it: a claim
+    /// wait ended with it Dirty or New, not released unrun, or the walk
     /// planned it New and claimed it from Dirty. The node was left unrun
     /// and unclaimed, and the walk visits it again, as a read that came
     /// after that landing expands its deps before claiming it.
@@ -3554,6 +3554,18 @@ impl<C: Cells> Runtime<C> {
                     if let Visit::VerifyOnly(owner) = visit {
                         self.memoize(id, owner);
                         return Computed::Done;
+                    }
+                    // The thread waited on ran the node and left it New with
+                    // the deps it read, which a later read expands first.
+                    if seen != Seen::Unwalked
+                        && spins != 0
+                        && g0.is_none_or(|g| g == node.generation())
+                        && !node.unrun()
+                    {
+                        #[cfg(test)]
+                        self.wait_revisits
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return Computed::Revisit;
                     }
                 }
                 // The generation check below would end a recycled root.

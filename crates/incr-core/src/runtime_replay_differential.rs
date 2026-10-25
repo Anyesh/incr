@@ -4570,19 +4570,15 @@ fn two_thread_oracle_rejects_a_failed_set_untrue_of_its_inputs() {
 }
 
 /// 0x741b's first phase overlaps op 0 (`Get(0)`) with op 1 (`TryGet(2)`).
-/// At a frame budget of 2, about one run in three, op 1's replayed
-/// episode lands node 10 Failed before it reaches 9, and op 0's walk,
-/// planned before that, meets 10 Failed through 9 and leaves 0, 9, 10
-/// and others the interleaving picks Failed, a set neither order leaves:
-/// op 0 first enters a cycle and op 1 leaves {10}, and op 1 first leaves
-/// {0, 2, 3, 4, 5, 9, 10, 11, 12}. The oracle takes the set as history:
-/// its nodes fail through 10, and the second order's others still panic
-/// when read. Holding either thread at a park point
-/// gives a serial run, so the runs are free and the test reruns until the
-/// oracle takes one, each run checked.
+/// At a frame budget of 2, op 1's replayed episode can land node 10
+/// Failed while op 0's walk, planned before it, waits on a claim. Op 0's
+/// walk visits the nodes it waited on again, so every run leaves one
+/// order's Failed set: op 0 first enters a cycle and op 1 leaves {10},
+/// and op 1 first leaves {0, 2, 3, 4, 5, 9, 10, 11, 12}. None needs the
+/// oracle's history, which a walk that went on with its old plan did.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn two_thread_oracle_takes_a_history_failed_set() {
+fn two_thread_walk_planned_before_an_episode_leaves_an_orders_failed_set() {
     let case = gen_case(0x741b, false, true);
     let phases = phases(&case, 0x741b);
     assert_eq!(phases[0].ops(), [0, 1]);
@@ -4598,7 +4594,7 @@ fn two_thread_oracle_takes_a_history_failed_set() {
         [failed(&[10]), failed(&[0, 2, 3, 4, 5, 9, 10, 11, 12])]
     );
     quiet(|| {
-        for _ in 0..2000 {
+        for _ in 0..300 {
             let serial = Serial::new(&case, &phases);
             let verdict = Mutex::new(None);
             let got = run_two_until(&case, &phases, Some(2), 0, &|_| {}, &|_, prefix, live| {
@@ -4608,19 +4604,13 @@ fn two_thread_oracle_takes_a_history_failed_set() {
                 stop
             });
             let verdict = verdict.into_inner().unwrap();
-            let history = verdict.is_some();
+            assert!(
+                verdict.is_none(),
+                "a run of 0x741b left {:?}",
+                settled(&got[1].1 .0)
+            );
             serial.check("0x741b", &got, verdict);
-            if history {
-                let set = settled(&got[1].1 .0);
-                assert!(
-                    failed(&[0, 9, 10]).iter().all(|f| set.contains(f)),
-                    "{set:?}"
-                );
-                assert!(!orders.contains(&set), "{set:?}");
-                return;
-            }
         }
-        panic!("no run of 0x741b left a history Failed set");
     });
 }
 
