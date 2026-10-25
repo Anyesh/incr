@@ -705,6 +705,9 @@ thread_local! {
     static OPEN: std::cell::RefCell<Vec<Eval>> = const { std::cell::RefCell::new(Vec::new()) };
     /// While set, the runs of Native closures that start on this thread.
     static NATIVE: std::cell::RefCell<Option<Vec<NativeRun>>> = const { std::cell::RefCell::new(None) };
+    /// While set, how many closure runs start on this thread, by side and
+    /// node index, for [`replay_run_counts`].
+    static RUNS: std::cell::RefCell<Option<HashMap<(usize, usize), u32>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// A Native closure's run: its node by side, index and the order it was
@@ -979,6 +982,11 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             let (expr, world) = (expr.clone(), world.clone());
             let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
             let compute = move |rt: &Runtime<C>| {
+                RUNS.with(|r| {
+                    if let Some(runs) = &mut *r.borrow_mut() {
+                        *runs.entry((side, i)).or_default() += 1;
+                    }
+                });
                 if native {
                     NATIVE.with(|n| {
                         if let Some(runs) = &mut *n.borrow_mut() {
@@ -6392,6 +6400,71 @@ fn replay_scan() {
     }
     let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
     scan(from..n, std::env::var_os("REPLAY_ALL").is_some(), check);
+}
+
+/// One unbounded single-thread run of each case in `REPLAY_FROM..REPLAY_SCAN`
+/// under Local and under Shared, printing a line per run for
+/// `rc-sweep.sh`, which compares two engines' lines: `RC <seed> <Local|Shared>
+/// <case hash> <ok|panic> <outcomes> | <side>.<node>:<closure runs> ...`,
+/// with the outcomes `;`-separated. `panic` is a run the harness itself
+/// failed (an invariant), whose outcomes stop where it failed.
+#[test]
+#[ignore = "a diagnostic that counts closure runs"]
+fn replay_run_counts() {
+    use std::hash::{Hash, Hasher};
+    let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
+    let to: u64 = std::env::var("REPLAY_SCAN").map_or(2000, |v| v.parse().expect("a count"));
+    /// Whether the harness held, the outcomes, and the closure runs by node.
+    type Counted = (bool, Vec<Out>, Vec<((usize, usize), u32)>);
+    fn counted<C: Cells>(case: &Case) -> Counted {
+        let outs = std::cell::RefCell::new(Vec::new());
+        RUNS.with(|r| *r.borrow_mut() = Some(HashMap::new()));
+        let ok = catch_unwind(AssertUnwindSafe(|| {
+            let rts = runtimes::<C>(None, 0);
+            let live = Live::new(&rts, case);
+            reset_thread();
+            for op in &case.ops {
+                outs.borrow_mut().push(live.apply(op));
+                live.assert_invariants();
+                if let Err(m) = live.check_thread() {
+                    panic!("operation {op:?}: {m}");
+                }
+            }
+        }))
+        .is_ok();
+        let mut runs: Vec<_> = (RUNS.with(|r| r.borrow_mut().take()))
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        runs.sort_unstable();
+        (ok, outs.into_inner(), runs)
+    }
+    // libtest's `test ... ` line has no newline yet, so the first line
+    // would start mid-line.
+    eprintln!();
+    quiet(|| {
+        for seed in from..to {
+            let case = gen_case(seed, false, false);
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{:?}{:?}{:?}", case.specs, case.specs2, case.ops).hash(&mut h);
+            for (kind, (ok, outs, runs)) in [
+                ("Local", counted::<Local>(&case)),
+                ("Shared", counted::<Shared>(&case)),
+            ] {
+                let outs: Vec<String> = outs.iter().map(|o| format!("{o:?}")).collect();
+                let runs: Vec<String> = (runs.iter())
+                    .map(|((side, i), n)| format!("{side}.{i}:{n}"))
+                    .collect();
+                eprintln!(
+                    "RC {seed:x} {kind} {:016x} {} {} | {}",
+                    h.finish(),
+                    if ok { "ok" } else { "panic" },
+                    outs.join(";").replace([' ', '\n'], ""),
+                    runs.join(" ")
+                );
+            }
+        }
+    });
 }
 
 /// [`fresh_read`] rebuilds a read after a set, [`fresh_agrees`] takes
