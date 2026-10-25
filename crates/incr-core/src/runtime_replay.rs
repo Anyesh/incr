@@ -2030,7 +2030,7 @@ impl<C: Cells> Runtime<C> {
         };
         let copy = match replay::copy_payload(payload) {
             Some(copy) => copy,
-            None if self.hold_uncopied(ctl) => return,
+            None if self.hold_uncopied(ctl, self.regenerable(reading, payload)) => return,
             None => Box::new(replay::Regen(payload.type_id())),
         };
         let what = Delivered::Unwind {
@@ -2064,7 +2064,7 @@ impl<C: Cells> Runtime<C> {
         }
         let copy = match replay::copy_payload(payload) {
             Some(copy) => copy,
-            None if self.hold_uncopied(ctl) => return,
+            None if self.hold_uncopied(ctl, self.regenerable(reading, payload)) => return,
             None => Box::new(replay::Regen(payload.type_id())),
         };
         let what = Delivered::Unwind {
@@ -2080,11 +2080,17 @@ impl<C: Cells> Runtime<C> {
     /// The reading frame with control block `ctl` took a payload no copy
     /// can stand for, which its closure may drop: it is not doomed while it
     /// is within the budget, so its one read is the unbounded run's. Past
-    /// the budget the stack bound wins, and a retry regenerates the payload
-    /// (`regenerate`). True if the frame is held.
-    fn hold_uncopied(&self, ctl: *const cycle::ComputeCtl) -> bool {
+    /// the budget a retry regenerates the payload (`regenerate`) if it is
+    /// `regenerable`, so the stack bound holds; else the frame is held there
+    /// too, since rerunning a closure not declared replayable is a run the
+    /// unbounded run never makes. True if the frame is held.
+    fn hold_uncopied(&self, ctl: *const cycle::ComputeCtl, regenerable: bool) -> bool {
         if self.over_budget(self.dep_stack.depth() as u32) {
-            return false;
+            if regenerable {
+                return false;
+            }
+            #[cfg(test)]
+            PAST_BUDGET_HOLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // SAFETY: the reading frame is on the stack, so its control block
         // is live.
@@ -2093,6 +2099,13 @@ impl<C: Cells> Runtime<C> {
             flags.raise(cycle::NO_DOOM);
         }
         true
+    }
+
+    /// Whether a retry can regenerate `payload`, read from node `reading`
+    /// (`slot | generation << 32`): that node and every node noted as
+    /// having landed Failed with the payload may run again.
+    fn regenerable(&self, reading: u64, payload: &(dyn std::any::Any + Send)) -> bool {
+        self.replayable(reading as u32) && self.noted_all(payload, |slot| self.replayable(slot))
     }
 
     /// The payload a retry's read of Failed node `id` at `generation` raises
@@ -2168,12 +2181,17 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// One run of `regenerate`: node `id`'s closure, if the node is still
-    /// Failed at `generation`, with its reads of Failed nodes taking from
-    /// `made`, whose remainder comes back. Nothing lands: the node is
-    /// claimed from Failed for the run and goes back to it, the run's deps
-    /// are dropped, and a read that would compute, wait or create aborts
-    /// it. It runs outside `compute_attempts`, so no Native run limit
-    /// counts it.
+    /// Failed at `generation` and declared replayable, so its closure may
+    /// run again, with its reads of Failed nodes taking from `made`, whose
+    /// remainder comes back. Nothing lands: the node is claimed from Failed
+    /// for the run and goes back to it, the run's deps are dropped, and a
+    /// read that would compute, wait or create aborts it. It runs outside
+    /// `compute_attempts`, so no Native run limit counts it.
+    ///
+    /// No dep of a Failed node has changed since its run, so a closure that
+    /// reads only the deps that run recorded reads what it read and panics
+    /// as it did, unless it hides state the contract forbids. A run that
+    /// reads any other node took another path, and makes no payload.
     fn rerun(
         &self,
         id: NodeId,
@@ -2181,8 +2199,7 @@ impl<C: Cells> Runtime<C> {
         made: Vec<(u64, Box<dyn std::any::Any + Send>)>,
     ) -> (Rerun, Vec<(u64, Box<dyn std::any::Any + Send>)>) {
         let (node, flags) = self.nodes.get_with_flags(id.0);
-        // A cursor-driven operator's run consumes its upstream's log.
-        if C::u8_load_relaxed(flags) & NOT_REPLAYABLE != 0
+        if !self.replayable(id.0)
             || node.generation() != generation
             || state::try_transition::<C>(
                 node.state_cell(),
@@ -2216,11 +2233,17 @@ impl<C: Cells> Runtime<C> {
             value_code::set_bits(value_code::REGEN_BIT | value_code::REGEN_ABORTED, false);
             let (rest, wanted) = replay::regen_close();
             left = rest;
-            drop(self.dep_stack.pop_frame());
+            let read = self.dep_stack.pop_frame();
             let value = ctl.buf.take();
+            let mut recorded = Vec::new();
+            node.for_each_dep(|d| recorded.push(d.0));
+            recorded.sort_unstable();
+            let same_path = read
+                .iter()
+                .all(|(d, _)| recorded.binary_search(&d.0).is_ok());
             match ran {
                 Err(p) if cycle_state::unwind_kind().is_some() => engine = Some(p),
-                Err(p) if !aborted => rerun = Rerun::Panicked(p),
+                Err(p) if !aborted && same_path => rerun = Rerun::Panicked(p),
                 // A closure that caught the abort still wants the node.
                 ran => {
                     drop_payloads(ran.err());
@@ -4350,7 +4373,12 @@ impl<C: Cells> Runtime<C> {
         // after it regenerates the payload.
         let payload = self.regenerated(handle, rt, &key, payload);
         if !replay::copyable(&*payload) {
-            self.hold_uncopied(f.ctl);
+            let regenerable = self.replayable(handle.slot())
+                && nodes
+                    .nodes
+                    .iter()
+                    .all(|&((slot, _), _)| self.replayable(slot));
+            self.hold_uncopied(f.ctl, regenerable);
         }
         if !cycle {
             // The member marked for the panic was marked in the run it came
@@ -4860,6 +4888,12 @@ impl<C: Cells> Runtime<C> {
 }
 
 /// A clone of a landed value of type `T`, as a delivery holds it.
+/// Readers held past the budget because a payload they took can't be
+/// regenerated (`hold_uncopied`), for the differential scans to report.
+#[cfg(test)]
+pub(crate) static PAST_BUDGET_HOLDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// How one run of `Runtime::regenerate` ended.
 enum Rerun {
     /// The closure panicked with this payload.

@@ -499,6 +499,20 @@ impl<C: Cells> Runtime<C> {
         self.note_above(nodes.into_nodes(), payload, false);
     }
 
+    /// Whether `f` accepts the slot of every node of this runtime noted as
+    /// having landed Failed with `payload`.
+    pub(super) fn noted_all(&self, payload: &(dyn Any + Send), f: impl Fn(u32) -> bool) -> bool {
+        if !notes_held() {
+            return true;
+        }
+        let (rt, at) = (self.runtime_id, payload_key(payload));
+        UNWOUND.with(|u| {
+            u.borrow()
+                .iter()
+                .all(|w| w.rt != rt || w.payload != at || f(w.node.0))
+        })
+    }
+
     /// A delivery keeps a copy of `payload` for a frame's retry while
     /// `payload` unwinds on: the copy carries the landings noted for it,
     /// with their depths above `base`, the position just above the

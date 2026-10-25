@@ -6799,6 +6799,10 @@ fn scan(seeds: impl Iterator<Item = u64>, all: bool, check: impl Fn(u64)) {
         }
     });
     eprintln!("smallest failing: {best:?}");
+    eprintln!(
+        "readers held past the budget for a payload no retry can regenerate: {}",
+        super::replay_impl::PAST_BUDGET_HOLDS.load(Relaxed)
+    );
     if let Some((_, smallest)) = best {
         let skipped = if all {
             ""
