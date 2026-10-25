@@ -1696,18 +1696,24 @@ fn foreign_key(e: &KeptRead) -> Option<ForeignKey> {
 }
 
 /// Counts out the reads in `gone`, which have left the kept reads; when
-/// `none_left`, none is kept, so no count is left either.
+/// `none_left`, none is kept, so no count is left either. Debug builds
+/// count each out even then, so a count the reads lost track of panics
+/// rather than going with the clear.
 fn uncount_foreign(gone: &[(KeptRead, usize)], none_left: bool) {
     if gone.is_empty() {
         return;
     }
-    if none_left {
+    if none_left && !cfg!(debug_assertions) {
         FOREIGN_KEPT.with(|m| m.borrow_mut().clear());
         return;
     }
     for (e, _) in gone {
         count_foreign(e, false);
     }
+    debug_assert!(
+        !none_left || FOREIGN_KEPT.with(|m| m.borrow().is_empty()),
+        "incr-core: a foreign read's count outlived its kept read"
+    );
 }
 
 /// Counts `e` in or out of `FOREIGN_KEPT`, which holds, for each
