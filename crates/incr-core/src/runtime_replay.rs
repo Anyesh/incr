@@ -400,7 +400,7 @@ impl<C: Cells> Runtime<C> {
             let counts = replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl);
             ForeignReads {
                 context: (!counts.is_empty())
-                    .then(|| replay::context_name(self.runtime_id))
+                    .then(replay::innermost_context)
                     .flatten(),
                 counts,
             }
@@ -584,7 +584,7 @@ impl<C: Cells> Runtime<C> {
             failed |= !matches!(
                 a.stash.outcome,
                 Outcome::Value { .. } | Outcome::Verified { .. }
-            ) || !a.stash.foreign.adoptable(rt);
+            ) || !a.stash.foreign.adoptable();
             if failed {
                 bag.push_erased(Box::new(a.stash.outcome));
                 if root {
@@ -4839,21 +4839,22 @@ pub(super) struct Stash {
 }
 
 /// A stashed run's Clean reads of other runtimes, with those runtimes'
-/// changes as the reads found them and the context the run was made in.
+/// changes as the reads found them and the thread's innermost context, of
+/// any runtime, when the run ended.
 #[derive(Default)]
 struct ForeignReads {
     counts: Vec<Count>,
-    context: Option<(u64, u64)>,
+    context: Option<replay::ContextName>,
 }
 
 impl ForeignReads {
-    /// Within the context that made the run, a change since its reads was
-    /// made by the runs after them, which the unbounded run also makes after
-    /// them, or by another thread at no fixed point; elsewhere the unbounded
-    /// run reads now, so every count must hold.
-    fn adoptable(&self, rt: RuntimeId) -> bool {
+    /// While the context that made the run is open, a change since its reads
+    /// was made by the runs after them, which the unbounded run also makes
+    /// after them, or by another thread at no fixed point; once it has ended
+    /// the unbounded run reads now, so every count must hold.
+    fn adoptable(&self) -> bool {
         self.counts.is_empty()
-            || self.context.is_some() && replay::context_name(rt) == self.context
+            || self.context.is_some_and(replay::context_open)
             || self.counts.iter().all(Count::holds)
     }
 }

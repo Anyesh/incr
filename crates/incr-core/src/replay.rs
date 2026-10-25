@@ -1486,18 +1486,29 @@ pub(crate) fn check_read(
     });
 }
 
-/// This thread's innermost context of `rt`, named so that no context of
-/// another thread, now or later, has the same name: context ids count per
-/// thread.
-pub(crate) fn context_name(rt: RuntimeId) -> Option<(u64, u64)> {
+/// A context named so that no context of another thread, now or later, has
+/// the same name: context ids count per thread.
+pub(crate) type ContextName = (u64, u64);
+
+fn thread_tag() -> u64 {
     static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let thread = THREAD_TAG.with(|t| {
+    THREAD_TAG.with(|t| {
         if t.get() == 0 {
             t.set(NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         }
         t.get()
-    });
-    peek(|c| innermost(c, rt).map(|i| (thread, c[i].id)))
+    })
+}
+
+/// This thread's innermost context, of any runtime.
+pub(crate) fn innermost_context() -> Option<ContextName> {
+    let thread = thread_tag();
+    peek(|c| c.last().map(|x| (thread, x.id)))
+}
+
+/// Whether context `name` is open on this thread, at any depth.
+pub(crate) fn context_open(name: ContextName) -> bool {
+    name.0 == thread_tag() && peek(|c| c.iter().any(|x| x.id == name.1))
 }
 
 /// The checked reads of the frame of `ctl` at `cidx` of `rt`, which is

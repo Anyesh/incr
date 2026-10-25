@@ -1706,8 +1706,9 @@ fn set_after_clean_read_keeps_the_read() {
 /// A reader doomed on its first leaf reads that leaf's placeholder and so
 /// a replayable leaf its retry does not read: the leaf's speculative run
 /// reads another runtime's input Clean and stays stashed. The input is set
-/// before the next read of the leaf, which adopts the stash only while the
-/// other runtime is unchanged. Returns the leaf's value and runs.
+/// after the operation, so the next read of the leaf, outside the context
+/// that made the stash, adopts it only while the other runtime is
+/// unchanged. Returns the leaf's value and runs.
 fn stashed_clean_read_after_set<A: Cells, B: Cells>(budget: bool) -> (u64, u32) {
     let r1 = Box::new(Runtime::<A>::new());
     let r2 = Box::new(Runtime::<B>::new());
