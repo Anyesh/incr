@@ -2727,14 +2727,17 @@ enum Lookup {
     OwnAlive,
     ForeignCount,
     OwnLabel,
+    ForeignForEach,
+    ForeignSnapshot,
 }
 
 /// `foreign_ticket_shape` with b's read of j replaced by `lookup`: a get on
 /// another runtime's table, `is_alive` of another runtime's node or of a
-/// node of b's own runtime, another runtime's node count, or a label of
-/// b's own runtime. After the walk holds b's payload, the test thread
-/// flips the lookup's answer (an insert, a delete or a label), which
-/// dirties nothing; a rerun of b sees the new answer.
+/// node of b's own runtime, another runtime's node count, a label of b's
+/// own runtime, a `for_each` over another runtime's table, or the
+/// `snapshot_len` of another runtime's collection. After the walk holds b's payload, the test
+/// thread flips the lookup's answer (an insert, a delete or a label),
+/// which dirties nothing b reads; a rerun of b sees the new answer.
 fn lookup_ticket_shape<C: Cells>(
     lookup: Lookup,
     frames: u32,
@@ -2749,17 +2752,25 @@ fn lookup_ticket_shape<C: Cells>(
     let table = Arc::new(other.create_table::<u64, u64>());
     let gone = other.create_input(0_u64);
     let own_gone = rt.create_input(0_u64);
+    let coll = other.create_collection::<u64>();
+    let other_nodes = other.node_count();
     let i = rt.create_input(1_u64);
     let k = rt.create_input(0_u64);
-    let (b_other, b_table) = (Arc::clone(&other), Arc::clone(&table));
+    let (b_other, b_table, b_coll) = (Arc::clone(&other), Arc::clone(&table), coll.clone());
     let b = rt.create_query_with(
         move |rt: &Runtime<C>| -> u64 {
             let seen = match lookup {
                 Lookup::ForeignTable => b_table.get(&b_other, &3).is_some(),
                 Lookup::ForeignAlive => b_other.is_alive(gone),
                 Lookup::OwnAlive => rt.is_alive(own_gone),
-                Lookup::ForeignCount => b_other.node_count() == 1,
+                Lookup::ForeignCount => b_other.node_count() == other_nodes,
                 Lookup::OwnLabel => rt.label(own_gone.slot()).is_none(),
+                Lookup::ForeignForEach => {
+                    let mut entries = 0;
+                    b_table.for_each(&b_other, |_, _| entries += 1);
+                    entries == 0
+                }
+                Lookup::ForeignSnapshot => b_coll.snapshot_len() == 0,
             };
             std::panic::panic_any(CustomPayload(100 * rt.get(i) + if seen { 1 } else { 5 }))
         },
@@ -2774,12 +2785,13 @@ fn lookup_ticket_shape<C: Cells>(
     rt.set(k, 1);
     assert_eq!(rt.get(x), 7);
     match lookup {
-        Lookup::ForeignTable => {
+        Lookup::ForeignTable | Lookup::ForeignForEach => {
             table.get_or_insert_input(&other, 3, || 0);
         }
         Lookup::ForeignAlive | Lookup::ForeignCount => other.delete_node(gone),
         Lookup::OwnAlive => rt.delete_node(own_gone),
         Lookup::OwnLabel => rt.set_label(own_gone.slot(), "seen".into()),
+        Lookup::ForeignSnapshot => coll.insert(&other, 1),
     }
     let mut top_b = b;
     for _ in 0..mid {
@@ -2811,7 +2823,8 @@ fn lookup_ticket_shape<C: Cells>(
 
 /// Every budget gives what the unbounded run gives for
 /// `lookup_ticket_shape`, which takes the walk's payload: 205 for the
-/// table miss, 201 while the node was alive, counted or unlabelled.
+/// table miss, 201 while the node was alive, counted or unlabelled and
+/// while the table or collection was empty.
 fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
     let mut differ = Vec::new();
     for (lookup, payload) in [
@@ -2820,6 +2833,8 @@ fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
         (Lookup::OwnAlive, 201),
         (Lookup::ForeignCount, 201),
         (Lookup::OwnLabel, 201),
+        (Lookup::ForeignForEach, 201),
+        (Lookup::ForeignSnapshot, 201),
     ] {
         for outer in [0, 1, 3, 8] {
             for mid in [0, 1, 3] {
