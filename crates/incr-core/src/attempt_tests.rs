@@ -105,3 +105,20 @@ fn a_claim_met_on_an_old_attempt_reaches_no_later_attempt() {
     assert!(leave_flight());
     assert_eq!(take_met(), vec![met]);
 }
+
+#[test]
+fn a_discard_the_engine_raises_again_is_back_in_flight() {
+    use crate::cycle_state::UnwindKind;
+    use crate::cycle_state::{reopen_discard, set_unwind_kind, set_wounded, settle_discard};
+    begin();
+    set_unwind_kind(Some(UnwindKind::Discard));
+    assert!(!settle_discard());
+    assert!(!in_flight(), "the engine holds it");
+    reopen_discard();
+    assert!(in_flight(), "raised again past the engine");
+    assert!(mine().wound_in_flight(claim(1)));
+    assert!(settle_discard());
+    set_unwind_kind(None);
+    set_wounded(false);
+    crate::reserve::clear_taken();
+}

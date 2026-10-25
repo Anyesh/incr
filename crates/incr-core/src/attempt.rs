@@ -122,6 +122,17 @@ pub(crate) fn enter_flight() {
     });
 }
 
+/// The engine raises a discard it caught again, out of its hands: a
+/// flight of its own, unless one is open.
+pub(crate) fn reopen_flight() {
+    MINE.with(|w| {
+        if w.state.load(Ordering::Relaxed) & IN_FLIGHT == 0 {
+            w.flights.fetch_add(1, Ordering::Relaxed);
+            w.state.fetch_or(IN_FLIGHT, Ordering::AcqRel);
+        }
+    });
+}
+
 /// The engine has caught this thread's discard: whether a waiter wounded
 /// the attempt while it was in flight.
 pub(crate) fn leave_flight() -> bool {
@@ -287,8 +298,9 @@ impl Attempt {
     }
 }
 
-/// Whether this thread's attempt has a discard in flight, for tests.
-#[cfg(all(test, not(loom)))]
+/// Whether this thread's attempt has a discard in flight, for tests and
+/// debug checks.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn in_flight() -> bool {
     MINE.with(|w| w.state.load(Ordering::Relaxed) & IN_FLIGHT != 0)
 }

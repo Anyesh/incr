@@ -2718,6 +2718,10 @@ impl<C: Cells> Runtime<C> {
         if !std::thread::panicking() {
             match cycle_state::unwind_kind() {
                 Some(UnwindKind::Discard) => {
+                    debug_assert!(
+                        C::SINGLE_THREADED || crate::attempt::in_flight(),
+                        "incr-core: a discard a closure caught is out of flight"
+                    );
                     std::panic::resume_unwind(Box::new(cycle::DiscardUnwind))
                 }
                 Some(UnwindKind::Wound) => self.raise_wound(),

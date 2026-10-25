@@ -968,6 +968,14 @@ pub(crate) fn settle_discard() -> bool {
     true
 }
 
+/// Where the engine raises a discard it caught again, past its own catch
+/// sites: in flight again until the next one settles it.
+pub(crate) fn reopen_discard() {
+    if unwind_kind() == Some(UnwindKind::Discard) {
+        crate::attempt::reopen_flight();
+    }
+}
+
 pub(crate) fn take_unwind_kind() -> Option<UnwindKind> {
     let kind = unwind_kind();
     if kind.is_some() {

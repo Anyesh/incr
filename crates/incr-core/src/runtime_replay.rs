@@ -1212,6 +1212,10 @@ impl<C: Cells> Runtime<C> {
                     word = value_code::thread_word();
                 }
                 Some(UnwindKind::Discard) if !std::thread::panicking() => {
+                    debug_assert!(
+                        C::SINGLE_THREADED || crate::attempt::in_flight(),
+                        "incr-core: a discard a closure caught is out of flight"
+                    );
                     resume_unwind(Box::new(cycle::DiscardUnwind))
                 }
                 Some(UnwindKind::Wound) if !std::thread::panicking() => self.raise_wound(),
@@ -3599,6 +3603,9 @@ impl<C: Cells> Runtime<C> {
             if q == 0 {
                 bag.drain(self);
                 self.close_dropped(id);
+                if !C::SINGLE_THREADED {
+                    cycle_state::reopen_discard();
+                }
                 resume_unwind(payload);
             }
             cycle_state::take_unwind_kind();
@@ -4353,6 +4360,9 @@ impl<C: Cells> Runtime<C> {
     ) -> ! {
         self.close_unwound(id, boundary, kind);
         self.note_unwound_read(&*payload, kind);
+        if !C::SINGLE_THREADED {
+            cycle_state::reopen_discard();
+        }
         resume_unwind(payload)
     }
 
