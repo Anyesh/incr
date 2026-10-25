@@ -4214,22 +4214,24 @@ fn until(done: impl Fn() -> bool) {
 
 /// 0x527's ops 0 (`Get(0)`) and 1 (`Get(4)`) overlap. Op 1's attempt runs
 /// a nested episode under its `try_get(8)` that lands 8 and 15 Dirty,
-/// then parks until op 0 waits on its claim of 19; op 1 then waits on op
-/// 0, the younger op 1 is wounded, and op 0 finds 8 Dirty where either
-/// order has it New or op 1 finished. Op 0 then computes 8 alone and lands
-/// it Failed, and op 1's retry reads that: `Panic("failed")` where every
-/// order of the two reads gives a cycle panic. A wounded attempt is in
-/// no order, so no other read may build on its landings.
+/// then parks until op 0 has registered a wait. Without a hold, op 0 waits
+/// on another claim of op 1's, op 1 then waits on op 0 and is wounded, and
+/// op 0 finds 8 Dirty where either order has it New or op 1 finished: it
+/// lands 8 Failed alone, and op 1's retry reads that, `Panic("failed")`
+/// where every order gives a cycle panic. Another read must not build on
+/// an unfinished attempt's landings; with them held, op 0 waits on 8 or 15
+/// instead and no wound need happen.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T10-two-527-failed-read-escapes: a wounded attempt's nested-episode landings stay public until Variant V holds them (T8-44e3-clean-landing-variant)"]
-fn two_thread_read_builds_on_no_wounded_attempts_nested_episode() {
+#[ignore = "T10-two-527-failed-read-escapes: an unfinished attempt's nested-episode landings stay public until Variant V holds them (T8-44e3-clean-landing-variant)"]
+fn two_thread_read_builds_on_no_unfinished_attempts_nested_episode() {
     crate::child_test::run_in_child(
-        "runtime::replay_differential::two_thread_read_builds_on_no_wounded_attempts_nested_episode",
+        "runtime::replay_differential::two_thread_read_builds_on_no_unfinished_attempts_nested_episode",
         || {
             struct Hold {
                 on: AtomicBool,
                 landed: AtomicBool,
+                waited: AtomicBool,
                 b_started: AtomicBool,
             }
             let case = gen_case(0x527, false, true);
@@ -4241,6 +4243,7 @@ fn two_thread_read_builds_on_no_wounded_attempts_nested_episode() {
                     let hold = Arc::new(Hold {
                         on: AtomicBool::new(true),
                         landed: AtomicBool::new(false),
+                        waited: AtomicBool::new(false),
                         b_started: AtomicBool::new(false),
                     });
                     // Thread 0 runs op 1 and holds after its episode lands
@@ -4259,6 +4262,7 @@ fn two_thread_read_builds_on_no_wounded_attempts_nested_episode() {
                                     && !hold.landed.swap(true, SeqCst) =>
                                 {
                                     until(|| crate::waits::registered() > 0);
+                                    hold.waited.store(true, SeqCst);
                                 }
                                 Some(1) if !hold.b_started.swap(true, SeqCst) => {
                                     until(|| hold.landed.load(SeqCst));
@@ -4269,7 +4273,6 @@ fn two_thread_read_builds_on_no_wounded_attempts_nested_episode() {
                         assert!(live.world.rt(0).park_hook.set(hook).is_ok());
                     };
                     let serial = Serial::new(&case, &phases);
-                    let wounds = crate::waits::WOUNDS.load(SeqCst);
                     let verdict = Mutex::new(None);
                     let got = run_two_until(&case, &phases, None, 0, &rig, &|p, prefix, live| {
                         hold.on.store(false, SeqCst);
@@ -4279,7 +4282,10 @@ fn two_thread_read_builds_on_no_wounded_attempts_nested_episode() {
                         stop
                     });
                     assert!(hold.landed.load(SeqCst), "round {round}: op 1 landed no episode of 8 or 15");
-                    assert!(crate::waits::WOUNDS.load(SeqCst) > wounds, "round {round}: no wound");
+                    assert!(
+                        hold.waited.load(SeqCst),
+                        "round {round}: op 0 registered no wait while op 1's episode was held"
+                    );
                     serial.check("0x527", &got, verdict.into_inner().unwrap());
                 }
             });
