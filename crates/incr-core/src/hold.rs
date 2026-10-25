@@ -80,9 +80,31 @@ struct HoldSet {
     /// runtime whose frames are below them, or a retracted read), so their
     /// landings retract at the exit of their first entry.
     tainted: Vec<RuntimeId>,
+    /// Records a cut replaced on claims it keeps ([`keep_cut_rec`]).
+    cut_recs: Vec<CutRec>,
+    /// Runtimes with a replaced record not yet taken by [`take_recs`],
+    /// so each frame of a wound's unwind finds none without a walk.
+    recs: Vec<RuntimeId>,
+}
+
+/// The record a cut took a claim it keeps out of, kept until the claim's
+/// landing opens its entry, which takes it as its undo.
+struct CutRec {
+    rt: RuntimeId,
+    slot: u32,
+    rec: Option<Arc<GroupInfo>>,
+    /// The claim wrote its slot before the cut, so a retraction lands it
+    /// `New`, as a discard landing does.
+    wrote: bool,
 }
 
 impl HoldSet {
+    fn note_recs(&mut self, rt: RuntimeId) {
+        if !self.recs.contains(&rt) {
+            self.recs.push(rt);
+        }
+    }
+
     fn get(&mut self, cell: usize) -> Option<&mut Held> {
         let at = *self.by_cell.get(&cell)?;
         self.entries[at].as_mut()
@@ -183,6 +205,11 @@ pub(crate) fn open(
                 other => other.flatten(),
             };
         }
+        let cut = h
+            .cut_recs
+            .iter()
+            .position(|c| c.rt == rt && c.slot == slot)
+            .map(|i| h.cut_recs.swap_remove(i));
         let at = h.entries.len();
         h.entries.push(Some(Held {
             rt,
@@ -196,10 +223,11 @@ pub(crate) fn open(
             children: None,
             trace: Vec::new(),
             undo: Undo {
-                first,
+                first: first || cut.as_ref().is_some_and(|c| c.wrote),
                 value: kept,
                 verified_at,
-                ..Undo::default()
+                deps: None,
+                rec: cut.map(|c| (c.rec, true)),
             },
         }));
         h.by_cell.insert(cell, at);
@@ -234,6 +262,8 @@ pub(crate) fn keep_rec(cell: usize, rec: Option<Arc<GroupInfo>>, in_group: bool)
     with(|h| {
         if let Some(e) = h.get(cell).filter(|e| e.undo.rec.is_none()) {
             e.undo.rec = Some((rec, in_group));
+            let rt = e.rt;
+            h.note_recs(rt);
         }
     });
 }
@@ -314,11 +344,82 @@ pub(crate) fn forget(cell: usize) -> Option<Held> {
     })
 }
 
+/// A cut takes `slot`, a claim it keeps, out of `rec`, its group: under
+/// `Shared` the claim's landing is held ([`cut_kept`]), so that a
+/// retraction puts the whole group back, and a wound puts the record back
+/// before its unwind lands anything ([`take_recs`]).
+pub(crate) fn keep_cut_rec(rt: RuntimeId, slot: u32, rec: Option<Arc<GroupInfo>>, wrote: bool) {
+    value_code::set_held_bit(true);
+    with(|h| {
+        if !h.cut_recs.iter().any(|c| c.rt == rt && c.slot == slot) {
+            h.cut_recs.push(CutRec {
+                rt,
+                slot,
+                rec,
+                wrote,
+            });
+            h.note_recs(rt);
+        }
+    });
+}
+
+/// Whether a cut took `slot`, a claim of `rt` that has not landed held
+/// since, out of its group.
+pub(crate) fn cut_kept(rt: RuntimeId, slot: u32) -> bool {
+    active() && with(|h| h.cut_recs.iter().any(|c| c.rt == rt && c.slot == slot))
+}
+
+/// Takes the records and `IN_GROUP` bits `rt`'s attempt replaced, held
+/// landings' and cuts' alike, for a wound to put back before its unwind
+/// lands anything: a landing published first could name a member whose
+/// record is still the attempt's. The rest of each entry retracts at the
+/// entry's exit.
+pub(crate) fn take_recs(rt: RuntimeId) -> Vec<(u32, Option<Arc<GroupInfo>>, bool)> {
+    with(|h| {
+        let Some(at) = h.recs.iter().position(|&r| r == rt) else {
+            return Vec::new();
+        };
+        h.recs.swap_remove(at);
+        let mut recs: Vec<_> = h
+            .entries
+            .iter_mut()
+            .flatten()
+            .filter(|e| e.rt == rt)
+            .filter_map(|e| {
+                e.undo
+                    .rec
+                    .take()
+                    .map(|(rec, in_group)| (e.slot, rec, in_group))
+            })
+            .collect();
+        recs.extend(
+            take_cut_recs(h, rt)
+                .into_iter()
+                .map(|(slot, rec)| (slot, rec, true)),
+        );
+        recs
+    })
+}
+
+fn take_cut_recs(h: &mut HoldSet, rt: RuntimeId) -> Vec<(u32, Option<Arc<GroupInfo>>)> {
+    let mut taken = Vec::new();
+    h.cut_recs.retain_mut(|c| {
+        if c.rt == rt {
+            taken.push((c.slot, c.rec.take()));
+        }
+        c.rt != rt
+    });
+    taken
+}
+
 /// What an attempt's end takes for one runtime.
 pub(crate) struct Taken {
     /// In landing order.
     pub(crate) entries: Vec<Held>,
     pub(crate) episodes: u64,
+    /// The records of cut claims whose landing opened no entry, which a
+    /// retraction puts back and a publication leaves as the cut left them.
+    pub(crate) cut_recs: Vec<(u32, Option<Arc<GroupInfo>>)>,
 }
 
 /// Takes `rt`'s entries, with the episodes it landed, for publication or
@@ -333,8 +434,10 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
         }
         h.by_cell.retain(|_, at| h.entries[*at].is_some());
         h.tainted.retain(|r| *r != rt);
+        h.recs.retain(|r| *r != rt);
+        let cut_recs = take_cut_recs(h, rt);
         // A taint keeps the bit, so that the `HOLD` it raised passes up.
-        if h.by_cell.is_empty() && h.tainted.is_empty() {
+        if h.by_cell.is_empty() && h.tainted.is_empty() && h.cut_recs.is_empty() {
             h.entries.clear();
             h.consulted = false;
             value_code::set_held_bit(false);
@@ -348,13 +451,19 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
         Taken {
             entries: taken,
             episodes,
+            cut_recs,
         }
     })
 }
 
 /// Whether this thread holds landings of `rt`, or has tainted it.
 pub(crate) fn holds_runtime(rt: RuntimeId) -> bool {
-    active() && with(|h| h.tainted.contains(&rt) || h.entries.iter().flatten().any(|e| e.rt == rt))
+    active()
+        && with(|h| {
+            h.tainted.contains(&rt)
+                || h.entries.iter().flatten().any(|e| e.rt == rt)
+                || h.cut_recs.iter().any(|c| c.rt == rt)
+        })
 }
 
 /// `rt`'s runs read state this attempt has not published.

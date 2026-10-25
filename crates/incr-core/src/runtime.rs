@@ -989,10 +989,11 @@ pub struct Runtime<C: Cells> {
     #[cfg(test)]
     pub(crate) group_verifies: std::sync::Mutex<Vec<u32>>,
     /// Every claim a wound or a T8 discard landed as unrun: the node,
-    /// whether its episode had dissolved on that thread, and whether its
-    /// group record then named a member that had left it.
+    /// whether its episode had dissolved on that thread, whether its group
+    /// record then named a member that had left it, and whether it landed
+    /// in a group.
     #[cfg(test)]
-    pub(crate) unwound_landings: std::sync::Mutex<Vec<(u32, bool, bool)>>,
+    pub(crate) unwound_landings: std::sync::Mutex<Vec<(u32, bool, bool, bool)>>,
     /// Every doom, in order, as the doom point saw it.
     #[cfg(test)]
     pub(crate) dooms: std::sync::Mutex<Vec<replay_impl::DoomSeen>>,
@@ -3984,7 +3985,7 @@ impl<C: Cells> Runtime<C> {
                     if is_recompute { cycle::RECOMPUTE } else { 0 }
                         | if walked { cycle::WALKED } else { 0 }
                         | if speculative { cycle::SPECULATIVE } else { 0 }
-                        | self.rerun_hold(node),
+                        | self.rerun_hold(id, node),
                 );
                 let _kept = (!C::SINGLE_THREADED).then_some(hold::KeptGuard(&ctl));
                 let cidx = self.dep_stack.push_frame(self.runtime_id, id, &ctl);
@@ -4253,6 +4254,11 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Computed {
         let kind = cycle_state::take_unwind_kind();
+        // A wound raised in another runtime reaches this one's frames
+        // with its replaced records not yet back.
+        if !C::SINGLE_THREADED && cycle_state::wounded() && hold::active() {
+            self.retract_held_records();
+        }
         let (payload, children_stashed) = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
             self.stash_panic(id, ctl, deps, &attempt, payload)
         } else {

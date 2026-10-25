@@ -5,6 +5,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::Arc;
 
 use crate::cells::Cells;
 use crate::cycle_state::{self, UnwindKind};
@@ -15,7 +16,7 @@ use crate::node::{NodeData, NodeId};
 use crate::segmented_nodes::IN_GROUP;
 use crate::state::{self, NodeState};
 
-use super::{is_computing, ChildLanding, Runtime, SingleClaim};
+use super::{is_computing, ChildLanding, GroupInfo, Inner, Runtime, SingleClaim};
 use crate::dep_stack::DepStack;
 use crate::dependent_list::DependentList;
 use crate::handle::ErasedIncr;
@@ -69,12 +70,14 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// `HOLD` for a run of a node this thread holds and has claimed again,
-    /// so its write keeps what it displaces for the undo record.
+    /// or a claim a cut kept and took out of its group, so its write keeps
+    /// what it displaces for the undo record and its landing is held.
     #[inline(always)]
-    pub(super) fn rerun_hold(&self, node: &NodeData<C>) -> u16 {
+    pub(super) fn rerun_hold(&self, id: NodeId, node: &NodeData<C>) -> u16 {
         if !C::SINGLE_THREADED
             && hold::active()
-            && hold::holds(state::cell_key::<C>(node.state_cell()))
+            && (hold::holds(state::cell_key::<C>(node.state_cell()))
+                || hold::cut_kept(self.runtime_id, id.0))
         {
             crate::cycle::HOLD
         } else {
@@ -247,8 +250,52 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn retract_held(&self) {
-        let entries = hold::take(self.runtime_id).entries;
-        self.retract_entries(entries);
+        let hold::Taken {
+            entries, cut_recs, ..
+        } = hold::take(self.runtime_id);
+        self.retract_entries(entries, cut_recs);
+    }
+
+    /// A wound's first step, before its unwind lands anything: the
+    /// records the attempt replaced go back ([`hold::take_recs`]).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn retract_held_records(&self) {
+        let recs = hold::take_recs(self.runtime_id);
+        if recs.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.write();
+        for (slot, rec, in_group) in recs {
+            self.restore_rec(&mut inner, slot, rec, in_group);
+        }
+    }
+
+    fn restore_rec(
+        &self,
+        inner: &mut Inner<C>,
+        slot: u32,
+        rec: Option<Arc<GroupInfo>>,
+        in_group: bool,
+    ) {
+        match rec {
+            Some(r) => {
+                inner.member_recs.insert(slot, r);
+            }
+            None => {
+                inner.member_recs.remove(&slot);
+            }
+        }
+        let flags = self.nodes.get_with_flags(slot).1;
+        let bits = C::u8_load_relaxed(flags);
+        C::u8_store_relaxed(
+            flags,
+            if in_group {
+                bits | IN_GROUP
+            } else {
+                bits & !IN_GROUP
+            },
+        );
     }
 
     /// A non-Clean read of this runtime from another runtime's frame.
@@ -324,7 +371,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     fn publish_own(&self) {
-        let hold::Taken { entries, episodes } = hold::take(self.runtime_id);
+        // A cut claim's record stays as the cut left it.
+        let hold::Taken {
+            entries, episodes, ..
+        } = hold::take(self.runtime_id);
         if episodes != 0 {
             // Before the members land, so a read of one of their landings
             // also reads the count.
@@ -344,7 +394,7 @@ impl<C: Cells> Runtime<C> {
         // An engine panic partway leaves no node Computing without an owner:
         // what is left goes back as on a wound (G9).
         if let Err(payload) = published {
-            self.retract_entries(rest.collect());
+            self.retract_entries(rest.collect(), Vec::new());
             bag.drain_carried(payload);
         }
         bag.drain(self);
@@ -426,14 +476,18 @@ impl<C: Cells> Runtime<C> {
     /// values, then the state words, so no node is visible before its
     /// fields are back. Runs no user code; the attempt's values drop at
     /// the drain.
-    fn retract_entries(&self, mut entries: Vec<Held>) {
+    fn retract_entries(
+        &self,
+        mut entries: Vec<Held>,
+        cut_recs: Vec<(u32, Option<Arc<GroupInfo>>)>,
+    ) {
         entries.reverse();
         let mut bag = Deferred::new();
         let mut lost = vec![false; entries.len()];
         {
             let mut inner = self.inner.write();
-            for (i, e) in entries.iter().enumerate() {
-                let (node, flags) = self.nodes.get_with_flags(e.slot);
+            for (i, e) in entries.iter_mut().enumerate() {
+                let node = self.nodes.get(e.slot);
                 if let Some(old) = &e.undo.deps {
                     let live: Vec<NodeId> = old
                         .iter()
@@ -448,25 +502,12 @@ impl<C: Cells> Runtime<C> {
                         bag.push_dep_list(displaced);
                     }
                 }
-                if let Some((rec, in_group)) = &e.undo.rec {
-                    match rec {
-                        Some(r) => {
-                            inner.member_recs.insert(e.slot, r.clone());
-                        }
-                        None => {
-                            inner.member_recs.remove(&e.slot);
-                        }
-                    }
-                    let bits = C::u8_load_relaxed(flags);
-                    C::u8_store_relaxed(
-                        flags,
-                        if *in_group {
-                            bits | IN_GROUP
-                        } else {
-                            bits & !IN_GROUP
-                        },
-                    );
+                if let Some((rec, in_group)) = e.undo.rec.take() {
+                    self.restore_rec(&mut inner, e.slot, rec, in_group);
                 }
+            }
+            for (slot, rec) in cut_recs {
+                self.restore_rec(&mut inner, slot, rec, true);
             }
         }
         for (i, e) in entries.iter_mut().enumerate() {

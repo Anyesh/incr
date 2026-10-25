@@ -483,6 +483,9 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn raise_wound(&self) -> ! {
+        if !C::SINGLE_THREADED && hold::active() {
+            self.retract_held_records();
+        }
         cycle_state::set_wounded(true);
         cycle_state::set_unwind_kind(Some(UnwindKind::Wound));
         resume_unwind(Box::new(WoundUnwind))
@@ -1804,17 +1807,23 @@ impl<C: Cells> Runtime<C> {
         });
     }
 
-    /// The cut's exit from the group: at once under `Local`; under
-    /// `Shared` the released members keep the record until publication,
-    /// which runs the exit for them and `kept` (`crate::hold`).
     /// Takes each of `kept`, members a cut keeps claimed, out of a group
     /// whose record names a member that is no longer in it, so that the
     /// cut leaves no such record. They leave unverified, as a member
     /// landing Dirty out of its group does, since a wound lands them Dirty.
+    /// Under `Shared` a cut is an exposure: the record is kept for a
+    /// retraction, which puts the whole group back ([`hold::keep_cut_rec`]).
     fn leave_cut_group(&self, kept: &[u32]) {
         for &m in kept {
             let (node, flags) = self.nodes.get_with_flags(m);
             if C::u8_load_relaxed(flags) & IN_GROUP != 0 && self.names_departed(m) {
+                if !C::SINGLE_THREADED && !hold::holds(state::cell_key::<C>(node.state_cell())) {
+                    let rt = self.runtime_id;
+                    let wrote =
+                        cycle_state::with_held(|h| h.get(&(rt, m)).is_some_and(|e| e.wrote));
+                    let rec = self.inner.read().member_recs.get(&m).cloned();
+                    hold::keep_cut_rec(rt, m, rec, wrote);
+                }
                 self.leave_group(NodeId(m), node, flags, NodeState::Dirty);
             }
         }
@@ -2059,8 +2068,9 @@ impl<C: Cells> Runtime<C> {
             {
                 let dissolved = cycle_state::has_dissolved(self.runtime_id, id.0);
                 let stale = self.names_departed(id.0);
+                let grouped = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0;
                 let mut landings = self.unwound_landings.lock().unwrap();
-                landings.push((id.0, dissolved, stale));
+                landings.push((id.0, dissolved, stale, grouped));
             }
             self.discard_land_in_group(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
         } else {
