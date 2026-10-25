@@ -460,3 +460,38 @@ fn shared_stabilize_of_another_runtime_from_a_callback_ends_its_holds() {
         assert!(called.load(Ordering::SeqCst));
     });
 }
+
+/// An equal write hands back the rejected new value, not what the slot
+/// held, so a held node's undo never takes it: a retraction would restore
+/// a value of the wrong shape (`Displaced`) and panic partway.
+#[test]
+fn shared_held_undo_takes_a_displaced_value_but_not_a_rejected_one() {
+    let rt = Runtime::<Shared>::new();
+    let k = rt.create_input(1_i64);
+    let x = rt.create_query(move |rt| rt.get(k) * 2);
+    assert_eq!(rt.get(x), 2);
+    let undo_value = |wrote: bool| {
+        let node = rt.nodes.get(x.slot());
+        let mut bag = crate::deferred::Deferred::new();
+        rt.open_hold(super::NodeId(x.slot()), node, false, None, &mut bag);
+        rt.displaced(node, Some(Box::new(2_i64)), wrote, &mut bag);
+        let kept = crate::hold::take(rt.runtime_id)
+            .entries
+            .into_iter()
+            .map(|e| e.undo.value.is_some())
+            .collect::<Vec<_>>();
+        bag.drain(&rt);
+        kept
+    };
+    assert_eq!(
+        undo_value(false),
+        vec![false],
+        "a rejected value became the undo"
+    );
+    assert_eq!(
+        undo_value(true),
+        vec![true],
+        "a displaced value was not kept"
+    );
+    assert!(!crate::hold::active());
+}

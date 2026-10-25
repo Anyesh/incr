@@ -52,15 +52,18 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// What a landing's write displaced: kept for the undo record of a
-    /// node this thread holds, else dropped at the drain.
+    /// What a landing's `write_erased` handed back: if it `wrote`, what it
+    /// displaced, kept for the undo record of a node this thread holds;
+    /// else the rejected equal value, which is not what the slot held.
+    /// Either is dropped at the drain when not kept.
     pub(super) fn displaced(
         &self,
         node: &NodeData<C>,
         displaced: Option<Box<dyn Any>>,
+        wrote: bool,
         bag: &mut Deferred<C>,
     ) {
-        let back = if !C::SINGLE_THREADED && hold::active() {
+        let back = if wrote && !C::SINGLE_THREADED && hold::active() {
             hold::keep_value(state::cell_key::<C>(node.state_cell()), displaced)
         } else {
             displaced

@@ -2063,7 +2063,7 @@ impl<C: Cells> Runtime<C> {
     ) {
         if matches!(kind, Some(UnwindKind::Wound | UnwindKind::Discard)) {
             self.discard_land_in_group(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
-            // As the landing left them: it keeps the record and `IN_GROUP`.
+            // After the landing, which puts a wound's replaced records back.
             #[cfg(test)]
             {
                 let dissolved = cycle_state::has_dissolved(self.runtime_id, id.0);
@@ -2176,7 +2176,7 @@ impl<C: Cells> Runtime<C> {
         e.wrote |= wrote.get() != 0;
         let changed = match written {
             Ok((changed, displaced)) => {
-                self.displaced(node, displaced, bag);
+                self.displaced(node, displaced, changed || first, bag);
                 changed
             }
             Err(payload) => {
