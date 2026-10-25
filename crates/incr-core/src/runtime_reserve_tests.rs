@@ -602,6 +602,31 @@ fn an_entrys_joined_child_reads_a_sibling_a_doomed_run_would_read_natively() {
     }
 }
 
+/// T catches its read of X, as code handling a failed dep does, then joins
+/// a thread that reads X. Over budget the read dooms in X's subtree, and
+/// T's catch swallows the doom's unwind, so the join runs while X is
+/// released under T's reservation; on main X is Clean by then.
+#[test]
+fn a_closure_that_catches_a_doom_joins_a_reader_of_the_doomed_node() {
+    for frames in [u32::MAX, 1, 2] {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let t = rt.create_query_with(
+            move |rt: &Rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                v + thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap())
+            },
+            replayable(),
+        );
+        rt.set_max_frames(frames);
+        assert_eq!(within_10s(&rt, t), Some(Ok(28)), "budget {frames}");
+        rt.assert_invariant_i();
+    }
+}
+
 static JOIN_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static JOIN_TARGET: OnceLock<(Arc<Rt>, Incr<JoinV>)> = OnceLock::new();
 static JOIN_CHILD: std::sync::Mutex<Option<Option<u64>>> = std::sync::Mutex::new(None);
