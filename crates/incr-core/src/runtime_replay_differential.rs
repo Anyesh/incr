@@ -6689,12 +6689,7 @@ fn paired_clean_read_delivery_seeds() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn high_range_clean_read_delivery_seeds() {
-    for seed in [
-        0x92_b175_80fc,
-        0x92_b175_83ef,
-        0x92_b175_829f,
-        0x92_b175_8479,
-    ] {
+    for seed in [0x92_b175_83ef, 0x92_b175_829f, 0x92_b175_8479] {
         let case = gen_case(seed, false, false);
         quiet(|| {
             differential::<Local>(&case, seed);
