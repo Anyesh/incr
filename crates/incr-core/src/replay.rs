@@ -1012,12 +1012,13 @@ impl Context {
 
     /// Whether an entry of `node` at `generation` has yet to run: the
     /// running entry, at the front of its level until the driver pops it,
-    /// is not one.
+    /// is not one, but once popped no longer hides the entry behind it.
     pub(crate) fn queues(&self, node: u32, generation: u32) -> bool {
-        let running = self.running.is_some()
-            && self
-                .running_entry
-                .is_some_and(|e| e.node == node && e.generation == generation);
+        let running = self
+            .running_entry
+            .and(self.running)
+            .and_then(|level| self.levels.get(level as usize)?.front())
+            .is_some_and(|e| e.node == node && e.generation == generation);
         self.queued.get(&(node, generation)).copied().unwrap_or(0) > u32::from(running)
     }
 
