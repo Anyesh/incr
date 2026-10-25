@@ -7569,93 +7569,205 @@ fn two_thread_oracle_rejects_a_made_up_cycle() {
     assert!(!cycle_from_own_frames(|c| c.clear()));
 }
 
-/// Seed 0x3904's first phase at a budget of 1 frame: op 0 `Get(0)` on one
-/// thread, op 1 `Get(6)` on the other. Some runs give 1's `try_get(2)` a
-/// cycle that 6 then reads as 7777, so 5 is 2 and 4 panics, which no order
-/// does; the members 4's claims released, read again in the phase, fail
-/// through 4, and the phase leaves 1 to 6 Failed. In the first such run,
-/// `patch` edits the phase's recorded closure runs before the oracle sees
-/// them; returns whether the oracle took the run, every run before it
-/// checked as usual, and whether 4's history grounds it.
-fn cascade_from_a_history_panic(patch: fn(&mut HashMap<usize, Vec<Eval>>)) -> (bool, bool) {
-    let case = gen_case(0x3904, false, true);
-    let phases = phases(&case, 0x3904);
-    assert_eq!(phases[0].ops(), [0, 1]);
-    let mut took = None;
+/// A read phase judged on a hand-made history instead of on an interleaving
+/// some engine version happens to produce, so no engine change can take the
+/// fixture away. Y1 (4) and Z1 (5) read each other, as do Y2 (6) and Z2
+/// (7), and only the Ys have a Fallback, so a `try_get` that enters a
+/// cycle at its Z gets `Err(Cycle)` (7777) while a Z read after the cycle
+/// resolved is 4. Op 0 `Get(0)` first: W (3) enters both cycles at their
+/// Zs and is 15554. Op 1 `Get(8)` first: U (8) resolves both cycles from
+/// their Ys and W is 8. Either way X (2, `PanicIf` 4 mod 7), V (1) and 0
+/// compute, nothing is Failed, and op 0 gives 1 and op 1 gives 6. The
+/// history's W entered cycle 1 at Z1 but read Z2 after U resolved cycle 2,
+/// each a read some order's W makes, and gave 7781; X panicked over it, V
+/// unwound from X, and 0's `Catch` took V's panic, so the phase leaves X
+/// and V Failed, which no order does. The history holds the runs the
+/// oracle reads, not the cycles' own, so [`Serial::per_read`] finds no
+/// landing on the other thread to order a caught cycle by. `patch` edits
+/// them before the oracle
+/// sees them; returns whether [`Serial::check`] took the phase, whether
+/// X's history grounds it, and [`Serial::at_overlap`]'s verdict.
+fn history_failed_set(
+    patch: impl FnOnce(&mut HashMap<usize, Vec<Eval>>, &dyn Fn(usize, usize) -> ReadOut),
+) -> (bool, bool, Option<Result<(), String>>) {
+    let query = |expr, strategy| Spec::Query {
+        expr,
+        replay: true,
+        bare: false,
+        strategy,
+    };
+    let read = |n, try_| Box::new(Expr::Read(n, try_));
+    let one = || Box::new(Expr::Const(1));
+    let case = Case {
+        specs: vec![
+            query(
+                Expr::If(Box::new(Expr::Catch(read(1, false))), one(), one()),
+                Strat::None,
+            ),
+            query(Expr::Read(2, false), Strat::None),
+            query(Expr::PanicIf(read(3, false), 4), Strat::None),
+            query(Expr::Add(read(5, true), read(7, true)), Strat::None),
+            query(Expr::Add(read(5, false), one()), Strat::Fallback(3)),
+            query(Expr::Add(read(4, false), one()), Strat::None),
+            query(Expr::Add(read(7, false), one()), Strat::Fallback(3)),
+            query(Expr::Add(read(6, false), one()), Strat::None),
+            query(Expr::Add(read(4, true), read(6, true)), Strat::None),
+        ],
+        panics: true,
+        cycles: true,
+        queries: 9,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(0), Op::Get(8)],
+    };
+    let phases = vec![Phase::Read([Some(0), Some(1)])];
+    let mut result = None;
     quiet(|| {
-        for _ in 0..2000 {
-            let serial = Serial::new(&case, &phases);
-            let verdict = Mutex::new(None);
-            let hit = AtomicBool::new(false);
-            let grounded = AtomicBool::new(false);
-            let got = run_two_until(&case, &phases, Some(1), 0, &|_| {}, &|_, prefix, live| {
-                let states = &prefix.last().unwrap().1 .0;
-                if prefix.len() == 2 && (1..=6).all(|x| states[x] == NodeState::Failed) {
-                    hit.store(true, SeqCst);
-                    patch(&mut live.evals.lock().unwrap());
-                    grounded.store(serial.history_cause("0x3904", prefix, live, 4), SeqCst);
-                }
-                let v = serial.at_overlap("0x3904", prefix, live);
-                let stop = v.is_some();
-                *verdict.lock().unwrap() = v;
-                stop
-            });
-            let verdict = verdict.into_inner().unwrap();
-            if !hit.load(SeqCst) {
-                serial.check("0x3904", &got, verdict);
-                continue;
-            }
-            took = Some((
-                catch_unwind(AssertUnwindSafe(|| serial.check("0x3904", &got, verdict))).is_ok(),
-                grounded.load(SeqCst),
-            ));
-            return;
-        }
+        let runs = [0, 1].map(|m| run::<Shared>(&Order::new(&case, &phases, m).case, None, 0));
+        let outs = |t: &Trace| t.iter().map(|o| o.0.clone()).collect::<Vec<_>>();
+        assert_eq!(outs(&runs[0]), [Out::Value(1), Out::Value(6)]);
+        assert_eq!(outs(&runs[1]), [Out::Value(6), Out::Value(1)]);
+        assert!(runs.iter().all(|t| settled(&t[1].1 .0).is_empty()));
+        let mut snap = runs[0][1].1.clone();
+        snap.0[1] = NodeState::Failed;
+        snap.0[2] = NodeState::Failed;
+        let prefix: Trace = vec![(Out::Value(1), snap.clone()), (Out::Value(6), snap)];
+
+        let rts = runtimes::<Shared>(None, 0);
+        let live = Live::new(&rts, &case);
+        // A caught cycle's participants, which `Cycle` sorts by slot.
+        let cycle = |x: usize, y: usize| {
+            let mut slots = [x, y].map(|x| live.world.handle(0, x).erased().slot());
+            slots.sort_unstable();
+            ReadOut::Cycle(slots.to_vec())
+        };
+        let run = |node, reads: Vec<Read>, value, end, caught, returned| Eval {
+            node: (0, node),
+            first: true,
+            reads,
+            value,
+            end,
+            caught,
+            returned,
+        };
+        let value = ReadOut::Value;
+        let mut evals = HashMap::from([
+            (
+                0,
+                vec![
+                    run(
+                        3,
+                        vec![(0, 5, true, cycle(4, 5)), (0, 7, true, value(4))],
+                        Some(7781),
+                        6,
+                        vec![(0, 1)],
+                        vec![(1, 5)],
+                    ),
+                    run(
+                        2,
+                        vec![(0, 3, false, value(7781))],
+                        None,
+                        8,
+                        vec![],
+                        vec![(0, 7)],
+                    ),
+                    run(
+                        1,
+                        vec![(0, 2, false, ReadOut::Unwound)],
+                        None,
+                        9,
+                        vec![],
+                        vec![],
+                    ),
+                    run(
+                        0,
+                        vec![(0, 1, false, ReadOut::Unwound)],
+                        Some(1),
+                        10,
+                        vec![],
+                        vec![],
+                    ),
+                ],
+            ),
+            (
+                1,
+                vec![run(
+                    8,
+                    vec![(0, 4, true, value(3)), (0, 6, true, value(3))],
+                    Some(6),
+                    4,
+                    vec![],
+                    vec![(0, 2), (1, 3)],
+                )],
+            ),
+        ]);
+        patch(&mut evals, &cycle);
+        *live.evals.lock().unwrap() = evals;
+
+        let serial = Serial::new(&case, &phases);
+        let grounded = serial.history_cause("history fixture", &prefix, &live, 2);
+        let verdict = serial.at_overlap("history fixture", &prefix, &live);
+        let took = catch_unwind(AssertUnwindSafe(|| {
+            serial.check("history fixture", &prefix, verdict.clone())
+        }))
+        .is_ok();
+        result = Some((took, grounded, verdict));
     });
-    took.expect("no run of 0x3904 left 1 to 6 Failed")
+    result.expect("the fixture ran")
+}
+
+/// Node `x`'s run in op 0 of [`history_failed_set`], to patch.
+fn run_of(evals: &mut HashMap<usize, Vec<Eval>>, x: usize) -> &mut Eval {
+    (evals.get_mut(&0).into_iter().flatten())
+        .find(|e| e.node == (0, x))
+        .expect("op 0 ran it")
+}
+
+/// Asserts the oracle rejected the fixture because X, no longer grounded,
+/// does not land Failed when the phase's reads replay.
+fn rejected_as_ungrounded((took, grounded, verdict): (bool, bool, Option<Result<(), String>>)) {
+    assert!(!took && !grounded, "took {took}, grounded {grounded}");
+    match verdict {
+        Some(Err(m)) => assert!(
+            m.contains("node 2 Failed: a replay of the phase's reads landed it"),
+            "{m}"
+        ),
+        v => panic!("verdict {v:?}"),
+    }
 }
 
 #[test]
-#[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
+#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_failed_set_grounded_in_its_history() {
-    assert_eq!(cascade_from_a_history_panic(|_| {}), (true, true));
+    assert_eq!(history_failed_set(|_, _| {}), (true, true, Some(Ok(()))));
 }
 
+/// W's recorded 7781 is not its closure over its reads once it read Z1 =
+/// 4, and X's read of 7788 (still 4 mod 7) follows from no run of W:
+/// either way X's panic follows from no run the oracle takes.
 #[test]
-#[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
+#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_history_grounding_over_a_wrong_value() {
-    assert_eq!(
-        cascade_from_a_history_panic(|evals| {
-            for e in evals.values_mut().flatten() {
-                if e.node == (0, 5) && e.value == Some(2) {
-                    e.value = Some(3);
-                }
-            }
-        }),
-        (false, false)
-    );
+    rejected_as_ungrounded(history_failed_set(|evals, _| {
+        let w = run_of(evals, 3);
+        w.reads[0].3 = ReadOut::Value(4);
+        w.caught.clear();
+        w.returned.insert(0, (0, 1));
+    }));
+    rejected_as_ungrounded(history_failed_set(|evals, _| {
+        run_of(evals, 2).reads[0].3 = ReadOut::Value(7788);
+    }));
 }
 
-/// As above with every value kept but 1's caught cycle naming no
-/// participant, which no order's read of 2 gives: 7777 still follows from
-/// it, but 6, 5 and 4 ground through a read the oracle does not take.
+/// As above with every value kept but W's caught cycle naming cycle 2's
+/// members, which no order's read of Z1 gives: 7777 still follows from
+/// it, but W, X and V ground through a read the oracle does not take.
 #[test]
-#[ignore = "T8-oracle-history-fixture: doom reservations remove the budget-1 runs (0x3904, and 0x527 of 644fcdf7) whose Failed set these fixtures ground"]
+#[cfg_attr(miri, ignore)]
 fn two_thread_oracle_rejects_a_history_grounding_over_an_untaken_read() {
-    assert_eq!(
-        cascade_from_a_history_panic(|evals| {
-            for e in evals.values_mut().flatten() {
-                if e.node == (0, 1) && e.value == Some(7777) {
-                    for r in &mut e.reads {
-                        if let ReadOut::Cycle(c) = &mut r.3 {
-                            c.clear();
-                        }
-                    }
-                }
-            }
-        }),
-        (false, false)
-    );
+    rejected_as_ungrounded(history_failed_set(|evals, cycle| {
+        run_of(evals, 3).reads[0].3 = cycle(6, 7);
+    }));
 }
 
 /// Seed 0x55ac771450d16c5b's op 0, `Get(0)` on a fresh runtime: node 8 lands
