@@ -929,6 +929,11 @@ impl<C: Cells> Runtime<C> {
                 _ => Box::new(WoundUnwind),
             });
         }
+        // As at a compute's pop: a waiter that took over this thread's
+        // discard turns it into the wound the attempt retries from.
+        if result.is_err() && !C::SINGLE_THREADED && cycle_state::settle_discard() {
+            result = Err(Box::new(WoundUnwind));
+        }
         if ctl.has(cycle::DOOMED)
             && (result.is_ok() || !matches!(cycle_state::unwind_kind(), Some(UnwindKind::Wound)))
         {
