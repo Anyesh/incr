@@ -1851,10 +1851,10 @@ local_and_shared!(
     shared_a_replaced_blocked_landing_drops_outside_the_contexts
 );
 
-/// The running entry of a node, once popped, does not hide another entry
-/// of the node queued below it: that entry still owes the node's run.
-#[test]
-fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
+/// Whether the context queues an entry of a node before and after it pops
+/// the running entry of that node at `running`, with the target at level 0
+/// and one more entry of the node pushed at each of `pushed`.
+fn queues_around_the_running_entrys_pop(pushed: &[u32], running: u32) -> (bool, bool) {
     let rt = Runtime::<Shared>::new();
     let q = rt.create_query(|_| 0_u64);
     unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> crate::replay::KeyParts {
@@ -1880,12 +1880,27 @@ fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
     );
     let queued = crate::replay::with(|c| {
         let x = c.iter_mut().find(|x| x.id == id).unwrap();
-        x.push_entry(1, entry);
-        x.run_entry(1, entry);
+        for &level in pushed {
+            x.push_entry(level, entry);
+        }
+        x.run_entry(running, entry);
         let before = x.queues(entry.node, entry.generation);
-        x.pop_entry(1);
+        x.pop_entry(running);
         (before, x.queues(entry.node, entry.generation))
     });
     drop(crate::replay::close(id));
-    assert_eq!(queued, (true, true));
+    queued
+}
+
+/// The running entry of a node, once popped, does not hide another entry
+/// of the node queued below it: that entry still owes the node's run.
+#[test]
+fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[1], 1), (true, true));
+}
+
+/// Nor one queued behind it at its own level, now at that level's front.
+#[test]
+fn a_popped_running_entry_leaves_the_next_entry_of_its_node_queued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[0], 0), (true, true));
 }
