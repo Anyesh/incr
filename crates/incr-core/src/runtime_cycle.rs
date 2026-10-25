@@ -414,6 +414,7 @@ impl<C: Cells> Runtime<C> {
                 reserve::none_held(),
                 "incr-core: a wounded thread waits for its winner holding reservations"
             );
+            self.park(ParkPoint::WoundRetracted);
             self.await_winner();
             return None;
         }

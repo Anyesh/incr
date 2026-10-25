@@ -239,6 +239,9 @@ pub(crate) enum ParkPoint {
     /// At the end of `release_members`, once an episode's cut at this root
     /// has released its other members.
     MembersReleased(NodeId),
+    /// In `caught`'s wound branch, once the wounded attempt has given back
+    /// everything it held and before it waits for its winner.
+    WoundRetracted,
 }
 
 /// Ends the whole test binary: a parked thread's panic can be caught as a
@@ -5149,6 +5152,27 @@ impl<C: Cells> Runtime<C> {
         assert_eq!(node.verified_at(), 0, "a forced node was never verified");
         state::try_transition::<C>(node.state_cell(), NodeState::New, NodeState::Dirty)
             .expect("a forced node is New");
+    }
+
+    /// Each node a group record names at its current generation that does
+    /// not hold that same record, which `group_verify` would claim as a
+    /// group the node has left.
+    pub(crate) fn stale_group_records(&self) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut stale = Vec::new();
+        for (&slot, rec) in &inner.member_recs {
+            for &(m, generation) in &rec.members {
+                let shared = inner
+                    .member_recs
+                    .get(&m)
+                    .is_some_and(|r| Arc::ptr_eq(r, rec));
+                if self.nodes.get(m).generation() == generation && !shared {
+                    stale.push(format!("node {slot}'s group names node {m}, which left it"));
+                }
+            }
+        }
+        stale.sort();
+        stale
     }
 
     /// Records `members` as one landed group, as an episode's step 2 does.
