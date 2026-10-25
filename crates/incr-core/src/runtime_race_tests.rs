@@ -1654,6 +1654,13 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
     (x, a, in_a, read_a)
 }
 
+/// Moves `rt` past the revision whose caught panic `b` keeps a memo for,
+/// so that the next read of `x` reruns it.
+fn next_revision(rt: &Rt) {
+    let input = rt.create_input(0_u64);
+    rt.set(input, 1);
+}
+
 /// The episode that `x`'s recompute runs through its read of `a`, a
 /// group member, lands `a` Dirty, and once the read has taken the value,
 /// another thread claims `a`; the read's reservation of `a` keeps that
@@ -1665,6 +1672,7 @@ fn reader_of_group_episode_root_claimed_after_landing() {
     let rt = Arc::new(Rt::new());
     let (x, a, in_a, read_a) = poisoned_episode(&rt);
     rt.get(x);
+    next_revision(&rt);
     assert_eq!(rt.state_of(x), NodeState::Dirty);
     assert_eq!(rt.state_of(a), NodeState::Dirty);
     rt.group_verifies.lock().unwrap().clear();
@@ -1698,6 +1706,7 @@ fn reader_of_group_episode_root_keeps_it_until_the_read_takes_the_value() {
     let rt = Arc::new(Rt::new());
     let (x, a, _in_a, _read_a) = poisoned_episode(&rt);
     rt.get(x);
+    next_revision(&rt);
     assert_eq!(rt.state_of(a), NodeState::Dirty);
     let walked = Gate::new();
     park_at(&rt, vec![(ParkPoint::AfterWalk(id(a)), walked.clone())]);
