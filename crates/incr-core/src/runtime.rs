@@ -3096,6 +3096,7 @@ impl<C: Cells> Runtime<C> {
         };
         let mut walk = resume.unwrap_or_else(|| Walk::new(id, observed));
         let mut root = Computed::Done;
+        let root_node = self.nodes.get(id.0);
         let mut unchecked = None;
         #[cfg(test)]
         let mut revisited: Vec<NodeId> = Vec::new();
@@ -3103,6 +3104,18 @@ impl<C: Cells> Runtime<C> {
         while let Some(Entry { id: cur, taint }) = walk.work.pop() {
             let is_root = walk.work.is_empty();
             if taint < VISIT_COMPUTING {
+                // The root can land Failed while entries it expanded are
+                // still queued (a dep's run reads it, or another thread
+                // lands it); its compute then raises or reruns over what it
+                // reads itself, so as with a root found Failed, they need
+                // no cleaning. A passed entry hands on its taint as a Done
+                // compute would, in case the root is retried.
+                if !is_root && state::load::<C>(root_node.state_cell()) == NodeState::Failed {
+                    if taint < NO_TAINT {
+                        walk.taint(taint);
+                    }
+                    continue;
+                }
                 self.park(ParkPoint::BeforeComputeOne(cur));
                 let visit = if is_root || taint >= NO_TAINT {
                     Visit::Full
