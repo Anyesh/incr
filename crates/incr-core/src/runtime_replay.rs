@@ -2561,9 +2561,6 @@ impl<C: Cells> Runtime<C> {
             // it: the node leaves Failed as the walk would have flipped it,
             // in one step, so no read sees it Failed after the set.
             flipped = self.flip_failed_from(id, NodeState::ComputingDirty);
-            if !flipped {
-                replay::regen_running(self.runtime_id, id.0, false);
-            }
         }
         // The move back or the flip cleared the mark with the state: a
         // later clear could take the mark of the node's next rerun.
