@@ -1484,9 +1484,9 @@ enum FirstRead {
     ForeignLandedClean,
 }
 
-/// A replayable frame at budget 1 that reads 64 leaves runs twice, once
-/// doomed, whatever it first reads; see [`foreign_reader_is_doomed_with`]. The last leaf sets another runtime's
-/// input when it runs, which is after the first read in the unbounded run
+/// A replayable frame at budget 1 that reads 64 leaves is doomed once and
+/// retried, whatever it first reads; see [`foreign_reader_is_doomed_with`].
+/// The last leaf sets another runtime's input when it runs, which is after the first read in the unbounded run
 /// and between the doomed run and its retry here. A retry takes its doomed
 /// run's foreign read outcome again, Clean or not, so it agrees with the
 /// unbounded run.
@@ -1503,8 +1503,7 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
         FirstRead::ForeignLandedClean,
     ] {
         let runs = doomed_reader_runs::<A, B>(n, first);
-        // Since ffc1cc10 the landed case runs a third time;
-        // `landed_foreign_reader_runs_twice` holds it to two.
+        // `landed_foreign_reader_runs_twice` holds the landed case's count.
         if !matches!(first, FirstRead::ForeignLandedClean) {
             assert_eq!(runs, 2, "{first:?}");
         }

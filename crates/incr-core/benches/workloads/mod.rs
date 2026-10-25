@@ -652,13 +652,13 @@ impl<C: Cells> Workload for ChildrenChurn<C> {
     }
 }
 
+/// An input of the other runtime and how to make its next value.
+type Source<T> = (Incr<T>, fn(i64) -> T);
+
 /// A replayable query of one runtime that reads `READS` Clean queries of
 /// another each run, rerun every iteration by a set of its own input. A
 /// budgeted reader keeps each read's value for a retry, by a clone; an
 /// unbudgeted one is never retried and keeps nothing.
-/// An input of the other runtime and how to make its next value.
-type Source<T> = (Incr<T>, fn(i64) -> T);
-
 pub struct ForeignRead<T: Clone + PartialEq + Send + Sync + 'static> {
     rt: Runtime<Shared>,
     tick: Incr<i64>,
