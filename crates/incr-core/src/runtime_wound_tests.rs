@@ -892,6 +892,8 @@ struct DissolveOn<C: Cells> {
     top_reads_b: Arc<AtomicBool>,
     /// `r`'s next run reads only `k`, so its landing rests on no held one.
     r_alone: Arc<AtomicBool>,
+    /// `r`'s state as other threads see it when `top` reads `b`.
+    r_at_top: Arc<Mutex<Option<NodeState>>>,
 }
 
 type Dissolve = DissolveOn<Shared>;
@@ -967,12 +969,14 @@ impl<C: Cells> DissolveOn<C> {
         let w = rt.create_query_with(move |rt| 7 * rt.get(k), fixpoint());
         let b = rt.create_query(move |rt| rt.get(y));
         let top_reads_b = Arc::new(AtomicBool::new(false));
+        let r_at_top = Arc::new(Mutex::new(None));
         let top = {
-            let top_reads_b = top_reads_b.clone();
+            let (top_reads_b, r_at_top) = (top_reads_b.clone(), r_at_top.clone());
             rt.create_query(move |rt| {
                 let v = rt.get(r);
                 // As in `r`: a read that wounds A and never returns.
                 if top_reads_b.swap(false, Ordering::SeqCst) {
+                    *r_at_top.lock().unwrap() = Some(rt.nodes.get(r.slot()).state());
                     rt.get(b);
                 }
                 v
@@ -1000,6 +1004,7 @@ impl<C: Cells> DissolveOn<C> {
             r_reads_b,
             top_reads_b,
             r_alone,
+            r_at_top,
         }
     }
 
@@ -1407,6 +1412,14 @@ fn cut_exit_retracts(wound: CutWound) {
         waits::WOUNDS.load(Ordering::Relaxed) > wounds,
         "{wound:?}: no wound"
     );
+    if let CutWound::AfterR = wound {
+        assert!(!g.r_alone.load(Ordering::SeqCst), "r never ran alone");
+        assert_eq!(
+            *g.r_at_top.lock().unwrap(),
+            Some(NodeState::Computing),
+            "r's landing after the cut was not held"
+        );
+    }
     let (stale, in_old) = at_retraction
         .get()
         .cloned()

@@ -92,8 +92,10 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// `land_as` while this thread holds landings: the landing is held if
-    /// the node already has an entry, or if it was decided by reading a
-    /// held landing since the claim; `None` lets it land.
+    /// the node already has an entry, if it was decided by reading a held
+    /// landing since the claim, or if a cut kept the claim; `None` lets it
+    /// land. A wound's unwind lands nothing before the records the attempt
+    /// replaced are back ([`hold::take_recs`]), whichever runtime raised it.
     #[cold]
     #[inline(never)]
     pub(super) fn held_landing(
@@ -104,13 +106,17 @@ impl<C: Cells> Runtime<C> {
         flagged: NodeState,
         unrun: bool,
     ) -> Option<NodeState> {
+        if cycle_state::wounded() {
+            self.retract_held_records();
+        }
         let cell = state::cell_key::<C>(node.state_cell());
         if !hold::holds(cell) {
-            if !hold::consulted() {
+            if !hold::consulted() && !hold::cut_kept(self.runtime_id, id.0) {
                 return None;
             }
-            // Only a verify or an unrun release lands without opening an
-            // entry first; a release to New is of a claim from New.
+            // Only a verify, an unrun release, or a cut claim's landing off
+            // its rerun lands without opening an entry first; a release to
+            // New is of a claim from New.
             let first = target == NodeState::New;
             let own = hold::open(
                 cell,

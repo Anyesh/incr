@@ -4254,11 +4254,6 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
     ) -> Computed {
         let kind = cycle_state::take_unwind_kind();
-        // A wound raised in another runtime reaches this one's frames
-        // with its replaced records not yet back.
-        if !C::SINGLE_THREADED && cycle_state::wounded() && hold::active() {
-            self.retract_held_records();
-        }
         let (payload, children_stashed) = if kind.is_none() && ctl.has(cycle::SPECULATIVE) {
             self.stash_panic(id, ctl, deps, &attempt, payload)
         } else {

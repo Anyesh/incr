@@ -27,7 +27,8 @@ use crate::value_code;
 /// than verify against a value they never read.
 #[derive(Default)]
 pub(crate) struct Undo {
-    /// The claim came from `New`, so a retraction lands it `New`.
+    /// The claim came from `New`, or a cut kept it after it wrote its
+    /// slot, so a retraction lands it `New`.
     pub(crate) first: bool,
     /// The displaced value, boxed as the arena boxes it; `Some(None)`
     /// for a slot that was empty.
@@ -38,7 +39,9 @@ pub(crate) struct Undo {
     /// With each dep's generation, so a retraction drops a dep deleted
     /// during the hold.
     pub(crate) deps: Option<Vec<(NodeId, u32)>>,
-    /// The record and the `IN_GROUP` bit.
+    /// The record and the `IN_GROUP` bit; for a claim a cut kept, the
+    /// record from before the cut. A wound takes it back early
+    /// ([`take_recs`]).
     pub(crate) rec: Option<(Option<Arc<GroupInfo>>, bool)>,
 }
 
@@ -88,7 +91,8 @@ struct HoldSet {
 }
 
 /// The record a cut took a claim it keeps out of, kept until the claim's
-/// landing opens its entry, which takes it as its undo.
+/// held landing opens its entry, which takes it as its undo, or until the
+/// attempt ends or is wounded.
 struct CutRec {
     rt: RuntimeId,
     slot: u32,
