@@ -1,7 +1,7 @@
 //! Park-point tests for restore and checkpoint under `Shared`: one thread
-//! parks at a named point, or inside a value's `Clone`, while another
-//! writes, and the restored or stored result must not reflect the stale
-//! value.
+//! parks at a named point, or inside a value's `Clone` or a compute, while
+//! another writes or restores, and the restored or stored result must not
+//! reflect the stale value.
 
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -305,10 +305,11 @@ fn clamped(backends: &Backends, gate: &Arc<Gate>, runs: &Arc<AtomicUsize>) -> Cl
 }
 
 /// `plus(2)` is restored while another thread holds `scaled(2)`'s claim,
-/// running it after a set its value does not depend on. The trust check
-/// can't tell that run from one that moves the value, and can't wait on
-/// it under the memo lock, so `plus` seeds `RecomputeFirst`: it counts as
-/// revalidated and runs once, cut off at its stored value.
+/// running it (revalidated, as its input moved) after a set that leaves
+/// its value unchanged. The trust check can't tell that run from one that
+/// moves the value, and can't wait on it under the memo lock, so `plus`
+/// seeds `RecomputeFirst`: it counts as revalidated and runs once, cut off
+/// at its stored value.
 #[test]
 fn a_restore_over_a_claimed_dep_reruns_the_entry_once() {
     let backends = Backends::new();

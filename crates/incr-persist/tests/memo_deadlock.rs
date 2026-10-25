@@ -182,8 +182,9 @@ const PARITY_KEYS: u32 = 48;
 
 /// One thread restores `even` then `odd` upwards while another restores
 /// `odd` then `even` downwards, so their walks cross the two tables in
-/// opposite orders. Every entry is still restored once, and only one
-/// seeded while the other thread held its dep's claim runs, once
+/// opposite orders after a serial round that reuses every entry. Every
+/// entry is still restored once, and an entry runs only if it was seeded
+/// while the other thread held its dep's claim, and then once
 /// (`a_restore_over_a_claimed_dep_reruns_the_entry_once` in restore_tests).
 #[test]
 #[cfg_attr(miri, ignore)]
@@ -201,6 +202,16 @@ fn mutually_recursive_tables_restored_in_opposite_orders() {
                 }
                 let written = p.memo.checkpoint().unwrap().written;
                 assert_eq!(written, 2 * PARITY_KEYS as usize);
+            }
+            {
+                let before = runs.load(SeqCst);
+                let p = parity(&backends, &runs);
+                for k in 0..PARITY_KEYS {
+                    read(&p.memo, p.even, k);
+                    read(&p.memo, p.odd, k);
+                }
+                assert_eq!(runs.load(SeqCst), before);
+                assert_eq!(p.memo.stats().reused, 2 * u64::from(PARITY_KEYS));
             }
             for _ in 0..ROUNDS {
                 let before = runs.load(SeqCst);
