@@ -2178,21 +2178,21 @@ take 15.53 s against 15.45 s (mean of four alternating runs each).
 until the read that made them returns (Variant V): the owner sees its
 held landings through a view, a rerun of a held node keeps what its
 write displaces, and a runtime's holds publish or retract at its first
-entry's exit. Base `164cbf2f`, tip `6d0d2f7a`, same box, `icount.sh`
+entry's exit. Base `164cbf2f`, tip `d3dec85b`, same box, `icount.sh`
 defaults; PT line diffs at 2 iterations (`chain_shared` traces lose AUX
 data at 4).
 
 | workload | base | tip | delta |
 |---|---|---|---|
 | `get_clean_local` | 101 | 101 | 0 |
-| `get_clean_shared` | 193 | 197 | +4 |
+| `get_clean_shared` | 193 | 193 | 0 |
 | `table_hit_shared` | 218.14 | 218.14 | 0 |
-| `chain_local/propagate/100` | 98030.01 | 97443.01 | -587.00 |
-| `chain_shared/propagate/100` | 199512.33 | 203006.59 | +3494.26 |
-| `simple_count/local/1000` | 2221.56 | 2228.80 | +7.24 |
-| `simple_count/shared/1000` | 4285.93 | 4413.84 | +127.91 |
-| `fanout_local_4` | 17711 | 17714.01 | +3.01 |
-| `fanout_shared_4` | 24746.06 | 25760.05 | +1013.99 |
+| `chain_local/propagate/100` | 98030.01 | 97439.01 | -591.00 |
+| `chain_shared/propagate/100` | 199512.33 | 202636.59 | +3124.26 |
+| `simple_count/local/1000` | 2221.56 | 2224.60 | +3.04 |
+| `simple_count/shared/1000` | 4285.93 | 4340.75 | +54.82 |
+| `fanout_local_4` | 17711 | 17702 | -9 |
+| `fanout_shared_4` | 24746.06 | 25378.05 | +631.99 |
 
 - `chain_shared` +29 per compute up to `faab661e` (the tree before the
   first-entry fix), of which the named checks are: `seen`'s Computing
@@ -2200,11 +2200,11 @@ data at 4).
   held landings), `rerun_hold`'s `hold::active()` (+6), the landing's
   `hold::active()` (+5), the view's held-bit test (+3) and `KeptGuard`'s
   `KEPT` test (+2); the rest is spills around them.
-- The first-entry fix (`2f19ddd3..6d0d2f7a`) adds +5.8 per compute in
-  `chain_shared` and the `get_clean_shared` +4. The latter is register
-  allocation in `get` (frame 0x38 to 0x48, one more callee-saved
-  register) with the same calls and no change on the Clean path; it is
-  under T4's limit of 200.
+- The first-entry fix (`2f19ddd3..d3dec85b`) adds +2.1 per compute in
+  `chain_shared`. With the read wrapped in `first_entry` inline it also
+  cost `get_clean_shared` +4 (register allocation in `get`, frame 0x38
+  to 0x48) and `chain_shared` +3.7 per compute; `d3dec85b` moves that
+  entry into a cold `first_read`, which removed both.
 - `rerun_hold` and the kept value started inline in `compute_attempts`
   and cost every compute in spills even when no hold was active (Local
   +17, Shared +38 per compute against `276dafb2`); moving the
