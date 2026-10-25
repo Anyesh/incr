@@ -206,6 +206,9 @@ pub(crate) enum ParkPoint {
     /// In a replay driver's loop, after it took its next entry and before
     /// the virtual frames at and above that entry's level pop.
     BeforeEntry(NodeId),
+    /// In `hold_landing`, before it loads the state of `NodeId`, which a
+    /// replay entry's run just landed.
+    HoldLanding(NodeId),
     /// In `compute_one`, on finding the node claimed by another thread,
     /// before its first wait on that claim.
     ComputeWaits(NodeId),
