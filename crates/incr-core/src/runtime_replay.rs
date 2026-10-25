@@ -3030,8 +3030,7 @@ impl<C: Cells> Runtime<C> {
                     .iter_mut()
                     .find(|x| x.id == id)
                     .expect("incr-core: a running context is open");
-                x.running = Some(level);
-                x.running_entry = Some(entry);
+                x.run_entry(level, entry);
                 x.boundary
             });
             // An entry whose node this thread holds is a cycle member that a

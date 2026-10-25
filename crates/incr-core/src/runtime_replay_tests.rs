@@ -1881,8 +1881,7 @@ fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
     let queued = crate::replay::with(|c| {
         let x = c.iter_mut().find(|x| x.id == id).unwrap();
         x.push_entry(1, entry);
-        x.running = Some(1);
-        x.running_entry = Some(entry);
+        x.run_entry(1, entry);
         let before = x.queues(entry.node, entry.generation);
         x.pop_entry(1);
         (before, x.queues(entry.node, entry.generation))

@@ -1010,6 +1010,12 @@ impl Context {
             .find_map(|(level, q)| q.front().map(|e| (level as u32, *e)))
     }
 
+    /// Marks `entry`, the front of `level`, as the one the driver runs.
+    pub(crate) fn run_entry(&mut self, level: u32, entry: Entry) {
+        self.running = Some(level);
+        self.running_entry = Some(entry);
+    }
+
     /// Whether an entry of `node` at `generation` has yet to run: the
     /// running entry, at the front of its level until the driver pops it,
     /// is not one, but once popped no longer hides the entry behind it.
