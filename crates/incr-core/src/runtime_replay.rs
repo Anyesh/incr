@@ -3240,6 +3240,11 @@ impl<C: Cells> Runtime<C> {
             if !is_computing(observed) {
                 return Some(observed);
             }
+            // Another thread may end the reservation under the wait; its
+            // claim is then no give-back and may wait on this thread.
+            if !reserve::mine((self.runtime_id, node), generation) {
+                return None;
+            }
             spins += 1;
             C::backoff(spins);
         }
