@@ -333,6 +333,7 @@ impl<C: Cells> Runtime<C> {
     /// cycle unwind is raised, never returned.
     #[inline(always)]
     pub(super) fn enter<R>(&self, f: impl FnMut() -> R) -> R {
+        let _kept = cycle_state::KeptUnwind::if_unwinding();
         match self.entered(ReadKind::Get, f) {
             Ok(r) => r,
             Err(_) => unreachable!("incr-core: a get entry raises its cycles"),

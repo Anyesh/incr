@@ -2145,6 +2145,7 @@ impl<C: Cells> Runtime<C> {
     /// is the state `get` loaded.
     #[inline(never)]
     fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
+        let _kept = cycle_state::KeptUnwind::if_unwinding();
         match self.read_slow(handle, observed, ReadKind::Get) {
             Ok(value) => value,
             Err(cycle) => self.raise_cycle(cycle),
@@ -2185,6 +2186,7 @@ impl<C: Cells> Runtime<C> {
 
     #[inline(never)]
     fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
+        let _kept = cycle_state::KeptUnwind::if_unwinding();
         self.read_slow(handle, observed, ReadKind::TryGet)
     }
 
@@ -2712,6 +2714,7 @@ impl<C: Cells> Runtime<C> {
         &self,
         handle: Incr<T>,
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
+        let _kept = cycle_state::KeptUnwind::if_unwinding();
         // A set from a closure that caught a discard, a doom's included, or
         // a wound raises it again as a read does: its run is discarded, and
         // the unbounded run never makes the write.

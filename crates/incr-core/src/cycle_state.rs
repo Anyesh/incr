@@ -792,6 +792,9 @@ struct EntryState {
     /// A take-over met a claim the outermost entry keeps unreserved
     /// across its retries, as long as the ticket.
     taken: Cell<bool>,
+    /// Open `KeptUnwind`s: while any is, the attempt's flight belongs to
+    /// the unwind whose kind it keeps.
+    kept: Cell<u32>,
     failures: Cell<u64>,
     /// Set when `Outer` may hold something, so that an outermost entry
     /// with nothing to reset touches only this block, which has no
@@ -832,6 +835,7 @@ thread_local! {
             ticket: Cell::new(0),
             wounded: Cell::new(false),
             taken: Cell::new(false),
+            kept: Cell::new(0),
             failures: Cell::new(0),
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
@@ -860,6 +864,7 @@ loom::thread_local! {
         ticket: Cell::new(0),
         wounded: Cell::new(false),
         taken: Cell::new(false),
+        kept: Cell::new(0),
         failures: Cell::new(0),
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
@@ -951,6 +956,9 @@ pub(crate) fn unwind_kind() -> Option<UnwindKind> {
 pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
     let was = unwind_kind();
     value_code::set_unwind_bits(UnwindKind::bits(kind));
+    if flight_kept() {
+        return;
+    }
     let discard = Some(UnwindKind::Discard);
     if kind == discard && was != discard {
         crate::attempt::enter_flight();
@@ -964,7 +972,10 @@ pub(crate) fn set_unwind_kind(kind: Option<UnwindKind>) {
 /// while it was in flight, the discard becomes a wound, decided by the
 /// same CAS that ends the flight. True if it did.
 pub(crate) fn settle_discard() -> bool {
-    if unwind_kind() != Some(UnwindKind::Discard) || !crate::attempt::leave_flight() {
+    if unwind_kind() != Some(UnwindKind::Discard)
+        || flight_kept()
+        || !crate::attempt::leave_flight()
+    {
         return false;
     }
     value_code::set_unwind_bits(UnwindKind::bits(Some(UnwindKind::Wound)));
@@ -976,8 +987,52 @@ pub(crate) fn settle_discard() -> bool {
 /// Where the engine raises a discard it caught again, past its own catch
 /// sites: in flight again until the next one settles it.
 pub(crate) fn reopen_discard() {
-    if unwind_kind() == Some(UnwindKind::Discard) {
+    if unwind_kind() == Some(UnwindKind::Discard) && !flight_kept() {
         crate::attempt::reopen_flight();
+    }
+}
+
+/// Inside a [`KeptUnwind`], the attempt's flight is the kept unwind's,
+/// which only that unwind's own catch may end, settle or reopen: an inner
+/// catch that settled a wound there would raise it out of a destructor.
+fn flight_kept() -> bool {
+    ENTRY.with(|e| e.kept.get() != 0)
+}
+
+/// An engine unwind's kind, set aside while a destructor that runs in that
+/// unwind calls into the engine, and put back when the call returns or
+/// unwinds. The call's own unwinds and catches start from no kind, so they
+/// neither take the kept kind nor clobber it; an unwind that leaves the
+/// call goes to the destructor's code, which the kept kind no longer needs.
+pub(crate) struct KeptUnwind(u64);
+
+impl KeptUnwind {
+    /// Only an unwind with a kind is kept: inside the call, reads start
+    /// from none, so they keep nothing and their own kinds reach the
+    /// catches inside the call.
+    #[inline(always)]
+    pub(crate) fn if_unwinding() -> Option<Self> {
+        let bits = value_code::thread_word() & value_code::UNWIND_MASK;
+        if bits != 0 && std::thread::panicking() {
+            Some(Self::keep(bits))
+        } else {
+            None
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn keep(bits: u64) -> Self {
+        value_code::set_unwind_bits(0);
+        ENTRY.with(|e| e.kept.set(e.kept.get() + 1));
+        Self(bits)
+    }
+}
+
+impl Drop for KeptUnwind {
+    fn drop(&mut self) {
+        value_code::set_unwind_bits(self.0);
+        ENTRY.with(|e| e.kept.set(e.kept.get() - 1));
     }
 }
 

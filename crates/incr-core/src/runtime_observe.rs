@@ -365,6 +365,7 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         stamp: u64,
     ) -> Result<(), ObsErr> {
+        let _kept = cycle_state::KeptUnwind::if_unwinding();
         let id = NodeId(handle.slot());
         if observed == NodeState::Cyclic || is_computing(observed) {
             // `Ok` is a node on this thread's stack or held map, in a
