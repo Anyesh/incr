@@ -32,6 +32,17 @@ pub(super) struct Attempt {
     pub(super) verify_rev: u64,
 }
 
+/// An episode's members taken out of the held map, with what their
+/// landing needs.
+struct EpisodeLanding<'a> {
+    members: &'a [u32],
+    cu: &'a [u32],
+    cycle: Cycle,
+    stamp_rev: u64,
+    verify_rev: u64,
+    entries: Vec<(u32, Seen<Held>)>,
+}
+
 /// What cutting an episode to its root's SCC did.
 enum Shrink {
     Kept,
@@ -2137,12 +2148,19 @@ impl<C: Cells> Runtime<C> {
         cidx: u32,
         bag: &mut Deferred<C>,
     ) -> PopEnd {
-        if !C::SINGLE_THREADED {
-            // Before the members land, so that a read of one of their
-            // landings also reads the count.
-            cycle_state::own_episode(self.runtime_id);
-            C::u64_fetch_add(&self.episodes_landed, 1);
-        }
+        let landing = EpisodeLanding {
+            entries: self.take_episode(members, bag),
+            members,
+            cu,
+            cycle,
+            stamp_rev,
+            verify_rev,
+        };
+        self.publish_episode(landing, cidx, bag)
+    }
+
+    /// Takes an episode's members out of the held map, as seen here.
+    fn take_episode(&self, members: &[u32], bag: &mut Deferred<C>) -> Vec<(u32, Seen<Held>)> {
         let rt = self.runtime_id;
         let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             members
@@ -2161,7 +2179,7 @@ impl<C: Cells> Runtime<C> {
             "incr-core: an episode lands a speculative run's record"
         );
         let look = Look::here();
-        let mut entries: Vec<(u32, Seen<Held>)> = entries
+        entries
             .into_iter()
             .map(|(m, e)| {
                 let (e, spec_buf) = e.into_look(look);
@@ -2170,7 +2188,31 @@ impl<C: Cells> Runtime<C> {
                 }
                 (m, e)
             })
-            .collect();
+            .collect()
+    }
+
+    /// Steps 2 to 5 of `landing`: validates its members, installs their
+    /// deps and group record, writes their values and lands them.
+    fn publish_episode(
+        &self,
+        landing: EpisodeLanding<'_>,
+        cidx: u32,
+        bag: &mut Deferred<C>,
+    ) -> PopEnd {
+        let EpisodeLanding {
+            members,
+            cu,
+            cycle,
+            stamp_rev,
+            verify_rev,
+            mut entries,
+        } = landing;
+        if !C::SINGLE_THREADED {
+            // Before the members land, so that a read of one of their
+            // landings also reads the count.
+            cycle_state::own_episode(self.runtime_id);
+            C::u64_fetch_add(&self.episodes_landed, 1);
+        }
 
         // Step 2: validate, install and record the group under one hold.
         let mut inner = self.inner.write();
