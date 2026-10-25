@@ -267,7 +267,29 @@ impl<C: Cells> Runtime<C> {
             self.taint_reader();
             return read();
         }
-        let outcome = catch_unwind(AssertUnwindSafe(read));
+        self.first_entry(read)
+    }
+
+    /// An entry of this runtime other than a read (a stabilize, an
+    /// observer's walk, a delete) made inside another entry on the thread.
+    /// If it is this runtime's first, it ends its held landings at its exit
+    /// as [`Self::foreign_entry`] does; a later one leaves them to the
+    /// first, whose exit is still ahead.
+    #[inline]
+    pub(super) fn nested_entry<R>(&self, entry: impl FnOnce() -> R) -> R {
+        if C::SINGLE_THREADED
+            || cycle_state::depth() == 0
+            || cycle_state::open_entry_of(self.runtime_id)
+        {
+            return entry();
+        }
+        self.first_entry(entry)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn first_entry<R>(&self, entry: impl FnOnce() -> R) -> R {
+        let outcome = catch_unwind(AssertUnwindSafe(entry));
         if hold::holds_runtime(self.runtime_id) {
             let unwound = outcome.is_err()
                 && matches!(

@@ -1731,7 +1731,7 @@ impl<C: Cells> Runtime<C> {
     pub fn delete_node<T: Value>(&self, handle: Incr<T>) {
         self.check_handle(handle);
         let root = handle.erase();
-        match self.enter(|| self.delete_strict(root)) {
+        match self.nested_entry(|| self.enter(|| self.delete_strict(root))) {
             Ok(()) => {}
             // check_handle passed, so a concurrent delete got there first.
             Err(StrictRefusal::Gone) => {
@@ -1765,7 +1765,7 @@ impl<C: Cells> Runtime<C> {
         if root.runtime_id() != self.runtime_id {
             return Err(DeleteError::NotAlive);
         }
-        self.enter(|| self.delete_strict(root))
+        self.nested_entry(|| self.enter(|| self.delete_strict(root)))
             .map_err(|refusal| match refusal {
                 StrictRefusal::Gone => DeleteError::NotAlive,
                 StrictRefusal::HasDependents(_) => DeleteError::HasDependents,

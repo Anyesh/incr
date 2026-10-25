@@ -169,26 +169,27 @@ fn shared_cross_read_publishes_at_the_other_runtimes_exit() {
     assert_eq!(crate::hold::held_count(), 0);
 }
 
+/// A runtime the closures of the other read, which outlives every
+/// read: `Runtime<Local>` is not `Sync`, so no `Arc` of it can go
+/// into a closure.
+struct Rt<C: Cells>(*const Runtime<C>);
+// SAFETY: only dereferenced on the reading thread, while the runtime
+// is alive.
+unsafe impl<C: Cells> Send for Rt<C> {}
+// SAFETY: as above.
+unsafe impl<C: Cells> Sync for Rt<C> {}
+impl<C: Cells> Rt<C> {
+    fn get(&self) -> &Runtime<C> {
+        // SAFETY: see the type.
+        unsafe { &*self.0 }
+    }
+}
+
 /// A read of A runs B's q, which reads back into A's cycle while A's
 /// episode is held: q's landing rests on this attempt's unpublished
 /// state, so it retracts at the exit of B's entry, and q's next read runs
 /// it once more than `Local` does.
 fn read_back_into_a_held_cycle<C: Cells>() -> (i64, i64, NodeState, usize) {
-    /// A runtime the closures of the other read, which outlives every
-    /// read: `Runtime<Local>` is not `Sync`, so no `Arc` of it can go
-    /// into a closure.
-    struct Rt<C: Cells>(*const Runtime<C>);
-    // SAFETY: only dereferenced on the reading thread, while the runtime
-    // is alive.
-    unsafe impl<C: Cells> Send for Rt<C> {}
-    // SAFETY: as above.
-    unsafe impl<C: Cells> Sync for Rt<C> {}
-    impl<C: Cells> Rt<C> {
-        fn get(&self) -> &Runtime<C> {
-            // SAFETY: see the type.
-            unsafe { &*self.0 }
-        }
-    }
     let rt = Runtime::<C>::new();
     let other = Runtime::<C>::new();
     let (x, y) = two_cycle(&rt);
@@ -315,4 +316,68 @@ fn shared_cross_read_frees_both_runtimes() {
     drop(rt);
     assert!(weak_rt.upgrade().is_none());
     assert!(weak_other.upgrade().is_none());
+}
+
+/// A stabilize of B made inside an entry of A, whose observer computes
+/// B's cycle without a read: that entry is B's first on the thread, so
+/// B's held landings end at its exit, and another thread reads the cycle
+/// at once.
+fn stabilize_of_another_runtime_ends_its_holds(enter_a: impl FnOnce(Arc<Runtime<Shared>>)) {
+    let (want, _) = local_cycle_value_and_runs();
+    let other = Arc::new(Runtime::<Shared>::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (a, b) = counted_cycle(&other, &runs);
+    let fired = Arc::new(AtomicUsize::new(0));
+    {
+        let fired = fired.clone();
+        other.observe(a, move |_: &i64| {
+            fired.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    enter_a(other.clone());
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(other.state_of(a), NodeState::Clean);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = {
+        let other = other.clone();
+        std::thread::spawn(move || tx.send(other.get(a) + other.get(b)).unwrap())
+    };
+    let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+    assert_eq!(got, Ok(want), "another thread's read of the cycle");
+    reader.join().unwrap();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stabilize_of_another_runtime_ends_its_holds_at_the_exit() {
+    stabilize_of_another_runtime_ends_its_holds(|other| {
+        let rt = Runtime::<Shared>::new();
+        let root = rt.create_query(move |_rt| {
+            other.stabilize();
+            1_i64
+        });
+        assert_eq!(rt.get(root), 1);
+    });
+}
+
+/// As above from A's observer callback, which runs under a barrier frame
+/// with no compute of A on top.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stabilize_of_another_runtime_from_a_callback_ends_its_holds() {
+    stabilize_of_another_runtime_ends_its_holds(|other| {
+        let rt = Runtime::<Shared>::new();
+        let root = rt.create_query(|_rt| 1_i64);
+        let called = Arc::new(AtomicBool::new(false));
+        {
+            let called = called.clone();
+            rt.observe(root, move |_: &i64| {
+                other.stabilize();
+                called.store(true, Ordering::SeqCst);
+            });
+        }
+        rt.stabilize();
+        assert!(called.load(Ordering::SeqCst));
+    });
 }

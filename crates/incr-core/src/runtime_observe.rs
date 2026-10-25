@@ -261,7 +261,7 @@ impl<C: Cells> Runtime<C> {
     /// thread if duplicate notifications matter.
     pub fn stabilize(&self) {
         value_code::check();
-        self.enter(|| self.stabilize_entered());
+        self.nested_entry(|| self.enter(|| self.stabilize_entered()));
     }
 
     fn stabilize_entered(&self) {
@@ -378,8 +378,10 @@ impl<C: Cells> Runtime<C> {
         }
         let _observing = Observing::record(self.runtime_id, id.0);
         let walked = catch_unwind(AssertUnwindSafe(|| {
-            self.entered(ReadKind::TryGet, || {
-                self.ensure_clean(id, handle.generation())
+            self.nested_entry(|| {
+                self.entered(ReadKind::TryGet, || {
+                    self.ensure_clean(id, handle.generation())
+                })
             })
         }));
         let computed = match walked {

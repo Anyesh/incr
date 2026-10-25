@@ -1223,6 +1223,12 @@ impl Drop for EntryDepth {
                 switch_out(e);
             }
         });
+        // Each runtime's first entry on the thread ends its holds, and
+        // the outermost is every runtime's first.
+        debug_assert!(
+            !self.outermost || std::thread::panicking() || !crate::hold::active(),
+            "incr-core: a held landing outlives the thread's outermost entry"
+        );
     }
 }
 
