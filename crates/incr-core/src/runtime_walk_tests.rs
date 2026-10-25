@@ -1024,18 +1024,16 @@ fn wave6_doomed_run_after_taking_a_ticket<C: Cells>(budget: Option<u32>, custom:
 /// A replayable run that takes a contained ticket, drops the payload and is
 /// doomed by a later read past the budget must leave its retry the same
 /// payload: h is `6 + g` = 16, as unbounded. A payload no copy can stand
-/// for keeps h from being doomed only while h is within the budget, so at
-/// budget 1, where h's first read is past it, the retry reads f Failed with
-/// no payload: 10 plus the length of that read's message.
+/// for keeps h from being doomed, past the budget too since f is not
+/// replayable and so can't run again to regenerate it (`hold_uncopied`).
 fn wave6_doomed_run_keeps_the_ticket_it_took<C: Cells>() {
     for custom in [false, true] {
         let unbounded = wave6_doomed_run_after_taking_a_ticket::<C>(None, custom);
         assert_eq!(unbounded, 6 + 10, "custom {custom}");
         for b in 1..=3 {
-            let want = if custom && b == 1 { 139 } else { unbounded };
             assert_eq!(
                 wave6_doomed_run_after_taking_a_ticket::<C>(Some(b), custom),
-                want,
+                unbounded,
                 "budget {b}, custom {custom}"
             );
         }
@@ -2132,7 +2130,10 @@ fn quiet_ticket_booms() {
 /// f_i's panic and then reads level i + 1. With `failed`, every f_i is
 /// Failed with its own contained ticket, a `NotClone` payload if `custom`,
 /// so every level takes a ticket payload. Returns the count of caught
-/// panics.
+/// panics. A `NotClone` f_i is replayable, so a retry past the budget
+/// regenerates its payload; with a non-replayable one the readers would be
+/// held past the budget and the stack would not be bounded (CHANGELOG,
+/// Known limitations).
 fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 {
     quiet_ticket_booms();
     let rt = Runtime::<C>::new();
@@ -2141,13 +2142,23 @@ fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 
     let sel = rt.create_input(0_i64);
     let fs: Vec<Incr<i64>> = (0..n)
         .map(|_| {
-            rt.create_query(move |rt: &Runtime<C>| {
-                if rt.get(j) == 0 && custom {
-                    std::panic::panic_any(NotClone(1));
-                }
-                assert!(rt.get(j) != 0, "ticket boom");
-                0
-            })
+            rt.create_query_with(
+                move |rt: &Runtime<C>| {
+                    if rt.get(j) == 0 && custom {
+                        std::panic::panic_any(NotClone(1));
+                    }
+                    assert!(rt.get(j) != 0, "ticket boom");
+                    0
+                },
+                QueryOpts {
+                    replay: if custom {
+                        Replay::Allowed
+                    } else {
+                        Replay::Native
+                    },
+                    ..Default::default()
+                },
+            )
         })
         .collect();
     let all = fs.clone();
@@ -2197,25 +2208,27 @@ fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
     assert_eq!(got, if failed { n as i64 } else { 0 });
 }
 
-/// The chain at 2000 with a ticket per caught read, every read's ticket
-/// taken while the frames below hold theirs: the tickets' work stays
-/// linear in the reads.
+/// The chain at 2000 to 64000 with a ticket per caught read, every read's
+/// ticket taken while the frames below hold theirs: the tickets' work
+/// stays linear in the reads. A retry's read of a regenerable payload keeps
+/// a copy of its notes, about 20 units a read.
 fn ticket_catching_chain_work<C: Cells>() {
-    let n = 2000;
-    let work = thread::Builder::new()
-        .stack_size(2 << 20)
-        .spawn(move || {
-            crate::replay::take_note_work();
-            assert_eq!(ticket_catching_chain::<C>(n, true, true), n as i64);
-            crate::replay::take_note_work()
-        })
-        .unwrap()
-        .join()
-        .unwrap();
-    assert!(
-        work <= 16 * n as u64,
-        "{work} units of note work for {n} reads"
-    );
+    for n in [2000, 4000, 16000, test_size(64_000)] {
+        let work = thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                crate::replay::take_note_work();
+                assert_eq!(ticket_catching_chain::<C>(n, true, true), n as i64);
+                crate::replay::take_note_work()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(
+            work <= 24 * n as u64,
+            "{work} units of note work for {n} reads"
+        );
+    }
 }
 
 #[test]
@@ -2426,12 +2439,12 @@ fn shared_stale_dep_whose_episode_cycles_is_not_read() {
 #[test]
 fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
     let (r, q, p, x) = (NodeId(1), NodeId(2), NodeId(3), NodeId(4));
-    let mut walk = Walk::new(r, NodeState::Dirty);
+    let mut walk = Walk::new(r, 0, NodeState::Dirty);
     walk.visited = Some(Default::default());
     // R's deps Q and P, P's dep X, a New node with installed deps.
-    walk.expand(q, NodeState::Dirty);
-    walk.visit(p, false);
-    walk.visit(x, true);
+    walk.expand(q, 0, NodeState::Dirty);
+    walk.visit(p, 0, false);
+    walk.visit(x, 0, true);
     assert!(walk.first_new_expansion(x));
     walk.prune(3);
     assert_eq!(walk.work.len(), 3);
@@ -2443,14 +2456,14 @@ fn a_pruned_plan_forgets_the_visits_and_expansions_it_dropped() {
 #[test]
 fn an_untainted_entry_merged_into_its_parent_keeps_the_new_mark() {
     let (r, p, x) = (NodeId(1), NodeId(2), NodeId(3));
-    let mut walk = Walk::new(r, NodeState::Dirty);
+    let mut walk = Walk::new(r, 0, NodeState::Dirty);
     walk.work.clear();
-    walk.visit(p, true);
-    walk.visit(p, false);
+    walk.visit(p, 0, true);
+    walk.visit(p, 0, false);
     walk.drop_repeats(walk.work.len());
     assert_eq!(walk.work.len(), 1);
     assert_eq!(walk.work[0].taint, NO_TAINT_NEW);
-    walk.visit(x, false);
+    walk.visit(x, 0, false);
     walk.unsettled(x);
     assert_eq!(walk.work.len(), 1);
     assert_eq!(walk.work[0].taint, NO_TAINT_NEW);
