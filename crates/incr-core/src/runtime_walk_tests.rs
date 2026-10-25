@@ -2148,8 +2148,10 @@ fn ticket_catching_chain<C: Cells>(n: usize, failed: bool, custom: bool) -> i64 
 /// the default frame budget must bound in a debug build too.
 fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
     // Frames that are never doomed overflow this stack at 1000 to 2000
-    // levels.
-    let n = test_size(100_000);
+    // levels. X reads all n leaves, and at frame budget 1 a `Shared`
+    // frame's first evaluation reruns once per child it reads (CHANGELOG,
+    // Known limitations), so `Shared` runs a quarter of the levels.
+    let n = test_size(if C::SINGLE_THREADED { 100_000 } else { 25_000 });
     let got = thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(move || ticket_catching_chain::<C>(n, failed, custom))
