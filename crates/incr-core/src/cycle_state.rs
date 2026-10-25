@@ -781,15 +781,9 @@ impl HeldMap {
 /// and its exit touch one thread-local.
 struct EntryState {
     depth: Cell<u32>,
-    /// The id of the runtime whose entry is the outermost one.
-    outer_rt: Cell<u64>,
-    /// Open entries of `Shared` runtimes.
-    shared_depth: Cell<u32>,
-    /// A second runtime with open entries, and their count; any further
-    /// runtime is counted in [`LISTED_RTS`].
-    inner_rt: Cell<u64>,
-    inner_depth: Cell<u32>,
-    listed: Cell<bool>,
+    /// The key of the runtime whose entry is the innermost one: its id,
+    /// with [`SHARED_KEY`] for a `Shared` runtime.
+    cur_rt: Cell<u64>,
     /// This thread's wound-wait ticket, 0 until its first registration
     /// inside the current outermost entry, which keeps it across retries.
     ticket: Cell<u64>,
@@ -831,11 +825,7 @@ thread_local! {
     static ENTRY: EntryState = const {
         EntryState {
             depth: Cell::new(0),
-            outer_rt: Cell::new(0),
-            shared_depth: Cell::new(0),
-            inner_rt: Cell::new(0),
-            inner_depth: Cell::new(0),
-            listed: Cell::new(false),
+            cur_rt: Cell::new(0),
             ticket: Cell::new(0),
             wounded: Cell::new(false),
             failures: Cell::new(0),
@@ -846,7 +836,7 @@ thread_local! {
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
-    static LISTED_RTS: RefCell<Vec<(u64, u32)>> = const { RefCell::new(Vec::new()) };
+    static OUTER_RTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     static OUTER: RefCell<Outer> = const {
         RefCell::new(Outer {
             dissolved: Vec::new(),
@@ -862,11 +852,7 @@ loom::thread_local! {
     static HELD: RefCell<HeldMap> = RefCell::new(HeldMap::new());
     static ENTRY: EntryState = EntryState {
         depth: Cell::new(0),
-        outer_rt: Cell::new(0),
-        shared_depth: Cell::new(0),
-        inner_rt: Cell::new(0),
-        inner_depth: Cell::new(0),
-        listed: Cell::new(false),
+        cur_rt: Cell::new(0),
         ticket: Cell::new(0),
         wounded: Cell::new(false),
         failures: Cell::new(0),
@@ -876,7 +862,7 @@ loom::thread_local! {
         budget_clock: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
-    static LISTED_RTS: RefCell<Vec<(u64, u32)>> = RefCell::new(Vec::new());
+    static OUTER_RTS: RefCell<Vec<u64>> = RefCell::new(Vec::new());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         dissolved_groups: Vec::new(),
@@ -1143,26 +1129,20 @@ pub(crate) fn wounded() -> bool {
     ENTRY.with(|e| e.wounded.get())
 }
 
+/// Marks a `Shared` runtime's key; runtime ids stay far below 2^63.
+const SHARED_KEY: u64 = 1 << 63;
+
 /// One count on the thread's engine entry depth; dropping it, by an
 /// unwind included, gives the count back, and the outermost entry's drop
-/// gives up the thread's ticket. It also counts the entry for its runtime
-/// and for the `Shared` runtimes, as a runtime nested in another one's
-/// entry is never the thread's outermost.
+/// gives up the thread's ticket. An entry of another runtime than the
+/// innermost one's also keeps that runtime's key in [`OUTER_RTS`] until
+/// it exits, as a runtime nested in another one's entry is never the
+/// thread's outermost.
 pub(crate) struct EntryDepth {
     outermost: bool,
+    switched: bool,
     first_for_runtime: bool,
-    shared: bool,
     shared_outermost: bool,
-    counted: Counted,
-}
-
-/// Where an entry's runtime is counted besides the thread's depth.
-#[derive(Clone, Copy, PartialEq)]
-enum Counted {
-    /// The outermost entry's runtime, counted by the depth.
-    Outer,
-    Inner,
-    Listed(u64),
 }
 
 impl EntryDepth {
@@ -1171,47 +1151,34 @@ impl EntryDepth {
     pub(crate) fn enter(rt: RuntimeId, shared: bool) -> Self {
         let base = 0_u8;
         let base = std::ptr::from_ref(&base) as usize;
-        let rt = rt.get();
-        let (depth, first, counted, shared_below) = ENTRY.with(|e| {
+        let key = rt.get() | if shared { SHARED_KEY } else { 0 };
+        ENTRY.with(|e| {
             let depth = e.depth.get();
             e.depth.set(depth + 1);
-            let shared_below = shared && {
-                let n = e.shared_depth.get();
-                e.shared_depth.set(n + 1);
-                n != 0
-            };
-            let (first, counted) = if depth == 0 {
-                e.outer_rt.set(rt);
+            if depth == 0 {
+                e.cur_rt.set(key);
                 e.stack_base.set(base);
                 e.budget_clock
                     .set(BUDGET_CLOCK.load(std::sync::atomic::Ordering::Relaxed));
                 #[cfg(all(test, not(loom)))]
                 OUTERMOST_ENTRIES.with(|n| n.set(n.get() + 1));
-                (true, Counted::Outer)
-            } else if e.outer_rt.get() == rt {
-                (false, Counted::Outer)
-            } else {
-                let n = e.inner_depth.get();
-                if n != 0 && e.inner_rt.get() == rt {
-                    e.inner_depth.set(n + 1);
-                    (false, Counted::Inner)
-                } else if n == 0 && !e.listed.get() {
-                    e.inner_rt.set(rt);
-                    e.inner_depth.set(1);
-                    (true, Counted::Inner)
-                } else {
-                    (enter_listed(e, rt), Counted::Listed(rt))
+                Self {
+                    outermost: true,
+                    switched: false,
+                    first_for_runtime: true,
+                    shared_outermost: shared,
                 }
-            };
-            (depth, first, counted, shared_below)
-        });
-        Self {
-            outermost: depth == 0,
-            first_for_runtime: first,
-            shared,
-            shared_outermost: shared && !shared_below,
-            counted,
-        }
+            } else if e.cur_rt.get() == key {
+                Self {
+                    outermost: false,
+                    switched: false,
+                    first_for_runtime: false,
+                    shared_outermost: false,
+                }
+            } else {
+                switch_in(e, key)
+            }
+        })
     }
 
     #[inline(always)]
@@ -1240,58 +1207,39 @@ impl Drop for EntryDepth {
         ENTRY.with(|e| {
             let depth = e.depth.get() - 1;
             e.depth.set(depth);
-            if self.shared {
-                e.shared_depth.set(e.shared_depth.get() - 1);
-            }
-            match self.counted {
-                Counted::Outer => {}
-                Counted::Inner => e.inner_depth.set(e.inner_depth.get() - 1),
-                Counted::Listed(rt) => exit_listed(e, rt),
-            }
             if depth == 0 {
                 e.ticket.set(0);
+            }
+            if self.switched {
+                switch_out(e);
             }
         });
     }
 }
 
-/// Counts an entry of `rt` in [`LISTED_RTS`]; true if it is `rt`'s first
-/// open one. A runtime listed stays out of the inner slot until its count
-/// ends, so that it is never counted in both.
 #[cold]
 #[inline(never)]
-fn enter_listed(e: &EntryState, rt: u64) -> bool {
-    e.listed.set(true);
-    LISTED_RTS.with(|l| {
-        let mut l = l.borrow_mut();
-        match l.iter_mut().find(|(r, _)| *r == rt) {
-            Some((_, n)) => {
-                *n += 1;
-                false
-            }
-            None => {
-                l.push((rt, 1));
-                true
-            }
+fn switch_in(e: &EntryState, key: u64) -> EntryDepth {
+    let below = e.cur_rt.replace(key);
+    OUTER_RTS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.push(below);
+        EntryDepth {
+            outermost: false,
+            switched: true,
+            first_for_runtime: !s.contains(&key),
+            shared_outermost: key & SHARED_KEY != 0 && s.iter().all(|&k| k & SHARED_KEY == 0),
         }
     })
 }
 
 #[cold]
 #[inline(never)]
-fn exit_listed(e: &EntryState, rt: u64) {
-    LISTED_RTS.with(|l| {
-        let mut l = l.borrow_mut();
-        let at = l
-            .iter()
-            .position(|(r, _)| *r == rt)
-            .expect("incr-core: a listed entry is counted");
-        l[at].1 -= 1;
-        if l[at].1 == 0 {
-            l.swap_remove(at);
-        }
-        e.listed.set(!l.is_empty());
-    });
+fn switch_out(e: &EntryState) {
+    let below = OUTER_RTS
+        .with(|s| s.borrow_mut().pop())
+        .expect("incr-core: a switched entry keeps the key below it");
+    e.cur_rt.set(below);
 }
 
 /// Whether an engine entry of `rt` is open on this thread.
@@ -1300,10 +1248,8 @@ pub(crate) fn open_entry_of(rt: RuntimeId) -> bool {
     let rt = rt.get();
     ENTRY.with(|e| {
         e.depth.get() != 0
-            && (e.outer_rt.get() == rt
-                || (e.inner_depth.get() != 0 && e.inner_rt.get() == rt)
-                || (e.listed.get()
-                    && LISTED_RTS.with(|l| l.borrow().iter().any(|&(r, _)| r == rt))))
+            && (e.cur_rt.get() & !SHARED_KEY == rt
+                || OUTER_RTS.with(|s| s.borrow().iter().any(|&k| k & !SHARED_KEY == rt)))
     })
 }
 

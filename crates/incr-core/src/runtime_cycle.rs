@@ -197,44 +197,34 @@ fn in_cycles(adj: &[Vec<usize>]) -> Vec<bool> {
         .collect()
 }
 
-/// Ends what the outermost `Shared` engine entry on the thread leaves of
-/// its replay, whichever way it exits: contexts of another runtime that
-/// its unwinds kept, or a doom's PENDING reservations from a `mark` that
-/// unwound. A reservation left behind would keep another thread waiting
-/// until this one enters the engine again. Under a `Local` runtime's
-/// outermost entry it removes only the contexts opened above its own
-/// position, as those below are the `Local` frames', and a wound
-/// unwinding through it waits out its winner here, where the claim it
-/// waited on is this runtime's to check.
-struct OutermostExit<'a, C: Cells> {
-    rt: &'a Runtime<C>,
-    /// The entry's position under a `Local` outermost entry, `None` for
-    /// the thread's outermost.
-    nested_at: Option<u32>,
-}
+/// Ends what an outermost engine entry leaves of its replay, whichever
+/// way it exits: contexts of another runtime that its unwinds kept, or a
+/// doom's PENDING reservations from a `mark` that unwound. A reservation
+/// left behind would keep another thread waiting until this one enters
+/// the engine again.
+struct OutermostExit;
 
-impl<C: Cells> Drop for OutermostExit<'_, C> {
+impl Drop for OutermostExit {
     fn drop(&mut self) {
-        let Some(cidx) = self.nested_at else {
-            if !reserve::none_held() {
-                replay::reset();
-                reserve::end_contexts();
-            }
-            return;
-        };
-        replay::drop_all_from(cidx);
-        if cycle_state::wounded() {
-            reserve::end_all();
-            debug_assert!(
-                cycle_state::held_keys()
-                    .iter()
-                    .all(|&(rt, _)| rt != self.rt.runtime_id),
-                "incr-core: a wounded thread waits for its winner holding claims"
-            );
-            self.rt.await_winner();
-        } else if !reserve::none_held() {
+        if !reserve::none_held() {
+            replay::reset();
             reserve::end_contexts();
         }
+    }
+}
+
+/// [`OutermostExit`] for the outermost `Shared` entry under a `Local`
+/// runtime's outermost entry, whose contexts, all below `cidx`, stay. A
+/// wound unwinding through it waits out its winner here, where the claim
+/// the winner waited on is this runtime's to check.
+struct NestedSharedExit<'a, C: Cells> {
+    rt: &'a Runtime<C>,
+    cidx: u32,
+}
+
+impl<C: Cells> Drop for NestedSharedExit<'_, C> {
+    fn drop(&mut self) {
+        self.rt.end_nested_shared(self.cidx);
     }
 }
 
@@ -299,19 +289,40 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     pub(super) fn entered<R>(&self, kind: ReadKind, mut f: impl FnMut() -> R) -> Result<R, Cycle> {
         let entry = EntryDepth::enter(self.runtime_id, !C::SINGLE_THREADED);
+        let _nested = (!C::SINGLE_THREADED && entry.shared_outermost() && !entry.is_outermost())
+            .then(|| self.nested_shared_exit());
         if !entry.is_outermost() && kind == ReadKind::Get {
-            let _exit = self.outermost_exit(&entry);
             return Ok(f());
         }
-        self.entered_catching(&entry, kind, &mut f)
+        self.entered_catching(entry.is_outermost(), kind, &mut f)
     }
 
-    #[inline(always)]
-    fn outermost_exit(&self, entry: &EntryDepth) -> Option<OutermostExit<'_, C>> {
-        (!C::SINGLE_THREADED && entry.shared_outermost()).then(|| OutermostExit {
+    #[cold]
+    #[inline(never)]
+    fn nested_shared_exit(&self) -> NestedSharedExit<'_, C> {
+        NestedSharedExit {
             rt: self,
-            nested_at: (!entry.is_outermost()).then(|| self.dep_stack.next_cidx()),
-        })
+            cidx: self.dep_stack.next_cidx(),
+        }
+    }
+
+    /// The end of [`NestedSharedExit`].
+    #[cold]
+    #[inline(never)]
+    fn end_nested_shared(&self, cidx: u32) {
+        replay::drop_all_from(cidx);
+        if cycle_state::wounded() {
+            reserve::end_all();
+            debug_assert!(
+                cycle_state::held_keys()
+                    .iter()
+                    .all(|&(rt, _)| rt != self.runtime_id),
+                "incr-core: a wounded thread waits for its winner holding claims"
+            );
+            self.await_winner();
+        } else if !reserve::none_held() {
+            reserve::end_contexts();
+        }
     }
 
     /// [`Self::entered`] for an entry that is not a `try_get`, where a
@@ -327,12 +338,11 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     fn entered_catching<R>(
         &self,
-        entry: &EntryDepth,
+        outermost: bool,
         kind: ReadKind,
         f: &mut impl FnMut() -> R,
     ) -> Result<R, Cycle> {
-        let outermost = entry.is_outermost();
-        let _exit = self.outermost_exit(entry);
+        let _exit = (outermost && !C::SINGLE_THREADED).then(|| OutermostExit);
         loop {
             if outermost {
                 cycle_state::reset_outermost();
