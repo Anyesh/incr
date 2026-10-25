@@ -13,10 +13,11 @@
 //! Every transition is a CAS on the word, and the bits above [`FLAGS`]
 //! count the attempts, so a waiter holding an old attempt's word acts on
 //! no later one. A take-over takes no ticket: any waiter may restart an
-//! older attempt, once per in-flight discard it meets. Bits 1 and 3 are
-//! kept for a waiter's pin of a landed value, which a take-over still
-//! wounds (the retry publishes pinned landings as taken), and for the
-//! owner's mark of an episode others can see.
+//! older attempt, once per in-flight discard it meets. A waiter that took
+//! a value the attempt landed sets [`PINNED`]; a take-over still wounds a
+//! pinned attempt, whose retry publishes its pinned landings as taken
+//! rather than retract a value another thread has returned. Bit 3 is kept
+//! for the owner's mark of an episode others can see.
 
 #[cfg(not(loom))]
 use std::sync::{
@@ -32,6 +33,8 @@ use loom::sync::{
 
 /// A doom's unwind is in flight: set and cleared by the owner only.
 pub(crate) const IN_FLIGHT: u32 = 1;
+/// A waiter holds a value the attempt landed, to the attempt's end.
+pub(crate) const PINNED: u32 = 2;
 /// A waiter acted for the attempt: it retries from its entry.
 pub(crate) const WOUNDED: u32 = 4;
 const FLAGS: u32 = 15;
@@ -93,8 +96,9 @@ impl Attempt {
         self.current(w) && w & WOUNDED != 0
     }
 
-    /// A waiter on this attempt: wounds it if its doom's unwind is in
-    /// flight and nothing pins it. True if it is wounded now.
+    /// A waiter on this attempt: wounds it if its discard is in flight,
+    /// pinned or not, since its owner may be in user code that waits on
+    /// the waiter. True if it is wounded now.
     pub(crate) fn wound_in_flight(&self) -> bool {
         let mut w = self.word.load(Ordering::Acquire);
         loop {
@@ -124,6 +128,50 @@ impl Attempt {
     }
 }
 
+impl Attempt {
+    /// A waiter takes a value this attempt landed: pins it unless it is
+    /// wounded already, whose landings its retry may retract. True if it
+    /// is pinned now.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the landing hand-over of T8-44e3 is its first caller"
+        )
+    )]
+    pub(crate) fn pin(&self) -> bool {
+        let mut w = self.word.load(Ordering::Acquire);
+        loop {
+            if !self.current(w) || w & WOUNDED != 0 {
+                return false;
+            }
+            if w & PINNED != 0 {
+                return true;
+            }
+            match self.word.compare_exchange_weak(
+                w,
+                w | PINNED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(now) => w = now,
+            }
+        }
+    }
+
+    /// The flags of this attempt's word; none once it has ended.
+    #[cfg(all(test, not(loom)))]
+    fn flags(&self) -> u32 {
+        let w = self.word.load(Ordering::Acquire);
+        if self.current(w) {
+            w & FLAGS
+        } else {
+            0
+        }
+    }
+}
+
 /// Whether this thread's attempt has a discard in flight, for tests.
 #[cfg(all(test, not(loom)))]
 pub(crate) fn in_flight() -> bool {
@@ -133,3 +181,7 @@ pub(crate) fn in_flight() -> bool {
 /// Attempts a waiter wounded, for tests and the scans' counts.
 #[cfg(all(test, not(loom)))]
 pub(crate) static TAKE_OVERS: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(all(test, not(loom)))]
+#[path = "attempt_tests.rs"]
+mod tests;
