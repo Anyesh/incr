@@ -1988,9 +1988,9 @@ fn shared_read_returns_the_value_its_walk_landed_dirty() {
 /// r from Dirty computes y before v: y's nested read of r leaves v Dirty
 /// (tainted by y), r's read of y defers r into this thread's held map, and
 /// y's read of p (on the stack below the walk) defers y too, so r stays
-/// held by this thread. Another thread then releases claims before v, so
-/// the walk replans with a root it holds itself. Returns p's read and
-/// whether the release ran.
+/// held by this thread. Another thread then releases claims before v,
+/// whose forced replan check then finds a root this thread holds. Returns
+/// p's read and whether the release ran.
 fn observer_walk_with_its_root_held_here(release: bool) -> (Option<u64>, bool) {
     let rt = Arc::new(Rt::new());
     let x = rt.create_input(1_u64);
@@ -2038,7 +2038,7 @@ fn observer_walk_with_its_root_held_here(release: bool) -> (Option<u64>, bool) {
     let hook_rt = Arc::downgrade(&rt);
     let installed = rt.park_hook.set(Box::new(move |point| {
         let rt = hook_rt.upgrade().unwrap();
-        if matches!(point, ParkPoint::BeforeComputeOne(_))
+        if point == ParkPoint::BeforeComputeOne(id(v))
             && rt.own_claim_owner(id(r)).is_some()
             && release
             && !hook_released.swap(true, Ordering::Relaxed)
@@ -2050,6 +2050,7 @@ fn observer_walk_with_its_root_held_here(release: bool) -> (Option<u64>, bool) {
     super::FORCE_REPLAN_HERE.with(|f| f.set(true));
     let read = catch_unwind(AssertUnwindSafe(|| rt.get(p)));
     super::FORCE_REPLAN_HERE.with(|f| f.set(false));
+    assert_eq!(rt.root_replans.load(Ordering::Relaxed), 0);
     (read.ok(), released.load(Ordering::Relaxed))
 }
 

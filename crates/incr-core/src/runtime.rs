@@ -3188,12 +3188,13 @@ impl<C: Cells> Runtime<C> {
                     // root, and two threads whose caught cycles release each
                     // other's claims would then restart each other without end.
                     // A root its deps-first computes deferred into this
-                    // thread's held map is not walked again: the plan goes
-                    // on to the root's compute, which reads it as deferred.
+                    // thread's held map is not walked again, since its walk
+                    // would wait on this thread's own claim: the plan goes on
+                    // to the root's compute, which reads it as deferred.
                     let released = !resumed
                         && !ran_unsettled
                         && self.released_since(planned)
-                        && self.own_claim_owner(id).is_none();
+                        && !cycle_state::holds(self.runtime_id, id.0);
                     resumed = false;
                     planned = self.planned();
                     if !self.prune_settled(&mut walk) {
