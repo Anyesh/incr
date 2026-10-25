@@ -224,6 +224,93 @@ fn shared_read_back_into_a_held_cycle_retracts_the_other_runtime() {
     assert_eq!(runs, local_runs + 1);
 }
 
+/// A read of A's `x` runs B's `q`, which reads `x` back while A's frame
+/// holds its claim: `q`'s landing rests on this attempt's stack, so it
+/// retracts at the exit of B's entry, and `q`'s next read runs it again.
+fn read_back_into_a_claimed_frame<C: Cells>() -> (i64, i64, NodeState, usize) {
+    let rt = Runtime::<C>::new();
+    let other = Runtime::<C>::new();
+    let x_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let q_runs = Arc::new(AtomicUsize::new(0));
+    let q = {
+        let (back, x_cell, q_runs) = (Rt(&raw const rt), x_cell.clone(), q_runs.clone());
+        other.create_query(move |_| {
+            q_runs.fetch_add(1, Ordering::SeqCst);
+            back.get()
+                .try_get(*x_cell.get().unwrap())
+                .map_or(-1, |v| v + 1)
+        })
+    };
+    let x = {
+        let other = Rt(&raw const other);
+        rt.create_query(move |_| other.get().get(q) + 10)
+    };
+    x_cell.set(x).unwrap();
+    let got = rt.get(x);
+    let after = other.state_of(q);
+    let again = other.get(q);
+    (got, again, after, q_runs.load(Ordering::SeqCst))
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_read_back_into_a_claimed_frame_retracts_the_other_runtime() {
+    let (got, again, after, runs) = read_back_into_a_claimed_frame::<Shared>();
+    let (want, want_again, local_after, local_runs) = read_back_into_a_claimed_frame::<Local>();
+    assert_eq!((got, again), (want, want_again));
+    assert!(
+        matches!(after, NodeState::Dirty | NodeState::New),
+        "{after:?}, Local's {local_after:?}"
+    );
+    assert_eq!(
+        runs,
+        local_runs + usize::from(local_after == NodeState::Clean)
+    );
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
+/// A's closure catches the wound B's `c` raised and reads B's cycle
+/// again: nothing unwinds through that second entry of B, but the thread
+/// is wounded at its exit, so its landings retract, and the retry reads
+/// the cycle a third time.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_entry_of_a_wounded_thread_retracts_the_other_runtime() {
+    let other = Arc::new(Runtime::<Shared>::new());
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (a, b) = counted_cycle(&other, &runs);
+    let wounded = Arc::new(AtomicBool::new(false));
+    let c = {
+        let wounded = wounded.clone();
+        other.create_query(move |rt| {
+            let v = rt.get(a) + rt.get(b);
+            if !wounded.swap(true, Ordering::SeqCst) {
+                rt.raise_wound();
+            }
+            v
+        })
+    };
+    let rt = Runtime::<Shared>::new();
+    let second_entry = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let root = {
+        let (other, second_entry) = (other.clone(), second_entry.clone());
+        rt.create_query(move |_| {
+            let first = catch_unwind(AssertUnwindSafe(|| other.get(c)));
+            if first.is_err() {
+                let v = other.get(a) + other.get(b);
+                second_entry.lock().unwrap().push(v);
+            }
+            first.unwrap_or(0)
+        })
+    };
+    let (want, local_runs) = local_cycle_value_and_runs();
+    assert_eq!(rt.get(root), want);
+    assert_eq!(*second_entry.lock().unwrap(), vec![want]);
+    assert_eq!(other.state_of(a), NodeState::Clean);
+    assert_eq!(runs.load(Ordering::SeqCst), 3 * local_runs);
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
 /// A wound raised inside B's entry unwinds through it: B's held episode
 /// retracts there, and the retry reads B again from scratch.
 #[test]
