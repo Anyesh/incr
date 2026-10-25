@@ -151,6 +151,11 @@ jobs:
           - { model: "loom_models::vframe_failed_provenance_relanded", bound: 2 }
           - { model: "loom_models::drain_vs_set", bound: 2 }
           - { model: "loom_models::flip_racing_a_contained_hold_releases_the_ticket", bound: 2 }
+          - { model: "loom_models::loom_held_landing_publishes_under_set", bound: 2 }
+          - { model: "loom_models::loom_held_group_record_precedes_state", bound: 2 }
+          - { model: "loom_models::loom_held_episode_wound_retracts_values", bound: 2 }
+          - { model: "loom_models::loom_own_landed_reread_matches_local", bound: 2 }
+          - { model: "loom_models::loom_released_group_members_stay_grouped_until_the_read_ends", bound: 2 }
           - { model: "loom_seed_models::seed_vs_set", bound: 2 }
           - { model: "loom_seed_models::seed_vs_dep_recompute", bound: 2 }
           - { model: "loom_seed_models::seed_vs_reader", bound: 2 }
