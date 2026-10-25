@@ -1202,7 +1202,9 @@ impl<C: Cells> Runtime<C> {
         // next would land as a cycle's discard instead of Failed. A caught
         // discard is raised again here: left set, the next frame to pop
         // would take it as its own swallow, and a context can absorb that
-        // frame's discard, so the catching closure's value would land.
+        // frame's discard, so the catching closure's value would land. So
+        // is a caught wound, which a speculative drop under this read would
+        // overwrite with its own discard.
         if word & value_code::UNWIND_MASK != 0 {
             match cycle_state::unwind_kind() {
                 Some(UnwindKind::Cycle) => {
@@ -1212,6 +1214,7 @@ impl<C: Cells> Runtime<C> {
                 Some(UnwindKind::Discard) if !std::thread::panicking() => {
                     resume_unwind(Box::new(cycle::DiscardUnwind))
                 }
+                Some(UnwindKind::Wound) if !std::thread::panicking() => self.raise_wound(),
                 _ => {}
             }
         }
@@ -1721,6 +1724,11 @@ impl<C: Cells> Runtime<C> {
 
     /// Sets the unwind kind of a drop unwind about to be raised.
     pub(super) fn set_drop_kind(&self) {
+        debug_assert_ne!(
+            cycle_state::unwind_kind(),
+            Some(UnwindKind::Wound),
+            "a speculative drop under a caught wound"
+        );
         #[cfg(test)]
         self.drop_unwinds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
