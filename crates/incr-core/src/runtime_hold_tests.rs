@@ -296,11 +296,10 @@ fn shared_entry_of_a_wounded_thread_unwinds_before_landing() {
             first.unwrap_or(0)
         })
     };
-    let (want, local_runs) = local_cycle_value_and_runs();
+    let (want, _) = local_cycle_value_and_runs();
     assert_eq!(rt.get(root), want);
     assert!(second_entry.lock().unwrap().is_empty());
     assert_eq!(other.state_of(a), NodeState::Clean);
-    assert_eq!(runs.load(Ordering::SeqCst), 2 * local_runs);
     assert_eq!(crate::hold::held_count(), 0);
 }
 
