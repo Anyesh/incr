@@ -3,11 +3,11 @@
 //! same.
 
 use criterion::{BatchSize, Bencher};
-use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, Runtime, Shared};
+use incr_core::{Cells, ErasedIncr, Incr, IncrCollection, QueryOpts, Replay, Runtime, Shared};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::hint::black_box;
-use std::sync::Barrier;
+use std::sync::{Arc, Barrier};
 
 /// One measured operation. `setup` builds what a single `run` consumes;
 /// criterion times only `run` and drops its output untimed, which is
@@ -649,5 +649,81 @@ impl<C: Cells> Workload for ChildrenChurn<C> {
         self.val.set(v);
         self.rt.set(self.x, v);
         black_box(self.rt.get(self.creator))
+    }
+}
+
+/// An input of the other runtime and how to make its next value.
+type Source<T> = (Incr<T>, fn(i64) -> T);
+
+/// A replayable query of one runtime that reads `READS` Clean queries of
+/// another each run, rerun every iteration by a set of its own input. A
+/// budgeted reader keeps each read's value for a retry, by a clone; an
+/// unbudgeted one is never retried and keeps nothing.
+pub struct ForeignRead<T: Clone + PartialEq + Send + Sync + 'static> {
+    rt: Runtime<Shared>,
+    tick: Incr<i64>,
+    reader: Incr<i64>,
+    other: Arc<Runtime<Shared>>,
+    // Set on every run when the reads are not Clean, so each recomputes.
+    source: Option<Source<T>>,
+    n: Cell<i64>,
+}
+
+impl<T: Clone + PartialEq + Send + Sync + 'static> ForeignRead<T> {
+    pub fn new(
+        budgeted: bool,
+        reads: usize,
+        dirty: bool,
+        make: fn(i64) -> T,
+        len: fn(&T) -> i64,
+    ) -> Self {
+        let rt: Runtime<Shared> = Runtime::new();
+        if !budgeted {
+            rt.set_max_frames(u32::MAX);
+        }
+        let other: Arc<Runtime<Shared>> = Arc::new(Runtime::new());
+        let source = other.create_input(make(0));
+        let read: Vec<Incr<T>> = (0..reads)
+            .map(|_| other.create_query(move |rt| rt.get(source)))
+            .collect();
+        for &q in &read {
+            let _ = other.get(q);
+        }
+        let tick = rt.create_input(0_i64);
+        let from = Arc::clone(&other);
+        let reader = rt.create_query_with(
+            move |rt| {
+                let base = rt.get(tick);
+                read.iter().map(|&q| len(&from.get(q))).sum::<i64>() + base
+            },
+            QueryOpts {
+                replay: Replay::Allowed,
+                ..Default::default()
+            },
+        );
+        let _ = rt.get(reader);
+        Self {
+            rt,
+            tick,
+            reader,
+            other,
+            source: dirty.then_some((source, make)),
+            n: Cell::new(0),
+        }
+    }
+}
+
+impl<T: Clone + PartialEq + Send + Sync + 'static> Workload for ForeignRead<T> {
+    type Input = ();
+    type Output<'a> = i64;
+    fn setup(&self) {}
+    fn run(&self, (): ()) -> i64 {
+        let n = self.n.get() + 1;
+        self.n.set(n);
+        if let Some((source, make)) = self.source {
+            self.other.set(source, make(n));
+        }
+        self.rt.set(self.tick, n);
+        black_box(self.rt.get(self.reader))
     }
 }

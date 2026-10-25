@@ -104,7 +104,9 @@ impl<C: Cells> Runtime<C> {
 
     /// The node and control block of this runtime's running compute.
     fn creator(&self, what: &str) -> (NodeId, *const ComputeCtl) {
-        value_code::check();
+        if value_code::checked_word() & value_code::REGEN_BIT != 0 {
+            super::replay_impl::abort_regen();
+        }
         match self.dep_stack.active_compute(self.runtime_id) {
             Some(frame) => frame,
             None => panic!(

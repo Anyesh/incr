@@ -412,10 +412,9 @@ impl<C: Cells> Runtime<C> {
         if episodes != 0 {
             // Before the members land, so a read of one of their landings
             // also reads the count.
-            for _ in 0..episodes {
-                crate::cycle_state::own_episode(self.runtime_id);
-            }
-            C::u64_fetch_add(&self.episodes_landed, episodes);
+            let landed = episodes * super::LANDED;
+            crate::cycle_state::own_episode(self.runtime_id, landed);
+            C::u64_fetch_add(&self.episodes_landed, landed);
         }
         let mut bag = Deferred::new();
         let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
@@ -516,6 +515,10 @@ impl<C: Cells> Runtime<C> {
         cut_recs: Vec<(u32, Option<Arc<GroupInfo>>)>,
     ) {
         entries.reverse();
+        // The retracted claims land unrun, as a release's do.
+        if !entries.is_empty() {
+            self.count_release();
+        }
         let mut bag = Deferred::new();
         let mut lost = vec![false; entries.len()];
         {

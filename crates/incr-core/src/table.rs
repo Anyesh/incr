@@ -182,6 +182,10 @@ const LIVE: u32 = 1 << 30;
 const TOMBSTONE: u32 = 2 << 30;
 const STATE_MASK: u32 = 3 << 30;
 const FRAGMENT_MASK: u32 = (1 << 30) - 1;
+const _: () = assert!(crate::bits::disjoint(&[
+    STATE_MASK as u64,
+    FRAGMENT_MASK as u64
+]));
 #[cfg(not(loom))]
 const MIN_CAPACITY: usize = 16;
 // Four buckets under loom, so a model reaches a rehash in three inserts.

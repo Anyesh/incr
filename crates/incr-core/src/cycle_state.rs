@@ -116,7 +116,8 @@ pub(crate) struct Held {
     opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    poisoned: bool,
+    /// The `POISONED` and `HANDLED` flags of the runs' frames.
+    poison: u16,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
@@ -161,7 +162,7 @@ impl Held {
             wrote: false,
             opened: false,
             changed: false,
-            poisoned: false,
+            poison: 0,
             failed: false,
             episode: None,
             ep: 0,
@@ -171,7 +172,8 @@ impl Held {
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
-    /// child index and whether it was poisoned. Under speculation it first
+    /// child index and its frame's `POISONED` and `HANDLED` flags
+    /// (`poison`). Under speculation it first
     /// keeps the record it replaces; outside, it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
     /// caller to drop outside the held map.
@@ -181,7 +183,7 @@ impl Held {
         deps: Vec<(NodeId, u32)>,
         buf: Option<Erased>,
         opened: bool,
-        poisoned: bool,
+        poison: u16,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
             self.keep_record();
@@ -199,7 +201,7 @@ impl Held {
         }
         self.last = deps;
         self.opened = opened;
-        self.poisoned |= poisoned;
+        self.poison |= poison;
         (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
 
@@ -252,7 +254,7 @@ impl Held {
                 last: self.last.clone(),
                 installed: self.installed.clone(),
                 opened: self.opened,
-                poisoned: self.poisoned,
+                poison: self.poison,
             }));
         }
     }
@@ -273,7 +275,7 @@ impl Held {
         self.last = r.last;
         self.installed = r.installed;
         self.opened = r.opened;
-        self.poisoned = r.poisoned;
+        self.poison = r.poison;
         self.buf
             .take()
             .map(|buf| Unbuilt::<dyn std::any::Any>::new(buf))
@@ -349,8 +351,9 @@ impl<H: Borrow<Held>> Seen<H> {
         self.0.borrow().opened
     }
 
-    pub(crate) fn poisoned(&self) -> bool {
-        self.0.borrow().poisoned
+    /// The runs' `POISONED` and `HANDLED` flags: either lands Dirty.
+    pub(crate) fn poison(&self) -> u16 {
+        self.0.borrow().poison
     }
 }
 
@@ -389,7 +392,7 @@ struct RunRecord {
     last: Vec<(NodeId, u32)>,
     installed: Vec<NodeId>,
     opened: bool,
-    poisoned: bool,
+    poison: u16,
 }
 
 /// An episode between member runs. A doom that discards a member run
@@ -399,7 +402,8 @@ pub(crate) struct Episode {
     pub(crate) root: NodeId,
     pub(crate) cidx: u32,
     pub(crate) validated: bool,
-    /// The landing's one cut to the root's SCC in the final reads has run.
+    /// The landing's one cut to the root's SCC in the final reads has run,
+    /// or is skipped (`uncut`).
     pub(crate) pruned: bool,
     pub(crate) members: Vec<u32>,
     pub(crate) cu: Vec<u32>,
@@ -408,6 +412,10 @@ pub(crate) struct Episode {
     /// The root's compute is a walk's entry, which contains the episode's
     /// abort.
     pub(crate) walked: bool,
+    /// The episode skipped the cut to the root's SCC: the root dissolved
+    /// an episode earlier in this entry, or the landing's one cut shrank
+    /// it and it ran again uncut.
+    pub(crate) uncut: bool,
 }
 
 pub(crate) struct Round {
@@ -804,6 +812,8 @@ struct EntryState {
     /// budget changed later may have frames on the stack that read under
     /// the budget before.
     budget_clock: Cell<u64>,
+    /// The length of `Outer::failed_here`, read by every Shared walk.
+    failed_here: Cell<usize>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -817,6 +827,8 @@ struct Outer {
     /// Each runtime whose budget change this thread has met, with the
     /// `BUDGET_CLOCK` count of the change.
     budgets_met: Vec<(RuntimeId, u64)>,
+    /// The nodes this thread has landed Failed, at their generations.
+    failed_here: Vec<(RuntimeId, u32, u32)>,
 }
 
 #[cfg(not(loom))]
@@ -833,6 +845,7 @@ thread_local! {
             held_any: Cell::new(false),
             stack_base: Cell::new(0),
             budget_clock: Cell::new(0),
+            failed_here: Cell::new(0),
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
@@ -843,6 +856,7 @@ thread_local! {
             dissolved_groups: Vec::new(),
             last_cycle: None,
             budgets_met: Vec::new(),
+            failed_here: Vec::new(),
         })
     };
 }
@@ -860,6 +874,7 @@ loom::thread_local! {
         held_any: Cell::new(false),
         stack_base: Cell::new(0),
         budget_clock: Cell::new(0),
+        failed_here: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
@@ -868,6 +883,7 @@ loom::thread_local! {
         dissolved_groups: Vec::new(),
         last_cycle: None,
         budgets_met: Vec::new(),
+        failed_here: Vec::new(),
     });
 }
 
@@ -1070,6 +1086,30 @@ pub(crate) fn meet_budget_change(rt: RuntimeId, changed: u64) -> bool {
     })
 }
 
+pub(crate) fn note_failed_here(rt: RuntimeId, slot: u32, generation: u32) {
+    OUTER.with(|o| o.borrow_mut().failed_here.push((rt, slot, generation)));
+    ENTRY.with(|e| {
+        e.outer_set.set(true);
+        e.failed_here.set(e.failed_here.get() + 1);
+    });
+}
+
+/// How many Failed landings this thread has made in its outermost entry.
+pub(crate) fn failed_here_count() -> usize {
+    ENTRY.with(|e| e.failed_here.get())
+}
+
+/// Whether one of this thread's Failed landings after its first `from`
+/// in its outermost entry is of `slot` of `rt` at `generation`.
+pub(crate) fn failed_here_since(from: usize, rt: RuntimeId, slot: u32, generation: u32) -> bool {
+    OUTER.with(|o| {
+        let o = o.borrow();
+        o.failed_here
+            .get(from..)
+            .is_some_and(|f| f.contains(&(rt, slot, generation)))
+    })
+}
+
 /// The stack address the outermost engine entry recorded.
 pub(crate) fn stack_base() -> usize {
     ENTRY.with(|e| e.stack_base.get())
@@ -1080,19 +1120,19 @@ pub(crate) fn depth() -> u32 {
     ENTRY.with(|e| e.depth.get())
 }
 
-/// Counts an episode this thread lands on `rt`, for the last
-/// `OWN_RUNTIMES` runtimes it landed one on. A count dropped or restarted
+/// Adds `by` to this thread's share of `rt`'s episode count, for the last
+/// `OWN_RUNTIMES` runtimes it counted on. A count dropped or restarted
 /// only makes a walk's own share differ from all landings, which re-plans.
-pub(crate) fn own_episode(rt: RuntimeId) {
+pub(crate) fn own_episode(rt: RuntimeId, by: u64) {
     OWN_EPISODES.with(|o| {
         let mut o = o.borrow_mut();
         match o.iter_mut().find(|(r, _)| *r == rt) {
-            Some((_, n)) => *n = n.wrapping_add(1),
+            Some((_, n)) => *n = n.wrapping_add(by),
             None => {
                 if o.len() == OWN_RUNTIMES {
                     o.remove(0);
                 }
-                o.push((rt, 1));
+                o.push((rt, by));
             }
         }
     });
@@ -1308,6 +1348,8 @@ pub(crate) fn reset_outermost() {
             o.dissolved_groups.clear();
             o.last_cycle = None;
             o.budgets_met.clear();
+            o.failed_here.clear();
+            ENTRY.with(|e| e.failed_here.set(0));
         });
     }
 }

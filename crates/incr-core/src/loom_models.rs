@@ -1792,6 +1792,70 @@ fn doom_reservations_cross(len: usize, frames: u32) {
     });
 }
 
+/// A thread's wait on another thread's claim of a node it reserves
+/// (`given_back_state`) ends under every interleaving with the state the
+/// claim leaves: X is Dirty and reserved here while the other thread
+/// either reads X, claiming it and giving it back unrun to the
+/// reservation, or claims and lands it Clean as a claim that skips the
+/// reservation check does.
+fn give_back_wait(lands: bool) {
+    run(move || {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        assert_eq!(rt.get(x), 2);
+        rt.set(i, 2);
+        let (slot, generation) = (x.slot(), x.generation());
+        {
+            let _scope = crate::reserve::Scope::new(Some(1));
+            crate::reserve::note((rt.runtime_id, slot), generation);
+        }
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || {
+                if lands {
+                    let cell = rt.nodes.get(slot).state_cell();
+                    crate::state::try_transition::<Loom>(
+                        cell,
+                        NodeState::Dirty,
+                        NodeState::Computing,
+                    )
+                    .unwrap();
+                    crate::state::try_transition::<Loom>(
+                        cell,
+                        NodeState::Computing,
+                        NodeState::Clean,
+                    )
+                    .unwrap();
+                    None
+                } else {
+                    Some(rt.get(x))
+                }
+            })
+        };
+        let left = rt.given_back_state(slot, generation);
+        let want = if lands {
+            [NodeState::Dirty, NodeState::Clean]
+        } else {
+            [NodeState::Dirty; 2]
+        };
+        assert!(left.is_some_and(|s| want.contains(&s)), "{left:?}");
+        crate::reserve::end_all();
+        let read = other.join().unwrap();
+        assert!(read.is_none() || read == Some(3), "{read:?}");
+    });
+}
+
+#[test]
+fn give_back_wait_ends_on_a_give_back() {
+    give_back_wait(false);
+}
+
+#[test]
+fn give_back_wait_ends_on_a_landing() {
+    give_back_wait(true);
+}
+
 /// [`doom_reservations_cross`] on F <-> X at budget 1: each read dooms on
 /// the other thread's entry node.
 #[test]

@@ -46,15 +46,48 @@ pub(crate) const KEPT_BIT: u64 = 1 << 58;
 /// recording the read until its cold path clears it.
 pub(crate) const FOREIGN_BIT: u64 = 1 << 57;
 
+/// Set while a dep's closure runs again to regenerate a panic payload no
+/// copy can stand for (`Runtime::regenerate`): a read that would compute,
+/// wait or create aborts that run instead.
+pub(crate) const REGEN_BIT: u64 = 1 << 56;
+
+/// Set when a read aborted the run `REGEN_BIT` marks.
+pub(crate) const REGEN_ABORTED: u64 = 1 << 55;
+
+/// Set while this thread holds records of what runs' reads took, for a
+/// regeneration in the engine call (`replay::note_took`).
+pub(crate) const TOOK_BIT: u64 = 1 << 54;
+
 /// Set while this thread holds landings (`hold`), so that a frame pop
 /// passes a frame's `HOLD` to its reader with the load it already makes.
-pub(crate) const HELD_BIT: u64 = 1 << 56;
+pub(crate) const HELD_BIT: u64 = 1 << 53;
 
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
 /// so a live memo, unwind kind, replay context or note never trips the
 /// contract panic.
-pub(crate) const COUNTER_MASK: u64 =
-    !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT | NOTES_BIT | KEPT_BIT | FOREIGN_BIT | HELD_BIT);
+pub(crate) const COUNTER_MASK: u64 = !(MEMO_BIT
+    | UNWIND_MASK
+    | REPLAY_BIT
+    | NOTES_BIT
+    | KEPT_BIT
+    | FOREIGN_BIT
+    | REGEN_BIT
+    | REGEN_ABORTED
+    | TOOK_BIT
+    | HELD_BIT);
+
+const _: () = assert!(crate::bits::disjoint(&[
+    MEMO_BIT,
+    UNWIND_MASK,
+    REPLAY_BIT,
+    NOTES_BIT,
+    KEPT_BIT,
+    FOREIGN_BIT,
+    REGEN_BIT,
+    REGEN_ABORTED,
+    TOOK_BIT,
+    HELD_BIT,
+]));
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
@@ -82,14 +115,12 @@ pub(crate) fn clear_memo_bit() {
 }
 
 pub(crate) fn set_held_bit(held: bool) {
-    THREAD_WORD.with(|w| {
-        let word = w.get();
-        w.set(if held {
-            word | HELD_BIT
-        } else {
-            word & !HELD_BIT
-        });
-    });
+    set_bits(HELD_BIT, held);
+}
+
+/// Sets or clears `bits` in this thread's word.
+pub(crate) fn set_bits(bits: u64, on: bool) {
+    THREAD_WORD.with(|w| w.set(if on { w.get() | bits } else { w.get() & !bits }));
 }
 
 pub(crate) fn set_foreign_bit() {
