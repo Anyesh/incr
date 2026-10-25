@@ -96,9 +96,10 @@ pub(crate) struct Inner<C: Cells> {
     pub(crate) member_recs: HashMap<u32, Arc<GroupInfo>>,
     /// Each query whose deps a user panic's union replaced as it released
     /// the query New ([`Runtime::land_panic_released`]): that union's
-    /// length, and how many of its deps, from the front, its last finished
-    /// run read. A Failed landing's union carries an entry the query
-    /// already had and starts none. Any other publish of its deps drops
+    /// length, and how many of its deps, from the front, it held before
+    /// the released run. A Failed landing's union carries an entry the
+    /// query already had and starts none, so after a failed run those held
+    /// deps include what that run read. Any other publish of its deps drops
     /// it, as does its delete; a Stale publish, which installs nothing,
     /// keeps it. A read's walk uses it only for a released New node.
     pub(crate) released_deps: HashMap<u32, (u32, u32)>,
@@ -4439,8 +4440,9 @@ impl<C: Cells> Runtime<C> {
         self.land_single(id, node, flags, NodeState::New, NodeState::New);
     }
 
-    /// How many of `id`'s deps, from the front, its last finished run read,
-    /// if a user panic released it New over more. The mark is stored before
+    /// How many of `id`'s deps, from the front, it held before its released
+    /// run ([`Inner::released_deps`]), if a user panic released it New over
+    /// more. The mark is stored before
     /// the release's state CAS lands the node New, and the walk loads that
     /// state with acquire.
     #[inline]
