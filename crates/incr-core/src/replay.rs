@@ -1682,6 +1682,18 @@ pub(crate) fn run_unwind_kind(kind: Option<UnwindKind>, speculative: bool) -> Op
     }
 }
 
+/// Whether a doomed run of node `slot` at `generation` of `rt` left a
+/// lowlink or a claim watermark for the run that finishes its frame, which
+/// an adopted stash would not take.
+pub(crate) fn frame_records(rt: RuntimeId, slot: u32, generation: u32) -> bool {
+    with(|c| {
+        c.iter().filter(|x| x.rt == rt).any(|x| {
+            x.lows.iter().any(|l| l.0 == slot && l.1 == generation)
+                || x.claim_revs.has_node(slot, generation)
+        })
+    })
+}
+
 /// Counts a speculative entry's run while it lives; dropping it, by an
 /// unwind included, gives the count back.
 pub(crate) struct Speculating(());
@@ -2265,6 +2277,10 @@ impl EarliestByFrame {
 
     pub(crate) fn has(&self, frame: Frame) -> bool {
         self.by_frame.contains_key(&frame)
+    }
+
+    fn has_node(&self, node: u32, generation: u32) -> bool {
+        self.by_node.contains_key(&(node, generation))
     }
 
     pub(crate) fn take(&mut self, frame: Frame, path: u64) -> Option<u64> {

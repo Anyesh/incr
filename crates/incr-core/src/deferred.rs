@@ -223,6 +223,19 @@ impl<C: Cells> Deferred<C> {
     /// `payload` with its kind restored.
     #[cold]
     pub(crate) fn drain_carried(&mut self, payload: Box<dyn Any + Send>) -> ! {
+        self.drop_isolated();
+        resume_unwind(payload)
+    }
+
+    /// Drops every item under [`isolate`], for an owner whose items no
+    /// run of the unbounded run built.
+    #[cold]
+    pub(crate) fn drain_isolated(mut self) {
+        self.drop_isolated();
+        self.forget_empty();
+    }
+
+    fn drop_isolated(&mut self) {
         if let Some(token) = self.dep_list.take() {
             isolate(|| retire_dep_list::<C>(token));
         }
@@ -231,7 +244,6 @@ impl<C: Cells> Deferred<C> {
                 isolate(|| drop(item));
             }
         }
-        resume_unwind(payload)
     }
 }
 

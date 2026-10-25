@@ -31,14 +31,13 @@
 //! node an order settles that they left Dirty or New must still read so,
 //! and the run ends there.
 //!
-//! A speculative entry can land a node the unbounded run leaves New, and
-//! with panics the engine's outcomes depend on that history: a walk
-//! computes a Dirty node's deps before its closure, so a dep's panic
-//! leaves the walk where the closure would have caught it, and a Failed
-//! dep panics at the walk where a New node's closure would catch its
-//! read. So once the states differ, a case with panics stops comparing,
-//! and a case without them, a third of the seeds, compares the results to
-//! the end.
+//! A speculative run may compute a node the unbounded run does not, but
+//! lands nothing, so states compare exactly. Single-threaded, no Native
+//! closure may run speculatively twice in a revision (`REPLAY_NATIVE_COUNT`
+//! also compares its run counts with the unbounded run's). `REPLAY_FIRST`
+//! scans cases
+//! whose Native closures take `FirstLanded`, so a run of one that the
+//! engine does not treat as the node's first shows in its value.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -126,6 +125,10 @@ enum Expr {
     /// The first operand on the closure's first run in its runtime, a
     /// doomed run included, else the second.
     FirstRun(Box<Expr>, Box<Expr>),
+    /// The first operand while the node has landed nothing since it was
+    /// made, else the second. A node's expression takes `FirstRun` or this,
+    /// not both.
+    FirstLanded(Box<Expr>, Box<Expr>),
 }
 
 #[derive(Clone, Debug)]
@@ -331,6 +334,29 @@ fn gen_case(seed: u64, cross: bool, paired: bool) -> Case {
     case
 }
 
+/// [`gen_case`] with most Native queries of the first runtime under
+/// `FirstLanded`, whose second branch adds one, so a Native closure's run
+/// that takes the wrong branch changes its value. Its own generator, so
+/// [`gen_case`]'s seeds keep naming the cases they did.
+fn gen_first_runs(seed: u64, cross: bool, paired: bool) -> Case {
+    let mut case = gen_case(seed, cross, paired);
+    let mut rng = Rng(seed ^ 0x3c6e_f372_fe94_f82b);
+    for spec in &mut case.specs[..case.queries] {
+        if let Spec::Query {
+            expr,
+            replay: false,
+            ..
+        } = spec
+        {
+            if rng.chance(70) {
+                let again = Expr::Add(Box::new(expr.clone()), Box::new(Expr::Const(1)));
+                *expr = Expr::FirstLanded(Box::new(expr.clone()), Box::new(again));
+            }
+        }
+    }
+    case
+}
+
 fn insert_op(case: &mut Case, rng: &mut Rng, op: Op) -> usize {
     let at = 1 + rng.below(case.ops.len() as u64) as usize;
     case.ops.insert(at, op);
@@ -346,6 +372,7 @@ fn shift(e: Expr, by: usize) -> Expr {
         Expr::PanicIf(a, when) => Expr::PanicIf(s(a), when),
         Expr::Catch(a) => Expr::Catch(s(a)),
         Expr::FirstRun(a, b) => Expr::FirstRun(s(a), s(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(s(a), s(b)),
         leaf => leaf,
     }
 }
@@ -361,6 +388,7 @@ fn past_template(e: Expr, skip: usize, nodes: usize) -> Expr {
         Expr::PanicIf(a, when) => Expr::PanicIf(p(a), when),
         Expr::Catch(a) => Expr::Catch(p(a)),
         Expr::FirstRun(a, b) => Expr::FirstRun(p(a), p(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(p(a), p(b)),
         leaf => leaf,
     }
 }
@@ -565,6 +593,7 @@ fn without_panics(e: Expr) -> Expr {
         Expr::If(c, a, b) => Expr::If(w(c), w(a), w(b)),
         Expr::Catch(inner) => Expr::Catch(w(inner)),
         Expr::FirstRun(a, b) => Expr::FirstRun(w(a), w(b)),
+        Expr::FirstLanded(a, b) => Expr::FirstLanded(w(a), w(b)),
         leaf => leaf,
     }
 }
@@ -603,6 +632,8 @@ unsafe impl<C: Cells> Sync for RtPtr<C> {}
 struct World<C: Cells> {
     rts: [RtPtr<C>; 2],
     tables: [Vec<Mutex<Option<Handle>>>; 2],
+    /// Queries made so far.
+    made: AtomicUsize,
 }
 
 impl<C: Cells> World<C> {
@@ -672,7 +703,14 @@ thread_local! {
     /// The closures running on this thread while `EVALS` is set,
     /// innermost last.
     static OPEN: std::cell::RefCell<Vec<Eval>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// While set, the runs of Native closures that start on this thread.
+    static NATIVE: std::cell::RefCell<Option<Vec<NativeRun>>> = const { std::cell::RefCell::new(None) };
 }
+
+/// A Native closure's run: its node by side, index and the order it was
+/// made in (a recreated node is a new one), the revision, and whether the
+/// run is speculative.
+type NativeRun = (usize, usize, usize, u64, bool);
 
 static EVAL_CLOCK: AtomicU64 = AtomicU64::new(0);
 
@@ -810,7 +848,9 @@ fn formula(
             Err(None) => Ok(9999),
             other => other,
         },
-        Expr::FirstRun(a, b) => formula(if first { a } else { b }, n, reads),
+        Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
+            formula(if first { a } else { b }, n, reads)
+        }
     }
 }
 
@@ -856,7 +896,7 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
             v
         }
         Expr::Catch(inner) => catch_unwind(AssertUnwindSafe(|| eval(n, inner))).unwrap_or(9999),
-        Expr::FirstRun(a, b) => {
+        Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
             if n.first {
                 eval(n, a)
             } else {
@@ -868,6 +908,7 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
 
 /// How a node's closure ran before the node is made.
 enum Ran {
+    /// It has not run, or for `FirstLanded`, has landed nothing.
     Never,
     /// Its last run was not its first, so any run of it is a rerun.
     Rerun,
@@ -880,6 +921,18 @@ enum Ran {
 
 /// Whether each of `reads` gets the same kind of outcome, and the same
 /// value, read again in order.
+/// Whether `e` takes `FirstLanded`, so its node's first run is the one
+/// that finds it landed nothing.
+fn lands_first(e: &Expr) -> bool {
+    match e {
+        Expr::FirstLanded(..) => true,
+        Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => false,
+        Expr::Add(a, b) | Expr::FirstRun(a, b) => lands_first(a) || lands_first(b),
+        Expr::If(c, a, b) => lands_first(c) || lands_first(a) || lands_first(b),
+        Expr::PanicIf(a, _) | Expr::Catch(a) => lands_first(a),
+    }
+}
+
 fn reads_alike<C: Cells>(world: &World<C>, reads: &[Read]) -> bool {
     reads.iter().all(|&(side, d, try_, ref out)| {
         let (rt, h) = (world.rt(side), world.handle(side, d));
@@ -909,6 +962,8 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             bare,
             strategy,
         } => {
+            let made = world.made.fetch_add(1, Relaxed);
+            let by_landing = lands_first(expr);
             let replay = if *replay {
                 Replay::Allowed
             } else {
@@ -919,17 +974,37 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
             // as a collection operator's does: a doomed first run would make
             // the retry take the other branch.
             let pinned = replay == Replay::Native && has_first_run(expr);
+            // `INCR_TEST_ALL_REPLAYABLE` replays the other Native queries.
+            let native = replay == Replay::Native && (pinned || !rt.all_replayable);
             let (expr, world) = (expr.clone(), world.clone());
             let runs = AtomicU32::new(u32::from(!matches!(ran, Ran::Never)));
-            let kept = match ran {
-                Ran::First(reads) => Some(reads),
-                Ran::Never | Ran::Rerun => None,
-            };
             let compute = move |rt: &Runtime<C>| {
-                let first = match runs.fetch_add(1, Relaxed) {
-                    0 => true,
-                    1 => kept.as_ref().is_some_and(|r| reads_alike(&world, r)),
-                    _ => false,
+                if native {
+                    NATIVE.with(|n| {
+                        if let Some(runs) = &mut *n.borrow_mut() {
+                            runs.push((
+                                side,
+                                i,
+                                made,
+                                rt.current_revision(),
+                                rt.computing_speculative(),
+                            ));
+                        }
+                    });
+                }
+                let first = if by_landing {
+                    rt.computing_first()
+                        && match &ran {
+                            Ran::Never => true,
+                            Ran::Rerun => false,
+                            Ran::First(reads) => reads_alike(&world, reads),
+                        }
+                } else {
+                    match runs.fetch_add(1, Relaxed) {
+                        0 => true,
+                        1 => matches!(&ran, Ran::First(reads) if reads_alike(&world, reads)),
+                        _ => false,
+                    }
                 };
                 let node = Node {
                     rt,
@@ -1049,16 +1124,10 @@ struct Live<C: Cells> {
 }
 
 /// After an operation: every query's state, every node's dependencies in
-/// the order its last landing installed them, every node's state, indexed
-/// as the deps are, and every node's cycle-group record as its members'
-/// (slot, generation) pairs, sorted, indexed the same way. Both runtimes'
-/// entries, the first's first.
-type Snapshot = (
-    Vec<NodeState>,
-    Vec<Vec<u32>>,
-    Vec<NodeState>,
-    Vec<Vec<(u32, u32)>>,
-);
+/// the order its last landing installed them, and every node's cycle-group
+/// record as its members' (slot, generation) pairs, sorted, indexed as the
+/// deps are. Both runtimes' entries, the first's first.
+type Snapshot = (Vec<NodeState>, Vec<Vec<u32>>, Vec<Vec<(u32, u32)>>);
 
 impl<C: Cells> Live<C> {
     fn new(rts: &[Box<Runtime<C>>; 2], case: &Case) -> Self {
@@ -1066,6 +1135,7 @@ impl<C: Cells> Live<C> {
         let world = Arc::new(World {
             rts: [RtPtr(&*rts[0]), RtPtr(&*rts[1])],
             tables: [table(case.specs.len()), table(case.specs2.len())],
+            made: AtomicUsize::new(0),
         });
         for (side, specs) in [&case.specs, &case.specs2].into_iter().enumerate() {
             for (i, spec) in specs.iter().enumerate().rev() {
@@ -1146,7 +1216,6 @@ impl<C: Cells> Live<C> {
         let w = &*self.world;
         let mut states = Vec::new();
         let mut deps = Vec::new();
-        let mut nodes = Vec::new();
         let mut groups = Vec::new();
         for side in 0..2 {
             let rt = w.rt(side);
@@ -1163,7 +1232,6 @@ impl<C: Cells> Live<C> {
                 let mut d = Vec::new();
                 rt.nodes.get(x).for_each_dep(|n| d.push(n.0));
                 deps.push(d);
-                nodes.push(rt.nodes.get(x).state());
             }
             let inner = rt.inner.read();
             for x in 0..rt.nodes.len() {
@@ -1173,7 +1241,7 @@ impl<C: Cells> Live<C> {
                 groups.push(members);
             }
         }
-        (states, deps, nodes, groups)
+        (states, deps, groups)
     }
 }
 
@@ -1546,7 +1614,6 @@ fn orders(
             .filter_map(|(j, i)| Some((j, cycles.get(i)?.clone())))
             .collect();
         let diff = first_diff(
-            &order.case,
             want,
             &arranged,
             Some(&settles),
@@ -2199,8 +2266,10 @@ fn consistent(
         })
         .collect();
     // A fresh query's closure runs as it last ran before the phase, since
-    // its last recreate (`Ran`). A first run is kept only if it landed
-    // Clean: a Failed or poisoned landing leaves nothing an order verifies.
+    // its last recreate (`Ran`). A first run is kept only if its first
+    // landing, at its own operation or at a later one that adopted its
+    // stash, was Clean: a Failed or poisoned landing leaves nothing an
+    // order verifies.
     let first_op = phase_reads.first().copied().unwrap_or(0);
     let evals = live.evals.lock().unwrap().clone();
     let ran = |x: usize| {
@@ -2214,9 +2283,22 @@ fn consistent(
             .flat_map(|(i, es)| es.iter().map(move |e| (i, e)))
             .filter(|(_, e)| e.node == (side, q))
             .max_by_key(|(_, e)| e.end);
+        let landed = |i: usize| {
+            (i..first_op)
+                .map(|j| prefix[j].1 .0[x])
+                .find(|&s| s != NodeState::New)
+        };
+        let by_landing = matches!(
+            spec_at(case, prefix, side, q),
+            Spec::Query { expr, .. } if lands_first(&expr)
+        );
         match last {
             None => Ran::Never,
-            Some((i, l)) if l.first && prefix[i].1 .0[x] == NodeState::Clean => {
+            Some((i, _)) if by_landing && landed(i).is_none() => Ran::Never,
+            Some((i, l)) if by_landing && l.first && landed(i) == Some(NodeState::Clean) => {
+                Ran::First(l.reads.clone())
+            }
+            Some((i, l)) if !by_landing && l.first && prefix[i].1 .0[x] == NodeState::Clean => {
                 Ran::First(l.reads.clone())
             }
             Some(_) => Ran::Rerun,
@@ -2351,7 +2433,6 @@ impl PanicText {
 /// `settles` in any node's cycle-group record too. An exemption excuses one
 /// operation's outcome and nothing after it.
 fn first_diff(
-    case: &Case,
     want: &Trace,
     got: &Trace,
     settles: Option<&[bool]>,
@@ -2360,10 +2441,6 @@ fn first_diff(
     cycles: &CycleReads,
 ) -> Option<(usize, String)> {
     for (i, ((want_out, want), (got_out, got))) in want.iter().zip(got).enumerate() {
-        if speculative_delete(&case.ops[i], want_out, got_out) {
-            SPECULATIVE_DELETES.fetch_add(1, Relaxed);
-            return None;
-        }
         // Under two threads the cycle a read reports is built from this
         // thread's frames, so members another thread landed first are left
         // out of it: a verified part of an order's participants matches.
@@ -2406,47 +2483,21 @@ fn first_diff(
     None
 }
 
-/// T8-speculative-landings, which removes this rule and the next: a
-/// speculative run computes nodes the unbounded run never computes and
-/// lands them Clean with their deps and group records, so a node New there
-/// may be Clean, or Dirty after a later set, with deps and a record here.
-fn speculative_landing(want: NodeState, got: NodeState) -> bool {
-    want == NodeState::New && matches!(got, NodeState::Clean | NodeState::Dirty)
-}
-
-/// T8-speculative-landings: such a landed node's edge refuses a delete the
-/// unbounded run makes. Up to it every difference was a speculative
-/// landing, so the edge is one of theirs; past it the runs hold different
-/// graphs, so the comparison of the case ends there, counted in
-/// [`SPECULATIVE_DELETES`].
-fn speculative_delete(op: &Op, want: &Out, got: &Out) -> bool {
-    matches!(
-        (op, want, got),
-        (Op::Delete(_), Out::Deleted(Ok(())), Out::Deleted(Err(e))) if e == "HasDependents"
-    )
-}
-
-static SPECULATIVE_DELETES: AtomicUsize = AtomicUsize::new(0);
-
 /// The nodes whose state, recorded deps or, with `with_groups`, cycle-group
-/// record differ between two snapshots, past the speculative landings.
-/// The two-thread oracle leaves groups out, so that a record alone never
-/// sends a phase's end to [`consistent`] in place of a matching order.
+/// record differ between two snapshots. The two-thread oracle leaves
+/// groups out, so that a record alone never sends a phase's end to
+/// [`consistent`] in place of a matching order.
 fn states_diff(want: &Snapshot, got: &Snapshot, with_groups: bool) -> Option<String> {
     let states: Vec<String> = (want.0.iter().zip(&got.0).enumerate())
-        .filter(|(_, (w, g))| w != g && !speculative_landing(**w, **g))
+        .filter(|(_, (w, g))| w != g)
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
         .collect();
     let deps: Vec<String> = (want.1.iter().zip(&got.1).enumerate())
-        .filter(|&(x, (w, g))| {
-            w != g && !(w.is_empty() && speculative_landing(want.2[x], got.2[x]))
-        })
+        .filter(|(_, (w, g))| w != g)
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
         .collect();
-    let groups: Vec<String> = (want.3.iter().zip(&got.3).enumerate())
-        .filter(|&(x, (w, g))| {
-            with_groups && w != g && !(w.is_empty() && speculative_landing(want.2[x], got.2[x]))
-        })
+    let groups: Vec<String> = (want.2.iter().zip(&got.2).enumerate())
+        .filter(|(_, (w, g))| with_groups && w != g)
         .map(|(x, (w, g))| format!("{x}: {w:?} for {g:?}"))
         .collect();
     (!states.is_empty() || !deps.is_empty() || !groups.is_empty()).then(|| {
@@ -2461,33 +2512,21 @@ fn states_diff(want: &Snapshot, got: &Snapshot, with_groups: bool) -> Option<Str
 
 #[test]
 fn states_diff_reports_group_records_off_the_two_thread_oracle() {
-    let snap = |state, group| -> Snapshot { (vec![], vec![vec![]], vec![state], vec![group]) };
-    let (want, got) = (
-        snap(NodeState::Clean, vec![(0, 1)]),
-        snap(NodeState::Clean, vec![]),
-    );
+    let snap = |group| -> Snapshot { (vec![], vec![vec![]], vec![group]) };
+    let (want, got) = (snap(vec![(0, 1)]), snap(vec![]));
     assert_eq!(
         states_diff(&want, &got, true).as_deref(),
         Some("states differ [], deps differ [], groups differ [0: [(0, 1)] for []]")
     );
     assert_eq!(states_diff(&want, &got, false), None);
-    let (want, got) = (
-        snap(NodeState::Clean, vec![]),
-        snap(NodeState::Clean, vec![(0, 1)]),
-    );
+    let (want, got) = (snap(vec![]), snap(vec![(0, 1)]));
     assert!(states_diff(&want, &got, true).is_some());
-    let (want, got) = (
-        snap(NodeState::New, vec![]),
-        snap(NodeState::Clean, vec![(0, 1)]),
-    );
-    assert_eq!(states_diff(&want, &got, true), None);
 }
 
 /// Panics, naming the case, at the first operation at which `got` differs
 /// from the unbounded run's `want`.
 fn compare(case: &Case, want: &Trace, got: &Trace, label: &str) {
     if let Some((i, what)) = first_diff(
-        case,
         want,
         got,
         None,
@@ -2543,12 +2582,12 @@ fn budget_label(seed: u64, frames: Option<u32>, bytes: usize) -> String {
 }
 
 fn differential<C: Cells>(case: &Case, seed: u64) {
-    let unbounded = labelled(&format!("seed {seed:#x}, unbounded"), || {
-        run::<C>(case, None, 0)
+    let (unbounded, native) = labelled(&format!("seed {seed:#x}, unbounded"), || {
+        run_counted::<C>(case, None, 0)
     });
     for (frames, bytes) in BUDGETS {
         let label = budget_label(seed, frames, bytes);
-        let mut bounded = labelled(&label, || run::<C>(case, frames, bytes));
+        let (mut bounded, runs) = labelled(&label, || run_counted::<C>(case, frames, bytes));
         // A forced revisit re-walks its entry, and a bounded run's retried
         // walks force it again at their own points, so only the outputs
         // are results.
@@ -2558,7 +2597,59 @@ fn differential<C: Cells>(case: &Case, seed: u64) {
             }
         }
         compare(case, &unbounded, &bounded, &label);
+        compare_native(&native, &runs, &label);
     }
+}
+
+/// [`run`], with the Native closure runs it started.
+fn run_counted<C: Cells>(
+    case: &Case,
+    frames: Option<u32>,
+    bytes: usize,
+) -> (Trace, Vec<NativeRun>) {
+    NATIVE.with(|n| *n.borrow_mut() = Some(Vec::new()));
+    let trace = catch_unwind(AssertUnwindSafe(|| run::<C>(case, frames, bytes)));
+    let runs = NATIVE.with(|n| n.borrow_mut().take()).unwrap_or_default();
+    match trace {
+        Ok(trace) => (trace, runs),
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+thread_local! {
+    /// Set by a test for [`compare_native`]'s full count on this thread.
+    static NATIVE_COUNT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Native runs by side, made order, revision and node: unbounded, bounded,
+/// and bounded speculative.
+type NativeCounts = HashMap<(usize, usize, u64, usize), (u32, u32, u32)>;
+
+/// Fails if a Native node runs speculatively more than once in a revision.
+/// With `REPLAY_NATIVE_COUNT` set, or [`NATIVE_COUNT`], also unless each
+/// runs in each revision as often as the unbounded run has it run, or once
+/// more where a speculative run reached it: retries under replay still
+/// rerun Native closures more often (T8-native-reruns-under-replay).
+fn compare_native(want: &[NativeRun], got: &[NativeRun], label: &str) {
+    let full = NATIVE_COUNT.with(std::cell::Cell::get)
+        || std::env::var_os("REPLAY_NATIVE_COUNT").is_some();
+    let mut counts: NativeCounts = HashMap::new();
+    for &(side, i, made, rev, _) in want {
+        counts.entry((side, made, rev, i)).or_default().0 += 1;
+    }
+    for &(side, i, made, rev, speculative) in got {
+        let c = counts.entry((side, made, rev, i)).or_default();
+        c.1 += 1;
+        c.2 += u32::from(speculative);
+    }
+    let mut off: Vec<_> = (counts.into_iter())
+        .filter(|&(_, (u, b, s))| s > 1 || full && (b < u || b > u + u32::from(s > 0)))
+        .collect();
+    off.sort_unstable();
+    assert!(
+        off.is_empty(),
+        "{label}: Native runs (side, made, revision, node): (unbounded, bounded, speculative) {off:?}"
+    );
 }
 
 /// The two-thread form: every phase schedule at every budget, unbounded
@@ -3346,13 +3437,13 @@ fn a_released_claim_takes_no_delivery_of_its_ended_run() {
     });
 }
 
-/// Seeds 0x6e3 and 0xdeb (and 0xd60, in [`strict_dirty_for_clean_seeds`]): a user panic in a ring releases members
+/// Seeds 0x6e3, 0xdeb and 0xd60: a user panic in a ring releases members
 /// whose doomed runs kept claim watermarks for their retries, and the
 /// members' next runs at those positions run fresh, taking none of them.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_released_member_takes_no_record_of_its_ended_run() {
-    for seed in [0x6e3, 0xdeb] {
+    for seed in [0x6e3, 0xdeb, 0xd60] {
         let case = gen_case(seed, false, false);
         quiet(|| {
             differential::<Local>(&case, seed);
@@ -3652,7 +3743,6 @@ fn two_thread_oracle_takes_either_order_of_a_read_pair() {
             let unbounded = run::<Shared>(&case, None, 0);
             let settles = in_order.settles();
             let (i, _) = first_diff(
-                &case,
                 &unbounded,
                 &got,
                 Some(&settles),
@@ -3890,18 +3980,19 @@ fn outcomes_alike<C: Cells>(case: &Case, seed: u64) {
     }
 }
 
-/// Seeds 0x833e (and 0x41eb, in [`strict_dirty_for_clean_seeds`]), one
-/// thread: a dropped chain truncates the virtual frame of a doomed episode
-/// member run whose failure count is still held, and releases the member
-/// with the discard landing. The count goes with the frame, since the
-/// member's next run there is a new one.
+/// Seeds 0x833e and 0x41eb, one thread: a dropped chain truncates the
+/// virtual frame of a doomed episode member run whose failure count is
+/// still held, and releases the member with the discard landing. The count
+/// goes with the frame, since the member's next run there is a new one.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_dropped_chain_takes_its_member_runs_failure_counts() {
     quiet(|| {
-        let case = gen_case(0x833e, false, false);
-        differential::<Local>(&case, 0x833e);
-        differential::<Shared>(&case, 0x833e);
+        for seed in [0x833e, 0x41eb] {
+            let case = gen_case(seed, false, false);
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        }
     });
 }
 
@@ -5316,6 +5407,7 @@ fn replay_seeds() {
         0xe7b,
         0xf41,
         0xfee,
+        0x1359,
         0x135a,
         0x114b,
         0x13b9,
@@ -5329,8 +5421,8 @@ fn replay_seeds() {
         0x22ef,
         0x271d,
         0x27d7,
+        0x2997,
         0x2bd9,
-        0x2cce,
         0x2d76,
         0x4654,
         0x518e,
@@ -5370,20 +5462,14 @@ fn replay_seeds() {
 }
 
 /// Seeds that differ under the strict comparator where the unbounded run
-/// leaves a node Dirty and the bounded run lands it Clean; 0xa5b and 0x1359
-/// return other outcomes too.
+/// leaves a node Dirty and the bounded run lands it Clean; 0xa5b returns
+/// other outcomes too.
 #[test]
 #[cfg_attr(miri, ignore)]
 #[ignore = "T8-strict-group-c-dirty-for-clean"]
 fn strict_dirty_for_clean_seeds() {
-    let cases = [0x41eb, 0xd60]
-        .map(|seed| (seed, gen_case(seed, false, false)))
-        .into_iter()
-        .chain(
-            [0xa5b, 0x1359, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d]
-                .map(|seed| (seed, gen_base(seed))),
-        );
-    for (seed, case) in cases {
+    for seed in [0xa5b, 0x0876_ebf0_5e41_2095, 0xa8cc_85b9_bbfd_657d] {
+        let case = gen_base(seed);
         quiet(|| {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);
@@ -5397,8 +5483,305 @@ fn strict_dirty_for_clean_seeds() {
 #[cfg_attr(miri, ignore)]
 #[ignore = "T8-strict-computed-left-new"]
 fn strict_computed_left_new_seeds() {
-    for seed in [0x2997, 0xd4f2] {
+    let case = gen_base(0xd4f2);
+    quiet(|| {
+        differential::<Local>(&case, 0xd4f2);
+        differential::<Shared>(&case, 0xd4f2);
+    });
+}
+
+/// 0x2cce: a bounded run returns a value where the unbounded run meets a
+/// cycle, which the stale-read rule excuses, and lands Clean a node the
+/// unbounded run leaves New, which it does not.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn strict_cycle_outcome_state_seed() {
+    let case = gen_base(0x2cce);
+    quiet(|| {
+        differential::<Local>(&case, 0x2cce);
+        differential::<Shared>(&case, 0x2cce);
+    });
+}
+
+/// At budget 1 node 0's read of 1 dooms, so its doomed run takes the
+/// placeholder's branch to the Native 2, which only that speculative run
+/// computes, over input 3. 3 is deleted and recreated, so the `Get(2)`
+/// discards the stash for its old generation and runs 2 again: 2 has
+/// landed nothing, so that run takes `FirstLanded`'s first branch, as 2's
+/// only unbounded run does.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_discarded_stash_leaves_the_next_run_first() {
+    let query = |expr, replay| Spec::Query {
+        expr,
+        replay,
+        bare: false,
+        strategy: Strat::None,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let case = Case {
+        specs: vec![
+            query(Expr::If(read(1), read(2), Box::new(Expr::Const(3))), true),
+            query(Expr::Const(5), false),
+            query(
+                Expr::FirstLanded(
+                    read(3),
+                    Box::new(Expr::Add(read(3), Box::new(Expr::Const(1)))),
+                ),
+                false,
+            ),
+            Spec::Input(2),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 3,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![
+            Op::Get(0),
+            Op::Delete(3),
+            Op::Recreate(3, Spec::Input(4)),
+            Op::Get(2),
+        ],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0);
+        differential::<Shared>(&case, 0);
+    });
+}
+
+/// The set of 11 leaves 4..=8 Dirty and the `Get(8)` settles 8 with its
+/// old value, so 4..=7 verify. At budget 1 0's read of 1 dooms, and 1's
+/// doomed run reads the placeholder for 10 and takes the branch to 2,
+/// which only that speculative run reads: its walk verifies 7..=4, which
+/// the unbounded run never reads and leaves Dirty.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_speculative_walk_verify_lands_nothing() {
+    let query = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let read = |n| Box::new(Expr::Read(n, false));
+    let zero = || Box::new(Expr::Const(0));
+    let case = Case {
+        specs: vec![
+            query(Expr::Read(1, false), true, false),
+            query(Expr::If(read(10), read(2), zero()), true, false),
+            query(Expr::Read(3, false), true, false),
+            query(Expr::Read(4, false), true, false),
+            query(Expr::Read(5, false), false, false),
+            query(Expr::Read(6, false), true, false),
+            query(Expr::Read(7, true), true, true),
+            query(Expr::Read(8, false), false, false),
+            query(Expr::If(read(9), zero(), zero()), true, false),
+            query(Expr::Read(11, true), true, true),
+            query(Expr::Const(1), true, false),
+            Spec::Input(2),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 11,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(4), Op::Set(11, 3), Op::Get(8), Op::Get(0)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0);
+        differential::<Shared>(&case, 0);
+    });
+}
+
+/// After the sets 5 is back at 2, so the `Get(0)` recomputes 4 to its
+/// old value and the Native 3 verifies, as the unbounded run's walk does.
+/// At budget 1 0's try-read of 1 dooms, and the speculative run's
+/// recompute of 4 is stashed rather than landed: 3's verify must still
+/// count it unchanged, or 3's closure runs where the unbounded run's
+/// never does.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_speculative_recompute_to_the_same_value_keeps_its_reader_verified() {
+    let query = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let case = Case {
+        specs: vec![
+            query(
+                Expr::Add(
+                    Box::new(Expr::Read(2, false)),
+                    Box::new(Expr::Read(1, true)),
+                ),
+                true,
+                false,
+            ),
+            query(Expr::Read(3, false), false, false),
+            query(Expr::Const(0), true, false),
+            query(
+                Expr::FirstLanded(Box::new(Expr::Read(4, true)), Box::new(Expr::Const(0))),
+                false,
+                false,
+            ),
+            query(Expr::Read(5, false), true, true),
+            Spec::Input(2),
+        ],
+        panics: false,
+        cycles: false,
+        queries: 5,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(1), Op::Set(5, 1), Op::Set(5, 2), Op::Get(0)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0);
+        differential::<Shared>(&case, 0);
+    });
+}
+
+/// Seeds whose Native closures run more often in a revision under replay
+/// than unbounded, by retries rather than speculative runs, run with
+/// [`compare_native`]'s full count; the base seeds are from
+/// [`replay_seeds`], and 0x88f7 is
+/// [`wave8_seed_88f7_released_claims_replay_as_unbounded`].
+#[test]
+#[cfg_attr(miri, ignore)]
+#[ignore = "T8-native-reruns-under-replay"]
+fn native_reruns_under_replay_seeds() {
+    NATIVE_COUNT.with(|c| c.set(true));
+    let mut failed: Vec<u64> = [
+        0x597,
+        0x934,
+        0xbc2,
+        0x2997,
+        0x4654,
+        0x0001_2b74,
+        0x00e8_d4a5_33fa,
+        0x551d_e2c5_404a_84b1,
+    ]
+    .into_iter()
+    .filter(|&seed| {
         let case = gen_base(seed);
+        catch_unwind(AssertUnwindSafe(|| {
+            quiet(|| {
+                differential::<Local>(&case, seed);
+                differential::<Shared>(&case, seed);
+            })
+        }))
+        .is_err()
+    })
+    .collect();
+    if catch_unwind(wave8_seed_88f7_released_claims_replay_as_unbounded).is_err() {
+        failed.push(0x88f7);
+    }
+    NATIVE_COUNT.with(|c| c.set(false));
+    assert!(failed.is_empty(), "{failed:x?}");
+}
+
+/// Seeds whose speculative continuations landed nodes Clean that the
+/// unbounded run leaves New, so a later read verified a node the unbounded
+/// run computes fresh and left it or its readers Dirty, Clean or New where
+/// the unbounded run does not. In 0x5ef, `Get(4)`'s speculative entry ran
+/// 13, 14 and 17 to 20; after `Set(22, 3)`, `Get(14)` verified the landed
+/// 14 and recomputed 17 to 21, landing 21 Clean over four reads of its
+/// inputs where the unbounded run leaves it Dirty over five. In 0xc94 a
+/// doomed run's speculative walk computes 6 and 5 and must not land them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_landings_verified_later_seeds() {
+    for seed in [
+        0x5ef,
+        0xc94,
+        0x0092_b175_7f47,
+        0x0092_b175_7fd1,
+        0x0092_b175_809c,
+        0x0092_b175_80bf,
+        0x0092_b175_8185,
+        0x0092_b175_8232,
+        0x0092_b175_83b5,
+        0x0092_b175_8415,
+        0x0092_b175_846e,
+        0x0092_b175_86ba,
+        0x0092_b175_86bf,
+        0x0092_b175_86d9,
+        0x0092_b175_8821,
+        0x0092_b175_8ad1,
+        0x0092_b175_8ad2,
+    ] {
+        let case = gen_case(seed, false, false);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
+/// Paired cases (`REPLAY_PAIRED`) whose speculative runs landed nodes the
+/// unbounded run leaves New or Dirty, by a compute or a walk's verify.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_landings_paired_seeds() {
+    for seed in [
+        0x16c,
+        0x1b1,
+        0x1d8,
+        0x1e6,
+        0x268,
+        0x2c2,
+        0x2e4,
+        0x349,
+        0x3a3,
+        0x565,
+        0x57a,
+        0x5ef,
+        0x784,
+        0x7bd,
+        0x7dd,
+        0x833,
+        0x837,
+        0x9dd,
+        0xb77,
+        0x3661_47ff,
+        0x3661_487d,
+        0x3661_490b,
+        0x3661_490e,
+        0x3661_4a16,
+        0x3661_4a3d,
+        0x3661_4a69,
+        0x3661_4a78,
+        0x3661_4b0b,
+        0x3661_4b3b,
+        0x3661_4b5a,
+        0x3661_4d27,
+        0x3661_4da1,
+        0x3661_4e1d,
+        0x3661_4e63,
+        0x3661_4f23,
+        0x3661_502f,
+        0x3661_50eb,
+        0x3661_511e,
+        0x3661_5142,
+        0x3661_52a5,
+        0x3661_52af,
+    ] {
+        let case = gen_case(seed, false, true);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
+/// [`gen_first_runs`] cases whose speculative recomputes to a node's own
+/// value made a Native reader run where the unbounded run verifies it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn speculative_recompute_first_landed_seeds() {
+    for seed in [0xacb, 0x3661_48a8, 0x3661_491a] {
+        let case = gen_first_runs(seed, false, false);
         quiet(|| {
             differential::<Local>(&case, seed);
             differential::<Shared>(&case, seed);
@@ -5601,7 +5984,6 @@ fn high_range_clean_read_delivery_seeds() {
 /// value.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T8-speculative-landings"]
 fn speculative_landing_seeds() {
     let case = gen_case(0xa02, true, false);
     quiet(|| {
@@ -5708,13 +6090,20 @@ fn two_threads() -> bool {
     std::env::var_os("REPLAY_TWO").is_some()
 }
 
-/// The case for `seed`, the base one if `REPLAY_BASE` is set, with a
-/// second runtime if `REPLAY_CROSS` is, and the two-thread form of the
-/// case if `REPLAY_TWO` or `REPLAY_PAIRED` is: `REPLAY_PAIRED` alone runs
-/// that case through the single-thread differential.
+/// The case for `seed`, the base one if `REPLAY_BASE` is set, else with
+/// Native `FirstLanded` nodes if `REPLAY_FIRST` is, with a second runtime
+/// if `REPLAY_CROSS` is, and the two-thread form of the case if
+/// `REPLAY_TWO` or `REPLAY_PAIRED` is: `REPLAY_PAIRED` alone runs that
+/// case through the single-thread differential.
 fn case_of(seed: u64) -> Case {
     if std::env::var_os("REPLAY_BASE").is_some() {
         gen_base(seed)
+    } else if std::env::var_os("REPLAY_FIRST").is_some() {
+        gen_first_runs(
+            seed,
+            std::env::var_os("REPLAY_CROSS").is_some(),
+            two_threads() || std::env::var_os("REPLAY_PAIRED").is_some(),
+        )
     } else {
         gen_case(
             seed,
@@ -5800,7 +6189,9 @@ fn has_first_run(e: &Expr) -> bool {
     match e {
         Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => false,
         Expr::FirstRun(..) => true,
-        Expr::Add(a, b) => has_first_run(a) || has_first_run(b),
+        // A run that lands nothing leaves `FirstLanded` on its first branch,
+        // so a doomed run's retry reads as it did.
+        Expr::Add(a, b) | Expr::FirstLanded(a, b) => has_first_run(a) || has_first_run(b),
         Expr::If(a, b, c) => has_first_run(a) || has_first_run(b) || has_first_run(c),
         Expr::PanicIf(a, _) | Expr::Catch(a) => has_first_run(a),
     }
@@ -5809,7 +6200,7 @@ fn has_first_run(e: &Expr) -> bool {
 fn size(e: &Expr) -> usize {
     match e {
         Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => 1,
-        Expr::Add(a, b) | Expr::FirstRun(a, b) => 1 + size(a) + size(b),
+        Expr::Add(a, b) | Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => 1 + size(a) + size(b),
         Expr::If(a, b, c) => 1 + size(a) + size(b) + size(c),
         Expr::PanicIf(a, _) | Expr::Catch(a) => 1 + size(a),
     }
@@ -5876,10 +6267,6 @@ fn scan(seeds: impl Iterator<Item = u64>, all: bool, check: impl Fn(u64)) {
         }
     });
     eprintln!("smallest failing: {best:?}");
-    eprintln!(
-        "comparisons ended at a delete a speculative landing refused: {}",
-        SPECULATIVE_DELETES.load(Relaxed)
-    );
     if let Some((_, smallest)) = best {
         let skipped = if all {
             ""
@@ -5916,7 +6303,9 @@ fn reads_any(e: &Expr, hit: &impl Fn(usize) -> bool) -> bool {
     match e {
         Expr::Const(_) | Expr::ReadOther(..) => false,
         Expr::Read(target, _) => hit(*target),
-        Expr::Add(a, b) | Expr::FirstRun(a, b) => reads_any(a, hit) || reads_any(b, hit),
+        Expr::Add(a, b) | Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
+            reads_any(a, hit) || reads_any(b, hit)
+        }
         Expr::If(c, a, b) => reads_any(c, hit) || reads_any(a, hit) || reads_any(b, hit),
         Expr::PanicIf(inner, _) | Expr::Catch(inner) => reads_any(inner, hit),
     }
@@ -6407,7 +6796,6 @@ fn review_8b_stand_in_unsettled_landing_computes_no_extra_node() {
 /// [5, 7, 10, 11, 17]. Landing it Dirty passes at every budget.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T8-speculative-landings: a discarded speculative write lands its node New"]
 fn review_8b_stand_in_unsettled_landing_reads_as_unbounded() {
     use Expr::{Add, Catch, Const, If, Read};
     let b = Box::new;
@@ -6833,6 +7221,19 @@ fn shrink_expr(e: &Expr) -> Vec<Expr> {
                     .map(|y| Expr::FirstRun(b(x), Box::new(y))),
             );
         }
+        Expr::FirstLanded(x, y) => {
+            out.extend([(**x).clone(), (**y).clone()]);
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::FirstLanded(Box::new(x), b(y))),
+            );
+            out.extend(
+                shrink_expr(y)
+                    .into_iter()
+                    .map(|y| Expr::FirstLanded(b(x), Box::new(y))),
+            );
+        }
     }
     out
 }
@@ -7041,6 +7442,89 @@ fn a_finished_runs_delivery_is_not_read_by_a_later_run_at_its_position() {
             [&want, &want],
             "budget 3, Local then Shared"
         );
+    });
+}
+
+/// Seed 0xd27d, shrunk by `replay_shrink`. 13 and 19 are fixpoints on a
+/// ring through 14, 15, 16, 17 and 18, which 15's read of 3 joins to the
+/// ring 4, 5, 6. Unbounded, `Get(19)` after `Get(15)` lands 17 and 18
+/// Failed and gives 9999; at a budget of 1 the bounded run leaves them
+/// Dirty and gives 0.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_caught_ring_panic_lands_failed_at_every_budget() {
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let c = |v| Box::new(Expr::Const(v));
+    let q = |expr, replay, bare, strategy| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy,
+    };
+    let zero = |replay, bare| q(Expr::Const(0), replay, bare, Strat::None);
+    let specs = vec![
+        zero(true, true),
+        zero(false, false),
+        zero(true, false),
+        replayable(Expr::Read(4, false), Strat::None),
+        replayable(
+            Expr::Read(5, true),
+            Strat::Fixpoint {
+                initial: 3,
+                limit: 1,
+            },
+        ),
+        replayable(Expr::If(r(6, false), c(0), r(5, false)), Strat::None),
+        q(Expr::If(r(13, true), c(1), c(0)), true, true, Strat::None),
+        zero(true, false),
+        zero(true, false),
+        zero(true, false),
+        zero(false, false),
+        zero(true, false),
+        zero(false, false),
+        replayable(
+            Expr::Read(14, false),
+            Strat::Fixpoint {
+                initial: 4,
+                limit: 2,
+            },
+        ),
+        q(Expr::Read(15, true), true, true, Strat::None),
+        replayable(
+            Expr::If(r(3, false), r(16, false), r(16, false)),
+            Strat::None,
+        ),
+        q(
+            Expr::Catch(Box::new(Expr::If(r(17, false), c(0), c(0)))),
+            false,
+            false,
+            Strat::None,
+        ),
+        replayable(Expr::Read(18, true), Strat::None),
+        replayable(Expr::PanicIf(r(19, false), 0), Strat::Fallback(1)),
+        replayable(
+            Expr::Read(13, false),
+            Strat::Fixpoint {
+                initial: 4,
+                limit: 2,
+            },
+        ),
+        zero(true, false),
+        zero(true, false),
+        Spec::Input(2),
+    ];
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 22,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::Get(15), Op::Get(19)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0xd27d);
+        differential::<Shared>(&case, 0xd27d);
     });
 }
 
