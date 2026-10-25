@@ -1065,8 +1065,9 @@ fn failed_member_cured_through_a_recorded_dep<C: Cells>() {
     rt.assert_invariant_i();
 }
 
-/// The cycle forms inside root x's own frame, which panics: x lands
-/// Failed through its compute's panic path, over the member y it read.
+/// Once j is 0, y reads x and closes a cycle inside root x's own frame:
+/// the read reports it and leaves x and y Dirty, as main does, and setting
+/// j back lets x recompute.
 fn failed_frame_node_over_its_released_member<C: Cells>() {
     let rt = Runtime::<C>::new();
     let j = rt.create_input(1_i64);
@@ -1091,13 +1092,21 @@ fn failed_frame_node_over_its_released_member<C: Cells>() {
 
     rt.set(j, 0);
     let err = quiet(|| rt.get(x)).unwrap_err();
-    assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
-    assert_eq!(rt.state_of(x), NodeState::Failed);
+    assert!(is_cycle(&*err, "1, 2"));
+    assert_eq!(rt.state_of(x), NodeState::Dirty);
+    assert_eq!(rt.state_of(y), NodeState::Dirty);
 
     rt.set(j, 1);
-    assert_ne!(rt.state_of(x), NodeState::Failed);
     assert_eq!(quiet(|| rt.get(x)).ok(), Some(2));
+    assert_eq!(rt.state_of(x), NodeState::Clean);
+    assert_eq!(rt.state_of(y), NodeState::Clean);
     rt.assert_invariant_i();
+}
+
+/// Whether `err` is the depth-0 cycle panic naming exactly `participants`.
+fn is_cycle(err: &(dyn std::any::Any + Send), participants: &str) -> bool {
+    err.downcast_ref::<String>()
+        .is_some_and(|m| m.ends_with(&format!("dependency cycle: {participants}")))
 }
 
 /// An `i64` whose compare panics only between 3 and 6.
