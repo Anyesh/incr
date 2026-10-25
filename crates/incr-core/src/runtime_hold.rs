@@ -95,7 +95,8 @@ impl<C: Cells> Runtime<C> {
     /// the node already has an entry, if it was decided by reading a held
     /// landing since the claim, or if a cut kept the claim; `None` lets it
     /// land. A wound's unwind lands nothing before the records the attempt
-    /// replaced are back ([`hold::take_recs`]), whichever runtime raised it.
+    /// replaced are back ([`hold::take_recs`]), whichever runtime raised
+    /// it, so a cut's claim then lands unrun under its old record.
     #[cold]
     #[inline(never)]
     pub(super) fn held_landing(
@@ -114,9 +115,9 @@ impl<C: Cells> Runtime<C> {
             if !hold::consulted() && !hold::cut_kept(self.runtime_id, id.0) {
                 return None;
             }
-            // Only a verify, an unrun release, or a cut claim's landing off
-            // its rerun lands without opening an entry first; a release to
-            // New is of a claim from New.
+            // Only a verify or an unrun release lands without opening an
+            // entry first, and a release to New is of a claim from New; a
+            // cut's claim off its rerun takes its origin from the cut.
             let first = target == NodeState::New;
             let own = hold::open(
                 cell,

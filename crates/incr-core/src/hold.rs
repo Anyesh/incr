@@ -28,7 +28,8 @@ use crate::value_code;
 #[derive(Default)]
 pub(crate) struct Undo {
     /// The claim came from `New`, or a cut kept it after it wrote its
-    /// slot, so a retraction lands it `New`.
+    /// slot, so a retraction lands it `New`; a cut's claim takes this from
+    /// the cut, not from the landing.
     pub(crate) first: bool,
     /// The displaced value, boxed as the arena boxes it; `Some(None)`
     /// for a slot that was empty.
@@ -97,9 +98,9 @@ struct CutRec {
     rt: RuntimeId,
     slot: u32,
     rec: Option<Arc<GroupInfo>>,
-    /// The claim wrote its slot before the cut, so a retraction lands it
-    /// `New`, as a discard landing does.
-    wrote: bool,
+    /// The claim came from `New` or wrote its slot before the cut, so a
+    /// retraction lands it `New`, as a discard landing does.
+    lands_new: bool,
 }
 
 impl HoldSet {
@@ -227,7 +228,7 @@ pub(crate) fn open(
             children: None,
             trace: Vec::new(),
             undo: Undo {
-                first: first || cut.as_ref().is_some_and(|c| c.wrote),
+                first: cut.as_ref().map_or(first, |c| c.lands_new),
                 value: kept,
                 verified_at,
                 deps: None,
@@ -352,7 +353,7 @@ pub(crate) fn forget(cell: usize) -> Option<Held> {
 /// `Shared` the claim's landing is held ([`cut_kept`]), so that a
 /// retraction puts the whole group back, and a wound puts the record back
 /// before its unwind lands anything ([`take_recs`]).
-pub(crate) fn keep_cut_rec(rt: RuntimeId, slot: u32, rec: Option<Arc<GroupInfo>>, wrote: bool) {
+pub(crate) fn keep_cut_rec(rt: RuntimeId, slot: u32, rec: Option<Arc<GroupInfo>>, lands_new: bool) {
     value_code::set_held_bit(true);
     with(|h| {
         if !h.cut_recs.iter().any(|c| c.rt == rt && c.slot == slot) {
@@ -360,7 +361,7 @@ pub(crate) fn keep_cut_rec(rt: RuntimeId, slot: u32, rec: Option<Arc<GroupInfo>>
                 rt,
                 slot,
                 rec,
-                wrote,
+                lands_new,
             });
             h.note_recs(rt);
         }

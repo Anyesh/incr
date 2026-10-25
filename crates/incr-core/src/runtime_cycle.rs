@@ -483,6 +483,8 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     pub(super) fn raise_wound(&self) -> ! {
+        // `held_landing` does this at the first landing too; here it also
+        // covers what the unwind decides from records before it lands.
         if !C::SINGLE_THREADED && hold::active() {
             self.retract_held_records();
         }
@@ -1819,10 +1821,11 @@ impl<C: Cells> Runtime<C> {
             if C::u8_load_relaxed(flags) & IN_GROUP != 0 && self.names_departed(m) {
                 if !C::SINGLE_THREADED && !hold::holds(state::cell_key::<C>(node.state_cell())) {
                     let rt = self.runtime_id;
-                    let wrote =
-                        cycle_state::with_held(|h| h.get(&(rt, m)).is_some_and(|e| e.wrote));
+                    let lands_new = cycle_state::with_held(|h| {
+                        h.get(&(rt, m)).is_some_and(|e| e.first || e.wrote)
+                    });
                     let rec = self.inner.read().member_recs.get(&m).cloned();
-                    hold::keep_cut_rec(rt, m, rec, wrote);
+                    hold::keep_cut_rec(rt, m, rec, lands_new);
                 }
                 self.leave_group(NodeId(m), node, flags, NodeState::Dirty);
             }
