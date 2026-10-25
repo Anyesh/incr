@@ -20,7 +20,7 @@ use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
-use crate::{reserve, set_stack, waits};
+use crate::{hold, reserve, set_stack, waits};
 
 /// What a compute attempt carries into its landings.
 #[derive(Copy, Clone)]
@@ -360,7 +360,12 @@ impl<C: Cells> Runtime<C> {
                 replay::reset();
             }
             match catch_unwind(AssertUnwindSafe(&mut *f)) {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    if outermost && !C::SINGLE_THREADED && hold::active() {
+                        self.publish_held();
+                    }
+                    return Ok(r);
+                }
                 Err(payload) => {
                     if let Some(cycle) = self.caught(outermost, kind, payload) {
                         return Err(cycle);
@@ -393,6 +398,11 @@ impl<C: Cells> Runtime<C> {
             cycle_state::take_unwind_kind();
             cycle_state::set_wounded(false);
             drop(payload);
+            // The winner may wait on a held landing: nothing the attempt
+            // landed stays, in any order.
+            if !C::SINGLE_THREADED && hold::active() {
+                self.retract_held();
+            }
             debug_assert!(
                 cycle_state::held_keys().is_empty(),
                 "incr-core: a wounded thread waits for its winner holding claims"
@@ -406,6 +416,11 @@ impl<C: Cells> Runtime<C> {
             );
             self.await_winner();
             return None;
+        }
+        // Any other unwind out of the outermost entry ends the attempt as
+        // its read's outcome, which every landing it made is part of.
+        if outermost && !C::SINGLE_THREADED && hold::active() {
+            self.publish_held();
         }
         match cycle_state::take_unwind_kind() {
             Some(UnwindKind::Cycle) => {
@@ -493,6 +508,11 @@ impl<C: Cells> Runtime<C> {
         });
         holds.extend(also.map(|x| (self.runtime_id, x.0)));
         holds.extend(cycle_state::held_keys());
+        holds.extend(
+            hold::keys(self.runtime_id)
+                .into_iter()
+                .map(|s| (self.runtime_id, s)),
+        );
         holds.extend(set_stack::claims());
         holds.extend(
             reserve::held()
@@ -1792,6 +1812,11 @@ impl<C: Cells> Runtime<C> {
             }
             let entry = cycle_state::with_held(|h| h.remove(&(rt, m)));
             if let Some(e) = entry {
+                // A cut is an exposure: its released members stay Computing to
+                // other threads until the attempt ends (`crate::hold`).
+                if !C::SINGLE_THREADED {
+                    self.open_hold(NodeId(m), self.nodes.get(m), e.first, bag);
+                }
                 self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
                 bag.push_erased(Box::new(e.into_values()));
             }
@@ -2207,12 +2232,6 @@ impl<C: Cells> Runtime<C> {
             verify_rev,
             mut entries,
         } = landing;
-        if !C::SINGLE_THREADED {
-            // Before the members land, so that a read of one of their
-            // landings also reads the count.
-            cycle_state::own_episode(self.runtime_id);
-            C::u64_fetch_add(&self.episodes_landed, 1);
-        }
 
         // Step 2: validate, install and record the group under one hold.
         let mut inner = self.inner.write();
@@ -2224,6 +2243,12 @@ impl<C: Cells> Runtime<C> {
         });
         if stale {
             drop(inner);
+            if !C::SINGLE_THREADED {
+                // Before the members land, so that a read of one of their
+                // landings also reads the count.
+                cycle_state::own_episode(self.runtime_id);
+                C::u64_fetch_add(&self.episodes_landed, 1);
+            }
             for (m, e) in entries {
                 let (node, flags) = self.nodes.get_with_flags(m);
                 if e.first {
@@ -2236,6 +2261,14 @@ impl<C: Cells> Runtime<C> {
                 bag.push_erased(Box::new(e.into_values()));
             }
             return PopEnd::Retry;
+        }
+        // Under Shared the episode is held until the attempt ends
+        // (`crate::hold`), which counts it then.
+        if !C::SINGLE_THREADED {
+            hold::note_episode(self.runtime_id);
+            for (m, e) in &entries {
+                self.open_hold(NodeId(*m), self.nodes.get(*m), e.first, bag);
+            }
         }
         let mut superseded = false;
         for (m, e) in &entries {
@@ -2250,6 +2283,17 @@ impl<C: Cells> Runtime<C> {
                     && !self.observed_clean(*d, verify_rev)
             });
             if old != new {
+                if !C::SINGLE_THREADED {
+                    hold::keep_deps(state::cell_key::<C>(node.state_cell()), || {
+                        old.iter()
+                            .map(|d| (*d, self.nodes.get(d.0).generation()))
+                            .collect()
+                    });
+                    if let Some(displaced) = node.install_deps(new) {
+                        bag.push_dep_list(displaced);
+                    }
+                    continue;
+                }
                 if let Some(displaced) = node.install_deps(new) {
                     bag.push_dep_list(displaced);
                 }
@@ -2270,8 +2314,12 @@ impl<C: Cells> Runtime<C> {
             cycle,
         });
         for (m, _) in &entries {
-            inner.member_recs.insert(*m, group.clone());
-            let flags = self.nodes.get_with_flags(*m).1;
+            let (node, flags) = self.nodes.get_with_flags(*m);
+            let old = inner.member_recs.insert(*m, group.clone());
+            if !C::SINGLE_THREADED {
+                let in_group = C::u8_load_relaxed(flags) & IN_GROUP != 0;
+                hold::keep_rec(state::cell_key::<C>(node.state_cell()), old, in_group);
+            }
             C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
         }
         drop(inner);
@@ -2282,8 +2330,17 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(m);
             let arena = self.arenas.erased(node.type_tag());
             if cu.binary_search(&m).is_ok() {
-                if let Some(old) = arena.clear_value(node.arena_slot()) {
+                let old = arena.clear_value(node.arena_slot());
+                let wrote = old.is_some();
+                let old = if C::SINGLE_THREADED {
+                    old
+                } else {
+                    hold::keep_value(state::cell_key::<C>(node.state_cell()), old)
+                };
+                if let Some(old) = old {
                     bag.push_erased(old);
+                }
+                if wrote {
                     entries[i].1.wrote = true;
                 }
                 node.max_changed_at(stamp_rev);
@@ -2304,6 +2361,13 @@ impl<C: Cells> Runtime<C> {
                             node.max_changed_at(stamp_rev);
                             e.changed = true;
                         }
+                        // An equal value hands back the rejected one, which
+                        // is not what the slot held.
+                        let displaced = if C::SINGLE_THREADED || !(changed || first) {
+                            displaced
+                        } else {
+                            hold::keep_value(state::cell_key::<C>(node.state_cell()), displaced)
+                        };
                         if let Some(d) = displaced {
                             bag.push_erased(d);
                         }

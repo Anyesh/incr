@@ -308,8 +308,9 @@ impl<C: Cells> Runtime<C> {
             && !ctl.has(cycle::DOOMED)
             && (ctl.flags.get() & (cycle::POISONED | cycle::KEPT_READ) != 0
                 || deps.iter().any(|&(d, generation)| {
+                    let cell = self.nodes.get(d.0).state_cell();
                     !matches!(
-                        state::load::<C>(self.nodes.get(d.0).state_cell()),
+                        self.seen(cell, state::load::<C>(cell)),
                         NodeState::Clean | NodeState::Cyclic
                     ) && !self.stashed(d.0, generation, false)
                 })
@@ -1435,7 +1436,8 @@ impl<C: Cells> Runtime<C> {
         let top = f.cidx.max(self.dep_stack.next_cidx().wrapping_sub(1));
         let mut spins = 0;
         loop {
-            match state::load::<C>(self.nodes.get(slot).state_cell()) {
+            let cell = self.nodes.get(slot).state_cell();
+            match self.seen(cell, state::load::<C>(cell)) {
                 NodeState::New
                 | NodeState::Dirty
                 | NodeState::Computing
@@ -1518,7 +1520,7 @@ impl<C: Cells> Runtime<C> {
                     let node = self.nodes.get(v.node);
                     node.generation() != v.generation
                         || matches!(
-                            state::load::<C>(node.state_cell()),
+                            self.seen(node.state_cell(), state::load::<C>(node.state_cell())),
                             NodeState::Clean
                                 | NodeState::Cyclic
                                 | NodeState::Failed
@@ -1807,7 +1809,8 @@ impl<C: Cells> Runtime<C> {
         let placeholder = self.placeholder::<T>()?;
         let rt = self.runtime_id;
         let slot = handle.slot();
-        if state::load::<C>(self.nodes.get(slot).state_cell()) == NodeState::Clean {
+        let cell = self.nodes.get(slot).state_cell();
+        if self.seen(cell, state::load::<C>(cell)) == NodeState::Clean {
             return None;
         }
         // SAFETY: the active frame's control block is live.
@@ -2881,7 +2884,7 @@ impl<C: Cells> Runtime<C> {
                 let retried = v.ep.is_none()
                     && node.generation() == v.generation
                     && matches!(
-                        state::load::<C>(node.state_cell()),
+                        self.seen(node.state_cell(), state::load::<C>(node.state_cell())),
                         NodeState::New | NodeState::Dirty
                     );
                 self.note_ancestor(&v);
@@ -3196,7 +3199,7 @@ impl<C: Cells> Runtime<C> {
         if node.generation() != v.generation {
             return false;
         }
-        match state::load::<C>(node.state_cell()) {
+        match self.seen(node.state_cell(), state::load::<C>(node.state_cell())) {
             NodeState::New | NodeState::Dirty => true,
             NodeState::Computing | NodeState::ComputingDirty => {
                 cycle_state::holds(self.runtime_id, v.node) || self.given_back(v)
@@ -3219,7 +3222,7 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(v.node);
         let mut spins = 0;
         loop {
-            let observed = state::load::<C>(node.state_cell());
+            let observed = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
             // After the load: a recycled slot's occupant is no claim of
             // the reserved node.
             if node.generation() != v.generation {
@@ -3464,8 +3467,9 @@ impl<C: Cells> Runtime<C> {
         self.look_held(slot, Look::here_or(spec), |e| {
             e.poisoned()
                 || e.last().iter().any(|&(d, _)| {
+                    let cell = self.nodes.get(d.0).state_cell();
                     !matches!(
-                        state::load::<C>(self.nodes.get(d.0).state_cell()),
+                        self.seen(cell, state::load::<C>(cell)),
                         NodeState::Clean | NodeState::Cyclic
                     )
                 })
@@ -4245,7 +4249,8 @@ impl<C: Cells> Runtime<C> {
     /// A walk stopped short of its root drops the node's other entries if
     /// the compute left it `unsettled`, as `walk_stopped` does.
     fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32, unsettled: bool) {
-        let state = state::load::<C>(self.nodes.get(node).state_cell());
+        let cell = self.nodes.get(node).state_cell();
+        let state = self.seen(cell, state::load::<C>(cell));
         let reading = u64::from(node) | (u64::from(generation) << 32);
         let what = match state {
             NodeState::Dirty => self
@@ -4347,7 +4352,8 @@ impl<C: Cells> Runtime<C> {
     /// with virtual frames.
     fn ensure_clean_virt(&self, id: NodeId, gen: u32) -> Computed {
         let word = value_code::checked_word();
-        let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
+        let cell = self.nodes.get(id.0).state_cell();
+        let observed = self.seen(cell, state::load::<C>(cell));
         if observed == NodeState::Clean {
             return Computed::Done;
         }

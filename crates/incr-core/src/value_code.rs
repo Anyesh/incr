@@ -46,11 +46,15 @@ pub(crate) const KEPT_BIT: u64 = 1 << 58;
 /// recording the read until its cold path clears it.
 pub(crate) const FOREIGN_BIT: u64 = 1 << 57;
 
+/// Set while this thread holds landings (`hold`), so that a frame pop
+/// passes a frame's `HOLD` to its reader with the load it already makes.
+pub(crate) const HELD_BIT: u64 = 1 << 56;
+
 /// The value-code counter's bits. Check sites test `word & COUNTER_MASK`,
 /// so a live memo, unwind kind, replay context or note never trips the
 /// contract panic.
 pub(crate) const COUNTER_MASK: u64 =
-    !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT | NOTES_BIT | KEPT_BIT | FOREIGN_BIT);
+    !(MEMO_BIT | UNWIND_MASK | REPLAY_BIT | NOTES_BIT | KEPT_BIT | FOREIGN_BIT | HELD_BIT);
 
 pub(crate) const CONTRACT_MESSAGE: &str = "value and key methods must not call into the runtime";
 
@@ -75,6 +79,17 @@ pub(crate) fn set_memo_bit() {
 
 pub(crate) fn clear_memo_bit() {
     THREAD_WORD.with(|w| w.set(w.get() & !MEMO_BIT));
+}
+
+pub(crate) fn set_held_bit(held: bool) {
+    THREAD_WORD.with(|w| {
+        let word = w.get();
+        w.set(if held {
+            word | HELD_BIT
+        } else {
+            word & !HELD_BIT
+        });
+    });
 }
 
 pub(crate) fn set_foreign_bit() {

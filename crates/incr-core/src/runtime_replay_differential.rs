@@ -4223,7 +4223,6 @@ fn until(done: impl Fn() -> bool) {
 /// instead and no wound need happen.
 #[test]
 #[cfg_attr(miri, ignore)]
-#[ignore = "T10-two-527-failed-read-escapes: an unfinished attempt's nested-episode landings stay public until Variant V holds them (T8-44e3-clean-landing-variant)"]
 fn two_thread_read_builds_on_no_unfinished_attempts_nested_episode() {
     crate::child_test::run_in_child(
         "runtime::replay_differential::two_thread_read_builds_on_no_unfinished_attempts_nested_episode",

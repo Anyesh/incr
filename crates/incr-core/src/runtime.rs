@@ -38,6 +38,7 @@ use crate::dependent_list::DependentList;
 use crate::fx::FxBuildHasher;
 use crate::generic_arena::GenericArena;
 use crate::handle::{ErasedIncr, Incr, RuntimeId};
+use crate::hold;
 use crate::lock_order::LockKind;
 use crate::locks::OrderedLock;
 use crate::node::{NodeData, NodeId, RetiredDeps};
@@ -847,6 +848,32 @@ fn reached_under_own_set(id: NodeId) -> ! {
     );
 }
 
+/// A held frame's write (`crate::hold`): as the compute wrapper's, but the
+/// displaced value is kept for the landing's undo record.
+#[cold]
+#[inline(never)]
+fn write_held<T: Value, C: Cells>(
+    arena: &GenericArena<T, C>,
+    slot: u32,
+    value: T,
+    ctl: &ComputeCtl,
+) -> Outcome {
+    let displaced = if ctl.has(cycle::RECOMPUTE) {
+        match arena.compare_and_write(slot, value, || ctl.wrote.set(1)) {
+            Compared::Equal(rejected) => {
+                drop(rejected);
+                return Outcome::Unchanged;
+            }
+            Compared::Replaced(displaced) => displaced,
+        }
+    } else {
+        ctl.wrote.set(1);
+        arena.write(slot, value)
+    };
+    hold::keep_written(displaced.map(|d| Box::new(d) as Box<dyn std::any::Any>));
+    Outcome::Changed
+}
+
 /// The runtime.
 ///
 /// # Closures may run more than once
@@ -914,6 +941,9 @@ pub struct Runtime<C: Cells> {
     /// land a member Clean over nodes it leaves New or Dirty, which a
     /// walk another thread planned earlier would go on to compute.
     pub(crate) episodes_landed: <C as Cells>::U64,
+    /// Threads holding landings of this runtime (`hold`), which reach it
+    /// by pointer until their outermost exit.
+    pub(crate) held_by: <C as Cells>::U64,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
     /// `1` when `get_traced` is actively recording. Checked on every
@@ -1038,6 +1068,14 @@ impl<C: Cells> Default for Runtime<C> {
     }
 }
 
+impl<C: Cells> Drop for Runtime<C> {
+    fn drop(&mut self) {
+        if !C::SINGLE_THREADED {
+            self.drop_held();
+        }
+    }
+}
+
 impl<C: Cells> Runtime<C> {
     pub fn new() -> Self {
         let runtime_id = RuntimeId::allocate();
@@ -1048,6 +1086,7 @@ impl<C: Cells> Runtime<C> {
             watch_queue: OrderedLock::new(LockKind::WatchQueue, watch_impl::WatchQueue::new()),
             revision: C::new_u64(2),
             episodes_landed: C::new_u64(0),
+            held_by: C::new_u64(0),
             walk: C::new_watermark(2),
             dep_stack: <C::DepStack as DepStack>::new(),
             runtime_id,
@@ -1158,6 +1197,21 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn push_trace(&self, id: NodeId, action: crate::trace::TraceAction) {
+        let action = if !C::SINGLE_THREADED && hold::active() {
+            match hold::defer_trace(
+                state::cell_key::<C>(self.nodes.get(id.0).state_cell()),
+                action,
+            ) {
+                Some(action) => action,
+                None => return,
+            }
+        } else {
+            action
+        };
+        self.push_trace_now(id, action);
+    }
+
+    fn push_trace_now(&self, id: NodeId, action: crate::trace::TraceAction) {
         self.inner
             .write()
             .trace_log
@@ -1326,12 +1380,16 @@ impl<C: Cells> Runtime<C> {
                             | cycle::BUFFERED
                             | cycle::LOW
                             | cycle::DOOMED
-                            | cycle::SPECULATIVE)
+                            | cycle::SPECULATIVE
+                            | cycle::HOLD)
                     {
                         0 => {
                             ctl.wrote.set(1);
                             drop(arena_inner.write(node.arena_slot(), new_value));
                             Outcome::Changed
+                        }
+                        cycle::HOLD | cycle::RECOMPUTE_HOLD => {
+                            write_held(&arena_inner, node.arena_slot(), new_value, ctl)
                         }
                         cycle::RECOMPUTE => {
                             if arena_inner.write_if_changed(
@@ -1723,8 +1781,11 @@ impl<C: Cells> Runtime<C> {
     /// its own below the caller, though nothing holds its claim.
     #[inline]
     fn assert_not_own_compute(&self, id: NodeId, generation: u32) {
+        // A landing this thread holds is deleted as `Local` deletes it
+        // (`claim_single`); only a claim on the stack refuses.
         assert!(
-            !self.holds_claim(id)
+            !self.dep_stack.is_computing(self.runtime_id, id)
+                && !cycle_state::holds(self.runtime_id, id.0)
                 && (value_code::thread_word() & value_code::REPLAY_BIT == 0
                     || self.no_virtual_frame(id.0, generation)),
             "incr-core: delete_node called from inside node {}'s own compute",
@@ -1790,6 +1851,9 @@ impl<C: Cells> Runtime<C> {
             }
             match cur {
                 NodeState::Computing | NodeState::ComputingDirty => {
+                    if let Some(claim) = self.claim_held_dead(handle) {
+                        return claim;
+                    }
                     self.refuse_wait_on_computing(id);
                     self.spin_on(id, spins, || {
                         !is_computing(state::load::<C>(node.state_cell()))
@@ -1817,7 +1881,10 @@ impl<C: Cells> Runtime<C> {
                     if self.owns_nodes(&inner, handle.slot()) {
                         return SingleClaim::Owner;
                     }
-                    if !inner.dependents[handle.slot() as usize].is_empty() {
+                    if self.has_dependents_seen(
+                        handle.slot(),
+                        &inner.dependents[handle.slot() as usize],
+                    ) {
                         return SingleClaim::HasDependents;
                     }
                     if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dead).is_ok() {
@@ -2189,7 +2256,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// The cycle of the group `handle` landed in last, if its last
-    /// landing was as a member of a cycle.
+    /// landing was as a member of a cycle. Under `Shared` this can show a
+    /// landing of another thread's compute that has not finished.
     pub fn cycle_of(&self, handle: impl Into<ErasedIncr>) -> Option<Cycle> {
         let handle = handle.into();
         if handle.runtime_id() != self.runtime_id {
@@ -2322,7 +2390,8 @@ impl<C: Cells> Runtime<C> {
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
                     if let Some(f) = frame {
-                        if state::load::<C>(node.state_cell()) == NodeState::Dirty
+                        if self.seen(node.state_cell(), state::load::<C>(node.state_cell()))
+                            == NodeState::Dirty
                             && !self.unchanged_stash(handle.slot(), handle.generation())
                         {
                             self.note_dirty_read(f, handle, &value);
@@ -2353,7 +2422,7 @@ impl<C: Cells> Runtime<C> {
         handle: Incr<T>,
         node: &NodeData<C>,
     ) -> Result<Cycle, NodeState> {
-        let state = state::load::<C>(node.state_cell());
+        let state = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
         if matches!(state, NodeState::Cyclic | NodeState::New) {
             if let Some(cycle) = self.cycle_of(handle) {
                 return Ok(cycle);
@@ -2375,14 +2444,14 @@ impl<C: Cells> Runtime<C> {
         let id = NodeId(handle.slot());
         self.park(ParkPoint::ValueCodeBeforeReload(id));
         let mut spins = 0;
-        let mut state = state::load::<C>(node.state_cell());
+        let mut state = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
         loop {
             // A `claim_set` that rolls back leaves the node as it found it,
             // so the read waits for the outcome instead of failing on it.
             while state == NodeState::Deleting {
                 spins += 1;
                 self.wait_out_deleting(id, spins);
-                state = state::load::<C>(node.state_cell());
+                state = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
             }
             if state != NodeState::Clean {
                 break;
@@ -2838,6 +2907,9 @@ impl<C: Cells> Runtime<C> {
     pub(crate) fn holds_claim(&self, id: NodeId) -> bool {
         self.dep_stack.is_computing(self.runtime_id, id)
             || cycle_state::holds(self.runtime_id, id.0)
+            || !C::SINGLE_THREADED
+                && hold::active()
+                && hold::holds(state::cell_key::<C>(self.nodes.get(id.0).state_cell()))
     }
 
     /// Before waiting on `id`'s `Computing` holder: under `Local` no
@@ -3070,6 +3142,7 @@ impl<C: Cells> Runtime<C> {
         word: u64,
         observed: NodeState,
     ) -> Computed {
+        let observed = self.seen(self.nodes.get(id.0).state_cell(), observed);
         // A read whose walk a doom stopped goes on with it even if its root
         // has been memoized since, as the unbounded run's walk goes on.
         let resume = if MODE & VIRT != 0 {
@@ -3169,7 +3242,7 @@ impl<C: Cells> Runtime<C> {
 
             let (node, flags) = self.nodes.get_with_flags(cur.0);
             let observed = if taint == VISIT {
-                state::load::<C>(node.state_cell())
+                self.seen(node.state_cell(), state::load::<C>(node.state_cell()))
             } else {
                 NodeState::Computing
             };
@@ -3209,6 +3282,19 @@ impl<C: Cells> Runtime<C> {
                             walk.taint(owner);
                             continue;
                         }
+                    }
+                    // An expansion's `Computing` can predate this
+                    // thread's own held landing of the node, which only
+                    // a visit through the view sees.
+                    if !C::SINGLE_THREADED
+                        && hold::active()
+                        && hold::shows(state::cell_key::<C>(node.state_cell()))
+                    {
+                        walk.push(Entry {
+                            id: cur,
+                            taint: VISIT,
+                        });
+                        continue;
                     }
                     // Another thread owns this subtree and is cleaning
                     // its deps itself; expanding them here would tear
@@ -3258,7 +3344,10 @@ impl<C: Cells> Runtime<C> {
                         let dep_node = self.nodes.get(dep.0);
                         let dep_state = state::load::<C>(dep_node.state_cell());
                         if !dep_state.is_settled() {
-                            walk.expand(dep, dep_state);
+                            let dep_state = self.seen(dep_node.state_cell(), dep_state);
+                            if !dep_state.is_settled() {
+                                walk.expand(dep, dep_state);
+                            }
                         }
                     });
                 }
@@ -3334,6 +3423,13 @@ impl<C: Cells> Runtime<C> {
         } else {
             NodeState::New
         };
+        // The owner's re-claim of its own held node goes back to the view.
+        if !C::SINGLE_THREADED
+            && hold::active()
+            && hold::land(state::cell_key::<C>(node.state_cell()), back, back, true)
+        {
+            return;
+        }
         node.set_unrun(true);
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, back).is_err() {
             let unflagged =
@@ -3350,11 +3446,13 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn prune_settled(&self, walk: &mut Walk) -> bool {
         let settled = walk.work.iter().position(|e| {
-            e.is_pending()
-                && matches!(
-                    state::load::<C>(self.nodes.get(e.id.0).state_cell()),
+            e.is_pending() && {
+                let cell = self.nodes.get(e.id.0).state_cell();
+                matches!(
+                    self.seen(cell, state::load::<C>(cell)),
                     NodeState::Clean | NodeState::Cyclic
                 )
+            }
         });
         match settled {
             Some(at) => {
@@ -3405,9 +3503,13 @@ impl<C: Cells> Runtime<C> {
                 {
                     return;
                 }
-                let dep_state = state::load::<C>(self.nodes.get(dep.0).state_cell());
+                let dep_cell = self.nodes.get(dep.0).state_cell();
+                let dep_state = state::load::<C>(dep_cell);
                 if !dep_state.is_settled() {
-                    walk.expand(dep, dep_state);
+                    let dep_state = self.seen(dep_cell, dep_state);
+                    if !dep_state.is_settled() {
+                        walk.expand(dep, dep_state);
+                    }
                 }
             });
         }
@@ -3495,7 +3597,7 @@ impl<C: Cells> Runtime<C> {
         let mut g0 = gen;
 
         'attempt: loop {
-            let observed = state::load::<C>(node.state_cell());
+            let observed = self.seen(node.state_cell(), state::load::<C>(node.state_cell()));
             // A wait can outlast the node, whose slot then holds another.
             if spins != 0 && g0.is_some_and(|g| g != node.generation()) {
                 return Computed::Gone;
@@ -3633,6 +3735,10 @@ impl<C: Cells> Runtime<C> {
                     Err(_) => continue,
                 }
             };
+            // What a landing of this claim consulted is read from here on.
+            if !C::SINGLE_THREADED && hold::active() {
+                hold::clear_consulted();
+            }
 
             if node.generation() != g {
                 // The claim landed on the slot's next occupant, so leave
@@ -3909,7 +4015,8 @@ impl<C: Cells> Runtime<C> {
                         | value_code::UNWIND_MASK
                         | value_code::REPLAY_BIT
                         | value_code::NOTES_BIT
-                        | value_code::KEPT_BIT)
+                        | value_code::KEPT_BIT
+                        | value_code::HELD_BIT)
                     != 0
                 {
                     let attempt = Attempt {
@@ -3971,43 +4078,49 @@ impl<C: Cells> Runtime<C> {
                     }
                 };
 
-                if ctl.flags.get() & (cycle::LOW | cycle::DOOMED | cycle::SPECULATIVE) != 0 {
-                    let attempt = Attempt {
-                        first,
-                        cidx,
-                        stamp_rev,
-                        verify_rev,
-                    };
-                    if ctl.has(cycle::DOOMED) {
-                        return self.discard_doomed(id, attempt, &ctl, None, bag);
-                    }
-                    if !ctl.has(cycle::LOW) {
-                        return self.stash_speculative(id, g, attempt, &ctl, deps, bag);
-                    }
-                    match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
-                        PopEnd::Deferred => return Computed::Deferred,
-                        PopEnd::Landed => {
-                            self.park(ParkPoint::EpisodeLanded(id));
-                            return self.episode_landed(node, walked);
+                let parked = ctl.flags.get()
+                    & (cycle::LOW | cycle::DOOMED | cycle::SPECULATIVE | cycle::HOLD);
+                if parked != 0 {
+                    if parked == cycle::HOLD {
+                        self.open_hold(id, node, first, bag);
+                    } else {
+                        let attempt = Attempt {
+                            first,
+                            cidx,
+                            stamp_rev,
+                            verify_rev,
+                        };
+                        if ctl.has(cycle::DOOMED) {
+                            return self.discard_doomed(id, attempt, &ctl, None, bag);
                         }
-                        PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
-                        PopEnd::Contained => return Computed::Unsettled,
-                        PopEnd::Dissolved => {
-                            if MODE & VIRT != 0 {
-                                self.rerun_root(id, cidx);
-                            }
-                            self.end_dissolved(id, bag);
-                            if MODE & VIRT != 0 {
-                                self.end_dissolved_reads(id, g, cidx);
-                            }
-                            continue 'run;
+                        if !ctl.has(cycle::LOW) {
+                            return self.stash_speculative(id, g, attempt, &ctl, deps, bag);
                         }
-                        PopEnd::Retry => {
-                            if MODE & VIRT != 0 {
-                                self.rerun_root(id, cidx);
+                        match self.cycle_pop(id, g, cidx, first, &ctl, deps, bag) {
+                            PopEnd::Deferred => return Computed::Deferred,
+                            PopEnd::Landed => {
+                                self.park(ParkPoint::EpisodeLanded(id));
+                                return self.episode_landed(node, walked);
                             }
-                            self.park_with_bag(ParkPoint::StaleRetry(id), bag);
-                            continue 'attempt;
+                            PopEnd::Suspended | PopEnd::Dropped => return Computed::Discarded,
+                            PopEnd::Contained => return Computed::Unsettled,
+                            PopEnd::Dissolved => {
+                                if MODE & VIRT != 0 {
+                                    self.rerun_root(id, cidx);
+                                }
+                                self.end_dissolved(id, bag);
+                                if MODE & VIRT != 0 {
+                                    self.end_dissolved_reads(id, g, cidx);
+                                }
+                                continue 'run;
+                            }
+                            PopEnd::Retry => {
+                                if MODE & VIRT != 0 {
+                                    self.rerun_root(id, cidx);
+                                }
+                                self.park_with_bag(ParkPoint::StaleRetry(id), bag);
+                                continue 'attempt;
+                            }
                         }
                     }
                 }
@@ -4091,7 +4204,10 @@ impl<C: Cells> Runtime<C> {
     /// a Clean root leaves Clean only through a walk, which flags the
     /// reader too.
     fn episode_landed(&self, node: &NodeData<C>, walked: bool) -> Computed {
-        if !matches!(node.state(), NodeState::Clean | NodeState::Cyclic) {
+        if !matches!(
+            self.seen(node.state_cell(), node.state()),
+            NodeState::Clean | NodeState::Cyclic
+        ) {
             self.poison_reader(walked);
         }
         Computed::Done
@@ -4150,6 +4266,10 @@ impl<C: Cells> Runtime<C> {
             bag,
         );
         let wrote = ctl.wrote.get() != 0;
+        // A panic its run met reading a held landing is held as its value is.
+        if kind.is_none() && !C::SINGLE_THREADED && ctl.has(cycle::HOLD) {
+            self.open_hold(id, node, attempt.first, bag);
+        }
         if children_stashed {
             let first = attempt.first;
             let stashed = ChildLanding::Stashed;
@@ -4357,6 +4477,10 @@ impl<C: Cells> Runtime<C> {
         deps: &[(NodeId, u32)],
         bag: &mut Deferred<C>,
     ) -> Option<Computed> {
+        // Whatever the pop does, the reader read this frame's node.
+        if ctl.has(cycle::HOLD) {
+            self.dep_stack.raise_hold();
+        }
         // A doomed run's pop is discarded and its retry pops in its place,
         // so it retires nothing the unbounded run keeps.
         let doomed = ctl.has(cycle::DOOMED);
@@ -4514,6 +4638,14 @@ impl<C: Cells> Runtime<C> {
             node.set_verified_at(0);
         }
         let mut inner = self.inner.write();
+        if !C::SINGLE_THREADED && hold::active() {
+            let in_group = C::u8_load_relaxed(flags) & IN_GROUP != 0;
+            hold::keep_rec(
+                state::cell_key::<C>(node.state_cell()),
+                inner.member_recs.get(&id.0).cloned(),
+                in_group,
+            );
+        }
         inner.member_recs.remove(&id.0);
         C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !IN_GROUP);
     }
@@ -4574,6 +4706,25 @@ impl<C: Cells> Runtime<C> {
 
     #[inline(always)]
     fn land_as(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> NodeState {
+        if !C::SINGLE_THREADED && hold::active() {
+            if let Some(held) = self.held_landing(id, node, target, flagged, unrun) {
+                return held;
+            }
+        }
+        self.land_now(id, node, target, flagged, unrun)
+    }
+
+    /// [`Self::land_as`] past the hold: the landing every other thread
+    /// sees.
+    #[inline(always)]
+    fn land_now(
         &self,
         id: NodeId,
         node: &NodeData<C>,
@@ -4731,17 +4882,37 @@ impl<C: Cells> Runtime<C> {
             diff.old_set.has(*d)
                 || self.observed_clean(*d, verify_rev)
                 || panic.is_some_and(|members| {
-                    self.nodes.get(d.0).state() == NodeState::Failed
+                    let dep = self.nodes.get(d.0);
+                    self.seen(dep.state_cell(), dep.state()) == NodeState::Failed
                         || members.binary_search(&d.0).is_ok()
                 })
         };
         let superseded = !diff.new.iter().all(settled);
+        let held = !C::SINGLE_THREADED
+            && hold::active()
+            && hold::holds(state::cell_key::<C>(node.state_cell()));
+        if held {
+            hold::keep_deps(state::cell_key::<C>(node.state_cell()), || {
+                diff.old
+                    .iter()
+                    .map(|d| (*d, self.nodes.get(d.0).generation()))
+                    .collect()
+            });
+        }
 
         // The displaced list is retired at the attempt's drain, after its
         // landing: a retire can reclaim pending values and run their
         // `Drop` under this hold otherwise.
         if let Some(displaced) = node.install_deps(diff.new) {
             bag.push_dep_list(displaced);
+        }
+        // A held node's reverse edges change at its publication (`hold`).
+        if held {
+            return if superseded {
+                Publish::Superseded
+            } else {
+                Publish::Published
+            };
         }
 
         for old_dep in diff.old {
@@ -4772,7 +4943,8 @@ impl<C: Cells> Runtime<C> {
         let node = self.nodes.get(dep.0);
         let state = node.state();
         (state.is_settled()
-            || state == NodeState::Dirty && self.unchanged_stash(dep.0, node.generation()))
+            || state == NodeState::Dirty && self.unchanged_stash(dep.0, node.generation())
+            || is_computing(state) && self.seen(node.state_cell(), state).is_settled())
             && node.changed_at() <= rev
     }
 
@@ -5137,6 +5309,13 @@ mod cycle_tests;
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_cycle_rule_tests.rs"]
 mod cycle_rule_tests;
+
+#[path = "runtime_hold.rs"]
+mod hold_impl;
+
+#[cfg(all(test, not(loom)))]
+#[path = "runtime_hold_tests.rs"]
+mod hold_tests;
 
 #[cfg(all(test, not(loom)))]
 #[path = "runtime_wound_tests.rs"]

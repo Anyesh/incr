@@ -123,7 +123,38 @@ pub fn try_transition<C: Cells>(
     expected: NodeState,
     new: NodeState,
 ) -> Result<(), NodeState> {
-    C::state_try_transition(cell, expected.as_u8(), new.as_u8()).map_err(NodeState::from_u8)
+    match C::state_try_transition(cell, expected.as_u8(), new.as_u8()) {
+        Ok(()) => Ok(()),
+        Err(raw) if C::SINGLE_THREADED => Err(NodeState::from_u8(raw)),
+        Err(raw) => claim_own_held::<C>(cell, expected, new, raw),
+    }
+}
+
+/// A claim of a node this thread's attempt holds, from the state the
+/// view shows it in: the owner takes its own landing back to rerun or
+/// reverify it, and the node's word stays `Computing` throughout.
+#[cold]
+#[inline(never)]
+fn claim_own_held<C: Cells>(
+    cell: &C::State,
+    expected: NodeState,
+    new: NodeState,
+    raw: u8,
+) -> Result<(), NodeState> {
+    let seen = NodeState::from_u8(raw);
+    if new == NodeState::Computing
+        && matches!(seen, NodeState::Computing | NodeState::ComputingDirty)
+        && crate::hold::reclaim(cell_key::<C>(cell), expected)
+    {
+        return Ok(());
+    }
+    Err(seen)
+}
+
+/// The address that keys a node's held landing in `crate::hold`.
+#[inline(always)]
+pub(crate) fn cell_key<C: Cells>(cell: &C::State) -> usize {
+    std::ptr::from_ref(cell).cast::<u8>() as usize
 }
 
 /// Claim the right to compute this node by transitioning to `Computing`

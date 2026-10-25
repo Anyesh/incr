@@ -198,7 +198,7 @@ impl<C: Cells> Runtime<C> {
         // store, so under the lock a node still Failed at this generation
         // is in the latest landing's ticket, if any.
         let landing = (id.0, node.generation());
-        if state::load::<C>(node.state_cell()) != NodeState::Failed {
+        if self.seen(node.state_cell(), state::load::<C>(node.state_cell())) != NodeState::Failed {
             return Err(Left);
         }
         let Some(seq) = t.landings.get(&landing).copied() else {
@@ -324,7 +324,8 @@ impl<C: Cells> Runtime<C> {
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
-                && state::load::<C>(node.state_cell()) == NodeState::Failed
+                && self.seen(node.state_cell(), state::load::<C>(node.state_cell()))
+                    == NodeState::Failed
                 && !t.landings.contains_key(&(slot, generation))
         });
         if nodes.is_empty() {

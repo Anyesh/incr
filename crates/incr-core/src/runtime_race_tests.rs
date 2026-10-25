@@ -86,6 +86,11 @@ impl Gate {
     pub(crate) fn release(&self) {
         self.0.release_tx.lock().unwrap().send(()).unwrap();
     }
+
+    /// Whether an armed gate has been reached.
+    pub(crate) fn reached(&self) -> bool {
+        !self.0.armed.load(Ordering::SeqCst)
+    }
 }
 
 /// Install the runtime's park hook with armed gates at `points`.
@@ -1405,11 +1410,12 @@ fn get_before_read_vs_delete_recycle() {
     assert_eq!(rt.get(new), 99);
 }
 
-/// A read whose walk lands its node New as a member of a cycle finds the
-/// slot empty, and another thread claims the node before the read loads
-/// its state and group: the read waits for that claim and returns the
-/// cycle, where it used to panic that a Clean node had no value (replay
-/// seeds 0x33e9, 0xa55 and 0x19f0 on two threads).
+/// A read whose walk lands its node New as a member of a cycle holds the
+/// landing until the read ends (`crate::hold`), so another thread's claim
+/// of the node waits for the read instead of claiming it between the
+/// landing and the read's load of the state and group, where the read
+/// once panicked that a Clean node had no value (replay seeds 0x33e9,
+/// 0xa55 and 0x19f0 on two threads).
 #[test]
 fn read_of_cycle_member_vs_claim_after_landing() {
     let rt = Arc::new(Rt::new());
@@ -1447,7 +1453,7 @@ fn read_of_cycle_member_vs_claim_after_landing() {
         thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).map_err(panic_message))
     };
     before_read.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::New);
+    assert_eq!(rt.state_of(a), NodeState::Computing);
     assert!(rt.cycle_of(a).is_some());
     // So that the claimer's walk recomputes the failed dep instead of
     // panicking on it before it claims a.
@@ -1460,14 +1466,13 @@ fn read_of_cycle_member_vs_claim_after_landing() {
             catch_unwind(AssertUnwindSafe(|| rt.try_get(a))).map_err(panic_message)
         })
     };
-    in_a.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Computing);
-    before_read.release();
-    // Time for the reader to load a's state while the claim is held.
     thread::sleep(Duration::from_millis(50));
+    assert!(!in_a.reached(), "the claimer ran a while the read held it");
+    before_read.release();
+    assert_eq!(reader.join().unwrap(), Ok(1000));
+    in_a.wait_parked();
     in_a.release();
 
-    assert_eq!(reader.join().unwrap(), Ok(1000));
     let cycle = claimer
         .join()
         .unwrap()
@@ -1513,11 +1518,11 @@ fn poisoned_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Gate, Gate) {
 }
 
 /// The episode that `x`'s recompute runs through its read of `a`, a
-/// group member, lands `a` Dirty, and once the read has taken the value,
-/// another thread claims `a`; the read's reservation of `a` keeps that
-/// claim out until then. `x`, whose deps are unchanged and so not
-/// validated at publish, must still not land Clean over it (seed 0x74f on
-/// two threads, budget None).
+/// group member, lands `a` Dirty and holds it until the read ends, so
+/// another thread's claim of `a` waits for the read, then group-verifies
+/// `a`. `x`, whose deps are unchanged and so not validated at publish,
+/// must still not land Clean over it (seed 0x74f on two threads, budget
+/// None).
 #[test]
 fn reader_of_group_episode_root_claimed_after_landing() {
     let rt = Arc::new(Rt::new());
@@ -1532,16 +1537,17 @@ fn reader_of_group_episode_root_claimed_after_landing() {
         thread::spawn(move || rt.get(x))
     };
     read_a.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Dirty);
+    assert_eq!(rt.state_of(a), NodeState::Computing);
     in_a.arm();
     let claimer = {
         let rt = Arc::clone(&rt);
         thread::spawn(move || rt.get(a))
     };
-    in_a.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Computing);
+    thread::sleep(Duration::from_millis(50));
+    assert!(!in_a.reached(), "the claimer ran a while the read held it");
     read_a.release();
     reader.join().unwrap();
+    in_a.wait_parked();
     in_a.release();
     claimer.join().unwrap();
     assert_eq!(rt.group_verifies.lock().unwrap().first(), Some(&id(a).0));
@@ -1549,8 +1555,8 @@ fn reader_of_group_episode_root_claimed_after_landing() {
 }
 
 /// The episode that `x`'s read of `a` runs, as that read's walk root,
-/// lands `a` Dirty; until the read has taken the value, another thread's
-/// claim of `a` waits out the read's reservation instead of running `a`.
+/// lands `a` Dirty and holds it until the read ends, so another thread's
+/// claim of `a` waits for the read instead of running `a`.
 #[test]
 fn reader_of_group_episode_root_keeps_it_until_the_read_takes_the_value() {
     let rt = Arc::new(Rt::new());
@@ -1564,18 +1570,15 @@ fn reader_of_group_episode_root_keeps_it_until_the_read_takes_the_value() {
         thread::spawn(move || rt.get(x))
     };
     walked.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Dirty);
-    let waits = rt.reservation_waits.load(Ordering::SeqCst);
+    assert_eq!(rt.state_of(a), NodeState::Computing);
     let claimer = {
         let rt = Arc::clone(&rt);
         thread::spawn(move || rt.get(a))
     };
-    while !claimer.is_finished() && rt.reservation_waits.load(Ordering::SeqCst) == waits {
-        thread::sleep(Duration::from_millis(1));
-    }
+    thread::sleep(Duration::from_millis(50));
     assert!(
-        rt.reservation_waits.load(Ordering::SeqCst) > waits,
-        "the claimer ran `a` before the read took its value"
+        !claimer.is_finished(),
+        "the claimer read `a` while the read held it"
     );
     walked.release();
     reader.join().unwrap();

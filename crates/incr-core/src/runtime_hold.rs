@@ -1,0 +1,449 @@
+//! The runtime's side of [`crate::hold`]: what this thread sees of its own
+//! held landings, holding a landing, and the attempt's end, which
+//! publishes them or, after a wound, retracts them.
+
+use std::collections::HashMap;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+use crate::cells::Cells;
+use crate::deferred::Deferred;
+use crate::fx::FxBuildHasher;
+use crate::hold::{self, Held};
+use crate::node::{NodeData, NodeId};
+use crate::segmented_nodes::IN_GROUP;
+use crate::state::{self, NodeState};
+
+use super::{is_computing, ChildLanding, Runtime, SingleClaim};
+use crate::dep_stack::DepStack;
+use crate::dependent_list::DependentList;
+use crate::handle::ErasedIncr;
+
+/// Each held slot's landing target, for publication's new-dep check.
+type Targets = HashMap<u32, NodeState, FxBuildHasher>;
+
+impl<C: Cells> Runtime<C> {
+    /// `raw`, loaded from `cell`, as this thread sees it: a node its
+    /// attempt holds reads as the landing's state. Only a `Computing`
+    /// load pays for the check.
+    #[inline(always)]
+    pub(crate) fn seen(&self, cell: &C::State, raw: NodeState) -> NodeState {
+        if !C::SINGLE_THREADED && is_computing(raw) {
+            self.held_seen(cell, raw)
+        } else {
+            raw
+        }
+    }
+
+    /// A read of a held landing makes the reading frame's landing depend
+    /// on it, so that landing is held too.
+    #[cold]
+    #[inline(never)]
+    fn held_seen(&self, cell: &C::State, raw: NodeState) -> NodeState {
+        match hold::view(state::cell_key::<C>(cell)) {
+            Some(target) => {
+                self.dep_stack.raise_hold();
+                target
+            }
+            None => raw,
+        }
+    }
+
+    /// `land_as` while this thread holds landings: the landing is held if
+    /// the node already has an entry, or if it was decided by reading a
+    /// held landing since the claim; `None` lets it land.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn held_landing(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        target: NodeState,
+        flagged: NodeState,
+        unrun: bool,
+    ) -> Option<NodeState> {
+        let cell = state::cell_key::<C>(node.state_cell());
+        if !hold::holds(cell) {
+            if !hold::consulted() {
+                return None;
+            }
+            // Only a verify or an unrun release lands without opening an
+            // entry first; a release to New is of a claim from New.
+            let first = target == NodeState::New;
+            let kept = hold::open(
+                cell,
+                self.runtime_id,
+                id.0,
+                node.generation(),
+                first,
+                None,
+                || self.ender(),
+            );
+            debug_assert!(kept.is_none(), "incr-core: a new entry takes no kept value");
+        }
+        hold::land(cell, target, flagged, unrun);
+        Some(target)
+    }
+
+    /// Opens the entry of a landing about to be held, before its writes,
+    /// so the undo record sees what they replace.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn open_hold(
+        &self,
+        id: NodeId,
+        node: &NodeData<C>,
+        first: bool,
+        bag: &mut Deferred<C>,
+    ) {
+        let cell = state::cell_key::<C>(node.state_cell());
+        let verified_at = Some(node.verified_at());
+        if let Some(own) = hold::open(
+            cell,
+            self.runtime_id,
+            id.0,
+            node.generation(),
+            first,
+            verified_at,
+            || self.ender(),
+        ) {
+            bag.push_erased(own);
+        }
+    }
+
+    /// Whether `c` has a dependent as `Local` would list it: a held
+    /// reader's reverse edges change only at its publication, so its new
+    /// deps count and the ones it dropped do not.
+    #[inline(always)]
+    pub(super) fn has_dependents_seen(&self, c: u32, listed: &DependentList) -> bool {
+        if C::SINGLE_THREADED || !hold::active() {
+            return !listed.is_empty();
+        }
+        self.has_dependents_held(c, listed)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn has_dependents_held(&self, c: u32, listed: &DependentList) -> bool {
+        let reads = |r: u32| {
+            let mut found = false;
+            self.nodes.get(r).for_each_dep(|d| found |= d.0 == c);
+            found
+        };
+        let held = |r: u32| hold::holds(state::cell_key::<C>(self.nodes.get(r).state_cell()));
+        listed.iter().any(|r| !held(r.0) || reads(r.0))
+            || hold::keys(self.runtime_id)
+                .into_iter()
+                .any(|r| reads(r) && !listed.iter().any(|l| l.0 == r))
+    }
+
+    /// [`Self::claim_single`] of a node this thread holds: claimed `Dead`
+    /// as `Local` claims its landing, and taken out of the hold.
+    #[inline(always)]
+    pub(super) fn claim_held_dead(&self, handle: ErasedIncr) -> Option<SingleClaim> {
+        if C::SINGLE_THREADED || !hold::active() {
+            return None;
+        }
+        self.claim_held_dead_cold(handle)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn claim_held_dead_cold(&self, handle: ErasedIncr) -> Option<SingleClaim> {
+        let slot = handle.slot();
+        let node = self.nodes.get(slot);
+        let cell = state::cell_key::<C>(node.state_cell());
+        hold::view(cell)?;
+        {
+            let inner = self.inner.read();
+            if node.generation() != handle.generation() {
+                return Some(SingleClaim::Gone);
+            }
+            if self.owns_nodes(&inner, slot) {
+                return Some(SingleClaim::Owner);
+            }
+            if self.has_dependents_seen(slot, &inner.dependents[slot as usize]) {
+                return Some(SingleClaim::HasDependents);
+            }
+            // Only another thread's set walk moves the word meanwhile, and
+            // only between Computing and ComputingDirty.
+            while state::try_transition::<C>(
+                node.state_cell(),
+                state::load::<C>(node.state_cell()),
+                NodeState::Dead,
+            )
+            .is_err()
+            {}
+        }
+        let held = hold::forget(cell).expect("incr-core: a viewed landing has its entry");
+        if let Some(old) = &held.undo.deps {
+            let mut now: Vec<NodeId> = Vec::new();
+            node.for_each_dep(|d| now.push(d));
+            let mut inner = self.inner.write();
+            for (o, _) in old {
+                if !now.contains(o) {
+                    inner.dependents[o.0 as usize].remove(NodeId(slot));
+                }
+            }
+        }
+        drop(held);
+        Some(SingleClaim::Claimed)
+    }
+
+    /// The attempt ended without a wound: every held landing lands, in
+    /// landing order, with what it deferred.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn publish_held(&self) {
+        self.end_held(true);
+    }
+
+    /// The attempt was wounded: every held landing goes back, on every
+    /// runtime it reached.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn retract_held(&self) {
+        self.end_held(false);
+    }
+
+    /// Other runtimes first, each to the end even if one panics, then
+    /// this one; the first panic goes on.
+    fn end_held(&self, publish: bool) {
+        let mut failed = None;
+        for e in hold::others(self.runtime_id) {
+            // SAFETY: an ender's runtime is live: its `Drop` refuses while
+            // a thread holds its landings (`held_by`), and this thread
+            // does until this call.
+            let ended = catch_unwind(AssertUnwindSafe(|| unsafe { (e.end)(e.rt, publish) }));
+            if let Err(payload) = ended {
+                failed.get_or_insert(payload);
+            }
+        }
+        let own = catch_unwind(AssertUnwindSafe(|| self.end_own(publish)));
+        if let Some(payload) = failed.or(own.err()) {
+            resume_unwind(payload);
+        }
+    }
+
+    fn end_own(&self, publish: bool) {
+        if publish {
+            self.publish_own();
+        } else {
+            let (entries, _episodes, ended) = hold::take(self.runtime_id);
+            self.release_ender(ended);
+            self.retract_entries(entries);
+        }
+    }
+
+    fn release_ender(&self, ended: bool) {
+        if ended {
+            C::u64_fetch_add(&self.held_by, u64::MAX);
+        }
+    }
+
+    /// What another runtime's outermost exit calls to end this one's held
+    /// landings; counts this thread in `held_by`.
+    fn ender(&self) -> hold::Ender {
+        C::u64_fetch_add(&self.held_by, 1);
+        hold::Ender {
+            rt: (self as *const Self).cast(),
+            end: end_erased::<C>,
+        }
+    }
+
+    /// Drops the landings this thread holds of a runtime being dropped:
+    /// its nodes go with it.
+    pub(super) fn drop_held(&self) {
+        if hold::holds_runtime(self.runtime_id) {
+            let (_entries, _episodes, ended) = hold::take(self.runtime_id);
+            self.release_ender(ended);
+        }
+        assert!(
+            C::u64_load_acquire(&self.held_by) == 0,
+            "incr-core: a runtime was dropped while a read on another thread holds its landings"
+        );
+    }
+
+    fn publish_own(&self) {
+        let (entries, episodes, ended) = hold::take(self.runtime_id);
+        self.release_ender(ended);
+        if episodes != 0 {
+            // Before the members land, so a read of one of their landings
+            // also reads the count.
+            for _ in 0..episodes {
+                crate::cycle_state::own_episode(self.runtime_id);
+            }
+            C::u64_fetch_add(&self.episodes_landed, episodes);
+        }
+        let mut bag = Deferred::new();
+        let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
+        let mut rest = entries.into_iter();
+        let published = catch_unwind(AssertUnwindSafe(|| {
+            for e in rest.by_ref() {
+                self.publish_one(e, &held, &mut bag);
+            }
+        }));
+        // An engine panic partway leaves no node Computing without an owner:
+        // what is left goes back as on a wound (G9).
+        if let Err(payload) = published {
+            self.retract_entries(rest.collect());
+            bag.drain_carried(payload);
+        }
+        bag.drain(self);
+    }
+
+    fn publish_one(&self, e: Held, held: &Targets, bag: &mut Deferred<C>) {
+        let id = NodeId(e.slot);
+        let node = self.nodes.get(e.slot);
+        debug_assert_eq!(node.generation(), e.generation);
+        let mut target = e.target;
+        if let Some(old) = &e.undo.deps {
+            let mut new: Vec<NodeId> = Vec::new();
+            node.for_each_dep(|d| new.push(d));
+            let was = |d: &NodeId| old.iter().any(|(o, _)| o == d);
+            {
+                let mut inner = self.inner.write();
+                for (o, _) in old {
+                    if !new.contains(o) {
+                        inner.dependents[o.0 as usize].remove(id);
+                    }
+                }
+                for n in &new {
+                    if !was(n) {
+                        inner.dependents[n.0 as usize].push_unique(id);
+                    }
+                }
+            }
+            // A set after the read could not reach the node through an edge
+            // that waited until now. A Clean landing's verified_at is the
+            // revision it read at.
+            let rev = node.verified_at();
+            if target == NodeState::Clean
+                && new
+                    .iter()
+                    .any(|d| !was(d) && !self.settled_at_publication(*d, held, rev))
+            {
+                target = NodeState::Dirty;
+            }
+        }
+        // The node lands whatever its children's landing does.
+        let children = e.children.map(|(landing, opened)| {
+            let landing = match landing {
+                ChildLanding::Sweep if target != NodeState::Clean => ChildLanding::Keep,
+                other => other,
+            };
+            catch_unwind(AssertUnwindSafe(|| {
+                self.land_children_now(id, landing, opened, bag)
+            }))
+        });
+        for action in e.trace {
+            self.push_trace_now(id, action);
+        }
+        self.land_now(id, node, target, e.flagged, e.unrun);
+        if let Some(Some(own)) = e.undo.value {
+            bag.push_erased(own);
+        }
+        if let Some(Err(payload)) = children {
+            resume_unwind(payload);
+        }
+    }
+
+    /// A new dep of a published landing: one this publication has yet to
+    /// land counts as its target, unless a set flagged it since.
+    fn settled_at_publication(&self, d: NodeId, held: &Targets, rev: u64) -> bool {
+        let dep = self.nodes.get(d.0);
+        let raw = state::load::<C>(dep.state_cell());
+        match held.get(&d.0) {
+            Some(&t) if is_computing(raw) => {
+                raw == NodeState::Computing
+                    && matches!(t, NodeState::Clean | NodeState::Cyclic)
+                    && dep.changed_at() <= rev
+            }
+            _ => self.observed_clean(d, rev),
+        }
+    }
+
+    /// Every entry goes back to what it replaced, and its node lands as
+    /// its claim found it, unrun. Records and dep lists first, then
+    /// values, then the state words, so no node is visible before its
+    /// fields are back. Runs no user code; the attempt's values drop at
+    /// the drain.
+    fn retract_entries(&self, mut entries: Vec<Held>) {
+        entries.reverse();
+        let mut bag = Deferred::new();
+        let mut lost = vec![false; entries.len()];
+        {
+            let mut inner = self.inner.write();
+            for (i, e) in entries.iter().enumerate() {
+                let (node, flags) = self.nodes.get_with_flags(e.slot);
+                if let Some(old) = &e.undo.deps {
+                    let live: Vec<NodeId> = old
+                        .iter()
+                        .filter(|&&(d, g)| {
+                            let dep = self.nodes.get(d.0);
+                            dep.generation() == g && dep.state() != NodeState::Dead
+                        })
+                        .map(|&(d, _)| d)
+                        .collect();
+                    lost[i] = live.len() != old.len();
+                    if let Some(displaced) = node.install_deps(&live) {
+                        bag.push_dep_list(displaced);
+                    }
+                }
+                if let Some((rec, in_group)) = &e.undo.rec {
+                    match rec {
+                        Some(r) => {
+                            inner.member_recs.insert(e.slot, r.clone());
+                        }
+                        None => {
+                            inner.member_recs.remove(&e.slot);
+                        }
+                    }
+                    let bits = C::u8_load_relaxed(flags);
+                    C::u8_store_relaxed(
+                        flags,
+                        if *in_group {
+                            bits | IN_GROUP
+                        } else {
+                            bits & !IN_GROUP
+                        },
+                    );
+                }
+            }
+        }
+        for (i, e) in entries.iter_mut().enumerate() {
+            let node = self.nodes.get(e.slot);
+            if let Some(old) = e.undo.value.take() {
+                let arena = self.arenas.erased(node.type_tag());
+                if let Some(own) = arena.restore_erased(node.arena_slot(), old) {
+                    bag.push_erased(own);
+                }
+            }
+            // A dep list that lost an entry no longer names the input the
+            // old value came from, so it must not verify.
+            let verified = if lost[i] {
+                0
+            } else {
+                e.undo.verified_at.unwrap_or(0)
+            };
+            node.set_verified_at(verified);
+            if let Some((_, opened)) = e.children {
+                self.land_children_now(NodeId(e.slot), ChildLanding::Discard, opened, &mut bag);
+            }
+        }
+        for e in entries {
+            let back = if e.undo.first {
+                NodeState::New
+            } else {
+                NodeState::Dirty
+            };
+            self.land_now(NodeId(e.slot), self.nodes.get(e.slot), back, back, true);
+        }
+        bag.drain(self);
+    }
+}
+
+/// SAFETY: `rt` is a live `Runtime<C>`.
+unsafe fn end_erased<C: Cells>(rt: *const (), publish: bool) {
+    // SAFETY: the caller's.
+    unsafe { &*rt.cast::<Runtime<C>>() }.end_own(publish);
+}

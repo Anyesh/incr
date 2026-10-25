@@ -398,6 +398,11 @@ pub(crate) const FOREIGN_HOLD: u16 = 512;
 /// `ComputeCtl::flags`: a speculative run, which the unbounded run may never
 /// make: its value is buffered and its landing withheld (`replay::Stash`).
 pub(crate) const SPECULATIVE: u16 = 1024;
+/// `ComputeCtl::flags`: the frame read a landing this thread's attempt
+/// holds (`crate::hold`), so its own landing is held too, and so is its
+/// reader's.
+pub(crate) const HOLD: u16 = 2048;
+pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at

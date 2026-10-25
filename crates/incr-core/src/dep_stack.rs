@@ -21,7 +21,7 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED};
+use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, POISONED};
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay::Step;
@@ -485,6 +485,18 @@ pub trait DepStack: 'static {
         self.with(|s| {
             s.bias = saved.bias;
             s.placed = saved.placed;
+        });
+    }
+
+    /// Marks the nearest compute frame, past any callback's barrier, as
+    /// having read a landing this thread holds, so its own landing is held.
+    fn raise_hold(&self) {
+        self.with(|s| {
+            if let Some(f) = s.frames.iter().rev().find(|f| f.rt != RuntimeId::SENTINEL) {
+                // SAFETY: the frame is on the stack, so its control block
+                // is live (see `Frame::ctl`).
+                unsafe { (*f.ctl).raise(HOLD) };
+            }
         });
     }
 
