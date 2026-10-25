@@ -2375,7 +2375,9 @@ impl<C: Cells> Runtime<C> {
             _ => {
                 let _hold = self.inner.write();
                 if C::u8_load_relaxed(&self.read_speculatively) == 0 {
-                    C::u8_store_relaxed(&self.read_speculatively, TURNED_ON);
+                    // Release, so a reader that finds it after the hold
+                    // sees every set claimed before the flip as claimed.
+                    C::u8_store_release(&self.read_speculatively, TURNED_ON);
                 }
             }
         }
