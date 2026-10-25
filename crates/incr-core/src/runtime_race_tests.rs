@@ -2253,9 +2253,11 @@ fn a_dirty_landing_before_the_walks_first_load_plans_the_node_again() {
 }
 
 /// A read whose walk lands its root Dirty returns that landing's value:
-/// R, over a dependency cycle it catches, lands Dirty with its run count,
-/// and a second read reruns it. Parked between its walk and its slot read,
-/// the first reader must not return the run the second reader started.
+/// R, over a dependency cycle it catches, lands Dirty with its run count.
+/// A second read's walk runs C as R's dep, before R's closure, so C's
+/// cycle reaches that read without rerunning R, as on main
+/// (B7-cycle-escapes-dirty-catcher). Parked between its walk and its slot
+/// read, the first reader still returns its own landing.
 #[test]
 fn shared_read_returns_the_value_its_walk_landed_dirty() {
     let rt = Arc::new(Runtime::<Shared>::new());
@@ -2290,8 +2292,13 @@ fn shared_read_returns_the_value_its_walk_landed_dirty() {
     }
     gate.release();
     assert_eq!(first.join().unwrap(), 100);
-    assert_eq!(second.join().unwrap(), 200);
-    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    let cycle = panic_message(
+        second
+            .join()
+            .expect_err("C's cycle reaches the second read"),
+    );
+    assert!(cycle.contains("dependency cycle"), "{cycle}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
 
 /// p stabilizes an observer of r, then reads x. r reads y and v = y + 1,
