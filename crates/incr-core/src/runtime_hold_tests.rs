@@ -225,8 +225,8 @@ fn shared_read_back_into_a_held_cycle_retracts_the_other_runtime() {
 }
 
 /// A read of A's `x` runs B's `q`, which reads `x` back while A's frame
-/// holds its claim: `q`'s landing rests on this attempt's stack, so it
-/// retracts at the exit of B's entry, and `q`'s next read runs it again.
+/// holds its claim: the read meets a claim, not a held landing, and gets
+/// the cycle `Local` gets, so `q` lands as under `Local`.
 fn read_back_into_a_claimed_frame<C: Cells>() -> (i64, i64, NodeState, usize) {
     let rt = Runtime::<C>::new();
     let other = Runtime::<C>::new();
@@ -254,28 +254,21 @@ fn read_back_into_a_claimed_frame<C: Cells>() -> (i64, i64, NodeState, usize) {
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn shared_read_back_into_a_claimed_frame_retracts_the_other_runtime() {
-    let (got, again, after, runs) = read_back_into_a_claimed_frame::<Shared>();
-    let (want, want_again, local_after, local_runs) = read_back_into_a_claimed_frame::<Local>();
-    assert_eq!((got, again), (want, want_again));
-    assert!(
-        matches!(after, NodeState::Dirty | NodeState::New),
-        "{after:?}, Local's {local_after:?}"
-    );
-    assert_eq!(
-        runs,
-        local_runs + usize::from(local_after == NodeState::Clean)
-    );
+fn shared_read_back_into_a_claimed_frame_lands_as_local() {
+    let shared = read_back_into_a_claimed_frame::<Shared>();
+    let local = read_back_into_a_claimed_frame::<Local>();
+    assert_eq!(shared, local);
     assert_eq!(crate::hold::held_count(), 0);
 }
 
 /// A's closure catches the wound B's `c` raised and reads B's cycle
-/// again: nothing unwinds through that second entry of B, but the thread
-/// is wounded at its exit, so its landings retract, and the retry reads
-/// the cycle a third time.
+/// again: the thread is still wounded, so that second entry of B unwinds
+/// with the wound before it lands anything, and the retry reads the cycle
+/// once more. A first entry's exit under a wound with nothing unwinding
+/// is thus not reached by a read; its retraction is the fallback.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn shared_entry_of_a_wounded_thread_retracts_the_other_runtime() {
+fn shared_entry_of_a_wounded_thread_unwinds_before_landing() {
     let other = Arc::new(Runtime::<Shared>::new());
     let runs = Arc::new(AtomicUsize::new(0));
     let (a, b) = counted_cycle(&other, &runs);
@@ -305,9 +298,9 @@ fn shared_entry_of_a_wounded_thread_retracts_the_other_runtime() {
     };
     let (want, local_runs) = local_cycle_value_and_runs();
     assert_eq!(rt.get(root), want);
-    assert_eq!(*second_entry.lock().unwrap(), vec![want]);
+    assert!(second_entry.lock().unwrap().is_empty());
     assert_eq!(other.state_of(a), NodeState::Clean);
-    assert_eq!(runs.load(Ordering::SeqCst), 3 * local_runs);
+    assert_eq!(runs.load(Ordering::SeqCst), 2 * local_runs);
     assert_eq!(crate::hold::held_count(), 0);
 }
 
