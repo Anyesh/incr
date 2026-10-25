@@ -3338,3 +3338,60 @@ fn a_stashed_value_is_cloned_outside_the_stash_lock() {
         "x ran again while its stash was shared"
     );
 }
+
+struct Custom(u64);
+
+/// b catches the `Custom` panic of c, which reads input i, and panics with
+/// `Custom(c + 10)`; r reads b at budget 1, so its retry regenerates b's
+/// payload (`regenerate`). Another thread sets i while b's closure runs
+/// for that regeneration: the set's walk finds b Computing, and b, back
+/// from the run, leaves Failed as the walk would have flipped it. The run
+/// finds c Dirty and makes no payload, so the retry's read runs b again
+/// with i's new value, as a read after the set does.
+#[test]
+fn a_set_during_a_regeneration_flips_the_node_it_runs() {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let gate = Gate::new();
+    let i = rt.create_input(1_u64);
+    let c = rt.create_query_with(
+        move |rt: &Rt| -> u64 { std::panic::panic_any(Custom(rt.get(i))) },
+        replayable(),
+    );
+    let in_regen = gate.clone();
+    let b = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            if crate::value_code::thread_word() & crate::value_code::REGEN_BIT != 0 {
+                in_regen.park();
+            }
+            let got = match catch_unwind(AssertUnwindSafe(|| rt.get(c))) {
+                Err(p) => p.downcast::<Custom>().map_or(100, |x| x.0 + 10),
+                Ok(v) => v,
+            };
+            std::panic::panic_any(Custom(got))
+        },
+        replayable(),
+    );
+    let j = rt.create_input(1_u64);
+    let deep = rt.create_query_with(move |rt: &Rt| rt.get(j), replayable());
+    let r = rt.create_query_with(
+        move |rt: &Rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<Custom>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        spawn(move || rt.try_get(r).unwrap_or(7777))
+    };
+    gate.wait_parked();
+    rt.set(i, 5);
+    gate.release();
+    assert_eq!(reader.join(), 15_001);
+}
