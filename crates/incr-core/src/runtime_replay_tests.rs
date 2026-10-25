@@ -2719,6 +2719,141 @@ fn shared_a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded() {
     a_contained_payload_after_a_clean_foreign_read_reads_as_unbounded::<Shared>();
 }
 
+/// A lookup b makes that records no dependency.
+#[derive(Clone, Copy, Debug)]
+enum Lookup {
+    ForeignTable,
+    ForeignAlive,
+    OwnAlive,
+}
+
+/// `foreign_ticket_shape` with b's read of j replaced by `lookup`: a get on
+/// another runtime's table, `is_alive` of another runtime's node, or
+/// `is_alive` of a node of b's own runtime. After the walk holds b's
+/// payload, the test thread flips the lookup's answer (an insert or a
+/// delete), which dirties nothing; a rerun of b sees the new answer.
+fn lookup_ticket_shape<C: Cells>(
+    lookup: Lookup,
+    frames: u32,
+    outer: u32,
+    mid: u32,
+    chain: u32,
+) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(frames);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let table = Arc::new(other.create_table::<u64, u64>());
+    let gone = other.create_input(0_u64);
+    let own_gone = rt.create_input(0_u64);
+    let i = rt.create_input(1_u64);
+    let k = rt.create_input(0_u64);
+    let (b_other, b_table) = (Arc::clone(&other), Arc::clone(&table));
+    let b = rt.create_query_with(
+        move |rt: &Runtime<C>| -> u64 {
+            let seen = match lookup {
+                Lookup::ForeignTable => b_table.get(&b_other, &3).is_some(),
+                Lookup::ForeignAlive => b_other.is_alive(gone),
+                Lookup::OwnAlive => rt.is_alive(own_gone),
+            };
+            std::panic::panic_any(CustomPayload(100 * rt.get(i) + if seen { 1 } else { 5 }))
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt| if rt.get(k) == 0 { rt.get(b) } else { 7 },
+        replayable(),
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    rt.set(i, 2);
+    rt.set(k, 1);
+    assert_eq!(rt.get(x), 7);
+    match lookup {
+        Lookup::ForeignTable => {
+            table.get_or_insert_input(&other, 3, || 0);
+        }
+        Lookup::ForeignAlive => other.delete_node(gone),
+        Lookup::OwnAlive => rt.delete_node(own_gone),
+    }
+    let mut top_b = b;
+    for _ in 0..mid {
+        let v = top_b;
+        top_b = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let v = deep;
+        deep = rt.create_query_with(move |rt| rt.get(v) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(top_b))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut top = r;
+    for _ in 0..outer {
+        let v = top;
+        top = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    rt.try_get(top).unwrap_or(7777)
+}
+
+/// Every budget gives what the unbounded run gives for
+/// `lookup_ticket_shape`, which takes the walk's payload: 205 for the
+/// table miss, 201 while the node was alive.
+fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
+    let mut differ = Vec::new();
+    for (lookup, payload) in [
+        (Lookup::ForeignTable, 205_u64),
+        (Lookup::ForeignAlive, 201),
+        (Lookup::OwnAlive, 201),
+    ] {
+        for outer in [0, 1, 3, 8] {
+            for mid in [0, 1, 3] {
+                for chain in [0, 2, 6] {
+                    let want = lookup_ticket_shape::<C>(lookup, u32::MAX, outer, mid, chain);
+                    assert_eq!(
+                        want,
+                        payload * 1000 + 2 + u64::from(chain),
+                        "the unbounded run did not take the walk's payload: \
+                         {lookup:?} outer={outer} mid={mid} chain={chain}"
+                    );
+                    for frames in 1..9 {
+                        let got = lookup_ticket_shape::<C>(lookup, frames, outer, mid, chain);
+                        if got != want {
+                            differ.push(format!(
+                                "{lookup:?} outer={outer} mid={mid} chain={chain} \
+                                 frames={frames}: {got} != {want}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "{} budgets differ from the unbounded run:\n{}",
+        differ.len(),
+        differ.join("\n")
+    );
+}
+
+#[test]
+fn local_a_payload_after_an_unrecorded_lookup_reads_as_unbounded() {
+    a_payload_after_an_unrecorded_lookup_reads_as_unbounded::<Local>();
+}
+
+#[test]
+fn shared_a_payload_after_an_unrecorded_lookup_reads_as_unbounded() {
+    a_payload_after_an_unrecorded_lookup_reads_as_unbounded::<Shared>();
+}
+
 /// A value whose `Clone` reads node `j` of another runtime, a read that is
 /// no dependency of the node that clones it.
 struct ReadsOther {
