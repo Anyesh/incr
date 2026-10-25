@@ -781,6 +781,9 @@ impl HeldMap {
 /// and its exit touch one thread-local.
 struct EntryState {
     depth: Cell<u32>,
+    /// The key of the runtime whose entry is the innermost one: its id,
+    /// with [`SHARED_KEY`] for a `Shared` runtime.
+    cur_rt: Cell<u64>,
     /// This thread's wound-wait ticket, 0 until its first registration
     /// inside the current outermost entry, which keeps it across retries.
     ticket: Cell<u64>,
@@ -822,6 +825,7 @@ thread_local! {
     static ENTRY: EntryState = const {
         EntryState {
             depth: Cell::new(0),
+            cur_rt: Cell::new(0),
             ticket: Cell::new(0),
             wounded: Cell::new(false),
             failures: Cell::new(0),
@@ -832,6 +836,7 @@ thread_local! {
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
+    static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
     static OUTER: RefCell<Outer> = const {
         RefCell::new(Outer {
             dissolved: Vec::new(),
@@ -847,6 +852,7 @@ loom::thread_local! {
     static HELD: RefCell<HeldMap> = RefCell::new(HeldMap::new());
     static ENTRY: EntryState = EntryState {
         depth: Cell::new(0),
+        cur_rt: Cell::new(0),
         ticket: Cell::new(0),
         wounded: Cell::new(false),
         failures: Cell::new(0),
@@ -856,6 +862,7 @@ loom::thread_local! {
         budget_clock: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
+    static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         dissolved_groups: Vec::new(),
@@ -1122,38 +1129,84 @@ pub(crate) fn wounded() -> bool {
     ENTRY.with(|e| e.wounded.get())
 }
 
+/// Marks a `Shared` runtime's key; runtime ids stay far below 2^63.
+const SHARED_KEY: u64 = 1 << 63;
+
 /// One count on the thread's engine entry depth; dropping it, by an
 /// unwind included, gives the count back, and the outermost entry's drop
-/// gives up the thread's ticket.
+/// gives up the thread's ticket. An entry of another runtime than the
+/// innermost one's keeps the key of the entry below it in [`OUTER_RTS`],
+/// so that the runtimes open below are known.
 pub(crate) struct EntryDepth {
     outermost: bool,
+    switched: bool,
+    first_for_runtime: bool,
+    shared_outermost: bool,
+}
+
+/// The keys below this thread's runtime switches, innermost last, with a
+/// count per key and of the `Shared` ones, so that a switch costs the
+/// same however many are open.
+#[derive(Default)]
+struct OuterRts {
+    stack: Vec<u64>,
+    open: HashMap<u64, u32, FxBuildHasher>,
+    shared: u32,
 }
 
 impl EntryDepth {
+    /// An entry of runtime `rt`, a `Shared` one if `shared`.
     #[inline(always)]
-    pub(crate) fn enter() -> Self {
+    pub(crate) fn enter(rt: RuntimeId, shared: bool) -> Self {
         let base = 0_u8;
         let base = std::ptr::from_ref(&base) as usize;
-        let depth = ENTRY.with(|e| {
+        let key = rt.get() | if shared { SHARED_KEY } else { 0 };
+        ENTRY.with(|e| {
             let depth = e.depth.get();
             e.depth.set(depth + 1);
             if depth == 0 {
+                e.cur_rt.set(key);
                 e.stack_base.set(base);
                 e.budget_clock
                     .set(BUDGET_CLOCK.load(std::sync::atomic::Ordering::Relaxed));
                 #[cfg(all(test, not(loom)))]
                 OUTERMOST_ENTRIES.with(|n| n.set(n.get() + 1));
+                Self {
+                    outermost: true,
+                    switched: false,
+                    first_for_runtime: true,
+                    shared_outermost: shared,
+                }
+            } else if e.cur_rt.get() == key {
+                Self {
+                    outermost: false,
+                    switched: false,
+                    first_for_runtime: false,
+                    shared_outermost: false,
+                }
+            } else {
+                switch_in(e, key)
             }
-            depth
-        });
-        Self {
-            outermost: depth == 0,
-        }
+        })
     }
 
     #[inline(always)]
     pub(crate) fn is_outermost(&self) -> bool {
         self.outermost
+    }
+
+    /// No entry of this runtime is open below this one on the thread.
+    #[inline(always)]
+    #[cfg_attr(any(not(test), loom), allow(dead_code))]
+    pub(crate) fn first_for_runtime(&self) -> bool {
+        self.first_for_runtime
+    }
+
+    /// The entry is a `Shared` runtime's, and no `Shared` runtime's entry
+    /// is open below it on the thread.
+    #[inline(always)]
+    pub(crate) fn shared_outermost(&self) -> bool {
+        self.shared_outermost
     }
 }
 
@@ -1166,8 +1219,78 @@ impl Drop for EntryDepth {
             if depth == 0 {
                 e.ticket.set(0);
             }
+            if self.switched {
+                switch_out(e);
+            }
         });
     }
+}
+
+#[cold]
+#[inline(never)]
+fn switch_in(e: &EntryState, key: u64) -> EntryDepth {
+    let below = e.cur_rt.get();
+    let pushed = OUTER_RTS.try_with(|o| {
+        let mut o = o.borrow_mut();
+        o.stack.push(below);
+        *o.open.entry(below).or_insert(0) += 1;
+        o.shared += u32::from(below & SHARED_KEY != 0);
+        (!o.open.contains_key(&key), o.shared == 0)
+    });
+    match pushed {
+        Ok((first_for_runtime, no_shared_below)) => {
+            e.cur_rt.set(key);
+            EntryDepth {
+                outermost: false,
+                switched: true,
+                first_for_runtime,
+                shared_outermost: key & SHARED_KEY != 0 && no_shared_below,
+            }
+        }
+        // An entry from a destructor of this thread's locals, after
+        // `OUTER_RTS`'s: it is taken as a nested entry of the runtime below.
+        Err(_) => EntryDepth {
+            outermost: false,
+            switched: false,
+            first_for_runtime: false,
+            shared_outermost: false,
+        },
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn switch_out(e: &EntryState) {
+    let below = OUTER_RTS.with(|o| {
+        let mut o = o.borrow_mut();
+        let below = o
+            .stack
+            .pop()
+            .expect("incr-core: a switched entry keeps the key below it");
+        match o.open.get_mut(&below) {
+            Some(n) if *n > 1 => *n -= 1,
+            _ => {
+                o.open.remove(&below);
+            }
+        }
+        o.shared -= u32::from(below & SHARED_KEY != 0);
+        below
+    });
+    e.cur_rt.set(below);
+}
+
+/// Whether an engine entry of `rt` is open on this thread.
+#[cfg_attr(any(not(test), loom), allow(dead_code))]
+pub(crate) fn open_entry_of(rt: RuntimeId) -> bool {
+    let rt = rt.get();
+    ENTRY.with(|e| {
+        e.depth.get() != 0
+            && (e.cur_rt.get() & !SHARED_KEY == rt
+                || OUTER_RTS.with(|o| {
+                    let o = o.borrow();
+                    o.open.contains_key(&rt) || o.open.contains_key(&(rt | SHARED_KEY))
+                }))
+    })
 }
 
 /// Resets the state an outermost entry starts from.

@@ -213,6 +213,22 @@ impl Drop for OutermostExit {
     }
 }
 
+/// [`OutermostExit`] for the outermost `Shared` entry under a `Local`
+/// runtime's outermost entry: it removes only the contexts at or above
+/// `cidx`, as the `Local` entry's below stay. A wound unwinding through it
+/// waits out its winner here, where the claim the winner waited on is
+/// this runtime's to check.
+struct NestedSharedExit<'a, C: Cells> {
+    rt: &'a Runtime<C>,
+    cidx: u32,
+}
+
+impl<C: Cells> Drop for NestedSharedExit<'_, C> {
+    fn drop(&mut self) {
+        self.rt.end_nested_shared(self.cidx);
+    }
+}
+
 /// Removes this thread's contexts and ends its reservations, those a doom
 /// noted before `mark` opened their context included: `reset` alone
 /// misses them when no context is open.
@@ -273,11 +289,40 @@ impl<C: Cells> Runtime<C> {
     /// into `Err`.
     #[inline(always)]
     pub(super) fn entered<R>(&self, kind: ReadKind, mut f: impl FnMut() -> R) -> Result<R, Cycle> {
-        let entry = EntryDepth::enter();
+        let entry = EntryDepth::enter(self.runtime_id, !C::SINGLE_THREADED);
+        let _nested = (!C::SINGLE_THREADED && entry.shared_outermost() && !entry.is_outermost())
+            .then(|| self.nested_shared_exit());
         if !entry.is_outermost() && kind == ReadKind::Get {
             return Ok(f());
         }
         self.entered_catching(entry.is_outermost(), kind, &mut f)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn nested_shared_exit(&self) -> NestedSharedExit<'_, C> {
+        NestedSharedExit {
+            rt: self,
+            cidx: self.dep_stack.next_cidx(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn end_nested_shared(&self, cidx: u32) {
+        replay::drop_all_from(cidx);
+        if cycle_state::wounded() {
+            reserve::end_all();
+            debug_assert!(
+                cycle_state::held_keys()
+                    .iter()
+                    .all(|&(rt, _)| rt != self.runtime_id),
+                "incr-core: a wounded thread waits for its winner holding claims"
+            );
+            self.await_winner();
+        } else if !reserve::none_held() {
+            reserve::end_contexts();
+        }
     }
 
     /// [`Self::entered`] for an entry that is not a `try_get`, where a
@@ -348,13 +393,7 @@ impl<C: Cells> Runtime<C> {
                 reserve::none_held(),
                 "incr-core: a wounded thread waits for its winner holding reservations"
             );
-            waits::await_winner(C::backoff, |(rt, slot)| {
-                rt == self.runtime_id
-                    && !matches!(
-                        state::load::<C>(self.nodes.get(slot).state_cell()),
-                        NodeState::New | NodeState::Dirty
-                    )
-            });
+            self.await_winner();
             return None;
         }
         match cycle_state::take_unwind_kind() {
@@ -375,6 +414,23 @@ impl<C: Cells> Runtime<C> {
                 resume_unwind(payload);
             }
         }
+    }
+
+    /// The head start of a wounded thread, which holds nothing now: until
+    /// its winner has taken the claim it waited on, if that is one of this
+    /// runtime's.
+    fn await_winner(&self) {
+        waits::await_winner(C::backoff, |(rt, slot)| {
+            #[cfg(all(test, not(loom)))]
+            if rt == self.runtime_id {
+                waits::OWN_CLAIM_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            rt == self.runtime_id
+                && !matches!(
+                    state::load::<C>(self.nodes.get(slot).state_cell()),
+                    NodeState::New | NodeState::Dirty
+                )
+        });
     }
 
     /// An engine unwind that a closure caught and returned past: a cycle
