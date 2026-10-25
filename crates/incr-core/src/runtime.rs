@@ -4059,6 +4059,8 @@ impl<C: Cells> Runtime<C> {
                     }
                     // Leaving the group is safe: a New node's record is inert,
                     // and the retry computes the node alone.
+                    // The retry's run has this run's key.
+                    self.drop_takes(id, node.generation(), cidx);
                     self.land_run(
                         id,
                         node,
@@ -4069,8 +4071,6 @@ impl<C: Cells> Runtime<C> {
                         true,
                         bag,
                     );
-                    // The retry's run has this run's key.
-                    self.unfailed_landing(id, node.generation(), cidx);
                     self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                     continue 'attempt;
                 }
@@ -4099,11 +4099,11 @@ impl<C: Cells> Runtime<C> {
                 };
                 // The run computed the node alone, as the unbounded run's
                 // does, so the node leaves its group.
+                self.drop_takes(id, node.generation(), cidx);
                 if self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag)
                     != NodeState::Clean
                 {
                     self.park_with_bag(ParkPoint::UnsettledLanding(id), bag);
-                    self.unfailed_landing(id, node.generation(), cidx);
                     self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;

@@ -2190,6 +2190,17 @@ impl<C: Cells> Runtime<C> {
         self.forget_failed_run(id.0, generation);
     }
 
+    /// `id` at `generation`, its frame at `cidx` just popped, lands a
+    /// computed value: its run's takes go. Its earlier Failed record went
+    /// when it left Failed (`flip_failed_from`), and one another thread's
+    /// run lands once the claim is released must stay.
+    pub(super) fn drop_takes(&self, id: NodeId, generation: u32, cidx: u32) {
+        if !self.budgeted() || replay::speculative() {
+            return;
+        }
+        drop(self.took_by_run(id, generation, cidx));
+    }
+
     /// What the run of `id` at `generation`, whose frame at `cidx` just
     /// popped, noted its reads took (`replay::note_took`).
     fn took_by_run(&self, id: NodeId, generation: u32, cidx: u32) -> Vec<replay::Took> {
