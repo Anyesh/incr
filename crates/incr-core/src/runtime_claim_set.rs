@@ -185,8 +185,8 @@ impl<C: Cells> Runtime<C> {
     /// first. A busy member rolls every claim back and is returned for
     /// the caller to wait out with no guard held.
     pub(super) fn claim_set(&self, roots: &[ErasedIncr], root: NodeId) -> SetEnd<'_, C> {
-        let _change = self.changes.change(replay::speculative());
         let mut inner = self.inner.write();
+        let _change = self.counted_change();
         let mut members = Members::default();
         self.gather(&inner, roots, &mut members);
         if members.order.is_empty() {
@@ -298,8 +298,8 @@ impl<C: Cells> Runtime<C> {
         candidates: &[ErasedIncr],
         bag: &mut Deferred<C>,
     ) -> HashSet<ErasedIncr> {
-        let _change = self.changes.change(replay::speculative());
         let mut inner = self.inner.write();
+        let _change = self.counted_change();
         let mut done: HashSet<ErasedIncr> = HashSet::new();
         let mut units: Vec<(ErasedIncr, Members)> = Vec::with_capacity(candidates.len());
         for &c in candidates {

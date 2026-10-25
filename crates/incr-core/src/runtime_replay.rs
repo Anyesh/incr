@@ -2347,6 +2347,9 @@ impl<C: Cells> Runtime<C> {
     /// adoption checks. `None` while this runtime changes or once the node
     /// is not Clean.
     fn checked_clean_read<T: Value>(&self, handle: Incr<T>) -> Option<(T, Count)> {
+        if !self.checked_reads_ready() {
+            return None;
+        }
         let seen = self.changes.count()?;
         let node = self.nodes.get(handle.slot());
         if state::load::<C>(node.state_cell()) != NodeState::Clean {
@@ -2355,6 +2358,37 @@ impl<C: Cells> Runtime<C> {
         let (type_tag, arena_slot) = self.fields_under(handle, node);
         let value = self.try_read_slot(handle, node, type_tag, arena_slot)?;
         Some((value, seen))
+    }
+
+    /// Whether sets and deletes of this runtime all count themselves in
+    /// `changes`. The first call turns that on under `inner.write()`, so
+    /// every set or delete claimed after it counts; a set claimed before it
+    /// may still be writing or walking, so until none is, this is false.
+    #[cold]
+    #[inline(never)]
+    fn checked_reads_ready(&self) -> bool {
+        const TURNED_ON: u8 = 1;
+        const READY: u8 = 2;
+        match C::u8_load_acquire(&self.read_speculatively) {
+            READY => return true,
+            TURNED_ON => {}
+            _ => {
+                let _hold = self.inner.write();
+                if C::u8_load_relaxed(&self.read_speculatively) == 0 {
+                    C::u8_store_relaxed(&self.read_speculatively, TURNED_ON);
+                }
+            }
+        }
+        // A delete claimed before is no concern: its nodes are already not
+        // Clean. A set claimed before holds its claim until it bumps the
+        // revision, and has walked once the watermark reaches it.
+        let settled = C::SINGLE_THREADED
+            || (0..self.nodes.len()).all(|s| !self.nodes.get(s).set_claimed())
+                && C::walked(&self.walk, &self.revision) >= self.current_revision();
+        if settled {
+            C::u8_store_release(&self.read_speculatively, READY);
+        }
+        settled
     }
 
     /// The key of the read of this runtime's node `reading` that `frame`,
