@@ -1458,6 +1458,7 @@ fn reset_thread() {
     INTERNAL.with(|i| i.borrow_mut().take());
     crate::replay::take_vindex_repushes();
     crate::replay::take_held_drops();
+    crate::reserve::end_all();
 }
 
 fn run<C: Cells>(case: &Case, frames: Option<u32>, bytes: usize) -> Trace {

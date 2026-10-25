@@ -3819,7 +3819,7 @@ impl<C: Cells> Runtime<C> {
                     node.max_verified_at(verify_rev);
                     let landed =
                         self.land_single(id, node, flags, NodeState::Clean, NodeState::Dirty);
-                    self.end_reservation_landed(id, node);
+                    self.end_reservation_landed(id, node, landed);
                     if landed == NodeState::Clean {
                         self.record_trace(id, crate::trace::TraceAction::VerifiedClean);
                     } else {
@@ -4074,14 +4074,12 @@ impl<C: Cells> Runtime<C> {
                 // does, so the node leaves its group.
                 let landed =
                     self.land_run(id, node, flags, target, NodeState::Dirty, &ctl, false, bag);
+                self.end_reservation_landed(id, node, landed);
                 if landed != NodeState::Clean {
-                    // This context's retry reruns the node, so its
-                    // reservation stays.
                     self.poison_reader(walked);
                     self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                     return Computed::Unsettled;
                 }
-                self.end_reservation_landed(id, node);
                 self.record_trace(id, crate::trace::TraceAction::Recomputed { value_changed });
                 return Computed::Done;
             }
@@ -4181,7 +4179,7 @@ impl<C: Cells> Runtime<C> {
                 Some(&*payload),
                 bag,
             );
-            self.end_reservation_landed(id, node);
+            self.end_reservation(id, node);
         }
         // After the landings, whose notes the kept copy carries.
         if !contain {
@@ -4570,16 +4568,22 @@ impl<C: Cells> Runtime<C> {
         self.land_as(id, node, target, flagged, false)
     }
 
-    /// Ends this thread's context reservation of `id`, whose run has landed
-    /// for good, as the unbounded run's frame releases its claim there.
-    /// Called only where no retry of the run follows: a landing the
-    /// context's replay redoes keeps it, as the Stale path's New landing and
-    /// a final run's Dirty landing, which this context's retry reruns
-    /// (0x36615207). The context's untaken deliveries of the node's outcome
+    /// Ends this thread's context reservation of `id` if its run `landed`
+    /// settled, as the unbounded run's frame releases its claim there. An
+    /// unsettled landing keeps it: this context's retry reruns the node, and
+    /// ending it there lets another thread rerun the node first.
+    pub(super) fn end_reservation_landed(&self, id: NodeId, node: &NodeData<C>, landed: NodeState) {
+        if landed.is_settled() {
+            self.end_reservation(id, node);
+        }
+    }
+
+    /// Ends this thread's context reservation of `id`, whose run no retry
+    /// follows. The context's untaken deliveries of the node's outcome
     /// stay: each stands for a read the unbounded frame made at this
     /// landing, and a later set lands that reader Dirty by its claim
     /// watermark.
-    pub(super) fn end_reservation_landed(&self, id: NodeId, node: &NodeData<C>) {
+    pub(super) fn end_reservation(&self, id: NodeId, node: &NodeData<C>) {
         if C::SINGLE_THREADED || !reserve::any() || replay::speculative() {
             return;
         }
