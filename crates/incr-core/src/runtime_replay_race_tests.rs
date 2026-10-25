@@ -1671,15 +1671,28 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
         rt.set_max_frames(frames);
         // Parks at the level-0 entry's claim after the episode under F's
         // entry dissolved, not at the claim that entry starts from.
+        // While the driver is parked, a visit of F comes from the other
+        // thread, at the point where its walk waits on F.
         let (parked, entered) = (gate.clone(), Arc::new(AtomicU8::new(0)));
-        let installed = rt.park_hook.set(Box::new(move |p| {
-            if p == ParkPoint::BeforeEntry(id(f)) && zran.load(SeqCst) == 1 {
-                entered.store(1, SeqCst);
-            }
-            if p == ParkPoint::BeforeClaim(id(f)) && entered.load(SeqCst) == 1 {
-                parked.park();
-            }
-        }));
+        let (held, reached) = (Arc::new(Mutex::new(None)), Arc::new(AtomicBool::new(false)));
+        let fcell = crate::state::cell_key::<Shared>(rt.nodes.get(f.slot()).state_cell());
+        let installed = rt.park_hook.set({
+            let (held, reached) = (held.clone(), reached.clone());
+            Box::new(move |p| {
+                if p == ParkPoint::BeforeEntry(id(f)) && zran.load(SeqCst) == 1 {
+                    entered.store(1, SeqCst);
+                }
+                if p == ParkPoint::BeforeComputeOne(id(f)) && entered.load(SeqCst) == 2 {
+                    reached.store(true, SeqCst);
+                }
+                if p == ParkPoint::BeforeClaim(id(f)) && entered.load(SeqCst) == 1 {
+                    *held.lock().unwrap() = Some(crate::hold::target(fcell));
+                    entered.store(2, SeqCst);
+                    parked.park();
+                    entered.store(3, SeqCst);
+                }
+            })
+        });
         assert!(installed.is_ok());
         let verified = rt.verified_at_of(f);
         let reader = {
@@ -1691,6 +1704,7 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
             gate.wait_parked();
             let landed = (
                 rt.state_of(f),
+                held.lock().unwrap().take(),
                 rt.cycle_of(f).is_some(),
                 rt.verified_at_of(f) == verified,
                 [x, y].map(|m| rt.nodes.get(m.slot()).state()),
@@ -1700,8 +1714,12 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
                 let rt = rt.clone();
                 spawn(move || outcome(|| rt.get(f)))
             };
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !reached.load(SeqCst) && std::time::Instant::now() < deadline {
+                thread::yield_now();
+            }
             let other = other.join_within(Duration::from_millis(200));
-            let waited = (other.is_err(), rt.state_of(f));
+            let waited = (reached.load(SeqCst), other.is_err(), rt.state_of(f));
             gate.release();
             gap = Some((landed, waited, other));
         }
@@ -1719,18 +1737,20 @@ fn shared_dissolved_member_root_leaves_the_group_its_cut_released() {
         landed,
         (
             NodeState::Computing,
+            Some(Some(NodeState::Dirty)),
             false,
             false,
             [NodeState::Computing; 2],
             Vec::new()
         ),
-        "F's discard landing: (state, in a group, verification kept, X and Y \
-         to another thread, stale group records)"
+        "F's discard landing: (state, the driver's held target, in a group, \
+         verification kept, X and Y to another thread, stale group records)"
     );
     assert_eq!(
         waited,
-        (true, NodeState::Computing),
-        "the other read while the driver is parked: (still waiting, F's state)"
+        (true, true, NodeState::Computing),
+        "the other read while the driver is parked: (reached F's wait, still \
+         waiting, F's state)"
     );
     assert_eq!((got, other), (want.clone(), want));
 }

@@ -181,6 +181,15 @@ pub(crate) fn shows(cell: usize) -> bool {
     active() && with(|h| h.get(cell).is_some_and(|e| !e.reclaimed))
 }
 
+/// The target of this thread's held landing for `cell`, as [`view`]
+/// shows it but without counting as a look.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn target(cell: usize) -> Option<NodeState> {
+    active()
+        .then(|| with(|h| h.get(cell).filter(|e| !e.reclaimed).map(|e| e.target)))
+        .flatten()
+}
+
 pub(crate) fn holds(cell: usize) -> bool {
     active() && with(|h| h.by_cell.contains_key(&cell))
 }
