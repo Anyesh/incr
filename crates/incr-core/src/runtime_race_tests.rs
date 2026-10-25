@@ -36,6 +36,7 @@ pub(crate) struct GateInner {
     reached_rx: Mutex<Receiver<()>>,
     release_tx: Mutex<Sender<()>>,
     release_rx: Mutex<Receiver<()>>,
+    test: Option<String>,
 }
 
 impl Gate {
@@ -48,6 +49,7 @@ impl Gate {
             reached_rx: Mutex::new(reached_rx),
             release_tx: Mutex::new(release_tx),
             release_rx: Mutex::new(release_rx),
+            test: thread::current().name().map(str::to_owned),
         }))
     }
 
@@ -60,12 +62,16 @@ impl Gate {
             return;
         }
         self.0.reached_tx.lock().unwrap().send(()).unwrap();
-        self.0
+        if self
+            .0
             .release_rx
             .lock()
             .unwrap()
             .recv_timeout(PARK_TIMEOUT)
-            .expect("parked thread was never released");
+            .is_err()
+        {
+            super::park_timed_out(self.0.test.as_deref());
+        }
     }
 
     pub(crate) fn wait_parked(&self) {
@@ -100,7 +106,8 @@ pub(super) fn park_at<C: Cells>(rt: &Runtime<C>, points: Vec<(ParkPoint, Gate)>)
 /// Waits until `rt` counts a wait on a doom reservation past `before`:
 /// another thread's read met the reservation and now waits it out.
 pub(super) fn await_reservation_wait<C: Cells>(rt: &Runtime<C>, before: u32) {
-    let deadline = std::time::Instant::now() + PARK_TIMEOUT;
+    // Before the parked thread's own timeout, whose abort would hide this assert.
+    let deadline = std::time::Instant::now() + PARK_TIMEOUT / 2;
     while rt.reservation_waits.load(Ordering::SeqCst) <= before {
         assert!(
             std::time::Instant::now() < deadline,
