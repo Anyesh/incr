@@ -776,3 +776,41 @@ fn local_many_foreign_reads_stay_linear() {
 fn shared_many_foreign_reads_stay_linear() {
     many_foreign_reads::<Shared>();
 }
+
+/// One budgeted frame reading `n` nodes of another runtime and then a
+/// 600-deep chain, which dooms it: the reads are kept as deliveries for
+/// its retry, sharing the frame's, maker's and node's lists, and removing
+/// them must not cost a pass over those lists each.
+fn wide_frame_deliveries<C: Cells>() {
+    let n = 4000;
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let top = chain(&rt, 600).nodes[0];
+    let reader = rt.create_query_with(
+        move |rt| reads.iter().map(|&x| foreign.get(x)).sum::<u64>() + rt.get(top),
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n * (n - 1) / 2 + 600);
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 16 * n,
+        "{work} units of note work for {n} delivered foreign reads"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Shared>);
+}
