@@ -6718,6 +6718,52 @@ fn high_range_clean_read_delivery_seeds() {
     }
 }
 
+/// 0x92b17580fc op 3, the stale-dep split main shares (CHANGELOG known
+/// limitation): the unbounded walk cleans a recorded dep the reader no
+/// longer reads and its run closes the cycle [23], while a bounded run
+/// reruns the reader first and gives the fresh Value(6).
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stale_dep_split_seed_matches_main() {
+    let case = gen_case(0x92_b175_80fc, false, false);
+    let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
+    let panic = |m: &str| Out::Panic(m.to_owned());
+    let with = |op3| {
+        vec![
+            panic("failed"),
+            panic("failed"),
+            Out::Done,
+            op3,
+            panic("cycle"),
+            Out::Done,
+        ]
+    };
+    quiet(|| {
+        assert_eq!(
+            outs(run::<Local>(&case, None, 0)),
+            with(Out::Cycle(vec![23])),
+            "Local unbounded"
+        );
+        assert_eq!(
+            outs(run::<Shared>(&case, None, 0)),
+            with(Out::Cycle(vec![23])),
+            "Shared unbounded"
+        );
+        for frames in [1, 2, 3] {
+            assert_eq!(
+                outs(run::<Local>(&case, Some(frames), 0)),
+                with(Out::Value(6)),
+                "Local, budget {frames}"
+            );
+            assert_eq!(
+                outs(run::<Shared>(&case, Some(frames), 0)),
+                with(Out::Value(6)),
+                "Shared, budget {frames}"
+            );
+        }
+    });
+}
+
 /// 0xa02 (see [`cross_seeds`]): a speculative landing read the second
 /// runtime's input before a set of it, and a later read returns the old
 /// value.
