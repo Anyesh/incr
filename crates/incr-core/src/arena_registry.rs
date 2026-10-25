@@ -17,6 +17,7 @@ use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use crate::cells::{Cells, PtrCell};
@@ -154,8 +155,9 @@ struct ArenaEntry<C: Cells> {
     /// finding the data part of an `Arc<dyn _>` takes. `Arc::as_ptr` of
     /// the typed `Arc` before its unsizing, which moves the same raw
     /// pointer, so it has the allocation's provenance; `arena` keeps the
-    /// allocation alive for as long as the entry exists.
-    typed: *const (),
+    /// allocation alive for as long as the entry exists. `NonNull`, so a
+    /// typed read's load carries that the arena is there and tests nothing.
+    typed: NonNull<()>,
 }
 
 #[cfg(loom)]
@@ -242,7 +244,7 @@ impl<C: Cells> ArenaRegistry<C> {
         // SAFETY: the entry was built from a `GenericArena<T, C>` for
         // the `T` its `type_id` names, which the compare just matched,
         // and `typed` is that arena's address, live while `entry.arena` is.
-        Some(unsafe { &*entry.typed.cast::<GenericArena<T, C>>() })
+        Some(unsafe { entry.typed.cast::<GenericArena<T, C>>().as_ref() })
     }
 
     /// The arena behind `tag`. Panics on a tag this registry never
@@ -305,7 +307,8 @@ impl<C: Cells> ArenaRegistry<C> {
             .expect("incr-core: more than 65535 distinct value types in one runtime");
         self.entries.grow_to(tag as usize);
         let arena = Arc::new(GenericArena::<T, C>::new());
-        let typed = Arc::as_ptr(&arena).cast::<()>();
+        let typed = NonNull::new(Arc::as_ptr(&arena).cast_mut().cast::<()>())
+            .expect("incr-core: an Arc's pointer is not null");
         let entry = Box::new(ArenaEntry {
             type_id,
             arena: arena as Arc<dyn ErasedArena<C>>,

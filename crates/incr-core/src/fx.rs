@@ -22,13 +22,10 @@ impl FxHasher {
 impl Hasher for FxHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks_exact(8);
-        for chunk in &mut chunks {
-            self.add(u64::from_le_bytes(
-                chunk.try_into().expect("an 8-byte chunk"),
-            ));
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for &chunk in chunks {
+            self.add(u64::from_le_bytes(chunk));
         }
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             let mut last = [0u8; 8];
             last[..rest.len()].copy_from_slice(rest);
@@ -95,6 +92,29 @@ mod tests {
         assert_eq!(b.hash_one("abc"), b.hash_one("abc"));
         assert_ne!(b.hash_one(("ab", "c")), b.hash_one(("a", "bc")));
         assert_ne!(b.hash_one(1_u64), b.hash_one(2_u64));
+    }
+
+    /// Pinned byte-string hashes: a table's iteration order, and anything
+    /// keyed through it, depends on them, so a rewrite of `write` must keep
+    /// every one.
+    #[test]
+    fn byte_hashes_keep_their_values() {
+        for (len, want) in [
+            (0, 0x0000_0000_0000_0000_u64),
+            (1, 0x5479_45e6_76e1_bbbc),
+            (7, 0xf74d_4a3d_93de_bae2),
+            (8, 0x74ee_0a78_ee68_3e42),
+            (9, 0x8da5_80d2_5022_a1b0),
+            (15, 0xf71b_ddf7_d699_d3a5),
+            (16, 0xa414_a2ae_74a1_b721),
+            (17, 0x00e7_d7d9_e2f6_e63b),
+            (64, 0x36af_e208_b9ac_47bb),
+        ] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let mut h = FxHasher::default();
+            h.write(&bytes);
+            assert_eq!(h.finish(), want, "{len} bytes");
+        }
     }
 
     #[test]

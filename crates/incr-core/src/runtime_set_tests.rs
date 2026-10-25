@@ -409,6 +409,7 @@ fn set_returning_displaced_returns_the_current_stamp_on_an_equal_value() {
 /// One input read by 50k queries (5k under `INCR_TEST_REDUCED`), half of
 /// which then drop it, and a quarter of the rest are deleted. Each unhook
 /// from the input's dependent list must not scan or shift the whole list.
+#[cfg(not(miri))]
 fn wide_input_rewires_in_sublinear_time<C: Cells>(rt: &Runtime<C>) {
     let n = crate::test_size::test_size(50_000);
     let x = rt.create_input(1_i64);
