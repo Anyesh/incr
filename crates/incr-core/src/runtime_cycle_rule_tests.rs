@@ -973,7 +973,9 @@ fn wave6_failed_member_over_dirty_co_member<C: Cells>() {
     rt.set(j, 1);
     assert_ne!(rt.state_of(b), NodeState::Failed);
     assert!(is_cycle(&*quiet(|| rt.get(b)).unwrap_err(), "1, 2"));
-    assert_eq!(rt.get(a), 2);
+    // Entry order (B7-fixpoint-head-after-member-cycle): a's walk recomputes
+    // b first and enters the cycle at b again; a fresh read of a gives 2.
+    assert!(is_cycle(&*quiet(|| rt.get(a)).unwrap_err(), "1, 2"));
     rt.assert_invariant_i();
 }
 
