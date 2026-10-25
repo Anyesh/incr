@@ -1618,40 +1618,36 @@ mod foreign_chain {
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_local() {
         super::foreign_reading_chain_stays_within_the_stack::<Local, Local>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared() {
         super::foreign_reading_chain_stays_within_the_stack::<Local, Shared>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_local() {
         super::foreign_reading_chain_stays_within_the_stack::<Shared, Local>();
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_shared() {
         super::foreign_reading_chain_stays_within_the_stack::<Shared, Shared>();
     }
@@ -1740,30 +1736,27 @@ mod foreign_panic_chain {
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared() {
         super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(None);
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn shared_shared() {
         super::foreign_panicking_chain_stays_within_the_stack::<Shared, Shared>(None);
     }
 
     #[test]
     #[cfg_attr(
-        debug_assertions,
+        any(debug_assertions, miri),
         ignore = "a debug build's frames at the default budget overflow a 2 MiB stack"
     )]
-    #[cfg_attr(miri, ignore)]
     fn local_shared_with_b_unbudgeted() {
         super::foreign_panicking_chain_stays_within_the_stack::<Local, Shared>(Some(u32::MAX));
     }
