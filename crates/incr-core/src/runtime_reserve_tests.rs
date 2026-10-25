@@ -833,6 +833,47 @@ fn a_shared_entry_inside_a_shared_one_under_a_local_one_starts_no_attempt() {
     );
 }
 
+/// The Dirty-landing take-over under a Local entry: each wound retries
+/// the Local entry, whose next Shared entry is a new attempt. The claims
+/// earlier take-overs met must stay taken across those retries, or every
+/// retry dooms X again and is taken over again.
+#[test]
+fn a_take_over_under_a_local_entry_restarts_its_read_boundedly() {
+    for frames in [1, 2] {
+        let shared = Arc::new(Rt::new());
+        shared.set_placeholder(0_u64);
+        let cc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let c = {
+            let cc = cc.clone();
+            shared.create_query_with(move |rt: &Rt| rt.get(*cc.get().unwrap()), replayable())
+        };
+        cc.set(c).unwrap();
+        let x = shared.create_query_with(
+            move |rt: &Rt| rt.try_get(c).map_or(7, |v| v + 1),
+            replayable(),
+        );
+        let t = shared.create_query_with(
+            move |rt: &Rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                v + thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap())
+            },
+            replayable(),
+        );
+        shared.set_max_frames(frames);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let local = Runtime::<Local>::new();
+            let l = local.create_query(move |_: &Runtime<Local>| shared.get(t));
+            let _ = tx.send(local.get(l));
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).ok(),
+            Some(14),
+            "budget {frames}"
+        );
+    }
+}
+
 /// A closure that catches an ordinary panic of its dep finds its attempt
 /// out of flight at any budget: only a discard's unwind is in flight.
 #[test]
