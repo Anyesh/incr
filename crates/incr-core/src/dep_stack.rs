@@ -505,6 +505,17 @@ pub trait DepStack: 'static {
         })
     }
 
+    /// The control block of the frame [`Self::raise_hold`] marks.
+    fn hold_reader(&self) -> Option<*const ComputeCtl> {
+        self.with(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .find(|f| f.rt != RuntimeId::SENTINEL)
+                .map(|f| f.ctl)
+        })
+    }
+
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {

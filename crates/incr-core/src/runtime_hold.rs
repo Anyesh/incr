@@ -315,50 +315,62 @@ impl<C: Cells> Runtime<C> {
         );
     }
 
-    /// A non-Clean read of this runtime from another runtime's frame.
-    /// The read is this runtime's first entry on the thread unless one of
-    /// its entries is open below: then, if the read rested on a held
-    /// landing, the reading run depends on state this attempt has not
-    /// published, so its runtime is tainted and its landing held; a read
-    /// that met only claims got what `Local` gets, a cycle. A first
-    /// entry ends this runtime's held landings at its exit, since nothing
+    /// A non-Clean read of this runtime from another runtime's frame. If
+    /// one of this runtime's entries is open below and the read rested on
+    /// a held landing, the reading run depends on state this attempt has
+    /// not published, so its runtime is tainted and its landing held; a
+    /// read that met only claims got what `Local` gets, a cycle. A first
+    /// entry's holds end at its exit ([`Self::first_entry`]).
+    #[cold]
+    #[inline(never)]
+    pub(super) fn foreign_entry<R>(&self, read: impl FnOnce() -> R) -> R {
+        if !cycle_state::open_entry_of(self.runtime_id) {
+            return read();
+        }
+        let before = hold::looks();
+        let r = read();
+        if hold::looks() != before {
+            self.taint_reader();
+        }
+        r
+    }
+
+    /// Whether an entry of this runtime made now is its first inside
+    /// another entry on the thread, whose exit ends its held landings
+    /// ([`Self::first_entry`]).
+    #[inline]
+    pub(super) fn first_nested(&self) -> bool {
+        !C::SINGLE_THREADED
+            && cycle_state::depth() != 0
+            && !cycle_state::open_entry_of(self.runtime_id)
+    }
+
+    /// An entry of this runtime other than a read (a stabilize, an
+    /// observer's walk, a delete) made inside another entry on the thread.
+    /// A read is wrapped in `read_slow` instead, around the walks it
+    /// retries.
+    #[inline]
+    pub(super) fn nested_entry<R>(&self, entry: impl FnOnce() -> R) -> R {
+        if self.first_nested() {
+            return self.first_entry(entry);
+        }
+        entry()
+    }
+
+    /// Runs this runtime's first entry inside another runtime's entry,
+    /// of any kind, and ends its held landings at the exit, since nothing
     /// may keep a pointer to the runtime past it: they publish if they
     /// read only published state, and retract (landing as not computed)
     /// if the runtime is tainted or the thread wounded, which taints the
     /// reader in turn.
     #[cold]
     #[inline(never)]
-    pub(super) fn foreign_entry<R>(&self, read: impl FnOnce() -> R) -> R {
-        if cycle_state::open_entry_of(self.runtime_id) {
-            let before = hold::looks();
-            let r = read();
-            if hold::looks() != before {
-                self.taint_reader();
-            }
-            return r;
-        }
-        self.first_entry(read)
-    }
-
-    /// An entry of this runtime other than a read (a stabilize, an
-    /// observer's walk, a delete) made inside another entry on the thread.
-    /// If it is this runtime's first, it ends its held landings at its exit
-    /// as [`Self::foreign_entry`] does; a later one leaves them to the
-    /// first, whose exit is still ahead.
-    #[inline]
-    pub(super) fn nested_entry<R>(&self, entry: impl FnOnce() -> R) -> R {
-        if C::SINGLE_THREADED
-            || cycle_state::depth() == 0
-            || cycle_state::open_entry_of(self.runtime_id)
-        {
-            return entry();
-        }
-        self.first_entry(entry)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn first_entry<R>(&self, entry: impl FnOnce() -> R) -> R {
+    pub(super) fn first_entry<R>(&self, entry: impl FnOnce() -> R) -> R {
+        let reader = self.dep_stack.hold_reader();
+        // SAFETY: the reading frame is below this entry on the stack, so
+        // its control block outlives it (see `Frame::ctl`).
+        let reader = reader.map(|c| unsafe { &*c });
+        let reader_held = reader.is_some_and(|c| c.has(crate::cycle::HOLD));
         let outcome = catch_unwind(AssertUnwindSafe(entry));
         if hold::holds_runtime(self.runtime_id) {
             let unwound = outcome.is_err()
@@ -371,6 +383,11 @@ impl<C: Cells> Runtime<C> {
                 self.taint_reader();
             } else {
                 self.publish_own();
+                // The frames' pops passed their HOLD to the reader, but
+                // what it read is published now.
+                if let Some(c) = reader.filter(|_| !reader_held) {
+                    c.clear(crate::cycle::HOLD);
+                }
             }
         }
         match outcome {

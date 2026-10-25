@@ -447,6 +447,10 @@ impl ComputeCtl {
         self.flags.set(self.flags.get() | flag);
     }
 
+    pub(crate) fn clear(&self, flag: u16) {
+        self.flags.set(self.flags.get() & !flag);
+    }
+
     /// Marks the frame part of an open cycle reaching down to `p`.
     pub(crate) fn lower(&self, p: u32) {
         self.raise(LOW);

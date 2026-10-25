@@ -323,6 +323,10 @@ impl<C: Cells> Runtime<C> {
     fn end_nested_shared(&self, cidx: u32) {
         replay::drop_all_from(cidx);
         if cycle_state::wounded() {
+            // The winner may wait on one of them.
+            if hold::holds_runtime(self.runtime_id) {
+                self.retract_held();
+            }
             reserve::end_all();
             debug_assert!(
                 cycle_state::held_keys()
