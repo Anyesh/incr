@@ -1488,6 +1488,7 @@ impl<C: Cells> Runtime<C> {
             self.park(ParkPoint::BeforeVirtualClaim(NodeId(slot)));
             match self.claim_virtual(p, top) {
                 Ok(()) => {
+                    self.unregenerable(Some(f));
                     return Some(
                         self.cycle_read(handle, NodeState::Computing, kind, None)
                             .expect("incr-core: a virtual hit holds the node it read"),
@@ -2031,6 +2032,9 @@ impl<C: Cells> Runtime<C> {
         let Some((f, reading, ordinal)) = self.dep_stack.unwound_read(self.runtime_id) else {
             return;
         };
+        if kind == Some(UnwindKind::Cycle) {
+            self.unregenerable(Some(f));
+        }
         let (ctl, cidx) = (f.ctl, f.cidx);
         let regenerable = self.note_took(f, reading, payload);
         let copy = match replay::copy_payload(payload) {

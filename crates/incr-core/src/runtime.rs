@@ -2302,7 +2302,10 @@ impl<C: Cells> Runtime<C> {
             // `get` found the node not Clean, so the walk starts at once.
             let walk =
                 || self.clean_walk::<MODE>(NodeId(slot), handle.generation(), word, observed);
-            match self.entered(kind, walk)? {
+            let walked = self
+                .entered(kind, walk)
+                .inspect_err(|_| self.unregenerable(frame));
+            match walked? {
                 Computed::Done | Computed::Unsettled => {
                     if MODE & VIRT != 0 {
                         if let Some(value) = self.stashed_read(handle) {
@@ -2334,19 +2337,24 @@ impl<C: Cells> Runtime<C> {
             }
             self.park(ParkPoint::AfterWalk(NodeId(slot)));
             let (type_tag, arena_slot) = self.fields_under(handle, node);
+            // Also loaded before the slot is read, so a value another
+            // thread lands Clean after a Dirty read is still noted as Dirty.
+            let dirty = || state::load::<C>(node.state_cell()) == NodeState::Dirty;
+            let dirty_before = frame.is_some() && dirty();
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
-                    if let Some(f) = frame {
-                        if state::load::<C>(node.state_cell()) == NodeState::Dirty
-                            && !self.unchanged_stash(handle.slot(), handle.generation())
-                        {
+                    if let Some(f) = frame.filter(|_| dirty_before || dirty()) {
+                        if !self.unchanged_stash(handle.slot(), handle.generation()) {
                             self.note_dirty_read(f, handle, &value);
                         }
                     }
                     return Ok(value);
                 }
                 None => match self.read_missing(handle, node) {
-                    Ok(cycle) => return Err(cycle),
+                    Ok(cycle) => {
+                        self.unregenerable(frame);
+                        return Err(cycle);
+                    }
                     Err(NodeState::Clean) => {
                         return Ok(self.read_slot(handle, node, type_tag, arena_slot));
                     }
@@ -4058,6 +4066,8 @@ impl<C: Cells> Runtime<C> {
                         true,
                         bag,
                     );
+                    // The retry's run has this run's key.
+                    self.unfailed_landing(id, node.generation(), cidx);
                     self.park_with_bag(ParkPoint::StaleRetry(id), bag);
                     continue 'attempt;
                 }
@@ -4169,10 +4179,12 @@ impl<C: Cells> Runtime<C> {
         if children_stashed {
             let first = attempt.first;
             let stashed = ChildLanding::Stashed;
+            self.unfailed_landing(id, node.generation(), attempt.cidx);
             self.discard_land_in_group(id, first, wrote, attempt.stamp_rev, stashed, bag);
         } else if kind.is_some() {
             // A cycle or a wound is no fault of this node's: it lands as
             // if it never ran, never Failed.
+            self.unfailed_landing(id, node.generation(), attempt.cidx);
             self.unwound_land(id, attempt.first, wrote, attempt.stamp_rev, kind, bag);
         } else {
             // Publish the union of the old deps and whatever was recorded
