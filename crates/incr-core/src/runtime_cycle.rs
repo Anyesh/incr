@@ -214,9 +214,10 @@ impl Drop for OutermostExit {
 }
 
 /// [`OutermostExit`] for the outermost `Shared` entry under a `Local`
-/// runtime's outermost entry, whose contexts, all below `cidx`, stay. A
-/// wound unwinding through it waits out its winner here, where the claim
-/// the winner waited on is this runtime's to check.
+/// runtime's outermost entry: it removes only the contexts at or above
+/// `cidx`, as the `Local` entry's below stay. A wound unwinding through it
+/// waits out its winner here, where the claim the winner waited on is
+/// this runtime's to check.
 struct NestedSharedExit<'a, C: Cells> {
     rt: &'a Runtime<C>,
     cidx: u32,
@@ -306,7 +307,6 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// The end of [`NestedSharedExit`].
     #[cold]
     #[inline(never)]
     fn end_nested_shared(&self, cidx: u32) {

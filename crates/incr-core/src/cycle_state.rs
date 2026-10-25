@@ -836,7 +836,7 @@ thread_local! {
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
-    static OUTER_RTS: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
     static OUTER: RefCell<Outer> = const {
         RefCell::new(Outer {
             dissolved: Vec::new(),
@@ -862,7 +862,7 @@ loom::thread_local! {
         budget_clock: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
-    static OUTER_RTS: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         dissolved_groups: Vec::new(),
@@ -1135,14 +1135,23 @@ const SHARED_KEY: u64 = 1 << 63;
 /// One count on the thread's engine entry depth; dropping it, by an
 /// unwind included, gives the count back, and the outermost entry's drop
 /// gives up the thread's ticket. An entry of another runtime than the
-/// innermost one's also keeps that runtime's key in [`OUTER_RTS`] until
-/// it exits, as a runtime nested in another one's entry is never the
-/// thread's outermost.
+/// innermost one's keeps the key of the entry below it in [`OUTER_RTS`],
+/// so that the runtimes open below are known.
 pub(crate) struct EntryDepth {
     outermost: bool,
     switched: bool,
     first_for_runtime: bool,
     shared_outermost: bool,
+}
+
+/// The keys below this thread's runtime switches, innermost last, with a
+/// count per key and of the `Shared` ones, so that a switch costs the
+/// same however many are open.
+#[derive(Default)]
+struct OuterRts {
+    stack: Vec<u64>,
+    open: HashMap<u64, u32, FxBuildHasher>,
+    shared: u32,
 }
 
 impl EntryDepth {
@@ -1220,25 +1229,53 @@ impl Drop for EntryDepth {
 #[cold]
 #[inline(never)]
 fn switch_in(e: &EntryState, key: u64) -> EntryDepth {
-    let below = e.cur_rt.replace(key);
-    OUTER_RTS.with(|s| {
-        let mut s = s.borrow_mut();
-        s.push(below);
-        EntryDepth {
-            outermost: false,
-            switched: true,
-            first_for_runtime: !s.contains(&key),
-            shared_outermost: key & SHARED_KEY != 0 && s.iter().all(|&k| k & SHARED_KEY == 0),
+    let below = e.cur_rt.get();
+    let pushed = OUTER_RTS.try_with(|o| {
+        let mut o = o.borrow_mut();
+        o.stack.push(below);
+        *o.open.entry(below).or_insert(0) += 1;
+        o.shared += u32::from(below & SHARED_KEY != 0);
+        (!o.open.contains_key(&key), o.shared == 0)
+    });
+    match pushed {
+        Ok((first_for_runtime, no_shared_below)) => {
+            e.cur_rt.set(key);
+            EntryDepth {
+                outermost: false,
+                switched: true,
+                first_for_runtime,
+                shared_outermost: key & SHARED_KEY != 0 && no_shared_below,
+            }
         }
-    })
+        // An entry from a destructor of this thread's locals, after the
+        // list's: it is taken as a nested entry of the runtime below.
+        Err(_) => EntryDepth {
+            outermost: false,
+            switched: false,
+            first_for_runtime: false,
+            shared_outermost: false,
+        },
+    }
 }
 
 #[cold]
 #[inline(never)]
 fn switch_out(e: &EntryState) {
-    let below = OUTER_RTS
-        .with(|s| s.borrow_mut().pop())
-        .expect("incr-core: a switched entry keeps the key below it");
+    let below = OUTER_RTS.with(|o| {
+        let mut o = o.borrow_mut();
+        let below = o
+            .stack
+            .pop()
+            .expect("incr-core: a switched entry keeps the key below it");
+        match o.open.get_mut(&below) {
+            Some(n) if *n > 1 => *n -= 1,
+            _ => {
+                o.open.remove(&below);
+            }
+        }
+        o.shared -= u32::from(below & SHARED_KEY != 0);
+        below
+    });
     e.cur_rt.set(below);
 }
 
@@ -1249,7 +1286,10 @@ pub(crate) fn open_entry_of(rt: RuntimeId) -> bool {
     ENTRY.with(|e| {
         e.depth.get() != 0
             && (e.cur_rt.get() & !SHARED_KEY == rt
-                || OUTER_RTS.with(|s| s.borrow().iter().any(|&k| k & !SHARED_KEY == rt)))
+                || OUTER_RTS.with(|o| {
+                    let o = o.borrow();
+                    o.open.contains_key(&rt) || o.open.contains_key(&(rt | SHARED_KEY))
+                }))
     })
 }
 

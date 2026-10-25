@@ -165,7 +165,7 @@ fn a_thread_counts_episodes_on_a_bounded_set_of_runtimes() {
 /// L, S, L, S, T, S on one thread: each runtime's first entry, and the
 /// first Shared one, are told apart from the thread's outermost.
 #[test]
-fn entries_count_per_runtime_under_another_runtimes_outermost() {
+fn entries_tell_each_runtimes_first_under_another_runtimes_outermost() {
     use super::{open_entry_of, EntryDepth};
     let (l, s, t) = (
         RuntimeId::for_test(1 << 40),
@@ -215,4 +215,31 @@ fn entries_count_per_runtime_under_another_runtimes_outermost() {
     assert!(!open_entry_of(l));
     let s6 = EntryDepth::enter(s, true);
     assert_eq!(flags(&s6), (true, true, true));
+}
+
+/// A thousand entries alternating between a Local and a Shared runtime:
+/// only the first of each is its runtime's first, and every switch is
+/// undone once they exit.
+#[test]
+fn alternating_runtimes_switch_back_on_exit() {
+    use super::{open_entry_of, EntryDepth};
+    let (l, s) = (
+        RuntimeId::for_test(1 << 41),
+        RuntimeId::for_test((1 << 41) + 1),
+    );
+    let entries: Vec<EntryDepth> = (0..1000)
+        .map(|i| {
+            let e = EntryDepth::enter(if i % 2 == 0 { l } else { s }, i % 2 == 1);
+            assert_eq!(e.first_for_runtime(), i < 2, "entry {i}");
+            assert_eq!(e.shared_outermost(), i == 1, "entry {i}");
+            e
+        })
+        .collect();
+    assert!(open_entry_of(l) && open_entry_of(s));
+    for e in entries.into_iter().rev() {
+        drop(e);
+    }
+    assert!(!open_entry_of(l) && !open_entry_of(s));
+    let s1 = EntryDepth::enter(s, true);
+    assert!(s1.is_outermost() && s1.shared_outermost());
 }
