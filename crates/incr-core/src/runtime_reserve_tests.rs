@@ -13,6 +13,7 @@ use std::time::Duration;
 use super::race_tests::{await_reservation_wait, id, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::Shared;
+use crate::child_test::run_in_child;
 use crate::cycle::{QueryOpts, Replay};
 use crate::handle::Incr;
 
@@ -711,6 +712,44 @@ fn a_take_over_of_a_node_that_lands_dirty_restarts_its_read_boundedly() {
         assert!(n <= 3, "budget {frames}: {n} take-overs");
         rt.assert_invariant_i();
     }
+}
+
+struct ReadOnDrop<'a>(&'a Rt, Incr<u64>);
+
+impl Drop for ReadOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.get(self.1);
+    }
+}
+
+/// T holds a guard that reads X when dropped, and T's read of Y is over
+/// budget, so the guard reads X inside T's doom unwind. A read there can't
+/// raise again without aborting the process, so it takes the placeholder.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_doomed_closures_destructor_reads_inside_its_unwind() {
+    run_in_child(
+        "runtime::reserve_tests::a_doomed_closures_destructor_reads_inside_its_unwind",
+        || {
+            for frames in [u32::MAX, 1, 2] {
+                let rt = Arc::new(Rt::new());
+                rt.set_placeholder(0_u64);
+                let i = rt.create_input(3_u64);
+                let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+                let x = rt.create_query_with(move |rt: &Rt| rt.get(i) + 2, replayable());
+                let t = rt.create_query_with(
+                    move |rt: &Rt| {
+                        let _guard = ReadOnDrop(rt, x);
+                        rt.get(y) + 10
+                    },
+                    replayable(),
+                );
+                rt.set_max_frames(frames);
+                assert_eq!(within_10s(&rt, t), Some(Ok(14)), "budget {frames}");
+            }
+        },
+    )
+    .assert_clean();
 }
 
 /// A closure that catches an ordinary panic of its dep finds its attempt
