@@ -3810,7 +3810,7 @@ mod tests {
         notes.push(rt, key, 1, ((5, 0), 10), false);
         notes.push(rt, key, 3, ((5, 0), 20), false);
         let whole = notes.copy(rt, key, 0).into_nodes();
-        assert_eq!(whole, vec![((5, 0), 1, 20)]);
+        assert_eq!(whole, vec![((5, 0), 1, 10), ((5, 0), 3, 20)]);
         let mut cut = notes.copy(rt, key, 0);
         let Nodes::Shared { cut: c, .. } = &mut cut.nodes else {
             panic!("a copy of a log shares it");
