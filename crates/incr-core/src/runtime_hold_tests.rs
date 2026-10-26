@@ -1259,18 +1259,22 @@ fn shared_holder_waiting_on_a_claim_of_a_reader_of_its_held_panic_landing_finish
 /// `f`'s Failed landing. A set of `x`, `f`'s dep, then finds no published
 /// edge to walk, so `f` lands Dirty at the attempt's end rather than
 /// Failed, and so do `d` and `r` over it: the next read runs them again.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn shared_held_failed_landing_over_a_dep_a_set_moved_lands_dirty() {
+fn held_failed_landing_over_a_moved_dep(
+    stop: bool,
+) -> (Arc<Runtime<Shared>>, Incr<i64>, Incr<i64>) {
     let rt = Arc::new(Runtime::<Shared>::new());
+    rt.set_max_frames(16);
     let gate = crate::runtime::race_tests::Gate::new();
     let x = rt.create_input(0_i64);
     let on = rt.create_input(0_i64);
-    let f = rt.create_query(move |rt| {
-        let v = rt.get(x);
-        assert!(v % 2 == 1, "even");
-        v
-    });
+    let f = rt.create_query_with(
+        move |rt| {
+            let v = rt.get(x);
+            assert!(v % 2 == 1, "even");
+            v
+        },
+        replayable(),
+    );
     let d = {
         let gate = gate.clone();
         rt.create_query(move |rt: &Runtime<Shared>| {
@@ -1293,11 +1297,54 @@ fn shared_held_failed_landing_over_a_dep_a_set_moved_lands_dirty() {
     gate.wait_parked();
     assert_eq!(rt.state_of(f), NodeState::Computing);
     rt.set(x, 1);
+    if stop {
+        let f_id = NodeId(f.slot());
+        let once = AtomicBool::new(true);
+        let hook: super::ParkHook = Box::new(move |point| {
+            if point == ParkPoint::HeldLanding(f_id) && once.swap(false, Ordering::SeqCst) {
+                panic!("a held landing panicked on purpose");
+            }
+        });
+        assert!(rt.park_hook.set(hook).is_ok());
+    }
     gate.release();
-    assert_eq!(reader.join().unwrap(), 7);
+    match reader.join() {
+        Ok(v) => assert!(!stop && v == 7, "{v}"),
+        Err(_) => assert!(stop),
+    }
+    (rt, f, r)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_failed_landing_over_a_dep_a_set_moved_lands_dirty() {
+    let (rt, f, r) = held_failed_landing_over_a_moved_dep(false);
     assert_eq!(rt.state_of(f), NodeState::Dirty);
     rt.assert_invariant_i();
     assert_eq!(rt.get(r), 10);
+}
+
+/// The landing lowered to Dirty drops its run's failed-run record and the
+/// ticket of the panic d contained, as a held Failed landing a set flagged
+/// does: the node is Failed no longer. With `stop`, a panic at the held
+/// landing stops the publication before f lands.
+fn lowered_held_failed_landing_drops_its_record(stop: bool) {
+    let (rt, f, _) = held_failed_landing_over_a_moved_dep(stop);
+    assert_eq!(rt.state_of(f), NodeState::Dirty);
+    assert_eq!(rt.failed_run_token(f.slot(), f.generation()), None);
+    assert_eq!(rt.contained_payloads(), 0);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_failed_landing_lowered_over_a_moved_dep_drops_its_record() {
+    lowered_held_failed_landing_drops_its_record(false);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stopped_held_failed_landing_lowered_over_a_moved_dep_drops_its_record() {
+    lowered_held_failed_landing_drops_its_record(true);
 }
 
 /// As above with g, which lets f's panic out, between d and f: a set
