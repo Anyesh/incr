@@ -2162,6 +2162,128 @@ fn a_regenerated_payload_reads_its_deps_as_the_unbounded_run_did() {
     }
 }
 
+/// Under `Shared`, after the root reads the fallback cycle y, whose
+/// episode holds every landing to the read's exit: c deletes x, a node
+/// the thread holds, and panics with a custom payload; b catches it and
+/// panics with its own, which r catches as in [`failed_dep_shape`]. The
+/// delete reads x's held landing, so c's Failed landing is held though
+/// its run read no held value. Returns the root's value, the states a
+/// second thread saw for c at each regeneration's rerun of c, and c's
+/// state after the read.
+fn held_failed_after_a_delete(
+    frames: u32,
+    outer: u32,
+    chain: u32,
+) -> (u64, Vec<NodeState>, NodeState) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    rt.set_placeholder(0_u64);
+    let i = rt.create_input(1_u64);
+    let z_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let z_read = Arc::clone(&z_cell);
+    let y = rt.create_query_with(
+        move |rt: &Runtime<Shared>| rt.get(*z_read.get().unwrap()) + 1,
+        QueryOpts {
+            cycle: CycleStrategy::fallback(|_: &Cycle| 100),
+            replay: Replay::Allowed,
+            ..QueryOpts::default()
+        },
+    );
+    let z = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(y) * 2, replayable());
+    z_cell.set(z).unwrap();
+    let x = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(y) + 1, replayable());
+    let gone = Arc::new(AtomicBool::new(false));
+    let deleted = Arc::clone(&gone);
+    let c = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> u64 {
+            if !deleted.load(SeqCst) && rt.try_delete_node(x).is_ok() {
+                deleted.store(true, SeqCst);
+            }
+            std::panic::panic_any(CustomPayload(rt.get(i)))
+        },
+        replayable(),
+    );
+    rt.set_max_frames(frames);
+    let b = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> u64 {
+            let got = match catch_unwind(AssertUnwindSafe(|| rt.get(c))) {
+                Err(p) => p.downcast::<CustomPayload>().map_or(100, |x| x.0 + 10),
+                Ok(v) => v,
+            };
+            std::panic::panic_any(CustomPayload(got))
+        },
+        replayable(),
+    );
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let v = deep;
+        deep = rt.create_query_with(move |rt| rt.get(v) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<CustomPayload>().map_or(2, |c| c.0),
+                Ok(_) => 3,
+            };
+            saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    let mut below = r;
+    for _ in 0..outer {
+        let v = below;
+        below = rt.create_query_with(move |rt| rt.get(v), replayable());
+    }
+    let top = rt.create_query_with(
+        move |rt| {
+            let _ = rt.get(y);
+            if !gone.load(SeqCst) {
+                let _ = rt.try_get(x);
+            }
+            rt.get(below)
+        },
+        replayable(),
+    );
+    let seen: Arc<Mutex<Vec<NodeState>>> = Arc::default();
+    let (watch, watcher) = (Arc::clone(&rt), Arc::clone(&seen));
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point == super::ParkPoint::RerunBack(NodeId(c.slot())) {
+            let rt = Arc::clone(&watch);
+            let state = std::thread::spawn(move || rt.nodes.get(c.slot()).state())
+                .join()
+                .unwrap();
+            watcher.lock().unwrap().push(state);
+        }
+    }));
+    assert!(installed.is_ok());
+    let got = rt.try_get(top).unwrap_or(7777);
+    let seen = seen.lock().unwrap().clone();
+    (got, seen, rt.state_of(c))
+}
+
+/// A held Failed landing is no regeneration's to rerun: no other thread
+/// sees c Failed before the read's exit publishes it, and the read ends
+/// with c Failed and the unbounded run's value under every budget.
+#[test]
+fn shared_held_failed_landing_is_never_rerun_before_its_publication() {
+    let mut case = 0;
+    for outer in [0, 1, 3] {
+        for chain in [0, 2, 6] {
+            let (want, _, state) = held_failed_after_a_delete(u32::MAX, outer, chain);
+            assert_eq!(state, NodeState::Failed);
+            for frames in sweep_frames(&mut case) {
+                let (got, seen, state) = held_failed_after_a_delete(frames, outer, chain);
+                let at = format!("outer={outer} chain={chain} frames={frames}");
+                assert_eq!(got, want, "{at}");
+                assert!(
+                    !seen.contains(&NodeState::Failed),
+                    "c Failed before the exit: {at} {seen:?}"
+                );
+                assert_eq!(state, NodeState::Failed, "{at}");
+            }
+        }
+    }
+}
+
 /// v reads r through `outer` levels, r catches the panic of f and then
 /// reads a chain of `chain` levels, and f's `try_get` of v cycles, so f
 /// panics with `CustomPayload(5)`. Past the budget f's retry reads v as a
