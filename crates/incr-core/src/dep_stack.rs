@@ -22,7 +22,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 
-use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED, UNREGENERABLE};
+use crate::cells::Cells;
+use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, POISONED, UNREGENERABLE};
 use crate::fx::FxBuildHasher;
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
@@ -364,13 +365,28 @@ impl Frames {
 /// frame's Clean read; no registry hands it out.
 pub(crate) const DIVERTED_TAG: u16 = u16::MAX;
 
+mod sealed {
+    /// Keeps [`super::DepStack`] to this crate's stacks: its default
+    /// methods dereference the control-block pointers its methods return,
+    /// which an outside implementation could forge.
+    pub trait Sealed {}
+}
+
 /// Strategy-parameterized dep tracker used by the runtime during compute.
-pub trait DepStack: 'static {
+pub trait DepStack: sealed::Sealed + 'static {
     fn new() -> Self;
 
     /// Runs `f` on the stack. `f` must not reach user code or the stack.
     #[doc(hidden)]
     fn with<R>(&self, f: impl FnOnce(&mut Frames) -> R) -> R;
+
+    /// The top frame's runtime tag, node and control block, for
+    /// [`Self::unrecorded_lookup`].
+    #[doc(hidden)]
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        self.with(|s| top_fields(s))
+    }
 
     /// Push a frame for `node` of runtime `rt` at the top of the stack,
     /// with the frame's depth as its conceptual-stack position, which is
@@ -479,18 +495,54 @@ pub trait DepStack: 'static {
                 .filter(|top| top.rt() != rt)
                 .map(|top| (top.tagged_rt, top.node, top.ctl, top.cidx))
         })?;
-        let keeps = if tagged.is_untested() {
+        // SAFETY: the frame is on the stack, so it is running and its
+        // control block is live.
+        self.top_keeps_foreign(tagged, node, unsafe { &*ctl })
+            .then(|| (tagged.rt(), ctl, cidx))
+    }
+
+    /// Whether the top frame, read as `tagged`, `node` and `ctl`, keeps
+    /// other runtimes' Clean reads, settling it when still untested.
+    fn top_keeps_foreign(&self, tagged: FrameRt, node: NodeId, ctl: &ComputeCtl) -> bool {
+        if tagged.is_untested() {
             #[cfg(all(test, not(loom)))]
             KEEP_SETTLES.with(|n| n.set(n.get() + 1));
-            // SAFETY: the frame is on the stack, so it is running and its
-            // control block is live.
-            let keeps = unsafe { (*ctl).keeps_foreign(node.0) };
+            // SAFETY: the frame is on the stack, so it is running.
+            let keeps = unsafe { ctl.keeps_foreign(node.0) };
             self.settle_foreign_keeping(keeps);
             keeps
         } else {
             tagged.keeps_foreign()
-        };
-        keeps.then(|| (tagged.rt(), ctl, cidx))
+        }
+    }
+
+    /// For a lookup that records no dependency, such as
+    /// `Runtime::is_alive` or a table's `get`: the top frame's runtime
+    /// (`SENTINEL` for a callback's barrier, `None` outside any compute),
+    /// after raising `UNREGENERABLE` on a compute frame that keeps other
+    /// runtimes' Clean reads, since a rerun of its node would look again
+    /// as things are then.
+    ///
+    /// Inlined so that a lookup outside any compute costs one look at the
+    /// stack; the marking stays out of line.
+    #[inline(always)]
+    fn unrecorded_lookup(&self) -> Option<RuntimeId> {
+        let (tagged, node, ctl) = self.top_for_lookup()?;
+        let top = tagged.rt();
+        if top != RuntimeId::SENTINEL {
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            self.mark_unrecorded_lookup(tagged, node, unsafe { &*ctl });
+        }
+        Some(top)
+    }
+
+    /// [`Self::unrecorded_lookup`]'s marking of the top compute frame.
+    #[inline(never)]
+    fn mark_unrecorded_lookup(&self, tagged: FrameRt, node: NodeId, ctl: &ComputeCtl) {
+        if self.top_keeps_foreign(tagged, node, ctl) {
+            ctl.raise(UNREGENERABLE);
+        }
     }
 
     /// Sends the top frame's Clean reads to the slow path (see
@@ -656,6 +708,31 @@ pub trait DepStack: 'static {
         });
     }
 
+    /// Marks the nearest `Shared` compute frame, past any callback's
+    /// barrier, as having read a landing this thread holds, so its own
+    /// landing is held. Returns the frame's runtime. A `Local` frame between
+    /// lands at once, as no exit publishes a `Local` runtime's holds.
+    fn raise_hold(&self) -> Option<RuntimeId> {
+        self.with(|s| {
+            let f = s.frames.iter().rev().find(|f| holds_for(f.rt()))?;
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            unsafe { (*f.ctl).raise(HOLD) };
+            Some(f.rt())
+        })
+    }
+
+    /// The control block of the frame [`Self::raise_hold`] marks.
+    fn hold_reader(&self) -> Option<*const ComputeCtl> {
+        self.with(|s| {
+            s.frames
+                .iter()
+                .rev()
+                .find(|f| holds_for(f.rt()))
+                .map(|f| f.ctl)
+        })
+    }
+
     /// Mark `rt`'s active frame, if any, as having read a dep that did
     /// not land `Clean`, so its compute must not land `Clean` either.
     fn poison_current_frame(&self, rt: RuntimeId) {
@@ -801,6 +878,8 @@ pub struct LocalDepStack {
     frames: *const RefCell<Frames>,
 }
 
+impl sealed::Sealed for LocalDepStack {}
+
 impl DepStack for LocalDepStack {
     fn new() -> Self {
         Self {
@@ -816,6 +895,38 @@ impl DepStack for LocalDepStack {
         // not outlive this call.
         f(&mut unsafe { &*self.frames }.borrow_mut())
     }
+
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        // SAFETY: as in `with`.
+        top_unguarded(unsafe { &*self.frames })
+    }
+}
+
+#[inline(always)]
+fn top_fields(s: &Frames) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+    s.frames
+        .last()
+        .map(|top| (top.tagged_rt, top.node, top.ctl))
+}
+
+/// [`top_fields`] without writing the borrow flag, which a lookup outside
+/// any compute would otherwise pay for on every call.
+#[inline(always)]
+fn top_unguarded(frames: &RefCell<Frames>) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+    // SAFETY: the shared reference lives only for the copy in
+    // `top_fields`, which takes no borrow of the frames.
+    top_fields(
+        unsafe { frames.try_borrow_unguarded() }
+            .expect("incr-core: dep stack borrowed during a lookup"),
+    )
+}
+
+/// [`DepStack::unrecorded_lookup`] on this thread's stack, for a lookup
+/// with no runtime at hand, such as a collection's snapshot.
+#[inline(always)]
+pub(crate) fn unrecorded_lookup<C: Cells>() {
+    <C::DepStack as DepStack>::new().unrecorded_lookup();
 }
 
 pub struct SharedDepStack;
@@ -825,8 +936,9 @@ thread_local! {
     static KEEP_SETTLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many untested frames [`DepStack::foreign_keeper`] settled on this
-/// thread since the last call.
+/// How many untested frames a foreign read or a lookup without a
+/// dependency settled on this thread since the last call (see
+/// [`DepStack::foreign_keeper`]).
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_keep_settles() -> u64 {
     KEEP_SETTLES.with(|n| n.replace(0))
@@ -854,6 +966,12 @@ impl Drop for FramesGuard {
     }
 }
 
+/// Whether a frame of `rt` can hold its landing: a compute frame of a
+/// `Shared` runtime.
+fn holds_for(rt: RuntimeId) -> bool {
+    rt != RuntimeId::SENTINEL && crate::cycle_state::shared_open(rt)
+}
+
 /// Registers `FRAMES_GUARD`'s destructor, on the push that allocates the
 /// thread's buffer. During thread-local destruction the registration is
 /// refused, and that late buffer is leaked.
@@ -862,6 +980,8 @@ impl Drop for FramesGuard {
 fn first_push() {
     let _ = FRAMES_GUARD.try_with(|_| {});
 }
+
+impl sealed::Sealed for SharedDepStack {}
 
 impl DepStack for SharedDepStack {
     fn new() -> Self {
@@ -879,6 +999,13 @@ impl DepStack for SharedDepStack {
         // does not outlive this call.
         f(&mut unsafe { &*frames }.borrow_mut())
     }
+
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        let frames: *const RefCell<Frames> = SHARED_FRAMES.with(|f| std::ptr::from_ref(&**f));
+        // SAFETY: as in `with`.
+        top_unguarded(unsafe { &*frames })
+    }
 }
 
 #[cfg(loom)]
@@ -888,6 +1015,9 @@ pub struct LoomDepStack;
 loom::thread_local! {
     static LOOM_FRAMES: RefCell<Frames> = RefCell::new(Frames::new());
 }
+
+#[cfg(loom)]
+impl sealed::Sealed for LoomDepStack {}
 
 #[cfg(loom)]
 impl DepStack for LoomDepStack {

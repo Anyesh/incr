@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
+use crate::changes::Count;
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::deferred::Unbuilt;
 use crate::few::Few;
@@ -470,7 +471,7 @@ pub(crate) struct Pending {
     by_read: Index<(u32, u32, u32, u64), usize>,
     /// How many deliveries each frame's own runtime's reads have still to
     /// take: those with no `foreign` key and not `taken`, kept by `push`,
-    /// `remove` and `set_taken`.
+    /// `unindex` and `set_taken`.
     untaken: HashMap<(u32, u32, u32), u32, FxBuildHasher>,
     /// By the frame's node and generation, at any position.
     by_node: Index<(u32, u32), usize>,
@@ -518,8 +519,34 @@ fn list<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: K, x: T) {
 
 /// Drops the items `gone` accepts from the list `map` holds under `at`.
 fn unlist<K: std::hash::Hash + Eq, T>(map: &mut Index<K, T>, at: &K, gone: impl Fn(&T) -> bool) {
-    if map.get_mut(at).is_some_and(|l| l.retain(|x| !gone(x))) {
+    if map.get_mut(at).is_some_and(|l| {
+        note_work(l.as_slice().len());
+        l.retain(|x| !gone(x))
+    }) {
         map.remove(at);
+    }
+}
+
+/// Drops the items `gone` accepts from each list `map` holds under `keys`,
+/// passing over each list once; with `many` false the keys are taken as
+/// distinct, which spares a single removal the set.
+fn unlist_all<K: std::hash::Hash + Eq + Copy>(
+    map: &mut Index<K, usize>,
+    keys: impl Iterator<Item = K>,
+    gone: impl Fn(&usize) -> bool,
+    many: bool,
+) {
+    if !many {
+        for k in keys {
+            unlist(map, &k, &gone);
+        }
+        return;
+    }
+    let mut seen = HashSet::with_hasher(FxBuildHasher);
+    for k in keys {
+        if seen.insert(k) {
+            unlist(map, &k, &gone);
+        }
     }
 }
 
@@ -557,33 +584,79 @@ impl Pending {
         let d = self.slots[i]
             .take()
             .expect("incr-core: a delivery is removed once");
-        unlist(&mut self.by_key, &d.key, |&j| j == i);
-        unlist(&mut self.by_maker, &d.maker, |&j| j == i);
-        unlist(&mut self.by_frame, &frame_of(&d.key), |&j| j == i);
-        unlist(&mut self.by_read, &read_of(&d.key), |&j| j == i);
-        if awaits(&d) {
-            self.count_taken(frame_of(&d.key));
+        self.unindex(std::slice::from_ref(&d));
+        d
+    }
+
+    /// Removes deliveries `is`, in that order.
+    fn remove_all(&mut self, is: Vec<usize>) -> Vec<Delivery> {
+        let out: Vec<Delivery> = is
+            .into_iter()
+            .map(|i| {
+                self.slots[i]
+                    .take()
+                    .expect("incr-core: a delivery is removed once")
+            })
+            .collect();
+        self.unindex(&out);
+        out
+    }
+
+    /// Drops `out`, deliveries just taken from their slots, from every
+    /// index, passing over each list they share once rather than once per
+    /// delivery: a wide frame's deliveries share its frame's, maker's and
+    /// node's lists.
+    fn unindex(&mut self, out: &[Delivery]) {
+        if out.is_empty() {
+            return;
         }
-        unlist(&mut self.by_node, &(d.key.node, d.key.generation), |&j| {
-            j == i
-        });
-        if d.provenance.is_some() {
-            self.traced -= 1;
-            let own = (d.key.cidx, d.key.node, d.key.generation);
-            for stand in std::iter::once(&own).chain(&d.below) {
-                unlist(&mut self.by_stand, stand, |&j| j == i);
+        let many = out.len() > 1;
+        let slots = &self.slots;
+        let gone = |&j: &usize| slots[j].is_none();
+        unlist_all(&mut self.by_key, out.iter().map(|d| d.key), gone, many);
+        unlist_all(&mut self.by_maker, out.iter().map(|d| d.maker), gone, many);
+        unlist_all(
+            &mut self.by_frame,
+            out.iter().map(|d| frame_of(&d.key)),
+            gone,
+            many,
+        );
+        unlist_all(
+            &mut self.by_read,
+            out.iter().map(|d| read_of(&d.key)),
+            gone,
+            many,
+        );
+        unlist_all(
+            &mut self.by_node,
+            out.iter().map(|d| (d.key.node, d.key.generation)),
+            gone,
+            many,
+        );
+        let traced = || out.iter().filter(|d| d.provenance.is_some());
+        if traced().next().is_some() {
+            self.traced -= traced().count();
+            let stands = traced().flat_map(|d| {
+                std::iter::once((d.key.cidx, d.key.node, d.key.generation))
+                    .chain(d.below.iter().copied())
+            });
+            unlist_all(&mut self.by_stand, stands, gone, many);
+            unlist_all(&mut self.by_frontier, traced().map(frontier), gone, many);
+        }
+        if out.iter().any(|d| d.passed) {
+            note_work(self.deep.len());
+            self.deep.retain(|j| !gone(j));
+        }
+        for d in out {
+            if awaits(d) {
+                self.count_taken(frame_of(&d.key));
             }
-            unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        if d.passed {
-            self.deep.retain(|&j| j != i);
-        }
-        self.live -= 1;
+        self.live -= out.len();
         // No index is held across a point where none is live.
         if self.live == 0 {
             self.slots.clear();
         }
-        d
     }
 
     pub(crate) fn get(&self, i: usize) -> &Delivery {
@@ -751,10 +824,8 @@ impl Pending {
 
     /// Removes the deliveries the run at `level` made, oldest first.
     pub(crate) fn extract_maker(&mut self, level: u32) -> Vec<Delivery> {
-        self.of_maker(level)
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = self.of_maker(level);
+        self.remove_all(is)
     }
 
     /// The deliveries for reads by the frame of `node` at `generation` and
@@ -765,10 +836,8 @@ impl Pending {
 
     /// Removes the deliveries for reads by that frame, oldest first.
     pub(crate) fn extract_frame(&mut self, node: u32, generation: u32, cidx: u32) -> Vec<Delivery> {
-        self.of_frame(node, generation, cidx)
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = self.of_frame(node, generation, cidx);
+        self.remove_all(is)
     }
 
     /// Whether a frame of `node` at `generation`, at any position, has an
@@ -789,10 +858,8 @@ impl Pending {
     /// Removes, oldest first, the deliveries for reads by the frames of
     /// `node` at `generation`, at any position.
     pub(crate) fn extract_node(&mut self, node: u32, generation: u32) -> Vec<Delivery> {
-        listed(&self.by_node, &(node, generation))
-            .into_iter()
-            .map(|i| self.remove(i))
-            .collect()
+        let is = listed(&self.by_node, &(node, generation));
+        self.remove_all(is)
     }
 
     /// Whether any delivery carries a provenance record.
@@ -925,6 +992,9 @@ pub(crate) struct Context {
     /// The position of level 0.
     pub(crate) boundary: u32,
     pub(crate) levels: Vec<VecDeque<Entry>>,
+    /// How many entries of each node and generation `levels` holds, so
+    /// [`Self::queues`] needs no scan.
+    queued: HashMap<(u32, u32), u32, FxBuildHasher>,
     pub(crate) vstack: Vec<VFrame>,
     /// Each node's `vstack` positions, lowest first, with the generation
     /// its virtual frame recorded.
@@ -934,6 +1004,9 @@ pub(crate) struct Context {
     pub(crate) running: Option<u32>,
     pub(crate) pending: Pending,
     pub(crate) running_entry: Option<Entry>,
+    /// The running entry still fronts its level: the driver has neither
+    /// popped nor truncated it.
+    running_fronts: bool,
     /// Every entry of this context is speculative: the context was opened
     /// inside a speculative entry's run.
     pub(crate) spec_base: bool,
@@ -1024,10 +1097,12 @@ impl Context {
             rt,
             boundary,
             levels: vec![VecDeque::from([target])],
+            queued: HashMap::from_iter([((target.node, target.generation), 1)]),
             vstack: Vec::new(),
             vindex: HashMap::default(),
             running: None,
             running_entry: None,
+            running_fronts: false,
             pending: Pending::default(),
             spec_base: target.spec,
             claims: Vec::new(),
@@ -1056,18 +1131,77 @@ impl Context {
             .find_map(|(level, q)| q.front().map(|e| (level as u32, *e)))
     }
 
+    /// Marks `entry`, the front of `level`, as the one the driver runs.
+    pub(crate) fn run_entry(&mut self, level: u32, entry: Entry) {
+        self.running = Some(level);
+        self.running_entry = Some(entry);
+        self.running_fronts = true;
+    }
+
+    /// Whether an entry of `node` at `generation` has yet to run: the
+    /// running entry is not one until the driver pops it.
+    pub(crate) fn queues(&self, node: u32, generation: u32) -> bool {
+        let running = self.running_fronts
+            && self
+                .running_entry
+                .is_some_and(|e| e.node == node && e.generation == generation);
+        self.queued.get(&(node, generation)).copied().unwrap_or(0) > u32::from(running)
+    }
+
+    /// Whether `node`'s virtual frame at `generation` stands for a frame
+    /// on the unbounded run's stack ([`Self::stacked`]).
+    pub(crate) fn stacks(&self, node: u32, generation: u32) -> bool {
+        self.position(node, generation)
+            .is_some_and(|p| (p as usize) < self.stacked().len())
+    }
+
     pub(crate) fn push_entry(&mut self, level: u32, entry: Entry) {
         let level = level as usize;
         if self.levels.len() <= level {
             self.levels.resize_with(level + 1, VecDeque::new);
         }
         self.levels[level].push_back(entry);
+        *self
+            .queued
+            .entry((entry.node, entry.generation))
+            .or_default() += 1;
     }
 
     /// Removes the oldest entry at `level`, the one the driver ran.
     pub(crate) fn pop_entry(&mut self, level: u32) {
-        self.levels[level as usize].pop_front();
+        self.drop_oldest(level);
         self.trim_levels();
+    }
+
+    /// Removes the oldest entry at `level`, leaving empty levels in place.
+    pub(crate) fn drop_oldest(&mut self, level: u32) {
+        if let Some(e) = self.levels[level as usize].pop_front() {
+            self.unqueue(e);
+            if self.running == Some(level) {
+                self.running_fronts = false;
+            }
+        }
+    }
+
+    /// Drops every level from `len` up with its entries.
+    pub(crate) fn truncate_levels(&mut self, len: usize) {
+        for q in self.levels.split_off(len.min(self.levels.len())) {
+            for e in q {
+                self.unqueue(e);
+            }
+        }
+        if self.running.is_some_and(|level| level as usize >= len) {
+            self.running_fronts = false;
+        }
+    }
+
+    fn unqueue(&mut self, e: Entry) {
+        if let MapEntry::Occupied(mut n) = self.queued.entry((e.node, e.generation)) {
+            *n.get_mut() -= 1;
+            if *n.get() == 0 {
+                n.remove();
+            }
+        }
     }
 
     /// Drops the empty levels on top, so `next_entry` finds the highest
@@ -1435,6 +1569,7 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
@@ -1442,6 +1577,7 @@ thread_local! {
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static THREAD_TAG: Cell<u64> = const { Cell::new(0) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
@@ -1456,6 +1592,7 @@ thread_local! {
 #[cfg(loom)]
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = RefCell::new(Vec::new());
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
@@ -1463,6 +1600,7 @@ loom::thread_local! {
     static COPIED_GEN: Cell<u64> = Cell::new(0);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
+    static THREAD_TAG: Cell<u64> = Cell::new(0);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
@@ -1478,11 +1616,12 @@ loom::thread_local! {
 thread_local! {
     static VINDEX_REPUSHES: Cell<u64> = const { Cell::new(0) };
     static NOTE_WORK: Cell<u64> = const { Cell::new(0) };
+    static PATH_STEPS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Counts `units` elements a pass over this thread's notes, their copies,
-/// its kept reads, a context's traced deliveries or the provenance records
-/// looked at.
+/// its kept reads, a context's traced deliveries, the provenance records
+/// or a delivery index's list looked at.
 #[inline(always)]
 pub(crate) fn note_work(units: usize) {
     #[cfg(all(test, not(loom)))]
@@ -1495,6 +1634,21 @@ pub(crate) fn note_work(units: usize) {
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_note_work() -> u64 {
     NOTE_WORK.with(|n| n.replace(0))
+}
+
+/// Counts `frames` stack frames a frame's path was folded over.
+#[inline(always)]
+pub(crate) fn path_steps(frames: usize) {
+    #[cfg(all(test, not(loom)))]
+    PATH_STEPS.with(|n| n.set(n.get() + frames as u64));
+    #[cfg(not(all(test, not(loom))))]
+    let _ = frames;
+}
+
+/// The frames [`path_steps`] counted on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_path_steps() -> u64 {
+    PATH_STEPS.with(|n| n.replace(0))
 }
 
 /// Virtual frames pushed on this thread for a node that already had one
@@ -1569,6 +1723,84 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
 /// raises gives it.
 pub(crate) fn keep_foreign_read(read: KeptRead, fresh: bool) {
     keep(read, fresh, true);
+}
+
+/// A speculative frame's Clean read of another runtime, with that
+/// runtime's count of changes as the read found it, which the frame's
+/// stash is adopted only while it still holds.
+struct CheckedRead {
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+}
+
+/// Keeps `seen` for the speculative frame of `ctl` at `cidx` of `rt`, as
+/// [`keep_read`] keeps the read: the checked reads of frames at or above its
+/// position, which have popped, go, and so do the frame's own ones on its
+/// first kept read (`fresh`), which an earlier frame there left.
+pub(crate) fn check_read(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+    fresh: bool,
+) {
+    CHECKED_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        d.retain(|e| e.rt != rt || e.cidx < cidx || !fresh && e.cidx == cidx && e.ctl == ctl);
+        let ours = |e: &&CheckedRead| e.rt == rt && e.cidx == cidx && e.ctl == ctl;
+        if !d.iter().rev().take_while(ours).any(|e| e.seen.same(&seen)) {
+            d.push(CheckedRead {
+                rt,
+                cidx,
+                ctl,
+                seen,
+            });
+        }
+    });
+}
+
+/// A context named so that no context of another thread, now or later, has
+/// the same name: context ids count per thread.
+pub(crate) type ContextName = (u64, u64);
+
+fn thread_tag() -> u64 {
+    static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    THREAD_TAG.with(|t| {
+        if t.get() == 0 {
+            t.set(NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        t.get()
+    })
+}
+
+/// This thread's outermost context, of any runtime: contexts nest, so some
+/// context open now is still open later exactly when this one is.
+pub(crate) fn outermost_context() -> Option<ContextName> {
+    let thread = thread_tag();
+    peek(|c| c.first().map(|x| (thread, x.id)))
+}
+
+/// Whether context `name` is open on this thread, at any depth.
+pub(crate) fn context_open(name: ContextName) -> bool {
+    name.0 == thread_tag() && peek(|c| c.iter().any(|x| x.id == name.1))
+}
+
+/// The checked reads of the frame of `ctl` at `cidx` of `rt`, which is
+/// popping, taken with those of frames above it.
+pub(crate) fn take_checked_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<Count> {
+    CHECKED_READS.with(|d| {
+        d.borrow_mut()
+            .extract_if(.., |e| e.rt == rt && e.cidx >= cidx)
+            .filter(|e| e.cidx == cidx && e.ctl == ctl)
+            .map(|e| e.seen)
+            .collect()
+    })
 }
 
 fn keep(mut read: KeptRead, fresh: bool, number: bool) {
@@ -1864,6 +2096,9 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
                 }
             });
             COPIED_GEN.with(|g| g.set(0));
+            if !speculative() {
+                CHECKED_READS.with(|c| c.borrow_mut().clear());
+            }
         }
         out
     })
@@ -2979,7 +3214,7 @@ pub(crate) struct EarliestByFrame {
     /// notes a record again: a record taken for one meanwhile would be one
     /// of the ended runs'.
     #[cfg(debug_assertions)]
-    ended: std::collections::HashSet<(u32, u32), FxBuildHasher>,
+    ended: HashSet<(u32, u32), FxBuildHasher>,
 }
 
 /// A frame's node, generation and position.

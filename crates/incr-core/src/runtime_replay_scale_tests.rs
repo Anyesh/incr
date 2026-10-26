@@ -135,7 +135,9 @@ macro_rules! cycle_100k_tests {
             #[test]
             #[cfg_attr(miri, ignore)]
             fn $name() {
-                on_stack(8 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
+                // Under a TSan debug build, budget 256's Shared ring
+                // levels overflow an 8 MiB stack.
+                on_stack(16 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
             }
         )*
     };
@@ -486,7 +488,8 @@ fn first_doom_depth<C: Cells>(rt: &Runtime<C>) -> usize {
 
 /// The byte budget dooms a 1000-chain of 16 KiB frames well below the
 /// frame budget of 256, which alone would overflow a 2 MiB thread, under
-/// `get` and under `stabilize` at the same depth, with the unbounded value.
+/// `get` and at most one level earlier under `stabilize`, with the
+/// unbounded value.
 fn byte_budget_first<C: Cells>() {
     let n = 1000;
     let rt = Runtime::<C>::new();
@@ -502,7 +505,15 @@ fn byte_budget_first<C: Cells>() {
     rt.observe(nodes[0], move |&v| seen.lock().unwrap().push(v));
     rt.stabilize();
     assert_eq!(*fired.lock().unwrap(), vec![n as u64]);
-    assert_eq!(first_doom_depth(&rt), depth);
+    // The budget counts from the outermost entry, so stabilize's observer
+    // frames come before the chain's; under TSan, Local's first level under
+    // get ends less than 1 KiB inside the 64 KiB, so stabilize dooms one
+    // level earlier.
+    let stabilized = first_doom_depth(&rt);
+    assert!(
+        stabilized <= depth && depth - stabilized <= 1,
+        "the doom came at depth {stabilized} under stabilize, {depth} under get"
+    );
     assert_eq!(rt.state_of(nodes[0]), NodeState::Clean);
 }
 
@@ -995,6 +1006,71 @@ fn shared_contained_chain_stays_linear_at_budget_1() {
     on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
 }
 
+/// A panicking query under an `n`-deep chain, read and then read again
+/// after an input change: each level's read takes the unwind and its frame
+/// lands Failed, which keys what the read took by the frame's path. The
+/// stack frames folded into paths, on the first read and on the second.
+fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let mut below = rt.create_query_with(move |rt| rt.get(input) + rt.get(failed), opts());
+    for _ in 1..n {
+        let dep = below;
+        below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
+    }
+    let top = below;
+    crate::replay::take_path_steps();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let first = crate::replay::take_path_steps();
+    rt.set(input, 1);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    (first, crate::replay::take_path_steps())
+}
+
+fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
+    let n = if cfg!(miri) { 8 } else { 4000 };
+    let (first, second) = panicking_chain_path_steps::<C>(frames, n);
+    assert!(
+        first <= 8 * n as u64 && second <= 8 * n as u64,
+        "{frames:?}: {first} and {second} frames folded into paths for a {n}-chain"
+    );
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || panicking_chain_paths_stay_linear::<Local>(None));
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(None)
+    });
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Local>(Some(1))
+    });
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(Some(1))
+    });
+}
+
 /// `k` Dirty readers over one Failed node with a Failed chain of `k` below
 /// it, whose edges a Clean run recorded, all entries of one walk: the walk
 /// passes the Failed node without walking the chain once per reader.
@@ -1198,7 +1274,7 @@ fn nested_caught_chain<C: Cells>(frames: u32) {
     assert_eq!(rt.get(below), n + 7);
     let work = crate::replay::take_note_work();
     assert!(
-        work <= 24 * n,
+        work <= 48 * n,
         "budget {frames}: {work} units of note work for a {n}-chain"
     );
 }
@@ -1320,4 +1396,42 @@ fn local_fan_out_under_replayed_chain_stays_linear() {
 #[cfg_attr(miri, ignore)]
 fn shared_fan_out_under_replayed_chain_stays_linear() {
     on_stack(1 << 26, fan_out_under_replayed_chain_stays_linear::<Shared>);
+}
+
+/// One budgeted frame reading `n` nodes of another runtime and then a
+/// 600-deep chain, which dooms it: the reads are kept as deliveries for
+/// its retry, sharing the frame's, maker's and node's lists, and removing
+/// them must not cost a pass over those lists each.
+fn wide_frame_deliveries<C: Cells>() {
+    let n = 4000;
+    let foreign = Arc::new(Runtime::<Shared>::new());
+    let reads: Vec<Incr<u64>> = (0..n).map(|i| foreign.create_query(move |_| i)).collect();
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let top = chain(&rt, 600).nodes[0];
+    let reader = rt.create_query_with(
+        move |rt| reads.iter().map(|&x| foreign.get(x)).sum::<u64>() + rt.get(top),
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n * (n - 1) / 2 + 600);
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
+    let work = crate::replay::take_note_work();
+    assert!(
+        work <= 16 * n,
+        "{work} units of note work for {n} delivered foreign reads"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_wide_frame_deliveries_stay_linear() {
+    on_stack(1 << 28, wide_frame_deliveries::<Shared>);
 }

@@ -46,6 +46,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use crate::handle::ErasedIncr;
@@ -409,6 +410,20 @@ pub(crate) const HANDLED: u16 = 2048;
 /// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
+/// `ComputeCtl::flags`: the frame kept a read (`KEPT_READ`) whose stash
+/// adoption can't check: of its own runtime, or of another runtime's node
+/// that was not Clean or was read while that runtime was changing.
+pub(crate) const KEPT_UNCHECKED: u16 = 8192;
+
+/// `ComputeCtl::flags`: the frame read a landing this thread's attempt
+/// holds (`crate::hold`), so its own landing is held too, and so is its
+/// reader's.
+pub(crate) const HOLD: u16 = 16384;
+/// A `HOLD` frame's write kept what it displaced in `crate::hold`, keyed
+/// by this control block, until the landing's entry takes it or the frame
+/// ends (`crate::hold::KeptGuard`).
+pub(crate) const KEPT: u16 = 32768;
+pub(crate) const RECOMPUTE_HOLD: u16 = RECOMPUTE | HOLD;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
@@ -424,7 +439,15 @@ const _: () = assert!(crate::bits::disjoint(&[
     SPECULATIVE as u64,
     HANDLED as u64,
     UNREGENERABLE as u64,
+    KEPT_UNCHECKED as u64,
+    HOLD as u64,
+    KEPT as u64,
 ]));
+
+/// [`ComputeCtl::marks`]: `path` holds the frame's path.
+const PATH_KEPT: u8 = 1;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::reads_counted`].
+const READS_COUNTED: u8 = 2;
 
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
@@ -438,14 +461,17 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
-    /// See [`Self::reads_counted`].
-    reads_counted: Cell<bool>,
+    /// `PATH_KEPT` and `READS_COUNTED`, which only get set.
+    marks: Cell<u8>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
     /// The frame's runtime's [`KeepResolver`], or null for a frame that
     /// settles its keeping when it is pushed or keeps nothing.
     keep: *const KeepResolver,
+    /// The frame's path once found (`kept_path`), left unwritten until
+    /// then so a push pays nothing for it.
+    path: Cell<MaybeUninit<u64>>,
 }
 
 /// Lives inside its runtime and answers whether a frame of node `slot` of
@@ -470,9 +496,10 @@ impl ComputeCtl {
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
-            reads_counted: Cell::new(false),
+            marks: Cell::new(0),
             children: Cell::new(std::ptr::null()),
             keep,
+            path: Cell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -492,11 +519,24 @@ impl ComputeCtl {
     /// A control block serves one frame, so a fresh one at a popped
     /// frame's address says no.
     pub(crate) fn reads_counted(&self) -> bool {
-        self.reads_counted.get()
+        self.marks.get() & READS_COUNTED != 0
     }
 
     pub(crate) fn count_reads(&self) {
-        self.reads_counted.set(true);
+        self.marks.set(self.marks.get() | READS_COUNTED);
+    }
+
+    /// The frame's path, if [`Self::keep_path`] kept it.
+    pub(crate) fn kept_path(&self) -> Option<u64> {
+        // SAFETY: `keep_path` writes `path` before it marks it kept.
+        (self.marks.get() & PATH_KEPT != 0).then(|| unsafe { self.path.get().assume_init() })
+    }
+
+    /// Keeps `path` as the frame's path, which the frames below it fix
+    /// while it is on the stack.
+    pub(crate) fn keep_path(&self, path: u64) {
+        self.path.set(MaybeUninit::new(path));
+        self.marks.set(self.marks.get() | PATH_KEPT);
     }
 
     #[inline(always)]
@@ -512,6 +552,10 @@ impl ComputeCtl {
     #[inline(always)]
     pub(crate) fn raise(&self, flag: u16) {
         self.flags.set(self.flags.get() | flag);
+    }
+
+    pub(crate) fn clear(&self, flag: u16) {
+        self.flags.set(self.flags.get() & !flag);
     }
 
     /// Marks the frame part of an open cycle reaching down to `p`.

@@ -16,9 +16,11 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
+use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
+use crate::changes::{Changes, Count};
 use crate::generic_arena::GenericArena;
 use crate::handle::Incr;
 use crate::loom_cells::Loom;
@@ -891,7 +893,6 @@ fn released_group(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
 }
 
 #[test]
-#[ignore = "T8-44e3-clean-landing-variant"]
 fn loom_released_group_members_stay_grouped_until_the_read_ends() {
     run(|| {
         let orders: Vec<(
@@ -923,6 +924,302 @@ fn loom_released_group_members_stay_grouped_until_the_read_ends() {
         };
         let got = (reads_r.join().unwrap(), reads_y.join().unwrap());
         assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// After k is set to 1, x (Fallback) and y, a landed group, form a cycle;
+/// q reads y and o reads x and then q. A's read of o lands the episode
+/// {x, y} and then waits on B's claim of q, while B's read of q waits on
+/// y: the waits-for cycle wounds one of them. A wounded A retracts the
+/// episode, so B never builds on a value of an attempt that gave its claims
+/// back, both reads match a single-thread order, and no group record names
+/// a node that left it.
+fn held_episode(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>, Incr<u64>) {
+    let k = rt.create_input(0_u64);
+    let yc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let x = {
+        let yc = yc.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Rt| match rt.get(k) {
+                0 => 0,
+                _ => rt.get(*yc.get().unwrap()) + 1,
+            },
+            |_c: &crate::cycle::Cycle| 10,
+        )
+    };
+    let y = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(x) + 100,
+    });
+    let q = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(y) + 1000,
+    });
+    let o = rt.create_query(move |rt: &Rt| match rt.get(k) {
+        0 => 0,
+        _ => rt.get(x) + rt.get(q),
+    });
+    yc.set(y).unwrap();
+    assert_eq!((rt.get(o), rt.get(q)), (0, 0));
+    rt.force_group_for_test(&[x.erase(), y.erase()]);
+    rt.set(k, 1);
+    (o, q, x, y)
+}
+
+#[test]
+fn loom_held_episode_wound_retracts_values() {
+    run(|| {
+        let orders: Vec<(
+            Result<u64, crate::cycle::Cycle>,
+            Result<u64, crate::cycle::Cycle>,
+        )> = [true, false]
+            .into_iter()
+            .map(|o_first| {
+                let rt = Rt::new();
+                let (o, q, _, _) = held_episode(&rt);
+                if o_first {
+                    let a = rt.try_get(o);
+                    (a, rt.try_get(q))
+                } else {
+                    let b = rt.try_get(q);
+                    (rt.try_get(o), b)
+                }
+            })
+            .collect();
+        let rt = Arc::new(Rt::new());
+        let (o, q, x, y) = held_episode(&rt);
+        let reads_o = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(o))
+        };
+        let reads_q = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(q))
+        };
+        let got = (reads_o.join().unwrap(), reads_q.join().unwrap());
+        assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+        assert!(
+            rt.in_group_of(x.erase(), y.erase()),
+            "x and y left their group"
+        );
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// A (Fallback) and B, where B also reads x, and o, which reads A and
+/// then B. A reader of o lands the episode {A, B} and is still in o when a
+/// setter changes x: the held members publish Dirty if the set came
+/// first, and the set's walk reaches o either way.
+#[test]
+fn loom_held_landing_publishes_under_set() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let x = rt.create_input(0_u64);
+        let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*bc.get().unwrap()) + 1,
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let b = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(x));
+        let o = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(b));
+        bc.set(b).unwrap();
+
+        let reader = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(o))
+        };
+        let setter = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.set(x, 1))
+        };
+        let read = reader.join().unwrap();
+        setter.join().unwrap();
+        assert!(read == 200 || read == 201, "o read {read}");
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(rt.get(b), 101, "(V) violated: B stale against x = 1");
+        assert_eq!(rt.get(o), 201, "(V) violated: o stale against x = 1");
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+    });
+}
+
+/// A (Fallback) and B, a landed group made Dirty by a set of x, which B
+/// reads; o reads A and then B. While A's thread holds the episode it ran
+/// for o, B's thread reads B and waits on a member: once A publishes, B's
+/// group verify finds every member under one record, never a group half
+/// published, and both reads match a single-thread order.
+fn republished_group(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
+    let x = rt.create_input(0_u64);
+    let bc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Rt| rt.get(*bc.get().unwrap()) + 1,
+            |_c: &crate::cycle::Cycle| 100,
+        )
+    };
+    let b = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(x));
+    let o = rt.create_query(move |rt: &Rt| rt.get(a) + rt.get(b));
+    bc.set(b).unwrap();
+    assert_eq!(rt.get(o), 200);
+    rt.set(x, 1);
+    (o, a, b)
+}
+
+#[test]
+fn loom_held_group_record_precedes_state() {
+    run(|| {
+        let orders: Vec<(
+            Result<u64, crate::cycle::Cycle>,
+            Result<u64, crate::cycle::Cycle>,
+        )> = [true, false]
+            .into_iter()
+            .map(|o_first| {
+                let rt = Rt::new();
+                let (o, _, b) = republished_group(&rt);
+                if o_first {
+                    let first = rt.try_get(o);
+                    (first, rt.try_get(b))
+                } else {
+                    let second = rt.try_get(b);
+                    (rt.try_get(o), second)
+                }
+            })
+            .collect();
+        let rt = Arc::new(Rt::new());
+        let (o, a, b) = republished_group(&rt);
+        let reads_o = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(o))
+        };
+        let reads_b = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.try_get(b))
+        };
+        let got = (reads_o.join().unwrap(), reads_b.join().unwrap());
+        assert!(orders.contains(&got), "{got:?}, single-thread {orders:?}");
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+        assert!(
+            rt.in_group_of(a.erase(), b.erase()),
+            "A and B left their group"
+        );
+
+        rt.assert_invariant_i();
+        rt.assert_walks_complete();
+        assert_eq!(crate::waits::registered(), 0);
+    });
+}
+
+/// c (Fallback) reads a and b, which read c: a landed group. Once i is 1, a
+/// no longer reads c, so the episode at c that o's read runs shrinks to
+/// {c, b} and releases a, held with a Dirty target; o then reads a, and its
+/// owner computes a alone inside the attempt. Counts every closure run.
+fn shrunk_cut<C: crate::cells::Cells>(
+    rt: &Runtime<C>,
+    runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> (Incr<i64>, Incr<i64>) {
+    let i = rt.create_input(0_i64);
+    let ac: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+    let bc: Arc<std::sync::OnceLock<Incr<i64>>> = Arc::new(std::sync::OnceLock::new());
+    let run = move |runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+        runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    let c = {
+        let (ac, bc, runs) = (ac.clone(), bc.clone(), runs.clone());
+        rt.create_query_with_fallback(
+            move |rt: &Runtime<C>| {
+                run(&runs);
+                rt.get(*ac.get().unwrap()) + rt.get(*bc.get().unwrap())
+            },
+            |cy: &crate::cycle::Cycle| 10 * cy.len() as i64,
+        )
+    };
+    let a = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            if rt.get(i) == 0 {
+                rt.get(c)
+            } else {
+                1
+            }
+        })
+    };
+    let b = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            rt.get(c) + 2
+        })
+    };
+    let o = {
+        let runs = runs.clone();
+        rt.create_query(move |rt: &Runtime<C>| {
+            run(&runs);
+            rt.get(c) + rt.get(a)
+        })
+    };
+    ac.set(a).unwrap();
+    bc.set(b).unwrap();
+    assert_eq!((rt.get(o), rt.get(a)), (60, 30));
+    rt.set(i, 1);
+    (o, a)
+}
+
+#[test]
+fn loom_own_landed_reread_matches_local() {
+    run(|| {
+        let local_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local = Runtime::<crate::cells::Local>::new();
+        let (o, a) = shrunk_cut(&local, &local_runs);
+        let want = (local.get(o), local.get(a));
+        let local_runs = local_runs.load(std::sync::atomic::Ordering::Relaxed);
+        let local_b_first = {
+            let rt = Runtime::<crate::cells::Local>::new();
+            let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
+            let b = rt.get(a);
+            (rt.get(o), b)
+        };
+
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rt = Rt::new();
+        let (o, a) = shrunk_cut(&rt, &runs);
+        assert_eq!((rt.get(o), rt.get(a)), want);
+        assert_eq!(
+            runs.load(std::sync::atomic::Ordering::Relaxed),
+            local_runs,
+            "closure runs differ from Local's"
+        );
+
+        let rt = Arc::new(Rt::new());
+        let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
+        let reads_o = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(o))
+        };
+        let reads_a = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(a))
+        };
+        let got = (reads_o.join().unwrap(), reads_a.join().unwrap());
+        assert!(
+            got == want || got == local_b_first,
+            "{got:?}, Local {want:?} or {local_b_first:?}"
+        );
+        assert_eq!(rt.stale_group_records(), Vec::<String>::new());
+        assert_eq!(rt.nodes.get(a.slot()).state(), NodeState::Clean);
 
         rt.assert_invariant_i();
         rt.assert_walks_complete();
@@ -1811,5 +2108,90 @@ fn flip_racing_a_contained_hold_releases_the_ticket() {
             "F is Clean but its contained payload is still held"
         );
         rt.assert_invariant_i();
+    });
+}
+/// A Clean check and a read made against a runtime's `Changes` while a
+/// change stores a value and then dirties it, as a set's swap and walk do.
+/// A count found before the change moves once the reader has seen any part
+/// of it, and one found after it ended comes with all of it, so a stash
+/// adopted while its count holds read what a read at the adoption would.
+#[test]
+fn loom_checked_read_vs_change() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let value = Arc::new(AtomicU64::new(0));
+        let dirty = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (changes, value, dirty) = (changes.clone(), value.clone(), dirty.clone());
+            thread::spawn(move || {
+                let _change = changes.change(false);
+                value.store(1, Ordering::Release);
+                dirty.store(1, Ordering::Release);
+            })
+        };
+        if let Some(seen) = changes.count() {
+            let clean = dirty.load(Ordering::Acquire) == 0;
+            let read = value.load(Ordering::Acquire);
+            let later = (dirty.load(Ordering::Acquire), value.load(Ordering::Acquire));
+            if seen.before_any() {
+                if !clean || read == 1 || later != (0, 0) {
+                    assert!(!seen.holds());
+                }
+            } else {
+                assert!(!clean && read == 1);
+            }
+        }
+        writer.join().unwrap();
+    });
+}
+
+/// A speculative and a non-speculative change race a checked read: once the
+/// reader has seen any part of the non-speculative one, or it has ended, a
+/// count found before both no longer passes as moved by speculative runs
+/// only.
+#[test]
+fn loom_speculative_changes_vs_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let real = Arc::new(AtomicU64::new(0));
+        let writers = [true, false].map(|speculative| {
+            let (changes, real) = (changes.clone(), real.clone());
+            thread::spawn(move || {
+                let _change = changes.change(speculative);
+                if !speculative {
+                    real.store(1, Ordering::Release);
+                }
+            })
+        });
+        let seen = changes.count();
+        if let Some(seen) = &seen {
+            if seen.before_any() && real.load(Ordering::Acquire) == 1 {
+                assert!(!seen.only_speculative_since());
+            }
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(!seen.only_speculative_since());
+        }
+    });
+}
+
+/// [`loom_speculative_changes_vs_check`]'s other side: with only a
+/// speculative change, a count found before it passes once it has ended.
+#[test]
+fn loom_speculative_change_passes_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let writer = {
+            let changes = changes.clone();
+            thread::spawn(move || drop(changes.change(true)))
+        };
+        let seen = changes.count();
+        writer.join().unwrap();
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(seen.only_speculative_since());
+        }
     });
 }

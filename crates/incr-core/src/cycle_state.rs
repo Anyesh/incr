@@ -1169,6 +1169,19 @@ pub(crate) fn wounded() -> bool {
     ENTRY.with(|e| e.wounded.get())
 }
 
+/// Checks, at an outermost entry's exit, that the thread carries no wound
+/// and holds no claim into its next entry.
+pub(crate) fn debug_assert_exit_clear() {
+    debug_assert!(
+        !wounded(),
+        "incr-core: an outermost entry exits with its thread still wounded"
+    );
+    debug_assert!(
+        !held_any() || held_keys().is_empty(),
+        "incr-core: an outermost entry exits holding claims"
+    );
+}
+
 /// Marks a `Shared` runtime's key; runtime ids stay far below 2^63.
 const SHARED_KEY: u64 = 1 << 63;
 
@@ -1263,6 +1276,12 @@ impl Drop for EntryDepth {
                 switch_out(e);
             }
         });
+        // Each runtime's first entry on the thread ends its holds, and
+        // the outermost is every runtime's first.
+        debug_assert!(
+            !self.outermost || std::thread::panicking() || !crate::hold::active(),
+            "incr-core: a held landing outlives the thread's outermost entry"
+        );
     }
 }
 
@@ -1320,16 +1339,29 @@ fn switch_out(e: &EntryState) {
 }
 
 /// Whether an engine entry of `rt` is open on this thread.
-#[cfg_attr(any(not(test), loom), allow(dead_code))]
 pub(crate) fn open_entry_of(rt: RuntimeId) -> bool {
     let rt = rt.get();
-    ENTRY.with(|e| {
-        e.depth.get() != 0
-            && (e.cur_rt.get() & !SHARED_KEY == rt
-                || OUTER_RTS.with(|o| {
-                    let o = o.borrow();
-                    o.open.contains_key(&rt) || o.open.contains_key(&(rt | SHARED_KEY))
-                }))
+    ENTRY.with(|e| e.depth.get() != 0 && (e.cur_rt.get() & !SHARED_KEY == rt || outer_open(rt)))
+}
+
+/// Whether an entry of `rt` made now is the first inside another entry on
+/// the thread: [`open_entry_of`] is false under a nonzero depth.
+pub(crate) fn first_nested_of(rt: RuntimeId) -> bool {
+    let rt = rt.get();
+    ENTRY.with(|e| e.depth.get() != 0 && e.cur_rt.get() & !SHARED_KEY != rt && !outer_open(rt))
+}
+
+/// Whether `rt` has an open entry on this thread as a `Shared` runtime.
+pub(crate) fn shared_open(rt: RuntimeId) -> bool {
+    let key = rt.get() | SHARED_KEY;
+    ENTRY.with(|e| e.depth.get() != 0 && e.cur_rt.get() == key)
+        || OUTER_RTS.with(|o| o.borrow().open.contains_key(&key))
+}
+
+fn outer_open(rt: u64) -> bool {
+    OUTER_RTS.with(|o| {
+        let o = o.borrow();
+        !o.open.is_empty() && (o.open.contains_key(&rt) || o.open.contains_key(&(rt | SHARED_KEY)))
     })
 }
 

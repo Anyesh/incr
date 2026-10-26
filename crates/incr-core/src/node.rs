@@ -322,12 +322,15 @@ impl<C: Cells> NodeData<C> {
     /// a change from a later verifier.
     #[inline(always)]
     pub fn max_verified_at(&self, v: u64) {
+        debug_assert!(v & !Self::REVISION_BITS == 0);
         let cur = C::u64_load_relaxed(&self.verified_at);
-        if C::SINGLE_THREADED {
-            C::u64_store_relaxed(&self.verified_at, (cur & !Self::MEMO).max(v));
+        // A memo's bit is above every revision, so a stamp that raises the
+        // word under Local is never over one.
+        if C::SINGLE_THREADED && v > cur {
+            C::u64_store_relaxed(&self.verified_at, v);
         } else if cur & Self::MEMO != 0 {
             self.stamp_over_memo(cur, v);
-        } else {
+        } else if !C::SINGLE_THREADED {
             C::u64_fetch_max(&self.verified_at, v);
         }
     }
@@ -416,9 +419,7 @@ impl<C: Cells> NodeData<C> {
     #[inline(always)]
     pub fn max_changed_at(&self, v: u64) {
         let cur = C::u64_load_relaxed(&self.verified_at);
-        if C::SINGLE_THREADED {
-            C::u64_store_relaxed(&self.verified_at, cur & !Self::MEMO);
-        } else if cur & Self::MEMO != 0 {
+        if cur & Self::MEMO != 0 {
             self.stamp_over_memo(cur, 0);
         }
         C::u64_fetch_max(&self.changed_at, v);
@@ -439,11 +440,12 @@ impl<C: Cells> NodeData<C> {
     /// `revision` loads, which only a memo's node loads.
     #[inline(always)]
     pub(crate) fn memo_at(&self, revision: impl FnOnce() -> u64) -> bool {
-        // The bit is loaded again after `changed_at`: a `changed_at` from a
-        // later landing orders the clear before it.
+        // Under Shared the bit is loaded again after `changed_at`: a
+        // `changed_at` from a later landing orders the clear before it.
         C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && {
             let changed = self.changed_at();
-            C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0 && changed == revision()
+            (C::SINGLE_THREADED || C::u64_load_acquire(&self.verified_at) & Self::MEMO != 0)
+                && changed == revision()
         }
     }
 
@@ -656,6 +658,18 @@ impl<C: Cells> NodeData<C> {
         }
     }
 
+    /// The deps as [`Self::for_each_dep`] scans them when they fit inline,
+    /// or `None` when they overflow. A caller's loop body over these stays
+    /// inline where a closure handed to `for_each_dep` may not, as its
+    /// overflow arm needs an out-of-line copy.
+    #[inline(always)]
+    pub fn inline_deps(&self) -> Option<impl Iterator<Item = NodeId> + '_> {
+        let count = Self::count_of(C::u8_load_acquire(&self.dep_count));
+        (count <= 7).then(move || {
+            (0..count as usize).map(move |i| NodeId(C::u32_load_acquire(&self.inline_deps[i])))
+        })
+    }
+
     #[inline(always)]
     fn for_each_inline_dep<F: FnMut(NodeId) + ?Sized>(&self, count: u8, f: &mut F) {
         for i in 0..(count as usize) {
@@ -710,10 +724,8 @@ impl<C: Cells> NodeData<C> {
 const _: () = {
     type N = NodeData<crate::cells::Local>;
     assert!(
-        N::OVERFLOW_MARKER & !N::COUNT_MASK == 0
-            && N::UNRUN & N::RELEASED == 0
-            && (N::UNRUN | N::RELEASED) & N::COUNT_MASK == 0,
-        "dep_count's count, unrun and released bits overlap"
+        N::OVERFLOW_MARKER & !N::COUNT_MASK == 0,
+        "dep_count's overflow marker lies outside its count bits"
     );
 };
 const _: () = assert!(
@@ -786,9 +798,8 @@ mod tests {
         assert_eq!(n.dep_count(), 0);
     }
 
-    #[test]
-    fn max_stamps_are_monotonic() {
-        let n: NodeData<Shared> = NodeData::new_input(0, 0, 10);
+    fn max_stamps_are_monotonic<C: Cells>() {
+        let n: NodeData<C> = NodeData::new_input(0, 0, 10);
         n.max_verified_at(7);
         assert_eq!(n.verified_at(), 10);
         n.max_verified_at(12);
@@ -797,6 +808,16 @@ mod tests {
         assert_eq!(n.changed_at(), 11);
         n.max_changed_at(5);
         assert_eq!(n.changed_at(), 11);
+    }
+
+    #[test]
+    fn max_stamps_are_monotonic_local() {
+        max_stamps_are_monotonic::<Local>();
+    }
+
+    #[test]
+    fn max_stamps_are_monotonic_shared() {
+        max_stamps_are_monotonic::<Shared>();
     }
 
     fn memo_ends_at_a_changed_at_raise<C: Cells>() {

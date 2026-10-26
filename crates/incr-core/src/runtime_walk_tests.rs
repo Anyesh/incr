@@ -621,9 +621,11 @@ fn shared_stale_dep_that_panics_is_not_read() {
 }
 
 /// `x` read `a` while `sel` was 0; setting `k` closes a cycle `a -> b -> a`
-/// and setting `sel` stops `x` reading `a`. A run from scratch never meets
-/// the cycle, so `get(x)` does not raise it, though the walk may run `a`.
-fn stale_dep_in_a_cycle_is_not_read<C: Cells>() {
+/// and setting `sel` stops `x` reading `a`. The walk of `x` cleans its
+/// recorded dep `a` before `x` reruns, and the cycle `a`'s run closes
+/// reaches `get(x)`, as on main, though a run from scratch never meets it:
+/// a known limitation until a walk can tell a dep its reader still reads.
+fn stale_dep_in_a_cycle_reaches_the_reader<C: Cells>() {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
     let k = rt.create_input(0_i64);
@@ -646,26 +648,27 @@ fn stale_dep_in_a_cycle_is_not_read<C: Cells>() {
 
     rt.set(k, 1);
     rt.set(sel, 1);
-    assert_eq!(rt.get(x), 100);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_err();
+    assert_eq!(panic_message(err), "incr-core: dependency cycle: 2, 3");
     let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
     assert!(panic_message(err).contains("cycle"));
 }
 
 #[test]
-fn local_stale_dep_in_a_cycle_is_not_read() {
-    stale_dep_in_a_cycle_is_not_read::<Local>();
+fn local_stale_dep_in_a_cycle_reaches_the_reader() {
+    stale_dep_in_a_cycle_reaches_the_reader::<Local>();
 }
 
 #[test]
-fn shared_stale_dep_in_a_cycle_is_not_read() {
-    stale_dep_in_a_cycle_is_not_read::<Shared>();
+fn shared_stale_dep_in_a_cycle_reaches_the_reader() {
+    stale_dep_in_a_cycle_reaches_the_reader::<Shared>();
 }
 
-/// As above, but `a` first reads `s`, which `try_get`s `a` and so becomes a
-/// held claim anchored at `a`'s own position before `b` closes the cycle.
-/// `a`'s unwind releases that claim, so the walk still contains the cycle:
-/// `get(x)` gives 100, as from scratch, and only a direct `get(a)` raises it.
-fn wave6_containable_counts_claim_anchored_at_walk_entry<C: Cells>() {
+/// As above, but `a` first reads `s`, which `try_get`s `a` and so holds a
+/// claim anchored at `a`'s own position before `b` closes the cycle. The
+/// cycle through `a`, `s` and `b` still reaches `get(x)` and every later
+/// read of `x` or `a`, as on main, while `s` reads its fallback.
+fn claim_anchored_at_the_walk_entry_reaches_the_reader<C: Cells>() {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
     let k = rt.create_input(0_i64);
@@ -690,25 +693,28 @@ fn wave6_containable_counts_claim_anchored_at_walk_entry<C: Cells>() {
 
     rt.set(k, 1);
     rt.set(sel, 1);
-    assert_eq!(rt.get(x), 100);
-    let err = catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_err();
-    assert!(panic_message(err).contains("cycle"));
+    for n in [x, x, a] {
+        let err = catch_unwind(AssertUnwindSafe(|| rt.get(n))).unwrap_err();
+        assert_eq!(panic_message(err), "incr-core: dependency cycle: 2, 3, 4");
+    }
+    assert_eq!(rt.get(s), 5);
 }
 
 #[test]
-fn wave6_local_containable_counts_claim_anchored_at_walk_entry() {
-    wave6_containable_counts_claim_anchored_at_walk_entry::<Local>();
+fn local_claim_anchored_at_the_walk_entry_reaches_the_reader() {
+    claim_anchored_at_the_walk_entry_reaches_the_reader::<Local>();
 }
 
 #[test]
-fn wave6_shared_containable_counts_claim_anchored_at_walk_entry() {
-    wave6_containable_counts_claim_anchored_at_walk_entry::<Shared>();
+fn shared_claim_anchored_at_the_walk_entry_reaches_the_reader() {
+    claim_anchored_at_the_walk_entry_reaches_the_reader::<Shared>();
 }
 
-/// As `stale_dep_in_a_cycle_is_not_read`, but `a` catches the cycle unwind
-/// and then panics on its own. The walk entry must contain that panic as it
-/// contains the cycle, so `get(x)` gives 100, as from scratch, and only a
-/// direct `get(a)` raises "a own".
+/// As `stale_dep_in_a_cycle_reaches_the_reader`, but `a` catches the cycle
+/// unwind and then panics on its own, which unwinds with the cycle's kind
+/// and its own payload. The walk entry contains that panic as any other,
+/// so `get(x)` gives 100, as from scratch, and only a direct `get(a)`
+/// raises "a own".
 fn wave7_walk_contains_own_panic_after_swallowed_cycle<C: Cells>() {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
@@ -838,24 +844,30 @@ fn shared_unread_walk_entry_leaves_the_reader_clean() {
     unread_walk_entry_leaves_the_reader_clean::<Shared>();
 }
 
-/// When `y`'s rerun still reads `e`, `z` read a value built on `e`'s Dirty
-/// landing and lands Dirty, at every frame budget.
-fn read_walk_entry_leaves_the_reader_dirty<C: Cells>() {
+/// When `y`'s rerun still reads `e`, the walk of `y` cleans `e`, whose
+/// catch of the cycle left it Dirty, by running its recorded dep `c1`
+/// before `e` reruns; `c1`'s cycle then reaches `get(z)`, as on main, at
+/// every frame budget: a known limitation until a walk leaves a dep a
+/// catching closure reads to that closure.
+fn caught_cycle_reaches_the_reader_through_the_catchers_walk<C: Cells>() {
     for frames in [None, Some(1), Some(2), Some(3)] {
-        let (z, e) = walk_entry_reader::<C>(frames, 0);
-        assert_ne!(e, NodeState::Clean, "frames {frames:?}");
-        assert_eq!(z, NodeState::Dirty, "frames {frames:?}");
+        let got = catch_unwind(AssertUnwindSafe(|| walk_entry_reader::<C>(frames, 0)));
+        assert_eq!(
+            got.map_err(panic_message),
+            Err("incr-core: dependency cycle: 2, 3".into()),
+            "frames {frames:?}"
+        );
     }
 }
 
 #[test]
-fn local_read_walk_entry_leaves_the_reader_dirty() {
-    read_walk_entry_leaves_the_reader_dirty::<Local>();
+fn local_caught_cycle_reaches_the_reader_through_the_catchers_walk() {
+    caught_cycle_reaches_the_reader_through_the_catchers_walk::<Local>();
 }
 
 #[test]
-fn shared_read_walk_entry_leaves_the_reader_dirty() {
-    read_walk_entry_leaves_the_reader_dirty::<Shared>();
+fn shared_caught_cycle_reaches_the_reader_through_the_catchers_walk() {
+    caught_cycle_reaches_the_reader_through_the_catchers_walk::<Shared>();
 }
 
 /// A dep the walk cleans panics, and the rerun still reads it: the rerun
@@ -885,6 +897,50 @@ fn walked_dep_panic_reaches_the_rerun_that_reads_it<C: Cells>() {
     assert_eq!(rt.get(x), 3);
     assert_eq!(rt.contained_payloads(), 0);
     assert_no_notes();
+}
+
+/// A dep the walk cleans panics and the rerun no longer reads it, so the
+/// payload its ticket holds is owed to no read; the set that flips the dep
+/// Dirty again drops it. Over many such revisions at most one is held.
+fn unread_walked_dep_payload_is_dropped_by_its_next_flip<C: Cells>() {
+    quiet_ticket_booms();
+    let rt = Runtime::<C>::new();
+    let sel = rt.create_input(0_i64);
+    let j = rt.create_input(1_i64);
+    let f = rt.create_query(move |rt| {
+        let v = rt.get(j);
+        assert!(v % 2 == 1, "ticket boom");
+        v
+    });
+    let x = rt.create_query(move |rt| if rt.get(sel) == 0 { rt.get(f) } else { 0 });
+    for k in 0..test_size(10_000) as i64 {
+        rt.set(j, 2 * k + 1);
+        assert_eq!(rt.contained_payloads(), 0, "revision pair {k}");
+        rt.set(sel, 0);
+        assert_eq!(rt.get(x), 2 * k + 1);
+        assert_eq!(rt.contained_payloads(), 0, "revision pair {k}");
+
+        rt.set(j, 2 * k + 2);
+        rt.set(sel, 1);
+        assert_eq!(rt.get(x), 0);
+        assert_eq!(rt.contained_payloads(), 1, "revision pair {k}");
+    }
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(f))).unwrap_err();
+    assert_eq!(panic_message(err), "ticket boom");
+    assert_eq!(rt.contained_payloads(), 0);
+    assert_no_notes();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_unread_walked_dep_payload_is_dropped_by_its_next_flip() {
+    unread_walked_dep_payload_is_dropped_by_its_next_flip::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unread_walked_dep_payload_is_dropped_by_its_next_flip() {
+    unread_walked_dep_payload_is_dropped_by_its_next_flip::<Shared>();
 }
 
 /// No unwind is in flight, so this thread keeps no landing for one.
@@ -2211,7 +2267,7 @@ fn ticket_catching_chain_on_a_thread<C: Cells>(failed: bool, custom: bool) {
 /// The chain at 2000 to 64000 with a ticket per caught read, every read's
 /// ticket taken while the frames below hold theirs: the tickets' work
 /// stays linear in the reads. A retry's read of a regenerable payload keeps
-/// a copy of its notes, about 20 units a read.
+/// a copy of its notes and unlists its deliveries, about 31 units a read.
 fn ticket_catching_chain_work<C: Cells>() {
     for n in [2000, 4000, 16000, test_size(64_000)] {
         let work = thread::Builder::new()
@@ -2225,7 +2281,7 @@ fn ticket_catching_chain_work<C: Cells>() {
             .join()
             .unwrap();
         assert!(
-            work <= 24 * n as u64,
+            work <= 48 * n as u64,
             "{work} units of note work for {n} reads"
         );
     }
@@ -2366,8 +2422,9 @@ fn shared_walk_enters_a_cycle_at_its_first_recomputed_member() {
 /// `c`, which reads `d`, which reads `b` back: R3 in the member run of `b`,
 /// a cycle over the held member `b`, `c` and `d` that aborts the episode.
 /// `x` reads `a` only while `sel` is 0. After `k` and `sel` go to 1, the
-/// walk of `x` recomputes its stale dep `a` and contains the abort, so the
-/// rerun, which no longer reads `a`, gives 100 as a fresh read of `x` does.
+/// walk of `x` recomputes its stale dep `a`, and the cycle that aborts the
+/// episode reaches `get(x)`, as on main, though a fresh read of `x` gives
+/// 100: the stale-dep known limitation.
 fn stale_dep_whose_episode_cycles<C: Cells>() -> Result<i64, String> {
     let rt = Runtime::<C>::new();
     let sel = rt.create_input(0_i64);
@@ -2426,14 +2483,22 @@ fn stale_dep_whose_episode_cycles<C: Cells>() -> Result<i64, String> {
     got
 }
 
+const EPISODE_CYCLE: &str = "incr-core: dependency cycle: 3, 4, 5";
+
 #[test]
-fn local_stale_dep_whose_episode_cycles_is_not_read() {
-    assert_eq!(stale_dep_whose_episode_cycles::<Local>(), Ok(100));
+fn local_stale_dep_whose_episode_cycles_reaches_the_reader() {
+    assert_eq!(
+        stale_dep_whose_episode_cycles::<Local>(),
+        Err(EPISODE_CYCLE.into())
+    );
 }
 
 #[test]
-fn shared_stale_dep_whose_episode_cycles_is_not_read() {
-    assert_eq!(stale_dep_whose_episode_cycles::<Shared>(), Ok(100));
+fn shared_stale_dep_whose_episode_cycles_reaches_the_reader() {
+    assert_eq!(
+        stale_dep_whose_episode_cycles::<Shared>(),
+        Err(EPISODE_CYCLE.into())
+    );
 }
 
 #[test]
