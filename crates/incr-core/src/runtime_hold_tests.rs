@@ -1049,6 +1049,64 @@ fn a_cycle_landed_after_a_take_over_sees_a_later_set() {
     assert_eq!(after, (fresh.try_get(fx).ok(), fresh.try_get(fw).ok()));
 }
 
+/// **A reader that dirties the cycle on every run restarts its holder a
+/// bounded number of times.** As above, but every child sets i after its
+/// read, so each retry of T runs the cycle again. A taken claim is never
+/// held again in T's outermost entry, so after the first take-over the
+/// next child reads w published and T ends; were w held again, each child
+/// would take it over and T would restart for good.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_reader_that_dirties_the_cycle_each_run_restarts_its_holder_boundedly() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let i = rt.create_input(0_u64);
+    let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let w = {
+        let xc = xc.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1) + rt.get(i)
+        })
+    };
+    let x = rt.create_query_with(
+        move |rt: &Runtime<Shared>| rt.try_get(w).map_or(100, |v| v + 1000),
+        crate::cycle::QueryOpts {
+            cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+            ..crate::cycle::QueryOpts::default()
+        },
+    );
+    assert!(xc.set(x).is_ok());
+    let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let t = {
+        let (takes, runs) = (takes.clone(), runs.clone());
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+            runs.fetch_add(1, Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + std::thread::scope(|s| {
+                s.spawn(|| {
+                    let r = rt.try_get(w).unwrap_or(9);
+                    rt.set(i, rt.get(i) + 1);
+                    r
+                })
+                .join()
+                .unwrap()
+            })
+        })
+    };
+    let reader = rt.clone();
+    assert!(
+        within_10s(move || reader.get(t)).is_some(),
+        "T restarted for good"
+    );
+    assert!(
+        takes.load(Ordering::SeqCst) >= 1,
+        "T's read was never taken over"
+    );
+    let runs = runs.load(Ordering::SeqCst);
+    assert!(runs <= 3, "T ran {runs} times");
+}
+
 /// **Two holders that join readers of each other's landings both end.**
 /// Each of two runtimes has a `try_get` cycle that its read T catches and
 /// holds; once both hold, each T joins a child reading the other's member.
