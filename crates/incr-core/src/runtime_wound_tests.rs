@@ -1722,7 +1722,8 @@ fn shared_retraction_restores_a_released_members_rerun() {
                     }
                 });
                 let o = rt.create_query(move |rt| match rt.get(i) {
-                    0 => rt.get(c) + rt.get(a),
+                    // c read last, so a walk of o enters the cycle at c.
+                    0 => rt.get(a) + rt.get(c),
                     _ => {
                         let read = rt.get(c) + rt.get(a);
                         go.park();
@@ -1834,25 +1835,32 @@ fn shared_retraction_restores_a_released_members_rerun() {
     .assert_clean();
 }
 
-/// **A retraction restores a released claim's entry.** `x` (Fixpoint)
-/// reads `y`, which reads `x` once `j` is 0; with `k` at 1, `x`'s run
-/// panics inside the episode, and `y`'s claim is released New over `[j]`
-/// and the `x` its run read, with an entry keeping `[j]`. With `k` back at
-/// 0, B's `c` reads `x`: the episode reruns `y` from New and lands it held
-/// Clean, which drops the entry, and `c` then raises a wound. The
-/// retraction lands `y` New over the same two deps, so its entry is back
-/// and a walk still expands only `j`.
+/// **A retraction restores a released claim's entry.** `x` reads `y`,
+/// which reads `x` once `j` is 0, while `m` is not 1; both are Fixpoint
+/// heads, so a walk enters the cycle at a head whichever it reaches
+/// first. Each set of `m` changes a dep of `x`, so the reads after it
+/// recompute `x` rather than settle it from `y`. With `k` at 1, `x`'s
+/// run panics inside the episode, and `y`'s claim is released New over
+/// `[j]` and the `x` its run read, with an entry keeping `[j]`. With `k`
+/// back at 0 and `m` at 2, B's `c` reads `x`: the episode reruns `y` from
+/// New and lands it held Clean, which drops the entry, and `c` then raises
+/// a wound. The retraction lands `y` New over the same two deps, so its
+/// entry is back and a walk still expands only `j`.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_retraction_restores_a_released_claims_entry() {
     let other = Arc::new(Runtime::<Shared>::new());
     let j = other.create_input(1_i64);
     let k = other.create_input(0_i64);
+    let m = other.create_input(1_i64);
     let y_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
     let x = {
         let y_cell = y_cell.clone();
         other.create_query_with(
             move |rt| {
+                if rt.get(m) == 1 {
+                    return 5;
+                }
                 let v = rt.get(*y_cell.get().unwrap());
                 assert!(rt.get(k) == 0, "x boom");
                 (v + 1).min(3)
@@ -1863,12 +1871,19 @@ fn shared_retraction_restores_a_released_claims_entry() {
             },
         )
     };
-    let y = other.create_query(move |rt| if rt.get(j) == 1 { 1 } else { rt.get(x) });
+    let y = other.create_query_with(
+        move |rt| if rt.get(j) == 1 { 1 } else { rt.get(x) },
+        QueryOpts {
+            cycle: CycleStrategy::Fixpoint(Fixpoint::new(|| 0_i64)),
+            ..QueryOpts::default()
+        },
+    );
     y_cell.set(y).unwrap();
-    assert_eq!(other.get(x), 2);
+    assert_eq!((other.get(x), other.get(y)), (5, 1));
 
     other.set(j, 0);
     other.set(k, 1);
+    other.set(m, 0);
     let err = catch_unwind(AssertUnwindSafe(|| other.get(x))).unwrap_err();
     assert_eq!(err.downcast_ref::<&str>(), Some(&"x boom"));
     let kept =
@@ -1878,6 +1893,7 @@ fn shared_retraction_restores_a_released_claims_entry() {
     other.assert_released_entries_match_deps();
 
     other.set(k, 0);
+    other.set(m, 2);
     let wounded = Arc::new(AtomicBool::new(false));
     let c = {
         let wounded = wounded.clone();
