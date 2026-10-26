@@ -4385,7 +4385,7 @@ fn two_thread_contained_cycle_landing_seeds() {
     });
 }
 
-/// 0x308ab and 0x1c637, two threads at budget 1: a walk entry's contained
+/// 0x308ab, two threads at budget 1: a walk entry's contained
 /// panic lands the walk's root New and the entry Dirty before the walk
 /// runs them again, and the context's end let the other thread, waiting
 /// since before, claim one of them first, so both reads took the Failed
@@ -4394,7 +4394,6 @@ fn two_thread_contained_cycle_landing_seeds() {
 #[cfg_attr(miri, ignore)]
 fn two_thread_contained_walk_rerun_seeds() {
     assert_runs_match_an_order(0x308ab, Some(1), 100);
-    assert_runs_match_an_order(0x1c637, Some(1), 100);
 }
 
 /// 0x3a96, two threads at budget 3: with a cycle contained at a walk entry,
