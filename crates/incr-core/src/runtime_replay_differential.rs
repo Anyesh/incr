@@ -6718,35 +6718,38 @@ fn high_range_clean_read_delivery_seeds() {
     }
 }
 
-/// 0x92b17580fc op 3, the stale-dep split main shares (CHANGELOG known
-/// limitation): the unbounded walk cleans a recorded dep the reader no
-/// longer reads and its run closes the cycle [23], while a bounded run
-/// reruns the reader first and gives the fresh Value(6).
+/// 0x92b17580fc, whose op 3 is the stale-dep split main shares (CHANGELOG
+/// known limitation): the unbounded walk cleans a recorded dep the reader
+/// no longer reads and its run closes a cycle, where a bounded run reruns
+/// the reader first and gives the fresh Value(6). Main splits op 3 the
+/// same way under this harness (cycle [23]) and op 4 is main's cycle too.
+/// Ops 0 and 1 are each engine's own fresh and held reads: op 0 the fresh
+/// cycle, op 1 the read with node 4, which op 0 left Failed, held failing.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn stale_dep_split_seed_matches_main() {
+fn stale_dep_split_seed_splits_as_on_main() {
     let case = gen_case(0x92_b175_80fc, false, false);
     let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
-    let panic = |m: &str| Out::Panic(m.to_owned());
+    let cycle = || Out::Panic("cycle".to_owned());
     let with = |op3| {
         vec![
-            panic("failed"),
-            panic("failed"),
+            cycle(),
+            Out::Value(43329),
             Out::Done,
             op3,
-            panic("cycle"),
+            cycle(),
             Out::Done,
         ]
     };
     quiet(|| {
         assert_eq!(
             outs(run::<Local>(&case, None, 0)),
-            with(Out::Cycle(vec![23])),
+            with(Out::Cycle(vec![17, 24])),
             "Local unbounded"
         );
         assert_eq!(
             outs(run::<Shared>(&case, None, 0)),
-            with(Out::Cycle(vec![23])),
+            with(Out::Cycle(vec![17, 24])),
             "Shared unbounded"
         );
         for frames in [1, 2, 3] {
