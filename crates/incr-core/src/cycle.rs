@@ -46,6 +46,7 @@
 use std::any::Any;
 use std::cell::Cell;
 use std::fmt;
+use std::mem::MaybeUninit;
 use std::sync::Arc;
 
 use crate::handle::ErasedIncr;
@@ -409,6 +410,8 @@ pub(crate) const HANDLED: u16 = 2048;
 /// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
+/// `ComputeCtl::flags`: `ComputeCtl::path` holds the frame's path.
+const PATH_KEPT: u16 = 8192;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
@@ -424,6 +427,7 @@ const _: () = assert!(crate::bits::disjoint(&[
     SPECULATIVE as u64,
     HANDLED as u64,
     UNREGENERABLE as u64,
+    PATH_KEPT as u64,
 ]));
 
 /// What one compute frame tells its wrapper and its landing. It lives on
@@ -444,6 +448,9 @@ pub struct ComputeCtl {
     /// The frame's runtime's [`KeepResolver`], or null for a frame that
     /// settles its keeping when it is pushed or keeps nothing.
     keep: *const KeepResolver,
+    /// The frame's path once found (`PATH_KEPT`), left unwritten until
+    /// then so a push pays nothing for it.
+    path: Cell<MaybeUninit<u64>>,
 }
 
 /// Lives inside its runtime and answers whether a frame of node `slot` of
@@ -470,6 +477,7 @@ impl ComputeCtl {
             wrote: Cell::new(0),
             children: Cell::new(std::ptr::null()),
             keep,
+            path: Cell::new(MaybeUninit::uninit()),
         }
     }
 
@@ -483,6 +491,20 @@ impl ComputeCtl {
         // SAFETY: the caller's frame is running, so the runtime holding
         // the resolver is borrowed and in place.
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
+    }
+
+    /// The frame's path, if [`Self::keep_path`] kept it.
+    pub(crate) fn kept_path(&self) -> Option<u64> {
+        // SAFETY: `keep_path` writes `path` before it raises `PATH_KEPT`.
+        self.has(PATH_KEPT)
+            .then(|| unsafe { self.path.get().assume_init() })
+    }
+
+    /// Keeps `path` as the frame's path, which the frames below it fix
+    /// while it is on the stack.
+    pub(crate) fn keep_path(&self, path: u64) {
+        self.path.set(MaybeUninit::new(path));
+        self.raise(PATH_KEPT);
     }
 
     #[inline(always)]
