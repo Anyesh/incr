@@ -48,6 +48,9 @@ fn an_old_attempts_word_acts_on_no_later_attempt() {
 }
 
 #[test]
+// Miri's clock advances with executed code, so the STUCK_AFTER loop alone
+// outlasts STUCK_FOR.
+#[cfg_attr(miri, ignore)]
 fn a_waiter_takes_over_only_a_flight_that_stays_open() {
     begin();
     let a = mine();
