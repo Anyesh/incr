@@ -4199,6 +4199,23 @@ fn cross_two_thread_seeds() {
     });
 }
 
+/// 0xd6d9 crossed: the Fixpoint head 0 of the cycle 0-1-2-3 panics, its
+/// release lands members 1, 2 and 3 New, and node 6 catches the panic
+/// through its read of 1. A replayed walk ran the cycle from 0, so the
+/// unwind reached 6's read of 1 marked as out of a Failed node: 6 landed
+/// with a memo, and its next read in the revision kept the members New
+/// where every order reruns them and fails them.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn caught_unwind_through_a_released_member_reruns_its_reader_seed() {
+    let case = gen_case(0xd6d9, true, true);
+    quiet(|| {
+        for _ in 0..8 {
+            differential_two(&case, 0xd6d9);
+        }
+    });
+}
+
 /// The unbounded single-thread runs of 0x524 and 0x3c9 with their first
 /// read phase's reads in the other order, laid out as two-thread traces,
 /// differ from the case-order runs: 0x524's closure payload goes to the
