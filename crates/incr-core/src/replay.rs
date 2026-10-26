@@ -1176,8 +1176,8 @@ impl Context {
             self.levels.resize_with(level + 1, VecDeque::new);
         }
         self.levels[level].push_back(entry);
-        if let Some(q) = &mut self.queued {
-            *q.entry((entry.node, entry.generation)).or_default() += 1;
+        if self.queued.is_some() {
+            self.count_in(entry);
         }
     }
 
@@ -1190,7 +1190,9 @@ impl Context {
     /// Removes the oldest entry at `level`, leaving empty levels in place.
     pub(crate) fn drop_oldest(&mut self, level: u32) {
         if let Some(e) = self.levels[level as usize].pop_front() {
-            self.unqueue(e);
+            if self.queued.is_some() {
+                self.count_out(e);
+            }
             if self.running == Some(level) {
                 self.running_fronts = false;
             }
@@ -1202,7 +1204,7 @@ impl Context {
         if self.queued.is_some() {
             for q in self.levels.split_off(len.min(self.levels.len())) {
                 for e in q {
-                    self.unqueue(e);
+                    self.count_out(e);
                 }
             }
         } else {
@@ -1213,7 +1215,17 @@ impl Context {
         }
     }
 
-    fn unqueue(&mut self, e: Entry) {
+    #[cold]
+    #[inline(never)]
+    fn count_in(&mut self, e: Entry) {
+        if let Some(q) = &mut self.queued {
+            *q.entry((e.node, e.generation)).or_default() += 1;
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn count_out(&mut self, e: Entry) {
         let Some(q) = &mut self.queued else {
             return;
         };
