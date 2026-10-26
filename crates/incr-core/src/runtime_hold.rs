@@ -17,7 +17,7 @@ use crate::node::{NodeData, NodeId};
 use crate::segmented_nodes::IN_GROUP;
 use crate::state::{self, NodeState};
 
-use super::{is_computing, ChildLanding, GroupInfo, Inner, Runtime, SingleClaim};
+use super::{is_computing, ChildLanding, GroupInfo, Inner, ParkPoint, Runtime, SingleClaim};
 use crate::dep_stack::DepStack;
 use crate::dependent_list::DependentList;
 use crate::handle::ErasedIncr;
@@ -462,6 +462,7 @@ impl<C: Cells> Runtime<C> {
         let mut rest = entries.into_iter();
         let published = catch_unwind(AssertUnwindSafe(|| {
             for e in rest.by_ref() {
+                self.park(ParkPoint::BeforePublish(NodeId(e.slot)));
                 self.publish_one(e, &held, &mut bag);
             }
         }));

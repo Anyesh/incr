@@ -240,6 +240,9 @@ pub(crate) enum ParkPoint {
     /// In `hold_landing`, before it loads the state of `NodeId`, which a
     /// replay entry's run just landed.
     HoldLanding(NodeId),
+    /// In `publish_own`, after its episodes are counted and before the
+    /// held landing of `NodeId` publishes.
+    BeforePublish(NodeId),
     /// In `compute_one`, on finding the node claimed by another thread,
     /// before its first wait on that claim.
     ComputeWaits(NodeId),
