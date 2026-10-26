@@ -3922,6 +3922,33 @@ mod tests {
         assert!(!holds(&mut pending, (2, 0)));
     }
 
+    /// A copy renoted in two parts, the second reusing the first, notes
+    /// what the whole copy renoted at once does: once the deeper frame's
+    /// notes go, both keep the shallower note's own stamp, as the frames
+    /// that made the notes would.
+    #[test]
+    fn a_renote_reused_across_a_stamp_change_notes_what_a_whole_one_does() {
+        let rt = RuntimeId::for_test(7);
+        let source: Box<dyn Any + Send> = Box::new("s");
+        let s = payload_key(&*source);
+        let mut from = Notes::new();
+        from.push(rt, s, 1, ((5, 0), 10), false);
+        let early = from.copy(rt, s, 0);
+        from.push(rt, s, 3, ((5, 0), 20), false);
+        let late = from.copy(rt, s, 0);
+        let mut reused = Notes::new();
+        reused.note_copy(rt, key(&P), 0, early.as_shared().unwrap());
+        reused.note_copy(rt, key(&P), 0, late.as_shared().unwrap());
+        let mut whole = Notes::new();
+        whole.note_copy(rt, key(&Q), 0, late.as_shared().unwrap());
+        reused.forget_from(2, None);
+        whole.forget_from(2, None);
+        let reused = reused.copy(rt, key(&P), 0).into_nodes();
+        let whole = whole.copy(rt, key(&Q), 0).into_nodes();
+        assert_eq!(reused, whole);
+        assert_eq!(whole, vec![((5, 0), 1, 10)]);
+    }
+
     /// A passed delivery's payload regenerated as `Q` counts as its source,
     /// so a containment of `Q` just above its frame reaches its landings.
     #[test]
