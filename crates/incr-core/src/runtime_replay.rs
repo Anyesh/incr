@@ -5186,14 +5186,15 @@ impl<C: Cells> Runtime<C> {
     /// with virtual frames.
     fn ensure_clean_virt(&self, id: NodeId, gen: u32) -> Computed {
         let word = value_code::checked_word();
+        let mut restarts = 0;
         loop {
             let cell = self.nodes.get(id.0).state_cell();
             let observed = self.seen(cell, state::load::<C>(cell));
             if observed == NodeState::Clean {
                 return Computed::Done;
             }
-            match self.clean_walk::<VIRT>(id, gen, word, observed) {
-                Computed::Replan => {}
+            match self.clean_walk::<VIRT>(id, gen, word, observed, restarts) {
+                Computed::Replan => restarts += 1,
                 computed => return computed,
             }
         }
