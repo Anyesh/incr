@@ -573,6 +573,9 @@ pub(crate) struct EpisodeLog {
     /// The highest landed episode and release numbers whose slots the log
     /// no longer holds.
     evicted: [Option<u32>; 2],
+    /// The threads and numbers of landed episodes whose members are still
+    /// publishing.
+    publishing: Vec<(u32, u32)>,
 }
 
 impl EpisodeLog {
@@ -591,6 +594,26 @@ impl EpisodeLog {
                 released,
             });
         }
+    }
+
+    /// Marks this thread's landed episode `number` as publishing until
+    /// [`Self::published`].
+    fn publish(&mut self, number: u32) {
+        self.publishing.push((cycle_state::thread_key(), number));
+    }
+
+    fn published(&mut self, number: u32) {
+        let me = (cycle_state::thread_key(), number);
+        self.publishing.retain(|&p| p != me);
+    }
+
+    /// Whether `slot` is a member of another thread's landed episode that
+    /// is still publishing.
+    fn is_publishing(&self, slot: u32) -> bool {
+        !self.publishing.is_empty()
+            && (self.entries.iter()).any(|e| {
+                !e.released && e.slot == slot && self.publishing.contains(&(e.by, e.number))
+            })
     }
 
     #[cfg(all(test, not(loom)))]
@@ -4159,9 +4182,10 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Waits out another thread's claims on `walk`'s pending entries in
-    /// `landed`: an episode is counted before its members land, so a
-    /// replan can meet one whose members are still held.
+    /// Waits out the claims on `walk`'s pending entries in `landed` whose
+    /// episode is still publishing: it is counted before its members land,
+    /// so a replan can meet them still held, by a thread that runs only
+    /// engine code until they land.
     fn wait_for_landings(&self, walk: &Walk, landed: &HashSet<u32, FxBuildHasher>) {
         let held: Vec<NodeId> = (walk.work.iter())
             .filter(|e| e.is_pending() && landed.contains(&e.id.0))
@@ -4172,6 +4196,7 @@ impl<C: Cells> Runtime<C> {
             let mut spins = 0;
             while is_computing(self.seen(cell, state::load::<C>(cell)))
                 && self.own_claim_owner(id).is_none()
+                && self.episode_log.read().is_publishing(id.0)
             {
                 spins += 1;
                 self.wait_on_claim(id, spins);

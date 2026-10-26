@@ -1881,27 +1881,45 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// Counts `episodes` landed episodes, before their `slots` land.
-    pub(super) fn count_landed(&self, episodes: u64, slots: impl IntoIterator<Item = u32>) {
-        self.count_episodes(false, episodes * super::LANDED, slots);
+    /// Counts `episodes` landed episodes, before their `slots` land, and
+    /// marks them publishing until [`Self::landed`] with the number this
+    /// returns.
+    pub(super) fn count_landed(
+        &self,
+        episodes: u64,
+        slots: impl IntoIterator<Item = u32>,
+    ) -> Option<u32> {
+        self.count_episodes(false, episodes * super::LANDED, slots)
+    }
+
+    /// Ends the publication [`Self::count_landed`] numbered `number`.
+    pub(super) fn landed(&self, number: Option<u32>) {
+        if let Some(number) = number {
+            self.episode_log.write().published(number);
+        }
     }
 
     /// Adds `add` to the episode count before `slots` land, so a claim
     /// that reads one of the landings also reads the count. The log is
     /// written under its lock with the count, so a walk that reads the
     /// count and then the log finds the slots.
-    fn count_episodes(&self, released: bool, add: u64, slots: impl IntoIterator<Item = u32>) {
+    fn count_episodes(
+        &self,
+        released: bool,
+        add: u64,
+        slots: impl IntoIterator<Item = u32>,
+    ) -> Option<u32> {
         let log = (!C::SINGLE_THREADED).then(|| self.episode_log.write());
         cycle_state::own_episode(self.runtime_id, add);
         let after = C::u64_fetch_add(&self.episodes_landed, add).wrapping_add(add);
-        if let Some(mut log) = log {
-            let number = if released {
-                (after / RELEASED) as u32
-            } else {
-                after as u32
-            };
-            log.push(released, number, slots);
+        let mut log = log?;
+        if released {
+            log.push(true, (after / RELEASED) as u32, slots);
+            return None;
         }
+        log.push(false, after as u32, slots);
+        log.publish(after as u32);
+        Some(after as u32)
     }
 
     /// Releases `slots` from the held map with the discard landing,

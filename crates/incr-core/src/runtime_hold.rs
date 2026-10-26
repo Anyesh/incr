@@ -446,11 +446,10 @@ impl<C: Cells> Runtime<C> {
         let hold::Taken {
             entries, episodes, ..
         } = hold::take(self.runtime_id);
-        if episodes != 0 {
-            // Before the members land, so a read of one of their landings
-            // also reads the count.
-            self.count_landed(episodes, entries.iter().map(|e| e.slot));
-        }
+        // Before the members land, so a read of one of their landings also
+        // reads the count.
+        let publishing =
+            (episodes != 0).then(|| self.count_landed(episodes, entries.iter().map(|e| e.slot)));
         // A release counted when its claims landed held: a walk planned
         // since then expanded through their held states, and must see the
         // count move when they publish.
@@ -470,8 +469,10 @@ impl<C: Cells> Runtime<C> {
         // what is left goes back as on a wound (G9).
         if let Err(payload) = published {
             self.retract_entries(rest.collect(), Vec::new());
+            self.landed(publishing.flatten());
             bag.drain_carried(payload);
         }
+        self.landed(publishing.flatten());
         bag.drain(self);
     }
 
