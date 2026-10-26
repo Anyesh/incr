@@ -2608,3 +2608,52 @@ fn shared_set_inside_the_attempt_flips_its_held_failed_landing() {
     assert_eq!(local.0, "3", "{local:?}");
     assert_eq!(set_after_a_caught_panic::<Shared>(), local);
 }
+
+/// g catches a's panic, sets a's input k and re-raises, so its own set
+/// flags g mid-run and g's held Failed landing publishes Dirty. r reads g
+/// twice: the second read must see g as the set left it and run it again.
+/// Returns what r's second read raised: 1 for a's new panic, 2 for "last
+/// compute panicked", 3 for a's first.
+fn reread_of_a_landing_its_own_set_flagged<C: Cells>() -> i64 {
+    let rt = Runtime::<C>::new();
+    let j = rt.create_input(1_i64);
+    let k = rt.create_input(0_i64);
+    let a = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        let (v, kk) = (rt.get(j), rt.get(k));
+        if v == 0 {
+            panic!("a boom {kk}")
+        }
+        v
+    });
+    let g = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        match catch_unwind(AssertUnwindSafe(|| rt.get(a))) {
+            Ok(v) => v,
+            Err(p) => {
+                rt.set(k, 1);
+                std::panic::resume_unwind(p)
+            }
+        }
+    });
+    let r = rt.create_query(move |rt: &Runtime<C>| -> i64 {
+        let first = catch_unwind(AssertUnwindSafe(|| rt.get(g)));
+        if first.is_ok() {
+            return 0;
+        }
+        let second = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
+        match second.as_str() {
+            "a boom 1" => 1,
+            "a boom 0" => 3,
+            m if m.contains("last compute panicked") => 2,
+            _ => 4,
+        }
+    });
+    assert_eq!(rt.get(r), 0);
+    rt.set(j, 0);
+    rt.get(r)
+}
+
+#[test]
+fn shared_reread_of_a_held_landing_its_own_set_flagged_runs_it_again() {
+    let local = reread_of_a_landing_its_own_set_flagged::<Local>();
+    assert_eq!(reread_of_a_landing_its_own_set_flagged::<Shared>(), local);
+}
