@@ -116,7 +116,8 @@ pub(crate) struct Held {
     opened: bool,
     /// The landing changed the slot's value.
     pub(crate) changed: bool,
-    poisoned: bool,
+    /// The `POISONED` and `HANDLED` flags of the runs' frames.
+    poison: u16,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
@@ -161,7 +162,7 @@ impl Held {
             wrote: false,
             opened: false,
             changed: false,
-            poisoned: false,
+            poison: 0,
             failed: false,
             episode: None,
             ep: 0,
@@ -171,7 +172,8 @@ impl Held {
     }
 
     /// Records a finished run: its deps, buffer, whether it reached the
-    /// child index and whether it was poisoned. Under speculation it first
+    /// child index and its frame's `POISONED` and `HANDLED` flags
+    /// (`poison`). Under speculation it first
     /// keeps the record it replaces; outside, it settles first. Returns
     /// the buffer it replaces and the value a settle dropped, for the
     /// caller to drop outside the held map.
@@ -181,7 +183,7 @@ impl Held {
         deps: Vec<(NodeId, u32)>,
         buf: Option<Erased>,
         opened: bool,
-        poisoned: bool,
+        poison: u16,
     ) -> (Option<Erased>, Option<Unbuilt>) {
         let spec_buf = if look.speculative {
             self.keep_record();
@@ -199,7 +201,7 @@ impl Held {
         }
         self.last = deps;
         self.opened = opened;
-        self.poisoned |= poisoned;
+        self.poison |= poison;
         (std::mem::replace(&mut self.buf, buf), spec_buf)
     }
 
@@ -252,7 +254,7 @@ impl Held {
                 last: self.last.clone(),
                 installed: self.installed.clone(),
                 opened: self.opened,
-                poisoned: self.poisoned,
+                poison: self.poison,
             }));
         }
     }
@@ -273,7 +275,7 @@ impl Held {
         self.last = r.last;
         self.installed = r.installed;
         self.opened = r.opened;
-        self.poisoned = r.poisoned;
+        self.poison = r.poison;
         self.buf
             .take()
             .map(|buf| Unbuilt::<dyn std::any::Any>::new(buf))
@@ -349,8 +351,9 @@ impl<H: Borrow<Held>> Seen<H> {
         self.0.borrow().opened
     }
 
-    pub(crate) fn poisoned(&self) -> bool {
-        self.0.borrow().poisoned
+    /// The runs' `POISONED` and `HANDLED` flags: either lands Dirty.
+    pub(crate) fn poison(&self) -> u16 {
+        self.0.borrow().poison
     }
 }
 
@@ -389,7 +392,7 @@ struct RunRecord {
     last: Vec<(NodeId, u32)>,
     installed: Vec<NodeId>,
     opened: bool,
-    poisoned: bool,
+    poison: u16,
 }
 
 /// An episode between member runs. A doom that discards a member run
@@ -399,7 +402,8 @@ pub(crate) struct Episode {
     pub(crate) root: NodeId,
     pub(crate) cidx: u32,
     pub(crate) validated: bool,
-    /// The landing's one cut to the root's SCC in the final reads has run.
+    /// The landing's one cut to the root's SCC in the final reads has run,
+    /// or is skipped (`uncut`).
     pub(crate) pruned: bool,
     pub(crate) members: Vec<u32>,
     pub(crate) cu: Vec<u32>,
@@ -408,6 +412,10 @@ pub(crate) struct Episode {
     /// The root's compute is a walk's entry, which contains the episode's
     /// abort.
     pub(crate) walked: bool,
+    /// The episode skipped the cut to the root's SCC: the root dissolved
+    /// an episode earlier in this entry, or the landing's one cut shrank
+    /// it and it ran again uncut.
+    pub(crate) uncut: bool,
 }
 
 pub(crate) struct Round {
@@ -781,6 +789,9 @@ impl HeldMap {
 /// and its exit touch one thread-local.
 struct EntryState {
     depth: Cell<u32>,
+    /// The key of the runtime whose entry is the innermost one: its id,
+    /// with [`SHARED_KEY`] for a `Shared` runtime.
+    cur_rt: Cell<u64>,
     /// This thread's wound-wait ticket, 0 until its first registration
     /// inside the current outermost entry, which keeps it across retries.
     ticket: Cell<u64>,
@@ -801,6 +812,8 @@ struct EntryState {
     /// budget changed later may have frames on the stack that read under
     /// the budget before.
     budget_clock: Cell<u64>,
+    /// The length of `Outer::failed_here`, read by every Shared walk.
+    failed_here: Cell<usize>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -814,6 +827,8 @@ struct Outer {
     /// Each runtime whose budget change this thread has met, with the
     /// `BUDGET_CLOCK` count of the change.
     budgets_met: Vec<(RuntimeId, u64)>,
+    /// The nodes this thread has landed Failed, at their generations.
+    failed_here: Vec<(RuntimeId, u32, u32)>,
 }
 
 #[cfg(not(loom))]
@@ -822,6 +837,7 @@ thread_local! {
     static ENTRY: EntryState = const {
         EntryState {
             depth: Cell::new(0),
+            cur_rt: Cell::new(0),
             ticket: Cell::new(0),
             wounded: Cell::new(false),
             failures: Cell::new(0),
@@ -829,15 +845,18 @@ thread_local! {
             held_any: Cell::new(false),
             stack_base: Cell::new(0),
             budget_clock: Cell::new(0),
+            failed_here: Cell::new(0),
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
+    static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
     static OUTER: RefCell<Outer> = const {
         RefCell::new(Outer {
             dissolved: Vec::new(),
             dissolved_groups: Vec::new(),
             last_cycle: None,
             budgets_met: Vec::new(),
+            failed_here: Vec::new(),
         })
     };
 }
@@ -847,6 +866,7 @@ loom::thread_local! {
     static HELD: RefCell<HeldMap> = RefCell::new(HeldMap::new());
     static ENTRY: EntryState = EntryState {
         depth: Cell::new(0),
+        cur_rt: Cell::new(0),
         ticket: Cell::new(0),
         wounded: Cell::new(false),
         failures: Cell::new(0),
@@ -854,13 +874,16 @@ loom::thread_local! {
         held_any: Cell::new(false),
         stack_base: Cell::new(0),
         budget_clock: Cell::new(0),
+        failed_here: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
+    static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         dissolved_groups: Vec::new(),
         last_cycle: None,
         budgets_met: Vec::new(),
+        failed_here: Vec::new(),
     });
 }
 
@@ -1108,6 +1131,30 @@ pub(crate) fn meet_budget_change(rt: RuntimeId, changed: u64) -> bool {
     })
 }
 
+pub(crate) fn note_failed_here(rt: RuntimeId, slot: u32, generation: u32) {
+    OUTER.with(|o| o.borrow_mut().failed_here.push((rt, slot, generation)));
+    ENTRY.with(|e| {
+        e.outer_set.set(true);
+        e.failed_here.set(e.failed_here.get() + 1);
+    });
+}
+
+/// How many Failed landings this thread has made in its outermost entry.
+pub(crate) fn failed_here_count() -> usize {
+    ENTRY.with(|e| e.failed_here.get())
+}
+
+/// Whether one of this thread's Failed landings after its first `from`
+/// in its outermost entry is of `slot` of `rt` at `generation`.
+pub(crate) fn failed_here_since(from: usize, rt: RuntimeId, slot: u32, generation: u32) -> bool {
+    OUTER.with(|o| {
+        let o = o.borrow();
+        o.failed_here
+            .get(from..)
+            .is_some_and(|f| f.contains(&(rt, slot, generation)))
+    })
+}
+
 /// The stack address the outermost engine entry recorded.
 pub(crate) fn stack_base() -> usize {
     ENTRY.with(|e| e.stack_base.get())
@@ -1118,19 +1165,19 @@ pub(crate) fn depth() -> u32 {
     ENTRY.with(|e| e.depth.get())
 }
 
-/// Counts an episode this thread lands on `rt`, for the last
-/// `OWN_RUNTIMES` runtimes it landed one on. A count dropped or restarted
+/// Adds `by` to this thread's share of `rt`'s episode count, for the last
+/// `OWN_RUNTIMES` runtimes it counted on. A count dropped or restarted
 /// only makes a walk's own share differ from all landings, which re-plans.
-pub(crate) fn own_episode(rt: RuntimeId) {
+pub(crate) fn own_episode(rt: RuntimeId, by: u64) {
     OWN_EPISODES.with(|o| {
         let mut o = o.borrow_mut();
         match o.iter_mut().find(|(r, _)| *r == rt) {
-            Some((_, n)) => *n = n.wrapping_add(1),
+            Some((_, n)) => *n = n.wrapping_add(by),
             None => {
                 if o.len() == OWN_RUNTIMES {
                     o.remove(0);
                 }
-                o.push((rt, 1));
+                o.push((rt, by));
             }
         }
     });
@@ -1167,38 +1214,84 @@ pub(crate) fn wounded() -> bool {
     ENTRY.with(|e| e.wounded.get())
 }
 
+/// Marks a `Shared` runtime's key; runtime ids stay far below 2^63.
+const SHARED_KEY: u64 = 1 << 63;
+
 /// One count on the thread's engine entry depth; dropping it, by an
 /// unwind included, gives the count back, and the outermost entry's drop
-/// gives up the thread's ticket.
+/// gives up the thread's ticket. An entry of another runtime than the
+/// innermost one's keeps the key of the entry below it in [`OUTER_RTS`],
+/// so that the runtimes open below are known.
 pub(crate) struct EntryDepth {
     outermost: bool,
+    switched: bool,
+    first_for_runtime: bool,
+    shared_outermost: bool,
+}
+
+/// The keys below this thread's runtime switches, innermost last, with a
+/// count per key and of the `Shared` ones, so that a switch costs the
+/// same however many are open.
+#[derive(Default)]
+struct OuterRts {
+    stack: Vec<u64>,
+    open: HashMap<u64, u32, FxBuildHasher>,
+    shared: u32,
 }
 
 impl EntryDepth {
+    /// An entry of runtime `rt`, a `Shared` one if `shared`.
     #[inline(always)]
-    pub(crate) fn enter() -> Self {
+    pub(crate) fn enter(rt: RuntimeId, shared: bool) -> Self {
         let base = 0_u8;
         let base = std::ptr::from_ref(&base) as usize;
-        let depth = ENTRY.with(|e| {
+        let key = rt.get() | if shared { SHARED_KEY } else { 0 };
+        ENTRY.with(|e| {
             let depth = e.depth.get();
             e.depth.set(depth + 1);
             if depth == 0 {
+                e.cur_rt.set(key);
                 e.stack_base.set(base);
                 e.budget_clock
                     .set(BUDGET_CLOCK.load(std::sync::atomic::Ordering::Relaxed));
                 #[cfg(all(test, not(loom)))]
                 OUTERMOST_ENTRIES.with(|n| n.set(n.get() + 1));
+                Self {
+                    outermost: true,
+                    switched: false,
+                    first_for_runtime: true,
+                    shared_outermost: shared,
+                }
+            } else if e.cur_rt.get() == key {
+                Self {
+                    outermost: false,
+                    switched: false,
+                    first_for_runtime: false,
+                    shared_outermost: false,
+                }
+            } else {
+                switch_in(e, key)
             }
-            depth
-        });
-        Self {
-            outermost: depth == 0,
-        }
+        })
     }
 
     #[inline(always)]
     pub(crate) fn is_outermost(&self) -> bool {
         self.outermost
+    }
+
+    /// No entry of this runtime is open below this one on the thread.
+    #[inline(always)]
+    #[cfg_attr(any(not(test), loom), allow(dead_code))]
+    pub(crate) fn first_for_runtime(&self) -> bool {
+        self.first_for_runtime
+    }
+
+    /// The entry is a `Shared` runtime's, and no `Shared` runtime's entry
+    /// is open below it on the thread.
+    #[inline(always)]
+    pub(crate) fn shared_outermost(&self) -> bool {
+        self.shared_outermost
     }
 }
 
@@ -1211,8 +1304,78 @@ impl Drop for EntryDepth {
             if depth == 0 {
                 e.ticket.set(0);
             }
+            if self.switched {
+                switch_out(e);
+            }
         });
     }
+}
+
+#[cold]
+#[inline(never)]
+fn switch_in(e: &EntryState, key: u64) -> EntryDepth {
+    let below = e.cur_rt.get();
+    let pushed = OUTER_RTS.try_with(|o| {
+        let mut o = o.borrow_mut();
+        o.stack.push(below);
+        *o.open.entry(below).or_insert(0) += 1;
+        o.shared += u32::from(below & SHARED_KEY != 0);
+        (!o.open.contains_key(&key), o.shared == 0)
+    });
+    match pushed {
+        Ok((first_for_runtime, no_shared_below)) => {
+            e.cur_rt.set(key);
+            EntryDepth {
+                outermost: false,
+                switched: true,
+                first_for_runtime,
+                shared_outermost: key & SHARED_KEY != 0 && no_shared_below,
+            }
+        }
+        // An entry from a destructor of this thread's locals, after
+        // `OUTER_RTS`'s: it is taken as a nested entry of the runtime below.
+        Err(_) => EntryDepth {
+            outermost: false,
+            switched: false,
+            first_for_runtime: false,
+            shared_outermost: false,
+        },
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn switch_out(e: &EntryState) {
+    let below = OUTER_RTS.with(|o| {
+        let mut o = o.borrow_mut();
+        let below = o
+            .stack
+            .pop()
+            .expect("incr-core: a switched entry keeps the key below it");
+        match o.open.get_mut(&below) {
+            Some(n) if *n > 1 => *n -= 1,
+            _ => {
+                o.open.remove(&below);
+            }
+        }
+        o.shared -= u32::from(below & SHARED_KEY != 0);
+        below
+    });
+    e.cur_rt.set(below);
+}
+
+/// Whether an engine entry of `rt` is open on this thread.
+#[cfg_attr(any(not(test), loom), allow(dead_code))]
+pub(crate) fn open_entry_of(rt: RuntimeId) -> bool {
+    let rt = rt.get();
+    ENTRY.with(|e| {
+        e.depth.get() != 0
+            && (e.cur_rt.get() & !SHARED_KEY == rt
+                || OUTER_RTS.with(|o| {
+                    let o = o.borrow();
+                    o.open.contains_key(&rt) || o.open.contains_key(&(rt | SHARED_KEY))
+                }))
+    })
 }
 
 /// Resets the state an outermost entry starts from.
@@ -1225,6 +1388,8 @@ pub(crate) fn reset_outermost() {
             o.dissolved_groups.clear();
             o.last_cycle = None;
             o.budgets_met.clear();
+            o.failed_here.clear();
+            ENTRY.with(|e| e.failed_here.set(0));
         });
     }
 }

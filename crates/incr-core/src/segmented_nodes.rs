@@ -89,6 +89,17 @@ pub(crate) const NOT_REPLAYABLE: u8 = 64;
 /// section (`runtime_watch.rs`).
 pub(crate) const WATCHED: u8 = 128;
 
+const _: () = assert!(crate::bits::disjoint(&[
+    HAS_CHILDREN as u64,
+    IN_GROUP as u64,
+    HAS_STRATEGY as u64,
+    HAS_INDEX as u64,
+    OWNED as u64,
+    REPLAYABLE as u64,
+    NOT_REPLAYABLE as u64,
+    WATCHED as u64,
+]));
+
 /// A segment of nodes and, beside them, one flags byte per node. The
 /// bytes are zeroed when the segment is allocated and stored only under
 /// the runtime's write lock, so a Relaxed load anywhere reads a value
