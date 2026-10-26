@@ -396,14 +396,7 @@ impl<C: Cells> Runtime<C> {
         rec: Option<Arc<GroupInfo>>,
         in_group: bool,
     ) {
-        match rec {
-            Some(r) => {
-                inner.member_recs.insert(slot, r);
-            }
-            None => {
-                inner.member_recs.remove(&slot);
-            }
-        }
+        inner.set_member_rec(self.runtime_id, slot, rec);
         let flags = self.nodes.get_with_flags(slot).1;
         let bits = C::u8_load_relaxed(flags);
         C::u8_store_relaxed(

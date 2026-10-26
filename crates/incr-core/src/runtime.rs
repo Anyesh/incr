@@ -117,6 +117,24 @@ pub(crate) struct GroupInfo {
 }
 
 impl<C: Cells> Inner<C> {
+    /// Sets `slot`'s group record, or removes it for `None`. Under
+    /// `Shared` the thread notes the record it left there, so that a claim
+    /// of a group entry tells another thread's change from its own.
+    pub(crate) fn set_member_rec(
+        &mut self,
+        rt: RuntimeId,
+        slot: u32,
+        rec: Option<Arc<GroupInfo>>,
+    ) -> Option<Arc<GroupInfo>> {
+        if !C::SINGLE_THREADED {
+            cycle_state::note_rec_left(rt, slot, rec.clone());
+        }
+        match rec {
+            Some(r) => self.member_recs.insert(slot, r),
+            None => self.member_recs.remove(&slot),
+        }
+    }
+
     fn new() -> Self {
         Self {
             compute_fns: SlotVec::new(),
@@ -751,7 +769,11 @@ const VISIT: u32 = u32::MAX;
 const VISIT_COMPUTING: u32 = u32::MAX - 1;
 
 /// `Entry::taint` of a pending entry no skipped dep has reached.
-const NO_TAINT: u32 = u32::MAX - 3;
+const NO_TAINT: u32 = u32::MAX - 4;
+
+/// `NO_TAINT` of the member a walk expanded its group at, in place of its
+/// own deps. Above `NO_TAINT`, as `NO_TAINT_NEW` is.
+const NO_TAINT_GROUP: u32 = u32::MAX - 3;
 
 /// `NO_TAINT` of a node the walk's visit found New. Above `NO_TAINT`, so
 /// a taint merged into it drops the mark; merging `NO_TAINT` is skipped.
@@ -764,6 +786,11 @@ enum Seen {
     Unwalked,
     Dirty,
     New,
+    /// The member a group expansion stood for, with the record it expanded
+    /// (null if the walk forgot it) and this thread's count of record
+    /// changes then: a plan that holds until another thread changes the
+    /// member's record.
+    Group(*const GroupInfo, usize),
 }
 
 /// One entry of `ensure_clean`'s walk. A visit (`taint >= VISIT_COMPUTING`)
@@ -834,11 +861,24 @@ pub(crate) struct Walk {
 struct Expanded {
     /// New nodes with installed deps the walk has expanded.
     new: HashSet<NodeId>,
-    /// The cycle groups the walk has expanded whole.
-    groups: Vec<Arc<GroupInfo>>,
+    /// The cycle groups the walk has expanded whole, each with the member
+    /// it was expanded at (at most one per member) and this thread's count
+    /// of record changes then.
+    groups: Vec<(NodeId, Arc<GroupInfo>, usize)>,
 }
 
 impl Walk {
+    #[cold]
+    #[inline(never)]
+    fn expanded_group(&self, id: NodeId) -> Seen {
+        self.expanded
+            .as_ref()
+            .and_then(|e| e.groups.iter().find(|(at, ..)| *at == id))
+            .map_or(Seen::Group(std::ptr::null(), 0), |(_, group, notes)| {
+                Seen::Group(Arc::as_ptr(group), *notes)
+            })
+    }
+
     /// Drops the pending entry of `id` the walk was to run next, whose
     /// compute ran elsewhere. The root's entry stays: a walk stopped at a
     /// non-root entry of the root's own node (a self-edge's repeat) still
@@ -896,7 +936,7 @@ impl Walk {
         (self.work.iter())
             .map(|e| e.id.0)
             .chain([cur.0])
-            .chain(groups.flat_map(|g| g.members.iter().map(|&(slot, _)| slot)))
+            .chain(groups.flat_map(|(_, g, _)| g.members.iter().map(|&(slot, _)| slot)))
     }
 
     /// Pushes back `entry`, whose compute a discard undid, for the reading
@@ -930,9 +970,14 @@ impl Walk {
 
     #[inline]
     fn visit(&mut self, id: NodeId, generation: u32, new: bool) {
+        self.visit_marked(id, generation, if new { NO_TAINT_NEW } else { NO_TAINT });
+    }
+
+    #[inline]
+    fn visit_marked(&mut self, id: NodeId, generation: u32, mark: u32) {
         self.push(Entry {
             id,
-            taint: if new { NO_TAINT_NEW } else { NO_TAINT },
+            taint: mark,
             generation,
         });
         self.first_visits += 1;
@@ -946,7 +991,11 @@ impl Walk {
     /// than the length before the visit.
     #[inline(always)]
     fn visit_pending(&mut self, id: NodeId, generation: u32, new: bool) -> usize {
-        self.visit(id, generation, new);
+        self.visit_pending_marked(id, generation, if new { NO_TAINT_NEW } else { NO_TAINT })
+    }
+
+    fn visit_pending_marked(&mut self, id: NodeId, generation: u32, mark: u32) -> usize {
+        self.visit_marked(id, generation, mark);
         self.work.len() - 1
     }
 
@@ -1099,7 +1148,7 @@ impl Walk {
             expanded.new.retain(|id| !gone(id));
             expanded
                 .groups
-                .retain(|g| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
+                .retain(|(_, g, _)| !g.members.iter().any(|&(m, _)| gone(&NodeId(m))));
         }
     }
 
@@ -2594,7 +2643,7 @@ impl<C: Cells> Runtime<C> {
             None
         };
         if bits & IN_GROUP != 0 {
-            inner.member_recs.remove(&slot);
+            inner.set_member_rec(self.runtime_id, slot, None);
         }
         self.set_released(inner, slot, node, None);
         let children = if bits & HAS_INDEX != 0 {
@@ -3901,6 +3950,8 @@ impl<C: Cells> Runtime<C> {
                     Seen::Unwalked
                 } else if taint == NO_TAINT_NEW || forced {
                     Seen::New
+                } else if taint == NO_TAINT_GROUP {
+                    walk.expanded_group(cur)
                 } else {
                     Seen::Dirty
                 };
@@ -4406,14 +4457,20 @@ impl<C: Cells> Runtime<C> {
             return false;
         }
         let groups = &mut walk.expanded.get_or_insert_with(Box::default).groups;
-        if groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
+        // A member keeps the first record expanded at it, which its marked
+        // entry's claim checks: a replaced record is replanned there, not
+        // expanded at the member a second time.
+        if groups
+            .iter()
+            .any(|(at, g, _)| *at == cur || Arc::ptr_eq(g, &group))
+        {
             return true;
         }
-        groups.push(group.clone());
+        groups.push((cur, group.clone(), cycle_state::recs_left_count()));
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pending = walk.visit_pending(cur, generation, false);
+        let pending = walk.visit_pending_marked(cur, generation, NO_TAINT_GROUP);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group
@@ -4449,6 +4506,25 @@ impl<C: Cells> Runtime<C> {
             }
         }
         true
+    }
+
+    /// Whether another thread changed `id`'s group record since the walk
+    /// expanded `expanded` at it, when this thread had noted `notes` record
+    /// changes. This thread's own changes are the walk's to carry on
+    /// through, as a `Local` walk, which never replans here, does.
+    #[cold]
+    #[inline(never)]
+    fn group_replaced_elsewhere(
+        &self,
+        id: NodeId,
+        expanded: *const GroupInfo,
+        notes: usize,
+    ) -> bool {
+        let current = self.inner.read().member_recs.get(&id.0).cloned();
+        !current
+            .as_ref()
+            .is_some_and(|r| std::ptr::eq(Arc::as_ptr(r), expanded))
+            && !cycle_state::left_rec_since(notes, self.runtime_id, id.0, current.as_ref())
     }
 
     /// A root the taint memo holds, computed without a walk. Out of line
@@ -4725,6 +4801,16 @@ impl<C: Cells> Runtime<C> {
             if claimed_dirty && seen == Seen::New {
                 self.unclaim_unrun(node, claimed_dirty);
                 return Computed::Revisit;
+            }
+            // Another thread's landings can take the members out of the
+            // group the walk expanded here, or land them into another one,
+            // after any wait the walk made, and the plan then never expanded
+            // the deps of the members that record does not hold.
+            if let Seen::Group(expanded, notes) = seen {
+                if self.group_replaced_elsewhere(id, expanded, notes) {
+                    self.unclaim_unrun(node, claimed_dirty);
+                    return Computed::Revisit;
+                }
             }
             // Another thread's memo landing since the load leaves a Dirty
             // the claim succeeds on, and the memo stands for this run.
@@ -5840,7 +5926,7 @@ impl<C: Cells> Runtime<C> {
                 in_group,
             );
         }
-        inner.member_recs.remove(&id.0);
+        inner.set_member_rec(self.runtime_id, id.0, None);
         C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) & !IN_GROUP);
     }
 
@@ -6515,7 +6601,7 @@ impl<C: Cells> Runtime<C> {
             cycle: Cycle::new(members.to_vec()),
         });
         for m in members {
-            inner.member_recs.insert(m.slot(), group.clone());
+            inner.set_member_rec(self.runtime_id, m.slot(), Some(group.clone()));
             let flags = self.nodes.get_with_flags(m.slot()).1;
             C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
         }

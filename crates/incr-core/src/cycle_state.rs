@@ -835,6 +835,9 @@ struct Outer {
     /// The landed group of each root whose episode dissolved in this
     /// entry, held so that no later record can reuse its address.
     dissolved_groups: Vec<(RuntimeId, u32, Arc<GroupInfo>)>,
+    /// The group record this thread left at each slot it changed, held so
+    /// that no later record can reuse its address.
+    recs_left: Vec<(RuntimeId, u32, Option<Arc<GroupInfo>>)>,
     last_cycle: Option<Cycle>,
     /// Each runtime whose budget change this thread has met, with the
     /// `BUDGET_CLOCK` count of the change.
@@ -870,6 +873,7 @@ thread_local! {
         RefCell::new(Outer {
             dissolved: Vec::new(),
             dissolved_groups: Vec::new(),
+            recs_left: Vec::new(),
             last_cycle: None,
             budgets_met: Vec::new(),
             failed_here: Vec::new(),
@@ -901,6 +905,7 @@ loom::thread_local! {
     static OUTER: RefCell<Outer> = RefCell::new(Outer {
         dissolved: Vec::new(),
         dissolved_groups: Vec::new(),
+        recs_left: Vec::new(),
         last_cycle: None,
         budgets_met: Vec::new(),
         failed_here: Vec::new(),
@@ -1575,6 +1580,42 @@ pub(crate) fn first_nested_of(rt: RuntimeId) -> bool {
     ENTRY.with(|e| e.depth.get() != 0 && e.cur_rt.get() & !SHARED_KEY != rt && !outer_open(rt))
 }
 
+/// Notes `rec` as the group record this thread left at `slot`.
+pub(crate) fn note_rec_left(rt: RuntimeId, slot: u32, rec: Option<Arc<GroupInfo>>) {
+    OUTER.with(|o| o.borrow_mut().recs_left.push((rt, slot, rec)));
+    ENTRY.with(|e| e.outer_set.set(true));
+}
+
+/// How many group record changes this thread has noted in this outermost
+/// entry.
+pub(crate) fn recs_left_count() -> usize {
+    OUTER.with(|o| o.borrow().recs_left.len())
+}
+
+/// Whether `current` is the group record this thread last left at `slot`,
+/// among the changes it noted after its first `since`.
+pub(crate) fn left_rec_since(
+    since: usize,
+    rt: RuntimeId,
+    slot: u32,
+    current: Option<&Arc<GroupInfo>>,
+) -> bool {
+    OUTER.with(|o| {
+        o.borrow()
+            .recs_left
+            .get(since..)
+            .unwrap_or_default()
+            .iter()
+            .rev()
+            .find(|(r, s, _)| *r == rt && *s == slot)
+            .is_some_and(|(_, _, left)| match (left, current) {
+                (Some(l), Some(c)) => Arc::ptr_eq(l, c),
+                (None, None) => true,
+                _ => false,
+            })
+    })
+}
+
 /// Whether `rt` has an open entry on this thread as a `Shared` runtime.
 pub(crate) fn shared_open(rt: RuntimeId) -> bool {
     let key = rt.get() | SHARED_KEY;
@@ -1597,6 +1638,7 @@ pub(crate) fn reset_outermost() {
             let mut o = o.borrow_mut();
             o.dissolved.clear();
             o.dissolved_groups.clear();
+            o.recs_left.clear();
             o.last_cycle = None;
             o.budgets_met.clear();
             o.failed_here.clear();
