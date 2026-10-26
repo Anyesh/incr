@@ -5624,10 +5624,9 @@ impl<C: Cells> Runtime<C> {
                     );
                 }
             }
-            // A rerun can't take a held landing from Failed, as its word
-            // stays Computing until the exit publishes it.
-            let regenerable =
-                own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0 && !self.lands_held(id, node);
+            // A held landing stays regenerable: the owner's rerun reclaims
+            // it through the view, and no other thread sees it Failed.
+            let regenerable = own_run && C::u8_load_relaxed(flags) & HAS_INDEX == 0;
             mark = self.failed_landing(
                 id,
                 node.generation(),
