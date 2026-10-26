@@ -1300,6 +1300,50 @@ fn shared_held_failed_landing_over_a_dep_a_set_moved_lands_dirty() {
     assert_eq!(rt.get(r), 10);
 }
 
+/// As above with g, which lets f's panic out, between d and f: a set
+/// that moved f's dep would have flipped g with f, so g lands Dirty too
+/// and its next read runs it.
+#[test]
+fn shared_held_failed_reader_of_a_landing_a_set_moved_lands_dirty() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let gate = crate::runtime::race_tests::Gate::new();
+    let x = rt.create_input(0_i64);
+    let on = rt.create_input(0_i64);
+    let f = rt.create_query(move |rt| -> i64 { panic!("f boom {}", rt.get(x)) });
+    let g = rt.create_query(move |rt| rt.get(f) + 1);
+    let d = {
+        let gate = gate.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            if rt.get(on) == 0 {
+                return 0;
+            }
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(g))).map_or(7, |v| v * 10);
+            gate.park();
+            v
+        })
+    };
+    let r = rt.create_query(move |rt: &Runtime<Shared>| rt.get(d));
+    assert_eq!(rt.get(r), 0);
+    rt.set(on, 1);
+    gate.arm();
+    let reader = {
+        let rt = Arc::clone(&rt);
+        std::thread::spawn(move || rt.get(r))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(g), NodeState::Computing);
+    rt.set(x, 1);
+    gate.release();
+    assert_eq!(reader.join().unwrap(), 7);
+    assert_eq!(
+        (rt.state_of(f), rt.state_of(g)),
+        (NodeState::Dirty, NodeState::Dirty)
+    );
+    rt.assert_invariant_i();
+    let again = panic_message(catch_unwind(AssertUnwindSafe(|| rt.get(g))).unwrap_err());
+    assert_eq!(again, "f boom 1");
+}
+
 /// The thread's state after a caught wound: whether it held, and what
 /// the read after it raised.
 type AfterWound = Arc<std::sync::Mutex<Option<(bool, Option<String>)>>>;
