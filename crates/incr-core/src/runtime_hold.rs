@@ -543,18 +543,24 @@ impl<C: Cells> Runtime<C> {
             self.count_release();
         }
         let mut bag = Deferred::new();
-        let targets = self.publication_targets(&entries);
         let mut rest = entries.into_iter();
         let published = catch_unwind(AssertUnwindSafe(|| {
+            let targets = self.publication_targets(rest.as_slice());
             for e in rest.by_ref() {
                 let target = targets[&e.slot];
                 self.publish_one(e, target, &mut bag);
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
-        // what is left goes back as on a wound (G9).
+        // what is left goes back as on a wound (G9), its edges with it.
         if let Err(payload) = published {
-            self.retract_entries(rest.collect(), Vec::new(), true);
+            let rest: Vec<Held> = rest.collect();
+            let mut inner = self.inner.write();
+            for e in &rest {
+                self.move_edges(&mut inner, e, true);
+            }
+            drop(inner);
+            self.retract_entries(rest, Vec::new(), true);
             bag.drain_carried(payload);
         }
         bag.drain(self);
@@ -579,25 +585,43 @@ impl<C: Cells> Runtime<C> {
             return false;
         }
         for e in entries {
-            let Some(old) = &e.undo.deps else {
-                continue;
-            };
-            let id = NodeId(e.slot);
-            let node = self.nodes.get(e.slot);
-            let mut new: Vec<NodeId> = Vec::new();
-            node.for_each_dep(|d| new.push(d));
-            for (o, _) in old {
-                if !new.contains(o) {
+            self.move_edges(&mut inner, e, false);
+        }
+        true
+    }
+
+    /// Moves a held landing's reverse edges from the deps it displaced to
+    /// the ones it installed, or back with `back`.
+    fn move_edges(&self, inner: &mut Inner<C>, e: &Held, back: bool) {
+        let Some(old) = &e.undo.deps else {
+            return;
+        };
+        let id = NodeId(e.slot);
+        let mut new: Vec<NodeId> = Vec::new();
+        self.nodes.get(e.slot).for_each_dep(|d| new.push(d));
+        for &(o, generation) in old {
+            if !new.contains(&o) {
+                if back {
+                    // Its edge gone, a displaced dep could be deleted and
+                    // its slot reused meanwhile.
+                    let dep = self.nodes.get(o.0);
+                    if dep.generation() == generation && dep.state() != NodeState::Dead {
+                        inner.dependents[o.0 as usize].push_unique(id);
+                    }
+                } else {
                     inner.dependents[o.0 as usize].remove(id);
                 }
             }
-            for n in &new {
-                if !old.iter().any(|(o, _)| o == n) {
+        }
+        for n in &new {
+            if !old.iter().any(|(o, _)| o == n) {
+                if back {
+                    inner.dependents[n.0 as usize].remove(id);
+                } else {
                     inner.dependents[n.0 as usize].push_unique(id);
                 }
             }
         }
-        true
     }
 
     /// What each held landing publishes as. A set after the read could
