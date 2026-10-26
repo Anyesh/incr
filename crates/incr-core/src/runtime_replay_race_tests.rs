@@ -4060,6 +4060,69 @@ fn noted_over(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
     (i, d, x)
 }
 
+/// x first reads c Clean. Once m is set, c's rerun reads the held episode
+/// of the cycle a-b and catches the self-cycle s, so c lands held toward
+/// Dirty, and x's rerun panics: x lands Failed over its old dep c while c
+/// still reads Computing to every other look. The landing is noted under
+/// c, so the set of i, whose walk stops at the published Dirty c, still
+/// flips x.
+#[test]
+fn a_failed_landing_over_a_held_dirty_dep_is_noted() {
+    let rt = Rt::new();
+    let m = rt.create_input(0_u64);
+    let i = rt.create_input(1_u64);
+    let bc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt: &Rt| rt.get(*bc.get().unwrap()) + 1,
+            |_c: &Cycle| 100,
+        )
+    };
+    bc.set(rt.create_query(move |rt: &Rt| rt.get(a) * 2))
+        .unwrap();
+    let sc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let s = {
+        let sc = sc.clone();
+        rt.create_query(move |rt: &Rt| rt.get(*sc.get().unwrap()))
+    };
+    sc.set(s).unwrap();
+    let c = rt.create_query(move |rt: &Rt| {
+        if rt.get(m) == 0 {
+            return rt.get(i);
+        }
+        rt.get(a);
+        rt.get(i) + rt.try_get(s).unwrap_or(0)
+    });
+    let seen: Arc<Mutex<Option<(NodeState, NodeState)>>> = Arc::default();
+    let x = {
+        let seen = seen.clone();
+        rt.create_query(move |rt: &Rt| {
+            let v = rt.get(c);
+            if v == 5 {
+                let cell = rt.nodes.get(id(c).0).state_cell();
+                let raw = crate::state::load::<Shared>(cell);
+                *seen.lock().unwrap() = Some((raw, rt.seen_quietly(cell, raw)));
+                std::panic::panic_any(Custom(v));
+            }
+            v
+        })
+    };
+    assert_eq!(rt.get(x), 1);
+    rt.set(m, 1);
+    rt.set(i, 5);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
+    assert_eq!(
+        seen.lock().unwrap().take(),
+        Some((NodeState::Computing, NodeState::Dirty)),
+        "c held toward Dirty when x read it"
+    );
+    assert_eq!(rt.nodes.get(id(x).0).state(), NodeState::Failed);
+    assert_eq!(rt.nodes.get(id(c).0).state(), NodeState::Dirty);
+    rt.set(i, 2);
+    assert_eq!(rt.get(x), 2, "x reran over the set");
+}
+
 /// x's walk contains `failed`'s panic once x stops reading it, holding a
 /// ticket for `failed`. Thread B's read of q2 reruns q1, whose read of
 /// `failed` takes that ticket as lent and stops; a regeneration on thread A
