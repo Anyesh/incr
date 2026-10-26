@@ -56,6 +56,8 @@ pub(crate) struct Joined {
 #[derive(Clone, Copy)]
 pub(crate) struct Member {
     pub(crate) node: (u32, u32),
+    /// As `Noted::at`.
+    pub(crate) at: u64,
     /// As `Noted::gone`.
     pub(crate) gone: u64,
 }
@@ -95,6 +97,9 @@ pub(crate) struct Log {
 #[derive(Clone)]
 pub(crate) struct Noted {
     pub(crate) node: (u32, u32),
+    /// The stamp of the Failed landing of `node` the note names: a later
+    /// landing of the node, on any thread, has another.
+    pub(crate) at: u64,
     /// A ticket a read took, whose first members the note stands for in
     /// place of `node`.
     pub(crate) lent: Option<(Arc<Members>, usize)>,
@@ -109,33 +114,35 @@ pub(crate) struct Noted {
 
 impl Log {
     /// The landings of the first `len` notes still noted at removal
-    /// `epoch`, each at its shallowest depth above `base`. A note below
-    /// `base` counts as just above it.
-    pub(crate) fn landings(&self, len: usize, epoch: u64, base: u32) -> Vec<((u32, u32), u32)> {
+    /// `epoch`, each at its shallowest depth above `base` and with the
+    /// newest stamp it was noted with. A note below `base` counts as just
+    /// above it.
+    pub(crate) fn landings(&self, len: usize, epoch: u64, base: u32) -> Vec<Landed> {
         note_work(len);
-        let mut nodes: Vec<((u32, u32), u32)> = Vec::new();
+        let mut nodes: Vec<Landed> = Vec::new();
         let mut at: HashMap<(u32, u32), usize, FxBuildHasher> = HashMap::default();
-        let mut add = |node: (u32, u32), depth: u32| match at.entry(node) {
+        let mut add = |node: (u32, u32), depth: u32, stamp: u64| match at.entry(node) {
             Entry::Occupied(i) => {
-                let d = &mut nodes[*i.get()].1;
+                let (_, d, s) = &mut nodes[*i.get()];
                 *d = (*d).min(depth);
+                *s = (*s).max(stamp);
             }
             Entry::Vacant(v) => {
                 v.insert(nodes.len());
-                nodes.push((node, depth));
+                nodes.push((node, depth, stamp));
             }
         };
         for e in self.entries[..len].iter().filter(|e| e.gone >= epoch) {
             let depth = e.cidx.saturating_sub(base);
             match &e.lent {
-                None => add(e.node, depth),
+                None => add(e.node, depth, e.at),
                 Some((members, len)) => {
                     note_work(*len);
                     for m in members.lock().members[..*len]
                         .iter()
                         .filter(|m| m.gone >= epoch)
                     {
-                        add(m.node, depth);
+                        add(m.node, depth, m.at);
                     }
                 }
             }
@@ -143,6 +150,13 @@ impl Log {
         nodes
     }
 }
+
+/// A noted landing, its depth above the reading frame and its stamp
+/// (`Noted::at`).
+pub(crate) type Landed = ((u32, u32), u32, u64);
+
+/// A noted landing and its stamp (`Noted::at`).
+pub(crate) type Stamped = ((u32, u32), u64);
 
 /// A note's place: entry `idx` of log `log` of payload `key`'s group.
 #[derive(Clone, Copy)]
@@ -223,10 +237,10 @@ impl Notes {
         rt: RuntimeId,
         key: PayloadKey,
         cidx: u32,
-        node: (u32, u32),
+        (node, at): Stamped,
         restorable: bool,
     ) {
-        self.push_noted(rt, key, cidx, node, None, restorable);
+        self.push_noted(rt, key, cidx, (node, at), None, restorable);
     }
 
     /// Notes the ticket `members` stands for, which a read took with the
@@ -239,7 +253,14 @@ impl Notes {
         members: Arc<Members>,
     ) {
         let len = members.lock().members.len();
-        self.push_noted(rt, key, cidx, (u32::MAX, 0), Some((members, len)), true);
+        self.push_noted(
+            rt,
+            key,
+            cidx,
+            ((u32::MAX, 0), 0),
+            Some((members, len)),
+            true,
+        );
     }
 
     fn push_noted(
@@ -247,7 +268,7 @@ impl Notes {
         rt: RuntimeId,
         key: PayloadKey,
         cidx: u32,
-        node: (u32, u32),
+        (node, at): Stamped,
         lent: Option<(Arc<Members>, usize)>,
         restorable: bool,
     ) {
@@ -273,6 +294,7 @@ impl Notes {
             let mut l = g.logs[log].log.borrow_mut();
             l.entries.push(Noted {
                 node,
+                at,
                 lent,
                 cidx,
                 restorable,
@@ -386,7 +408,7 @@ impl Notes {
                     continue;
                 };
                 match (e.lent, mine == Some(log as usize)) {
-                    (None, true) => out.nodes.push((idx, e.node)),
+                    (None, true) => out.nodes.push((idx, (e.node, e.at))),
                     (None, false) => {}
                     (Some((members, _)), true) => out.lent.push(members),
                     (Some((members, _)), false) => members.drop_note(),
@@ -409,7 +431,7 @@ impl Notes {
         rt: RuntimeId,
         cidx: u32,
         key: PayloadKey,
-    ) -> (Vec<(u32, u32)>, Vec<Arc<Members>>) {
+    ) -> (Vec<Stamped>, Vec<Arc<Members>>) {
         let mut ours = self.forget_levels(key, cidx, Some(rt));
         if let Some(above) = cidx.checked_add(1) {
             self.forget_from(above, None);
@@ -417,13 +439,7 @@ impl Notes {
             self.removed();
         }
         ours.nodes.sort_unstable_by_key(|&(idx, _)| idx);
-        let mut seen = BTreeSet::new();
-        let nodes = ours
-            .nodes
-            .into_iter()
-            .filter_map(|(_, node)| seen.insert(node).then_some(node))
-            .collect();
-        (nodes, ours.lent)
+        (newest(ours.nodes.into_iter().map(|(_, n)| n)), ours.lent)
     }
 
     /// A copy of `rt`'s notes of `key`, at their depths above `base`. The
@@ -477,7 +493,7 @@ impl Notes {
         &mut self,
         rt: RuntimeId,
         key: PayloadKey,
-    ) -> (Vec<(u32, u32)>, Vec<Arc<Members>>) {
+    ) -> (Vec<Stamped>, Vec<Arc<Members>>) {
         let Some(g) = self.remove_group(key) else {
             return (Vec::new(), Vec::new());
         };
@@ -500,14 +516,13 @@ impl Notes {
         };
         let log = l.log.borrow();
         note_work(log.entries.len());
-        let mut seen = BTreeSet::new();
-        let nodes = log
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|&(i, e)| e.lent.is_none() && restorable(mine.unwrap(), i, e))
-            .filter_map(|(_, e)| seen.insert(e.node).then_some(e.node))
-            .collect();
+        let nodes = newest(
+            log.entries
+                .iter()
+                .enumerate()
+                .filter(|&(i, e)| e.lent.is_none() && restorable(mine.unwrap(), i, e))
+                .map(|(_, e)| (e.node, e.at)),
+        );
         (nodes, lent)
     }
 }
@@ -515,8 +530,28 @@ impl Notes {
 /// What a removal took of a payload's notes.
 #[derive(Default)]
 struct Taken {
-    nodes: Vec<(u32, (u32, u32))>,
+    nodes: Vec<(u32, Stamped)>,
     lent: Vec<Arc<Members>>,
+}
+
+/// Each landing of `noted` once, in the order first noted, with the newest
+/// stamp it was noted with.
+fn newest(noted: impl Iterator<Item = Stamped>) -> Vec<Stamped> {
+    let mut nodes: Vec<Stamped> = Vec::new();
+    let mut at: HashMap<(u32, u32), usize, FxBuildHasher> = HashMap::default();
+    for (node, stamp) in noted {
+        match at.entry(node) {
+            Entry::Occupied(i) => {
+                let s = &mut nodes[*i.get()].1;
+                *s = (*s).max(stamp);
+            }
+            Entry::Vacant(v) => {
+                v.insert(nodes.len());
+                nodes.push((node, stamp));
+            }
+        }
+    }
+    nodes
 }
 
 /// Drops the notes of the tickets reads took in `g`, which went with
