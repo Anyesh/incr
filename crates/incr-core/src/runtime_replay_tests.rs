@@ -12,6 +12,7 @@ use crate::cycle::{ComputeCtl, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay
 use crate::cycle_state::{set_unwind_kind, unwind_kind, with_held, Held, UnwindKind};
 use crate::deferred::Deferred;
 use crate::dep_stack::DepStack;
+use crate::grid_table::GridKey;
 use crate::handle::Incr;
 use crate::node::NodeId;
 use crate::state::{self, NodeState};
@@ -2767,6 +2768,7 @@ enum Lookup {
     OwnGraph,
     ForeignCycle,
     OwnTrace,
+    ForeignGrid,
     GroupCount,
     GroupKeys,
     GroupGet,
@@ -2791,6 +2793,7 @@ fn lookup_ticket_shape<C: Cells>(
     rt.set_max_frames(frames);
     let other = Arc::new(Runtime::<Shared>::new());
     let table = Arc::new(other.create_table::<u64, u64>());
+    let grid = Arc::new(other.create_grid_table::<u64>());
     let gone = other.create_input(0_u64);
     let own_gone = rt.create_input(0_u64);
     let coll = other.create_collection::<u64>();
@@ -2818,12 +2821,14 @@ fn lookup_ticket_shape<C: Cells>(
     let k = rt.create_input(0_u64);
     let (b_other, b_table, b_coll) = (Arc::clone(&other), Arc::clone(&table), coll.clone());
     let (b_groups, b_sorted) = (Arc::clone(&groups), Arc::clone(&sorted));
+    let b_grid = Arc::clone(&grid);
     let own_nodes = Arc::new(AtomicUsize::new(0));
     let b_own_nodes = Arc::clone(&own_nodes);
     let b = rt.create_query_with(
         move |rt: &Runtime<C>| -> u64 {
             let seen = match lookup {
                 Lookup::ForeignTable => b_table.get(&b_other, &3).is_some(),
+                Lookup::ForeignGrid => b_grid.get(&b_other, GridKey::new(0, 0, 3)).is_some(),
                 Lookup::ForeignAlive => b_other.is_alive(gone),
                 Lookup::OwnAlive => rt.is_alive(own_gone),
                 Lookup::ForeignCount => b_other.node_count() == other_nodes,
@@ -2859,6 +2864,9 @@ fn lookup_ticket_shape<C: Cells>(
     match lookup {
         Lookup::ForeignTable | Lookup::ForeignForEach => {
             table.get_or_insert_input(&other, 3, || 0);
+        }
+        Lookup::ForeignGrid => {
+            grid.get_or_insert_input(&other, GridKey::new(0, 0, 3), || 0);
         }
         Lookup::ForeignAlive | Lookup::ForeignCount => other.delete_node(gone),
         Lookup::OwnAlive | Lookup::OwnTrace => rt.delete_node(own_gone),
@@ -2913,6 +2921,7 @@ fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
     let mut differ = Vec::new();
     for (lookup, payload) in [
         (Lookup::ForeignTable, 205_u64),
+        (Lookup::ForeignGrid, 205),
         (Lookup::ForeignAlive, 201),
         (Lookup::OwnAlive, 201),
         (Lookup::ForeignCount, 201),
