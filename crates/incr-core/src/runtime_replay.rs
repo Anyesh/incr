@@ -2704,17 +2704,22 @@ impl<C: Cells> Runtime<C> {
                 cycle: true,
                 payload,
                 ..
-            }) => Ok(Err(payload
+            }) if payload.is::<cycle::CycleUnwind>() => Ok(Err(payload
                 .downcast::<cycle::CycleUnwind>()
-                .expect("incr-core: a kept cycle is a cycle unwind")
+                .expect("incr-core: checked to be a cycle unwind")
                 .0)),
-            Some(Delivered::Unwind { payload, .. }) => {
+            Some(Delivered::Unwind { cycle, payload, .. }) => {
                 let raised = match &key {
                     Some(key) => self.regenerated(handle, reader, key, payload),
                     None => Some(payload),
                 };
                 match raised {
-                    Some(payload) => Err(payload),
+                    Some(payload) => {
+                        if cycle {
+                            cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
+                        }
+                        Err(payload)
+                    }
                     None => catch_unwind(AssertUnwindSafe(|| {
                         self.read_unframed(handle, observed, kind, word)
                     })),
@@ -2739,25 +2744,21 @@ impl<C: Cells> Runtime<C> {
                 payload: Box::new(cycle::CycleUnwind(c.clone())),
                 nodes: replay::Landings::default(),
             }),
-            // A cycle `get` raised, which the reader may catch.
-            Err(payload) if cycle_state::unwind_kind() == Some(UnwindKind::Cycle) => payload
-                .downcast_ref::<cycle::CycleUnwind>()
-                .map(|c| Delivered::Unwind {
-                    cycle: true,
-                    poison: 0,
-                    attributed: false,
-                    payload: Box::new(cycle::CycleUnwind(c.0.clone())),
-                    nodes: replay::Landings::default(),
-                }),
-            // A wound or a discard leaves the reader's run too.
-            Err(_) if cycle_state::unwind_kind().is_some() => None,
             Err(payload) => {
-                let copy = replay::copy_payload(&**payload);
-                if copy.is_none() {
+                let unwind = cycle_state::unwind_kind();
+                // A wound or a discard leaves the reader's run too. A cycle
+                // `get` raised, or a closure's own panic after it caught
+                // one, unwinds with the cycle's kind, and the reader may
+                // catch either.
+                let leaves = matches!(unwind, Some(UnwindKind::Wound | UnwindKind::Discard));
+                let copy = (!leaves)
+                    .then(|| replay::copy_payload(&**payload))
+                    .flatten();
+                if copy.is_none() && !leaves {
                     self.dep_stack.hold_foreign_reader();
                 }
                 copy.map(|payload| Delivered::Unwind {
-                    cycle: false,
+                    cycle: unwind == Some(UnwindKind::Cycle),
                     poison: 0,
                     attributed: false,
                     payload,
