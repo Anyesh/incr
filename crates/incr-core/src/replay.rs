@@ -764,7 +764,7 @@ impl Pending {
     /// check whole.
     #[cfg(all(test, not(loom)))]
     fn check_unhit(&self, ev: &Retire, hit: &[usize]) {
-        if self.live > 64 {
+        if self.slots.len() > 64 {
             return;
         }
         without_note_work(|| {
