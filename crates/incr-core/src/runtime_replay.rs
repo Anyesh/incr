@@ -3689,7 +3689,7 @@ impl<C: Cells> Runtime<C> {
                             taint_memo::restore(kept);
                         }
                         if matches!(popped, VPop::Left) && !C::SINGLE_THREADED && reserve::any() {
-                            self.end_unowed_reservation(v.node, v.generation);
+                            self.rest_unowed_reservation(v.node, v.generation);
                         }
                         popped_frames.push((v.clone(), false));
                     }
@@ -4692,36 +4692,53 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Ends this thread's context reservation of the node at `slot`, which
-    /// a read just took Dirty, a replay landing just left Dirty, or a
-    /// virtual frame's pop just left to the retry below it, unless this
-    /// thread still owes the node's run from here: its frame is on the
-    /// stack, it holds the claim, or a context stacks its virtual frame or
-    /// has an entry of it yet to run. A retry below that reads the node
-    /// again owes nothing: it first runs again what precedes that read,
-    /// and a reservation kept through that would make another thread's
-    /// read of the node, joined there, wait on a run not yet begun. An
-    /// outcome held for a frame of the node does not keep it either, as
-    /// this thread's retry may be joined on such a reader; for a held
-    /// panic, the reader's run differs from an unbounded one only in which
-    /// reader gets the payload, which the Shared payload contract leaves
-    /// open. Takes the reservation table's lock only to end one.
+    /// a read just took Dirty or a replay landing just left Dirty, unless
+    /// this thread still owes the node's run from here
+    /// ([`Self::unowed_reservation`]). An outcome held for a frame of the
+    /// node does not keep it, as this thread's retry may be joined on such
+    /// a reader; for a held panic, the reader's run differs from an
+    /// unbounded one only in which reader gets the payload, which the
+    /// Shared payload contract leaves open.
     #[cold]
     #[inline(never)]
     pub(super) fn end_unowed_reservation(&self, slot: u32, generation: u32) {
+        if self.unowed_reservation(slot, generation) {
+            reserve::end_landed((self.runtime_id, slot), generation);
+        }
+    }
+
+    /// Leaves at rest this thread's context reservation of the node at
+    /// `slot`, whose virtual frame's pop just left its run to the retry
+    /// below, unless this thread still owes the node's run from here. The
+    /// unbounded run's frame of the node still computes, so a read begun
+    /// before now waits on it; the retry first runs again what precedes
+    /// its read of the node, and a read it starts there (one it may join)
+    /// is ordered before that frame, so it passes.
+    #[cold]
+    #[inline(never)]
+    fn rest_unowed_reservation(&self, slot: u32, generation: u32) {
+        if self.unowed_reservation(slot, generation) {
+            reserve::rest((self.runtime_id, slot), generation);
+        }
+    }
+
+    /// Whether this thread's context reservation of the node at `slot`
+    /// stands for a run it no longer owes from here: neither its frame on
+    /// the stack, its claim, a context's virtual frame of it nor an entry
+    /// of it yet to run. Takes the reservation table's lock only when a
+    /// context reserves the node.
+    fn unowed_reservation(&self, slot: u32, generation: u32) -> bool {
         let rt = self.runtime_id;
         if replay::speculative() || !reserve::in_context((rt, slot), generation) {
-            return;
+            return false;
         }
         if self.dep_stack.frame_cidx(rt, NodeId(slot)).is_some() || cycle_state::holds(rt, slot) {
-            return;
+            return false;
         }
-        let owed = replay::with(|c| {
+        !replay::with(|c| {
             c.iter()
                 .any(|x| x.rt == rt && (x.stacks(slot, generation) || x.queues(slot, generation)))
-        });
-        if !owed {
-            reserve::end_landed((rt, slot), generation);
-        }
+        })
     }
 
     /// Drops the deliveries, claim watermarks and failure counts held, in
