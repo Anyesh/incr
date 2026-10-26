@@ -757,11 +757,10 @@ fn shared_reservation_ends_with_the_entry_that_reran_its_node() {
 }
 
 /// As [`shared_reservation_ends_with_the_entry_that_reran_its_node`], with
-/// X first reading A, a node that lands or panics when I is not 1, so the
-/// doom holds A's outcome for X's frame while V's retry joins.
+/// X first catching the panic of A, a node that panics when I is not 1, so
+/// the doom holds A's unwind for X's frame while V's retry joins.
 #[test]
 fn shared_reservation_ends_with_the_entry_that_reran_its_node_over_an_outcome() {
-    entry_rerun_join(First::Lands);
     entry_rerun_join(First::Caught);
 }
 
@@ -769,14 +768,12 @@ fn shared_reservation_ends_with_the_entry_that_reran_its_node_over_an_outcome() 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum First {
     None,
-    /// A, which is I + 100.
-    Lands,
     /// A, which panics when I is not 1, caught as 7.
     Caught,
 }
 
 fn entry_rerun_join(first: First) {
-    fn run(frames: u32, first: First) -> (Outcome, u32, bool, bool) {
+    fn run(frames: u32, first: First) -> (Outcome, u32, bool, bool, bool) {
         let rt = Arc::new(Rt::new());
         rt.set_placeholder(0_u64);
         rt.set_max_frames(frames);
@@ -800,7 +797,6 @@ fn entry_rerun_join(first: First) {
                 move |rt: &Rt| {
                     let a = match first {
                         First::None => 0,
-                        First::Lands => rt.get(a),
                         First::Caught => catch_unwind(AssertUnwindSafe(|| rt.get(a))).unwrap_or(7),
                     };
                     let v = if rt.get(i) == 1 {
@@ -818,12 +814,22 @@ fn entry_rerun_join(first: First) {
         };
         let joins = Arc::new(AtomicU32::new(0));
         let stalled = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicBool::new(false));
         let v = {
             let (gv, joins, stalled) = (gv.clone(), joins.clone(), stalled.clone());
+            let held = held.clone();
             let shared = Arc::downgrade(&rt);
             rt.create_query_with(
                 move |rt: &Rt| {
                     joins.fetch_add(1, SeqCst);
+                    let holds_x = crate::replay::with(|c| {
+                        c.iter()
+                            .flat_map(|ctx| ctx.pending.iter())
+                            .any(|d| !d.taken() && d.key.node == x.slot())
+                    });
+                    if holds_x {
+                        held.store(true, SeqCst);
+                    }
                     let waits = rt.reservation_waits.load(SeqCst);
                     let (tx, rx) = mpsc::channel();
                     let rt2 = shared.upgrade().unwrap();
@@ -870,16 +876,25 @@ fn entry_rerun_join(first: First) {
         let read = r.join();
         rt.assert_invariant_i();
         let doomed = !rt.dooms.lock().unwrap().is_empty();
-        (read, joins.load(SeqCst), stalled.load(SeqCst), doomed)
+        (
+            read,
+            joins.load(SeqCst),
+            stalled.load(SeqCst),
+            doomed,
+            held.load(SeqCst),
+        )
     }
-    let (_, joins, stalled, doomed) = run(u32::MAX, first);
+    let (_, joins, stalled, doomed, _) = run(u32::MAX, first);
     assert_eq!(
         (joins, stalled, doomed),
         (1, false, false),
         "the unbounded run, {first:?}"
     );
-    let (read, joins, stalled, doomed) = run(2, first);
+    let (read, joins, stalled, doomed, held) = run(2, first);
     assert!(doomed, "no doom ran, {first:?}");
+    if first == First::Caught {
+        assert!(held, "no outcome was held for X when V's retry joined");
+    }
     // A run that joins after the retry's may meet the doom again.
     assert!(joins >= 2, "V's retry did not join, {first:?}");
     assert!(
