@@ -286,6 +286,8 @@ pub(crate) enum ParkPoint {
     /// In a held publication, once the node has landed and before a panic
     /// its children's landing caught is resumed.
     HeldPublished(NodeId),
+    /// In a held publication, just before the node lands.
+    HeldLanding(NodeId),
     /// After a panicking held publication gave back what it had not
     /// published.
     GaveBack,

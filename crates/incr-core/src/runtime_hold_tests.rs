@@ -406,6 +406,48 @@ fn shared_held_publication_panic_reader_read_during_the_give_back() {
     rt.assert_invariant_i();
 }
 
+/// A held publication panics in the first landing it publishes, before
+/// that node lands: no node is left Computing without an owner, and every
+/// read afterwards returns what Local returns.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_before_a_landing_leaves_no_node_computing() {
+    let local = Runtime::<Local>::new();
+    let (la, lb) = two_cycle(&local);
+    let lp = local.create_query(move |rt| rt.get(la) + rt.get(lb));
+    let want = (local.get(lp), local.get(la), local.get(lb));
+    let rt = Runtime::<Shared>::new();
+    let (a, b) = two_cycle(&rt);
+    let p = rt.create_query(move |rt| rt.get(a) + rt.get(b));
+    let landing = Arc::new(AtomicUsize::new(usize::MAX));
+    let hook: super::ParkHook = {
+        let landing = landing.clone();
+        Box::new(move |point| {
+            if let super::ParkPoint::HeldLanding(id) = point {
+                if landing.swap(id.0 as usize, Ordering::SeqCst) == usize::MAX {
+                    panic!("a held landing panicked on purpose");
+                }
+            }
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
+    assert!(panic_message(err).contains("on purpose"));
+    assert_ne!(landing.load(Ordering::SeqCst), usize::MAX);
+    for (name, state) in [
+        ("a", rt.state_of(a)),
+        ("b", rt.state_of(b)),
+        ("p", rt.state_of(p)),
+    ] {
+        assert!(
+            !matches!(state, NodeState::Computing | NodeState::ComputingDirty),
+            "{name} left {state:?}"
+        );
+    }
+    assert_eq!((rt.get(p), rt.get(a), rt.get(b)), want);
+    rt.assert_invariant_i();
+}
+
 /// a (Fallback) and b read each other, counting their runs.
 fn counted_cycle<C: Cells>(rt: &Runtime<C>, runs: &Arc<AtomicUsize>) -> (Incr<i64>, Incr<i64>) {
     let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());

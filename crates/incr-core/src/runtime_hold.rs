@@ -716,6 +716,7 @@ impl<C: Cells> Runtime<C> {
         for action in e.trace {
             self.push_trace_now(id, action);
         }
+        self.park(super::ParkPoint::HeldLanding(id));
         let landed = self.land_now(id, node, target, e.flagged, e.unrun);
         // A set flagged the held Failed landing, as `land_failed` handles at
         // an unheld one.
