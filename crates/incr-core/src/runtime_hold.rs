@@ -457,7 +457,7 @@ impl<C: Cells> Runtime<C> {
         // since then expanded through their held states, and must see the
         // count move when they publish.
         if entries.iter().any(|e| e.unrun) {
-            self.count_release();
+            self.count_release(entries.iter().filter(|e| e.unrun).map(|e| e.slot));
         }
         let mut bag = Deferred::new();
         let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
@@ -567,7 +567,7 @@ impl<C: Cells> Runtime<C> {
         entries.reverse();
         // The retracted claims land unrun, as a release's do.
         if !entries.is_empty() {
-            self.count_release();
+            self.count_release(entries.iter().map(|e| e.slot));
         }
         let mut bag = Deferred::new();
         let mut lost = vec![false; entries.len()];

@@ -1939,7 +1939,7 @@ impl<C: Cells> Runtime<C> {
         let stamp_rev = self.current_revision();
         let mut bag = Deferred::new();
         if !taken.is_empty() {
-            self.count_release();
+            self.count_release(taken.iter().map(|&(slot, _)| slot));
         }
         for &(slot, first) in taken {
             cycle_state::with_held(|h| h.remove(&(rt, slot)));
@@ -4438,7 +4438,7 @@ impl<C: Cells> Runtime<C> {
         let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) else {
             return payload;
         };
-        self.count_release();
+        self.count_release([slot]);
         let (e, spec_buf) = e.into_look(Look::here());
         self.release_unwound_from(cidx, slot, kind, discarding, Some(&*payload), bag);
         let id = NodeId(slot);
@@ -4802,7 +4802,7 @@ impl<C: Cells> Runtime<C> {
         });
         let stamp_rev = self.current_revision();
         if !slots.is_empty() {
-            self.count_release();
+            self.count_release(slots.iter().copied());
         }
         for slot in slots {
             if let Some(e) = cycle_state::with_held(|h| h.remove(&(rt, slot))) {

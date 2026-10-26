@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::{DeleteError, DeleteOutcome, ParkPoint, Runtime};
+use super::{DeleteError, DeleteOutcome, ParkPoint, ReleaseLog, Runtime, RELEASE_LOG_LEN};
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
 use crate::handle::Incr;
@@ -2330,7 +2330,9 @@ fn observer_walk_with_its_root_held_here(release: bool) -> (Option<u64>, bool) {
             && release
             && !hook_released.swap(true, Ordering::Relaxed)
         {
-            thread::spawn(move || rt.count_release()).join().unwrap();
+            thread::spawn(move || rt.count_release([id(v).0]))
+                .join()
+                .unwrap();
         }
     }));
     assert!(installed.is_ok());
@@ -2373,7 +2375,9 @@ fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
             && hook_releases.fetch_add(1, Ordering::Relaxed) < RELEASES
         {
             let rt = hook_rt.upgrade().unwrap();
-            thread::spawn(move || rt.count_release()).join().unwrap();
+            thread::spawn(move || rt.count_release([id(a).0]))
+                .join()
+                .unwrap();
         }
     }));
     assert!(installed.is_ok());
@@ -2388,4 +2392,31 @@ fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
         rt.root_replans.load(Ordering::Relaxed),
         super::ROOT_RESTARTS
     );
+}
+
+/// A released replan restarts only for a release after its plan that
+/// landed one of the plan's nodes unrun, or whose slots the log has
+/// evicted; release numbers compare across their wrap.
+#[test]
+fn a_release_reaches_a_plan_only_through_its_own_slots() {
+    let mut log = ReleaseLog::default();
+    log.push(7, [3, 4]);
+    log.push(8, [9]);
+    assert!(log.reached(7, [1, 9].into_iter()));
+    assert!(!log.reached(7, [3, 4].into_iter()));
+    assert!(!log.reached(8, [9].into_iter()));
+    assert!(log.reached(6, [4].into_iter()));
+
+    let mut log = ReleaseLog::default();
+    log.push(u32::MAX, [5]);
+    log.push(0, [6]);
+    assert!(log.reached(u32::MAX - 1, [5].into_iter()));
+    assert!(log.reached(u32::MAX, [6].into_iter()));
+    assert!(!log.reached(u32::MAX, [5].into_iter()));
+
+    let mut log = ReleaseLog::default();
+    log.push(1, 0..RELEASE_LOG_LEN as u32);
+    log.push(2, [u32::MAX]);
+    assert!(log.reached(0, [u32::MAX - 1].into_iter()));
+    assert!(!log.reached(1, [0].into_iter()));
 }
