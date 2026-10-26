@@ -2185,7 +2185,6 @@ fn held_failed_after_a_delete(
         QueryOpts {
             cycle: CycleStrategy::fallback(|_: &Cycle| 100),
             replay: Replay::Allowed,
-            ..QueryOpts::default()
         },
     );
     let z = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(y) * 2, replayable());
