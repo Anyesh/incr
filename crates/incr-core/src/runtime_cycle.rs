@@ -1066,7 +1066,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(Box::new(Unbuilt::new(value)));
         }
-        self.release_held_from(cidx + 1, true, Some(UnwindKind::Discard), &mut bag);
+        self.release_held_except(cidx + 1, &[], &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
                 .and_then(Held::discard_buf)
@@ -1929,7 +1929,7 @@ impl<C: Cells> Runtime<C> {
         kind: Option<UnwindKind>,
         bag: &mut Deferred<C>,
     ) {
-        self.release_held_where(cidx, discarding, kind, None, &[], None, bag);
+        self.release_held_where(cidx, discarding, kind, None, &[], false, None, bag);
     }
 
     /// [`Self::release_held_from`] for a frame at `cidx` that unwound with
@@ -1948,13 +1948,22 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) {
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, kind, subtree, &[], payload, bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &[], false, payload, bag);
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping
-    /// the claims in `keep`.
+    /// the claims in `keep` and those [`keep_children_of_kept`] keeps.
     pub(super) fn release_held_except(&self, cidx: u32, keep: &[u32], bag: &mut Deferred<C>) {
-        self.release_held_where(cidx, true, Some(UnwindKind::Discard), None, keep, None, bag);
+        self.release_held_where(
+            cidx,
+            true,
+            Some(UnwindKind::Discard),
+            None,
+            keep,
+            true,
+            None,
+            bag,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1965,6 +1974,7 @@ impl<C: Cells> Runtime<C> {
         kind: Option<UnwindKind>,
         subtree: Option<u32>,
         keep: &[u32],
+        doom: bool,
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
@@ -1994,7 +2004,7 @@ impl<C: Cells> Runtime<C> {
             slots.retain(|m| {
                 !keep.contains(m) && h.get(&(rt, *m)).is_some_and(|e| released_at(rt, e, cidx))
             });
-            if kind == Some(UnwindKind::Discard) {
+            if doom {
                 keep_children_of_kept(h, rt, cidx, &mut slots);
             }
             slots
@@ -2844,11 +2854,14 @@ fn cycle_panic(cycle: Cycle) -> ! {
     panic!("{message}");
 }
 
-/// Takes out of a doom's `released` the claims a run above `cidx`
-/// deferred whose own claim the discard keeps, as a suspended episode keeps
-/// its member run's: that run's result stays, so the retry never asks for
-/// them again and they go when the run's claim goes, as unbounded.
+/// Takes out of a doom's `released` the claims deferred by a run above
+/// `cidx` whose own claim the discard keeps, as a suspended episode keeps
+/// its member run's: they stay held with it, as the unbounded run holds
+/// them.
 fn keep_children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &mut Vec<u32>) {
+    if released.is_empty() {
+        return;
+    }
     let mut owned: HashMap<u32, Vec<u32>> = HashMap::new();
     for g in h.owners(rt, cidx.saturating_add(1), u32::MAX) {
         owned
