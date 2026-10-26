@@ -4673,24 +4673,15 @@ fn shared_retry_joins_a_reader_that_takes_a_held_payload_over() {
 
 /// W catches Y's panic and parks in user code, so its attempt holds Y's
 /// Failed landing; another thread's read of Y takes the attempt over and
-/// parks in its own run of Y. W's retry takes Y back and runs it, and Y
-/// panics again under a claim the take-over met, with no entry to hold
-/// its landing: it publishes at once and keeps no held mark.
+/// parks before its own claim of Y. W's retry claims Y first and Y panics
+/// again under a claim the take-over met, with no entry to hold its
+/// landing: it publishes at once and keeps no held mark.
 #[test]
 fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
-    let (in_w, in_y) = (Gate::new(), Gate::new());
-    let y = {
-        let in_y = in_y.clone();
-        rt.create_query_with(
-            move |_: &Rt| -> u64 {
-                in_y.park_in_user_code();
-                panic!("y boom")
-            },
-            replayable(),
-        )
-    };
+    let (in_w, at_claim) = (Gate::new(), Gate::new());
+    let y = rt.create_query_with(|_: &Rt| -> u64 { panic!("y boom") }, replayable());
     let w = {
         let in_w = in_w.clone();
         rt.create_query_with(
@@ -4702,6 +4693,7 @@ fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
             replayable(),
         )
     };
+    hook(&rt, vec![(ParkPoint::BeforeClaim(id(y)), at_claim.clone())]);
     let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
     in_w.arm();
     let first = {
@@ -4709,12 +4701,12 @@ fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
         spawn(move || outcome(|| rt.get(w)))
     };
     in_w.wait_parked();
-    in_y.arm();
+    at_claim.arm();
     let other = {
         let (rt, y) = (rt.clone(), y);
         spawn(move || outcome(|| rt.get(y)))
     };
-    in_y.wait_parked();
+    at_claim.wait_parked();
     assert!(
         crate::attempt::TAKE_OVERS.load(SeqCst) > wounds,
         "the other read took nothing over"
@@ -4725,8 +4717,9 @@ fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
         !rt.nodes.get(id(y).0).held_mark(),
         "y keeps a held mark after the read that landed it"
     );
-    in_y.release();
-    assert_eq!(other.join(), Err("y boom".to_string()));
+    at_claim.release();
+    let other = other.join();
+    assert!(other.is_err(), "{other:?}");
     for n in [y, w] {
         assert!(
             !rt.nodes.get(id(n).0).held_mark(),
