@@ -990,11 +990,11 @@ impl<C: Cells> Runtime<C> {
         generation: u32,
         stash: Stash,
         revision: u64,
-    ) -> Result<bool, Stash> {
+    ) -> Result<bool, Box<Stash>> {
         let (displaced, ended) = {
             let mut s = self.stashes.write();
             if self.current_revision() != revision || self.reshaped_since(&stash) {
-                return Err(stash);
+                return Err(Box::new(stash));
             }
             self.park(ParkPoint::StashAfterCheck(NodeId(slot)));
             let ended = (s.revision != revision).then(|| std::mem::take(&mut s.map));
@@ -1004,7 +1004,7 @@ impl<C: Cells> Runtime<C> {
                     let kept = o.get_mut().get_mut();
                     let stale = self.reshaped_since(kept);
                     if !stale && !matches!(kept.outcome, Outcome::Tried) {
-                        return Err(stash);
+                        return Err(Box::new(stash));
                     }
                     let gone = stale && self.replayable(slot);
                     Some((std::mem::replace(kept, stash), gone))
@@ -1047,7 +1047,7 @@ impl<C: Cells> Runtime<C> {
         };
         let mine = ended.remove(&(slot, generation));
         self.drop_ended(ended);
-        mine.map_or(Ok(vacant), |mine| Err(mine.0))
+        mine.map_or(Ok(vacant), |mine| Err(Box::new(mine.0)))
     }
 
     /// Whether node `slot` at `generation` has a stash this revision, a
