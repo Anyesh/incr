@@ -565,13 +565,19 @@ impl<C: Cells> Runtime<C> {
             if let Some((slot, target)) = stopped {
                 let node = self.nodes.get(slot);
                 node.set_verified_at(0);
+                // While the claim is still this publication's: once the node
+                // lands, a record or ticket there may be a new claim's.
+                if target == NodeState::Failed {
+                    let generation = node.generation();
+                    let token = self.failed_run_token(slot, generation);
+                    self.leave_failed_target(NodeId(slot), generation, token, u64::MAX, &mut bag);
+                }
                 if rest.is_empty() {
                     self.count_release();
                 }
                 self.land_now(NodeId(slot), node, NodeState::Dirty, NodeState::Dirty, true);
                 if target == NodeState::Failed {
                     self.park(super::ParkPoint::FailedLandedOtherwise(NodeId(slot)));
-                    self.leave_failed_target(NodeId(slot), node.generation(), &mut bag);
                 }
             }
             self.retract_entries(rest, Vec::new(), true, true);
@@ -747,13 +753,19 @@ impl<C: Cells> Runtime<C> {
             self.push_trace_now(id, action);
         }
         self.park(super::ParkPoint::HeldLanding(id));
+        let failed = (target == NodeState::Failed).then(|| {
+            (
+                self.failed_run_token(e.slot, e.generation),
+                self.ticket_mark(),
+            )
+        });
         let landed = self.land_now(id, node, target, e.flagged, e.unrun);
         *stopped = None;
         // A set flagged the held Failed landing, as `land_failed` handles at
         // an unheld one.
-        if target == NodeState::Failed && landed != NodeState::Failed {
+        if let Some((token, mark)) = failed.filter(|_| landed != NodeState::Failed) {
             self.park(super::ParkPoint::FailedLandedOtherwise(id));
-            self.leave_failed_target(id, e.generation, bag);
+            self.leave_failed_target(id, e.generation, token, mark, bag);
         }
         self.park(super::ParkPoint::HeldPublished(id));
         if let Some(Err(payload)) = children {
@@ -762,11 +774,17 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A held Failed landing that did not land Failed drops its failed-run
-    /// record and tickets.
-    fn leave_failed_target(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) {
-        let token = self.failed_run_token(id.0, generation);
+    /// record, if `token` still names it, and its tickets before `mark`.
+    fn leave_failed_target(
+        &self,
+        id: NodeId,
+        generation: u32,
+        token: Option<u64>,
+        mark: u64,
+        bag: &mut Deferred<C>,
+    ) {
         self.forget_failed_run_if(id.0, generation, token);
-        self.left_failed_landing(id, u64::MAX, bag);
+        self.left_failed_landing(id, mark, bag);
     }
 
     /// A new dep of a published landing: one this publication has yet to

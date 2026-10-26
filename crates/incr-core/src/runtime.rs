@@ -213,8 +213,7 @@ pub(crate) enum ParkPoint {
     /// claim, with the attempt's bag carried along.
     UnsettledLanding(NodeId),
     /// In `land_failed` or a held publication, after a landing meant as
-    /// Failed released its claim landing otherwise, before it forgets its
-    /// record.
+    /// Failed released its claim landing otherwise.
     FailedLandedOtherwise(NodeId),
     /// In `flip_failed_from`, before the flip's CAS.
     FlipBeforeCas(NodeId),
