@@ -3871,6 +3871,12 @@ impl<C: Cells> Runtime<C> {
                     #[cfg(test)]
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let planned_len = walk.work.len();
+                    let epoch = if C::SINGLE_THREADED {
+                        0
+                    } else {
+                        node.held_epoch()
+                    };
                     walk.visit(cur, generation, observed == NodeState::New);
                     let kept = kept.map_or(usize::MAX, |k| k as usize);
                     if let Some(deps) = node.inline_deps() {
@@ -3887,6 +3893,18 @@ impl<C: Cells> Runtime<C> {
                         });
                     }
                     self.park(ParkPoint::WalkAfterDeps(cur));
+                    // Another thread's held run is no landing yet: walking
+                    // its deps first can enter a cycle where no serial
+                    // order does. Its epoch moves before its dep writes and
+                    // again before a retraction restores them.
+                    if !C::SINGLE_THREADED && node.held_since(epoch) {
+                        self.drop_held_expansion(
+                            &mut walk,
+                            planned_len,
+                            (cur, generation),
+                            (cur, generation),
+                        );
+                    }
                 }
             }
         }
@@ -3897,6 +3915,40 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// Undoes the expansion of `id` past `planned_len` if another thread's
+    /// held run is open on `held` (`id` or a member of its group), waits
+    /// that run out, and visits `id` again.
+    #[cold]
+    #[inline(never)]
+    fn drop_held_expansion(
+        &self,
+        walk: &mut Walk,
+        planned_len: usize,
+        (id, generation): (NodeId, u32),
+        (held, held_gen): (NodeId, u32),
+    ) {
+        let node = self.nodes.get(held.0);
+        if hold::holds(state::cell_key::<C>(node.state_cell())) {
+            return;
+        }
+        walk.work.truncate(planned_len);
+        walk.forget(|&n| n == id);
+        let open = || {
+            node.held_mark()
+                && node.generation() == held_gen
+                && state::load::<C>(node.state_cell()) != NodeState::Dead
+        };
+        let mut spins = 0;
+        while open() {
+            self.spin_on(held, &mut spins, || !open());
+        }
+        walk.push(Entry {
+            id,
+            taint: VISIT,
+            generation,
+        });
     }
 
     /// Queues `dep` on `walk` at its generation unless it is settled as
@@ -4054,9 +4106,17 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let planned_len = walk.work.len();
         walk.visit(cur, generation, false);
-        for &(m, _) in &group.members {
-            self.nodes.get(m).for_each_dep(|dep| {
+        let mut held = None;
+        for &(m, g) in &group.members {
+            let node = self.nodes.get(m);
+            let epoch = if C::SINGLE_THREADED {
+                0
+            } else {
+                node.held_epoch()
+            };
+            node.for_each_dep(|dep| {
                 if group
                     .members
                     .binary_search_by_key(&dep.0, |&(s, _)| s)
@@ -4073,6 +4133,12 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             });
+            if !C::SINGLE_THREADED && held.is_none() && node.held_since(epoch) {
+                held = Some((NodeId(m), g));
+            }
+        }
+        if let Some(held) = held {
+            self.drop_held_expansion(walk, planned_len, (cur, generation), held);
         }
         true
     }

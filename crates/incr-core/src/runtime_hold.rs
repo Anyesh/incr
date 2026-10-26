@@ -133,6 +133,7 @@ impl<C: Cells> Runtime<C> {
             // entry first, and a release to New is of a claim from New; a
             // cut's claim released unrun takes its origin from the cut.
             let first = target == NodeState::New;
+            node.set_held_mark(true);
             let own = hold::open(
                 cell,
                 self.runtime_id,
@@ -163,6 +164,7 @@ impl<C: Cells> Runtime<C> {
         let kept = ctl.and_then(hold::take_kept);
         let cell = state::cell_key::<C>(node.state_cell());
         let verified_at = Some(node.verified_at());
+        node.set_held_mark(true);
         if let Some(own) = hold::open(
             cell,
             self.runtime_id,
@@ -245,6 +247,7 @@ impl<C: Cells> Runtime<C> {
             self.counted_change()
         };
         let held = hold::forget(cell).expect("incr-core: a viewed landing has its entry");
+        node.set_held_mark(false);
         if let Some(old) = &held.undo.deps {
             let mut now: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| now.push(d));
@@ -523,6 +526,7 @@ impl<C: Cells> Runtime<C> {
         for action in e.trace {
             self.push_trace_now(id, action);
         }
+        node.set_held_mark(false);
         let landed = self.land_now(id, node, target, e.flagged, e.unrun);
         // A set flagged the held Failed landing, as `land_failed` handles at
         // an unheld one.
@@ -634,7 +638,9 @@ impl<C: Cells> Runtime<C> {
             } else {
                 NodeState::Dirty
             };
-            self.land_now(NodeId(e.slot), self.nodes.get(e.slot), back, back, true);
+            let node = self.nodes.get(e.slot);
+            node.set_held_mark(false);
+            self.land_now(NodeId(e.slot), node, back, back, true);
         }
         bag.drain(self);
     }
