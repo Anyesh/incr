@@ -5,6 +5,10 @@
 /// Whether `fields`, the flags and multi-bit fields of one word, are each
 /// nonzero and pairwise disjoint. Each word asserts it once, beside its
 /// constants, listing every flag the word holds.
+#[allow(
+    dead_code,
+    reason = "only `const _` asserts call it, which rustc 1.88, the MSRV, does not count as a use"
+)]
 pub(crate) const fn disjoint(fields: &[u64]) -> bool {
     let mut seen = 0;
     let mut i = 0;
