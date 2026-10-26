@@ -505,7 +505,7 @@ enum Visit {
 }
 
 /// What a walk under `Shared` planned under, as `Runtime::planned`.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default)]
 struct Planned {
     all: u64,
     own: u64,
@@ -670,6 +670,8 @@ pub(crate) struct Walk {
     /// attempt's retry counts as the unbounded run's walk does.
     root_failed_here: bool,
     failed_from: usize,
+    /// What the walk planned under, kept when a doom stashes it.
+    planned: Planned,
 }
 
 #[derive(Default, Clone)]
@@ -710,6 +712,7 @@ impl Walk {
             repushed: None,
             root_failed_here: false,
             failed_from: 0,
+            planned: Planned::default(),
         }
     }
 
@@ -3293,12 +3296,12 @@ impl<C: Cells> Runtime<C> {
             }
             return self.compute_direct::<MODE>(id, gen);
         }
-        // A resumed walk was planned before its doom, at a count no longer
-        // known, so it checks against none: it re-plans if any other
-        // thread has landed an episode.
+        // A resumed walk re-plans for the episodes other threads landed
+        // since its plan before the doom, as the unbounded run's walk does,
+        // not for older ones.
         let mut resumed = resume.is_some();
-        let mut planned = if resumed {
-            Planned { all: 0, own: 0 }
+        let mut planned = if let Some(walk) = &resume {
+            walk.planned
         } else {
             self.planned()
         };
@@ -3381,11 +3384,12 @@ impl<C: Cells> Runtime<C> {
                     continue;
                 }
                 if !C::SINGLE_THREADED && computed == Computed::Replan {
-                    // A resumed walk's placeholder count tells it nothing
-                    // about releases since its plan, which goes on. A walk
-                    // that left a closure Unsettled would rerun it from the
-                    // root, and two threads whose caught cycles release each
-                    // other's claims would then restart each other without end.
+                    // A resumed walk does not know whether its part before
+                    // the doom left a closure Unsettled, so its plan goes on
+                    // past releases. A walk that left a closure Unsettled
+                    // would rerun it from the root, and two threads whose
+                    // caught cycles release each other's claims would then
+                    // restart each other without end.
                     // A root its deps-first computes deferred into this
                     // thread's held map is not walked again, since its walk
                     // would wait on this thread's own claim: the plan goes on
@@ -3427,6 +3431,7 @@ impl<C: Cells> Runtime<C> {
                         taint,
                         generation,
                     };
+                    walk.planned = planned;
                     match self.walk_stopped(id, entry, visit, is_root, &mut walk, computed) {
                         Ok(after) => computed = after,
                         Err(stopped) => return stopped,
