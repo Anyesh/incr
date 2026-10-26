@@ -291,6 +291,11 @@ impl<C: Cells> Runtime<C> {
         if cycle_state::depth() == 0 {
             cycle_panic(cycle);
         }
+        // A closure that swallowed its wound reads on; its cycle must not
+        // take the wound's place in flight, or a catch returns it.
+        if cycle_state::wounded() {
+            self.raise_wound();
+        }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(Box::new(CycleUnwind(cycle)))
     }
@@ -428,6 +433,12 @@ impl<C: Cells> Runtime<C> {
             self.park(ParkPoint::WoundRetracted);
             self.await_winner();
             return None;
+        }
+        if cycle_state::wounded() {
+            // A nested `try_get` returns nothing to a wounded thread: the
+            // wound unwinds on to the outermost entry, whatever came out.
+            drop(payload);
+            self.raise_wound();
         }
         // Any other unwind out of the outermost entry ends the attempt as
         // its read's outcome, which every landing it made is part of.

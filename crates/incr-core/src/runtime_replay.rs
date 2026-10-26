@@ -4827,6 +4827,10 @@ impl<C: Cells> Runtime<C> {
                 payload
             }
         };
+        if cycle_state::wounded() {
+            drop(payload);
+            self.raise_wound();
+        }
         cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
         resume_unwind(payload)
     }
