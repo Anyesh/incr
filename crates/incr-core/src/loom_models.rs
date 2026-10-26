@@ -1781,6 +1781,8 @@ fn doom_lazy_reads_again() {
 struct Reached {
     take_over: std::sync::atomic::AtomicBool,
     no_take_over: std::sync::atomic::AtomicBool,
+    /// The other thread waited on X's reservation and did not take over.
+    waited_untaken: std::sync::atomic::AtomicBool,
 }
 
 impl Reached {
@@ -1789,15 +1791,19 @@ impl Reached {
         Self {
             take_over: AtomicBool::new(false),
             no_take_over: AtomicBool::new(false),
+            waited_untaken: AtomicBool::new(false),
         }
     }
 
-    fn note(&self, took: bool) {
+    fn note(&self, (took, waited): (bool, bool)) {
         use std::sync::atomic::Ordering::Relaxed;
         if took {
             self.take_over.store(true, Relaxed);
         } else {
             self.no_take_over.store(true, Relaxed);
+            if waited {
+                self.waited_untaken.store(true, Relaxed);
+            }
         }
     }
 
@@ -1810,6 +1816,14 @@ impl Reached {
         assert!(
             self.no_take_over.load(Relaxed),
             "every execution took the doom over"
+        );
+    }
+
+    fn assert_waited_untaken(&self) {
+        assert!(
+            self.waited_untaken
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "no execution waited on X without taking it over"
         );
     }
 }
@@ -1827,6 +1841,7 @@ struct LazyWorld {
 
 impl LazyWorld {
     fn new(t_run: impl Fn(&Rt, Incr<u64>, Incr<u64>) -> u64 + Send + Sync + 'static) -> Self {
+        // Shared by every model in the process: run one model per process.
         crate::attempt::TAKE_OVERS.store(0, std::sync::atomic::Ordering::Relaxed);
         let rt = Arc::new(Rt::new());
         rt.set_placeholder(0_u64);
@@ -1851,8 +1866,8 @@ impl LazyWorld {
 
     /// Reads T against another thread's read of X; checks both values, that
     /// T's read retried exactly when a waiter took the doom over.
-    /// Returns whether one did.
-    fn race(&self, want: u64, user_panics: bool) -> bool {
+    /// Returns whether one did, and whether the other thread waited on X.
+    fn race(&self, want: u64, user_panics: bool) -> (bool, bool) {
         let other = {
             let (rt, x) = (Arc::clone(&self.rt), self.x);
             thread::spawn(move || rt.get(x))
@@ -1874,7 +1889,12 @@ impl LazyWorld {
         self.rt.assert_invariant_i();
         assert_eq!(crate::waits::registered(), 0);
         assert!(!crate::reserve::any(), "a reservation outlived both reads");
-        took == 1
+        let waited = self
+            .rt
+            .reservation_waits
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0;
+        (took == 1, waited)
     }
 }
 
@@ -1883,8 +1903,9 @@ static END_RACE: Reached = Reached::new();
 /// T reads X, which dooms at budget 1, takes the placeholder and returns
 /// at once, so its run's end closes the lazy doom's flight while another
 /// thread waits on X's reservation. The waiter's wound and the end's
-/// `leave_flight` race in both orders: T's read retries exactly when the
-/// wound came first, and both reads give the unbounded run's values.
+/// `leave_flight` race in both orders, each reached with the waiter
+/// waiting: T's read retries exactly when the wound came first, and both
+/// reads give the unbounded run's values.
 #[test]
 fn doom_lazy_end_races_take_over() {
     run(|| {
@@ -1892,16 +1913,19 @@ fn doom_lazy_end_races_take_over() {
         END_RACE.note(world.race(114, false));
     });
     END_RACE.assert_both();
+    END_RACE.assert_waited_untaken();
 }
 
 static RAISE_RACE: Reached = Reached::new();
 
 /// T reads X, which dooms at budget 1, runs on past the placeholder and
 /// reads Z, which raises the doom's discard, while another thread waits on
-/// X's reservation. A wound between the placeholder and that read makes
-/// the discard's catch a wound (`settle_discard`): T's read retries
-/// exactly when a waiter took the doom over, and both reads give the
-/// unbounded run's values.
+/// X's reservation. A take-over in any order around that raise leaves T's
+/// read retried exactly when it happened, and both reads give the
+/// unbounded run's values. `settle_discard`'s wound only stops the attempt
+/// sooner: the sticky wound turns the discard into a wound at its catch
+/// anyway, so its red is the unit test
+/// `a_discard_the_engine_raises_again_is_back_in_flight`.
 #[test]
 fn doom_lazy_wound_before_raise() {
     run(|| {
@@ -1932,10 +1956,12 @@ static PANIC_RACE: Reached = Reached::new();
 
 /// T reads X, which dooms at budget 1, and on the placeholder panics in
 /// user code while another thread waits on X's reservation; a destructor
-/// in that panic reads W. The lazy doom stays open through the panic, so
-/// the destructor's read takes W's placeholder instead of raising the
-/// doom's discard, and the waiter can still take X over; T's read retries
-/// exactly when it does, and both reads give the unbounded run's values.
+/// in that panic reads W. The destructor's read never unwinds and the
+/// waiter can still take X over; T's read retries exactly when it does,
+/// and both reads give the unbounded run's values. A doomed frame takes
+/// placeholders while panicking with or without `KeptUnwind` keeping the
+/// lazy doom, so that guard's red is the unit test
+/// `a_destructors_discard_leaves_a_lazy_doom_in_flight`.
 #[test]
 fn doom_lazy_take_over_during_user_panic() {
     run(|| {
