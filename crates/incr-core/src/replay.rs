@@ -661,11 +661,15 @@ impl Pending {
 
     /// Delivery `i`'s latest take raised a copy of its payload keyed `key`.
     pub(crate) fn resume(&mut self, i: usize, key: PayloadKey) {
-        self.unfile_passed(i);
-        let d = self.get_mut(i);
-        d.resumed = Some(key);
-        if d.passed {
-            self.file_passed(i);
+        let old = self.get_mut(i).resumed.replace(key);
+        // Only a shallow filing is keyed by the copy's payload.
+        if let Some(Filed::Shallow(above, payloads)) = self.filed.get_mut(&i) {
+            // A copy keyed as the source shares the source's entry.
+            if let Some(old) = old.filter(|&old| Some(old) != payloads[0]) {
+                self.by_payload.remove(&(*above, old, i));
+            }
+            self.by_payload.insert((*above, key, i));
+            payloads[1] = Some(key);
         }
     }
 
@@ -3404,6 +3408,24 @@ mod tests {
         pending.retire(&contained(key(&Q)), false);
         assert!(holds(&mut pending, (2, 0)));
         pending.retire(&contained(key(&R)), false);
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A copy keyed as the source shares its entry, which a later take's
+    /// copy leaves to the source.
+    #[test]
+    fn a_take_after_a_copy_keyed_as_the_source_keeps_the_source_listed() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&P));
+        pending.resume(0, key(&Q));
+        assert!(pending.by_payload.contains(&(4, key(&P), 0)));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&P),
+            },
+            false,
+        );
         assert!(!holds(&mut pending, (2, 0)));
     }
 
