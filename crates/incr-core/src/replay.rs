@@ -3188,3 +3188,35 @@ fn note_earliest(
 pub(crate) fn innermost(c: &[Context], rt: RuntimeId) -> Option<usize> {
     c.iter().rposition(|x| x.rt == rt)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notes::Notes;
+
+    /// Copy `a` of a log is taken before a removal and copy `b` after it,
+    /// and `b` is marked first: `a` still holds the removed note, so its
+    /// mark must not stop at the watermark `b` left.
+    #[test]
+    fn an_earlier_copy_marks_the_notes_a_later_copy_left_out() {
+        for marks in [Marks::Kept, Marks::Copied] {
+            let rt = RuntimeId::for_test(7);
+            let payload: Box<dyn Any + Send> = Box::new("p");
+            let key = payload_key(&*payload);
+            let mut notes = Notes::new();
+            notes.push(rt, key, 1, (1, 0), false);
+            notes.push(rt, key, 2, (2, 0), false);
+            let a = notes.copy(rt, key, 0);
+            notes.forget_node(rt, (2, 0));
+            notes.push(rt, key, 3, (3, 0), false);
+            let b = notes.copy(rt, key, 0);
+            mark_in(marks, rt, &b);
+            mark_in(marks, rt, &a);
+            let set = match marks {
+                Marks::Kept => &KEPT_HELD,
+                Marks::Copied => &COPIED,
+            };
+            assert!(set.with(|s| s.borrow().contains(&(rt, (2, 0)))));
+        }
+    }
+}
