@@ -4243,6 +4243,91 @@ fn a_ticket_held_again_keeps_a_node_a_regeneration_reruns() {
     assert!(a.join(), "the regeneration made no payload");
 }
 
+/// x's walk runs `d` first, which panics "j=0" and lands Failed, and x then
+/// stops reading `d`, so the walk contains the panic for `d`'s landing.
+/// With `race`, the containment waits while a set of `j` flips `d` Dirty
+/// and another thread's read reruns it to a second panic, "j=2", landing
+/// Failed at the same generation; else the two run in the order `set_first`
+/// gives. Returns x, the other read's panic and a last read's panic.
+fn late_contain_case(frames: Option<u32>, race: bool, set_first: bool) -> (u64, String, String) {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    if let Some(frames) = frames {
+        rt.set_max_frames(frames);
+    }
+    let sel = rt.create_input(0_u64);
+    let j = rt.create_input(1_u64);
+    let d = rt.create_query_with(
+        move |rt: &Rt| -> u64 {
+            let v = rt.get(j);
+            if v != 1 {
+                std::panic::panic_any(format!("j={v}"));
+            }
+            v
+        },
+        replayable(),
+    );
+    let x = rt.create_query_with(
+        move |rt: &Rt| if rt.get(sel) == 0 { rt.get(d) } else { 100 },
+        replayable(),
+    );
+    assert_eq!(rt.get(x), 1);
+    rt.set(j, 0);
+    rt.set(sel, 1);
+    let read_d =
+        move |rt: &Rt| message(&*catch_unwind(AssertUnwindSafe(|| rt.get(d))).unwrap_err());
+    let rerun = move |rt: &Rt| {
+        rt.set(j, 2);
+        read_d(rt)
+    };
+    let (got_x, other) = if race {
+        let gate = Gate::new();
+        hook(&rt, vec![(ParkPoint::BeforeContain, gate.clone())]);
+        gate.arm();
+        let a = {
+            let rt = Arc::clone(&rt);
+            spawn(move || rt.get(x))
+        };
+        gate.wait_parked();
+        assert_eq!(
+            rt.nodes.get(id(d).0).state(),
+            NodeState::Failed,
+            "d's first landing"
+        );
+        let other = {
+            let rt = Arc::clone(&rt);
+            spawn(move || rerun(&rt)).join()
+        };
+        gate.release();
+        (a.join(), other)
+    } else if set_first {
+        let other = rerun(&rt);
+        (rt.get(x), other)
+    } else {
+        let got_x = rt.get(x);
+        (got_x, rerun(&rt))
+    };
+    (got_x, other, read_d(&rt))
+}
+
+/// A containment that comes after its landing was flipped and landed Failed
+/// again holds nothing for the newer landing, whose first read gets what a
+/// serial order gives, never the older landing's payload.
+#[test]
+fn a_late_containment_holds_no_payload_for_a_newer_failed_landing() {
+    for frames in [Some(1000), None] {
+        let serial = [
+            late_contain_case(frames, false, false),
+            late_contain_case(frames, false, true),
+        ];
+        let raced = late_contain_case(frames, true, false);
+        assert!(
+            serial.contains(&raced),
+            "{frames:?}: the raced run gave {raced:?}, the serial orders {serial:?}"
+        );
+    }
+}
+
 /// As above, with a second regeneration of `failed` on thread C that moves
 /// it Failed to Computing while the first, on thread A, has moved it back
 /// but not yet returned. A's return must not clear C's mark: q1's held

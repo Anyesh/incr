@@ -414,6 +414,7 @@ impl<C: Cells> Runtime<C> {
     /// landings `payload` made there hold it for their first read. Another
     /// payload's notes at `cidx` are the reading frame's, as at a landing.
     pub(super) fn contain(&self, cidx: u32, payload: Box<dyn Any + Send>, bag: &mut Deferred<C>) {
+        self.park(ParkPoint::BeforeContain);
         let (rt, at) = (self.runtime_id, payload_key(&*payload));
         self.retire_copies(&Retire::Contained { cidx, payload: at });
         let (nodes, lent) = if notes_held() {
