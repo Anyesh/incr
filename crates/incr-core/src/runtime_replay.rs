@@ -1071,9 +1071,9 @@ impl<C: Cells> Runtime<C> {
 
     /// Takes the stash of node `slot` at `generation` for a real run that
     /// adopts it, a verify's only if `verified`, and one from before a
-    /// delete only if `stale` (to drop it). A Native node's run keeps a
-    /// tried mark in its place for the revision, whether or not the
-    /// adoption lands it.
+    /// delete only if `stale` (to drop it); a stale one is otherwise
+    /// dropped here. A Native node's run keeps a tried mark in its place
+    /// for the revision, whether or not the adoption lands it.
     fn take_stash(&self, slot: u32, generation: u32, verified: bool, stale: bool) -> Option<Stash> {
         if C::u32_load_relaxed(&self.stash_count) == 0 {
             return None;
@@ -1085,11 +1085,30 @@ impl<C: Cells> Runtime<C> {
             return None;
         }
         let entry = s.map.get_mut(&(slot, generation))?.get_mut();
+        if !stale && self.reshaped_since(entry) {
+            let dead = if native {
+                let tried = Stash {
+                    outcome: Outcome::Tried,
+                    deps: Vec::new(),
+                    verify_rev: 0,
+                    index: None,
+                    reshapes: entry.reshapes,
+                };
+                std::mem::replace(entry, tried)
+            } else {
+                let dead = s.map.remove(&(slot, generation))?;
+                C::u32_store_relaxed(&self.stash_count, s.map.len() as u32);
+                dead.0
+            };
+            drop(s);
+            let mut bag = Deferred::new();
+            self.discard_stashed_children(NodeId(slot), dead.index, &mut bag);
+            drop(dead);
+            bag.drain_isolated();
+            return None;
+        }
         let verify = matches!(entry.outcome, Outcome::Verified { .. });
-        if !stale && self.reshaped_since(entry)
-            || matches!(entry.outcome, Outcome::Tried)
-            || verify && !verified
-        {
+        if matches!(entry.outcome, Outcome::Tried) || verify && !verified {
             return None;
         }
         if native && !verify {
