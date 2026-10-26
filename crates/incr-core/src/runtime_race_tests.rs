@@ -2531,7 +2531,7 @@ fn a_recompute_leaves_the_episode_log_empty() {
 }
 
 #[test]
-fn a_plan_is_reached_only_through_the_nodes_it_expanded() {
+fn a_plan_is_reached_only_through_the_nodes_it_met() {
     let entry = |id, taint| Entry {
         id: NodeId(id),
         taint,
@@ -2551,10 +2551,15 @@ fn a_plan_is_reached_only_through_the_nodes_it_expanded() {
             members: vec![(5, 0), (6, 0)],
             cycle: crate::cycle::Cycle::new(vec![member]),
         })],
+        waited: Vec::new(),
     }));
     let mut slots: Vec<u32> = walk.expanded_slots(NodeId(3)).collect();
     slots.sort_unstable();
     assert_eq!(slots, [1, 3, 5, 6]);
+    walk.waited_on(NodeId(2));
+    let mut slots: Vec<u32> = walk.expanded_slots(NodeId(3)).collect();
+    slots.sort_unstable();
+    assert_eq!(slots, [1, 2, 3, 5, 6]);
 }
 
 /// r reads m, which reads a0..a3, which read x. In each plan of r another

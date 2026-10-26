@@ -770,8 +770,9 @@ pub(crate) struct Walk {
     /// `None` below the switch, which keeps the walk free of set
     /// operations for small graphs.
     visited: Option<HashSet<NodeId>>,
-    /// Created at the walk's first New expansion or group expansion, in
-    /// one box so that a walk with neither tests one pointer at its drop.
+    /// Created at the walk's first New expansion, group expansion or claim
+    /// wait, in one box so that a walk with none tests one pointer at its
+    /// drop.
     expanded: Option<Box<Expanded>>,
     /// The entry a discarded compute pushed back for the reading frame's
     /// retry. It stays on top while set: the next pending pop takes it,
@@ -798,6 +799,8 @@ struct Expanded {
     new: HashSet<NodeId>,
     /// The cycle groups the walk has expanded whole.
     groups: Vec<Arc<GroupInfo>>,
+    /// The nodes whose claims the walk waited out at a visit.
+    waited: Vec<u32>,
 }
 
 impl Walk {
@@ -845,17 +848,27 @@ impl Walk {
             .insert(id)
     }
 
-    /// The nodes whose states the plan has expanded through: its pending
-    /// entries, `cur`, and every member of a group it expanded whole. A
-    /// queued visit has not been expanded yet.
+    /// The nodes the plan has met: its pending entries, `cur`, every member
+    /// of a group it expanded whole, and every node whose claim it waited
+    /// out, whose released state its next visit plans from. A queued visit
+    /// it never met is not one.
     #[cold]
     fn expanded_slots(&self, cur: NodeId) -> impl Iterator<Item = u32> + '_ {
         let groups = self.expanded.iter().flat_map(|x| &x.groups);
+        let waited = self.expanded.iter().flat_map(|x| x.waited.iter().copied());
         (self.work.iter())
             .filter(|e| e.is_pending())
             .map(|e| e.id.0)
             .chain([cur.0])
             .chain(groups.flat_map(|g| g.members.iter().map(|&(slot, _)| slot)))
+            .chain(waited)
+    }
+
+    /// Records that the walk waited out `id`'s claim at a visit.
+    #[cold]
+    #[inline(never)]
+    fn waited_on(&mut self, id: NodeId) {
+        (self.expanded.get_or_insert_with(Box::default).waited).push(id.0);
     }
 
     /// Pushes back `entry`, whose compute a discard undid, for the reading
@@ -3923,6 +3936,7 @@ impl<C: Cells> Runtime<C> {
                     // one of them may be a claim this thread holds, which
                     // only the expansion skips.
                     self.park(ParkPoint::BeforeComputeOne(cur));
+                    walk.waited_on(cur);
                     let mut spins = 0;
                     loop {
                         spins += 1;
