@@ -1928,31 +1928,13 @@ fn catch_up_frame(rt: RuntimeId, cidx: u32, reads: &mut [(KeptRead, usize)], eve
         }
         return;
     };
-    let mut landed = Landed::default();
-    // The latest landing of a node at or below the frame: a copy holding
-    // it loses every landing of another payload.
-    let mut below: Option<usize> = None;
-    let kept = &events.kept[events.kept.partition_point(|&i| i < first)..];
-    note_work(kept.len());
-    for &i in kept {
-        let l = &events.log[i];
-        if l.rt != rt {
-            continue;
-        }
-        if let Retire::Landing { cidx: at, node, .. } = l.ev {
-            landed.latest.insert(node, i);
-            landed.order.push(i);
-            if at <= cidx {
-                below = Some(i);
-            }
-        }
-    }
+    let (landed, below) = landed_since(rt, cidx, first, events);
     let landed = Rc::new(landed);
     let mut order: Vec<usize> = (0..reads.len()).collect();
     order.sort_unstable_by_key(|&k| std::cmp::Reverse(reads[k].1));
     let wide = &events.wide[events.wide.partition_point(|&i| i < first)..];
     note_work(wide.len());
-    let mut cuts = Cuts::default();
+    let mut cuts = CutPositions::default();
     let mut next = wide.len();
     for k in order {
         let (e, seen) = &mut reads[k];
@@ -1990,12 +1972,41 @@ fn catch_up_frame(rt: RuntimeId, cidx: u32, reads: &mut [(KeptRead, usize)], eve
     }
 }
 
+/// The landings of `rt`'s nodes kept copies held, logged from index
+/// `first` on, and the latest of them at or below the frame at `cidx`: a
+/// copy holding that node loses every landing of another payload.
+fn landed_since(
+    rt: RuntimeId,
+    cidx: u32,
+    first: usize,
+    events: &Events,
+) -> (Landed, Option<usize>) {
+    let mut landed = Landed::default();
+    let mut below = None;
+    let kept = &events.kept[events.kept.partition_point(|&i| i < first)..];
+    note_work(kept.len());
+    for &i in kept {
+        let l = &events.log[i];
+        if l.rt != rt {
+            continue;
+        }
+        if let Retire::Landing { cidx: at, node, .. } = l.ev {
+            landed.latest.insert(node, i);
+            landed.order.push(i);
+            if at <= cidx {
+                below = Some(i);
+            }
+        }
+    }
+    (landed, below)
+}
+
 /// The positions the events a backward pass has met take landings above,
 /// for a copy of the notes of a payload: an event takes those above its
 /// position, a containment of the copy's own payload also those at it, and
 /// a landing of another payload's those above it.
 #[derive(Default)]
-struct Cuts {
+struct CutPositions {
     any: Option<i64>,
     /// Per payload, what its events take from a copy of another payload's
     /// notes and from a copy of its own.
@@ -2004,7 +2015,7 @@ struct Cuts {
     best: [Option<(i64, PayloadKey)>; 2],
 }
 
-impl Cuts {
+impl CutPositions {
     fn add(&mut self, ev: &Retire) {
         match *ev {
             Retire::Above(at) => self.any = Some(self.any.map_or(at.into(), |a| a.min(at.into()))),
