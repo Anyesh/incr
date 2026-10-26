@@ -515,6 +515,7 @@ pub(crate) struct Taken {
 pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
         let mut taken: Vec<Held> = Vec::new();
+        visited(h.by_rt.len());
         if let Some(i) = h.by_rt.iter().position(|r| r.rt == rt) {
             let places = h.by_rt.swap_remove(i).places;
             visited(places.len());
@@ -558,12 +559,10 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
 pub(crate) fn holds_runtime(rt: RuntimeId) -> bool {
     active()
         && with(|h| {
+            visited(h.tainted.len() + h.closed.len() + h.by_rt.len() + h.cut_recs.len());
             h.tainted.contains(&rt)
                 || h.closed.contains(&rt)
-                || {
-                    visited(h.by_rt.len());
-                    h.by_rt.iter().any(|r| r.rt == rt)
-                }
+                || h.by_rt.iter().any(|r| r.rt == rt)
                 || h.cut_recs.iter().any(|c| c.rt == rt)
         })
 }
