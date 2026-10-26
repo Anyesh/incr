@@ -3,7 +3,7 @@
 //! publishes them or, after a wound, retracts them.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -544,11 +544,9 @@ impl<C: Cells> Runtime<C> {
         }
         let mut bag = Deferred::new();
         let mut rest = entries.into_iter();
-        let mut published: Vec<u32> = Vec::new();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let targets = self.publication_targets(rest.as_slice());
             for (e, target) in rest.by_ref().zip(targets) {
-                published.push(e.slot);
                 self.publish_one(e, target, &mut bag);
             }
         }));
@@ -558,7 +556,7 @@ impl<C: Cells> Runtime<C> {
             let rest: Vec<Held> = rest.collect();
             let given: Vec<u32> = rest.iter().map(|e| e.slot).collect();
             self.retract_entries(rest, Vec::new(), true, true);
-            self.unverify_readers(&published, &given);
+            self.unverify_readers(&given);
             bag.drain_carried(payload);
         }
         bag.drain(self);
@@ -567,15 +565,20 @@ impl<C: Cells> Runtime<C> {
 
     /// A published landing that read one given back computed over a value
     /// the give-back undid, while give-backs keep `changed_at`: it must
-    /// recompute, not verify, and what reads it must see it Dirty.
-    fn unverify_readers(&self, published: &[u32], given: &[u32]) {
-        for &slot in published {
-            let node = self.nodes.get(slot);
-            let mut over_given = false;
-            node.for_each_dep(|d| over_given |= given.contains(&d.0));
-            if over_given {
-                node.set_verified_at(0);
+    /// recompute, not verify, and what reads it must see it Dirty. Every
+    /// reader of a given-back landing outside the give-back is unverified,
+    /// published or not.
+    fn unverify_readers(&self, given: &[u32]) {
+        let mut readers: Vec<NodeId> = Vec::new();
+        {
+            let inner = self.inner.read();
+            for &slot in given {
+                inner.dependents[slot as usize].extend_into(&mut readers);
             }
+        }
+        let skip: HashSet<u32, FxBuildHasher> = given.iter().copied().collect();
+        for d in readers.into_iter().filter(|d| !skip.contains(&d.0)) {
+            self.nodes.get(d.0).set_verified_at(0);
         }
         for &slot in given {
             let (_, flags) = self.nodes.get_with_flags(slot);
