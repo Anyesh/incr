@@ -3041,8 +3041,31 @@ fn seed_e126d92b8f_case() -> Case {
 #[cfg_attr(miri, ignore)]
 fn seed_48e9_stash_over_a_dep_landed_after_a_delete() {
     let mut case = gen_case(0x48e9, false, false);
+    assert!(matches!(case.ops[4], Op::Delete(13)) && matches!(case.ops[6], Op::Recreate(13, _)));
     case.ops.truncate(9);
     case.ops.extend([Op::Get(12), Op::TryGet(11)]);
+    quiet(|| {
+        differential::<Local>(&case, 0x48e9);
+        differential::<Shared>(&case, 0x48e9);
+    });
+}
+
+/// As above, with the speculative runs after the delete, over the dead
+/// handle of 13: the recreate that follows them changes 12's read as the
+/// delete did.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_48e9_stash_over_a_dead_handle_then_a_recreate() {
+    let case = gen_case(0x48e9, false, false);
+    assert!(matches!(case.ops[4], Op::Delete(13)) && matches!(case.ops[6], Op::Recreate(13, _)));
+    let mut ops = case.ops[..3].to_vec();
+    ops.extend([
+        case.ops[4].clone(),
+        case.ops[3].clone(),
+        case.ops[6].clone(),
+    ]);
+    ops.extend([Op::Get(12), Op::TryGet(11)]);
+    let case = Case { ops, ..case };
     quiet(|| {
         differential::<Local>(&case, 0x48e9);
         differential::<Shared>(&case, 0x48e9);
