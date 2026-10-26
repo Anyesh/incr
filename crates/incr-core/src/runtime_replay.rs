@@ -4408,11 +4408,11 @@ impl<C: Cells> Runtime<C> {
     /// again owes nothing: it first runs again what precedes that read,
     /// and a reservation kept through that would make another thread's
     /// read of the node, joined there, wait on a run not yet begun. An
-    /// outcome held for a frame of the node does not keep it either: such a
-    /// reader could not wait it out, and its own run differs only in which
-    /// panic text it reads, which the Shared payload contract leaves open.
-    /// Takes
-    /// the reservation table's lock only to end one.
+    /// outcome held for a frame of the node does not keep it either, as
+    /// this thread's retry may be joined on such a reader; for a held
+    /// panic, the reader's run differs from an unbounded one only in which
+    /// reader gets the payload, which the Shared payload contract leaves
+    /// open. Takes the reservation table's lock only to end one.
     #[cold]
     #[inline(never)]
     pub(super) fn end_unowed_reservation(&self, slot: u32, generation: u32) {
