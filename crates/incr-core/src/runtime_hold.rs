@@ -982,12 +982,14 @@ impl<C: Cells> Runtime<C> {
     /// A new dep of a Failed landing that may have moved since the
     /// landing's run read it at `rev`: a walk left it Dirty, it changed
     /// after `rev`, or another thread computes it now. One its attempt left
-    /// New, such as a cycle's discard, did not move.
+    /// New, such as a cycle's discard, did not move. A held one moved only
+    /// if it changed: the run read its held landing, Dirty or not, and a
+    /// set since then flagged its word or walked its pending edges.
     fn moved_since_read(&self, d: NodeId, held: &Targets, rev: u64) -> bool {
         let dep = self.nodes.get(d.0);
         let raw = state::load::<C>(dep.state_cell());
         let now = match held.get(&d.0) {
-            Some(&t) if raw == NodeState::Computing => t,
+            Some(_) if raw == NodeState::Computing => return dep.changed_at() > rev,
             _ if is_computing(raw) => return true,
             _ => raw,
         };
