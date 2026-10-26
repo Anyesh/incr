@@ -2030,10 +2030,12 @@ impl<'a> Serial<'a> {
             });
             // The read-twice class one level up (ruled for 0x13b77): a node
             // x whose run in the op caught a non-empty cycle, every member of
-            // which the phase left landed and the other read ran, and
-            // whose value from that run q read, may give each read of it
-            // either order's value, whether those runs landed before its
-            // catch returned or after.
+            // which the phase left landed and the other read ran, one of
+            // them after x's last read before the catch and before q's run
+            // ended, and whose value from that run q read, may give each
+            // read of it either order's value. The other read's runs need
+            // not land last, nor end after the catch returned: on 0x13b77
+            // its unwound runs move x and this thread reruns the cycle.
             let landed_there = |slot: &u32| {
                 spec_of.get(slot).is_some_and(|&x| {
                     matches!(states[x], NodeState::Clean | NodeState::Failed)
@@ -2041,12 +2043,27 @@ impl<'a> Serial<'a> {
                 })
             };
             let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
+            let q_end = last.map_or(u64::MAX, |run| run.end);
+            let moved_after = |slot: &u32, lo: u64| {
+                spec_of.get(slot).is_some_and(|&x| {
+                    theirs
+                        .iter()
+                        .any(|o| o.node == (0, x) && o.end > lo && o.end < q_end)
+                })
+            };
             let catchers: HashSet<usize> = (mine.iter())
                 .filter(|e| e.node.0 == 0 && e.node.1 != q)
                 .filter(|e| {
                     e.caught.iter().any(|&(k, _)| {
+                        let lo = (e.returned.iter().chain(&e.caught))
+                            .filter(|&&(j, _)| j < k)
+                            .map(|&(_, t)| t)
+                            .max()
+                            .unwrap_or(0);
                         matches!(&e.reads[k], (0, _, true, ReadOut::Cycle(c))
-                            if !c.is_empty() && c.iter().all(landed_there))
+                            if !c.is_empty()
+                                && c.iter().all(landed_there)
+                                && c.iter().any(|s| moved_after(s, lo)))
                     })
                 })
                 .filter(|e| {
@@ -2204,7 +2221,7 @@ impl<'a> Serial<'a> {
     /// of a catcher's value each give that node's value in some order's
     /// last run of it or of `q` in op `i`, switching at most once, from
     /// orders with op `i` first to orders with the other read first, as
-    /// the other read's landing does not undo; its other reads are all one
+    /// the other read's runs are not undone; its other reads are all one
     /// order's last run of `q`'s.
     #[allow(clippy::too_many_arguments)]
     fn catcher_reads(
@@ -5815,9 +5832,9 @@ fn two_thread_oracle_rejects_a_catchers_value_no_order_gives() {
     );
 }
 
-/// Op 1 ran 4 and 5 and op 0 then ran them last, as 0x13b77's thread
-/// reruns a cycle the partner's unwound runs left: those runs are what
-/// moved W between 0's reads, as one thread's op alone cannot.
+/// Op 1 ran 4 and 5 and op 0 ran them after it: who ran a member last
+/// does not decide, as 0x13b77's thread reruns the cycle the partner's
+/// unwound runs left.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn two_thread_oracle_takes_a_catchers_reads_when_this_thread_reran_the_cycle_last() {
@@ -5839,6 +5856,32 @@ fn two_thread_oracle_takes_a_catchers_reads_when_this_thread_reran_the_cycle_las
 fn two_thread_oracle_keeps_whole_orders_for_a_cycle_the_other_read_never_ran() {
     let v = catcher_reader(|evals| evals.get_mut(&1).unwrap().clear());
     assert_eq!(v, None);
+}
+
+/// Op 1's runs of 4 and 5 ended after 0's run, so they moved nothing 0
+/// read.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_keeps_whole_orders_when_the_other_read_ran_the_cycle_after() {
+    let v = catcher_reader(|evals| {
+        for e in evals.get_mut(&1).unwrap() {
+            e.end += 10;
+        }
+    });
+    assert_eq!(v, None);
+}
+
+/// 0 also read 1, a constant, as 2, which no order's run of 0 read.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_oracle_rejects_a_catchers_reader_whose_other_reads_are_no_order() {
+    let v = catcher_reader(|evals| {
+        (run_of(evals, 0).reads).push((0, 1, false, ReadOut::Value(2)));
+    });
+    assert!(
+        matches!(&v, Some(Err(m)) if m.contains("are no one order's")),
+        "{v:?}"
+    );
 }
 
 /// 0 read W = 8 both times, never the 15554 its catch gave.
