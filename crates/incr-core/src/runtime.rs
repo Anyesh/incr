@@ -283,6 +283,9 @@ pub(crate) enum ParkPoint {
     /// At an exit that publishes held landings (the outermost entry's, or a
     /// runtime's first entry inside another's), just before it does.
     BeforeHeldPublish,
+    /// In a held publication, once the node has landed and before a panic
+    /// its children's landing caught is resumed.
+    HeldPublished(NodeId),
 }
 
 /// Ends the whole test binary: a parked thread's panic can be caught as a

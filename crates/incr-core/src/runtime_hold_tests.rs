@@ -157,6 +157,71 @@ fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
     rt.assert_invariant_i();
 }
 
+/// A held publication panics after its first landing, as a child sweep's
+/// caught panic resumes there. p, still to land, had dropped o for n, and
+/// publication had already moved its reverse edges: giving p back moves
+/// them back, so a later set of o reaches p and n stays deletable.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_publication_panic_gives_back_the_moved_edges() {
+    let rt = Runtime::<Shared>::new();
+    let t = rt.create_input(1_i64);
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(
+            move |rt| rt.get(*bc.get().unwrap()) + rt.get(t),
+            |_c: &Cycle| 100,
+        )
+    };
+    let b = rt.create_query(move |rt| rt.get(a) * 2);
+    bc.set(b).unwrap();
+    let (s, o, n) = (
+        rt.create_input(false),
+        rt.create_input(10_i64),
+        rt.create_input(20_i64),
+    );
+    let p = rt.create_query(move |rt| rt.get(a) + if rt.get(s) { rt.get(n) } else { rt.get(o) });
+    rt.get(p);
+    let armed = Arc::new(AtomicBool::new(false));
+    let p_first = Arc::new(AtomicBool::new(false));
+    let hook: super::ParkHook = {
+        let (armed, p_first) = (armed.clone(), p_first.clone());
+        Box::new(move |point| {
+            let super::ParkPoint::HeldPublished(id) = point else {
+                return;
+            };
+            if !armed.load(Ordering::SeqCst) {
+                return;
+            }
+            if id == super::NodeId(p.slot()) {
+                p_first.store(true, Ordering::SeqCst);
+                return;
+            }
+            armed.store(false, Ordering::SeqCst);
+            panic!("a held publication panicked on purpose");
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    rt.set(s, true);
+    rt.set(t, 2);
+    armed.store(true, Ordering::SeqCst);
+    let err = catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_err();
+    assert!(panic_message(err).contains("on purpose"));
+    assert!(
+        !p_first.load(Ordering::SeqCst),
+        "p published before the panic"
+    );
+    assert!(rt.has_reverse_edge(o, p), "o lost its edge to p");
+    assert!(!rt.has_reverse_edge(n, p), "phantom edge on n");
+    rt.set(s, false);
+    assert_eq!(rt.get(p), rt.get(a) + 10);
+    rt.set(o, 15);
+    assert_eq!(rt.get(p), rt.get(a) + 15, "a set of o missed p");
+    assert!(rt.try_delete_node(n).is_ok());
+    rt.assert_invariant_i();
+}
+
 /// a (Fallback) and b read each other, counting their runs.
 fn counted_cycle<C: Cells>(rt: &Runtime<C>, runs: &Arc<AtomicUsize>) -> (Incr<i64>, Incr<i64>) {
     let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());

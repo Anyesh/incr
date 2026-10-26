@@ -679,6 +679,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(Some(own)) = e.undo.value {
             bag.push_erased(own);
         }
+        self.park(super::ParkPoint::HeldPublished(id));
         if let Some(Err(payload)) = children {
             resume_unwind(payload);
         }
