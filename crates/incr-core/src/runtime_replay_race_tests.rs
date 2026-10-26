@@ -4671,33 +4671,65 @@ fn shared_retry_joins_a_reader_that_takes_a_held_payload_over() {
     );
 }
 
-/// As above: once the read ends, no node keeps a held mark, though the
-/// wound's retry reruns Y, whose claim the other read took over, and Y
-/// panics again with no entry to hold its landing.
+/// W catches Y's panic and parks in user code, so its attempt holds Y's
+/// Failed landing; another thread's read of Y takes the attempt over and
+/// parks in its own run of Y. W's retry takes Y back and runs it, and Y
+/// panics again under a claim the take-over met, with no entry to hold
+/// its landing: it publishes at once and keeps no held mark.
 #[test]
 fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
-    let s = joined_over_a_payload();
-    s.rt.set_max_frames(2);
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let (in_w, in_y) = (Gate::new(), Gate::new());
+    let y = {
+        let in_y = in_y.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                in_y.park_in_user_code();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let w = {
+        let in_w = in_w.clone();
+        rt.create_query_with(
+            move |rt: &Rt| {
+                let caught = catch_unwind(AssertUnwindSafe(|| rt.get(y))).is_err();
+                in_w.park_in_user_code();
+                u64::from(caught)
+            },
+            replayable(),
+        )
+    };
     let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
-    hook(
-        &s.rt,
-        vec![(ParkPoint::BeforeEntry(id(s.w)), s.gate.clone())],
-    );
+    in_w.arm();
     let first = {
-        let (rt, w) = (s.rt.clone(), s.w);
+        let (rt, w) = (rt.clone(), w);
         spawn(move || outcome(|| rt.get(w)))
     };
-    s.gate.wait_parked();
-    s.switch.store(true, SeqCst);
-    s.gate.release();
-    let _ = first.join();
+    in_w.wait_parked();
+    in_y.arm();
+    let other = {
+        let (rt, y) = (rt.clone(), y);
+        spawn(move || outcome(|| rt.get(y)))
+    };
+    in_y.wait_parked();
     assert!(
         crate::attempt::TAKE_OVERS.load(SeqCst) > wounds,
         "the other read took nothing over"
     );
-    for n in [s.y, s.x, s.w] {
+    in_w.release();
+    assert_eq!(first.join(), Ok(1));
+    assert!(
+        !rt.nodes.get(id(y).0).held_mark(),
+        "y keeps a held mark after the read that landed it"
+    );
+    in_y.release();
+    assert_eq!(other.join(), Err("y boom".to_string()));
+    for n in [y, w] {
         assert!(
-            !s.rt.nodes.get(id(n).0).held_mark(),
+            !rt.nodes.get(id(n).0).held_mark(),
             "node {} keeps a held mark",
             id(n).0
         );
