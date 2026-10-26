@@ -2936,13 +2936,12 @@ static EXIT_RACE: HandOvers = HandOvers::new();
 static NESTED_EXIT_RACE: HandOvers = HandOvers::new();
 
 /// The owner stands at [`ParkPoint::BeforeHeldPublish`] of `rt` on the
-/// model's main thread as one descheduled there for `yields`, so the
-/// waiter's patience can run out between its last progress and its
-/// publication; `reached` notes whether a hand-over wounded it there.
-/// Yields are not loom choices: too many and the waiter always takes the
-/// landing, too few and it never can, so each model sets the count that
-/// leaves the end to a preemption, which `reached` checks.
-fn park_before_publish(rt: &Rt, reached: &'static HandOvers, yields: usize) {
+/// model's main thread as one descheduled there, so the waiter's patience
+/// can run out between its last progress and its publication; `reached`
+/// notes whether a hand-over wounded it there. Yields are not loom
+/// choices: with two the waiter never took the landing at bound 2 and
+/// with four it always did, so three leave it to a preemption.
+fn park_before_publish(rt: &Rt, reached: &'static HandOvers) {
     let owner = thread::current().id();
     let hook: crate::runtime::ParkHook = Box::new(move |point| {
         if point != crate::runtime::ParkPoint::BeforeHeldPublish || thread::current().id() != owner
@@ -2950,7 +2949,7 @@ fn park_before_publish(rt: &Rt, reached: &'static HandOvers, yields: usize) {
             return;
         }
         let before = crate::attempt::hold_wounded();
-        for _ in 0..yields {
+        for _ in 0..3 {
             thread::yield_now();
         }
         if !before {
@@ -2994,7 +2993,7 @@ fn exit_race_orders(nested: bool) -> [(u64, u64); 2] {
 /// the wound and retries (the outermost entry's exit, or `first_entry`'s
 /// raise when nested), or publishes and the reader reads what it
 /// published. Both reads give one serial order's values.
-fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers, yields: usize) {
+fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers) {
     use loom::sync::atomic::{AtomicBool, Ordering};
     run(move || {
         let orders = exit_race_orders(nested);
@@ -3002,7 +3001,7 @@ fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers, yie
         let inner = Arc::new(Rt::new());
         let holder = if nested { &inner } else { &rt };
         let (x, w) = try_get_pair(holder);
-        park_before_publish(holder, reached, yields);
+        park_before_publish(holder, reached);
         let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(holder))));
         let reader: Arc<Mutex<Option<thread::JoinHandle<u64>>>> = Arc::new(Mutex::new(None));
         let spawned = Arc::new(AtomicBool::new(false));
@@ -3045,12 +3044,12 @@ fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers, yie
 
 #[test]
 fn hand_over_races_publication_at_the_outermost_exit() {
-    hand_over_races_publication_at(false, &EXIT_RACE, 3);
+    hand_over_races_publication_at(false, &EXIT_RACE);
 }
 
 #[test]
 fn hand_over_races_publication_at_a_first_entry_exit() {
-    hand_over_races_publication_at(true, &NESTED_EXIT_RACE, 2);
+    hand_over_races_publication_at(true, &NESTED_EXIT_RACE);
 }
 
 /// x (a Fallback head) and w read each other with `try_get`, and w also
