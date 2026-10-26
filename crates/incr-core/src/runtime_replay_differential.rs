@@ -3195,6 +3195,7 @@ fn resuming_past_a_held_root_skips_no_cycle_read() {
     }
     fn check<C: Cells>() {
         let (want, none) = nine::<C>(None);
+        assert!(!want.is_empty());
         assert_eq!(none, [0, 0]);
         let (got, [skipped, taken]) = nine::<C>(Some(1));
         assert_eq!(got, want);
