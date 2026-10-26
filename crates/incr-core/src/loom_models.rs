@@ -2928,3 +2928,127 @@ fn hand_over_wounds_a_holder_that_joins_a_reader() {
         assert!(!crate::hold::active(), "a held landing outlived the read");
     });
 }
+
+/// Which ends of a held landing's publication a model's executions reached:
+/// published, or wounded by a waiter's hand-over while the owner stood at
+/// its publication.
+static EXIT_RACE: HandOvers = HandOvers::new();
+static NESTED_EXIT_RACE: HandOvers = HandOvers::new();
+
+/// The owner stands at [`ParkPoint::BeforeHeldPublish`] of `rt` on the
+/// model's main thread as one descheduled there for `yields`, so the
+/// waiter's patience can run out between its last progress and its
+/// publication; `reached` notes whether a hand-over wounded it there.
+/// Yields are not loom choices: too many and the waiter always takes the
+/// landing, too few and it never can, so each model sets the count that
+/// leaves the end to a preemption, which `reached` checks.
+fn park_before_publish(rt: &Rt, reached: &'static HandOvers, yields: usize) {
+    let owner = thread::current().id();
+    let hook: crate::runtime::ParkHook = Box::new(move |point| {
+        if point != crate::runtime::ParkPoint::BeforeHeldPublish || thread::current().id() != owner
+        {
+            return;
+        }
+        let before = crate::attempt::hold_wounded();
+        for _ in 0..yields {
+            thread::yield_now();
+        }
+        if !before {
+            reached.note(crate::attempt::hold_wounded());
+        }
+    });
+    assert!(rt.park_hook.set(hook).is_ok());
+}
+
+/// T's read of x and a reader's `try_get` of w, in serial order on a
+/// fresh runtime: T first, or the reader first.
+fn exit_race_orders(nested: bool) -> [(u64, u64); 2] {
+    [true, false].map(|t_first| {
+        let rt = Arc::new(Rt::new());
+        let inner = Arc::new(Rt::new());
+        let holder = if nested { &inner } else { &rt };
+        let (x, w) = try_get_pair(holder);
+        let read_t = move |rt: &Rt| catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+        let t = if nested {
+            let inner = Arc::clone(&inner);
+            let q = inner.create_query(read_t);
+            rt.create_query(move |_: &Rt| inner.get(q))
+        } else {
+            rt.create_query(read_t)
+        };
+        let read_w = || holder.try_get(w).unwrap_or(9);
+        if t_first {
+            let v = rt.get(t);
+            (v, read_w())
+        } else {
+            let r = read_w();
+            (rt.get(t), r)
+        }
+    })
+}
+
+/// T catches its read of x, which holds x and w, starts a thread that
+/// reads w and returns; with `nested`, x and w are another runtime's, read
+/// in T's first entry of it. The owner may be descheduled before it
+/// publishes, so the reader may take w over then: the publication finds
+/// the wound and retries (the outermost entry's exit, or `first_entry`'s
+/// raise when nested), or publishes and the reader reads what it
+/// published. Both reads give one serial order's values.
+fn hand_over_races_publication_at(nested: bool, reached: &'static HandOvers, yields: usize) {
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    run(move || {
+        let orders = exit_race_orders(nested);
+        let rt = Arc::new(Rt::new());
+        let inner = Arc::new(Rt::new());
+        let holder = if nested { &inner } else { &rt };
+        let (x, w) = try_get_pair(holder);
+        park_before_publish(holder, reached, yields);
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(holder))));
+        let reader: Arc<Mutex<Option<thread::JoinHandle<u64>>>> = Arc::new(Mutex::new(None));
+        let spawned = Arc::new(AtomicBool::new(false));
+        let read_t = {
+            let (me, reader, spawned) = (Arc::clone(&me), Arc::clone(&reader), spawned);
+            move |rt: &Rt| {
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                if !spawned.swap(true, Ordering::Relaxed) {
+                    let other = me.lock().unwrap().clone().unwrap();
+                    let handle = thread::spawn(move || other.try_get(w).unwrap_or(9));
+                    *reader.lock().unwrap() = Some(handle);
+                }
+                v
+            }
+        };
+        let t = if nested {
+            let inner = Arc::clone(&inner);
+            let q = inner.create_query(read_t);
+            rt.create_query(move |_: &Rt| inner.get(q))
+        } else {
+            rt.create_query(read_t)
+        };
+        let got_t = rt.get(t);
+        let handle = reader.lock().unwrap().take().unwrap();
+        let got_w = handle.join().unwrap();
+        *me.lock().unwrap() = None;
+        assert!(
+            orders.contains(&(got_t, got_w)),
+            "T {got_t}, reader {got_w}: no serial order's, {orders:?}"
+        );
+        for rt in [&rt, &inner] {
+            rt.assert_invariant_i();
+        }
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the reads");
+        assert!(!crate::hold::active(), "a held landing outlived the reads");
+    });
+    reached.assert_both();
+}
+
+#[test]
+fn hand_over_races_publication_at_the_outermost_exit() {
+    hand_over_races_publication_at(false, &EXIT_RACE, 3);
+}
+
+#[test]
+fn hand_over_races_publication_at_a_first_entry_exit() {
+    hand_over_races_publication_at(true, &NESTED_EXIT_RACE, 2);
+}
