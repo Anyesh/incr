@@ -3938,6 +3938,7 @@ mod tests {
     /// what the whole copy renoted at once does: once the deeper frame's
     /// notes go, both keep the shallower note's own stamp, as the frames
     /// that made the notes would.
+    #[cfg(not(loom))]
     #[test]
     fn a_renote_reused_across_a_stamp_change_notes_what_a_whole_one_does() {
         let rt = RuntimeId::for_test(7);
