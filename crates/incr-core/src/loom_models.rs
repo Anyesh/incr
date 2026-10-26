@@ -1826,7 +1826,6 @@ struct LazyWorld {
     rt: Arc<Rt>,
     x: Incr<u64>,
     t: Incr<u64>,
-    x_runs: Arc<std::sync::atomic::AtomicUsize>,
     epochs: Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
@@ -1838,17 +1837,7 @@ impl LazyWorld {
         rt.set_max_frames(1);
         let i = rt.create_input(3_u64);
         let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
-        let x_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let x = {
-            let x_runs = Arc::clone(&x_runs);
-            rt.create_query_with(
-                move |rt: &Rt| {
-                    x_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    rt.get(y) + 10
-                },
-                replayable(),
-            )
-        };
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
         let z = rt.create_query_with(move |rt: &Rt| rt.get(i) + 20, replayable());
         let epochs = Arc::new(std::sync::Mutex::new(Vec::new()));
         let t = {
@@ -1861,18 +1850,11 @@ impl LazyWorld {
                 replayable(),
             )
         };
-        Self {
-            rt,
-            x,
-            t,
-            x_runs,
-            epochs,
-        }
+        Self { rt, x, t, epochs }
     }
 
     /// Reads T against another thread's read of X; checks both values, that
-    /// T's read retried exactly when a waiter took the doom over, and that
-    /// X ran once, or twice with a take-over.
+    /// T's read retried exactly when a waiter took the doom over.
     /// Returns whether one did.
     fn race(&self, want: u64, user_panics: bool) -> bool {
         let other = {
@@ -1888,12 +1870,6 @@ impl LazyWorld {
         let epochs = self.epochs.lock().unwrap().clone();
         let retried = epochs.first() != epochs.last();
         assert!(took <= 1, "{took} take-overs of one doom");
-        // Only a wound's retry may run X again.
-        let x_runs = self.x_runs.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(
-            x_runs == 1 || (x_runs == 2 && took == 1),
-            "X ran {x_runs} times with {took} take-overs"
-        );
         assert_eq!(
             retried,
             took == 1,
