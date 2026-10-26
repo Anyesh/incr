@@ -2028,9 +2028,34 @@ impl<'a> Serial<'a> {
                         if c.iter().all(|slot| landed_there_after(slot, at)))
                 })
             });
+            // The read-twice class one level up (ruled for 0x13b77): a node
+            // whose run in the op caught a cycle the other read ran every
+            // member of in the phase may give each read of it either order's
+            // value, whether those runs landed before its catch returned or
+            // after.
+            let ran_there = |slot: &u32| {
+                spec_of
+                    .get(slot)
+                    .is_some_and(|&x| theirs.iter().any(|o| o.node == (0, x)))
+            };
+            let catchers: HashSet<usize> = (mine.iter())
+                .filter(|e| e.node.0 == 0 && e.node.1 != q)
+                .filter(|e| {
+                    e.caught.iter().any(|&(k, _)| {
+                        matches!(&e.reads[k], (0, _, true, ReadOut::Cycle(c))
+                            if c.iter().all(ran_there))
+                    })
+                })
+                .map(|e| e.node.1)
+                .collect();
             let last = (mine.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
-            if let (true, Some(run)) = (caught, last) {
-                let verdict = self.closure_over_reads(label, prefix, p, i, q, run);
+            let reads_catcher = last.is_some_and(|run| {
+                run.reads
+                    .iter()
+                    .any(|r| r.0 == 0 && catchers.contains(&r.1))
+            });
+            if let (true, Some(run)) = (caught || reads_catcher, last) {
+                let verdict = self.closure_over_reads(label, prefix, p, i, q, run, &catchers);
                 self.per_read.lock().unwrap().insert(i, verdict);
             }
         }
@@ -2105,8 +2130,10 @@ impl<'a> Serial<'a> {
     /// The outcome node `q`'s closure gives over `run`'s reads, for op `i`
     /// of phase `p`, or why a read is no order's outcome for it, an
     /// order's outcome being that of a read in the order's last run of `q`
-    /// in op `i`: the orders are those an order of the phases before gives
-    /// `prefix` in, with either read of phase `p` first.
+    /// in op `i`, or for a read of one of `catchers`, any order's value of
+    /// that node in op `i`: the orders are those an order of the phases
+    /// before gives `prefix` in, with either read of phase `p` first.
+    #[allow(clippy::too_many_arguments)]
     fn closure_over_reads(
         &self,
         label: &str,
@@ -2115,9 +2142,15 @@ impl<'a> Serial<'a> {
         i: usize,
         q: usize,
         run: &Eval,
+        catchers: &HashSet<usize>,
     ) -> Result<Out, String> {
         let allowed = self.allowed_reads(label, prefix, p, i, q);
-        if let Some(r) = run.reads.iter().find(|r| !allowed.contains(*r)) {
+        let values = self.order_values(label, prefix, p, i, catchers);
+        let ok = |r: &Read| {
+            allowed.contains(r)
+                || matches!(r, (0, x, _, ReadOut::Value(v)) if values.contains(&(*x, *v)))
+        };
+        if let Some(r) = run.reads.iter().find(|r| !ok(r)) {
             return Err(format!(
                 "op {i}: node {q} read {r:?}, which no order gives that read"
             ));
@@ -2150,6 +2183,48 @@ impl<'a> Serial<'a> {
         i: usize,
         q: usize,
     ) -> HashSet<Read> {
+        let mut allowed: HashSet<Read> = HashSet::new();
+        self.each_order_run(label, prefix, p, i, |log| {
+            let last = (log.iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
+            allowed.extend(last.into_iter().flat_map(|e| e.reads.iter().cloned()));
+        });
+        allowed
+    }
+
+    /// The values the last run of each of `nodes` in op `i` of phase `p`
+    /// returns in some order, as [`Self::allowed_reads`] takes the orders.
+    fn order_values(
+        &self,
+        label: &str,
+        prefix: &Trace,
+        p: usize,
+        i: usize,
+        nodes: &HashSet<usize>,
+    ) -> HashSet<(usize, u64)> {
+        let mut values = HashSet::new();
+        if nodes.is_empty() {
+            return values;
+        }
+        self.each_order_run(label, prefix, p, i, |log| {
+            for &x in nodes {
+                let last = (log.iter().filter(|e| e.node == (0, x))).max_by_key(|e| e.end);
+                values.extend(last.and_then(|e| e.value).map(|v| (x, v)));
+            }
+        });
+        values
+    }
+
+    /// Calls `f` with op `i`'s closure runs in each order an order of the
+    /// phases before phase `p` gives `prefix` in, with either read of
+    /// phase `p` first.
+    fn each_order_run(
+        &self,
+        label: &str,
+        prefix: &Trace,
+        p: usize,
+        i: usize,
+        mut f: impl FnMut(&[Eval]),
+    ) {
         let (case, phases) = (self.case, self.phases);
         let start = phases[p].ops()[0];
         let pair = phases[..p].iter().filter(|ph| ph.ops().len() == 2).count();
@@ -2165,7 +2240,6 @@ impl<'a> Serial<'a> {
             )
             .0
         };
-        let mut allowed: HashSet<Read> = HashSet::new();
         for m in masks.iter().flat_map(|m| [m & !(1 << pair), m | 1 << pair]) {
             let order = Order::new(case, phases, m);
             let at = order
@@ -2179,10 +2253,8 @@ impl<'a> Serial<'a> {
                     run_logged::<Shared>(&order.case, None, 0, true).1
                 })
             });
-            let last = (log[at].iter().filter(|e| e.node == (0, q))).max_by_key(|e| e.end);
-            allowed.extend(last.into_iter().flat_map(|e| e.reads.iter().cloned()));
+            f(&log[at]);
         }
-        allowed
     }
 
     /// The runs on runtime 0 of the read phase `prefix` ends with, by op,
@@ -5525,13 +5597,12 @@ fn two_thread_delivered_read_of_a_held_landing_holds_its_reader_157d3() {
 }
 
 /// 0x13b77 unbounded: thread 0's read of 5 enters the cycle {8, 9} at 8,
-/// so 7 gets the cycle and 6 = 7780, and 5 reads 6 again. The cycle's
-/// unrun landings of 7, 8 and 9 published at once, so thread 1's retried
-/// read of 9 resolved the Fixpoint and landed them Failed mid-attempt, and
-/// 5's second read of 6 gave 9999, a result no order gives.
+/// so 6 catches it as 7780, then thread 1's read of 9 enters it at 9 and
+/// lands 8 and 9 Failed, and 5's later reads of 6 give 9999: 19998, which
+/// the oracle takes per read, each read of the catcher 6 being one order's.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn two_thread_cycle_members_of_a_held_catch_stay_held_13b77() {
+fn two_thread_reader_of_a_caught_cycle_is_ordered_per_read_13b77() {
     let case = gen_case(0x13b77, false, true);
     let phases = phases(&case, 0x13b77);
     quiet(|| {
@@ -5901,7 +5972,7 @@ fn two_thread_oracle_orders_a_get_that_caught_a_cycle_per_read() {
             .unwrap();
         read.3 = ReadOut::Value(3);
         let why = serial
-            .closure_over_reads("0x1006", &prefix, overlap, 7, 7, &sevens)
+            .closure_over_reads("0x1006", &prefix, overlap, 7, 7, &sevens, &HashSet::new())
             .unwrap_err();
         assert!(why.contains("no order gives that read"), "{why}");
         let rejects = |bad: Trace, what: &str| {
