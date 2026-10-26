@@ -2958,6 +2958,83 @@ fn seed_56cd8c2_keeps_the_failed_set() {
     });
 }
 
+/// 0x198c2, shrunk (cross): 9 reads the chain 16 to 18 only at budget 1's
+/// depth, so its doomed run reads 18's foreign dep, the other runtime's 0,
+/// Clean; a set of that runtime's input follows, and the next `Get(0)`
+/// must not take the doomed run's value of 18.
+fn seed_198c2_case() -> Case {
+    let q = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let r = |n, t| Box::new(Expr::Read(n, t));
+    let c = |v| Box::new(Expr::Const(v));
+    let mut specs = vec![
+        q(Expr::Read(1, false), false, false),
+        q(Expr::Read(2, false), false, false),
+        q(Expr::Read(3, false), true, false),
+        q(Expr::Read(4, false), true, false),
+        q(Expr::Read(15, false), true, false),
+    ];
+    specs.extend((5..9).map(|i| q(Expr::Const(0), true, i == 8)));
+    specs.push(q(Expr::If(r(10, false), r(16, false), c(0)), true, false));
+    specs.push(q(Expr::Const(1), true, false));
+    specs.extend((11..15).map(|_| q(Expr::Const(0), true, false)));
+    specs.extend([
+        q(Expr::Read(16, false), true, false),
+        q(Expr::Read(17, false), true, false),
+        q(Expr::Read(18, false), true, false),
+        q(
+            Expr::Add(r(19, false), Box::new(Expr::ReadOther(0, false))),
+            true,
+            false,
+        ),
+        q(Expr::Read(20, false), false, true),
+        Spec::Input(2),
+        Spec::Input(4),
+    ]);
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 20,
+        specs2: vec![
+            q(Expr::Read(2, false), false, false),
+            q(
+                Expr::If(
+                    Box::new(Expr::Add(r(3, true), r(3, false))),
+                    r(2, true),
+                    Box::new(Expr::If(r(2, false), r(2, false), r(3, true))),
+                ),
+                true,
+                false,
+            ),
+            q(Expr::Read(3, true), true, false),
+            Spec::Input(3),
+        ],
+        queries2: 3,
+        ops: vec![
+            Op::Get(0),
+            Op::Set(20, 1),
+            Op::TryGet(9),
+            Op::Set2(3, 2),
+            Op::Get(0),
+        ],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_198c2_retry_reads_the_foreign_set() {
+    let case = seed_198c2_case();
+    quiet(|| {
+        differential::<Local>(&case, 0x1_98c2);
+        differential::<Shared>(&case, 0x1_98c2);
+    });
+}
+
 /// 0xe126d92b8f, shrunk. 9 (Fallback) reads 4, which `try_get`s 5, and 5
 /// reaches 9 again through 6. In `Get(9)` the walk of Fixpoint member 2's
 /// run computes 9 twice at the same position and path, and at budget 3
