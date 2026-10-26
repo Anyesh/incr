@@ -2330,3 +2330,35 @@ data at 4).
   block (`7eedc225`, `46fa3232`) removed that.
 - Local pays nothing: `chain_local` is 6 per compute below base, from
   layout.
+
+## The replay context counts queued entries only once a reservation asks
+
+`w/T10-queued-scan` (tip `90bb837e`, on `c87e7bd4`) stops counting every
+entry a replay context queues: the count map is built when a `Shared`
+reservation's end first asks `Context::queues`, and kept in step only from
+then on, by cold out-of-line updates. Local contexts never build it. Scale
+icount by `gh-scale-icount.sh c87e7bd4b 90bb837e6` (gh-cmd
+`90bb837e-d51efe`, all 58 rows ran), ratios tip over base:
+
+| workload | ratio |
+|---|---|
+| `local_taint_100k_at_budget_1_on_a_1_mib_thread` | 0.9884 |
+| `local_doom_under_stabilize` | 0.9911 |
+| `local_fallback_cycle_100k_at_budget_1` | 0.9949 |
+| `local_panicking_chain_paths_stay_linear_at_budget_1` | 1.0037 |
+| `local_taint_100k_at_budget_256_on_a_1_mib_thread` | 1.0008 |
+| `shared_doom_under_stabilize` | 1.0029 |
+| `shared_taint_100k_at_budget_1_on_a_1_mib_thread` | 1.0032 |
+| `shared_wide_frame_deliveries_stay_linear` | 1.0040 |
+
+- The two `Local` rows above base are glibc heap state, not engine work
+  (callgrind, gh-cmds `90bb837e-0f9bfa`, `90bb837e-07cd0c`,
+  `90bb837e-3b644f`): `incr_core` self cost falls on both
+  (`panicking_chain` 10,084.2M against 10,085.0M), and the rise sits in
+  `_int_malloc` and `malloc_consolidate` under `Context::take_unwind`
+  (+113M over the same 4000 calls) while frees fall 101M. With
+  `GLIBC_TUNABLES=glibc.malloc.tcache_count=0` the tip is below base on
+  both rows; with fastbins off as well it is 0.06% and 0.03% above.
+- The other `Local` rows above 1.0 are within 0.03%.
+- `Shared` rows that end reservations pay for the built map's cold
+  updates, up to 0.4%.
