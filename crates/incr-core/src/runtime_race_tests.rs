@@ -2786,3 +2786,63 @@ fn walk_rereads_under_constant_releases() {
         }
     }
 }
+
+/// `k` = try_get(x), or 7777 on a cycle; x = get(z); z = get(x) with a
+/// Fallback of 15. Entered at `x` the cycle closes at `x`, which has no
+/// strategy, so `k` takes its error; entered at `z` it resolves to 15.
+/// `top` = get(k) + get(x), parking at `gate` between the two reads.
+fn cycle_verdict_taken_then_landed(rt: &Rt, gate: Gate) -> (Incr<u64>, Incr<u64>) {
+    let cell: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+    let z_reads = cell.clone();
+    let z = rt.create_query_with_fallback(move |rt| rt.get(*z_reads.get().unwrap()), |_| 15_u64);
+    let x = rt.create_query(move |rt| rt.get(z));
+    cell.set(x).unwrap();
+    let k = rt.create_query(move |rt| rt.try_get(x).unwrap_or(7777));
+    let top = rt.create_query(move |rt| {
+        let taken = rt.get(k);
+        gate.park();
+        taken + rt.get(x)
+    });
+    (top, z)
+}
+
+/// Thread A's read of `top` takes the cycle verdict on `x` through `k`,
+/// then parks; B's read of `z` lands `x` = 15 meanwhile. A's `top` must
+/// give an order's answer: 30 (B's read first, so `k` = 15) or a cycle
+/// panic (A's first), never 7777 + 15 from both (seed 0x6e771's shape).
+#[test]
+fn a_read_that_took_a_cycle_verdict_another_thread_lands_over_reruns() {
+    {
+        let rt = Rt::new();
+        let (top, _) = cycle_verdict_taken_then_landed(&rt, Gate::new());
+        assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    }
+    {
+        let rt = Rt::new();
+        let (top, z) = cycle_verdict_taken_then_landed(&rt, Gate::new());
+        assert_eq!((rt.get(z), rt.get(top)), (15, 30));
+    }
+    let rt = Arc::new(Rt::new());
+    let gate = Gate::new();
+    let (top, z) = cycle_verdict_taken_then_landed(&rt, gate.clone());
+    gate.arm();
+    let first = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("A".into())
+            .spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(top))).ok())
+            .unwrap()
+    };
+    gate.wait_parked();
+    let second = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("B".into())
+            .spawn(move || rt.get(z))
+            .unwrap()
+    };
+    let landed = second.join().unwrap();
+    gate.release();
+    assert_eq!((first.join().unwrap(), landed), (Some(30), 15));
+    rt.assert_invariant_i();
+}
