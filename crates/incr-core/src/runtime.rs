@@ -590,7 +590,7 @@ impl EpisodeLog {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
