@@ -3052,3 +3052,59 @@ fn hand_over_races_publication_at_the_outermost_exit() {
 fn hand_over_races_publication_at_a_first_entry_exit() {
     hand_over_races_publication_at(true, &NESTED_EXIT_RACE, 2);
 }
+
+/// x (a Fallback head) and w read each other with `try_get`, and w also
+/// reads i. T catches its read of x, which holds x and w, and joins a
+/// thread that reads w and then sets i, so every run of T runs the cycle
+/// again. The first reader takes w over; a taken claim is never held
+/// again in T's outermost entry, so the next reader reads w published and
+/// T ends. Were w held again, every reader would take it over and T would
+/// restart for good. The model of worker-5's
+/// `a_reader_that_dirties_the_cycle_each_run_restarts_its_holder_boundedly`.
+#[test]
+fn hand_over_restarts_a_holder_boundedly() {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(0_u64);
+        let xc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+        let w = {
+            let xc = std::sync::Arc::clone(&xc);
+            rt.create_query(move |rt: &Rt| {
+                rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1) + rt.get(i)
+            })
+        };
+        let x = rt.create_query_with(
+            move |rt: &Rt| rt.try_get(w).map_or(100, |v| v + 1000),
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+                ..crate::cycle::QueryOpts::default()
+            },
+        );
+        assert!(xc.set(x).is_ok());
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let t = {
+            let (me, runs) = (Arc::clone(&me), Arc::clone(&runs));
+            rt.create_query(move |rt: &Rt| {
+                let run = runs.fetch_add(1, Ordering::Relaxed) + 1;
+                assert!(run <= 3, "T restarts for good: run {run}");
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                let other = me.lock().unwrap().clone().unwrap();
+                let reader = thread::spawn(move || {
+                    let r = other.try_get(w).unwrap_or(9);
+                    other.set(i, other.get(i) + 1);
+                    r
+                });
+                v + reader.join().unwrap()
+            })
+        };
+        rt.get(t);
+        *me.lock().unwrap() = None;
+        assert!(runs.load(Ordering::Relaxed) >= 2, "no reader took w over");
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+        assert!(!crate::hold::active(), "a held landing outlived the read");
+    });
+}
