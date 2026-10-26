@@ -246,8 +246,8 @@ fn wide_node_runs_twice<C: Cells>(rt: &Runtime<C>) {
         replayable(),
     );
     assert_eq!(rt.get(wide), (0..64).sum::<u64>());
-    // A Shared doomed frame unwinds at its placeholder read, so it dooms
-    // once per leaf instead of pushing the rest.
+    // A Shared doomed frame raises its discard at its next read past the
+    // placeholder, so it dooms once per leaf instead of pushing the rest.
     let want = if C::SINGLE_THREADED { 2 } else { 65 };
     assert_eq!(runs.load(SeqCst), want);
 }
@@ -805,8 +805,8 @@ fn shared_speculative_compute_leaves_new() {
 fn speculative_native_runs_once_per_revision<C: Cells>(rt: &Runtime<C>) {
     let s = side_read(rt, false);
     assert_eq!(rt.get(s.r), 5);
-    // A Shared doomed frame unwinds at b's placeholder read, so no
-    // speculative run computes `c`.
+    // A Shared doomed frame raises its discard at its next read
+    // after b's placeholder, so no speculative run computes `c`.
     let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
     assert_eq!(s.runs.load(SeqCst), speculative);
     assert_eq!(rt.get(s.c), 11);
@@ -1061,8 +1061,9 @@ fn failed_nested_adoption_keeps_the_tried_mark<C: Cells>(rt: &Runtime<C>) {
         replayable(),
     );
     assert_eq!(rt.get(r), 5);
-    // A Shared doomed frame unwinds at b's placeholder read, so no
-    // speculative run computes `p` and nothing is stashed.
+    // A Shared doomed frame raises its discard at its next read
+    // after b's placeholder, so no speculative run computes `p`
+    // and nothing is stashed.
     let local = C::SINGLE_THREADED;
     assert_eq!(
         C::u32_load_relaxed(&rt.stash_count),
@@ -1122,8 +1123,8 @@ fn speculative_panic_is_raised_once<C: Cells>(replay: bool) {
         replayable(),
     );
     assert_eq!(rt.get(r), 5);
-    // A Shared doomed frame unwinds at b's placeholder read, so no
-    // speculative run computes `c`.
+    // A Shared doomed frame raises its discard at its next read
+    // after b's placeholder, so no speculative run computes `c`.
     let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
     assert_eq!(runs.load(SeqCst), speculative);
     assert_eq!(rt.state_of(c), NodeState::New);
@@ -1219,8 +1220,9 @@ fn adopted_write_panic_lands_failed<C: Cells>(replay: bool) {
     assert_eq!(rt.get(x).v, 1);
     rt.set(input, 2);
     assert_eq!(rt.get(r), 5);
-    // A Shared doomed frame unwinds at b's placeholder read, so no
-    // speculative run recomputes `x` and the real claim runs it.
+    // A Shared doomed frame raises its discard at its next read
+    // after b's placeholder, so no speculative run recomputes `x`
+    // and the real claim runs it.
     let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
     assert_eq!(runs.load(SeqCst), 1 + speculative);
     boom.store(true, SeqCst);
@@ -1299,8 +1301,8 @@ fn native_creator_runs_once_as_unbounded<C: Cells>() {
             "(c, c's runs, node count) at budget 1 vs unbounded, panics {panics}"
         );
         // The unbounded run never reaches `c`; one run ahead of need is
-        // the bound. A Shared doomed frame unwinds at b's placeholder read,
-        // so it never runs `c` ahead of need.
+        // the bound. A Shared doomed frame raises its discard at its next
+        // read after b's placeholder, so it never runs `c` ahead of need.
         let (v, runs, nodes) = native_creator_runs_once::<C>(1, false, panics);
         let (_, unbounded_runs, unbounded_nodes) =
             native_creator_runs_once::<C>(u32::MAX, false, panics);
@@ -1518,8 +1520,8 @@ fn local_dropped_creator_stash_discards_its_child() {
     dropped_creator_stash_discards_its_child::<Local>();
 }
 
-// No Shared variant: a Shared doomed frame unwinds at its placeholder read,
-// so c's speculative run is never made.
+// No Shared variant: a Shared doomed frame raises its discard at its next
+// read past the placeholder, so c's speculative run is never made.
 
 /// How the speculative run of `c` in [`native_rerun_exception`] reads
 /// `p`, a query that panics.
@@ -1590,8 +1592,8 @@ fn native_rerun_exceptions<C: Cells>() {
         RerunShape::DroppedChain,
     ] {
         let (v, runs) = native_rerun_exception::<C>(u32::MAX, shape);
-        // A Shared doomed frame unwinds at b's placeholder read, so only
-        // the real read runs `c`.
+        // A Shared doomed frame raises its discard at its next read
+        // after b's placeholder, so only the real read runs `c`.
         let rerun = u32::from(C::SINGLE_THREADED && shape != RerunShape::Doomed);
         assert_eq!(
             native_rerun_exception::<C>(1, shape),
@@ -1659,8 +1661,8 @@ fn local_unadopted_stash_is_freed() {
     unadopted_stash_is_freed::<Local>(false);
 }
 
-// No Shared variant: a Shared doomed frame unwinds at b's placeholder read,
-// so c is never stashed.
+// No Shared variant: a Shared doomed frame raises its discard at its next
+// read after b's placeholder, so c is never stashed.
 
 /// `r`'s read of `q` dooms at budget 1, so its doomed run reads `q`'s
 /// placeholder 0 and goes on to `c`, a Native node that panics if it sees

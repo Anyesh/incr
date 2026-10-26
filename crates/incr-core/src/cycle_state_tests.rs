@@ -248,9 +248,10 @@ struct DiscardOnDrop;
 
 impl Drop for DiscardOnDrop {
     fn drop(&mut self) {
-        let _kept = super::KeptUnwind::if_unwinding();
-        super::set_unwind_kind(Some(super::UnwindKind::Discard));
-        super::set_unwind_kind(None);
+        super::KeptUnwind::around(|| {
+            super::set_unwind_kind(Some(super::UnwindKind::Discard));
+            super::set_unwind_kind(None);
+        });
     }
 }
 

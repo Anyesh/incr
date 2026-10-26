@@ -355,8 +355,9 @@ fn panic_in_a_speculative_entry<C: Cells>() {
     for nested in [false, true] {
         let quiet = speculative::<C>(Some(1), nested, false, false);
         assert_eq!(quiet.out, Out::Value(7), "nested: {nested}");
-        // A Shared doomed frame unwinds at A's placeholder read, so S's
-        // speculative entry is never pushed.
+        // A Shared doomed frame raises its discard at its next read
+        // after A's placeholder, so S's speculative entry is never
+        // pushed.
         assert_eq!(
             quiet.panicking_runs,
             u32::from(C::SINGLE_THREADED),
@@ -405,8 +406,9 @@ fn virtual_hit_then_panic_in_a_speculative_entry<C: Cells>() {
         );
     }
     if !C::SINGLE_THREADED {
-        // A Shared doomed frame unwinds at A's placeholder read, so S's
-        // speculative entry is never pushed.
+        // A Shared doomed frame raises its discard at its next read
+        // after A's placeholder, so S's speculative entry is never
+        // pushed.
         assert_eq!(bounded.panicking_runs, 0);
         return;
     }
@@ -498,8 +500,9 @@ fn panic_in_a_speculative_entrys_continuation<C: Cells>() {
     };
     let (unbounded, unbounded_failures, _) = run(None);
     let (bounded, bounded_failures, panics) = run(Some(1));
-    // A Shared doomed frame unwinds at A's placeholder read, so F never
-    // reads Q and M's speculative run is never made.
+    // A Shared doomed frame raises its discard at its next read after
+    // A's placeholder, so F never reads Q and M's speculative run is
+    // never made.
     if C::SINGLE_THREADED {
         assert!(panics > 0, "M's continuation reached its panic");
     }
@@ -690,8 +693,8 @@ fn panicking_episode_in_a_speculative_entry<C: Cells>() {
         (Callback::Step, "step boom", false),
         (Callback::Drop, "drop boom", false),
     ] {
-        // A Shared doomed frame unwinds at its placeholder read, so S's
-        // speculative entry is never pushed.
+        // A Shared doomed frame raises its discard at its next read past
+        // the placeholder, so S's speculative entry is never pushed.
         let speculative = speculative && C::SINGLE_THREADED;
         let new_or_dirty = |states: &[NodeState]| {
             states
@@ -1424,12 +1427,6 @@ where
     let (base, real, _) = minted[minted.len() - 1];
     assert_eq!(base, 100);
     assert!(real.iter().all(|&h| rt.is_alive(h)), "{minted:?}");
-    if !C::SINGLE_THREADED {
-        // A Shared doomed frame unwinds at its placeholder read, so no run
-        // goes on to miss with a pending handle.
-        assert!(minted.iter().all(|&(base, _, _)| base == 100), "{minted:?}");
-        return;
-    }
     let (base, doomed, got) = minted[0];
     assert_eq!((base, got), (0, 0), "pending handles read the placeholder");
     assert!(doomed.iter().all(|&h| h == doomed[0] && !rt.is_alive(h)));

@@ -1085,19 +1085,36 @@ pub(crate) fn end_lazy(ctl: usize) -> bool {
 pub(crate) struct KeptUnwind(u64, usize);
 
 impl KeptUnwind {
-    /// Only an unwind with a kind or a lazy doom is kept: inside the call,
-    /// reads start from none, so they keep nothing and their own kinds
-    /// reach the catches inside the call.
+    /// Runs `f`, an engine call, under [`raise_if_lazy`]. Only an unwind
+    /// with a kind or a lazy doom is kept: inside the call, reads start
+    /// from none, so they keep nothing and their own kinds reach the
+    /// catches inside the call. Only the cold path holds the guard: drop
+    /// glue in the call's own frame would give every unwind through it a
+    /// landing pad to stop at.
     #[inline(always)]
-    pub(crate) fn if_unwinding() -> Option<Self> {
+    pub(crate) fn around<R>(f: impl FnOnce() -> R) -> R {
         let bits = value_code::thread_word() & value_code::UNWIND_MASK;
-        if bits != 0 {
-            std::thread::panicking().then(|| Self::keep(bits))
-        } else if std::thread::panicking() && lazy_open() {
-            Some(Self::keep(0))
-        } else {
-            None
+        if bits != 0 || std::thread::panicking() {
+            return Self::kept(bits, f);
         }
+        if lazy_open() {
+            raise_lazy();
+        }
+        f()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn kept<R>(bits: u64, f: impl FnOnce() -> R) -> R {
+        if !std::thread::panicking() {
+            raise_if_lazy();
+            return f();
+        }
+        if bits == 0 && !lazy_open() {
+            return f();
+        }
+        let _kept = Self::keep(bits);
+        f()
     }
 
     #[cold]
