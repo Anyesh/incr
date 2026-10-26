@@ -552,15 +552,21 @@ impl<C: Cells> Runtime<C> {
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
-        // what is left goes back as on a wound (G9), its edges with it.
+        // what is left goes back as on a wound (G9), its edges with it, and
+        // a landing already published over one of them lands Dirty.
         if let Err(payload) = published {
             let rest: Vec<Held> = rest.collect();
+            let slots: Vec<u32> = rest.iter().map(|e| e.slot).collect();
             let mut inner = self.inner.write();
             for e in &rest {
                 self.move_edges(&mut inner, e, true);
             }
             drop(inner);
             self.retract_entries(rest, Vec::new(), true);
+            for slot in slots {
+                let (_, flags) = self.nodes.get_with_flags(slot);
+                self.mark_dependents_dirty(NodeId(slot), flags);
+            }
             bag.drain_carried(payload);
         }
         bag.drain(self);

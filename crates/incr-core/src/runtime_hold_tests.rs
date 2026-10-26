@@ -160,7 +160,8 @@ fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
 /// A held publication panics after its first landing, as a child sweep's
 /// caught panic resumes there. p, still to land, had dropped o for n, and
 /// publication had already moved its reverse edges: giving p back moves
-/// them back, so a later set of o reaches p and n stays deletable.
+/// them back, so a later set of o reaches p and n stays deletable, and a
+/// landing published over one given back is Dirty, as (I) needs.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_held_publication_panic_gives_back_the_moved_edges() {
@@ -214,6 +215,7 @@ fn shared_held_publication_panic_gives_back_the_moved_edges() {
     );
     assert!(rt.has_reverse_edge(o, p), "o lost its edge to p");
     assert!(!rt.has_reverse_edge(n, p), "phantom edge on n");
+    rt.assert_invariant_i();
     rt.set(s, false);
     assert_eq!(rt.get(p), rt.get(a) + 10);
     rt.set(o, 15);
