@@ -1122,6 +1122,76 @@ fn loom_held_group_record_precedes_state() {
     });
 }
 
+/// Which runs a cross-runtime held wait model's executions reached, by
+/// whether some closure ran again after the waits-for cycle was broken.
+static CROSS_HELD_REACH: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+/// Thread 1 reads q of runtime A, which reads c, landing A's two-node cycle
+/// {c, d} held, and then b of runtime B; thread 2 reads b, which reads c.
+/// When thread 2 claims b and then waits on c, its wait in A must see
+/// thread 1's hold although thread 1 waits in B, so the waits-for cycle
+/// through b's claim breaks, one side runs again, and both reads give their
+/// single-thread values. Some executions must break that cycle and some
+/// must never form it.
+#[test]
+fn loom_cross_runtime_held_wait() {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    run(|| {
+        let ra = std::sync::Arc::new(Rt::new());
+        let rb = std::sync::Arc::new(Rt::new());
+        let runs = std::sync::Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+        let dc: Arc<std::sync::OnceLock<Incr<u64>>> = Arc::new(std::sync::OnceLock::new());
+        let c = {
+            let dc = dc.clone();
+            ra.create_query_with_fallback(
+                move |rt: &Rt| rt.get(*dc.get().unwrap()) + 1,
+                |_c: &crate::cycle::Cycle| 100,
+            )
+        };
+        let d = ra.create_query(move |rt: &Rt| rt.get(c) * 2);
+        dc.set(d).unwrap();
+        // Weak captures, so the two runtimes' closures form no Arc cycle.
+        let b = {
+            let (ra, runs) = (std::sync::Arc::downgrade(&ra), runs.clone());
+            rb.create_query(move |_: &Rt| {
+                runs[0].fetch_add(1, Relaxed);
+                ra.upgrade().unwrap().get(c) + 1
+            })
+        };
+        let q = {
+            let (rb, runs) = (std::sync::Arc::downgrade(&rb), runs.clone());
+            ra.create_query(move |rt: &Rt| {
+                runs[1].fetch_add(1, Relaxed);
+                rt.get(c) + rb.upgrade().unwrap().get(b)
+            })
+        };
+        let reads_b = {
+            let rb = std::sync::Arc::clone(&rb);
+            thread::spawn(move || rb.get(b))
+        };
+        assert_eq!(ra.get(q), 201);
+        assert_eq!(reads_b.join().unwrap(), 101);
+        for rt in [&ra, &rb] {
+            rt.assert_invariant_i();
+            rt.assert_walks_complete();
+        }
+        assert_eq!(crate::waits::registered(), 0);
+        let again = runs.iter().any(|r| r.load(Relaxed) > 1);
+        CROSS_HELD_REACH[usize::from(again)].store(true, Relaxed);
+    });
+    assert!(
+        CROSS_HELD_REACH[1].load(std::sync::atomic::Ordering::Relaxed),
+        "no execution formed the cross-runtime waits-for cycle"
+    );
+    assert!(
+        CROSS_HELD_REACH[0].load(std::sync::atomic::Ordering::Relaxed),
+        "every execution formed the cross-runtime waits-for cycle"
+    );
+}
+
 /// c (Fallback) reads a and b, which read c: a landed group. Once i is 1, a
 /// no longer reads c, so the episode at c that o's read runs shrinks to
 /// {c, b} and releases a, held with a Dirty target; o then reads a, and its
