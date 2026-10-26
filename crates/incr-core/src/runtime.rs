@@ -873,10 +873,6 @@ impl Walk {
         }
     }
 
-    /// Visits `id` again as a walk that never met it would, past a first
-    /// visit that expanded it (or the group it is now a member of).
-    #[cold]
-    #[inline(never)]
     /// Plans afresh from the root, whose claim the walk waited out, as the
     /// read would after the other thread's landing: where the walk enters a
     /// cycle of recorded deps depends on its visit count at the switch to
@@ -889,6 +885,10 @@ impl Walk {
         self.expanded = None;
     }
 
+    /// Visits `id` again as a walk that never met it would, past a first
+    /// visit that expanded it (or the group it is now a member of).
+    #[cold]
+    #[inline(never)]
     fn revisit(&mut self, id: NodeId, generation: u32) {
         self.forget(|&n| n == id);
         self.push(Entry {
