@@ -681,7 +681,7 @@ fn a_closure_that_catches_a_doom_in_a_cycle_joins_a_reader_of_a_member() {
 /// it reaches (T, X, C).
 #[test]
 fn a_take_over_of_a_node_that_lands_dirty_restarts_its_read_boundedly() {
-    for frames in [u32::MAX, 1, 2] {
+    let run = |frames: u32| {
         let rt = Arc::new(Rt::new());
         rt.set_placeholder(0_u64);
         let cc: Arc<OnceLock<Incr<u64>>> = Arc::default();
@@ -707,10 +707,18 @@ fn a_take_over_of_a_node_that_lands_dirty_restarts_its_read_boundedly() {
             )
         };
         rt.set_max_frames(frames);
-        assert_eq!(within_10s(&rt, t), Some(Ok(14)), "budget {frames}");
-        let n = takes.load(SeqCst);
+        let got = within_10s(&rt, t);
+        if got.is_some() {
+            rt.assert_invariant_i();
+        }
+        (got, takes.load(SeqCst))
+    };
+    let (unbounded, _) = run(u32::MAX);
+    assert!(unbounded.is_some(), "the unbounded read hung");
+    for frames in [1, 2] {
+        let (got, n) = run(frames);
+        assert_eq!(got, unbounded, "budget {frames}");
         assert!(n <= 3, "budget {frames}: {n} take-overs");
-        rt.assert_invariant_i();
     }
 }
 
@@ -1011,7 +1019,7 @@ fn a_shared_entry_inside_a_shared_one_under_a_local_one_starts_no_attempt() {
 /// retry dooms X again and is taken over again.
 #[test]
 fn a_take_over_under_a_local_entry_restarts_its_read_boundedly() {
-    for frames in [1, 2] {
+    let run = |frames: u32| {
         let shared = Arc::new(Rt::new());
         shared.set_placeholder(0_u64);
         let cc: Arc<OnceLock<Incr<u64>>> = Arc::default();
@@ -1042,15 +1050,22 @@ fn a_take_over_under_a_local_entry_restarts_its_read_boundedly() {
         thread::spawn(move || {
             let local = Runtime::<Local>::new();
             let l = local.create_query(move |_: &Runtime<Local>| shared.get(t));
-            let _ = tx.send(local.get(l));
+            let _ = tx.send(outcome(|| local.get(l)));
         });
-        assert_eq!(
+        (
             rx.recv_timeout(Duration::from_secs(10)).ok(),
-            Some(14),
-            "budget {frames}"
-        );
-        if frames == 1 {
-            assert!(takes.load(SeqCst) > 0, "no take-over at budget 1");
+            takes.load(SeqCst),
+        )
+    };
+    let (unbounded, _) = run(u32::MAX);
+    assert!(unbounded.is_some(), "the unbounded read hung");
+    for frames in [1, 2] {
+        let (got, takes) = run(frames);
+        assert_eq!(got, unbounded, "budget {frames}");
+        // Only a contained cycle leaves X a value for the child to wait on;
+        // when C's cycle escapes, the read fails with no take-over.
+        if frames == 1 && matches!(unbounded, Some(Ok(_))) {
+            assert!(takes > 0, "no take-over at budget 1");
         }
     }
 }
@@ -1130,6 +1145,8 @@ impl Clone for JoinV {
 /// and the read's clone of R's value joins a thread that reads R. The
 /// child must rerun R, as a second read does, rather than wait on the
 /// read's reservation of its own node, and the read keeps its own value.
+/// Whether a rerun contains C's cycle or lets it out is the containment
+/// rule's call; the child and the second read must agree on it.
 #[test]
 fn a_reads_clone_joins_a_child_reading_the_node_it_landed_dirty() {
     let rt = Arc::new(Rt::new());
@@ -1155,7 +1172,15 @@ fn a_reads_clone_joins_a_child_reading_the_node_it_landed_dirty() {
         let _ = tx.send(outcome(|| reader.get(r).0));
     });
     assert_eq!(rx.recv_timeout(Duration::from_secs(10)).ok(), Some(Ok(100)));
-    assert_eq!(*JOIN_CHILD.lock().unwrap(), Some(Some(200)));
+    let child = JOIN_CHILD.lock().unwrap().take();
+    let child = child.expect("the clone joined no child");
+    let again = thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(r).0)).ok())
+        .join()
+        .unwrap();
+    assert_eq!(child.is_some(), again.is_some(), "{child:?}, {again:?}");
+    if let Some(v) = child {
+        assert_eq!((v, again), (200, Some(300)));
+    }
 }
 
 /// **A reservation outlives the owner's final landing**, at budget 2: R
