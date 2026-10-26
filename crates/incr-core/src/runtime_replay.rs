@@ -2731,6 +2731,13 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Computing,
             );
             if moved.is_ok() {
+                // The owner reclaims its own held landing with the word
+                // still Computing; no other thread may take a held one.
+                debug_assert!(
+                    !node.held_mark()
+                        || crate::hold::holds(state::cell_key::<C>(node.state_cell())),
+                    "incr-core: a held landing's word left Computing before its publication"
+                );
                 replay::regen_running(self.runtime_id, id.0, true);
             }
             drop(t);
