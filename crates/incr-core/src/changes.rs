@@ -73,6 +73,7 @@ impl Changes {
             changes: Arc::clone(&self.0),
             at,
             speculative,
+            mixed: false,
         })
     }
 }
@@ -98,6 +99,9 @@ pub(crate) struct Count {
     changes: Arc<Words>,
     at: u64,
     speculative: u64,
+    /// Whether reads folded in by [`Count::absorb`] saw different numbers
+    /// of changes that were not speculative.
+    mixed: bool,
 }
 
 impl Count {
@@ -113,7 +117,8 @@ impl Count {
         // makes this refuse.
         let speculative = self.changes.speculative.load(Ordering::Acquire);
         let now = self.changes.word.load(Ordering::Acquire);
-        now as u32 == 0
+        !self.mixed
+            && now as u32 == 0
             && (now >> 32).wrapping_sub(self.at >> 32) == speculative.wrapping_sub(self.speculative)
     }
 
@@ -123,8 +128,74 @@ impl Count {
         self.at == 0 && self.speculative == 0
     }
 
-    /// Whether `self` and `other` are of one runtime at one count.
-    pub(crate) fn same(&self, other: &Count) -> bool {
-        Arc::ptr_eq(&self.changes, &other.changes) && self.at == other.at
+    /// Folds in `other` if it is of the same runtime, so that `holds` and
+    /// `only_speculative_since` answer for both reads: each holds for every
+    /// read only if it holds for the oldest and, for the second, every read
+    /// saw the same number of changes that were not speculative.
+    pub(crate) fn absorb(&mut self, other: &Count) -> bool {
+        if !Arc::ptr_eq(&self.changes, &other.changes) {
+            return false;
+        }
+        self.mixed |= other.mixed || self.others() != other.others();
+        if other.at < self.at {
+            self.at = other.at;
+            self.speculative = other.speculative;
+        }
+        true
+    }
+
+    fn others(&self) -> u64 {
+        (self.at >> 32).wrapping_sub(self.speculative)
+    }
+}
+
+/// Adds `count` to `counts`, folded into the count of its runtime there if
+/// there is one, so that `counts` holds one count per runtime however often
+/// a runtime changed between the reads.
+pub(crate) fn fold(counts: &mut Vec<Count>, count: &Count) {
+    if !counts.iter_mut().any(|c| c.absorb(count)) {
+        counts.push(count.clone());
+    }
+}
+
+#[cfg(all(test, not(loom)))]
+mod tests {
+    use super::*;
+
+    /// Over every order of four changes, speculative or not, the folded
+    /// counts of any reads between them decide as all of the reads do.
+    #[test]
+    fn folded_counts_decide_as_their_reads() {
+        for order in 0..16_u32 {
+            let changes = Changes::new();
+            let other = Changes::new();
+            let mut reads = vec![changes.count().unwrap()];
+            for step in 0..4 {
+                drop(changes.change((order >> step) & 1 == 1));
+                reads.push(changes.count().unwrap());
+                for subset in 1..1_u32 << reads.len() {
+                    let picked: Vec<&Count> = (0..reads.len())
+                        .filter(|&i| (subset >> i) & 1 == 1)
+                        .map(|i| &reads[i])
+                        .collect();
+                    let mut folded = vec![other.count().unwrap()];
+                    for c in &picked {
+                        fold(&mut folded, c);
+                    }
+                    assert_eq!(folded.len(), 2, "order {order:b} subset {subset:b}");
+                    let c = &folded[1];
+                    assert_eq!(
+                        c.holds(),
+                        picked.iter().all(|c| c.holds()),
+                        "order {order:b} step {step} subset {subset:b}"
+                    );
+                    assert_eq!(
+                        c.only_speculative_since(),
+                        picked.iter().all(|c| c.only_speculative_since()),
+                        "order {order:b} step {step} subset {subset:b}"
+                    );
+                }
+            }
+        }
     }
 }

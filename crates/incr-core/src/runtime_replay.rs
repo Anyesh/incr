@@ -7,7 +7,7 @@ use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
-use crate::changes::Count;
+use crate::changes::{self, Count};
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::{Frame, Placement};
@@ -415,6 +415,8 @@ impl<C: Cells> Runtime<C> {
             context: (!counts.is_empty() && shared).then_some(context).flatten(),
             counts,
         };
+        #[cfg(all(test, not(loom)))]
+        THREAD_MOST_FOREIGN_COUNTS.with(|m| m.set(m.get().max(foreign.counts.len())));
         let kept = self.stash(
             id.0,
             generation,
@@ -1093,10 +1095,10 @@ impl<C: Cells> Runtime<C> {
                 continue;
             }
             shared &= foreign.context == context;
+            #[cfg(all(test, not(loom)))]
+            THREAD_INHERITED_FOREIGN_COUNTS.with(|n| n.set(n.get() + foreign.counts.len()));
             for count in &foreign.counts {
-                if !counts.iter().any(|c| c.same(count)) {
-                    counts.push(count.clone());
-                }
+                changes::fold(counts, count);
             }
         }
         shared
@@ -5758,6 +5760,13 @@ thread_local! {
         const { std::cell::Cell::new(0) };
     /// Payloads `Runtime::regenerate` made on this thread.
     pub(crate) static THREAD_REGENERATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// The longest foreign count list a stash made on this thread kept.
+    pub(crate) static THREAD_MOST_FOREIGN_COUNTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// The foreign counts stashes made on this thread took from their
+    /// stashed deps.
+    pub(crate) static THREAD_INHERITED_FOREIGN_COUNTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 

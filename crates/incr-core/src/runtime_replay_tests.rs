@@ -3298,3 +3298,81 @@ fn local_a_payload_after_a_value_code_foreign_read_reads_as_unbounded() {
 fn shared_a_payload_after_a_value_code_foreign_read_reads_as_unbounded() {
     a_payload_after_a_value_code_foreign_read_reads_as_unbounded::<Shared>();
 }
+
+/// A top query at budget 1 reading New query c and, on c's placeholder,
+/// a chain of `n` replayable hops, each reading input j of another
+/// runtime Clean and then having a second thread set j before its next
+/// hop: the doomed top's speculative run of the chain stashes each hop
+/// over the stash of the hop it read, so every stash inherits reads of j
+/// at counts of their own. The longest foreign count list any stash kept,
+/// and the counts the stashes inherited.
+fn foreign_counts_under_interleaved_sets<C: Cells>(n: u64) -> (usize, usize) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let j = other.create_input(0_u64);
+    let sets = Arc::new(AtomicU32::new(0));
+    let mut head = rt.create_query_with(
+        {
+            let other = Arc::clone(&other);
+            move |_: &Runtime<C>| other.get(j)
+        },
+        replayable(),
+    );
+    for _ in 1..n {
+        let below = head;
+        let other = Arc::clone(&other);
+        let sets = Arc::clone(&sets);
+        head = rt.create_query_with(
+            move |rt| {
+                let seen = other.get(j);
+                let o = Arc::clone(&other);
+                let v = u64::from(sets.fetch_add(1, SeqCst)) + 1;
+                std::thread::spawn(move || o.set(j, v)).join().unwrap();
+                rt.get(below) + seen
+            },
+            replayable(),
+        );
+    }
+    let c = rt.create_query_with(|_| 1_u64, replayable());
+    let top = rt.create_query_with(
+        move |rt| if rt.get(c) % 2 == 0 { rt.get(head) } else { 0 },
+        replayable(),
+    );
+    let most = &super::replay_impl::THREAD_MOST_FOREIGN_COUNTS;
+    let inherited = &super::replay_impl::THREAD_INHERITED_FOREIGN_COUNTS;
+    most.with(|m| m.set(0));
+    inherited.with(|m| m.set(0));
+    assert_eq!(rt.get(top), 0);
+    (
+        most.with(std::cell::Cell::get),
+        inherited.with(std::cell::Cell::get),
+    )
+}
+
+/// A stash keeps one count per foreign runtime, however often that runtime
+/// changed between the reads it and its stashed deps made.
+fn a_stash_keeps_one_count_per_foreign_runtime<C: Cells>() {
+    for n in [4, 16, 64] {
+        let (most, inherited) = foreign_counts_under_interleaved_sets::<C>(n);
+        assert!(
+            inherited >= n as usize - 2,
+            "n={n}: the stashes inherited {inherited} counts"
+        );
+        assert_eq!(
+            most, 1,
+            "n={n}: a stash kept more counts than foreign runtimes"
+        );
+    }
+}
+
+#[test]
+fn local_a_stash_keeps_one_count_per_foreign_runtime() {
+    a_stash_keeps_one_count_per_foreign_runtime::<Local>();
+}
+
+#[test]
+fn shared_a_stash_keeps_one_count_per_foreign_runtime() {
+    a_stash_keeps_one_count_per_foreign_runtime::<Shared>();
+}
