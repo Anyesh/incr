@@ -16,7 +16,6 @@ use crate::node::NodeId;
 use crate::state::NodeState;
 use crate::test_size::test_size;
 use crate::value_code;
-use crate::waits;
 
 /// Nested first computes overflow the default test thread stack somewhere
 /// between 600 and 700 levels in debug builds. The taint chain's 10,000
@@ -2460,7 +2459,8 @@ fn shared_stale_dep_whose_episode_cycles_reaches_the_reader() {
 
 /// **A walk that waited out another thread's claim of its root plans as a
 /// fresh walk would.** B's walk visits `r` New and parks before claiming
-/// it; A claims `r` and parks in its run. Released, B waits on A's claim.
+/// it; A claims `r` and parks in its run. Released, B waits on A's claim
+/// until A's run has ended.
 /// A's run catches the cycle `b -> c -> b` entered at `b`, then panics when
 /// `b` sees the fallback of `c` (Fallback), so `r`, `b` and `c` land unwound
 /// with recorded deps on each other. B's walk revisits `r` and alternates
@@ -2500,13 +2500,16 @@ fn shared_walk_that_waited_on_its_root_plans_afresh() {
             rt.try_get(c).unwrap_or(0)
         })
     };
-    let before_claim = Gate::new();
+    let (before_claim, waits) = (Gate::new(), Gate::new());
     park_at(
         &rt,
-        vec![(
-            ParkPoint::BeforeComputeOne(NodeId(r.slot())),
-            before_claim.clone(),
-        )],
+        vec![
+            (
+                ParkPoint::BeforeComputeOne(NodeId(r.slot())),
+                before_claim.clone(),
+            ),
+            (ParkPoint::ComputeWaits(NodeId(r.slot())), waits.clone()),
+        ],
     );
     let read = || {
         let rt = rt.clone();
@@ -2518,17 +2521,12 @@ fn shared_walk_that_waited_on_its_root_plans_afresh() {
     let first = read();
     in_run.wait_parked();
     before_claim.release();
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
-    while !waits::waited_on((rt.runtime_id, r.slot())) {
-        assert!(std::time::Instant::now() < deadline, "B never waited on r");
-        thread::sleep(Duration::from_millis(1));
-    }
+    waits.wait_parked();
     in_run.release();
+    let first = first.join().unwrap();
+    waits.release();
     let boom = || Err("b saw c's fallback".to_owned());
-    assert_eq!(
-        (first.join().unwrap(), second.join().unwrap()),
-        (boom(), boom())
-    );
+    assert_eq!((first, second.join().unwrap()), (boom(), boom()));
     assert_eq!(
         catch_unwind(AssertUnwindSafe(|| rt.get(r))).map_err(panic_message),
         boom()
