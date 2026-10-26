@@ -1169,8 +1169,9 @@ fn loom_held_group_record_precedes_state() {
 
 /// c (Fallback) reads a and b, which read c: a landed group. Once i is 1, a
 /// no longer reads c, so the episode at c that o's read runs shrinks to
-/// {c, b} and releases a, held with a Dirty target; o then reads a, and its
-/// owner computes a alone inside the attempt. Counts every closure run.
+/// {c, b}. Counts every closure run. The shrunk episode panics, as on main,
+/// where a fresh graph returns (21, 1) (board
+/// T10-shrunk-cut-incremental-cycle-panic), so models compare outcomes.
 fn shrunk_cut<C: crate::cells::Cells>(
     rt: &Runtime<C>,
     runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1229,19 +1230,25 @@ fn loom_own_landed_reread_matches_local() {
         let local_runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let local = Runtime::<crate::cells::Local>::new();
         let (o, a) = shrunk_cut(&local, &local_runs);
-        let want = (local.get(o), local.get(a));
+        let want = (
+            panic_message(|| local.get(o)),
+            panic_message(|| local.get(a)),
+        );
         let local_runs = local_runs.load(std::sync::atomic::Ordering::Relaxed);
         let local_b_first = {
             let rt = Runtime::<crate::cells::Local>::new();
             let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
-            let b = rt.get(a);
-            (rt.get(o), b)
+            let b = panic_message(|| rt.get(a));
+            (panic_message(|| rt.get(o)), b)
         };
 
         let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let rt = Rt::new();
         let (o, a) = shrunk_cut(&rt, &runs);
-        assert_eq!((rt.get(o), rt.get(a)), want);
+        assert_eq!(
+            (panic_message(|| rt.get(o)), panic_message(|| rt.get(a))),
+            want
+        );
         assert_eq!(
             runs.load(std::sync::atomic::Ordering::Relaxed),
             local_runs,
@@ -1252,11 +1259,11 @@ fn loom_own_landed_reread_matches_local() {
         let (o, a) = shrunk_cut(&rt, &std::sync::Arc::default());
         let reads_o = {
             let rt = Arc::clone(&rt);
-            thread::spawn(move || rt.get(o))
+            thread::spawn(move || panic_message(|| rt.get(o)))
         };
         let reads_a = {
             let rt = Arc::clone(&rt);
-            thread::spawn(move || rt.get(a))
+            thread::spawn(move || panic_message(|| rt.get(a)))
         };
         let got = (reads_o.join().unwrap(), reads_a.join().unwrap());
         assert!(
@@ -2343,7 +2350,7 @@ fn discard_under_set() {
 }
 
 /// A read's panic message, its panic expected.
-fn panic_message(f: impl FnOnce() -> u64) -> Result<u64, String> {
+fn panic_message<R>(f: impl FnOnce() -> R) -> Result<R, String> {
     EXPECTING_UNWIND.with(|e| e.set(true));
     let out = catch_unwind(AssertUnwindSafe(f)).map_err(|e| {
         e.downcast_ref::<String>()
