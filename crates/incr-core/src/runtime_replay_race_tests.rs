@@ -3919,7 +3919,7 @@ fn a_noted_failed_landing_still_computing_is_flagged_by_the_set() {
         NodeState::Dirty
     )
     .is_ok());
-    assert!(!rt.failed_past.load(SeqCst));
+    assert_eq!(rt.failed_past.load(SeqCst), 0);
 }
 
 /// A delete of d drops the notes over it, so set walks stop looking.
@@ -3929,7 +3929,7 @@ fn a_deleted_dep_drops_the_failed_landings_noted_over_it() {
     rt.delete_node(x);
     rt.delete_node(d);
     assert!(
-        !rt.failed_past.load(SeqCst),
+        rt.failed_past.load(SeqCst) == 0,
         "d's delete kept the notes over it"
     );
 }
@@ -3948,7 +3948,7 @@ fn noted_failed_landing() -> (Rt, Incr<u64>, Incr<u64>, Incr<u64>) {
         crate::state::try_transition::<Shared>(cell, NodeState::Clean, NodeState::Dirty).is_ok()
     );
     rt.note_past_sets(id(x), x.generation(), &[(id(d), 0)]);
-    assert!(rt.failed_past.load(SeqCst));
+    assert_ne!(rt.failed_past.load(SeqCst), 0);
     (rt, i, d, x)
 }
 

@@ -63,6 +63,14 @@ pub(crate) struct Tickets {
     past: BTreeMap<u32, Vec<(u32, u32)>>,
 }
 
+/// `slot`'s bit in `Runtime::failed_past`: a walk takes the tickets' lock
+/// only at a dep whose bit is set, so notes under other slots, even ones
+/// no walk will reach again, cost it nothing.
+#[inline(always)]
+pub(super) fn past_bit(slot: u32) -> u64 {
+    1 << (slot & 63)
+}
+
 #[derive(Clone, Copy)]
 struct Joined {
     ticket: u64,
@@ -580,9 +588,11 @@ impl<C: Cells> Runtime<C> {
     /// dep, whose dependents the walk that made it Dirty flagged; a dep a
     /// caught panic left Dirty had no such walk. The landing is noted under
     /// each such dep for the next walk that reaches it, so it lasts its
-    /// revision and not past the dep's next change. A dep still Computing is
-    /// not noted: on this thread it is an open cycle head the landing belongs
-    /// to, and a flip there reruns the caught cycle on every read (0x1daa).
+    /// revision and not past the dep's next change, except under `Shared`
+    /// for a set whose walk passed the dep before the note was made. A dep
+    /// still Computing is not noted: on this thread it is an open cycle head
+    /// the landing belongs to, and a flip there reruns the caught cycle on
+    /// every read (0x1daa).
     /// Speculative landings are noted too: the take checks the node.
     #[inline(always)]
     pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
@@ -611,8 +621,13 @@ impl<C: Cells> Runtime<C> {
             if !notes.contains(&(id.0, generation)) {
                 notes.push((id.0, generation));
             }
+            self.failed_past.fetch_or(past_bit(dep.0), Relaxed);
         }
-        self.failed_past.store(true, Relaxed);
+    }
+
+    fn sync_past(&self, t: &Tickets) {
+        let bits = t.past.keys().fold(0, |bits, &slot| bits | past_bit(slot));
+        self.failed_past.store(bits, Relaxed);
     }
 
     /// A set's walk reached `dep`: queues the landings noted over it that
@@ -628,7 +643,7 @@ impl<C: Cells> Runtime<C> {
         let Some(notes) = t.past.remove(&dep.0) else {
             return;
         };
-        self.failed_past.store(!t.past.is_empty(), Relaxed);
+        self.sync_past(&t);
         drop(t);
         for (id, generation) in notes {
             let node = self.nodes.get(id);
@@ -682,7 +697,7 @@ impl<C: Cells> Runtime<C> {
         if self.tickets_held() {
             self.bury(slot, generation);
         }
-        if self.failed_past.load(Relaxed) {
+        if self.failed_past.load(Relaxed) & past_bit(slot) != 0 {
             self.bury_past(slot);
         }
         if self.regens_held.load(Relaxed) {
@@ -703,7 +718,7 @@ impl<C: Cells> Runtime<C> {
     fn bury_past(&self, slot: u32) {
         let mut t = self.tickets.write();
         if t.past.remove(&slot).is_some() {
-            self.failed_past.store(!t.past.is_empty(), Relaxed);
+            self.sync_past(&t);
         }
     }
 

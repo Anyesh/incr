@@ -1054,8 +1054,10 @@ pub struct Runtime<C: Cells> {
     pub(crate) provenance: provenance_impl::Table<C>,
     tickets: C::Lock<contain_impl::Tickets>,
     tickets_held: std::sync::atomic::AtomicBool,
-    /// `tickets` notes a Failed landing past a set's walk.
-    failed_past: std::sync::atomic::AtomicBool,
+    /// The slots `tickets` notes Failed landings under, by `past_bit`.
+    /// Stored under `tickets`'s lock, so a walk ordered after a note sees
+    /// its bit; one concurrent with the note may miss it either way.
+    failed_past: std::sync::atomic::AtomicU64,
     regens: C::Lock<replay_impl::Regens>,
     /// Set once `regens` holds a record, so a delete looks for one only then.
     regens_held: std::sync::atomic::AtomicBool,
@@ -1190,7 +1192,7 @@ impl<C: Cells> Runtime<C> {
             provenance: provenance_impl::table::<C>(),
             tickets: contain_impl::tickets::<C>(),
             tickets_held: std::sync::atomic::AtomicBool::new(false),
-            failed_past: std::sync::atomic::AtomicBool::new(false),
+            failed_past: std::sync::atomic::AtomicU64::new(0),
             regens: replay_impl::regens::<C>(),
             regens_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -3083,7 +3085,7 @@ impl<C: Cells> Runtime<C> {
                         if state::try_transition::<C>(node.state_cell(), cur, NodeState::Dirty)
                             .is_ok()
                         {
-                            if past {
+                            if past & contain_impl::past_bit(id.0) != 0 {
                                 self.take_past_sets(id, &mut queue);
                             }
                             let inner = self.inner.read();
@@ -3177,7 +3179,7 @@ impl<C: Cells> Runtime<C> {
                         // reads from it (and sees the dep Dirty) or this CAS
                         // fails on the claim and the next pass flags it.
                         if state::try_transition::<C>(node.state_cell(), cur, cur).is_ok() {
-                            if past {
+                            if past & contain_impl::past_bit(id.0) != 0 {
                                 self.take_past_sets(id, &mut queue);
                             }
                             break;
