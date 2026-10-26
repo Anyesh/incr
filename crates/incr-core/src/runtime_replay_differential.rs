@@ -5524,6 +5524,30 @@ fn two_thread_delivered_read_of_a_held_landing_holds_its_reader_157d3() {
     });
 }
 
+/// 0x13b77 unbounded: thread 0's read of 5 enters the cycle {8, 9} at 8,
+/// so 7 gets the cycle and 6 = 7780, and 5 reads 6 again. The cycle's
+/// unrun landings of 7, 8 and 9 published at once, so thread 1's retried
+/// read of 9 resolved the Fixpoint and landed them Failed mid-attempt, and
+/// 5's second read of 6 gave 9999, a result no order gives.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_cycle_members_of_a_held_catch_stay_held_13b77() {
+    let case = gen_case(0x13b77, false, true);
+    let phases = phases(&case, 0x13b77);
+    quiet(|| {
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    let serial = Serial::new(&case, &phases);
+                    for _ in 0..40 {
+                        serial.differential("0x13b77", None, 0, &|_| {});
+                    }
+                });
+            }
+        });
+    });
+}
+
 /// 0x934's ops 7 (`Get(11)`) and 8 (`TryGet(13)`) overlap on a Dirty
 /// cycle, and each order of them leaves {0, 3..13} Failed. Here op 7's
 /// walk is held at its first compute, node 3, while op 8 lands 10 to 13
