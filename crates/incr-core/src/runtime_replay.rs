@@ -5044,6 +5044,13 @@ impl<C: Cells> Runtime<C> {
     /// The path of a frame at position `cidx`: the highest virtual frame
     /// below it extended by the frames on the stack between them.
     pub(super) fn path_at(&self, cidx: u32) -> u64 {
+        let (path, frames) = self.fold_path_at(cidx);
+        replay::path_steps(frames);
+        path
+    }
+
+    /// [`Self::path_at`], with the number of stack frames it folded over.
+    fn fold_path_at(&self, cidx: u32) -> (u64, usize) {
         let rt = self.runtime_id;
         let base = replay::peek(|c| {
             c.iter()
@@ -5058,13 +5065,14 @@ impl<C: Cells> Runtime<C> {
         let (from, path) = base.map_or((0, 0), |(at, path)| (at + 1, path));
         replay::with_seqs(|seqs| {
             self.dep_stack.with(|s| {
-                (s.frames.iter().zip(1..))
+                let path = (s.frames.iter().zip(1..))
                     .filter(|(f, _)| f.rt() == rt && (from..cidx).contains(&f.cidx))
                     .fold(path, |path, (f, depth)| {
                         let mut step = f.step();
                         step.seq = seqs.of(rt, f.ctl, depth);
                         replay::extend_path(path, step)
-                    })
+                    });
+                (path, s.frames.len())
             })
         })
     }
