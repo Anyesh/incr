@@ -3552,23 +3552,19 @@ impl<C: Cells> Runtime<C> {
                     self.expansions
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     walk.visit(cur, generation, observed == NodeState::New);
-                    let mut expand = |dep: NodeId| {
-                        let dep_node = self.nodes.get(dep.0);
-                        let dep_state = state::load::<C>(dep_node.state_cell());
-                        if !dep_state.is_settled() {
-                            walk.expand(dep, dep_node.generation(), dep_state);
+                    let kept = kept.map_or(usize::MAX, |k| k as usize);
+                    if let Some(deps) = node.inline_deps() {
+                        for dep in deps.take(kept) {
+                            self.walk_dep(&mut walk, dep);
                         }
-                    };
-                    if let Some(kept) = kept {
+                    } else {
                         let mut n = 0;
                         node.for_each_dep(|dep| {
                             n += 1;
                             if n <= kept {
-                                expand(dep);
+                                self.walk_dep(&mut walk, dep);
                             }
                         });
-                    } else {
-                        node.for_each_dep(&mut expand);
                     }
                 }
             }
@@ -3580,6 +3576,16 @@ impl<C: Cells> Runtime<C> {
             std::sync::atomic::Ordering::Relaxed,
         );
         root
+    }
+
+    /// Queues `dep` on `walk` at its generation unless it is settled.
+    #[inline(always)]
+    fn walk_dep(&self, walk: &mut Walk, dep: NodeId) {
+        let dep_node = self.nodes.get(dep.0);
+        let dep_state = state::load::<C>(dep_node.state_cell());
+        if !dep_state.is_settled() {
+            walk.expand(dep, dep_node.generation(), dep_state);
+        }
     }
 
     /// What a walk under `Shared` plans under: the runtime's episode

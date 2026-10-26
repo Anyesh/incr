@@ -656,6 +656,18 @@ impl<C: Cells> NodeData<C> {
         }
     }
 
+    /// The deps as [`Self::for_each_dep`] scans them when they fit inline,
+    /// or `None` when they overflow. A caller's loop body over these stays
+    /// inline where a closure handed to `for_each_dep` may not, as its
+    /// overflow arm needs an out-of-line copy.
+    #[inline(always)]
+    pub fn inline_deps(&self) -> Option<impl Iterator<Item = NodeId> + '_> {
+        let count = Self::count_of(C::u8_load_acquire(&self.dep_count));
+        (count <= 7).then(move || {
+            (0..count as usize).map(move |i| NodeId(C::u32_load_acquire(&self.inline_deps[i])))
+        })
+    }
+
     #[inline(always)]
     fn for_each_inline_dep<F: FnMut(NodeId) + ?Sized>(&self, count: u8, f: &mut F) {
         for i in 0..(count as usize) {
