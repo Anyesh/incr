@@ -5402,8 +5402,13 @@ impl<C: Cells> Runtime<C> {
             bag,
         );
         let wrote = ctl.wrote.get() != 0;
-        // A panic its run met reading a held landing is held as its value is.
-        if kind.is_none() && !C::SINGLE_THREADED && ctl.has(cycle::HOLD) {
+        // A panic its run met reading a held landing is held as its value
+        // is, and so is a cycle's unrun landing, which another thread could
+        // otherwise enter at another member before the catch publishes.
+        if matches!(kind, None | Some(UnwindKind::Cycle))
+            && !C::SINGLE_THREADED
+            && ctl.has(cycle::HOLD)
+        {
             self.open_hold(id, node, attempt.first, Some(ctl), bag);
         }
         if children_stashed {
