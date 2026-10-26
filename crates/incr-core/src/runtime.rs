@@ -5800,12 +5800,14 @@ impl<C: Cells> Runtime<C> {
             && hold::active()
             && hold::holds(state::cell_key::<C>(node.state_cell()));
         if held {
-            hold::keep_deps(state::cell_key::<C>(node.state_cell()), || {
+            let cell = state::cell_key::<C>(node.state_cell());
+            hold::keep_deps(cell, || {
                 diff.old
                     .iter()
                     .map(|d| (*d, self.nodes.get(d.0).generation()))
                     .collect()
             });
+            hold::keep_read(cell, recorded);
         }
 
         // The displaced list is retired at the attempt's drain, after its

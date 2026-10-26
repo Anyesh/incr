@@ -524,7 +524,7 @@ impl<C: Cells> Runtime<C> {
             cut_recs,
             wounded,
         } = hold::take(self.runtime_id);
-        if wounded {
+        if wounded || !self.publish_edges(&entries) {
             self.retract_entries(entries, cut_recs, true);
             return false;
         }
@@ -560,6 +560,45 @@ impl<C: Cells> Runtime<C> {
         true
     }
 
+    /// The held landings' reverse edges, under one write lock as
+    /// `publish_diff` installs an unheld landing's. False, with no edge
+    /// changed, if a dep one of them read was deleted, and its slot perhaps
+    /// reused, since: as an unheld landing over a stale dep, the attempt
+    /// retries rather than land on what it read.
+    fn publish_edges(&self, entries: &[Held]) -> bool {
+        let mut inner = self.inner.write();
+        let stale = entries
+            .iter()
+            .flat_map(|e| &e.read)
+            .any(|&(d, generation)| {
+                let dep = self.nodes.get(d.0);
+                dep.generation() != generation || dep.state() == NodeState::Dead
+            });
+        if stale {
+            return false;
+        }
+        for e in entries {
+            let Some(old) = &e.undo.deps else {
+                continue;
+            };
+            let id = NodeId(e.slot);
+            let node = self.nodes.get(e.slot);
+            let mut new: Vec<NodeId> = Vec::new();
+            node.for_each_dep(|d| new.push(d));
+            for (o, _) in old {
+                if !new.contains(o) {
+                    inner.dependents[o.0 as usize].remove(id);
+                }
+            }
+            for n in &new {
+                if !old.iter().any(|(o, _)| o == n) {
+                    inner.dependents[n.0 as usize].push_unique(id);
+                }
+            }
+        }
+        true
+    }
+
     fn publish_one(&self, e: Held, held: &Targets, bag: &mut Deferred<C>) {
         let id = NodeId(e.slot);
         let node = self.nodes.get(e.slot);
@@ -569,19 +608,6 @@ impl<C: Cells> Runtime<C> {
             let mut new: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| new.push(d));
             let was = |d: &NodeId| old.iter().any(|(o, _)| o == d);
-            {
-                let mut inner = self.inner.write();
-                for (o, _) in old {
-                    if !new.contains(o) {
-                        inner.dependents[o.0 as usize].remove(id);
-                    }
-                }
-                for n in &new {
-                    if !was(n) {
-                        inner.dependents[n.0 as usize].push_unique(id);
-                    }
-                }
-            }
             // A set after the read could not reach the node through an edge
             // that waited until now. A Clean landing's verified_at is the
             // revision it read at.

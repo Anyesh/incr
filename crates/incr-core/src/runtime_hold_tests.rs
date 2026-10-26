@@ -108,9 +108,10 @@ fn shared_delete_of_a_node_landed_earlier_in_the_read() {
 
 /// p reads a held cycle and then d, its first read of d, so p's edge on d
 /// waits for the read's exit. Another thread deletes d, which has no
-/// dependent yet, and recycles its slot before the exit publishes: p must
-/// not land Clean over the deleted value, nor leave an edge on the slot's
-/// new node.
+/// dependent yet, and recycles its slot before the exit publishes. As for
+/// an unheld compute over a recycled dep, the read's value is not
+/// returned, p's retry fails on d's stale handle, and the slot's new node
+/// gets no edge.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
@@ -140,18 +141,18 @@ fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
         })
     };
     assert!(rt.park_hook.set(hook).is_ok());
-    assert_eq!(rt.get(p), 107);
+    let read = catch_unwind(AssertUnwindSafe(|| rt.get(p)));
+    assert!(
+        read.is_err(),
+        "the read returned a value over a deleted dep"
+    );
     let recycled = *recycled.get().expect("the read published held landings");
     assert_eq!(recycled.slot(), d.slot(), "the delete freed d's slot");
     assert!(
         !rt.has_reverse_edge(recycled, p),
         "phantom edge on the recycled slot"
     );
-    assert_ne!(
-        rt.state_of(p),
-        NodeState::Clean,
-        "p is Clean over a deleted dep"
-    );
+    assert_eq!(rt.state_of(p), NodeState::Failed);
     assert!(rt.try_delete_node(recycled).is_ok());
     rt.assert_invariant_i();
 }

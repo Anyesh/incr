@@ -83,6 +83,10 @@ pub(crate) struct Held {
     pub(crate) children: Option<(ChildLanding, bool)>,
     /// Trace actions of the held landings, logged at publication.
     pub(crate) trace: Vec<TraceAction>,
+    /// The deps the last landing read, each with its generation then:
+    /// their reverse edges wait for publication, which a delete of one
+    /// meanwhile turns back ([`keep_read`]).
+    pub(crate) read: Vec<(NodeId, u32)>,
     pub(crate) undo: Undo,
 }
 
@@ -415,6 +419,7 @@ pub(crate) fn open_even_taken(
             reclaimed: true,
             children: None,
             trace: Vec::new(),
+            read: Vec::new(),
             undo: Undo {
                 first: cut.as_ref().map_or(first, |c| c.lands_new),
                 value: kept,
@@ -447,6 +452,16 @@ pub(crate) fn keep_deps(cell: usize, old: impl FnOnce() -> Vec<(NodeId, u32)>) {
     with(|h| {
         if let Some(e) = h.get(cell).filter(|e| e.undo.deps.is_none()) {
             e.undo.deps = Some(old());
+        }
+    });
+}
+
+/// The deps a held node's landing read, replacing an earlier landing's.
+pub(crate) fn keep_read(cell: usize, read: &[(NodeId, u32)]) {
+    with(|h| {
+        if let Some(e) = h.get(cell) {
+            e.read.clear();
+            e.read.extend_from_slice(read);
         }
     });
 }

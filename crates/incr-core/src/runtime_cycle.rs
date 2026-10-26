@@ -2474,11 +2474,13 @@ impl<C: Cells> Runtime<C> {
             });
             if old != new {
                 if held {
-                    hold::keep_deps(state::cell_key::<C>(node.state_cell()), || {
+                    let cell = state::cell_key::<C>(node.state_cell());
+                    hold::keep_deps(cell, || {
                         old.iter()
                             .map(|d| (*d, self.nodes.get(d.0).generation()))
                             .collect()
                     });
+                    hold::keep_read(cell, e.deps());
                     if let Some(displaced) = node.install_deps(new) {
                         bag.push_dep_list(displaced);
                     }
