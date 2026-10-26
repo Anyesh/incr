@@ -2800,20 +2800,33 @@ impl<C: Cells> Runtime<C> {
         payload: Payload,
     ) -> ! {
         let kind = cycle_state::take_unwind_kind();
-        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)));
+        self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
         cycle_state::set_unwind_kind(kind);
         bag.drain_carried(payload)
     }
 
     /// Lands group verify's claims `claimed`, taken from Dirty, back to
-    /// Dirty and in their group, as if never claimed: no member ran, so
-    /// another thread's read of one must make the decision a read before
-    /// the claims would have made.
-    fn release_group_claims<'a>(&self, claimed: impl IntoIterator<Item = &'a u32>) {
+    /// Dirty as if never claimed: no member ran, so another thread's read
+    /// of one must make the decision a read before the claims would have
+    /// made. They stay in their group unless `leave`, when they land out
+    /// of it, unverified (see `leave_group`).
+    fn release_group_claims<'a>(&self, claimed: impl IntoIterator<Item = &'a u32>, leave: bool) {
         let rt = self.runtime_id;
         for &c in claimed {
             cycle_state::with_held(|h| h.remove(&(rt, c)));
-            self.land_unrun(NodeId(c), self.nodes.get(c), NodeState::Dirty);
+            let (node, flags) = self.nodes.get_with_flags(c);
+            if leave {
+                self.land_single_as(
+                    NodeId(c),
+                    node,
+                    flags,
+                    NodeState::Dirty,
+                    NodeState::Dirty,
+                    true,
+                );
+            } else {
+                self.land_unrun(NodeId(c), node, NodeState::Dirty);
+            }
         }
     }
 
@@ -2866,13 +2879,24 @@ impl<C: Cells> Runtime<C> {
             // this thread's stack, whose claim the unbounded run fails.
             let virtual_member = value_code::thread_word() & value_code::REPLAY_BIT != 0
                 && self.virtual_position(m, generation).is_some();
-            let mut ok = !virtual_member && self.claim_member(x, m, &claimed, bag);
+            let took = !virtual_member && self.claim_member(x, m, &claimed, bag);
+            let mut ok = took;
             if ok && node.generation() != generation {
                 self.land_unrun(NodeId(m), node, NodeState::Dirty);
                 ok = false;
             }
             if !ok {
-                self.release_group_claims(&claimed);
+                // A member neither Dirty nor running, as this thread sees
+                // it, fails this record in every order for this revision,
+                // so its claims leave the group as single landings do; kept,
+                // every visit to a member would claim them all again, and
+                // two threads' passes wait on each other.
+                let seen =
+                    self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
+                self.release_group_claims(
+                    &claimed,
+                    !took && !virtual_member && seen != NodeState::Dirty && !is_computing(seen),
+                );
                 return GroupEnd::Ordinary;
             }
             cycle_state::with_held(|h| {
@@ -2940,7 +2964,7 @@ impl<C: Cells> Runtime<C> {
             // A tainted node never runs: release the group, and leave `x`
             // Dirty for the closure that still reads it, whose read the
             // taint memo makes compute `x` alone.
-            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)));
+            self.release_group_claims(claimed.iter().chain(std::iter::once(&x.0)), false);
             self.memoize(x, owner);
             return GroupEnd::Done(Computed::Done);
         }
