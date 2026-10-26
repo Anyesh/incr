@@ -337,8 +337,9 @@ pub(crate) fn note_walk(claim: Claim, generation: u32) {
         {
             let mut t = table();
             match t.get(&claim) {
-                // Another thread's reservation already holds every op this
-                // one would.
+                // Another thread's reservation stands for the node; at
+                // rest it holds fewer ops than this listing would, the known
+                // later-op gap.
                 Some(&(g, owner, _)) if g == generation && owner != token => return false,
                 Some(&(g, _, _)) if g == generation => {}
                 _ => {
