@@ -1473,6 +1473,18 @@ impl Context {
         }
     }
 
+    /// As [`Self::deliver_direct`], for a frame whose compute ran in the
+    /// retry that took an earlier walk or direct delivery for the read:
+    /// those are replaced, since the runs they kept no longer cover the
+    /// ended ones.
+    pub(crate) fn redeliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
+        let key = ReadKey::blocked(below);
+        drop(self.pending.remove_keyed(&key, |d| {
+            matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
+        }));
+        self.deliver_direct(below, runs);
+    }
+
     /// The run of the frame at `frame` along `path` is over, and a later
     /// run of its node there is another run: the claim watermark or failure
     /// count kept for the ended run's retry would pass the ended run's
