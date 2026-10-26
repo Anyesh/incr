@@ -1469,3 +1469,58 @@ fn a_doomed_run_on_past_its_placeholder_leaves_its_retry_the_unbounded_value() {
         );
     }
 }
+
+/// Reads Y, then joins a thread that reads X, when dropped by a panic.
+struct JoinOnPanic<'a> {
+    rt: &'a Rt,
+    x: Incr<u64>,
+    y: Incr<u64>,
+}
+
+impl Drop for JoinOnPanic<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let (rt, x) = (self.rt, self.x);
+            let _ = rt.get(self.y);
+            thread::scope(|s| s.spawn(|| rt.get(x)).join().unwrap());
+        }
+    }
+}
+
+/// T reads X, which dooms at budget 1, and panics on the placeholder; a
+/// local's drop then reads Y, which takes the placeholder, and joins a
+/// thread that reads X, which the doom reserved: the child takes X over
+/// from the panicking doom instead of waiting on the joining thread.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_panic_past_a_placeholder_keeps_the_doom_in_flight_for_its_drops() {
+    run_in_child(
+        "runtime::reserve_tests::a_panic_past_a_placeholder_keeps_the_doom_in_flight_for_its_drops",
+        || {
+            for frames in [u32::MAX, 1] {
+                let rt = Arc::new(Rt::new());
+                rt.set_placeholder(0_u64);
+                let i = rt.create_input(3_u64);
+                let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+                let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+                let t = rt.create_query_with(
+                    move |rt: &Rt| {
+                        let v = rt.get(x);
+                        let _guard = JoinOnPanic { rt, x, y };
+                        assert_ne!(v, 0, "placeholder");
+                        v + 14
+                    },
+                    replayable(),
+                );
+                rt.set_max_frames(frames);
+                assert_eq!(within_10s(&rt, t), Some(Ok(28)), "budget {frames}");
+                rt.assert_invariant_i();
+                assert!(
+                    !crate::reserve::any(),
+                    "budget {frames}: a reservation outlived the read"
+                );
+            }
+        },
+    )
+    .assert_clean();
+}

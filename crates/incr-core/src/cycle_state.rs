@@ -1080,17 +1080,21 @@ pub(crate) fn end_lazy(ctl: usize) -> bool {
 /// unwinds. The call's own unwinds and catches start from no kind, so they
 /// neither take the kept kind nor clobber it; an unwind that leaves the
 /// call goes to the destructor's code, which the kept kind no longer needs.
-pub(crate) struct KeptUnwind(u64);
+/// A lazy doom open under the panic is kept the same way: its flight is
+/// the panic's, and the call's own frames must not close it.
+pub(crate) struct KeptUnwind(u64, usize);
 
 impl KeptUnwind {
-    /// Only an unwind with a kind is kept: inside the call, reads start
-    /// from none, so they keep nothing and their own kinds reach the
-    /// catches inside the call.
+    /// Only an unwind with a kind or a lazy doom is kept: inside the call,
+    /// reads start from none, so they keep nothing and their own kinds
+    /// reach the catches inside the call.
     #[inline(always)]
     pub(crate) fn if_unwinding() -> Option<Self> {
         let bits = value_code::thread_word() & value_code::UNWIND_MASK;
-        if bits != 0 && std::thread::panicking() {
-            Some(Self::keep(bits))
+        if bits != 0 {
+            std::thread::panicking().then(|| Self::keep(bits))
+        } else if std::thread::panicking() && lazy_open() {
+            Some(Self::keep(0))
         } else {
             None
         }
@@ -1100,15 +1104,21 @@ impl KeptUnwind {
     #[inline(never)]
     fn keep(bits: u64) -> Self {
         value_code::set_unwind_bits(0);
-        ENTRY.with(|e| e.kept.set(e.kept.get() + 1));
-        Self(bits)
+        let lazy = ENTRY.with(|e| {
+            e.kept.set(e.kept.get() + 1);
+            e.lazy.replace(0)
+        });
+        Self(bits, lazy)
     }
 }
 
 impl Drop for KeptUnwind {
     fn drop(&mut self) {
         value_code::set_unwind_bits(self.0);
-        ENTRY.with(|e| e.kept.set(e.kept.get() - 1));
+        ENTRY.with(|e| {
+            e.kept.set(e.kept.get() - 1);
+            e.lazy.set(self.1);
+        });
     }
 }
 
