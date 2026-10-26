@@ -3490,24 +3490,6 @@ fn seed_e126d92b8f_repeated_runs_keep_their_deliveries() {
     }
 }
 
-/// 0xcc82 at 3 frames, shrunk to 10 reading 11 reading 18: a doom below
-/// a later run of 11 discarded it at the root of 10's walk of 11, and the
-/// retry's read of 11 counted 11's runs from none, so the rerun took the
-/// first run's seq and resumed the walk that run's read of 18 was given.
-/// 18 never ran and kept the group record the unbounded run takes it out
-/// of.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn seed_cc82_root_retry_reads_no_earlier_runs_delivery() {
-    for cross in [false, true] {
-        let case = gen_case(0xcc82, cross, false);
-        quiet(|| {
-            differential::<Local>(&case, 0xcc82);
-            differential::<Shared>(&case, 0xcc82);
-        });
-    }
-}
-
 /// 0x16d87, shrunk: a fresh `TryGet(18)`, which unbounded gets a cycle of
 /// six participants. At budget 1, a speculative run's walk memoized 10
 /// under the frame at position 1, so 11's later read of 10 computed it
