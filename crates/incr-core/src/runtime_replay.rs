@@ -4465,6 +4465,7 @@ impl<C: Cells> Runtime<C> {
                 false,
                 bag,
             );
+            self.note_unwound_landing(id, node);
             self.end_reservation(id, node);
         }
         if let Some(spec_buf) = spec_buf {

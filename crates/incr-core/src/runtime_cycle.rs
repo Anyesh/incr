@@ -2045,6 +2045,7 @@ impl<C: Cells> Runtime<C> {
             }
             // A cycle's retry may run a member again; a user panic ends its run.
             if !discarding && kind.is_none() {
+                self.note_unwound_landing(id, self.nodes.get(slot));
                 self.end_reservation(id, self.nodes.get(slot));
             }
             // A discarded claim's run is one the unbounded run never makes,

@@ -314,13 +314,13 @@ pub(crate) fn note_root(claim: Claim, generation: u32) {
     ROOTS.with(|n| n.set(n.get() + 1));
 }
 
-/// Reserves `claim`, which a run inside this thread's innermost read just
-/// landed New or Dirty in a budgeted runtime, until that read ends, at
-/// rest from now. A walk entry's contained unwind lands claims its walk
-/// runs again outside any doom's scope, and the context whose end follows
-/// the containment no longer holds them. Ops begun before wait, as the unbounded run's claim would
-/// make them; later ones, which the read's own retry may spawn and join,
-/// pass. The read's own node is [`note_root`]'s.
+/// Reserves `claim`, which a user panic's unwind inside this thread's
+/// innermost read just landed New or Dirty, until that read ends, at rest
+/// from now. A walk entry's contained unwind lands claims its walk runs
+/// again outside any doom's scope, and the context whose end follows the
+/// containment no longer holds them. Ops begun before wait, as the
+/// unbounded run's claim would make them; later ones, which the read's own
+/// retry may spawn and join, pass. The read's own node is [`note_root`]'s.
 #[cold]
 #[inline(never)]
 pub(crate) fn note_walk(claim: Claim, generation: u32) {
