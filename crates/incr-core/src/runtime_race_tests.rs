@@ -2182,6 +2182,58 @@ fn a_walk_that_waited_out_a_released_group_claim_keeps_its_plan() {
     rt.assert_invariant_i();
 }
 
+/// Thread A's walk expands `p` as the group {p, x} and parks before its
+/// compute; another thread lands both members out of the group, Dirty.
+/// A's claim of `p` then plans it again as a read after those landings
+/// would: `x` runs as a walk entry before `p` is claimed, not nested in
+/// `p`'s verify, which is where a panicking member's failure is contained.
+#[test]
+fn a_walk_whose_expanded_group_dissolved_plans_its_entry_again() {
+    let rt = Arc::new(Rt::new());
+    let k = rt.create_input(0_i64);
+    let x = rt.create_query(move |rt| rt.get(k) * 10);
+    let p = rt.create_query(move |rt| rt.get(x) + rt.get(k));
+    assert_eq!(rt.get(p), 0);
+    rt.force_group_for_test(&[p.erase(), x.erase()]);
+    rt.set(k, 1);
+    let planned = Gate::new();
+    planned.arm();
+    let p_at_x: Arc<Mutex<Vec<NodeState>>> = Arc::default();
+    let installed = rt.park_hook.set(Box::new({
+        let (rt, planned, p_at_x) = (Arc::downgrade(&rt), planned.clone(), p_at_x.clone());
+        move |point| {
+            if thread::current().name() != Some("A") {
+                return;
+            }
+            if point == ParkPoint::BeforeComputeOne(id(p)) {
+                planned.park();
+            } else if point == ParkPoint::BeforeComputeOne(id(x)) {
+                if let Some(rt) = rt.upgrade() {
+                    p_at_x.lock().unwrap().push(rt.state_of(p));
+                }
+            }
+        }
+    }));
+    assert!(installed.is_ok());
+    let a = {
+        let rt = Arc::clone(&rt);
+        thread::Builder::new()
+            .name("A".into())
+            .spawn(move || rt.get(p))
+            .unwrap()
+    };
+    planned.wait_parked();
+    for m in [p.erase(), x.erase()] {
+        let (node, flags) = rt.nodes.get_with_flags(m.slot());
+        rt.leave_group(NodeId(m.slot()), node, flags, NodeState::Dirty);
+    }
+    planned.release();
+    assert_eq!(a.join().unwrap(), 11);
+    assert_eq!(*p_at_x.lock().unwrap(), [NodeState::Dirty]);
+    assert_eq!(rt.get(p), 11);
+    rt.assert_invariant_i();
+}
+
 /// Thread A's walk plans `a` New and parks at `at`; another read lands
 /// `a` Dirty meanwhile. A's claim from Dirty plans `a` again, so it gets
 /// 3, as a serial second read does.
