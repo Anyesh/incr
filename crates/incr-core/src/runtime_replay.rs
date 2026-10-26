@@ -7,6 +7,7 @@ use std::any::Any;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
+use crate::changes::Count;
 use crate::cycle_state::{Held, Look};
 use crate::deferred::Unbuilt;
 use crate::dep_stack::Placement;
@@ -315,9 +316,13 @@ impl<C: Cells> Runtime<C> {
 
     /// A speculative entry's run stashes only Clean values: a node it would
     /// land Dirty, poisoned, over a dep that is neither Clean nor stashed, or
-    /// over a read of a value a later landing changed (`KEPT_READ`), has a
+    /// over a kept read its adoption can't check (`KEPT_UNCHECKED`), has a
     /// history the unbounded run may never give it, and a later walk
-    /// of its deps would differ from a first run of its closure. Nor does it
+    /// of its deps would differ from a first run of its closure. A Clean
+    /// read of another runtime is checked: the stash keeps that runtime's
+    /// count of changes as the read found it, and is adopted only while the
+    /// count holds. A run that read a placeholder (`PH_SEEN`) is never
+    /// stashed, since only a doomed frame reads one. Nor does it
     /// stash a node whose marked frame still owes its retry an outcome: the
     /// unbounded run's frame lands the node first, and its readers read
     /// that landing. Such a pop drops the chain. A doomed frame's pop lands
@@ -334,7 +339,7 @@ impl<C: Cells> Runtime<C> {
         word & value_code::REPLAY_BIT != 0
             && replay::speculative()
             && !ctl.has(cycle::DOOMED)
-            && (ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_READ) != 0
+            && (ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_UNCHECKED) != 0
                 || deps.iter().any(|&(d, generation)| {
                     !matches!(
                         state::load::<C>(self.nodes.get(d.0).state_cell()),
@@ -388,6 +393,23 @@ impl<C: Cells> Runtime<C> {
                 }
             };
         let index = self.stashed_index(id, ctl);
+        if cfg!(any(test, debug_assertions)) {
+            assert!(
+                !ctl.has(cycle::PH_SEEN),
+                "incr-core: a placeholder read dooms its frame"
+            );
+        }
+        let foreign = if ctl.has(cycle::KEPT_READ) {
+            let counts = replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl);
+            ForeignReads {
+                context: (!counts.is_empty())
+                    .then(replay::outermost_context)
+                    .flatten(),
+                counts,
+            }
+        } else {
+            ForeignReads::default()
+        };
         let kept = self.stash(
             id.0,
             generation,
@@ -397,6 +419,7 @@ impl<C: Cells> Runtime<C> {
                     unchanged,
                 },
                 deps,
+                foreign,
                 verify_rev: attempt.verify_rev,
                 index,
             },
@@ -440,6 +463,7 @@ impl<C: Cells> Runtime<C> {
                 Stash {
                     outcome: Outcome::Verified { since },
                     deps: self.current_deps(node),
+                    foreign: ForeignReads::default(),
                     verify_rev,
                     index: None,
                 },
@@ -563,7 +587,7 @@ impl<C: Cells> Runtime<C> {
             failed |= !matches!(
                 a.stash.outcome,
                 Outcome::Value { .. } | Outcome::Verified { .. }
-            );
+            ) || !a.stash.foreign.adoptable();
             if failed {
                 bag.push_erased(Box::new(a.stash.outcome));
                 if root {
@@ -886,6 +910,7 @@ impl<C: Cells> Runtime<C> {
             Stash {
                 outcome: Outcome::Panic(Unbuilt::new(payload)),
                 deps: deps.to_vec(),
+                foreign: ForeignReads::default(),
                 verify_rev: attempt.verify_rev,
                 index,
             },
@@ -933,6 +958,7 @@ impl<C: Cells> Runtime<C> {
             Stash {
                 outcome: Outcome::Tried,
                 deps: Vec::new(),
+                foreign: ForeignReads::default(),
                 verify_rev: 0,
                 index: None,
             },
@@ -1040,6 +1066,7 @@ impl<C: Cells> Runtime<C> {
             let tried = Stash {
                 outcome: Outcome::Tried,
                 deps: Vec::new(),
+                foreign: ForeignReads::default(),
                 verify_rev: 0,
                 index: None,
             };
@@ -2695,6 +2722,7 @@ impl<C: Cells> Runtime<C> {
         let taken = key
             .as_ref()
             .and_then(|key| replay::take_pending(reader, key, clone_landed::<T>));
+        let mut seen = None;
         let outcome = match taken {
             Some(Delivered::Landed(value, _)) => Ok(Ok(*value
                 .into_inner()
@@ -2724,6 +2752,12 @@ impl<C: Cells> Runtime<C> {
                 unreachable!("incr-core: a walk's direction is not a value")
             }
             None => catch_unwind(AssertUnwindSafe(|| {
+                if observed == NodeState::Clean && flags.has(cycle::SPECULATIVE) {
+                    if let Some((value, s)) = self.checked_clean_read(handle) {
+                        seen = Some(s);
+                        return Ok(value);
+                    }
+                }
                 self.read_unframed(handle, observed, kind, word)
             })),
         };
@@ -2757,6 +2791,10 @@ impl<C: Cells> Runtime<C> {
         };
         if let Some(what) = what {
             flags.raise(cycle::KEPT_READ);
+            match seen {
+                Some(seen) => replay::check_read(reader, cidx, ctl, seen, !kept),
+                None => flags.raise(cycle::KEPT_UNCHECKED),
+            }
             replay::keep_read(
                 replay::KeptRead {
                     rt: reader,
@@ -2816,9 +2854,60 @@ impl<C: Cells> Runtime<C> {
             what: Delivered::Landed(Unbuilt::new(clone_landed::<T>(&value)), cycle::POISONED),
         };
         let kept = flags.has(cycle::KEPT_READ);
-        flags.raise(cycle::KEPT_READ);
+        flags.raise(cycle::KEPT_READ | cycle::KEPT_UNCHECKED);
         replay::keep_foreign_read(read, !kept);
         Ok(value)
+    }
+
+    /// A Clean read of `handle` by another runtime's speculative frame, with
+    /// this runtime's changes as found before it, which that frame's stash
+    /// adoption checks. `None` while this runtime changes or once the node
+    /// is not Clean.
+    fn checked_clean_read<T: Value>(&self, handle: Incr<T>) -> Option<(T, Count)> {
+        if !self.checked_reads_ready() {
+            return None;
+        }
+        let seen = self.changes.count()?;
+        let node = self.nodes.get(handle.slot());
+        if state::load::<C>(node.state_cell()) != NodeState::Clean {
+            return None;
+        }
+        let (type_tag, arena_slot) = self.fields_under(handle, node);
+        let value = self.try_read_slot(handle, node, type_tag, arena_slot)?;
+        Some((value, seen))
+    }
+
+    /// Whether sets and deletes of this runtime all count themselves in
+    /// `changes`. The first call turns that on under `inner.write()`, so
+    /// every set or delete claimed after it counts; a set claimed before it
+    /// may still be writing or walking, so until none is, this is false.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn checked_reads_ready(&self) -> bool {
+        const TURNED_ON: u8 = 1;
+        const READY: u8 = 2;
+        match C::u8_load_acquire(&self.read_speculatively) {
+            READY => return true,
+            TURNED_ON => {}
+            _ => {
+                let _hold = self.inner.write();
+                if C::u8_load_relaxed(&self.read_speculatively) == 0 {
+                    // Release, so a reader that finds it after the hold
+                    // sees every set claimed before the flip as claimed.
+                    C::u8_store_release(&self.read_speculatively, TURNED_ON);
+                }
+            }
+        }
+        // A delete claimed before is no concern: its nodes are already not
+        // Clean. A set claimed before holds its claim until it bumps the
+        // revision, and has walked once the watermark reaches it.
+        let settled = C::SINGLE_THREADED
+            || (0..self.nodes.len()).all(|s| !self.nodes.get(s).set_claimed())
+                && C::walked(&self.walk, &self.revision) >= self.current_revision();
+        if settled {
+            C::u8_store_release(&self.read_speculatively, READY);
+        }
+        settled
     }
 
     /// The key of the read of this runtime's node `reading` that `frame`,
@@ -2899,7 +2988,7 @@ impl<C: Cells> Runtime<C> {
         // SAFETY: the frame is on the stack, so its control block is live.
         let flags = unsafe { &*ctl };
         let fresh = !flags.has(cycle::KEPT_READ);
-        flags.raise(cycle::KEPT_READ);
+        flags.raise(cycle::KEPT_READ | cycle::KEPT_UNCHECKED);
         replay::keep_read(
             replay::KeptRead {
                 rt: self.runtime_id,
@@ -5437,9 +5526,34 @@ struct Adopting {
 pub(super) struct Stash {
     outcome: Outcome,
     deps: Vec<(NodeId, u32)>,
+    foreign: ForeignReads,
     verify_rev: u64,
     /// A creator's child index as its run left it, unlanded.
     index: Option<StashedIndex>,
+}
+
+/// A stashed run's Clean reads of other runtimes, with those runtimes'
+/// changes as the reads found them and the thread's outermost context, of
+/// any runtime, when the run ended.
+#[derive(Default)]
+struct ForeignReads {
+    counts: Vec<Count>,
+    context: Option<replay::ContextName>,
+}
+
+impl ForeignReads {
+    /// While a context open at the run's end is still open, a speculative
+    /// run's change since the reads is taken as one the unbounded run makes
+    /// after them, as main assumes of every stash: true of this thread's
+    /// later speculative runs, not of another thread's. Any other change, or
+    /// any change once all those contexts have ended, may come before the
+    /// unbounded run's read, so the counts must hold.
+    fn adoptable(&self) -> bool {
+        self.counts.is_empty()
+            || self.context.is_some_and(replay::context_open)
+                && self.counts.iter().all(Count::only_speculative_since)
+            || self.counts.iter().all(Count::holds)
+    }
 }
 
 /// The child index of a creator whose run is stashed: the index's run

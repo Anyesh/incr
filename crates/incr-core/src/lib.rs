@@ -21,6 +21,7 @@ pub mod arena;
 mod arena_registry;
 mod bits;
 pub mod cells;
+mod changes;
 mod children;
 pub mod collection;
 pub mod cycle;

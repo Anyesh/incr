@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
 use std::rc::Rc;
 
+use crate::changes::Count;
 use crate::cycle_state::{held_episode, Episode, UnwindKind};
 use crate::deferred::Unbuilt;
 use crate::few::Few;
@@ -1435,6 +1436,7 @@ type CopiedSet = HashSet<(RuntimeId, (u32, u32)), FxBuildHasher>;
 #[cfg(not(loom))]
 thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = const { RefCell::new(Vec::new()) };
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = const { RefCell::new(Vec::new()) };
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = const { Cell::new(0) };
     static REGEN: RefCell<Regenerating> = const { RefCell::new(Regenerating::new()) };
@@ -1442,6 +1444,7 @@ thread_local! {
     static COPIED_GEN: Cell<u64> = const { Cell::new(0) };
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static THREAD_TAG: Cell<u64> = const { Cell::new(0) };
     static SPECULATIVE: Cell<u32> = const { Cell::new(0) };
     static CARRY: Cell<Option<Carry>> = const { Cell::new(None) };
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = const { RefCell::new(Vec::new()) };
@@ -1456,6 +1459,7 @@ thread_local! {
 #[cfg(loom)]
 loom::thread_local! {
     static KEPT_READS: RefCell<Vec<(KeptRead, usize)>> = RefCell::new(Vec::new());
+    static CHECKED_READS: RefCell<Vec<CheckedRead>> = RefCell::new(Vec::new());
     static KEPT_EVENTS: RefCell<Events> = RefCell::new(Events::default());
     static KEPT_TOP: Cell<u32> = Cell::new(0);
     static REGEN: RefCell<Regenerating> = RefCell::new(Regenerating::new());
@@ -1463,6 +1467,7 @@ loom::thread_local! {
     static COPIED_GEN: Cell<u64> = Cell::new(0);
     static CONTEXTS: RefCell<Vec<Context>> = RefCell::new(Vec::new());
     static NEXT_ID: Cell<u64> = Cell::new(1);
+    static THREAD_TAG: Cell<u64> = Cell::new(0);
     static SPECULATIVE: Cell<u32> = Cell::new(0);
     static CARRY: Cell<Option<Carry>> = Cell::new(None);
     static MEMBER_RUNS: RefCell<Vec<(u32, (u64, u32))>> = RefCell::new(Vec::new());
@@ -1569,6 +1574,84 @@ pub(crate) fn keep_read(read: KeptRead, fresh: bool) {
 /// raises gives it.
 pub(crate) fn keep_foreign_read(read: KeptRead, fresh: bool) {
     keep(read, fresh, true);
+}
+
+/// A speculative frame's Clean read of another runtime, with that
+/// runtime's count of changes as the read found it, which the frame's
+/// stash is adopted only while it still holds.
+struct CheckedRead {
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+}
+
+/// Keeps `seen` for the speculative frame of `ctl` at `cidx` of `rt`, as
+/// [`keep_read`] keeps the read: the checked reads of frames at or above its
+/// position, which have popped, go, and so do the frame's own ones on its
+/// first kept read (`fresh`), which an earlier frame there left.
+pub(crate) fn check_read(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+    seen: Count,
+    fresh: bool,
+) {
+    CHECKED_READS.with(|d| {
+        let mut d = d.borrow_mut();
+        d.retain(|e| e.rt != rt || e.cidx < cidx || !fresh && e.cidx == cidx && e.ctl == ctl);
+        let ours = |e: &&CheckedRead| e.rt == rt && e.cidx == cidx && e.ctl == ctl;
+        if !d.iter().rev().take_while(ours).any(|e| e.seen.same(&seen)) {
+            d.push(CheckedRead {
+                rt,
+                cidx,
+                ctl,
+                seen,
+            });
+        }
+    });
+}
+
+/// A context named so that no context of another thread, now or later, has
+/// the same name: context ids count per thread.
+pub(crate) type ContextName = (u64, u64);
+
+fn thread_tag() -> u64 {
+    static NEXT_THREAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    THREAD_TAG.with(|t| {
+        if t.get() == 0 {
+            t.set(NEXT_THREAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        t.get()
+    })
+}
+
+/// This thread's outermost context, of any runtime: contexts nest, so some
+/// context open now is still open later exactly when this one is.
+pub(crate) fn outermost_context() -> Option<ContextName> {
+    let thread = thread_tag();
+    peek(|c| c.first().map(|x| (thread, x.id)))
+}
+
+/// Whether context `name` is open on this thread, at any depth.
+pub(crate) fn context_open(name: ContextName) -> bool {
+    name.0 == thread_tag() && peek(|c| c.iter().any(|x| x.id == name.1))
+}
+
+/// The checked reads of the frame of `ctl` at `cidx` of `rt`, which is
+/// popping, taken with those of frames above it.
+pub(crate) fn take_checked_reads(
+    rt: RuntimeId,
+    cidx: u32,
+    ctl: *const crate::cycle::ComputeCtl,
+) -> Vec<Count> {
+    CHECKED_READS.with(|d| {
+        d.borrow_mut()
+            .extract_if(.., |e| e.rt == rt && e.cidx >= cidx)
+            .filter(|e| e.cidx == cidx && e.ctl == ctl)
+            .map(|e| e.seen)
+            .collect()
+    })
 }
 
 fn keep(mut read: KeptRead, fresh: bool, number: bool) {
@@ -1864,6 +1947,9 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
                 }
             });
             COPIED_GEN.with(|g| g.set(0));
+            if !speculative() {
+                CHECKED_READS.with(|c| c.borrow_mut().clear());
+            }
         }
         out
     })

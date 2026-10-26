@@ -409,6 +409,10 @@ pub(crate) const HANDLED: u16 = 2048;
 /// again, as a Dirty node's slot, a stash, a cycle, or another runtime's
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
+/// `ComputeCtl::flags`: the frame kept a read (`KEPT_READ`) whose stash
+/// adoption can't check: of its own runtime, or of another runtime's node
+/// that was not Clean or was read while that runtime was changing.
+pub(crate) const KEPT_UNCHECKED: u16 = 8192;
 
 const _: () = assert!(crate::bits::disjoint(&[
     RECOMPUTE as u64,
@@ -424,6 +428,7 @@ const _: () = assert!(crate::bits::disjoint(&[
     SPECULATIVE as u64,
     HANDLED as u64,
     UNREGENERABLE as u64,
+    KEPT_UNCHECKED as u64,
 ]));
 
 /// What one compute frame tells its wrapper and its landing. It lives on

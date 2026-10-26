@@ -16,9 +16,11 @@ use std::cell::Cell;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
+use loom::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
 use loom::thread;
 
+use crate::changes::{Changes, Count};
 use crate::generic_arena::GenericArena;
 use crate::handle::Incr;
 use crate::loom_cells::Loom;
@@ -1811,5 +1813,90 @@ fn flip_racing_a_contained_hold_releases_the_ticket() {
             "F is Clean but its contained payload is still held"
         );
         rt.assert_invariant_i();
+    });
+}
+/// A Clean check and a read made against a runtime's `Changes` while a
+/// change stores a value and then dirties it, as a set's swap and walk do.
+/// A count found before the change moves once the reader has seen any part
+/// of it, and one found after it ended comes with all of it, so a stash
+/// adopted while its count holds read what a read at the adoption would.
+#[test]
+fn loom_checked_read_vs_change() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let value = Arc::new(AtomicU64::new(0));
+        let dirty = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (changes, value, dirty) = (changes.clone(), value.clone(), dirty.clone());
+            thread::spawn(move || {
+                let _change = changes.change(false);
+                value.store(1, Ordering::Release);
+                dirty.store(1, Ordering::Release);
+            })
+        };
+        if let Some(seen) = changes.count() {
+            let clean = dirty.load(Ordering::Acquire) == 0;
+            let read = value.load(Ordering::Acquire);
+            let later = (dirty.load(Ordering::Acquire), value.load(Ordering::Acquire));
+            if seen.before_any() {
+                if !clean || read == 1 || later != (0, 0) {
+                    assert!(!seen.holds());
+                }
+            } else {
+                assert!(!clean && read == 1);
+            }
+        }
+        writer.join().unwrap();
+    });
+}
+
+/// A speculative and a non-speculative change race a checked read: once the
+/// reader has seen any part of the non-speculative one, or it has ended, a
+/// count found before both no longer passes as moved by speculative runs
+/// only.
+#[test]
+fn loom_speculative_changes_vs_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let real = Arc::new(AtomicU64::new(0));
+        let writers = [true, false].map(|speculative| {
+            let (changes, real) = (changes.clone(), real.clone());
+            thread::spawn(move || {
+                let _change = changes.change(speculative);
+                if !speculative {
+                    real.store(1, Ordering::Release);
+                }
+            })
+        });
+        let seen = changes.count();
+        if let Some(seen) = &seen {
+            if seen.before_any() && real.load(Ordering::Acquire) == 1 {
+                assert!(!seen.only_speculative_since());
+            }
+        }
+        for w in writers {
+            w.join().unwrap();
+        }
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(!seen.only_speculative_since());
+        }
+    });
+}
+
+/// [`loom_speculative_changes_vs_check`]'s other side: with only a
+/// speculative change, a count found before it passes once it has ended.
+#[test]
+fn loom_speculative_change_passes_check() {
+    loom::model(|| {
+        let changes = Arc::new(Changes::new());
+        let writer = {
+            let changes = changes.clone();
+            thread::spawn(move || drop(changes.change(true)))
+        };
+        let seen = changes.count();
+        writer.join().unwrap();
+        if let Some(seen) = seen.filter(Count::before_any) {
+            assert!(seen.only_speculative_since());
+        }
     });
 }
