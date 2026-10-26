@@ -62,6 +62,8 @@ impl Gate {
             return;
         }
         self.0.reached_tx.lock().unwrap().send(()).unwrap();
+        // A gate stands for a step the test holds, not a stuck holder.
+        let _parked = crate::attempt::Parked::new();
         if self
             .0
             .release_rx
