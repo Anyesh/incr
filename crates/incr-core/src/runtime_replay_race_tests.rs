@@ -1964,8 +1964,25 @@ fn read_over_a_delivery(
     u.rt.set_max_frames(u32::MAX);
     let want_first = outcome(|| u.rt.get(u.top));
     let want_other = outcome(|| u.rt.get(if other_reads_w { u.top } else { u.x }));
-    assert_eq!((&first, &other), (&want_first, &want_other));
+    assert_eq!(first, want_first);
+    assert_eq!(
+        kind(&other),
+        kind(&want_other),
+        "{other:?} against {want_other:?}"
+    );
+    assert_eq!(
+        (rt.state_of(s.x), rt.state_of(s.y)),
+        (u.rt.state_of(u.x), u.rt.state_of(u.y))
+    );
     (first, other)
+}
+
+/// A read's outcome as two racing Shared threads' reads are compared:
+/// which reader of a panicked node gets the payload and which gets "last
+/// compute panicked" is not part of the result (the wiki decision "Shared
+/// panic payload contract"), so a panic is one kind whatever its text.
+fn kind(r: &Result<u64, String>) -> Result<u64, ()> {
+    r.as_ref().map(|v| *v).map_err(|_| ())
 }
 
 fn failed(r: &Result<u64, String>) -> bool {
@@ -3208,7 +3225,16 @@ fn shared_reader_waits_out_a_held_delivery_at_an_equal_path() {
         outcome(|| u.rt.get(u.w)),
     );
     assert_eq!(want.0, Err("y boom".to_string()));
-    assert_eq!((first, landed, other), want);
+    assert_eq!(first, want.0);
+    assert_eq!(
+        (kind(&landed), kind(&other)),
+        (kind(&want.1), kind(&want.2)),
+        "{landed:?}, {other:?} against {want:?}"
+    );
+    assert_eq!(
+        (rt.state_of(x), rt.state_of(y), rt.state_of(w)),
+        (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.w))
+    );
 }
 
 /// The two-deliveries shape of `runtime_replay_unwind_tests`: A
@@ -4187,5 +4213,10 @@ fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
     u.switch.store(true, SeqCst);
     let want = (outcome(|| u.rt.get(u.w)), u.joined.lock().unwrap().clone());
     assert_eq!(want.1, Some(Err("y boom".to_string())));
-    assert_eq!(got, want);
+    assert_eq!(
+        (kind(&got.0), got.1.as_ref().map(kind)),
+        (kind(&want.0), want.1.as_ref().map(kind)),
+        "{got:?} against {want:?}"
+    );
+    assert_eq!(s.rt.state_of(s.y), u.rt.state_of(u.y));
 }
