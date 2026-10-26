@@ -157,8 +157,8 @@ pub(crate) enum ParkPoint {
     BeforeReservationCheck(NodeId),
     /// In `clean_walk`, before a visit of a non-root entry loads its state.
     BeforeVisit(NodeId),
-    /// In `clean_walk`, after a visit loaded the node's state and before
-    /// it reads the node's deps to expand them.
+    /// In `clean_walk`, after a visit loaded the node's state and decided
+    /// to expand it, just before it reads the node's deps.
     WalkBeforeDeps(NodeId),
     /// In `clean_walk`, after a visit read the node's deps and before it
     /// checks whether another thread's held run wrote them.
@@ -3854,7 +3854,6 @@ impl<C: Cells> Runtime<C> {
                     });
                 }
                 _ => {
-                    self.park(ParkPoint::WalkBeforeDeps(cur));
                     // New nodes can carry installed edges on each other
                     // after a cycle breaks, so each is expanded at most
                     // once per walk. A never-run node has no deps and
@@ -3877,6 +3876,7 @@ impl<C: Cells> Runtime<C> {
                     } else {
                         node.held_epoch()
                     };
+                    self.park(ParkPoint::WalkBeforeDeps(cur));
                     walk.visit(cur, generation, observed == NodeState::New);
                     let kept = kept.map_or(usize::MAX, |k| k as usize);
                     if let Some(deps) = node.inline_deps() {
