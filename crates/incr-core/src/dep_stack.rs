@@ -275,6 +275,14 @@ pub trait DepStack: 'static {
     #[doc(hidden)]
     fn with<R>(&self, f: impl FnOnce(&mut Frames) -> R) -> R;
 
+    /// The top frame's runtime tag, node and control block, for
+    /// [`Self::unrecorded_lookup`].
+    #[doc(hidden)]
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        self.with(|s| top_fields(s))
+    }
+
     /// Push a frame for `node` of runtime `rt` at the top of the stack,
     /// with the frame's depth as its conceptual-stack position, which is
     /// returned.
@@ -399,22 +407,27 @@ pub trait DepStack: 'static {
     /// after raising `UNREGENERABLE` on a compute frame that keeps other
     /// runtimes' Clean reads, since a rerun of its node would look again
     /// as things are then.
+    ///
+    /// Inlined so that a lookup outside any compute costs one look at the
+    /// stack; the marking stays out of line.
+    #[inline(always)]
     fn unrecorded_lookup(&self) -> Option<RuntimeId> {
-        let (tagged, node, ctl) = self.with(|s| {
-            s.frames
-                .last()
-                .map(|top| (top.tagged_rt, top.node, top.ctl))
-        })?;
+        let (tagged, node, ctl) = self.top_for_lookup()?;
         let top = tagged.rt();
         if top != RuntimeId::SENTINEL {
             // SAFETY: the frame is on the stack, so its control block is
             // live (see `Frame::ctl`).
-            let ctl = unsafe { &*ctl };
-            if self.top_keeps_foreign(tagged, node, ctl) {
-                ctl.raise(UNREGENERABLE);
-            }
+            self.mark_unrecorded_lookup(tagged, node, unsafe { &*ctl });
         }
         Some(top)
+    }
+
+    /// [`Self::unrecorded_lookup`]'s marking of the top compute frame.
+    #[inline(never)]
+    fn mark_unrecorded_lookup(&self, tagged: FrameRt, node: NodeId, ctl: &ComputeCtl) {
+        if self.top_keeps_foreign(tagged, node, ctl) {
+            ctl.raise(UNREGENERABLE);
+        }
     }
 
     /// Sends the top frame's Clean reads to the slow path (see
@@ -734,10 +747,36 @@ impl DepStack for LocalDepStack {
         // not outlive this call.
         f(&mut unsafe { &*self.frames }.borrow_mut())
     }
+
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        // SAFETY: as in `with`.
+        top_unguarded(unsafe { &*self.frames })
+    }
+}
+
+#[inline(always)]
+fn top_fields(s: &Frames) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+    s.frames
+        .last()
+        .map(|top| (top.tagged_rt, top.node, top.ctl))
+}
+
+/// [`top_fields`] without writing the borrow flag, which a lookup outside
+/// any compute would otherwise pay for on every call.
+#[inline(always)]
+fn top_unguarded(frames: &RefCell<Frames>) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+    // SAFETY: the shared reference lives only for the copy in
+    // `top_fields`, which takes no borrow of the frames.
+    top_fields(
+        unsafe { frames.try_borrow_unguarded() }
+            .expect("incr-core: dep stack borrowed during a lookup"),
+    )
 }
 
 /// [`DepStack::unrecorded_lookup`] on this thread's stack, for a lookup
 /// with no runtime at hand, such as a collection's snapshot.
+#[inline(always)]
 pub(crate) fn unrecorded_lookup<C: Cells>() {
     <C::DepStack as DepStack>::new().unrecorded_lookup();
 }
@@ -803,6 +842,13 @@ impl DepStack for SharedDepStack {
         // exits, never during a call on that thread, and the reference
         // does not outlive this call.
         f(&mut unsafe { &*frames }.borrow_mut())
+    }
+
+    #[inline(always)]
+    fn top_for_lookup(&self) -> Option<(FrameRt, NodeId, *const ComputeCtl)> {
+        let frames: *const RefCell<Frames> = SHARED_FRAMES.with(|f| std::ptr::from_ref(&**f));
+        // SAFETY: as in `with`.
+        top_unguarded(unsafe { &*frames })
     }
 }
 
