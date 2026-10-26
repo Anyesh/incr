@@ -1647,14 +1647,27 @@ impl Context {
 
     /// As [`Self::deliver_direct`], for a frame whose compute ran in the
     /// retry that took an earlier walk or direct delivery for the read:
-    /// those are replaced, since the runs they kept no longer cover the
-    /// ended ones.
+    /// the walk goes and the direct one is read again with `runs`, since
+    /// the runs it kept no longer cover the ended ones. A direct one from
+    /// the same maker is updated in place: removing it walks the maker's
+    /// index, as long as the budget, once per doom.
     pub(crate) fn redeliver_direct(&mut self, below: &VFrame, runs: RunSlot) {
         let key = ReadKey::blocked(below);
-        drop(self.pending.remove_keyed(&key, |d| {
-            matches!(d.what, Delivered::Walk(..) | Delivered::Direct)
-        }));
-        self.deliver_direct(below, runs);
+        self.pending.remove_walks(&key);
+        match self
+            .pending
+            .find_keyed(&key, |d| matches!(d.what, Delivered::Direct))
+        {
+            Some(i) if self.pending.get(i).maker == below.maker => {
+                self.pending.get_mut(i).runs = runs;
+                self.pending.set_taken(i, false);
+            }
+            Some(i) => {
+                drop(self.pending.remove(i));
+                self.deliver_direct(below, runs);
+            }
+            None => self.deliver_direct(below, runs),
+        }
     }
 
     /// The run of the frame at `frame` along `path` is over, and a later
