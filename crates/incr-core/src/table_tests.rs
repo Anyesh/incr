@@ -458,6 +458,13 @@ where
     let nodes = rt.node_count();
     assert_eq!(rt.get(q), 0);
     let seen = seen.lock().unwrap();
+    if !C::SINGLE_THREADED {
+        // A Shared doomed frame unwinds at the gate's placeholder read, so
+        // no code past it runs and no pending handle is made.
+        assert!(seen.hit.is_none() && seen.log.is_empty());
+        assert_eq!(rt.node_count(), nodes);
+        return;
+    }
     assert_eq!(seen.hit, Some(present), "a hit returns the real handle");
     assert_eq!(
         seen.second, seen.pending,
@@ -503,6 +510,12 @@ where
         replayable(),
     );
     rt.get(q);
+    if !C::SINGLE_THREADED {
+        // A Shared doomed frame unwinds at the gate's placeholder read, so
+        // no pending handle is minted to escape.
+        assert!(escaped.lock().unwrap().is_none());
+        return;
+    }
     let p = escaped.lock().unwrap().expect("minted in the frame");
     const OUTSIDE: &str = "pending handle used outside the replay attempt";
     panics_with(OUTSIDE, || {
@@ -580,15 +593,21 @@ where
         replayable(),
     );
     assert_eq!(rt.get(q), 0);
-    let message = seen
-        .lock()
-        .unwrap()
-        .take()
-        .expect("the doomed miss panicked");
-    assert!(
-        message.contains("needs a placeholder for alloc::string::String"),
-        "{message}"
-    );
+    if C::SINGLE_THREADED {
+        let message = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the doomed miss panicked");
+        assert!(
+            message.contains("needs a placeholder for alloc::string::String"),
+            "{message}"
+        );
+    } else {
+        // A Shared doomed frame unwinds at the gate's placeholder read, so
+        // the doomed miss is never made.
+        assert!(seen.lock().unwrap().is_none());
+    }
     panics_with("placeholder already set", || {
         rt.set_placeholder::<u8>(1);
         rt.set_placeholder::<u8>(2);

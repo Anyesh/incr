@@ -146,6 +146,13 @@ jobs:
           - { model: "loom_models::virtual_hit_claim_race", bound: 2 }
           - { model: "loom_models::doom_reservations_cross_direct", bound: 2 }
           - { model: "loom_models::doom_reservations_cross_held", bound: 2 }
+          - { model: "loom_models::doom_caught_joins_reader", bound: 2 }
+          - { model: "loom_models::doom_in_flight_race", bound: 2 }
+          - { model: "loom_models::doom_lazy_joins_reader", bound: 2 }
+          - { model: "loom_models::doom_lazy_reads_again", bound: 2 }
+          - { model: "loom_models::give_back_wait_ends_on_a_give_back", bound: 2 }
+          - { model: "loom_models::give_back_wait_ends_on_a_landing", bound: 2 }
+          - { model: "loom_models::give_back_wait_ends_when_a_take_over_keeps_the_claim", bound: 2 }
           - { model: "loom_models::discard_under_set", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance", bound: 2 }
           - { model: "loom_models::vframe_failed_provenance_relanded", bound: 2 }

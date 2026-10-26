@@ -1856,6 +1856,58 @@ fn give_back_wait_ends_on_a_landing() {
     give_back_wait(true);
 }
 
+/// [`give_back_wait`] where the other thread takes over: this thread's
+/// reservation of X is held by an attempt whose discard is in flight, and
+/// the other thread wounds that attempt, claims X and keeps the claim until
+/// this thread's wait has returned. The wait must end once the wound takes
+/// the reservation away, not wait out a claim that outlives it.
+#[test]
+fn give_back_wait_ends_when_a_take_over_keeps_the_claim() {
+    use loom::sync::atomic::{AtomicBool, Ordering};
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let i = rt.create_input(1_u64);
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        assert_eq!(rt.get(x), 2);
+        rt.set(i, 2);
+        let (slot, generation) = (x.slot(), x.generation());
+        crate::attempt::begin();
+        {
+            let _scope = crate::reserve::Scope::new(Some(1));
+            crate::reserve::note((rt.runtime_id, slot), generation);
+        }
+        crate::attempt::enter_flight();
+        let attempt = crate::attempt::mine();
+        let returned = Arc::new(AtomicBool::new(false));
+        let taker = {
+            let rt = Arc::clone(&rt);
+            let returned = Arc::clone(&returned);
+            thread::spawn(move || {
+                if !attempt.wound_in_flight((rt.runtime_id, slot)) {
+                    return false;
+                }
+                let cell = rt.nodes.get(slot).state_cell();
+                crate::state::try_transition::<Loom>(cell, NodeState::Dirty, NodeState::Computing)
+                    .unwrap();
+                while !returned.load(Ordering::Acquire) {
+                    thread::yield_now();
+                }
+                crate::state::try_transition::<Loom>(cell, NodeState::Computing, NodeState::Clean)
+                    .unwrap();
+                true
+            })
+        };
+        let left = rt.given_back_state(slot, generation);
+        returned.store(true, Ordering::Release);
+        assert!(left.is_none() || left == Some(NodeState::Dirty), "{left:?}");
+        let wounded = crate::attempt::leave_flight();
+        crate::reserve::end_all();
+        let took = taker.join().unwrap();
+        assert_eq!(took, wounded);
+        assert!(left.is_some() || took, "the wait ended with no take-over");
+    });
+}
+
 /// [`doom_reservations_cross`] on F <-> X at budget 1: each read dooms on
 /// the other thread's entry node.
 #[test]
@@ -1869,6 +1921,129 @@ fn doom_reservations_cross_direct() {
 #[test]
 fn doom_reservations_cross_held() {
     doom_reservations_cross(3, 2);
+}
+
+/// T catches its read of X, which dooms at budget 1, and joins a thread
+/// that reads X before its pop. The reader meets X reserved for T's
+/// retry while T's discard is in flight, takes it over, which wounds T's
+/// attempt, and both reads give the unbounded run's values.
+#[test]
+fn doom_caught_joins_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let t = {
+            let me = Arc::clone(&me);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                    let other = me.lock().unwrap().clone().unwrap();
+                    v + thread::spawn(move || other.get(x)).join().unwrap()
+                },
+                replayable(),
+            )
+        };
+        assert_eq!(rt.get(t), 28);
+        *me.lock().unwrap() = None;
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+    });
+}
+
+/// T reads X, which dooms at budget 1, while another thread reads X. The
+/// reader can meet X's reservation while T's discard is in flight, before
+/// the engine's pop catches it, and take it over, which restarts T's
+/// read; or the pop ends the flight first and the reader waits for T's
+/// context. Either way both reads give X's value and nothing stays
+/// reserved.
+#[test]
+fn doom_in_flight_race() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let t = rt.create_query_with(move |rt: &Rt| rt.get(x) + 100, replayable());
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(x))
+        };
+        assert_eq!(rt.get(t), 114);
+        assert_eq!(other.join().unwrap(), 14);
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+    });
+}
+
+/// T reads X, which dooms at budget 1, so T takes the placeholder and runs
+/// on with its doom's flight open, into a join of a thread that reads X.
+/// The reader meets X reserved for T's retry, takes it over and computes
+/// X; T's run ends as the wound its read retries from, and both reads give
+/// the unbounded run's values.
+#[test]
+fn doom_lazy_joins_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let t = {
+            let me = Arc::clone(&me);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    let other = me.lock().unwrap().clone().unwrap();
+                    v + thread::spawn(move || other.get(x)).join().unwrap()
+                },
+                replayable(),
+            )
+        };
+        assert_eq!(rt.get(t), 28);
+        *me.lock().unwrap() = None;
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+    });
+}
+
+/// T reads X, which dooms at budget 1, then Z, while another thread reads
+/// X. T runs on past X's placeholder with its flight open and raises the
+/// discard at its read of Z; the reader may take X over in that window or
+/// wait for T's context. Both reads give the unbounded run's values and
+/// nothing stays reserved.
+#[test]
+fn doom_lazy_reads_again() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let z = rt.create_query_with(move |rt: &Rt| rt.get(i) + 20, replayable());
+        let t = rt.create_query_with(move |rt: &Rt| rt.get(x) + rt.get(z) + 100, replayable());
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(x))
+        };
+        assert_eq!(rt.get(t), 137);
+        assert_eq!(other.join().unwrap(), 14);
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+    });
 }
 
 /// F, Clean at s = 0, reads a New query N once s is set, so at budget 1

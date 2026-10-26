@@ -51,7 +51,25 @@ enum QReads {
     Plain,
     /// Through a `catch_unwind` that returns this value instead.
     Swallowing(i64),
+    /// Through a `catch_unwind` after which the closure calls the engine
+    /// once more, recording in [`AFTER_CATCH`] whether that call unwound.
+    SwallowingThen(After),
 }
+
+/// The engine call `q` makes after catching an unwind of its read of `r`:
+/// a read of the Dirty `w`, or a set of `w`'s input.
+#[derive(Copy, Clone, PartialEq)]
+enum After {
+    Read,
+    Set,
+}
+
+/// For each call after a catch in [`QReads::SwallowingThen`], whether it
+/// unwound and how many times `w`'s closure ran inside it. Each test runs
+/// in its own child process.
+static AFTER_CATCH: Mutex<Vec<(bool, usize)>> = Mutex::new(Vec::new());
+
+static W_RUNS: AtomicUsize = AtomicUsize::new(0);
 
 /// Thread A computes `a`, which now reads `q`; thread B computes `q`,
 /// whose closure reads `r`, and the walk for `r` reaches `a` through
@@ -79,6 +97,13 @@ impl StaleEdge {
         let i = rt.create_input(1_i64);
         let k = rt.create_input(2_i64);
         let v = rt.create_input(3_i64);
+        let w_in = rt.create_input(0_i64);
+        let w = rt.create_query(move |rt| {
+            W_RUNS.fetch_add(1, Ordering::Relaxed);
+            rt.get(w_in) + 1
+        });
+        assert_eq!(rt.get(w), 1);
+        rt.set(w_in, 1);
         let q_cell: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
         let a_gate = Gate::new();
         let a = {
@@ -106,6 +131,20 @@ impl StaleEdge {
                     QReads::Swallowing(instead) => {
                         catch_unwind(AssertUnwindSafe(|| rt.get(r))).unwrap_or(instead)
                     }
+                    QReads::SwallowingThen(after) => catch_unwind(AssertUnwindSafe(|| rt.get(r)))
+                        .unwrap_or_else(|_| {
+                            let runs = W_RUNS.load(Ordering::Relaxed);
+                            let call = catch_unwind(AssertUnwindSafe(|| match after {
+                                After::Read => drop(rt.get(w)),
+                                After::Set => rt.set(w_in, 2),
+                            }));
+                            let ran = W_RUNS.load(Ordering::Relaxed) - runs;
+                            AFTER_CATCH.lock().unwrap().push((call.is_err(), ran));
+                            if let Err(payload) = call {
+                                std::panic::resume_unwind(payload);
+                            }
+                            -1
+                        }),
                 }
             })
         };
@@ -313,6 +352,47 @@ fn shared_swallowed_wound_on_a_first_compute() {
             assert_eq!(g.rt.get(g.a), 12);
             g.rt.assert_invariant_i();
         },
+    )
+    .assert_clean();
+}
+
+/// `q` catches the wound of its read of `r` and then reads the Dirty `w`
+/// (or sets `w`'s input): that call raises the wound again before any
+/// engine work, as one after a caught discard does. Computing `w` on the
+/// wounded thread leaves its pending wound to whatever that work does: in
+/// seed 0x2e05 a speculative drop inside such a recompute overwrote it,
+/// and the catching closure's value landed. The retry computes 4.
+fn call_after_a_caught_wound_raises_it_again(after: After) {
+    let g = StaleEdge::new(QReads::SwallowingThen(after), false);
+    let q = g.q;
+    let (thread_a, thread_b) = g.run(true, move |rt| rt.get(q));
+    assert_eq!(thread_a.join().unwrap(), 4);
+    assert_eq!(thread_b.join().unwrap().unwrap(), 4);
+    assert_wounded();
+    let raised = AFTER_CATCH.lock().unwrap().clone();
+    assert!(
+        !raised.is_empty() && raised.iter().all(|&r| r == (true, 0)),
+        "each call after a caught wound: (whether it raised, w's runs in it): {raised:?}"
+    );
+    g.rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_read_after_a_caught_wound_raises_it_again() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_read_after_a_caught_wound_raises_it_again",
+        || call_after_a_caught_wound_raises_it_again(After::Read),
+    )
+    .assert_clean();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_set_after_a_caught_wound_raises_it_again() {
+    crate::child_test::run_in_child(
+        "runtime::wound_tests::shared_set_after_a_caught_wound_raises_it_again",
+        || call_after_a_caught_wound_raises_it_again(After::Set),
     )
     .assert_clean();
 }

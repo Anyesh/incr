@@ -1507,7 +1507,11 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
         // The landed case runs a third time; the ignored
         // `landed_foreign_reader_runs_twice` tracks it.
         if !matches!(first, FirstRead::ForeignLandedClean) {
-            assert_eq!(runs, 2, "{first:?}");
+            // A Shared doomed frame unwinds at its placeholder read, so it
+            // takes one doomed run per leaf where Local's one doomed run
+            // reads them all.
+            let want = if A::SINGLE_THREADED { 2 } else { n as u32 + 1 };
+            assert_eq!(runs, want, "{first:?}");
         }
     }
 }
@@ -1560,8 +1564,8 @@ fn landed_foreign_reader_runs_twice() {
     let first = FirstRead::ForeignLandedClean;
     assert_eq!(doomed_reader_runs::<Local, Local>(64, first), 2);
     assert_eq!(doomed_reader_runs::<Local, Shared>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Shared, Local>(64, first), 2);
-    assert_eq!(doomed_reader_runs::<Shared, Shared>(64, first), 2);
+    assert_eq!(doomed_reader_runs::<Shared, Local>(64, first), 65);
+    assert_eq!(doomed_reader_runs::<Shared, Shared>(64, first), 65);
 }
 
 /// A value whose `Clone` reads another runtime's input, as the value-code

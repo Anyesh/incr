@@ -1237,7 +1237,9 @@ impl<C: Cells> Runtime<C> {
         // next would land as a cycle's discard instead of Failed. A caught
         // discard is raised again here: left set, the next frame to pop
         // would take it as its own swallow, and a context can absorb that
-        // frame's discard, so the catching closure's value would land.
+        // frame's discard, so the catching closure's value would land. So
+        // is a caught wound, which a speculative drop under this read would
+        // overwrite with its own discard.
         if word & value_code::UNWIND_MASK != 0 {
             match cycle_state::unwind_kind() {
                 Some(UnwindKind::Cycle) => {
@@ -1245,8 +1247,13 @@ impl<C: Cells> Runtime<C> {
                     word = value_code::thread_word();
                 }
                 Some(UnwindKind::Discard) if !std::thread::panicking() => {
+                    debug_assert!(
+                        C::SINGLE_THREADED || crate::attempt::in_flight(),
+                        "incr-core: a discard a closure caught is out of flight"
+                    );
                     resume_unwind(Box::new(cycle::DiscardUnwind))
                 }
+                Some(UnwindKind::Wound) if !std::thread::panicking() => self.raise_wound(),
                 _ => {}
             }
         }
@@ -1763,8 +1770,28 @@ impl<C: Cells> Runtime<C> {
         Computed::Discarded
     }
 
+    /// A doomed frame's placeholder read: the frame's first runs on in user
+    /// code ([`cycle_state::open_lazy`]); a later one raises the discard.
+    fn run_on_doomed(&self, ctl: *const ComputeCtl) {
+        if cycle_state::lazy_open() {
+            self.doom_unwind();
+        }
+        cycle_state::open_lazy(ctl as usize);
+    }
+
+    /// Raises a [`cycle::DoomUnwind`] from a doomed frame's read.
+    pub(super) fn doom_unwind(&self) -> ! {
+        debug_assert!(!C::SINGLE_THREADED);
+        cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
+        resume_unwind(Box::new(cycle::DoomUnwind))
+    }
+
     /// Sets the unwind kind of a drop unwind about to be raised.
     pub(super) fn set_drop_kind(&self) {
+        debug_assert!(
+            std::thread::panicking() || cycle_state::unwind_kind() != Some(UnwindKind::Wound),
+            "incr-core: a speculative drop under a caught wound"
+        );
         #[cfg(test)]
         self.drop_unwinds
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1910,6 +1937,9 @@ impl<C: Cells> Runtime<C> {
                 },
             );
         });
+        if !C::SINGLE_THREADED && !std::thread::panicking() {
+            self.run_on_doomed(f.ctl);
+        }
         ctl.raise(cycle::PH_SEEN);
         Some(placeholder)
     }
@@ -1926,6 +1956,11 @@ impl<C: Cells> Runtime<C> {
             ctl.has(cycle::DOOMED),
             "incr-core: a placeholder read dooms its frame"
         );
+        // A read from a destructor in an unwind can't raise again, so it
+        // takes the placeholder, as under `Local`.
+        if !C::SINGLE_THREADED && ctl.has(cycle::DOOMED) && !std::thread::panicking() {
+            self.run_on_doomed(f.ctl);
+        }
         ctl.raise(cycle::PH_SEEN);
         self.placeholder::<T>()
             .expect("incr-core: a doomed read's type has a placeholder")
@@ -4147,6 +4182,13 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
         failures: u64,
     ) -> VPop {
+        debug_assert!(
+            !payload.is::<cycle::DoomUnwind>(),
+            "incr-core: a doom unwind left the doomed frames"
+        );
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         let kind = cycle_state::unwind_kind();
         let mut bag = Deferred::new();
         let mut payload = payload;
@@ -4188,6 +4230,9 @@ impl<C: Cells> Runtime<C> {
             if q == 0 {
                 bag.drain(self);
                 self.close_dropped(id);
+                if !C::SINGLE_THREADED {
+                    cycle_state::reopen_discard();
+                }
                 resume_unwind(payload);
             }
             cycle_state::take_unwind_kind();
@@ -4519,6 +4564,13 @@ impl<C: Cells> Runtime<C> {
         payload: Box<dyn std::any::Any + Send>,
         failures: u64,
     ) -> Option<Computed> {
+        debug_assert!(
+            !payload.is::<cycle::DoomUnwind>(),
+            "incr-core: a doom unwind left the doomed frames"
+        );
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         let kind = cycle_state::unwind_kind();
         if kind == Some(UnwindKind::Discard) {
             let (own, enclosing) = replay::with(|c| {
@@ -4986,6 +5038,9 @@ impl<C: Cells> Runtime<C> {
     ) -> ! {
         self.close_unwound(id, boundary, kind);
         self.note_unwound_read(&*payload, kind);
+        if !C::SINGLE_THREADED {
+            cycle_state::reopen_discard();
+        }
         resume_unwind(payload)
     }
 

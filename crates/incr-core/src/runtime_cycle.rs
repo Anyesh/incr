@@ -20,7 +20,7 @@ use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
-use crate::{hold, reserve, set_stack, waits};
+use crate::{attempt, hold, reserve, set_stack, waits};
 
 /// What a compute attempt carries into its landings.
 #[derive(Copy, Clone)]
@@ -313,10 +313,14 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn nested_shared_exit(&self) -> NestedSharedExit<'_, C> {
-        NestedSharedExit {
+        let exit = NestedSharedExit {
             rt: self,
             cidx: self.dep_stack.next_cidx(),
-        }
+        };
+        // No retry loop of this runtime begins its attempts under a `Local`
+        // entry: each `Shared` entry here is one.
+        attempt::begin();
+        exit
     }
 
     #[cold]
@@ -348,6 +352,8 @@ impl<C: Cells> Runtime<C> {
     /// cycle unwind is raised, never returned.
     #[inline(always)]
     pub(super) fn enter<R>(&self, f: impl FnMut() -> R) -> R {
+        let _kept = cycle_state::KeptUnwind::if_unwinding();
+        cycle_state::raise_if_lazy();
         match self.entered(ReadKind::Get, f) {
             Ok(r) => r,
             Err(_) => unreachable!("incr-core: a get entry raises its cycles"),
@@ -366,6 +372,9 @@ impl<C: Cells> Runtime<C> {
             if outermost {
                 cycle_state::reset_outermost();
                 replay::reset();
+                if !C::SINGLE_THREADED {
+                    attempt::begin();
+                }
             }
             match catch_unwind(AssertUnwindSafe(&mut *f)) {
                 Ok(r) => {
@@ -393,6 +402,9 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         payload: Box<dyn std::any::Any + Send>,
     ) -> Option<Cycle> {
+        if !C::SINGLE_THREADED {
+            cycle_state::settle_discard();
+        }
         replay::drop_from(self.runtime_id, self.dep_stack.next_cidx());
         if outermost {
             self.retire_notes();
@@ -607,8 +619,15 @@ impl<C: Cells> Runtime<C> {
             self.reservation_waits
                 .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
-        while reserve::elsewhere(claim, generation) {
-            self.spin_holding(id, also, spins, || !reserve::elsewhere(claim, generation));
+        // An owner whose discard stays in flight may be in user code that
+        // waits on this thread; taking over wounds its attempt.
+        let patience = std::cell::RefCell::new(attempt::Patience::default());
+        let held = || {
+            reserve::elsewhere(claim, generation)
+                && !reserve::take_over(claim, generation, &mut patience.borrow_mut())
+        };
+        while held() {
+            self.spin_holding(id, also, spins, || !held());
         }
         *spins = (*spins).max(1);
     }
@@ -934,6 +953,12 @@ impl<C: Cells> Runtime<C> {
         let failures = began.unwrap_or_else(cycle_state::failures);
         let first = replay::peek_id();
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
+        if !C::SINGLE_THREADED
+            && ctl.has(cycle::DOOMED)
+            && cycle_state::end_lazy(std::ptr::from_ref(&ctl) as usize)
+        {
+            result = Err(Box::new(WoundUnwind));
+        }
         let (deps, reading) = self.dep_stack.pop_frame_reading();
         let word = value_code::thread_word();
         // A member run starts after its episode root's pop, so nothing
@@ -953,6 +978,11 @@ impl<C: Cells> Runtime<C> {
                 Some(UnwindKind::Discard) => Box::new(cycle::DiscardUnwind),
                 _ => Box::new(WoundUnwind),
             });
+        }
+        // As at a compute's pop: a waiter that took over this thread's
+        // discard turns it into the wound the attempt retries from.
+        if result.is_err() && !C::SINGLE_THREADED && cycle_state::settle_discard() {
+            result = Err(Box::new(WoundUnwind));
         }
         if ctl.has(cycle::DOOMED)
             && (result.is_ok() || !matches!(cycle_state::unwind_kind(), Some(UnwindKind::Wound)))
