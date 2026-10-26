@@ -3597,3 +3597,38 @@ fn hand_over_at_a_cycle_closed_under_another_runtimes_frame() {
         other.assert_invariant_i();
     });
 }
+
+/// A query lands Dirty with a memo for revision 5, then a set moves the
+/// revision to 6 and the next claim lands it Dirty without one (a
+/// poisoned run), raising `changed_at` to 6. A reader at revision 6 that
+/// loads the node Dirty never takes the memo for 5, through `memo_at`'s
+/// second load of the bit.
+#[test]
+fn loom_memo_ends_before_a_later_landings_changed_at() {
+    use crate::state::{store, try_transition};
+    run(|| {
+        let node: Arc<NodeData<Loom>> = Arc::new(NodeData::new_query(0, 0));
+        let lander = {
+            let node = Arc::clone(&node);
+            thread::spawn(move || {
+                let state = node.state_cell();
+                try_transition::<Loom>(state, NodeState::New, NodeState::Computing).unwrap();
+                node.max_changed_at(5);
+                node.set_memo(5);
+                store::<Loom>(state, NodeState::Dirty);
+                try_transition::<Loom>(state, NodeState::Dirty, NodeState::Computing).unwrap();
+                node.max_changed_at(6);
+                node.set_verified_at(0);
+                store::<Loom>(state, NodeState::Dirty);
+            })
+        };
+        if node.state() == NodeState::Dirty {
+            assert!(
+                !node.memo_at(|| 6),
+                "a reader at 6 took the memo for 5 with the later landing's changed_at"
+            );
+        }
+        lander.join().unwrap();
+        assert!(!node.memo_at(|| 6));
+    });
+}
