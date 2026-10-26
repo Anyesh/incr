@@ -2373,11 +2373,11 @@ moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
   walk's cfg(test) park calls and `NO_RESTART_HERE` check removed so that
   only engine code differs: `096fb59d6` 1635.52M, `9a6be2014` 1647.65M
   (+12.13M, +0.74 %). The step is `619c9e167` (`815b25be3` 1632.04M,
-  `619c9e167` 1647.72M), where `_dl_find_object` goes from 11.22M to
-  27.27M over the same 321,960 calls (callgrind), 34.8 to 84.7
-  instructions per call: the lookup's cost moved with the test binary's
-  layout, not its count. Over `096fb59d6` to `9a6be2014` everything
-  outside `_dl_find_object` nets -3.8M (+12.13M against its +15.96M:
+  `619c9e167` 1647.72M), where `_dl_find_object`, both its parts, goes
+  from 13.38M to 28.88M over the same 321,960 calls (callgrind), 41.5 to
+  89.7 instructions per call: the lookup's cost moved with the test
+  binary's layout, not its count. Over `096fb59d6` to `9a6be2014` everything
+  outside `_dl_find_object` nets -3.3M (+12.13M against its +15.41M:
   B-tree and `Notes` code moving between symbols, `_Unwind_Find_FDE`
   -3.0M); across the `619c9e167` step alone it is about +2.6M. With
   the cfg(test) code in, the same step lands at `61d37ff85` instead.
