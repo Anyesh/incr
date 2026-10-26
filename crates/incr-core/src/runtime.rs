@@ -4131,6 +4131,9 @@ impl<C: Cells> Runtime<C> {
     fn prune_settled(&self, walk: &mut Walk) -> bool {
         let since = walk.first_planned.all as u32;
         let landed = self.episode_log.read().others_since(false, since);
+        if let Some(landed) = &landed {
+            self.wait_for_landings(walk, landed);
+        }
         let settled = walk.work.iter().position(|e| {
             e.is_pending()
                 && landed
@@ -4150,6 +4153,26 @@ impl<C: Cells> Runtime<C> {
                 true
             }
             None => false,
+        }
+    }
+
+    /// Waits out another thread's claims on `walk`'s pending entries in
+    /// `landed`: an episode is counted before its members land, so a
+    /// replan can meet one whose members are still held.
+    fn wait_for_landings(&self, walk: &Walk, landed: &HashSet<u32, FxBuildHasher>) {
+        let held: Vec<NodeId> = (walk.work.iter())
+            .filter(|e| e.is_pending() && landed.contains(&e.id.0))
+            .map(|e| e.id)
+            .collect();
+        for id in held {
+            let cell = self.nodes.get(id.0).state_cell();
+            let mut spins = 0;
+            while is_computing(self.seen(cell, state::load::<C>(cell)))
+                && self.own_claim_owner(id).is_none()
+            {
+                spins += 1;
+                self.wait_on_claim(id, spins);
+            }
         }
     }
 
