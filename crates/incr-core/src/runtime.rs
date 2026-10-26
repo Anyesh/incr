@@ -157,6 +157,12 @@ pub(crate) enum ParkPoint {
     BeforeReservationCheck(NodeId),
     /// In `clean_walk`, before a visit of a non-root entry loads its state.
     BeforeVisit(NodeId),
+    /// In `clean_walk`, after a visit loaded the node's state and before
+    /// it reads the node's deps to expand them.
+    WalkBeforeDeps(NodeId),
+    /// In `clean_walk`, after a visit read the node's deps and before it
+    /// checks whether another thread's held run wrote them.
+    WalkAfterDeps(NodeId),
     /// In `compute_one`, after a walk entry's claim and before the check
     /// for episodes other threads landed since the walk planned.
     AfterWalkClaim(NodeId),
@@ -564,6 +570,13 @@ static FORCE_REPLAN: std::sync::LazyLock<bool> =
 thread_local! {
     /// `FORCE_REPLAN` for this thread alone.
     pub(crate) static FORCE_REPLAN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    /// Test toggle: a walk on this thread never restarts its read after
+    /// another thread's release.
+    pub(crate) static NO_RESTART_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How `compute_one` left the node it was handed.
@@ -3655,6 +3668,12 @@ impl<C: Cells> Runtime<C> {
                     // would wait on this thread's own claim: the plan goes on
                     // to the root's compute, which reads it as deferred. A
                     // read restarts at most `ROOT_RESTARTS` times.
+                    #[cfg(all(test, not(loom)))]
+                    let restarts = if NO_RESTART_HERE.with(std::cell::Cell::get) {
+                        ROOT_RESTARTS
+                    } else {
+                        restarts
+                    };
                     let released = !resumed
                         && !ran_unsettled
                         && restarts < ROOT_RESTARTS
@@ -3835,6 +3854,7 @@ impl<C: Cells> Runtime<C> {
                     });
                 }
                 _ => {
+                    self.park(ParkPoint::WalkBeforeDeps(cur));
                     // New nodes can carry installed edges on each other
                     // after a cycle breaks, so each is expanded at most
                     // once per walk. A never-run node has no deps and
@@ -3866,6 +3886,7 @@ impl<C: Cells> Runtime<C> {
                             }
                         });
                     }
+                    self.park(ParkPoint::WalkAfterDeps(cur));
                 }
             }
         }
