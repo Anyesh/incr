@@ -120,6 +120,9 @@ pub(crate) struct Held {
     poison: u16,
     /// A run of this claim panicked in user code.
     pub(crate) failed: bool,
+    /// A run's frame took `HOLD`, as a cycle closed on this thread's stack
+    /// under it: the landing is held, as that frame's pop would hold it.
+    pub(crate) hold: bool,
     /// `Cycle(M)` while the node is a member of a running episode.
     pub(crate) episode: Option<Cycle>,
     /// That episode's id, 0 when there is none.
@@ -164,6 +167,7 @@ impl Held {
             changed: false,
             poison: 0,
             failed: false,
+            hold: false,
             episode: None,
             ep: 0,
             in_cu: false,

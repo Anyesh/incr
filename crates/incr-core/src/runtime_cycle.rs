@@ -1076,6 +1076,7 @@ impl<C: Cells> Runtime<C> {
                 !ctl.children.get().is_null(),
                 ctl.poison(),
             );
+            e.hold |= ctl.has(cycle::HOLD);
             // An engine unwind is no fault of the member's.
             if result.is_err() && cycle_state::unwind_kind().is_none() {
                 if stand_in && e.episode.is_none() {
@@ -2262,9 +2263,10 @@ impl<C: Cells> Runtime<C> {
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
         let first = e.first;
-        // A cut's claim lands held: its entry opens before the write, so
-        // the undo keeps what the write displaces.
-        if !C::SINGLE_THREADED && hold::cut_kept(rt, slot) {
+        // A cut's claim lands held, as does one whose run took `HOLD`: its
+        // entry opens before the write, so the undo keeps what the write
+        // displaces.
+        if !C::SINGLE_THREADED && (e.hold || hold::cut_kept(rt, slot)) {
             self.open_hold(id, node, first, None, bag);
         }
         let written = catch_unwind(AssertUnwindSafe(|| {
