@@ -1178,6 +1178,7 @@ fn dissolve_keeps_the_released_members_grouped(z_reads_b: bool) {
 /// `y` outside it, and `r`'s read of `y` meets the unseeded `y` on B's
 /// stack: a cycle error that no single-thread order raises.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_wound_after_an_episode_dissolve_keeps_the_released_members_grouped",
@@ -1226,6 +1227,7 @@ fn shared_wound_of_a_dissolved_root_lands_no_record_naming_a_member_that_left() 
 /// retract with the read, so B verifies the group as a single thread
 /// would.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn shared_wound_after_clean_landings_of_released_members_keeps_their_group() {
     crate::child_test::run_in_child(
         "runtime::wound_tests::shared_wound_after_clean_landings_of_released_members_keeps_their_group",
