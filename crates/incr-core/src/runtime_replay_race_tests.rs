@@ -4617,3 +4617,69 @@ fn a_delivery_handed_back_by_a_doom_keeps_its_reader_reserved() {
     let want = [outcome(|| u.get(ux)), outcome(|| u.get(ux))];
     assert_racing_reads([&first, &other], [&want[0], &want[1]]);
 }
+
+/// W reads a, whose two-node cycle with b is held for W's attempt, and c,
+/// which reads a and so is held too, then parks in user code. Another
+/// thread's read of c takes the attempt over and parks before its own
+/// claim of c. W's retry claims c first, under a claim the take-over met,
+/// and c's run reads a held landing again, with no entry to hold c's
+/// landing: c publishes at once and keeps no held mark, so the other
+/// thread's read of c does not wait on a hold that no entry ends.
+#[test]
+fn shared_taken_reader_of_a_held_cycle_keeps_no_held_mark() {
+    let rt = Arc::new(Rt::new());
+    rt.set_max_frames(u32::MAX);
+    let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let a = {
+        let bc = bc.clone();
+        rt.create_query_with_fallback(move |rt| rt.get(*bc.get().unwrap()) + 1, |_c: &Cycle| 100)
+    };
+    let b = rt.create_query(move |rt: &Rt| rt.get(a) * 2);
+    bc.set(b).unwrap();
+    let c = rt.create_query(move |rt: &Rt| rt.get(a) + 1);
+    let (in_w, at_claim) = (Gate::new(), Gate::new());
+    let w = {
+        let in_w = in_w.clone();
+        rt.create_query(move |rt: &Rt| {
+            let v = rt.get(a) + rt.get(c);
+            in_w.park_in_user_code();
+            v
+        })
+    };
+    hook(&rt, vec![(ParkPoint::BeforeClaim(id(c)), at_claim.clone())]);
+    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
+    in_w.arm();
+    let first = {
+        let (rt, w) = (rt.clone(), w);
+        spawn(move || outcome(|| rt.get(w)))
+    };
+    in_w.wait_parked();
+    at_claim.arm();
+    let other = {
+        let (rt, c) = (rt.clone(), c);
+        spawn(move || outcome(|| rt.get(c)))
+    };
+    at_claim.wait_parked();
+    assert!(
+        crate::attempt::TAKE_OVERS.load(SeqCst) > wounds,
+        "the other read took nothing over"
+    );
+    in_w.release();
+    // Short of the gate's park timeout, which would abort the binary first.
+    let first = first.join_within(Duration::from_secs(5));
+    at_claim.release();
+    assert!(
+        !rt.nodes.get(id(c).0).held_mark(),
+        "c keeps a held mark after the read that landed it"
+    );
+    assert_eq!(first.ok().expect("W's retry never returned"), Ok(201));
+    assert_eq!(other.join(), Ok(101));
+    for n in [a, b, c] {
+        assert!(
+            !rt.nodes.get(id(n).0).held_mark(),
+            "node {} keeps a held mark",
+            id(n).0
+        );
+    }
+    assert_eq!(rt.get(b), 200);
+}

@@ -62,11 +62,21 @@ impl Gate {
     }
 
     pub(crate) fn park(&self) {
+        // A gate stands for a step the test holds, not a stuck holder.
+        self.park_as(true);
+    }
+
+    /// [`Self::park`] as a wait in the closure's own code, such as a join:
+    /// a waiter on a landing the attempt holds may take it over.
+    pub(crate) fn park_in_user_code(&self) {
+        self.park_as(false);
+    }
+
+    fn park_as(&self, step: bool) {
         if !self.0.armed.swap(false, Ordering::SeqCst) {
             return;
         }
-        // A gate stands for a step the test holds, not a stuck holder.
-        let _parked = crate::attempt::Parked::new();
+        let _parked = step.then(crate::attempt::Parked::new);
         self.0.reached_tx.lock().unwrap().send(()).unwrap();
         if self
             .0
