@@ -1090,6 +1090,73 @@ fn shared_retracted_failed_landing_releases_its_ticket() {
     assert_eq!(other.tickets_kept(), (0, false));
 }
 
+/// The states of `p`, `m` and `w`.
+type Chain = (NodeState, NodeState, NodeState);
+
+type Handles = (Incr<i64>, Incr<i64>, Incr<i64>);
+
+/// `r` reads `w`, which reads `m`, which reads `p`; a set makes `p` panic,
+/// and the panic unwinds through `m` and `w` to `r`, which catches it. With
+/// `wound`, `r`'s first run then wounds its attempt, and records the
+/// states the unwind left for other threads at that point.
+fn unwind_then_wound<C: Cells>(wound: bool) -> (i64, Chain, Option<Chain>) {
+    let rt = Runtime::<C>::new();
+    let i = rt.create_input(1_i64);
+    let p = rt.create_query(move |rt| {
+        let v = rt.get(i);
+        assert!(v != 2, "p boom");
+        v
+    });
+    let m = rt.create_query(move |rt| rt.get(p) + 1);
+    let w = rt.create_query(move |rt| rt.get(m) + 1);
+    let chain: Arc<OnceLock<Handles>> = Arc::new(OnceLock::new());
+    let at_wound = Arc::new(std::sync::Mutex::new(None));
+    let wounded = Arc::new(AtomicBool::new(!wound));
+    let r = {
+        let (chain, at_wound, wounded) = (chain.clone(), at_wound.clone(), wounded.clone());
+        rt.create_query(move |rt| {
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(w))).unwrap_or(0);
+            if !wounded.swap(true, Ordering::SeqCst) {
+                let &(p, m, w) = chain.get().unwrap();
+                *at_wound.lock().unwrap() = Some((rt.state_of(p), rt.state_of(m), rt.state_of(w)));
+                rt.raise_wound();
+            }
+            v
+        })
+    };
+    chain.set((p, m, w)).unwrap();
+    assert_eq!(rt.get(r), 3);
+    wounded.store(!wound, Ordering::SeqCst);
+    rt.set(i, 2);
+    let v = rt.get(r);
+    let after = (rt.state_of(p), rt.state_of(m), rt.state_of(w));
+    let at = *at_wound.lock().unwrap();
+    (v, after, at)
+}
+
+/// A user panic's unwind lands every frame it passes. Under `Shared`
+/// those landings are held to the attempt's end, so a wound later in the
+/// attempt takes them back before any other thread plans from them; the
+/// retry then lands what `Local` lands.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_unwind_landings_are_held_until_a_wound_retracts_them() {
+    let (want, local_after, _) = unwind_then_wound::<Local>(false);
+    let (v, after, at_wound) = unwind_then_wound::<Shared>(true);
+    let held = (
+        NodeState::Computing,
+        NodeState::Computing,
+        NodeState::Computing,
+    );
+    assert_eq!(
+        at_wound,
+        Some(held),
+        "the unwind's landings were published before the wound"
+    );
+    assert_eq!((v, after), (want, local_after));
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
 /// The thread's state after a caught wound: whether it held, and what
 /// the read after it raised.
 type AfterWound = Arc<std::sync::Mutex<Option<(bool, Option<String>)>>>;
