@@ -632,6 +632,11 @@ impl<C: Cells> Runtime<C> {
             .map(|e| e.slot)
             .collect();
         self.release_retracted(&failed, &mut bag);
+        // Once the dep lists are back and before the held marks clear, so a
+        // walk that read a retracted run's deps sees the mark or the count.
+        if !C::SINGLE_THREADED && !entries.is_empty() {
+            C::u64_fetch_add(&self.retractions.0, 1);
+        }
         for e in entries {
             let back = if e.undo.first {
                 NodeState::New

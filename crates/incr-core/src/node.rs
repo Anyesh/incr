@@ -22,7 +22,7 @@
 //!   52     4     arena_slot    u32
 //!   56     2     type_tag      u16
 //!   58     1     state         Cells::State
-//!   59     1     dep_count     Cells::U8    (0x80 unrun, 0x40 released marks, 0x30 held epoch)
+//!   59     1     dep_count     Cells::U8    (0x80 unrun, 0x40 released, 0x20 held marks)
 //!   60     4     generation    Cells::U32
 //! ```
 //!
@@ -171,7 +171,7 @@ const _: () = assert!(crate::bits::disjoint(&[
     NodeData::<crate::cells::Local>::COUNT_MASK as u64,
     NodeData::<crate::cells::Local>::RELEASED as u64,
     NodeData::<crate::cells::Local>::UNRUN as u64,
-    NodeData::<crate::cells::Local>::HELD_EPOCH as u64,
+    NodeData::<crate::cells::Local>::HELD as u64,
 ]));
 
 impl<C: Cells> NodeData<C> {
@@ -540,40 +540,19 @@ impl<C: Cells> NodeData<C> {
     }
 
     /// Whether a held landing's entry is open on the node, so its dep list
-    /// may be a run no other thread may build on yet.
+    /// may be a run no other thread may build on yet. Acquire, so a scan
+    /// that read an id a held run installed and loads this after it sees
+    /// the mark.
     #[inline(always)]
     pub(crate) fn held_mark(&self) -> bool {
-        C::u8_load_acquire(&self.dep_count) & Self::HELD_STEP != 0
-    }
-
-    /// The held epoch: a count of held entries opened and closed on the
-    /// node, odd while one is open. A scan that loads it (Acquire) before
-    /// and after reading the deps and finds it even and unchanged read no
-    /// id a held run wrote, a run a wound has retracted since included,
-    /// unless two runs opened and closed in between.
-    #[inline(always)]
-    pub(crate) fn held_epoch(&self) -> u8 {
-        C::u8_load_acquire(&self.dep_count) & Self::HELD_EPOCH
-    }
-
-    /// Whether a scan that loaded `before` from [`Self::held_epoch`] may
-    /// have read a held run's deps.
-    #[inline(always)]
-    pub(crate) fn held_since(&self, before: u8) -> bool {
-        before & Self::HELD_STEP != 0 || self.held_epoch() != before
+        C::u8_load_acquire(&self.dep_count) & Self::HELD != 0
     }
 
     /// Only the holder calls it, under its claim: before the held run's
     /// writes, and before the publication or retraction releases the claim.
     #[inline(always)]
     pub(crate) fn set_held_mark(&self, held: bool) {
-        let raw = C::u8_load_relaxed(&self.dep_count);
-        if (raw & Self::HELD_STEP != 0) != held {
-            let epoch = raw.wrapping_add(Self::HELD_STEP) & Self::HELD_EPOCH;
-            // Release like install_deps's, so a scan that reads this
-            // value still sees the deps installed before it.
-            C::u8_store_release(&self.dep_count, raw & !Self::HELD_EPOCH | epoch);
-        }
+        self.set_mark(Self::HELD, held);
     }
 
     /// The unrun, released and held marks, which an install keeps.
@@ -662,10 +641,9 @@ impl<C: Cells> NodeData<C> {
     /// line, and a publish already reads this cell.
     const RELEASED: u8 = 0x40;
 
-    /// `dep_count` bits for [`Self::held_epoch`], and its low bit, set
-    /// while a held entry is open.
-    const HELD_EPOCH: u8 = 0x30;
-    const HELD_STEP: u8 = 0x10;
+    /// `dep_count` bit for [`Self::held_mark`], read with the count by a
+    /// walk's expansion.
+    const HELD: u8 = 0x20;
 
     const COUNT_MASK: u8 = 0x0f;
 
