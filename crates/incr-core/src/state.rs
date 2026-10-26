@@ -133,7 +133,7 @@ pub fn try_transition<C: Cells>(
 /// A transition of a node this thread's attempt holds, from the state the
 /// view shows it in, while the node's word stays `Computing`: the owner
 /// claims its own landing back to rerun or reverify it, or its set's walk
-/// flips the landing to `Dirty`.
+/// moves the landing as it would a published one.
 #[cold]
 #[inline(never)]
 fn claim_own_held<C: Cells>(
@@ -147,8 +147,7 @@ fn claim_own_held<C: Cells>(
         let key = cell_key::<C>(cell);
         let own = match new {
             NodeState::Computing => crate::hold::reclaim(key, expected, seen),
-            NodeState::Dirty => crate::hold::flip(key, expected, seen),
-            _ => false,
+            _ => crate::hold::flip(key, expected, new, seen),
         };
         if own {
             // The claim's run reads after the set that flagged the word.

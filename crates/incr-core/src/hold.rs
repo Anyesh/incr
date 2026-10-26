@@ -395,11 +395,19 @@ pub(crate) fn pending_edges(rt: RuntimeId) -> Vec<(u32, u32)> {
     })
 }
 
-/// A set's walk flips the owner's held node from `expected`, the target
-/// the view shows, to `Dirty`, as it would flip the published landing.
+/// A set's walk moves the owner's held node from `expected`, the state
+/// the view shows, to `new`, as it would move the published landing:
+/// Clean, Failed or Dirty to Dirty, a visit of New, Cyclic to New.
 #[cold]
 #[inline(never)]
-pub(crate) fn flip(cell: usize, expected: NodeState, raw: NodeState) -> bool {
+pub(crate) fn flip(cell: usize, expected: NodeState, new: NodeState, raw: NodeState) -> bool {
+    use NodeState::{Clean, Cyclic, Dirty, Failed, New};
+    if !matches!(
+        (expected, new),
+        (Clean | Failed | Dirty, Dirty) | (New, New) | (Cyclic, New)
+    ) {
+        return false;
+    }
     active()
         && with(|h| {
             let Some(e) = h
@@ -408,7 +416,8 @@ pub(crate) fn flip(cell: usize, expected: NodeState, raw: NodeState) -> bool {
             else {
                 return false;
             };
-            e.target = NodeState::Dirty;
+            e.target = new;
+            e.flagged = new;
             true
         })
 }
