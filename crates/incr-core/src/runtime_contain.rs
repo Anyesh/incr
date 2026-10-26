@@ -267,7 +267,7 @@ impl<C: Cells> Runtime<C> {
         // Every Failed landing removes the node from the tickets before its
         // store, so under the lock a node still Failed at this generation
         // is in the latest landing's ticket, if any.
-        if state::load::<C>(node.state_cell()) != NodeState::Failed {
+        if self.seen(node.state_cell(), state::load::<C>(node.state_cell())) != NodeState::Failed {
             return Err(Left);
         }
         // After the state, as a recycle bumps it before its new node lands.
@@ -439,7 +439,10 @@ impl<C: Cells> Runtime<C> {
         nodes.retain(|&(slot, generation)| {
             let node = self.nodes.get(slot);
             node.generation() == generation
-                && self.in_failed_landing(slot)
+                && self.in_failed_landing(
+                    slot,
+                    self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
+                )
                 && t.of((slot, generation))
                     .is_none_or(|(j, held)| !held && !taken.iter().any(|&(id, _)| id == j.ticket))
         });
@@ -502,11 +505,12 @@ impl<C: Cells> Runtime<C> {
         None
     }
 
-    /// Whether `slot`'s node is in its Failed landing: Failed, or Computing
-    /// under a regenerating run, which lands nothing and puts it back. Exact
-    /// under the tickets lock, under which a rerun moves it and marks it.
-    fn in_failed_landing(&self, slot: u32) -> bool {
-        match state::load::<C>(self.nodes.get(slot).state_cell()) {
+    /// Whether `slot`'s node, in `state` as this thread sees it, is in its
+    /// Failed landing: Failed, or Computing under a regenerating run, which
+    /// lands nothing and puts it back. Exact under the tickets lock, under
+    /// which a rerun moves it and marks it.
+    fn in_failed_landing(&self, slot: u32, state: NodeState) -> bool {
+        match state {
             NodeState::Failed => true,
             NodeState::Computing | NodeState::ComputingDirty => {
                 crate::replay::is_regen_running(self.runtime_id, slot)
@@ -526,7 +530,10 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(m.node.0);
             assert!(
                 node.generation() == m.node.1
-                    && self.in_failed_landing(m.node.0)
+                    && self.in_failed_landing(
+                        m.node.0,
+                        self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell())),
+                    )
                     && t.landings.get(&m.node).is_some_and(|j| j.ticket == id),
                 "incr-core: a ticket keeps only Failed landings it indexes"
             );
@@ -573,6 +580,24 @@ impl<C: Cells> Runtime<C> {
         self.park(ParkPoint::FlippedFailed(id));
         self.forget_failed_run_if(id.0, node.generation(), token);
         true
+    }
+
+    /// A retraction lands the held Failed landings of `slots` unrun: their
+    /// tickets let go of them as a flip's do.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn release_retracted(&self, slots: &[u32], bag: &mut Deferred<C>) {
+        if slots.is_empty() || !self.tickets_held() {
+            return;
+        }
+        let mut t = self.tickets.write();
+        let mut stale = Vec::new();
+        for &slot in slots {
+            stale.extend(release(&mut t, u64::MAX, slot_landings(slot)));
+        }
+        self.sync_held(&t);
+        drop(t);
+        defer(stale, bag);
     }
 
     /// After a set's walk: drops the tickets its flips released.

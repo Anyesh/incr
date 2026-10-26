@@ -341,8 +341,9 @@ impl<C: Cells> Runtime<C> {
             && !ctl.has(cycle::DOOMED)
             && (ctl.flags.get() & (cycle::POISONED | cycle::HANDLED | cycle::KEPT_UNCHECKED) != 0
                 || deps.iter().any(|&(d, generation)| {
+                    let cell = self.nodes.get(d.0).state_cell();
                     !matches!(
-                        state::load::<C>(self.nodes.get(d.0).state_cell()),
+                        self.seen(cell, state::load::<C>(cell)),
                         NodeState::Clean | NodeState::Cyclic
                     ) && !self.stashed(d.0, generation, false)
                 })
@@ -566,7 +567,7 @@ impl<C: Cells> Runtime<C> {
                 };
                 if self.nodes.get(d.0).generation() != dg {
                     failed = true;
-                } else if !self.observed_clean(d, rev) {
+                } else if !self.published_clean(d, rev) {
                     match self.claim_stashed(d, dg) {
                         Some(dep) => stack.push(dep),
                         None => failed = true,
@@ -613,7 +614,7 @@ impl<C: Cells> Runtime<C> {
                     if let Some(Outcome::Verified { since }) =
                         stack.last().map(|t| &t.stash.outcome)
                     {
-                        failed = !self.observed_clean(adopted, *since);
+                        failed = !self.published_clean(adopted, *since);
                     }
                 }
                 Landing::Landed(_) if root => {
@@ -767,9 +768,7 @@ impl<C: Cells> Runtime<C> {
             arena.write_erased(node.arena_slot(), value, first, &wrote)
         })) {
             Ok((changed, displaced)) => {
-                if let Some(d) = displaced {
-                    bag.push_erased(d);
-                }
+                self.displaced(node, displaced, changed || first, bag);
                 changed
             }
             // The unbounded run's write panics after its run too, and its
@@ -1245,6 +1244,7 @@ impl<C: Cells> Runtime<C> {
         kind: ReadKind,
         frame: Option<ActiveRead>,
         mut word: u64,
+        first: bool,
     ) -> Result<T, Cycle> {
         let foreign = word & value_code::FOREIGN_BIT != 0;
         if foreign {
@@ -1278,10 +1278,11 @@ impl<C: Cells> Runtime<C> {
             }
         }
         if word & value_code::REGEN_BIT != 0 {
+            let observed = self.seen(self.nodes.get(handle.slot()).state_cell(), observed);
             self.regen_read(NodeId(handle.slot()), handle.generation(), observed);
         }
         if foreign {
-            return self.foreign_read(handle, observed, kind, word);
+            return self.foreign_read(handle, observed, kind, word, first);
         }
         // A delivery goes to its frame's retry in a non-speculative run: a
         // speculative run that computes the same node is on another path,
@@ -1501,7 +1502,7 @@ impl<C: Cells> Runtime<C> {
         let mut spins = 0;
         loop {
             let node = self.nodes.get(slot);
-            match state::load::<C>(node.state_cell()) {
+            match self.seen(node.state_cell(), state::load::<C>(node.state_cell())) {
                 // Another thread's memo landing: the read takes the memo.
                 NodeState::Dirty if node.memo_at(|| self.current_revision()) => return None,
                 NodeState::New
@@ -1591,7 +1592,9 @@ impl<C: Cells> Runtime<C> {
                 .filter(|v| {
                     let node = self.nodes.get(v.node);
                     node.generation() != v.generation
-                        || match state::load::<C>(node.state_cell()) {
+                        || match self
+                            .seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()))
+                        {
                             NodeState::Clean
                             | NodeState::Cyclic
                             | NodeState::Failed
@@ -1889,7 +1892,8 @@ impl<C: Cells> Runtime<C> {
         let placeholder = self.placeholder::<T>()?;
         let rt = self.runtime_id;
         let slot = handle.slot();
-        if state::load::<C>(self.nodes.get(slot).state_cell()) == NodeState::Clean {
+        let cell = self.nodes.get(slot).state_cell();
+        if self.seen(cell, state::load::<C>(cell)) == NodeState::Clean {
             return None;
         }
         // SAFETY: the active frame's control block is live.
@@ -2699,6 +2703,21 @@ impl<C: Cells> Runtime<C> {
         observed: NodeState,
         kind: ReadKind,
         word: u64,
+        first: bool,
+    ) -> Result<T, Cycle> {
+        // A first nested entry has no entry of this runtime open below it.
+        if C::SINGLE_THREADED || first {
+            return self.foreign_read_framed(handle, observed, kind, word);
+        }
+        self.foreign_entry(|| self.foreign_read_framed(handle, observed, kind, word))
+    }
+
+    fn foreign_read_framed<T: Value>(
+        &self,
+        handle: Incr<T>,
+        observed: NodeState,
+        kind: ReadKind,
+        word: u64,
     ) -> Result<T, Cycle> {
         let Some((reader, node, ctl, cidx)) = self.dep_stack.top_frame() else {
             return self.read_unframed(handle, observed, kind, word);
@@ -2964,7 +2983,7 @@ impl<C: Cells> Runtime<C> {
         }
         if word & (value_code::COUNTER_MASK | value_code::REPLAY_BIT | value_code::UNWIND_MASK) != 0
         {
-            return self.read_cold(handle, observed, kind, None, word);
+            return self.read_cold(handle, observed, kind, None, word, false);
         }
         self.read_walk::<T, 0>(handle, node, observed, kind, word, None)
     }
@@ -3548,7 +3567,7 @@ impl<C: Cells> Runtime<C> {
                 let node = self.nodes.get(v.node);
                 let retried = v.ep.is_none()
                     && matches!(
-                        state::load::<C>(node.state_cell()),
+                        self.seen(node.state_cell(), state::load::<C>(node.state_cell())),
                         NodeState::New | NodeState::Dirty
                     )
                     && node.generation() == v.generation;
@@ -3861,7 +3880,7 @@ impl<C: Cells> Runtime<C> {
     /// of a node this thread reserves, which comes back unrun.
     fn vframe_unfinished(&self, v: &VFrame) -> bool {
         let node = self.nodes.get(v.node);
-        let state = state::load::<C>(node.state_cell());
+        let state = self.seen_quietly(node.state_cell(), state::load::<C>(node.state_cell()));
         // After the load: a recycle bumps it before its node's state.
         if node.generation() != v.generation {
             return false;
@@ -3901,7 +3920,10 @@ impl<C: Cells> Runtime<C> {
         let node_data = self.nodes.get(node);
         let mut spins = 0;
         loop {
-            let observed = state::load::<C>(node_data.state_cell());
+            let observed = self.seen_quietly(
+                node_data.state_cell(),
+                state::load::<C>(node_data.state_cell()),
+            );
             // After the load: a recycled slot's occupant is no claim of
             // the reserved node.
             if node_data.generation() != generation {
@@ -4149,8 +4171,9 @@ impl<C: Cells> Runtime<C> {
         self.look_held(slot, Look::here_or(spec), |e| {
             e.poison() != 0
                 || e.last().iter().any(|&(d, _)| {
+                    let cell = self.nodes.get(d.0).state_cell();
                     !matches!(
-                        state::load::<C>(self.nodes.get(d.0).state_cell()),
+                        self.seen(cell, state::load::<C>(cell)),
                         NodeState::Clean | NodeState::Cyclic
                     )
                 })
@@ -4160,12 +4183,12 @@ impl<C: Cells> Runtime<C> {
 
     /// The end of an episode a virtual frame's pop ran. A dissolved root's
     /// claim lands as if its run never happened, since no frame computes it
-    /// here: the entry below does. It keeps the root in its group, where the
-    /// unbounded run's frame holds it until its alone landing, so another
-    /// thread verifies the group as in the order where it reads first; this
-    /// entry's retry computes the root alone (`end_dissolved`). A suspended
-    /// episode restarts the driver, which runs the entries its doom pushed
-    /// first.
+    /// here: the entry below does. It keeps a group it is still in, one the
+    /// cut released no member from, where the unbounded run's frame holds
+    /// it until its alone landing, so another thread verifies the group as
+    /// in the order where it reads first; this entry's retry computes the
+    /// root alone (`end_dissolved`). A suspended episode restarts the
+    /// driver, which runs the entries its doom pushed first.
     fn episode_task_end(&self, root: NodeId, cidx: u32, end: PopEnd, mut bag: Deferred<C>) -> VPop {
         if matches!(end, PopEnd::Dissolved | PopEnd::Retry) {
             self.rerun_root(root, cidx);
@@ -4959,7 +4982,8 @@ impl<C: Cells> Runtime<C> {
             UNSETTLED_HOLDS.with(|n| n.set(n.get() + 1));
         }
         self.park(ParkPoint::HoldLanding(NodeId(node)));
-        let mut state = state::load::<C>(self.nodes.get(node).state_cell());
+        let cell = self.nodes.get(node).state_cell();
+        let mut state = self.seen_quietly(cell, state::load::<C>(cell));
         if is_computing(state) {
             debug_assert!(
                 !cycle_state::holds(self.runtime_id, node),
@@ -5082,7 +5106,8 @@ impl<C: Cells> Runtime<C> {
     fn ensure_clean_virt(&self, id: NodeId, gen: u32) -> Computed {
         let word = value_code::checked_word();
         loop {
-            let observed = state::load::<C>(self.nodes.get(id.0).state_cell());
+            let cell = self.nodes.get(id.0).state_cell();
+            let observed = self.seen(cell, state::load::<C>(cell));
             if observed == NodeState::Clean {
                 return Computed::Done;
             }

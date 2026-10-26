@@ -426,18 +426,20 @@ impl<C: Cells> Runtime<C> {
                 },
                 // One delete per entry, so a wound retries only the
                 // delete it interrupted and the count stays exact.
-                Step::DeleteSingle => match self.enter(|| self.delete_erased(top)) {
-                    DeleteOutcome::Deleted => {
-                        deleted += 1;
-                        stack.pop_segment(base);
+                Step::DeleteSingle => {
+                    match self.nested_entry(|| self.enter(|| self.delete_erased(top))) {
+                        DeleteOutcome::Deleted => {
+                            deleted += 1;
+                            stack.pop_segment(base);
+                        }
+                        DeleteOutcome::AlreadyGone => stack.pop_segment(base),
+                        // A dependent attached after the step; walk to it next.
+                        DeleteOutcome::HasDependents => {}
                     }
-                    DeleteOutcome::AlreadyGone => stack.pop_segment(base),
-                    // A dependent attached after the step; walk to it next.
-                    DeleteOutcome::HasDependents => {}
-                },
+                }
                 Step::DeleteSet => {
                     let seg = &stack.entries[base..];
-                    if let Some(n) = self.enter(|| self.delete_segment(seg)) {
+                    if let Some(n) = self.nested_entry(|| self.enter(|| self.delete_segment(seg))) {
                         deleted += n;
                         stack.pop_segment(base);
                     }

@@ -86,6 +86,11 @@ impl Gate {
     pub(crate) fn release(&self) {
         self.0.release_tx.lock().unwrap().send(()).unwrap();
     }
+
+    /// Whether an armed gate has been reached.
+    pub(crate) fn reached(&self) -> bool {
+        !self.0.armed.load(Ordering::SeqCst)
+    }
 }
 
 /// Install the runtime's park hook with armed gates at `points`.
@@ -1540,11 +1545,12 @@ fn get_before_read_vs_delete_recycle() {
     assert_eq!(rt.get(new), 99);
 }
 
-/// A read whose walk lands its node New as a member of a cycle finds the
-/// slot empty, and another thread claims the node before the read loads
-/// its state and group: the read waits for that claim and returns the
-/// cycle, where it used to panic that a Clean node had no value (replay
-/// seeds 0x33e9, 0xa55 and 0x19f0 on two threads).
+/// A read whose walk lands its node New as a member of a cycle holds the
+/// landing until the read ends (`crate::hold`), so another thread's claim
+/// of the node waits for the read instead of claiming it between the
+/// landing and the read's load of the state and group, where the read
+/// once panicked that a Clean node had no value (replay seeds 0x33e9,
+/// 0xa55 and 0x19f0 on two threads).
 #[test]
 fn read_of_cycle_member_vs_claim_after_landing() {
     let rt = Arc::new(Rt::new());
@@ -1589,7 +1595,7 @@ fn read_of_cycle_member_vs_claim_after_landing() {
         thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(x))).map_err(panic_message))
     };
     before_read.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::New);
+    assert_eq!(rt.state_of(a), NodeState::Computing);
     assert!(rt.cycle_of(a).is_some());
     // So that the claimer's walk recomputes the failed dep instead of
     // panicking on it before it claims a.
@@ -1602,14 +1608,13 @@ fn read_of_cycle_member_vs_claim_after_landing() {
             catch_unwind(AssertUnwindSafe(|| rt.try_get(a))).map_err(panic_message)
         })
     };
-    in_a.wait_parked();
-    assert_eq!(rt.state_of(a), NodeState::Computing);
-    before_read.release();
-    // Time for the reader to load a's state while the claim is held.
     thread::sleep(Duration::from_millis(50));
+    assert!(!in_a.reached(), "the claimer ran a while the read held it");
+    before_read.release();
+    assert_eq!(reader.join().unwrap(), Ok(1000));
+    in_a.wait_parked();
     in_a.release();
 
-    assert_eq!(reader.join().unwrap(), Ok(1000));
     let cycle = claimer
         .join()
         .unwrap()

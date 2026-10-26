@@ -20,7 +20,7 @@ use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
 use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
-use crate::{reserve, set_stack, waits};
+use crate::{hold, reserve, set_stack, waits};
 
 /// What a compute attempt carries into its landings.
 #[derive(Copy, Clone)]
@@ -30,6 +30,18 @@ pub(super) struct Attempt {
     pub(super) cidx: u32,
     pub(super) stamp_rev: u64,
     pub(super) verify_rev: u64,
+}
+
+/// An episode's members taken out of the held map, with what their
+/// landing needs.
+struct EpisodeLanding<'a> {
+    members: &'a [u32],
+    cu: &'a [u32],
+    uncut: bool,
+    cycle: Cycle,
+    stamp_rev: u64,
+    verify_rev: u64,
+    entries: Vec<(u32, Seen<Held>)>,
 }
 
 /// What cutting an episode to its root's SCC did.
@@ -312,6 +324,13 @@ impl<C: Cells> Runtime<C> {
     fn end_nested_shared(&self, cidx: u32) {
         replay::drop_all_from(cidx);
         if cycle_state::wounded() {
+            // The winner may wait on one of them. Only `Local` frames lie
+            // below the thread's first `Shared` entry, and none takes `HOLD`,
+            // so no reader is tainted.
+            if hold::holds_runtime(self.runtime_id) {
+                self.retract_held();
+            }
+            debug_assert!(self.dep_stack.hold_reader().is_none());
             reserve::end_all();
             debug_assert!(
                 cycle_state::held_keys()
@@ -349,7 +368,12 @@ impl<C: Cells> Runtime<C> {
                 replay::reset();
             }
             match catch_unwind(AssertUnwindSafe(&mut *f)) {
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    if outermost && !C::SINGLE_THREADED && hold::active() {
+                        self.publish_held();
+                    }
+                    return Ok(r);
+                }
                 Err(payload) => {
                     if let Some(cycle) = self.caught(outermost, kind, payload) {
                         return Err(cycle);
@@ -382,6 +406,11 @@ impl<C: Cells> Runtime<C> {
             cycle_state::take_unwind_kind();
             cycle_state::set_wounded(false);
             drop(payload);
+            // The winner may wait on a held landing: nothing the attempt
+            // landed stays, in any order.
+            if !C::SINGLE_THREADED && hold::active() {
+                self.retract_held();
+            }
             debug_assert!(
                 cycle_state::held_keys().is_empty(),
                 "incr-core: a wounded thread waits for its winner holding claims"
@@ -393,8 +422,14 @@ impl<C: Cells> Runtime<C> {
                 reserve::none_held(),
                 "incr-core: a wounded thread waits for its winner holding reservations"
             );
+            self.park(ParkPoint::WoundRetracted);
             self.await_winner();
             return None;
+        }
+        // Any other unwind out of the outermost entry ends the attempt as
+        // its read's outcome, which every landing it made is part of.
+        if outermost && !C::SINGLE_THREADED && hold::active() {
+            self.publish_held();
         }
         match cycle_state::take_unwind_kind() {
             Some(UnwindKind::Cycle) => {
@@ -482,6 +517,11 @@ impl<C: Cells> Runtime<C> {
         });
         holds.extend(also.map(|x| (self.runtime_id, x.0)));
         holds.extend(cycle_state::held_keys());
+        holds.extend(
+            hold::keys(self.runtime_id)
+                .into_iter()
+                .map(|s| (self.runtime_id, s)),
+        );
         holds.extend(set_stack::claims());
         holds.extend(
             reserve::held()
@@ -1634,7 +1674,8 @@ impl<C: Cells> Runtime<C> {
 
     /// Cuts `ep` to the root's SCC in `graph`, the member graph of the
     /// last runs, releasing the rest with the discard landing. A root
-    /// alone with no self-edge dissolves.
+    /// alone with no self-edge dissolves. The members kept leave a group
+    /// the cut released others from ([`Self::leave_cut_group`]).
     fn shrink_to_root_scc(
         &self,
         root: NodeId,
@@ -1656,7 +1697,8 @@ impl<C: Cells> Runtime<C> {
             .collect();
         if scc.len() == 1 && !graph[at].contains(&at) {
             cycle_state::dissolved_before(rt, root.0);
-            self.release_members(members, Some(root.0), bag);
+            self.release_members(root, members, Some(root.0), bag);
+            self.leave_cut_group(&[root.0]);
             return Shrink::Dissolved;
         }
         if scc.len() == members.len() {
@@ -1667,7 +1709,8 @@ impl<C: Cells> Runtime<C> {
             .copied()
             .filter(|m| scc.binary_search(m).is_err())
             .collect();
-        self.release_members(&gone, None, bag);
+        self.release_members(root, &gone, None, bag);
+        self.leave_cut_group(&scc);
         cu.retain(|m| scc.binary_search(m).is_ok());
         *members = scc;
         Shrink::Shrunk
@@ -1761,6 +1804,44 @@ impl<C: Cells> Runtime<C> {
         });
     }
 
+    /// Takes each of `kept`, members a cut keeps claimed, out of a group
+    /// whose record names a member that is no longer in it, so that the
+    /// cut leaves no such record. They leave unverified, as a member
+    /// landing Dirty out of its group does, since a wound lands them Dirty.
+    /// Under `Shared` a cut is an exposure: the record is kept for a
+    /// retraction, which puts the whole group back ([`hold::keep_cut_rec`]).
+    fn leave_cut_group(&self, kept: &[u32]) {
+        for &m in kept {
+            let (node, flags) = self.nodes.get_with_flags(m);
+            if C::u8_load_relaxed(flags) & IN_GROUP != 0 && self.names_departed(m) {
+                if !C::SINGLE_THREADED && !hold::holds(state::cell_key::<C>(node.state_cell())) {
+                    let rt = self.runtime_id;
+                    let lands_new = cycle_state::with_held(|h| {
+                        h.get(&(rt, m)).is_some_and(|e| e.first || e.wrote)
+                    });
+                    let rec = self.inner.read().member_recs.get(&m).cloned();
+                    hold::keep_cut_rec(rt, m, rec, lands_new);
+                }
+                self.leave_group(NodeId(m), node, flags, NodeState::Dirty);
+            }
+        }
+    }
+
+    /// Whether `slot`'s group record names a member that is no longer in
+    /// it.
+    fn names_departed(&self, slot: u32) -> bool {
+        let inner = self.inner.read();
+        let Some(group) = inner.member_recs.get(&slot) else {
+            return false;
+        };
+        group.members.iter().any(|&(m, _)| {
+            !inner
+                .member_recs
+                .get(&m)
+                .is_some_and(|g| Arc::ptr_eq(g, group))
+        })
+    }
+
     /// Counts a release of held claims, before they land, for the walks
     /// other threads planned while they were held: a claim that reads one
     /// of the landings also reads the count.
@@ -1773,8 +1854,14 @@ impl<C: Cells> Runtime<C> {
 
     /// Releases `slots` from the held map with the discard landing,
     /// except `keep`. They leave their group, as the unbounded run's
-    /// episode cuts them at the same point.
-    fn release_members(&self, slots: &[u32], keep: Option<u32>, bag: &mut Deferred<C>) {
+    /// episode at `root` cuts them at the same point.
+    fn release_members(
+        &self,
+        root: NodeId,
+        slots: &[u32],
+        keep: Option<u32>,
+        bag: &mut Deferred<C>,
+    ) {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
         if slots.iter().any(|&m| Some(m) != keep) {
@@ -1786,10 +1873,18 @@ impl<C: Cells> Runtime<C> {
             }
             let entry = cycle_state::with_held(|h| h.remove(&(rt, m)));
             if let Some(e) = entry {
+                // A cut is an exposure: its released members stay Computing to
+                // other threads until the attempt ends (`crate::hold`), and
+                // leave their group at once, as under `Local`, with the record
+                // kept for a retraction.
+                if !C::SINGLE_THREADED {
+                    self.open_hold(NodeId(m), self.nodes.get(m), e.first, None, bag);
+                }
                 self.discard_land(NodeId(m), e.first, e.wrote, stamp_rev, bag);
                 bag.push_erased(Box::new(e.into_values()));
             }
         }
+        self.park(ParkPoint::MembersReleased(root));
     }
 
     /// Lands every claim of this runtime held at or above `cidx`: with
@@ -1975,6 +2070,15 @@ impl<C: Cells> Runtime<C> {
     ) {
         if matches!(kind, Some(UnwindKind::Wound | UnwindKind::Discard)) {
             self.discard_land_in_group(id, first, wrote, stamp_rev, ChildLanding::Discard, bag);
+            // After the landing, which puts a wound's replaced records back.
+            #[cfg(test)]
+            {
+                let dissolved = cycle_state::has_dissolved(self.runtime_id, id.0);
+                let stale = self.names_departed(id.0);
+                let grouped = C::u8_load_relaxed(self.nodes.get_with_flags(id.0).1) & IN_GROUP != 0;
+                let mut landings = self.unwound_landings.lock().unwrap();
+                landings.push((id.0, dissolved, stale, grouped));
+            }
         } else {
             self.discard_land(id, first, wrote, stamp_rev, bag);
         }
@@ -2068,15 +2172,18 @@ impl<C: Cells> Runtime<C> {
         let arena = self.arenas.erased(node.type_tag());
         let wrote = Cell::new(0_u8);
         let first = e.first;
+        // A cut's claim lands held: its entry opens before the write, so
+        // the undo keeps what the write displaces.
+        if !C::SINGLE_THREADED && hold::cut_kept(rt, slot) {
+            self.open_hold(id, node, first, None, bag);
+        }
         let written = catch_unwind(AssertUnwindSafe(|| {
             arena.write_erased(node.arena_slot(), value, first, &wrote)
         }));
         e.wrote |= wrote.get() != 0;
         let changed = match written {
             Ok((changed, displaced)) => {
-                if let Some(d) = displaced {
-                    bag.push_erased(d);
-                }
+                self.displaced(node, displaced, changed || first, bag);
                 changed
             }
             Err(payload) => {
@@ -2141,12 +2248,20 @@ impl<C: Cells> Runtime<C> {
         cidx: u32,
         bag: &mut Deferred<C>,
     ) -> PopEnd {
-        if !C::SINGLE_THREADED {
-            // Before the members land, so that a read of one of their
-            // landings also reads the count.
-            cycle_state::own_episode(self.runtime_id, LANDED);
-            C::u64_fetch_add(&self.episodes_landed, LANDED);
-        }
+        let landing = EpisodeLanding {
+            entries: self.take_episode(members, bag),
+            members,
+            cu,
+            uncut,
+            cycle,
+            stamp_rev,
+            verify_rev,
+        };
+        self.publish_episode(landing, cidx, bag)
+    }
+
+    /// Takes an episode's members out of the held map, as seen here.
+    fn take_episode(&self, members: &[u32], bag: &mut Deferred<C>) -> Vec<(u32, Seen<Held>)> {
         let rt = self.runtime_id;
         let entries: Vec<(u32, Held)> = cycle_state::with_held(|h| {
             members
@@ -2165,7 +2280,7 @@ impl<C: Cells> Runtime<C> {
             "incr-core: an episode lands a speculative run's record"
         );
         let look = Look::here();
-        let mut entries: Vec<(u32, Seen<Held>)> = entries
+        entries
             .into_iter()
             .map(|(m, e)| {
                 let (e, spec_buf) = e.into_look(look);
@@ -2174,7 +2289,26 @@ impl<C: Cells> Runtime<C> {
                 }
                 (m, e)
             })
-            .collect();
+            .collect()
+    }
+
+    /// Steps 2 to 5 of `landing`: validates its members, installs their
+    /// deps and group record, writes their values and lands them.
+    fn publish_episode(
+        &self,
+        landing: EpisodeLanding<'_>,
+        cidx: u32,
+        bag: &mut Deferred<C>,
+    ) -> PopEnd {
+        let EpisodeLanding {
+            members,
+            cu,
+            uncut,
+            cycle,
+            stamp_rev,
+            verify_rev,
+            mut entries,
+        } = landing;
 
         // Step 2: validate, install and record the group under one hold.
         let mut inner = self.inner.write();
@@ -2200,10 +2334,20 @@ impl<C: Cells> Runtime<C> {
             }
             return PopEnd::Retry;
         }
+        // Under Shared the episode is held until the attempt ends
+        // (`crate::hold`), which counts it then.
+        if !C::SINGLE_THREADED {
+            hold::note_episode(self.runtime_id);
+            for (m, e) in &entries {
+                self.open_hold(NodeId(*m), self.nodes.get(*m), e.first, None, bag);
+            }
+        }
         let mut superseded = false;
         for (m, e) in &entries {
             let id = NodeId(*m);
             let node = self.nodes.get(*m);
+            // Before the deps compare: the held branch below continues past the loop end.
+            self.drop_landed_entry(&mut inner, *m, node);
             let mut old: Vec<NodeId> = Vec::new();
             node.for_each_dep(|d| old.push(d));
             let new: &[NodeId] = e.installed();
@@ -2213,6 +2357,17 @@ impl<C: Cells> Runtime<C> {
                     && !self.observed_clean(*d, verify_rev)
             });
             if old != new {
+                if !C::SINGLE_THREADED {
+                    hold::keep_deps(state::cell_key::<C>(node.state_cell()), || {
+                        old.iter()
+                            .map(|d| (*d, self.nodes.get(d.0).generation()))
+                            .collect()
+                    });
+                    if let Some(displaced) = node.install_deps(new) {
+                        bag.push_dep_list(displaced);
+                    }
+                    continue;
+                }
                 if let Some(displaced) = node.install_deps(new) {
                     bag.push_dep_list(displaced);
                 }
@@ -2227,15 +2382,18 @@ impl<C: Cells> Runtime<C> {
                     }
                 }
             }
-            self.set_released(&mut inner, *m, node, None);
         }
         let group = Arc::new(GroupInfo {
             members: entries.iter().map(|(m, e)| (*m, e.generation)).collect(),
             cycle,
         });
         for (m, _) in &entries {
-            inner.member_recs.insert(*m, group.clone());
-            let flags = self.nodes.get_with_flags(*m).1;
+            let (node, flags) = self.nodes.get_with_flags(*m);
+            let old = inner.member_recs.insert(*m, group.clone());
+            if !C::SINGLE_THREADED {
+                let in_group = C::u8_load_relaxed(flags) & IN_GROUP != 0;
+                hold::keep_rec(state::cell_key::<C>(node.state_cell()), old, in_group);
+            }
             C::u8_store_relaxed(flags, C::u8_load_relaxed(flags) | IN_GROUP);
         }
         drop(inner);
@@ -2256,8 +2414,17 @@ impl<C: Cells> Runtime<C> {
             let node = self.nodes.get(m);
             let arena = self.arenas.erased(node.type_tag());
             if cu.binary_search(&m).is_ok() {
-                if let Some(old) = arena.clear_value(node.arena_slot()) {
+                let old = arena.clear_value(node.arena_slot());
+                let wrote = old.is_some();
+                let old = if C::SINGLE_THREADED {
+                    old
+                } else {
+                    hold::keep_value(state::cell_key::<C>(node.state_cell()), old)
+                };
+                if let Some(old) = old {
                     bag.push_erased(old);
+                }
+                if wrote {
                     entries[i].1.wrote = true;
                 }
                 node.max_changed_at(stamp_rev);
@@ -2278,9 +2445,7 @@ impl<C: Cells> Runtime<C> {
                             node.max_changed_at(stamp_rev);
                             e.changed = true;
                         }
-                        if let Some(d) = displaced {
-                            bag.push_erased(d);
-                        }
+                        self.displaced(node, displaced, changed || first, bag);
                     }
                     Err(payload) => {
                         e.failed = true;

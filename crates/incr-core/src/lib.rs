@@ -36,6 +36,7 @@ pub mod fx;
 pub mod generic_arena;
 pub mod handle;
 mod hashed_multiset;
+mod hold;
 pub mod lock_order;
 pub mod locks;
 #[cfg(loom)]
