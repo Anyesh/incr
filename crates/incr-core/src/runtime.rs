@@ -218,6 +218,10 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a run that did not land Clean released its
     /// claim, with the attempt's bag carried along.
     UnsettledLanding(NodeId),
+    /// In `land_failed`, after a landing meant as Failed published the
+    /// record of the payload it lets out and before `land_single` stores
+    /// its state or holds it for publication.
+    FailedBeforeStore(NodeId),
     /// In `land_failed` or a held publication, after a landing meant as
     /// Failed released its claim landing otherwise.
     FailedLandedOtherwise(NodeId),
@@ -5531,6 +5535,9 @@ impl<C: Cells> Runtime<C> {
         } else {
             None
         };
+        if landing == NodeState::Failed {
+            self.park(ParkPoint::FailedBeforeStore(id));
+        }
         let landed = self.land_single(id, node, flags, landing, flagged);
         if !C::SINGLE_THREADED && landed == NodeState::Failed {
             cycle_state::note_failed_here(self.runtime_id, id.0, node.generation());
