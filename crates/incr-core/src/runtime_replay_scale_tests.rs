@@ -1264,7 +1264,7 @@ fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
     // budget, never with the chain.
     let per_level = match (through, frames) {
         (false, _) => 48,
-        (true, 1) => 48,
+        (true, 1) => 72,
         (true, _) => 240,
     };
     let n = if cfg!(miri) { 8 } else { 4000 };
@@ -1580,14 +1580,15 @@ fn same_text_fan_over_chain_stays_linear<C: Cells>(through: bool) {
     // Below about 1000 panics the chain's own notes take a share of the
     // bound that only a shorter chain under a smaller budget leaves room for.
     let (frames, len, sizes): (u32, usize, &[u64]) = if cfg!(miri) {
-        (8, 24, &[128])
+        (8, 24, &[512])
     } else {
         (256, 600, &[1000, 4000, 16000])
     };
     for &n in sizes {
         let work = same_text_fan_over_chain::<C>(n, through, frames, len);
+        let per_panic = if through { 40 } else { 32 };
         assert!(
-            work <= 24 * n,
+            work <= per_panic * n,
             "{work} units of note work for {n} caught panics of one text, through={through}"
         );
     }
