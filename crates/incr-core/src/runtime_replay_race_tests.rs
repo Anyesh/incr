@@ -1965,11 +1965,7 @@ fn read_over_a_delivery(
     u.rt.set_max_frames(u32::MAX);
     let want_first = outcome(|| u.rt.get(u.top));
     let want_other = outcome(|| u.rt.get(if other_reads_w { u.top } else { u.x }));
-    assert_eq!(
-        classes([&first, &other]),
-        classes([&want_first, &want_other]),
-        "{first:?}, {other:?} against {want_first:?}, {want_other:?}"
-    );
+    assert_racing_reads([&first, &other], [&want_first, &want_other]);
     assert_eq!(
         (rt.state_of(s.x), rt.state_of(s.y), rt.state_of(s.top)),
         (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.top))
@@ -1977,18 +1973,26 @@ fn read_over_a_delivery(
     (first, other)
 }
 
-/// Racing Shared reads' outcomes as they are compared: which reader of a
+/// Compares racing Shared reads with an unbounded run's: which reader of a
 /// panicked node gets the payload and which gets "last compute panicked"
 /// is not part of the result (the wiki decision "Shared panic payload
-/// contract"), so they are compared as a set, every "last compute
-/// panicked" alike.
-fn classes<const N: usize>(reads: [&Result<u64, String>; N]) -> [Result<u64, String>; N] {
-    let mut c = reads.map(|r| match r {
-        Err(m) if m.contains("last compute panicked") => Err("failed".to_string()),
-        r => r.clone(),
-    });
-    c.sort();
-    c
+/// contract"), so each read's value or panic must agree, and the panics'
+/// texts must agree as a set, every "last compute panicked" alike.
+fn assert_racing_reads<const N: usize>(
+    got: [&Result<u64, String>; N],
+    want: [&Result<u64, String>; N],
+) {
+    let classes = |reads: [&Result<u64, String>; N]| {
+        let mut c = reads.map(|r| match r {
+            Err(m) if m.contains("last compute panicked") => Err("failed".to_string()),
+            r => r.clone(),
+        });
+        c.sort();
+        c
+    };
+    let values = |reads: [&Result<u64, String>; N]| reads.map(|r| r.as_ref().ok().copied());
+    assert_eq!(values(got), values(want), "{got:?} against {want:?}");
+    assert_eq!(classes(got), classes(want), "{got:?} against {want:?}");
 }
 
 fn failed(r: &Result<u64, String>) -> bool {
@@ -3235,11 +3239,7 @@ fn shared_reader_waits_out_a_held_delivery_at_an_equal_path() {
         outcome(|| u.rt.get(u.w)),
     );
     assert_eq!(want.0, Err("y boom".to_string()));
-    assert_eq!(
-        classes([&first, &landed, &other]),
-        classes([&want.0, &want.1, &want.2]),
-        "{first:?}, {landed:?}, {other:?} against {want:?}"
-    );
+    assert_racing_reads([&first, &landed, &other], [&want.0, &want.1, &want.2]);
     assert_eq!(
         (rt.state_of(x), rt.state_of(y), rt.state_of(w)),
         (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.w))
@@ -4232,11 +4232,7 @@ fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
     let want = (outcome(|| u.rt.get(u.w)), u.joined.lock().unwrap().clone());
     let want_joined = want.1.clone().expect("the unbounded joined read returned");
     assert_eq!(want_joined, Err("y boom".to_string()));
-    assert_eq!(
-        classes([&first, &joined]),
-        classes([&want.0, &want_joined]),
-        "{first:?}, {joined:?} against {want:?}"
-    );
+    assert_racing_reads([&first, &joined], [&want.0, &want_joined]);
     assert_eq!(
         (s.rt.state_of(s.x), s.rt.state_of(s.y), s.rt.state_of(s.w)),
         (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.w))

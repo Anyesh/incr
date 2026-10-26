@@ -823,9 +823,11 @@ fn entry_rerun_join(first: First) {
                 move |rt: &Rt| {
                     joins.fetch_add(1, SeqCst);
                     let holds_x = crate::replay::with(|c| {
-                        c.iter()
-                            .flat_map(|ctx| ctx.pending.iter())
-                            .any(|d| !d.taken() && d.key.node == x.slot())
+                        c.iter().flat_map(|ctx| ctx.pending.iter()).any(|d| {
+                            !d.taken()
+                                && d.key.node == x.slot()
+                                && matches!(d.what, crate::replay::Delivered::Unwind { .. })
+                        })
                     });
                     if holds_x {
                         held.store(true, SeqCst);
