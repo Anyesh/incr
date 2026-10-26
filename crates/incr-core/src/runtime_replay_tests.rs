@@ -464,6 +464,29 @@ fn the_unbudgeted_list_follows_the_budgets() {
     assert!(!super::replay_impl::unbudgeted(id));
 }
 
+thread_local! {
+    static EXIT_DROPPED: Runtime<Local> = Runtime::new();
+}
+
+/// A runtime its thread's exit drops after `NOTE_DECIDED` is destroyed,
+/// which it is when the runtime's first budget change comes after its
+/// creation, still leaves the unbudgeted list.
+#[test]
+fn a_runtime_dropped_after_the_note_hook_leaves_the_list() {
+    let other = Runtime::<Local>::new();
+    other.set_max_frames(u32::MAX);
+    let id = std::thread::spawn(|| {
+        EXIT_DROPPED.with(|rt| {
+            rt.set_max_frames(u32::MAX);
+            rt.runtime_id
+        })
+    })
+    .join()
+    .unwrap();
+    assert!(!super::replay_impl::unbudgeted(id));
+    drop(other);
+}
+
 /// Races `set_max_frames(u32::MAX)` with a byte budget: another thread
 /// sets the byte budget after `set_max_frames` is called and before it
 /// takes the list's lock.
