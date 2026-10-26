@@ -12,7 +12,7 @@
 //! larger one cut off by a timeout: B7 sat at bound 2 while a bound-3 run
 //! of the same model spent three hours elsewhere in the search.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Once;
 
@@ -53,23 +53,56 @@ fn silence_expected_panics() {
     ONCE.call_once(|| {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            // Outside a model, loom's thread-locals panic on access, and a
-            // panic in the hook aborts the process. So do they while one of
-            // loom's own panics (a branch limit, a deadlock) holds its
-            // execution state borrowed, which would hide loom's message.
-            let in_loom = info.location().is_some_and(|l| l.file().contains("/loom-"));
-            let expected = !in_loom
-                && IN_MODEL.with(Cell::get)
-                && EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false);
-            if !expected {
-                default(info);
+            if IN_MODEL.with(Cell::get) {
+                if fatal(info) {
+                    report_raw(info);
+                } else if EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false) {
+                    return;
+                } else {
+                    LAST_SHOWN.with(|l| *l.borrow_mut() = Some(describe(info)));
+                }
             }
+            default(info);
         }));
     });
 }
 
+/// Loom's own panics (a branch limit, a deadlock, its state touched
+/// outside an execution) and core's non-unwinding ones. While these run
+/// loom's thread-locals panic on access, which in the hook aborts: loom
+/// may hold its state borrowed, or a failed model's teardown drops threads
+/// whose locals hold loom objects outside any execution.
+fn fatal(info: &std::panic::PanicHookInfo<'_>) -> bool {
+    info.location()
+        .is_some_and(|l| l.file().contains("/loom-") || l.file().ends_with("core/src/panicking.rs"))
+}
+
+fn describe(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info.payload();
+    let msg = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("");
+    let at = info.location().map(ToString::to_string).unwrap_or_default();
+    format!("panicked at {at}: {msg}")
+}
+
+/// A fatal panic usually ends in an abort, which loses the test harness's
+/// captured output, so it and the last panic shown before it, often the
+/// model's failed assertion, also go to the process's stderr.
+fn report_raw(info: &std::panic::PanicHookInfo<'_>) {
+    use std::io::Write;
+    let mut err = std::io::stderr().lock();
+    if let Some(last) = LAST_SHOWN.with(|l| l.take()) {
+        let _ = writeln!(err, "loom model, last panic shown: {last}");
+    }
+    let _ = writeln!(err, "loom model, fatal: {}", describe(info));
+}
+
 std::thread_local! {
     static IN_MODEL: Cell<bool> = const { Cell::new(false) };
+    static LAST_SHOWN: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Marks the thread as inside [`loom::model`] until dropped, unwinding
@@ -79,6 +112,7 @@ struct InModel;
 impl InModel {
     fn enter() -> Self {
         IN_MODEL.with(|m| m.set(true));
+        LAST_SHOWN.with(|l| *l.borrow_mut() = None);
         Self
     }
 }
