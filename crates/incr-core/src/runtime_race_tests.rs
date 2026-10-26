@@ -2389,3 +2389,82 @@ fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
         super::ROOT_RESTARTS
     );
 }
+
+/// Each of `walkers` threads reads the top of its own 200-query chain over
+/// its own input after setting it, `ROUNDS` times, while `releasers` threads
+/// call `release` on the same runtime without pause until every walk is done.
+fn walks_under_releases(walkers: usize, releasers: usize, release: fn(&Rt)) -> Arc<Rt> {
+    const DEPTH: usize = 200;
+    const ROUNDS: u64 = 200;
+    let rt = Arc::new(Rt::new());
+    let done = Arc::new(AtomicBool::new(false));
+    let releasing: Vec<_> = (0..releasers)
+        .map(|_| {
+            let (rt, done) = (rt.clone(), done.clone());
+            thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    release(&rt);
+                }
+            })
+        })
+        .collect();
+    let walking: Vec<_> = (0..walkers)
+        .map(|_| {
+            let rt = rt.clone();
+            thread::spawn(move || {
+                let input = rt.create_input(0_u64);
+                let mut top = rt.create_query(move |rt| rt.get(input));
+                for _ in 1..DEPTH {
+                    let below = top;
+                    top = rt.create_query(move |rt| rt.get(below) + 1);
+                }
+                for round in 1..=ROUNDS {
+                    rt.set(input, round);
+                    assert_eq!(rt.get(top), round + DEPTH as u64 - 1);
+                }
+            })
+        })
+        .collect();
+    for w in walking {
+        w.join().unwrap();
+    }
+    done.store(true, Ordering::Relaxed);
+    for r in releasing {
+        r.join().unwrap();
+    }
+    rt
+}
+
+/// Times walks under releases that never pause, by the test's own
+/// "finished in"; runs on trees without the walk's release check too.
+#[test]
+#[ignore = "a timing probe"]
+fn walks_under_constant_releases_timing() {
+    walks_under_releases(4, 4, |rt| rt.count_release());
+}
+
+/// Releases do not make a walk reread; retractions do, once each per walk
+/// that checks after them, so a stream of retractions that never pauses
+/// costs rereads but still lets the walks finish. Prints the most rereads
+/// one walk did under each.
+#[test]
+#[ignore = "a probe that prints counts"]
+fn walk_rereads_under_constant_releases() {
+    let retract = |rt: &Rt| {
+        Shared::u64_fetch_add(&rt.retractions.0, 1);
+    };
+    for (kind, release) in [
+        ("releases", (|rt: &Rt| rt.count_release()) as fn(&Rt)),
+        ("retractions", retract),
+    ] {
+        for releasers in [1, 4, 8] {
+            let rt = walks_under_releases(4, releasers, release);
+            println!(
+                "{kind} from {releasers} threads: rereads {}, most in one walk {}, walks of 200 queries {}",
+                rt.rereads.load(Ordering::Relaxed),
+                rt.max_walk_rereads.load(Ordering::Relaxed),
+                4 * 200
+            );
+        }
+    }
+}

@@ -720,6 +720,8 @@ pub(crate) struct Walk {
     /// The runtime's retraction count as the walk last checked it, loaded
     /// before any dep list it reads since.
     retracted: u64,
+    #[cfg(test)]
+    rereads: u32,
 }
 
 #[derive(Default, Clone)]
@@ -762,6 +764,8 @@ impl Walk {
             failed_from: 0,
             planned: Planned::default(),
             retracted: 0,
+            #[cfg(test)]
+            rereads: 0,
         }
     }
 
@@ -1171,6 +1175,11 @@ pub struct Runtime<C: Cells> {
     first_visits: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     expansions: std::sync::atomic::AtomicU64,
+    /// Expansions dropped and read again, and the most one walk did.
+    #[cfg(test)]
+    pub(crate) rereads: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) max_walk_rereads: std::sync::atomic::AtomicU32,
     /// Group verifications failed by a member's `verified_at` of 0.
     #[cfg(test)]
     pub(crate) group_zero_fails: std::sync::atomic::AtomicU64,
@@ -1321,6 +1330,10 @@ impl<C: Cells> Runtime<C> {
             first_visits: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             expansions: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            rereads: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            max_walk_rereads: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             group_zero_fails: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
@@ -3944,6 +3957,13 @@ impl<C: Cells> Runtime<C> {
         let own = hold::holds(state::cell_key::<C>(node.state_cell()));
         if own && !moved {
             return;
+        }
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            walk.rereads += 1;
+            self.rereads.fetch_add(1, Relaxed);
+            self.max_walk_rereads.fetch_max(walk.rereads, Relaxed);
         }
         walk.work.truncate(planned_len);
         walk.forget(|&n| n == id);
