@@ -566,6 +566,17 @@ thread_local! {
     pub(crate) static FORCE_REPLAN_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+#[cfg(all(test, not(loom)))]
+thread_local! {
+    static WALK_PUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The entries walks pushed on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_walk_pushes() -> u64 {
+    WALK_PUSHES.with(|n| n.replace(0))
+}
+
 /// How `compute_one` left the node it was handed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Computed {
@@ -764,6 +775,8 @@ impl Walk {
 
     #[inline(always)]
     fn push(&mut self, entry: Entry) {
+        #[cfg(all(test, not(loom)))]
+        WALK_PUSHES.with(|n| n.set(n.get() + 1));
         if self.work.len() == self.work.capacity() {
             self.grow();
         }

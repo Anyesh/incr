@@ -941,12 +941,12 @@ fn shared_many_foreign_clean_reads_stay_linear() {
     many_foreign_reads::<Shared>(true);
 }
 
-/// The note work of the second read of a chain of `n` queries over a
-/// Failed node at budget `frames`, after a set below the chain. One
-/// payload goes up the chain, and its ticket
-/// gains a landing per step: each reader takes the ticket and the next
-/// landing holds it again.
-fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
+/// The note work of the first read of a chain of `n` queries over a
+/// panicking node at budget `frames`, and of the second read after a set
+/// below the chain. One payload goes up the chain, and its ticket gains a
+/// landing per step: each reader takes the ticket and the next landing
+/// holds it again.
+fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
     let rt = Runtime::<C>::new();
     let opts = || match frames {
         Some(_) => replayable(),
@@ -964,11 +964,13 @@ fn contained_chain<C: Cells>(frames: Option<u32>, n: usize) -> u64 {
         below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
     }
     let top = below;
+    crate::replay::take_note_work();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let first = crate::replay::take_note_work();
     rt.set(input, 1);
     crate::replay::take_note_work();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
-    crate::replay::take_note_work()
+    (first, crate::replay::take_note_work())
 }
 
 fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
@@ -978,7 +980,13 @@ fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
         &[1000, 2000, 4000]
     };
     for &n in sizes {
-        let work = contained_chain::<C>(frames, n);
+        let (first, work) = contained_chain::<C>(frames, n);
+        // At a budget of 1 the first read's note work is still quadratic,
+        // a known limitation this bound leaves out.
+        assert!(
+            frames.is_some() || first <= 16 * n as u64,
+            "{frames:?}: {first} units of note work for a {n}-chain's first read"
+        );
         assert!(
             work <= 16 * n as u64,
             "{frames:?}: {work} units of note work for a {n}-chain"
@@ -1009,8 +1017,9 @@ fn shared_contained_chain_stays_linear_at_budget_1() {
 /// A panicking query under an `n`-deep chain, read and then read again
 /// after an input change: each level's read takes the unwind and its frame
 /// lands Failed, which keys what the read took by the frame's path. The
-/// stack frames folded into paths, on the first read and on the second.
-fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
+/// stack frames folded into paths on the first read and on the second, and
+/// the entries the second read's walks pushed.
+fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64, u64) {
     let rt = Runtime::<C>::new();
     let opts = || match frames {
         Some(_) => replayable(),
@@ -1032,16 +1041,25 @@ fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, 
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
     let first = crate::replay::take_path_steps();
     rt.set(input, 1);
+    crate::runtime::take_walk_pushes();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
-    (first, crate::replay::take_path_steps())
+    (
+        first,
+        crate::replay::take_path_steps(),
+        crate::runtime::take_walk_pushes(),
+    )
 }
 
 fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
     let n = if cfg!(miri) { 8 } else { 4000 };
-    let (first, second) = panicking_chain_path_steps::<C>(frames, n);
+    let (first, second, pushes) = panicking_chain_path_steps::<C>(frames, n);
     assert!(
         first <= 8 * n as u64 && second <= 8 * n as u64,
         "{frames:?}: {first} and {second} frames folded into paths for a {n}-chain"
+    );
+    assert!(
+        pushes <= 8 * n as u64,
+        "{frames:?}: the second read's walks pushed {pushes} entries for a {n}-chain"
     );
 }
 
@@ -1248,19 +1266,48 @@ fn shared_custom_payload_chain_100k_at_budget_1_on_a_1_mib_thread() {
 /// reads and catches its own panicking query and then reads the level
 /// below. Every caught panic's Failed landing is copied into a delivery,
 /// and a later landing of a node no copy holds must not cost a pass over
-/// the context's deliveries.
-fn nested_caught_chain<C: Cells>(frames: u32) {
-    let n: u64 = if cfg!(miri) { 8 } else { 4000 };
+/// the context's deliveries. `through` puts a query between each level and
+/// its panicking one, so each copy holds a landing a level deeper.
+fn nested_caught_chain<C: Cells>(frames: u32, through: bool) {
+    // Each doomed level's retry catches its kept reads up on what up to
+    // `frames` levels above it did, so the work per level grows with the
+    // budget, never with the chain.
+    let per_level = match (through, frames) {
+        (false, _) => 48,
+        (true, 1) => 80,
+        (true, _) => 260,
+    };
+    let n = if cfg!(miri) { 8 } else { 4000 };
+    let work = nested_caught_chain_work::<C>(frames, through, n);
+    assert!(
+        work <= per_level * n,
+        "budget {frames}: {work} units of note work for a {n}-chain"
+    );
+    if through && !cfg!(miri) {
+        let small = nested_caught_chain_work::<C>(frames, through, 1000);
+        assert!(
+            work <= 6 * small,
+            "budget {frames}: {small} and {work} units of note work for 1000- and 4000-chains"
+        );
+    }
+}
+
+/// The note work of a chain of `n` levels as [`nested_caught_chain`] builds it.
+fn nested_caught_chain_work<C: Cells>(frames: u32, through: bool, n: u64) -> u64 {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
     rt.set_max_frames(frames);
     let input = rt.create_input(7_u64);
     let mut below = rt.create_query_with(move |rt| rt.get(input), replayable());
     for k in 0..n {
-        let failing = rt.create_query_with(
+        let mut failing = rt.create_query_with(
             move |rt: &Runtime<C>| -> u64 { panic!("chain {}", k + rt.get(input)) },
             replayable(),
         );
+        if through {
+            let panicking = failing;
+            failing = rt.create_query_with(move |rt| rt.get(panicking), replayable());
+        }
         let dep = below;
         below = rt.create_query_with(
             move |rt| {
@@ -1272,31 +1319,47 @@ fn nested_caught_chain<C: Cells>(frames: u32) {
     }
     crate::replay::take_note_work();
     assert_eq!(rt.get(below), n + 7);
-    let work = crate::replay::take_note_work();
-    assert!(
-        work <= 48 * n,
-        "budget {frames}: {work} units of note work for a {n}-chain"
-    );
+    crate::replay::take_note_work()
 }
 
 #[test]
 fn local_nested_caught_chain_stays_linear() {
-    on_stack(1 << 26, || nested_caught_chain::<Local>(256));
+    on_stack(1 << 26, || nested_caught_chain::<Local>(256, false));
 }
 
 #[test]
 fn shared_nested_caught_chain_stays_linear() {
-    on_stack(1 << 26, || nested_caught_chain::<Shared>(256));
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(256, false));
+}
+
+#[test]
+fn local_nested_caught_chain_through_a_query_stays_linear() {
+    on_stack(1 << 26, || nested_caught_chain::<Local>(256, true));
+}
+
+#[test]
+fn shared_nested_caught_chain_through_a_query_stays_linear() {
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(256, true));
 }
 
 #[test]
 fn local_nested_caught_chain_stays_linear_at_budget_1() {
-    on_stack(1 << 26, || nested_caught_chain::<Local>(1));
+    on_stack(1 << 26, || nested_caught_chain::<Local>(1, false));
 }
 
 #[test]
 fn shared_nested_caught_chain_stays_linear_at_budget_1() {
-    on_stack(1 << 26, || nested_caught_chain::<Shared>(1));
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(1, false));
+}
+
+#[test]
+fn local_nested_caught_chain_through_a_query_stays_linear_at_budget_1() {
+    on_stack(1 << 26, || nested_caught_chain::<Local>(1, true));
+}
+
+#[test]
+fn shared_nested_caught_chain_through_a_query_stays_linear_at_budget_1() {
+    on_stack(1 << 26, || nested_caught_chain::<Shared>(1, true));
 }
 
 /// One replayable reader catches `n / 2` panics and then reads a chain
@@ -1348,6 +1411,87 @@ fn local_caught_fan_over_deep_chain_stays_linear() {
 #[test]
 fn shared_caught_fan_over_deep_chain_stays_linear() {
     on_stack(1 << 26, || caught_fan_over_deep_chain::<Shared>(256));
+}
+
+/// As above with one text for every panic: each box takes an address an
+/// earlier caught one freed, so the panics share a payload key and a note
+/// log per address, and each kept read's copy holds every landing caught
+/// on its log before it. The retry must not pay that prefix again per
+/// read. `through` puts a query between the frame and each panicking
+/// one, so every copy also holds landings a level deeper, which each
+/// later caught panic's landings take from it.
+fn same_text_fan_over_chain<C: Cells>(n: u64, through: bool) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(256);
+    let failing: Vec<Incr<u64>> = (0..n)
+        .map(|_| {
+            let f = rt.create_query_with(|_| -> u64 { panic!("fan") }, replayable());
+            if through {
+                rt.create_query_with(move |rt| rt.get(f) + 1, replayable())
+            } else {
+                f
+            }
+        })
+        .collect();
+    let top = chain(&rt, 600).nodes[0];
+    let reader = rt.create_query_with(
+        move |rt| {
+            let caught = failing
+                .iter()
+                .filter(|&&f| catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err())
+                .count() as u64;
+            caught + rt.get(top)
+        },
+        replayable(),
+    );
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(reader), n + 600);
+    assert!(!rt.dooms.lock().unwrap().is_empty(), "the chain doomed");
+    crate::replay::take_note_work()
+}
+
+fn same_text_fan_over_chain_stays_linear<C: Cells>(through: bool) {
+    let sizes: &[u64] = if cfg!(miri) {
+        &[8]
+    } else {
+        &[1000, 4000, 16000]
+    };
+    for &n in sizes {
+        let work = same_text_fan_over_chain::<C>(n, through);
+        assert!(
+            work <= 40 * n,
+            "{work} units of note work for {n} caught panics of one text, through={through}"
+        );
+    }
+}
+
+#[test]
+fn local_same_text_fan_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Local>(false)
+    });
+}
+
+#[test]
+fn shared_same_text_fan_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Shared>(false);
+    });
+}
+
+#[test]
+fn local_same_text_fan_through_a_frame_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Local>(true)
+    });
+}
+
+#[test]
+fn shared_same_text_fan_through_a_frame_over_chain_stays_linear() {
+    on_stack(1 << 26, || {
+        same_text_fan_over_chain_stays_linear::<Shared>(true)
+    });
 }
 
 /// One budgeted frame reading `n` nodes of another runtime and then a

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
-use crate::replay::{note_work, Landings, PayloadKey};
+use crate::replay::{note_work, Landings, PayloadKey, SharedCopy};
 
 /// Removals of notes and of a ticket's landings, on every thread: a copy
 /// taken at `EPOCH` sees what a later removal takes.
@@ -50,7 +50,40 @@ pub(crate) struct Members {
 pub(crate) struct Joined {
     pub(crate) members: Vec<Member>,
     /// As `Log::marked`.
-    pub(crate) marked: (u64, usize),
+    pub(crate) marked: Marked,
+}
+
+/// How far a set's generation has marked a list of notes: every one
+/// before `upto` still noted at removal `epoch` is in the set.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Marked {
+    generation: u64,
+    upto: usize,
+    epoch: u64,
+}
+
+impl Marked {
+    /// Where a mark of the first `len` notes still noted at removal `epoch`
+    /// for `generation` starts, moving the watermark past them. A copy
+    /// taken before a later one holds notes removed in between, which the
+    /// later one's mark left out, so it marks from the start.
+    pub(crate) fn advance(&mut self, generation: u64, len: usize, epoch: u64) -> usize {
+        if self.generation == generation && epoch >= self.epoch {
+            let from = self.upto.min(len);
+            if len > self.upto {
+                self.upto = len;
+                self.epoch = epoch;
+            }
+            from
+        } else {
+            *self = Marked {
+                generation,
+                upto: len,
+                epoch,
+            };
+            0
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -87,9 +120,13 @@ impl Members {
 #[derive(Default)]
 pub(crate) struct Log {
     pub(crate) entries: Vec<Noted>,
-    /// The copied set's generation and how far into `entries` it has
-    /// marked the notes copies took (`replay::mark_copied`).
-    pub(crate) marked: (u64, usize),
+    /// How far the copied set has marked the notes copies took
+    /// (`replay::mark_copied`).
+    pub(crate) marked: Marked,
+    /// As `marked`, for the kept reads' copies (`replay::keep`).
+    pub(crate) kept_marked: Marked,
+    /// The copy of this log [`Notes::note_copy`] noted last.
+    renoted: Option<Renoted>,
 }
 
 #[derive(Clone)]
@@ -107,25 +144,84 @@ pub(crate) struct Noted {
     pub(crate) gone: u64,
 }
 
+/// What a catch-up took from a shared copy without taking it apart: the
+/// landings deeper than `depth`, and those of the nodes `landed` has a
+/// landing of from event `seen` on.
+#[derive(Clone)]
+pub(crate) struct Cut {
+    pub(crate) depth: u32,
+    pub(crate) seen: usize,
+    pub(crate) landed: Rc<Landed>,
+}
+
+/// The landings logged while a frame's reads were kept: each node's
+/// latest, and all of them in log order.
+#[derive(Default)]
+pub(crate) struct Landed {
+    pub(crate) latest: HashMap<(u32, u32), usize, FxBuildHasher>,
+    pub(crate) order: Vec<usize>,
+}
+
+impl Cut {
+    fn keeps(&self, node: (u32, u32), depth: u32) -> bool {
+        depth <= self.depth && self.landed.latest.get(&node).is_none_or(|&i| i < self.seen)
+    }
+
+    /// Whether `self` keeps exactly the entries `other` keeps: the same
+    /// depth, and no landing logged between the two `seen`.
+    fn same_as(&self, other: &Cut) -> bool {
+        let (lo, hi) = (self.seen.min(other.seen), self.seen.max(other.seen));
+        let order = &self.landed.order;
+        Rc::ptr_eq(&self.landed, &other.landed)
+            && self.depth == other.depth
+            && order.partition_point(|&i| i < hi) == order.partition_point(|&i| i < lo)
+    }
+}
+
 impl Log {
     /// The landings of the first `len` notes still noted at removal
-    /// `epoch`, each at its shallowest depth above `base`. A note below
-    /// `base` counts as just above it.
-    pub(crate) fn landings(&self, len: usize, epoch: u64, base: u32) -> Vec<((u32, u32), u32)> {
-        note_work(len);
+    /// `epoch`, each at its shallowest depth above `base`, but those `cut`
+    /// took. A note below `base` counts as just above it.
+    pub(crate) fn landings(
+        &self,
+        len: usize,
+        epoch: u64,
+        base: u32,
+        cut: Option<&Cut>,
+    ) -> Vec<((u32, u32), u32)> {
+        self.landings_in(0, len, epoch, base, cut)
+    }
+
+    /// As [`Self::landings`], of the notes from entry `from` on only. A
+    /// node `cut` takes at one depth it takes at every deeper one, so
+    /// cutting each note keeps the node at its shallowest kept depth.
+    fn landings_in(
+        &self,
+        from: usize,
+        len: usize,
+        epoch: u64,
+        base: u32,
+        cut: Option<&Cut>,
+    ) -> Vec<((u32, u32), u32)> {
+        note_work(len - from);
         let mut nodes: Vec<((u32, u32), u32)> = Vec::new();
         let mut at: HashMap<(u32, u32), usize, FxBuildHasher> = HashMap::default();
-        let mut add = |node: (u32, u32), depth: u32| match at.entry(node) {
-            Entry::Occupied(i) => {
-                let d = &mut nodes[*i.get()].1;
-                *d = (*d).min(depth);
+        let mut add = |node: (u32, u32), depth: u32| {
+            if cut.is_some_and(|c| !c.keeps(node, depth)) {
+                return;
             }
-            Entry::Vacant(v) => {
-                v.insert(nodes.len());
-                nodes.push((node, depth));
+            match at.entry(node) {
+                Entry::Occupied(i) => {
+                    let d = &mut nodes[*i.get()].1;
+                    *d = (*d).min(depth);
+                }
+                Entry::Vacant(v) => {
+                    v.insert(nodes.len());
+                    nodes.push((node, depth));
+                }
             }
         };
-        for e in self.entries[..len].iter().filter(|e| e.gone >= epoch) {
+        for e in self.entries[from..len].iter().filter(|e| e.gone >= epoch) {
             let depth = e.cidx.saturating_sub(base);
             match &e.lent {
                 None => add(e.node, depth),
@@ -202,6 +298,21 @@ pub(crate) struct Notes {
     /// hold another note after its payload's notes all went.
     by_node: BTreeMap<(RuntimeId, (u32, u32)), Vec<At>>,
     live: usize,
+    /// Bumped when a note goes, which voids every log's `renoted`.
+    renote_gen: u64,
+}
+
+/// The copy a log's last [`Notes::note_copy`] noted, whose first `len`
+/// entries a later copy to the same place need not note again.
+struct Renoted {
+    renote_gen: u64,
+    len: usize,
+    epoch: u64,
+    from_base: u32,
+    rt: RuntimeId,
+    key: PayloadKey,
+    base: u32,
+    cut: Option<Cut>,
 }
 
 impl Notes {
@@ -211,6 +322,7 @@ impl Notes {
             tops: BTreeSet::new(),
             by_node: BTreeMap::new(),
             live: 0,
+            renote_gen: 0,
         }
     }
 
@@ -227,6 +339,60 @@ impl Notes {
         restorable: bool,
     ) {
         self.push_noted(rt, key, cidx, node, None, restorable);
+    }
+
+    /// Notes, under `key` and above `base`, the landings `copy` holds: the
+    /// first `len` entries of its log still noted at removal `epoch`, at
+    /// their depths above the copy's base, but those its cut took. When
+    /// the copy of the log noted last went to the same place, at an epoch
+    /// no later, under the same cut, and no note has gone since, the
+    /// entries it held are noted already, so only later ones are: a second
+    /// note of a node at the same place, or deeper than another, retires
+    /// with that one and adds no landing.
+    pub(crate) fn note_copy(
+        &mut self,
+        rt: RuntimeId,
+        key: PayloadKey,
+        base: u32,
+        copy: SharedCopy<'_>,
+    ) {
+        let SharedCopy {
+            log,
+            len,
+            epoch,
+            base: from_base,
+            cut,
+        } = copy;
+        let from = match &log.borrow().renoted {
+            Some(r)
+                if (r.renote_gen, r.rt, r.key, r.base, r.from_base)
+                    == (self.renote_gen, rt, key, base, from_base)
+                    && r.len <= len
+                    && r.epoch <= epoch
+                    && match (&r.cut, cut) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => a.same_as(b),
+                        _ => false,
+                    } =>
+            {
+                r.len
+            }
+            _ => 0,
+        };
+        let nodes = log.borrow().landings_in(from, len, epoch, from_base, cut);
+        for (node, depth) in nodes {
+            self.push(rt, key, base + depth, node, false);
+        }
+        log.borrow_mut().renoted = Some(Renoted {
+            renote_gen: self.renote_gen,
+            len,
+            epoch,
+            from_base,
+            rt,
+            key,
+            base,
+            cut: cut.cloned(),
+        });
     }
 
     /// Notes the ticket `members` stands for, which a read took with the
@@ -345,6 +511,7 @@ impl Notes {
                 self.groups.remove(&at.key);
             }
             self.live -= 1;
+            self.renote_gen += 1;
             self.retop(at.key, old, new);
         }
         self.removed();
@@ -381,6 +548,7 @@ impl Notes {
         for (_, level) in gone {
             note_work(level.at.len());
             self.live -= level.live as usize;
+            self.renote_gen += 1;
             for (log, idx) in level.at {
                 let Some(e) = g.take(log, idx, removal) else {
                     continue;
@@ -448,6 +616,7 @@ impl Notes {
         let live: u32 = g.levels.values().map(|l| l.live).sum();
         note_work(g.levels.len());
         self.live -= live as usize;
+        self.renote_gen += 1;
         self.retop(key, g.top(), None);
         self.removed();
         Some(g)
@@ -464,7 +633,7 @@ impl Notes {
             .log(rt)
             .map(|l| {
                 let l = l.log.borrow();
-                l.landings(l.entries.len(), epoch, base)
+                l.landings(l.entries.len(), epoch, base, None)
             })
             .unwrap_or_default();
         drop_lent(&g, |_, _| false);
