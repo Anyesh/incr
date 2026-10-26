@@ -4333,6 +4333,24 @@ fn two_thread_resumed_walk_replans_for_episodes_since_its_plan_seed() {
     });
 }
 
+/// 0x9d90 at budget 1 frame: op 12 `Get(8)` recorded node 6's deps
+/// [5, 1, 9] where every order records [5, 5, 9], and left 20 and 21
+/// New and Dirty where every order cleans them, until a resumed walk
+/// re-planned against the episode count it planned under.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_resumed_walk_records_the_unbounded_deps_seed() {
+    let seed = 0x9d90;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let label = format!("seed {seed:#x}, two threads {phases:?}, budget 1 frame");
+    quiet(|| {
+        for _ in 0..20 {
+            Serial::new(&case, &phases).differential(&label, Some(1), 0, &|_| {});
+        }
+    });
+}
+
 /// 0x9a7d at budget 2: op 0 recorded the cycle group {8, 9, 19, 24} where
 /// the unbounded run records {9, 19, 24}, and phase 6's read of 16 walked
 /// that group and cleaned 1, 2 and 23, which the unbounded run leaves
