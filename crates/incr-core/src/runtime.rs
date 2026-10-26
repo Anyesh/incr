@@ -129,6 +129,16 @@ impl<C: Cells> Inner<C> {
         if !C::SINGLE_THREADED {
             cycle_state::note_rec_left(rt, slot, rec.clone());
         }
+        self.set_others_member_rec(slot, rec)
+    }
+
+    /// [`Self::set_member_rec`] for a change that is another thread's, the
+    /// retraction of its held landing: not noted as this thread's.
+    pub(crate) fn set_others_member_rec(
+        &mut self,
+        slot: u32,
+        rec: Option<Arc<GroupInfo>>,
+    ) -> Option<Arc<GroupInfo>> {
         match rec {
             Some(r) => self.member_recs.insert(slot, r),
             None => self.member_recs.remove(&slot),
