@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use super::race_tests::{await_reservation_wait, id, Gate};
 use super::{ParkPoint, Runtime};
 use crate::cells::{Cells, Local, Shared};
-use crate::child_test::run_in_child;
+use crate::child_test::{run_in_child, run_in_child_within, Outcome as ChildOutcome};
 use crate::cycle::{QueryOpts, Replay};
 use crate::handle::Incr;
 
@@ -1523,4 +1523,61 @@ fn a_panic_past_a_placeholder_keeps_the_doom_in_flight_for_its_drops() {
         },
     )
     .assert_clean();
+}
+
+/// T joins a thread that reads its parent P, but only on a placeholder
+/// for X, so the unbounded run never joins. Over budget the doomed T runs
+/// on into the join, and the reader waits on P, which this thread computes:
+/// a hang, as on main b9f0d0bf, where a doomed run goes on in user code
+/// too. Known limitation: the bounded run may hang, killed by the child's
+/// timeout, but never gives another value.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_placeholder_join_of_a_reader_of_the_parent_hangs_as_on_main() {
+    fn shape(frames: u32) -> Option<Outcome> {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let parent = Arc::new(OnceLock::<Incr<u64>>::new());
+        let t = {
+            let parent = parent.clone();
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    if v == 0 {
+                        let p = *parent.get().unwrap();
+                        thread::scope(|s| s.spawn(|| rt.get(p)).join().unwrap());
+                    }
+                    v
+                },
+                replayable(),
+            )
+        };
+        let p = rt.create_query_with(move |rt: &Rt| rt.get(t) + 1, replayable());
+        parent.set(p).unwrap();
+        rt.set_max_frames(frames);
+        within_10s(&rt, p)
+    }
+    assert_eq!(shape(u32::MAX), Some(Ok(15)));
+    // A hung budget leaves its doom's reservations in the process, so the
+    // budgets after it may hang on them too; each still gets its 10 s.
+    let child = run_in_child_within(
+        "runtime::reserve_tests::a_placeholder_join_of_a_reader_of_the_parent_hangs_as_on_main",
+        Duration::from_secs(40),
+        || {
+            for frames in [1, 2, 3] {
+                let got = shape(frames);
+                assert!(
+                    matches!(got, None | Some(Ok(15))),
+                    "budget {frames}: {got:?}"
+                );
+            }
+        },
+    );
+    assert!(
+        matches!(child, ChildOutcome::Clean | ChildOutcome::Killed),
+        "{child:?}"
+    );
 }
