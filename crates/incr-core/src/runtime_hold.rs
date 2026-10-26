@@ -407,7 +407,7 @@ impl<C: Cells> Runtime<C> {
 
     /// The reading frame's landing depends on state this attempt has not
     /// published: it is held, and its runtime tainted.
-    pub(super) fn taint_reader(&self) {
+    fn taint_reader(&self) {
         if let Some(reader) = self.dep_stack.raise_hold() {
             hold::taint(reader);
         }
