@@ -2877,3 +2877,54 @@ fn a_read_joining_a_reader_of_a_cycle_below_it_finishes() {
 fn a_read_joining_a_reader_of_a_cycle_through_it_deadlocks() {
     cycle_join(true);
 }
+
+/// x and w read each other with `try_get`, so a read of x lands both
+/// Cyclic, held by the reading attempt.
+fn try_get_pair(rt: &Rt) -> (Incr<u64>, Incr<u64>) {
+    let i = rt.create_input(3_u64);
+    let xc: std::sync::Arc<std::sync::OnceLock<Incr<u64>>> = std::sync::Arc::default();
+    let w = {
+        let xc = std::sync::Arc::clone(&xc);
+        rt.create_query(move |rt: &Rt| rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1))
+    };
+    let x = rt.create_query(move |rt: &Rt| rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000));
+    assert!(xc.set(x).is_ok());
+    (x, w)
+}
+
+/// T catches its read of x, which holds x and w, and joins a thread that
+/// reads w. T is blocked in user code on that reader, so the reader wounds
+/// T's attempt and takes w over; T's next pop ends its run as the wound,
+/// and its retry, in which w is never held again, gives what the unbounded
+/// test `a_join_reads_a_member_its_reader_holds_cyclic` does.
+#[test]
+fn hand_over_wounds_a_holder_that_joins_a_reader() {
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        let (x, w) = try_get_pair(&rt);
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let t = {
+            let (me, runs) = (Arc::clone(&me), Arc::clone(&runs));
+            rt.create_query(move |rt: &Rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                let other = me.lock().unwrap().clone().unwrap();
+                v + thread::spawn(move || other.try_get(w).unwrap_or(9))
+                    .join()
+                    .unwrap()
+            })
+        };
+        assert_eq!(rt.get(t), 9);
+        *me.lock().unwrap() = None;
+        // The reader can only end by taking w over, and the run it wounds
+        // retries once: in the retry w is never held, so its reader waits
+        // for nothing.
+        assert_eq!(runs.load(Ordering::Relaxed), 2, "T's runs");
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+        assert!(!crate::hold::active(), "a held landing outlived the read");
+    });
+}
