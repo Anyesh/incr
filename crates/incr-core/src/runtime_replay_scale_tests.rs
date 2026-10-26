@@ -1006,6 +1006,71 @@ fn shared_contained_chain_stays_linear_at_budget_1() {
     on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
 }
 
+/// A panicking query under an `n`-deep chain, read and then read again
+/// after an input change: each level's read takes the unwind and its frame
+/// lands Failed, which keys what the read took by the frame's path. The
+/// stack frames folded into paths, on the first read and on the second.
+fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
+    let rt = Runtime::<C>::new();
+    let opts = || match frames {
+        Some(_) => replayable(),
+        None => QueryOpts::default(),
+    };
+    if let Some(frames) = frames {
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(frames);
+    }
+    let failed = rt.create_query_with(|_| -> u64 { panic!("failed below the chain") }, opts());
+    let input = rt.create_input(0_u64);
+    let mut below = rt.create_query_with(move |rt| rt.get(input) + rt.get(failed), opts());
+    for _ in 1..n {
+        let dep = below;
+        below = rt.create_query_with(move |rt| rt.get(dep) + 1, opts());
+    }
+    let top = below;
+    crate::replay::take_path_steps();
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    let first = crate::replay::take_path_steps();
+    rt.set(input, 1);
+    assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
+    (first, crate::replay::take_path_steps())
+}
+
+fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
+    let n = if cfg!(miri) { 8 } else { 4000 };
+    let (first, second) = panicking_chain_path_steps::<C>(frames, n);
+    assert!(
+        first <= 8 * n as u64 && second <= 8 * n as u64,
+        "{frames:?}: {first} and {second} frames folded into paths for a {n}-chain"
+    );
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || panicking_chain_paths_stay_linear::<Local>(None));
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(None)
+    });
+}
+
+#[test]
+fn local_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Local>(Some(1))
+    });
+}
+
+#[test]
+fn shared_panicking_chain_paths_stay_linear_at_budget_1() {
+    on_stack(1 << 28, || {
+        panicking_chain_paths_stay_linear::<Shared>(Some(1))
+    });
+}
+
 /// `k` Dirty readers over one Failed node with a Failed chain of `k` below
 /// it, whose edges a Clean run recorded, all entries of one walk: the walk
 /// passes the Failed node without walking the chain once per reader.
