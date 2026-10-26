@@ -185,9 +185,10 @@ impl Cut {
 
 impl Log {
     /// The landings of the first `len` notes still noted at removal
-    /// `epoch`, each at its shallowest depth above `base` and with the
-    /// newest stamp it was noted with, but those `cut` took. A note below
-    /// `base` counts as just above it.
+    /// `epoch`, one per node and depth above `base`, with the newest stamp
+    /// noted there, but those `cut` took. A note below `base` counts as
+    /// just above it. A node keeps a landing at each depth it was noted at,
+    /// since each depth's stamp goes when that frame's notes do.
     pub(crate) fn landings(
         &self,
         len: usize,
@@ -198,9 +199,7 @@ impl Log {
         self.landings_in(0, len, epoch, base, cut)
     }
 
-    /// As [`Self::landings`], of the notes from entry `from` on only. A
-    /// node `cut` takes at one depth it takes at every deeper one, so
-    /// cutting each note keeps the node at its shallowest kept depth.
+    /// As [`Self::landings`], of the notes from entry `from` on only.
     fn landings_in(
         &self,
         from: usize,
@@ -211,15 +210,14 @@ impl Log {
     ) -> Vec<Landed> {
         note_work(len - from);
         let mut nodes: Vec<Landed> = Vec::new();
-        let mut at: HashMap<(u32, u32), usize, FxBuildHasher> = HashMap::default();
+        let mut at: HashMap<((u32, u32), u32), usize, FxBuildHasher> = HashMap::default();
         let mut add = |node: (u32, u32), depth: u32, stamp: u64| {
             if cut.is_some_and(|c| !c.keeps(node, depth)) {
                 return;
             }
-            match at.entry(node) {
+            match at.entry((node, depth)) {
                 Entry::Occupied(i) => {
-                    let (_, d, s) = &mut nodes[*i.get()];
-                    *d = (*d).min(depth);
+                    let s = &mut nodes[*i.get()].2;
                     *s = (*s).max(stamp);
                 }
                 Entry::Vacant(v) => {
@@ -386,8 +384,9 @@ impl Notes {
     /// the copy of the log noted last went to the same place, at an epoch
     /// no later, under the same cut, and no note has gone since, the
     /// entries it held are noted already, so only later ones are: a second
-    /// note of a node at the same place, or deeper than another, retires
-    /// with that one and adds no landing.
+    /// note of a node at the same place retires with the first, and one
+    /// deeper retires with its own frame, as each note of a whole renote
+    /// does.
     pub(crate) fn note_copy(
         &mut self,
         rt: RuntimeId,

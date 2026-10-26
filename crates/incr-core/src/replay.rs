@@ -635,9 +635,6 @@ impl Pending {
 
     /// Removes deliveries `is`, in that order.
     fn remove_all(&mut self, is: Vec<usize>) -> Vec<Delivery> {
-        for &i in &is {
-            self.unfile_passed(i);
-        }
         let out: Vec<Delivery> = is
             .into_iter()
             .map(|i| {
@@ -3825,7 +3822,7 @@ mod tests {
         notes.push(rt, key, 1, ((5, 0), 10), false);
         notes.push(rt, key, 3, ((5, 0), 20), false);
         let whole = notes.copy(rt, key, 0).into_nodes();
-        assert_eq!(whole, vec![((5, 0), 1, 20)]);
+        assert_eq!(whole, vec![((5, 0), 1, 10), ((5, 0), 3, 20)]);
         let mut cut = notes.copy(rt, key, 0);
         let Nodes::Shared { cut: c, .. } = &mut cut.nodes else {
             panic!("a copy of a log shares it");
@@ -3935,6 +3932,82 @@ mod tests {
             false,
         );
         assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// A copy renoted in two parts, the second reusing the first, notes
+    /// what the whole copy renoted at once does: once the deeper frame's
+    /// notes go, both keep the shallower note's own stamp, as the frames
+    /// that made the notes would.
+    #[test]
+    fn a_renote_reused_across_a_stamp_change_notes_what_a_whole_one_does() {
+        let rt = RuntimeId::for_test(7);
+        let source: Box<dyn Any + Send> = Box::new("s");
+        let s = payload_key(&*source);
+        let mut from = Notes::new();
+        from.push(rt, s, 1, ((5, 0), 10), false);
+        let early = from.copy(rt, s, 0);
+        from.push(rt, s, 3, ((5, 0), 20), false);
+        let late = from.copy(rt, s, 0);
+        let mut reused = Notes::new();
+        reused.note_copy(rt, key(&P), 0, early.as_shared().unwrap());
+        take_note_work();
+        reused.note_copy(rt, key(&P), 0, late.as_shared().unwrap());
+        let reusing = take_note_work();
+        let mut whole = Notes::new();
+        whole.note_copy(rt, key(&Q), 0, late.as_shared().unwrap());
+        assert!(
+            reusing < take_note_work(),
+            "the second renote reused the first"
+        );
+        reused.forget_from(2, None);
+        whole.forget_from(2, None);
+        let reused = reused.copy(rt, key(&P), 0).into_nodes();
+        let whole = whole.copy(rt, key(&Q), 0).into_nodes();
+        assert_eq!(reused, whole);
+        assert_eq!(whole, vec![((5, 0), 1, 10)]);
+    }
+
+    /// A passed delivery's payload regenerated as `Q` counts as its source,
+    /// so a containment of `Q` just above its frame reaches its landings.
+    #[test]
+    fn a_containment_of_a_regenerated_payload_retires_its_passed_landing() {
+        unsafe fn parts(_: *const (), _: u32, _: u32, _: bool) -> KeyParts {
+            (0, 0, None, 0)
+        }
+        let target = Entry {
+            node: 0,
+            generation: 0,
+            suspect: false,
+            spec: false,
+            retry: Retry::Walk,
+            walked: false,
+            r5: false,
+        };
+        let keys = FrameKeys {
+            owner: std::ptr::null(),
+            parts,
+        };
+        let id = open(RuntimeId::for_test(7), 0, target, keys);
+        let context = |c: &mut Vec<Context>| c.iter_mut().position(|x| x.id == id).unwrap();
+        with(|c| {
+            let at = context(c);
+            c[at].pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        });
+        regenerated_at(id, 0, key(&Q));
+        let held = with(|c| {
+            let at = context(c);
+            let pending = &mut c[at].pending;
+            pending.retire(
+                &Retire::Contained {
+                    cidx: 4,
+                    payload: key(&Q),
+                },
+                false,
+            );
+            holds(pending, (2, 0))
+        });
+        drop(close(id));
+        assert!(!held);
     }
 
     /// A delivery that loses its deeper landings is filed again as one
