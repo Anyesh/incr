@@ -3703,11 +3703,13 @@ impl<C: Cells> Runtime<C> {
             // run ends, as the unbounded run drops it when a set changed
             // that frame's earlier reads. A run doomed again has not
             // ended: the frame comes back as an entry of its own, and its
-            // next retry reads the delivery again.
+            // next retry reads the delivery again. That holds for the
+            // deliveries a run below made for this entry's own frame too.
             if matches!(ran, Ok(Computed::Discarded)) && dropped.is_none() {
                 replay::with(|c| {
                     if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-                        for i in x.pending.of_maker(level) {
+                        let own = x.pending.of_frame(entry.node, entry.generation, at);
+                        for i in x.pending.of_maker(level).into_iter().chain(own) {
                             x.pending.set_taken(i, false);
                         }
                     }
