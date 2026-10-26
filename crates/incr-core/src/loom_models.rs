@@ -1751,6 +1751,224 @@ fn doom_lazy_reads_again() {
     });
 }
 
+/// The orders a lazy doom model's executions reached, kept outside the
+/// model in plain atomics and checked once every execution has run.
+struct Reached {
+    take_over: std::sync::atomic::AtomicBool,
+    no_take_over: std::sync::atomic::AtomicBool,
+    take_over_with_caught: std::sync::atomic::AtomicBool,
+}
+
+impl Reached {
+    const fn new() -> Self {
+        use std::sync::atomic::AtomicBool;
+        Self {
+            take_over: AtomicBool::new(false),
+            no_take_over: AtomicBool::new(false),
+            take_over_with_caught: AtomicBool::new(false),
+        }
+    }
+
+    fn note(&self, took: bool, caught: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if took {
+            self.take_over.store(true, Relaxed);
+            if caught {
+                self.take_over_with_caught.store(true, Relaxed);
+            }
+        } else {
+            self.no_take_over.store(true, Relaxed);
+        }
+    }
+
+    fn assert_both(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        assert!(
+            self.take_over.load(Relaxed),
+            "no execution took the doom over"
+        );
+        assert!(
+            self.no_take_over.load(Relaxed),
+            "every execution took the doom over"
+        );
+    }
+}
+
+/// A lazy doom world at budget 1: T's closure is `t_run` over X (= Y + 10,
+/// Y = I + 1, I = 3) and Z (= I + 20), and X counts its runs. T's runs push the attempt epoch they ran in, which moves on
+/// only when the outermost entry retries after a wound.
+struct LazyWorld {
+    rt: Arc<Rt>,
+    x: Incr<u64>,
+    t: Incr<u64>,
+    x_runs: Arc<std::sync::atomic::AtomicUsize>,
+    epochs: Arc<std::sync::Mutex<Vec<u32>>>,
+}
+
+impl LazyWorld {
+    fn new(t_run: impl Fn(&Rt, Incr<u64>, Incr<u64>) -> u64 + Send + Sync + 'static) -> Self {
+        crate::attempt::TAKE_OVERS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let x = {
+            let x_runs = Arc::clone(&x_runs);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    x_runs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    rt.get(y) + 10
+                },
+                replayable(),
+            )
+        };
+        let z = rt.create_query_with(move |rt: &Rt| rt.get(i) + 20, replayable());
+        let epochs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t = {
+            let epochs = Arc::clone(&epochs);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    epochs.lock().unwrap().push(crate::attempt::epoch());
+                    t_run(rt, x, z)
+                },
+                replayable(),
+            )
+        };
+        Self {
+            rt,
+            x,
+            t,
+            x_runs,
+            epochs,
+        }
+    }
+
+    /// Reads T against another thread's read of X; checks both values,
+    /// that X ran once, and that T's read retried exactly when a waiter
+    /// took the doom over. Returns whether one did.
+    fn race(&self, want: u64) -> bool {
+        let other = {
+            let (rt, x) = (Arc::clone(&self.rt), self.x);
+            thread::spawn(move || rt.get(x))
+        };
+        EXPECTING_UNWIND.with(|e| e.set(true));
+        let got = self.rt.get(self.t);
+        EXPECTING_UNWIND.with(|e| e.set(false));
+        assert_eq!(got, want);
+        assert_eq!(other.join().unwrap(), 14);
+        assert_eq!(
+            self.x_runs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "X ran on both threads"
+        );
+        let took = crate::attempt::TAKE_OVERS.load(std::sync::atomic::Ordering::Relaxed);
+        let epochs = self.epochs.lock().unwrap().clone();
+        let retried = epochs.first() != epochs.last();
+        assert!(took <= 1, "{took} take-overs of one doom");
+        assert_eq!(
+            retried,
+            took == 1,
+            "T's read retried {retried} with {took} take-overs (epochs {epochs:?})"
+        );
+        self.rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+        took == 1
+    }
+}
+
+static END_RACE: Reached = Reached::new();
+
+/// T reads X, which dooms at budget 1, takes the placeholder and returns
+/// at once, so its run's end closes the lazy doom's flight while another
+/// thread waits on X's reservation. The waiter's wound and the end's
+/// `leave_flight` race in both orders: T's read retries exactly when the
+/// wound came first, X runs once, and both reads give the unbounded run's
+/// values.
+#[test]
+fn doom_lazy_end_races_take_over() {
+    run(|| {
+        let world = LazyWorld::new(|rt, x, _| rt.get(x) + 100);
+        END_RACE.note(world.race(114), false);
+    });
+    END_RACE.assert_both();
+}
+
+static RAISE_RACE: Reached = Reached::new();
+
+/// T reads X, which dooms at budget 1, runs on past the placeholder and
+/// reads Z, which raises the doom's discard, while another thread waits on
+/// X's reservation. A wound between the placeholder and that read makes
+/// the discard's catch a wound (`settle_discard`): T's read retries
+/// exactly when a waiter took the doom over, and both reads give the
+/// unbounded run's values.
+#[test]
+fn doom_lazy_wound_before_raise() {
+    run(|| {
+        let world = LazyWorld::new(|rt, x, z| rt.get(x) + rt.get(z) + 100);
+        RAISE_RACE.note(world.race(137), false);
+    });
+    RAISE_RACE.assert_both();
+}
+
+/// On drop, reads W from the frame it runs in, under a catch, and notes
+/// whether the read unwound.
+struct ReadOnDrop<'a> {
+    rt: &'a Rt,
+    w: Incr<u64>,
+    caught: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for ReadOnDrop<'_> {
+    fn drop(&mut self) {
+        if catch_unwind(AssertUnwindSafe(|| self.rt.get(self.w))).is_err() {
+            self.caught
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+static DESTRUCTOR_DISCARD: Reached = Reached::new();
+
+/// T reads X, which dooms at budget 1, and on the placeholder panics in
+/// user code; a destructor in that panic reads W, a doomed read that
+/// raises a discard the destructor catches, while another thread waits on
+/// X's reservation. The lazy doom's flight stays open through the
+/// destructor, so the waiter can still take X over; T's read retries
+/// exactly when it does, and both reads give the unbounded run's values.
+#[test]
+fn doom_lazy_destructor_discard_keeps_flight() {
+    run(|| {
+        let caught = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let world = {
+            let caught = Arc::clone(&caught);
+            LazyWorld::new(move |rt, x, z| {
+                let v = rt.get(x);
+                if v == 0 {
+                    let _read = ReadOnDrop {
+                        rt,
+                        w: z,
+                        caught: &caught,
+                    };
+                    panic!("a doomed run panics past its placeholder");
+                }
+                v + 100
+            })
+        };
+        let took = world.race(114);
+        DESTRUCTOR_DISCARD.note(took, caught.load(std::sync::atomic::Ordering::Relaxed));
+    });
+    DESTRUCTOR_DISCARD.assert_both();
+    assert!(
+        DESTRUCTOR_DISCARD
+            .take_over_with_caught
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "no execution both caught the destructor's discard and took the doom over"
+    );
+}
+
 /// F, Clean at s = 0, reads a New query N once s is set, so at budget 1
 /// its run claimed from Dirty dooms on N and is discarded, while another
 /// thread sets s again. The discard landing keeps that set's dirtying:

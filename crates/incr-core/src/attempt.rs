@@ -244,8 +244,8 @@ impl Attempt {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    #[cfg(all(test, not(loom)))]
-                    TAKE_OVERS.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(test)]
+                    TAKE_OVERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return true;
                 }
                 Err(now) => w = now,
@@ -304,9 +304,18 @@ pub(crate) fn in_flight() -> bool {
     MINE.with(|w| w.state.load(Ordering::Relaxed) & IN_FLIGHT != 0)
 }
 
-/// Attempts a waiter wounded, for tests and the scans' counts.
-#[cfg(all(test, not(loom)))]
-pub(crate) static TAKE_OVERS: AtomicU32 = AtomicU32::new(0);
+/// This thread's attempt epoch, which moves on only at the outermost
+/// entry and its retries: a model tells a wound's retry from a replay
+/// retry by it.
+#[cfg(test)]
+pub(crate) fn epoch() -> u32 {
+    MINE.with(|w| w.state.load(Ordering::Relaxed) & !FLAGS)
+}
+
+/// Attempts a waiter wounded, for tests and the scans' counts; a plain
+/// atomic under loom too, which a model reads after its threads join.
+#[cfg(test)]
+pub(crate) static TAKE_OVERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[cfg(all(test, not(loom)))]
 #[path = "attempt_tests.rs"]
