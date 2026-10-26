@@ -2355,7 +2355,8 @@ fn an_observer_walk_replanned_with_its_root_held_here_reads_as_unreplanned() {
 /// does when it discards a doomed cycle's round each time it retries
 /// (0x2997), so every plan of r is stale by the time it computes. The read
 /// still finishes while the releases go on: they stop only after
-/// `RELEASES`, far more than a bounded read waits out.
+/// `RELEASES`, far more than a bounded read waits out. The walk never waits
+/// on another thread's claim, so no release restarts it from its root.
 #[test]
 fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
     const RELEASES: usize = 1000;
@@ -2383,6 +2384,109 @@ fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
         released < RELEASES / 10,
         "the read restarted until the releases stopped: {released} releases, {} root replans",
         rt.root_replans.load(Ordering::Relaxed)
+    );
+    assert_eq!(rt.root_replans.load(Ordering::Relaxed), 0);
+}
+
+/// r reads m, which reads a0..a3, which read x. In each plan of r another
+/// thread holds the first a not yet landed, so the walk waits on its claim,
+/// and the holder counts a release before it lands, as a thread whose
+/// caught cycle or doomed round releases claims does (0x2997, 0x19a69):
+/// every plan meets a claim a release may have ended. The walk restarts
+/// from its root `ROOT_RESTARTS` times and then plans on, where without the
+/// bound each plan would restart it again.
+#[test]
+fn a_walk_that_waits_on_a_released_claim_every_plan_restarts_a_bounded_number_of_times() {
+    const MEMBERS: usize = 4;
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let holding = Arc::new(AtomicBool::new(false));
+    let waiting = Arc::new(AtomicBool::new(false));
+    let holder = Arc::new(Mutex::new(None));
+    let members: Vec<Incr<u64>> = (0..MEMBERS)
+        .map(|_| {
+            let (held, waited, holder, wrt) = (
+                holding.clone(),
+                waiting.clone(),
+                holder.clone(),
+                Arc::downgrade(&rt),
+            );
+            rt.create_query(move |rt| {
+                if *holder.lock().unwrap() == Some(thread::current().id()) {
+                    held.store(true, Ordering::SeqCst);
+                    let start = std::time::Instant::now();
+                    while !waited.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2)
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    wrt.upgrade().unwrap().count_release();
+                }
+                rt.get(x) + 1
+            })
+        })
+        .collect();
+    let read_members = members.clone();
+    let m = rt.create_query(move |rt| read_members.iter().map(|&a| rt.get(a)).sum::<u64>());
+    let r = rt.create_query(move |rt| rt.get(m) + 1);
+    assert_eq!(rt.get(r), 9);
+    rt.set(x, 2);
+    let main = thread::current().id();
+    let held_this_plan = Arc::new(AtomicBool::new(false));
+    let holds = Arc::new(AtomicUsize::new(0));
+    let holders = Arc::new(Mutex::new(Vec::new()));
+    let (hook_holds, hook_holders, hook_plan) =
+        (holds.clone(), holders.clone(), held_this_plan.clone());
+    let hook_rt = Arc::downgrade(&rt);
+    let hook_members = members.clone();
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if thread::current().id() != main {
+            return;
+        }
+        if point == ParkPoint::BeforeVisit(id(m)) {
+            hook_plan.store(false, Ordering::SeqCst);
+            return;
+        }
+        if let ParkPoint::BeforeComputeOne(n) = point {
+            if hook_members.iter().any(|&a| id(a) == n) {
+                waiting.store(true, Ordering::SeqCst);
+            }
+            return;
+        }
+        let ParkPoint::BeforeVisit(n) = point else {
+            return;
+        };
+        let Some(&a) = hook_members.iter().find(|&&a| id(a) == n) else {
+            return;
+        };
+        let rt = hook_rt.upgrade().unwrap();
+        if hook_plan.swap(true, Ordering::SeqCst) || rt.nodes.get(n.0).state() == NodeState::Clean {
+            return;
+        }
+        hook_holds.fetch_add(1, Ordering::SeqCst);
+        holding.store(false, Ordering::SeqCst);
+        waiting.store(false, Ordering::SeqCst);
+        let slot = holder.clone();
+        let (tx, rx) = mpsc::channel();
+        hook_holders.lock().unwrap().push(thread::spawn(move || {
+            *slot.lock().unwrap() = Some(thread::current().id());
+            tx.send(()).unwrap();
+            rt.get(a)
+        }));
+        rx.recv().unwrap();
+        let start = std::time::Instant::now();
+        while !holding.load(Ordering::SeqCst) && start.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }));
+    assert!(installed.is_ok());
+    assert_eq!(rt.get(r), 13);
+    for h in std::mem::take(&mut *holders.lock().unwrap()) {
+        assert_eq!(h.join().unwrap(), 3);
+    }
+    let holds = holds.load(Ordering::SeqCst);
+    assert!(
+        holds > super::ROOT_RESTARTS as usize,
+        "only {holds} plans waited on a held member"
     );
     assert_eq!(
         rt.root_replans.load(Ordering::Relaxed),

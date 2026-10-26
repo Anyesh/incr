@@ -452,6 +452,11 @@ const _: () = assert!(crate::bits::disjoint(&[
     KEPT as u64,
 ]));
 
+/// [`ComputeCtl::marks`]: `path` holds the frame's path.
+const PATH_KEPT: u8 = 1;
+/// [`ComputeCtl::marks`]: see [`ComputeCtl::reads_counted`].
+const READS_COUNTED: u8 = 2;
+
 /// What one compute frame tells its wrapper and its landing. It lives on
 /// the stack of the code that runs the closure, and the frame points at
 /// it while the closure runs.
@@ -464,8 +469,8 @@ pub struct ComputeCtl {
     pub(crate) buf: Cell<Option<Erased>>,
     /// Set once the slot holds the new value.
     pub(crate) wrote: Cell<u8>,
-    /// Whether `path` holds the frame's path.
-    path_kept: Cell<bool>,
+    /// `PATH_KEPT` and `READS_COUNTED`, which only get set.
+    marks: Cell<u8>,
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
@@ -473,7 +478,7 @@ pub struct ComputeCtl {
     /// or null for a frame that settles its keeping when it is pushed or
     /// keeps nothing.
     keep: *const KeepResolver,
-    /// The frame's path once found (`path_kept`), left unwritten until
+    /// The frame's path once found (`kept_path`), left unwritten until
     /// then so a push pays nothing for it.
     path: Cell<MaybeUninit<u64>>,
 }
@@ -501,7 +506,7 @@ impl ComputeCtl {
             lowlink: Cell::new(u32::MAX),
             buf: Cell::new(None),
             wrote: Cell::new(0),
-            path_kept: Cell::new(false),
+            marks: Cell::new(0),
             children: Cell::new(std::ptr::null()),
             keep,
             path: Cell::new(MaybeUninit::uninit()),
@@ -523,19 +528,28 @@ impl ComputeCtl {
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
     }
 
+    /// Whether the dep stack counts this frame's reads in its side table.
+    /// A control block serves one frame, so a fresh one at a popped
+    /// frame's address says no.
+    pub(crate) fn reads_counted(&self) -> bool {
+        self.marks.get() & READS_COUNTED != 0
+    }
+
+    pub(crate) fn count_reads(&self) {
+        self.marks.set(self.marks.get() | READS_COUNTED);
+    }
+
     /// The frame's path, if [`Self::keep_path`] kept it.
     pub(crate) fn kept_path(&self) -> Option<u64> {
-        // SAFETY: `keep_path` writes `path` before it sets `path_kept`.
-        self.path_kept
-            .get()
-            .then(|| unsafe { self.path.get().assume_init() })
+        // SAFETY: `keep_path` writes `path` before it marks it kept.
+        (self.marks.get() & PATH_KEPT != 0).then(|| unsafe { self.path.get().assume_init() })
     }
 
     /// Keeps `path` as the frame's path, which the frames below it fix
     /// while it is on the stack.
     pub(crate) fn keep_path(&self, path: u64) {
         self.path.set(MaybeUninit::new(path));
-        self.path_kept.set(true);
+        self.marks.set(self.marks.get() | PATH_KEPT);
     }
 
     #[inline(always)]

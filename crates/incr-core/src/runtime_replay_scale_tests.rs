@@ -1350,6 +1350,54 @@ fn shared_caught_fan_over_deep_chain_stays_linear() {
     on_stack(1 << 26, || caught_fan_over_deep_chain::<Shared>(256));
 }
 
+/// The note work of the first read of a replayed query 300 hops above a
+/// parent that reads `n` New leaf queries, at the default budget: each
+/// leaf's run under the open context takes its path from the parent's
+/// step, which needs the parent's read count of that leaf. Note work counts
+/// only a frame's read-count lookups past `SCAN_DEPS` deps, since one at or
+/// under it costs at most that constant.
+fn fan_out_under_replayed_chain<C: Cells>(n: u64) -> u64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    let leaves: Vec<Incr<u64>> = (0..n)
+        .map(|i| rt.create_query_with(move |_| i, replayable()))
+        .collect();
+    let mut top = rt.create_query_with(
+        move |rt| leaves.iter().map(|&l| rt.get(l)).sum::<u64>(),
+        replayable(),
+    );
+    for _ in 0..300 {
+        let below = top;
+        top = rt.create_query_with(move |rt| rt.get(below), replayable());
+    }
+    crate::replay::take_note_work();
+    assert_eq!(rt.get(top), n * (n - 1) / 2);
+    crate::replay::take_note_work()
+}
+
+fn fan_out_under_replayed_chain_stays_linear<C: Cells>() {
+    let n = crate::test_size::test_size(8_000) as u64;
+    let half = fan_out_under_replayed_chain::<C>(n / 2);
+    let full = fan_out_under_replayed_chain::<C>(n);
+    assert!(
+        full <= 2 * half + half / 4 && full <= 64 * n,
+        "{half} units of note work at {} leaves, {full} at {n}",
+        n / 2
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_fan_out_under_replayed_chain_stays_linear() {
+    on_stack(1 << 26, fan_out_under_replayed_chain_stays_linear::<Local>);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_fan_out_under_replayed_chain_stays_linear() {
+    on_stack(1 << 26, fan_out_under_replayed_chain_stays_linear::<Shared>);
+}
+
 /// One budgeted frame reading `n` nodes of another runtime and then a
 /// 600-deep chain, which dooms it: the reads are kept as deliveries for
 /// its retry, sharing the frame's, maker's and node's lists, and removing
