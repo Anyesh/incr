@@ -684,9 +684,9 @@ impl Pending {
             Some(Filed::Deep(top)) => {
                 self.by_top.remove(&(top, i));
             }
-            Some(Filed::Shallow(top, payloads)) => {
+            Some(Filed::Shallow(above, payloads)) => {
                 for p in payloads.into_iter().flatten() {
-                    self.by_payload.remove(&(top, p, i));
+                    self.by_payload.remove(&(above, p, i));
                 }
             }
             None => {}
@@ -3366,6 +3366,8 @@ mod tests {
         let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
         pending.retire(&Retire::Above(4), false);
         assert!(!holds(&mut pending, (5, 0)));
+        assert!(pending.by_top.is_empty());
+        assert!(matches!(pending.filed.get(&0), Some(Filed::Shallow(4, _))));
         pending.retire(
             &Retire::Contained {
                 cidx: 4,
@@ -3384,6 +3386,7 @@ mod tests {
         let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
         pending.resume(0, key(&Q));
         pending.resume(0, key(&R));
+        assert!(!pending.by_payload.contains(&(4, key(&Q), 0)));
         let contained = |payload| Retire::Contained { cidx: 4, payload };
         pending.retire(&contained(key(&Q)), false);
         assert!(holds(&mut pending, (2, 0)));
