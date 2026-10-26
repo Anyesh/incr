@@ -2369,9 +2369,10 @@ fn shared_group_leave_with_a_taken_claim_keeps_the_group() {
 
 /// x reads a, whose catch of its cycle with b is held until x's exit, then
 /// joins a child that reads a. The child must not wait on x's hold, which
-/// is raised where the cycle closes at every budget here: unbounded x gets
-/// a value, as on main (whose child gets a cycle error), and each budget
-/// gets the unbounded one.
+/// is raised where the cycle closes at every budget here. Whichever reader
+/// of a comes second gets the cycle, as on main, so x returns a value or
+/// panics; either way it returns, and each budget gets the unbounded run's
+/// outcome.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn a_closure_that_reads_a_caught_cycle_joins_a_reader_of_its_catcher() {
@@ -2403,7 +2404,7 @@ fn a_closure_that_reads_a_caught_cycle_joins_a_reader_of_its_catcher() {
         rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
     };
     let unbounded = run(u32::MAX);
-    assert!(matches!(unbounded, Some(Some(_))), "{unbounded:?}");
+    assert!(unbounded.is_some(), "x does not return");
     for frames in [1, 2] {
         assert_eq!(run(frames), unbounded, "budget {frames}");
     }
