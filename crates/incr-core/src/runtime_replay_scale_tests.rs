@@ -135,7 +135,9 @@ macro_rules! cycle_100k_tests {
             #[test]
             #[cfg_attr(miri, ignore)]
             fn $name() {
-                on_stack(8 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
+                // Under a TSan debug build, budget 256's Shared ring
+                // levels overflow an 8 MiB stack.
+                on_stack(16 << 20, || cycle_100k::<$cells>(Strategy::$strategy, $frames));
             }
         )*
     };
