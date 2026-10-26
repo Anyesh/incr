@@ -600,6 +600,13 @@ thread_local! {
     /// Test toggle: a walk on this thread never restarts its read after
     /// another thread's release.
     pub(crate) static NO_RESTART_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WALK_PUSHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The entries walks pushed on this thread since the last call.
+#[cfg(all(test, not(loom)))]
+pub(crate) fn take_walk_pushes() -> u64 {
+    WALK_PUSHES.with(|n| n.replace(0))
 }
 
 /// How `compute_one` left the node it was handed.
@@ -820,6 +827,8 @@ impl Walk {
 
     #[inline(always)]
     fn push(&mut self, entry: Entry) {
+        #[cfg(all(test, not(loom)))]
+        WALK_PUSHES.with(|n| n.set(n.get() + 1));
         if self.work.len() == self.work.capacity() {
             self.grow();
         }

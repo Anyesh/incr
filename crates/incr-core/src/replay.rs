@@ -397,29 +397,18 @@ impl Landings {
         std::mem::take(self.owned_nodes())
     }
 
-    /// The depth of the deepest landing the copy still holds, or `None`
-    /// once it holds none; a shared copy at depth 0 answers 0 unread.
+    /// A bound on the depth of the deepest landing the copy still holds:
+    /// exact for an owned copy, `None` once it holds none; a shared copy
+    /// answers its depth unread, even once its notes are all removed.
     fn deepest(&self) -> Option<u32> {
         match &self.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
                 nodes.iter().map(|&(_, depth, _)| depth).max()
             }
-            // No landing is deeper than `depth`.
-            Nodes::Shared { depth: 0, .. } => Some(0),
-            Nodes::Shared {
-                log,
-                len,
-                epoch,
-                base,
-                cut,
-                ..
-            } => log
-                .borrow()
-                .landings(*len, *epoch, *base, cut.as_ref())
-                .iter()
-                .map(|&(_, depth, _)| depth)
-                .max(),
+            // No landing is deeper than `depth`, and finding the deepest
+            // would take each delivery of a deep chain's copy apart.
+            Nodes::Shared { depth, .. } => Some(*depth),
         }
     }
 
@@ -646,6 +635,9 @@ impl Pending {
 
     /// Removes deliveries `is`, in that order.
     fn remove_all(&mut self, is: Vec<usize>) -> Vec<Delivery> {
+        for &i in &is {
+            self.unfile_passed(i);
+        }
         let out: Vec<Delivery> = is
             .into_iter()
             .map(|i| {
@@ -1597,14 +1589,16 @@ impl Context {
                 unreachable!("incr-core: taken as an unwind");
             };
             let payload = std::mem::replace(payload, regen);
-            d.resumed = Some(payload_key(&*payload));
-            return Delivered::Unwind {
+            let key = payload_key(&*payload);
+            let what = Delivered::Unwind {
                 cycle: *cycle,
                 poison: *poison,
                 attributed: *attributed,
                 payload,
                 nodes: nodes.clone(),
             };
+            self.pending.resume(i, key);
+            return what;
         };
         let what = Delivered::Unwind {
             cycle: *cycle,
@@ -3252,11 +3246,11 @@ pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
     with(|c| {
         for x in c.iter_mut().filter(|x| x.rt == rt) {
             for i in x.pending.keyed(key).to_vec() {
-                let d = x.pending.get_mut(i);
+                let d = x.pending.get(i);
                 if d.taken
                     && matches!(&d.what, Delivered::Unwind { payload, .. } if payload.is::<Regen>())
                 {
-                    d.resumed = Some(raised);
+                    x.pending.resume(i, raised);
                 }
             }
         }
@@ -3267,7 +3261,7 @@ pub(crate) fn regenerated(rt: RuntimeId, key: &ReadKey, raised: PayloadKey) {
 pub(crate) fn regenerated_at(id: u64, i: usize, raised: PayloadKey) {
     with(|c| {
         if let Some(x) = c.iter_mut().find(|x| x.id == id) {
-            x.pending.get_mut(i).resumed = Some(raised);
+            x.pending.resume(i, raised);
         }
     });
 }
@@ -3983,6 +3977,66 @@ mod tests {
             false,
         );
         assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// Opens a context holding `pending`, runs `f` on it and closes it.
+    fn in_context(pending: Pending, f: impl FnOnce(u64)) {
+        unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> KeyParts {
+            unreachable!()
+        }
+        let entry = Entry {
+            node: 1,
+            generation: 0,
+            suspect: false,
+            spec: false,
+            retry: Retry::Compute,
+            walked: false,
+            r5: false,
+        };
+        let keys = FrameKeys {
+            owner: std::ptr::null(),
+            parts: no_parts,
+        };
+        let id = open(RuntimeId::SENTINEL, 1, entry, keys);
+        with(|c| c.iter_mut().find(|x| x.id == id).unwrap().pending = pending);
+        f(id);
+        drop(close(id));
+    }
+
+    fn retires_contained_at_4(id: u64, payload: PayloadKey) -> bool {
+        with(|c| {
+            let x = c.iter_mut().find(|x| x.id == id).unwrap();
+            x.pending
+                .retire(&Retire::Contained { cidx: 4, payload }, false);
+            !holds(&mut x.pending, (2, 0))
+        })
+    }
+
+    /// A regenerated payload stands for a delivery's source as a take's
+    /// copy does, so a containment of it retires a landing just above the
+    /// frame.
+    #[test]
+    fn a_containment_of_a_payload_regenerated_at_its_delivery_retires_its_landing() {
+        in_context(passed_at_3(key(&P), vec![((2, 0), 0)]), |id| {
+            regenerated_at(id, 0, key(&Q));
+            assert!(retires_contained_at_4(id, key(&Q)));
+        });
+    }
+
+    #[test]
+    fn a_containment_of_a_payload_regenerated_for_its_read_retires_its_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        let d = pending.get_mut(0);
+        d.taken = true;
+        let Delivered::Unwind { payload, .. } = &mut d.what else {
+            unreachable!()
+        };
+        *payload = Box::new(Regen(std::any::TypeId::of::<&str>()));
+        let read = d.key;
+        in_context(pending, |id| {
+            regenerated(RuntimeId::SENTINEL, &read, key(&Q));
+            assert!(retires_contained_at_4(id, key(&Q)));
+        });
     }
 
     /// Short of a node a copy holds, a landing of another payload retires

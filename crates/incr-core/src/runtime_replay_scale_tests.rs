@@ -981,10 +981,8 @@ fn contained_chain_stays_linear<C: Cells>(frames: Option<u32>) {
     };
     for &n in sizes {
         let (first, work) = contained_chain::<C>(frames, n);
-        // At a budget of 1 the first read's note work is still quadratic,
-        // a known limitation this bound leaves out.
         assert!(
-            frames.is_some() || first <= 16 * n as u64,
+            first <= 24 * n as u64,
             "{frames:?}: {first} units of note work for a {n}-chain's first read"
         );
         assert!(
@@ -1014,11 +1012,32 @@ fn shared_contained_chain_stays_linear_at_budget_1() {
     on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(1)));
 }
 
+#[test]
+fn local_contained_chain_stays_linear_at_budget_2() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(2)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_2() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(2)));
+}
+
+#[test]
+fn local_contained_chain_stays_linear_at_budget_16() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Local>(Some(16)));
+}
+
+#[test]
+fn shared_contained_chain_stays_linear_at_budget_16() {
+    on_stack(1 << 28, || contained_chain_stays_linear::<Shared>(Some(16)));
+}
+
 /// A panicking query under an `n`-deep chain, read and then read again
 /// after an input change: each level's read takes the unwind and its frame
 /// lands Failed, which keys what the read took by the frame's path. The
-/// stack frames folded into paths, on the first read and on the second.
-fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64) {
+/// stack frames folded into paths on the first read and on the second, and
+/// the entries the second read's walks pushed.
+fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, u64, u64) {
     let rt = Runtime::<C>::new();
     let opts = || match frames {
         Some(_) => replayable(),
@@ -1040,16 +1059,25 @@ fn panicking_chain_path_steps<C: Cells>(frames: Option<u32>, n: usize) -> (u64, 
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
     let first = crate::replay::take_path_steps();
     rt.set(input, 1);
+    crate::runtime::take_walk_pushes();
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(top))).is_err());
-    (first, crate::replay::take_path_steps())
+    (
+        first,
+        crate::replay::take_path_steps(),
+        crate::runtime::take_walk_pushes(),
+    )
 }
 
 fn panicking_chain_paths_stay_linear<C: Cells>(frames: Option<u32>) {
     let n = if cfg!(miri) { 8 } else { 4000 };
-    let (first, second) = panicking_chain_path_steps::<C>(frames, n);
+    let (first, second, pushes) = panicking_chain_path_steps::<C>(frames, n);
     assert!(
         first <= 8 * n as u64 && second <= 8 * n as u64,
         "{frames:?}: {first} and {second} frames folded into paths for a {n}-chain"
+    );
+    assert!(
+        pushes <= 8 * n as u64,
+        "{frames:?}: the second read's walks pushed {pushes} entries for a {n}-chain"
     );
 }
 
