@@ -1047,7 +1047,7 @@ impl<C: Cells> Runtime<C> {
     /// A member run a doom discarded: it stood on placeholders, so nothing
     /// it computed is kept, but the member keeps its claim, for the run's
     /// retry at its virtual frame. The claims anchored above it take the
-    /// discard landing.
+    /// discard landing, but for those virtual frames above it own.
     #[cold]
     #[inline(never)]
     fn member_run_doomed(
@@ -1066,7 +1066,9 @@ impl<C: Cells> Runtime<C> {
         if let Some(value) = ctl.buf.take() {
             bag.push_erased(Box::new(Unbuilt::new(value)));
         }
-        self.release_held_from(cidx + 1, true, Some(UnwindKind::Discard), &mut bag);
+        let mut keep = Vec::new();
+        self.virtually_owned(cidx + 1, &mut keep);
+        self.release_held_except(cidx + 1, &keep, &mut bag);
         let old = cycle_state::with_held(|h| {
             h.get_mut(&(self.runtime_id, slot))
                 .and_then(Held::discard_buf)
@@ -1936,8 +1938,10 @@ impl<C: Cells> Runtime<C> {
     /// `kind`: the claims its subtree deferred to a root below it go too.
     /// A doom's discard keeps those, for the frame's retry to read, and so
     /// does a speculative run's unwind, which the unbounded run may never
-    /// make: another frame at the position may own them. `payload` is the
-    /// unwind's, which a claim landing Failed lets out.
+    /// make: another frame at the position may own them. A discard also
+    /// keeps what virtual frames at or above it own
+    /// ([`Self::virtually_owned`]), as a doomed frame's does. `payload` is
+    /// the unwind's, which a claim landing Failed lets out.
     pub(super) fn release_unwound_from(
         &self,
         cidx: u32,
@@ -1947,8 +1951,12 @@ impl<C: Cells> Runtime<C> {
         payload: Option<&(dyn std::any::Any + Send)>,
         bag: &mut Deferred<C>,
     ) {
+        let mut keep = Vec::new();
+        if kind == Some(UnwindKind::Discard) {
+            self.virtually_owned(cidx, &mut keep);
+        }
         let subtree = (kind != Some(UnwindKind::Discard) && !replay::speculative()).then_some(node);
-        self.release_held_where(cidx, discarding, kind, subtree, &[], payload, bag);
+        self.release_held_where(cidx, discarding, kind, subtree, &keep, payload, bag);
     }
 
     /// [`Self::release_held_from`] for a doomed frame's discard, keeping

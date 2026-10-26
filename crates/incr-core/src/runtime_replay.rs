@@ -3473,6 +3473,25 @@ impl<C: Cells> Runtime<C> {
     /// returned.
     fn keep_virtual(&self, id: NodeId, cidx: u32, keep: &mut Vec<u32>) -> Option<u64> {
         let rt = self.runtime_id;
+        let rooted = self.virtually_owned(cidx, keep) || replay::suspended_low_at(rt, cidx);
+        if !rooted || cycle_state::holds(rt, id.0) {
+            return None;
+        }
+        replay::with(|c| {
+            c.iter()
+                .filter(|x| x.rt == rt)
+                .flat_map(|x| x.vstack.iter())
+                .find(|v| v.cidx == cidx && v.node == id.0)
+                .map(|v| v.path)
+        })
+    }
+
+    /// Adds to `keep` the claims anchored at or above `cidx` that virtual
+    /// frames there own, whatever their node, and returns whether one is
+    /// anchored at `cidx`. A discard at the position keeps them until the
+    /// virtual frame's pop or retry, or its context's end.
+    pub(super) fn virtually_owned(&self, cidx: u32, keep: &mut Vec<u32>) -> bool {
+        let rt = self.runtime_id;
         let mut rooted = false;
         cycle_state::with_held(|h| {
             for g in h.virtual_owners(rt, cidx, u32::MAX) {
@@ -3485,17 +3504,7 @@ impl<C: Cells> Runtime<C> {
                 }
             }
         });
-        rooted |= replay::suspended_low_at(rt, cidx);
-        if !rooted || cycle_state::holds(rt, id.0) {
-            return None;
-        }
-        replay::with(|c| {
-            c.iter()
-                .filter(|x| x.rt == rt)
-                .flat_map(|x| x.vstack.iter())
-                .find(|v| v.cidx == cidx && v.node == id.0)
-                .map(|v| v.path)
-        })
+        rooted
     }
 
     /// The doomed root of kept claims stays claimed, as a virtual hit's
