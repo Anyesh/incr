@@ -1,13 +1,9 @@
-use super::{
-    note_settled_here, own_episode, own_episodes, reset_outermost, settled_here_count,
-    settled_here_since, Held, Look, OWN_EPISODES, SETTLED_WORK,
-};
+use super::{own_episode, own_episodes, Held, Look, OWN_EPISODES};
 use crate::cycle::{self, Erased};
 use crate::deferred::Unbuilt;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
 use crate::replay;
-use std::cell::Cell;
 
 fn value(v: u32) -> Option<Erased> {
     Some(Box::new(v))
@@ -244,28 +240,4 @@ fn alternating_runtimes_switch_back_on_exit() {
     assert!(!s1.is_outermost() && s1.first_for_runtime() && s1.shared_outermost());
     drop(s1);
     drop(l1);
-}
-
-/// A replan asks the settled log about each pending node it checks; the
-/// index takes each landing once, so a read that lands `n` nodes and asks
-/// after each costs O(n), not O(n^2).
-#[test]
-fn the_settled_log_index_grows_with_the_landings() {
-    fn work(n: u32) -> u64 {
-        let rt = RuntimeId::allocate();
-        reset_outermost();
-        SETTLED_WORK.with(|w| w.set(0));
-        for slot in 0..n {
-            note_settled_here(rt, slot, 0);
-            assert!(settled_here_since(0, rt, slot, 0));
-            assert!(!settled_here_since(settled_here_count(), rt, slot, 0));
-        }
-        reset_outermost();
-        SETTLED_WORK.with(Cell::get)
-    }
-    let (small, large) = (work(1000), work(4000));
-    assert!(
-        large <= 4 * small + 8,
-        "{small} units for 1000 landings, {large} for 4000"
-    );
 }

@@ -449,9 +449,7 @@ impl<C: Cells> Runtime<C> {
         if episodes != 0 {
             // Before the members land, so a read of one of their landings
             // also reads the count.
-            let landed = episodes * super::LANDED;
-            crate::cycle_state::own_episode(self.runtime_id, landed);
-            C::u64_fetch_add(&self.episodes_landed, landed);
+            self.count_landed(episodes, entries.iter().map(|e| e.slot));
         }
         // A release counted when its claims landed held: a walk planned
         // since then expanded through their held states, and must see the

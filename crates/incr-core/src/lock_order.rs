@@ -43,8 +43,9 @@ pub enum LockKind {
     /// A runtime's stashes of speculative runs. Only value code, which reads
     /// Clean nodes without a lock, runs under it.
     Stashes,
-    /// A runtime's log of released slots, under which nothing is taken.
-    Releases,
+    /// A runtime's log of the slots episodes and releases landed, under
+    /// which nothing is taken.
+    Episodes,
 }
 
 impl LockKind {
@@ -65,7 +66,7 @@ impl LockKind {
             LockKind::Directory => 66,
             LockKind::WatchQueue => 70,
             LockKind::Stashes => 75,
-            LockKind::Releases => 80,
+            LockKind::Episodes => 80,
         }
     }
 }

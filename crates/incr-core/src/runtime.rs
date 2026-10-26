@@ -547,42 +547,76 @@ pub(crate) const LANDED: u64 = 1;
 /// so a walk tells it from a landing.
 pub(crate) const RELEASED: u64 = 1 << 32;
 
-/// How many released slots [`ReleaseLog`] keeps.
-const RELEASE_LOG_LEN: usize = 1024;
+/// How many slots [`EpisodeLog`] keeps.
+const EPISODE_LOG_LEN: usize = 1024;
 
-/// The slots the latest releases of held claims landed unrun, each with
-/// its release's number (the count `episodes_landed` holds over
-/// [`RELEASED`] once it is added), so a walk can tell whether a release
-/// since its plan reached it.
-#[derive(Default)]
-pub(crate) struct ReleaseLog {
-    slots: std::collections::VecDeque<(u32, u32)>,
-    /// The highest release number whose slots the log no longer holds.
-    evicted: Option<u32>,
+/// A slot an episode or a release landed, with the thread that landed it
+/// and its number: the low half of `episodes_landed` once a landed
+/// episode is added, the count over [`RELEASED`] once a release is.
+#[derive(Clone, Copy)]
+struct Logged {
+    number: u32,
+    slot: u32,
+    by: u32,
+    released: bool,
 }
 
-impl ReleaseLog {
-    fn push(&mut self, release: u32, slots: impl IntoIterator<Item = u32>) {
+/// The slots the latest landed episodes and releases of held claims
+/// landed, so that a walk can tell whether another thread's episode since
+/// its plan reached it.
+#[derive(Default)]
+pub(crate) struct EpisodeLog {
+    entries: std::collections::VecDeque<Logged>,
+    /// The highest landed episode and release numbers whose slots the log
+    /// no longer holds.
+    evicted: [Option<u32>; 2],
+}
+
+impl EpisodeLog {
+    fn push(&mut self, released: bool, number: u32, slots: impl IntoIterator<Item = u32>) {
+        let by = cycle_state::thread_key();
         for slot in slots {
-            if self.slots.len() == RELEASE_LOG_LEN {
-                self.evicted = self.slots.pop_front().map(|(n, _)| n);
+            if self.entries.len() == EPISODE_LOG_LEN {
+                if let Some(old) = self.entries.pop_front() {
+                    self.evicted[usize::from(old.released)] = Some(old.number);
+                }
             }
-            self.slots.push_back((release, slot));
+            self.entries.push_back(Logged {
+                number,
+                slot,
+                by,
+                released,
+            });
         }
     }
 
-    /// Whether a release numbered after `since` landed one of `planned`
-    /// unrun, or may have, its slots being evicted.
-    fn reached(&self, since: u32, mut planned: impl Iterator<Item = u32>) -> bool {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The slots other threads' landed episodes (`released` false) or
+    /// releases numbered after `since` landed, or `None` if the log may
+    /// have evicted some of them.
+    fn others_since(&self, released: bool, since: u32) -> Option<HashSet<u32, FxBuildHasher>> {
         let after = |n: u32| n.wrapping_sub(since) as i32 > 0;
-        if self.evicted.is_some_and(after) {
-            return true;
+        if self.evicted[usize::from(released)].is_some_and(after) {
+            return None;
         }
-        let released: HashSet<u32, FxBuildHasher> = (self.slots.iter())
-            .filter(|&&(n, _)| after(n))
-            .map(|&(_, slot)| slot)
-            .collect();
-        !released.is_empty() && planned.any(|slot| released.contains(&slot))
+        let me = cycle_state::thread_key();
+        Some(
+            (self.entries.iter())
+                .filter(|e| e.released == released && e.by != me && after(e.number))
+                .map(|e| e.slot)
+                .collect(),
+        )
+    }
+
+    /// Whether another thread's release numbered after `since` landed one
+    /// of `planned` unrun, or may have, its slots being evicted.
+    fn reached(&self, since: u32, mut planned: impl Iterator<Item = u32>) -> bool {
+        self.others_since(true, since)
+            .is_none_or(|released| !released.is_empty() && planned.any(|s| released.contains(&s)))
     }
 }
 
@@ -751,9 +785,6 @@ pub(crate) struct Walk {
     failed_from: usize,
     /// What the walk planned under, kept when a doom stashes it.
     planned: Planned,
-    /// This thread's `settled_here` count when the walk first planned: a
-    /// node it has landed since is one the walk's own reads settled.
-    settled_from: usize,
 }
 
 #[derive(Default, Clone)]
@@ -795,7 +826,6 @@ impl Walk {
             root_failed_here: false,
             failed_from: 0,
             planned: Planned::default(),
-            settled_from: 0,
         }
     }
 
@@ -807,6 +837,19 @@ impl Walk {
             .get_or_insert_with(Box::default)
             .new
             .insert(id)
+    }
+
+    /// The nodes whose states the plan has expanded through: its pending
+    /// entries, `cur`, and every member of a group it expanded whole. A
+    /// queued visit has not been expanded yet.
+    #[cold]
+    fn expanded_slots(&self, cur: NodeId) -> impl Iterator<Item = u32> + '_ {
+        let groups = self.expanded.iter().flat_map(|x| &x.groups);
+        (self.work.iter())
+            .filter(|e| e.is_pending())
+            .map(|e| e.id.0)
+            .chain([cur.0])
+            .chain(groups.flat_map(|g| g.members.iter().map(|&(slot, _)| slot)))
     }
 
     /// Pushes back `entry`, whose compute a discard undid, for the reading
@@ -1246,7 +1289,7 @@ pub struct Runtime<C: Cells> {
     /// Speculative runs' withheld landings of this revision.
     pub(crate) stashes: OrderedLock<replay_impl::Stashes, C>,
     /// The slots of the latest releases of held claims.
-    pub(crate) releases: OrderedLock<ReleaseLog, C>,
+    pub(crate) episode_log: OrderedLock<EpisodeLog, C>,
     /// How many stashes `stashes` holds, so a claim can skip its lock.
     pub(crate) stash_count: C::U32,
     /// What other runtimes' speculative runs check their Clean reads of
@@ -1379,7 +1422,7 @@ impl<C: Cells> Runtime<C> {
             #[cfg(test)]
             drop_unwinds: std::sync::atomic::AtomicU32::new(0),
             stashes: OrderedLock::new(LockKind::Stashes, replay_impl::Stashes::default()),
-            releases: OrderedLock::new(LockKind::Releases, ReleaseLog::default()),
+            episode_log: OrderedLock::new(LockKind::Episodes, EpisodeLog::default()),
             stash_count: C::new_u32(0),
             changes: crate::changes::Changes::new(),
             read_speculatively: C::new_u8(0),
@@ -3629,7 +3672,6 @@ impl<C: Cells> Runtime<C> {
             let mut walk = Walk::new(id, gen, observed);
             if !C::SINGLE_THREADED {
                 walk.failed_from = cycle_state::failed_here_count();
-                walk.settled_from = cycle_state::settled_here_count();
             }
             walk
         });
@@ -3723,8 +3765,8 @@ impl<C: Cells> Runtime<C> {
                         && !cycle_state::holds(self.runtime_id, id.0)
                         && self.release_reached(&walk, cur, planned);
                     resumed = false;
-                    planned = self.planned();
-                    if !self.prune_settled(&mut walk) {
+                    let since = std::mem::replace(&mut planned, self.planned());
+                    if !self.prune_settled(&mut walk, since) {
                         if released {
                             // The plan expanded through a released claim's old
                             // state, a node it ran perhaps included, so the
@@ -4007,8 +4049,9 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn release_reached(&self, walk: &Walk, cur: NodeId, planned: Planned) -> bool {
         let since = (planned.all / RELEASED) as u32;
-        let planned = walk.work.iter().map(|e| e.id.0).chain([cur.0]);
-        self.releases.read().reached(since, planned)
+        self.episode_log
+            .read()
+            .reached(since, walk.expanded_slots(cur))
     }
 
     /// After a claim CAS of `id` at `generation` succeeded: whether another
@@ -4052,16 +4095,24 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Drops the part of `walk`'s plan under its lowest pending node that
-    /// another thread has left Clean or Cyclic, as a walk planned now would
-    /// not expand it, and keeps the rest with what the walk has learned.
-    /// One this thread landed since the walk planned is the walk's own
-    /// progress, which the plan already accounts for. False if no pending
-    /// node has settled.
+    /// another thread's episode since `since` left Clean or Cyclic, as a
+    /// walk planned now would not expand it, and keeps the rest with what
+    /// the walk has learned. A node this thread or a plain landing settled
+    /// is one the plan goes on through, as with no episode. If the log has
+    /// dropped some of the episode's slots, any settled node counts. False
+    /// if no pending node has settled.
     #[cold]
     #[inline(never)]
-    fn prune_settled(&self, walk: &mut Walk) -> bool {
+    fn prune_settled(&self, walk: &mut Walk, since: Planned) -> bool {
+        let landed = self
+            .episode_log
+            .read()
+            .others_since(false, since.all as u32);
         let settled = walk.work.iter().position(|e| {
             e.is_pending()
+                && landed
+                    .as_ref()
+                    .is_none_or(|landed| landed.contains(&e.id.0))
                 && {
                     let cell = self.nodes.get(e.id.0).state_cell();
                     matches!(
@@ -4069,7 +4120,6 @@ impl<C: Cells> Runtime<C> {
                         NodeState::Clean | NodeState::Cyclic
                     )
                 }
-                && !self.landed_here(walk, e.id, e.generation)
         });
         match settled {
             Some(at) => {
@@ -4078,14 +4128,6 @@ impl<C: Cells> Runtime<C> {
             }
             None => false,
         }
-    }
-
-    /// Whether this thread has landed `id` at `generation` Clean or Cyclic
-    /// since `walk` first planned.
-    #[cold]
-    #[inline(never)]
-    fn landed_here(&self, walk: &Walk, id: NodeId, generation: u32) -> bool {
-        cycle_state::settled_here_since(walk.settled_from, self.runtime_id, id.0, generation)
     }
 
     /// The first time a walk reaches a Dirty member of a landed group, it
@@ -5607,8 +5649,6 @@ impl<C: Cells> Runtime<C> {
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
                 self.report_landing(id);
-            } else if !C::SINGLE_THREADED && !unrun {
-                self.note_settled_here(id, node);
             }
             return target;
         }
@@ -5620,16 +5660,8 @@ impl<C: Cells> Runtime<C> {
         );
         if !matches!(flagged, NodeState::Clean | NodeState::Cyclic) {
             self.report_landing(id);
-        } else if !C::SINGLE_THREADED && !unrun {
-            self.note_settled_here(id, node);
         }
         flagged
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn note_settled_here(&self, id: NodeId, node: &NodeData<C>) {
-        cycle_state::note_settled_here(self.runtime_id, id.0, node.generation());
     }
 
     /// Validate a compute's recorded deps, then install them and update

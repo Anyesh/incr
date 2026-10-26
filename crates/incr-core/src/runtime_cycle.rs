@@ -1880,10 +1880,22 @@ impl<C: Cells> Runtime<C> {
         if !C::SINGLE_THREADED {
             // The log is written under its lock with the count, so a walk
             // that reads the count and then the log finds the slots.
-            let mut log = self.releases.write();
+            let mut log = self.episode_log.write();
             cycle_state::own_episode(self.runtime_id, RELEASED);
             let before = C::u64_fetch_add(&self.episodes_landed, RELEASED);
-            log.push(((before / RELEASED) as u32).wrapping_add(1), slots);
+            log.push(true, ((before / RELEASED) as u32).wrapping_add(1), slots);
+        }
+    }
+
+    /// Counts `episodes` landed episodes, before their `slots` land, as
+    /// [`Self::count_release`] counts a release.
+    pub(super) fn count_landed(&self, episodes: u64, slots: impl IntoIterator<Item = u32>) {
+        let landed = episodes * super::LANDED;
+        let log = (!C::SINGLE_THREADED).then(|| self.episode_log.write());
+        cycle_state::own_episode(self.runtime_id, landed);
+        let before = C::u64_fetch_add(&self.episodes_landed, landed);
+        if let Some(mut log) = log {
+            log.push(false, before.wrapping_add(landed) as u32, slots);
         }
     }
 

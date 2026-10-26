@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
@@ -814,8 +815,8 @@ struct EntryState {
     budget_clock: Cell<u64>,
     /// The length of `Outer::failed_here`, read by every Shared walk.
     failed_here: Cell<usize>,
-    /// The length of `Outer::settled_here`, read by every Shared walk.
-    settled_here: Cell<usize>,
+    /// This thread's [`thread_key`], 0 until first asked.
+    thread_key: Cell<u32>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -831,12 +832,6 @@ struct Outer {
     budgets_met: Vec<(RuntimeId, u64)>,
     /// The nodes this thread has landed Failed, at their generations.
     failed_here: Vec<(RuntimeId, u32, u32)>,
-    /// The nodes this thread has landed Clean or Cyclic, at their
-    /// generations, and the last position of each among the first
-    /// `settled_indexed`, built when a replan first asks.
-    settled_here: Vec<(RuntimeId, u32, u32)>,
-    settled_index: HashMap<(RuntimeId, u32, u32), usize, FxBuildHasher>,
-    settled_indexed: usize,
 }
 
 #[cfg(not(loom))]
@@ -854,7 +849,7 @@ thread_local! {
             stack_base: Cell::new(0),
             budget_clock: Cell::new(0),
             failed_here: Cell::new(0),
-            settled_here: Cell::new(0),
+            thread_key: Cell::new(0),
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
@@ -866,9 +861,6 @@ thread_local! {
             last_cycle: None,
             budgets_met: Vec::new(),
             failed_here: Vec::new(),
-            settled_here: Vec::new(),
-            settled_index: HashMap::with_hasher(FxBuildHasher),
-            settled_indexed: 0,
         })
     };
 }
@@ -887,7 +879,7 @@ loom::thread_local! {
         stack_base: Cell::new(0),
         budget_clock: Cell::new(0),
         failed_here: Cell::new(0),
-        settled_here: Cell::new(0),
+        thread_key: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
@@ -897,10 +889,21 @@ loom::thread_local! {
         last_cycle: None,
         budgets_met: Vec::new(),
         failed_here: Vec::new(),
-        settled_here: Vec::new(),
-        settled_index: HashMap::with_hasher(FxBuildHasher),
-        settled_indexed: 0,
     });
+}
+
+static NEXT_THREAD_KEY: AtomicU32 = AtomicU32::new(1);
+
+/// A number no other thread alive holds, which tells this thread's
+/// episodes in a runtime's log from other threads'.
+pub(crate) fn thread_key() -> u32 {
+    ENTRY.with(|e| {
+        if e.thread_key.get() == 0 {
+            e.thread_key
+                .set(NEXT_THREAD_KEY.fetch_add(1, Ordering::Relaxed).max(1));
+        }
+        e.thread_key.get()
+    })
 }
 
 /// Runs `f` on the held map. `f` must not call user code or the engine.
@@ -1123,53 +1126,6 @@ pub(crate) fn failed_here_since(from: usize, rt: RuntimeId, slot: u32, generatio
         o.failed_here
             .get(from..)
             .is_some_and(|f| f.contains(&(rt, slot, generation)))
-    })
-}
-
-#[cfg(all(test, not(loom)))]
-thread_local! {
-    /// The settled log's lookups and index insertions on this thread.
-    pub(super) static SETTLED_WORK: Cell<u64> = const { Cell::new(0) };
-}
-
-pub(crate) fn note_settled_here(rt: RuntimeId, slot: u32, generation: u32) {
-    // A landing from a thread-local destructor after `OUTER`'s goes
-    // unlogged rather than aborting the thread.
-    if OUTER
-        .try_with(|o| o.borrow_mut().settled_here.push((rt, slot, generation)))
-        .is_ok()
-    {
-        ENTRY.with(|e| {
-            e.outer_set.set(true);
-            e.settled_here.set(e.settled_here.get() + 1);
-        });
-    }
-}
-
-/// How many Clean or Cyclic landings this thread has made in its
-/// outermost entry.
-pub(crate) fn settled_here_count() -> usize {
-    ENTRY.with(|e| e.settled_here.get())
-}
-
-/// Whether one of this thread's Clean or Cyclic landings after its first
-/// `from` in its outermost entry is of `slot` of `rt` at `generation`.
-/// Amortized O(1): the index grows by the landings since the last ask.
-#[cold]
-#[inline(never)]
-pub(crate) fn settled_here_since(from: usize, rt: RuntimeId, slot: u32, generation: u32) -> bool {
-    OUTER.with(|o| {
-        let o = &mut *o.borrow_mut();
-        #[cfg(all(test, not(loom)))]
-        SETTLED_WORK
-            .with(|w| w.set(w.get() + 1 + (o.settled_here.len() - o.settled_indexed) as u64));
-        for (at, &key) in o.settled_here.iter().enumerate().skip(o.settled_indexed) {
-            o.settled_index.insert(key, at);
-        }
-        o.settled_indexed = o.settled_here.len();
-        o.settled_index
-            .get(&(rt, slot, generation))
-            .is_some_and(|&at| at >= from)
     })
 }
 
@@ -1439,13 +1395,7 @@ pub(crate) fn reset_outermost() {
             o.last_cycle = None;
             o.budgets_met.clear();
             o.failed_here.clear();
-            o.settled_here.clear();
-            o.settled_index.clear();
-            o.settled_indexed = 0;
-            ENTRY.with(|e| {
-                e.failed_here.set(0);
-                e.settled_here.set(0);
-            });
+            ENTRY.with(|e| e.failed_here.set(0));
         });
     }
 }

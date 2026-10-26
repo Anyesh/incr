@@ -11,7 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::{DeleteError, DeleteOutcome, ParkPoint, ReleaseLog, Runtime, RELEASE_LOG_LEN};
+use super::{
+    DeleteError, DeleteOutcome, Entry, EpisodeLog, Expanded, GroupInfo, ParkPoint, Runtime, Walk,
+    EPISODE_LOG_LEN, NO_TAINT, VISIT,
+};
 use crate::cells::{Cells, Local, Shared};
 use crate::collection::{GroupedCollection, IncrCollection};
 use crate::handle::Incr;
@@ -2399,28 +2402,102 @@ fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
 /// A released replan restarts only for a release after its plan that
 /// landed one of the plan's nodes unrun, or whose slots the log has
 /// evicted; release numbers compare across their wrap.
+/// Pushes to `log` from another thread.
+fn foreign(mut log: EpisodeLog, released: bool, number: u32, slots: Vec<u32>) -> EpisodeLog {
+    thread::spawn(move || {
+        log.push(released, number, slots);
+        log
+    })
+    .join()
+    .unwrap()
+}
+
 #[test]
-fn a_release_reaches_a_plan_only_through_its_own_slots() {
-    let mut log = ReleaseLog::default();
-    log.push(7, [3, 4]);
-    log.push(8, [9]);
+fn an_episode_reaches_a_plan_only_through_another_threads_slots() {
+    let mut log = foreign(EpisodeLog::default(), true, 7, vec![3, 4]);
+    log = foreign(log, true, 8, vec![9]);
+    log.push(true, 8, [1]);
     assert!(log.reached(7, [1, 9].into_iter()));
+    assert!(!log.reached(7, [1].into_iter()), "an own release reached");
     assert!(!log.reached(7, [3, 4].into_iter()));
     assert!(!log.reached(8, [9].into_iter()));
     assert!(log.reached(6, [4].into_iter()));
 
-    let mut log = ReleaseLog::default();
-    log.push(u32::MAX, [5]);
-    log.push(0, [6]);
+    log = foreign(log, false, 5, vec![2]);
+    log.push(false, 6, [11]);
+    assert!(!log.reached(0, [2].into_iter()), "a landed episode reached");
+    let landed = |log: &EpisodeLog, since| {
+        let mut slots: Vec<u32> = log
+            .others_since(false, since)
+            .unwrap()
+            .into_iter()
+            .collect();
+        slots.sort_unstable();
+        slots
+    };
+    assert_eq!(landed(&log, 4), [2]);
+    assert_eq!(landed(&log, 5), [0_u32; 0]);
+
+    let mut log = foreign(EpisodeLog::default(), true, u32::MAX, vec![5]);
+    log = foreign(log, true, 0, vec![6]);
     assert!(log.reached(u32::MAX - 1, [5].into_iter()));
     assert!(log.reached(u32::MAX, [6].into_iter()));
     assert!(!log.reached(u32::MAX, [5].into_iter()));
 
-    let mut log = ReleaseLog::default();
-    log.push(1, 0..RELEASE_LOG_LEN as u32);
-    log.push(2, [u32::MAX]);
+    let all = || (0..EPISODE_LOG_LEN as u32).collect::<Vec<_>>();
+    let mut log = foreign(EpisodeLog::default(), true, 1, all());
+    log = foreign(log, true, 2, vec![u32::MAX]);
     assert!(log.reached(0, [u32::MAX - 1].into_iter()));
     assert!(!log.reached(1, [0].into_iter()));
+    assert!(log.others_since(false, 0).is_some());
+    log = foreign(log, false, 3, all());
+    log = foreign(log, false, 4, vec![u32::MAX]);
+    assert!(log.others_since(false, 2).is_none());
+    assert_eq!(landed(&log, 3), [u32::MAX]);
+}
+
+/// Landings write nothing to the episode log, which only landed episodes
+/// and releases of held claims fill, so a Shared recompute pays for no log.
+#[test]
+fn a_recompute_leaves_the_episode_log_empty() {
+    let rt = Rt::new();
+    let x = rt.create_input(0_u64);
+    let fan: Vec<Incr<u64>> = (0..1000)
+        .map(|_| rt.create_query(move |rt: &Rt| rt.get(x) + 1))
+        .collect();
+    let sum = rt.create_query(move |rt: &Rt| fan.iter().map(|&q| rt.get(q)).sum::<u64>());
+    for v in 1..4 {
+        rt.set(x, v);
+        assert_eq!(rt.get(sum), (v + 1) * 1000);
+    }
+    assert_eq!(rt.episode_log.read().len(), 0);
+}
+
+#[test]
+fn a_plan_is_reached_only_through_the_nodes_it_expanded() {
+    let entry = |id, taint| Entry {
+        id: NodeId(id),
+        taint,
+        generation: 0,
+    };
+    let rt = Rt::new();
+    let member = rt.create_input(0_u64).erase();
+    let mut walk = Walk::new(NodeId(0), 0, NodeState::Dirty);
+    walk.push(entry(1, NO_TAINT));
+    walk.push(entry(2, VISIT));
+    let mut slots: Vec<u32> = walk.expanded_slots(NodeId(3)).collect();
+    slots.sort_unstable();
+    assert_eq!(slots, [1, 3]);
+    walk.expanded = Some(Box::new(Expanded {
+        new: Default::default(),
+        groups: vec![Arc::new(GroupInfo {
+            members: vec![(5, 0), (6, 0)],
+            cycle: crate::cycle::Cycle::new(vec![member]),
+        })],
+    }));
+    let mut slots: Vec<u32> = walk.expanded_slots(NodeId(3)).collect();
+    slots.sort_unstable();
+    assert_eq!(slots, [1, 3, 5, 6]);
 }
 
 /// r reads m, which reads a0..a3, which read x. In each plan of r another
@@ -2428,8 +2505,8 @@ fn a_release_reaches_a_plan_only_through_its_own_slots() {
 /// and the holder counts a release before it lands, as a thread whose
 /// caught cycle or doomed round releases claims does (0x2997, 0x19a69):
 /// every plan meets a claim a release may have ended. The walk restarts
-/// from its root at most `ROOT_RESTARTS` times and then plans on, where
-/// without the bound each plan would restart it again.
+/// from its root at least once and at most `ROOT_RESTARTS` times and then
+/// plans on, where without the bound each plan would restart it again.
 #[test]
 fn a_walk_that_waits_on_a_released_claim_every_plan_restarts_a_bounded_number_of_times() {
     const MEMBERS: usize = 4;
@@ -2532,7 +2609,7 @@ fn a_walk_that_waits_on_a_released_claim_every_plan_restarts_a_bounded_number_of
     );
     let replans = rt.root_replans.load(Ordering::Relaxed);
     assert!(
-        replans <= super::ROOT_RESTARTS,
+        (1..=super::ROOT_RESTARTS).contains(&replans),
         "{replans} root replans over {holds} waited plans"
     );
 }
