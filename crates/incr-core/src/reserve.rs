@@ -11,7 +11,7 @@
 //! retry that reruns from the closure start, the reservation rests: it
 //! holds only ops begun before then, since a later op may be a reader the
 //! retry itself started. An op begun after the rest can still compute the
-//! node ahead of the retry. It is stored
+//! node ahead of the retry. A reservation is stored
 //! before the release that publishes it, so a claim that reads the release
 //! sees it. A node generation has at most one reservation: reserving it
 //! needs its claim, and a claim waits out another thread's reservation.
@@ -47,8 +47,7 @@ use loom::sync::{
 const BUCKETS_LEN: usize = 1024;
 
 /// A reservation's node generation, its owner's token, and the [`SEQ`]
-/// value its owner left its run at ([`AWAKE`] while the unbounded run's
-/// frame of the node would stand).
+/// value its owner left its run at ([`AWAKE`] while every op waits on it).
 type Entry = (u32, usize, u64);
 
 /// The stamp of a reservation every other reader waits on.
