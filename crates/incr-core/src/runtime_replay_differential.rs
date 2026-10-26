@@ -3032,6 +3032,23 @@ fn seed_e126d92b8f_case() -> Case {
     }
 }
 
+/// 0x48e9's class on one thread, from the seed's single-thread case with
+/// two reads added: an early speculative run stashes 11 and the nodes it
+/// read, 13 is deleted and recreated, which leaves the revision as it
+/// was, and a real run lands 12 anew. 11's stash must not be adopted
+/// over it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_48e9_stash_over_a_dep_landed_after_a_delete() {
+    let mut case = gen_case(0x48e9, false, false);
+    case.ops.truncate(9);
+    case.ops.extend([Op::Get(12), Op::TryGet(11)]);
+    quiet(|| {
+        differential::<Local>(&case, 0x48e9);
+        differential::<Shared>(&case, 0x48e9);
+    });
+}
+
 #[test]
 #[cfg_attr(miri, ignore)]
 fn seed_e126d92b8f_repeated_runs_keep_their_deliveries() {
