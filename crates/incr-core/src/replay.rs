@@ -635,9 +635,6 @@ impl Pending {
 
     /// Removes deliveries `is`, in that order.
     fn remove_all(&mut self, is: Vec<usize>) -> Vec<Delivery> {
-        for &i in &is {
-            self.unfile_passed(i);
-        }
         let out: Vec<Delivery> = is
             .into_iter()
             .map(|i| {
