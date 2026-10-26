@@ -1524,19 +1524,8 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
         // The landed case runs a third time; the ignored
         // `landed_foreign_reader_runs_twice` tracks it.
         if !matches!(first, FirstRead::ForeignLandedClean) {
-            assert_eq!(runs, (doomed_reader_first_runs::<A>(n), 1), "{first:?}");
+            assert_eq!(runs, (2, 1), "{first:?}");
         }
-    }
-}
-
-/// The reader's runs in a first revision: a Shared doomed frame unwinds at
-/// its next read, so it takes one doomed run per leaf where Local's one
-/// doomed run reads them all.
-fn doomed_reader_first_runs<A: Cells>(n: u64) -> u32 {
-    if A::SINGLE_THREADED {
-        2
-    } else {
-        n as u32 + 1
     }
 }
 
@@ -1664,12 +1653,7 @@ fn rereading_foreign_reader_runs(first: FirstRead, steady: bool) {
             doomed_reader_runs::<Shared, Local>(n, first, steady),
             doomed_reader_runs::<Shared, Shared>(n, first, steady),
         ];
-        let shared = if steady {
-            2
-        } else {
-            doomed_reader_first_runs::<Shared>(n)
-        };
-        assert_eq!(runs, [(2, 1), (2, 1), (shared, 1), (shared, 1)], "{n}");
+        assert_eq!(runs, [(2, 1); 4], "{n}");
     }
 }
 
@@ -1843,11 +1827,9 @@ fn stashed_clean_read_after_set<A: Cells, B: Cells>(budget: bool) -> (u64, u32) 
 }
 
 /// The stash tests' values and leaf runs for Local and Shared readers: the
-/// budget's extra run is the speculative one off the placeholder, which a
-/// Shared doomed frame does not make, as it unwinds there.
+/// budget's extra run is the speculative one off the placeholder.
 fn stashed_leaf_runs(budget: bool) -> [(u64, u32); 4] {
-    let local = if budget { 2 } else { 1 };
-    [(2000, local), (2000, local), (2000, 1), (2000, 1)]
+    [(2000, if budget { 2 } else { 1 }); 4]
 }
 
 #[test]

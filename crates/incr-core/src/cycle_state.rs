@@ -1074,6 +1074,13 @@ pub(crate) fn lazy_open() -> bool {
     ENTRY.with(|e| e.lazy.get() != 0)
 }
 
+/// Whether frame `ctl` is the doomed frame that runs on past its
+/// placeholder.
+#[inline]
+pub(crate) fn lazy_is(ctl: usize) -> bool {
+    ENTRY.with(|e| e.lazy.get() == ctl)
+}
+
 /// An engine call from a doomed frame that runs on past its placeholder
 /// raises the frame's discard, so the frame never reads, runs or writes
 /// past its doom. Not while unwinding: that call keeps the unwind's kind.
@@ -1133,6 +1140,25 @@ impl KeptUnwind {
         let bits = value_code::thread_word() & value_code::UNWIND_MASK;
         if bits != 0 || lazy_open() {
             return Self::kept(bits, f);
+        }
+        f()
+    }
+
+    /// [`Self::around`] for a read, which the doomed frame that runs on
+    /// past its placeholder may make when `own` says the read is that
+    /// frame's own: the read takes another placeholder, never computing or
+    /// waiting, and raises the discard where it would. A wide doomed frame
+    /// then pushes every doomed read in one run rather than one per run.
+    #[inline(always)]
+    pub(crate) fn around_read<R>(f: impl FnOnce() -> R, own: impl FnOnce() -> bool) -> R {
+        let bits = value_code::thread_word() & value_code::UNWIND_MASK;
+        if bits != 0 || lazy_open() {
+            if std::thread::panicking() {
+                return Self::kept(bits, f);
+            }
+            if lazy_open() && !own() {
+                raise_lazy();
+            }
         }
         f()
     }
