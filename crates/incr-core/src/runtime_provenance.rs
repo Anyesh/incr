@@ -273,8 +273,8 @@ impl<C: Cells> Runtime<C> {
         bag.drain_carried(payload)
     }
 
-    /// A Failed read on this thread: if it is made for the read a record
-    /// names, the read's panic is carried until a landing lets it out or
+    /// A Failed read on this thread: if it is made for the read an unspent
+    /// record names, the read's panic is carried until a landing lets it out or
     /// another Failed read of the same node. That read's frame is the
     /// reading frame, or the virtual frame below when the read is a driver
     /// entry's own compute; the Failed node is the read node, as a walk
