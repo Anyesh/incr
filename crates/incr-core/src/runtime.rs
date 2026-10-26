@@ -873,16 +873,21 @@ impl Walk {
         }
     }
 
-    /// Plans afresh from the root, whose claim the walk waited out, as the
-    /// read would after the other thread's landing: where the walk enters a
-    /// cycle of recorded deps depends on its visit count at the switch to
-    /// exact mode.
+    /// Plans afresh from the root, which another thread landed since the
+    /// walk planned it (a claim the walk waited out, or a New plan that met
+    /// it Dirty), as a read that came after that landing would: where the
+    /// walk enters a cycle of recorded deps depends on its visit count at
+    /// the switch to exact mode, and which queued entries a Failed root
+    /// passes depends on the Failed landings since the walk began.
     #[cold]
     #[inline(never)]
     fn restart(&mut self) {
         self.first_visits = 0;
         self.visited = None;
         self.expanded = None;
+        self.repushed = None;
+        self.root_failed_here = false;
+        self.failed_from = cycle_state::failed_here_count();
     }
 
     /// Visits `id` again as a walk that never met it would, past a first
