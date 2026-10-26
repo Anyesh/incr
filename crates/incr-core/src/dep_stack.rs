@@ -50,6 +50,10 @@ pub struct Frame {
     pub(crate) reading: u64,
 }
 
+/// Up to this many deps a frame finds how often it read a node by scanning
+/// them, at a cost bounded by this constant, which note work leaves out.
+const SCAN_DEPS: usize = 32;
+
 impl Frame {
     #[inline(always)]
     pub(crate) fn rt(&self) -> RuntimeId {
@@ -73,6 +77,9 @@ impl Frame {
     /// How many times the frame has read the node it reads now, this read
     /// included.
     fn reads_of_reading(&self) -> u32 {
+        if self.deps.len() > SCAN_DEPS {
+            crate::replay::note_work(self.deps.len());
+        }
         self.deps
             .iter()
             .filter(|&&(d, g)| (u64::from(d.0) | (u64::from(g) << 32)) == self.reading)
@@ -428,6 +435,9 @@ pub trait DepStack: 'static {
     fn reads_of(&self, rt: RuntimeId, dep: NodeId, generation: u32) -> u32 {
         self.with(|s| {
             s.active(rt).map_or(0, |top| {
+                if top.deps.len() > SCAN_DEPS {
+                    crate::replay::note_work(top.deps.len());
+                }
                 top.deps.iter().filter(|&&d| d == (dep, generation)).count() as u32
             })
         })
