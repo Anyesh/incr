@@ -288,8 +288,8 @@ pub(crate) enum ParkPoint {
     HeldPublished(NodeId),
     /// In a held publication, just before the node lands.
     HeldLanding(NodeId),
-    /// After a panicking held publication gave back what it had not
-    /// published.
+    /// As a panicking held publication's give-back has landed, before its
+    /// catch does anything more.
     GaveBack,
 }
 

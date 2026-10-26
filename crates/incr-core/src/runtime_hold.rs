@@ -574,7 +574,6 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             self.retract_entries(rest, Vec::new(), true, true);
-            self.park(super::ParkPoint::GaveBack);
             bag.drain_carried(payload);
         }
         bag.drain(self);
@@ -874,6 +873,9 @@ impl<C: Cells> Runtime<C> {
                 NodeState::Dirty
             };
             self.land_now(NodeId(e.slot), self.nodes.get(e.slot), back, back, true);
+        }
+        if edges_published {
+            self.park(super::ParkPoint::GaveBack);
         }
         bag.drain(self);
     }
