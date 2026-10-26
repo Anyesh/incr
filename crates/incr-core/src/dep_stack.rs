@@ -1261,7 +1261,8 @@ mod tests {
 
     /// Nested frames past `SCAN_DEPS` keep their own counts, and a frame
     /// pushed where a counted one popped, with nothing counted below in
-    /// between, starts from its own deps, for the same node too.
+    /// between, starts from its own deps, for the same node and a control
+    /// block at the same address too.
     #[test]
     fn read_counts_belong_to_their_frame() {
         let s = LocalDepStack::new();
@@ -1272,8 +1273,8 @@ mod tests {
             s.record_read(rt(1), NodeId(1), 1);
         }
         assert_eq!(s.reads_of_current(rt(1)), reads);
+        let mut ctl = ComputeCtl::new(0);
         for (round, inner) in [NodeId(2), NodeId(3), NodeId(3)].into_iter().enumerate() {
-            let ctl = ComputeCtl::new(0);
             s.push_frame(rt(1), NodeId(101), &ctl);
             for k in 1..=reads {
                 s.record_read(rt(1), inner, 1);
@@ -1281,9 +1282,27 @@ mod tests {
                 assert_eq!(s.reads_of(rt(1), NodeId(1), 1), 0, "round {round}");
             }
             s.pop_frame();
+            ctl = ComputeCtl::new(0);
         }
         assert_eq!(s.reads_of(rt(1), NodeId(1), 1), reads);
         s.pop_frame();
+    }
+
+    /// A control block whose frame built read counts cannot serve a second
+    /// frame, whose lookups would take those counts as its own.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a control block serves one frame")]
+    fn a_counted_control_block_is_not_pushed_again() {
+        let s = LocalDepStack::new();
+        let ctl = ComputeCtl::new(0);
+        s.push_frame(rt(1), NodeId(100), &ctl);
+        for _ in 0..2 * SCAN_DEPS {
+            s.record_read(rt(1), NodeId(1), 1);
+        }
+        s.reads_of_current(rt(1));
+        s.pop_frame();
+        s.push_frame(rt(1), NodeId(100), &ctl);
     }
 
     /// A frame counted at an index where a much wider one was counted
