@@ -18,7 +18,7 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 use super::*;
 use crate::cycle::{downcast, CycleUnwind, Erased, WoundUnwind};
-use crate::cycle_state::{Episode, Held, Look, Round, Seen, Step};
+use crate::cycle_state::{Episode, Held, HeldMap, Look, Round, Seen, Step};
 use crate::deferred::Unbuilt;
 use crate::{hold, reserve, set_stack, waits};
 
@@ -1994,6 +1994,9 @@ impl<C: Cells> Runtime<C> {
             slots.retain(|m| {
                 !keep.contains(m) && h.get(&(rt, *m)).is_some_and(|e| released_at(rt, e, cidx))
             });
+            if kind == Some(UnwindKind::Discard) {
+                keep_children_of_kept(h, rt, cidx, &mut slots);
+            }
             slots
                 .into_iter()
                 .map(|m| (m, h.remove(&(rt, m)).expect("the slot was just listed")))
@@ -2839,6 +2842,37 @@ fn cycle_panic(cycle: Cycle) -> ! {
     let message = format!("incr-core: dependency cycle: {cycle}");
     cycle_state::set_last_cycle(cycle);
     panic!("{message}");
+}
+
+/// Takes out of a doom's `released` the claims a run above `cidx`
+/// deferred whose own claim the discard keeps, as a suspended episode keeps
+/// its member run's: that run's result stays, so the retry never asks for
+/// them again and they go when the run's claim goes, as unbounded.
+fn keep_children_of_kept(h: &HeldMap, rt: RuntimeId, cidx: u32, released: &mut Vec<u32>) {
+    let mut owned: HashMap<u32, Vec<u32>> = HashMap::new();
+    for g in h.owners(rt, cidx.saturating_add(1), u32::MAX) {
+        owned
+            .entry(h.owner(g).node())
+            .or_default()
+            .extend_from_slice(h.members(g));
+    }
+    if owned.is_empty() {
+        return;
+    }
+    let mut out: HashSet<u32> = released.iter().copied().collect();
+    let mut kept: Vec<u32> = owned
+        .keys()
+        .copied()
+        .filter(|n| h.contains_key(&(rt, *n)) && !out.contains(n))
+        .collect();
+    while let Some(n) = kept.pop() {
+        for m in owned.remove(&n).unwrap_or_default() {
+            if out.remove(&m) {
+                kept.push(m);
+            }
+        }
+    }
+    released.retain(|m| out.contains(m));
 }
 
 /// Whether an unwind from position `cidx` releases held claim `e`: an
