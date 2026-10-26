@@ -3176,12 +3176,11 @@ fn episode_shape() -> Episode {
 /// At budget 1 this thread's `get(X)` dooms X on its read of Y, whose
 /// entry lands Failed, and parks before X's retry. X's closure switches
 /// to read R first, and the other thread reads R, whose read of X waits
-/// for X's reservation while it holds R's claim. X's retry then reads R:
+/// for this thread while it holds R's claim. X's retry then reads R:
 /// the waits-for registry breaks that cycle by a wound, whose victim
 /// decides which read comes first, and the reads end as in that order's
-/// unbounded run. In either order the other thread's read of R raises
-/// "last compute panicked" for Y, which this thread landed Failed, in place
-/// of "y boom", which the `Shared` payload contract leaves open.
+/// unbounded run, the other thread's read of R raising "y boom" as both
+/// orders' do.
 #[test]
 fn shared_episode_reader_and_a_vframes_retry_break_a_waits_for_cycle() {
     let s = episode_shape();
@@ -3197,15 +3196,27 @@ fn shared_episode_reader_and_a_vframes_retry_break_a_waits_for_cycle() {
     s.gate.wait_parked();
     assert_eq!(s.rt.state_of(s.y), NodeState::Computing);
     s.in_cycle.store(1, SeqCst);
-    let waits = s.rt.reservation_waits.load(SeqCst);
     let other = {
         let (rt, r) = (s.rt.clone(), s.r);
         spawn(move || outcome(|| rt.get(r)))
     };
-    await_reservation_wait(&s.rt, waits);
+    await_registered_wait(&s.rt, s.x);
     assert_eq!(s.rt.state_of(s.x), NodeState::New, "the other thread ran X");
     s.gate.release();
-    let (first, other) = (first.join(), other.join());
+    // A wounded attempt gives Y's held landing back, so Y runs again,
+    // arms the gate and parks X's next entry.
+    let (mut first, start) = (first, std::time::Instant::now());
+    let first = loop {
+        match first.join_within(Duration::from_millis(50)) {
+            Ok(f) => break f,
+            Err(waiting) => {
+                assert!(start.elapsed() < JOIN_TIMEOUT, "X's read never returned");
+                s.gate.release();
+                first = waiting;
+            }
+        }
+    };
+    let other = other.join();
     s.rt.assert_invariant_i();
     assert_eq!(
         s.rt.provenance_records(),
@@ -3233,12 +3244,7 @@ fn shared_episode_reader_and_a_vframes_retry_break_a_waits_for_cycle() {
         .find(|w| w.0 == first)
         .unwrap_or_else(|| panic!("{first:?} is no order's read of X"));
     assert_eq!(want_other, Err("y boom".to_string()));
-    assert!(
-        other
-            .as_ref()
-            .is_err_and(|m| m.contains("node 0 read but its last compute panicked")),
-        "{other:?}"
-    );
+    assert_eq!(other, want_other);
     assert_eq!(s.rt.state_of(s.x), want_state);
 }
 
