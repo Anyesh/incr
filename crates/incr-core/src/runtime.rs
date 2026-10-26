@@ -1357,7 +1357,10 @@ impl<C: Cells> Runtime<C> {
         self.expansions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    // Out of line, so its guard's cleanup stays out of the landing-pad
+    // tables of the frames a caught panic unwinds, which scale gates time.
     #[cfg(test)]
+    #[inline(never)]
     fn park(&self, point: ParkPoint) {
         if let Some(hook) = self.park_hook.get() {
             #[cfg(not(loom))]
