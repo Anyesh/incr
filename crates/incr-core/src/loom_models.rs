@@ -1820,8 +1820,9 @@ impl Reached {
 }
 
 /// A lazy doom world at budget 1: T's closure is `t_run` over X (= Y + 10,
-/// Y = I + 1, I = 3) and Z (= I + 20), and X counts its runs. T's runs push the attempt epoch they ran in, which moves on
-/// only when the outermost entry retries after a wound.
+/// Y = I + 1, I = 3) and Z (= I + 20). T's runs push the attempt epoch
+/// they ran in, which moves on only when the outermost entry retries
+/// after a wound.
 struct LazyWorld {
     rt: Arc<Rt>,
     x: Incr<u64>,
