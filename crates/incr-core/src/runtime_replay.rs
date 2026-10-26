@@ -2715,6 +2715,8 @@ impl<C: Cells> Runtime<C> {
                 };
                 match raised {
                     Some(payload) => {
+                        // Raised with the cycle's kind, as the read that
+                        // kept it unwound.
                         if cycle {
                             cycle_state::set_unwind_kind(Some(UnwindKind::Cycle));
                         }
