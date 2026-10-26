@@ -775,11 +775,7 @@ impl Walk {
                 true
             }
             None => {
-                // This visit goes too if it lies in a repeat's subtree, as
-                // in exact mode from the start, so where the walk enters a
-                // cycle of recorded deps does not depend on the visit count.
                 let len = self.work.len();
-                self.drop_repeats(len);
                 self.visited = Some(
                     self.work
                         .iter()
@@ -787,6 +783,7 @@ impl Walk {
                         .map(|e| e.id)
                         .collect(),
                 );
+                self.drop_cycle();
                 self.work.len() == len
             }
         }
@@ -799,6 +796,39 @@ impl Walk {
         if let Some(expanded) = &mut self.expanded {
             expanded.new.remove(&id);
         }
+    }
+
+    /// At the switch, a node pending twice is one the walk reached again
+    /// through its own recorded deps. Drops everything pushed above the
+    /// first entry of the lowest such node, its taint passed to that entry,
+    /// and leaves the dropped nodes visited: the walk computes the node of
+    /// the cycle it reached first, and that node's run enters the cycle,
+    /// whatever the visit count was at the switch.
+    fn drop_cycle(&mut self) {
+        let mut first = HashMap::new();
+        let mut entry: Option<usize> = None;
+        for (at, e) in self.work.iter().enumerate() {
+            if e.is_pending() {
+                let f = *first.entry(e.id).or_insert(at);
+                if f != at {
+                    entry = Some(entry.map_or(f, |x| x.min(f)));
+                }
+            }
+        }
+        let Some(entry) = entry else {
+            return;
+        };
+        let taint = self.work[entry + 1..]
+            .iter()
+            .filter(|e| e.is_pending())
+            .map(|e| e.taint)
+            .min()
+            .unwrap_or(NO_TAINT);
+        if taint < NO_TAINT {
+            self.work[entry].taint = self.work[entry].taint.min(taint);
+        }
+        self.repushed = None;
+        self.work.truncate(entry + 1);
     }
 
     /// At the switch, drops what the walk pushed below `top` since it first
