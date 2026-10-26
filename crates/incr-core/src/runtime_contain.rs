@@ -178,6 +178,11 @@ fn with_notes<R>(f: impl FnOnce(&mut Notes) -> R) -> R {
         let holds = !n.is_empty();
         if held != holds {
             value_code::set_notes_bit(holds);
+            if !holds
+                && value_code::thread_word() & (value_code::KEPT_BIT | value_code::REPLAY_BIT) == 0
+            {
+                replay::end_kept_marks();
+            }
         }
         r
     })

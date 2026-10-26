@@ -2085,15 +2085,26 @@ fn extract_kept(cidx: u32, mut which: impl FnMut(&KeptRead) -> bool) -> Vec<(Kep
             "incr-core: a foreign read's count outlived its kept read"
         );
         value_code::set_kept_bit(!d.is_empty());
-        if d.is_empty() && value_code::thread_word() & value_code::REPLAY_BIT == 0 {
+        let word = value_code::thread_word();
+        if d.is_empty() && word & value_code::REPLAY_BIT == 0 {
             COPIED.with(clear_set);
             COPIED_GEN.with(|g| g.set(0));
-            KEPT_HELD.with(clear_set);
-            KEPT_GEN.with(|g| g.set(0));
-            KEPT_ALL.with(|k| k.set(false));
+            if word & value_code::NOTES_BIT == 0 {
+                end_kept_marks();
+            }
         }
         out
     })
+}
+
+/// Clears the kept set once no read is kept, no context is open and the
+/// thread holds no notes. While notes stay, a later read may keep a longer
+/// copy of a log whose earlier entries are marked, and clearing then
+/// would mark them again for every read up a chain.
+pub(crate) fn end_kept_marks() {
+    KEPT_HELD.with(clear_set);
+    KEPT_GEN.with(|g| g.set(0));
+    KEPT_ALL.with(|k| k.set(false));
 }
 
 fn clear_set(set: &RefCell<CopiedSet>) {
