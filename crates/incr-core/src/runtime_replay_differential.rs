@@ -4220,6 +4220,25 @@ fn two_thread_wait_ended_new_seeds() {
     });
 }
 
+/// 0x9a7d at budget 2: op 0 recorded the cycle group {8, 9, 19, 24} where
+/// the unbounded run records {9, 19, 24}, and phase 6's read of 16 walked
+/// that group and cleaned 1, 2 and 23, which the unbounded run leaves
+/// Dirty: a bounded run must record the cycle group the unbounded run
+/// does.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_thread_budget_cycle_group_matches_unbounded_seed() {
+    let seed = 0x9a7d;
+    let case = gen_case(seed, false, true);
+    let phases = phases(&case, seed);
+    let label = format!("seed {seed:#x}, two threads {phases:?}, budget 2 frames");
+    quiet(|| {
+        for _ in 0..20 {
+            Serial::new(&case, &phases).differential(&label, Some(2), 0, &|_| {});
+        }
+    });
+}
+
 /// Two-thread seeds with panics or cycles whose overlapping reads, at most
 /// budgets, come out as the unbounded run of the other order: which read
 /// lands a node both read first decides which gets a closure's payload,
