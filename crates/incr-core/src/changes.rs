@@ -93,6 +93,7 @@ impl Drop for Change<'_> {
 }
 
 /// A runtime's [`Changes`] as a Clean read of it found them.
+#[derive(Clone)]
 pub(crate) struct Count {
     changes: Arc<Words>,
     at: u64,

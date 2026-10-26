@@ -399,16 +399,17 @@ impl<C: Cells> Runtime<C> {
                 "incr-core: a placeholder read dooms its frame"
             );
         }
-        let foreign = if ctl.has(cycle::KEPT_READ) {
-            let counts = replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl);
-            ForeignReads {
-                context: (!counts.is_empty())
-                    .then(replay::outermost_context)
-                    .flatten(),
-                counts,
-            }
+        let mut counts = if ctl.has(cycle::KEPT_READ) {
+            replay::take_checked_reads(self.runtime_id, attempt.cidx, ctl)
         } else {
-            ForeignReads::default()
+            Vec::new()
+        };
+        self.inherit_counts(&deps, &mut counts);
+        let foreign = ForeignReads {
+            context: (!counts.is_empty())
+                .then(replay::outermost_context)
+                .flatten(),
+            counts,
         };
         let kept = self.stash(
             id.0,
@@ -1041,6 +1042,35 @@ impl<C: Cells> Runtime<C> {
         s.revision == revision
             && (s.map.get_mut(&(slot, generation)))
                 .is_some_and(|e| tried || !matches!(e.get_mut().outcome, Outcome::Tried))
+    }
+
+    /// Adds to `counts` the checked reads of the stashes among `deps`: the
+    /// run read their stashed values, which a refused adoption of theirs
+    /// replaces with a real run's in the same revision, past this stash's
+    /// check of its deps.
+    fn inherit_counts(&self, deps: &[(NodeId, u32)], counts: &mut Vec<Count>) {
+        if C::u32_load_relaxed(&self.stash_count) == 0
+            || deps.iter().all(|&(d, _)| {
+                state::load::<C>(self.nodes.get(d.0).state_cell()) == NodeState::Clean
+            })
+        {
+            return;
+        }
+        let revision = self.current_revision();
+        let mut s = self.stashes.write();
+        if s.revision != revision {
+            return;
+        }
+        for &(d, generation) in deps {
+            let Some(entry) = s.map.get_mut(&(d.0, generation)) else {
+                continue;
+            };
+            for count in &entry.get_mut().foreign.counts {
+                if !counts.iter().any(|c| c.same(count)) {
+                    counts.push(count.clone());
+                }
+            }
+        }
     }
 
     /// Takes the stash of node `slot` at `generation` for a real run that
