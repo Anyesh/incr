@@ -236,11 +236,13 @@ where
     /// do not call in inner loops.
     pub fn snapshot(&self) -> Vec<T> {
         value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
         self.state.read().snapshot().0
     }
 
     pub fn snapshot_len(&self) -> usize {
         value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
         self.state.read().sorted.len()
     }
 }

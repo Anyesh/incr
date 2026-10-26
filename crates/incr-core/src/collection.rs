@@ -880,6 +880,7 @@ impl<T: Value + Hash + Eq, C: Cells> IncrCollection<T, C> {
     /// Number of live elements (with multiset duplicates counted).
     pub fn snapshot_len(&self) -> usize {
         value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
         self.log.read().len()
     }
 
@@ -1823,18 +1824,21 @@ where
 
     pub fn keys(&self) -> Vec<K> {
         value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
         let groups = self.groups.read();
         value_code::run(|| groups.keys().cloned().collect())
     }
 
     pub fn get_group(&self, key: &K) -> Option<IncrCollection<T, C>> {
         value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
         let groups = self.groups.read();
         value_code::run(|| groups.get(key)).cloned()
     }
 
     pub fn group_count(&self) -> usize {
         value_code::check();
+        crate::dep_stack::unrecorded_lookup::<C>();
         self.groups.read().len()
     }
 

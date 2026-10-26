@@ -21,6 +21,7 @@
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 
+use crate::cells::Cells;
 use crate::cycle::{ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, POISONED, UNREGENERABLE};
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
@@ -399,18 +400,49 @@ pub trait DepStack: 'static {
                 .filter(|top| top.rt() != rt)
                 .map(|top| (top.tagged_rt, top.node, top.ctl, top.cidx))
         })?;
-        let keeps = if tagged.is_untested() {
+        // SAFETY: the frame is on the stack, so it is running and its
+        // control block is live.
+        self.top_keeps_foreign(tagged, node, unsafe { &*ctl })
+            .then(|| (tagged.rt(), ctl, cidx))
+    }
+
+    /// Whether the top frame, read as `tagged`, `node` and `ctl`, keeps
+    /// other runtimes' Clean reads, settling it when still untested.
+    fn top_keeps_foreign(&self, tagged: FrameRt, node: NodeId, ctl: &ComputeCtl) -> bool {
+        if tagged.is_untested() {
             #[cfg(all(test, not(loom)))]
             KEEP_SETTLES.with(|n| n.set(n.get() + 1));
-            // SAFETY: the frame is on the stack, so it is running and its
-            // control block is live.
-            let keeps = unsafe { (*ctl).keeps_foreign(node.0) };
+            // SAFETY: the frame is on the stack, so it is running.
+            let keeps = unsafe { ctl.keeps_foreign(node.0) };
             self.settle_foreign_keeping(keeps);
             keeps
         } else {
             tagged.keeps_foreign()
-        };
-        keeps.then(|| (tagged.rt(), ctl, cidx))
+        }
+    }
+
+    /// For a lookup that records no dependency, such as
+    /// `Runtime::is_alive` or a table's `get`: the top frame's runtime
+    /// (`SENTINEL` for a callback's barrier, `None` outside any compute),
+    /// after raising `UNREGENERABLE` on a compute frame that keeps other
+    /// runtimes' Clean reads, since a rerun of its node would look again
+    /// as things are then.
+    fn unrecorded_lookup(&self) -> Option<RuntimeId> {
+        let (tagged, node, ctl) = self.with(|s| {
+            s.frames
+                .last()
+                .map(|top| (top.tagged_rt, top.node, top.ctl))
+        })?;
+        let top = tagged.rt();
+        if top != RuntimeId::SENTINEL {
+            // SAFETY: the frame is on the stack, so its control block is
+            // live (see `Frame::ctl`).
+            let ctl = unsafe { &*ctl };
+            if self.top_keeps_foreign(tagged, node, ctl) {
+                ctl.raise(UNREGENERABLE);
+            }
+        }
+        Some(top)
     }
 
     /// Sends the top frame's Clean reads to the slow path (see
@@ -732,6 +764,12 @@ impl DepStack for LocalDepStack {
     }
 }
 
+/// [`DepStack::unrecorded_lookup`] on this thread's stack, for a lookup
+/// with no runtime at hand, such as a collection's snapshot.
+pub(crate) fn unrecorded_lookup<C: Cells>() {
+    <C::DepStack as DepStack>::new().unrecorded_lookup();
+}
+
 pub struct SharedDepStack;
 
 /// For a binding that runs user code in another language: whether this
@@ -753,8 +791,9 @@ thread_local! {
     static KEEP_SETTLES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many untested frames [`DepStack::foreign_keeper`] settled on this
-/// thread since the last call.
+/// How many untested frames a foreign read or a lookup without a
+/// dependency settled on this thread since the last call (see
+/// [`DepStack::foreign_keeper`]).
 #[cfg(all(test, not(loom)))]
 pub(crate) fn take_keep_settles() -> u64 {
     KEEP_SETTLES.with(|n| n.replace(0))
