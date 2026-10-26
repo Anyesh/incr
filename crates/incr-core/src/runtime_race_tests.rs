@@ -2399,6 +2399,63 @@ fn a_walk_another_thread_releases_under_on_every_plan_finishes() {
     );
 }
 
+/// r reads e, which read x and old, and reads new once x is 2. W's walk
+/// of r plans e and old under it. Before W claims old, another thread U
+/// counts an episode with e's slot whose landing of e is still to come, so
+/// W replans with e not yet settled. U then reads e Clean through new and
+/// counts an unrelated episode, and W replans again: the episode counted
+/// before its landing still settled e since W planned, so W drops old,
+/// which nothing reads now, as base drops any settled node.
+#[test]
+fn a_replan_prunes_under_an_episode_counted_before_its_landing() {
+    let rt = Arc::new(Rt::new());
+    let x = rt.create_input(1_u64);
+    let old_runs = Arc::new(AtomicUsize::new(0));
+    let old = {
+        let runs = Arc::clone(&old_runs);
+        rt.create_query(move |rt: &Rt| {
+            runs.fetch_add(1, Ordering::Relaxed);
+            rt.get(x) + 100
+        })
+    };
+    let new = rt.create_query(move |rt: &Rt| rt.get(x) + 200);
+    let e = rt.create_query(move |rt: &Rt| match rt.get(x) {
+        1 => rt.get(old),
+        _ => rt.get(new),
+    });
+    let r = rt.create_query(move |rt: &Rt| rt.get(e) + 1);
+    assert_eq!(rt.get(r), 102);
+    rt.set(x, 2);
+    old_runs.store(0, Ordering::Relaxed);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = Arc::clone(&calls);
+    let hook_rt = Arc::downgrade(&rt);
+    let installed = rt.park_hook.set(Box::new(move |point| {
+        if point != ParkPoint::BeforeComputeOne(id(old)) {
+            return;
+        }
+        let rt = hook_rt.upgrade().unwrap();
+        match hook_calls.fetch_add(1, Ordering::Relaxed) {
+            0 => thread::spawn(move || rt.count_landed(1, [id(e).0])),
+            1 => thread::spawn(move || {
+                assert_eq!(rt.get(e), 202);
+                rt.count_landed(1, [id(x).0]);
+            }),
+            _ => return,
+        }
+        .join()
+        .unwrap();
+    }));
+    assert!(installed.is_ok());
+    assert_eq!(rt.get(r), 203);
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "W did not replan twice");
+    assert_eq!(
+        old_runs.load(Ordering::Relaxed),
+        0,
+        "the walk ran old through e's settled state"
+    );
+}
+
 /// A released replan restarts only for a release after its plan that
 /// landed one of the plan's nodes unrun, or whose slots the log has
 /// evicted; release numbers compare across their wrap.
