@@ -547,8 +547,7 @@ impl<C: Cells> Runtime<C> {
         let mut published: Vec<u32> = Vec::new();
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let targets = self.publication_targets(rest.as_slice());
-            for e in rest.by_ref() {
-                let target = targets[&e.slot];
+            for (e, target) in rest.by_ref().zip(targets) {
                 published.push(e.slot);
                 self.publish_one(e, target, &mut bag);
             }
@@ -641,50 +640,53 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
-    /// What each held landing publishes as. A set after the read could
-    /// not reach a node through an edge that waited until now, so a Clean
-    /// landing over a new dep not settled at publication lands Dirty, and
-    /// so does every Clean landing that reads one lowered so, transitively:
-    /// the set's walk reached none of them.
-    fn publication_targets(&self, entries: &[Held]) -> Targets {
-        let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
+    /// What each held landing publishes as, by position. A set after the
+    /// read could not reach a node through an edge that waited until now,
+    /// so a Clean landing over a new dep not settled at publication lands
+    /// Dirty, and so does every Clean landing that reads one lowered so,
+    /// transitively: the set's walk reached none of them.
+    fn publication_targets(&self, entries: &[Held]) -> Vec<NodeState> {
+        let mut targets: Vec<NodeState> = entries.iter().map(|e| e.target).collect();
+        let mut held: Option<Targets> = None;
+        let mut lowered: Vec<usize> = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            if e.target != NodeState::Clean || e.read.is_empty() {
+                continue;
+            }
+            let held =
+                held.get_or_insert_with(|| entries.iter().map(|e| (e.slot, e.target)).collect());
+            // A Clean landing's verified_at is the revision it read at.
+            let rev = self.nodes.get(e.slot).verified_at();
+            if e.read
+                .iter()
+                .any(|&(d, _)| !self.settled_at_publication(d, held, rev))
+            {
+                lowered.push(i);
+            }
+        }
+        if lowered.is_empty() {
+            return targets;
+        }
         let at: HashMap<u32, usize, FxBuildHasher> = entries
             .iter()
             .enumerate()
             .map(|(i, e)| (e.slot, i))
             .collect();
         let mut readers: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
-        let mut lowered: Vec<usize> = Vec::new();
         for (i, e) in entries.iter().enumerate() {
-            let node = self.nodes.get(e.slot);
-            // A Clean landing's verified_at is the revision it read at.
-            let rev = node.verified_at();
-            let mut unsettled = false;
-            node.for_each_dep(|d| {
+            self.nodes.get(e.slot).for_each_dep(|d| {
                 if let Some(&j) = at.get(&d.0) {
                     readers[j].push(i);
                 }
-                if let Some(old) = &e.undo.deps {
-                    unsettled |= e.target == NodeState::Clean
-                        && !old.iter().any(|(o, _)| *o == d)
-                        && !self.settled_at_publication(d, &held, rev);
-                }
             });
-            if unsettled {
-                lowered.push(i);
-            }
         }
-        let mut targets = held;
         for &i in &lowered {
-            targets.insert(entries[i].slot, NodeState::Dirty);
+            targets[i] = NodeState::Dirty;
         }
         while let Some(j) = lowered.pop() {
             for &i in &readers[j] {
-                let t = targets
-                    .get_mut(&entries[i].slot)
-                    .expect("a held entry has a target");
-                if *t == NodeState::Clean {
-                    *t = NodeState::Dirty;
+                if targets[i] == NodeState::Clean {
+                    targets[i] = NodeState::Dirty;
                     lowered.push(i);
                 }
             }

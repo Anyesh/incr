@@ -83,9 +83,10 @@ pub(crate) struct Held {
     pub(crate) children: Option<(ChildLanding, bool)>,
     /// Trace actions of the held landings, logged at publication.
     pub(crate) trace: Vec<TraceAction>,
-    /// The deps the last landing read, each with its generation then:
-    /// their reverse edges wait for publication, which a delete of one
-    /// meanwhile turns back ([`keep_read`]).
+    /// The deps the last landing read that the published dep list lacks,
+    /// each with its generation then: their reverse edges wait for
+    /// publication, which a delete of one meanwhile turns back
+    /// ([`keep_read`]).
     pub(crate) read: Vec<(NodeId, u32)>,
     pub(crate) undo: Undo,
 }
@@ -456,12 +457,20 @@ pub(crate) fn keep_deps(cell: usize, old: impl FnOnce() -> Vec<(NodeId, u32)>) {
     });
 }
 
-/// The deps a held node's landing read, replacing an earlier landing's.
-pub(crate) fn keep_read(cell: usize, read: &[(NodeId, u32)]) {
+/// The deps a held node's landing read that its published dep list
+/// lacks, replacing an earlier landing's; `displaced` tells the deps the
+/// landing replaces. Empty, so no allocation, while the deps stay put.
+pub(crate) fn keep_read(cell: usize, read: &[(NodeId, u32)], displaced: impl Fn(NodeId) -> bool) {
     with(|h| {
         if let Some(e) = h.get(cell) {
-            e.read.clear();
-            e.read.extend_from_slice(read);
+            // A displaced dep has its published edge unless an earlier held
+            // landing read it new.
+            let earlier = std::mem::take(&mut e.read);
+            e.read.extend(
+                read.iter()
+                    .copied()
+                    .filter(|&(d, _)| !displaced(d) || earlier.iter().any(|&(p, _)| p == d)),
+            );
         }
     });
 }

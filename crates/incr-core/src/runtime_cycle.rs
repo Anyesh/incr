@@ -2480,7 +2480,7 @@ impl<C: Cells> Runtime<C> {
                             .map(|d| (*d, self.nodes.get(d.0).generation()))
                             .collect()
                     });
-                    hold::keep_read(cell, e.deps());
+                    hold::keep_read(cell, e.deps(), |d| old.contains(&d));
                     if let Some(displaced) = node.install_deps(new) {
                         bag.push_dep_list(displaced);
                     }
