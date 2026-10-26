@@ -267,8 +267,15 @@ impl Frames {
 /// frame's Clean read; no registry hands it out.
 pub(crate) const DIVERTED_TAG: u16 = u16::MAX;
 
+mod sealed {
+    /// Keeps [`super::DepStack`] to this crate's stacks: its default
+    /// methods dereference the control-block pointers its methods return,
+    /// which an outside implementation could forge.
+    pub trait Sealed {}
+}
+
 /// Strategy-parameterized dep tracker used by the runtime during compute.
-pub trait DepStack: 'static {
+pub trait DepStack: sealed::Sealed + 'static {
     fn new() -> Self;
 
     /// Runs `f` on the stack. `f` must not reach user code or the stack.
@@ -732,6 +739,8 @@ pub struct LocalDepStack {
     frames: *const RefCell<Frames>,
 }
 
+impl sealed::Sealed for LocalDepStack {}
+
 impl DepStack for LocalDepStack {
     fn new() -> Self {
         Self {
@@ -827,6 +836,8 @@ fn first_push() {
     let _ = FRAMES_GUARD.try_with(|_| {});
 }
 
+impl sealed::Sealed for SharedDepStack {}
+
 impl DepStack for SharedDepStack {
     fn new() -> Self {
         Self
@@ -859,6 +870,9 @@ pub struct LoomDepStack;
 loom::thread_local! {
     static LOOM_FRAMES: RefCell<Frames> = RefCell::new(Frames::new());
 }
+
+#[cfg(loom)]
+impl sealed::Sealed for LoomDepStack {}
 
 #[cfg(loom)]
 impl DepStack for LoomDepStack {
