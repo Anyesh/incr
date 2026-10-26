@@ -2901,8 +2901,11 @@ fn shared_vframe_landed_failed_over_an_episodes_delivery() {
         rt.create_query_with(
             move |rt: &Rt| {
                 let v = rt.get(x) + 1;
-                // The stand-in comes first, as the doomed run unwinds at
-                // its read of X; the episode's run panics.
+                // The doomed run reads X's placeholder 0 and is discarded;
+                // the stand-in comes next, and the episode's run panics.
+                if v == 1 {
+                    return v;
+                }
                 if f_runs.fetch_add(1, SeqCst) >= 1 {
                     gate.arm();
                     panic!("f boom")

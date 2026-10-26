@@ -1689,6 +1689,68 @@ fn doom_in_flight_race() {
     });
 }
 
+/// T reads X, which dooms at budget 1, so T takes the placeholder and runs
+/// on with its doom's flight open, into a join of a thread that reads X.
+/// The reader meets X reserved for T's retry, takes it over and computes
+/// X; T's run ends as the wound its read retries from, and both reads give
+/// the unbounded run's values.
+#[test]
+fn doom_lazy_joins_reader() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let me: Arc<Mutex<Option<Arc<Rt>>>> = Arc::new(Mutex::new(Some(Arc::clone(&rt))));
+        let t = {
+            let me = Arc::clone(&me);
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    let v = rt.get(x);
+                    let other = me.lock().unwrap().clone().unwrap();
+                    v + thread::spawn(move || other.get(x)).join().unwrap()
+                },
+                replayable(),
+            )
+        };
+        assert_eq!(rt.get(t), 28);
+        *me.lock().unwrap() = None;
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived the read");
+    });
+}
+
+/// T reads X, which dooms at budget 1, then Z, while another thread reads
+/// X. T runs on past X's placeholder with its flight open and raises the
+/// discard at its read of Z; the reader may take X over in that window or
+/// wait for T's context. Both reads give the unbounded run's values and
+/// nothing stays reserved.
+#[test]
+fn doom_lazy_reads_again() {
+    run(|| {
+        let rt = Arc::new(Rt::new());
+        rt.set_placeholder(0_u64);
+        rt.set_max_frames(1);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let z = rt.create_query_with(move |rt: &Rt| rt.get(i) + 20, replayable());
+        let t = rt.create_query_with(move |rt: &Rt| rt.get(x) + rt.get(z) + 100, replayable());
+        let other = {
+            let rt = Arc::clone(&rt);
+            thread::spawn(move || rt.get(x))
+        };
+        assert_eq!(rt.get(t), 137);
+        assert_eq!(other.join().unwrap(), 14);
+        rt.assert_invariant_i();
+        assert_eq!(crate::waits::registered(), 0);
+        assert!(!crate::reserve::any(), "a reservation outlived both reads");
+    });
+}
+
 /// F, Clean at s = 0, reads a New query N once s is set, so at budget 1
 /// its run claimed from Dirty dooms on N and is discarded, while another
 /// thread sets s again. The discard landing keeps that set's dirtying:

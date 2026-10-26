@@ -1767,8 +1767,17 @@ impl<C: Cells> Runtime<C> {
         Computed::Discarded
     }
 
+    /// A doomed frame's placeholder read: the frame's first runs on in user
+    /// code ([`cycle_state::open_lazy`]); a later one raises the discard.
+    fn run_on_doomed(&self, ctl: *const ComputeCtl) {
+        if cycle_state::lazy_open() {
+            self.doom_unwind();
+        }
+        cycle_state::open_lazy(ctl as usize);
+    }
+
     /// Raises a [`cycle::DoomUnwind`] from a doomed frame's read.
-    fn doom_unwind(&self) -> ! {
+    pub(super) fn doom_unwind(&self) -> ! {
         debug_assert!(!C::SINGLE_THREADED);
         cycle_state::set_unwind_kind(Some(UnwindKind::Discard));
         resume_unwind(Box::new(cycle::DoomUnwind))
@@ -1925,7 +1934,7 @@ impl<C: Cells> Runtime<C> {
             );
         });
         if !C::SINGLE_THREADED && !std::thread::panicking() {
-            self.doom_unwind();
+            self.run_on_doomed(f.ctl);
         }
         ctl.raise(cycle::PH_SEEN);
         Some(placeholder)
@@ -1946,7 +1955,7 @@ impl<C: Cells> Runtime<C> {
         // A read from a destructor in an unwind can't raise again, so it
         // takes the placeholder, as under `Local`.
         if !C::SINGLE_THREADED && ctl.has(cycle::DOOMED) && !std::thread::panicking() {
-            self.doom_unwind();
+            self.run_on_doomed(f.ctl);
         }
         ctl.raise(cycle::PH_SEEN);
         self.placeholder::<T>()

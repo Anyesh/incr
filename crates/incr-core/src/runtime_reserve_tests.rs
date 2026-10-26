@@ -1424,3 +1424,48 @@ fn shared_reservation_of_a_dirty_landing_ends_with_the_read() {
     assert!(!want.1, "the unbounded run's join stalled");
     assert_eq!(run(2), want);
 }
+
+/// T reads X, which dooms at budget 1, and runs on past the placeholder:
+/// it hits a table, asks whether the hit is alive, reads it and reads
+/// another runtime's Clean node. What those fast reads mark on T's frame
+/// goes with its discarded run, so its retry gives the unbounded value.
+#[test]
+fn a_doomed_run_on_past_its_placeholder_leaves_its_retry_the_unbounded_value() {
+    for frames in [u32::MAX, 1] {
+        let rt = Arc::new(Rt::new());
+        let other = Arc::new(Rt::new());
+        let c = other.create_input(5_u64);
+        let oc = other.create_query(move |rt: &Rt| rt.get(c) * 2);
+        assert_eq!(other.get(oc), 10);
+        rt.set_placeholder(0_u64);
+        let table = Arc::new(rt.create_table::<u64, u64>());
+        let h = table.get_or_insert_input(&rt, 1, || 7);
+        let i = rt.create_input(3_u64);
+        let y = rt.create_query_with(move |rt: &Rt| rt.get(i) + 1, replayable());
+        let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 10, replayable());
+        let runs = Arc::new(AtomicU32::new(0));
+        let t = {
+            let (table, other, runs) = (table.clone(), other.clone(), runs.clone());
+            rt.create_query_with(
+                move |rt: &Rt| {
+                    runs.fetch_add(1, SeqCst);
+                    let v = rt.get(x);
+                    let hit = table.get_or_insert_input(rt, 1, || 99);
+                    v + rt.get(hit) + u64::from(rt.is_alive(hit)) + other.get(oc)
+                },
+                replayable(),
+            )
+        };
+        rt.set_max_frames(frames);
+        assert_eq!(rt.get(t), 14 + 7 + 1 + 10, "budget {frames}");
+        assert_eq!(table.get(&rt, &1), Some(h), "budget {frames}");
+        let want = if frames == 1 { 2 } else { 1 };
+        assert_eq!(runs.load(SeqCst), want, "budget {frames}");
+        rt.assert_invariant_i();
+        other.assert_invariant_i();
+        assert!(
+            crate::reserve::none_held(),
+            "budget {frames}: a reservation outlived the read"
+        );
+    }
+}

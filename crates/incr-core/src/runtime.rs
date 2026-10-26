@@ -2300,6 +2300,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
         let _kept = cycle_state::KeptUnwind::if_unwinding();
+        cycle_state::raise_if_lazy();
         match self.read_slow(handle, observed, ReadKind::Get) {
             Ok(value) => value,
             Err(cycle) => self.raise_cycle(cycle),
@@ -2341,6 +2342,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(never)]
     fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
         let _kept = cycle_state::KeptUnwind::if_unwinding();
+        cycle_state::raise_if_lazy();
         self.read_slow(handle, observed, ReadKind::TryGet)
     }
 
@@ -2888,6 +2890,7 @@ impl<C: Cells> Runtime<C> {
         handle: Incr<T>,
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
         let _kept = cycle_state::KeptUnwind::if_unwinding();
+        cycle_state::raise_if_lazy();
         // A set from a closure that caught a discard, a doom's included, or
         // a wound raises it again as a read does: its run is discarded, and
         // the unbounded run never makes the write.
@@ -4307,6 +4310,12 @@ impl<C: Cells> Runtime<C> {
                         compute(self, id.0, &ctl)
                     })),
                 };
+                if !C::SINGLE_THREADED
+                    && ctl.has(cycle::DOOMED)
+                    && cycle_state::end_lazy(std::ptr::from_ref(&ctl) as usize)
+                {
+                    result = Err(Box::new(cycle::WoundUnwind));
+                }
                 let (deps, reading) = self.dep_stack.pop_frame_reading();
                 let word = value_code::thread_word();
                 if word

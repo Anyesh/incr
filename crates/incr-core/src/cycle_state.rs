@@ -803,6 +803,9 @@ struct EntryState {
     /// Open `KeptUnwind`s: while any is, the attempt's flight belongs to
     /// the unwind whose kind it keeps.
     kept: Cell<u32>,
+    /// The control block of the doomed frame that took its first
+    /// placeholder and runs on in user code, or 0.
+    lazy: Cell<usize>,
     failures: Cell<u64>,
     /// Set when `Outer` may hold something, so that an outermost entry
     /// with nothing to reset touches only this block, which has no
@@ -848,6 +851,7 @@ thread_local! {
             wounded: Cell::new(false),
             taken: Cell::new(false),
             kept: Cell::new(0),
+            lazy: Cell::new(0),
             failures: Cell::new(0),
             outer_set: Cell::new(false),
             held_any: Cell::new(false),
@@ -879,6 +883,7 @@ loom::thread_local! {
         wounded: Cell::new(false),
         taken: Cell::new(false),
         kept: Cell::new(0),
+        lazy: Cell::new(0),
         failures: Cell::new(0),
         outer_set: Cell::new(false),
         held_any: Cell::new(false),
@@ -1013,6 +1018,61 @@ pub(crate) fn reopen_discard() {
 /// catch that settled a wound there would raise it out of a destructor.
 fn flight_kept() -> bool {
     ENTRY.with(|e| e.kept.get() != 0)
+}
+
+/// A doomed `Shared` frame takes its first placeholder and runs on in user
+/// code, its doom's flight open as an unwind's would be: a thread that
+/// waits on the doom's reservations takes them over, so the frame may join
+/// it. The frame's next engine call raises the discard instead.
+pub(crate) fn open_lazy(ctl: usize) {
+    ENTRY.with(|e| e.lazy.set(ctl));
+    if !flight_kept() {
+        crate::attempt::reopen_flight();
+    }
+}
+
+/// Whether a doomed frame of this thread runs on past its placeholder.
+#[inline]
+pub(crate) fn lazy_open() -> bool {
+    ENTRY.with(|e| e.lazy.get() != 0)
+}
+
+/// An engine call from a doomed frame that runs on past its placeholder
+/// raises the frame's discard, so the frame never reads, runs or writes
+/// past its doom. Not while unwinding: that call keeps the unwind's kind.
+#[inline]
+pub(crate) fn raise_if_lazy() {
+    if lazy_open() && !std::thread::panicking() {
+        raise_lazy();
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn raise_lazy() -> ! {
+    set_unwind_kind(Some(UnwindKind::Discard));
+    std::panic::resume_unwind(Box::new(crate::cycle::DoomUnwind))
+}
+
+/// The end of frame `ctl`'s run, by return or by unwind. If the frame ran
+/// on past its placeholder, its flight closes here, unless a discard it
+/// raised is unwinding, whose catch settles it. True if a waiter wounded
+/// the attempt meanwhile: the run ends as the wound its entry retries from.
+pub(crate) fn end_lazy(ctl: usize) -> bool {
+    if ENTRY.with(|e| e.lazy.get()) != ctl {
+        return false;
+    }
+    ENTRY.with(|e| e.lazy.set(0));
+    if unwind_kind() == Some(UnwindKind::Discard)
+        || flight_kept()
+        || !crate::attempt::leave_flight()
+    {
+        return false;
+    }
+    value_code::set_unwind_bits(UnwindKind::bits(Some(UnwindKind::Wound)));
+    crate::reserve::mark_taken();
+    set_wounded(true);
+    true
 }
 
 /// An engine unwind's kind, set aside while a destructor that runs in that

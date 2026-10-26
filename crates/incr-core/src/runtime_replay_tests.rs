@@ -1444,11 +1444,12 @@ fn doomed_value_drops<C: Cells>(frames: u32) -> (u32, u32, bool) {
 /// isolated or happens in a run that is discarded, so a panicking `Drop`
 /// reaches no read.
 fn replay_builds_and_drops<C: Cells>() {
-    // A Shared doomed frame unwinds at its placeholder read, so it builds
-    // no value and no speculative run follows it: Shared adds nothing.
-    let extra = |n: u32| if C::SINGLE_THREADED { n } else { 0 };
+    // A Shared doomed frame runs on past its placeholder and builds its
+    // value, but its next read raises the discard, so no speculative run
+    // follows it.
+    let speculative = |n: u32| if C::SINGLE_THREADED { n } else { 0 };
     assert_eq!(doomed_value_drops::<C>(u32::MAX), (2, 0, false));
-    assert_eq!(doomed_value_drops::<C>(1), (2 + extra(1), extra(1), false));
+    assert_eq!(doomed_value_drops::<C>(1), (3, 1, false));
     for adopt in [false, true] {
         for keep in [true, false] {
             let (built, dropped, panicked) = speculative_value_drops::<C>(u32::MAX, adopt, keep);
@@ -1456,8 +1457,8 @@ fn replay_builds_and_drops<C: Cells>() {
             assert_eq!(
                 speculative_value_drops::<C>(1, adopt, keep),
                 (
-                    built + extra(1 + u32::from(!adopt)),
-                    dropped + extra(u32::from(!keep) + u32::from(!adopt)),
+                    built + speculative(1 + u32::from(!adopt)),
+                    dropped + speculative(u32::from(!keep) + u32::from(!adopt)),
                     false
                 ),
                 "adopt {adopt}, keep {keep}"

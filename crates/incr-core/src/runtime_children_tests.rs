@@ -663,12 +663,6 @@ fn doomed_frame<C: Cells>(rt: &Runtime<C>) {
     let before = rt.node_count();
     rt.set(x, 1);
     assert_eq!(rt.get(creator), vec![first]);
-    if !C::SINGLE_THREADED {
-        // A Shared doomed frame unwinds at its placeholder read, so the
-        // code past the gate never runs.
-        assert!(seen.lock().unwrap().is_none());
-        return;
-    }
     let (doomed, nodes) = seen.lock().unwrap().take().expect("the run was doomed");
     assert_eq!(doomed[0], first);
     assert_eq!(doomed[1].runtime_id(), RuntimeId::PENDING);

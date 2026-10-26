@@ -334,6 +334,7 @@ impl<C: Cells> Runtime<C> {
     #[inline(always)]
     pub(super) fn enter<R>(&self, f: impl FnMut() -> R) -> R {
         let _kept = cycle_state::KeptUnwind::if_unwinding();
+        cycle_state::raise_if_lazy();
         match self.entered(ReadKind::Get, f) {
             Ok(r) => r,
             Err(_) => unreachable!("incr-core: a get entry raises its cycles"),
@@ -912,6 +913,12 @@ impl<C: Cells> Runtime<C> {
         let failures = began.unwrap_or_else(cycle_state::failures);
         let first = replay::peek_id();
         let mut result = catch_unwind(AssertUnwindSafe(|| compute(self, slot, &ctl)));
+        if !C::SINGLE_THREADED
+            && ctl.has(cycle::DOOMED)
+            && cycle_state::end_lazy(std::ptr::from_ref(&ctl) as usize)
+        {
+            result = Err(Box::new(WoundUnwind));
+        }
         let (deps, reading) = self.dep_stack.pop_frame_reading();
         let word = value_code::thread_word();
         // A member run starts after its episode root's pop, so nothing
