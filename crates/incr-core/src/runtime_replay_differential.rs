@@ -4492,7 +4492,7 @@ fn a_doomed_member_run_keeps_a_failure_marked_above_it() {
 /// the cycle: both reads can panic, both return 9999, or `Get(0)` returns
 /// 14, none of which an order gives.
 #[test]
-#[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
+#[cfg_attr(miri, ignore)]
 fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
     let case = gen_case(0x5aab, false, true);
     quiet(|| {
@@ -4506,9 +4506,8 @@ fn a_doomed_frame_keeps_its_node_from_the_other_thread() {
 /// node 0, whose cycle branches on a caught panic, and `Get(0)` returns
 /// 9999 where every order panics. Each thread's doom discard-lands a node
 /// the other thread then claims, down the chain from node 26, as in 0x5aab.
-/// It fails in about one debug `differential_two` run in five.
 #[test]
-#[ignore = "T8-doomed-frame-keeps-claim: a doomed frame hands its node to another thread"]
+#[cfg_attr(miri, ignore)]
 fn a_doomed_frame_keeps_its_node_from_the_other_thread_e4aa8b2e() {
     let case = gen_case(0xe4aa_8b2e, false, true);
     quiet(|| {
@@ -7493,6 +7492,40 @@ fn replay_scan() {
     }
     let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
     scan(from..n, std::env::var_os("REPLAY_ALL").is_some(), check);
+}
+
+/// Local against Shared over seeds `REPLAY_FROM..REPLAY_SCAN`, with the
+/// generator `REPLAY_CROSS` and `REPLAY_PAIRED` pick: each case's unbounded
+/// single-thread run under each must give the same outcome and leave the
+/// same nodes Failed or Cyclic after every operation.
+#[test]
+#[ignore = "a diagnostic that scans seeds"]
+fn replay_local_shared_scan() {
+    let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
+    let to: u64 = std::env::var("REPLAY_SCAN").map_or(2000, |v| v.parse().expect("a count"));
+    let cross = std::env::var_os("REPLAY_CROSS").is_some();
+    let paired = std::env::var_os("REPLAY_PAIRED").is_some();
+    scan(from..to, true, |seed| {
+        local_shared(&gen_case(seed, cross, paired), seed);
+    });
+}
+
+fn local_shared(case: &Case, seed: u64) {
+    let local = labelled(&format!("seed {seed:#x}, Local unbounded"), || {
+        run::<Local>(case, None, 0)
+    });
+    let shared = labelled(&format!("seed {seed:#x}, Shared unbounded"), || {
+        run::<Shared>(case, None, 0)
+    });
+    for (i, ((lo, ls), (so, ss))) in local.iter().zip(&shared).enumerate() {
+        let (lf, sf) = (settled(&ls.0), settled(&ss.0));
+        assert!(
+            lo == so && lf == sf,
+            "seed {seed:#x}: Local and Shared differ at operation {i} ({:?}): \
+             Local {lo:?} settled {lf:?}, Shared {so:?} settled {sf:?}",
+            case.ops[i]
+        );
+    }
 }
 
 /// An operation, a closure run's node, and a node it read.
