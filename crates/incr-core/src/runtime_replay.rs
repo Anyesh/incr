@@ -672,10 +672,17 @@ impl<C: Cells> Runtime<C> {
                     });
                 }
             }
-            failed |= !matches!(
-                a.stash.outcome,
-                Outcome::Value { .. } | Outcome::Verified { .. }
-            ) || !a.stash.foreign.adoptable();
+            let foreign_refused = !a.stash.foreign.adoptable();
+            if foreign_refused {
+                // The node relands in this revision, which changes what its
+                // readers' stashes read with no new revision.
+                C::u64_fetch_add(&self.reshapes, 1);
+            }
+            failed |= foreign_refused
+                || !matches!(
+                    a.stash.outcome,
+                    Outcome::Value { .. } | Outcome::Verified { .. }
+                );
             if failed {
                 bag.push_erased(Box::new(a.stash.outcome));
                 if root {
