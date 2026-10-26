@@ -59,6 +59,9 @@ struct Record {
     /// another thread let the record's read failure out unchanged. A later
     /// landing never removes one.
     propagated: Vec<(u32, u32)>,
+    /// Its delivery was taken: later reads and landings come after the
+    /// read it names, so it matches no reader and `propagated` is frozen.
+    spent: bool,
 }
 
 /// The records of the payloads held on every thread, each live while a
@@ -80,6 +83,7 @@ impl Records {
             Record {
                 reader,
                 propagated: Vec::new(),
+                spent: false,
             },
         );
         self.by_reader.entry(reader).or_default().push(id);
@@ -90,7 +94,22 @@ impl Records {
         let Some(r) = self.live.remove(&id) else {
             return;
         };
-        if let MapEntry::Occupied(mut ids) = self.by_reader.entry(r.reader) {
+        self.unlist(r.reader, id);
+    }
+
+    fn spend(&mut self, id: u64) {
+        let Some(r) = self.live.get_mut(&id) else {
+            return;
+        };
+        if !r.spent {
+            r.spent = true;
+            let reader = r.reader;
+            self.unlist(reader, id);
+        }
+    }
+
+    fn unlist(&mut self, reader: Reader, id: u64) {
+        if let MapEntry::Occupied(mut ids) = self.by_reader.entry(reader) {
             ids.get_mut().retain(|&i| i != id);
             if ids.get().is_empty() {
                 ids.remove();
@@ -114,6 +133,10 @@ struct Hold<C: Cells> {
 impl<C: Cells> Provenance for Hold<C> {
     fn record(&self) -> u64 {
         self.id
+    }
+
+    fn spend(&self) {
+        self.table.write().spend(self.id);
     }
 }
 
@@ -321,7 +344,7 @@ impl<C: Cells> Runtime<C> {
         if let Some(c) = carried {
             if !self.provenance.read().live.is_empty() {
                 let mut records = self.provenance.write();
-                if let Some(r) = records.live.get_mut(&c.record) {
+                if let Some(r) = records.live.get_mut(&c.record).filter(|r| !r.spent) {
                     if !r.propagated.contains(&(id.0, generation)) {
                         r.propagated.push((id.0, generation));
                     }
