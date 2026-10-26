@@ -3781,7 +3781,10 @@ impl<C: Cells> Runtime<C> {
                     // thread's held map is not walked again, since its walk
                     // would wait on this thread's own claim: the plan goes on
                     // to the root's compute, which reads it as deferred. A
-                    // read restarts at most `ROOT_RESTARTS` times.
+                    // read restarts at most `ROOT_RESTARTS` times. The next
+                    // plan's count is read first, so a release counted
+                    // during the checks is left for the next replan.
+                    let next = self.planned();
                     let released = !resumed
                         && !ran_unsettled
                         && restarts < ROOT_RESTARTS
@@ -3789,7 +3792,7 @@ impl<C: Cells> Runtime<C> {
                         && !cycle_state::holds(self.runtime_id, id.0)
                         && self.release_reached(&walk, cur, planned);
                     resumed = false;
-                    planned = self.planned();
+                    planned = next;
                     if !self.prune_settled(&mut walk) {
                         if released {
                             // The plan expanded through a released claim's old
