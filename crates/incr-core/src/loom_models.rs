@@ -1209,8 +1209,7 @@ fn loom_held_group_record_precedes_state() {
 /// c: a landed group. Once i is 1, a no longer reads c, so the episode at c
 /// that o's read runs shrinks to {c, b} and o re-reads a, released from it,
 /// giving a fresh graph's (21, 1). Counts every closure run. Without b's
-/// fallback the shrunk episode panics, as on main (board
-/// T10-shrunk-cut-incremental-cycle-panic).
+/// fallback the shrunk episode panics, as on main.
 fn shrunk_cut<C: crate::cells::Cells>(
     rt: &Runtime<C>,
     runs: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -1284,6 +1283,10 @@ fn loom_own_landed_reread_matches_local() {
             let b = panic_message(|| rt.get(a));
             (panic_message(|| rt.get(o)), b)
         };
+        assert!(
+            local_b_first.0.is_ok() && local_b_first.1.is_ok(),
+            "Local panics reading a first: {local_b_first:?}"
+        );
 
         let runs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let rt = Rt::new();
