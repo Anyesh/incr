@@ -693,7 +693,7 @@ impl<C: Cells> Runtime<C> {
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let targets = self.publication_targets(rest.as_slice());
             for (e, target) in rest.by_ref().zip(targets) {
-                stopped = Some((e.slot, e.target));
+                stopped = Some((e.slot, e.landed()));
                 self.publish_one(e, target, &mut bag, &mut stopped);
             }
         }));
@@ -914,6 +914,7 @@ impl<C: Cells> Runtime<C> {
         let id = NodeId(e.slot);
         let node = self.nodes.get(e.slot);
         debug_assert_eq!(node.generation(), e.generation);
+        let was_failed = e.landed() == NodeState::Failed;
         // First, so that a panic below drops no user value mid-unwind.
         if let Some(Some(own)) = e.undo.value {
             bag.push_erased(own);
@@ -933,7 +934,7 @@ impl<C: Cells> Runtime<C> {
         }
         node.set_held_mark(false);
         self.park(super::ParkPoint::HeldLanding(id));
-        let failed = (e.target == NodeState::Failed).then(|| {
+        let failed = was_failed.then(|| {
             (
                 self.failed_run_token(e.slot, e.generation),
                 self.ticket_mark(),
@@ -1081,9 +1082,12 @@ impl<C: Cells> Runtime<C> {
         }
         let failed: Vec<u32> = entries
             .iter()
-            .filter(|e| e.target == NodeState::Failed)
+            .filter(|e| e.landed() == NodeState::Failed)
             .map(|e| e.slot)
             .collect();
+        for &slot in &failed {
+            self.forget_failed_run(slot, self.nodes.get(slot).generation());
+        }
         self.release_retracted(&failed, &mut bag);
         // Once the dep lists are back and before the held marks clear, so a
         // walk that read a retracted run's deps sees the mark or the count.

@@ -96,6 +96,17 @@ pub(crate) struct Held {
 }
 
 impl Held {
+    /// Failed if a landing in the attempt was Failed, else the target: the
+    /// record and tickets of that landing go with the entry even after a
+    /// set's flip or a rerun moved its target.
+    pub(crate) fn landed(&self) -> NodeState {
+        if self.failed_at.is_some() {
+            NodeState::Failed
+        } else {
+            self.target
+        }
+    }
+
     /// The state the landing publishes as over the node's word `raw`: a
     /// set that flagged the word since lands it `flagged`.
     fn shown(&self, raw: NodeState) -> NodeState {
