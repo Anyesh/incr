@@ -2,13 +2,13 @@
 //! the bounds on runs and walks the plan's T8 tests set.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{Runtime, DEFAULT_MAX_FRAMES};
 use crate::cells::{Cells, Local, Shared};
 use crate::child_test::run_alone;
-use crate::cycle::{ComputeCtl, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
+use crate::cycle::{ComputeCtl, Cycle, CycleStrategy, Fixpoint, QueryOpts, Replay, BUFFERED};
 use crate::cycle_state::{set_unwind_kind, unwind_kind, with_held, Held, UnwindKind};
 use crate::deferred::Deferred;
 use crate::dep_stack::DepStack;
@@ -2729,15 +2729,21 @@ enum Lookup {
     OwnLabel,
     ForeignForEach,
     ForeignSnapshot,
+    OwnGraph,
+    ForeignCycle,
+    OwnTrace,
+    GroupCount,
+    GroupKeys,
+    GroupGet,
+    SortedSnapshot,
+    SortedLen,
 }
 
-/// `foreign_ticket_shape` with b's read of j replaced by `lookup`: a get on
-/// another runtime's table, `is_alive` of another runtime's node or of a
-/// node of b's own runtime, another runtime's node count, a label of b's
-/// own runtime, a `for_each` over another runtime's table, or the
-/// `snapshot_len` of another runtime's collection. After the walk holds b's payload, the test
-/// thread flips the lookup's answer (an insert, a delete or a label),
-/// which dirties nothing b reads; a rerun of b sees the new answer.
+/// `foreign_ticket_shape` with b's read of j replaced by `lookup`, one of
+/// the lookups that record no dependency, on b's own runtime or another.
+/// After the walk holds b's payload, the test thread flips the lookup's
+/// answer (an insert, a delete, a label or a cycle landing), which
+/// dirties nothing b reads; a rerun of b sees the new answer.
 fn lookup_ticket_shape<C: Cells>(
     lookup: Lookup,
     frames: u32,
@@ -2753,10 +2759,32 @@ fn lookup_ticket_shape<C: Cells>(
     let gone = other.create_input(0_u64);
     let own_gone = rt.create_input(0_u64);
     let coll = other.create_collection::<u64>();
+    let groups = Arc::new(coll.group_by(&other, |v| *v % 2));
+    let sorted = Arc::new(coll.sort_by_key(&other, |v| *v));
+    let closes = other.create_input(0_u64);
+    let loop_cell: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let looped = {
+        let loop_cell = Arc::clone(&loop_cell);
+        other.create_query_with_fallback(
+            move |o| {
+                if o.get(closes) == 1 {
+                    o.get(*loop_cell.get().unwrap()) + 1
+                } else {
+                    0
+                }
+            },
+            |_: &Cycle| 100_u64,
+        )
+    };
+    assert!(loop_cell.set(looped).is_ok());
+    assert_eq!(other.get(looped), 0);
     let other_nodes = other.node_count();
     let i = rt.create_input(1_u64);
     let k = rt.create_input(0_u64);
     let (b_other, b_table, b_coll) = (Arc::clone(&other), Arc::clone(&table), coll.clone());
+    let (b_groups, b_sorted) = (Arc::clone(&groups), Arc::clone(&sorted));
+    let own_nodes = Arc::new(AtomicUsize::new(0));
+    let b_own_nodes = Arc::clone(&own_nodes);
     let b = rt.create_query_with(
         move |rt: &Runtime<C>| -> u64 {
             let seen = match lookup {
@@ -2771,6 +2799,14 @@ fn lookup_ticket_shape<C: Cells>(
                     entries == 0
                 }
                 Lookup::ForeignSnapshot => b_coll.snapshot_len() == 0,
+                Lookup::OwnGraph => rt.graph_snapshot().iter().all(|n| n.label.is_none()),
+                Lookup::ForeignCycle => b_other.cycle_of(looped).is_none(),
+                Lookup::OwnTrace => rt.get_traced(i).1.total_nodes == b_own_nodes.load(Relaxed),
+                Lookup::GroupCount => b_groups.group_count() == 0,
+                Lookup::GroupKeys => b_groups.keys().is_empty(),
+                Lookup::GroupGet => b_groups.get_group(&1).is_none(),
+                Lookup::SortedSnapshot => b_sorted.snapshot().is_empty(),
+                Lookup::SortedLen => b_sorted.snapshot_len() == 0,
             };
             std::panic::panic_any(CustomPayload(100 * rt.get(i) + if seen { 1 } else { 5 }))
         },
@@ -2780,6 +2816,7 @@ fn lookup_ticket_shape<C: Cells>(
         move |rt| if rt.get(k) == 0 { rt.get(b) } else { 7 },
         replayable(),
     );
+    own_nodes.store(rt.node_count(), Relaxed);
     assert!(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err());
     rt.set(i, 2);
     rt.set(k, 1);
@@ -2789,9 +2826,22 @@ fn lookup_ticket_shape<C: Cells>(
             table.get_or_insert_input(&other, 3, || 0);
         }
         Lookup::ForeignAlive | Lookup::ForeignCount => other.delete_node(gone),
-        Lookup::OwnAlive => rt.delete_node(own_gone),
-        Lookup::OwnLabel => rt.set_label(own_gone.slot(), "seen".into()),
-        Lookup::ForeignSnapshot => coll.insert(&other, 1),
+        Lookup::OwnAlive | Lookup::OwnTrace => rt.delete_node(own_gone),
+        Lookup::OwnLabel | Lookup::OwnGraph => rt.set_label(own_gone.slot(), "seen".into()),
+        Lookup::ForeignCycle => {
+            other.set(closes, 1);
+            assert_eq!(other.get(looped), 100);
+        }
+        Lookup::ForeignSnapshot
+        | Lookup::GroupCount
+        | Lookup::GroupKeys
+        | Lookup::GroupGet
+        | Lookup::SortedSnapshot
+        | Lookup::SortedLen => {
+            coll.insert(&other, 1);
+            other.get(groups.version_node());
+            other.get(sorted.version_node());
+        }
     }
     let mut top_b = b;
     for _ in 0..mid {
@@ -2823,8 +2873,7 @@ fn lookup_ticket_shape<C: Cells>(
 
 /// Every budget gives what the unbounded run gives for
 /// `lookup_ticket_shape`, which takes the walk's payload: 205 for the
-/// table miss, 201 while the node was alive, counted or unlabelled and
-/// while the table or collection was empty.
+/// table miss, and 201 for the other lookups, made before their flip.
 fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
     let mut differ = Vec::new();
     for (lookup, payload) in [
@@ -2835,6 +2884,14 @@ fn a_payload_after_an_unrecorded_lookup_reads_as_unbounded<C: Cells>() {
         (Lookup::OwnLabel, 201),
         (Lookup::ForeignForEach, 201),
         (Lookup::ForeignSnapshot, 201),
+        (Lookup::OwnGraph, 201),
+        (Lookup::ForeignCycle, 201),
+        (Lookup::OwnTrace, 201),
+        (Lookup::GroupCount, 201),
+        (Lookup::GroupKeys, 201),
+        (Lookup::GroupGet, 201),
+        (Lookup::SortedSnapshot, 201),
+        (Lookup::SortedLen, 201),
     ] {
         for outer in [0, 1, 3, 8] {
             for mid in [0, 1, 3] {
