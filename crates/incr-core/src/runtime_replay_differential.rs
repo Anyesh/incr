@@ -7188,6 +7188,24 @@ fn paired_clean_read_delivery_seeds() {
     }
 }
 
+/// Paired cases run single-threaded: at budget 1 a walk entry under a
+/// closure's read panicked and landed Failed, and the closure that caught
+/// the unwind kept its value as a memo, where the unbounded run flags the
+/// read by the node read, still Dirty, and runs the closure again. 0x4d326's
+/// 14 caught 17's panic through its read of 19 and its reader 13 took 9999
+/// four times; 0x580c7 left a wrong dep list behind the same memo.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_caught_walk_entry_panic_leaves_no_memo_seeds() {
+    for seed in [0x4d326, 0x580c7] {
+        let case = gen_case(seed, false, true);
+        quiet(|| {
+            differential::<Local>(&case, seed);
+            differential::<Shared>(&case, seed);
+        });
+    }
+}
+
 /// High-range strict scan seeds (from 630042492734) that landed Dirty
 /// for Clean before a retry's Clean read took its delivery; 0x92b175829f
 /// is a stashed walk rest resumed past a root that had landed Clean.
