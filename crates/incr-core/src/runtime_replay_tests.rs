@@ -3321,7 +3321,9 @@ local_and_shared!(
 /// third runtime, Dirty at that read when `dirty` is set (the framed
 /// foreign read), else Clean (settled by `c`'s keep resolver).
 /// Once j moves to 3, `c` computes 13, as the unbounded run does, rather
-/// than adopt its speculative run's value.
+/// than adopt its speculative run's value. That holds for the `Local`
+/// forms only: a `Shared` `rt`'s doomed run raises its discard at its read
+/// of `a`, so `c` runs no speculative run there and the last read is plain.
 fn unbudgeted_speculative_foreign_read<C: Cells>(dirty: bool) {
     let rt = Runtime::<C>::new();
     rt.set_placeholder(0_u64);
@@ -3355,7 +3357,8 @@ fn unbudgeted_speculative_foreign_read<C: Cells>(dirty: bool) {
         replayable(),
     );
     assert_eq!(rt.get(r), 5);
-    assert_eq!(runs.load(SeqCst), 1, "c's speculative run");
+    let speculative = if C::SINGLE_THREADED { 1 } else { 0 };
+    assert_eq!(runs.load(SeqCst), speculative, "c's speculative run");
     other.set(jin, 3);
     assert_eq!(other.get(j), 3);
     assert_eq!(a.get(c), 13);
