@@ -84,9 +84,9 @@ pub(crate) struct Held {
     pub(crate) children: Option<(ChildLanding, bool)>,
     /// Trace actions of the held landings, logged at publication.
     pub(crate) trace: Vec<TraceAction>,
-    /// The deps the last landing read that the published dep list lacks,
-    /// each with its generation then: their reverse edges wait for
-    /// publication, which a delete of one meanwhile turns back
+    /// The deps the node's landings installed that its published dep list
+    /// lacks, each with its generation when read: their reverse edges wait
+    /// for publication, which a delete of one meanwhile turns back
     /// ([`keep_read`]).
     pub(crate) read: Vec<(NodeId, u32)>,
     pub(crate) undo: Undo,
@@ -461,8 +461,8 @@ pub(crate) fn keep_deps(cell: usize, old: impl FnOnce() -> Vec<(NodeId, u32)>) {
 /// The deps a held node's landing installs, each with its generation
 /// when read, less those its published dep list has, replacing an earlier
 /// landing's, or adding to it for a landing that keeps the deps it
-/// installed (`keep`, a panicked one's union). Linear: a long published
-/// list is hashed.
+/// installed (`keep`, a panicked one's union), each dep once. Linear: past
+/// a short list, the deps to skip are hashed.
 pub(crate) fn keep_read(cell: usize, installed: impl Iterator<Item = (NodeId, u32)>, keep: bool) {
     with(|h| {
         if let Some(e) = h.get(cell) {
@@ -470,14 +470,13 @@ pub(crate) fn keep_read(cell: usize, installed: impl Iterator<Item = (NodeId, u3
                 e.read.clear();
             }
             let published = e.undo.deps.as_deref().unwrap_or(&[]);
-            if published.len() > SCAN_MAX {
-                let published: HashSet<NodeId, FxBuildHasher> =
-                    published.iter().map(|&(d, _)| d).collect();
-                e.read
-                    .extend(installed.filter(|(d, _)| !published.contains(d)));
+            let skip = published.iter().chain(&e.read).map(|&(d, _)| d);
+            if published.len() + e.read.len() > SCAN_MAX {
+                let skip: HashSet<NodeId, FxBuildHasher> = skip.collect();
+                e.read.extend(installed.filter(|(d, _)| !skip.contains(d)));
             } else {
-                e.read
-                    .extend(installed.filter(|&(d, _)| !published.iter().any(|&(p, _)| p == d)));
+                let skip: Vec<NodeId> = skip.collect();
+                e.read.extend(installed.filter(|(d, _)| !skip.contains(d)));
             }
         }
     });

@@ -372,8 +372,8 @@ fn shared_held_publication_panic_reader_of_a_formed_cycle_recomputes() {
     rt.assert_invariant_i();
 }
 
-/// As above, with another thread reverting t and reading p between g's
-/// give-back and the publication's unverifying of p.
+/// As above, with another thread reverting t and reading p once g's
+/// give-back has landed.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn shared_held_publication_panic_reader_read_during_the_give_back() {
