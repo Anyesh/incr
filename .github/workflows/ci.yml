@@ -152,7 +152,7 @@ jobs:
           - { model: "loom_models::doom_lazy_reads_again", bound: 2 }
           - { model: "loom_models::doom_lazy_end_races_take_over", bound: 2 }
           - { model: "loom_models::doom_lazy_wound_before_raise", bound: 2 }
-          - { model: "loom_models::doom_lazy_destructor_discard_keeps_flight", bound: 2 }
+          - { model: "loom_models::doom_lazy_take_over_during_user_panic", bound: 2 }
           - { model: "loom_models::give_back_wait_ends_on_a_give_back", bound: 2 }
           - { model: "loom_models::give_back_wait_ends_on_a_landing", bound: 2 }
           - { model: "loom_models::give_back_wait_ends_when_a_take_over_keeps_the_claim", bound: 2 }

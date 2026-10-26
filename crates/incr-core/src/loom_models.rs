@@ -1781,7 +1781,6 @@ fn doom_lazy_reads_again() {
 struct Reached {
     take_over: std::sync::atomic::AtomicBool,
     no_take_over: std::sync::atomic::AtomicBool,
-    take_over_with_caught: std::sync::atomic::AtomicBool,
 }
 
 impl Reached {
@@ -1790,17 +1789,13 @@ impl Reached {
         Self {
             take_over: AtomicBool::new(false),
             no_take_over: AtomicBool::new(false),
-            take_over_with_caught: AtomicBool::new(false),
         }
     }
 
-    fn note(&self, took: bool, caught: bool) {
+    fn note(&self, took: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         if took {
             self.take_over.store(true, Relaxed);
-            if caught {
-                self.take_over_with_caught.store(true, Relaxed);
-            }
         } else {
             self.no_take_over.store(true, Relaxed);
         }
@@ -1894,7 +1889,7 @@ static END_RACE: Reached = Reached::new();
 fn doom_lazy_end_races_take_over() {
     run(|| {
         let world = LazyWorld::new(|rt, x, _| rt.get(x) + 100);
-        END_RACE.note(world.race(114, false), false);
+        END_RACE.note(world.race(114, false));
     });
     END_RACE.assert_both();
 }
@@ -1911,7 +1906,7 @@ static RAISE_RACE: Reached = Reached::new();
 fn doom_lazy_wound_before_raise() {
     run(|| {
         let world = LazyWorld::new(|rt, x, z| rt.get(x) + rt.get(z) + 100);
-        RAISE_RACE.note(world.race(137, false), false);
+        RAISE_RACE.note(world.race(137, false));
     });
     RAISE_RACE.assert_both();
 }
@@ -1921,55 +1916,52 @@ fn doom_lazy_wound_before_raise() {
 struct ReadOnDrop<'a> {
     rt: &'a Rt,
     w: Incr<u64>,
-    caught: &'a std::sync::atomic::AtomicBool,
+    unwound: &'a std::sync::atomic::AtomicBool,
 }
 
 impl Drop for ReadOnDrop<'_> {
     fn drop(&mut self) {
         if catch_unwind(AssertUnwindSafe(|| self.rt.get(self.w))).is_err() {
-            self.caught
+            self.unwound
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
 
-static DESTRUCTOR_DISCARD: Reached = Reached::new();
+static PANIC_RACE: Reached = Reached::new();
 
 /// T reads X, which dooms at budget 1, and on the placeholder panics in
-/// user code; a destructor in that panic reads W, a doomed read that
-/// raises a discard the destructor catches, while another thread waits on
-/// X's reservation. The lazy doom's flight stays open through the
-/// destructor, so the waiter can still take X over; T's read retries
+/// user code while another thread waits on X's reservation; a destructor
+/// in that panic reads W. The lazy doom stays open through the panic, so
+/// the destructor's read takes W's placeholder instead of raising the
+/// doom's discard, and the waiter can still take X over; T's read retries
 /// exactly when it does, and both reads give the unbounded run's values.
 #[test]
-fn doom_lazy_destructor_discard_keeps_flight() {
+fn doom_lazy_take_over_during_user_panic() {
     run(|| {
-        let caught = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unwound = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let world = {
-            let caught = Arc::clone(&caught);
+            let unwound = Arc::clone(&unwound);
             LazyWorld::new(move |rt, x, z| {
                 let v = rt.get(x);
                 if v == 0 {
                     let _read = ReadOnDrop {
                         rt,
                         w: z,
-                        caught: &caught,
+                        unwound: &unwound,
                     };
                     panic!("a doomed run panics past its placeholder");
                 }
                 v + 100
             })
         };
-        let took = world.race(114, true);
-        DESTRUCTOR_DISCARD.note(took, caught.load(std::sync::atomic::Ordering::Relaxed));
+        PANIC_RACE.note(world.race(114, true));
+        assert!(
+            !unwound.load(std::sync::atomic::Ordering::Relaxed),
+            "the destructor's read raised the lazy doom's discard"
+        );
     });
-    DESTRUCTOR_DISCARD.assert_both();
-    assert!(
-        DESTRUCTOR_DISCARD
-            .take_over_with_caught
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "no execution both caught the destructor's discard and took the doom over"
-    );
+    PANIC_RACE.assert_both();
 }
 
 /// F, Clean at s = 0, reads a New query N once s is set, so at budget 1
