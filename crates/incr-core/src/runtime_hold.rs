@@ -570,6 +570,7 @@ impl<C: Cells> Runtime<C> {
                 }
                 self.land_now(NodeId(slot), node, NodeState::Dirty, NodeState::Dirty, true);
                 if target == NodeState::Failed {
+                    self.park(super::ParkPoint::FailedLandedOtherwise(NodeId(slot)));
                     self.leave_failed_target(NodeId(slot), node.generation(), &mut bag);
                 }
             }
@@ -751,6 +752,7 @@ impl<C: Cells> Runtime<C> {
         // A set flagged the held Failed landing, as `land_failed` handles at
         // an unheld one.
         if target == NodeState::Failed && landed != NodeState::Failed {
+            self.park(super::ParkPoint::FailedLandedOtherwise(id));
             self.leave_failed_target(id, e.generation, bag);
         }
         self.park(super::ParkPoint::HeldPublished(id));

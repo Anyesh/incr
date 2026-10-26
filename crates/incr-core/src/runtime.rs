@@ -212,8 +212,9 @@ pub(crate) enum ParkPoint {
     /// In `compute_one`, after a run that did not land Clean released its
     /// claim, with the attempt's bag carried along.
     UnsettledLanding(NodeId),
-    /// In `land_failed`, after a landing meant as Failed released its
-    /// claim landing otherwise, before it forgets its record.
+    /// In `land_failed` or a held publication, after a landing meant as
+    /// Failed released its claim landing otherwise, before it forgets its
+    /// record.
     FailedLandedOtherwise(NodeId),
     /// In `flip_failed_from`, before the flip's CAS.
     FlipBeforeCas(NodeId),

@@ -1743,3 +1743,87 @@ fn two_holders_that_join_readers_of_each_others_landings_both_end() {
         assert!(n <= 2, "{n} take-overs");
     }
 }
+
+/// r reads a cycle and catches x, which reads the cycle's held member and
+/// panics, so x's Failed landing is held. At publication x lands
+/// otherwise: stopped by a panic before its landing (`stop`), or flagged by
+/// a set of i. Another thread then runs x, which lands Failed with its own
+/// record, before the publication drops the record of x's held run: it
+/// must leave the new one.
+fn held_failed_target_keeps_the_next_runs_record(stop: bool) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(16);
+    let (a, _) = two_cycle(&*rt);
+    let i = rt.create_input(0_i64);
+    let x = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> i64 {
+            std::panic::panic_any(HeldPayload(rt.get(a) + rt.get(i)))
+        },
+        replayable(),
+    );
+    let r = rt.create_query_with(
+        move |rt| rt.get(a) + i64::from(catch_unwind(AssertUnwindSafe(|| rt.get(x))).is_err()),
+        replayable(),
+    );
+    let x_id = super::NodeId(x.slot());
+    let next_run: Arc<OnceLock<Option<u64>>> = Arc::default();
+    let hook: super::ParkHook = {
+        let (weak, next_run) = (Arc::downgrade(&rt), next_run.clone());
+        let (landing, otherwise) = (AtomicBool::new(true), AtomicBool::new(true));
+        Box::new(move |point| {
+            let rt = weak.upgrade().unwrap();
+            if point == super::ParkPoint::HeldLanding(x_id) && landing.swap(false, Ordering::SeqCst)
+            {
+                if stop {
+                    panic!("a held landing panicked on purpose");
+                }
+                let set = Arc::clone(&rt);
+                std::thread::spawn(move || set.set(i, 1)).join().unwrap();
+            }
+            if point == super::ParkPoint::FailedLandedOtherwise(x_id)
+                && otherwise.swap(false, Ordering::SeqCst)
+            {
+                let run = Arc::clone(&rt);
+                let b = std::thread::spawn(move || {
+                    catch_unwind(AssertUnwindSafe(|| run.get(x))).is_err()
+                });
+                let start = std::time::Instant::now();
+                while !b.is_finished() {
+                    assert!(
+                        start.elapsed() < std::time::Duration::from_secs(20),
+                        "the other thread's run of x never finished"
+                    );
+                    std::thread::yield_now();
+                }
+                assert!(b.join().unwrap(), "x's run did not fail");
+                next_run
+                    .set(rt.failed_run_token(x_id.0, x.generation()))
+                    .unwrap();
+            }
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    let read = catch_unwind(AssertUnwindSafe(|| rt.get(r)));
+    assert_eq!(read.is_err(), stop);
+    let b_record = next_run.get().copied().expect("x never landed otherwise");
+    assert!(b_record.is_some(), "x's run left no record");
+    assert_eq!(
+        rt.failed_run_token(x_id.0, x.generation()),
+        b_record,
+        "the publication forgot the record of x's next run"
+    );
+    rt.assert_invariant_i();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_stopped_held_failed_target_keeps_the_next_runs_record() {
+    held_failed_target_keeps_the_next_runs_record(true);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_flagged_held_failed_target_keeps_the_next_runs_record() {
+    held_failed_target_keeps_the_next_runs_record(false);
+}
