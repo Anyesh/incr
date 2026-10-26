@@ -396,15 +396,15 @@ impl Landings {
         std::mem::take(self.owned_nodes())
     }
 
-    /// The deepest landing's depth, if it is above just the reading frame.
-    fn deep_depth(&self) -> Option<u32> {
+    /// At least the deepest landing's depth, if it has a landing.
+    fn deepest(&self) -> Option<u32> {
         let deepest = match &self.nodes {
             Nodes::Owned(nodes) => {
                 note_work(nodes.len());
                 nodes.iter().map(|&(_, depth)| depth).max()
             }
             // No landing is deeper than `depth`.
-            Nodes::Shared { depth: 0, .. } => None,
+            Nodes::Shared { depth: 0, .. } => Some(0),
             Nodes::Shared {
                 log,
                 len,
@@ -419,7 +419,7 @@ impl Landings {
                 .map(|&(_, depth)| depth)
                 .max(),
         };
-        deepest.filter(|&d| d > 0)
+        deepest
     }
 
     /// At least the deepest landing's depth.
@@ -522,11 +522,10 @@ pub(crate) struct Pending {
     /// The deliveries with a record, by the position of the lowest frame
     /// they stand for, which the pop of the virtual frame below extends.
     by_frontier: Index<u32, usize>,
-    /// The passed deliveries that carry a landing deeper than just above
-    /// their frame, which a pop can retire, by the highest position one of
-    /// their landings may have (`deep_top`).
-    deep: BTreeSet<(u32, usize)>,
-    deep_top: HashMap<usize, u32, FxBuildHasher>,
+    /// The passed deliveries that carry landings, by the highest position
+    /// one of their landings may have (`Delivery::top`).
+    by_top: BTreeSet<(u32, usize)>,
+    top_of: HashMap<usize, u32, FxBuildHasher>,
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -587,10 +586,10 @@ impl Pending {
             }
             list(&mut self.by_frontier, frontier(&d), i);
         }
-        let top = if d.passed { d.deep_top() } else { None };
+        let top = if d.passed { d.top() } else { None };
         self.slots.push(Some(d));
         if let Some(top) = top {
-            self.list_deep(i, top);
+            self.list_top(i, top);
         }
         self.live += 1;
     }
@@ -617,8 +616,8 @@ impl Pending {
             }
             unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        if let Some(top) = self.deep_top.remove(&i) {
-            self.deep.remove(&(top, i));
+        if let Some(top) = self.top_of.remove(&i) {
+            self.by_top.remove(&(top, i));
         }
         self.live -= 1;
         // No index is held across a point where none is live.
@@ -645,21 +644,20 @@ impl Pending {
         let d = self.get_mut(i);
         if !d.passed {
             d.passed = true;
-            if let Some(top) = d.deep_top() {
-                self.list_deep(i, top);
+            if let Some(top) = d.top() {
+                self.list_top(i, top);
             }
         }
     }
 
-    fn list_deep(&mut self, i: usize, top: u32) {
-        self.deep.insert((top, i));
-        self.deep_top.insert(i, top);
+    fn list_top(&mut self, i: usize, top: u32) {
+        self.by_top.insert((top, i));
+        self.top_of.insert(i, top);
     }
 
     /// Applies `ev` to the landings the passed deliveries carry: those of
     /// every passed delivery for a node's landing that a copy may hold,
-    /// else only the deeper ones, since an event at or below a frame
-    /// ends that frame's run.
+    /// else only those of deliveries with a landing the event can reach.
     fn retire(&mut self, ev: &Retire, all: bool) {
         let slots = &mut self.slots;
         let apply = |d: &mut Delivery| {
@@ -676,29 +674,29 @@ impl Pending {
                 apply(d);
             }
         }
-        // Short of a copied node's landing, a pop or a containment retires
-        // only landings above its position, or at it, so a delivery none of
-        // whose landings reaches that high keeps them all.
+        // Short of a copied node's landing, an event retires only landings
+        // above its position, or at it for a containment of the delivery's
+        // own payload, so a delivery none of whose landings reaches that
+        // high keeps them all.
         let from = match *ev {
             _ if all => 0,
-            Retire::Above(at) => at.saturating_add(1),
+            Retire::Above(at) | Retire::Landing { cidx: at, .. } => at.saturating_add(1),
             Retire::Contained { cidx: at, .. } => at,
-            Retire::Landing { .. } => 0,
         };
-        let hit: Vec<(u32, usize)> = self.deep.range((from, 0)..).copied().collect();
+        let hit: Vec<(u32, usize)> = self.by_top.range((from, 0)..).copied().collect();
         for (top, i) in hit {
-            self.deep.remove(&(top, i));
+            self.by_top.remove(&(top, i));
             let d = slots[i]
                 .as_mut()
                 .expect("incr-core: a delivery's index is live");
             if !all {
                 apply(d);
             }
-            if let Some(top) = d.deep_top() {
-                self.deep.insert((top, i));
-                self.deep_top.insert(i, top);
+            if let Some(top) = d.top() {
+                self.by_top.insert((top, i));
+                self.top_of.insert(i, top);
             } else {
-                self.deep_top.remove(&i);
+                self.top_of.remove(&i);
             }
         }
     }
@@ -919,11 +917,10 @@ impl Delivery {
         self.taken
     }
 
-    /// The highest position its landings have, if one is deeper than just
-    /// above its frame.
-    fn deep_top(&self) -> Option<u32> {
+    /// The highest position its landings may have, if it has one.
+    fn top(&self) -> Option<u32> {
         match &self.what {
-            Delivered::Unwind { nodes, .. } => nodes.deep_depth().map(|d| self.key.cidx + 1 + d),
+            Delivered::Unwind { nodes, .. } => nodes.deepest().map(|d| self.key.cidx + 1 + d),
             _ => None,
         }
     }
