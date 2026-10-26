@@ -486,7 +486,8 @@ fn first_doom_depth<C: Cells>(rt: &Runtime<C>) -> usize {
 
 /// The byte budget dooms a 1000-chain of 16 KiB frames well below the
 /// frame budget of 256, which alone would overflow a 2 MiB thread, under
-/// `get` and under `stabilize` at the same depth, with the unbounded value.
+/// `get` and at most one level earlier under `stabilize`, with the
+/// unbounded value.
 fn byte_budget_first<C: Cells>() {
     let n = 1000;
     let rt = Runtime::<C>::new();
@@ -502,7 +503,15 @@ fn byte_budget_first<C: Cells>() {
     rt.observe(nodes[0], move |&v| seen.lock().unwrap().push(v));
     rt.stabilize();
     assert_eq!(*fired.lock().unwrap(), vec![n as u64]);
-    assert_eq!(first_doom_depth(&rt), depth);
+    // The budget counts from the outermost entry, so stabilize's observer
+    // frames come before the chain's; under TSan, Local's first level under
+    // get ends less than 1 KiB inside the 64 KiB, so stabilize dooms one
+    // level earlier.
+    let stabilized = first_doom_depth(&rt);
+    assert!(
+        stabilized <= depth && depth - stabilized <= 1,
+        "the doom came at depth {stabilized} under stabilize, {depth} under get"
+    );
     assert_eq!(rt.state_of(nodes[0]), NodeState::Clean);
 }
 
