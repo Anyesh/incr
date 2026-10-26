@@ -2501,19 +2501,18 @@ fn walk_into_unwound_cycle<C: Cells>(through_top: bool) -> [Result<i64, String>;
     [first, read()]
 }
 
-/// **A walk enters a cycle of its recorded deps where exact mode does,
-/// however many visits came before.** Reading through `top` makes one
-/// more visit before the walk reaches `b` and `c`; both walks run `b`
-/// first, which closes the cycle at its entry.
+/// **A walk enters a cycle of its recorded deps at the node of it the walk
+/// reached first, however many visits came before.** Reading through
+/// `top` makes one more visit before the walk reaches `b` and `c`; both
+/// walks run `c` first, whose run reads `b`, which sees `c`'s fallback.
 fn walk_entry_into_unwound_cycle_ignores_earlier_visits<C: Cells>() {
-    let boom = Err("b saw c's fallback".to_owned());
-    let cycle = Err("incr-core: dependency cycle: 2, 3".to_owned());
+    let boom = || Err("b saw c's fallback".to_owned());
     assert_eq!(
         [
             walk_into_unwound_cycle::<C>(false),
             walk_into_unwound_cycle::<C>(true)
         ],
-        [[boom.clone(), cycle.clone()], [boom, cycle]]
+        [[boom(), boom()], [boom(), boom()]]
     );
 }
 
