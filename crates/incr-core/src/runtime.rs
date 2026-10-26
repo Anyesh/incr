@@ -2299,12 +2299,10 @@ impl<C: Cells> Runtime<C> {
     /// is the state `get` loaded.
     #[inline(never)]
     fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
-        let _kept = cycle_state::KeptUnwind::if_unwinding();
-        cycle_state::raise_if_lazy();
-        match self.read_slow(handle, observed, ReadKind::Get) {
+        cycle_state::KeptUnwind::around(|| match self.read_slow(handle, observed, ReadKind::Get) {
             Ok(value) => value,
             Err(cycle) => self.raise_cycle(cycle),
-        }
+        })
     }
 
     /// Read the current value of a node, like [`Self::get`], or the cycle
@@ -2341,9 +2339,7 @@ impl<C: Cells> Runtime<C> {
 
     #[inline(never)]
     fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
-        let _kept = cycle_state::KeptUnwind::if_unwinding();
-        cycle_state::raise_if_lazy();
-        self.read_slow(handle, observed, ReadKind::TryGet)
+        cycle_state::KeptUnwind::around(|| self.read_slow(handle, observed, ReadKind::TryGet))
     }
 
     /// The cycle of the group `handle` landed in last, if its last
@@ -2889,8 +2885,14 @@ impl<C: Cells> Runtime<C> {
         &self,
         handle: Incr<T>,
     ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
-        let _kept = cycle_state::KeptUnwind::if_unwinding();
-        cycle_state::raise_if_lazy();
+        cycle_state::KeptUnwind::around(|| self.claim_input_kept(handle))
+    }
+
+    #[inline(always)]
+    fn claim_input_kept<T: Value>(
+        &self,
+        handle: Incr<T>,
+    ) -> (SetClaim<'_, C>, &GenericArena<T, C>, u32) {
         // A set from a closure that caught a discard, a doom's included, or
         // a wound raises it again as a read does: its run is discarded, and
         // the unbounded run never makes the write.
