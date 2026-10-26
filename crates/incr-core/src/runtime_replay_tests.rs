@@ -2244,10 +2244,11 @@ fn held_failed_after_a_delete(
         replayable(),
     );
     let seen: Arc<Mutex<Vec<NodeState>>> = Arc::default();
-    let (watch, watcher) = (Arc::clone(&rt), Arc::clone(&seen));
+    // Weak, so the hook the runtime owns does not keep the runtime alive.
+    let (watch, watcher) = (Arc::downgrade(&rt), Arc::clone(&seen));
     let installed = rt.park_hook.set(Box::new(move |point| {
         if point == super::ParkPoint::RerunBack(NodeId(c.slot())) {
-            let rt = Arc::clone(&watch);
+            let rt = watch.upgrade().expect("the runtime parks its own hook");
             let state = std::thread::spawn(move || rt.nodes.get(c.slot()).state())
                 .join()
                 .unwrap();
