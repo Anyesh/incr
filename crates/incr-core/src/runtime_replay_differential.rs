@@ -6785,10 +6785,12 @@ fn high_range_clean_read_delivery_seeds() {
 /// cycle, op 1 the read with node 4, which op 0 left Failed, held failing.
 /// With every query replayable a bounded run closes op 3's cycle as the
 /// unbounded run does, and the split moves to op 4, whose bounded read
-/// gives the fresh Value(9999).
+/// gives the fresh Value(9999); main still splits op 3 in that mode, so
+/// op 4's split is this engine's, accepted under the same known
+/// limitation by the integrator's ruling of 26 Oct.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn stale_dep_split_seed_splits_as_on_main() {
+fn stale_dep_split_seed_keeps_its_known_split() {
     let case = gen_case(0x92_b175_80fc, false, false);
     let outs = |t: Trace| t.into_iter().map(|(out, _)| out).collect::<Vec<_>>();
     let cycle = || Out::Panic("cycle".to_owned());
