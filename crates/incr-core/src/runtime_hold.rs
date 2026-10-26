@@ -258,7 +258,8 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Opens the entry of a landing about to be held, before its writes,
-    /// so the undo record sees what they replace.
+    /// so the undo record sees what they replace; false if a waiter took
+    /// the claim, whose landing publishes at once.
     #[cold]
     #[inline(never)]
     pub(super) fn open_hold(
@@ -268,7 +269,7 @@ impl<C: Cells> Runtime<C> {
         first: bool,
         ctl: Option<&ComputeCtl>,
         bag: &mut Deferred<C>,
-    ) {
+    ) -> bool {
         let kept = ctl.and_then(hold::take_kept);
         let cell = state::cell_key::<C>(node.state_cell());
         let verified_at = Some(node.verified_at());
@@ -283,9 +284,12 @@ impl<C: Cells> Runtime<C> {
         ) {
             bag.push_erased(own);
         }
-        if hold::holds(cell) {
+        // Only an entry's publication or retraction clears the mark.
+        let held = hold::holds(cell);
+        if held {
             node.set_held_mark(true);
         }
+        held
     }
 
     /// [`Self::open_hold`] of a member of an episode held although a waiter
@@ -321,8 +325,7 @@ impl<C: Cells> Runtime<C> {
         wrote: bool,
         bag: &mut Deferred<C>,
     ) {
-        if !C::SINGLE_THREADED {
-            self.open_hold(id, node, first || wrote, None, bag);
+        if !C::SINGLE_THREADED && self.open_hold(id, node, first || wrote, None, bag) {
             self.dep_stack.raise_hold();
         }
     }
