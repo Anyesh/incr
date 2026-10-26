@@ -2328,3 +2328,45 @@ fn shared_group_leave_with_a_taken_claim_keeps_the_group() {
         "a claim left its group (record, IN_GROUP) for the untaken and the taken claim"
     );
 }
+
+/// x reads a, whose catch of its cycle with b is held until x's exit, then
+/// joins a child that reads a. The child must not wait on x's hold, which
+/// is raised where the cycle closes at every budget here: unbounded x gets
+/// a value, as on main (whose child gets a cycle error), and each budget
+/// gets the unbounded one.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_closure_that_reads_a_caught_cycle_joins_a_reader_of_its_catcher() {
+    let run = |frames: u32| {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+        let a = {
+            let bc = bc.clone();
+            rt.create_query_with(
+                move |rt: &Runtime<Shared>| rt.try_get(*bc.get().unwrap()).unwrap_or(7777),
+                replayable(),
+            )
+        };
+        let b = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(a) + 1, replayable());
+        bc.set(b).unwrap();
+        let x = rt.create_query_with(
+            move |rt: &Runtime<Shared>| {
+                let v = rt.get(a);
+                v + std::thread::scope(|s| s.spawn(|| rt.try_get(a).unwrap_or(-1)).join().unwrap())
+            },
+            replayable(),
+        );
+        rt.set_max_frames(frames);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = rt.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(catch_unwind(AssertUnwindSafe(|| reader.get(x))).ok());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
+    };
+    let unbounded = run(u32::MAX);
+    assert!(matches!(unbounded, Some(Some(_))), "{unbounded:?}");
+    for frames in [1, 2] {
+        assert_eq!(run(frames), unbounded, "budget {frames}");
+    }
+}
