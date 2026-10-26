@@ -2377,7 +2377,9 @@ moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
   27.27M over the same 321,960 calls (callgrind), 34.8 to 84.7
   instructions per call: the lookup's cost moved with the test binary's
   layout, not its count, and engine symbols net -4M. With the cfg(test)
-  code in, the same step lands at `61d37ff85` instead.
+  code in, the same step lands at `61d37ff85` instead. Same family as
+  `B7-clean-walk-fde-growth`, unwind cost through the walk that moves
+  with codegen.
 
 ## The replay context counts queued entries only once a reservation asks
 
