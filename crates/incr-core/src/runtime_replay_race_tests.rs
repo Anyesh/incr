@@ -4351,10 +4351,10 @@ fn a_ticket_held_again_keeps_a_node_a_regeneration_reruns() {
 
 /// x's walk runs `d` first, which panics "j=0" and lands Failed, and x then
 /// stops reading `d`, so the walk contains the panic for `d`'s landing.
-/// With `race`, the containment waits while a set of `j` flips `d` Dirty
-/// and another thread's read reruns it to a second panic, "j=2", landing
-/// Failed at the same generation; else the two run in the order `set_first`
-/// gives. Returns x, the other read's panic and a last read's panic.
+/// With `race`, the containment waits while a set of `j` and another
+/// thread's read of `d` start; the read waits for `d`'s held landing to
+/// publish, then reruns it to a second panic, "j=2"; else the two run in
+/// the order `set_first` gives. Returns x, the other read's panic and a last read's panic.
 fn late_contain_case(frames: Option<u32>, race: bool, set_first: bool) -> (u64, String, String) {
     let rt = Arc::new(Rt::new());
     rt.set_placeholder(0_u64);
@@ -4395,17 +4395,20 @@ fn late_contain_case(frames: Option<u32>, race: bool, set_first: bool) -> (u64, 
             spawn(move || rt.get(x))
         };
         gate.wait_parked();
+        // d's first landing is a user panic's, held to the end of A's
+        // attempt, so the other read waits for its publication.
         assert_eq!(
             rt.nodes.get(id(d).0).state(),
-            NodeState::Failed,
+            NodeState::Computing,
             "d's first landing"
         );
         let other = {
             let rt = Arc::clone(&rt);
-            spawn(move || rerun(&rt)).join()
+            spawn(move || rerun(&rt))
         };
         gate.release();
-        (a.join(), other)
+        let got_x = a.join();
+        (got_x, other.join())
     } else if set_first {
         let other = rerun(&rt);
         (rt.get(x), other)
