@@ -697,6 +697,9 @@ struct Eval {
     returned: Vec<(usize, u64)>,
     /// The reads, by index, whose target was an open run on this thread.
     closing: Vec<usize>,
+    /// Whether the run ended in a doomed frame, which read a placeholder,
+    /// lands nothing and runs again.
+    doomed: bool,
 }
 
 thread_local! {
@@ -728,10 +731,10 @@ fn record<R>(f: impl FnOnce() -> R) -> (R, Vec<Eval>) {
 }
 
 /// A closure run, open while it runs if the thread records.
-struct Running(bool);
+struct Running<'a, C: Cells>(bool, &'a Runtime<C>);
 
-impl Running {
-    fn start(node: (usize, usize), first: bool) -> Self {
+impl<'a, C: Cells> Running<'a, C> {
+    fn start(rt: &'a Runtime<C>, node: (usize, usize), first: bool) -> Self {
         let on = EVALS.with(|e| e.borrow().is_some());
         if on {
             OPEN.with(|o| {
@@ -744,10 +747,11 @@ impl Running {
                     caught: Vec::new(),
                     returned: Vec::new(),
                     closing: Vec::new(),
+                    doomed: false,
                 })
             });
         }
-        Running(on)
+        Running(on, rt)
     }
 
     fn returned(&self, v: u64) {
@@ -757,7 +761,7 @@ impl Running {
     }
 }
 
-impl Drop for Running {
+impl<C: Cells> Drop for Running<'_, C> {
     fn drop(&mut self) {
         if !self.0 {
             return;
@@ -766,6 +770,7 @@ impl Drop for Running {
             .with(|o| o.borrow_mut().pop())
             .expect("the run is open");
         e.end = EVAL_CLOCK.fetch_add(1, SeqCst);
+        e.doomed = self.1.computing_doomed();
         EVALS.with(|l| {
             if let Some(l) = l.borrow_mut().as_mut() {
                 l.push(e);
@@ -1029,7 +1034,7 @@ fn make<C: Cells>(world: &Arc<World<C>>, side: usize, i: usize, spec: &Spec, ran
                     at: i,
                     first,
                 };
-                let running = Running::start((side, i), node.first);
+                let running = Running::start(rt, (side, i), node.first);
                 let v = eval(&node, &expr);
                 running.returned(v);
                 v
@@ -3167,7 +3172,8 @@ fn seed_16d87_takes_no_speculative_memo() {
 /// 0x56cd8c2's read of held 8 goes past `cycle_read` only to resume its
 /// walk: each skip is a resume `clean_walk` then takes, so no read skips
 /// twice, and the resumed entry 9 still reads held 8 as the unbounded run
-/// does, a cycle unwind and then the in-cycle value.
+/// does, a cycle unwind and then the in-cycle value. A doomed run of 9,
+/// which reads 8's placeholder, lands nothing and is not compared.
 #[test]
 #[cfg_attr(miri, ignore)]
 fn resuming_past_a_held_root_skips_no_cycle_read() {
@@ -3181,7 +3187,7 @@ fn resuming_past_a_held_root_skips_no_cycle_read() {
             let (_, ran) = record(|| live.apply(op));
             reads = ran
                 .into_iter()
-                .filter(|e| e.node == (0, 9))
+                .filter(|e| e.node == (0, 9) && !e.doomed)
                 .map(|e| e.reads)
                 .collect();
         }
@@ -7217,6 +7223,7 @@ fn disagreements_count_one_run_and_one_revision() {
         caught: Vec::new(),
         returned: Vec::new(),
         closing,
+        doomed: false,
     };
     let read = |target, out| (0, target, true, out);
     let ops = vec![Op::Get(13), Op::Get(15), Op::Set(0, 1), Op::Get(2)];
@@ -7949,6 +7956,7 @@ fn history_failed_set(
             caught,
             returned,
             closing: Vec::new(),
+            doomed: false,
         };
         let value = ReadOut::Value;
         let mut evals = HashMap::from([

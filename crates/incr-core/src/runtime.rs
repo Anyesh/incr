@@ -5570,6 +5570,11 @@ impl<C: Cells> Runtime<C> {
     }
 
     #[cfg(not(loom))]
+    pub(crate) fn computing_doomed(&self) -> bool {
+        self.computing_flags() & cycle::DOOMED != 0
+    }
+
+    #[cfg(not(loom))]
     /// Give `member` installed edges to `extra` on top of its own, with
     /// the reverse edges, as an episode leaves a cycle's members. It
     /// installs without the member's claim, so no other thread may run.
