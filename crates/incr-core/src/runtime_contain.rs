@@ -578,27 +578,19 @@ impl<C: Cells> Runtime<C> {
 
     /// Before `id` lands Failed over `deps`. A set's walk stops at a Dirty
     /// dep, whose dependents the walk that made it Dirty flagged; a dep a
-    /// caught panic leaves Dirty, now or when a run open on this thread
-    /// (other than the released `co_members`, sorted) lands it, had no such
-    /// walk. The landing is noted under each such dep for the next walk that
-    /// reaches it, so it lasts its revision and not past the dep's next
-    /// change. Speculative landings are noted too: the take checks the node.
+    /// caught panic left Dirty had no such walk. The landing is noted under
+    /// each such dep for the next walk that reaches it, so it lasts its
+    /// revision and not past the dep's next change. A dep still Computing is
+    /// not noted: on this thread it is an open cycle head the landing belongs
+    /// to, and a flip there reruns the caught cycle on every read (0x1daa).
+    /// Speculative landings are noted too: the take checks the node.
     #[inline(always)]
-    pub(super) fn note_past_sets(
-        &self,
-        id: NodeId,
-        generation: u32,
-        deps: &[(NodeId, u32)],
-        co_members: &[u32],
-    ) {
-        let past = |&(dep, _): &(NodeId, u32)| match state::load::<C>(
-            self.nodes.get(dep.0).state_cell(),
-        ) {
-            NodeState::Dirty | NodeState::ComputingDirty => true,
-            NodeState::Computing => {
-                co_members.binary_search(&dep.0).is_err() && self.own_claim_owner(dep).is_some()
-            }
-            _ => false,
+    pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
+        let past = |&(dep, _): &(NodeId, u32)| {
+            matches!(
+                state::load::<C>(self.nodes.get(dep.0).state_cell()),
+                NodeState::Dirty | NodeState::ComputingDirty
+            )
         };
         if deps.iter().any(past) {
             self.note_past(id, generation, deps.iter().filter(|d| past(d)));

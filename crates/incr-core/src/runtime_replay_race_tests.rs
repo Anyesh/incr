@@ -3947,7 +3947,7 @@ fn noted_failed_landing() -> (Rt, Incr<u64>, Incr<u64>, Incr<u64>) {
     assert!(
         crate::state::try_transition::<Shared>(cell, NodeState::Clean, NodeState::Dirty).is_ok()
     );
-    rt.note_past_sets(id(x), x.generation(), &[(id(d), 0)], &[]);
+    rt.note_past_sets(id(x), x.generation(), &[(id(d), 0)]);
     assert!(rt.failed_past.load(SeqCst));
     (rt, i, d, x)
 }

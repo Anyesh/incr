@@ -8113,23 +8113,6 @@ fn a_failed_landing_stays_in_reach_of_sets() {
     });
 }
 
-/// Seed 0x264a: at op 4 spec 4 panics over spec 5, a cycle's head still
-/// open on the same thread, which then lands Dirty, so op 12's set of 19
-/// stopped at spec 5 and left specs 4 and 3 Failed.
-#[test]
-#[cfg_attr(miri, ignore)]
-fn a_failed_landing_over_an_open_cycle_head_stays_in_reach_of_sets() {
-    let seed = 0x264a;
-    let case = gen_case(seed, false, false);
-    assert!(matches!(case.ops[12], Op::Set(19, 0)));
-    quiet(|| {
-        differential::<Local>(&case, seed);
-        differential::<Shared>(&case, seed);
-        let trace = run::<Local>(&case, None, 0);
-        assert_eq!([3, 4].map(|x| trace[12].1 .0[x]), [NodeState::Dirty; 2]);
-    });
-}
-
 /// Seed 0x922f4fd7cf058ec: at budget 1, a walk's entry dooms with a
 /// repeat pending entry of its node beneath it. The replayed compute must
 /// not pop that repeat from the stashed walk: unbounded, the repeat

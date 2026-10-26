@@ -4735,7 +4735,7 @@ impl<C: Cells> Runtime<C> {
                 regenerable,
                 bag,
             );
-            self.note_past_sets(id, node.generation(), deps, co_members);
+            self.note_past_sets(id, node.generation(), deps);
         } else {
             self.unfailed_landing(id, node.generation(), attempt.cidx);
         }
