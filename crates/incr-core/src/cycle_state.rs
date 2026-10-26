@@ -1005,6 +1005,24 @@ pub(crate) fn settle_discard() -> bool {
     true
 }
 
+/// A waiter wounded this thread's attempt while it held landings and took
+/// one over (`hold::hand_over`): the thread is wounded, its run ends as
+/// the wound its entry retries from, and the claims its waiters met are
+/// taken. True if this set the wound's kind; inside a [`KeptUnwind`] only
+/// the kept unwind's catch may, and the entry's exit finds the wound.
+pub(crate) fn settle_hold() -> bool {
+    if wounded() {
+        return false;
+    }
+    crate::reserve::mark_taken();
+    set_wounded(true);
+    if flight_kept() {
+        return false;
+    }
+    value_code::set_unwind_bits(UnwindKind::bits(Some(UnwindKind::Wound)));
+    true
+}
+
 /// Where the engine raises a discard it caught again, past its own catch
 /// sites: in flight again until the next one settles it.
 pub(crate) fn reopen_discard() {

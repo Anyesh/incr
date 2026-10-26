@@ -376,8 +376,10 @@ impl<C: Cells> Runtime<C> {
             }
             match catch_unwind(AssertUnwindSafe(&mut *f)) {
                 Ok(r) => {
-                    if outermost && !C::SINGLE_THREADED && hold::active() {
-                        self.publish_held();
+                    if outermost && !C::SINGLE_THREADED && hold::active() && !self.publish_held() {
+                        cycle_state::settle_hold();
+                        self.retry_wounded(r);
+                        continue;
                     }
                     return Ok(r);
                 }
@@ -413,33 +415,16 @@ impl<C: Cells> Runtime<C> {
         // A wound wins over any kind: whatever unwound last, this
         // thread gave up its claims to an older one, and retries.
         if outermost && cycle_state::wounded() {
-            cycle_state::take_unwind_kind();
-            cycle_state::set_wounded(false);
-            drop(payload);
-            // The winner may wait on a held landing: nothing the attempt
-            // landed stays, in any order.
-            if !C::SINGLE_THREADED && hold::active() {
-                self.retract_held();
-            }
-            debug_assert!(
-                cycle_state::held_keys().is_empty(),
-                "incr-core: a wounded thread waits for its winner holding claims"
-            );
-            // Another runtime's contexts, which `drop_from` keeps, would keep
-            // their reservations while the winner waits on one of them.
-            end_replay();
-            debug_assert!(
-                reserve::none_held(),
-                "incr-core: a wounded thread waits for its winner holding reservations"
-            );
-            self.park(ParkPoint::WoundRetracted);
-            self.await_winner();
+            self.retry_wounded(payload);
             return None;
         }
         // Any other unwind out of the outermost entry ends the attempt as
-        // its read's outcome, which every landing it made is part of.
-        if outermost && !C::SINGLE_THREADED && hold::active() {
-            self.publish_held();
+        // its read's outcome, which every landing it made is part of,
+        // unless a waiter took one of them over first.
+        if outermost && !C::SINGLE_THREADED && hold::active() && !self.publish_held() {
+            cycle_state::settle_hold();
+            self.retry_wounded(payload);
+            return None;
         }
         match cycle_state::take_unwind_kind() {
             Some(UnwindKind::Cycle) => {
@@ -459,6 +444,33 @@ impl<C: Cells> Runtime<C> {
                 resume_unwind(payload);
             }
         }
+    }
+
+    /// The outermost entry's attempt was wounded: it drops what its run
+    /// returned or raised, gives back everything it holds and waits out
+    /// its winner's head start before it retries.
+    fn retry_wounded<P>(&self, run: P) {
+        cycle_state::take_unwind_kind();
+        cycle_state::set_wounded(false);
+        drop(run);
+        // The winner may wait on a held landing: nothing the attempt
+        // landed stays, in any order.
+        if !C::SINGLE_THREADED && hold::active() {
+            self.retract_held();
+        }
+        debug_assert!(
+            cycle_state::held_keys().is_empty(),
+            "incr-core: a wounded thread waits for its winner holding claims"
+        );
+        // Another runtime's contexts, which `drop_from` keeps, would keep
+        // their reservations while the winner waits on one of them.
+        end_replay();
+        debug_assert!(
+            reserve::none_held(),
+            "incr-core: a wounded thread waits for its winner holding reservations"
+        );
+        self.park(ParkPoint::WoundRetracted);
+        self.await_winner();
     }
 
     /// The head start of a wounded thread, which holds nothing now: until
@@ -538,13 +550,18 @@ impl<C: Cells> Runtime<C> {
                 .into_iter()
                 .filter(|&c| c != (self.runtime_id, on.0)),
         );
+        // An owner that holds `on`'s landing may be in user code that
+        // waits on this thread, through no claim the registry sees.
+        let mut patience = attempt::Patience::default();
         // A thread that holds nothing is no one's owner, so no waits-for
         // cycle can pass through it and it never needs a registration.
         if holds.is_empty() {
             let mut spins = waits::REGISTER_AFTER;
             while !done() {
-                spins += 1;
-                C::backoff(spins);
+                if !self.hand_over(on, &mut patience) {
+                    spins += 1;
+                    C::backoff(spins);
+                }
             }
             return;
         }
@@ -564,8 +581,10 @@ impl<C: Cells> Runtime<C> {
                 drop(reg);
                 self.raise_wound();
             }
-            spins += 1;
-            C::backoff(spins);
+            if !self.hand_over(on, &mut patience) {
+                spins += 1;
+                C::backoff(spins);
+            }
         }
     }
 
@@ -1891,6 +1910,13 @@ impl<C: Cells> Runtime<C> {
     pub(super) fn count_release(&self) {
         if !C::SINGLE_THREADED {
             cycle_state::own_episode(self.runtime_id, RELEASED);
+            C::u64_fetch_add(&self.episodes_landed, RELEASED);
+        }
+    }
+
+    /// [`Self::count_release`] of another thread's claims.
+    pub(super) fn count_foreign_release(&self) {
+        if !C::SINGLE_THREADED {
             C::u64_fetch_add(&self.episodes_landed, RELEASED);
         }
     }

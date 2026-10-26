@@ -5154,6 +5154,15 @@ impl<C: Cells> Runtime<C> {
         if ctl.has(cycle::HOLD) {
             self.dep_stack.raise_hold();
         }
+        // A holder's pop is engine progress, which restarts its waiters'
+        // patience; once one has taken a landing over, the pop raises the
+        // wound the attempt retries from.
+        if !C::SINGLE_THREADED && word & value_code::HELD_BIT != 0 {
+            crate::attempt::hold_progress();
+            if crate::attempt::hold_wounded() && cycle_state::settle_hold() {
+                *result = Err(Box::new(cycle::WoundUnwind));
+            }
+        }
         // A doomed run's pop is discarded and its retry pops in its place,
         // so it retires nothing the unbounded run keeps.
         let doomed = ctl.has(cycle::DOOMED);

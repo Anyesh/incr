@@ -19,8 +19,11 @@
 //! can reserve, however often it is doomed. A waiter that took
 //! a value the attempt landed sets [`PINNED`]; a take-over still wounds a
 //! pinned attempt, whose retry publishes its pinned landings as taken
-//! rather than retract a value another thread has returned. Bit 3 is kept
-//! for the owner's mark of an episode others can see.
+//! rather than retract a value another thread has returned. While the
+//! attempt holds landings (`crate::hold`), which other threads see as
+//! `Computing`, the owner raises [`HOLDING`]: it may sit in user code that
+//! waits on a reader of one, and a waiter that wounds it takes over the
+//! landing it waits on (`Runtime::hand_over`).
 
 #[cfg(not(loom))]
 use std::sync::{
@@ -44,6 +47,8 @@ pub(crate) const IN_FLIGHT: u32 = 1;
 pub(crate) const PINNED: u32 = 2;
 /// A waiter acted for the attempt: it retries from its entry.
 pub(crate) const WOUNDED: u32 = 4;
+/// The attempt holds landings: set and cleared by the owner only.
+pub(crate) const HOLDING: u32 = 8;
 const FLAGS: u32 = 15;
 const EPOCH: u32 = FLAGS + 1;
 
@@ -133,6 +138,38 @@ pub(crate) fn reopen_flight() {
     });
 }
 
+/// The owner opens a held landing: its attempt, now holding. Its flights
+/// count moves on with this and every [`hold_progress`], so a waiter's
+/// patience runs out only on a holder that makes no engine progress.
+pub(crate) fn enter_hold() -> Attempt {
+    MINE.with(|w| {
+        w.flights.fetch_add(1, Ordering::Relaxed);
+        let was = w.state.fetch_or(HOLDING, Ordering::AcqRel);
+        Attempt {
+            word: w.clone(),
+            epoch: was & !FLAGS,
+        }
+    })
+}
+
+/// The holding owner made engine progress: a waiter's patience restarts.
+pub(crate) fn hold_progress() {
+    MINE.with(|w| {
+        w.flights.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// The owner's held landings end: whether a waiter wounded the attempt
+/// while it held them.
+pub(crate) fn leave_hold() -> bool {
+    MINE.with(|w| w.state.fetch_and(!HOLDING, Ordering::AcqRel) & WOUNDED != 0)
+}
+
+/// Whether a waiter wounded this thread's attempt while it holds landings.
+pub(crate) fn hold_wounded() -> bool {
+    MINE.with(|w| w.state.load(Ordering::Acquire) & (HOLDING | WOUNDED) == HOLDING | WOUNDED)
+}
+
 /// The engine has caught this thread's discard: whether a waiter wounded
 /// the attempt while it was in flight.
 pub(crate) fn leave_flight() -> bool {
@@ -184,7 +221,7 @@ impl Attempt {
         if w & WOUNDED != 0 {
             return true;
         }
-        if w & IN_FLIGHT == 0 {
+        if w & (IN_FLIGHT | HOLDING) == 0 {
             patience.seen = None;
             return false;
         }
@@ -211,8 +248,9 @@ impl Attempt {
     }
 
     /// A waiter on this attempt, which met it at `claim`: wounds it if its
-    /// discard is in flight, pinned or not, since its owner may be in user
-    /// code that waits on the waiter. True if it is wounded now.
+    /// discard is in flight or it holds landings, pinned or not, since its
+    /// owner may be in user code that waits on the waiter. True if it is
+    /// wounded now.
     pub(crate) fn wound_in_flight(&self, claim: Claim) -> bool {
         let mut w = self.word.state.load(Ordering::Acquire);
         let mut listed = false;
@@ -223,7 +261,7 @@ impl Attempt {
             if w & WOUNDED != 0 {
                 return true;
             }
-            if w & IN_FLIGHT == 0 {
+            if w & (IN_FLIGHT | HOLDING) == 0 {
                 return false;
             }
             if !listed {

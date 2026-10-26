@@ -5,11 +5,29 @@
 //! end publishes every held landing, or a wound retracts them from their
 //! undo records. Everything here is cold: the hot paths reach it only
 //! behind [`active`] or an arm that already matched `Computing`.
+//!
+//! Each thread's set is shared through a process-wide list, so that a
+//! waiter on a held landing whose owner sits in user code (a join of a
+//! thread that reads it) can wound the owner's attempt and take the
+//! landing over ([`hand_over`]), as a take-over of a doom does.
 
 use std::any::Any;
-use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, Weak};
+
+#[cfg(not(loom))]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex,
+};
+
+#[cfg(loom)]
+use loom::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex,
+};
+
+use crate::attempt::{self, Attempt, Patience};
 
 use crate::cycle::{self, ComputeCtl};
 use crate::fx::FxBuildHasher;
@@ -19,6 +37,7 @@ use crate::runtime::{ChildLanding, GroupInfo};
 use crate::state::NodeState;
 use crate::trace::TraceAction;
 use crate::value_code;
+use crate::waits::Claim;
 
 /// What a node's first held landing in the attempt displaced, made once
 /// and kept through the node's later re-landings. A field left `None`
@@ -91,7 +110,16 @@ struct HoldSet {
     /// Runtimes with a replaced record not yet taken by [`take_recs`],
     /// so each frame of a wound's unwind finds none without a walk.
     recs: Vec<RuntimeId>,
+    /// The owner's attempt while the set has entries, for a waiter's
+    /// [`hand_over`].
+    attempt: Option<Attempt>,
 }
+
+// SAFETY: a set is reached from other threads only by `hand_over`, under
+// its lock. Its boxed values and records are those of `Shared` runtimes,
+// whose values are `Send + Sync` (holds are `Shared`-only), and the rest
+// is ids, states and trace actions.
+unsafe impl Send for HoldSet {}
 
 /// The record a cut took a claim it keeps out of, kept until the claim's
 /// held landing opens its entry, which takes it as its undo, or until the
@@ -118,18 +146,99 @@ impl HoldSet {
     }
 }
 
+type SharedSet = Arc<Mutex<HoldSet>>;
+
 #[cfg(not(loom))]
 thread_local! {
-    static HOLD: RefCell<HoldSet> = RefCell::new(HoldSet::default());
+    static HOLD: SharedSet = register();
 }
 
 #[cfg(loom)]
 loom::thread_local! {
-    static HOLD: RefCell<HoldSet> = RefCell::new(HoldSet::default());
+    static HOLD: SharedSet = register();
+}
+
+#[cfg(not(loom))]
+static SETS: Mutex<Vec<Weak<Mutex<HoldSet>>>> = Mutex::new(Vec::new());
+
+/// Sets with an owner's attempt in them: a waiter scans [`SETS`] only
+/// while one may hold its node.
+#[cfg(not(loom))]
+static HOLDERS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref SETS: Mutex<Vec<Weak<Mutex<HoldSet>>>> = Mutex::new(Vec::new());
+    static ref HOLDERS: AtomicUsize = AtomicUsize::new(0);
+}
+
+fn register() -> SharedSet {
+    let set = Arc::new(Mutex::new(HoldSet::default()));
+    let mut sets = SETS.lock().unwrap_or_else(PoisonError::into_inner);
+    sets.retain(|s| s.strong_count() != 0);
+    sets.push(Arc::downgrade(&set));
+    set
 }
 
 fn with<R>(f: impl FnOnce(&mut HoldSet) -> R) -> R {
-    HOLD.with(|h| f(&mut h.borrow_mut()))
+    HOLD.with(|h| f(&mut h.lock().unwrap_or_else(PoisonError::into_inner)))
+}
+
+impl HoldSet {
+    /// The set's first entry of the attempt marks the attempt holding.
+    fn enter_hold(&mut self) {
+        let mine = attempt::enter_hold();
+        if self.attempt.replace(mine).is_none() {
+            HOLDERS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The set has no entries left: its attempt holds nothing.
+    fn leave_hold(&mut self) {
+        if self.attempt.take().is_some() {
+            attempt::leave_hold();
+            HOLDERS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A waiter on the held landing of the node whose state cell is at `cell`,
+/// `claim`: if another thread holds it and has made no engine progress
+/// through `patience` of a take-over, its attempt is wounded and the entry
+/// handed to the waiter to retract. The wound and the take are under the
+/// owner's lock, as its publication's check of the wound is, so no entry
+/// is both published and taken. An entry the owner has claimed again is
+/// never taken: that is a claim wait.
+#[cold]
+#[inline(never)]
+pub(crate) fn hand_over(cell: usize, claim: Claim, patience: &mut Patience) -> Option<Held> {
+    if HOLDERS.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let mine = HOLD.with(Arc::as_ptr);
+    let sets: Vec<SharedSet> = SETS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter_map(Weak::upgrade)
+        .filter(|s| Arc::as_ptr(s) != mine)
+        .collect();
+    for set in sets {
+        let mut h = set.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(&at) = h.by_cell.get(&cell) else {
+            continue;
+        };
+        let e = h.entries[at].as_ref()?;
+        if e.reclaimed || (e.rt, e.slot) != claim {
+            return None;
+        }
+        if !h.attempt.as_ref()?.wound_if_stuck(claim, patience) {
+            return None;
+        }
+        h.by_cell.remove(&cell);
+        return h.entries[at].take();
+    }
+    None
 }
 
 /// Whether this thread holds any landing.
@@ -219,6 +328,9 @@ pub(crate) fn open(
     verified_at: Option<u64>,
     kept: Option<Option<Box<dyn Any>>>,
 ) -> Option<Box<dyn Any>> {
+    if crate::reserve::taken((rt, slot)) {
+        return kept.flatten();
+    }
     value_code::set_held_bit(true);
     with(|h| {
         if let Some(e) = h.get(cell) {
@@ -257,6 +369,7 @@ pub(crate) fn open(
             },
         }));
         h.by_cell.insert(cell, at);
+        h.enter_hold();
         None
     })
 }
@@ -336,6 +449,7 @@ pub(crate) fn land(cell: usize, target: NodeState, flagged: NodeState, unrun: bo
         e.flagged = flagged;
         e.unrun = unrun;
         e.reclaimed = false;
+        attempt::hold_progress();
         true
     })
 }
@@ -455,12 +569,16 @@ pub(crate) struct Taken {
     /// The records of cut claims whose landing opened no entry, which a
     /// retraction puts back and a publication leaves as the cut left them.
     pub(crate) cut_recs: Vec<(u32, Option<Arc<GroupInfo>>)>,
+    /// A waiter wounded the attempt, and may have taken entries the
+    /// landings read: they retract rather than publish.
+    pub(crate) wounded: bool,
 }
 
 /// Takes `rt`'s entries, with the episodes it landed, for publication or
 /// retraction, and clears its taint.
 pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
+        let wounded = h.attempt.as_ref().is_some_and(Attempt::wounded);
         let mut taken: Vec<Held> = Vec::new();
         for e in h.entries.iter_mut() {
             if e.as_ref().is_some_and(|e| e.rt == rt) {
@@ -468,6 +586,9 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
             }
         }
         h.by_cell.retain(|_, at| h.entries[*at].is_some());
+        if h.by_cell.is_empty() {
+            h.leave_hold();
+        }
         h.tainted.retain(|r| *r != rt);
         h.recs.retain(|r| *r != rt);
         let cut_recs = take_cut_recs(h, rt);
@@ -487,6 +608,7 @@ pub(crate) fn take(rt: RuntimeId) -> Taken {
             entries: taken,
             episodes,
             cut_recs,
+            wounded,
         }
     })
 }
