@@ -797,7 +797,8 @@ impl<C: Cells> Runtime<C> {
     /// so a Clean landing over a new dep not settled at publication lands
     /// Dirty, as does a Failed one over a new dep moved since its run, and
     /// so does every Clean landing that reads one lowered so,
-    /// transitively: the set's walk reached none of them.
+    /// transitively, while a Dirty one's memo is dropped, as the set's
+    /// flag would have done: the set's walk reached none of them.
     fn publication_targets(&self, entries: &[Held]) -> Vec<NodeState> {
         let mut targets: Vec<NodeState> = entries.iter().map(|e| e.target).collect();
         let mut held: Option<Targets> = None;
@@ -846,9 +847,17 @@ impl<C: Cells> Runtime<C> {
         }
         while let Some(j) = lowered.pop() {
             for &i in &readers[j] {
-                if targets[i] == NodeState::Clean {
-                    targets[i] = NodeState::Dirty;
-                    lowered.push(i);
+                let node = self.nodes.get(entries[i].slot);
+                match targets[i] {
+                    NodeState::Clean => {
+                        targets[i] = NodeState::Dirty;
+                        lowered.push(i);
+                    }
+                    NodeState::Dirty if node.keeps_memo() => {
+                        node.set_verified_at(0);
+                        lowered.push(i);
+                    }
+                    _ => {}
                 }
             }
         }
