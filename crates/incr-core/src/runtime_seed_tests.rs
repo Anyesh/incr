@@ -631,12 +631,6 @@ fn a_doomed_frame_sees_frame_doomed_and_reads_the_pending_handle<C: Cells>() {
         super::replay_tests::replayable(),
     );
     rt.get(q);
-    if !C::SINGLE_THREADED {
-        // A Shared doomed frame unwinds at the gate's placeholder read, so
-        // only the retry logs.
-        assert_eq!(*seen.lock().unwrap(), [(true, false, None)]);
-        return;
-    }
     assert_eq!(
         *seen.lock().unwrap(),
         [(false, true, Some(9)), (true, false, None)]

@@ -261,8 +261,8 @@ fn read_of_a_vframes_own_node<C: Cells>() {
     assert_eq!(rt.get(g.f), 7);
     assert_eq!(rt.state_of(g.c), NodeState::New);
     let runs = |g: &IfGraph| [F, CC, A, B].map(|i| g.runs.of(i));
-    // A Shared doomed frame unwinds at A's placeholder read, so C is never
-    // read before F lands.
+    // A Shared doomed frame raises its discard at its next read after A's
+    // placeholder, so C is never read before F lands.
     let c_runs = if C::SINGLE_THREADED { 1 } else { 0 };
     assert_eq!(runs(&g), [3, c_runs, 1, 1], "closure runs of F, C, A and B");
     assert_eq!(rt.get(g.c), 8);
@@ -476,8 +476,9 @@ fn taint_memo_owned_by_a_virtual_position<C: Cells>() {
     let (t, d, again, skips) = observe(None);
     assert_eq!(skips, 0);
     let (bt, bd, bagain, bskips) = observe(Some(1));
-    // A Shared doomed frame unwinds at its placeholder read, so the run
-    // that anchors a claim at a virtual frame is never made.
+    // A Shared doomed frame raises its discard at its next read past the
+    // placeholder, so the run that anchors a claim at a virtual frame is
+    // never made.
     if C::SINGLE_THREADED {
         assert!(
             bskips > 0,
@@ -608,8 +609,9 @@ fn walk_driven_discard_in_an_entry<C: Cells>() {
         (h, c, dooms),
         (Outcome::Value(66), NodeState::Clean, String::new())
     );
-    // A Shared doomed frame unwinds at M's placeholder read, so H's next
-    // run dooms on its own read of C, before N's doom and again after it.
+    // A Shared doomed frame raises its discard at its next read after M's
+    // placeholder, so H's next run dooms on its own read of C, before N's
+    // doom and again after it.
     let dooms = if C::SINGLE_THREADED { "MN" } else { "M?N?" };
     assert_eq!(
         observe(Some(1)),
@@ -1018,8 +1020,8 @@ fn speculative_chain_drops_without_unwinding<C: Cells>() {
     if C::SINGLE_THREADED {
         assert!(drops > 0, "no chain was dropped");
     } else {
-        // A Shared doomed frame unwinds at A's placeholder read, so F never
-        // reads S speculatively.
+        // A Shared doomed frame raises its discard at its next read after
+        // A's placeholder, so F never reads S speculatively.
         assert_eq!(drops, 0);
     }
 }

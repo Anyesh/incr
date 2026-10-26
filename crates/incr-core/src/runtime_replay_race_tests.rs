@@ -623,8 +623,8 @@ fn shared_walk_reaches_a_vframe_another_thread_waits_on() {
         spawn(move || rt.get(p))
     };
     entry.wait_parked();
-    // P's doomed run unwinds at A's placeholder read, so P runs again and
-    // dooms on c0 before c0's entry.
+    // P's doomed run raises its discard at its next read after A's
+    // placeholder, so P runs again and dooms on c0 before c0's entry.
     assert_eq!(s.p_runs.load(SeqCst), 2);
     let waits = s.rt.reservation_waits.load(SeqCst);
     let waiter = {
