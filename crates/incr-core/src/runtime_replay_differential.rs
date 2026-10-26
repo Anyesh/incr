@@ -10009,3 +10009,26 @@ fn seed_381_first_run_state() {
         differential::<Shared>(&case, 0x381);
     });
 }
+
+/// 0x1e6f4: a reader that reran after its retry took a delivered panic
+/// read the Failed node again under the record's key, and the record
+/// raised the panic where the unbounded run raises the plain failure. The
+/// byte window moves with codegen, so every width runs.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_rerun_reader_takes_no_spent_record_at_any_byte_width() {
+    let seed = 0x0001_e6f4;
+    let case = gen_case(seed, false, false);
+    quiet(|| {
+        let unbounded = run::<Shared>(&case, None, 0);
+        for bytes in (4 * 1024..=32 * 1024).step_by(512) {
+            let label = budget_label(seed, None, bytes);
+            compare(
+                &case,
+                &unbounded,
+                &run::<Shared>(&case, None, bytes),
+                &label,
+            );
+        }
+    });
+}
