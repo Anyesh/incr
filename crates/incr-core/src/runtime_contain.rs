@@ -614,17 +614,22 @@ impl<C: Cells> Runtime<C> {
     /// each such dep for the next walk that reaches it, so it lasts its
     /// revision and not past the dep's next change, except under `Shared`
     /// for a set whose walk passed the dep before the note was made. A dep
-    /// still Computing is not noted: on this thread it is an open cycle head
-    /// the landing belongs to, and a flip there reruns the caught cycle on
-    /// every read (0x1daa).
+    /// is judged as this thread sees it, so a landing it holds toward Dirty
+    /// is noted, and so is one a set flagged while held, which publishes
+    /// as flagged, not as its target. A dep still Computing is not noted: on
+    /// this thread it is an open cycle head the landing belongs to, and a
+    /// flip there reruns the caught cycle on every read (0x1daa).
     /// Speculative landings are noted too: the take checks the node.
     #[inline(always)]
     pub(super) fn note_past_sets(&self, id: NodeId, generation: u32, deps: &[(NodeId, u32)]) {
         let past = |&(dep, _): &(NodeId, u32)| {
-            matches!(
-                state::load::<C>(self.nodes.get(dep.0).state_cell()),
-                NodeState::Dirty | NodeState::ComputingDirty
-            )
+            let cell = self.nodes.get(dep.0).state_cell();
+            let raw = state::load::<C>(cell);
+            raw == NodeState::ComputingDirty
+                || matches!(
+                    self.seen_quietly(cell, raw),
+                    NodeState::Dirty | NodeState::ComputingDirty
+                )
         };
         if deps.iter().any(past) {
             self.note_past(id, generation, deps.iter().filter(|d| past(d)));
