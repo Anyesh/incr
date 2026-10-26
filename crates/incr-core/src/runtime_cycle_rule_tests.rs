@@ -1261,6 +1261,7 @@ pairs!(
     cross_runtime_read_records_nothing,
     foreign_reader_is_doomed_and_retried,
     foreign_ring_read_is_not_rerun,
+    foreign_caught_cycle_is_not_rerun,
 );
 
 /// A runtime that another runtime's closures read. Test-only: it outlives
@@ -2097,6 +2098,66 @@ fn foreign_ring_read_is_not_rerun<A: Cells, B: Cells>() {
     assert_eq!(run(u32::MAX), Ok(7777));
     for frames in [1, 2] {
         assert_eq!(run(frames), Ok(7777), "budget {frames}");
+    }
+}
+
+/// Seed 0x985b shrunk: a replayable reader of runtime A catches the cycle
+/// its `get` of runtime B's c closes (c and d read each other), then is
+/// doomed by a read past the budget. The retry takes the caught cycle the
+/// first read kept instead of computing c again, so c runs as often as in
+/// the unbounded run. The same holds when c catches the cycle and panics
+/// on its own, which unwinds with the cycle's kind, and when the reader
+/// reads c by `try_get`.
+fn foreign_caught_cycle_is_not_rerun<A: Cells, B: Cells>() {
+    let run = |frames: u32, own_panic: bool, try_get: bool| {
+        let r1 = Box::new(Runtime::<A>::new());
+        let r2 = Box::new(Runtime::<B>::new());
+        r1.set_max_frames(frames);
+        r1.set_placeholder(0_u64);
+        let runs = Arc::new(AtomicU32::new(0));
+        let d = cell::<u64>();
+        let c = {
+            let (runs, d) = (runs.clone(), d.clone());
+            r2.create_query(move |rt| {
+                runs.fetch_add(1, Ordering::Relaxed);
+                let d = *d.get().unwrap();
+                if own_panic {
+                    let _ = catch_unwind(AssertUnwindSafe(|| rt.get(d)));
+                    panic!("c gave up on its cycle");
+                }
+                rt.get(d)
+            })
+        };
+        d.set(r2.create_query(move |rt| rt.get(c))).unwrap();
+        let dep = r1.create_query(|_| 1_u64);
+        let reader = {
+            let r2 = OtherRt(&*r2);
+            r1.create_query_with(
+                move |rt| {
+                    let read = || {
+                        if try_get {
+                            r2.try_get(c).unwrap_or(9999)
+                        } else {
+                            r2.get(c)
+                        }
+                    };
+                    catch_unwind(AssertUnwindSafe(read)).unwrap_or(9999) + rt.get(dep)
+                },
+                QueryOpts {
+                    replay: Replay::Allowed,
+                    ..Default::default()
+                },
+            )
+        };
+        let value = r1.get(reader);
+        let doomed = !r1.dooms.lock().unwrap().is_empty();
+        (value, runs.load(Ordering::Relaxed), doomed)
+    };
+    for (own_panic, try_get) in [(false, false), (true, false), (false, true), (true, true)] {
+        let case = format!("own panic {own_panic}, try_get {try_get}");
+        let (value, runs, doomed) = run(u32::MAX, own_panic, try_get);
+        assert_eq!((value, doomed), (10000, false), "{case}");
+        assert_eq!(run(1, own_panic, try_get), (value, runs, true), "{case}");
     }
 }
 
