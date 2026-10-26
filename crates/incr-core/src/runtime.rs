@@ -636,7 +636,11 @@ const VISIT: u32 = u32::MAX;
 const VISIT_COMPUTING: u32 = u32::MAX - 1;
 
 /// `Entry::taint` of a pending entry no skipped dep has reached.
-const NO_TAINT: u32 = u32::MAX - 3;
+const NO_TAINT: u32 = u32::MAX - 4;
+
+/// `NO_TAINT` of the member a walk expanded its group at, in place of its
+/// own deps. Above `NO_TAINT`, as `NO_TAINT_NEW` is.
+const NO_TAINT_GROUP: u32 = u32::MAX - 3;
 
 /// `NO_TAINT` of a node the walk's visit found New. Above `NO_TAINT`, so
 /// a taint merged into it drops the mark; merging `NO_TAINT` is skipped.
@@ -649,6 +653,9 @@ enum Seen {
     Unwalked,
     Dirty,
     New,
+    /// The member a group expansion stood for: a plan that no longer holds
+    /// once the group is gone.
+    Group,
 }
 
 /// One entry of `ensure_clean`'s walk. A visit (`taint >= VISIT_COMPUTING`)
@@ -796,9 +803,14 @@ impl Walk {
 
     #[inline]
     fn visit(&mut self, id: NodeId, generation: u32, new: bool) {
+        self.visit_marked(id, generation, if new { NO_TAINT_NEW } else { NO_TAINT });
+    }
+
+    #[inline]
+    fn visit_marked(&mut self, id: NodeId, generation: u32, mark: u32) {
         self.push(Entry {
             id,
-            taint: if new { NO_TAINT_NEW } else { NO_TAINT },
+            taint: mark,
             generation,
         });
         self.first_visits += 1;
@@ -3635,6 +3647,8 @@ impl<C: Cells> Runtime<C> {
                     Seen::Unwalked
                 } else if taint == NO_TAINT_NEW || forced {
                     Seen::New
+                } else if taint == NO_TAINT_GROUP {
+                    Seen::Group
                 } else {
                     Seen::Dirty
                 };
@@ -4030,19 +4044,10 @@ impl<C: Cells> Runtime<C> {
     #[cold]
     #[inline(never)]
     fn expand_group(&self, cur: NodeId, walk: &mut Walk) -> bool {
-        let group = self.inner.read().member_recs.get(&cur.0).cloned();
-        let Some(group) = group else {
+        let generation = self.nodes.get(cur.0).generation();
+        let Some(group) = self.standing_group(cur, generation) else {
             return false;
         };
-        let generation = self.nodes.get(cur.0).generation();
-        if !group
-            .members
-            .iter()
-            .any(|&(m, g)| m == cur.0 && g == generation)
-            || cycle_state::is_dissolved_group(self.runtime_id, cur.0, &group)
-        {
-            return false;
-        }
         let groups = &mut walk.expanded.get_or_insert_with(Box::default).groups;
         if groups.iter().any(|g| Arc::ptr_eq(g, &group)) {
             return true;
@@ -4051,7 +4056,7 @@ impl<C: Cells> Runtime<C> {
         #[cfg(test)]
         self.expansions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        walk.visit(cur, generation, false);
+        walk.visit_marked(cur, generation, NO_TAINT_GROUP);
         for &(m, _) in &group.members {
             self.nodes.get(m).for_each_dep(|dep| {
                 if group
@@ -4072,6 +4077,18 @@ impl<C: Cells> Runtime<C> {
             });
         }
         true
+    }
+
+    /// The group record `id` is a member of at `generation`, unless a
+    /// landing took it out or this thread dissolved the group.
+    fn standing_group(&self, id: NodeId, generation: u32) -> Option<Arc<GroupInfo>> {
+        let group = self.inner.read().member_recs.get(&id.0).cloned()?;
+        (group
+            .members
+            .iter()
+            .any(|&(m, g)| m == id.0 && g == generation)
+            && !cycle_state::is_dissolved_group(self.runtime_id, id.0, &group))
+        .then_some(group)
     }
 
     /// A root the taint memo holds, computed without a walk. Out of line
@@ -4349,6 +4366,16 @@ impl<C: Cells> Runtime<C> {
                 }
             }
             if claimed_dirty && seen == Seen::New {
+                self.unclaim_unrun(node, claimed_dirty);
+                return Computed::Revisit;
+            }
+            // Another thread's landings can take the members out of the
+            // group the walk expanded here, after any wait the walk made,
+            // and the plan then never expanded the members' own deps.
+            if seen == Seen::Group
+                && (C::u8_load_relaxed(flags) & IN_GROUP == 0
+                    || self.standing_group(id, g).is_none())
+            {
                 self.unclaim_unrun(node, claimed_dirty);
                 return Computed::Revisit;
             }
