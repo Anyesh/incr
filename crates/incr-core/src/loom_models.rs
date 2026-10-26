@@ -2715,15 +2715,17 @@ impl HandOvers {
     }
 }
 
-/// A waiter's claim wait on the held landing of `CELL`, for as many checks
-/// as a stuck owner needs, under loom's `STUCK_AFTER`.
+/// A waiter's claim wait on the held landing of `HELD_CELL`: the check
+/// that sees the owner's flight, `STUCK_AFTER` more, and one spare for a
+/// flight the owner's progress restarts. No yield between checks: loom
+/// resumes a yielded waiter only by preempting a runnable owner, so with
+/// one the waiter could never outlast an owner that is not blocked.
 fn wait_to_hand_over(rt: crate::handle::RuntimeId) -> bool {
     let mut patience = crate::attempt::Patience::default();
     for _ in 0..4 {
         if crate::hold::hand_over(HELD_CELL, (rt, HELD_SLOT), &mut patience).is_some() {
             return true;
         }
-        thread::yield_now();
     }
     false
 }
@@ -2766,8 +2768,8 @@ fn hand_over_races_publication() {
 static RECLAIM_RACE: HandOvers = HandOvers::new();
 
 /// A waiter on a held landing races the owner claiming it again
-/// (`hold::reclaim`): an entry the owner computes again is never taken,
-/// and one taken is gone from the owner's view.
+/// (`hold::reclaim`): exactly one of them gets the entry, so one the owner
+/// computes again is never taken, and one taken is gone from its view.
 #[test]
 fn hand_over_races_reclaim() {
     run(|| {
@@ -2776,7 +2778,7 @@ fn hand_over_races_reclaim() {
         let waiter = thread::spawn(move || wait_to_hand_over(rt));
         let reclaimed = crate::hold::reclaim(HELD_CELL, NodeState::Clean);
         let handed = waiter.join().unwrap();
-        assert!(!(reclaimed && handed), "a reclaimed entry was taken");
+        assert_ne!(reclaimed, handed, "reclaimed {reclaimed}, taken {handed}");
         assert_eq!(crate::hold::holds(HELD_CELL), !handed);
         let taken = crate::hold::take(rt);
         assert_eq!(taken.wounded, handed);
