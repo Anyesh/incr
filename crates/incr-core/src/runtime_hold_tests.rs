@@ -794,3 +794,118 @@ fn local_reader_of_a_held_landing_holds_nothing_at_its_exit() {
     assert_eq!(got, b_rt.get(a) + b_rt.get(b) + b_rt.get(a) * 10);
     assert_eq!(LOCAL_RT.with(|l| l.get(r)), b_rt.get(a) * 10);
 }
+
+/// An observed node reads a cycle and then panics: under `Shared` its
+/// Failed landing is held to the end of `stabilize`'s entry, and the
+/// observer walk must take it as the node's error, as under `Local`, and
+/// go on to the next observer.
+fn stabilize_records_a_failure_that_read_a_cycle<C: Cells>() {
+    let rt = Runtime::<C>::new();
+    let (a, _) = two_cycle(&rt);
+    let failing = rt.create_query(move |rt| -> i64 {
+        let v = rt.get(a);
+        assert!(v < 0, "observed after the cycle");
+        v
+    });
+    let input = rt.create_input(1_i64);
+    let after = rt.create_query(move |rt| rt.get(input) + 1);
+    let fired = Arc::new(AtomicUsize::new(0));
+    rt.observe(failing, |_| {});
+    {
+        let fired = fired.clone();
+        rt.observe(after, move |_| {
+            fired.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    let stabilized = catch_unwind(AssertUnwindSafe(|| rt.stabilize()));
+    assert!(
+        stabilized.is_ok(),
+        "stabilize raised the observed node's panic"
+    );
+    assert_eq!(fired.load(Ordering::SeqCst), 1);
+    assert_eq!(rt.state_of(failing), NodeState::Failed);
+}
+
+#[test]
+fn local_stabilize_records_a_failure_that_read_a_cycle() {
+    stabilize_records_a_failure_that_read_a_cycle::<Local>();
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_stabilize_records_a_failure_that_read_a_cycle() {
+    stabilize_records_a_failure_that_read_a_cycle::<Shared>();
+}
+
+/// A payload no copy can stand for, so a retry regenerates it.
+struct HeldPayload(i64);
+
+fn replayable<T>() -> crate::cycle::QueryOpts<T> {
+    crate::cycle::QueryOpts {
+        replay: crate::cycle::Replay::Allowed,
+        ..Default::default()
+    }
+}
+
+/// r reads a cycle, then catches b, which reads the cycle's held member
+/// and panics with `HeldPayload`, then reads a chain past the budget. Under
+/// `Shared` b's Failed landing is held to the end of the read, and the
+/// retry's regeneration of b's payload must still give r what the
+/// unbounded run's read did.
+fn held_failed_regeneration_shape<C: Cells>(frames: u32, chain: u32) -> i64 {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(frames);
+    let (a, _) = two_cycle(&rt);
+    let i = rt.create_input(1_i64);
+    let b = rt.create_query_with(
+        move |rt: &Runtime<C>| -> i64 { std::panic::panic_any(HeldPayload(rt.get(a))) },
+        replayable(),
+    );
+    let mut deep = rt.create_query_with(move |rt| rt.get(i), replayable());
+    for _ in 0..chain {
+        let v = deep;
+        deep = rt.create_query_with(move |rt| rt.get(v) + 1, replayable());
+    }
+    let r = rt.create_query_with(
+        move |rt| {
+            let cycle = rt.get(a);
+            let saw = match catch_unwind(AssertUnwindSafe(|| rt.get(b))) {
+                Err(p) => p.downcast_ref::<HeldPayload>().map_or(2, |h| h.0),
+                Ok(_) => 3,
+            };
+            cycle * 1_000_000 + saw * 1000 + rt.get(deep)
+        },
+        replayable(),
+    );
+    rt.try_get(r).unwrap_or(7777)
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_held_failed_landing_regenerates_its_payload_as_unheld() {
+    for chain in [0, 2, 6] {
+        for local in [true, false] {
+            let shape = |frames| {
+                if local {
+                    held_failed_regeneration_shape::<Local>(frames, chain)
+                } else {
+                    held_failed_regeneration_shape::<Shared>(frames, chain)
+                }
+            };
+            let want = shape(u32::MAX);
+            assert_eq!(
+                want / 1_000_000,
+                want % 1_000_000 / 1000,
+                "b's payload carries a's value"
+            );
+            for frames in 1..9 {
+                assert_eq!(
+                    shape(frames),
+                    want,
+                    "local={local} chain={chain} frames={frames}"
+                );
+            }
+        }
+    }
+}
