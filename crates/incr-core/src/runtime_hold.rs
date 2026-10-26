@@ -497,7 +497,14 @@ impl<C: Cells> Runtime<C> {
         for action in e.trace {
             self.push_trace_now(id, action);
         }
-        self.land_now(id, node, target, e.flagged, e.unrun);
+        let landed = self.land_now(id, node, target, e.flagged, e.unrun);
+        // A set flagged the held Failed landing, as `land_failed` handles at
+        // an unheld one.
+        if target == NodeState::Failed && landed != NodeState::Failed {
+            let token = self.failed_run_token(e.slot, e.generation);
+            self.forget_failed_run_if(e.slot, e.generation, token);
+            self.left_failed_landing(id, u64::MAX, bag);
+        }
         if let Some(Some(own)) = e.undo.value {
             bag.push_erased(own);
         }
