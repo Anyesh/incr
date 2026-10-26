@@ -355,12 +355,8 @@ fn panic_in_a_speculative_entry<C: Cells>() {
     for nested in [false, true] {
         let quiet = speculative::<C>(Some(1), nested, false, false);
         assert_eq!(quiet.out, Out::Value(7), "nested: {nested}");
-        // A Shared doomed frame raises its discard at its next read
-        // after A's placeholder, so S's speculative entry is never
-        // pushed.
         assert_eq!(
-            quiet.panicking_runs,
-            u32::from(C::SINGLE_THREADED),
+            quiet.panicking_runs, 1,
             "the speculative entry ran, nested: {nested}"
         );
         for state in &quiet.states[1..] {
@@ -399,19 +395,6 @@ fn virtual_hit_then_panic_in_a_speculative_entry<C: Cells>() {
     assert_eq!(unbounded.out, Out::Value(7));
     let bounded = speculative::<C>(Some(1), true, false, true);
     assert_eq!(bounded.out, unbounded.out);
-    for state in &bounded.states[1..] {
-        assert!(
-            matches!(state, NodeState::New | NodeState::Dirty),
-            "a speculative node is {state:?}"
-        );
-    }
-    if !C::SINGLE_THREADED {
-        // A Shared doomed frame raises its discard at its next read
-        // after A's placeholder, so S's speculative entry is never
-        // pushed.
-        assert_eq!(bounded.panicking_runs, 0);
-        return;
-    }
     assert_eq!(bounded.panicking_runs, 1, "S2's run reached its panic");
     assert_eq!(
         bounded.back_read,
@@ -500,12 +483,7 @@ fn panic_in_a_speculative_entrys_continuation<C: Cells>() {
     };
     let (unbounded, unbounded_failures, _) = run(None);
     let (bounded, bounded_failures, panics) = run(Some(1));
-    // A Shared doomed frame raises its discard at its next read after
-    // A's placeholder, so F never reads Q and M's speculative run is
-    // never made.
-    if C::SINGLE_THREADED {
-        assert!(panics > 0, "M's continuation reached its panic");
-    }
+    assert!(panics > 0, "M's continuation reached its panic");
     assert_eq!(bounded, unbounded, "Q, P, M and H: state and deps");
     assert_eq!(bounded_failures, unbounded_failures, "failures counted");
 }
@@ -693,9 +671,6 @@ fn panicking_episode_in_a_speculative_entry<C: Cells>() {
         (Callback::Step, "step boom", false),
         (Callback::Drop, "drop boom", false),
     ] {
-        // A Shared doomed frame raises its discard at its next read past
-        // the placeholder, so S's speculative entry is never pushed.
-        let speculative = speculative && C::SINGLE_THREADED;
         let new_or_dirty = |states: &[NodeState]| {
             states
                 .iter()
