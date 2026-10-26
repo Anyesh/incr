@@ -5448,9 +5448,8 @@ impl<C: Cells> Runtime<C> {
                 deps,
                 &[],
                 Some(&*payload),
-                // A `HOLD` run's held Failed landing stays regenerable: the
-                // owner's rerun takes it back through the view.
-                !ctl.has(cycle::UNREGENERABLE),
+                !ctl.has(cycle::UNREGENERABLE)
+                    && (!ctl.has(cycle::HOLD) || self.held_reads_regenerable(deps)),
                 bag,
             );
             self.end_reservation(id, node);

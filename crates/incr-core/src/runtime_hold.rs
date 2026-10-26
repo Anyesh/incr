@@ -51,6 +51,24 @@ impl<C: Cells> Runtime<C> {
         }
     }
 
+    /// Whether a `HOLD` run that panicked over `deps` can run again to
+    /// regenerate its payload: its rerun takes a held Failed dep back
+    /// through the view, but a rerun's read of any other held landing, or
+    /// in a runtime a closed cycle or a retraction holds, would not read
+    /// what the run read.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn held_reads_regenerable(&self, deps: &[(NodeId, u32)]) -> bool {
+        if hold::closed(self.runtime_id) || hold::tainted(self.runtime_id) {
+            return false;
+        }
+        deps.iter().all(|&(d, _)| {
+            let cell = self.nodes.get(d.0).state_cell();
+            let key = state::cell_key::<C>(cell);
+            !hold::holds(key) || hold::peek(key, state::load::<C>(cell)) == Some(NodeState::Failed)
+        })
+    }
+
     /// A read of a held landing makes the reading frame's landing depend
     /// on it, so that landing is held too.
     #[cold]
