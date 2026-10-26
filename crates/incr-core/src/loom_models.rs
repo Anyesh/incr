@@ -54,9 +54,13 @@ fn silence_expected_panics() {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             // Outside a model, loom's thread-locals panic on access, and a
-            // panic in the hook aborts the process.
-            let expected =
-                IN_MODEL.with(Cell::get) && EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false);
+            // panic in the hook aborts the process. So do they while one of
+            // loom's own panics (a branch limit, a deadlock) holds its
+            // execution state borrowed, which would hide loom's message.
+            let in_loom = info.location().is_some_and(|l| l.file().contains("/loom-"));
+            let expected = !in_loom
+                && IN_MODEL.with(Cell::get)
+                && EXPECTING_UNWIND.try_with(Cell::get).unwrap_or(false);
             if !expected {
                 default(info);
             }
