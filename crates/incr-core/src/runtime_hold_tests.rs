@@ -2467,7 +2467,7 @@ fn caught_delivery_shape(
     let n2 = q(
         Box::new(move |rt| {
             let v = r(rt, 1, false);
-            if v % 7 == 0 {
+            if v.is_multiple_of(7) {
                 std::panic::panic_any(String::from("boom 2"));
             }
             let c = if even(v) { 0 } else { r(rt, 13, true) };
