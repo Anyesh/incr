@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{btree_map, BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -240,20 +240,27 @@ impl Log {
     }
 }
 
-/// A note's place: entry `idx` of log `log` of payload `key`'s group.
+/// A note's place: entry `idx` of log `log` of group `group`.
 #[derive(Clone, Copy)]
 struct At {
-    key: PayloadKey,
+    group: u64,
     log: u32,
     idx: u32,
 }
 
 /// The notes of one payload.
 struct Group {
+    /// Its id, for the places of its notes, which outlast its payload's
+    /// key when it is parked and goes back under another copy's key.
+    id: u64,
     logs: Vec<RuntimeLog>,
     /// The positions with a note, with the notes there, some of which may
     /// have gone since.
     levels: BTreeMap<u32, Level>,
+    /// The notes still noted, the sum of every level's `live`.
+    live: usize,
+    /// A read's ticket was noted in it.
+    lent: bool,
 }
 
 struct RuntimeLog {
@@ -300,6 +307,13 @@ pub(crate) struct Notes {
     live: usize,
     /// Bumped when a note goes, which voids every log's `renoted`.
     renote_gen: u64,
+    /// The groups [`Self::take`] took whole, each kept to go back as it was
+    /// when the copy it handed out is delivered at the place it was taken
+    /// from. `by_node` keeps their places meanwhile.
+    parked: Vec<Group>,
+    /// Each group's key by its id.
+    keys: BTreeMap<u64, PayloadKey>,
+    next_group: u64,
 }
 
 /// The copy a log's last [`Notes::note_copy`] noted, whose first `len`
@@ -323,6 +337,9 @@ impl Notes {
             by_node: BTreeMap::new(),
             live: 0,
             renote_gen: 0,
+            parked: Vec::new(),
+            keys: BTreeMap::new(),
+            next_group: 0,
         }
     }
 
@@ -363,6 +380,21 @@ impl Notes {
             base: from_base,
             cut,
         } = copy;
+        if let Some(i) = self
+            .parked
+            .iter()
+            .position(|g| Rc::ptr_eq(&g.logs[0].log, log))
+        {
+            let g = self.parked.swap_remove(i);
+            if (g.logs[0].rt, from_base) == (rt, base)
+                && cut.is_none()
+                && len == log.borrow().entries.len()
+                && !self.groups.contains_key(&key)
+            {
+                self.unpark(key, g, len, epoch, base);
+                return;
+            }
+        }
         let from = match &log.borrow().renoted {
             Some(r)
                 if (r.renote_gen, r.rt, r.key, r.base, r.from_base)
@@ -395,6 +427,27 @@ impl Notes {
         });
     }
 
+    /// Puts parked group `g` back under `key`, as noting again the copy of
+    /// its first `len` entries taken at removal `epoch` above `base` would.
+    fn unpark(&mut self, key: PayloadKey, g: Group, len: usize, epoch: u64, base: u32) {
+        note_work(1);
+        let (rt, top) = (g.logs[0].rt, g.top());
+        self.live += g.live;
+        self.keys.insert(g.id, key);
+        g.logs[0].log.borrow_mut().renoted = Some(Renoted {
+            renote_gen: self.renote_gen,
+            len,
+            epoch,
+            from_base: base,
+            rt,
+            key,
+            base,
+            cut: None,
+        });
+        self.groups.insert(key, g);
+        self.retop(key, None, top);
+    }
+
     /// Notes the ticket `members` stands for, which a read took with the
     /// payload of `key`, as its members so far.
     pub(crate) fn push_lent(
@@ -419,10 +472,23 @@ impl Notes {
     ) {
         note_work(1);
         let indexed = lent.is_none();
-        let g = self.groups.entry(key).or_insert_with(|| Group {
-            logs: Vec::new(),
-            levels: BTreeMap::new(),
-        });
+        let g = match self.groups.entry(key) {
+            btree_map::Entry::Occupied(g) => g.into_mut(),
+            btree_map::Entry::Vacant(v) => {
+                let id = self.next_group;
+                self.next_group += 1;
+                self.keys.insert(id, key);
+                v.insert(Group {
+                    id,
+                    logs: Vec::new(),
+                    levels: BTreeMap::new(),
+                    live: 0,
+                    lent: false,
+                })
+            }
+        };
+        g.live += 1;
+        g.lent |= !indexed;
         let old = g.top();
         let log = match g.logs.iter().position(|l| l.rt == rt) {
             Some(i) => i,
@@ -450,13 +516,13 @@ impl Notes {
         let level = g.levels.entry(cidx).or_default();
         level.live += 1;
         level.at.push((log, idx));
-        let new = g.top();
+        let (new, group) = (g.top(), g.id);
         self.retop(key, old, new);
         if indexed {
             self.by_node
                 .entry((rt, node))
                 .or_default()
-                .push(At { key, log, idx });
+                .push(At { group, log, idx });
         }
         self.live += 1;
     }
@@ -473,7 +539,9 @@ impl Notes {
     }
 
     fn removed(&mut self) {
-        if self.live == 0 {
+        // A parked group whose copy went can never go back.
+        self.parked.retain(|g| Rc::strong_count(&g.logs[0].log) > 1);
+        if self.live == 0 && self.parked.is_empty() {
             self.by_node.clear();
         }
     }
@@ -486,9 +554,18 @@ impl Notes {
         note_work(places.len());
         let removal = removal();
         for at in places {
-            let Some(g) = self.groups.get_mut(&at.key) else {
+            // A parked group's places are no longer all indexed, so it goes
+            // back only as its copy's notes.
+            if !self.parked.is_empty() {
+                self.parked.retain(|g| g.id != at.group);
+            }
+            let Some(&key) = self.keys.get(&at.group) else {
                 continue;
             };
+            let g = self
+                .groups
+                .get_mut(&key)
+                .expect("incr-core: a group's key is indexed");
             let Some(l) = g.logs.get(at.log as usize).filter(|l| l.rt == rt) else {
                 continue;
             };
@@ -503,16 +580,18 @@ impl Notes {
                 .get_mut(&cidx)
                 .expect("incr-core: a note's level is indexed");
             level.live -= 1;
+            g.live -= 1;
             if level.live == 0 {
                 g.levels.remove(&cidx);
             }
             let new = g.top();
             if new.is_none() {
-                self.groups.remove(&at.key);
+                self.groups.remove(&key);
+                self.keys.remove(&at.group);
             }
             self.live -= 1;
             self.renote_gen += 1;
-            self.retop(at.key, old, new);
+            self.retop(key, old, new);
         }
         self.removed();
     }
@@ -548,6 +627,7 @@ impl Notes {
         for (_, level) in gone {
             note_work(level.at.len());
             self.live -= level.live as usize;
+            g.live -= level.live as usize;
             self.renote_gen += 1;
             for (log, idx) in level.at {
                 let Some(e) = g.take(log, idx, removal) else {
@@ -561,9 +641,10 @@ impl Notes {
                 }
             }
         }
-        let new = g.top();
+        let (new, id) = (g.top(), g.id);
         if new.is_none() {
             self.groups.remove(&key);
+            self.keys.remove(&id);
         }
         self.retop(key, old, new);
         out
@@ -613,9 +694,9 @@ impl Notes {
 
     fn remove_group(&mut self, key: PayloadKey) -> Option<Group> {
         let g = self.groups.remove(&key)?;
-        let live: u32 = g.levels.values().map(|l| l.live).sum();
-        note_work(g.levels.len());
-        self.live -= live as usize;
+        self.keys.remove(&g.id);
+        note_work(1);
+        self.live -= g.live;
         self.renote_gen += 1;
         self.retop(key, g.top(), None);
         self.removed();
@@ -623,12 +704,24 @@ impl Notes {
     }
 
     /// Takes `key`'s notes, returning `rt`'s landings of them at their
-    /// depths above `base`.
+    /// depths above `base`. When they are all `rt`'s, no ticket among
+    /// them, and none below `base`, the group is parked and the copy
+    /// shares its log, so a delivery of the copy back at `base` puts the
+    /// group back instead of noting each landing again.
     pub(crate) fn take(&mut self, rt: RuntimeId, key: PayloadKey, base: u32) -> Landings {
         let epoch = epoch();
-        let Some(g) = self.remove_group(key) else {
+        let Some(mut g) = self.remove_group(key) else {
             return Landings::owned(Some(key), Vec::new());
         };
+        let whole = g.logs.len() == 1 && g.logs[0].rt == rt && !g.lent;
+        if whole && g.levels.first_key_value().is_some_and(|(&c, _)| c >= base) {
+            let top = g.top().expect("incr-core: a group holds a note");
+            let l = &mut g.logs[0];
+            l.copied = l.log.borrow().entries.len();
+            let copy = Landings::shared(Some(key), l.log.clone(), epoch, base, top);
+            self.parked.push(g);
+            return copy;
+        }
         let nodes = g
             .log(rt)
             .map(|l| {
