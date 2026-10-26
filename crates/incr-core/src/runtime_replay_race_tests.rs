@@ -3455,9 +3455,10 @@ fn retaken_a_first() -> (Outcome, Outcome, [NodeState; 2]) {
 /// budget 2: the retry of A's caught read takes the delivery for X's read
 /// of B, which lands X Dirty, and a retry doomed again takes it a second
 /// time. Parked between the two takes, at the driver's second entry for
-/// C, another thread reads X: X stays reserved through the first take's
-/// landing, so that read waits and lands nothing, and both reads end as
-/// in the unbounded run in which A's came first. X's closure is not
+/// C, another thread reads X: the first take's landing of X is held, and
+/// the owner is parked in engine code, not user code, so that read waits
+/// and lands nothing, and both reads end as in the unbounded run in which
+/// A's came first. X's closure is not
 /// switched here: a switch between the takes would make X's two landed
 /// runs disagree, which no serial order does.
 #[test]
@@ -3485,16 +3486,18 @@ fn shared_retaken_delivery_with_a_waiting_reader() {
         NodeState::Computing,
         "the first take holds X's landing"
     );
-    let waits = s.rt.reservation_waits.load(SeqCst);
     let other = {
         let (rt, x) = (s.rt.clone(), s.x);
         spawn(move || outcome(|| rt.get(x)))
     };
-    await_reservation_wait(&s.rt, waits);
+    // A reader that holds nothing never registers its wait.
+    let Err(other) = other.join_within(Duration::from_millis(200)) else {
+        panic!("the other thread's read of X did not wait for the held landing");
+    };
     assert_eq!(
         s.rt.state_of(s.x),
-        NodeState::Dirty,
-        "the other thread landed X under the reservation"
+        NodeState::Computing,
+        "the other thread landed X while its landing was held"
     );
     gate.release();
     let (a, x) = (reader.join(), other.join());
