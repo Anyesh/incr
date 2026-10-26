@@ -106,6 +106,56 @@ fn shared_delete_of_a_node_landed_earlier_in_the_read() {
     );
 }
 
+/// p reads a held cycle and then d, its first read of d, so p's edge on d
+/// waits for the read's exit. Another thread deletes d, which has no
+/// dependent yet, and recycles its slot before the exit publishes: p must
+/// not land Clean over the deleted value, nor leave an edge on the slot's
+/// new node.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_held_new_dep_deleted_and_recycled_before_the_exit() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let (a, _) = two_cycle(&*rt);
+    let d = rt.create_input(7_i64);
+    let p = rt.create_query(move |rt| rt.get(a) + rt.get(d));
+    let recycled: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let hook: super::ParkHook = {
+        let (weak, recycled) = (Arc::downgrade(&rt), recycled.clone());
+        let owner = std::thread::current().id();
+        Box::new(move |point| {
+            if point != super::ParkPoint::BeforeHeldPublish
+                || std::thread::current().id() != owner
+                || recycled.get().is_some()
+            {
+                return;
+            }
+            let rt = weak.upgrade().unwrap();
+            let node = std::thread::spawn(move || {
+                rt.delete_node(d);
+                rt.create_input(99_i64)
+            })
+            .join()
+            .unwrap();
+            recycled.set(node).unwrap();
+        })
+    };
+    assert!(rt.park_hook.set(hook).is_ok());
+    assert_eq!(rt.get(p), 107);
+    let recycled = *recycled.get().expect("the read published held landings");
+    assert_eq!(recycled.slot(), d.slot(), "the delete freed d's slot");
+    assert!(
+        !rt.has_reverse_edge(recycled, p),
+        "phantom edge on the recycled slot"
+    );
+    assert_ne!(
+        rt.state_of(p),
+        NodeState::Clean,
+        "p is Clean over a deleted dep"
+    );
+    assert!(rt.try_delete_node(recycled).is_ok());
+    rt.assert_invariant_i();
+}
+
 /// a (Fallback) and b read each other, counting their runs.
 fn counted_cycle<C: Cells>(rt: &Runtime<C>, runs: &Arc<AtomicUsize>) -> (Incr<i64>, Incr<i64>) {
     let bc: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
