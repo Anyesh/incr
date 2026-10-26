@@ -71,10 +71,9 @@ pub(crate) struct Held {
 struct HoldSet {
     by_cell: HashMap<usize, usize, FxBuildHasher>,
     entries: Vec<Option<Held>>,
-    /// Each runtime with held landings: where its entries are, as
-    /// `(entry, cell)` (some taken since), and how many are still held, so
-    /// a runtime's first entry and its exit touch only its own.
-    by_rt: Vec<(RuntimeId, Vec<(usize, usize)>, usize)>,
+    /// Each runtime with held landings, so a runtime's first entry and its
+    /// exit touch only its own.
+    by_rt: Vec<RtHolds>,
     seq: u64,
     /// A held node was read through the view since the last claim.
     consulted: bool,
@@ -98,6 +97,14 @@ struct HoldSet {
     /// Runtimes with a replaced record not yet taken by [`take_recs`],
     /// so each frame of a wound's unwind finds none without a walk.
     recs: Vec<RuntimeId>,
+}
+
+/// A runtime's held landings: where its entries are, as `(entry, cell)`
+/// (some taken since), and how many are still held.
+struct RtHolds {
+    rt: RuntimeId,
+    places: Vec<(usize, usize)>,
+    held: usize,
 }
 
 /// The record a cut took a claim it keeps out of, kept until the claim's
@@ -125,12 +132,16 @@ impl HoldSet {
     }
 
     fn added(&mut self, rt: RuntimeId, at: usize, cell: usize) {
-        match self.by_rt.iter_mut().find(|r| r.0 == rt) {
+        match self.by_rt.iter_mut().find(|r| r.rt == rt) {
             Some(r) => {
-                r.1.push((at, cell));
-                r.2 += 1;
+                r.places.push((at, cell));
+                r.held += 1;
             }
-            None => self.by_rt.push((rt, vec![(at, cell)], 1)),
+            None => self.by_rt.push(RtHolds {
+                rt,
+                places: vec![(at, cell)],
+                held: 1,
+            }),
         }
     }
 
@@ -138,10 +149,10 @@ impl HoldSet {
         let i = self
             .by_rt
             .iter()
-            .position(|r| r.0 == rt)
+            .position(|r| r.rt == rt)
             .expect("incr-core: a held landing's runtime is listed");
-        self.by_rt[i].2 -= 1;
-        if self.by_rt[i].2 == 0 {
+        self.by_rt[i].held -= 1;
+        if self.by_rt[i].held == 0 {
             self.by_rt.swap_remove(i);
         }
     }
@@ -504,8 +515,8 @@ pub(crate) struct Taken {
 pub(crate) fn take(rt: RuntimeId) -> Taken {
     with(|h| {
         let mut taken: Vec<Held> = Vec::new();
-        if let Some(i) = h.by_rt.iter().position(|r| r.0 == rt) {
-            let places = h.by_rt.swap_remove(i).1;
+        if let Some(i) = h.by_rt.iter().position(|r| r.rt == rt) {
+            let places = h.by_rt.swap_remove(i).places;
             visited(places.len());
             for (at, cell) in places {
                 if let Some(e) = h.entries[at].take() {
@@ -551,7 +562,7 @@ pub(crate) fn holds_runtime(rt: RuntimeId) -> bool {
                 || h.closed.contains(&rt)
                 || {
                     visited(h.by_rt.len());
-                    h.by_rt.iter().any(|r| r.0 == rt)
+                    h.by_rt.iter().any(|r| r.rt == rt)
                 }
                 || h.cut_recs.iter().any(|c| c.rt == rt)
         })
