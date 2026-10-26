@@ -4096,7 +4096,7 @@ fn noted_over(rt: &Rt) -> (Incr<u64>, Incr<u64>, Incr<u64>) {
 }
 
 /// x first reads c Clean. Once m is set, c's rerun reads the held episode
-/// of the cycle a-b and catches the self-cycle s, so c lands held toward
+/// of the cycle a-b and catches the panic of p, so c lands held toward
 /// Dirty, and x's rerun panics: x lands Failed over its old dep c while c
 /// still reads Computing to every other look. The landing is noted under
 /// c, so the set of i, whose walk stops at the published Dirty c, still
@@ -4116,18 +4116,13 @@ fn a_failed_landing_over_a_held_dirty_dep_is_noted() {
     };
     bc.set(rt.create_query(move |rt: &Rt| rt.get(a) * 2))
         .unwrap();
-    let sc: Arc<OnceLock<Incr<u64>>> = Arc::default();
-    let s = {
-        let sc = sc.clone();
-        rt.create_query(move |rt: &Rt| rt.get(*sc.get().unwrap()))
-    };
-    sc.set(s).unwrap();
+    let p = rt.create_query(|_: &Rt| -> u64 { std::panic::panic_any(Custom(0)) });
     let c = rt.create_query(move |rt: &Rt| {
         if rt.get(m) == 0 {
             return rt.get(i);
         }
         rt.get(a);
-        rt.get(i) + rt.try_get(s).unwrap_or(0)
+        rt.get(i) + catch_unwind(AssertUnwindSafe(|| rt.get(p))).unwrap_or(0)
     });
     let seen: Arc<Mutex<Option<(NodeState, NodeState)>>> = Arc::default();
     let x = {
