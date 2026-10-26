@@ -154,7 +154,7 @@ impl BudgetEntry {
     /// inside `unbudgeted`, so the lock orders racing setters whole.
     fn note(&self, unbudgeted: impl FnOnce() -> bool) {
         #[cfg(test)]
-        if let Some(hook) = NOTE_DECIDED.with(std::cell::Cell::take) {
+        if let Some(hook) = NOTE_DECIDED.try_with(std::cell::Cell::take).ok().flatten() {
             hook();
         }
         let mut list = UNBUDGETED
