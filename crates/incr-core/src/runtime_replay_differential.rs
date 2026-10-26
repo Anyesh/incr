@@ -9122,6 +9122,21 @@ fn a_replan_keeps_the_plan_above_an_entry_its_own_walk_settled() {
     });
 }
 
+/// As above with thread 0's op reading 20 itself, so the walk a release
+/// sends back is its read's outermost one, and the read enters again
+/// before the walk goes on.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_outermost_replan_keeps_the_plan_above_an_entry_its_own_walk_settled() {
+    let seed = 0x34ec3;
+    let mut case = gen_case(seed, true, true);
+    case.ops[10] = Op::TryGet(20);
+    use NodeState::Clean;
+    quiet(|| {
+        hold_planned_walk(&case, seed, [10, 11], 20, &[(1, Clean), (2, Clean)]);
+    });
+}
+
 /// 0x7c3a1173e's ops 2 (`Get(4)`, thread 0) and 3 (`Get(11)`, thread 1)
 /// enter the cycle 4, 5, 6, 7, 8, 9, 11, 12 at different members. Thread
 /// 0 plans its read while 4 is New and is held at its claim until thread
