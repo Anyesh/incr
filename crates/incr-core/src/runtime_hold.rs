@@ -135,6 +135,11 @@ impl<C: Cells> Runtime<C> {
             // trust: Dirty and never verified, so another reader runs it
             // again. One with an entry still lands into it.
             if reserve::taken((self.runtime_id, id.0)) {
+                reserve::note_taken_landing(
+                    (self.runtime_id, id.0),
+                    node.generation(),
+                    target == NodeState::Cyclic,
+                );
                 if !matches!(
                     target,
                     NodeState::Clean | NodeState::Failed | NodeState::Cyclic
@@ -142,9 +147,6 @@ impl<C: Cells> Runtime<C> {
                     return None;
                 }
                 node.set_verified_at(0);
-                if target == NodeState::Cyclic {
-                    reserve::note_taken_cyclic((self.runtime_id, id.0), node.generation());
-                }
                 return Some(self.land_now(id, node, NodeState::Dirty, NodeState::Dirty, unrun));
             }
             if !hold::consulted() && !hold::cut_kept(self.runtime_id, id.0) {

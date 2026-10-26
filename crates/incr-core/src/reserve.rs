@@ -140,7 +140,7 @@ thread_local! {
     /// never doom again before its outermost entry exits.
     static TAKEN: RefCell<Vec<Claim>> = const { RefCell::new(Vec::new()) };
     /// Taken claims this thread landed for a Cyclic outcome, at their
-    /// generations: published Dirty, with no value to read back.
+    /// generations, not read since: published Dirty, with no value.
     static TAKEN_CYCLIC: RefCell<Vec<(Claim, u32)>> = const { RefCell::new(Vec::new()) };
     static MINE: Listed = const { Listed(RefCell::new(Vec::new())) };
     static SCOPE: Cell<Option<u64>> = const { Cell::new(None) };
@@ -599,17 +599,28 @@ fn taken_slow(claim: Claim) -> bool {
     TAKEN.with(|t| t.borrow().contains(&claim))
 }
 
-/// A taken `claim` at `generation` landed for a Cyclic outcome, which
-/// this thread's read of it gives until its outermost entry exits.
-pub(crate) fn note_taken_cyclic(claim: Claim, generation: u32) {
-    TAKEN_CYCLIC.with(|t| t.borrow_mut().push((claim, generation)));
+/// This thread landed taken `claim` at `generation`, for a Cyclic outcome
+/// if `cyclic`: the next read of it on this thread, and only that one,
+/// gives that cycle, so no later landing by any thread is read as it.
+pub(crate) fn note_taken_landing(claim: Claim, generation: u32, cyclic: bool) {
+    TAKEN_CYCLIC.with(|t| {
+        let mut t = t.borrow_mut();
+        t.retain(|&(c, _)| c != claim);
+        if cyclic {
+            t.push((claim, generation));
+        }
+    });
 }
 
-/// Whether this thread landed taken `claim` at `generation` for a Cyclic
-/// outcome in its outermost entry.
-pub(crate) fn taken_cyclic(claim: Claim, generation: u32) -> bool {
+/// Whether this thread's last landing of taken `claim` at `generation`
+/// was for a Cyclic outcome not read since; the read takes it.
+pub(crate) fn take_taken_cyclic(claim: Claim, generation: u32) -> bool {
     crate::cycle_state::any_taken()
-        && TAKEN_CYCLIC.with(|t| t.borrow().contains(&(claim, generation)))
+        && TAKEN_CYCLIC.with(|t| {
+            let mut t = t.borrow_mut();
+            let at = t.iter().position(|&n| n == (claim, generation));
+            at.map(|at| t.swap_remove(at)).is_some()
+        })
 }
 
 #[cfg(all(test, not(loom)))]

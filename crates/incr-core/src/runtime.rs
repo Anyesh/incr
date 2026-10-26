@@ -2809,10 +2809,10 @@ impl<C: Cells> Runtime<C> {
         }
         // This thread's own landing of a taken claim for a Cyclic outcome
         // is Dirty to every reader, but walking it again would land it so
-        // again, for good: its own read takes the cycle it landed.
+        // again, for good: its next read takes the cycle it landed.
         let own_cyclic = || {
             !C::SINGLE_THREADED
-                && reserve::taken_cyclic((self.runtime_id, handle.slot()), handle.generation())
+                && reserve::take_taken_cyclic((self.runtime_id, handle.slot()), handle.generation())
         };
         if matches!(state, NodeState::Cyclic | NodeState::New)
             || (state == NodeState::Dirty && own_cyclic())
