@@ -4388,10 +4388,13 @@ impl<C: Cells> Runtime<C> {
             self.unwind_out_of(id, boundary, kind, payload);
         }
         cycle_state::take_unwind_kind();
+        // The reader below read `node`, an episode's root when a member
+        // panicked, so it is classed by what `node` landed, as a live
+        // unwind's reader is (`unwound_poison`).
         let poison = if continuation && self.episode_member(node) {
             0
         } else {
-            self.failed_poison(kind, v.node)
+            self.failed_poison(kind, node)
         };
         let replaced = replay::with(|c| match c.iter_mut().find(|x| x.id == id) {
             Some(x) => x.deliver_unwind(

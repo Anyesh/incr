@@ -9835,6 +9835,63 @@ fn a_dissolved_roots_rerun_at_the_bottom_walks_its_reads_again() {
     });
 }
 
+/// Seed 0x12376's op 2, `TryGet(8)`, shrunk: 12 roots an episode whose
+/// member 10 panics and lands Failed, and at a budget of 1 the episode runs
+/// from 12's virtual frame, so its unwind reaches 9's read of 12 there.
+/// 12 is released, not Failed, so 9 has caught a dep that did not land, as
+/// the unbounded run's unwind out of 12 tells it. Classing the read by the
+/// member that panicked made it a held outcome: 9 and then 8 kept memos of
+/// 9999 for the revision where the unbounded run reruns 9 and finds the
+/// cycle through 7 and 8.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_episode_roots_unwind_poisons_its_reader_as_the_root_landed() {
+    let read = |n| Box::new(Expr::Read(n, false));
+    let try_read = |n| Box::new(Expr::Read(n, true));
+    let mut specs: Vec<Spec> = (0..15)
+        .map(|_| replayable(Expr::Const(0), Strat::None))
+        .collect();
+    specs[6] = replayable(
+        Expr::Add(read(10), try_read(7)),
+        Strat::Fixpoint {
+            initial: 0,
+            limit: 2,
+        },
+    );
+    specs[7] = replayable(Expr::Read(8, false), Strat::None);
+    specs[8] = replayable(
+        Expr::If(read(9), Box::new(Expr::Const(0)), read(9)),
+        Strat::None,
+    );
+    specs[9] = replayable(Expr::Catch(try_read(12)), Strat::None);
+    specs[10] = replayable(
+        Expr::PanicIf(Box::new(Expr::Add(try_read(11), try_read(11))), 4),
+        Strat::Fallback(4),
+    );
+    specs[11] = replayable(Expr::Read(12, true), Strat::None);
+    specs[12] = replayable(
+        Expr::Add(
+            Box::new(Expr::Add(try_read(6), Box::new(Expr::Const(1)))),
+            Box::new(Expr::Const(1)),
+        ),
+        Strat::None,
+    );
+    specs.push(Spec::Input(0));
+    let case = Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 15,
+        specs2: Vec::new(),
+        queries2: 0,
+        ops: vec![Op::TryGet(8)],
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x12376);
+        differential::<Shared>(&case, 0x12376);
+    });
+}
+
 /// Seed 0x381 with `FirstRun` on its Native queries, shrunk by
 /// `replay_shrink`: at budget 3, query 0 stayed New where the unbounded run
 /// computes it, because 18's Clean read of 19 skipped the walk a doom had
