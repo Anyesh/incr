@@ -4403,8 +4403,9 @@ impl<C: Cells> Runtime<C> {
     /// a read just took Dirty, a replay landing just left Dirty, or a
     /// virtual frame's pop just left to the retry below it, unless this
     /// thread still owes the node's run from here: its frame is on the
-    /// stack, it holds the claim, or a context stacks its virtual frame or
-    /// has an entry of it yet to run. A retry below that reads the node
+    /// stack, it holds the claim, or a context stacks its virtual frame,
+    /// has an entry of it yet to run, or holds an outcome for a frame of it
+    /// that a retry is yet to land. A retry below that reads the node
     /// again owes nothing: it first runs again what precedes that read,
     /// and a reservation kept through that would make another thread's
     /// read of the node, joined there, wait on a run not yet begun. Takes
@@ -4420,8 +4421,12 @@ impl<C: Cells> Runtime<C> {
             return;
         }
         let owed = replay::with(|c| {
-            c.iter()
-                .any(|x| x.rt == rt && (x.stacks(slot, generation) || x.queues(slot, generation)))
+            c.iter().any(|x| {
+                x.rt == rt
+                    && (x.stacks(slot, generation)
+                        || x.queues(slot, generation)
+                        || x.pending.owes_outcome(slot, generation))
+            })
         });
         if !owed {
             reserve::end_landed((rt, slot), generation);
