@@ -543,11 +543,12 @@ impl<C: Cells> Runtime<C> {
             self.count_release();
         }
         let mut bag = Deferred::new();
-        let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
+        let targets = self.publication_targets(&entries);
         let mut rest = entries.into_iter();
         let published = catch_unwind(AssertUnwindSafe(|| {
             for e in rest.by_ref() {
-                self.publish_one(e, &held, &mut bag);
+                let target = targets[&e.slot];
+                self.publish_one(e, target, &mut bag);
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
@@ -599,27 +600,61 @@ impl<C: Cells> Runtime<C> {
         true
     }
 
-    fn publish_one(&self, e: Held, held: &Targets, bag: &mut Deferred<C>) {
+    /// What each held landing publishes as. A set after the read could
+    /// not reach a node through an edge that waited until now, so a Clean
+    /// landing over a new dep not settled at publication lands Dirty, and
+    /// so does every Clean landing that reads one lowered so, transitively:
+    /// the set's walk reached none of them.
+    fn publication_targets(&self, entries: &[Held]) -> Targets {
+        let held: Targets = entries.iter().map(|e| (e.slot, e.target)).collect();
+        let at: HashMap<u32, usize, FxBuildHasher> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.slot, i))
+            .collect();
+        let mut readers: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+        let mut lowered: Vec<usize> = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            let node = self.nodes.get(e.slot);
+            // A Clean landing's verified_at is the revision it read at.
+            let rev = node.verified_at();
+            let mut unsettled = false;
+            node.for_each_dep(|d| {
+                if let Some(&j) = at.get(&d.0) {
+                    readers[j].push(i);
+                }
+                if let Some(old) = &e.undo.deps {
+                    unsettled |= e.target == NodeState::Clean
+                        && !old.iter().any(|(o, _)| *o == d)
+                        && !self.settled_at_publication(d, &held, rev);
+                }
+            });
+            if unsettled {
+                lowered.push(i);
+            }
+        }
+        let mut targets = held;
+        for &i in &lowered {
+            targets.insert(entries[i].slot, NodeState::Dirty);
+        }
+        while let Some(j) = lowered.pop() {
+            for &i in &readers[j] {
+                let t = targets
+                    .get_mut(&entries[i].slot)
+                    .expect("a held entry has a target");
+                if *t == NodeState::Clean {
+                    *t = NodeState::Dirty;
+                    lowered.push(i);
+                }
+            }
+        }
+        targets
+    }
+
+    fn publish_one(&self, e: Held, target: NodeState, bag: &mut Deferred<C>) {
         let id = NodeId(e.slot);
         let node = self.nodes.get(e.slot);
         debug_assert_eq!(node.generation(), e.generation);
-        let mut target = e.target;
-        if let Some(old) = &e.undo.deps {
-            let mut new: Vec<NodeId> = Vec::new();
-            node.for_each_dep(|d| new.push(d));
-            let was = |d: &NodeId| old.iter().any(|(o, _)| o == d);
-            // A set after the read could not reach the node through an edge
-            // that waited until now. A Clean landing's verified_at is the
-            // revision it read at.
-            let rev = node.verified_at();
-            if target == NodeState::Clean
-                && new
-                    .iter()
-                    .any(|d| !was(d) && !self.settled_at_publication(*d, held, rev))
-            {
-                target = NodeState::Dirty;
-            }
-        }
         // The node lands whatever its children's landing does.
         let children = e.children.map(|(landing, opened)| {
             let landing = match landing {
