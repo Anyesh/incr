@@ -835,8 +835,9 @@ impl<K: TableKey, T: Value, C: Cells, S: BuildHasher> NodeTable<K, T, C, S> {
         }
     }
 
-    /// Refuses a lookup inside a compute of the table's runtime; inside
-    /// another runtime's compute, see `DepStack::unrecorded_lookup`.
+    /// Marks the lookup on the running compute (see
+    /// `DepStack::unrecorded_lookup`) and refuses it inside a compute of
+    /// the table's runtime.
     fn refuse_own_compute_lookup(&self, rt: &Runtime<C>, call: &str) {
         assert!(
             rt.dep_stack.unrecorded_lookup() != Some(rt.runtime_id),
