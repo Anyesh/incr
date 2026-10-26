@@ -207,7 +207,7 @@ impl<C: Cells> Runtime<C> {
     /// [`Self::claim_single`] of a node this thread holds: claimed `Dead`
     /// as `Local` claims its landing, and taken out of the hold.
     #[inline(always)]
-    pub(super) fn claim_held_dead(&self, handle: ErasedIncr) -> Option<SingleClaim> {
+    pub(super) fn claim_held_dead(&self, handle: ErasedIncr) -> Option<SingleClaim<'_>> {
         if C::SINGLE_THREADED || !hold::active() {
             return None;
         }
@@ -216,12 +216,12 @@ impl<C: Cells> Runtime<C> {
 
     #[cold]
     #[inline(never)]
-    fn claim_held_dead_cold(&self, handle: ErasedIncr) -> Option<SingleClaim> {
+    fn claim_held_dead_cold(&self, handle: ErasedIncr) -> Option<SingleClaim<'_>> {
         let slot = handle.slot();
         let node = self.nodes.get(slot);
         let cell = state::cell_key::<C>(node.state_cell());
         hold::view(cell)?;
-        {
+        let change = {
             let inner = self.inner.read();
             if node.generation() != handle.generation() {
                 return Some(SingleClaim::Gone);
@@ -241,7 +241,9 @@ impl<C: Cells> Runtime<C> {
             )
             .is_err()
             {}
-        }
+            // Under the hold, as `claim_single` takes it.
+            self.counted_change()
+        };
         let held = hold::forget(cell).expect("incr-core: a viewed landing has its entry");
         if let Some(old) = &held.undo.deps {
             let mut now: Vec<NodeId> = Vec::new();
@@ -263,7 +265,7 @@ impl<C: Cells> Runtime<C> {
             bag.push_erased(old);
         }
         bag.drain(self);
-        Some(SingleClaim::Claimed)
+        Some(SingleClaim::Claimed(change))
     }
 
     /// The attempt ended without a wound: every held landing lands, in
