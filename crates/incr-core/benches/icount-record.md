@@ -2365,3 +2365,51 @@ moved since its last check. Base `096fb59d6`, tip `285b26d31`, same box,
   and over the 1 % bar on `shared_incremental`; `285b26d31` inlines it.
 - Local pays nothing: the checks are compiled out, `chain_local` is 82
   per op below base, from layout.
+
+## The replay context counts queued entries only once a reservation asks
+
+`w/T10-queued-scan` (tip `90bb837e`, on `c87e7bd4`) stops counting every
+entry a replay context queues: the count map is built when a `Shared`
+reservation's end first asks `Context::queues`, and kept in step only from
+then on, by cold out-of-line updates. Local contexts never build it. Hard
+gates by `icount.sh` on this box, `65ce8fa5` against `c87e7bd4`:
+`get_clean_local` 100, `get_clean_shared` 193, `table_hit_local` 155.14,
+`table_hit_shared` 218.14 and `value_slot_read_shared` 87 on both, exact.
+Scale icount by `gh-scale-icount.sh c87e7bd4b 90bb837e6` (gh-cmd
+`90bb837e-d51efe`, all 58 rows ran), ratios tip over base:
+
+| workload | ratio |
+|---|---|
+| `local_taint_100k_at_budget_1_on_a_1_mib_thread` | 0.9884 |
+| `local_doom_under_stabilize` | 0.9911 |
+| `local_fallback_cycle_100k_at_budget_1` | 0.9949 |
+| `local_panicking_chain_paths_stay_linear_at_budget_1` | 1.0037 |
+| `local_taint_100k_at_budget_256_on_a_1_mib_thread` | 1.0008 |
+| `shared_doom_under_stabilize` | 1.0029 |
+| `shared_taint_100k_at_budget_1_on_a_1_mib_thread` | 1.0032 |
+| `shared_wide_frame_deliveries_stay_linear` | 1.0040 |
+
+- The two `Local` rows above base are glibc heap state, not engine work
+  (callgrind, gh-cmds `90bb837e-0f9bfa`, `90bb837e-07cd0c`,
+  `90bb837e-3b644f`): `incr_core` self cost falls on both
+  (`panicking_chain` 10,084.2M against 10,085.0M). Over the whole
+  program, malloc rises (`_int_malloc` +168M, `malloc_consolidate` +15M)
+  and frees fall (`_int_free_maybe_consolidate` -101M, all of `free`
+  -106M). With `GLIBC_TUNABLES=glibc.malloc.tcache_count=0` the tip is
+  below base on both rows; with fastbins off as well it is 0.06% and 0.03%
+  above.
+- The other `Local` rows above 1.0, at most 1.0003, are not the change
+  either (callgrind, gh-cmds `65ce8fa5-8a39ee` and `65ce8fa5-c6a900`,
+  against `c87e7bd4`).
+  `local_contained_chain_stays_linear_at_budget_1` runs below base under
+  callgrind in every allocator setting (default 36,301.6M against
+  36,360.6M), with `incr_core` self cost 1.4M lower. The three foreign-read
+  rows have identical `incr_core` self cost, so the `Local` push, drop and
+  truncate `Option` checks cost them nothing; each is a constant ~1.1k
+  instructions up in every allocator setting, all of it in the dynamic
+  loader's relocations and libtest's handling of a test list four tests
+  longer (`TestDesc::clone`, `filter_tests`, the list's collect and drop).
+  `local_fixpoint_cycle_100k_at_budget_256` (+53,754, 1.0000) was not
+  measured further.
+- `Shared` rows that end reservations pay for the built map's cold
+  updates, up to 0.4%.

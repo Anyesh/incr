@@ -1874,10 +1874,9 @@ local_and_shared!(
     shared_a_replaced_blocked_landing_drops_outside_the_contexts
 );
 
-/// Whether the context queues an entry of a node before and after it pops
-/// the running entry of that node at `running`, with the target at level 0
-/// and one more entry of the node pushed at each of `pushed`.
-fn queues_around_the_running_entrys_pop(pushed: &[u32], running: u32) -> (bool, bool) {
+/// Runs `f` on a context whose target, at level 0, is an entry of a
+/// query, with that entry.
+fn with_a_context<R>(f: impl FnOnce(&mut crate::replay::Context, crate::replay::Entry) -> R) -> R {
     let rt = Runtime::<Shared>::new();
     let q = rt.create_query(|_| 0_u64);
     unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> crate::replay::KeyParts {
@@ -1901,8 +1900,16 @@ fn queues_around_the_running_entrys_pop(pushed: &[u32], running: u32) -> (bool, 
             parts: no_parts,
         },
     );
-    let queued = crate::replay::with(|c| {
-        let x = c.iter_mut().find(|x| x.id == id).unwrap();
+    let r = crate::replay::with(|c| f(c.iter_mut().find(|x| x.id == id).unwrap(), entry));
+    drop(crate::replay::close(id));
+    r
+}
+
+/// Whether the context queues an entry of a node before and after it pops
+/// the running entry of that node at `running`, with the target at level 0
+/// and one more entry of the node pushed at each of `pushed`.
+fn queues_around_the_running_entrys_pop(pushed: &[u32], running: u32) -> (bool, bool) {
+    with_a_context(|x, entry| {
         for &level in pushed {
             x.push_entry(level, entry);
         }
@@ -1910,9 +1917,14 @@ fn queues_around_the_running_entrys_pop(pushed: &[u32], running: u32) -> (bool, 
         let before = x.queues(entry.node, entry.generation);
         x.pop_entry(running);
         (before, x.queues(entry.node, entry.generation))
-    });
-    drop(crate::replay::close(id));
-    queued
+    })
+}
+
+/// The running entry is not one its node still owes, before or after its
+/// pop.
+#[test]
+fn the_running_entry_alone_leaves_its_node_unqueued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[], 0), (false, false));
 }
 
 /// The running entry of a node, once popped, does not hide another entry
@@ -1926,6 +1938,67 @@ fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
 #[test]
 fn a_popped_running_entry_leaves_the_next_entry_of_its_node_queued() {
     assert_eq!(queues_around_the_running_entrys_pop(&[0], 0), (true, true));
+}
+
+/// Truncating the levels above the running entry drops their entries of
+/// its node, and an entry at a level the truncation keeps stays queued.
+#[test]
+fn truncated_levels_leave_only_the_kept_entries_of_a_node_queued() {
+    let queued = with_a_context(|x, entry| {
+        x.push_entry(1, entry);
+        x.push_entry(3, entry);
+        x.run_entry(0, entry);
+        x.truncate_levels(2);
+        let kept = x.queues(entry.node, entry.generation);
+        x.truncate_levels(1);
+        (kept, x.queues(entry.node, entry.generation))
+    });
+    assert_eq!(queued, (true, false));
+}
+
+/// Pushes, pops and truncations after the first ask keep the answer in step
+/// with the levels.
+#[test]
+fn queued_entries_follow_the_levels_after_the_first_ask() {
+    let queued = with_a_context(|x, entry| {
+        x.push_entry(1, entry);
+        x.run_entry(0, entry);
+        let first = x.queues(entry.node, entry.generation);
+        x.push_entry(2, entry);
+        x.truncate_levels(2);
+        x.drop_oldest(0);
+        let popped = x.queues(entry.node, entry.generation);
+        x.truncate_levels(1);
+        (first, popped, x.queues(entry.node, entry.generation))
+    });
+    assert_eq!(queued, (true, true, false));
+}
+
+/// The count keys on node and generation: an entry of another node, or of
+/// the node at another generation, is not one of the running entry's.
+#[test]
+fn queued_entries_are_told_apart_by_node_and_generation() {
+    let queued = with_a_context(|x, entry| {
+        let other = crate::replay::Entry {
+            node: entry.node + 1,
+            ..entry
+        };
+        let later = crate::replay::Entry {
+            generation: entry.generation + 1,
+            ..entry
+        };
+        x.push_entry(1, other);
+        x.push_entry(1, later);
+        x.run_entry(0, entry);
+        let asked = (
+            x.queues(entry.node, entry.generation),
+            x.queues(other.node, other.generation),
+            x.queues(later.node, later.generation),
+        );
+        x.truncate_levels(1);
+        (asked, x.queues(other.node, other.generation))
+    });
+    assert_eq!(queued, ((false, true, true), false));
 }
 
 #[derive(Debug)]

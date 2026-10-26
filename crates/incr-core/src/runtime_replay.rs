@@ -4839,7 +4839,7 @@ impl<C: Cells> Runtime<C> {
             return false;
         }
         !replay::with(|c| {
-            c.iter()
+            c.iter_mut()
                 .any(|x| x.rt == rt && (x.stacks(slot, generation) || x.queues(slot, generation)))
         })
     }
