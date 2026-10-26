@@ -1134,6 +1134,9 @@ pub struct Runtime<C: Cells> {
     pub(crate) episodes_landed: <C as Cells>::U64,
     /// Retractions of held landings on this runtime, by every thread. On
     /// its own cache line, as every walk's dep read under `Shared` loads it.
+    /// A walk rereads a dep list once per retraction since its last check,
+    /// so walks are lock-free: only retractions arriving faster than one dep
+    /// read, each of which takes a wound, could starve one.
     pub(crate) retractions: OwnLine<<C as Cells>::U64>,
     pub(crate) walk: <C as Cells>::Watermark,
     pub(crate) runtime_id: RuntimeId,
