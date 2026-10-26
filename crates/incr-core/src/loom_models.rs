@@ -2938,11 +2938,13 @@ static NESTED_EXIT_RACE: HandOvers = HandOvers::new();
 /// The owner stands at [`ParkPoint::BeforeHeldPublish`] of `rt` on the
 /// model's main thread as one descheduled there, so the waiter's patience
 /// can run out between its last progress and its publication; `reached`
-/// notes whether a hand-over wounded it there. Yields are not loom
+/// notes, at its first publication only (a retry's publish says nothing
+/// about the race), whether a hand-over wounded it there. Yields are not loom
 /// choices: with two the waiter never took the landing at bound 2 and
 /// with four it always did, so three leave it to a preemption.
 fn park_before_publish(rt: &Rt, reached: &'static HandOvers) {
     let owner = thread::current().id();
+    let first = std::sync::atomic::AtomicBool::new(true);
     let hook: crate::runtime::ParkHook = Box::new(move |point| {
         if point != crate::runtime::ParkPoint::BeforeHeldPublish || thread::current().id() != owner
         {
@@ -2952,7 +2954,7 @@ fn park_before_publish(rt: &Rt, reached: &'static HandOvers) {
         for _ in 0..3 {
             thread::yield_now();
         }
-        if !before {
+        if !before && first.swap(false, std::sync::atomic::Ordering::Relaxed) {
             reached.note(crate::attempt::hold_wounded());
         }
     });
@@ -3087,7 +3089,7 @@ fn hand_over_restarts_a_holder_boundedly() {
             let (me, runs) = (Arc::clone(&me), Arc::clone(&runs));
             rt.create_query(move |rt: &Rt| {
                 let run = runs.fetch_add(1, Ordering::Relaxed) + 1;
-                assert!(run <= 3, "T restarts for good: run {run}");
+                assert!(run <= 2, "T restarts for good: run {run}");
                 let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
                 let other = me.lock().unwrap().clone().unwrap();
                 let reader = thread::spawn(move || {
