@@ -3075,6 +3075,70 @@ local_and_shared!(
     shared_speculative_value_code_foreign_read
 );
 
+/// [`side_read`]'s shape with `c` in an unbudgeted runtime `a`, read from
+/// `rt`'s doomed run, so `c`'s run there is speculative. `c` reads j of a
+/// third runtime, Dirty at that read when `dirty` is set, else Clean.
+/// Once j moves to 3, `c` computes 13, as the unbounded run does, rather
+/// than adopt its speculative run's value.
+fn unbudgeted_speculative_foreign_read<C: Cells>(dirty: bool) {
+    let rt = Runtime::<C>::new();
+    rt.set_placeholder(0_u64);
+    rt.set_max_frames(1);
+    let other = Arc::new(Runtime::<Shared>::new());
+    let jin = other.create_input(1_u64);
+    let j = other.create_query(move |o: &Runtime<Shared>| o.get(jin));
+    assert_eq!(other.get(j), 1);
+    if dirty {
+        other.set(jin, 2);
+    }
+    let a = Arc::new(Runtime::<Shared>::new());
+    let o = Arc::clone(&other);
+    let runs = Arc::new(AtomicU32::new(0));
+    let counted = runs.clone();
+    let c = a.create_query(move |_: &Runtime<Shared>| {
+        counted.fetch_add(1, SeqCst);
+        o.get(j) + 10
+    });
+    let b = rt.create_query(|_| 5_u64);
+    let reader = Arc::clone(&a);
+    let r = rt.create_query_with(
+        move |rt| {
+            let x = rt.get(b);
+            if x == 0 {
+                reader.get(c)
+            } else {
+                x
+            }
+        },
+        replayable(),
+    );
+    assert_eq!(rt.get(r), 5);
+    assert_eq!(runs.load(SeqCst), 1, "c's speculative run");
+    other.set(jin, 3);
+    assert_eq!(other.get(j), 3);
+    assert_eq!(a.get(c), 13);
+}
+
+#[test]
+fn local_unbudgeted_speculative_clean_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Local>(false);
+}
+
+#[test]
+fn shared_unbudgeted_speculative_clean_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Shared>(false);
+}
+
+#[test]
+fn local_unbudgeted_speculative_dirty_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Local>(true);
+}
+
+#[test]
+fn shared_unbudgeted_speculative_dirty_foreign_read() {
+    unbudgeted_speculative_foreign_read::<Shared>(true);
+}
+
 /// `foreign_ticket_shape` with b's read of j moved into value code: b
 /// clones `v`, whose `Clone` reads j of the other runtime. When x's walk
 /// runs b, j is Dirty, so the value code's read takes the cold path and
