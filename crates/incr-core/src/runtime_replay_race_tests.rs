@@ -4671,6 +4671,39 @@ fn shared_retry_joins_a_reader_that_takes_a_held_payload_over() {
     );
 }
 
+/// As above: once the read ends, no node keeps a held mark, though the
+/// wound's retry reruns Y, whose claim the other read took over, and Y
+/// panics again with no entry to hold its landing.
+#[test]
+fn shared_taken_claim_that_panics_again_keeps_no_held_mark() {
+    let s = joined_over_a_payload();
+    s.rt.set_max_frames(2);
+    let wounds = crate::attempt::TAKE_OVERS.load(SeqCst);
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.w)), s.gate.clone())],
+    );
+    let first = {
+        let (rt, w) = (s.rt.clone(), s.w);
+        spawn(move || outcome(|| rt.get(w)))
+    };
+    s.gate.wait_parked();
+    s.switch.store(true, SeqCst);
+    s.gate.release();
+    let _ = first.join();
+    assert!(
+        crate::attempt::TAKE_OVERS.load(SeqCst) > wounds,
+        "the other read took nothing over"
+    );
+    for n in [s.y, s.x, s.w] {
+        assert!(
+            !s.rt.nodes.get(id(n).0).held_mark(),
+            "node {} keeps a held mark",
+            id(n).0
+        );
+    }
+}
+
 /// X catches Y's panic and then reads Z, so at budget 1 its retry takes
 /// Y's held payload and is doomed again at Z, which arms `gate`.
 fn take_then_doom_shape() -> (Arc<Rt>, Gate, Incr<u64>) {
