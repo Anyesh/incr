@@ -396,7 +396,7 @@ impl Landings {
         std::mem::take(self.owned_nodes())
     }
 
-    /// At least the deepest landing's depth, if it has a landing.
+    /// At least the deepest landing's depth, if it may have a landing.
     fn deepest(&self) -> Option<u32> {
         let deepest = match &self.nodes {
             Nodes::Owned(nodes) => {
@@ -522,10 +522,22 @@ pub(crate) struct Pending {
     /// The deliveries with a record, by the position of the lowest frame
     /// they stand for, which the pop of the virtual frame below extends.
     by_frontier: Index<u32, usize>,
-    /// The passed deliveries that carry landings, by the highest position
-    /// one of their landings may have (`Delivery::top`).
+    /// The passed deliveries with a landing deeper than just above their
+    /// frame, by the highest position one of their landings may have.
     by_top: BTreeSet<(u32, usize)>,
-    top_of: HashMap<usize, u32, FxBuildHasher>,
+    /// The passed deliveries whose landings are all just above their frame,
+    /// by that position and each payload they stand for: only a walk's
+    /// entry there containing that payload retires them.
+    by_payload: BTreeSet<(u32, PayloadKey, usize)>,
+    listed: HashMap<usize, Listed, FxBuildHasher>,
+}
+
+/// Where a passed delivery is listed for the events that retire its
+/// landings (`Pending::retire`).
+#[derive(Clone, Copy)]
+enum Listed {
+    Deep(u32),
+    Shallow(u32, [Option<PayloadKey>; 2]),
 }
 
 fn frame_of(key: &ReadKey) -> (u32, u32, u32) {
@@ -586,10 +598,10 @@ impl Pending {
             }
             list(&mut self.by_frontier, frontier(&d), i);
         }
-        let top = if d.passed { d.top() } else { None };
+        let passed = d.passed;
         self.slots.push(Some(d));
-        if let Some(top) = top {
-            self.list_top(i, top);
+        if passed {
+            self.list(i);
         }
         self.live += 1;
     }
@@ -616,9 +628,7 @@ impl Pending {
             }
             unlist(&mut self.by_frontier, &frontier(&d), |&j| j == i);
         }
-        if let Some(top) = self.top_of.remove(&i) {
-            self.by_top.remove(&(top, i));
-        }
+        self.unlist(i);
         self.live -= 1;
         // No index is held across a point where none is live.
         if self.live == 0 {
@@ -644,22 +654,61 @@ impl Pending {
         let d = self.get_mut(i);
         if !d.passed {
             d.passed = true;
-            if let Some(top) = d.top() {
-                self.list_top(i, top);
-            }
+            self.list(i);
         }
     }
 
-    fn list_top(&mut self, i: usize, top: u32) {
-        self.by_top.insert((top, i));
-        self.top_of.insert(i, top);
+    /// Delivery `i`'s latest take raised a copy of its payload keyed `key`.
+    pub(crate) fn resume(&mut self, i: usize, key: PayloadKey) {
+        self.unlist(i);
+        let d = self.get_mut(i);
+        d.resumed = Some(key);
+        if d.passed {
+            self.list(i);
+        }
+    }
+
+    fn list(&mut self, i: usize) {
+        let d = self.get(i);
+        let Delivered::Unwind { nodes, .. } = &d.what else {
+            return;
+        };
+        let top = d.key.cidx + 1;
+        let listed = match nodes.deepest() {
+            None => return,
+            Some(0) => {
+                let payloads = [nodes.source, d.resumed];
+                for p in payloads.into_iter().flatten() {
+                    self.by_payload.insert((top, p, i));
+                }
+                Listed::Shallow(top, payloads)
+            }
+            Some(depth) => {
+                self.by_top.insert((top + depth, i));
+                Listed::Deep(top + depth)
+            }
+        };
+        self.listed.insert(i, listed);
+    }
+
+    fn unlist(&mut self, i: usize) {
+        match self.listed.remove(&i) {
+            Some(Listed::Deep(top)) => {
+                self.by_top.remove(&(top, i));
+            }
+            Some(Listed::Shallow(top, payloads)) => {
+                for p in payloads.into_iter().flatten() {
+                    self.by_payload.remove(&(top, p, i));
+                }
+            }
+            None => {}
+        }
     }
 
     /// Applies `ev` to the landings the passed deliveries carry: those of
     /// every passed delivery for a node's landing that a copy may hold,
     /// else only those of deliveries with a landing the event can reach.
     fn retire(&mut self, ev: &Retire, all: bool) {
-        let slots = &mut self.slots;
         let apply = |d: &mut Delivery| {
             note_work(1);
             if d.key.cidx < ev.cidx() || all {
@@ -669,35 +718,35 @@ impl Pending {
                 }
             }
         };
-        if all {
-            for d in slots.iter_mut().flatten().filter(|d| d.passed) {
+        let hit: Vec<usize> = if all {
+            for d in self.slots.iter_mut().flatten().filter(|d| d.passed) {
                 apply(d);
             }
-        }
-        // Short of a copied node's landing, an event retires only landings
-        // above its position, or at it for a containment of the delivery's
-        // own payload, so a delivery none of whose landings reaches that
-        // high keeps them all.
-        let from = match *ev {
-            _ if all => 0,
-            Retire::Above(at) | Retire::Landing { cidx: at, .. } => at.saturating_add(1),
-            Retire::Contained { cidx: at, .. } => at,
+            self.listed.keys().copied().collect()
+        } else {
+            // Short of a copied node's landing, an event retires only
+            // landings of a frame below it that are above its position, or
+            // at it for a containment of the delivery's own payload, so a
+            // delivery none of whose landings reaches that high keeps them
+            // all.
+            let (from, contained) = match *ev {
+                Retire::Above(at) | Retire::Landing { cidx: at, .. } => {
+                    (at.saturating_add(1), None)
+                }
+                Retire::Contained { cidx: at, payload } => (at, Some((at, payload))),
+            };
+            let deep = self.by_top.range((from, 0)..).map(|&(_, i)| i);
+            let shallow = contained.into_iter().flat_map(|(at, p)| {
+                (self.by_payload.range((at, p, 0)..=(at, p, usize::MAX))).map(|&(_, _, i)| i)
+            });
+            deep.chain(shallow).collect()
         };
-        let hit: Vec<(u32, usize)> = self.by_top.range((from, 0)..).copied().collect();
-        for (top, i) in hit {
-            self.by_top.remove(&(top, i));
-            let d = slots[i]
-                .as_mut()
-                .expect("incr-core: a delivery's index is live");
+        for i in hit {
+            self.unlist(i);
             if !all {
-                apply(d);
+                apply(self.get_mut(i));
             }
-            if let Some(top) = d.top() {
-                self.by_top.insert((top, i));
-                self.top_of.insert(i, top);
-            } else {
-                self.top_of.remove(&i);
-            }
+            self.list(i);
         }
     }
 
@@ -915,14 +964,6 @@ impl Delivery {
 
     pub(crate) fn taken(&self) -> bool {
         self.taken
-    }
-
-    /// The highest position its landings may have, if it has one.
-    fn top(&self) -> Option<u32> {
-        match &self.what {
-            Delivered::Unwind { nodes, .. } => nodes.deepest().map(|d| self.key.cidx + 1 + d),
-            _ => None,
-        }
     }
 
     fn is_untaken_panic(&self) -> bool {
@@ -1335,7 +1376,7 @@ impl Context {
             nodes: nodes.clone(),
         };
         if let Delivered::Unwind { payload, .. } = &what {
-            self.pending.get_mut(i).resumed = Some(payload_key(&**payload));
+            self.pending.resume(i, payload_key(&**payload));
         }
         what
     }
@@ -3220,13 +3261,9 @@ mod tests {
         }
     }
 
-    /// A passed delivery's landing just above its frame is a note at the
-    /// position of the frame's next read, which a walk's entry there
-    /// containing the same payload retires.
-    #[test]
-    fn a_containment_just_above_a_frame_retires_its_passed_landing() {
-        let payload: Box<dyn Any + Send> = Box::new("p");
-        let key = payload_key(&*payload);
+    /// A pending list holding one passed delivery of the frame at 3 whose
+    /// payload is keyed `source`, with landings `nodes`.
+    fn passed_at_3(source: PayloadKey, nodes: Vec<((u32, u32), u32)>) -> Pending {
         let read = ReadKey {
             node: 1,
             generation: 0,
@@ -3242,22 +3279,72 @@ mod tests {
             cycle: false,
             poison: true,
             attributed: false,
-            payload,
-            nodes: Landings::owned(Some(key), vec![((2, 0), 0)]),
+            payload: Box::new("p"),
+            nodes: Landings::owned(Some(source), nodes),
         };
         let mut pending = Pending::default();
         pending.push(Delivery::new(read, 0, what));
         pending.pass(0);
-        pending.retire(
-            &Retire::Contained {
-                cidx: 4,
-                payload: key,
-            },
-            false,
-        );
+        pending
+    }
+
+    fn holds(pending: &mut Pending, node: (u32, u32)) -> bool {
         let Delivered::Unwind { nodes, .. } = &mut pending.get_mut(0).what else {
             unreachable!()
         };
-        assert!(!nodes.holds((2, 0)));
+        nodes.holds(node)
+    }
+
+    static P: &str = "p";
+    static Q: &str = "q";
+
+    fn key(payload: &'static &'static str) -> PayloadKey {
+        payload_key(payload)
+    }
+
+    /// A passed delivery's landing just above its frame is a note at the
+    /// position of the frame's next read, which a walk's entry there
+    /// containing the same payload retires.
+    #[test]
+    fn a_containment_just_above_a_frame_retires_its_passed_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        let contained = |payload| Retire::Contained { cidx: 4, payload };
+        pending.retire(&contained(key(&Q)), false);
+        assert!(holds(&mut pending, (2, 0)));
+        pending.retire(&contained(key(&P)), false);
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// The copy a take raises stands for the delivery's payload as its
+    /// source does, so a containment of the copy retires the landing too.
+    #[test]
+    fn a_containment_of_a_resumed_copy_retires_its_passed_landing() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0)]);
+        pending.resume(0, key(&Q));
+        pending.retire(
+            &Retire::Contained {
+                cidx: 4,
+                payload: key(&Q),
+            },
+            false,
+        );
+        assert!(!holds(&mut pending, (2, 0)));
+    }
+
+    /// Short of a node a copy holds, a landing of another payload retires
+    /// only the landings above its position.
+    #[test]
+    fn a_landing_retires_passed_landings_only_above_it() {
+        let mut pending = passed_at_3(key(&P), vec![((2, 0), 0), ((5, 0), 1)]);
+        pending.retire(
+            &Retire::Landing {
+                cidx: 4,
+                payload: Some(key(&Q)),
+                node: (9, 0),
+            },
+            false,
+        );
+        assert!(holds(&mut pending, (2, 0)));
+        assert!(!holds(&mut pending, (5, 0)));
     }
 }
