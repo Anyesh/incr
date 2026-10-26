@@ -107,6 +107,16 @@ impl<D: DepStack> Drop for Placed<'_, D> {
     }
 }
 
+/// A speculative frame's [`cycle::KeepResolver`], made by
+/// [`Runtime::speculative_keep`] and in place for the frame's run;
+/// `resolver` first, so a pointer to the whole is one to it.
+#[repr(C)]
+pub(super) struct SpeculativeKeep {
+    resolver: cycle::KeepResolver,
+    /// The frame's runtime's [`Runtime::keep_resolver_ptr`].
+    rt: *const cycle::KeepResolver,
+}
+
 /// A frame below a doomed read, as marking sees it.
 struct Below {
     node: u32,
@@ -247,13 +257,61 @@ impl<C: Cells> Runtime<C> {
     ///
     /// `r` is a running compute's runtime's [`Self::keep_resolver_ptr`].
     pub(super) unsafe fn resolve_keep(r: *const cycle::KeepResolver, slot: u32) -> bool {
+        // SAFETY: as the caller's.
+        let rt = unsafe { Self::of_keep_resolver(r) };
+        rt.budgeted() && rt.replayable(slot)
+    }
+
+    /// The runtime around its `keep_resolver` at `r`.
+    ///
+    /// # Safety
+    ///
+    /// `r` is a running compute's runtime's [`Self::keep_resolver_ptr`].
+    unsafe fn of_keep_resolver<'a>(r: *const cycle::KeepResolver) -> &'a Self {
         // SAFETY: the running compute borrows the runtime, so it is in
         // place around its `keep_resolver`, and `r`'s provenance covers it.
-        let rt = unsafe {
+        unsafe {
             &*r.byte_sub(std::mem::offset_of!(Self, keep_resolver))
                 .cast::<Self>()
-        };
-        rt.budgeted() && rt.replayable(slot)
+        }
+    }
+
+    /// A speculative frame's resolver, for its run's lifetime.
+    pub(super) fn speculative_keep(&self) -> SpeculativeKeep {
+        SpeculativeKeep {
+            resolver: cycle::KeepResolver {
+                keeps: Self::resolve_speculative_keep,
+            },
+            rt: self.keep_resolver_ptr(),
+        }
+    }
+
+    /// [`Self::resolve_keep`] for a speculative frame, which settles on top
+    /// of the stack. One that keeps none of them makes its Clean reads of
+    /// other runtimes unrecorded, so it is marked `KEPT_UNCHECKED`, and its
+    /// stash is not adopted over them.
+    ///
+    /// # Safety
+    ///
+    /// `r` points to a [`Self::speculative_keep`] that is in place.
+    unsafe fn resolve_speculative_keep(r: *const cycle::KeepResolver, slot: u32) -> bool {
+        // SAFETY: `r` is a `SpeculativeKeep`'s, made by a running compute
+        // of the runtime at its `rt`.
+        let rt_keep = unsafe { (*r.cast::<SpeculativeKeep>()).rt };
+        // SAFETY: as above.
+        let keeps = unsafe { Self::resolve_keep(rt_keep, slot) };
+        if !keeps {
+            // SAFETY: as above.
+            let rt = unsafe { Self::of_keep_resolver(rt_keep) };
+            let top = rt.dep_stack.top_frame();
+            debug_assert!(top.is_some_and(|(r, n, _, _)| (r, n.0) == (rt.runtime_id, slot)));
+            if let Some((_, _, ctl, _)) = top {
+                // SAFETY: the frame is on the stack, so its control block
+                // is live.
+                unsafe { &*ctl }.raise(cycle::KEPT_UNCHECKED);
+            }
+        }
+        keeps
     }
 
     /// The `keep_resolver` pointer for [`Self::resolve_keep`], offset from
@@ -320,10 +378,10 @@ impl<C: Cells> Runtime<C> {
 
     /// A speculative entry's run stashes only Clean values: a node it would
     /// land Dirty, poisoned, over a dep that is neither Clean nor stashed, or
-    /// over a kept read its adoption can't check (`KEPT_UNCHECKED`), has a
+    /// over a read its adoption can't check (`KEPT_UNCHECKED`), has a
     /// history the unbounded run may never give it, and a later walk
-    /// of its deps would differ from a first run of its closure. A Clean
-    /// read of another runtime is checked: the stash keeps that runtime's
+    /// of its deps would differ from a first run of its closure. A kept
+    /// Clean read of another runtime is checked: the stash keeps that runtime's
     /// count of changes as the read found it, and is adopted only while the
     /// count holds. A run that read a placeholder (`PH_SEEN`) is never
     /// stashed, since only a doomed frame reads one. Nor does it

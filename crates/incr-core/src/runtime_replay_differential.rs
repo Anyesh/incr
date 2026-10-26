@@ -123,6 +123,9 @@ enum Expr {
     PanicIf(Box<Expr>, u64),
     /// The operand, or 9999 if it unwinds.
     Catch(Box<Expr>),
+    /// The operand, after a lookup of the node's own handle that records
+    /// nothing (`Runtime::is_alive`).
+    Lookup(Box<Expr>),
     /// The first operand on the closure's first run in its runtime, a
     /// doomed run included, else the second.
     FirstRun(Box<Expr>, Box<Expr>),
@@ -372,6 +375,7 @@ fn shift(e: Expr, by: usize) -> Expr {
         Expr::If(c, a, b) => Expr::If(s(c), s(a), s(b)),
         Expr::PanicIf(a, when) => Expr::PanicIf(s(a), when),
         Expr::Catch(a) => Expr::Catch(s(a)),
+        Expr::Lookup(a) => Expr::Lookup(s(a)),
         Expr::FirstRun(a, b) => Expr::FirstRun(s(a), s(b)),
         Expr::FirstLanded(a, b) => Expr::FirstLanded(s(a), s(b)),
         leaf => leaf,
@@ -388,6 +392,7 @@ fn past_template(e: Expr, skip: usize, nodes: usize) -> Expr {
         Expr::If(c, a, b) => Expr::If(p(c), p(a), p(b)),
         Expr::PanicIf(a, when) => Expr::PanicIf(p(a), when),
         Expr::Catch(a) => Expr::Catch(p(a)),
+        Expr::Lookup(a) => Expr::Lookup(p(a)),
         Expr::FirstRun(a, b) => Expr::FirstRun(p(a), p(b)),
         Expr::FirstLanded(a, b) => Expr::FirstLanded(p(a), p(b)),
         leaf => leaf,
@@ -593,6 +598,7 @@ fn without_panics(e: Expr) -> Expr {
         Expr::Add(a, b) => Expr::Add(w(a), w(b)),
         Expr::If(c, a, b) => Expr::If(w(c), w(a), w(b)),
         Expr::Catch(inner) => Expr::Catch(w(inner)),
+        Expr::Lookup(inner) => Expr::Lookup(w(inner)),
         Expr::FirstRun(a, b) => Expr::FirstRun(w(a), w(b)),
         Expr::FirstLanded(a, b) => Expr::FirstLanded(w(a), w(b)),
         leaf => leaf,
@@ -860,6 +866,7 @@ fn formula(
             Err(None) => Ok(9999),
             other => other,
         },
+        Expr::Lookup(inner) => formula(inner, n, reads),
         Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
             formula(if first { a } else { b }, n, reads)
         }
@@ -908,6 +915,10 @@ fn eval<C: Cells>(n: &Node<'_, C>, e: &Expr) -> u64 {
             v
         }
         Expr::Catch(inner) => catch_unwind(AssertUnwindSafe(|| eval(n, inner))).unwrap_or(9999),
+        Expr::Lookup(inner) => {
+            n.rt.is_alive(n.world.handle(n.side, n.at).erased());
+            eval(n, inner)
+        }
         Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => {
             if n.first {
                 eval(n, a)
@@ -941,7 +952,7 @@ fn lands_first(e: &Expr) -> bool {
         Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => false,
         Expr::Add(a, b) | Expr::FirstRun(a, b) => lands_first(a) || lands_first(b),
         Expr::If(c, a, b) => lands_first(c) || lands_first(a) || lands_first(b),
-        Expr::PanicIf(a, _) | Expr::Catch(a) => lands_first(a),
+        Expr::PanicIf(a, _) | Expr::Catch(a) | Expr::Lookup(a) => lands_first(a),
     }
 }
 
@@ -1106,6 +1117,7 @@ fn first_run_as(e: &Expr, first: bool) -> Expr {
         Expr::If(a, b, c) => Expr::If(f(a), f(b), f(c)),
         Expr::PanicIf(a, w) => Expr::PanicIf(f(a), *w),
         Expr::Catch(a) => Expr::Catch(f(a)),
+        Expr::Lookup(a) => Expr::Lookup(f(a)),
     }
 }
 
@@ -1223,7 +1235,7 @@ fn reaches_cycle(specs: &[Spec], n: usize) -> bool {
                 reads(b, out);
                 reads(c, out);
             }
-            Expr::PanicIf(a, _) | Expr::Catch(a) => reads(a, out),
+            Expr::PanicIf(a, _) | Expr::Catch(a) | Expr::Lookup(a) => reads(a, out),
         }
     }
     let deps = |m: usize| {
@@ -3202,6 +3214,88 @@ fn seed_4e9f_raises_no_panic_of_a_stale_read() {
     });
 }
 
+/// 0x22f, shrunk (cross). At budget 1, `Get(0)`'s read of 1 is over the
+/// budget, so 0 goes on speculatively into 2 and 3, and 3, not replayable,
+/// reads the other runtime's input 5 (4) with no kept read. `Set2` moves
+/// that input to 2, and the recreated 1 reads 2 twice, where the unbounded
+/// run computes 2 from the new input.
+fn seed_22f_case() -> Case {
+    let q = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let r = |n| Box::new(Expr::Read(n, false));
+    let mut specs = vec![
+        q(Expr::If(r(1), r(2), Box::new(Expr::Const(0))), true, false),
+        q(Expr::Const(3), true, false),
+        q(Expr::Read(3, false), true, false),
+        q(Expr::ReadOther(5, false), false, false),
+    ];
+    specs.extend((0..5).map(|_| q(Expr::Const(0), true, false)));
+    specs.push(Spec::Input(4));
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 9,
+        specs2: vec![
+            q(Expr::Read(5, false), true, false),
+            q(Expr::Read(3, false), true, false),
+            q(
+                Expr::Add(
+                    Box::new(Expr::If(r(5), Box::new(Expr::Read(5, true)), r(3))),
+                    Box::new(Expr::PanicIf(r(5), 0)),
+                ),
+                true,
+                false,
+            ),
+            q(Expr::Read(5, false), false, false),
+            q(Expr::ReadOther(2, false), true, true),
+            Spec::Input(4),
+        ],
+        queries2: 5,
+        ops: vec![
+            Op::Get(0),
+            Op::Set2(5, 2),
+            Op::Delete(0),
+            Op::Delete(1),
+            Op::Recreate(1, q(Expr::Add(r(2), r(2)), true, false)),
+            Op::Get(1),
+        ],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_22f_adopts_no_stash_over_an_unkept_foreign_read() {
+    let case = seed_22f_case();
+    quiet(|| {
+        differential::<Local>(&case, 0x22f);
+        differential::<Shared>(&case, 0x22f);
+    });
+}
+
+/// [`seed_22f_case`] with a lookup ahead of 3's read of the other runtime:
+/// the lookup records nothing and settles 3's frame as not keeping other
+/// runtimes' Clean reads, so that read takes the fast path.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_22f_adopts_no_stash_over_an_unkept_foreign_read_after_a_lookup() {
+    let mut case = seed_22f_case();
+    case.specs[3] = Spec::Query {
+        expr: Expr::Lookup(Box::new(Expr::ReadOther(5, false))),
+        replay: false,
+        bare: false,
+        strategy: Strat::None,
+    };
+    quiet(|| {
+        differential::<Local>(&case, 0x22f);
+        differential::<Shared>(&case, 0x22f);
+    });
+}
+
 /// 0x198c2, shrunk (cross): 9 reads the chain 16 to 18 only at budget 1's
 /// depth, so its doomed run reads 18's foreign dep, the other runtime's 0,
 /// Clean; a set of that runtime's input follows, and the next `Get(0)`
@@ -4158,6 +4252,7 @@ fn map_reads(e: &Expr, to: &impl Fn(usize) -> usize) -> Expr {
         Expr::If(a, b, c) => Expr::If(f(a), f(b), f(c)),
         Expr::PanicIf(a, w) => Expr::PanicIf(f(a), *w),
         Expr::Catch(a) => Expr::Catch(f(a)),
+        Expr::Lookup(a) => Expr::Lookup(f(a)),
         Expr::FirstRun(a, b) => Expr::FirstRun(f(a), f(b)),
         Expr::FirstLanded(a, b) => Expr::FirstLanded(f(a), f(b)),
     }
@@ -7762,7 +7857,7 @@ fn has_first_run(e: &Expr) -> bool {
         // so a doomed run's retry reads as it did.
         Expr::Add(a, b) | Expr::FirstLanded(a, b) => has_first_run(a) || has_first_run(b),
         Expr::If(a, b, c) => has_first_run(a) || has_first_run(b) || has_first_run(c),
-        Expr::PanicIf(a, _) | Expr::Catch(a) => has_first_run(a),
+        Expr::PanicIf(a, _) | Expr::Catch(a) | Expr::Lookup(a) => has_first_run(a),
     }
 }
 
@@ -7771,7 +7866,7 @@ fn size(e: &Expr) -> usize {
         Expr::Const(_) | Expr::Read(..) | Expr::ReadOther(..) => 1,
         Expr::Add(a, b) | Expr::FirstRun(a, b) | Expr::FirstLanded(a, b) => 1 + size(a) + size(b),
         Expr::If(a, b, c) => 1 + size(a) + size(b) + size(c),
-        Expr::PanicIf(a, _) | Expr::Catch(a) => 1 + size(a),
+        Expr::PanicIf(a, _) | Expr::Catch(a) | Expr::Lookup(a) => 1 + size(a),
     }
 }
 
@@ -7859,7 +7954,7 @@ fn reach(specs: &[Vec<Spec>; 2]) -> HashSet<((usize, usize), (usize, usize))> {
                 reads(b, side, out);
                 reads(c, side, out);
             }
-            Expr::PanicIf(a, _) | Expr::Catch(a) => reads(a, side, out),
+            Expr::PanicIf(a, _) | Expr::Catch(a) | Expr::Lookup(a) => reads(a, side, out),
         }
     }
     let deps = |(side, i): (usize, usize)| {
@@ -8529,7 +8624,7 @@ fn reads_any(e: &Expr, hit: &impl Fn(usize) -> bool) -> bool {
             reads_any(a, hit) || reads_any(b, hit)
         }
         Expr::If(c, a, b) => reads_any(c, hit) || reads_any(a, hit) || reads_any(b, hit),
-        Expr::PanicIf(inner, _) | Expr::Catch(inner) => reads_any(inner, hit),
+        Expr::PanicIf(inner, _) | Expr::Catch(inner) | Expr::Lookup(inner) => reads_any(inner, hit),
     }
 }
 
@@ -9574,6 +9669,14 @@ fn shrink_expr(e: &Expr) -> Vec<Expr> {
         Expr::Catch(x) => {
             out.push((**x).clone());
             out.extend(shrink_expr(x).into_iter().map(|x| Expr::Catch(Box::new(x))));
+        }
+        Expr::Lookup(x) => {
+            out.push((**x).clone());
+            out.extend(
+                shrink_expr(x)
+                    .into_iter()
+                    .map(|x| Expr::Lookup(Box::new(x))),
+            );
         }
         Expr::FirstRun(x, y) => {
             out.extend([(**x).clone(), (**y).clone()]);

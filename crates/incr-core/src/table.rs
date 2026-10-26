@@ -457,6 +457,10 @@ struct Counts {
 /// A map from keys to nodes of the runtime that created it, through
 /// [`Runtime::create_table`]. A hit returns the existing entry whichever
 /// call created it. Dropping the table leaves its nodes alive.
+///
+/// A lookup, a `get_or_insert_*` hit included, records no dependency on
+/// the table: a query whose value depends on the node a key maps to must
+/// read it through the handle with `rt.get`, which records one.
 pub struct NodeTable<K: TableKey, T: Value, C: Cells, S = FxBuildHasher> {
     runtime_id: RuntimeId,
     array: C::TableArray<K>,

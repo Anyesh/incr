@@ -411,9 +411,13 @@ pub(crate) const HANDLED: u16 = 2048;
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
 /// `ComputeCtl::flags`: the frame made a read its stash adoption can't
-/// check: a kept read (`KEPT_READ`) of its own runtime, or of another
-/// runtime's node that was not Clean or was read while that runtime was
-/// changing, or a read of a deleted node's handle.
+/// check, so a speculative run of it is not stashed:
+/// - a kept read (`KEPT_READ`) of its own runtime, or of another runtime's
+///   node that was not Clean or was read while that runtime was changing;
+/// - on a `SPECULATIVE` frame, a read of another runtime it neither keeps
+///   nor records, or holds instead of keeping (`FOREIGN_HOLD`), and a
+///   lookup that records nothing;
+/// - a read of a deleted node's handle.
 pub(crate) const KEPT_UNCHECKED: u16 = 8192;
 
 /// `ComputeCtl::flags`: the frame read a landing this thread's attempt
@@ -465,19 +469,21 @@ pub struct ComputeCtl {
     /// The creator's `ChildIndex` while this run may reach it, or null
     /// until the run creates its first child.
     pub(crate) children: Cell<*const ()>,
-    /// The frame's runtime's [`KeepResolver`], or null for a frame that
-    /// settles its keeping when it is pushed or keeps nothing.
+    /// The frame's runtime's [`KeepResolver`], a speculative frame's own,
+    /// or null for a frame that settles its keeping when it is pushed or
+    /// keeps nothing.
     keep: *const KeepResolver,
     /// The frame's path once found (`path_kept`), left unwritten until
     /// then so a push pays nothing for it.
     path: Cell<MaybeUninit<u64>>,
 }
 
-/// Lives inside its runtime and answers whether a frame of node `slot` of
-/// that runtime keeps other runtimes' Clean reads for its retry. The
-/// runtime's `keep_resolver_ptr` is good while one of its computes runs,
-/// since the compute borrows the runtime; a pointer taken from the field
-/// itself may not reach the rest of the runtime.
+/// Lives inside its runtime (a speculative frame's, beside its run) and
+/// answers whether a frame of node `slot` of that runtime keeps other
+/// runtimes' Clean reads for its retry. The runtime's `keep_resolver_ptr`
+/// is good while one of its computes runs, since the compute borrows the
+/// runtime; a pointer taken from the field itself may not reach the rest
+/// of the runtime.
 pub(crate) struct KeepResolver {
     pub(crate) keeps: unsafe fn(*const KeepResolver, u32) -> bool,
 }
@@ -503,14 +509,17 @@ impl ComputeCtl {
     }
 
     /// Whether this frame, of node `slot`, keeps other runtimes' Clean
-    /// reads.
+    /// reads. A speculative frame's resolver marks it `KEPT_UNCHECKED`
+    /// when it does not.
     ///
     /// # Safety
     ///
-    /// The frame must be running, so that its runtime is borrowed.
+    /// The frame must be running and on top of the stack, so that its
+    /// runtime is borrowed.
     pub(crate) unsafe fn keeps_foreign(&self, slot: u32) -> bool {
         // SAFETY: the caller's frame is running, so the runtime holding
-        // the resolver is borrowed and in place.
+        // the resolver is borrowed and in place, as is a speculative
+        // frame's resolver beside its run.
         !self.keep.is_null() && unsafe { ((*self.keep).keeps)(self.keep, slot) }
     }
 
