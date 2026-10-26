@@ -1298,6 +1298,13 @@ pub(crate) fn first_nested_of(rt: RuntimeId) -> bool {
     ENTRY.with(|e| e.depth.get() != 0 && e.cur_rt.get() & !SHARED_KEY != rt && !outer_open(rt))
 }
 
+/// Whether `rt` has an open entry on this thread as a `Shared` runtime.
+pub(crate) fn shared_open(rt: RuntimeId) -> bool {
+    let key = rt.get() | SHARED_KEY;
+    ENTRY.with(|e| e.depth.get() != 0 && e.cur_rt.get() == key)
+        || OUTER_RTS.with(|o| o.borrow().open.contains_key(&key))
+}
+
 fn outer_open(rt: u64) -> bool {
     OUTER_RTS.with(|o| {
         let o = o.borrow();

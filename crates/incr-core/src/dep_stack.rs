@@ -488,16 +488,13 @@ pub trait DepStack: 'static {
         });
     }
 
-    /// Marks the nearest compute frame, past any callback's barrier, as
-    /// having read a landing this thread holds, so its own landing is held.
-    /// Returns the frame's runtime.
+    /// Marks the nearest `Shared` compute frame, past any callback's
+    /// barrier, as having read a landing this thread holds, so its own
+    /// landing is held. Returns the frame's runtime. A `Local` frame between
+    /// lands at once, as no exit publishes a `Local` runtime's holds.
     fn raise_hold(&self) -> Option<RuntimeId> {
         self.with(|s| {
-            let f = s
-                .frames
-                .iter()
-                .rev()
-                .find(|f| f.rt != RuntimeId::SENTINEL)?;
+            let f = s.frames.iter().rev().find(|f| holds_for(f.rt))?;
             // SAFETY: the frame is on the stack, so its control block is
             // live (see `Frame::ctl`).
             unsafe { (*f.ctl).raise(HOLD) };
@@ -511,7 +508,7 @@ pub trait DepStack: 'static {
             s.frames
                 .iter()
                 .rev()
-                .find(|f| f.rt != RuntimeId::SENTINEL)
+                .find(|f| holds_for(f.rt))
                 .map(|f| f.ctl)
         })
     }
@@ -677,6 +674,12 @@ impl Drop for FramesGuard {
             }
         });
     }
+}
+
+/// Whether a frame of `rt` can hold its landing: a compute frame of a
+/// `Shared` runtime.
+fn holds_for(rt: RuntimeId) -> bool {
+    rt != RuntimeId::SENTINEL && crate::cycle_state::shared_open(rt)
 }
 
 /// Registers `FRAMES_GUARD`'s destructor, on the push that allocates the
