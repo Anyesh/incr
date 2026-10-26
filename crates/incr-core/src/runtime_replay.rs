@@ -1452,6 +1452,8 @@ impl<C: Cells> Runtime<C> {
                 if let Some(value) = self.read_doomed(handle, f) {
                     return Ok(value);
                 }
+                // Past its placeholder the frame never computes or waits.
+                cycle_state::raise_if_lazy();
                 // A node with a virtual frame stands for a frame below this
                 // one and can't be computed in it. With no placeholder to
                 // read, the doomed frame's run ends here: it is discarded
@@ -1934,9 +1936,13 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// A doomed frame's placeholder read: the frame's first runs on in user
-    /// code ([`cycle_state::open_lazy`]); a later one raises the discard.
+    /// code ([`cycle_state::open_lazy`]), and so do its later ones; another
+    /// frame's raises the discard.
     fn run_on_doomed(&self, ctl: *const ComputeCtl) {
         if cycle_state::lazy_open() {
+            if cycle_state::lazy_is(ctl as usize) {
+                return;
+            }
             self.doom_unwind();
         }
         cycle_state::open_lazy(ctl as usize);

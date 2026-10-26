@@ -1524,7 +1524,7 @@ fn foreign_reader_is_doomed_with<A: Cells, B: Cells>(n: u64) {
         // The landed case runs a third time; the ignored
         // `landed_foreign_reader_runs_twice` tracks it.
         if !matches!(first, FirstRead::ForeignLandedClean) {
-            assert_eq!(runs, (doomed_reader_first_runs::<A>(n), 1), "{first:?}");
+            assert_eq!(runs, (2, 1), "{first:?}");
         }
     }
 }

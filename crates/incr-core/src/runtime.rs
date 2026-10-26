@@ -2664,10 +2664,25 @@ impl<C: Cells> Runtime<C> {
     /// is the state `get` loaded.
     #[inline(never)]
     fn get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> T {
-        cycle_state::KeptUnwind::around(|| match self.read_slow(handle, observed, ReadKind::Get) {
-            Ok(value) => value,
-            Err(cycle) => self.raise_cycle(cycle),
-        })
+        cycle_state::KeptUnwind::around_read(
+            || match self.read_slow(handle, observed, ReadKind::Get) {
+                Ok(value) => value,
+                Err(cycle) => self.raise_cycle(cycle),
+            },
+            || self.reads_in_lazy_frame(),
+        )
+    }
+
+    /// Whether this runtime's read comes from the doomed frame that runs on
+    /// past its placeholder.
+    #[cold]
+    #[inline(never)]
+    fn reads_in_lazy_frame(&self) -> bool {
+        self.dep_stack
+            .top_for_lookup()
+            .is_some_and(|(top, _, ctl)| {
+                top.rt() == self.runtime_id && cycle_state::lazy_is(ctl as usize)
+            })
     }
 
     /// Read the current value of a node, like [`Self::get`], or the cycle
@@ -2704,7 +2719,10 @@ impl<C: Cells> Runtime<C> {
 
     #[inline(never)]
     fn try_get_slow<T: Value>(&self, handle: Incr<T>, observed: NodeState) -> Result<T, Cycle> {
-        cycle_state::KeptUnwind::around(|| self.read_slow(handle, observed, ReadKind::TryGet))
+        cycle_state::KeptUnwind::around_read(
+            || self.read_slow(handle, observed, ReadKind::TryGet),
+            || self.reads_in_lazy_frame(),
+        )
     }
 
     /// The cycle of the group `handle` landed in last, if its last
