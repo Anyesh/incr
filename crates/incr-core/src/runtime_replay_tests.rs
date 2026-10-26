@@ -1851,6 +1851,60 @@ local_and_shared!(
     shared_a_replaced_blocked_landing_drops_outside_the_contexts
 );
 
+/// Whether the context queues an entry of a node before and after it pops
+/// the running entry of that node at `running`, with the target at level 0
+/// and one more entry of the node pushed at each of `pushed`.
+fn queues_around_the_running_entrys_pop(pushed: &[u32], running: u32) -> (bool, bool) {
+    let rt = Runtime::<Shared>::new();
+    let q = rt.create_query(|_| 0_u64);
+    unsafe fn no_parts(_: *const (), _: u32, _: u32, _: bool) -> crate::replay::KeyParts {
+        unreachable!()
+    }
+    let entry = crate::replay::Entry {
+        node: q.slot(),
+        generation: q.generation(),
+        suspect: false,
+        spec: false,
+        retry: crate::replay::Retry::Compute,
+        walked: false,
+        r5: false,
+    };
+    let id = crate::replay::open(
+        rt.runtime_id,
+        1,
+        entry,
+        crate::replay::FrameKeys {
+            owner: std::ptr::null(),
+            parts: no_parts,
+        },
+    );
+    let queued = crate::replay::with(|c| {
+        let x = c.iter_mut().find(|x| x.id == id).unwrap();
+        for &level in pushed {
+            x.push_entry(level, entry);
+        }
+        x.run_entry(running, entry);
+        let before = x.queues(entry.node, entry.generation);
+        x.pop_entry(running);
+        (before, x.queues(entry.node, entry.generation))
+    });
+    drop(crate::replay::close(id));
+    queued
+}
+
+/// The running entry of a node, once popped, does not hide another entry
+/// of the node queued below it: that entry still owes the node's run.
+#[test]
+fn a_popped_running_entry_leaves_a_lower_entry_of_its_node_queued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[1], 1), (true, true));
+}
+
+/// Nor one queued behind it at its own level, now at that level's front.
+#[test]
+fn a_popped_running_entry_leaves_the_next_entry_of_its_node_queued() {
+    assert_eq!(queues_around_the_running_entrys_pop(&[0], 0), (true, true));
+}
+
 #[derive(Debug)]
 struct CustomPayload(u64);
 

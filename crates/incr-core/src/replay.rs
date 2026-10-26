@@ -992,6 +992,9 @@ pub(crate) struct Context {
     /// The position of level 0.
     pub(crate) boundary: u32,
     pub(crate) levels: Vec<VecDeque<Entry>>,
+    /// How many entries of each node and generation `levels` holds, so
+    /// [`Self::queues`] needs no scan.
+    queued: HashMap<(u32, u32), u32, FxBuildHasher>,
     pub(crate) vstack: Vec<VFrame>,
     /// Each node's `vstack` positions, lowest first, with the generation
     /// its virtual frame recorded.
@@ -1001,6 +1004,9 @@ pub(crate) struct Context {
     pub(crate) running: Option<u32>,
     pub(crate) pending: Pending,
     pub(crate) running_entry: Option<Entry>,
+    /// The running entry still fronts its level: the driver has neither
+    /// popped nor truncated it.
+    running_fronts: bool,
     /// Every entry of this context is speculative: the context was opened
     /// inside a speculative entry's run.
     pub(crate) spec_base: bool,
@@ -1091,10 +1097,12 @@ impl Context {
             rt,
             boundary,
             levels: vec![VecDeque::from([target])],
+            queued: HashMap::from_iter([((target.node, target.generation), 1)]),
             vstack: Vec::new(),
             vindex: HashMap::default(),
             running: None,
             running_entry: None,
+            running_fronts: false,
             pending: Pending::default(),
             spec_base: target.spec,
             claims: Vec::new(),
@@ -1123,18 +1131,77 @@ impl Context {
             .find_map(|(level, q)| q.front().map(|e| (level as u32, *e)))
     }
 
+    /// Marks `entry`, the front of `level`, as the one the driver runs.
+    pub(crate) fn run_entry(&mut self, level: u32, entry: Entry) {
+        self.running = Some(level);
+        self.running_entry = Some(entry);
+        self.running_fronts = true;
+    }
+
+    /// Whether an entry of `node` at `generation` has yet to run: the
+    /// running entry is not one until the driver pops it.
+    pub(crate) fn queues(&self, node: u32, generation: u32) -> bool {
+        let running = self.running_fronts
+            && self
+                .running_entry
+                .is_some_and(|e| e.node == node && e.generation == generation);
+        self.queued.get(&(node, generation)).copied().unwrap_or(0) > u32::from(running)
+    }
+
+    /// Whether `node`'s virtual frame at `generation` stands for a frame
+    /// on the unbounded run's stack ([`Self::stacked`]).
+    pub(crate) fn stacks(&self, node: u32, generation: u32) -> bool {
+        self.position(node, generation)
+            .is_some_and(|p| (p as usize) < self.stacked().len())
+    }
+
     pub(crate) fn push_entry(&mut self, level: u32, entry: Entry) {
         let level = level as usize;
         if self.levels.len() <= level {
             self.levels.resize_with(level + 1, VecDeque::new);
         }
         self.levels[level].push_back(entry);
+        *self
+            .queued
+            .entry((entry.node, entry.generation))
+            .or_default() += 1;
     }
 
     /// Removes the oldest entry at `level`, the one the driver ran.
     pub(crate) fn pop_entry(&mut self, level: u32) {
-        self.levels[level as usize].pop_front();
+        self.drop_oldest(level);
         self.trim_levels();
+    }
+
+    /// Removes the oldest entry at `level`, leaving empty levels in place.
+    pub(crate) fn drop_oldest(&mut self, level: u32) {
+        if let Some(e) = self.levels[level as usize].pop_front() {
+            self.unqueue(e);
+            if self.running == Some(level) {
+                self.running_fronts = false;
+            }
+        }
+    }
+
+    /// Drops every level from `len` up with its entries.
+    pub(crate) fn truncate_levels(&mut self, len: usize) {
+        for q in self.levels.split_off(len.min(self.levels.len())) {
+            for e in q {
+                self.unqueue(e);
+            }
+        }
+        if self.running.is_some_and(|level| level as usize >= len) {
+            self.running_fronts = false;
+        }
+    }
+
+    fn unqueue(&mut self, e: Entry) {
+        if let MapEntry::Occupied(mut n) = self.queued.entry((e.node, e.generation)) {
+            *n.get_mut() -= 1;
+            if *n.get() == 0 {
+                n.remove();
+            }
+        }
     }
 
     /// Drops the empty levels on top, so `next_entry` finds the highest

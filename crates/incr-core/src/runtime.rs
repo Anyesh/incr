@@ -2660,9 +2660,19 @@ impl<C: Cells> Runtime<C> {
             let dirty_before = frame.is_some() && dirty();
             match self.try_read_slot(handle, node, type_tag, arena_slot) {
                 Some(value) => {
-                    if let Some(f) = frame.filter(|_| dirty_before || dirty()) {
-                        if !self.unchanged_stash(handle.slot(), handle.generation()) {
-                            self.note_dirty_read(f, handle, &value);
+                    // Outside an open context only a doom's pending claims are
+                    // reserved, and no read takes a value before they are adopted.
+                    let reserving = !C::SINGLE_THREADED
+                        && value_code::thread_word() & value_code::REPLAY_BIT != 0
+                        && reserve::any();
+                    if (frame.is_some() || reserving) && (dirty_before || dirty()) {
+                        if let Some(f) = frame {
+                            if !self.unchanged_stash(handle.slot(), handle.generation()) {
+                                self.note_dirty_read(f, handle, &value);
+                            }
+                        }
+                        if reserving {
+                            self.end_unowed_reservation(slot, handle.generation());
                         }
                     }
                     return Ok(value);
@@ -5338,10 +5348,11 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Ends this thread's context reservation of `id` if its run `landed`
-    /// settled, as the unbounded run's frame releases its claim there. An
-    /// unsettled landing keeps it until a later run of this context lands
-    /// the node settled or the context is removed, so that no other thread
-    /// reruns the node in between.
+    /// settled, as the unbounded run's frame releases its claim there. A
+    /// Dirty replay landing or a Dirty read ends it through
+    /// [`Self::end_unowed_reservation`] unless this thread runs the node
+    /// again; any other unsettled landing keeps it until a later run lands
+    /// the node settled or the context is removed.
     pub(super) fn end_reservation_landed(&self, id: NodeId, node: &NodeData<C>, landed: NodeState) {
         if landed.is_settled() {
             self.end_reservation(id, node);

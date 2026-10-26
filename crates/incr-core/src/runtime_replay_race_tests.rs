@@ -1966,9 +1966,10 @@ fn delivery_shape(x: Panics, w: Option<Panics>) -> Delivery {
 /// budget, one frame per node, so Y's entry lands Failed and its payload
 /// waits for X's virtual frame. The driver parks before the next entry
 /// while another thread reads X, or W with `other_reads_w`, the node of a
-/// virtual frame: that read waits for the dooming thread's landing and
-/// computes nothing. Both outcomes are the unbounded run's in which this
-/// thread's read came first, and no provenance record outlives the reads.
+/// virtual frame: that read waits on the dooming thread's reservation and
+/// computes nothing while the driver is parked. The outcomes are an
+/// unbounded run's up to which read gets the payload, and no provenance
+/// record outlives the reads.
 fn read_over_a_delivery(
     x: Panics,
     w: Option<Panics>,
@@ -2008,8 +2009,34 @@ fn read_over_a_delivery(
     u.rt.set_max_frames(u32::MAX);
     let want_first = outcome(|| u.rt.get(u.top));
     let want_other = outcome(|| u.rt.get(if other_reads_w { u.top } else { u.x }));
-    assert_eq!((&first, &other), (&want_first, &want_other));
+    assert_racing_reads([&first, &other], [&want_first, &want_other]);
+    assert_eq!(
+        (rt.state_of(s.x), rt.state_of(s.y), rt.state_of(s.top)),
+        (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.top))
+    );
     (first, other)
+}
+
+/// Compares racing Shared reads with an unbounded run's: which reader of a
+/// panicked node gets the payload and which gets "last compute panicked"
+/// is not part of the result (the wiki decision "Shared panic payload
+/// contract"), so each read's value or panic must agree, and the panics'
+/// texts must agree as a set, every "last compute panicked" alike.
+fn assert_racing_reads<const N: usize>(
+    got: [&Result<u64, String>; N],
+    want: [&Result<u64, String>; N],
+) {
+    let classes = |reads: [&Result<u64, String>; N]| {
+        let mut c = reads.map(|r| match r {
+            Err(m) if m.contains("last compute panicked") => Err("failed".to_string()),
+            r => r.clone(),
+        });
+        c.sort();
+        c
+    };
+    let values = |reads: [&Result<u64, String>; N]| reads.map(|r| r.as_ref().ok().copied());
+    assert_eq!(values(got), values(want), "{got:?} against {want:?}");
+    assert_eq!(classes(got), classes(want), "{got:?} against {want:?}");
 }
 
 fn failed(r: &Result<u64, String>) -> bool {
@@ -2051,8 +2078,11 @@ fn shared_vframe_reader_waits_under_a_native_read() {
     assert_eq!(first, Err("y boom".to_string()));
     assert!(failed(&other), "{other:?}");
     let (first, other) = read_over_a_delivery(Panics::Own, Some(Panics::Out), false);
-    assert_eq!(first, Err("x own".to_string()));
-    assert!(failed(&other), "{other:?}");
+    let own = Err("x own".to_string());
+    assert!(
+        (first == own && failed(&other)) || (other == own && failed(&first)),
+        "{first:?}, {other:?}"
+    );
 }
 
 /// The other thread reads W, the bottom frame of the chain W and X, and
@@ -3177,10 +3207,11 @@ fn equal_path_shape() -> EqualPath {
 /// Failed, and the driver parks before W's retry with Y's payload held
 /// for X's frame at position 1. Parked there, W's switch is set and the
 /// other thread reads X and then W, each the node of a virtual frame:
-/// both wait for this thread's landings, so the payload stays held for
+/// both wait on this thread's reservations, so the payload stays held for
 /// X's frame while the driver is parked and no replay of the other
 /// thread's reaches it. The reads are the unbounded run's in which this
-/// thread's came first with the switch set before it.
+/// thread's came first with the switch set before it, up to which read
+/// gets the payload.
 #[test]
 fn shared_reader_waits_out_a_held_delivery_at_an_equal_path() {
     let EqualPath {
@@ -3252,7 +3283,11 @@ fn shared_reader_waits_out_a_held_delivery_at_an_equal_path() {
         outcome(|| u.rt.get(u.w)),
     );
     assert_eq!(want.0, Err("y boom".to_string()));
-    assert_eq!((first, landed, other), want);
+    assert_racing_reads([&first, &landed, &other], [&want.0, &want.1, &want.2]);
+    assert_eq!(
+        (rt.state_of(x), rt.state_of(y), rt.state_of(w)),
+        (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.w))
+    );
 }
 
 /// The two-deliveries shape of `runtime_replay_unwind_tests`: A
@@ -4120,4 +4155,130 @@ fn a_finished_regeneration_keeps_the_mark_of_the_next_rerun() {
     );
     rerun.release();
     assert!(c.join(), "the second regeneration made no payload");
+}
+
+/// What [`shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload`]
+/// builds: W reads X, X reads Y, which panics "y boom" and arms `gate`;
+/// with `switch` set, W first joins another thread's read of X.
+struct JoinedOverAPayload {
+    rt: Arc<Rt>,
+    gate: Gate,
+    y: Incr<u64>,
+    x: Incr<u64>,
+    w: Incr<u64>,
+    switch: Arc<AtomicBool>,
+    joined: Arc<Mutex<Option<Result<u64, String>>>>,
+    stalled: Arc<AtomicBool>,
+}
+
+fn joined_over_a_payload() -> JoinedOverAPayload {
+    let rt = Arc::new(Rt::new());
+    rt.set_placeholder(0_u64);
+    let gate = Gate::new();
+    let y = {
+        let gate = gate.clone();
+        rt.create_query_with(
+            move |_: &Rt| -> u64 {
+                gate.arm();
+                panic!("y boom")
+            },
+            replayable(),
+        )
+    };
+    let x = rt.create_query_with(move |rt: &Rt| rt.get(y) + 1, replayable());
+    let switch = Arc::new(AtomicBool::new(false));
+    let joined = Arc::new(Mutex::new(None));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let w = {
+        let (switch, joined, stalled) = (switch.clone(), joined.clone(), stalled.clone());
+        let shared = Arc::downgrade(&rt);
+        rt.create_query_with(
+            move |rt: &Rt| {
+                if switch.load(SeqCst) {
+                    let waits = rt.reservation_waits.load(SeqCst);
+                    let (tx, rx) = mpsc::channel();
+                    let rt2 = shared.upgrade().unwrap();
+                    thread::spawn(move || {
+                        let _ = tx.send(outcome(|| rt2.get(x)));
+                    });
+                    let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
+                    loop {
+                        if let Ok(read) = rx.try_recv() {
+                            *joined.lock().unwrap() = Some(read);
+                            break;
+                        }
+                        // Waiting here for a thread that waits on this one
+                        // would hang, so a wait ends the join.
+                        if rt.reservation_waits.load(SeqCst) != waits {
+                            stalled.store(true, SeqCst);
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the joined read neither returned nor waited"
+                        );
+                        thread::yield_now();
+                    }
+                }
+                rt.get(x) + 1
+            },
+            replayable(),
+        )
+    };
+    JoinedOverAPayload {
+        rt,
+        gate,
+        y,
+        x,
+        w,
+        switch,
+        joined,
+        stalled,
+    }
+}
+
+/// At budget 2 this thread's `get(W)` dooms W and X, Y's entry lands
+/// Failed and Y's payload waits for X's virtual frame. W's switch, set
+/// while the driver is parked, makes W's retry join another thread's read
+/// of X before W reads X. That read must not wait on this thread, which
+/// waits on it; which of the two reads gets Y's payload is open, as in
+/// the Shared payload contract.
+#[test]
+fn shared_retry_joins_a_reader_of_a_node_awaiting_a_held_payload() {
+    let s = joined_over_a_payload();
+    s.rt.set_max_frames(2);
+    hook(
+        &s.rt,
+        vec![(ParkPoint::BeforeEntry(id(s.w)), s.gate.clone())],
+    );
+    let first = {
+        let (rt, w) = (s.rt.clone(), s.w);
+        spawn(move || outcome(|| rt.get(w)))
+    };
+    s.gate.wait_parked();
+    assert_eq!(s.rt.state_of(s.y), NodeState::Failed);
+    s.switch.store(true, SeqCst);
+    s.gate.release();
+    let first = first.join();
+    let joined = s.joined.lock().unwrap().clone();
+    assert!(!s.stalled.load(SeqCst), "the joined read waited: {first:?}");
+    let joined = joined.expect("the joined read returned");
+    s.rt.assert_invariant_i();
+    assert_eq!(
+        s.rt.provenance_records(),
+        0,
+        "a record outlived its delivery"
+    );
+
+    let u = joined_over_a_payload();
+    u.rt.set_max_frames(u32::MAX);
+    u.switch.store(true, SeqCst);
+    let want = (outcome(|| u.rt.get(u.w)), u.joined.lock().unwrap().clone());
+    let want_joined = want.1.clone().expect("the unbounded joined read returned");
+    assert_eq!(want_joined, Err("y boom".to_string()));
+    assert_racing_reads([&first, &joined], [&want.0, &want_joined]);
+    assert_eq!(
+        (s.rt.state_of(s.x), s.rt.state_of(s.y), s.rt.state_of(s.w)),
+        (u.rt.state_of(u.x), u.rt.state_of(u.y), u.rt.state_of(u.w))
+    );
 }

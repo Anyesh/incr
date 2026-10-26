@@ -66,6 +66,10 @@ pub(crate) struct EntrySeen {
 /// How a virtual frame's pop left its context's driver.
 enum VPop {
     Next,
+    /// The frame, rooting no claims and with no stand-in, leaves its run
+    /// to the retry below, which reads the node afresh once it has run
+    /// what precedes that read again.
+    Left,
     /// A doom (`true`) or a dropped chain pushed entries: the driver picks
     /// its next entry again.
     Restart(bool),
@@ -3595,9 +3599,12 @@ impl<C: Cells> Runtime<C> {
                     self.tarjan_pop(id, &v, &mut kept)
                 };
                 match popped {
-                    VPop::Next => {
+                    VPop::Next | VPop::Left => {
                         if retried && !kept.is_empty() {
                             taint_memo::restore(kept);
+                        }
+                        if matches!(popped, VPop::Left) && !C::SINGLE_THREADED && reserve::any() {
+                            self.end_unowed_reservation(v.node, v.generation);
                         }
                         popped_frames.push((v.clone(), false));
                     }
@@ -3641,8 +3648,7 @@ impl<C: Cells> Runtime<C> {
                     .iter_mut()
                     .find(|x| x.id == id)
                     .expect("incr-core: a running context is open");
-                x.running = Some(level);
-                x.running_entry = Some(entry);
+                x.run_entry(level, entry);
                 x.boundary
             });
             // An entry whose node this thread holds is a cycle member that a
@@ -4118,7 +4124,7 @@ impl<C: Cells> Runtime<C> {
                 };
             }
         } else if !rooted {
-            return VPop::Next;
+            return VPop::Left;
         }
         let mut bag = Deferred::new();
         if v.spec {
@@ -4504,6 +4510,39 @@ impl<C: Cells> Runtime<C> {
         drop(ended);
     }
 
+    /// Ends this thread's context reservation of the node at `slot`, which
+    /// a read just took Dirty, a replay landing just left Dirty, or a
+    /// virtual frame's pop just left to the retry below it, unless this
+    /// thread still owes the node's run from here: its frame is on the
+    /// stack, it holds the claim, or a context stacks its virtual frame or
+    /// has an entry of it yet to run. A retry below that reads the node
+    /// again owes nothing: it first runs again what precedes that read,
+    /// and a reservation kept through that would make another thread's
+    /// read of the node, joined there, wait on a run not yet begun. An
+    /// outcome held for a frame of the node does not keep it either, as
+    /// this thread's retry may be joined on such a reader; for a held
+    /// panic, the reader's run differs from an unbounded one only in which
+    /// reader gets the payload, which the Shared payload contract leaves
+    /// open. Takes the reservation table's lock only to end one.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn end_unowed_reservation(&self, slot: u32, generation: u32) {
+        let rt = self.runtime_id;
+        if replay::speculative() || !reserve::in_context((rt, slot), generation) {
+            return;
+        }
+        if self.dep_stack.frame_cidx(rt, NodeId(slot)).is_some() || cycle_state::holds(rt, slot) {
+            return;
+        }
+        let owed = replay::with(|c| {
+            c.iter()
+                .any(|x| x.rt == rt && (x.stacks(slot, generation) || x.queues(slot, generation)))
+        });
+        if !owed {
+            reserve::end_landed((rt, slot), generation);
+        }
+    }
+
     /// Drops the deliveries, claim watermarks and failure counts held, in
     /// any of this runtime's contexts, for the frames of the nodes in
     /// `released`, whose claims a user panic's release just landed: that
@@ -4689,7 +4728,7 @@ impl<C: Cells> Runtime<C> {
                     payload,
                 },
             );
-            x.levels.truncate(level as usize);
+            x.truncate_levels(level as usize);
             x.trim_levels();
             (replaced, x.truncate_vstack(level as usize))
         });
@@ -4719,9 +4758,9 @@ impl<C: Cells> Runtime<C> {
                 .iter_mut()
                 .find(|x| x.id == id)
                 .expect("incr-core: a running context is open");
-            x.levels.truncate(q as usize + 1);
+            x.truncate_levels(q as usize + 1);
             if !keep {
-                x.levels[q as usize].pop_front();
+                x.drop_oldest(q);
             }
             x.trim_levels();
             // Entries a doom handed over from the dropped frames go with
@@ -4950,6 +4989,17 @@ impl<C: Cells> Runtime<C> {
                 x.claims.retain(|&(l, _)| l < level);
             }
         });
+        // `hold_landing` above ran while this entry still counted as yet to
+        // run.
+        if landed && level > 0 && !C::SINGLE_THREADED && reserve::any() {
+            let mut state = state::load::<C>(self.nodes.get(node).state_cell());
+            if is_computing(state) {
+                state = self.given_back_state(node, generation).unwrap_or(state);
+            }
+            if state == NodeState::Dirty {
+                self.end_unowed_reservation(node, generation);
+            }
+        }
         if level == 0 {
             self.close_context(id, boundary);
             if ended == Ended::Contained {
@@ -4975,7 +5025,9 @@ impl<C: Cells> Runtime<C> {
     /// it right after the compute. If an episode landed it with no value,
     /// that read gets the episode's cycle, as the read that ran it would.
     /// A walk stopped short of its root drops the node's other entries if
-    /// the compute left it `unsettled`, as `walk_stopped` does.
+    /// the compute left it `unsettled`, as `walk_stopped` does. A Dirty
+    /// landing ends the node's run, so its reservation ends too unless this
+    /// thread runs it again.
     fn hold_landing(&self, id: u64, level: u32, node: u32, generation: u32, unsettled: bool) {
         #[cfg(test)]
         if unsettled {
@@ -5060,6 +5112,9 @@ impl<C: Cells> Runtime<C> {
             }
         });
         drop(unkept);
+        if state == NodeState::Dirty && !C::SINGLE_THREADED && reserve::any() {
+            self.end_unowed_reservation(node, generation);
+        }
     }
 
     /// Closes context `id` and unwinds `payload` on to the read that ran

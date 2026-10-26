@@ -415,6 +415,16 @@ fn still_listed(claim: Claim, generation: u32) -> bool {
     .unwrap_or(false)
 }
 
+/// Whether a context of this thread reserves `claim` at `generation`.
+pub(crate) fn in_context(claim: Claim, generation: u32) -> bool {
+    MINE.try_with(|m| {
+        m.0.borrow()
+            .iter()
+            .any(|g| g.context != ROOT_READ && g.claims.contains(&(claim, generation)))
+    })
+    .unwrap_or(false)
+}
+
 /// Ends this thread's context reservations of `claim` at `generation`,
 /// whose run has landed for good. A read's reservation of its own node
 /// stays until the read has taken the value.
