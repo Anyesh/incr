@@ -12,7 +12,7 @@
 //! landing over ([`hand_over`]), as a take-over of a doom does.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, PoisonError, Weak};
 
 #[cfg(not(loom))]
@@ -30,6 +30,7 @@ use loom::sync::{
 use crate::attempt::{self, Attempt, Patience};
 
 use crate::cycle::{self, ComputeCtl};
+use crate::dep_set::SCAN_MAX;
 use crate::fx::FxBuildHasher;
 use crate::handle::RuntimeId;
 use crate::node::NodeId;
@@ -457,20 +458,27 @@ pub(crate) fn keep_deps(cell: usize, old: impl FnOnce() -> Vec<(NodeId, u32)>) {
     });
 }
 
-/// The deps a held node's landing read that its published dep list
-/// lacks, replacing an earlier landing's; `displaced` tells the deps the
-/// landing replaces. Empty, so no allocation, while the deps stay put.
-pub(crate) fn keep_read(cell: usize, read: &[(NodeId, u32)], displaced: impl Fn(NodeId) -> bool) {
+/// The deps a held node's landing installs, each with its generation
+/// when read, less those its published dep list has, replacing an earlier
+/// landing's, or adding to it for a landing that keeps the deps it
+/// installed (`keep`, a panicked one's union). Linear: a long published
+/// list is hashed.
+pub(crate) fn keep_read(cell: usize, installed: impl Iterator<Item = (NodeId, u32)>, keep: bool) {
     with(|h| {
         if let Some(e) = h.get(cell) {
-            // A displaced dep has its published edge unless an earlier held
-            // landing read it new.
-            let earlier = std::mem::take(&mut e.read);
-            e.read.extend(
-                read.iter()
-                    .copied()
-                    .filter(|&(d, _)| !displaced(d) || earlier.iter().any(|&(p, _)| p == d)),
-            );
+            if !keep {
+                e.read.clear();
+            }
+            let published = e.undo.deps.as_deref().unwrap_or(&[]);
+            if published.len() > SCAN_MAX {
+                let published: HashSet<NodeId, FxBuildHasher> =
+                    published.iter().map(|&(d, _)| d).collect();
+                e.read
+                    .extend(installed.filter(|(d, _)| !published.contains(d)));
+            } else {
+                e.read
+                    .extend(installed.filter(|&(d, _)| !published.iter().any(|&(p, _)| p == d)));
+            }
         }
     });
 }

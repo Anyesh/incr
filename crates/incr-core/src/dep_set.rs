@@ -9,7 +9,7 @@ use crate::node::NodeId;
 
 /// While either list is at most this long, a diff by scans is linear in
 /// the other and beats building hash sets.
-const SCAN_MAX: usize = 16;
+pub(crate) const SCAN_MAX: usize = 16;
 
 #[inline]
 pub(crate) fn needs_hashing(old_len: usize, new_len: usize) -> bool {

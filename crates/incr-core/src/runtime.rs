@@ -5810,7 +5810,7 @@ impl<C: Cells> Runtime<C> {
                     .map(|d| (*d, self.nodes.get(d.0).generation()))
                     .collect()
             });
-            hold::keep_read(cell, recorded, |d| diff.old_set.has(d));
+            hold::keep_read(cell, recorded.iter().copied(), panic.is_some());
         }
 
         // The displaced list is retired at the attempt's drain, after its

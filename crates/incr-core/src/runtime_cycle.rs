@@ -2480,7 +2480,18 @@ impl<C: Cells> Runtime<C> {
                             .map(|d| (*d, self.nodes.get(d.0).generation()))
                             .collect()
                     });
-                    hold::keep_read(cell, e.deps(), |d| old.contains(&d));
+                    // A restarted episode's deps include reads it did not
+                    // install.
+                    let installed = (new.len() > crate::dep_set::SCAN_MAX)
+                        .then(|| crate::dep_set::DepHashSet::new(new));
+                    hold::keep_read(
+                        cell,
+                        e.deps().iter().copied().filter(|&(d, _)| match &installed {
+                            Some(set) => set.has(d),
+                            None => new.contains(&d),
+                        }),
+                        false,
+                    );
                     if let Some(displaced) = node.install_deps(new) {
                         bag.push_dep_list(displaced);
                     }
