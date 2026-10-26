@@ -1440,6 +1440,44 @@ fn a_cycle_caught_across_runtimes_holds_its_catcher() {
     assert_eq!(crate::hold::held_count(), 0);
 }
 
+/// a reads e of another `Shared` runtime, and e catches its read of a: the
+/// cycle closes under e's frame, which is not a's runtime's, so the read
+/// has no active frame there. e's entry exit publishes, and a, whose value
+/// depends on where the cycle was entered, stays held while y reads it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_cycle_closed_under_another_runtimes_frame_holds_its_reader() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let other = Arc::new(Runtime::<Shared>::new());
+    let ac: Arc<OnceLock<Incr<i64>>> = Arc::new(OnceLock::new());
+    let e = {
+        let (rt, ac) = (rt.clone(), ac.clone());
+        other.create_query(move |_| rt.try_get(*ac.get().unwrap()).unwrap_or(7777))
+    };
+    let a = {
+        let other = other.clone();
+        rt.create_query(move |_| other.get(e) + 1)
+    };
+    ac.set(a).unwrap();
+    let held = Arc::new(AtomicUsize::new(usize::MAX));
+    let y = {
+        let held = held.clone();
+        rt.create_query(move |rt| {
+            let v = rt.get(a);
+            held.store(crate::hold::held_count(), Ordering::SeqCst);
+            v + 1
+        })
+    };
+    assert_eq!(rt.get(y), 7779);
+    assert_eq!(
+        held.load(Ordering::SeqCst),
+        1,
+        "a is held when y has read it"
+    );
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
 /// As above with a `Local` frame r between: r catches the cycle and lands
 /// at once, as no `Local` landing is held, and the hold goes to x, the
 /// nearest `Shared` frame below it.
