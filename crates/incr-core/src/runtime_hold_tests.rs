@@ -599,15 +599,18 @@ fn shared_get_of_another_runtime_from_a_shared_compute_ends_its_holds() {
     });
 }
 
+/// The thread's state after a caught wound: whether it held, and what
+/// the read after it raised.
+type AfterWound = Arc<std::sync::Mutex<Option<(bool, Option<String>)>>>;
+
 /// B's `x` reads B's held cycle, then D's `z`, which reads that cycle
 /// back: D retracts at its exit and taints x, which carries `HOLD`. A
-/// wound out of x passes the `HOLD` down to `Local` A's reader, and the
-/// exit of B, the thread's first `Shared` entry, retracts B. The reader
-/// catches the wound and reads C, its first entry of C: while it carries
-/// `HOLD`, the thread must still hold.
+/// wound out of x passes no `HOLD` to `Local` A's reader, and the exit of
+/// B, the thread's first `Shared` entry, retracts B. The reader catches
+/// the wound and reads C, its first entry of C, with nothing held.
 #[test]
 #[cfg_attr(miri, ignore)]
-fn shared_under_local_reader_that_caught_a_wound_out_of_a_retracted_entry_still_holds() {
+fn shared_under_local_reader_that_caught_a_wound_out_of_a_retracted_entry_holds_nothing() {
     let b_rt = Arc::new(Runtime::<Shared>::new());
     let (a, b) = two_cycle(&*b_rt);
     let d_rt = Arc::new(Runtime::<Shared>::new());
@@ -628,9 +631,7 @@ fn shared_under_local_reader_that_caught_a_wound_out_of_a_retracted_entry_still_
     };
     let c_rt = Arc::new(Runtime::<Shared>::new());
     let q = c_rt.create_query(|_| 7_i64);
-    // After the caught wound: whether the thread held, and what the read
-    // of C raised.
-    let after: Arc<std::sync::Mutex<Option<(bool, Option<String>)>>> = Arc::default();
+    let after: AfterWound = Arc::default();
     let rt = Runtime::<Local>::new();
     let root = {
         let (b_rt, c_rt, after) = (b_rt.clone(), c_rt.clone(), after.clone());
@@ -661,10 +662,7 @@ fn shared_under_local_reader_that_caught_a_wound_out_of_a_retracted_entry_still_
         raised, None,
         "the read of C after the caught wound panicked"
     );
-    assert!(
-        held,
-        "the reader carries HOLD while the thread holds nothing"
-    );
+    assert!(!held, "the thread holds after B's retraction");
     assert_eq!(got, b_rt.get(x) + 7);
     assert_eq!(crate::hold::held_count(), 0);
 }
