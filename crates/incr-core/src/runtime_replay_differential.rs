@@ -5815,6 +5815,22 @@ fn seed_3cb3_reads_a_failed_dep_as_the_revision_left_it() {
     });
 }
 
+/// 0x32d4: op 3's `Get(7)` reaches spec 3 = `Catch(Add(Read(10), Read(4,
+/// true)))`, whose read of 10 `try_get`s 14 inside the cycle 14 -> 5 -> 6
+/// -> 7 -> 8 -> 9 -> 10 -> 14. Unbounded, 10's `try_get` meets the cycle in
+/// 10's own frame and 3 goes on to read 4. Every budget must leave 3 with
+/// the same recorded deps; at 16 KiB its rerun used to record only 10.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_32d4_bounded_rerun_records_the_unbounded_deps() {
+    let case = gen_case(0x32d4, false, false);
+    assert!(matches!(case.ops[3], Op::Get(7)));
+    quiet(|| {
+        differential::<Local>(&case, 0x32d4);
+        differential::<Shared>(&case, 0x32d4);
+    });
+}
+
 /// The same rule inside one read: 0x15b3's op 10 `Get(19)` lands 20 Failed
 /// (`PanicIf(3, 3)` over input 21 = 2), and 19 catches it; 0x264a's op 17
 /// `Get(9)` reads 2 = 4 + `Catch(Read(3))` over 3 and 4, which landed
