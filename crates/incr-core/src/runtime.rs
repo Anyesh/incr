@@ -5541,7 +5541,9 @@ impl<C: Cells> Runtime<C> {
             if target == NodeState::Dirty {
                 reserve::note_root((self.runtime_id, id.0), node.generation());
             }
-            reserve::note_walk((self.runtime_id, id.0), node.generation());
+            if self.budgeted() {
+                reserve::note_walk((self.runtime_id, id.0), node.generation());
+            }
         }
         if state::try_transition::<C>(node.state_cell(), NodeState::Computing, target).is_ok() {
             if !matches!(target, NodeState::Clean | NodeState::Cyclic) {
