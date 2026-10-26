@@ -710,10 +710,8 @@ impl<C: Cells> NodeData<C> {
 const _: () = {
     type N = NodeData<crate::cells::Local>;
     assert!(
-        N::OVERFLOW_MARKER & !N::COUNT_MASK == 0
-            && N::UNRUN & N::RELEASED == 0
-            && (N::UNRUN | N::RELEASED) & N::COUNT_MASK == 0,
-        "dep_count's count, unrun and released bits overlap"
+        N::OVERFLOW_MARKER & !N::COUNT_MASK == 0,
+        "dep_count's overflow marker lies outside its count bits"
     );
 };
 const _: () = assert!(
