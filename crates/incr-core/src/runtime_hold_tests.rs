@@ -670,3 +670,127 @@ fn shared_retracted_failed_landing_releases_its_ticket() {
     assert_eq!(other.contained_payloads(), 0);
     assert_eq!(other.tickets_kept(), (0, false));
 }
+
+/// The thread's state after a caught wound: whether it held, and what
+/// the read after it raised.
+type AfterWound = Arc<std::sync::Mutex<Option<(bool, Option<String>)>>>;
+
+/// B's `x` reads B's held cycle, then D's `z`, which reads that cycle
+/// back: D retracts at its exit and taints x, which carries `HOLD`. A
+/// wound out of x passes no `HOLD` to `Local` A's reader, and the exit of
+/// B, the thread's first `Shared` entry, retracts B. The reader catches
+/// the wound and reads C, its first entry of C, with nothing held.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_under_local_reader_that_caught_a_wound_out_of_a_retracted_entry_holds_nothing() {
+    let b_rt = Arc::new(Runtime::<Shared>::new());
+    let (a, b) = two_cycle(&*b_rt);
+    let d_rt = Arc::new(Runtime::<Shared>::new());
+    let z = {
+        let b_rt = b_rt.clone();
+        d_rt.create_query(move |_| b_rt.get(a) + 1)
+    };
+    let wounded = Arc::new(AtomicBool::new(false));
+    let x = {
+        let (d_rt, wounded) = (d_rt.clone(), wounded.clone());
+        b_rt.create_query(move |rt| {
+            let v = rt.get(a) + rt.get(b) + d_rt.get(z);
+            if !wounded.swap(true, Ordering::SeqCst) {
+                rt.raise_wound();
+            }
+            v
+        })
+    };
+    let c_rt = Arc::new(Runtime::<Shared>::new());
+    let q = c_rt.create_query(|_| 7_i64);
+    let after: AfterWound = Arc::default();
+    let rt = Runtime::<Local>::new();
+    let root = {
+        let (b_rt, c_rt, after) = (b_rt.clone(), c_rt.clone(), after.clone());
+        rt.create_query(move |_| {
+            let v = match catch_unwind(AssertUnwindSafe(|| b_rt.get(x))) {
+                Ok(v) => v,
+                Err(_) => {
+                    let held = crate::hold::active();
+                    let raised = catch_unwind(AssertUnwindSafe(|| c_rt.get(q)))
+                        .err()
+                        .filter(|p| p.is::<String>() || p.is::<&str>())
+                        .map(panic_message);
+                    *after.lock().unwrap() = Some((held, raised));
+                    0
+                }
+            };
+            v + c_rt.get(q)
+        })
+    };
+    let got = rt.get(root);
+    assert!(wounded.load(Ordering::SeqCst));
+    let (held, raised) = after
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the reader caught the wound");
+    assert_eq!(
+        raised, None,
+        "the read of C after the caught wound panicked"
+    );
+    assert!(!held, "the thread holds after B's retraction");
+    assert_eq!(got, b_rt.get(x) + 7);
+    assert_eq!(crate::hold::held_count(), 0);
+}
+
+/// B's `x` reads B's held cycle, then D's `z`, which reads that cycle
+/// back: D retracts at its exit and taints x, so B's exit, its first
+/// entry under `Local` A's reader, retracts B and taints the reader. A
+/// read of C follows. Nothing may stay held past A's outermost exit.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_reader_of_a_retracted_shared_entry_holds_nothing_at_its_exit() {
+    let b_rt = Arc::new(Runtime::<Shared>::new());
+    let (a, b) = two_cycle(&*b_rt);
+    let d_rt = Arc::new(Runtime::<Shared>::new());
+    let z = {
+        let b_rt = b_rt.clone();
+        d_rt.create_query(move |_| b_rt.get(a) + 1)
+    };
+    let x = {
+        let d_rt = d_rt.clone();
+        b_rt.create_query(move |rt| rt.get(a) + rt.get(b) + d_rt.get(z))
+    };
+    let c_rt = Arc::new(Runtime::<Shared>::new());
+    let q = c_rt.create_query(|_| 7_i64);
+    let rt = Runtime::<Local>::new();
+    let root = {
+        let (b_rt, c_rt) = (b_rt.clone(), c_rt.clone());
+        rt.create_query(move |_| b_rt.get(x) + c_rt.get(q))
+    };
+    let got = rt.get(root);
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(got, b_rt.get(x) + 7);
+}
+
+thread_local! {
+    static LOCAL_RT: Runtime<Local> = Runtime::new();
+}
+
+/// x, under an outermost `Shared` read, reads its held cycle and then a
+/// `Local` node r that reads the cycle back: r's frame reads a held
+/// landing, but no exit publishes a `Local` runtime's holds, so r must land
+/// at once and pass the hold to x.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn local_reader_of_a_held_landing_holds_nothing_at_its_exit() {
+    let b_rt = Arc::new(Runtime::<Shared>::new());
+    let (a, b) = two_cycle(&*b_rt);
+    let r = {
+        let b_rt = b_rt.clone();
+        LOCAL_RT.with(|l| l.create_query(move |_| b_rt.get(a) * 10))
+    };
+    let x = b_rt.create_query(move |rt| rt.get(a) + rt.get(b) + LOCAL_RT.with(|l| l.get(r)));
+    let got = b_rt.get(x);
+    assert!(!crate::hold::active(), "the thread holds past its exit");
+    assert_eq!(crate::hold::held_count(), 0);
+    assert_eq!(got, b_rt.get(a) + b_rt.get(b) + b_rt.get(a) * 10);
+    assert_eq!(LOCAL_RT.with(|l| l.get(r)), b_rt.get(a) * 10);
+}

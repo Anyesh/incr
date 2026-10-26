@@ -324,10 +324,13 @@ impl<C: Cells> Runtime<C> {
     fn end_nested_shared(&self, cidx: u32) {
         replay::drop_all_from(cidx);
         if cycle_state::wounded() {
-            // The winner may wait on one of them.
+            // The winner may wait on one of them. Only `Local` frames lie
+            // below the thread's first `Shared` entry, and none takes `HOLD`,
+            // so no reader is tainted.
             if hold::holds_runtime(self.runtime_id) {
                 self.retract_held();
             }
+            debug_assert!(self.dep_stack.hold_reader().is_none());
             reserve::end_all();
             debug_assert!(
                 cycle_state::held_keys()
