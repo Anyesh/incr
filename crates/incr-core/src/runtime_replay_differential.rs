@@ -3115,6 +3115,69 @@ fn seed_4e9f_raises_no_panic_of_a_stale_read() {
     });
 }
 
+/// 0x22f, shrunk (cross). At budget 1, `Get(0)`'s read of 1 is over the
+/// budget, so 0 goes on speculatively into 2 and 3, and 3, not replayable,
+/// reads the other runtime's input 5 (4) with no kept read. `Set2` moves
+/// that input to 2, and the recreated 1 reads 2 twice, where the unbounded
+/// run computes 2 from the new input.
+fn seed_22f_case() -> Case {
+    let q = |expr, replay, bare| Spec::Query {
+        expr,
+        replay,
+        bare,
+        strategy: Strat::None,
+    };
+    let r = |n| Box::new(Expr::Read(n, false));
+    let mut specs = vec![
+        q(Expr::If(r(1), r(2), Box::new(Expr::Const(0))), true, false),
+        q(Expr::Const(3), true, false),
+        q(Expr::Read(3, false), true, false),
+        q(Expr::ReadOther(5, false), false, false),
+    ];
+    specs.extend((0..5).map(|_| q(Expr::Const(0), true, false)));
+    specs.push(Spec::Input(4));
+    Case {
+        specs,
+        panics: true,
+        cycles: true,
+        queries: 9,
+        specs2: vec![
+            q(Expr::Read(5, false), true, false),
+            q(Expr::Read(3, false), true, false),
+            q(
+                Expr::Add(
+                    Box::new(Expr::If(r(5), Box::new(Expr::Read(5, true)), r(3))),
+                    Box::new(Expr::PanicIf(r(5), 0)),
+                ),
+                true,
+                false,
+            ),
+            q(Expr::Read(5, false), false, false),
+            q(Expr::ReadOther(2, false), true, true),
+            Spec::Input(4),
+        ],
+        queries2: 5,
+        ops: vec![
+            Op::Get(0),
+            Op::Set2(5, 2),
+            Op::Delete(0),
+            Op::Delete(1),
+            Op::Recreate(1, q(Expr::Add(r(2), r(2)), true, false)),
+            Op::Get(1),
+        ],
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn seed_22f_adopts_no_stash_over_an_unkept_foreign_read() {
+    let case = seed_22f_case();
+    quiet(|| {
+        differential::<Local>(&case, 0x22f);
+        differential::<Shared>(&case, 0x22f);
+    });
+}
+
 /// 0x198c2, shrunk (cross): 9 reads the chain 16 to 18 only at budget 1's
 /// depth, so its doomed run reads 18's foreign dep, the other runtime's 0,
 /// Clean; a set of that runtime's input follows, and the next `Get(0)`
