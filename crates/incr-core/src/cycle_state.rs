@@ -1112,11 +1112,8 @@ impl KeptUnwind {
     #[inline(always)]
     pub(crate) fn around<R>(f: impl FnOnce() -> R) -> R {
         let bits = value_code::thread_word() & value_code::UNWIND_MASK;
-        if bits != 0 || std::thread::panicking() {
+        if bits != 0 || lazy_open() {
             return Self::kept(bits, f);
-        }
-        if lazy_open() {
-            raise_lazy();
         }
         f()
     }
@@ -1126,9 +1123,6 @@ impl KeptUnwind {
     fn kept<R>(bits: u64, f: impl FnOnce() -> R) -> R {
         if !std::thread::panicking() {
             raise_if_lazy();
-            return f();
-        }
-        if bits == 0 && !lazy_open() {
             return f();
         }
         let _kept = Self::keep(bits);
