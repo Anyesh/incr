@@ -329,7 +329,7 @@ impl<C: Cells> Runtime<C> {
         let hold::Taken {
             entries, cut_recs, ..
         } = hold::take(self.runtime_id);
-        self.retract_entries(entries, cut_recs, true);
+        self.retract_entries(entries, cut_recs, true, false);
     }
 
     /// A claim wait on `on`, past `REGISTER_AFTER`: if another thread holds
@@ -347,7 +347,7 @@ impl<C: Cells> Runtime<C> {
         // The retraction is the owner's: none of this thread's contexts
         // reserves what it lands.
         let _scope = reserve::Scope::new(None);
-        self.retract_entries(vec![e], Vec::new(), false);
+        self.retract_entries(vec![e], Vec::new(), false, false);
         true
     }
 
@@ -525,7 +525,7 @@ impl<C: Cells> Runtime<C> {
             wounded,
         } = hold::take(self.runtime_id);
         if wounded || !self.publish_edges(&entries) {
-            self.retract_entries(entries, cut_recs, true);
+            self.retract_entries(entries, cut_recs, true, false);
             return false;
         }
         // A cut claim's record stays as the cut left it.
@@ -544,33 +544,44 @@ impl<C: Cells> Runtime<C> {
         }
         let mut bag = Deferred::new();
         let mut rest = entries.into_iter();
-        let published = catch_unwind(AssertUnwindSafe(|| {
+        let mut published: Vec<u32> = Vec::new();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
             let targets = self.publication_targets(rest.as_slice());
             for e in rest.by_ref() {
                 let target = targets[&e.slot];
+                published.push(e.slot);
                 self.publish_one(e, target, &mut bag);
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
-        // what is left goes back as on a wound (G9), its edges with it, and
-        // a landing already published over one of them lands Dirty.
-        if let Err(payload) = published {
+        // what is left goes back as on a wound (G9), its edges with it.
+        if let Err(payload) = outcome {
             let rest: Vec<Held> = rest.collect();
-            let slots: Vec<u32> = rest.iter().map(|e| e.slot).collect();
-            let mut inner = self.inner.write();
-            for e in &rest {
-                self.move_edges(&mut inner, e, true);
-            }
-            drop(inner);
-            self.retract_entries(rest, Vec::new(), true);
-            for slot in slots {
-                let (_, flags) = self.nodes.get_with_flags(slot);
-                self.mark_dependents_dirty(NodeId(slot), flags);
-            }
+            let given: Vec<u32> = rest.iter().map(|e| e.slot).collect();
+            self.retract_entries(rest, Vec::new(), true, true);
+            self.unverify_readers(&published, &given);
             bag.drain_carried(payload);
         }
         bag.drain(self);
         true
+    }
+
+    /// A published landing that read one given back computed over a value
+    /// the give-back undid, while give-backs keep `changed_at`: it must
+    /// recompute, not verify, and what reads it must see it Dirty.
+    fn unverify_readers(&self, published: &[u32], given: &[u32]) {
+        for &slot in published {
+            let node = self.nodes.get(slot);
+            let mut over_given = false;
+            node.for_each_dep(|d| over_given |= given.contains(&d.0));
+            if over_given {
+                node.set_verified_at(0);
+            }
+        }
+        for &slot in given {
+            let (_, flags) = self.nodes.get_with_flags(slot);
+            self.mark_dependents_dirty(NodeId(slot), flags);
+        }
     }
 
     /// The held landings' reverse edges, under one write lock as
@@ -741,6 +752,7 @@ impl<C: Cells> Runtime<C> {
         mut entries: Vec<Held>,
         cut_recs: Vec<(u32, Option<Arc<GroupInfo>>)>,
         own: bool,
+        edges_published: bool,
     ) {
         entries.reverse();
         // The retracted claims land unrun, as a release's do.
@@ -757,6 +769,9 @@ impl<C: Cells> Runtime<C> {
             let mut inner = self.inner.write();
             for (i, e) in entries.iter_mut().enumerate() {
                 let node = self.nodes.get(e.slot);
+                if edges_published {
+                    self.move_edges(&mut inner, e, true);
+                }
                 if let Some(old) = &e.undo.deps {
                     let live: Vec<NodeId> = old
                         .iter()
