@@ -1063,3 +1063,268 @@ fn a_cycle_caught_under_a_local_root_holds_nothing_past_the_read() {
     assert!(!crate::hold::active(), "the thread holds past its exit");
     assert_eq!(crate::hold::held_count(), 0);
 }
+
+/// Runs `f` on a fresh thread and returns its result, or `None` if it has
+/// not returned within 10 s (the thread is left running).
+fn within_10s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10)).ok()
+}
+
+/// x and w read each other through `try_get`, x a Fallback head if
+/// `fallback`; T reads x under a catch and then joins a thread that reads
+/// w with `try_get`. T's value, or `None` if T or its child hung, and the
+/// take-overs T's read restarted for.
+fn join_reader_of_held_member(fallback: bool) -> (Option<u64>, u32) {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let i = rt.create_input(3_u64);
+    let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let w = {
+        let xc = xc.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1)
+        })
+    };
+    let read_w = move |rt: &Runtime<Shared>| rt.try_get(w).map_or(rt.get(i) + 100, |v| v + 1000);
+    let x = if fallback {
+        rt.create_query_with(
+            read_w,
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+                ..crate::cycle::QueryOpts::default()
+            },
+        )
+    } else {
+        rt.create_query(read_w)
+    };
+    assert!(xc.set(x).is_ok());
+    let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let t = {
+        let takes = takes.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + std::thread::scope(|s| s.spawn(|| rt.try_get(w).unwrap_or(9)).join().unwrap())
+        })
+    };
+    let got = within_10s(move || rt.get(t));
+    (got, takes.load(Ordering::SeqCst))
+}
+
+/// **A closure that holds a cycle's landings can join a reader of one.**
+/// x and w land Cyclic, held by T's read, which caught the cycle; the
+/// child reading w must not wait for T's attempt to end, since T waits for
+/// it. The child takes w over and T's read restarts, at most once per held
+/// node, with what every order gives.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_join_reads_a_member_its_reader_holds_cyclic() {
+    let (got, takes) = join_reader_of_held_member(false);
+    assert_eq!(got, Some(9));
+    assert!(takes <= 2, "{takes} take-overs");
+}
+
+/// As above with x a Fallback head, so the episode lands values held.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_join_reads_a_member_its_reader_holds_with_a_value() {
+    let (got, takes) = join_reader_of_held_member(true);
+    assert_eq!(got, Some(101));
+    assert!(takes <= 2, "{takes} take-overs");
+}
+
+/// **A cycle landed after a take-over sees a later set.** T holds the
+/// cycle x, w and joins a child that takes w over, reads it and sets i, so
+/// T's retry runs the cycle again with w taken, and w now reads k too: the
+/// episode lands unheld, and w's new dep must get its reverse edge as any
+/// landing's does, or a later set of k never reaches w, which then reads
+/// stale against a runtime that saw i's and k's last values from the start.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_cycle_landed_after_a_take_over_sees_a_later_set() {
+    let cycle = |input: u64, extra: u64| {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let i = rt.create_input(input);
+        let k = rt.create_input(extra);
+        let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let w = {
+            let xc = xc.clone();
+            rt.create_query(move |rt: &Runtime<Shared>| {
+                let more = if rt.get(i) >= 4 { rt.get(k) } else { 0 };
+                rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1) + more
+            })
+        };
+        let x = rt.create_query_with(
+            move |rt: &Runtime<Shared>| rt.try_get(w).map_or(100, |v| v + 1000),
+            crate::cycle::QueryOpts {
+                cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+                ..crate::cycle::QueryOpts::default()
+            },
+        );
+        assert!(xc.set(x).is_ok());
+        (rt, i, k, x, w)
+    };
+    let (rt, i, k, x, w) = cycle(3, 20);
+    let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let set_once = Arc::new(AtomicBool::new(false));
+    let t = {
+        let (takes, set_once) = (takes.clone(), set_once.clone());
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + std::thread::scope(|s| {
+                s.spawn(|| {
+                    let r = rt.try_get(w).unwrap_or(9);
+                    if !set_once.swap(true, Ordering::SeqCst) {
+                        rt.set(i, 4);
+                    }
+                    r
+                })
+                .join()
+                .unwrap()
+            })
+        })
+    };
+    let reader = rt.clone();
+    assert!(
+        within_10s(move || reader.get(t)).is_some(),
+        "T or its child hung"
+    );
+    assert!(
+        takes.load(Ordering::SeqCst) >= 1,
+        "T's read was never taken over"
+    );
+    rt.set(k, 30);
+    let after = (rt.try_get(x).ok(), rt.try_get(w).ok());
+    let (fresh, _, _, fx, fw) = cycle(4, 30);
+    assert_eq!(after, (fresh.try_get(fx).ok(), fresh.try_get(fw).ok()));
+}
+
+/// **A reader that dirties the cycle on every run restarts its holder a
+/// bounded number of times.** As above, but every child sets i after its
+/// read, so each retry of T runs the cycle again. A taken claim is never
+/// held again in T's outermost entry, so after the first take-over the
+/// next child reads w published and T ends; were w held again, each child
+/// would take it over and T would restart for good.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_reader_that_dirties_the_cycle_each_run_restarts_its_holder_boundedly() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    let i = rt.create_input(0_u64);
+    let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+    let w = {
+        let xc = xc.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1) + rt.get(i)
+        })
+    };
+    let x = rt.create_query_with(
+        move |rt: &Runtime<Shared>| rt.try_get(w).map_or(100, |v| v + 1000),
+        crate::cycle::QueryOpts {
+            cycle: crate::cycle::CycleStrategy::fallback(|_| 50_u64),
+            ..crate::cycle::QueryOpts::default()
+        },
+    );
+    assert!(xc.set(x).is_ok());
+    let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let t = {
+        let (takes, runs) = (takes.clone(), runs.clone());
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+            runs.fetch_add(1, Ordering::SeqCst);
+            let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+            v + std::thread::scope(|s| {
+                s.spawn(|| {
+                    let r = rt.try_get(w).unwrap_or(9);
+                    rt.set(i, rt.get(i) + 1);
+                    r
+                })
+                .join()
+                .unwrap()
+            })
+        })
+    };
+    let reader = rt.clone();
+    assert!(
+        within_10s(move || reader.get(t)).is_some(),
+        "T restarted for good"
+    );
+    assert!(
+        takes.load(Ordering::SeqCst) >= 1,
+        "T's read was never taken over"
+    );
+    let runs = runs.load(Ordering::SeqCst);
+    assert!(runs <= 3, "T ran {runs} times");
+}
+
+/// **Two holders that join readers of each other's landings both end.**
+/// Each of two runtimes has a `try_get` cycle that its read T catches and
+/// holds; once both hold, each T joins a child reading the other's member.
+/// Each child takes its member over, so both reads restart, and a taken
+/// claim is never held again, so neither restarts for good.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn two_holders_that_join_readers_of_each_others_landings_both_end() {
+    struct Side {
+        rt: Arc<Runtime<Shared>>,
+        x: Incr<u64>,
+        w: Incr<u64>,
+    }
+    fn side() -> Side {
+        let rt = Arc::new(Runtime::<Shared>::new());
+        let xc: Arc<OnceLock<Incr<u64>>> = Arc::default();
+        let w = {
+            let xc = xc.clone();
+            rt.create_query(move |rt: &Runtime<Shared>| {
+                rt.try_get(*xc.get().unwrap()).map_or(5, |v| v + 1)
+            })
+        };
+        let x = rt.create_query(move |rt: &Runtime<Shared>| rt.try_get(w).map_or(7, |v| v + 1));
+        assert!(xc.set(x).is_ok());
+        Side { rt, x, w }
+    }
+    let (a, b) = (side(), side());
+    let arrived = Arc::new(AtomicUsize::new(0));
+    let reader = |me: &Side, other: &Side| {
+        let (x, w, other_rt) = (me.x, other.w, other.rt.clone());
+        let arrived = arrived.clone();
+        let takes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t = {
+            let takes = takes.clone();
+            me.rt.create_query(move |rt: &Runtime<Shared>| {
+                takes.fetch_max(crate::reserve::takes(), Ordering::SeqCst);
+                let v = catch_unwind(AssertUnwindSafe(|| rt.get(x))).unwrap_or(0);
+                // Both hold their cycle before either joins, on the first
+                // attempt; a restart finds both arrived.
+                arrived.fetch_add(1, Ordering::SeqCst);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while arrived.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let other_rt = other_rt.clone();
+                v + std::thread::scope(|s| {
+                    s.spawn(move || other_rt.try_get(w).unwrap_or(9))
+                        .join()
+                        .unwrap()
+                })
+            })
+        };
+        let rt = me.rt.clone();
+        (
+            std::thread::spawn(move || within_10s(move || rt.get(t))),
+            takes,
+        )
+    };
+    let (ta, takes_a) = reader(&a, &b);
+    let (tb, takes_b) = reader(&b, &a);
+    let (got_a, got_b) = (ta.join().unwrap(), tb.join().unwrap());
+    assert_eq!((got_a, got_b), (Some(9), Some(9)));
+    for takes in [takes_a, takes_b] {
+        let n = takes.load(Ordering::SeqCst);
+        assert!(n <= 2, "{n} take-overs");
+    }
+}

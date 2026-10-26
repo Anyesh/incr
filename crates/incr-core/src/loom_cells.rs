@@ -147,6 +147,11 @@ impl<T: Value> ValueSlot<T> for LoomValueSlot<T> {
     fn try_read(&self) -> Option<T> {
         self.current().cloned()
     }
+    fn try_read_then(&self, loaded: impl FnOnce()) -> Option<T> {
+        let cur = self.current();
+        loaded();
+        cur.cloned()
+    }
     fn write(&self, v: T) -> Option<LoomDisplaced<T>> {
         self.swap(Box::into_raw(Box::new(v)))
     }

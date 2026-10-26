@@ -61,6 +61,8 @@ impl Gate {
         if !self.0.armed.swap(false, Ordering::SeqCst) {
             return;
         }
+        // A gate stands for a step the test holds, not a stuck holder.
+        let _parked = crate::attempt::Parked::new();
         self.0.reached_tx.lock().unwrap().send(()).unwrap();
         if self
             .0
