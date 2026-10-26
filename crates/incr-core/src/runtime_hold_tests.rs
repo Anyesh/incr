@@ -2738,3 +2738,51 @@ fn shared_set_inside_the_attempt_over_its_held_cycle_finishes() {
     let shared = within_10s(|| set_over_a_held_cycle(&Runtime::<Shared>::new()));
     assert_eq!(shared, Some(local));
 }
+
+/// Thread A's o catches f's panic, then reads r, which reads f's held
+/// Failed landing and fails with it: r's landing is held because its run
+/// read a held one. While A is parked before its exit, thread B reads r,
+/// budgeted and replayable, so r's Failed landing has a regeneration
+/// record once published. B must wait for A's publication rather than
+/// rerun r over it, and fail either way.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn shared_reader_of_a_held_failed_landing_is_not_rerun_by_another_thread() {
+    let rt = Arc::new(Runtime::<Shared>::new());
+    rt.set_placeholder(0_i64);
+    rt.set_max_frames(16);
+    let gate = Gate::new();
+    let i = rt.create_input(1_i64);
+    let f = rt.create_query_with(
+        move |rt: &Runtime<Shared>| -> i64 { panic!("f boom {}", rt.get(i)) },
+        replayable(),
+    );
+    let r = rt.create_query_with(move |rt: &Runtime<Shared>| rt.get(f) + 1, replayable());
+    let o = {
+        let gate = gate.clone();
+        rt.create_query(move |rt: &Runtime<Shared>| {
+            let caught = catch_unwind(AssertUnwindSafe(|| rt.get(f))).is_err();
+            let read = catch_unwind(AssertUnwindSafe(|| rt.get(r))).is_err();
+            gate.park();
+            i64::from(caught) + i64::from(read)
+        })
+    };
+    gate.arm();
+    let a = {
+        let rt = Arc::clone(&rt);
+        std::thread::spawn(move || rt.get(o))
+    };
+    gate.wait_parked();
+    assert_eq!(rt.state_of(r), NodeState::Computing);
+    let b = {
+        let rt = Arc::clone(&rt);
+        std::thread::spawn(move || catch_unwind(AssertUnwindSafe(|| rt.get(r))).is_err())
+    };
+    gate.release();
+    assert_eq!(a.join().unwrap(), 2);
+    let b = within_10s(move || b.join().unwrap()).expect("B's read of r never finished");
+    assert!(b, "B's read of r returned a value");
+    assert_eq!(rt.state_of(r), NodeState::Failed);
+    assert_eq!(rt.state_of(f), NodeState::Failed);
+    rt.assert_invariant_i();
+}
