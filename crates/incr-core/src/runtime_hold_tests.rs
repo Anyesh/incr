@@ -771,7 +771,10 @@ fn local_reader_of_a_retracted_shared_entry_holds_nothing_at_its_exit() {
 }
 
 thread_local! {
-    static LOCAL_RT: Runtime<Local> = Runtime::new();
+    /// Leaked, so no thread's exit drops it: a runtime dropped in TLS
+    /// teardown can reach `BudgetEntry`'s thread-locals after their
+    /// destruction while another test's runtime is unbudgeted.
+    static LOCAL_RT: &'static Runtime<Local> = Box::leak(Box::new(Runtime::new()));
 }
 
 /// x, under an outermost `Shared` read, reads its held cycle and then a
