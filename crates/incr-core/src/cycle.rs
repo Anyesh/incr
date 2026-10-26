@@ -411,9 +411,13 @@ pub(crate) const HANDLED: u16 = 2048;
 /// node, so its panic is not regenerated (`Runtime::regenerate`).
 pub(crate) const UNREGENERABLE: u16 = 4096;
 /// `ComputeCtl::flags`: the frame made a read its stash adoption can't
-/// check: a kept read (`KEPT_READ`) of its own runtime, or of another
-/// runtime's node that was not Clean or was read while that runtime was
-/// changing, or a read of a deleted node's handle.
+/// check, so a speculative run of it is not stashed:
+/// - a kept read (`KEPT_READ`) of its own runtime, or of another runtime's
+///   node that was not Clean or was read while that runtime was changing;
+/// - on a `SPECULATIVE` frame, a read of another runtime it neither keeps
+///   nor records, or holds instead of keeping (`FOREIGN_HOLD`), and a
+///   lookup that records nothing;
+/// - a read of a deleted node's handle.
 pub(crate) const KEPT_UNCHECKED: u16 = 8192;
 
 /// `ComputeCtl::flags`: the frame read a landing this thread's attempt

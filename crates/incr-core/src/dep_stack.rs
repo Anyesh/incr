@@ -23,7 +23,8 @@ use std::mem::ManuallyDrop;
 
 use crate::cells::Cells;
 use crate::cycle::{
-    ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, KEPT_UNCHECKED, POISONED, UNREGENERABLE,
+    ComputeCtl, BUFFERED, DOOMED, FOREIGN_HOLD, HOLD, KEPT_UNCHECKED, POISONED, SPECULATIVE,
+    UNREGENERABLE,
 };
 use crate::handle::{FrameRt, RuntimeId};
 use crate::node::NodeId;
@@ -173,6 +174,8 @@ impl Frames {
     /// kept read can carry: within its own runtime's budget, that frame can
     /// no longer be doomed, because its retry would read the other runtime
     /// again (see [`FOREIGN_HOLD`]). A frame doomed already keeps its doom.
+    /// A `SPECULATIVE` frame is also marked `KEPT_UNCHECKED`, since its
+    /// stash adoption could not see that runtime change.
     #[cold]
     #[inline(never)]
     fn hold_foreign_reader(&mut self) {
@@ -185,6 +188,9 @@ impl Frames {
         let ctl = unsafe { &*top.ctl };
         // A rerun of the reader's node reads the other runtime again.
         ctl.raise(UNREGENERABLE);
+        if ctl.has(SPECULATIVE) {
+            ctl.raise(KEPT_UNCHECKED);
+        }
         if !ctl.has(DOOMED) {
             let held = ctl.has(FOREIGN_HOLD);
             ctl.raise(FOREIGN_HOLD);
@@ -381,7 +387,9 @@ pub trait DepStack: sealed::Sealed + 'static {
     /// The top frame's runtime, control block and position, when it is
     /// another runtime's than `rt` and keeps `rt`'s Clean reads (see
     /// [`FrameRt`]). A frame still untested is settled here,
-    /// by its runtime, once.
+    /// by its runtime, once. Another runtime's frame that does not keep
+    /// them reads `rt` unrecorded, so a `SPECULATIVE` one is marked
+    /// `KEPT_UNCHECKED`: its stash could not see `rt` change.
     fn foreign_keeper(&self, rt: RuntimeId) -> Option<(RuntimeId, *const ComputeCtl, u32)> {
         let (tagged, node, ctl, cidx) = self.with(|s| {
             s.frames
@@ -391,8 +399,14 @@ pub trait DepStack: sealed::Sealed + 'static {
         })?;
         // SAFETY: the frame is on the stack, so it is running and its
         // control block is live.
-        self.top_keeps_foreign(tagged, node, unsafe { &*ctl })
-            .then(|| (tagged.rt(), ctl, cidx))
+        let control = unsafe { &*ctl };
+        if self.top_keeps_foreign(tagged, node, control) {
+            return Some((tagged.rt(), ctl, cidx));
+        }
+        if control.has(SPECULATIVE) {
+            control.raise(KEPT_UNCHECKED);
+        }
+        None
     }
 
     /// Whether the top frame, read as `tagged`, `node` and `ctl`, keeps
@@ -415,7 +429,8 @@ pub trait DepStack: sealed::Sealed + 'static {
     /// (`SENTINEL` for a callback's barrier, `None` outside any compute),
     /// after raising `UNREGENERABLE` on a compute frame that keeps other
     /// runtimes' Clean reads, since a rerun of its node would look again
-    /// as things are then.
+    /// as things are then, and `KEPT_UNCHECKED` on a `SPECULATIVE` one,
+    /// since its stash adoption could not see the answer change.
     ///
     /// Inlined so that a lookup outside any compute costs one look at the
     /// stack; the marking stays out of line.
@@ -436,6 +451,9 @@ pub trait DepStack: sealed::Sealed + 'static {
     fn mark_unrecorded_lookup(&self, tagged: FrameRt, node: NodeId, ctl: &ComputeCtl) {
         if self.top_keeps_foreign(tagged, node, ctl) {
             ctl.raise(UNREGENERABLE);
+        }
+        if ctl.has(SPECULATIVE) {
+            ctl.raise(KEPT_UNCHECKED);
         }
     }
 

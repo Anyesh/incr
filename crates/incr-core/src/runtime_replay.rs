@@ -322,8 +322,8 @@ impl<C: Cells> Runtime<C> {
     /// land Dirty, poisoned, over a dep that is neither Clean nor stashed, or
     /// over a kept read its adoption can't check (`KEPT_UNCHECKED`), has a
     /// history the unbounded run may never give it, and a later walk
-    /// of its deps would differ from a first run of its closure. A Clean
-    /// read of another runtime is checked: the stash keeps that runtime's
+    /// of its deps would differ from a first run of its closure. A kept
+    /// Clean read of another runtime is checked: the stash keeps that runtime's
     /// count of changes as the read found it, and is adopted only while the
     /// count holds. A run that read a placeholder (`PH_SEEN`) is never
     /// stashed, since only a doomed frame reads one. Nor does it
