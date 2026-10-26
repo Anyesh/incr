@@ -4185,21 +4185,25 @@ impl<C: Cells> Runtime<C> {
     /// Waits out the claims on `walk`'s pending entries in `landed` whose
     /// episode is still publishing: it is counted before its members land,
     /// so a replan can meet them still held, by a thread that runs only
-    /// engine code until they land.
+    /// engine code until they land. The wait ends with the publication, so
+    /// a later compute that claims the node is never waited on here.
     fn wait_for_landings(&self, walk: &Walk, landed: &HashSet<u32, FxBuildHasher>) {
-        let held: Vec<NodeId> = (walk.work.iter())
+        let held: Vec<(NodeId, u32)> = (walk.work.iter())
             .filter(|e| e.is_pending() && landed.contains(&e.id.0))
-            .map(|e| e.id)
+            .map(|e| (e.id, e.generation))
             .collect();
-        for id in held {
-            let cell = self.nodes.get(id.0).state_cell();
+        for (id, generation) in held {
+            let node = self.nodes.get(id.0);
+            let cell = node.state_cell();
+            let waiting = || {
+                node.generation() == generation
+                    && is_computing(self.seen(cell, state::load::<C>(cell)))
+                    && self.own_claim_owner(id).is_none()
+                    && self.episode_log.read().is_publishing(id.0)
+            };
             let mut spins = 0;
-            while is_computing(self.seen(cell, state::load::<C>(cell)))
-                && self.own_claim_owner(id).is_none()
-                && self.episode_log.read().is_publishing(id.0)
-            {
-                spins += 1;
-                self.wait_on_claim(id, spins);
+            while waiting() {
+                self.spin_on(id, &mut spins, || !waiting());
             }
         }
     }
