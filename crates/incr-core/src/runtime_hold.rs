@@ -555,15 +555,13 @@ impl<C: Cells> Runtime<C> {
         if episodes != 0 {
             // Before the members land, so a read of one of their landings
             // also reads the count.
-            let landed = episodes * super::LANDED;
-            crate::cycle_state::own_episode(self.runtime_id, landed);
-            C::u64_fetch_add(&self.episodes_landed, landed);
+            self.count_landed(episodes, entries.iter().map(|e| e.slot));
         }
         // A release counted when its claims landed held: a walk planned
         // since then expanded through their held states, and must see the
         // count move when they publish.
         if entries.iter().any(|e| e.unrun) {
-            self.count_release();
+            self.count_release(entries.iter().filter(|e| e.unrun).map(|e| e.slot));
         }
         let mut bag = Deferred::new();
         let mut rest = entries.into_iter();
@@ -596,9 +594,7 @@ impl<C: Cells> Runtime<C> {
                     let token = self.failed_run_token(slot, generation);
                     self.leave_failed_target(NodeId(slot), generation, token, u64::MAX, &mut bag);
                 }
-                if rest.is_empty() {
-                    self.count_release();
-                }
+                self.count_release([slot]);
                 self.land_now(NodeId(slot), node, NodeState::Dirty, NodeState::Dirty, true);
                 if target == NodeState::Failed {
                     self.park(super::ParkPoint::FailedLandedOtherwise(NodeId(slot)));
@@ -843,10 +839,11 @@ impl<C: Cells> Runtime<C> {
         entries.reverse();
         // The retracted claims land unrun, as a release's do.
         if !entries.is_empty() {
+            let slots = entries.iter().map(|e| e.slot);
             if own {
-                self.count_release();
+                self.count_release(slots);
             } else {
-                self.count_foreign_release();
+                self.count_foreign_release(slots);
             }
         }
         let mut bag = Deferred::new();

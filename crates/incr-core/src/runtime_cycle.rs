@@ -1928,19 +1928,51 @@ impl<C: Cells> Runtime<C> {
     }
 
     /// Counts a release of held claims, before they land, for the walks
-    /// other threads planned while they were held: a claim that reads one
-    /// of the landings also reads the count.
-    pub(super) fn count_release(&self) {
+    /// other threads planned while they were held.
+    pub(super) fn count_release(&self, slots: impl IntoIterator<Item = u32>) {
         if !C::SINGLE_THREADED {
-            cycle_state::own_episode(self.runtime_id, RELEASED);
-            C::u64_fetch_add(&self.episodes_landed, RELEASED);
+            self.count_episodes(true, true, RELEASED, slots);
+        }
+    }
+
+    /// Counts `episodes` landed episodes, before their `slots` land.
+    pub(super) fn count_landed(&self, episodes: u64, slots: impl IntoIterator<Item = u32>) {
+        self.count_episodes(false, true, episodes * super::LANDED, slots);
+    }
+
+    /// Adds `add` to the episode count before `slots` land, so a claim
+    /// that reads one of the landings also reads the count. The log is
+    /// written under its lock with the count, so a walk that reads the
+    /// count and then the log finds the slots.
+    /// An `own` count is this thread's, which its own walks do not count
+    /// as another thread's.
+    fn count_episodes(
+        &self,
+        released: bool,
+        own: bool,
+        add: u64,
+        slots: impl IntoIterator<Item = u32>,
+    ) {
+        let log = (!C::SINGLE_THREADED).then(|| self.episode_log.write());
+        if own {
+            cycle_state::own_episode(self.runtime_id, add);
+        }
+        let after = C::u64_fetch_add(&self.episodes_landed, add).wrapping_add(add);
+        if let Some(mut log) = log {
+            let number = if released {
+                (after / RELEASED) as u32
+            } else {
+                after as u32
+            };
+            let by = if own { cycle_state::thread_key() } else { 0 };
+            log.push(released, number, by, slots);
         }
     }
 
     /// [`Self::count_release`] of another thread's claims.
-    pub(super) fn count_foreign_release(&self) {
+    pub(super) fn count_foreign_release(&self, slots: impl IntoIterator<Item = u32>) {
         if !C::SINGLE_THREADED {
-            C::u64_fetch_add(&self.episodes_landed, RELEASED);
+            self.count_episodes(true, false, RELEASED, slots);
         }
     }
 
@@ -1957,7 +1989,7 @@ impl<C: Cells> Runtime<C> {
         let rt = self.runtime_id;
         let stamp_rev = self.current_revision();
         if slots.iter().any(|&m| Some(m) != keep) {
-            self.count_release();
+            self.count_release(slots.iter().copied().filter(|&m| Some(m) != keep));
         }
         for &m in slots {
             if Some(m) == keep {
@@ -2069,7 +2101,7 @@ impl<C: Cells> Runtime<C> {
         if entries.is_empty() {
             return;
         }
-        self.count_release();
+        self.count_release(entries.iter().map(|&(slot, _)| slot));
         entries.sort_unstable_by_key(|(slot, _)| *slot);
         let released: Vec<u32> = entries.iter().map(|(slot, _)| *slot).collect();
         let stamp_rev = self.current_revision();
@@ -2419,7 +2451,7 @@ impl<C: Cells> Runtime<C> {
         });
         if stale {
             drop(inner);
-            self.count_release();
+            self.count_release(entries.iter().map(|&(m, _)| m));
             for (m, e) in entries {
                 let (node, flags) = self.nodes.get_with_flags(m);
                 if e.first {
@@ -2660,7 +2692,7 @@ impl<C: Cells> Runtime<C> {
         bag: &mut Deferred<C>,
     ) -> ! {
         // The landing counted itself, but its members now land unrun.
-        self.count_release();
+        self.count_release(entries.iter().map(|&(m, _)| m));
         let kind = cycle_state::take_unwind_kind();
         // Step 3 sets no memo before its last compare, and a claimed
         // member holds none from an earlier landing.

@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::ops::{Deref, DerefMut};
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use crate::cycle::{Cycle, Erased, ErasedStrategy};
@@ -823,6 +824,8 @@ struct EntryState {
     budget_clock: Cell<u64>,
     /// The length of `Outer::failed_here`, read by every Shared walk.
     failed_here: Cell<usize>,
+    /// This thread's [`thread_key`], 0 until first asked.
+    thread_key: Cell<u32>,
 }
 
 /// What the outermost entry resets: the roots whose episodes dissolved,
@@ -858,6 +861,7 @@ thread_local! {
             stack_base: Cell::new(0),
             budget_clock: Cell::new(0),
             failed_here: Cell::new(0),
+            thread_key: Cell::new(0),
         }
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = const { RefCell::new(Vec::new()) };
@@ -890,6 +894,7 @@ loom::thread_local! {
         stack_base: Cell::new(0),
         budget_clock: Cell::new(0),
         failed_here: Cell::new(0),
+        thread_key: Cell::new(0),
     };
     static OWN_EPISODES: RefCell<Vec<(RuntimeId, u64)>> = RefCell::new(Vec::new());
     static OUTER_RTS: RefCell<OuterRts> = RefCell::new(OuterRts::default());
@@ -900,6 +905,20 @@ loom::thread_local! {
         budgets_met: Vec::new(),
         failed_here: Vec::new(),
     });
+}
+
+static NEXT_THREAD_KEY: AtomicU32 = AtomicU32::new(1);
+
+/// A number no other thread alive holds, which tells this thread's
+/// episodes in a runtime's log from other threads'.
+pub(crate) fn thread_key() -> u32 {
+    ENTRY.with(|e| {
+        if e.thread_key.get() == 0 {
+            e.thread_key
+                .set(NEXT_THREAD_KEY.fetch_add(1, Ordering::Relaxed).max(1));
+        }
+        e.thread_key.get()
+    })
 }
 
 /// Runs `f` on the held map. `f` must not call user code or the engine.

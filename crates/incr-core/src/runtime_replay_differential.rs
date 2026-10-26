@@ -9567,6 +9567,43 @@ fn a_walk_replans_after_another_thread_lands_an_intermediate_by_a_cycle() {
     });
 }
 
+/// 0x34ec3 crosstwo's ops 10 (`TryGet(18)`, thread 0) and 11
+/// (`TryGet(1)`, thread 1). Thread 0's walk of 20 plans 26 and, through
+/// the group of 6, 20 and 26 again above it; it runs the upper 26 and is
+/// held before the upper 20 while thread 1's caught cycle releases a
+/// claim and lands 1 and 2 Clean. The lower entry of 26 is Clean by the
+/// walk's own run, so the replan must keep the plan above it: the serial
+/// walk goes on to run 7, whose read of 8 raises 9's self-cycle where
+/// 18's try_get of 19 catches it. Pruning there left 7 unrun, so the
+/// cycle was raised under 18's plain read of 19 instead and `TryGet(18)`
+/// returned it.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn a_replan_keeps_the_plan_above_an_entry_its_own_walk_settled() {
+    let seed = 0x34ec3;
+    let case = gen_case(seed, true, true);
+    use NodeState::Clean;
+    quiet(|| {
+        let got = hold_planned_walk(&case, seed, [10, 11], 20, &[(1, Clean), (2, Clean)]);
+        assert_eq!(got[10].0, Out::Value(18));
+    });
+}
+
+/// As above with thread 0's op reading 20 itself, so the walk a release
+/// sends back is its read's outermost one, and the read enters again
+/// before the walk goes on.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn an_outermost_replan_keeps_the_plan_above_an_entry_its_own_walk_settled() {
+    let seed = 0x34ec3;
+    let mut case = gen_case(seed, true, true);
+    case.ops[10] = Op::TryGet(20);
+    use NodeState::Clean;
+    quiet(|| {
+        hold_planned_walk(&case, seed, [10, 11], 20, &[(1, Clean), (2, Clean)]);
+    });
+}
+
 /// 0x7c3a1173e's ops 2 (`Get(4)`, thread 0) and 3 (`Get(11)`, thread 1)
 /// enter the cycle 4, 5, 6, 7, 8, 9, 11, 12 at different members. Thread
 /// 0 plans its read while 4 is New and is held at its claim until thread
