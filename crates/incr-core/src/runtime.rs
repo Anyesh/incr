@@ -877,6 +877,18 @@ impl Walk {
     /// visit that expanded it (or the group it is now a member of).
     #[cold]
     #[inline(never)]
+    /// Plans afresh from the root, whose claim the walk waited out, as the
+    /// read would after the other thread's landing: where the walk enters a
+    /// cycle of recorded deps depends on its visit count at the switch to
+    /// exact mode.
+    #[cold]
+    #[inline(never)]
+    fn restart(&mut self) {
+        self.first_visits = 0;
+        self.visited = None;
+        self.expanded = None;
+    }
+
     fn revisit(&mut self, id: NodeId, generation: u32) {
         self.forget(|&n| n == id);
         self.push(Entry {
@@ -3357,6 +3369,9 @@ impl<C: Cells> Runtime<C> {
                 if !C::SINGLE_THREADED && computed == Computed::Revisit {
                     #[cfg(test)]
                     revisited.push(cur);
+                    if is_root {
+                        walk.restart();
+                    }
                     walk.revisit(cur, generation);
                     continue;
                 }
