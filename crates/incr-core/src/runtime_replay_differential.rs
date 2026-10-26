@@ -7476,6 +7476,40 @@ fn replay_scan() {
     scan(from..n, std::env::var_os("REPLAY_ALL").is_some(), check);
 }
 
+/// Local against Shared over seeds `REPLAY_FROM..REPLAY_SCAN`, with the
+/// generator `REPLAY_CROSS` and `REPLAY_PAIRED` pick: each case's unbounded
+/// single-thread run under each must give the same outcome and leave the
+/// same nodes Failed or Cyclic after every operation.
+#[test]
+#[ignore = "a diagnostic that scans seeds"]
+fn replay_local_shared_scan() {
+    let from: u64 = std::env::var("REPLAY_FROM").map_or(0, |v| v.parse().expect("a seed"));
+    let to: u64 = std::env::var("REPLAY_SCAN").map_or(2000, |v| v.parse().expect("a count"));
+    let cross = std::env::var_os("REPLAY_CROSS").is_some();
+    let paired = std::env::var_os("REPLAY_PAIRED").is_some();
+    scan(from..to, true, |seed| {
+        local_shared(&gen_case(seed, cross, paired), seed);
+    });
+}
+
+fn local_shared(case: &Case, seed: u64) {
+    let local = labelled(&format!("seed {seed:#x}, Local unbounded"), || {
+        run::<Local>(case, None, 0)
+    });
+    let shared = labelled(&format!("seed {seed:#x}, Shared unbounded"), || {
+        run::<Shared>(case, None, 0)
+    });
+    for (i, ((lo, ls), (so, ss))) in local.iter().zip(&shared).enumerate() {
+        let (lf, sf) = (settled(&ls.0), settled(&ss.0));
+        assert!(
+            lo == so && lf == sf,
+            "seed {seed:#x}: Local and Shared differ at operation {i} ({:?}): \
+             Local {lo:?} settled {lf:?}, Shared {so:?} settled {sf:?}",
+            case.ops[i]
+        );
+    }
+}
+
 /// An operation, a closure run's node, and a node it read.
 type RunRead = (usize, (usize, usize), (usize, usize));
 
