@@ -1933,6 +1933,24 @@ fn truncated_levels_leave_only_the_kept_entries_of_a_node_queued() {
     assert_eq!(queued, (true, false));
 }
 
+/// Pushes, pops and truncations after the first ask keep the answer in step
+/// with the levels.
+#[test]
+fn queued_entries_follow_the_levels_after_the_first_ask() {
+    let queued = with_a_context(|x, entry| {
+        x.push_entry(1, entry);
+        x.run_entry(0, entry);
+        let first = x.queues(entry.node, entry.generation);
+        x.push_entry(2, entry);
+        x.truncate_levels(2);
+        x.drop_oldest(0);
+        let popped = x.queues(entry.node, entry.generation);
+        x.truncate_levels(1);
+        (first, popped, x.queues(entry.node, entry.generation))
+    });
+    assert_eq!(queued, (true, true, false));
+}
+
 #[derive(Debug)]
 struct CustomPayload(u64);
 
