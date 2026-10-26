@@ -2183,33 +2183,37 @@ fn a_walk_that_waited_out_a_released_group_claim_keeps_its_plan() {
 }
 
 /// Thread A's walk expands `p` as the group {p, x} and parks before its
-/// compute; another thread lands both members out of the group, Dirty.
-/// A's claim of `p` then plans it again as a read after those landings
-/// would: `x` runs as a walk entry before `p` is claimed, not nested in
-/// `p`'s verify, which is where a panicking member's failure is contained.
-#[test]
-fn a_walk_whose_expanded_group_dissolved_plans_its_entry_again() {
+/// compute; another thread lands both members out of the group, Dirty, and
+/// with `regroup` lands {p, x, z} as a new group. A's claim of `p` then
+/// plans it again as a read after those landings would: the node the new
+/// plan expands (`x`, or `z`'s dep `w` outside the new group) runs as a
+/// walk entry before `p` is claimed, not nested in `p`'s compute, which is
+/// where a panicking member's failure is contained.
+fn expanded_group_replaced_before_the_claim(regroup: bool) {
     let rt = Arc::new(Rt::new());
     let k = rt.create_input(0_i64);
+    let w = rt.create_query(move |rt| rt.get(k) + 1);
     let x = rt.create_query(move |rt| rt.get(k) * 10);
+    let z = rt.create_query(move |rt| rt.get(w) * 2);
     let p = rt.create_query(move |rt| rt.get(x) + rt.get(k));
-    assert_eq!(rt.get(p), 0);
+    assert_eq!((rt.get(p), rt.get(z)), (0, 2));
     rt.force_group_for_test(&[p.erase(), x.erase()]);
     rt.set(k, 1);
+    let probe = if regroup { id(w) } else { id(x) };
     let planned = Gate::new();
     planned.arm();
-    let p_at_x: Arc<Mutex<Vec<NodeState>>> = Arc::default();
+    let p_at_probe: Arc<Mutex<Vec<NodeState>>> = Arc::default();
     let installed = rt.park_hook.set(Box::new({
-        let (rt, planned, p_at_x) = (Arc::downgrade(&rt), planned.clone(), p_at_x.clone());
+        let (rt, planned, p_at_probe) = (Arc::downgrade(&rt), planned.clone(), p_at_probe.clone());
         move |point| {
             if thread::current().name() != Some("A") {
                 return;
             }
             if point == ParkPoint::BeforeComputeOne(id(p)) {
                 planned.park();
-            } else if point == ParkPoint::BeforeComputeOne(id(x)) {
+            } else if point == ParkPoint::BeforeComputeOne(probe) {
                 if let Some(rt) = rt.upgrade() {
-                    p_at_x.lock().unwrap().push(rt.state_of(p));
+                    p_at_probe.lock().unwrap().push(rt.state_of(p));
                 }
             }
         }
@@ -2227,11 +2231,24 @@ fn a_walk_whose_expanded_group_dissolved_plans_its_entry_again() {
         let (node, flags) = rt.nodes.get_with_flags(m.slot());
         rt.leave_group(NodeId(m.slot()), node, flags, NodeState::Dirty);
     }
+    if regroup {
+        rt.force_group_for_test(&[p.erase(), x.erase(), z.erase()]);
+    }
     planned.release();
     assert_eq!(a.join().unwrap(), 11);
-    assert_eq!(*p_at_x.lock().unwrap(), [NodeState::Dirty]);
-    assert_eq!(rt.get(p), 11);
+    assert_eq!(*p_at_probe.lock().unwrap(), [NodeState::Dirty]);
+    assert_eq!((rt.get(p), rt.get(z)), (11, 4));
     rt.assert_invariant_i();
+}
+
+#[test]
+fn a_walk_whose_expanded_group_dissolved_plans_its_entry_again() {
+    expanded_group_replaced_before_the_claim(false);
+}
+
+#[test]
+fn a_walk_whose_expanded_group_was_replaced_plans_its_entry_again() {
+    expanded_group_replaced_before_the_claim(true);
 }
 
 /// Thread A's walk plans `a` New and parks at `at`; another read lands
