@@ -394,7 +394,7 @@ impl<T: Value, C: Cells> GridTable<T, C> {
     pub fn get(&self, rt: &Runtime<C>, key: GridKey) -> Option<Incr<T>> {
         self.check_runtime(rt);
         key.check();
-        self.refuse_in_compute(rt, "get");
+        self.refuse_own_compute_lookup(rt, "get");
         self.find(rt, key)
     }
 
@@ -606,6 +606,17 @@ impl<T: Value, C: Cells> GridTable<T, C> {
                 rt.runtime_id.get(),
             );
         }
+    }
+
+    /// Marks the lookup on the running compute (see
+    /// `DepStack::unrecorded_lookup`) and refuses it inside a compute of
+    /// the table's runtime.
+    fn refuse_own_compute_lookup(&self, rt: &Runtime<C>, call: &str) {
+        assert!(
+            rt.dep_stack.unrecorded_lookup() != Some(rt.runtime_id),
+            "incr-core: GridTable::{call} called during compute; a lookup is not a \
+             dependency, so a compute finds its nodes through get_or_insert_*",
+        );
     }
 
     fn refuse_in_compute(&self, rt: &Runtime<C>, call: &str) {
