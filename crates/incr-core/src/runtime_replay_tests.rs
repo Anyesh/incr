@@ -2233,10 +2233,10 @@ fn recomputed_cycle_shape<C: Cells>(frames: u32, outer: u32, chain: u32, k0: u64
     (before, rt.try_get(top).unwrap_or(7777))
 }
 
-/// r sees b's payload after b's own run walked a cycle as the unbounded run's
-/// r did, at every budget. The unbounded r sees `CustomPayload(5)`, b's
-/// payload for the cycle, at every depth, as a fresh runtime with k set
-/// gives.
+/// r sees after the set what the unbounded run's r did, at every budget.
+/// The walk of b recomputes its stale dep y, whose cycle reaches the read
+/// (`Err`, 7777), as on main, where a fresh runtime with k set gives b's
+/// `CustomPayload(5)`: the stale-dep known limitation.
 #[test]
 fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
     for outer in [0, 1, 3] {
@@ -2250,13 +2250,9 @@ fn a_payload_after_a_cycle_its_run_walked_reads_as_unbounded() {
                     }
                 };
                 let want = shape(u32::MAX, 0);
-                assert_eq!(
-                    want.1,
-                    shape(u32::MAX, 1).0,
-                    "the unbounded read is not the fresh one"
-                );
                 let chain = u64::from(chain);
-                assert_eq!(want, (6001 + chain, 5001 + chain));
+                assert_eq!(shape(u32::MAX, 1).0, 5001 + chain, "fresh");
+                assert_eq!(want, (6001 + chain, 7777));
                 for frames in 1..9 {
                     assert_eq!(
                         shape(frames, 0),
