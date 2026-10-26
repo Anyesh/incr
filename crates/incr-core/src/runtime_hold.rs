@@ -544,12 +544,12 @@ impl<C: Cells> Runtime<C> {
         }
         let mut bag = Deferred::new();
         let mut rest = entries.into_iter();
-        let mut last: Option<u32> = None;
+        let mut stopped: Option<(u32, NodeState)> = None;
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             let targets = self.publication_targets(rest.as_slice());
             for (e, target) in rest.by_ref().zip(targets) {
-                last = Some(e.slot);
-                self.publish_one(e, target, &mut bag);
+                stopped = Some((e.slot, target));
+                self.publish_one(e, target, &mut bag, &mut stopped);
             }
         }));
         // An engine panic partway leaves no node Computing without an owner:
@@ -558,16 +558,20 @@ impl<C: Cells> Runtime<C> {
         // verified, over the deps and edges it installed.
         if let Err(payload) = outcome {
             let rest: Vec<Held> = rest.collect();
-            let stopped = last.filter(|&slot| is_computing(self.nodes.get(slot).state()));
-            let given: Vec<u32> = rest.iter().map(|e| e.slot).chain(stopped).collect();
+            let given: Vec<u32> = (rest.iter().map(|e| e.slot))
+                .chain(stopped.map(|(slot, _)| slot))
+                .collect();
             self.unverify_readers(&given);
-            if let Some(slot) = stopped {
+            if let Some((slot, target)) = stopped {
                 let node = self.nodes.get(slot);
                 node.set_verified_at(0);
                 if rest.is_empty() {
                     self.count_release();
                 }
                 self.land_now(NodeId(slot), node, NodeState::Dirty, NodeState::Dirty, true);
+                if target == NodeState::Failed {
+                    self.leave_failed_target(NodeId(slot), node.generation(), &mut bag);
+                }
             }
             self.retract_entries(rest, Vec::new(), true, true);
             self.park(super::ParkPoint::GaveBack);
@@ -713,7 +717,15 @@ impl<C: Cells> Runtime<C> {
         targets
     }
 
-    fn publish_one(&self, e: Held, target: NodeState, bag: &mut Deferred<C>) {
+    /// Clears `stopped` once the entry has landed: a panic past that point
+    /// leaves the published node to whoever claims it next.
+    fn publish_one(
+        &self,
+        e: Held,
+        target: NodeState,
+        bag: &mut Deferred<C>,
+        stopped: &mut Option<(u32, NodeState)>,
+    ) {
         let id = NodeId(e.slot);
         let node = self.nodes.get(e.slot);
         debug_assert_eq!(node.generation(), e.generation);
@@ -736,17 +748,24 @@ impl<C: Cells> Runtime<C> {
         }
         self.park(super::ParkPoint::HeldLanding(id));
         let landed = self.land_now(id, node, target, e.flagged, e.unrun);
+        *stopped = None;
         // A set flagged the held Failed landing, as `land_failed` handles at
         // an unheld one.
         if target == NodeState::Failed && landed != NodeState::Failed {
-            let token = self.failed_run_token(e.slot, e.generation);
-            self.forget_failed_run_if(e.slot, e.generation, token);
-            self.left_failed_landing(id, u64::MAX, bag);
+            self.leave_failed_target(id, e.generation, bag);
         }
         self.park(super::ParkPoint::HeldPublished(id));
         if let Some(Err(payload)) = children {
             resume_unwind(payload);
         }
+    }
+
+    /// A held Failed landing that did not land Failed drops its failed-run
+    /// record and tickets.
+    fn leave_failed_target(&self, id: NodeId, generation: u32, bag: &mut Deferred<C>) {
+        let token = self.failed_run_token(id.0, generation);
+        self.forget_failed_run_if(id.0, generation, token);
+        self.left_failed_landing(id, u64::MAX, bag);
     }
 
     /// A new dep of a published landing: one this publication has yet to
